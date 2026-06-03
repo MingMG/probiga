@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ProBigA 复盘分析平台</title>
+<link rel="stylesheet" href="/static/css/style.css?v=16">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-logo">Pro<span>Big</span>A</div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">市场概览</div>
+    <button class="sidebar-item active" data-tab="monitor" onclick="switchTab('monitor')">📺 市场监控</button>
+    <button class="sidebar-item" data-tab="fused" onclick="switchTab('fused')">📊 热股排行</button>
+    <button class="sidebar-item" data-tab="sector" onclick="switchTab('sector')">🌊 板块分析</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">个股热度</div>
+    <button class="sidebar-item" data-tab="strong" onclick="switchTab('strong')">🔥 强势股</button>
+    <button class="sidebar-item" data-tab="concept" onclick="switchTab('concept')">🏷️ 概念 / 行业</button>
+    <button class="sidebar-item" data-tab="alist" onclick="switchTab('alist')">🐲 龙虎榜</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">资金流向</div>
+    <button class="sidebar-item" data-tab="capital" onclick="switchTab('capital')">💰 个股资金</button>
+    <button class="sidebar-item" data-tab="mainforce" onclick="switchTab('mainforce')">🔍 主力行为</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">选股工具</div>
+    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 选股策略</button>
+    <button class="sidebar-item" data-tab="jq-picks" onclick="switchTab('jq-picks')">🤖 聚宽策略</button>
+    <button class="sidebar-item" data-tab="recommended" onclick="switchTab('recommended')">💎 AI推荐</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">持仓管理</div>
+    <button class="sidebar-item" data-tab="portfolio" onclick="switchTab('portfolio')">📈 自选股</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">资讯公告</div>
+    <button class="sidebar-item" data-tab="news" onclick="switchTab('news')">📰 快讯</button>
+    <button class="sidebar-item" data-tab="notice" onclick="switchTab('notice')">📜 个股公告</button>
+  </div>
+
+  <div class="sidebar-group">
+    <div class="sidebar-group-title">系统</div>
+    <button class="sidebar-item" data-tab="scheduler" onclick="switchTab('scheduler')">⚙️ 调度管理</button>
+    <button class="sidebar-item" data-tab="stock-list" onclick="switchTab('stock-list')">📋 全市场股票</button>
+  </div>
+</aside>
+
+<div class="main-content">
+  <header class="header">
+    <h1 id="pageTitle">市场监控</h1>
+    <input type="date" id="datePicker" class="date-input" onchange="refreshAll()">
+    <button class="btn-refresh" onclick="refreshAll()">🔄 刷新</button>
+    <span class="status-text" id="statusText">就绪</span>
+    <div style="flex:1"></div>
+    <button class="btn-layout-toggle" id="btnLayoutToggle" onclick="toggleLayout()" title="切换新版/老版菜单">🔀 新版</button>
+  </header>
+
+  <div class="content" id="contentArea">
+    <!-- 新版 tab -->
+    <div id="tab-monitor" class="tab-content active"><div class="loading">加载中...</div></div>
+    <div id="tab-fused" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-sector" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-strong" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-concept" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-alist" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-capital" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-mainforce" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-screen" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-jq-picks" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-recommended" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-portfolio" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-news" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-notice" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-scheduler" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-stock-list" class="tab-content"><div class="loading">加载中...</div></div>
+    <!-- 老版额外 tab -->
+    <div id="tab-sentiment" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-multi3" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-multi5" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-ths" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-east" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-xq" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-sina" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-review" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-sector-heat" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-concept3" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-concept5" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-industry3" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-industry5" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-capital-rt" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-sector-movement" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-sector-rotation" class="tab-content"><div class="loading">加载中...</div></div>
+  </div>
+</div>
+
+<!-- 龙虎榜席位弹窗 -->
+<div class="modal-overlay" id="alistModal" onclick="if(event.target===this)closeAlistModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="alistModalTitle">龙虎榜席位</span>
+      <button class="modal-close" onclick="closeAlistModal()">✕</button>
+    </div>
+    <div class="modal-body" id="alistModalBody" style="overflow-y:auto;padding:16px"></div>
+  </div>
+</div>
+<div id="tab-concept-detail" style="display:none"></div>
+<div id="tab-minute-chart" style="display:none"></div>
+
+<!-- K线弹窗 -->
+<div class="modal-overlay" id="klineModal" onclick="if(event.target===this)closeKlineModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="klineModalTitle">K线走势</span>
+      <button class="modal-close" onclick="closeKlineModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <iframe id="klineIframe" src="" allow="fullscreen"></iframe>
+    </div>
+  </div>
+</div>
+
+<!-- 分析弹窗 -->
+<div class="modal-overlay" id="analyzeModal" onclick="if(event.target===this)closeAnalyzeModal()">
+  <div class="modal-box" style="max-width:560px;position:relative">
+    <div class="modal-header" style="position:sticky;top:0;z-index:2">
+      <span class="modal-title" id="analyzeModalTitle">🤖 AI 分析</span>
+      <button class="modal-close" onclick="closeAnalyzeModal()">✕</button>
+    </div>
+    <div class="modal-body" id="analyzeModalBody" style="padding:20px 24px;max-height:60vh;overflow-y:auto;font-size:14px;line-height:1.8;color:#ccc;white-space:pre-wrap"></div>
+  </div>
+</div>
+
+<!-- 历史分析记录弹窗 -->
+<div class="modal-overlay" id="historyModal" onclick="if(event.target===this)closeHistoryModal()">
+  <div class="modal-box" style="max-width:600px">
+    <div class="modal-header">
+      <span class="modal-title" id="historyModalTitle">📋 历史分析记录</span>
+      <button class="modal-close" onclick="closeHistoryModal()">✕</button>
+    </div>
+    <div class="modal-body" id="historyModalBody" style="max-height:60vh;overflow-y:auto;padding:16px;font-size:13px;color:#ccc"></div>
+  </div>
+</div>
+
+<!-- 交易弹窗 -->
+<div class="modal-overlay" id="tradeModal" onclick="if(event.target===this)closeTradeModal()">
+  <div class="modal-box" style="max-width:400px">
+    <div class="modal-header">
+      <span class="modal-title" id="tradeModalTitle">💰 交易</span>
+      <button class="modal-close" onclick="closeTradeModal()">✕</button>
+    </div>
+    <div class="modal-body" style="padding:20px;color:#ccc;font-size:14px">
+      <input type="hidden" id="tradeCode">
+      <div style="margin-bottom:12px;color:#888;font-size:12px">
+        持仓成本 <strong id="tradeCost" style="color:#e0e0e0">-</strong> 元，
+        持有 <strong id="tradeShares" style="color:#e0e0e0">0</strong> 股
+      </div>
+      <div style="margin-bottom:12px">
+        <label style="font-size:12px;color:#888;display:block;margin-bottom:4px">买入/卖出价 (元)</label>
+        <input id="tradePrice" type="number" step="0.01" placeholder="0.00" style="width:100%;padding:8px 12px;border-radius:6px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0;font-size:14px">
+      </div>
+      <div style="margin-bottom:16px">
+        <label style="font-size:12px;color:#888;display:block;margin-bottom:4px">股数</label>
+        <input id="tradeQty" type="number" placeholder="100" style="width:100%;padding:8px 12px;border-radius:6px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0;font-size:14px">
+      </div>
+      <div style="display:flex;gap:10px">
+        <button onclick="pfExecTransact('buy')" style="flex:1;padding:10px;border:none;border-radius:6px;background:#388e3c;color:#fff;cursor:pointer;font-size:14px;font-weight:600">📈 加仓</button>
+        <button onclick="pfExecTransact('sell')" style="flex:1;padding:10px;border:none;border-radius:6px;background:#c62828;color:#fff;cursor:pointer;font-size:14px;font-weight:600">📉 减仓</button>
+      </div>
+      <div style="margin-top:8px;font-size:11px;color:#666">加仓按买入金额重算成本，减仓盈亏会摊到剩余持仓成本</div>
+    </div>
+  </div>
+</div>
+
+<!-- 概念成分股弹窗 -->
+<div class="modal-overlay" id="conceptModal" onclick="if(event.target===this)closeConceptModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <span class="modal-title" id="conceptModalTitle">成分股</span>
+      <button class="modal-close" onclick="closeConceptModal()">✕</button>
+    </div>
+    <div class="modal-body" id="conceptModalBody" style="overflow-y:auto;padding:16px"></div>
+  </div>
+</div>
+
+<!-- 股票详情弹窗 -->
+<div class="modal-overlay" id="stockDetailModal" onclick="if(event.target===this)closeStockDetailModal()">
+  <div class="modal-box" style="max-width:720px">
+    <div class="modal-header">
+      <span class="modal-title" id="stockDetailTitle">股票详情</span>
+      <button class="modal-close" onclick="closeStockDetailModal()">✕</button>
+    </div>
+    <div class="modal-body" id="stockDetailBody" style="padding:20px;max-height:72vh;overflow-y:auto"></div>
+  </div>
+</div>
+
+<!-- 主力行为分析弹窗 -->
+<div class="modal-overlay" id="mainforceModal" onclick="if(event.target===this)closeMainforceModal()">
+  <div class="modal-box" style="max-width:800px">
+    <div class="modal-header">
+      <span class="modal-title" id="mainforceModalTitle">🔍 主力行为分析</span>
+      <button class="modal-close" onclick="closeMainforceModal()">✕</button>
+    </div>
+    <div class="modal-body" id="mainforceModalBody" style="padding:20px;max-height:72vh;overflow-y:auto"></div>
+  </div>
+</div>
+
+<script>
+var API_BASE = '/api/hot-data';
+var PAGE_TITLES = {
+  monitor:'📺 市场监控',
+  fused:'📊 热股排行',
+  sector:'🌊 板块分析',
+  strong:'🔥 强势股',
+  concept:'🏷️ 概念 / 行业',
+  alist:'🐲 龙虎榜',
+  capital:'💰 个股资金',
+  mainforce:'🔍 主力行为分析',
+  screen:'🎯 选股策略',
+  'jq-picks':'🤖 聚宽策略',
+  recommended:'💎 AI推荐买入',
+  portfolio:'📈 自选股',
+  news:'📰 快讯',
+  notice:'📜 个股公告',
+  scheduler:'⚙️ 调度管理',
+  'stock-list':'📋 全市场股票'
+};
+</script>
+<script src="/static/js/app.js?v=21"></script>
+</body>
+</html>

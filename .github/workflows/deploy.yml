@@ -1,0 +1,36 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Alibaba Cloud ECS
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /opt/ProBigA
+            git pull origin main
+            source venv/bin/activate
+            pip install -e ./adata --quiet
+            pip install -r requirements-platform.txt --quiet
+            systemctl restart probiga
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sleep 2
+            systemctl status probiga --no-pager -l | head -5
+            curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1/

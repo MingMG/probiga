@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Fetch K-line data from LOCAL machine (different IP), then upload to server DB via SSH tunnel."""
+import sys
+import os
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'adata'))
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+REMOTE_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@47.113.123.190:3306/probiga?charset=utf8mb4"
+START_DATE = "2026-04-28"
+END_DATE = "2026-05-08"
+
+def main():
+    engine = create_engine(REMOTE_MYSQL_URL, connect_args={"connect_timeout": 30})
+
+    with engine.connect() as conn:
+        all_codes = [r[0] for r in conn.execute(text("SELECT stock_code FROM si_all_code ORDER BY stock_code")).fetchall()]
+        existing = set(r[0] for r in conn.execute(text(
+            "SELECT stock_code FROM sm_stock_kline WHERE trade_date >= :s GROUP BY stock_code HAVING COUNT(*) >= 5"
+        ), {"s": START_DATE}).fetchall())
+
+    missing = [c for c in all_codes if c not in existing]
+    print(f"Total: {len(all_codes)}, Already: {len(existing)}, Missing: {len(missing)}", flush=True)
+
+    if not missing:
+        print("All stocks have data. Done.", flush=True)
+        return
+
+    from adata.stock.market.stock_market.stock_market import StockMarket
+    mk = StockMarket()
+    name_map = {}
+
+    kline_cols = [
+        "stock_code", "short_name", "trade_time", "trade_date", "k_type", "adjust_type",
+        "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
+        "turnover_ratio", "pre_close",
+    ]
+
+    success = 0
+    failed = 0
+    failed_codes = []
+    batch = []
+    batch_size = 200
+
+    def flush_batch():
+        nonlocal batch
+        if batch:
+            combined = pd.concat(batch, ignore_index=True)
+            combined["etl_sync_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+            with engine.begin() as conn:
+                for _, row in combined.iterrows():
+                    conn.execute(text(
+                        "DELETE FROM sm_stock_kline WHERE stock_code = :c AND trade_date >= :s AND trade_date <= :e"
+                    ), {"c": row["stock_code"], "s": START_DATE, "e": END_DATE})
+            combined.to_sql("sm_stock_kline", engine, if_exists="append", index=False)
+            print(f"  [BATCH] Wrote {len(combined)} rows ({len(batch)} stocks)", flush=True)
+            batch = []
+
+    for i, code in enumerate(missing):
+        try:
+            df = mk.get_market(
+                stock_code=code, start_date=START_DATE, end_date=END_DATE,
+                k_type=1, adjust_type=1,
+            )
+            if df is not None and not df.empty:
+                df["k_type"] = 1
+                df["adjust_type"] = 1
+                df["short_name"] = name_map.get(str(code).strip().zfill(6), "")
+                batch.append(df[kline_cols])
+                success += 1
+            else:
+                failed += 1
+                failed_codes.append(code)
+        except Exception as e:
+            failed += 1
+            failed_codes.append(code)
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+1}/{len(missing)}] {code} error: {e}", flush=True)
+
+        if (i + 1) % batch_size == 0:
+            flush_batch()
+            print(f"[{i+1}/{len(missing)}] success={success}, failed={failed}", flush=True)
+
+        time.sleep(0.2)
+
+    flush_batch()
+    print(f"\nDone! success={success}, failed={failed}", flush=True)
+    if failed_codes:
+        print(f"Failed codes (first 50): {failed_codes[:50]}", flush=True)
+
+if __name__ == "__main__":
+    main()

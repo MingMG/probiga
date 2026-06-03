@@ -1,0 +1,451 @@
+【本仓库】实际采集使用 AkShare；已接入函数清单见同目录《已接入-AkShare-清单.md》。  
+当前 `a_share_daily_sina` 活跃脚本**未接**舆情类 AkShare。下文为 adata 风格接口文档原文。
+--------------------------------------------------------------------------------
+SENTIMENT
+舆情
+风险舆情，提前预警相关风险，尽量规避风险。
+
+舆情也只是做提醒作用，不做具体的推荐，具体的影响因子由自己的模型决定。
+
+舆情-SENTIMENT
+1. 近一个月的股票解禁列表
+说明介绍
+获取最近一个月的股票解禁数据
+
+帮助提前规避解禁股票，对于大额解禁个股参考意义巨大。
+
+调用方法
+sentiment.stock_lifting_last_month()
+Copied!
+输入参数
+无
+
+返回结果
+字段	类型	注释	说明
+stock_code	string	股票代码	300539
+short_name	string	股票简称	横河精密
+lift_date	date	解禁日期	1.1234
+volume	decimal	解禁股数(股)	2023-06-05
+amount	decimal	当前解禁市值(元)	根据当前价格计算
+ratio	decimal	占总股本比例(%)	0.36
+price	decimal	当前价格(元)	13.14
+参考示例
+import adata
+df = adata.sentiment.stock_lifting_last_month()
+print(df)
+Copied!
+# 结果示例
+    stock_code short_name   lift_date     volume      amount  ratio  price
+0       605399       晨光新材  2023-08-04  201000000  3628000000  64.35  18.05
+1       688385       复旦微电  2023-08-04    6000000   344000000   0.73  57.26
+2       301038       深水规院  2023-08-04    6435000   121000000   3.75  18.85
+3       603351       威尔药业  2023-08-04    1443500    39508900   1.07  27.37
+4       301278       快可电子  2023-08-04   22698000  1431000000  27.28  63.04
+..         ...        ...         ...        ...         ...    ...    ...
+307     837092       汉鑫科技  2023-07-05     762000    11826200   1.59  15.52
+308     430564       天润科技  2023-07-05     652900     3923700   0.88   6.01
+309     873001       纬达光电  2023-07-05    7682800    51090700   5.00   6.65
+310     002847       盐津铺子  2023-07-05     597000    49337300   0.30  82.64
+311     301202       朗威股份  2023-07-05   32310100  1454000000  23.69  45.00
+
+[312 rows x 7 columns]
+
+Process finished with exit code 0
+Copied!
+2. 融资融券余额数据
+说明介绍
+查询全市场融资融券余额数据
+
+调用方法
+sentiment.securities_margin()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+start_date	date	否	开始时间；例：2022-01-01，默认：最近一年的数据
+返回结果
+字段	类型	注释	说明
+trade_date	date	交易日期	2023-07-21
+rzye	decimal	融资余额（元）	1485586705452
+rqye	decimal	融券余额（元）	90400227216
+rzrqye	decimal	融资融券余额（元）	1575986932668
+rzrqyecz	decimal	融资融券余额差值（元）	1575986932668
+参考示例
+import adata
+df = adata.sentiment.securities_margin(start_date='2022-01-01')
+print(df)
+Copied!
+# 结果示例
+     trade_date           rzye          rqye         rzrqye       rzrqyecz
+0    2023-07-21  1485586705452   90400227216  1575986932668  1395186478236
+1    2023-07-20  1490792912237   91309450769  1582102363006  1399483461468
+..          ...            ...           ...            ...            ...
+373  2022-01-05  1716321973743  113216333911  1829538307654  1603105639832
+374  2022-01-04  1719028439852  115847621780  1834876061632  1603180818072
+
+[375 rows x 5 columns]
+
+Process finished with exit code 0
+Copied!
+------------
+北向资金（沪深港通）-NORTH
+北向对A股的影响越来越大，该行情指标可作为一个影响因子
+
+1. 北向实时流入行情
+说明介绍
+获取北向的实时流入行情
+
+调用方法
+sentiment.north.north_flow_current()
+Copied!
+输入参数
+无
+
+返回结果
+字段	类型	注释	说明
+trade_time	datetime	交易时间	2023-06-01 09:30:00
+net_hgt	decimal	沪港通净买入金额（元）	405050400
+net_sgt	decimal	深港通净买入金额（元）	151704400
+net_tgt	decimal	北向净买入金额（元）	556754800；沪港通和深港通合计
+参考示例
+import adata
+df = adata.sentiment.north.north_flow_current()
+print(df)
+Copied!
+# 结果示例
+             trade_time     net_hgt    net_sgt     net_tgt
+0 2023-08-01 11:30:00  3506502400  558573500  4065075901
+
+Process finished with exit code 0
+Copied!
+2. 北向分时流入行情
+说明介绍
+获取北向的分时流入行情
+
+调用方法
+sentiment.north.north_flow_min()
+Copied!
+输入参数
+无
+
+返回结果
+字段	类型	注释	说明
+trade_time	datetime	交易时间	2023-06-01 09:30:00
+net_hgt	decimal	沪港通净买入金额（元）	405050400
+net_sgt	decimal	深港通净买入金额（元）	151704400
+net_tgt	decimal	北向净买入金额（元）	556754800；沪港通和深港通合计
+参考示例
+import adata
+df = adata.sentiment.north.north_flow_min()
+print(df)
+Copied!
+# 结果示例
+             trade_time     net_hgt    net_sgt     net_tgt
+0   2023-08-01 09:30:00   405050400  151704400   556754800
+1   2023-08-01 09:31:00   577789000  152477000   730266000
+2   2023-08-01 09:32:00   495193200   10233700   505426900
+..                  ...         ...        ...         ...
+118 2023-08-01 11:28:00  4033936100  840697700  4874633800
+119 2023-08-01 11:29:00  3506502400  558562100  4065064500
+120 2023-08-01 11:30:00  3506502400  558573500  4065075901
+
+[121 rows x 4 columns]
+Process finished with exit code 0
+Copied!
+2. 北向历史流入行情
+说明介绍
+获取北向的历史流入行情
+
+最早日期：2017-01-01
+
+调用方法
+sentiment.north.north_flow()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+start_date	date	否	开始时间；例：2022-01-01，默认：最近30日的数据
+返回结果
+字段	类型	注释	说明
+trade_date	date	交易时间	2023-06-01
+net_hgt	decimal	沪港通净买入金额（元）	405050400；买入和卖出合计
+buy_hgt	decimal	沪港通买入金额（元）	
+buy_hgt	decimal	沪港通卖出金额（元）	
+net_sgt	decimal	深港通净买入金额（元）	151704400；买入和卖出合计
+buy_hgt	decimal	深港通买入金额（元）	
+sell_sgt	decimal	深港通卖出金额（元）	
+net_tgt	decimal	北向净买入金额（元）	556754800；沪港通和深港通合计
+buy_tgt	decimal	北向买入金额（元）	
+sell_tgt	decimal	北向卖出金额（元）	
+参考示例
+import adata
+df = adata.sentiment.north.north_flow(start_date='2017-01-01')
+print(df)
+Copied!
+# 结果示例
+      trade_date     net_hgt  ...      buy_tgt     sell_tgt
+0     2023-07-31  6211770000  ...  78681680000  69334910000
+1     2023-07-28  8021100000  ...  69420320000  53017340000
+2     2023-07-27  2135580000  ...  51371700000  47624610000
+...          ...         ...  ...          ...          ...
+1522  2017-01-05   609840000  ...   2550420000   2942820000
+1523  2017-01-04   583470000  ...   2525760000   3355420000
+1524  2017-01-03   598660000  ...   2104810000   2161100000
+
+[1525 rows x 10 columns]
+
+Process finished with exit code 0
+Copied!
+------------
+热门榜-HOT
+1. 东方财富人气榜TOP100
+说明介绍
+东方财富人气榜TOP100
+
+每次调用都是最新的数据
+
+调用方法
+sentiment.hot.pop_rank_100_east()
+Copied!
+输入参数
+无
+
+返回结果
+字段	类型	注释	说明
+rank	int	排名	100
+stock_code	string	股票代码	000799
+short_name	string	股票简称	酒鬼酒
+price	decimal	最新价格	88
+change	decimal	涨跌额	2
+change_pct	decimal	涨跌幅（%）	10.0020
+参考示例
+import adata
+df = adata.sentiment.hot.pop_rank_100_east()
+print(df)
+Copied!
+# 结果示例
+    rank stock_code short_name  price    change  change_pct
+0      1     301301       川宁生物  15.82  3.168746       20.03
+1      2     600789       鲁抗医药   7.85  0.780290        9.94
+2      3     002085       万丰奥威  16.20 -0.050220       -0.31
+3      4     002670       国盛金控  12.72  0.830616        6.53
+4      5     603739       蔚蓝生物  15.26  1.529052       10.02
+..   ...        ...        ...    ...       ...         ...
+95    96     000506      *ST中润   4.60 -0.228160       -4.96
+96    97     603019       中科曙光  47.21 -0.467379       -0.99
+97    98     603986       兆易创新  82.01  3.395214        4.14
+98    99     002709       天赐材料  22.22  1.290982        5.81
+99   100     300418       昆仑万维  41.28  1.341600        3.25
+
+[100 rows x 6 columns]
+Copied!
+2. 同花顺热股TOP100
+说明介绍
+同花顺热股TOP100
+
+每次调用都是最新的数据
+
+调用方法
+sentiment.hot.hot_rank_100_ths()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+start_date	date	否	开始时间；例：2022-01-01，默认：最近30日的数据
+返回结果
+字段	类型	注释	说明
+rank	int	排名	100
+stock_code	string	股票代码	000799
+short_name	string	股票简称	酒鬼酒
+change_pct	decimal	涨跌幅（%）	10.002
+hot_value	decimal	热度值	432509.0
+pop_tag	string	人气标签	首板涨停
+concept_tag	string	概念板块	白酒概念;国企改革
+参考示例
+import adata
+df = adata.sentiment.hot.hot_rank_100_ths()
+print(df)
+Copied!
+# 结果示例
+    rank stock_code short_name  change_pct  hot_value pop_tag       concept_tag
+0      1     000099       中信海直      0.6284  4053176.0    持续上榜  飞行汽车(eVTOL);低空经济
+1      2     002085       万丰奥威     -0.3077  2992777.0    持续上榜  飞行汽车(eVTOL);低空经济
+2      3     601127        赛力斯     -1.0642  2966129.0     NaN         百度概念;华为概念
+3      4     002590       万安科技      8.9172  2376913.0     NaN  低空经济;飞行汽车(eVTOL)
+4      5     300107       建新股份     11.3866  2133884.0     NaN    飞行汽车(eVTOL);染料
+..   ...        ...        ...         ...        ...     ...               ...
+95    96     000858        五粮液      2.6923   441919.0     NaN         超级品牌;白酒概念
+96    97     002035       华帝股份     10.0413   439802.0    首板涨停        家用电器;空气能热泵
+97    98     300905        宝丽迪     19.9863   439383.0    首板涨停          光刻胶;节能环保
+98    99     300829       金丹科技     20.0000   434725.0    首板涨停       可降解塑料;新材料概念
+99   100     000799        酒鬼酒     10.0020   432509.0    首板涨停         白酒概念;国企改革
+
+[100 rows x 7 columns]
+Copied!
+3. 同花热门概念板块TOP20
+说明介绍
+同花热门概念板块TOP20
+
+每次调用都是最新的数据
+
+调用方法
+sentiment.hot.hot_concept_20_ths()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+plate_type	int	否	板块类型：默认：1.概念板块；2.行业板块，默认：1.概念板块
+返回结果
+字段	类型	注释	说明
+rank	int	排名	1
+concept_code	string	概念代码	881157
+concept_name	string	概念名称	证券
+change_pct	decimal	涨跌幅（%）	0.2488
+hot_value	decimal	热度值	1130204.5
+hot_tag	string	连续351天上榜	热度标签
+参考示例
+import adata
+df = adata.sentiment.hot.hot_concept_20_ths()
+print(df)
+Copied!
+# 结果示例
+    rank concept_code concept_name  change_pct  hot_value   hot_tag
+0      1       881157           证券      0.2488  1130204.5  连续351天上榜
+1      2       881109         化学制品      4.5520   640911.5   10天9次上榜
+2      3       881145           电力      2.4941   502987.5   连续62天上榜
+3      4       881153        房地产开发      0.8296   460370.0  连续351天上榜
+..   ...        ...        ...         ...        ...     ...         ...
+16    17       881126        汽车零部件      1.8692   116196.0  连续217天上榜
+17    18       881141           中药      1.9951   108051.5  连续351天上榜
+18    19       881160        景点及旅游     -1.2024   103004.5   连续29天上榜
+19    20       881166         国防军工      0.9097    95759.0   连续89天上榜
+
+Process finished with exit code -1
+
+Copied!
+--------------
+龙虎榜-ALIST
+1. 每日龙虎榜列表
+说明介绍
+获取相应日期的所有龙虎榜列表
+
+调用方法
+sentiment.hot.list_a_list_daily()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+report_date	date	是	报告日期：默认：当天；2024-07-01
+返回结果
+字段	类型	注释	说明
+trade_date	int	交易日期	2024-07-01
+short_name	string	股票简称	全新好
+stock_code	string	股票代码	000007
+close	decimal	收盘价(元)	5.16000
+change_cpt	decimal	涨跌幅(%)	-9.94760
+turnover_ratio	decimal	换手率(%)	8.37860
+a_net_amount	decimal	龙虎榜净买入额(元)	4939641.98000
+a_buy_amount	decimal	龙虎榜买入额(元)	23347567.29000
+a_sell_amount	decimal	龙虎榜卖出额(元)	18407925.31000
+a_amount	decimal	龙虎榜成交额(元)	41755492.60000
+amount	decimal	总成交额(元)	137998593
+net_amount_rate	decimal	龙虎榜净买额占总成交额比例(%)	3.57949
+a_amount_rate	decimal	龙虎榜成交额占总成交额比例(%)	30.25791
+reason	string	上榜原因	日跌幅偏离值达到7%的前5只证券
+参考示例
+import adata
+df = adata.sentiment.hot.list_a_list_daily(report_date='2024-07-04')
+print(df)
+Copied!
+# 结果示例
+    trade_date  ...                                    reason
+0   2024-07-04  ...                          日跌幅偏离值达到7%的前5只证券
+1   2024-07-04  ...  连续三个交易日内，涨幅偏离值累计达到12%的ST证券、*ST证券和未完成股改证券
+2   2024-07-04  ...                          日跌幅偏离值达到7%的前5只证券
+..         ...  ...                                       ...
+59  2024-07-04  ...                          当日换手率达到20%的前5只股票
+60  2024-07-04  ...                          当日换手率达到20%的前5只股票
+61  2024-07-04  ...                          当日换手率达到20%的前5只股票
+
+Copied!
+2. 单只股票龙虎榜信息
+说明介绍
+获取单只股票龙虎榜信息
+
+注：先获取列表，再根据列表来获取
+
+调用方法
+sentiment.hot.get_a_list_info()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+report_date	date	否	报告日期：默认：当天；2024-07-01
+stock_code	string	是	股票代码：600297
+返回结果
+字段	类型	注释	说明
+trade_date	int	交易日期	2024-07-01
+stock_code	string	股票代码	000007
+operate_code	string	营业部代码	10678762
+operate_name	string	营业部名称	东方财富证券股份有限公司拉萨金融城南环路证券营业部
+a_net_amount	decimal	龙虎榜净买入额(元)	4939641.98000
+a_buy_amount	decimal	龙虎榜买入额(元)	23347567.29000
+a_sell_amount	decimal	龙虎榜卖出额(元)	18407925.31000
+a_buy_amount_rate	decimal	龙虎榜买入额占总成交额比例(%)	3.57949
+a_sell_amount_rate	decimal	龙虎榜卖出额占总成交额比例(%)	30.25791
+reason	string	上榜原因	有价格涨跌幅限制的日收盘价格涨幅偏离值达到7%的前五只证券
+参考示例
+import adata
+df = adata.sentiment.hot.get_a_list_info(stock_code='600297', report_date='2024-07-12')
+print(df)
+Copied!
+# 结果示例
+
+    trade_date  ...                                  reason
+3   2024-07-12  ...           有价格涨跌幅限制的日收盘价格涨幅偏离值达到7%的前五只证券
+6   2024-07-12  ...           有价格涨跌幅限制的日收盘价格涨幅偏离值达到7%的前五只证券
+7   2024-07-12  ...           有价格涨跌幅限制的日收盘价格涨幅偏离值达到7%的前五只证券
+..         ...  ...                                       ...
+17  2024-07-12  ...  非ST、*ST和S证券连续三个交易日内收盘价格涨幅偏离值累计达到20%的证券
+18  2024-07-12  ...  非ST、*ST和S证券连续三个交易日内收盘价格涨幅偏离值累计达到20%的证券
+19  2024-07-12  ...  非ST、*ST和S证券连续三个交易日内收盘价格涨幅偏离值累计达到20%的证券
+
+[20 rows x 10 columns]
+
+Copied!
+--------------
+扫雷-MINE
+1. 单只股票扫雷避险信息
+说明介绍
+获取单只股票扫雷避险信息
+
+调用方法
+sentiment.mine.mine_clearance_tdx()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码：600811；st东方
+返回结果
+字段	类型	注释	说明
+stock_code	string	股票代码	600811
+short_name	string	股票简称	st东方
+score	decimal	评分	1；总的评分，所有项一样
+f_type	string	一级类别	财务类风险
+s_type	string	二级类别	短期负债风险
+t_type	string	三级类别	短期负债风险
+reason	string	原因	东方集团：东方集团关于大股东部分股份被强制平仓的公告
+参考示例
+import adata
+df = adata.sentiment.mine.mine_clearance_tdx(stock_code='600811')
+print(df)
+Copied!
+# 结果示例
+
+   stock_code  ...                                             reason
+0      600811  ...   截止至2024-09-30，货币资金占短期负债和一年内到期非流动负债不足40%，利息保障倍数<3
+1      600811  ...                  截止2024-09-30,该公司财务费用高于归属母公司股东净利润。
+2      600811  ...                     截止20240930，公司营业收入相比去年同期降幅超过50%
+               ...                                        ... 
+15     600811  ...                                   会计师事务所出具保留意见审计报告
+16     600811  ...                                             股价小于1元
+17     600811  ...                                              *ST股票
+
+[18 rows x 6 columns]
+
+
+
+Copied!

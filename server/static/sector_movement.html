@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>板块异动监控 - ProBigA</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: #0a0a0a;
+  color: #ccc; min-height: 100vh; padding: 20px;
+}
+.container { max-width: 1800px; margin: 0 auto; }
+
+.header {
+  background: #141414; border-radius: 12px;
+  padding: 20px 28px; margin-bottom: 20px;
+  display: flex; justify-content: space-between; align-items: center;
+  border: 1px solid #222;
+}
+.header h1 { font-size: 22px; color: #eee; font-weight: 700; }
+.header-info { display: flex; gap: 16px; align-items: center; font-size: 13px; color: #666; }
+.header-info .rt-badge {
+  background: #1a3a1a; color: #4caf50;
+  padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600;
+}
+
+.section-title {
+  font-size: 16px; font-weight: 600; color: #888; margin: 24px 0 12px;
+  padding-left: 12px; border-left: 3px solid #333;
+}
+
+.sector-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+  gap: 12px;
+}
+
+.sector-card {
+  border-radius: 8px; overflow: hidden;
+  transition: all 0.2s; cursor: pointer;
+  background: #141414;
+  border: 1px solid #1e1e1e;
+}
+.sector-card:hover {
+  border-color: #333;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+}
+
+.sector-head {
+  padding: 14px 18px; display: flex; justify-content: space-between; align-items: center;
+}
+.sector-name { font-size: 17px; font-weight: 700; color: #eee; }
+.sector-change {
+  font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums;
+}
+.sector-change.up { color: #e74c3c; }
+.sector-change.down { color: #27ae60; }
+.sector-change.flat { color: #666; }
+
+.sector-meta {
+  padding: 0 18px 10px; display: flex; gap: 14px; font-size: 12px; color: #555;
+}
+.sector-meta .up-cnt { color: #e74c3c; }
+.sector-meta .dn-cnt { color: #27ae60; }
+
+.leader-bar {
+  padding: 10px 18px; background: #181818;
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px; border-top: 1px solid #1e1e1e;
+}
+.leader-label { color: #d4a017; font-weight: 600; }
+.leader-info { display: flex; gap: 12px; align-items: center; }
+.leader-name { color: #ddd; font-weight: 600; }
+.leader-momentum { font-weight: 700; font-variant-numeric: tabular-nums; color: #aaa; }
+
+.movers-panel {
+  max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
+  background: #111;
+}
+.sector-card.expanded .movers-panel { max-height: 500px; }
+
+.movers-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.movers-table th {
+  padding: 7px 16px; text-align: left; color: #444; font-weight: 500;
+  border-bottom: 1px solid #1a1a1a;
+}
+.movers-table td {
+  padding: 5px 16px; border-bottom: 1px solid #141414;
+  color: #bbb;
+}
+.movers-table tr:hover { background: #1a1a1a; }
+.movers-table .col-rank { width: 30px; color: #d4a017; font-weight: 700; }
+.movers-table .col-name { font-weight: 600; color: #eee; }
+.movers-table .col-momentum { font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+.movers-table .col-change { font-variant-numeric: tabular-nums; text-align: right; }
+.movers-table .col-amount { text-align: right; color: #555; }
+
+.c-up { color: #e74c3c; }
+.c-down { color: #27ae60; }
+.c-flat { color: #555; }
+
+.loading {
+  text-align: center; padding: 60px; color: #444; font-size: 16px;
+}
+
+.toggle-hint {
+  text-align: center; font-size: 12px; color: #333; padding: 8px;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0a0a0a; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📊 板块异动监控</h1>
+    <div class="header-info">
+      <span id="snapshotTime">--</span>
+      <span id="rtBadge" class="rt-badge" style="display:none">实时</span>
+      <span id="refreshStatus">自动刷新中</span>
+    </div>
+  </div>
+
+  <div id="loading" class="loading">加载中...</div>
+  <div id="content" style="display:none">
+    <div class="section-title">板块涨跌（按异动幅度排序）</div>
+    <div id="sectorGrid" class="sector-grid"></div>
+    <div class="toggle-hint">点击板块卡片展开/收起龙头个股详情</div>
+  </div>
+</div>
+
+<script>
+let allSectors = [];
+
+async function fetchSectors() {
+  try {
+    const resp = await fetch('/api/sector/movement');
+    return await resp.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function fmtAmt(v) {
+  if (!v) return '-';
+  const yi = v / 100000000;
+  return yi >= 1 ? yi.toFixed(1) + '亿' : (v / 10000).toFixed(0) + '万';
+}
+
+function fmtPct(v, needSign) {
+  if (v === null || v === undefined) return '-';
+  const s = v > 0 ? '+' : '';
+  return (needSign ? s : '') + v.toFixed(2) + '%';
+}
+
+function chgClass(v) {
+  if (v > 0) return 'up';
+  if (v < 0) return 'down';
+  return 'flat';
+}
+
+function chgColor(v) {
+  if (v > 0) return '#e74c3c';
+  if (v < 0) return '#27ae60';
+  return '#555';
+}
+
+function renderSectors(data) {
+  const sectors = data.sectors || [];
+  allSectors = sectors;
+  const grid = document.getElementById('sectorGrid');
+  grid.innerHTML = '';
+
+  if (!sectors.length) {
+    grid.innerHTML = '<div class="loading">暂无板块数据</div>';
+    return;
+  }
+
+  sectors.forEach((s, idx) => {
+    const avg = s.avg_change || 0;
+    const type = avg > 0.3 ? 'surge' : avg < -0.3 ? 'plunge' : 'neutral';
+    const leader = s.leader;
+    const lMom = leader ? leader.momentum : 0;
+    const lChg = leader ? leader.change_pct : 0;
+
+    const barColor = avg >= 0 ? '#e74c3c' : '#27ae60';
+
+    let moversRows = '';
+    (s.top_movers || []).forEach((m, mi) => {
+      const mc = chgColor(m.change_pct);
+      const mom = m.momentum || 0;
+      moversRows += `<tr>
+        <td class="col-rank">${mi + 1}</td>
+        <td class="col-name">${m.name}</td>
+        <td class="col-momentum" style="color:${chgColor(mom)}">${fmtPct(mom, true)}</td>
+        <td class="col-change" style="color:${mc}">${fmtPct(m.change_pct, true)}</td>
+        <td class="col-amount">${fmtAmt(m.amount)}</td>
+      </tr>`;
+    });
+
+    const card = document.createElement('div');
+    card.className = `sector-card ${type}`;
+    card.style.borderLeft = `3px solid ${barColor}`;
+    card.innerHTML = `
+      <div class="sector-head" onclick="this.parentElement.classList.toggle('expanded')">
+        <span class="sector-name">${s.name}</span>
+        <span class="sector-change ${chgClass(avg)}">${avg >= 0 ? '▲' : '▼'} ${fmtPct(avg, true)}</span>
+      </div>
+      <div class="sector-meta">
+        <span>成分股 ${s.stock_count}</span>
+        <span class="c-up">↑${s.up_count}</span>
+        <span class="c-down">↓${s.down_count}</span>
+      </div>
+      <div class="leader-bar">
+        <span class="leader-label">🐲 龙头</span>
+        <div class="leader-info">
+          <span class="leader-name">${leader ? leader.name : '-'}</span>
+          <span class="leader-momentum">动量 <span style="color:${chgColor(lMom)}">${fmtPct(lMom, true)}</span></span>
+          <span>日涨幅 <span style="color:${chgColor(lChg)}">${fmtPct(lChg, true)}</span></span>
+        </div>
+      </div>
+      <div class="movers-panel">
+        <table class="movers-table">
+          <thead><tr>
+            <th>#</th><th>股票</th><th style="text-align:right">2分钟动量</th>
+            <th style="text-align:right">日涨幅</th><th style="text-align:right">成交额</th>
+          </tr></thead>
+          <tbody>${moversRows}</tbody>
+        </table>
+      </div>`;
+    grid.appendChild(card);
+  });
+}
+
+async function refresh() {
+  const data = await fetchSectors();
+  if (!data) return;
+
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('content').style.display = 'block';
+  document.getElementById('snapshotTime').textContent = '快照: ' + (data.snapshot_time || '--');
+
+  const rtBadge = document.getElementById('rtBadge');
+  if (data.has_momentum) {
+    rtBadge.style.display = 'inline';
+    rtBadge.textContent = '含动量';
+  } else {
+    rtBadge.style.display = 'none';
+  }
+
+  renderSectors(data);
+}
+
+document.addEventListener('DOMContentLoaded', async function() {
+  await refresh();
+  setInterval(refresh, 30000);
+});
+</script>
+</body>
+</html>

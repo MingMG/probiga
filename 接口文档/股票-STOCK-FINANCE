@@ -1,0 +1,84 @@
+【本仓库】实际采集使用 AkShare；已接入函数清单见同目录《已接入-AkShare-清单.md》。  
+当前 `a_share_daily_sina` 活跃脚本**未接**财务类 AkShare。下文为 adata 风格接口文档原文。
+--------------------------------------------------------------------------------
+STOCK
+整个项目API的数据字典，按照模块层级分类命名，描述尽量精简，以便进行查阅。
+
+股票-STOCK-FINANCE
+------------
+财务指标相关
+1. 股票财务核心指标
+说明介绍
+
+获取单只股票财务的核心指标
+
+调用方法
+
+stock.finance.get_core_index()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	股票代码	
+short_name	string	股票简称	
+report_date	date	报告日期	
+report_type	date	报告类型	
+notice_date	date	公布日期	
+basic_eps	decimal	基本每股收益(元)	
+diluted_eps	decimal	稀释每股收益(元)	
+non_gaap_eps	decimal	扣非每股收益(元)	
+net_asset_ps	decimal	每股净资产(元)	
+cap_reserve_ps	decimal	每股公积金(元)	
+undist_profit_ps	decimal	每股未分配利润(元)	
+oper_cf_ps	decimal	每股经营现金流(元)	
+total_rev	decimal	营业总收入(元)	
+gross_profit	decimal	毛利润(元)	
+net_profit_attr_sh	decimal	归属净利润(元)	
+non_gaap_net_profit	decimal	扣非净利润(元)	
+total_rev_yoy_gr	decimal	营业总收入同比增长(%)	
+net_profit_yoy_gr	decimal	归属净利润同比增长(%)	
+non_gaap_net_profit_yoy_gr	decimal	扣非净利润同比增长(%)	
+total_rev_qoq_gr	decimal	营业总收入滚动环比增长(%)	
+net_profit_qoq_gr	decimal	归属净利润滚动环比增长(%)	
+non_gaap_net_profit_qoq_gr	decimal	扣非净利润滚动环比增长(%)	
+roe_wtd	decimal	净资产收益率(加权)(%)	
+roe_non_gaap_wtd	decimal	净资产收益率(扣非/加权)(%)	
+roa_wtd	decimal	总资产收益率(加权)(%)	
+gross_margin	decimal	毛利率(%)	
+net_margin	decimal	净利率(%)	
+adv_receipts_to_rev	decimal	预收账款/营业总收入	
+net_cf_sales_to_rev	decimal	销售净现金流/营业总收入	
+oper_cf_to_rev	decimal	经营净现金流/营业总收入	
+eff_tax_rate	decimal	实际税率(%)	
+curr_ratio	decimal	流动比率	
+quick_ratio	decimal	速动比率	
+cash_flow_ratio	decimal	现金流量比率	
+asset_liab_ratio	decimal	资产负债率(%)	
+equity_multiplier	decimal	权益系数	
+equity_ratio	decimal	产权比率	
+total_asset_turn_days	decimal	总资产周转天数(天)	
+inv_turn_days	decimal	存货周转天数(天)	
+acct_recv_turn_days	decimal	应收账款周转天数(天)	
+total_asset_turn_rate	decimal	总资产周转率(次)	
+inv_turn_rate	decimal	存货周转率(次)	
+acct_recv_turn_rate	decimal	应收账款周转率(次)	
+参考示例
+
+import adata
+df = adata.stock.finance.get_core_index(stock_code='300033')
+print(df)
+Copied!
+# 结果示例
+   stock_code short_name  ... inv_turn_rate acct_recv_turn_rate
+18     300033        同花顺  ...          None           26.699629
+50     300033        同花顺  ...          None           10.924870
+0      300033        同花顺  ...          None           77.597095
+..        ...        ...  ...           ...                 ...
+16     300033        同花顺  ...          None           47.873623
+17     300033        同花顺  ...          None           42.495436
+
+[66 rows x 45 columns]

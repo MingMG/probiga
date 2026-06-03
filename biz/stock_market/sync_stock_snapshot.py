@@ -1,0 +1,206 @@
+"""
+全市场股票快照表 刷新脚本
+
+从 sm_stock_kline（最新日K）+ sm_stock_capital_flow_daily（最新资金流向）
+合并写入 sm_stock_snapshot，每只股票一行，约5000条。
+
+用法：
+    python biz/stock_market/sync_stock_snapshot.py                # 自动取最新交易日
+    python biz/stock_market/sync_stock_snapshot.py --date 2025-05-30  # 指定日期
+"""
+
+import argparse
+import os
+import sys
+from datetime import datetime
+
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# ── 数据库连接 ──────────────────────────────────────────────
+MYSQL_URL = os.getenv(
+    "MYSQL_URL",
+    "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga",
+)
+
+
+def get_engine():
+    return create_engine(MYSQL_URL, pool_size=5, max_overflow=10)
+
+
+# ── 核心逻辑 ────────────────────────────────────────────────
+def get_latest_trade_date(engine) -> str:
+    """从 sm_stock_kline 取最新交易日"""
+    sql = text("""
+        SELECT MAX(trade_date) AS d
+        FROM sm_stock_kline
+        WHERE k_type = 1 AND adjust_type = 0
+    """)
+    row = pd.read_sql(sql, engine).iloc[0]
+    if pd.isna(row["d"]):
+        print("[ERROR] sm_stock_kline 表无数据，无法确定最新交易日")
+        sys.exit(1)
+    return str(row["d"])
+
+
+def get_nth_trade_date(engine, trade_date: str, offset: int) -> str:
+    """取第N个交易日前的日期"""
+    sql = text("""
+        SELECT trade_date FROM sm_stock_kline
+        WHERE k_type = 1 AND trade_date <= :d
+        GROUP BY trade_date ORDER BY trade_date DESC
+        LIMIT 1 OFFSET :n
+    """)
+    rows = pd.read_sql(sql, engine, params={"d": trade_date, "n": offset})
+    if rows.empty:
+        return trade_date
+    return str(rows.iloc[0]["trade_date"])
+
+
+def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
+    """从 sm_stock_kline + sm_stock_capital_flow_daily 合并数据，预计算多日涨幅、市值、行业"""
+    # 1. 主查询：当日K线
+    sql = text("""
+        SELECT
+            k.stock_code,
+            k.short_name,
+            k.trade_date,
+            k.open,
+            k.close,
+            k.high,
+            k.low,
+            k.pre_close,
+            k.change,
+            k.change_pct,
+            k.volume,
+            k.amount,
+            k.turnover_ratio
+        FROM sm_stock_kline k
+        WHERE k.trade_date = :d
+          AND k.k_type = 1
+          AND k.adjust_type = 0
+    """)
+    df = pd.read_sql(sql, engine, params={"d": trade_date})
+
+    # 1a. 实时行情（sm_stock_current，取最新快照）
+    cur = pd.read_sql(text("""
+        SELECT stock_code, price AS cur_price, change_pct AS cur_change_pct
+        FROM sm_stock_current
+        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM sm_stock_current)
+    """), engine)
+    cur = cur.drop_duplicates(subset=["stock_code"], keep="first")
+    df = df.merge(cur, on="stock_code", how="left")
+    # price = 实时价优先，回退到K线close
+    df["price"] = df["cur_price"].fillna(df["close"])
+    df.drop(columns=["cur_price", "cur_change_pct"], inplace=True)
+    print(f"[INFO] 实时行情: {len(cur)} 条")
+
+    # 1b. 资金流向（取最新可用日期，不要求与K线日期一致）
+    flow_td = pd.read_sql(text("SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily"), engine)
+    flow_date = flow_td.iloc[0]["d"]
+    if flow_date is not None and not pd.isna(flow_date):
+        flow = pd.read_sql(text("""
+            SELECT stock_code, main_net_inflow, max_net_inflow,
+                   lg_net_inflow, mid_net_inflow, sm_net_inflow
+            FROM sm_stock_capital_flow_daily
+            WHERE trade_date = :d
+        """), engine, params={"d": str(flow_date)})
+        flow = flow.drop_duplicates(subset=["stock_code"], keep="first")
+        df = df.merge(flow, on="stock_code", how="left")
+        print(f"[INFO] 资金流向日期: {flow_date}, {len(flow)} 条")
+
+    # 2. 近3/5/10日涨幅
+    td3 = get_nth_trade_date(engine, trade_date, 2)
+    td5 = get_nth_trade_date(engine, trade_date, 4)
+    td10 = get_nth_trade_date(engine, trade_date, 9)
+
+    for label, td_n in [("change_3d", td3), ("change_5d", td5), ("change_10d", td10)]:
+        hist = pd.read_sql(
+            text("SELECT stock_code, close AS close_n FROM sm_stock_kline "
+                 "WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0"),
+            engine, params={"d": td_n},
+        )
+        df = df.merge(hist, on="stock_code", how="left")
+        df[label] = ((df["close"] - df["close_n"]) / df["close_n"] * 100).round(2)
+        df.drop(columns=["close_n"], inplace=True)
+
+    # 3. 总市值 = 最新收盘价 * 总股本
+    shares = pd.read_sql(
+        text("SELECT stock_code, total_shares FROM si_stock_shares"), engine
+    )
+    shares = shares.drop_duplicates(subset=["stock_code"], keep="last")
+    df = df.merge(shares, on="stock_code", how="left")
+    df["market_cap"] = (df["close"] * df["total_shares"]).round(2)
+    df.drop(columns=["total_shares"], inplace=True)
+
+    # 4. 行业（申万一级）
+    industry = pd.read_sql(
+        text("SELECT stock_code, industry_name FROM si_industry_sw WHERE industry_type = '申万一级'"),
+        engine,
+    )
+    industry = industry.drop_duplicates(subset=["stock_code"], keep="first")
+    df = df.merge(industry.rename(columns={"industry_name": "industry"}), on="stock_code", how="left")
+
+    # 最终去重（防止 merge 产生重复行）
+    df = df.drop_duplicates(subset=["stock_code"], keep="first")
+
+    return df
+
+
+def write_snapshot(engine, df: pd.DataFrame) -> None:
+    """TRUNCATE + INSERT 写入快照表"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    df["etl_sync_at"] = now
+
+    # 同步自选股排序 + 持仓标记
+    try:
+        pdf = pd.read_sql(
+            text("SELECT stock_code, sort_order, shares FROM st_user_portfolio"),
+            engine,
+        )
+        order_map = dict(zip(pdf["stock_code"], pdf["sort_order"]))
+        holding_codes = set(pdf[pdf["shares"] > 0]["stock_code"].tolist())
+    except Exception:
+        order_map = {}
+        holding_codes = set()
+
+    df["sort_order"] = df["stock_code"].map(order_map)
+    df["is_holding"] = df["stock_code"].isin(holding_codes).astype(int)
+
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE sm_stock_snapshot"))
+
+    df.to_sql(
+        "sm_stock_snapshot",
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=1000,
+        method="multi",
+    )
+
+
+# ── 主流程 ──────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(description="刷新全市场股票快照表")
+    parser.add_argument("--date", type=str, default=None, help="交易日期，格式 YYYY-MM-DD，默认自动取最新")
+    args = parser.parse_args()
+
+    engine = get_engine()
+
+    trade_date = args.date or get_latest_trade_date(engine)
+    print(f"[INFO] 快照日期: {trade_date}")
+
+    df = fetch_snapshot(engine, trade_date)
+    print(f"[INFO] 拉取到 {len(df)} 只股票数据")
+
+    if df.empty:
+        print("[WARN] 无数据，跳过写入")
+        return
+
+    write_snapshot(engine, df)
+    print(f"[OK] sm_stock_snapshot 已刷新，共 {len(df)} 行，日期 {trade_date}")
+
+
+if __name__ == "__main__":
+    main()

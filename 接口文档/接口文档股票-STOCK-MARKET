@@ -1,0 +1,759 @@
+【本仓库】实际采集使用 AkShare；已接入函数清单见同目录《已接入-AkShare-清单.md》。  
+下文为 adata 风格接口文档原文，与 `ak.xxx()` 不是同名一一对应。
+--------------------------------------------------------------------------------
+STOCK
+股票-STOCK-MARKET
+1. 分红-DIVIDEND
+说明介绍
+
+获取对应股票的所有历史分红信息
+
+调用方法
+
+stock.market.get_dividend()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：000001
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	代码	600001
+report_date	date	公告日	1990-01-01
+dividend_plan	string	分红方案	10股派3.00元，10股转赠5.00股
+ex_dividend_date	date	除权除息日	1990-01-01
+参考示例
+
+import adata
+df = adata.stock.market.get_dividend(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+   report_date         dividend_plan ex_dividend_date stock_code
+0   2023-06-07             10股派2.85元       2023-06-14     000001
+2   2022-07-15             10股派2.28元       2022-07-22     000001
+4   2021-05-07             10股派1.80元       2021-05-14     000001
+6   2020-05-22             10股派2.18元       2020-05-28     000001
+8   2019-06-20             10股派1.45元       2019-06-26     000001
+10  2018-07-06             10股派1.36元       2018-07-12     000001
+12  2017-07-17             10股派1.58元       2017-07-21     000001
+14  2016-06-08  10股派1.53元，10股转赠2.00股       2016-06-16     000001
+16  2015-04-07  10股派1.74元，10股转赠2.00股       2015-04-13     000001
+18  2014-06-06  10股派1.60元，10股转赠2.00股       2014-06-12     000001
+20  2013-06-14             10股派1.70元       2013-06-20     000001
+21  2012-10-12             10股派1.00元       2012-10-19     000001
+29  2008-10-24             10股派0.34元       2008-10-31     000001
+39  2003-09-23             10股派1.50元       2003-09-29     000001
+42  2002-07-17             10股派1.50元       2002-07-23     000001
+47  1999-10-11             10股派6.00元       1999-10-18     000001
+52  1997-08-19             10股派2.00元       1997-08-25     000001
+54  1996-05-23            10股转赠5.00股       1996-05-27     000001
+55  1995-09-15             10股派3.00元       1995-09-25     000001
+57  1994-07-02  10股派5.00元，10股转赠2.00股       1994-07-11     000001
+60  1993-05-07  10股派3.00元，10股转赠5.00股       1993-05-24     000001
+61  1992-03-14             10股派2.00元       1992-03-23     000001
+62  1991-03-03             10股派3.00元       1991-05-02     000001
+Copied!
+2. 股票行情-MARKET
+2.1 k线行情
+说明介绍
+获取当个股票的K线行情信息
+
+日，周，月K
+
+调用方法
+stock.market.get_market()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+stock_code	string	是	000001	股票代码
+start_date	string	否	1990-01-01	开始时间；例：'2021-01-01'
+end_date	string	否	当天	结束时间；例：'2021-01-01'
+k_type	int	否	1	k线类型：1.日；2.周；3.月 ；4.季度；5.5分钟；15.15分钟；30.30分钟；60.60分钟；默认：1 日k
+adjust_type	int	否	1	k线复权类型：0.不复权；1.前复权；2.后复权 默认：1 前复权
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+open	decimal	开盘价(元)	9.98
+close	decimal	收盘价(元)	9.98
+high	decimal	最高价(元)	9.98
+low	decimal	最低价(元)	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额(元)	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+turnover_ratio	decimal	换手率(%)	0.38
+pre_close	decimal	昨收(元)	10.00
+参考示例
+import adata
+df = adata.stock.market.get_market(stock_code='000001', start_date='2021-01-01', k_type=1, adjust_type=1)
+print(df)
+Copied!
+# 结果示例
+              trade_time   open  close  ... pre_close stock_code  trade_date
+0    2021-01-04 00:00:00  18.41  17.91  ...     18.65     000001  2021-01-04
+1    2021-01-05 00:00:00  17.71  17.48  ...     17.91     000001  2021-01-05
+2    2021-01-06 00:00:00  17.39  18.87  ...     17.48     000001  2021-01-06
+3    2021-01-07 00:00:00  18.83  19.21  ...     18.87     000001  2021-01-07
+4    2021-01-08 00:00:00  19.21  19.16  ...     19.21     000001  2021-01-08
+..                   ...    ...    ...  ...       ...        ...         ...
+601  2023-06-29 00:00:00  11.29  11.18  ...     11.30     000001  2023-06-29
+602  2023-06-30 00:00:00  11.18  11.23  ...     11.18     000001  2023-06-30
+603  2023-07-03 00:00:00  11.24  11.49  ...     11.23     000001  2023-07-03
+604  2023-07-04 00:00:00  11.46  11.40  ...     11.49     000001  2023-07-04
+605  2023-07-05 00:00:00  11.36  11.34  ...     11.40     000001  2023-07-05
+
+[606 rows x 13 columns]
+Copied!
+2.2 分时行情
+说明介绍
+获取单个股票最新交易日的分时行情
+
+盘中请求就是当天的实时分时行情
+
+分钟级别：每分钟一条数据
+
+调用方法
+stock.market.get_market_min()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：000001,默认获取最新交易日的分时行情
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+price	decimal	价格(元)	9.98
+avg_price	decimal	平均价(元)	9.98
+change	decimal	涨跌额(元)	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+参考示例
+import adata
+df = adata.stock.market.get_market_min(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+    stock_code           trade_time  price  ...  volume  avg_price   amount
+0       000001  2023-07-05 09:30:00  11.36  ...  488600      11.36  5550496
+1       000001  2023-07-05 09:31:00  11.37  ...  461600      11.36  5247873
+2       000001  2023-07-05 09:32:00  11.37  ...  220500      11.37  2507387
+3       000001  2023-07-05 09:33:00  11.38  ...  148500      11.37  1688939
+4       000001  2023-07-05 09:34:00  11.38  ...  111100      11.37  1263744
+..         ...                  ...    ...  ...     ...        ...      ...
+236     000001  2023-07-05 14:56:00  11.34  ...  159600      11.33  1808983
+237     000001  2023-07-05 14:57:00  11.34  ...  292200      11.33  3313452
+238     000001  2023-07-05 14:58:00  11.35  ...   11300      11.33   128253
+239     000001  2023-07-05 14:59:00  11.35  ...       0      11.33        0
+240     000001  2023-07-05 15:00:00  11.34  ...  657700      11.33  7458318
+
+[241 rows x 8 columns]
+Copied!
+2.3 实时行情
+说明介绍
+获取多只股票的实时最新行情数据
+
+可以传多只股票的代码，建议最多不超过500个，多了接口无法返回
+
+调用方法
+stock.market.list_market_current()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+code_list	list	是	数量限制最多500个，股票代码列表；例：['000001', '600001', '000795', '872925']
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+short_name	string	简称	平安银行
+price	decimal	当前价格(元)	12.36
+change	decimal	涨跌额(元)	0.02
+change_pct	decimal	涨跌幅(%)	0.16
+volume	decimal	成交量(股)	34452500
+amount	decimal	成交额(元)	
+参考示例
+import adata
+df = adata.stock.market.list_market_current(code_list=['000001', '600001', '000795', '872925'])
+print(df)
+Copied!
+# 结果示例
+  stock_code short_name  price change change_pct     volume        amount
+0     000001       平安银行  11.34  -0.06      -0.53   42348200   479720000.0
+1     000795        英洛华   8.10   0.53       7.00  140166000  1098610000.0
+2     872925       锦好医疗  9.530  0.000      0.000     318846   3008578.290
+Copied!
+2.4 五档行情
+说明介绍
+获取单个股票的5档行情
+
+调用方法
+stock.market.get_market_five()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	str	是	股票代码；例：'000001'
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+short_name	string	简称	平安银行
+s5	decimal	卖5价(元)	11.29
+sv5	decimal	卖5量(股)	2263
+s4	decimal	卖4价(元)	11.28
+sv4	decimal	卖4量(股)	2263
+s3	decimal	卖3价(元)	11.27
+sv3	decimal	卖3量(股)	2263
+s2	decimal	卖2价(元)	11.26
+sv2	decimal	卖2量(股)	2263
+s1	decimal	卖1价(元)	11.25
+sv1	decimal	卖1量(股)	2263
+b1	decimal	买1价(元)	11.24
+bv1	decimal	买1量(股)	2263
+b2	decimal	买2价(元)	11.23
+bv2	decimal	买2量(股)	2263
+b3	decimal	买3价(元)	11.22
+bv3	decimal	买3量(股)	2263
+b4	decimal	买4价(元)	11.21
+bv4	decimal	买4量(股)	2263
+b5	decimal	买5价(元)	11.20
+bv5	decimal	买5量(股)	2263
+参考示例
+import adata
+df = adata.stock.market.get_market_five(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+  stock_code short_name     s5   sv5     s4  ...   bv3     b4    bv4     b5    bv5
+0     000001     平安银行  11.29  2263  11.28  ...  8234  11.21  11227  11.20  14241
+
+[1 rows x 22 columns]
+Copied!
+2.5 分时成交
+说明介绍
+获取单个股票的成交分时，最新200条记录
+
+调用方法
+stock.market.get_market_bar()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	str	是	股票代码；例：'000001'
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+trade_time	datetime	成交时间	2023-09-13 09:31:45
+price	decimal	当前价格(元)	12.36
+volume	decimal	成交量(股)	34452500
+bs_type	string	买卖类型	B：买入，S：卖出
+参考示例
+import adata
+df = adata.stock.market.get_market_bar(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+    stock_code           trade_time  price  volume bs_type
+0       000001  2023-09-13 14:46:15  11.25    5800       B
+1       000001  2023-09-13 14:46:18  11.25     500       B
+..         ...                  ...    ...     ...     ...
+198     000001  2023-09-13 14:57:00  11.24    5100       S
+199     000001  2023-09-13 15:00:00  11.25  351500       B
+
+[200 rows x 5 columns]
+Copied!
+3. 资金流向-CAPITAL_FLOW
+3.1 分时资金流向
+说明介绍
+获取单个股票的资金流向分时
+
+调用方法
+stock.market.get_capital_flow_min()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	str	是	股票代码；例：'000001'
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+trade_time	datetime	交易时间	2023-09-13 09:31:00
+main_net_inflow	decimal	主力资金净流入(元)	2526394.0
+max_net_inflow	decimal	特大单净流入(元)	2526394.0
+lg_net_inflow	decimal	大单净流入(元)	2526394.0
+mid_net_inflow	decimal	中单净流入(元)	2526394.0
+sm_net_inflow	decimal	小单净流入(元)	2526394.0
+参考示例
+import adata
+df = adata.stock.market.get_capital_flow_min(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+    stock_code          trade_time  ...  lg_net_inflow  max_net_inflow
+0       000001 2024-07-01 09:31:00  ...      2526394.0      -7783258.0
+1       000001 2024-07-01 09:32:00  ...      6225393.0     -10094040.0
+..         ...                 ...  ...            ...             ...
+238     000001 2024-07-01 14:59:00  ...     28848843.0     196753761.0
+239     000001 2024-07-01 15:00:00  ...     28848843.0     196753761.0
+
+[240 rows x 7 columns]
+Copied!
+3.2 资金流向-日度
+说明介绍
+获取单个股票的资金流向历史数据-日度
+
+注：只能获取最近2-3年的数据
+
+调用方法
+stock.market.get_capital_flow()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+stock_code	str	是	股票代码；例：'000001'
+start_date	date	否	开始时间
+end_date	date	否	结束时间
+返回结果
+字段	类型	注释	说明
+stock_code	string	代码	600001
+trade_date	date	交易日期	2023-09-13
+main_net_inflow	decimal	主力资金净流入(元)	2526394.0
+max_net_inflow	decimal	特大单净流入(元)	2526394.0
+lg_net_inflow	decimal	大单净流入(元)	2526394.0
+mid_net_inflow	decimal	中单净流入(元)	2526394.0
+sm_net_inflow	decimal	小单净流入(元)	2526394.0
+参考示例
+import adata
+df = adata.stock.market.get_capital_flow(stock_code='000001')
+print(df)
+Copied!
+# 结果示例
+    stock_code  trade_date  ...  lg_net_inflow  max_net_inflow
+0       000001  2024-06-28  ...    -12017600.0      28667900.0
+1       000001  2024-06-27  ...     -7480400.0      62277700.0
+2       000001  2024-06-26  ...    -12715700.0      19353300.0
+..         ...         ...  ...            ...             ...
+667     000001  2021-09-23  ...   -272000000.0       8215700.0
+668     000001  2021-09-22  ...      2247000.0     121000000.0
+669     000001  2021-09-17  ...   -129000000.0     -66753500.0
+
+[670 rows x 7 columns]
+Copied!
+概念行情-CONCEPT MARKET
+同花顺和东方财富的返回字段结果有所不同，请根据需求进行选择
+股票概念是各大厂商自定义的，在设置成分上有所不同，所以分开提供
+指数是官方提供，各大厂商一致可进行融合处理。
+20. 概念行情-同花顺-THS
+概念和指数在字典表以及运作的逻辑是一致的，所以参数的命名都为：index_code
+
+20.1 k线
+说明介绍
+获取单个同花顺概念指数的K线行情
+
+日，周，月K
+
+调用方法
+stock.market.get_market_concept_ths()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	886013	同花顺概念指数代码；8开头；例：886041
+k_type	int	否	1	k线类型：1.日；2.周；3.月 默认：1 日k
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	886041
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+open	decimal	开盘价	9.98
+close	decimal	收盘价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_ths(index_code='886041')
+print(df)
+Copied!
+# 结果示例
+    trade_date      open      high  ...           trade_time change change_pct
+0   2023-04-11  1000.238  1045.339  ...  2023-04-11 00:00:00   None       None
+1   2023-04-12  1042.454  1079.156  ...  2023-04-12 00:00:00  33.73       3.24
+2   2023-04-13  1067.842  1097.239  ...  2023-04-13 00:00:00 -10.72       -1.0
+3   2023-04-14  1066.132  1082.673  ...  2023-04-14 00:00:00  -3.71      -0.35
+4   2023-04-17  1052.973  1053.219  ...  2023-04-17 00:00:00 -32.52      -3.06
+..                   ...      ...        ...  ...         ...    ...        ...
+53  2023-06-30   983.923   996.860  ...  2023-06-30 00:00:00   7.06       0.72
+54  2023-07-03   995.890   996.022  ...  2023-07-03 00:00:00  -3.61      -0.36
+55  2023-07-04   986.366   998.607  ...  2023-07-04 00:00:00    8.4       0.85
+56  2023-07-05  1003.030  1017.040  ...  2023-07-05 00:00:00  -8.08      -0.81
+57  2023-07-06      None      None  ...  2023-07-06 00:00:00  -0.92      -0.09
+
+[58 rows x 11 columns]
+Copied!
+20.2 分时
+说明介绍
+获取单个同花顺概念指数的分时行情
+
+调用方法
+stock.market.get_market_concept_min_ths()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	886041	同花顺概念指数代码；8开头；例：886041
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	886041
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+price	decimal	现价	9.98
+avg_price	decimal	均价	默认为：None
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+注意：同花顺分时没有平均价；
+
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_min_ths(index_code='886041')
+print(df)
+Copied!
+# 结果示例
+              trade_time    price     amount  ...  trade_date change change_pct
+0    2023-07-06 09:30:00  988.049  220005020  ...  2023-07-06 -2.441  -0.246444
+1    2023-07-06 09:31:00  984.919  668256970  ...  2023-07-06 -5.571  -0.562449
+2    2023-07-06 09:32:00  988.754  544952910  ...  2023-07-06 -1.736  -0.175267
+3    2023-07-06 09:33:00  990.360  412018700  ...  2023-07-06 -0.130  -0.013125
+4    2023-07-06 09:34:00  991.679  349169300  ...  2023-07-06  1.189   0.120042
+..                   ...      ...        ...  ...         ...    ...        ...
+236  2023-07-06 14:56:00  986.953  201322000  ...  2023-07-06 -3.537  -0.357096
+237  2023-07-06 14:57:00  987.137  220634000  ...  2023-07-06 -3.353  -0.338519
+238  2023-07-06 14:58:00  987.043   37234000  ...  2023-07-06 -3.447  -0.348010
+239  2023-07-06 14:59:00  987.043          0  ...  2023-07-06 -3.447  -0.348010
+240  2023-07-06 15:00:00  987.264  313642000  ...  2023-07-06 -3.226  -0.325697
+
+[241 rows x 9 columns]
+Copied!
+20.3 实时
+说明介绍
+获取当个同花顺概念指数的实时行情，即最新的行情数据。
+
+调用方法
+stock.market.get_market_concept_current_ths()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	886041	同花顺概念指数代码；8开头；例：886041
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	886041
+trade_time	time	交易时间	1990-01-01 00:00:00；返回当前的时间
+trade_date	date	交易日期	1990-01-01
+open	decimal	开盘价	9.98
+price	decimal	现价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	默认为：None
+change_pct	decimal	涨跌幅(%)	默认为：None
+注意：同花顺实时行情没有昨日收盘，涨跌额和涨跌幅无法计算；
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_current_ths(index_code='886041')
+print(df)
+Copied!
+# 结果示例
+            trade_time  trade_date  ...           amount index_code
+0  2023-07-06 17:57:00  2023-07-06  ...  27101941000.000     886041
+
+[1 rows x 9 columns]
+Copied!
+21. 概念行情-东方财富-EAST
+概念和指数在字典表以及运作的逻辑是一致的，所以参数的命名都为：index_code
+
+21.1 k线
+说明介绍
+获取单个东方财富概念指数的K线行情
+
+日，周，月K
+
+调用方法
+stock.market.get_market_concept_east()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	BK0612	东方财富概念指数代码；BK开头
+k_type	int	否	1	k线类型：1.日；2.周；3.月 默认：1 日k
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	BK0612
+trade_time	time	交易时间	2012-06-14 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	2012-06-14 00:00:00
+open	decimal	开盘价	9.98
+close	decimal	收盘价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_east(index_code='BK0612')
+print(df)
+Copied!
+# 结果示例
+     index_code           trade_time  ...  change  change_pct
+0        BK0612  2012-06-14 00:00:00  ... -239.25      -23.93
+1        BK0612  2012-06-15 00:00:00  ...    5.69        0.75
+2        BK0612  2012-06-18 00:00:00  ...    0.57        0.07
+3        BK0612  2012-06-19 00:00:00  ...   -3.31       -0.43
+4        BK0612  2012-06-20 00:00:00  ...    0.61        0.08
+...         ...                  ...  ...     ...         ...
+2707     BK0612  2023-08-02 00:00:00  ...  -10.44       -0.72
+2708     BK0612  2023-08-03 00:00:00  ...   14.37        1.00
+2709     BK0612  2023-08-04 00:00:00  ...    3.63        0.25
+2710     BK0612  2023-08-07 00:00:00  ...  -11.75       -0.80
+2711     BK0612  2023-08-08 00:00:00  ...   -5.10       -0.35
+
+[2712 rows x 11 columns]
+Copied!
+21.2 分时
+说明介绍
+获取单个东方财富概念指数的分时行情
+
+调用方法
+stock.market.get_market_concept_min_east()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	BK0612	东方财富概念指数代码；BK开头
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	BK0612
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+price	decimal	现价	9.98
+avg_price	decimal	均价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_min_east(index_code='BK0612')
+print(df)
+Copied!
+# 结果示例
+    index_code           trade_time  ... change  change_pct
+0       BK0612  2023-08-08 09:30:00  ...  -3.27       -0.23
+1       BK0612  2023-08-08 09:31:00  ...  -4.50       -0.31
+2       BK0612  2023-08-08 09:32:00  ...  -5.02       -0.35
+3       BK0612  2023-08-08 09:33:00  ...  -4.75       -0.33
+4       BK0612  2023-08-08 09:34:00  ...  -6.32       -0.44
+..         ...                  ...  ...    ...         ...
+236     BK0612  2023-08-08 14:56:00  ...  -4.94       -0.34
+237     BK0612  2023-08-08 14:57:00  ...  -4.75       -0.33
+238     BK0612  2023-08-08 14:58:00  ...  -4.96       -0.34
+239     BK0612  2023-08-08 14:59:00  ...  -4.96       -0.34
+240     BK0612  2023-08-08 15:00:00  ...  -5.10       -0.35
+
+[241 rows x 9 columns]
+Copied!
+21.3 实时
+说明介绍
+获取当个东方财富概念指数的实时行情，即最新的行情数据。
+
+调用方法
+stock.market.get_market_concept_current_east()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	BK0612	东方财富概念指数代码；BK开头
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	886041
+trade_time	time	交易时间	1990-01-01 00:00:00；返回当前的时间
+trade_date	date	交易日期	默认：None
+open	decimal	开盘价	9.98
+price	decimal	现价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+注意：东方财富实时接口未返回交易日期；结果为最新行情数据。
+参考示例
+import adata
+df = adata.stock.market.get_market_concept_current_east(index_code='BK0612')
+print(df)
+Copied!
+# 结果示例
+  index_code                 trade_time  ...  change  change_pct
+0     BK0612 2023-08-08 19:21:52.012726  ...  -510.0       -0.35
+
+[1 rows x 11 columns]
+Copied!
+23. 概念资金流向-东方财富-EAST
+23.1 近N日所有概念流向
+说明介绍
+获取所有的概念近(1,5,10)日的资金流向
+
+调用方法
+stock.market.all_capital_flow_east()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+days_type	int	否	天数类型：1,5,10，默认：近1天
+返回结果
+字段	类型	注释	说明
+index_code	string	概念代码	BK0897
+index_name	string	概念名称	IPv6
+change_pct	decimal	概念最近N日涨跌幅(%)	-0.68
+main_net_inflow	decimal	主力资金净流入(元)	2526394.0
+main_net_inflow_rate	decimal	主力资金净流入占比(%)	0.77
+max_net_inflow	decimal	特大单净流入(元)	2526394.0
+max_net_inflow_rate	decimal	特大单净流入占比(%)	0.77
+lg_net_inflow	decimal	大单净流入(元)	2526394.0
+lg_net_inflow_rate	decimal	特大单净流入占比(%)	0.77
+mid_net_inflow	decimal	中单净流入(元)	2526394.0
+mid_net_inflow_rate	decimal	中单净流入占比(%)	0.77
+sm_net_inflow	decimal	小单净流入(元)	2526394.0
+sm_net_inflow_rate	decimal	小单净流入占比(%)	0.77
+stock_code	string	流入最大股代码	000063
+stock_name	string	流入最大股名称	中兴通讯
+参考示例
+import adata
+df = adata.stock.market.all_capital_flow_east(days_type=10)
+print(df)
+Copied!
+# 结果示例
+    index_code index_name  change_pct  ...  sm_net_inflow_rate  stock_code  stock_name
+0       BK0897       IPv6       -0.68  ...                0.00        中兴通讯      000063
+1       BK0947       屏下摄像       -2.23  ...                0.77        中兴通讯      000063
+..         ...        ...         ...  ...                 ...         ...         ...
+573     BK0867       富时罗素       -5.09  ...                3.30        中兴通讯      000063
+574     BK0596       融资融券       -6.96  ...                3.01        中兴通讯      000063
+
+[575 rows x 15 columns]
+Copied!
+40. 指数行情-INDEX MARKET
+概念和指数在字典表以及运作的逻辑是一致的，所以参数的命名都为：index_code
+
+40.1 k线
+说明介绍
+获取单个指数的K线行情
+
+日，周，月K
+
+调用方法
+stock.market.get_market_index()
+Copied!
+输入参数
+参数	类型	是否必填	默认值	说明
+index_code	string	是	000001	指数代码；例：000001 上证指数
+k_type	int	否	1	k线类型：1.日；2.周；3.月 默认：1 日k
+start_date	string	否	2020-01-01	开始时间：2020-01-01
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	000001
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+open	decimal	开盘价	9.98
+close	decimal	收盘价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额(元)	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+参考示例
+import adata
+df = adata.stock.market.get_market_index(index_code='000001', start_date='2022-12-01')
+print(df)
+Copied!
+# 结果示例
+     trade_date     open     high  ...           trade_time change change_pct
+463  2022-12-01  3187.99  3198.41  ...  2022-12-01 00:00:00  14.13       0.45
+464  2022-12-02  3160.58  3170.90  ...  2022-12-02 00:00:00  -9.33      -0.29
+465  2022-12-05  3181.92  3213.44  ...  2022-12-05 00:00:00  55.67       1.76
+..          ...      ...      ...  ...                  ...    ...        ...
+603  2023-07-03  3209.16  3246.86  ...  2023-07-03 00:00:00  41.92       1.31
+604  2023-07-04  3241.23  3246.96  ...  2023-07-04 00:00:00   1.37       0.04
+605  2023-07-05  3240.05  3241.84  ...  2023-07-05 00:00:00  -22.4      -0.69
+
+[143 rows x 11 columns]
+Copied!
+40.2 分时
+说明介绍
+获取单个指数的分时行情
+
+调用方法
+stock.market.get_market_index_min()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+index_code	string	是	指数代码；例：000001 上证指数
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	000001
+trade_time	time	交易时间	1990-01-01 00:00:00；分时图使用具体的时间
+trade_date	date	交易日期	1990-01-01
+price	decimal	现价	9.98
+avg_price	decimal	均价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+change	decimal	涨跌额	-0.02
+change_pct	decimal	涨跌幅(%)	-0.16
+参考示例
+import adata
+df = adata.stock.market.get_market_index_min(index_code='000001')
+print(df)
+Copied!
+# 结果示例
+    index_code           trade_time  trade_date  ...      amount  change change_pct
+0       000001  2023-07-06 09:30:00  2023-07-06  ...  2166038100   -7.09      -0.22
+1       000001  2023-07-06 09:31:00  2023-07-06  ...  7596315500   -8.18      -0.25
+2       000001  2023-07-06 09:32:00  2023-07-06  ...  5490170400   -8.39      -0.26
+..         ...                  ...         ...  ...         ...     ...        ...
+239     000001  2023-07-06 14:58:00  2023-07-06  ...   171210000  -16.76      -0.52
+240     000001  2023-07-06 14:59:00  2023-07-06  ...           0  -16.76      -0.52
+241     000001  2023-07-06 15:00:00  2023-07-06  ...  3825890000  -17.38      -0.54
+
+[242 rows x 9 columns]
+Copied!
+40.3 实时
+说明介绍
+获取当个指数的实时行情，即最新的指数行情数据。
+
+调用方法
+stock.market.get_market_index_current()
+Copied!
+输入参数
+参数	类型	是否必填	说明
+index_code	string	是	指数代码；例：000001 上证指数
+返回结果
+字段	类型	注释	说明
+index_code	string	代码	000001
+trade_time	time	交易时间	1990-01-01 00:00:00；返回当前的时间
+trade_date	date	交易日期	1990-01-01
+open	decimal	开盘价	9.98
+price	decimal	现价	9.98
+high	decimal	最高价	9.98
+low	decimal	最低价	9.98
+volume	decimal	成交量(股)	64745722
+amount	decimal	成交额(元)	934285179.00
+参考示例
+import adata
+df = adata.stock.market.get_market_index_current(index_code='000001')
+print(df)
+Copied!
+# 结果示例
+            trade_time  trade_date  ...           amount index_code
+0  2023-07-06 18:07:00  2023-07-06  ...  320808310000.00     000001
+
+[1 rows x 9 columns]

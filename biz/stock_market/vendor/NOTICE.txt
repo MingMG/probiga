@@ -1,0 +1,2 @@
+sina_kline_decoder.js 内容摘录自 AkShare 项目 akshare/stock/cons.py 中的 hk_js_decode（Apache License 2.0）。
+详见: https://github.com/akfamily/akshare

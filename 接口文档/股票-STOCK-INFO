@@ -1,0 +1,576 @@
+【本仓库】实际采集使用 AkShare；已接入函数清单见同目录《已接入-AkShare-清单.md》。  
+下文为 adata 风格接口文档原文。
+--------------------------------------------------------------------------------
+STOCK
+整个项目API的数据字典，按照模块层级分类命名，描述尽量精简，以便进行查阅。
+
+股票-STOCK-INFO
+------------
+股票相关
+1. 股票代码信息
+说明介绍
+
+获取A股所有股票代码信息列表
+
+调用方法
+
+stock.info.all_code()
+Copied!
+输入参数
+
+无
+
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	代码	600001
+short_name	string	简称	中国平安
+exchange	string	交易所	SH:上交；BJ：北交；SZ：深交
+list_date	date	上市日期	1998-06-24；部分退市的股票存在无法获取，属于正常情况
+参考示例
+
+import adata
+df = adata.stock.info.all_code()
+print(df)
+Copied!
+# 结果示例
+     stock_code short_name exchange   list_date
+0        000001       平安银行       SZ  1991-04-03
+1        000002      万  科Ａ       SZ  1991-01-29
+2        000003      PT金田A       SZ         NaN
+...         ...        ...      ...         ...
+5637     900955       退市海B       SH         NaN
+5638     900956       东贝B股       SH         NaN
+5639     900957       凌云Ｂ股       SH  2000-07-28
+
+[5640 rows x 4 columns]
+Copied!
+2. 股票股本信息
+说明介绍
+
+获取单个股票的股本信息
+
+用作市值计算，最新市值=最新股本*最新股价
+
+调用方法
+
+stock.info.get_stock_shares()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：600001
+is_history	bool	否	是否获取所有历史；默认是
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	代码	600001
+change_date	date	变动时间	2023-07-17
+total_shares	int	总股本：股	119534983
+limit_shares	int	限售股本：股	119534983
+list_a_shares	int	流通A股股本：股	119534983
+change_reason	string	变动原因	首发限售股份上市
+参考示例
+
+import adata
+df = adata.stock.info.get_stock_shares(stock_code='600001', is_history=True)
+print(df)
+Copied!
+# 结果示例
+   stock_code change_date  ...  list_a_shares  change_reason
+0      600001  2009-04-30  ...     2816456569      股改限售流通股上市
+1      600001  2008-04-30  ...     2608760287      股改限售流通股上市
+		...         ...       ...          ...    ...
+18     600001  2006-03-08  ...      922283347          债转股上市
+19     600001  2006-03-07  ...      904626208          债转股上市
+
+[20 rows x 6 columns]
+
+Copied!
+3. 股票申万一二级行业信息
+说明介绍
+
+获取单个股票的申万一二级行业信息
+
+调用方法
+
+stock.info.get_industry_sw()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	代码	300033
+sw_code	string	申万行业代码	710000
+industry_name	string	行业名称	计算机
+industry_type	string	行业类别	申万一级
+source	string	来源	百度股市通
+参考示例
+
+import adata
+df = adata.stock.info.get_industry_sw(stock_code='300033')
+print(df)
+Copied!
+# 结果示例
+  stock_code sw_code industry_name industry_type source
+0     300033  710000           计算机          申万一级  百度股市通
+1     300033  710400          软件开发          申万二级  百度股市通
+Copied!
+------THS------
+概念相关-同花顺
+同花顺概念有相关限制，建议使用东方财富或者百度的；
+
+后续停止维护同花顺的相关数据。
+
+21. 概念指数信息-ths
+说明介绍
+
+获取同花顺的概念代码信息列表
+
+调用方法
+
+stock.info.all_concept_code_ths()
+Copied!
+输入参数
+
+无
+
+返回结果
+
+字段	类型	注释	说明
+name	string	名称	物联网
+index_code	string	指数代码	同花顺的概念指数代码是：8开头；例：885312
+concept_code	string	概念代码	同花顺的概念代码是：3开头；例：309061；注意不要混淆
+source	string	来源	同花顺
+参考示例
+
+import adata
+df = adata.stock.info.all_concept_code_ths()
+print(df)
+Copied!
+# 结果示例
+    index_code      name concept_code source
+0       886050      算力租赁       309068    同花顺
+1       886049      空间计算       309066    同花顺
+2       886048     英伟达概念       309065    同花顺
+3       886047      脑机接口       308535    同花顺
+4       886046  MR（混合现实）       309063    同花顺
+..         ...       ...          ...    ...
+390     885311      智能电网       300037    同花顺
+391     885284      稀缺资源       300777    同花顺
+392        NaN  国家大基金持股        307816    同花顺
+393        NaN      首发新股       301531    同花顺
+394        NaN     半年报预增       308458    同花顺
+
+[395 rows x 4 columns]
+Copied!
+22. 概念指数成分信息-ths
+说明介绍
+
+获取同花顺的概念代码对应的最新成分列表信息，即概念代码和股票代码的关系。
+
+成分信息会动态变动，需定期更新一次，建议每周进行更新
+
+调用方法
+
+stock.info.concept_constituent_ths()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+index_code	string	否	指数代码；8开头；例：885556
+concept_code	string	否	概念代码；3开头；例：300843
+name	string	否	概念名称；例：5G；来源于：同花顺问财
+wait_time	int	否	等待时间：毫秒；表示每个请求的间隔时间，主要用于防止请求太频繁的限制。
+**注：**三个参数选择其一，优先推荐使用指数代码
+
+返回结果
+
+字段	类型	注释	说明
+short_name	string	股票简称	联特科技
+stock_code	string	股票代码	301205
+参考示例
+
+import adata
+df = adata.stock.info.concept_constituent_ths(index_code="885556")
+print(df)
+Copied!
+# 结果示例
+stock_code short_name
+0       688536        思瑞浦
+1       301205       联特科技
+2       300308       中际旭创
+3       003031       中瓷电子
+4       301191       菲菱科思
+..         ...        ...
+316     600601       方正科技
+317     601929       吉视传媒
+318     000889       ST中嘉
+319     002089      *ST新海
+320     000810       创维数字
+
+[321 rows x 2 columns]
+Copied!
+23. 单只股票所属概念-ths
+说明介绍
+
+获取单只股票所属的概念信息
+
+调用方法
+
+stock.info.get_concept_ths()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	股票代码	300033
+concept_code	string	股票代码	886031
+name	string	概念名称	ChatGPT概念
+source	string	来源	同花顺
+reason	string	概念原因	打造的i问财目前是财经.....语音对话交互问答系统。
+参考示例
+
+import adata
+df = adata.stock.info.get_concept_ths(stock_code="300033")
+print(df)
+Copied!
+# 结果示例
+   stock_code concept_code       name source       reason
+0      300033       886019     AIGC概念    同花顺    据公司2020年、2021年年报......自动生成技术。
+1      300033       886031  ChatGPT概念    同花顺    打造的i问财目前是财经.....语音对话交互问答系统。
+2      300033       885456      互联网金融    同花顺
+..         ...          ...    ...    ...                    ...
+9      300033       885402       智能医疗    同花顺
+10     300033       886041       数据要素    同花顺
+11     300033       885663       证金持股    同花顺
+
+[12 rows x 5 columns]
+
+Copied!
+------EAST------
+概念相关-东方财富
+31. 概念指数信息-east
+说明介绍
+
+获取东方财富的的概念代码信息列表
+
+调用方法
+
+stock.info.all_concept_code_east()
+Copied!
+输入参数
+
+无
+
+返回结果
+
+字段	类型	注释	说明
+name	string	名称	大飞机
+index_code	string	指数代码	东方财富的概念指数代码是：BK开头
+concept_code	string	概念代码	东方财富的概念指数代码是：BK开头，为了兼容指数代码和概念代码一致
+source	string	来源	东方财富
+参考示例
+
+import adata
+df = adata.stock.info.all_concept_code_east()
+print(df)
+Copied!
+# 结果示例
+    concept_code index_code    name source
+0         BK0814     BK0814     大飞机   东方财富
+1         BK0519     BK0519    稀缺资源   东方财富
+2         BK1047     BK1047    数据安全   东方财富
+..           ...        ...     ...    ...
+433       BK0804     BK0804     深股通   东方财富
+434       BK0867     BK0867    富时罗素   东方财富
+435       BK0596     BK0596    融资融券   东方财富
+
+[436 rows x 4 columns]
+Copied!
+32. 概念指数成分信息-east
+说明介绍
+
+获取东方财富的概念代码对应的最新成分列表信息，即概念代码和股票代码的关系。
+
+成分信息会动态变动，需定期更新一次，建议每周进行更新
+
+调用方法
+
+stock.info.concept_constituent_east()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+concept_code	string	否	概念代码；BK开头
+返回结果
+
+字段	类型	注释	说明
+short_name	string	股票简称	银之杰
+stock_code	string	股票代码	300085
+参考示例
+
+import adata
+df = adata.stock.info.concept_constituent_east(index_code="BK0637")
+print(df)
+Copied!
+# 结果示例
+    stock_code short_name
+0       300085        银之杰
+1       002280       联络互动
+2       301236       软通动力
+..         ...        ...
+208     600919       江苏银行
+209     002385        大北农
+210     601318       中国平安
+
+[211 rows x 2 columns]
+Copied!
+33. 单只股票所属概念-east
+说明介绍
+
+获取单只股票所属的概念信息
+
+调用方法
+
+stock.info.get_concept_east()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	股票代码	600020
+concept_code	string	股票代码	BK0685
+name	string	概念名称	举牌
+source	string	来源	东方财富
+reason	string	概念原因	2023年06月05日公告显示获长城人寿保险股份有限公司举牌。
+参考示例
+
+import adata
+df = adata.stock.info.get_concept_east(stock_code="600020")
+print(df)
+Copied!
+# 结果示例
+  stock_code concept_code  name source                                                    reason
+0     600020       BK0685    举牌   东方财富                           2023年06月05日公告显示获长城人寿保险股份有限公司举牌。
+1     600020       BK0700   充电桩   东方财富  公司所属10对高速公路服务区95座充电桩已建设完成,计划2022年6月底前完成剩余7对高速公路服务区充电桩建设。
+2     600020       BK0683  国企改革   东方财富                                         公司的实际控制人为河南省人民政府。
+3     600020       BK0604  参股保险   东方财富                                  初始投资2亿元持有中原农业保险18.18%股权。
+4     600020       BK0506    创投   东方财富                              2020年半年报显示公司旗下有西藏秉原创业投资有限公司。
+
+Copied!
+34. 单只股票所属板块-east
+说明介绍
+
+获取单只股票所属的板块信息：行业，板块（地区），概念
+
+这是一个综合的接口，也可以用来获取个股的概念
+
+调用方法
+
+stock.info.get_plate_east()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033
+plate_type	int	否	1. 行业 2. 地域板块 3.概念 ，默认：None 全部
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	股票代码	600020
+plate_code	string	板块代码	BK0685
+plate_name	string	板块名称	举牌
+plate_type	string	板块类型	行业，板块，概念；
+其中板块特指地区板块
+source	string	来源	东方财富
+参考示例
+
+import adata
+df = adata.stock.info.get_plate_east(stock_code="600020", plate_type=1)
+print(df)
+Copied!
+# 结果示例
+  stock_code plate_code plate_name plate_type source
+0     600020     BK0421       铁路公路         行业   东方财富
+
+Copied!
+------BAIDU------
+41. 单只股票所属概念-baidu
+说明介绍
+
+获取单只股票所属的概念信息
+
+调用方法
+
+stock.info.get_concept_baidu()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+stock_code	string	是	股票代码；例：300033；也可以一次传入多个[]
+返回结果
+
+字段	类型	注释	说明
+stock_code	string	股票代码	600020
+concept_code	string	股票代码	BK0685
+name	string	概念名称	举牌
+source	string	来源	百度股市通
+reason	string	概念原因	空
+参考示例
+
+import adata
+df = adata.stock.info.get_concept_baidu(stock_code="600020")
+print(df)
+Copied!
+# 结果示例
+   stock_code concept_code      name source reason
+0      600020       002486    文化传媒概念  百度股市通       
+1      600020       003506        创投  百度股市通       
+2      600020       003596      融资融券  百度股市通       
+......  
+12     600020       GN2102   标普道琼斯中国  百度股市通       
+13     600020       GN2109    高速公路概念  百度股市通       
+14     600020       GN2142       破净股  百度股市通    
+
+Copied!
+------INDEX------
+指数相关
+51. 指数代码信息
+说明介绍
+
+获取A股所有指数信息列表
+
+调用方法
+
+stock.info.all_index_code()
+Copied!
+输入参数
+
+无
+
+返回结果
+
+字段	类型	注释	说明
+name	string	指数简称	能源金属
+index_code	string	指数代码	399366
+concept_code	string	概念代码	同花顺的编码；例：000819 对应1B0819
+source	string	来源	同花顺
+参考示例
+
+import adata
+df = adata.stock.info.all_index_code()
+print(df)
+Copied!
+# 结果示例
+    index_code concept_code   name source
+0       399366       399366   能源金属    同花顺
+1       000823       1B0823  800有色    同花顺
+2       399395       399395   国证有色    同花顺
+3       000819       1B0819   有色金属    同花顺
+4       399232       399232   采矿指数    同花顺
+..         ...          ...    ...    ...
+546     399617       399617   深证消费    同花顺
+547     399389       399389   国证通信    同花顺
+548     000869       1B0869   HK银行    同花顺
+549     399621       399621   深证电信    同花顺
+550     399688       399688   深成电信    同花顺
+
+[551 rows x 4 columns]
+Copied!
+52. 指数成分信息
+说明介绍
+
+获取指数对应的最新成分列表信息，即指数代码和股票代码的关系。
+
+成分信息会动态变动，需定期更新一次，建议每周进行更新
+
+调用方法
+
+stock.info.index_constituent()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+index_code	string	是	指数代码；例：000823
+返回结果
+
+字段	类型	注释	说明
+short_name	string	股票简称	云南锗业
+stock_code	string	股票代码	002428
+index_code	string	指数代码	000823
+wait_time	int	否	等待时间：毫秒；
+表示每个请求的间隔时间，主要用于防止请求太频繁的限制。
+参考示例
+
+import adata
+df = adata.stock.info.index_constituent(index_code='000823')
+print(df)
+Copied!
+# 结果示例
+   index_code stock_code short_name
+0      000823     002428       云南锗业
+1      000823     601020       华钰矿业
+2      000823     000960       锡业股份
+3      000823     600497       驰宏锌锗
+4      000823     002392       北京利尔
+..        ...        ...        ...
+68     000823     002056       横店东磁
+69     000823     000629       钒钛股份
+70     000823     600111       北方稀土
+71     000823     600366       宁波韵升
+72     000823     600259       广晟有色
+
+[73 rows x 3 columns]
+Copied!
+------OTHER------
+其它信息
+91. 交易日历
+说明介绍
+
+获取对应年份的交易日历信息
+
+调用方法
+
+stock.info.trade_calendar()
+Copied!
+输入参数
+
+参数	类型	是否必填	说明
+year	int	是	年份；例：2023
+返回结果
+
+字段	类型	注释	说明
+trade_date	date	交易日	2023-05-20
+trade_status	int	交易状态：0.非交易日；1.交易日	1
+day_week	int	一周第几天	从星期天开始的
+参考示例
+
+import adata
+df = adata.stock.info.trade_calendar(year=2023)
+print(df)
+Copied!
+# 结果示例
+     trade_date trade_status  day_week
+0    2023-01-01            0         1
+1    2023-01-02            0         2
+2    2023-01-03            1         3
+3    2023-01-04            1         4
+4    2023-01-05            1         5
+..          ...          ...       ...
+360  2023-12-27            1         4
+361  2023-12-28            1         5
+362  2023-12-29            1         6
+363  2023-12-30            0         7
+364  2023-12-31            0         1
+
+[365 rows x 3 columns]

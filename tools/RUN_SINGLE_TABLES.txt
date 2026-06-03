@@ -1,0 +1,28 @@
+位置均在仓库根 E:\My Code\ProBigA 下执行（已配置 PYTHONPATH/sys.path 的脚本除外）。
+
+一、一键跑多表（推荐「继续跑」）
+  仅 run_single_table 支持的表（含新浪默认的 si_all_index_code）：
+    python tools\run_single_table.py --run-all
+
+  新浪指数 + 上面全部（PowerShell）：
+    powershell -ExecutionPolicy Bypass -File tools\run_all_single_tables.ps1
+
+  CMD 双击/命令行：
+    tools\run_all_single_tables.cmd
+
+二、只补指数（东财不可用时）
+    python tools\fetch_si_all_index_code_sina.py
+
+三、单表（与表名一致）
+    python tools\run_single_table.py <表名>
+    python tools\run_single_table.py --list
+
+  与 tools\single_table\sync_<表名>.cmd 等价（双击 cmd 前需已 cd 到仓库根，cmd 内已写 cd）。
+
+四、前置
+  pip install -e ./adata
+  pip install -r requirements-platform.txt
+  多数 sm_* 依赖 si_all_code；东财概念成分依赖 si_concept_code_east（脚本内会尝试先拉列表）。
+
+五、不跑 sm_stock_kline
+  本批脚本不包含日 K；日 K 仍用 sync_stock_market --only stock_kline。
