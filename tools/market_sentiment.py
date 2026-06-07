@@ -299,8 +299,11 @@ def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float:
         prev_set = set(df[df["_datestr"] == d_prev]["concept_name"].unique())
         curr_set = set(df[df["_datestr"] == d_curr]["concept_name"].unique())
 
-        prev_top10 = df[(df["_datestr"] == d_prev) & (df["rank"] <= 10)]["concept_name"].unique()
-        curr_top10 = df[(df["_datestr"] == d_curr) & (df["rank"] <= 10)]["concept_name"].unique()
+        # 必须按 rank 排序后再取 TOP N，.unique() 不保序会导致 [:5] 取到错误的板块
+        prev_top10_df = df[(df["_datestr"] == d_prev) & (df["rank"] <= 10)].sort_values("rank")
+        curr_top10_df = df[(df["_datestr"] == d_curr) & (df["rank"] <= 10)].sort_values("rank")
+        prev_top10 = prev_top10_df["concept_name"].tolist()
+        curr_top10 = curr_top10_df["concept_name"].tolist()
 
         if len(prev_top10) == 0:
             continue
@@ -358,54 +361,50 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     d1 = trade_dates[0]
     d2 = trade_dates[-1]
 
-    # 2.1 用 sm_stock_kline 的 amount(成交额) 作市值代理, 拆分大小盘
-    kline_q = text("""
-        SELECT trade_date, change_pct, amount
-        FROM sm_stock_kline
-        WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
-          AND amount > 0
-    """)
-    kline_df = pd.read_sql(kline_q, engine, params={"d1": d1, "d2": d2})
-
-    # 每日大小盘分组统计
-    daily_style = {}
-    for td_str in trade_dates:
-        sub = kline_df[kline_df["trade_date"].apply(_to_date_str) == td_str]
-        if sub.empty or len(sub) < 20:
-            continue
-        amt_vals = sub["amount"].dropna().values
-        if len(amt_vals) < 10:
-            continue
-        p30 = np.percentile(amt_vals, 30)
-        p70 = np.percentile(amt_vals, 70)
-
-        large_sub = sub[sub["amount"] >= p70]
-        small_sub = sub[sub["amount"] <= p30]
-        mid_sub = sub[(sub["amount"] > p30) & (sub["amount"] < p70)]
-        all_sub = sub
-
-        daily_style[td_str] = {
-            "avg_chg": round(float(all_sub["change_pct"].mean()), 4) if not all_sub["change_pct"].isna().all() else 0,
-            "up_ratio": round(float((all_sub["change_pct"] > 0).mean()), 4) if len(all_sub) > 0 else 0,
-            "large_chg": round(float(large_sub["change_pct"].mean()), 4) if len(large_sub) > 0 and not large_sub["change_pct"].isna().all() else 0,
-            "large_cnt": len(large_sub),
-            "mid_chg": round(float(mid_sub["change_pct"].mean()), 4) if len(mid_sub) > 0 and not mid_sub["change_pct"].isna().all() else 0,
-            "mid_cnt": len(mid_sub),
-            "small_chg": round(float(small_sub["change_pct"].mean()), 4) if len(small_sub) > 0 and not small_sub["change_pct"].isna().all() else 0,
-            "small_cnt": len(small_sub),
-        }
-
-    # 2.2 整体涨跌统计
-    market_q = text("""
+    # 2.1 用 SQL NTILE 在数据库端完成大小盘分组（替代加载全量数据到内存）
+    # NTILE(3): bottom 33% = 小盘, top 33% = 大盘
+    style_q = text("""
         SELECT trade_date,
-               COALESCE(AVG(change_pct), 0) AS avg_chg,
-               COALESCE(AVG(CASE WHEN change_pct > 0 THEN 1.0 ELSE 0.0 END), 0) AS up_ratio
-        FROM sm_stock_kline
-        WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+            -- 整体
+            AVG(change_pct) AS avg_chg,
+            AVG(CASE WHEN change_pct > 0 THEN 1.0 ELSE 0.0 END) AS up_ratio,
+            -- 大盘 (按成交额 Top 33%)
+            AVG(CASE WHEN amt_rank <= large_cut THEN change_pct END) AS large_chg,
+            SUM(CASE WHEN amt_rank <= large_cut THEN 1 ELSE 0 END) AS large_cnt,
+            -- 小盘 (按成交额 Bottom 33%)
+            AVG(CASE WHEN amt_rank >= small_cut THEN change_pct END) AS small_chg,
+            SUM(CASE WHEN amt_rank >= small_cut THEN 1 ELSE 0 END) AS small_cnt
+        FROM (
+            SELECT trade_date, change_pct, amount,
+                ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY amount) AS amt_rank,
+                CAST(COUNT(*) OVER (PARTITION BY trade_date) * 0.33 AS UNSIGNED) AS large_cut,
+                CAST(COUNT(*) OVER (PARTITION BY trade_date) * 0.67 + 1 AS UNSIGNED) AS small_cut
+            FROM sm_stock_kline
+            WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+              AND amount > 0
+        ) ranked
         GROUP BY trade_date
         ORDER BY trade_date
     """)
-    market_df = pd.read_sql(market_q, engine, params={"d1": d1, "d2": d2})
+    style_df = pd.read_sql(style_q, engine, params={"d1": d1, "d2": d2})
+
+    daily_style = {}
+    market_df_rows = []
+    for _, row in style_df.iterrows():
+        td_str = _to_date_str(row["trade_date"])
+        daily_style[td_str] = {
+            "avg_chg": round(float(row["avg_chg"] or 0), 4),
+            "up_ratio": round(float(row["up_ratio"] or 0), 4),
+            "large_chg": round(float(row["large_chg"] or 0), 4),
+            "large_cnt": int(row["large_cnt"] or 0),
+            "small_chg": round(float(row["small_chg"] or 0), 4),
+            "small_cnt": int(row["small_cnt"] or 0),
+            "mid_chg": 0,
+            "mid_cnt": 0,
+        }
+        market_df_rows.append({"trade_date": row["trade_date"], "avg_chg": row["avg_chg"], "up_ratio": row["up_ratio"]})
+
+    market_df = pd.DataFrame(market_df_rows)
 
     # 2.3 大小盘合计
     large_total_chg = 0

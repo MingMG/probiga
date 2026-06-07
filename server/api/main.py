@@ -74,11 +74,15 @@ def _run_task(row: dict, ROOT: Path, engine) -> None:
 
     start_t = datetime.now()
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        popen_kwargs = dict(
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, cwd=str(ROOT), env=child_env,
-            preexec_fn=os.setsid,
         )
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["preexec_fn"] = os.setsid
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         _running_procs[task_id] = proc
         stdout, stderr = proc.communicate()
         _running_procs.pop(task_id, None)

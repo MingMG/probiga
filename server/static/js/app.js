@@ -2635,6 +2635,7 @@
         h += card('崛起行业', risingS.length, 'red');
         h += card('退潮行业', fallingS.length, 'green');
         h += card('崛起概念', risingC.length, 'orange');
+        if (data.data_source) h += card('数据源', data.data_source === 'east' ? '东财成交额' : 'THS热度', data.data_source === 'east' ? '#4caf50' : '#ff9800');
         h += '</div>';
 
         // ── 调仓建议（核心区域） ──
@@ -3459,10 +3460,14 @@
     }
 
     var monitorRefreshTimer = null;
+    var _monitorCharts = {};  // Chart.js 实例注册表，避免重复创建
 
     function loadMonitorPage(container) {
-        container.innerHTML = '<div class="loading">加载监控数据中...</div>';
-        
+        // 清理旧图表实例
+        Object.keys(_monitorCharts).forEach(function(k) {
+            if (_monitorCharts[k]) { _monitorCharts[k].destroy(); delete _monitorCharts[k]; }
+        });
+
         function fetchMonitorData() {
             fetch('/api/monitor/data')
                 .then(function(r) { return r.json(); })
@@ -3471,7 +3476,13 @@
                         container.innerHTML = '<div class="loading" style="color:#e74c3c">❌ 数据加载失败: ' + data.error + '</div>';
                         return;
                     }
-                    renderMonitorPage(container, data);
+                    if (!document.getElementById('monitorGauge')) {
+                        // 首次渲染：构建完整 DOM
+                        renderMonitorPage(container, data);
+                    } else {
+                        // 刷新：仅更新数据和图表
+                        updateMonitorPage(data);
+                    }
                     var statusEl = document.getElementById('monitorRefreshStatus');
                     if (statusEl) {
                         statusEl.textContent = '上次刷新: ' + new Date().toLocaleTimeString();
@@ -3498,7 +3509,120 @@
             clearInterval(monitorRefreshTimer);
             monitorRefreshTimer = null;
         }
+        Object.keys(_monitorCharts).forEach(function(k) {
+            if (_monitorCharts[k]) { _monitorCharts[k].destroy(); delete _monitorCharts[k]; }
+        });
     };
+
+    /* 更新仪表盘数据（不重建 DOM，只更新数值和图表数据） */
+    function updateMonitorPage(data) {
+        var heatVal = data.market_heat || 0;
+        var heatColor = heatVal <= 200 ? '#66bb6a' : heatVal <= 400 ? '#bdbdbd' : heatVal <= 600 ? '#ef5350' : '#c62828';
+
+        // 更新仪表盘数值
+        var gv = document.querySelector('.gauge-value');
+        if (gv) { gv.style.color = heatColor; gv.textContent = heatVal; }
+        var gl = document.querySelector('.gauge-label');
+        if (gl) { gl.style.color = heatColor; gl.textContent = data.heat_status || '-'; }
+        var gc = document.querySelector('.gauge-change');
+        if (gc) {
+            gc.className = 'gauge-change ' + (data.heat_change >= 0 ? 'positive' : 'negative');
+            gc.textContent = '较昨日 ' + (data.heat_change >= 0 ? '↑ +' : '↓ ') + Math.abs(data.heat_change || 0).toFixed(2) + '%';
+        }
+        drawGauge(heatVal);
+
+        // 更新更新时间
+        var rtBadge = data.is_realtime ? ' <span style="color:#e74c3c">●实时</span>' : '';
+        var subtitle = document.querySelector('.monitor-subtitle');
+        if (subtitle) {
+            subtitle.innerHTML = '数据更新: ' + (data.update_time || '-') + rtBadge + ' | <span id="monitorRefreshStatus">自动刷新中...</span>';
+        }
+
+        // 更新分析文本
+        var aLabels = ['market_temp', 'industry_focus', 'style_judge', 'capital_flow', 'signal'];
+        var aItems = document.querySelectorAll('.analysis-item .analysis-content');
+        aItems.forEach(function(el, i) {
+            if (aLabels[i] && data.analysis && data.analysis[aLabels[i]]) {
+                el.textContent = data.analysis[aLabels[i]];
+            }
+        });
+
+        // 更新统计数值
+        var tmtEl = document.getElementById('tmtRatio');
+        if (tmtEl) tmtEl.textContent = (data.tmt_ratio || 0).toFixed(2) + '%';
+        var csiHeatEl = document.getElementById('csi1000Heat');
+        if (csiHeatEl) csiHeatEl.textContent = data.csi1000.heat || '-';
+        var csiChgEl = document.getElementById('csi1000Chg');
+        if (csiChgEl) csiChgEl.textContent = (data.csi1000.change >= 0 ? '+' : '') + (data.csi1000.change || 0).toFixed(2) + '%';
+        var sideEl = document.getElementById('sidelineRatio');
+        if (sideEl) sideEl.textContent = (data.sideline_ratio || 0).toFixed(2) + '%';
+
+        // 更新概念表格
+        var tbody = document.getElementById('conceptTableBody');
+        if (tbody && data.concept_rows) {
+            var th = '';
+            data.concept_rows.forEach(function(r) {
+                var tagCls = r.change >= 0 ? 'tag-up' : 'tag-down';
+                var tagText = r.change >= 0 ? '↑ 上涨' : '↓ 下跌';
+                th += '<tr><td>' + r.name + '</td><td class="value">' + r.heat + '</td>';
+                th += '<td><span class="tag ' + tagCls + '">' + tagText + ' ' + Math.abs(r.change).toFixed(2) + '%</span></td></tr>';
+            });
+            tbody.innerHTML = th;
+        }
+
+        // 更新摘要数值
+        var indRows = document.querySelectorAll('.indicator-row .indicator-value');
+        if (indRows.length >= 4) {
+            indRows[0].textContent = data.up_count || 0;
+            indRows[1].textContent = data.down_count || 0;
+            indRows[2].textContent = (data.sideline_ratio || 0).toFixed(2) + '%';
+            indRows[3].textContent = data.total_amount ? (data.total_amount / 1e8).toFixed(0) + '亿' : '-';
+        }
+
+        // 更新图表数据（复用已有 Chart 实例，不重建）
+        setTimeout(function() {
+            updateChart('heatChart', data.history.dates, [
+                { data: data.history.heat },
+                { data: data.history.amount }
+            ]);
+            if (data.top_industries && data.top_industries.length > 0) {
+                updateChart('industryChart',
+                    data.top_industries.map(function(r) { return r.name; }),
+                    [{ data: data.top_industries.map(function(r) { return r.heat; }),
+                       backgroundColor: data.top_industries.map(function(r) { return r.change >= 0 ? '#d32f2f' : '#2e7d32'; }) }]
+                );
+            }
+            if (data.history && data.history.tmt_ratio) {
+                updateChart('tmtChart', data.history.dates, [{ data: data.history.tmt_ratio }]);
+            }
+            if (data.csi1000 && data.history && data.history.csi1000_heat) {
+                updateChart('csi1000Chart', data.history.dates, [{ data: data.history.csi1000_heat }]);
+            }
+            if (data.concept_rows && data.concept_rows.length > 0) {
+                updateChart('conceptChart',
+                    data.concept_rows.map(function(r) { return r.name; }),
+                    [{ data: data.concept_rows.map(function(r) { return r.heat; }) }]
+                );
+            }
+            if (data.history && data.history.sideline) {
+                updateChart('sidelineChart', data.history.dates, [{ data: data.history.sideline }]);
+            }
+        }, 50);
+    }
+
+    /* 更新已有的 Chart.js 实例数据（不销毁重建） */
+    function updateChart(canvasId, labels, datasets) {
+        var chart = _monitorCharts[canvasId];
+        if (!chart) return;
+        chart.data.labels = labels;
+        datasets.forEach(function(ds, i) {
+            if (chart.data.datasets[i]) {
+                chart.data.datasets[i].data = ds.data;
+                if (ds.backgroundColor !== undefined) chart.data.datasets[i].backgroundColor = ds.backgroundColor;
+            }
+        });
+        chart.update('none');  // 'none' 跳过动画，直接刷新
+    }
 
     function renderMonitorPage(container, data) {
         var h = '';
@@ -3617,13 +3741,14 @@
             var chartOpts = {
                 responsive: true,
                 maintainAspectRatio: false,
+                animation: false,
                 plugins: {
                     legend: { labels: { color: '#666', font: { size: 11 }, boxWidth: 12, padding: 12 } }
                 }
             };
             var xAxisOpts = { ticks: { color: '#888', font: { size: 10 } }, grid: { color: 'rgba(0,0,0,0.04)' } };
 
-            createChart('heatChart', 'line', {
+            _monitorCharts['heatChart'] = createChart('heatChart', 'line', {
                 labels: data.history.dates,
                 datasets: [{
                     label: '热度',
@@ -3655,7 +3780,7 @@
             }));
 
             if (data.top_industries && data.top_industries.length > 0) {
-                createChart('industryChart', 'bar', {
+                _monitorCharts['industryChart'] = createChart('industryChart', 'bar', {
                     labels: data.top_industries.map(function(r) { return r.name; }),
                     datasets: [{
                         label: '热度',
@@ -3675,7 +3800,7 @@
             }
 
             if (data.history && data.history.tmt_ratio) {
-                createChart('tmtChart', 'line', {
+                _monitorCharts['tmtChart'] = createChart('tmtChart', 'line', {
                     labels: data.history.dates,
                     datasets: [{
                         label: 'TMT合计占比',
@@ -3696,7 +3821,7 @@
             }
 
             if (data.csi1000 && data.history && data.history.csi1000_heat) {
-                createChart('csi1000Chart', 'line', {
+                _monitorCharts['csi1000Chart'] = createChart('csi1000Chart', 'line', {
                     labels: data.history.dates,
                     datasets: [{
                         label: 'CSI1000热度',
@@ -3717,7 +3842,7 @@
             }
 
             if (data.concept_rows && data.concept_rows.length > 0) {
-                createChart('conceptChart', 'bar', {
+                _monitorCharts['conceptChart'] = createChart('conceptChart', 'bar', {
                     labels: data.concept_rows.map(function(r) { return r.name; }),
                     datasets: [{
                         label: '热度',
@@ -3737,7 +3862,7 @@
             }
 
             if (data.history && data.history.sideline) {
-                createChart('sidelineChart', 'line', {
+                _monitorCharts['sidelineChart'] = createChart('sidelineChart', 'line', {
                     labels: data.history.dates,
                     datasets: [{
                         label: '观望资金占比',

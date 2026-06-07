@@ -18,6 +18,7 @@
 
 import argparse
 import os
+import random
 import re
 import sys
 import time
@@ -38,13 +39,14 @@ if _ROOT_STR not in sys.path:
 DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 _MAX_RETRIES = 2
-_RETRY_BASE_DELAY = 2.0
-_REQUEST_DELAY = float(os.environ.get("FLOW_REQUEST_DELAY", "0.15"))
-_BATCH_PAUSE = float(os.environ.get("FLOW_BATCH_PAUSE", "10.0"))
-_BATCH_PAUSE_EVERY = int(os.environ.get("FLOW_BATCH_PAUSE_EVERY", "500"))
+_RETRY_BASE_DELAY = 3.0
+_REQUEST_DELAY = float(os.environ.get("FLOW_REQUEST_DELAY", "0.5"))
+_REQUEST_DELAY_JITTER = float(os.environ.get("FLOW_REQUEST_JITTER", "0.3"))  # 随机抖动范围
+_BATCH_PAUSE = float(os.environ.get("FLOW_BATCH_PAUSE", "30.0"))
+_BATCH_PAUSE_EVERY = int(os.environ.get("FLOW_BATCH_PAUSE_EVERY", "50"))
 
 _CONSECUTIVE_FAIL_THRESHOLD = 10
-_COOLDOWN_WAIT = 120  # 所有数据源都失败时等待秒数
+_COOLDOWN_WAIT = 180  # 所有数据源都失败时等待秒数
 
 _UNIT_MULTIPLIERS = {"亿": 1e8, "万": 1e4}
 
@@ -242,7 +244,8 @@ def fetch_capital_flow_daily(target_date: str):
             except Exception as e:
                 last_error = e
                 if attempt < _MAX_RETRIES:
-                    time.sleep(_RETRY_BASE_DELAY * (2 ** attempt))
+                    retry_delay = _RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 2)
+                    time.sleep(retry_delay)
 
         if df is not None:
             parts.append(df)
@@ -266,13 +269,16 @@ def fetch_capital_flow_daily(target_date: str):
                 print(f"\n  [!] 连续 {consecutive_fail} 次失败，切换到数据源: {current_source}")
                 consecutive_fail = 0
             else:
-                print(f"\n  [!] 所有数据源都连续失败，等待 {_COOLDOWN_WAIT}s 冷却...")
-                time.sleep(_COOLDOWN_WAIT)
+                cooldown = _COOLDOWN_WAIT + random.uniform(0, 60)
+                print(f"\n  [!] 所有数据源都连续失败，等待 {cooldown:.0f}s 冷却...")
+                time.sleep(cooldown)
                 source_idx = 0
                 current_source, fetch_func = sources[source_idx]
                 consecutive_fail = 0
 
-        time.sleep(_REQUEST_DELAY)
+        # 随机抖动，避免固定间隔被识别为爬虫
+        delay = _REQUEST_DELAY + random.uniform(0, _REQUEST_DELAY_JITTER)
+        time.sleep(delay)
 
         if (i + 1) % 200 == 0:
             elapsed = time.time() - t_start
@@ -282,8 +288,9 @@ def fetch_capital_flow_daily(target_date: str):
                   f"[{current_source}] {elapsed:.0f}s 已用, 预计还需 {eta:.0f}s")
 
         if _BATCH_PAUSE_EVERY > 0 and (i + 1) % _BATCH_PAUSE_EVERY == 0:
-            print(f"  批次暂停 {_BATCH_PAUSE}s（已处理 {i+1} 只）...")
-            time.sleep(_BATCH_PAUSE)
+            pause = _BATCH_PAUSE + random.uniform(0, 10)
+            print(f"  批次暂停 {pause:.0f}s（已处理 {i+1} 只）...")
+            time.sleep(pause)
 
     elapsed_total = time.time() - t_start
     print(f"\n===== 汇总 =====")

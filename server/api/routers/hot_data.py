@@ -4779,9 +4779,17 @@ def market_sentiment(
     top: int = Query(default=5, ge=1, le=15),
 ):
     """市场情绪与风格分析 — 主线/轮动/大小盘"""
+    # 盘中 120s 缓存，盘后 300s 缓存（情绪分析计算量大，缓存更长）
+    _ttl = 120 if _is_monitor_trading_time() else 300
+    _ckey = f"market_sentiment_{date}_{days}_{top}"
+    cached = _cache_get(_ckey, ttl_seconds=_ttl)
+    if cached is not None:
+        return cached
     try:
         from tools.market_sentiment import run_full_analysis
         result = run_full_analysis(lookback_days=days, end_date=date, top_n=top, engine=get_engine())
+        if "error" not in result:
+            _cache_set(_ckey, result)
         return result
     except Exception as e:
         return {"error": str(e)}
@@ -5000,29 +5008,34 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
 
         heat_change = round(((market_heat - prev_heat) / prev_heat * 100) if prev_heat > 0 else 0, 2)
 
-        industry_rows = _read_sql(
-            "SELECT concept_name, hot_value, change_pct FROM st_hot_concept_ths_daily "
-            "WHERE snapshot_date = :d AND plate_type = 2 ORDER BY hot_value DESC LIMIT 10",
-            {"d": trade_date},
+        # 一次性查询所有板块类型和日期的数据（替代4次顺序查询+回退）
+        _query_dates = [trade_date] + ([prev_date] if prev_date else [])
+        _ph_dates = ",".join([f"'{d}'" for d in _query_dates])
+        all_hot_rows = _read_sql(
+            f"SELECT snapshot_date, plate_type, concept_name, hot_value, change_pct "
+            f"FROM st_hot_concept_ths_daily "
+            f"WHERE snapshot_date IN ({_ph_dates}) AND plate_type IN (1, 2, 3) "
+            f"ORDER BY plate_type, snapshot_date, hot_value DESC"
         )
-        if not industry_rows and prev_date:
-            industry_rows = _read_sql(
-                "SELECT concept_name, hot_value, change_pct FROM st_hot_concept_ths_daily "
-                "WHERE snapshot_date = :d AND plate_type = 2 ORDER BY hot_value DESC LIMIT 10",
-                {"d": prev_date},
-            )
 
-        concept_rows = _read_sql(
-            "SELECT concept_name, hot_value, change_pct FROM st_hot_concept_ths_daily "
-            "WHERE snapshot_date = :d AND plate_type = 1 ORDER BY hot_value DESC LIMIT 10",
-            {"d": trade_date},
-        )
-        if not concept_rows and prev_date:
-            concept_rows = _read_sql(
-                "SELECT concept_name, hot_value, change_pct FROM st_hot_concept_ths_daily "
-                "WHERE snapshot_date = :d AND plate_type = 1 ORDER BY hot_value DESC LIMIT 10",
-                {"d": prev_date},
-            )
+        # 按优先级提取行业数据：plate_type=3（东财）> plate_type=2（THS），先当日再前日
+        industry_rows = []
+        for _pt in (3, 2):
+            for _qd in _query_dates:
+                _filtered = [r for r in all_hot_rows if r["plate_type"] == _pt and str(r["snapshot_date"])[:10] == _qd]
+                if _filtered:
+                    industry_rows = _filtered[:10]
+                    break
+            if industry_rows:
+                break
+
+        # 概念数据：plate_type=1，先当日再前日
+        concept_rows = []
+        for _qd in _query_dates:
+            _filtered = [r for r in all_hot_rows if r["plate_type"] == 1 and str(r["snapshot_date"])[:10] == _qd]
+            if _filtered:
+                concept_rows = _filtered[:10]
+                break
 
         TMT_CHILDREN = (
             "电子化学品", "半导体", "消费电子", "其他电子", "光学光电子", "元件",
@@ -5069,7 +5082,8 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
         history_tmt = []
         history_csi1000_heat = []
 
-        # 一次性 GROUP BY 查询 20 个交易日的历史数据（替代逐日 N+1 查询）
+        # 一次性 GROUP BY 查询 20 个交易日的历史数据（加日期范围避免全表扫描）
+        _hist_start = str(trade_date)[:8] + "01"  # 月初起始，覆盖足够天数
         history_batch_sql = """
         SELECT trade_date,
             SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) AS up_cnt,
@@ -5077,12 +5091,12 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
             COALESCE(SUM(amount), 0) AS amt,
             SUM(CASE WHEN ABS(change_pct) < 1 THEN 1 ELSE 0 END) AS sideline_cnt
         FROM sm_stock_kline
-        WHERE k_type = 1
+        WHERE k_type = 1 AND trade_date >= :hist_start
         GROUP BY trade_date
         ORDER BY trade_date DESC
         LIMIT 20
         """
-        history_batch = _read_sql(history_batch_sql)
+        history_batch = _read_sql(history_batch_sql, {"hist_start": _hist_start})
         # 按日期正序排列（从旧到新）
         history_batch = list(reversed(history_batch))
         for dr in history_batch:
@@ -6074,16 +6088,39 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         trade_date = str(td_rows[0]["d"]) if td_rows and td_rows[0].get("d") else str(date.today())
 
     # ── 1. 获取近 N 天的行业热度排名数据 ──
+    # 优先使用东财数据（plate_type=3行业/4二级行业，真实成交额），回退到THS数据（plate_type=1概念/2行业，搜索热度）
     from datetime import timedelta
     td = datetime.strptime(trade_date, "%Y-%m-%d")
     start_date = (td - timedelta(days=days * 2)).strftime("%Y-%m-%d")  # 多取一些天
 
-    rank_rows = _read_sql("""
-        SELECT snapshot_date, plate_type, rank, concept_code, concept_name, change_pct, hot_value
-        FROM st_hot_concept_ths_daily
-        WHERE snapshot_date >= :sd AND snapshot_date <= :td AND plate_type IN (1, 2)
-        ORDER BY snapshot_date, plate_type, rank
+    # 先查东财行业数据（plate_type=3）是否有足够天数
+    east_dates = _read_sql("""
+        SELECT DISTINCT snapshot_date FROM st_hot_concept_ths_daily
+        WHERE snapshot_date >= :sd AND snapshot_date <= :td AND plate_type = 3
+        ORDER BY snapshot_date
     """, {"sd": start_date, "td": trade_date})
+
+    use_east = len(east_dates) >= 2  # 东财数据至少2天才用
+
+    if use_east:
+        # 用东财数据：行业用 plate_type=3，概念仍用 plate_type=1
+        rank_rows = _read_sql("""
+            SELECT snapshot_date, plate_type, rank, concept_code, concept_name, change_pct, hot_value
+            FROM st_hot_concept_ths_daily
+            WHERE snapshot_date >= :sd AND snapshot_date <= :td
+              AND (plate_type = 3 OR plate_type = 1)
+            ORDER BY snapshot_date, plate_type, rank
+        """, {"sd": start_date, "td": trade_date})
+        data_source = "east"
+    else:
+        # 回退到THS数据
+        rank_rows = _read_sql("""
+            SELECT snapshot_date, plate_type, rank, concept_code, concept_name, change_pct, hot_value
+            FROM st_hot_concept_ths_daily
+            WHERE snapshot_date >= :sd AND snapshot_date <= :td AND plate_type IN (1, 2)
+            ORDER BY snapshot_date, plate_type, rank
+        """, {"sd": start_date, "td": trade_date})
+        data_source = "ths"
 
     if not rank_rows:
         return {"trade_date": trade_date, "error": "暂无板块排名数据"}
@@ -6095,9 +6132,10 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         d = str(r["snapshot_date"])
         item = {"rank": r["rank"], "code": r.get("concept_code"), "name": r["concept_name"],
                 "change_pct": float(r["change_pct"] or 0), "hot_value": float(r["hot_value"] or 0)}
-        if r["plate_type"] == 2:
+        pt = r["plate_type"]
+        if pt in (2, 3):  # 行业数据：THS(2) 或 东财一级(3)
             industry_data.setdefault(d, []).append(item)
-        else:
+        else:  # 概念数据：THS(1) 或 东财二级(4)
             concept_data.setdefault(d, []).append(item)
 
     # 排序得到最近的日期列表
@@ -6297,6 +6335,7 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
 
     return {
         "trade_date": trade_date,
+        "data_source": data_source,
         "lookback_days": len(recent_dates),
         "group_momentum": group_momentum,
         "advice": advice,
@@ -6308,4 +6347,28 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         "industry_trends": industry_trends[:20],
         "concept_trends": concept_trends[:20],
     }
+
+
+# ── 盘中实时数据刷新 ──
+@router.post("/realtime/refresh")
+def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow|concept|index)$")):
+    """手动刷新盘中数据（行情快照、资金流向、概念行情、指数行情）"""
+    import subprocess as _sp
+    script = str(_ROOT / "tools" / "crawl_realtime_batch.py")
+    env = {**os.environ, "MYSQL_URL": str(get_engine().url)}
+    try:
+        result = _sp.run(
+            [sys.executable, script, "--only", only],
+            capture_output=True, text=True, timeout=120, env=env,
+            cwd=str(_ROOT),
+        )
+        return {
+            "success": result.returncode == 0,
+            "output": result.stdout[-500:] if result.stdout else "",
+            "error": result.stderr[-500:] if result.stderr else "",
+        }
+    except _sp.TimeoutExpired:
+        return {"success": False, "error": "timeout"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
