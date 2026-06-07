@@ -19,6 +19,7 @@
     function pct(v) { if (v == null || v === '' || isNaN(v)) return '-'; var n = Number(v); return (n >= 0 ? '+' : '') + n.toFixed(2) + '%'; }
     function clsPct(v) { var n = Number(v); if (isNaN(n)) return ''; return n > 0 ? 'red' : (n < 0 ? 'green' : 'gray'); }
     function fmtMoney(v) { if (v == null || isNaN(v)) return '-'; var n = Math.abs(v); var s = v < 0 ? '-' : ''; if (n >= 1e8) return s + (n / 1e8).toFixed(2) + '亿'; if (n >= 1e4) return s + (n / 1e4).toFixed(1) + '万'; return s + n.toFixed(0); }
+    function fmtPrice(v) { if (v == null || isNaN(v)) return '-'; var n = Number(v); var s = String(n); var dot = s.indexOf('.'); if (dot < 0) return s + '.00'; var dec = s.length - dot - 1; if (dec <= 2) return n.toFixed(2); return s; }
     function isTradingTime() {
         var now = new Date();
         var day = now.getDay();
@@ -298,7 +299,7 @@
                  var profitEl = row.querySelector('.pf-profit');
                  var pctEl = row.querySelector('.pf-profit-pct');
                  if (curPriceEl && costEl && sharesEl && profitEl && pctEl) {
-                     costEl.textContent = newCost.toFixed(4);
+                     costEl.textContent = fmtPrice(newCost);
                      sharesEl.textContent = newShares;
                      var curPrice = parseFloat(curPriceEl.textContent) || 0;
                      var profit = (curPrice - newCost) * newShares;
@@ -394,7 +395,7 @@
                     var pColor = hd.profit_pct >= 0 ? '#e74c3c' : '#27ae60';
                     var pSign = hd.profit_pct >= 0 ? '+' : '';
                     html += '<div style="background:linear-gradient(135deg,rgba(26,115,232,0.12),rgba(26,115,232,0.04));border:1px solid rgba(26,115,232,0.2);border-radius:10px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
-                    html += '<div><div style="font-size:10px;color:#888;margin-bottom:2px">现价</div><div style="font-size:20px;font-weight:800;color:#222">' + Number(hd.cur_price).toFixed(2) + '</div></div>';
+                    html += '<div><div style="font-size:10px;color:#888;margin-bottom:2px">现价</div><div style="font-size:20px;font-weight:800;color:#222">' + fmtPrice(hd.cur_price) + '</div></div>';
                     html += '<div style="width:1px;height:32px;background:rgba(0,0,0,0.1)"></div>';
                     html += '<div><div style="font-size:10px;color:#888;margin-bottom:2px">持仓</div><div style="font-size:14px;font-weight:600;color:#333">' + hd.shares + '股</div></div>';
                     html += '<div><div style="font-size:10px;color:#888;margin-bottom:2px">成本</div><div style="font-size:14px;font-weight:600;color:#333">' + Number(hd.cost_price).toFixed(2) + '</div></div>';
@@ -451,7 +452,7 @@
                 html += '<div style="padding:12px 0;border-bottom:1px solid #2a2a2a">' +
                     '<div style="display:flex;justify-content:space-between;margin-bottom:6px">' +
                     '<span style="color:#888;font-size:12px">📅 '+h.analysis_time+'</span>' +
-                    '<span style="font-size:12px">现价 <strong>'+Number(h.cur_price||0).toFixed(2)+'</strong> ' +
+                    '<span style="font-size:12px">现价 <strong>'+fmtPrice(h.cur_price)+'</strong> ' +
                     '<span class="'+chgCls+'">'+(Number(h.change_pct||0)>=0?'+':'')+Number(h.change_pct||0).toFixed(2)+'%</span></span>' +
                     '</div>' +
                     '<div style="font-size:13px;line-height:1.7;color:#ccc">' +
@@ -1061,7 +1062,7 @@
                 var badgeEl = row.querySelector('.pf-row-badge');
                 if (curEl) curEl.textContent = pr.toFixed(2);
                 if (chgEl) { chgEl.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%'; chgEl.className = chgCls + ' pf-chg-pct'; }
-                if (costEl) costEl.textContent = cp.toFixed(4);
+                if (costEl) costEl.textContent = fmtPrice(cp);
                 if (sharesEl) sharesEl.textContent = r.shares || 0;
                 if (todayEl) { todayEl.textContent = tdCell.text; todayEl.className = tdCell.cls; }
                 if (badgeEl) badgeEl.innerHTML = pfBadge(r);
@@ -1136,9 +1137,9 @@
                         '<td style=\"text-align:center;color:#555;font-size:14px;cursor:grab\" class=\"pf-drag-handle\">⠿</td>' +
                         '<td>'+nameLink(r.stock_code, r.stock_code)+'</td>' +
                         '<td><strong>'+nameLink(r.stock_code, r.display_name)+'</strong><span class=\"pf-row-badge\">'+pfBadge(r)+'</span></td>' +
-                        '<td class=\"pf-cur-price\">'+pr.toFixed(2)+'</td>' +
+                        '<td class=\"pf-cur-price\">'+fmtPrice(pr)+'</td>' +
                         '<td class=\"'+chgCls+' pf-chg-pct\">'+(chg>=0?'+':'')+chg.toFixed(2)+'%</td>' +
-                        '<td class=\"pf-cost\">'+cp.toFixed(4)+'</td>' +
+                        '<td class=\"pf-cost\">'+fmtPrice(cp)+'</td>' +
                         '<td class=\"pf-shares\">'+(r.shares||0)+'</td>' +
                         '<td class=\"'+tdCell.cls+'\">'+tdCell.text+'</td>' +
                         '<td class=\"pf-profit '+pfClsRow+'\">'+profitTxt+'</td>' +
@@ -1720,7 +1721,7 @@
         // ── 一、行情数据 ──
         h += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px">';
         var qFields = [
-            { label: '现价', value: m.price != null ? Number(m.price).toFixed(2) : '-' },
+            { label: '现价', value: m.price != null ? fmtPrice(m.price) : '-' },
             { label: '涨跌幅', value: m.change_pct != null ? pct(m.change_pct) : '-', cls: chgClass },
             { label: 'PE(TTM)', value: m.pe_ttm != null ? Number(m.pe_ttm).toFixed(1) : '-' },
             { label: 'PB', value: m.pb != null ? Number(m.pb).toFixed(2) : '-' },
