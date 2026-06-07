@@ -809,7 +809,8 @@
             loadJqPicksPage(c);
         },
         'recommended': function (d, c) {
-            loadRecommendedPage(d, c);
+            // AI推荐默认加载最新数据，不使用日期选择器的值
+            loadRecommendedPage('', c);
         },
         /* ── 持仓管理 ── */
         portfolio: function (d, c) {
@@ -3022,10 +3023,11 @@
     var sectorMoveTimer = null;
     var sectorMoveData = null;
     var sectorMoveFilter = 'all';
+    var sectorMoveGroupBy = 'industry';
 
     function loadSectorMovementPage(container) {
         container.innerHTML = '<div class="loading">加载板块异动数据...</div>';
-        fetch('/api/sector/movement')
+        fetch('/api/sector/movement?group_by=all')
             .then(function(r) { return r.json(); })
             .then(function(data) {
                 if (data.error) {
@@ -3034,10 +3036,11 @@
                 }
                 sectorMoveData = data;
                 sectorMoveFilter = 'all';
+                sectorMoveGroupBy = 'industry';
                 renderSectorMovementPage(container, data);
                 if (sectorMoveTimer) clearInterval(sectorMoveTimer);
                 sectorMoveTimer = setInterval(function() {
-                    fetch('/api/sector/movement').then(function(r) { return r.json(); }).then(function(d) {
+                    fetch('/api/sector/movement?group_by=all').then(function(r) { return r.json(); }).then(function(d) {
                         if (!d.error) { sectorMoveData = d; renderSectorMovementPage(container, d); }
                     });
                 }, 30000);
@@ -3048,7 +3051,15 @@
     }
 
     function renderSectorMovementPage(container, data) {
-        var sectors = data.sectors || [];
+        // 根据当前分组模式选择数据
+        var sectors;
+        if (sectorMoveGroupBy === 'industry' && data.industry_sectors) {
+            sectors = data.industry_sectors || [];
+        } else if (sectorMoveGroupBy === 'concept' && data.concept_sectors) {
+            sectors = data.concept_sectors || [];
+        } else {
+            sectors = data.sectors || [];
+        }
         var surgeSectors = sectors.filter(function(s) { return s.avg_change > 0.5; });
         var plungeSectors = sectors.filter(function(s) { return s.avg_change < -0.5; });
         var filtered = sectors;
@@ -3308,10 +3319,16 @@
         }
         h += '</div>';
 
-        // 操作栏
+        // 操作栏 - 使用今天的日期显示
+        var todayStr = new Date().toISOString().split('T')[0];
+        var displayDate = data.date || dateStr;
+        var dateInfo = todayStr;
+        if (displayDate && displayDate !== todayStr) {
+            dateInfo = todayStr + '（数据截至 ' + displayDate + '）';
+        }
         h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
         h += '<button onclick="window._runRecommendedScreen()" style="padding:8px 20px;border:none;border-radius:8px;background:linear-gradient(135deg,#e74c3c,#c0392b);color:#fff;font-weight:700;font-size:14px;cursor:pointer;box-shadow:0 2px 8px rgba(231,76,60,0.3);">🔍 开始筛选</button>';
-        h += '<span style="font-size:12px;color:#888;">筛选日期: ' + (data.date || dateStr) + ' | 共 <span id="recFilteredCount">' + count + '</span> 只</span>';
+        h += '<span style="font-size:12px;color:#888;">筛选日期: ' + dateInfo + ' | 共 <span id="recFilteredCount">' + count + '</span> 只</span>';
         h += '<span id="recStatus" style="font-size:12px;color:#f39c12;"></span>';
         h += '</div>';
         // 分数筛选输入框
@@ -3326,7 +3343,7 @@
             h += '<div style="font-size:48px;margin-bottom:16px;">💎</div>';
             h += '<div style="font-size:16px;font-weight:600;color:#555;margin-bottom:8px;">暂无推荐数据</div>';
             h += '<div style="font-size:13px;color:#999;margin-bottom:8px;">点击「开始筛选」按钮，系统将自动量化筛选 + AI评分</div>';
-            h += '<div style="font-size:12px;color:#aaa;">筛选日期: ' + (data.date || dateStr) + '（如已点击筛选但无结果，说明当前无股票满足全部条件）</div>';
+            h += '<div style="font-size:12px;color:#aaa;">筛选日期: ' + dateInfo + '（如已点击筛选但无结果，说明当前无股票满足全部条件）</div>';
             h += '</div>';
             container.innerHTML = h;
             return;

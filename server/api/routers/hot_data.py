@@ -4658,8 +4658,11 @@ def sector_heat_matrix(
         data.sort(key=lambda x: x["date"], reverse=True)
 
         # 热度值归一化 → 0~100
-        # raw量大(>100)先log压缩，已缩放的直接min-max
+        # 东财数据(plate_type 3/4): 原始成交额，全局log压缩+全局min-max归一化
+        # THS数据(plate_type 1/2): 搜索热度原始值已是0~100，直接使用
         import math as _math
+
+        # 1) 先保存原始值到 raw_data
         for row in data:
             d = row["date"]
             raw_data[d] = {}
@@ -4667,30 +4670,49 @@ def sector_heat_matrix(
                 obj = row.get(key)
                 if obj:
                     raw_data[d][key] = dict(obj)
-                if obj and len(obj) > 1:
-                    raw_vals = [float(v) for v in obj.values()]
-                    if max(raw_vals) > 500:  # 原始成交额，需要log压缩
-                        lv = {n: _math.log(max(float(v), 0) + 1) for n, v in obj.items()}
-                    else:  # 已缩放过，直接用
-                        lv = {n: float(v) for n, v in obj.items()}
-                    min_lv = min(lv.values())
-                    max_lv = max(lv.values())
-                    if max_lv > min_lv:
-                        for name in obj:
-                            obj[name] = round((lv[name] - min_lv) / (max_lv - min_lv) * 100, 1)
+
+        # 2) 东财数据：全局log压缩 + 全局min-max归一化
+        east_keys = ("east_industry", "east_industry_sub")
+        all_east_log_vals = []
+        for row in data:
+            for key in east_keys:
+                obj = row.get(key)
+                if obj and len(obj) > 0:
+                    for v in obj.values():
+                        fv = float(v)
+                        if fv > 0:
+                            all_east_log_vals.append(_math.log(fv + 1))
+
+        east_global_min = min(all_east_log_vals) if all_east_log_vals else 0
+        east_global_max = max(all_east_log_vals) if all_east_log_vals else 1
+        east_range = east_global_max - east_global_min
+
+        for row in data:
+            for key in east_keys:
+                obj = row.get(key)
+                if obj and len(obj) > 0:
+                    if east_range > 0:
+                        for name in list(obj.keys()):
+                            fv = float(obj[name])
+                            log_v = _math.log(fv + 1) if fv > 0 else east_global_min
+                            obj[name] = round((log_v - east_global_min) / east_range * 100, 1)
                     else:
                         for name in obj:
-                            obj[name] = 100.0 if max_lv > 0 else 0.0
+                            obj[name] = 50.0
 
-        # 每日热度汇总（各组总和）
+        # 3) THS数据：原始值已是0~100，直接使用（不做归一化）
+        # 无需处理
+
+        # 4) 每日热度汇总（各组平均值，更直观）
         daily_totals = {}
         for row in data:
             d = row["date"]
             daily_totals[d] = {}
             for key in ("ths_industry", "ths_concept", "east_industry", "east_industry_sub"):
                 obj = row.get(key)
-                if obj:
-                    daily_totals[d][key] = round(sum(obj.values()), 1)
+                if obj and len(obj) > 0:
+                    vals = [float(v) for v in obj.values()]
+                    daily_totals[d][key] = round(sum(vals) / len(vals), 1)
                 else:
                     daily_totals[d][key] = 0
 
@@ -4848,8 +4870,16 @@ def _get_realtime_overview():
 
 
 @router.get("/sector/movement")
-def sector_movement():
-    """板块异动检测 + 龙头识别"""
+def sector_movement(group_by: str = Query(default="industry", regex="^(industry|concept|all)$")):
+    """板块异动检测 + 龙头识别
+
+    group_by: industry=按行业分组(申万一级), concept=按概念分组, all=同时展示两组
+    """
+    _ttl = 30 if _is_monitor_trading_time() else 120
+    _ckey = f"sector_movement_{group_by}"
+    cached = _cache_get(_ckey, ttl_seconds=_ttl)
+    if cached is not None:
+        return cached
     try:
         from collections import defaultdict
 
@@ -4890,18 +4920,36 @@ def sector_movement():
             return {"sectors": []}
 
         ph = ",".join([f"'{c}'" for c in codes])
-        try:
-            sector_rows = _read_sql(f"""
-                SELECT stock_code, name AS plate_name
-                FROM si_stock_concept_map
-                WHERE stock_code IN ({ph})
-            """)
-        except Exception:
-            sector_rows = []
 
-        sector_map = defaultdict(set)
-        for sr in sector_rows:
-            sector_map[str(sr["stock_code"])].add(str(sr["plate_name"]))
+        # 获取概念板块映射
+        concept_map = defaultdict(set)
+        if group_by in ("concept", "all"):
+            try:
+                concept_rows = _read_sql(f"""
+                    SELECT stock_code, name AS plate_name
+                    FROM si_stock_concept_map
+                    WHERE stock_code IN ({ph})
+                """)
+                for sr in concept_rows:
+                    concept_map[str(sr["stock_code"])].add(str(sr["plate_name"]))
+            except Exception:
+                pass
+
+        # 获取行业板块映射（申万一级行业）
+        industry_map = defaultdict(set)
+        if group_by in ("industry", "all"):
+            try:
+                industry_rows = _read_sql(f"""
+                    SELECT stock_code, industry_name
+                    FROM si_industry_sw
+                    WHERE stock_code IN ({ph}) AND industry_type = '申万一级'
+                """)
+                for sr in industry_rows:
+                    name = str(sr["industry_name"] or "").strip()
+                    if name:
+                        industry_map[str(sr["stock_code"])].add(name)
+            except Exception:
+                pass
 
         code_data = {}
         for r in raw:
@@ -4916,36 +4964,55 @@ def sector_movement():
                 "amount": float(r["now_amt"] or 0),
             }
 
-        groups = defaultdict(list)
-        for sc, plates in sector_map.items():
-            if sc not in code_data:
-                continue
-            for pn in plates:
-                groups[pn].append(code_data[sc])
+        def _build_sector_list(groups_map):
+            """从分组映射构建板块列表"""
+            groups = defaultdict(list)
+            for sc, plates in groups_map.items():
+                if sc not in code_data:
+                    continue
+                for pn in plates:
+                    groups[pn].append(code_data[sc])
 
-        sector_list = []
-        for sector, stocks in groups.items():
-            stocks.sort(key=lambda s: abs(s["momentum"]), reverse=True)
-            avg_chg = round(sum(s["change_pct"] for s in stocks) / len(stocks), 2)
-            up = sum(1 for s in stocks if s["change_pct"] > 0)
-            dn = sum(1 for s in stocks if s["change_pct"] < 0)
-            leader = stocks[0] if stocks else None
-            sector_list.append({
-                "name": sector,
-                "avg_change": avg_chg,
-                "stock_count": len(stocks),
-                "up_count": up,
-                "down_count": dn,
-                "leader": leader,
-                "top_movers": stocks[:10],
-            })
+            sector_list = []
+            for sector, stocks in groups.items():
+                if len(stocks) < 2:  # 过滤成分股太少的板块
+                    continue
+                # 龙头识别：按 成交额 * abs(动量) 综合排序
+                stocks.sort(key=lambda s: s["amount"] * max(abs(s["momentum"]), 0.1), reverse=True)
+                avg_chg = round(sum(s["change_pct"] for s in stocks) / len(stocks), 2)
+                up = sum(1 for s in stocks if s["change_pct"] > 0)
+                dn = sum(1 for s in stocks if s["change_pct"] < 0)
+                leader = stocks[0] if stocks else None
+                sector_list.append({
+                    "name": sector,
+                    "avg_change": avg_chg,
+                    "stock_count": len(stocks),
+                    "up_count": up,
+                    "down_count": dn,
+                    "leader": leader,
+                    "top_movers": stocks[:10],
+                })
 
-        sector_list.sort(key=lambda s: abs(s["avg_change"]), reverse=True)
-        return {
+            sector_list.sort(key=lambda s: abs(s["avg_change"]), reverse=True)
+            return sector_list
+
+        result = {
             "snapshot_time": str(now_sa),
             "has_momentum": has_prev,
-            "sectors": sector_list,
+            "group_by": group_by,
         }
+
+        if group_by == "all":
+            result["industry_sectors"] = _build_sector_list(industry_map)
+            result["concept_sectors"] = _build_sector_list(concept_map)
+            result["sectors"] = result["industry_sectors"]  # 默认展示行业
+        elif group_by == "industry":
+            result["sectors"] = _build_sector_list(industry_map)
+        else:
+            result["sectors"] = _build_sector_list(concept_map)
+
+        _cache_set(_ckey, result)
+        return result
     except Exception as e:
         return {"sectors": [], "error": str(e)}
 
@@ -6100,7 +6167,7 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         ORDER BY snapshot_date
     """, {"sd": start_date, "td": trade_date})
 
-    use_east = len(east_dates) >= 2  # 东财数据至少2天才用
+    use_east = len(east_dates) >= max(days // 2, 5)  # 东财数据至少需要足够天数才用
 
     if use_east:
         # 用东财数据：行业用 plate_type=3，概念仍用 plate_type=1
@@ -6180,15 +6247,19 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
             avg_early_chg = sum(early_changes) / len(early_changes)
             chg_trend = avg_recent_chg - avg_early_chg  # 正数=涨势增强
 
-            # 热度趋势
+            # 热度趋势（用log压缩消除不同数据源量纲差异）
+            import math as _math
             recent_hot = trend["hot_values"][-3:] if len(trend["hot_values"]) >= 3 else trend["hot_values"]
             early_hot = trend["hot_values"][:3] if len(trend["hot_values"]) >= 3 else trend["hot_values"][:1]
             avg_recent_hot = sum(recent_hot) / len(recent_hot)
             avg_early_hot = sum(early_hot) / len(early_hot)
-            hot_trend = avg_recent_hot - avg_early_hot
+            # log压缩后计算变化率，消除THS(0-100)和东财(成交额)的量纲差异
+            log_recent = _math.log(max(avg_recent_hot, 0) + 1)
+            log_early = _math.log(max(avg_early_hot, 0) + 1)
+            hot_trend = log_recent - log_early  # 正数=热度上升
 
-            # 综合动量得分
-            momentum = rank_change * 3 + chg_trend * 2 + (hot_trend / max(1, avg_early_hot)) * 10
+            # 综合动量得分（三项均为正值=向好）
+            momentum = rank_change * 3 + chg_trend * 2 + hot_trend * 15
 
             results.append({
                 "name": name,
