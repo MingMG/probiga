@@ -2636,7 +2636,7 @@
         h += card('崛起行业', risingS.length, 'red');
         h += card('退潮行业', fallingS.length, 'green');
         h += card('崛起概念', risingC.length, 'orange');
-        if (data.data_source) h += card('数据源', data.data_source === 'east' ? '东财成交额' : 'THS热度', data.data_source === 'east' ? '#4caf50' : '#ff9800');
+        if (data.data_source) h += card('数据源', data.data_source === 'east' ? '东财成交额' : 'THS搜索热度', data.data_source === 'east' ? '#4caf50' : '#ff9800');
         h += '</div>';
 
         // ── 调仓建议（核心区域） ──
@@ -2873,7 +2873,7 @@
             });
             html += '</tr>';
 
-            html += '<tr class="sh-name-row"><th class="sh-row-header sh-date-header"></th><th class="sh-col-name" style="color:#f0c040">总和</th>';
+            html += '<tr class="sh-name-row"><th class="sh-row-header sh-date-header"></th><th class="sh-col-name" style="color:#f0c040">均值</th>';
             groupNames.forEach(function (l1) {
                 html += '<th class="sh-col-name sh-l1-name" style="font-weight:700">' + l1 + '</th>';
                 (eastTree[l1] || []).forEach(function (l2) {
@@ -2882,7 +2882,7 @@
             });
             html += '</tr>';
         } else {
-            html += '<tr class="sh-name-row"><th class="sh-row-header sh-date-header">日期</th><th class="sh-col-name" style="color:#f0c040">总和</th>';
+            html += '<tr class="sh-name-row"><th class="sh-row-header sh-date-header">日期</th><th class="sh-col-name" style="color:#f0c040">均值</th>';
             groupNames.forEach(function (name) {
                 html += '<th class="sh-col-name">' + name + '</th>';
             });
@@ -2904,7 +2904,7 @@
 
             html += '<tr class="sh-data-row' + cls + '">';
             html += '<td class="sh-row-header sh-date-cell">' + mmdd + '</td>';
-            html += '<td class="sh-cell sh-total-cell" style="font-weight:700;color:#e6a800" title="' + d + ' 总热度: ' + grand + '">' + grand + '</td>';
+            html += '<td class="sh-cell sh-total-cell" style="font-weight:700;color:#e6a800" title="' + d + ' 平均热度: ' + grand + '">' + grand + '</td>';
 
             var groupData = row[dataKey] || {};
             var rawGroupData = rawData[d] && rawData[d][dataKey] ? rawData[d][dataKey] : {};
@@ -2950,6 +2950,7 @@
 
         html += '<div style="margin-top:12px;color:#888;font-size:11px;display:flex;gap:20px;flex-wrap:wrap">';
         html += '<span>📊 数值越大热度越高，颜色越红</span>';
+        html += '<span>📈 东财=成交额归一化，THS=搜索热度原值</span>';
         if (tabName === '东财一级行业') html += '<span>📂 加粗为一级行业，子行业在右侧</span>';
         html += '</div>';
 
@@ -3079,6 +3080,14 @@
         h += '</div>';
         h += '</div>';
 
+        // 行业/概念分组切换
+        h += '<div style="display:flex;gap:10px;margin-bottom:12px;align-items:center">';
+        var grpBtnBase = 'padding:6px 16px;border:1px solid #ddd;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;transition:all 0.2s';
+        h += '<span style="font-size:12px;color:#888;margin-right:4px">分组:</span>';
+        h += '<button onclick="window._smGroupBy(\'industry\')" style="' + grpBtnBase + ';color:' + (sectorMoveGroupBy === 'industry' ? '#fff' : '#666') + ';background:' + (sectorMoveGroupBy === 'industry' ? '#1a73e8' : '#f5f5f5') + '">行业板块</button>';
+        h += '<button onclick="window._smGroupBy(\'concept\')" style="' + grpBtnBase + ';color:' + (sectorMoveGroupBy === 'concept' ? '#fff' : '#666') + ';background:' + (sectorMoveGroupBy === 'concept' ? '#1a73e8' : '#f5f5f5') + '">概念板块</button>';
+        h += '</div>';
+
         h += '<div style="display:flex;gap:10px;margin-bottom:20px">';
         var btnBase = 'padding:8px 20px;border:1px solid #ddd;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;transition:all 0.2s;background:#fff';
         h += '<button onclick="window._smFilter(\'all\')" style="' + btnBase + ';color:' + (sectorMoveFilter === 'all' ? '#222' : '#999') + (sectorMoveFilter === 'all' ? ';background:#f0f0f0' : '') + '">全部 (' + sectors.length + ')</button>';
@@ -3150,6 +3159,12 @@
 
     window._smFilter = function(f) {
         sectorMoveFilter = f;
+        var c = document.getElementById('sectorBody');
+        if (c && sectorMoveData) renderSectorMovementPage(c, sectorMoveData);
+    };
+
+    window._smGroupBy = function(g) {
+        sectorMoveGroupBy = g;
         var c = document.getElementById('sectorBody');
         if (c && sectorMoveData) renderSectorMovementPage(c, sectorMoveData);
     };
@@ -3998,6 +4013,13 @@
         var savedLayout = 'new';
         try { savedLayout = localStorage.getItem('probiga_layout') || 'new'; } catch (e) {}
         applyLayout(savedLayout);
+        // 恢复保存的页面
+        var savedTab = '';
+        try { savedTab = localStorage.getItem('probiga_current_tab') || ''; } catch (e) {}
+        if (!_restoreTab(savedTab)) {
+            // 没有保存的页面或页面不存在，加载默认页面
+            loadTab('fused');
+        }
         // 再更新日期
         fetch(API_BASE + '/latest-trade-date').then(function (r) { return r.json(); }).then(function (res) {
             if (res.latest_date && res.latest_date <= today) {
