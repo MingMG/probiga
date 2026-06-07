@@ -5121,9 +5121,10 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
 
         up_cnt = int(cur["up_cnt"] or 0)
         down_cnt = int(cur["down_cnt"] or 0)
+        sideline_cnt = int(cur["sideline_cnt"] or 0)
         total = int(cur["total"] or 1)
         total_amount = float(cur["total_amount"] or 0)
-        sideline_ratio = round(int(cur["sideline_cnt"] or 0) / total * 100, 2)
+        sideline_ratio = round(sideline_cnt / total * 100, 2)
         market_heat = round(up_cnt / total * 1000, 0)
 
         prev_date_rows = _read_sql(
@@ -5280,6 +5281,7 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
             "is_realtime": is_realtime,
             "up_count": up_cnt,
             "down_count": down_cnt,
+            "sideline_count": sideline_cnt,
             "market_heat": market_heat,
             "heat_change": heat_change,
             "heat_percentile": heat_percentile,
