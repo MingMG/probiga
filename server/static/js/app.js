@@ -3396,7 +3396,7 @@
         if (hasNewFormat) {
             h += '<th style="width:90px;">买入建议</th><th>短线评分</th><th>长线评分</th>';
             h += '<th>资金面</th><th>技术面</th><th>情绪面</th>';
-            h += '<th>市场情绪</th><th>风险等级</th>';
+            h += '<th>市场情绪</th><th>消息面</th><th>风险等级</th>';
         } else {
             h += '<th>综合评分</th><th>基本面</th><th>资金面</th><th>估值</th><th>技术面</th>';
         }
@@ -3452,6 +3452,9 @@
 
                 // 市场情绪
                 h += '<td style="text-align:center;color:' + scoreColor(r.market_mood_score) + ';">' + (r.market_mood_score != null ? Math.round(r.market_mood_score) : '-') + '</td>';
+
+                // 消息面
+                h += '<td style="text-align:center;color:' + scoreColor(r.event_score) + ';">' + (r.event_score != null ? Math.round(r.event_score) : '-') + '</td>';
 
                 // 风险等级
                 var riskLevel = r.event_risk_level || 'LOW';

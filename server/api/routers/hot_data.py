@@ -5439,7 +5439,7 @@ def recommended_stocks(trade_date: str = Query(default="")):
                    r.sources, r.pick_date,
                    r.long_term_score, r.short_term_score,
                    r.recommend_status, r.recommend_reason, r.event_risk_level,
-                   r.sentiment_score, r.market_mood_score
+                   r.sentiment_score, r.market_mood_score, r.event_score
             FROM st_recommended_stocks r
             WHERE r.pick_date = :d
             ORDER BY r.ai_score DESC
@@ -5584,6 +5584,7 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                             "event_risk_level": result.event_risk.level,
                             "sentiment_score": result.scores.sentiment,
                             "market_mood_score": result.scores.market_mood,
+                            "event_score": result.scores.event,
                         })
                 except Exception as e:
                     import logging
@@ -5611,12 +5612,12 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                              fundamental, capital_score, valuation, technical,
                              reason, sources, pick_date,
                              recommend_status, recommend_reason, event_risk_level,
-                             sentiment_score, market_mood_score, created_at)
+                             sentiment_score, market_mood_score, event_score, created_at)
                             VALUES (:code, :name, :score, :lt_score, :st_score,
                                     :fund, :cap, :val, :tech,
                                     :reason, :sources, :pick,
                                     :rec_status, :rec_reason, :risk_level,
-                                    :sentiment, :market_mood, NOW())
+                                    :sentiment, :market_mood, :event, NOW())
                         """), {
                             "code": r["stock_code"], "name": r["short_name"], "score": r["ai_score"],
                             "lt_score": r.get("long_term_score"), "st_score": r.get("short_term_score"),
@@ -5628,6 +5629,7 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                             "risk_level": r.get("event_risk_level", "LOW"),
                             "sentiment": r.get("sentiment_score"),
                             "market_mood": r.get("market_mood_score"),
+                            "event": r.get("event_score"),
                         })
 
                     import logging
