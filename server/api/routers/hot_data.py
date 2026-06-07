@@ -4658,8 +4658,8 @@ def sector_heat_matrix(
         data.sort(key=lambda x: x["date"], reverse=True)
 
         # 热度值归一化 → 0~100
-        # 东财数据(plate_type 3/4): 原始成交额，全局log压缩+全局min-max归一化
-        # THS数据(plate_type 1/2): 搜索热度原始值已是0~100，直接使用
+        # 所有数据源(东财成交额/THS搜索热度)都用全局log压缩+全局min-max归一化
+        # 不同数据源独立归一化，各自内部跨日可比
         import math as _math
 
         # 1) 先保存原始值到 raw_data
@@ -4671,44 +4671,45 @@ def sector_heat_matrix(
                 if obj:
                     raw_data[d][key] = dict(obj)
 
-        # 2) 东财数据：全局log压缩 + 全局min-max归一化
-        east_keys = ("east_industry", "east_industry_sub")
-        all_east_log_vals = []
-        for row in data:
-            for key in east_keys:
+        # 2) 对每组数据独立做全局log压缩 + 全局min-max归一化
+        normalize_keys = ("ths_industry", "ths_concept", "east_industry", "east_industry_sub")
+        for key in normalize_keys:
+            # 收集该组所有日期的值
+            all_log_vals = []
+            for row in data:
                 obj = row.get(key)
                 if obj and len(obj) > 0:
                     for v in obj.values():
                         fv = float(v)
                         if fv > 0:
-                            all_east_log_vals.append(_math.log(fv + 1))
+                            all_log_vals.append(_math.log(fv + 1))
 
-        east_global_min = min(all_east_log_vals) if all_east_log_vals else 0
-        east_global_max = max(all_east_log_vals) if all_east_log_vals else 1
-        east_range = east_global_max - east_global_min
+            if not all_log_vals:
+                continue
 
-        for row in data:
-            for key in east_keys:
+            g_min = min(all_log_vals)
+            g_max = max(all_log_vals)
+            g_range = g_max - g_min
+
+            # 归一化
+            for row in data:
                 obj = row.get(key)
                 if obj and len(obj) > 0:
-                    if east_range > 0:
+                    if g_range > 0:
                         for name in list(obj.keys()):
                             fv = float(obj[name])
-                            log_v = _math.log(fv + 1) if fv > 0 else east_global_min
-                            obj[name] = round((log_v - east_global_min) / east_range * 100, 1)
+                            log_v = _math.log(fv + 1) if fv > 0 else g_min
+                            obj[name] = round((log_v - g_min) / g_range * 100, 1)
                     else:
                         for name in obj:
                             obj[name] = 50.0
 
-        # 3) THS数据：原始值已是0~100，直接使用（不做归一化）
-        # 无需处理
-
-        # 4) 每日热度汇总（各组平均值，更直观）
+        # 3) 每日热度汇总（各组平均值，更直观）
         daily_totals = {}
         for row in data:
             d = row["date"]
             daily_totals[d] = {}
-            for key in ("ths_industry", "ths_concept", "east_industry", "east_industry_sub"):
+            for key in normalize_keys:
                 obj = row.get(key)
                 if obj and len(obj) > 0:
                     vals = [float(v) for v in obj.values()]
@@ -5435,7 +5436,10 @@ def recommended_stocks(trade_date: str = Query(default="")):
         rows = _read_sql("""
             SELECT r.stock_code, r.short_name, r.ai_score, r.fundamental,
                    r.capital_score, r.valuation, r.technical, r.reason,
-                   r.sources, r.pick_date
+                   r.sources, r.pick_date,
+                   r.long_term_score, r.short_term_score,
+                   r.recommend_status, r.recommend_reason, r.event_risk_level,
+                   r.sentiment_score, r.market_mood_score
             FROM st_recommended_stocks r
             WHERE r.pick_date = :d
             ORDER BY r.ai_score DESC
@@ -5448,7 +5452,10 @@ def recommended_stocks(trade_date: str = Query(default="")):
                 rows = _read_sql("""
                     SELECT r.stock_code, r.short_name, r.ai_score, r.fundamental,
                            r.capital_score, r.valuation, r.technical, r.reason,
-                           r.sources, r.pick_date
+                           r.sources, r.pick_date,
+                           r.long_term_score, r.short_term_score,
+                           r.recommend_status, r.recommend_reason, r.event_risk_level,
+                           r.sentiment_score, r.market_mood_score
                     FROM st_recommended_stocks r
                     WHERE r.pick_date = :d
                     ORDER BY r.ai_score DESC
@@ -5575,6 +5582,8 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                             "recommend_status": result.recommend.status,
                             "recommend_reason": result.recommend.reason,
                             "event_risk_level": result.event_risk.level,
+                            "sentiment_score": result.scores.sentiment,
+                            "market_mood_score": result.scores.market_mood,
                         })
                 except Exception as e:
                     import logging
@@ -5587,6 +5596,13 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
             # 写入数据库
             if results:
                 with engine.begin() as conn:
+                    # 确保新字段存在
+                    for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT")]:
+                        try:
+                            conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN IF NOT EXISTS {col} {dtype}"))
+                        except Exception:
+                            pass  # 列已存在或权限不足
+
                     conn.execute(text("DELETE FROM st_recommended_stocks WHERE pick_date = :d"), {"d": trade_date})
                     for r in results:
                         conn.execute(text("""
@@ -5594,11 +5610,13 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                             (stock_code, short_name, ai_score, long_term_score, short_term_score,
                              fundamental, capital_score, valuation, technical,
                              reason, sources, pick_date,
-                             recommend_status, recommend_reason, event_risk_level, created_at)
+                             recommend_status, recommend_reason, event_risk_level,
+                             sentiment_score, market_mood_score, created_at)
                             VALUES (:code, :name, :score, :lt_score, :st_score,
                                     :fund, :cap, :val, :tech,
                                     :reason, :sources, :pick,
-                                    :rec_status, :rec_reason, :risk_level, NOW())
+                                    :rec_status, :rec_reason, :risk_level,
+                                    :sentiment, :market_mood, NOW())
                         """), {
                             "code": r["stock_code"], "name": r["short_name"], "score": r["ai_score"],
                             "lt_score": r.get("long_term_score"), "st_score": r.get("short_term_score"),
@@ -5608,6 +5626,8 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                             "rec_status": r.get("recommend_status", "ALLOW"),
                             "rec_reason": r.get("recommend_reason", ""),
                             "risk_level": r.get("event_risk_level", "LOW"),
+                            "sentiment": r.get("sentiment_score"),
+                            "market_mood": r.get("market_mood_score"),
                         })
 
                     import logging

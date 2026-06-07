@@ -2950,7 +2950,7 @@
 
         html += '<div style="margin-top:12px;color:#888;font-size:11px;display:flex;gap:20px;flex-wrap:wrap">';
         html += '<span>📊 数值越大热度越高，颜色越红</span>';
-        html += '<span>📈 东财=成交额归一化，THS=搜索热度原值</span>';
+        html += '<span>📈 各组独立归一化(log压缩+全局min-max)，组内跨日可比</span>';
         if (tabName === '东财一级行业') html += '<span>📂 加粗为一级行业，子行业在右侧</span>';
         html += '</div>';
 
