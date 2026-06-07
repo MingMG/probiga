@@ -3069,8 +3069,13 @@ th{{color:#888;font-weight:500;font-size:12px}}
 
 @router.get("/hot-data/daily-review/export")
 def export_daily_review(review_date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """导出复盘数据为文本（保留兼容）"""
+    """导出复盘数据为文本（优先返回专业复盘）"""
     try:
+        # 优先查询专业复盘
+        pro_rows = _read_sql("SELECT pro_review FROM st_daily_review_pro WHERE review_date = :d", {"d": review_date})
+        if pro_rows and pro_rows[0].get("pro_review"):
+            return {"date": review_date, "text": pro_rows[0]["pro_review"]}
+
         rows = _read_sql("SELECT * FROM st_daily_review WHERE review_date = :d", {"d": review_date})
         if not rows:
             return {"error": "无数据"}
@@ -3145,6 +3150,21 @@ def export_daily_review(review_date: str = Query(default_factory=lambda: date.to
         return {"date": review_date, "text": "\n".join(text_lines)}
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/hot-data/daily-review/pro")
+def pro_daily_review(review_date: str = Query(default_factory=lambda: date.today().isoformat())):
+    """专业复盘数据"""
+    try:
+        rows = _read_sql("SELECT * FROM st_daily_review_pro WHERE review_date = :d", {"d": review_date})
+        if not rows:
+            fb = _fallback_date("st_daily_review_pro", "review_date", review_date)
+            if fb != review_date:
+                rows = _read_sql("SELECT * FROM st_daily_review_pro WHERE review_date = :d", {"d": fb})
+                return {"date": fb, "fallback": True, "data": rows, "total": len(rows)}
+        return {"date": review_date, "data": rows, "total": len(rows)}
+    except Exception as e:
+        return {"date": review_date, "data": [], "total": 0, "error": str(e)}
 
 
 # ═══════════════════════════════════════════
@@ -5643,7 +5663,7 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
             if results:
                 with engine.begin() as conn:
                     # 确保新字段存在（兼容不支持 IF NOT EXISTS 的 MySQL 版本）
-                    for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT")]:
+                    for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT"), ("event_score", "FLOAT")]:
                         try:
                             conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN {col} {dtype}"))
                         except Exception:

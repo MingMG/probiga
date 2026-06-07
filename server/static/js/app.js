@@ -242,6 +242,37 @@
     function jsonF(v, def) { if (!v) return def; if (typeof v === 'object') return v; try { return JSON.parse(v); } catch(e) { return def; } }
     window.genReviewBtn = function(d) { fetch('/api/hot-data/daily-review/generate?review_date=' + d, {method:'POST'}).then(function(r){return r.json()}).then(function(res){alert('生成' + (res.status === 'success' ? '成功' : '失败') + '!');}); };
     window.exportReview = function(d) { fetch('/api/hot-data/daily-review/print?review_date='+d).then(function(r){return r.blob()}).then(function(b){var a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='review_'+d+'.html'; a.click(); URL.revokeObjectURL(a.href);}); };
+    window.switchReviewTab = function(tab) {
+        var basicEl = document.getElementById('review-basic');
+        var proEl = document.getElementById('review-pro');
+        var tabBasic = document.getElementById('tab-pro-basic');
+        var tabPro = document.getElementById('tab-pro-pro');
+        if (!basicEl || !proEl) return;
+        if (tab === 'pro') {
+            basicEl.style.display = 'none';
+            proEl.style.display = 'block';
+            if (tabBasic) { tabBasic.style.background = '#1e1e1e'; tabBasic.style.color = '#888'; }
+            if (tabPro) { tabPro.style.background = '#2a2a3e'; tabPro.style.color = '#1a73e8'; tabPro.style.fontWeight = '600'; }
+        } else {
+            basicEl.style.display = 'block';
+            proEl.style.display = 'none';
+            if (tabBasic) { tabBasic.style.background = '#2a2a3e'; tabBasic.style.color = '#1a73e8'; tabBasic.style.fontWeight = '600'; }
+            if (tabPro) { tabPro.style.background = '#1e1e1e'; tabPro.style.color = '#888'; tabPro.style.fontWeight = 'normal'; }
+        }
+    };
+    function _renderProReview(text) {
+        if (!text) return '';
+        // 简单Markdown渲染：加粗、标题、列表
+        return text
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/^【(.+?)】/gm, '<div style="font-size:18px;font-weight:700;color:#1a73e8;margin-bottom:16px;text-align:center">【$1】</div>')
+            .replace(/^(\d+)\.\s+(.+)$/gm, '<div style="font-size:15px;font-weight:700;color:#e0e0e0;margin:16px 0 8px;border-bottom:1px solid #333;padding-bottom:4px">$1. $2</div>')
+            .replace(/^- (.+)$/gm, '<div style="padding-left:16px;margin:4px 0;color:#bbb">• $1</div>')
+            .replace(/\*\*(.+?)\*\*/g, '<strong style="color:#e0e0e0">$1</strong>')
+            .replace(/"([^"]+)"/g, '<span style="color:#4fc3f7">"$1"</span>')
+            .replace(/\n\n/g, '<br/>')
+            .replace(/\n/g, '');
+    }
     window.loadPortfolio = function(){ loadTab('portfolio'); };
 
     /* ===== 自选股 ===== */
@@ -945,29 +976,47 @@
             loadNotices();
         },
         review: function (d, c) {
-            apiGet('/daily-review?review_date=' + d).then(function (res) {
+            // 先加载基础复盘，同时加载专业复盘
+            Promise.all([
+                apiGet('/daily-review?review_date=' + d),
+                apiGet('/daily-review/pro?review_date=' + d)
+            ]).then(function(results) {
+                var res = results[0];
+                var proRes = results[1];
                 syncDateFromResponse(res);
                 if (!res.data || !res.data.length) {
                     c.innerHTML = '<div class="loading" style="padding:20px"><p>当前日期暂无复盘数据</p><button onclick="genReviewBtn(\'' + d + '\')" style="margin-top:10px;padding:8px 20px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:14px">🔄 生成复盘数据</button></div>';
                     return;
                 }
                 var r = res.data[0];
+                var hasPro = proRes && proRes.data && proRes.data.length && proRes.data[0].pro_review;
+                var proData = hasPro ? proRes.data[0] : null;
+
+                var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
+                html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">📋 复盘数据 | ' + r.review_date + '</span>';
+                html += '<div><button onclick="exportReview(\'' + r.review_date + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px;margin-right:8px">📥 导出</button>';
+                if (hasPro) html += '<button onclick="exportReview(\'' + r.review_date + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#4caf50;color:#fff;cursor:pointer;font-size:12px">📥 导出专业版</button>';
+                html += '</div></div>';
+
+                // Tab 切换
+                if (hasPro) {
+                    html += '<div style="display:flex;gap:4px;margin-bottom:16px">';
+                    html += '<span id="tab-pro-basic" onclick="switchReviewTab(\'basic\')" style="padding:6px 16px;border-radius:6px 6px 0 0;cursor:pointer;font-size:13px;background:#2a2a3e;color:#1a73e8;font-weight:600">📊 数据总览</span>';
+                    html += '<span id="tab-pro-pro" onclick="switchReviewTab(\'pro\')" style="padding:6px 16px;border-radius:6px 6px 0 0;cursor:pointer;font-size:13px;background:#1e1e1e;color:#888">📋 专业复盘</span>';
+                    html += '</div>';
+                }
+
+                // 基础复盘内容
+                html += '<div id="review-basic">';
                 var hot = jsonF(r.hot_sectors, []);
                 var cold = jsonF(r.cold_sectors, []);
                 var volUp = jsonF(r.volume_up_sectors, []);
                 var volDown = jsonF(r.volume_down_sectors, []);
                 var idxA = jsonF(r.index_analysis, []);
-
                 var amt = (Number(r.total_amount || 0) / 1e8).toFixed(0);
                 var idxChg = Number(r.index_change_pct || 0);
 
-                var html = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
-                html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">📋 复盘数据 | ' + r.review_date + '</span>';
-                html += '<button onclick="exportReview(\'' + r.review_date + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px">📥 导出</button>';
-                html += '</div>';
-
                 html += '<div class="stats-bar">' + card('市场热度', (r.market_heat || '-') + '%', 'blue') + card('成交额', amt + '亿', 'orange') + card(r.index_name || '指数', (r.index_price || '-'), 'red') + card('涨跌幅', (idxChg >= 0 ? '+' : '') + idxChg.toFixed(2) + '%', idxChg >= 0 ? 'red' : 'green') + card('量能', r.total_amount_change || '-', 'blue') + card('观望', (r.sideline_ratio || '-') + '%', 'comment') + '</div>';
-
                 html += '<p style="margin:12px 0;color:#aaa;line-height:1.6">' + (r.market_heat_note || '') + '</p>';
 
                 if ((hot && hot.length) || (cold && cold.length)) {
@@ -1000,6 +1049,16 @@
 
                 if (r.summary) html += '<div style="margin-top:16px;background:#1a1a2e;border-left:3px solid #1a73e8;padding:12px 16px;border-radius:4px"><h4 style="color:#e0e0e0;margin:0 0 6px">📝 综合结论</h4><p style="color:#aaa;line-height:1.8;font-size:13px;white-space:pre-wrap;margin:0">'+(r.summary||'')+'</p></div>';
                 html += '<p style="margin-top:10px;color:#666;font-size:11px">'+(r.disclaimer||'')+'</p>';
+                html += '</div>';
+
+                // 专业复盘内容
+                if (hasPro) {
+                    html += '<div id="review-pro" style="display:none">';
+                    html += '<div style="background:#1a1a2e;border-radius:8px;padding:20px;font-size:14px;line-height:2;color:#ccc;white-space:pre-wrap;font-family:monospace">';
+                    html += _renderProReview(proData.pro_review);
+                    html += '</div></div>';
+                }
+
                 c.innerHTML = html;
             });
         },
