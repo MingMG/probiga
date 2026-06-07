@@ -377,8 +377,8 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         FROM (
             SELECT trade_date, change_pct, amount,
                 ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY amount) AS amt_rank,
-                CAST(COUNT(*) OVER (PARTITION BY trade_date) * 0.33 AS UNSIGNED) AS large_cut,
-                CAST(COUNT(*) OVER (PARTITION BY trade_date) * 0.67 + 1 AS UNSIGNED) AS small_cut
+                FLOOR(COUNT(*) OVER (PARTITION BY trade_date) * 0.33) AS large_cut,
+                FLOOR(COUNT(*) OVER (PARTITION BY trade_date) * 0.67) + 1 AS small_cut
             FROM sm_stock_kline
             WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
               AND amount > 0
