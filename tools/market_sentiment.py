@@ -393,27 +393,13 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 "large_cnt": int(len(large)),
                 "small_chg": round(float(small['change_pct'].mean() or 0), 4),
                 "small_cnt": int(len(small)),
+                "mid_chg": 0,
+                "mid_cnt": 0,
             }
             market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
     style_df = pd.DataFrame(market_df_rows) if market_df_rows else pd.DataFrame()
 
-    daily_style = {}
-    market_df_rows = []
-    for _, row in style_df.iterrows():
-        td_str = _to_date_str(row["trade_date"])
-        daily_style[td_str] = {
-            "avg_chg": round(float(row["avg_chg"] or 0), 4),
-            "up_ratio": round(float(row["up_ratio"] or 0), 4),
-            "large_chg": round(float(row["large_chg"] or 0), 4),
-            "large_cnt": int(row["large_cnt"] or 0),
-            "small_chg": round(float(row["small_chg"] or 0), 4),
-            "small_cnt": int(row["small_cnt"] or 0),
-            "mid_chg": 0,
-            "mid_cnt": 0,
-        }
-        market_df_rows.append({"trade_date": row["trade_date"], "avg_chg": row["avg_chg"], "up_ratio": row["up_ratio"]})
-
-    market_df = pd.DataFrame(market_df_rows)
+    market_df = style_df
 
     # 2.3 大小盘合计
     large_total_chg = 0
