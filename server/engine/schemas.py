@@ -24,7 +24,8 @@ class ScoreDetail(BaseModel):
     capital: Optional[float] = Field(None, description="资金面评分(0-100)")
     technical: Optional[float] = Field(None, description="技术面评分(0-100)")
     sentiment: Optional[float] = Field(None, description="情绪面评分(0-100)")
-    event: Optional[float] = Field(None, description="事件催化评分(0-100)")
+    market_mood: Optional[float] = Field(None, description="市场情绪评分(0-100)")
+    event: Optional[float] = Field(None, description="消息面评分(0-100)")
 
 
 class EventRisk(BaseModel):

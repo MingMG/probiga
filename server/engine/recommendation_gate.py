@@ -78,8 +78,19 @@ class RecommendationGate:
                 'risks': risks,
             }
 
-        # 3. 检查短线评分是否达标
+        # 3. 检查市场情绪极差的情况
+        market_mood_score = short_term.get('market_mood_score', 50)
         short_term_score = short_term.get('short_term_score', 0)
+        if market_mood_score < 30 and short_term_score < 65:
+            return {
+                'status': self.STATUS_SUSPENDED,
+                'reason': f'市场整体情绪低迷(情绪评分{market_mood_score})，个股难以独立走强',
+                'events': triggered_events,
+                'strengths': strengths,
+                'risks': risks,
+            }
+
+        # 4. 检查短线评分是否达标
         if short_term_score < 50:
             return {
                 'status': self.STATUS_BLOCK,
@@ -89,7 +100,7 @@ class RecommendationGate:
                 'risks': risks,
             }
 
-        # 4. 检查长线评分
+        # 5. 检查长线评分
         long_term_score = long_term.get('long_term_score', 0)
         if long_term_score < 30:
             return {
@@ -100,7 +111,7 @@ class RecommendationGate:
                 'risks': risks,
             }
 
-        # 5. 允许推荐
+        # 6. 允许推荐
         return {
             'status': self.STATUS_ALLOW,
             'reason': '各项指标正常，允许推荐',

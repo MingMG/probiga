@@ -110,6 +110,7 @@ class StockAnalysisEngine:
                 capital=short_term_result['capital_score'],
                 technical=short_term_result['technical_score'],
                 sentiment=short_term_result['sentiment_score'],
+                market_mood=short_term_result.get('market_mood_score'),
                 event=short_term_result['event_score'],
             ),
             event_risk=EventRisk(
@@ -208,6 +209,7 @@ class StockAnalysisEngine:
                 capital=short_term_result['capital_score'],
                 technical=short_term_result['technical_score'],
                 sentiment=short_term_result['sentiment_score'],
+                market_mood=short_term_result.get('market_mood_score'),
                 event=short_term_result['event_score'],
             ),
             event_risk=EventRisk(

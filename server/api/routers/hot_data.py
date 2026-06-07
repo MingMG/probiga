@@ -5596,12 +5596,12 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
             # 写入数据库
             if results:
                 with engine.begin() as conn:
-                    # 确保新字段存在
+                    # 确保新字段存在（兼容不支持 IF NOT EXISTS 的 MySQL 版本）
                     for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT")]:
                         try:
-                            conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN IF NOT EXISTS {col} {dtype}"))
+                            conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN {col} {dtype}"))
                         except Exception:
-                            pass  # 列已存在或权限不足
+                            pass  # 列已存在（Duplicate column）
 
                     conn.execute(text("DELETE FROM st_recommended_stocks WHERE pick_date = :d"), {"d": trade_date})
                     for r in results:

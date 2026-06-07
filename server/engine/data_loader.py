@@ -496,6 +496,57 @@ class StockDataLoader:
         )
         holding = holding_rows[0] if holding_rows else None
 
+        # ─── 十一、市场情绪（全市场涨跌统计）───
+        market_mood = {}
+        try:
+            # 最新交易日全市场涨跌统计
+            mood_rows = _read_sql("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) as up_count,
+                    SUM(CASE WHEN change_pct < 0 THEN 1 ELSE 0 END) as down_count,
+                    SUM(CASE WHEN change_pct = 0 THEN 1 ELSE 0 END) as flat_count,
+                    SUM(CASE WHEN change_pct >= 9.9 THEN 1 ELSE 0 END) as limit_up,
+                    SUM(CASE WHEN change_pct <= -9.9 THEN 1 ELSE 0 END) as limit_down,
+                    AVG(change_pct) as avg_change
+                FROM sm_stock_kline
+                WHERE trade_date = :td AND k_type = 1
+            """, {"td": trade_date})
+            if mood_rows:
+                m = mood_rows[0]
+                total = int(m.get("total") or 0)
+                up = int(m.get("up_count") or 0)
+                down = int(m.get("down_count") or 0)
+                market_mood = {
+                    "total": total,
+                    "up_count": up,
+                    "down_count": down,
+                    "flat_count": int(m.get("flat_count") or 0),
+                    "limit_up": int(m.get("limit_up") or 0),
+                    "limit_down": int(m.get("limit_down") or 0),
+                    "avg_change": round(float(m.get("avg_change") or 0), 2),
+                    "up_ratio": round(up / max(total, 1), 3),
+                }
+
+            # 近3日每日涨跌比（趋势判断）
+            recent_mood = _read_sql("""
+                SELECT trade_date,
+                    SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as up_ratio,
+                    AVG(change_pct) as avg_chg
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND trade_date <= :td
+                GROUP BY trade_date
+                ORDER BY trade_date DESC
+                LIMIT 3
+            """, {"td": trade_date})
+            if recent_mood:
+                market_mood["recent_days"] = [
+                    {"date": str(r["trade_date"]), "up_ratio": round(float(r["up_ratio"] or 0), 3), "avg_chg": round(float(r["avg_chg"] or 0), 2)}
+                    for r in reversed(recent_mood)
+                ]
+        except Exception:
+            pass
+
         # ─── 最新新闻时间 ───
         last_news_time = None
         if news:
@@ -523,6 +574,7 @@ class StockDataLoader:
             "lifting": lifting,
             "mine_clearance": mine_clearance,
             "holding": holding,
+            "market_mood": market_mood,
         }
 
     def load_light_data(self, stock_code: str) -> dict:

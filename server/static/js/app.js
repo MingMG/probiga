@@ -3341,6 +3341,28 @@
         if (displayDate && displayDate !== todayStr) {
             dateInfo = todayStr + '（数据截至 ' + displayDate + '）';
         }
+
+        // 统计推荐买入数量
+        var buyCount = 0, watchCount = 0, blockCount = 0;
+        items.forEach(function(r) {
+            var status = r.recommend_status || 'ALLOW';
+            var score = r.short_term_score || r.ai_score || 0;
+            if (status === 'BLOCK') blockCount++;
+            else if (status === 'SUSPENDED') watchCount++;
+            else if (score >= 60) buyCount++;
+            else watchCount++;
+        });
+
+        // 推荐买入汇总卡片
+        h += '<div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap;">';
+        h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#0d4a0d,#1a7a1a);border-radius:10px;padding:12px;text-align:center;color:#fff;border:1px solid #27ae60;">';
+        h += '<div style="font-size:28px;font-weight:800;color:#2ecc71;">' + buyCount + '</div><div style="font-size:11px;color:#a8e6cf;">✅ 推荐买入</div></div>';
+        h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#4a3a0d,#7a6a1a);border-radius:10px;padding:12px;text-align:center;color:#fff;border:1px solid #f39c12;">';
+        h += '<div style="font-size:28px;font-weight:800;color:#f1c40f;">' + watchCount + '</div><div style="font-size:11px;color:#f9e79f;">⚡ 谨慎观望</div></div>';
+        h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#4a0d0d,#7a1a1a);border-radius:10px;padding:12px;text-align:center;color:#fff;border:1px solid #e74c3c;">';
+        h += '<div style="font-size:28px;font-weight:800;color:#e74c3c;">' + blockCount + '</div><div style="font-size:11px;color:#f5b7b1;">❌ 不推荐</div></div>';
+        h += '</div>';
+
         h += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
         h += '<button onclick="window._runRecommendedScreen()" style="padding:8px 20px;border:none;border-radius:8px;background:linear-gradient(135deg,#e74c3c,#c0392b);color:#fff;font-weight:700;font-size:14px;cursor:pointer;box-shadow:0 2px 8px rgba(231,76,60,0.3);">🔍 开始筛选</button>';
         h += '<span style="font-size:12px;color:#888;">筛选日期: ' + dateInfo + ' | 共 <span id="recFilteredCount">' + count + '</span> 只</span>';
@@ -3372,9 +3394,9 @@
         h += '<th>代码</th><th>名称</th>';
 
         if (hasNewFormat) {
-            h += '<th>推荐状态</th><th>短线评分</th><th>长线评分</th>';
+            h += '<th style="width:90px;">买入建议</th><th>短线评分</th><th>长线评分</th>';
             h += '<th>资金面</th><th>技术面</th><th>情绪面</th>';
-            h += '<th>风险等级</th>';
+            h += '<th>市场情绪</th><th>风险等级</th>';
         } else {
             h += '<th>综合评分</th><th>基本面</th><th>资金面</th><th>估值</th><th>技术面</th>';
         }
@@ -3396,11 +3418,22 @@
             h += '<td>' + (r.short_name || '-') + '</td>';
 
             if (hasNewFormat) {
-                // 推荐状态
+                // 推荐状态 - 醒目的买入建议标签
                 var status = r.recommend_status || 'ALLOW';
-                var statusColor = statusColors[status] || '#666';
-                var statusLabel = statusLabels[status] || status;
-                h += '<td style="text-align:center;"><span style="background:' + statusColor + ';color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;">' + statusLabel + '</span></td>';
+                var stScore = r.short_term_score || r.ai_score || 0;
+                var badgeText, badgeBg, badgeColor;
+                if (status === 'BLOCK') {
+                    badgeText = '❌ 不推荐'; badgeBg = 'linear-gradient(135deg,#c0392b,#e74c3c)'; badgeColor = '#fff';
+                } else if (status === 'SUSPENDED') {
+                    badgeText = '⚠️ 暂停'; badgeBg = 'linear-gradient(135deg,#d4a017,#f39c12)'; badgeColor = '#fff';
+                } else if (stScore >= 70) {
+                    badgeText = '✅ 推荐买入'; badgeBg = 'linear-gradient(135deg,#1e8449,#27ae60)'; badgeColor = '#fff';
+                } else if (stScore >= 60) {
+                    badgeText = '⚡ 谨慎买入'; badgeBg = 'linear-gradient(135deg,#b7950b,#f1c40f)'; badgeColor = '#fff';
+                } else {
+                    badgeText = '⏸ 观望'; badgeBg = 'linear-gradient(135deg,#555,#888)'; badgeColor = '#fff';
+                }
+                h += '<td style="text-align:center;"><span style="background:' + badgeBg + ';color:' + badgeColor + ';padding:4px 10px;border-radius:6px;font-size:12px;font-weight:700;white-space:nowrap;display:inline-block;">' + badgeText + '</span></td>';
 
                 // 短线评分
                 h += '<td style="text-align:center;font-weight:700;font-size:16px;color:' + scoreColor(r.short_term_score) + ';">' + (r.short_term_score != null ? Math.round(r.short_term_score) : '-') + '</td>';
@@ -3417,10 +3450,13 @@
                 // 情绪面
                 h += '<td style="text-align:center;color:' + scoreColor(r.sentiment_score) + ';">' + (r.sentiment_score != null ? Math.round(r.sentiment_score) : '-') + '</td>';
 
+                // 市场情绪
+                h += '<td style="text-align:center;color:' + scoreColor(r.market_mood_score) + ';">' + (r.market_mood_score != null ? Math.round(r.market_mood_score) : '-') + '</td>';
+
                 // 风险等级
                 var riskLevel = r.event_risk_level || 'LOW';
                 var riskColor = riskColors[riskLevel] || '#666';
-                h += '<td style="text-align:center;"><span style="color:' + riskLevel + ';font-weight:600;">' + riskLevel + '</span></td>';
+                h += '<td style="text-align:center;"><span style="color:' + riskColor + ';font-weight:600;">' + riskLevel + '</span></td>';
             } else {
                 // 旧格式
                 h += '<td style="text-align:center;font-weight:700;font-size:16px;color:' + scoreColor(r.ai_score) + ';">' + (r.ai_score != null ? r.ai_score : '-') + '</td>';
