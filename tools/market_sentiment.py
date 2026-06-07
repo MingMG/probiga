@@ -375,13 +375,17 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
             AVG(CASE WHEN amt_rank >= small_cut THEN change_pct END) AS small_chg,
             SUM(CASE WHEN amt_rank >= small_cut THEN 1 ELSE 0 END) AS small_cnt
         FROM (
-            SELECT trade_date, change_pct, amount,
-                ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY amount) AS amt_rank,
-                FLOOR(COUNT(*) OVER (PARTITION BY trade_date) * 0.33) AS large_cut,
-                FLOOR(COUNT(*) OVER (PARTITION BY trade_date) * 0.67) + 1 AS small_cut
-            FROM sm_stock_kline
-            WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
-              AND amount > 0
+            SELECT trade_date, change_pct, amount, amt_rank,
+                FLOOR(total_cnt * 0.33) AS large_cut,
+                FLOOR(total_cnt * 0.67) + 1 AS small_cut
+            FROM (
+                SELECT trade_date, change_pct, amount,
+                    ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY amount) AS amt_rank,
+                    COUNT(*) OVER (PARTITION BY trade_date) AS total_cnt
+                FROM sm_stock_kline
+                WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+                  AND amount > 0
+            ) t1
         ) ranked
         GROUP BY trade_date
         ORDER BY trade_date
