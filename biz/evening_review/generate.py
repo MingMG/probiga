@@ -494,10 +494,63 @@ def analyze_with_deepseek(data: dict, date_str: str) -> str:
         return ""
 
 
+def pro_review_to_wecom(pro_text: str, date_str: str) -> str:
+    """将专业复盘Markdown转为企微markdown格式（加颜色标签）"""
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    date_display = dt.strftime("%m月%d日")
+
+    lines = []
+    for line in pro_text.split("\n"):
+        # 标题行
+        if line.startswith("【") and line.endswith("】"):
+            lines.append(f"## 📊 {line}")
+        # 数字标题
+        elif line and line[0].isdigit() and ". " in line[:4]:
+            lines.append(f"\n**{line}**")
+        # 列表项
+        elif line.startswith("- "):
+            content = line[2:]
+            # 给关键数据加颜色
+            content = _colorize_pro_line(content)
+            lines.append(f"> {content}")
+        # 空行
+        elif not line.strip():
+            lines.append("")
+        # 其他
+        else:
+            lines.append(line)
+
+    result = "\n".join(lines)
+    result += f'\n\n<font color="comment">数据基于 {date_str} 收盘 · ProBigA 专业复盘 · 仅供参考不构成投资建议</font>'
+    return result
+
+
+def _colorize_pro_line(content: str) -> str:
+    """给专业复盘行中的关键数据加企微颜色标签"""
+    import re
+    # 涨幅数字 +XX% → 红色
+    content = re.sub(r'(\+\d+\.?\d*%)', r'<font color="warning">\1</font>', content)
+    # 跌幅数字 -XX% → 绿色
+    content = re.sub(r'(-\d+\.?\d*%)', r'<font color="info">\1</font>', content)
+    # 温度分数 XX 分 → 蓝色
+    content = re.sub(r'(\d+\.?\d*)\s*分', r'<font color="comment">\1分</font>', content)
+    # "强势"/"偏强" → 红色, "弱势"/"偏弱" → 绿色
+    content = content.replace('"强势"', '<font color="warning">"强势"</font>')
+    content = content.replace('"偏强"', '<font color="warning">"偏强"</font>')
+    content = content.replace('"弱势"', '<font color="info">"弱势"</font>')
+    content = content.replace('"偏弱"', '<font color="info">"偏弱"</font>')
+    content = content.replace('"冰点"', '<font color="info">"冰点"</font>')
+    content = content.replace('"发酵"', '<font color="warning">"发酵"</font>')
+    content = content.replace('"高潮"', '<font color="warning">"高潮"</font>')
+    content = content.replace('"退潮"', '<font color="info">"退潮"</font>')
+    return content
+
+
 def main():
     p = argparse.ArgumentParser(description="A股每日晚报")
     p.add_argument("date", nargs="?", help="日期 YYYY-MM-DD，默认最新交易日")
     p.add_argument("--test", action="store_true", help="不推送，仅打印")
+    p.add_argument("--legacy", action="store_true", help="使用旧版AI分析模式")
     args = p.parse_args()
 
     engine = get_engine()
@@ -508,16 +561,31 @@ def main():
         date_str = _find_latest_trade_date(engine)
         log.info("使用最新交易日: %s", date_str)
 
-    log.info("采集盘面数据...")
-    data = collect_market_data(engine, date_str)
+    report = ""
 
-    log.info("DeepSeek AI 盘面分析中...")
-    ai_analysis = analyze_with_deepseek(data, date_str)
-    if ai_analysis:
-        log.info("AI 分析 %d 字", len(ai_analysis))
+    if not args.legacy:
+        # ── 优先使用专业复盘 ──
+        log.info("生成专业复盘...")
+        try:
+            from biz.review.generate import generate_pro_review
+            pro_text = generate_pro_review(engine, date_str)
+            log.info("专业复盘生成完成 (%d 字)", len(pro_text))
+            report = pro_review_to_wecom(pro_text, date_str)
+        except Exception as e:
+            log.error("专业复盘生成失败: %s，回退到AI分析模式", e)
 
-    log.info("生成晚报报告...")
-    report = build_report(data, date_str, ai_analysis)
+    if not report:
+        # ── 回退：旧版AI分析模式 ──
+        log.info("采集盘面数据...")
+        data = collect_market_data(engine, date_str)
+
+        log.info("DeepSeek AI 盘面分析中...")
+        ai_analysis = analyze_with_deepseek(data, date_str)
+        if ai_analysis:
+            log.info("AI 分析 %d 字", len(ai_analysis))
+
+        log.info("生成晚报报告...")
+        report = build_report(data, date_str, ai_analysis)
 
     if args.test:
         print(report)
