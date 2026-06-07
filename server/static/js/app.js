@@ -1145,7 +1145,9 @@
                     '<div><label style="font-size:11px;color:#888;display:block">股数</label><input id="pfShares" type="number" placeholder="0" style="width:80px;padding:6px 10px;border-radius:4px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0"></div>' +
                     '<label title="勾选后会写入今日买入流水，当日盈亏按 现价-买入价 计算；不勾选则按历史持仓录入" style="display:flex;gap:4px;align-items:center;color:#aaa;font-size:12px;margin-bottom:7px"><input id="pfTodayBuy" type="checkbox">今日买入</label>' +
                     '<button onclick="pfAdd()" style="padding:6px 16px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:13px">添加</button>' +
-                    '</div></div>';
+                    '</div></div>' +
+                    '<div id="pfMarketBar" style="display:flex;gap:16px;align-items:center;padding:8px 16px;background:#111827;border-radius:8px;margin-bottom:14px;font-size:12px;color:#9ca3af;flex-wrap:wrap">' +
+                    '<span>📊 市场概览加载中...</span></div>';
 
                 var sum = res.summary || {};
                 var toolbar = '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px">' +
@@ -1260,6 +1262,28 @@
                         }
                     });
                 }
+                // 加载市场概览条
+                fetch('/api/monitor/data').then(function(r){return r.json()}).then(function(md) {
+                    var bar = document.getElementById('pfMarketBar');
+                    if (!bar || md.error) return;
+                    var upc = md.up_count || 0, dnc = md.down_count || 0;
+                    var total = upc + dnc || 1;
+                    var upPct = (upc / total * 100).toFixed(0);
+                    var amt = md.total_amount ? (md.total_amount / 1e8).toFixed(0) + '亿' : '-';
+                    var heat = md.market_heat || 0;
+                    var heatColor = heat > 600 ? '#ef4444' : heat < 400 ? '#22c55e' : '#f59e0b';
+                    var chg = md.heat_change || 0;
+                    var chgIcon = chg >= 0 ? '▲' : '▼';
+                    var topInd = (md.top_industries || []).slice(0, 3).map(function(t){ return t.name; }).join(' ') || '-';
+                    bar.innerHTML =
+                        '<span style="font-weight:600;color:#e5e7eb">📊 市场</span>' +
+                        '<span>上涨 <b style="color:#ef4444">' + upc + '</b></span>' +
+                        '<span>下跌 <b style="color:#22c55e">' + dnc + '</b></span>' +
+                        '<span>涨比 <b style="color:#f59e0b">' + upPct + '%</b></span>' +
+                        '<span>成交 <b style="color:#60a5fa">' + amt + '</b></span>' +
+                        '<span>热度 <b style="color:' + heatColor + '">' + heat.toFixed(0) + '</b> <span style="font-size:11px;color:' + (chg>=0?'#ef4444':'#22c55e') + '">' + chgIcon + Math.abs(chg).toFixed(1) + '%</span></span>' +
+                        '<span>热门 ' + topInd + '</span>';
+                }).catch(function(){});
             }
             fetch('/api/portfolio/list').then(function(r){return r.json()}).then(renderPortfolio);
 
