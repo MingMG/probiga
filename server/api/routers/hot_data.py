@@ -3480,39 +3480,67 @@ def _portfolio_day_profit(
 @router.get("/portfolio/list")
 def portfolio_list():
     """持仓列表（带实时行情）"""
+    # 盘中30s缓存，盘后120s缓存
+    _ttl = 30 if _is_monitor_trading_time() else 120
+    cached = _cache_get("portfolio_list", ttl_seconds=_ttl)
+    if cached is not None:
+        return cached
     try:
         _ensure_portfolio_position_columns()
+        # 1. 一次性查出所有持仓
         rows = _read_sql("""
-            SELECT p.*,
-                   COALESCE(s.price, k.close) AS cur_price,
-                   s.price AS live_price,
-                   COALESCE(s.`change`, k.close - k.pre_close) AS price_change,
-                   COALESCE(s.change_pct, k.change_pct) AS change_pct,
-                   COALESCE(s.short_name, k.short_name) AS current_name,
-                    k.pre_close AS kline_pre_close,
-                    k.trade_date AS kline_trade_date
-            FROM st_user_portfolio p
-            LEFT JOIN sm_stock_current s ON s.stock_code = p.stock_code COLLATE utf8mb4_general_ci
-            LEFT JOIN (
-                 SELECT k1.stock_code, k1.trade_date, k1.close, k1.change_pct, k1.short_name, k1.pre_close
-                 FROM sm_stock_kline k1
-                 INNER JOIN (
-                     SELECT stock_code, MAX(trade_date) AS max_d
-                     FROM sm_stock_kline
-                     WHERE k_type = 1 AND stock_code IN (SELECT stock_code COLLATE utf8mb4_general_ci FROM st_user_portfolio)
-                     GROUP BY stock_code
-                 ) k2 ON k1.stock_code = k2.stock_code AND k1.trade_date = k2.max_d
-                 WHERE k1.k_type = 1
-             ) k ON k.stock_code = p.stock_code COLLATE utf8mb4_general_ci
+            SELECT p.* FROM st_user_portfolio p
             ORDER BY (p.shares > 0) DESC, p.sort_order, p.id
         """)
-        live_quotes = {}
+        if not rows:
+            return {"data": [], "total": 0, "summary": {}}
+
         codes = [str(r.get("stock_code") or "").strip().zfill(6) for r in rows if r.get("stock_code")]
-        if codes:
-            try:
-                live_quotes = _portfolio_fetch_live_quotes(codes)
-            except Exception:
-                live_quotes = {}
+        if not codes:
+            return {"data": rows, "total": len(rows), "summary": {}}
+
+        # 2. 一次性查最新K线（用子查询取每只股票最新一天，避免全表扫描）
+        ph = ",".join([f"'{c}'" for c in codes])
+        kline_map = {}
+        try:
+            kline_rows = _read_sql(f"""
+                SELECT stock_code, trade_date, close, change_pct, short_name, pre_close
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND stock_code IN ({ph})
+                  AND trade_date >= DATE_SUB(CURDATE(), INTERVAL 10 DAY)
+                ORDER BY stock_code, trade_date DESC
+            """)
+            for kr in kline_rows:
+                sc = str(kr["stock_code"])
+                if sc not in kline_map:  # 只取最新一条
+                    kline_map[sc] = kr
+        except Exception:
+            pass
+
+        # 3. 一次性拉取实时行情（带缓存）
+        live_quotes = {}
+        try:
+            live_quotes = _portfolio_fetch_live_quotes(codes)
+        except Exception:
+            live_quotes = {}
+
+        # 4. 一次性查今日所有交易记录
+        today_trades_map = {}  # {stock_code: [trades]}
+        try:
+            _ensure_portfolio_trans_log_table()
+            all_trades = _read_sql(f"""
+                SELECT stock_code, trans_type, price, shares, source
+                FROM st_portfolio_trans_log
+                WHERE stock_code IN ({ph}) AND trans_date = CURDATE()
+                ORDER BY stock_code, created_at, id
+            """)
+            for tr in all_trades:
+                sc = str(tr["stock_code"]).strip().zfill(6)
+                today_trades_map.setdefault(sc, []).append(tr)
+        except Exception:
+            pass
+
+        # 5. 组装数据
         total_hold_profit = 0.0
         today_hold_profit = 0.0
         holding_count = 0
@@ -3520,13 +3548,28 @@ def portfolio_list():
         today_cleared_count = 0
         for r in rows:
             code = str(r.get("stock_code") or "").strip().zfill(6)
+            # 合并K线数据
+            k = kline_map.get(code, {})
+            r["kline_pre_close"] = k.get("pre_close")
+            r["kline_trade_date"] = str(k.get("trade_date", ""))[:10] if k.get("trade_date") else None
+            # 合并实时行情
             _portfolio_apply_quote(r, live_quotes.get(code))
+            # 补充缺失字段
+            if r.get("cur_price") is None:
+                r["cur_price"] = k.get("close")
+            if r.get("change_pct") is None:
+                r["change_pct"] = k.get("change_pct")
+            if r.get("current_name") is None:
+                r["current_name"] = k.get("short_name")
             trade_date = _portfolio_quote_trade_date(r)
             r["quote_trade_date"] = trade_date
             cp = float(r.get("cost_price") or 0)
             pr = float(r.get("cur_price") or 0) if r.get("cur_price") is not None else 0.0
             sh = int(r.get("shares") or 0)
-            trades = _portfolio_effective_today_trades(code, sh, cp, r, trade_date)
+            # 用批量查好的交易记录
+            trades = today_trades_map.get(code, [])
+            if not trades and _portfolio_is_today_buy_position(r, trade_date) and sh > 0 and cp > 0:
+                trades = [{"trans_type": "buy", "price": cp, "shares": sh, "source": "position_add"}]
             trade_state = _portfolio_today_trade_state(sh, trades)
             r.update(trade_state)
             r["is_holding"] = sh > 0
@@ -3534,15 +3577,9 @@ def portfolio_list():
             r["profit"] = hold_profit
             r["profit_pct"] = round((pr / cp - 1) * 100, 2) if sh > 0 and pr > 0 and cp > 0 else None
             r["today_profit"] = _portfolio_day_profit(
-                sh,
-                pr,
-                r.get("live_price"),
-                r.get("price_change"),
-                r.get("kline_pre_close"),
-                r.get("change_pct"),
-                r["stock_code"],
-                trades,
-                trade_date,
+                sh, pr, r.get("live_price"), r.get("price_change"),
+                r.get("kline_pre_close"), r.get("change_pct"),
+                r["stock_code"], trades, trade_date,
             )
             r["display_name"] = r.get("current_name") or r.get("short_name") or r["stock_code"]
             if r.get("is_today_open") or r.get("is_today_reopened"):
@@ -3555,7 +3592,7 @@ def portfolio_list():
                     total_hold_profit += hold_profit
             if r["today_profit"] is not None:
                 today_hold_profit += r["today_profit"]
-        return {
+        result = {
             "data": rows,
             "total": len(rows),
             "summary": {
@@ -3566,6 +3603,8 @@ def portfolio_list():
                 "today_cleared_count": today_cleared_count,
             },
         }
+        _cache_set("portfolio_list", result)
+        return result
     except Exception as e:
         return {"data": [], "total": 0, "error": str(e)}
 
@@ -3890,7 +3929,12 @@ def _portfolio_resolve_quote(code: str, klines: list | None) -> dict:
 
 
 def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
-    """拉取最新价写入 sm_stock_current，返回 {stock_code: quote_dict}。"""
+    """拉取最新价写入 sm_stock_current，返回 {stock_code: quote_dict}。盘中60s缓存。"""
+    # 检查缓存
+    _cache_key = "portfolio_live_quotes"
+    cached = _cache_get(_cache_key, ttl_seconds=60)
+    if cached is not None:
+        return cached
     import numpy as np
 
     clean = [str(c).strip().zfill(6) for c in codes if str(c).strip()]
@@ -3987,6 +4031,7 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
             "snapshot_at": now_str,
             "source": str(row.get("_quote_source") or "live"),
         }
+    _cache_set(_cache_key, out)
     return out
 
 
