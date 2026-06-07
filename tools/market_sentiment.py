@@ -361,36 +361,41 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     d1 = trade_dates[0]
     d2 = trade_dates[-1]
 
-    # 2.1 用 SQL NTILE 在数据库端完成大小盘分组（替代加载全量数据到内存）
-    # NTILE(3): bottom 33% = 小盘, top 33% = 大盘
-    style_q = text("""
-        SELECT trade_date,
-            -- 整体
-            AVG(change_pct) AS avg_chg,
-            AVG(CASE WHEN change_pct > 0 THEN 1.0 ELSE 0.0 END) AS up_ratio,
-            -- 大盘 (按成交额 Top 33%)
-            AVG(CASE WHEN amt_rank <= large_cut THEN change_pct END) AS large_chg,
-            SUM(CASE WHEN amt_rank <= large_cut THEN 1 ELSE 0 END) AS large_cnt,
-            -- 小盘 (按成交额 Bottom 33%)
-            AVG(CASE WHEN amt_rank >= small_cut THEN change_pct END) AS small_chg,
-            SUM(CASE WHEN amt_rank >= small_cut THEN 1 ELSE 0 END) AS small_cnt
-        FROM (
-            SELECT trade_date, change_pct, amount, amt_rank,
-                FLOOR(total_cnt * 0.33) AS large_cut,
-                FLOOR(total_cnt * 0.67) + 1 AS small_cut
-            FROM (
-                SELECT trade_date, change_pct, amount,
-                    ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY amount) AS amt_rank,
-                    COUNT(*) OVER (PARTITION BY trade_date) AS total_cnt
-                FROM sm_stock_kline
-                WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
-                  AND amount > 0
-            ) t1
-        ) ranked
-        GROUP BY trade_date
-        ORDER BY trade_date
+    # 2.1 加载涨跌+成交额数据，在Python端按成交额分大盘/小盘（兼容MySQL 5.7）
+    raw_q = text("""
+        SELECT trade_date, change_pct, amount
+        FROM sm_stock_kline
+        WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+          AND amount > 0
+        ORDER BY trade_date, amount
     """)
-    style_df = pd.read_sql(style_q, engine, params={"d1": d1, "d2": d2})
+    raw_df = pd.read_sql(raw_q, engine, params={"d1": d1, "d2": d2})
+
+    daily_style = {}
+    market_df_rows = []
+    if not raw_df.empty:
+        for td, grp in raw_df.groupby('trade_date'):
+            td_str = _to_date_str(td)
+            n = len(grp)
+            large_cut = int(n * 0.33)
+            small_cut = int(n * 0.67) + 1
+            avg_chg = grp['change_pct'].mean()
+            up_ratio = (grp['change_pct'] > 0).mean()
+            large = grp.iloc[:large_cut]  # 最小的33%成交额 = 小盘... 不对，ORDER BY amount升序，前33%是小盘
+            # 修正：按成交额降序排，前33%是大盘
+            grp_sorted = grp.sort_values('amount', ascending=False)
+            large = grp_sorted.iloc[:large_cut]
+            small = grp_sorted.iloc[small_cut:]
+            daily_style[td_str] = {
+                "avg_chg": round(float(avg_chg or 0), 4),
+                "up_ratio": round(float(up_ratio or 0), 4),
+                "large_chg": round(float(large['change_pct'].mean() or 0), 4),
+                "large_cnt": int(len(large)),
+                "small_chg": round(float(small['change_pct'].mean() or 0), 4),
+                "small_cnt": int(len(small)),
+            }
+            market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
+    style_df = pd.DataFrame(market_df_rows) if market_df_rows else pd.DataFrame()
 
     daily_style = {}
     market_df_rows = []
