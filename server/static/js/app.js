@@ -1263,27 +1263,30 @@
                     });
                 }
                 // 加载市场概览条
-                fetch('/api/monitor/data').then(function(r){return r.json()}).then(function(md) {
-                    var bar = document.getElementById('pfMarketBar');
-                    if (!bar || md.error) return;
-                    var upc = md.up_count || 0, dnc = md.down_count || 0;
-                    var total = upc + dnc || 1;
-                    var upPct = (upc / total * 100).toFixed(0);
-                    var amt = md.total_amount ? (md.total_amount / 1e8).toFixed(0) + '亿' : '-';
-                    var heat = md.market_heat || 0;
-                    var heatColor = heat > 600 ? '#ef4444' : heat < 400 ? '#22c55e' : '#f59e0b';
-                    var chg = md.heat_change || 0;
-                    var chgIcon = chg >= 0 ? '▲' : '▼';
-                    var topInd = (md.top_industries || []).slice(0, 3).map(function(t){ return t.name; }).join(' ') || '-';
-                    bar.innerHTML =
-                        '<span style="font-weight:600;color:#e5e7eb">📊 市场</span>' +
-                        '<span>上涨 <b style="color:#ef4444">' + upc + '</b></span>' +
-                        '<span>下跌 <b style="color:#22c55e">' + dnc + '</b></span>' +
-                        '<span>涨比 <b style="color:#f59e0b">' + upPct + '%</b></span>' +
-                        '<span>成交 <b style="color:#60a5fa">' + amt + '</b></span>' +
-                        '<span>热度 <b style="color:' + heatColor + '">' + heat.toFixed(0) + '</b> <span style="font-size:11px;color:' + (chg>=0?'#ef4444':'#22c55e') + '">' + chgIcon + Math.abs(chg).toFixed(1) + '%</span></span>' +
-                        '<span>热门 ' + topInd + '</span>';
-                }).catch(function(){});
+                window._pfRefreshMarketBar = function() {
+                    fetch('/api/monitor/data').then(function(r){return r.json()}).then(function(md) {
+                        var bar = document.getElementById('pfMarketBar');
+                        if (!bar || md.error) return;
+                        var upc = md.up_count || 0, dnc = md.down_count || 0;
+                        var total = upc + dnc || 1;
+                        var upPct = (upc / total * 100).toFixed(0);
+                        var amt = md.total_amount ? (md.total_amount / 1e8).toFixed(0) + '亿' : '-';
+                        var heat = md.market_heat || 0;
+                        var heatColor = heat > 600 ? '#ef4444' : heat < 400 ? '#22c55e' : '#f59e0b';
+                        var chg = md.heat_change || 0;
+                        var chgIcon = chg >= 0 ? '▲' : '▼';
+                        var topInd = (md.top_industries || []).slice(0, 3).map(function(t){ return t.name; }).join(' · ') || '-';
+                        bar.innerHTML =
+                            '<span style="font-weight:600;color:#e5e7eb">📊 市场</span>' +
+                            '<span>上涨 <b style="color:#ef4444">' + upc + '</b></span>' +
+                            '<span>下跌 <b style="color:#22c55e">' + dnc + '</b></span>' +
+                            '<span>涨比 <b style="color:#f59e0b">' + upPct + '%</b></span>' +
+                            '<span>成交 <b style="color:#60a5fa">' + amt + '</b></span>' +
+                            '<span>热度 <b style="color:' + heatColor + '">' + heat.toFixed(0) + '</b> <span style="font-size:11px;color:' + (chg>=0?'#ef4444':'#22c55e') + '">' + chgIcon + Math.abs(chg).toFixed(1) + '%</span></span>' +
+                            '<span>热门 ' + topInd + '</span>';
+                    }).catch(function(){});
+                };
+                window._pfRefreshMarketBar();
             }
             fetch('/api/portfolio/list').then(function(r){return r.json()}).then(renderPortfolio);
 
@@ -1300,6 +1303,7 @@
                              if (res.summary) pfUpdateSummary(res);
                              res.data.forEach(pfUpdateRow);
                         });
+                        if (window._pfRefreshMarketBar) window._pfRefreshMarketBar();
                     } else if (!window._pfAutoRefreshDone) {
                         window._pfAutoRefreshDone = true;
                         fetch('/api/portfolio/live').then(function(r){return r.json()}).then(function(res){
