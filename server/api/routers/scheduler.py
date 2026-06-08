@@ -104,7 +104,7 @@ def run_task_now(task_id: int):
 
     import os
     child_env = os.environ.copy()
-    child_env.setdefault("MYSQL_URL", str(get_engine().url))
+    child_env.setdefault("MYSQL_URL", get_engine().url.render_as_string(hide_password=False))
     child_env.setdefault("PYTHONPATH", str(root))
 
     try:

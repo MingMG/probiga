@@ -64,7 +64,7 @@ def _run_task(row: dict, ROOT: Path, engine) -> None:
 
     child_env = os.environ.copy()
     # 使用引擎实际连接的URL，确保子进程能正确连接数据库
-    child_env["MYSQL_URL"] = str(engine.url)
+    child_env["MYSQL_URL"] = engine.url.render_as_string(hide_password=False)
     child_env.setdefault("PYTHONPATH", str(ROOT))
 
     with engine.begin() as u:
