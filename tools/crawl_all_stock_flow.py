@@ -214,6 +214,7 @@ def main():
     parser.add_argument("--slow", action="store_true", help="慢速模式")
     parser.add_argument("--resume", action="store_true", help="断点续爬")
     parser.add_argument("--dry-run", action="store_true", help="只显示计划")
+    parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
     engine = create_engine(MYSQL_URL, pool_pre_ping=True)

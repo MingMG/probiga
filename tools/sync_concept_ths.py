@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime
 from sqlalchemy import create_engine, text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
 mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
 engine = create_engine(mysql_url, pool_pre_ping=True)
 

@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import create_engine, text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
 
 # 需要确保存在的任务列表
 REQUIRED_TASKS = [
@@ -29,6 +29,7 @@ REQUIRED_TASKS = [
     ('龙虎榜明细', 'alist_info', 'tools/run_single_table.py', 'st_a_list_info', '17:45', 21),
     ('个股资金流向(全量)', 'capital_flow', 'tools/fetch_sm_stock_capital_flow_daily.py', '', '17:30', 30),
     ('概念资金流向', 'concept_flow', 'tools/run_single_table.py', 'sm_concept_capital_flow_east', '19:30', 54),
+    ('A股晚报推送', 'evening_review', 'biz/evening_review/generate.py', '', '20:00', 90),
 ]
 
 

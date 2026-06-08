@@ -63,8 +63,9 @@ def _run_task(row: dict, ROOT: Path, engine) -> None:
     cmd = [sys.executable, str(script)] + args
 
     child_env = os.environ.copy()
-    child_env["MYSQL_URL"] = os.environ.get("MYSQL_URL") or "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-    child_env.setdefault("PYTHONPATH", str(ROOT) + ":" + str(ROOT / "adata"))
+    # 使用引擎实际连接的URL，确保子进程能正确连接数据库
+    child_env["MYSQL_URL"] = str(engine.url)
+    child_env.setdefault("PYTHONPATH", str(ROOT))
 
     with engine.begin() as u:
         u.execute(

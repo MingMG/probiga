@@ -143,6 +143,7 @@ def save_to_db(engine, df: pd.DataFrame):
 def main():
     parser = argparse.ArgumentParser(description="东财概念板块实时行情")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
     engine = create_engine(MYSQL_URL, pool_pre_ping=True)

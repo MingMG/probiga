@@ -104,8 +104,8 @@ def run_task_now(task_id: int):
 
     import os
     child_env = os.environ.copy()
-    child_env.setdefault("MYSQL_URL", os.environ.get("MYSQL_URL", "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"))
-    child_env.setdefault("PYTHONPATH", str(root) + ":" + str(root / "adata"))
+    child_env.setdefault("MYSQL_URL", str(get_engine().url))
+    child_env.setdefault("PYTHONPATH", str(root))
 
     try:
         start = datetime.now()
