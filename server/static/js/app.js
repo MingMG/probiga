@@ -3680,6 +3680,7 @@
         function fmtRate(v) { var n = Number(v || 0); return '<span class="' + (n >= 0 ? 'c-red' : 'c-green') + '">' + (n >= 0 ? '+' : '') + n.toFixed(2) + '%</span>'; }
         function fmtMoney(v) { var n = Number(v || 0); if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(2) + '万'; return n.toFixed(0); }
         function stockLink(code, name) { return '<a href="javascript:void(0)" onclick="openKlineModal(\'' + code + '\',\'' + (name || '') + '\')" class="clickable-name">' + (name || code) + '</a>'; }
+        function parseReason(v) { if (!v) return '-'; if (typeof v === 'string' && v.charAt(0) === '{') { try { var o = JSON.parse(v); return o.reason || o.sell_reason || v; } catch(e) { return v; } } return v; }
 
         Promise.all([
             fetch(SIM_API + '/dashboard').then(function(r){return r.json()}),
@@ -3786,13 +3787,17 @@
                 h += '<div style="max-height:400px;overflow-y:auto;">';
                 h += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
                 h += '<thead><tr style="color:#999;text-align:left;border-bottom:1px solid #e8e8e8;position:sticky;top:0;background:#fff;">';
-                h += '<th style="padding:8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>买入理由</th><th>卖出理由</th><th>AI评分</th><th>日期</th>';
+                h += '<th style="padding:8px;">状态</th><th>策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>买入理由</th><th>卖出理由</th><th>AI</th><th>日期</th>';
                 h += '</tr></thead><tbody id="simHistBody">';
                 histData.forEach(function(r) {
                     var st = r.strategy_type || '';
                     var isSold = r.status === 'sold';
+                    var statusHtml = isSold
+                        ? '<span style="color:#27ae60;font-weight:600;">已平仓</span>'
+                        : '<span style="color:#e74c3c;font-weight:600;">持仓中</span>';
                     h += '<tr class="sim-hist-row" data-st="' + st + '" style="border-bottom:1px solid #f0f0f0;">';
-                    h += '<td style="padding:8px;color:' + (strategyColors[st]||'#999') + ';font-weight:600;">' + (strategyNames[st]||st) + '</td>';
+                    h += '<td style="padding:8px;">' + statusHtml + '</td>';
+                    h += '<td style="color:' + (strategyColors[st]||'#999') + ';font-weight:600;">' + (strategyNames[st]||st) + '</td>';
                     h += '<td>' + r.stock_code + '</td>';
                     h += '<td>' + stockLink(r.stock_code, r.short_name) + '</td>';
                     h += '<td>' + (r.buy_price||0).toFixed(2) + '</td>';
@@ -3800,8 +3805,8 @@
                     h += '<td>' + (isSold ? fmtRate(r.profit_rate) : '-') + '</td>';
                     h += '<td>' + (isSold ? fmtPnl(r.profit) : '-') + '</td>';
                     h += '<td>' + (isSold ? (r.holding_days||0) + '天' : '-') + '</td>';
-                    h += '<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.buy_reason||'') + '">' + (r.buy_reason||'-') + '</td>';
-                    h += '<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.sell_reason||'') + '">' + (isSold ? (r.sell_reason||'-') : '持仓中') + '</td>';
+                    h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(parseReason(r.buy_reason)) + '">' + parseReason(r.buy_reason) + '</td>';
+                    h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.sell_reason||'') + '">' + (isSold ? (r.sell_reason||'-') : '-') + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
                     h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + (isSold ? ' → ' + (r.sell_date||'') : '') + '</td>';
                     h += '</tr>';
@@ -3847,7 +3852,7 @@
                     h += '<td>' + (r.shares||0) + '</td>';
                     h += '<td>' + fmtMoney(r.amount||0) + '</td>';
                     h += '<td>' + (r.fee||0).toFixed(2) + '</td>';
-                    h += '<td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + (r.reason||'') + '">' + (r.reason||'-') + '</td>';
+                    h += '<td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + escAttr(parseReason(r.reason)) + '">' + parseReason(r.reason) + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
                     h += '</tr>';
                 });
