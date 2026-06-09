@@ -73,6 +73,30 @@ STRATEGY_CONFIG = {
 RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
 
+def _random_intraday_time(seed: str, session: str = "any") -> str:
+    """
+    生成一个随机的盘中时间(HH:MM:SS)。
+    seed: 用于确定性随机的种子(如股票代码+日期)
+    session: 'am'=上午 9:30-11:30, 'pm'=下午 13:00-15:00, 'any'=任意盘中
+    """
+    import random
+    r = random.Random(seed)
+    if session == "am":
+        minutes = r.randint(0, 120)  # 9:30 开始的分钟偏移
+        h, m = 9 + (30 + minutes) // 60, (30 + minutes) % 60
+    elif session == "pm":
+        minutes = r.randint(0, 120)  # 13:00 开始的分钟偏移
+        h, m = 13 + minutes // 60, minutes % 60
+    else:
+        minutes = r.randint(0, 330)  # 全天 9:25-15:00 共335分钟
+        total = 9 * 60 + 25 + minutes
+        h, m = total // 60, total % 60
+        if h >= 11 and m > 30 and h < 13:  # 跳过午休
+            h, m = 13, m - 30
+    s = r.randint(0, 59)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
     import numpy as np
     df = pd.read_sql(text(sql), get_engine(), params=params)
@@ -832,7 +856,7 @@ class SimTradeEngine:
             "amount": round(open_price * shares, 2),
             "shares": shares,
             "date": trade_date,
-            "time": f"09:{30 + hash(stock_code) % 5:02d}",
+            "time": _random_intraday_time(stock_code + trade_date + "buy", "am"),
             "reason": analysis.get("reason", ""),
             "ai": analysis.get("ai_score", 0),
             "ss": analysis.get("short_score", 0),
@@ -860,7 +884,7 @@ class SimTradeEngine:
             "reason": analysis.get("reason", ""),
             "ai": analysis.get("ai_score", 0),
             "date": trade_date,
-            "time": f"09:{30 + hash(stock_code) % 5:02d}",
+            "time": _random_intraday_time(stock_code + trade_date + "buy", "am"),
         })
 
         return {"status": "ok", "stock_code": stock_code, "price": open_price,
@@ -921,8 +945,7 @@ class SimTradeEngine:
             reason_detail = ""
             should_sell = False
 
-            # 回测卖出时间(按触发类型给不同时间)
-            sell_time = "10:15"
+            sell_time = _random_intraday_time(code + trade_date + "sell", "any")
 
             # 止盈: 当日最高价达到止盈线(假设盘中触发)
             if high_rate >= cfg["take_profit"]:
@@ -930,7 +953,7 @@ class SimTradeEngine:
                 reason_detail = f"盈利{high_rate:.2f}%已达止盈线{cfg['take_profit']}%, 买入价{buy_price:.2f}→盘中高点{high_price:.2f}, 持仓{holding_days}天"
                 should_sell = True
                 sell_price = round(buy_price * (1 + cfg["take_profit"] / 100), 2)
-                sell_time = "10:35"
+                sell_time = _random_intraday_time(code + trade_date + "tp", "am")
             # 止损: 当日最低价触及止损线
             elif float(rows[0].get("low") or 0) > 0:
                 low_rate = ((float(rows[0]["low"]) - buy_price) / buy_price) * 100
@@ -939,26 +962,26 @@ class SimTradeEngine:
                     reason_detail = f"亏损{low_rate:.2f}%已触及止损线{cfg['stop_loss']}%, 买入价{buy_price:.2f}→盘中低点{float(rows[0]['low']):.2f}, 持仓{holding_days}天, 及时止损"
                     should_sell = True
                     sell_price = round(buy_price * (1 + cfg["stop_loss"] / 100), 2)
-                    sell_time = "09:45"
+                    sell_time = _random_intraday_time(code + trade_date + "sl", "am")
                 elif holding_days >= cfg["max_days"]:
                     reason = "time_limit"
                     reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
                     should_sell = True
                     sell_price = close_price
-                    sell_time = "14:55"
+                    sell_time = _random_intraday_time(code + trade_date + "tl", "pm")
                 elif cfg["trailing_activate"] and high_rate >= cfg["trailing_activate"]:
                     if (high_rate - profit_rate) >= cfg["trailing_drawdown"]:
                         reason = "trailing_stop"
                         reason_detail = f"最高盈利{high_rate:.2f}%回撤至{profit_rate:.2f}%, 回撤{high_rate-profit_rate:.2f}%超阈值{cfg['trailing_drawdown']}%, 保护利润"
                         should_sell = True
                         sell_price = close_price
-                        sell_time = "13:20"
+                        sell_time = _random_intraday_time(code + trade_date + "ts", "pm")
             elif holding_days >= cfg["max_days"]:
                 reason = "time_limit"
                 reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
                 should_sell = True
                 sell_price = close_price
-                sell_time = "14:55"
+                sell_time = _random_intraday_time(code + trade_date + "tl2", "pm")
 
             if should_sell:
                 shares = int(h["buy_shares"])
