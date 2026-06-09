@@ -3688,30 +3688,25 @@
             fetch(SIM_API + '/flow?limit=200').then(function(r){return r.json()})
         ]).then(function(results) {
             var dash = results[0], hist = results[1], flow = results[2];
-            if (dash.error) { container.innerHTML = '<div class="loading" style="color:#e74c3c">❌ ' + dash.error + '</div>'; return; }
+            if (dash.error) { container.innerHTML = '<div class="loading" style="color:#e74c3c">' + dash.error + '</div>'; return; }
 
             var h = '';
             var sum = dash.summary || {};
 
             // ── 操作栏 ──
             h += '<div style="display:flex;gap:10px;margin-bottom:16px;align-items:center;flex-wrap:wrap;">';
-            h += '<button onclick="simTradeScan()" style="padding:8px 20px;border:none;border-radius:6px;background:linear-gradient(135deg,#1a73e8,#0d47a1);color:#fff;cursor:pointer;font-size:13px;font-weight:600;">🔄 扫描信号</button>';
-            h += '<button onclick="simTradeBacktest()" style="padding:8px 20px;border:none;border-radius:6px;background:linear-gradient(135deg,#e67e22,#d35400);color:#fff;cursor:pointer;font-size:13px;font-weight:600;">📊 回测历史</button>';
-            h += '<span style="color:#888;font-size:12px;margin-left:8px;">总资金池: 100万 | 每笔10万</span>';
+            h += '<button onclick="simTradeScan()" class="btn-refresh" style="padding:8px 20px;">扫描信号</button>';
+            h += '<button onclick="simTradeBacktest()" style="padding:8px 20px;border:none;border-radius:8px;background:#e67e22;color:#fff;cursor:pointer;font-size:13px;font-weight:600;">回测历史</button>';
+            h += '<span style="color:#999;font-size:12px;margin-left:8px;">总资金池: 100万 | 每笔10万</span>';
             h += '</div>';
 
-            // ── 汇总卡片 ──
-            h += '<div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">';
-            h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;text-align:center;color:#fff;">';
-            h += '<div style="font-size:28px;font-weight:800;color:#e74c3c;">' + (sum.total_trades || 0) + '</div><div style="font-size:11px;color:#aaa;">总交易</div></div>';
-            h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;text-align:center;color:#fff;">';
-            h += '<div style="font-size:28px;font-weight:800;color:#27ae60;">' + (sum.win_rate || 0) + '%</div><div style="font-size:11px;color:#aaa;">总胜率</div></div>';
-            h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;text-align:center;color:#fff;">';
-            h += '<div style="font-size:28px;font-weight:800;' + (sum.total_profit >= 0 ? 'color:#e74c3c' : 'color:#27ae60') + ';">' + fmtMoney(sum.total_profit || 0) + '</div><div style="font-size:11px;color:#aaa;">总盈亏</div></div>';
-            h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;text-align:center;color:#fff;">';
-            h += '<div style="font-size:28px;font-weight:800;color:#f39c12;">' + (sum.total_holding || 0) + '</div><div style="font-size:11px;color:#aaa;">持仓数</div></div>';
-            h += '<div style="flex:1;min-width:100px;background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:10px;padding:16px;text-align:center;color:#fff;">';
-            h += '<div style="font-size:16px;font-weight:800;color:#3498db;">' + fmtMoney(sum.total_holding_amount || 0) + '</div><div style="font-size:11px;color:#aaa;">持仓市值</div></div>';
+            // ── 汇总卡片(使用系统 stat-card 样式) ──
+            h += '<div class="stats-bar">';
+            h += card('总交易', sum.total_trades || 0, 'blue');
+            h += card('总胜率', (sum.win_rate || 0) + '%', 'green');
+            h += card('总盈亏', fmtMoney(sum.total_profit || 0), (sum.total_profit || 0) >= 0 ? 'red' : 'green');
+            h += card('持仓数', sum.total_holding || 0, 'orange');
+            h += card('持仓市值', fmtMoney(sum.total_holding_amount || 0), 'blue');
             h += '</div>';
 
             // ── 三种策略卡片 ──
@@ -3719,19 +3714,18 @@
             ['ultra_short', 'short_term', 'swing'].forEach(function(st) {
                 var s = (dash.strategies || {})[st] || {};
                 var color = strategyColors[st];
-                h += '<div style="flex:1;min-width:220px;background:#1e1e2e;border:1px solid #333;border-radius:10px;padding:16px;">';
+                h += '<div style="flex:1;min-width:220px;background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 6px rgba(0,0,0,.05);">';
                 h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">';
                 h += '<span style="font-size:15px;font-weight:700;color:' + color + ';">' + (s.name || st) + '策略</span>';
-                h += '<span style="font-size:11px;color:#666;">持仓 ' + (s.holding_count || 0) + '/' + {ultra_short:3,short_term:3,swing:2}[st] + '</span>';
+                h += '<span style="font-size:11px;color:#999;">持仓 ' + (s.holding_count || 0) + '/' + {ultra_short:3,short_term:3,swing:2}[st] + '</span>';
                 h += '</div>';
                 h += '<div style="display:flex;gap:8px;margin-bottom:8px;">';
-                h += '<div style="flex:1;text-align:center;"><div style="font-size:20px;font-weight:700;color:#fff;">' + (s.total_trades || 0) + '</div><div style="font-size:10px;color:#888;">交易</div></div>';
-                h += '<div style="flex:1;text-align:center;"><div style="font-size:20px;font-weight:700;color:#27ae60;">' + (s.win_rate || 0) + '%</div><div style="font-size:10px;color:#888;">胜率</div></div>';
-                h += '<div style="flex:1;text-align:center;"><div style="font-size:14px;font-weight:700;' + ((s.total_profit||0)>=0?'color:#e74c3c':'color:#27ae60') + ';">' + fmtMoney(s.total_profit||0) + '</div><div style="font-size:10px;color:#888;">盈亏</div></div>';
+                h += '<div style="flex:1;text-align:center;"><div style="font-size:20px;font-weight:700;color:#333;">' + (s.total_trades || 0) + '</div><div style="font-size:10px;color:#999;">交易</div></div>';
+                h += '<div style="flex:1;text-align:center;"><div style="font-size:20px;font-weight:700;color:#27ae60;">' + (s.win_rate || 0) + '%</div><div style="font-size:10px;color:#999;">胜率</div></div>';
+                h += '<div style="flex:1;text-align:center;"><div style="font-size:14px;font-weight:700;' + ((s.total_profit||0)>=0?'color:#e74c3c':'color:#27ae60') + ';">' + fmtMoney(s.total_profit||0) + '</div><div style="font-size:10px;color:#999;">盈亏</div></div>';
                 h += '</div>';
-                // 持仓明细
                 if (s.holdings && s.holdings.length > 0) {
-                    h += '<div style="border-top:1px solid #333;padding-top:8px;margin-top:4px;">';
+                    h += '<div style="border-top:1px solid #f0f0f0;padding-top:8px;margin-top:4px;">';
                     s.holdings.forEach(function(ph) {
                         h += '<div style="display:flex;justify-content:space-between;font-size:11px;padding:2px 0;">';
                         h += '<span>' + stockLink(ph.stock_code, ph.short_name) + '</span>';
@@ -3745,8 +3739,8 @@
             h += '</div>';
 
             // ── 当前持仓表 ──
-            h += '<div style="background:#1e1e2e;border:1px solid #333;border-radius:10px;padding:16px;margin-bottom:20px;">';
-            h += '<h3 style="margin:0 0 12px;color:#e0e0e0;font-size:14px;">📋 当前持仓</h3>';
+            h += '<div class="table-wrap" style="padding:16px;margin-bottom:20px;">';
+            h += '<h3 style="margin:0 0 12px;color:#2d3436;font-size:14px;">当前持仓</h3>';
             var allHoldings = [];
             ['ultra_short', 'short_term', 'swing'].forEach(function(st) {
                 ((dash.strategies||{})[st]||{}).holdings||[].forEach(function(ph) {
@@ -3755,15 +3749,15 @@
                 });
             });
             if (allHoldings.length === 0) {
-                h += '<div style="color:#666;font-size:13px;padding:20px;text-align:center;">暂无持仓</div>';
+                h += '<div style="color:#999;font-size:13px;padding:20px;text-align:center;">暂无持仓</div>';
             } else {
                 h += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
-                h += '<thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333;">';
-                h += '<th style="padding:6px 8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>现价</th><th>盈亏</th><th>收益率</th><th>持仓天数</th><th>AI评分</th><th>操作</th>';
+                h += '<thead><tr style="color:#999;text-align:left;border-bottom:1px solid #e8e8e8;">';
+                h += '<th style="padding:8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>现价</th><th>盈亏</th><th>收益率</th><th>持仓天数</th><th>AI评分</th><th>操作</th>';
                 h += '</tr></thead><tbody>';
                 allHoldings.forEach(function(ph) {
-                    h += '<tr style="border-bottom:1px solid #2a2a2a;">';
-                    h += '<td style="padding:6px 8px;color:' + strategyColors[ph.strategy_type] + ';font-weight:600;">' + strategyNames[ph.strategy_type] + '</td>';
+                    h += '<tr style="border-bottom:1px solid #f0f0f0;">';
+                    h += '<td style="padding:8px;color:' + strategyColors[ph.strategy_type] + ';font-weight:600;">' + strategyNames[ph.strategy_type] + '</td>';
                     h += '<td>' + ph.stock_code + '</td>';
                     h += '<td>' + stockLink(ph.stock_code, ph.short_name) + '</td>';
                     h += '<td>' + (ph.buy_price||0).toFixed(2) + '</td>';
@@ -3772,7 +3766,7 @@
                     h += '<td>' + fmtRate(ph.pnl_rate) + '</td>';
                     h += '<td>' + (ph.holding_days||0) + '天</td>';
                     h += '<td>' + (ph.ai_score||0) + '</td>';
-                    h += '<td><button onclick="simTradeClosePos(' + (ph.id||0) + ')" style="padding:2px 8px;border:1px solid #e74c3c;border-radius:3px;background:transparent;color:#e74c3c;font-size:11px;cursor:pointer;">平仓</button></td>';
+                    h += '<td><button onclick="simTradeClosePos(' + (ph.id||0) + ')" style="padding:2px 8px;border:1px solid #e74c3c;border-radius:4px;background:transparent;color:#e74c3c;font-size:11px;cursor:pointer;">平仓</button></td>';
                     h += '</tr>';
                 });
                 h += '</tbody></table>';
@@ -3781,26 +3775,25 @@
 
             // ── 历史交易记录 ──
             var histData = hist.data || [];
-            h += '<div style="background:#1e1e2e;border:1px solid #333;border-radius:10px;padding:16px;margin-bottom:20px;">';
+            h += '<div class="table-wrap" style="padding:16px;margin-bottom:20px;">';
             h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">';
-            h += '<h3 style="margin:0;color:#e0e0e0;font-size:14px;">📜 历史交易 (' + histData.length + ')</h3>';
-            h += '<div>';
-            h += '<select id="simHistFilter" onchange="filterSimHistory()" style="padding:4px 8px;border:1px solid #444;border-radius:4px;background:#2a2a3e;color:#ccc;font-size:12px;">';
+            h += '<h3 style="margin:0;color:#2d3436;font-size:14px;">历史交易 (' + histData.length + ')</h3>';
+            h += '<select id="simHistFilter" onchange="filterSimHistory()" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;background:#fff;color:#333;font-size:12px;">';
             h += '<option value="">全部策略</option><option value="ultra_short">超短</option><option value="short_term">短线</option><option value="swing">波段</option>';
-            h += '</select></div></div>';
+            h += '</select></div>';
             if (histData.length === 0) {
-                h += '<div style="color:#666;font-size:13px;padding:20px;text-align:center;">暂无交易记录</div>';
+                h += '<div style="color:#999;font-size:13px;padding:20px;text-align:center;">暂无交易记录</div>';
             } else {
                 h += '<div style="max-height:400px;overflow-y:auto;">';
                 h += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
-                h += '<thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333;position:sticky;top:0;background:#1e1e2e;">';
-                h += '<th style="padding:6px 8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>卖出原因</th><th>AI评分</th><th>买入日</th><th>卖出日</th>';
+                h += '<thead><tr style="color:#999;text-align:left;border-bottom:1px solid #e8e8e8;position:sticky;top:0;background:#fff;">';
+                h += '<th style="padding:8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>卖出原因</th><th>AI评分</th><th>买入日</th><th>卖出日</th>';
                 h += '</tr></thead><tbody id="simHistBody">';
                 histData.forEach(function(r) {
                     var st = r.strategy_type || '';
                     var isSold = r.status === 'sold';
-                    h += '<tr class="sim-hist-row" data-st="' + st + '" style="border-bottom:1px solid #2a2a2a;">';
-                    h += '<td style="padding:6px 8px;color:' + (strategyColors[st]||'#888') + ';font-weight:600;">' + (strategyNames[st]||st) + '</td>';
+                    h += '<tr class="sim-hist-row" data-st="' + st + '" style="border-bottom:1px solid #f0f0f0;">';
+                    h += '<td style="padding:8px;color:' + (strategyColors[st]||'#999') + ';font-weight:600;">' + (strategyNames[st]||st) + '</td>';
                     h += '<td>' + r.stock_code + '</td>';
                     h += '<td>' + stockLink(r.stock_code, r.short_name) + '</td>';
                     h += '<td>' + (r.buy_price||0).toFixed(2) + '</td>';
@@ -3810,8 +3803,8 @@
                     h += '<td>' + (isSold ? (r.holding_days||0) + '天' : '-') + '</td>';
                     h += '<td>' + (isSold ? (reasonLabels[r.sell_reason]||r.sell_reason||'-') : '持仓中') + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
-                    h += '<td style="font-size:11px;color:#888;">' + (r.buy_date||'') + '</td>';
-                    h += '<td style="font-size:11px;color:#888;">' + (isSold ? (r.sell_date||'') : '-') + '</td>';
+                    h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + '</td>';
+                    h += '<td style="font-size:11px;color:#999;">' + (isSold ? (r.sell_date||'') : '-') + '</td>';
                     h += '</tr>';
                 });
                 h += '</tbody></table></div>';
@@ -3820,37 +3813,37 @@
 
             // ── 操作流水表 ──
             var flowData = flow.data || [];
-            h += '<div style="background:#1e1e2e;border:1px solid #333;border-radius:10px;padding:16px;margin-bottom:20px;">';
+            h += '<div class="table-wrap" style="padding:16px;margin-bottom:20px;">';
             h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">';
-            h += '<h3 style="margin:0;color:#e0e0e0;font-size:14px;">💧 操作流水 (' + flowData.length + ')</h3>';
+            h += '<h3 style="margin:0;color:#2d3436;font-size:14px;">操作流水 (' + flowData.length + ')</h3>';
             h += '<div style="display:flex;gap:8px;">';
-            h += '<select id="simFlowSource" onchange="filterSimFlow()" style="padding:4px 8px;border:1px solid #444;border-radius:4px;background:#2a2a3e;color:#ccc;font-size:12px;">';
+            h += '<select id="simFlowSource" onchange="filterSimFlow()" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;background:#fff;color:#333;font-size:12px;">';
             h += '<option value="">全部来源</option><option value="simulation">模拟交易</option><option value="watchlist">自选股</option>';
             h += '</select>';
-            h += '<select id="simFlowType" onchange="filterSimFlow()" style="padding:4px 8px;border:1px solid #444;border-radius:4px;background:#2a2a3e;color:#ccc;font-size:12px;">';
+            h += '<select id="simFlowType" onchange="filterSimFlow()" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;background:#fff;color:#333;font-size:12px;">';
             h += '<option value="">全部类型</option><option value="sim_buy">模拟买入</option><option value="sim_sell">模拟卖出</option><option value="watch_buy">自选买入</option><option value="watch_sell">自选卖出</option>';
             h += '</select>';
             h += '</div></div>';
             if (flowData.length === 0) {
-                h += '<div style="color:#666;font-size:13px;padding:20px;text-align:center;">暂无流水记录</div>';
+                h += '<div style="color:#999;font-size:13px;padding:20px;text-align:center;">暂无流水记录</div>';
             } else {
                 h += '<div style="max-height:400px;overflow-y:auto;">';
                 h += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
-                h += '<thead><tr style="color:#888;text-align:left;border-bottom:1px solid #333;position:sticky;top:0;background:#1e1e2e;">';
-                h += '<th style="padding:6px 8px;">日期</th><th>时间</th><th>代码</th><th>名称</th><th>来源</th><th>方向</th><th>策略</th><th>价格</th><th>股数</th><th>金额</th><th>手续费</th><th>原因</th><th>评分</th>';
+                h += '<thead><tr style="color:#999;text-align:left;border-bottom:1px solid #e8e8e8;position:sticky;top:0;background:#fff;">';
+                h += '<th style="padding:8px;">日期</th><th>时间</th><th>代码</th><th>名称</th><th>来源</th><th>方向</th><th>策略</th><th>价格</th><th>股数</th><th>金额</th><th>手续费</th><th>原因</th><th>评分</th>';
                 h += '</tr></thead><tbody id="simFlowBody">';
                 flowData.forEach(function(r) {
                     var isBuy = r.trans_type === 'buy';
                     var srcLabel = r.source === 'simulation' ? '模拟' : '自选';
                     var srcColor = r.source === 'simulation' ? '#1a73e8' : '#e67e22';
-                    h += '<tr class="sim-flow-row" data-source="' + (r.source||'') + '" data-flowtype="' + (r.flow_type||'') + '" style="border-bottom:1px solid #2a2a2a;">';
-                    h += '<td style="padding:6px 8px;font-size:11px;color:#888;">' + (r.trans_date||'') + '</td>';
-                    h += '<td style="font-size:11px;color:#888;">' + (r.trans_time||'') + '</td>';
+                    h += '<tr class="sim-flow-row" data-source="' + (r.source||'') + '" data-flowtype="' + (r.flow_type||'') + '" style="border-bottom:1px solid #f0f0f0;">';
+                    h += '<td style="padding:8px;font-size:11px;color:#999;">' + (r.trans_date||'') + '</td>';
+                    h += '<td style="font-size:11px;color:#999;">' + (r.trans_time||'') + '</td>';
                     h += '<td>' + r.stock_code + '</td>';
                     h += '<td>' + stockLink(r.stock_code, r.short_name) + '</td>';
                     h += '<td><span style="color:' + srcColor + ';font-weight:600;">' + srcLabel + '</span></td>';
                     h += '<td><span style="color:' + (isBuy?'#e74c3c':'#27ae60') + ';font-weight:600;">' + (isBuy?'买入':'卖出') + '</span></td>';
-                    h += '<td style="color:' + (strategyColors[r.strategy_type]||'#888') + ';">' + (strategyNames[r.strategy_type]||'-') + '</td>';
+                    h += '<td style="color:' + (strategyColors[r.strategy_type]||'#999') + ';">' + (strategyNames[r.strategy_type]||'-') + '</td>';
                     h += '<td>' + (r.price||0).toFixed(2) + '</td>';
                     h += '<td>' + (r.shares||0) + '</td>';
                     h += '<td>' + fmtMoney(r.amount||0) + '</td>';
@@ -3863,8 +3856,7 @@
             }
             h += '</div>';
 
-            // ── 操作状态 ──
-            h += '<div id="simTradeStatus" style="color:#888;font-size:12px;text-align:center;padding:8px;"></div>';
+            h += '<div id="simTradeStatus" style="color:#999;font-size:12px;text-align:center;padding:8px;"></div>';
 
             container.innerHTML = h;
         }).catch(function(e) {
