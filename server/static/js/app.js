@@ -3681,6 +3681,8 @@
         function fmtMoney(v) { var n = Number(v || 0); if (Math.abs(n) >= 1e4) return (n / 1e4).toFixed(2) + '万'; return n.toFixed(0); }
         function stockLink(code, name) { return '<a href="javascript:void(0)" onclick="openKlineModal(\'' + code + '\',\'' + (name || '') + '\')" class="clickable-name">' + (name || code) + '</a>'; }
         function parseReason(v) { if (!v) return '-'; if (typeof v === 'string' && v.charAt(0) === '{') { try { var o = JSON.parse(v); return o.reason || o.sell_reason || v; } catch(e) { return v; } } return v; }
+        var sellReasonMap = {take_profit:'止盈', stop_loss:'止损', time_limit:'时间止损', trailing_stop:'动态止盈', manual_close:'手动平仓'};
+        function fmtSellReason(v) { if (!v) return '-'; return sellReasonMap[v] || v; }
 
         Promise.all([
             fetch(SIM_API + '/dashboard').then(function(r){return r.json()}),
@@ -3806,7 +3808,7 @@
                     h += '<td>' + (isSold ? fmtPnl(r.profit) : '-') + '</td>';
                     h += '<td>' + (isSold ? (r.holding_days||0) + '天' : '-') + '</td>';
                     h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(parseReason(r.buy_reason)) + '">' + parseReason(r.buy_reason) + '</td>';
-                    h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.sell_reason||'') + '">' + (isSold ? (r.sell_reason||'-') : '-') + '</td>';
+                    h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(fmtSellReason(r.sell_reason)) + '">' + (isSold ? fmtSellReason(r.sell_reason) : '-') + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
                     h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + (isSold ? ' → ' + (r.sell_date||'') : '') + '</td>';
                     h += '</tr>';
