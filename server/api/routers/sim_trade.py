@@ -61,8 +61,9 @@ def _safe_int(v, default=0) -> int:
 def sim_trade_dashboard():
     """模拟交易总览数据"""
     try:
+        from server.engine.sim_trade_engine import _ensure_tables
+        _ensure_tables()
         engine = SimTradeEngine()
-        engine._ensure_tables()
 
         result = {"strategies": {}, "summary": {}}
         total_trades = 0
