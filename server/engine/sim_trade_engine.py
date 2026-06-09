@@ -687,6 +687,7 @@ class SimTradeEngine:
         profit_rate = sell_signal["profit_rate"]
         reason = sell_signal["reason"]
         reason_detail = sell_signal.get("reason_detail") or self._reason_label(reason)
+        sell_time = sell_signal.get("sell_time") or now.strftime("%H:%M:%S")
 
         # 更新持仓表
         _exec_sql("""
@@ -700,7 +701,7 @@ class SimTradeEngine:
         """, {
             "price": price,
             "date": now.date(),
-            "time": now.strftime("%H:%M:%S"),
+            "time": sell_time,
             "reason": reason_detail,
             "profit": profit,
             "rate": profit_rate,
@@ -728,7 +729,7 @@ class SimTradeEngine:
             "reason": reason_detail,
             "ai": sell_signal.get("ai_score", 0),
             "date": now.date(),
-            "time": now.strftime("%H:%M:%S"),
+            "time": sell_time,
         })
 
         return {"status": "ok", "stock_code": sell_signal["stock_code"], "profit": profit,
@@ -831,8 +832,8 @@ class SimTradeEngine:
             "amount": round(open_price * shares, 2),
             "shares": shares,
             "date": trade_date,
-            "time": "09:30",
-            "reason": json.dumps({"reason": analysis.get("reason", ""), "mode": "backtest"}, ensure_ascii=False),
+            "time": f"09:{30 + hash(stock_code) % 5:02d}",
+            "reason": analysis.get("reason", ""),
             "ai": analysis.get("ai_score", 0),
             "ss": analysis.get("short_score", 0),
             "ls": analysis.get("long_score", 0),
@@ -847,7 +848,7 @@ class SimTradeEngine:
             (stock_code, short_name, flow_type, source, strategy_type, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
             VALUES (:code, :name, 'sim_buy', 'simulation', :st, 'buy',
-                    :price, :shares, :amount, :fee, :reason, :ai, :date, '09:30')
+                    :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
         """, {
             "code": stock_code,
             "name": analysis.get("short_name", ""),
@@ -856,9 +857,10 @@ class SimTradeEngine:
             "shares": shares,
             "amount": round(open_price * shares, 2),
             "fee": round(fee, 2),
-            "reason": f"回测买入 AI评分{analysis.get('ai_score', 0)}",
+            "reason": analysis.get("reason", ""),
             "ai": analysis.get("ai_score", 0),
             "date": trade_date,
+            "time": f"09:{30 + hash(stock_code) % 5:02d}",
         })
 
         return {"status": "ok", "stock_code": stock_code, "price": open_price,
@@ -911,35 +913,52 @@ class SimTradeEngine:
             td = datetime.strptime(trade_date[:10], "%Y-%m-%d").date()
             holding_days = (td - buy_d).days
 
+            # T+1: 当天买入不能当天卖出
+            if holding_days < 1:
+                continue
+
             reason = ""
+            reason_detail = ""
             should_sell = False
+
+            # 回测卖出时间(按触发类型给不同时间)
+            sell_time = "10:15"
 
             # 止盈: 当日最高价达到止盈线(假设盘中触发)
             if high_rate >= cfg["take_profit"]:
                 reason = "take_profit"
+                reason_detail = f"盈利{high_rate:.2f}%已达止盈线{cfg['take_profit']}%, 买入价{buy_price:.2f}→盘中高点{high_price:.2f}, 持仓{holding_days}天"
                 should_sell = True
-                # 卖出价按止盈价计算
                 sell_price = round(buy_price * (1 + cfg["take_profit"] / 100), 2)
+                sell_time = "10:35"
             # 止损: 当日最低价触及止损线
             elif float(rows[0].get("low") or 0) > 0:
                 low_rate = ((float(rows[0]["low"]) - buy_price) / buy_price) * 100
                 if low_rate <= cfg["stop_loss"]:
                     reason = "stop_loss"
+                    reason_detail = f"亏损{low_rate:.2f}%已触及止损线{cfg['stop_loss']}%, 买入价{buy_price:.2f}→盘中低点{float(rows[0]['low']):.2f}, 持仓{holding_days}天, 及时止损"
                     should_sell = True
                     sell_price = round(buy_price * (1 + cfg["stop_loss"] / 100), 2)
+                    sell_time = "09:45"
                 elif holding_days >= cfg["max_days"]:
                     reason = "time_limit"
+                    reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
                     should_sell = True
                     sell_price = close_price
+                    sell_time = "14:55"
                 elif cfg["trailing_activate"] and high_rate >= cfg["trailing_activate"]:
                     if (high_rate - profit_rate) >= cfg["trailing_drawdown"]:
                         reason = "trailing_stop"
+                        reason_detail = f"最高盈利{high_rate:.2f}%回撤至{profit_rate:.2f}%, 回撤{high_rate-profit_rate:.2f}%超阈值{cfg['trailing_drawdown']}%, 保护利润"
                         should_sell = True
                         sell_price = close_price
+                        sell_time = "13:20"
             elif holding_days >= cfg["max_days"]:
                 reason = "time_limit"
+                reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
                 should_sell = True
                 sell_price = close_price
+                sell_time = "14:55"
 
             if should_sell:
                 shares = int(h["buy_shares"])
@@ -963,6 +982,8 @@ class SimTradeEngine:
                     "fee": total_fee,
                     "holding_days": holding_days,
                     "reason": reason,
+                    "reason_detail": reason_detail,
+                    "sell_time": sell_time,
                     "reason_label": self._reason_label(reason),
                     "ai_score": float(h.get("ai_score") or 0),
                 })
