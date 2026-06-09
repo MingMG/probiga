@@ -1548,12 +1548,12 @@ def screen_stocks(
     low_lookback: int = Query(default=20, alias="lookback"),
     min_chg_trend: float = Query(default=-1, alias="min_trend"),
     limit_pct: float = Query(default=9.5, alias="limit"),
-    trend_days: int = Query(default=10, alias="t_days", description="[trend_strong] 连续站上MA5最少天数"),
-    ma_slope_min: float = Query(default=0.5, alias="slope", description="[trend_strong] MA20斜率下限%"),
-    vol_ratio_min: float = Query(default=0.8, alias="vr_min", description="[trend_strong] 量比下限"),
-    vol_ratio_max: float = Query(default=2.5, alias="vr_max", description="[trend_strong] 量比上限"),
-    max_60d_gain: float = Query(default=150.0, alias="max_gain", description="[trend_strong] 60日最大涨幅%"),
-    new_high_pct: float = Query(default=0.95, alias="nh_pct", description="[trend_strong] 距新高比例"),
+    trend_days: int = Query(default=5, alias="t_days", description="[trend_strong] 连续站上MA5最少天数"),
+    ma_slope_min: float = Query(default=0.2, alias="slope", description="[trend_strong] MA20斜率下限%"),
+    vol_ratio_min: float = Query(default=0.5, alias="vr_min", description="[trend_strong] 量比下限"),
+    vol_ratio_max: float = Query(default=3.0, alias="vr_max", description="[trend_strong] 量比上限"),
+    max_60d_gain: float = Query(default=200.0, alias="max_gain", description="[trend_strong] 60日最大涨幅%"),
+    new_high_pct: float = Query(default=0.90, alias="nh_pct", description="[trend_strong] 距新高比例"),
 ):
     """选股策略筛选（自动兜底最新可用日期）"""
 
@@ -3250,6 +3250,25 @@ def _portfolio_log_trans(code: str, trans_type: str, price: float, shares: int, 
     """, {"c": code, "t": trans_type, "p": price, "s": shares, "src": source})
 
 
+def _watchlist_write_flow(code: str, short_name: str, trans_type: str, price: float, shares: int):
+    """自选股操作同步写入操作流水表 st_trade_flow"""
+    try:
+        from server.api.routers.portfolio_math import portfolio_trade_fee as _fee
+        amount = round(price * shares, 2)
+        fee = round(_fee(trans_type, price, shares), 2)
+        flow_type = "watch_buy" if trans_type == "buy" else "watch_sell"
+        _exec_sql("""
+            INSERT INTO st_trade_flow
+            (stock_code, short_name, flow_type, source, strategy_type, trans_type,
+             price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
+            VALUES (:code, :name, :ft, 'watchlist', '', :tt,
+                    :price, :shares, :amount, :fee, '自选股操作', 0, CURDATE(), DATE_FORMAT(NOW(), '%H:%i'))
+        """, {"code": code, "name": short_name or "", "ft": flow_type, "tt": trans_type,
+              "price": price, "shares": shares, "amount": amount, "fee": fee})
+    except Exception:
+        pass
+
+
 def _portfolio_cost_profit(shares: int, cur_price: float, cost_price: float) -> float | None:
     return portfolio_cost_profit(shares, cur_price, cost_price)
 
@@ -3756,6 +3775,12 @@ def portfolio_transact(stock_code: str, body: PortfolioTransact):
 
         _portfolio_log_trans(code, trans_type, price, trade_shares)
 
+        # 同步写入操作流水表(st_trade_flow)
+        try:
+            _watchlist_write_flow(code, old.get("short_name", ""), trans_type, price, trade_shares)
+        except Exception:
+            pass
+
         recalc = portfolio_recalc_cost_from_history(code, _read_sql)
         if recalc.get("status") != "ok":
             return recalc
@@ -4060,13 +4085,30 @@ def portfolio_live():
     """自选股实时行情：拉取最新价 + 返回自选股数据（含当日盈亏/持仓盈亏），一次搞定"""
     try:
         _ensure_portfolio_position_columns()
-        pf_rows = _read_sql("SELECT stock_code, short_name, cost_price, shares, last_operation, is_holding FROM st_user_portfolio ORDER BY (shares > 0) DESC, sort_order")
+        pf_rows = _read_sql("SELECT * FROM st_user_portfolio ORDER BY (shares > 0) DESC, sort_order")
         codes = [r["stock_code"] for r in pf_rows] if pf_rows else []
         if not codes:
             return {"data": [], "total": 0}
         quotes = _portfolio_fetch_live_quotes(codes)
         if not quotes:
             quotes = {}
+        # 批量查最新K线，取 pre_close
+        ph = ",".join([f"'{c}'" for c in codes])
+        kline_map = {}
+        try:
+            kline_rows = _read_sql(f"""
+                SELECT stock_code, trade_date, close, change_pct, short_name, pre_close
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND stock_code IN ({ph})
+                  AND trade_date >= DATE_SUB(CURDATE(), INTERVAL 10 DAY)
+                ORDER BY stock_code, trade_date DESC
+            """)
+            for kr in kline_rows:
+                sc_k = str(kr["stock_code"])
+                if sc_k not in kline_map:
+                    kline_map[sc_k] = kr
+        except Exception:
+            pass
         _today_str = date.today().isoformat()
         result = []
         total_hold_profit = 0.0
@@ -4077,8 +4119,14 @@ def portfolio_live():
         for r in (pf_rows or []):
             sc = r["stock_code"]
             q = quotes.get(sc, {})
+            k = kline_map.get(sc, {})
+            kline_pre_close = k.get("pre_close")
             cur_price = q.get("price") or 0
+            if not cur_price:
+                cur_price = k.get("close") or 0
             chg_pct = q.get("change_pct") or 0
+            if not chg_pct:
+                chg_pct = k.get("change_pct") or 0
             cp = float(r.get("cost_price") or 0)
             sh = int(r.get("shares") or 0)
             profit = round((cur_price - cp) * sh, 2) if cur_price and cp else 0
@@ -4089,9 +4137,9 @@ def portfolio_live():
             today_profit = _portfolio_day_profit(
                 sh,
                 cur_price,
-                cur_price,
+                q.get("price") if q.get("price") else None,
                 q.get("change"),
-                None,
+                kline_pre_close,
                 chg_pct,
                 sc,
                 trades,
@@ -5532,6 +5580,15 @@ def recommended_stocks(trade_date: str = Query(default="")):
                 """, {"d": trade_date})
         if not rows:
             return {"date": trade_date, "data": [], "total": 0, "note": "暂无推荐数据，请先运行筛选"}
+        # 补全缺失的股票名称
+        empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
+        if empty_name_codes:
+            ph = ",".join(f"'{c}'" for c in empty_name_codes)
+            name_rows = _read_sql(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({ph})")
+            name_map = {nr["stock_code"]: nr["short_name"] for nr in name_rows if nr.get("short_name")}
+            for r in rows:
+                if not r.get("short_name"):
+                    r["short_name"] = name_map.get(r["stock_code"]) or r["stock_code"]
         # 关联最新行情
         codes = [r["stock_code"] for r in rows]
         placeholders = ",".join(f"'{c}'" for c in codes)
@@ -5576,6 +5633,12 @@ def _smart_trade_date() -> str:
     return _latest_date("sm_stock_kline")
 
 
+@router.get("/hot-data/recommended-stocks/progress")
+def recommended_stocks_progress():
+    """查询 AI 推荐筛选进度"""
+    return _cache_get("rec_screen_progress") or {"status": "idle", "percent": 0, "step": "未启动"}
+
+
 @router.post("/hot-data/recommended-stocks/run")
 def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int = Query(default=50)):
     """触发 AI 推荐股票筛选（使用统一分析引擎）"""
@@ -5584,6 +5647,9 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
     if not trade_date:
         trade_date = _smart_trade_date()
 
+    # 初始化进度
+    _cache_set("rec_screen_progress", {"status": "running", "percent": 0, "step": "正在初始化...", "total": 0, "done": 0, "passed": 0})
+
     def _run_screen():
         try:
             from tools.screen_stocks import run_trend_strong, run_low_start, run_trend, run_flow
@@ -5591,15 +5657,18 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
             engine = get_engine()
             top_per_mode = 30
 
-            # 量化初选
+            # 阶段1: 量化初选 (0-30%)
+            _cache_set("rec_screen_progress", {"status": "running", "percent": 5, "step": "量化初选：趋势启动...", "total": 0, "done": 0, "passed": 0})
             all_dfs = []
             screeners = [
-                ("trend_strong", lambda: run_trend_strong(engine, trade_date, top_per_mode, 1, 0, 10, 0.5, 0.8, 2.5, 150.0, 0.95)),
+                ("trend_strong", lambda: run_trend_strong(engine, trade_date, top_per_mode, 1, 0, 5, 0.2, 0.5, 3.0, 200.0, 0.90)),
                 ("low_start", lambda: run_low_start(engine, trade_date, top_per_mode, 1, 0, 60, 0.28, 1.25, 2.0, 10.5)),
                 ("trend", lambda: run_trend(engine, trade_date, top_per_mode, 1, 0, 0)),
                 ("flow", lambda: run_flow(engine, trade_date, top_per_mode, 5_000_000)),
             ]
-            for name, fn in screeners:
+            step_labels = {"trend_strong": "强势趋势票", "low_start": "低位放量", "trend": "多头趋势", "flow": "资金流入"}
+            for i, (name, fn) in enumerate(screeners):
+                _cache_set("rec_screen_progress", {"status": "running", "percent": 5 + i * 7, "step": f"量化初选：{step_labels.get(name, name)}...", "total": 0, "done": 0, "passed": 0})
                 try:
                     df = fn()
                     if df is not None and not df.empty:
@@ -5609,8 +5678,10 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                     pass
 
             if not all_dfs:
+                _cache_set("rec_screen_progress", {"status": "done", "percent": 100, "step": "量化初选无结果", "total": 0, "done": 0, "passed": 0})
                 return
 
+            _cache_set("rec_screen_progress", {"status": "running", "percent": 30, "step": "合并去重...", "total": 0, "done": 0, "passed": 0})
             combined = pd.concat(all_dfs, ignore_index=True)
             combined["stock_code"] = combined["stock_code"].astype(str).str.strip().str.zfill(6)
             if "short_name" in combined.columns:
@@ -5621,20 +5692,21 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
             sources.columns = ["stock_code", "sources"]
             dedup = dedup.merge(sources, on="stock_code", how="left")
 
-            # 使用统一分析引擎进行评分
+            total = len(dedup)
+            # 阶段2: AI逐只分析 (30-90%)
+            _cache_set("rec_screen_progress", {"status": "running", "percent": 30, "step": f"AI分析中 (0/{total})...", "total": total, "done": 0, "passed": 0})
+
             from server.engine.stock_analysis_engine import StockAnalysisEngine
             analysis_engine = StockAnalysisEngine()
 
             results = []
-            for _, row in dedup.iterrows():
+            for idx, (_, row) in enumerate(dedup.iterrows()):
                 code = str(row["stock_code"]).zfill(6)
-                name = row.get("short_name", code)
+                name = row.get("short_name") or code
 
                 try:
-                    # 使用统一引擎分析
                     result = analysis_engine.analyze(code, full_data=True)
 
-                    # 保留所有评分 >= min_score 的股票（不要求 ALLOW 状态）
                     if result.short_term_score >= min_score:
                         results.append({
                             "stock_code": code,
@@ -5661,18 +5733,27 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
                     logging.getLogger(__name__).warning(f"分析 {code} 失败: {e}")
                     continue
 
-            # 按短线评分降序排序
+                # 每分析3只或最后一只能更新进度
+                if (idx + 1) % 3 == 0 or idx + 1 == total:
+                    pct = 30 + int((idx + 1) / total * 60)
+                    _cache_set("rec_screen_progress", {
+                        "status": "running", "percent": pct,
+                        "step": f"AI分析中 ({idx + 1}/{total}) 通过{len(results)}只...",
+                        "total": total, "done": idx + 1, "passed": len(results),
+                    })
+
+            # 阶段3: 写入数据库 (90-100%)
+            _cache_set("rec_screen_progress", {"status": "running", "percent": 92, "step": "写入数据库...", "total": total, "done": total, "passed": len(results)})
+
             results.sort(key=lambda x: x.get("short_term_score", 0), reverse=True)
 
-            # 写入数据库
             if results:
                 with engine.begin() as conn:
-                    # 确保新字段存在（兼容不支持 IF NOT EXISTS 的 MySQL 版本）
                     for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT"), ("event_score", "FLOAT")]:
                         try:
                             conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN {col} {dtype}"))
                         except Exception:
-                            pass  # 列已存在（Duplicate column）
+                            pass
 
                     conn.execute(text("DELETE FROM st_recommended_stocks WHERE pick_date = :d"), {"d": trade_date})
                     for r in results:
@@ -5704,9 +5785,16 @@ def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int =
 
                     import logging
                     logging.getLogger(__name__).info(f"推荐筛选完成，共 {len(results)} 只股票")
+
+            _cache_set("rec_screen_progress", {
+                "status": "done", "percent": 100,
+                "step": f"筛选完成，共 {len(results)} 只股票通过",
+                "total": total, "done": total, "passed": len(results),
+            })
         except Exception as ex:
             import logging
             logging.getLogger(__name__).error(f"recommended-stocks error: {ex}", exc_info=True)
+            _cache_set("rec_screen_progress", {"status": "error", "percent": 0, "step": f"筛选失败: {str(ex)[:80]}", "total": 0, "done": 0, "passed": 0})
 
     t = threading.Thread(target=_run_screen, daemon=True)
     t.start()

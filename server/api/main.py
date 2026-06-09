@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
-from server.api.routers import health, hot_data, notify, scheduler
+from server.api.routers import health, hot_data, notify, scheduler, sim_trade
 from server.api.routers._engine import get_engine
 
 logger = logging.getLogger("scheduler_daemon")
@@ -241,6 +241,7 @@ app.include_router(health.router, prefix="/api")
 app.include_router(notify.router, prefix="/api")
 app.include_router(hot_data.router, prefix="/api")
 app.include_router(scheduler.router, prefix="/api")
+app.include_router(sim_trade.router, prefix="/api")
 
 static_dir = Path(__file__).resolve().parent.parent / "static"
 
