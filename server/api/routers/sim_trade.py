@@ -290,7 +290,7 @@ def sim_trade_history(
         rows = _read_sql(f"""
             SELECT id, stock_code, short_name, strategy_type,
                    buy_price, buy_shares, buy_date, buy_time, buy_amount,
-                   ai_score, short_score, long_score,
+                   buy_reason, ai_score, short_score, long_score,
                    status, sell_price, sell_date, sell_time, sell_reason,
                    profit, profit_rate, holding_days, fee_total,
                    event_risk_level

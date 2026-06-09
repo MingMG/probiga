@@ -3675,7 +3675,6 @@
         var SIM_API = '/api/sim-trade';
         var strategyNames = {ultra_short: '超短', short_term: '短线', swing: '波段'};
         var strategyColors = {ultra_short: '#e74c3c', short_term: '#f39c12', swing: '#3498db'};
-        var reasonLabels = {take_profit: '止盈', stop_loss: '止损', time_limit: '时间止损', trailing_stop: '动态止盈', manual_close: '手动平仓'};
 
         function fmtPnl(v) { var n = Number(v || 0); return '<span class="' + (n >= 0 ? 'c-red' : 'c-green') + '">' + (n >= 0 ? '+' : '') + n.toFixed(2) + '</span>'; }
         function fmtRate(v) { var n = Number(v || 0); return '<span class="' + (n >= 0 ? 'c-red' : 'c-green') + '">' + (n >= 0 ? '+' : '') + n.toFixed(2) + '%</span>'; }
@@ -3787,7 +3786,7 @@
                 h += '<div style="max-height:400px;overflow-y:auto;">';
                 h += '<table style="width:100%;font-size:12px;border-collapse:collapse;">';
                 h += '<thead><tr style="color:#999;text-align:left;border-bottom:1px solid #e8e8e8;position:sticky;top:0;background:#fff;">';
-                h += '<th style="padding:8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>卖出原因</th><th>AI评分</th><th>买入日</th><th>卖出日</th>';
+                h += '<th style="padding:8px;">策略</th><th>代码</th><th>名称</th><th>买入价</th><th>卖出价</th><th>收益率</th><th>盈亏</th><th>天数</th><th>买入理由</th><th>卖出理由</th><th>AI评分</th><th>日期</th>';
                 h += '</tr></thead><tbody id="simHistBody">';
                 histData.forEach(function(r) {
                     var st = r.strategy_type || '';
@@ -3801,10 +3800,10 @@
                     h += '<td>' + (isSold ? fmtRate(r.profit_rate) : '-') + '</td>';
                     h += '<td>' + (isSold ? fmtPnl(r.profit) : '-') + '</td>';
                     h += '<td>' + (isSold ? (r.holding_days||0) + '天' : '-') + '</td>';
-                    h += '<td>' + (isSold ? (reasonLabels[r.sell_reason]||r.sell_reason||'-') : '持仓中') + '</td>';
+                    h += '<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.buy_reason||'') + '">' + (r.buy_reason||'-') + '</td>';
+                    h += '<td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(r.sell_reason||'') + '">' + (isSold ? (r.sell_reason||'-') : '持仓中') + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
-                    h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + '</td>';
-                    h += '<td style="font-size:11px;color:#999;">' + (isSold ? (r.sell_date||'') : '-') + '</td>';
+                    h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + (isSold ? ' → ' + (r.sell_date||'') : '') + '</td>';
                     h += '</tr>';
                 });
                 h += '</tbody></table></div>';
