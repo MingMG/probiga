@@ -3810,7 +3810,7 @@
                     h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(parseReason(r.buy_reason)) + '">' + parseReason(r.buy_reason) + '</td>';
                     h += '<td style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#666;" title="' + escAttr(fmtSellReason(r.sell_reason)) + '">' + (isSold ? fmtSellReason(r.sell_reason) : '-') + '</td>';
                     h += '<td>' + (r.ai_score||0) + '</td>';
-                    h += '<td style="font-size:11px;color:#999;">' + (r.buy_date||'') + (isSold ? ' → ' + (r.sell_date||'') : '') + '</td>';
+                    h += '<td style="font-size:11px;color:#999;white-space:nowrap;">' + (r.buy_date||'') + ' ' + (r.buy_time||'') + (isSold ? '<br>→ ' + (r.sell_date||'') + ' ' + (r.sell_time||'') : '') + '</td>';
                     h += '</tr>';
                 });
                 h += '</tbody></table></div>';

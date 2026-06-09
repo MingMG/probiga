@@ -638,7 +638,7 @@ class SimTradeEngine:
             "amount": amount,
             "shares": shares,
             "date": now.date(),
-            "time": now.strftime("%H:%M"),
+            "time": now.strftime("%H:%M:%S"),
             "reason": signal.get("reason", ""),
             "ai": signal.get("ai_score", 0),
             "ss": signal.get("short_score", 0),
@@ -668,7 +668,7 @@ class SimTradeEngine:
             "reason": signal.get("reason", ""),
             "ai": signal.get("ai_score", 0),
             "date": now.date(),
-            "time": now.strftime("%H:%M"),
+            "time": now.strftime("%H:%M:%S"),
         })
 
         return {"status": "ok", "stock_code": signal["stock_code"], "price": price,
@@ -700,7 +700,7 @@ class SimTradeEngine:
         """, {
             "price": price,
             "date": now.date(),
-            "time": now.strftime("%H:%M"),
+            "time": now.strftime("%H:%M:%S"),
             "reason": reason_detail,
             "profit": profit,
             "rate": profit_rate,
@@ -728,7 +728,7 @@ class SimTradeEngine:
             "reason": reason_detail,
             "ai": sell_signal.get("ai_score", 0),
             "date": now.date(),
-            "time": now.strftime("%H:%M"),
+            "time": now.strftime("%H:%M:%S"),
         })
 
         return {"status": "ok", "stock_code": sell_signal["stock_code"], "profit": profit,
