@@ -3,6 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0.."
 set PORT=8010
 if not defined MYSQL_URL set "MYSQL_URL=mysql+pymysql://root:ProBigA%%4070966@localhost:3306/probiga?charset=utf8mb4"
+if not defined API_EMBEDDED_SCHEDULER_ENABLED set "API_EMBEDDED_SCHEDULER_ENABLED=true"
 echo ============================================
 echo   ProBigA 热门数据看板
 echo   http://localhost:%PORT%

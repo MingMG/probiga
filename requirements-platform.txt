@@ -3,5 +3,15 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 pydantic-settings>=2.0.0
 httpx>=0.27.0
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
 sqlalchemy>=2.0.0
 pymysql>=1.1.0
+fastavro>=1.9.0
+# 可选：仅聚宽分钟数据链路需要；主站应可在未安装时正常启动
+jqdatasdk>=1.9.8
+# 可选：仅 QMT 盘中数据链路需要；需先安装 QMT 客户端，xtquant 通常随 QMT 自带
+# pip install xtquant  或从 QMT 安装目录复制 xtquant 到 site-packages
+# xtquant
+pytest>=8.0.0

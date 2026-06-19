@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from datetime import datetime
@@ -26,15 +25,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from server.common.config import get_mysql_url
 
 # 复用 adata 中已封装的东财接口
 from adata.stock.info.stock_info import StockInfo
 
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True, pool_size=3, max_overflow=5)
+    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, pool_size=3, max_overflow=5)
 
 
 def run_ddl(engine):

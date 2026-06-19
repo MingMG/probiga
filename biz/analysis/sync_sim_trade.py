@@ -3,8 +3,9 @@
 模拟交易定时任务
 
 盘中每1分钟运行一次（只查推荐股+持仓，请求量极小）：
-1. 检查卖出信号 → 执行卖出
-2. 检查三种策略的买入信号 → 执行买入
+1. 检查实时模拟卖出信号 → 执行卖出
+2. 检查盘中验证卖出信号 → 执行卖出
+3. 检查三种策略的实时模拟买入信号 → 执行买入
 
 使用方法：
     python -m biz.analysis.sync_sim_trade
@@ -38,9 +39,9 @@ def run_sim_trade_scan():
 
     engine = SimTradeEngine()
 
-    # 1. 检查卖出信号
+    # 1. 检查实时模拟卖出信号
     sell_signals = engine.check_sell_signals()
-    logger.info("检测到 %d 个卖出信号", len(sell_signals))
+    logger.info("检测到 %d 个实时模拟卖出信号", len(sell_signals))
 
     for sig in sell_signals:
         try:
@@ -54,7 +55,23 @@ def run_sim_trade_scan():
         except Exception as e:
             logger.error("卖出 %s 失败: %s", sig["stock_code"], e)
 
-    # 2. 检查买入信号(三种策略)
+    # 2. 检查盘中验证卖出信号。这里只卖出，不自动创建验证买入。
+    forward_sell_signals = engine.check_forward_sell_signals()
+    logger.info("检测到 %d 个盘中验证卖出信号", len(forward_sell_signals))
+
+    for sig in forward_sell_signals:
+        try:
+            ret = engine.execute_sell(sig)
+            logger.info(
+                "盘中验证卖出 %s(%s) %s 价格%.2f 盈亏%.2f(%.2f%%) 原因:%s",
+                sig["short_name"], sig["stock_code"], sig["strategy_type"],
+                sig["sell_price"], sig["profit"], sig["profit_rate"],
+                sig["reason_label"],
+            )
+        except Exception as e:
+            logger.error("盘中验证卖出 %s 失败: %s", sig["stock_code"], e)
+
+    # 3. 检查实时模拟买入信号(三种策略)
     total_bought = 0
     for stype, cfg in STRATEGY_CONFIG.items():
         try:
@@ -76,11 +93,17 @@ def run_sim_trade_scan():
         except Exception as e:
             logger.error("[%s] 检查买入信号失败: %s", cfg["name"], e)
 
-    logger.info("模拟交易扫描完成: 卖出%d笔, 买入%d笔", len(sell_signals), total_bought)
+    total_sold = len(sell_signals) + len(forward_sell_signals)
+    logger.info(
+        "模拟交易扫描完成: 实时卖出%d笔, 验证卖出%d笔, 买入%d笔",
+        len(sell_signals), len(forward_sell_signals), total_bought,
+    )
     logger.info("=" * 50)
 
     return {
-        "sell_count": len(sell_signals),
+        "sell_count": total_sold,
+        "live_sell_count": len(sell_signals),
+        "forward_sell_count": len(forward_sell_signals),
         "buy_count": total_bought,
     }
 

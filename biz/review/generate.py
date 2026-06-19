@@ -27,10 +27,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.config import get_mysql_url
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("review")
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_review_tables.sql"
 
 SECTOR_NAMES = {
@@ -57,8 +58,7 @@ SECTOR_NAMES = {
 
 
 def get_engine():
-    url = os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL
-    return create_engine(url, pool_pre_ping=True)
+    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
 
 
 def run_ddl(engine):

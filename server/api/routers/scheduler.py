@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """定时任务管理 API"""
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -28,23 +28,60 @@ def _execute_sql(sql: str, params: dict = None):
         conn.execute(text(sql), params or {})
 
 
+def _coerce_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _next_run_at(row: dict, now: datetime) -> str:
+    interval_minutes = int(row.get("interval_minutes") or 0)
+    if interval_minutes > 0:
+        ref_time = _coerce_datetime(row.get("last_triggered_at")) or _coerce_datetime(row.get("last_run_at"))
+        if not ref_time:
+            return now.strftime("%Y-%m-%d %H:%M")
+        next_dt = ref_time + timedelta(minutes=interval_minutes)
+        if next_dt <= now:
+            next_dt = now
+        return next_dt.strftime("%Y-%m-%d %H:%M")
+
+    cron_time = str(row.get("cron_time") or "17:10").strip()
+    try:
+        h, m = cron_time.split(":")
+        next_dt = datetime(now.year, now.month, now.day, int(h), int(m))
+        if next_dt <= now:
+            next_dt += timedelta(days=1)
+        return next_dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
 @router.get("/scheduler/tasks")
 def list_tasks():
-    from datetime import datetime, timedelta
     rows = _read_sql("SELECT * FROM st_scheduled_tasks ORDER BY sort_order")
     now = datetime.now()
-    today = now.strftime("%Y-%m-%d")
     for r in rows:
-        ct = str(r.get("cron_time") or "17:10").strip()
-        try:
-            h, m = ct.split(":")
-            next_dt = datetime(now.year, now.month, now.day, int(h), int(m))
-            if next_dt <= now:
-                next_dt += timedelta(days=1)
-            r["next_run_at"] = next_dt.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            r["next_run_at"] = ""
+        r["next_run_at"] = _next_run_at(r, now)
     return {"data": rows, "total": len(rows)}
+
+
+@router.get("/scheduler/quality")
+def scheduler_quality(
+    trade_date: str = "",
+    include_realtime: bool = False,
+):
+    from tools.data_quality_check import run_checks
+
+    return run_checks(
+        get_engine(),
+        trade_date.strip() or None,
+        include_realtime=include_realtime,
+    )
 
 
 @router.post("/scheduler/tasks/{task_id}/toggle")
@@ -80,7 +117,10 @@ def run_task_now(task_id: int):
         return {"error": "任务不存在"}
     task = row[0]
 
-    _execute_sql("UPDATE st_scheduled_tasks SET last_run_status = 'running', last_run_at = NOW() WHERE id = :id", {"id": task_id})
+    _execute_sql(
+        "UPDATE st_scheduled_tasks SET last_run_status = 'running', last_run_at = NOW(), last_triggered_at = NOW() WHERE id = :id",
+        {"id": task_id},
+    )
 
     root = Path(__file__).resolve().parents[3]
     script = root / task["script_path"]
@@ -104,7 +144,7 @@ def run_task_now(task_id: int):
 
     import os
     child_env = os.environ.copy()
-    child_env.setdefault("MYSQL_URL", get_engine().url.render_as_string(hide_password=False))
+    child_env["MYSQL_URL"] = get_engine().url.render_as_string(hide_password=False)
     child_env.setdefault("PYTHONPATH", str(root))
 
     try:
@@ -133,7 +173,7 @@ def run_task_now(task_id: int):
 def stop_task(task_id: int):
     import os
     import signal
-    from server.api.main import _running_procs
+    from server.api.scheduler_runtime import _running_lock, _running_procs, _running_task_ids
 
     row = _read_sql("SELECT id, task_name, last_run_status FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
@@ -160,4 +200,6 @@ def stop_task(task_id: int):
         "UPDATE st_scheduled_tasks SET last_run_status = 'stopped', last_run_output = '用户手动停止', updated_at = NOW() WHERE id = :id",
         {"id": task_id},
     )
+    with _running_lock:
+        _running_task_ids.discard(int(task_id))
     return {"id": task_id, "status": "stopped", "process_killed": killed}

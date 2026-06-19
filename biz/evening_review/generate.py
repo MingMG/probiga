@@ -32,13 +32,13 @@ if str(ROOT / "adata") not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("evening")
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-WX_BRIEFING_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b1110965-119d-438b-856d-0d87c751cf13"
+from server.common.config import get_mysql_url, get_settings, get_wecom_webhook
+
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 
 def get_engine():
-    return create_engine(os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL, pool_pre_ping=True)
+    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
 
 
 def _fmt_pct(v: float | None) -> str:
@@ -317,11 +317,15 @@ def push_to_wecom(content: str) -> bool:
     """推送到早报机器人"""
     MAX_BYTES = 4000
     content_bytes = content.encode("utf-8")
+    webhook_url = get_wecom_webhook("briefing", required=False)
+    if not webhook_url:
+        log.warning("WECOM briefing webhook is not configured; skip push.")
+        return True
 
     if len(content_bytes) <= MAX_BYTES:
         payload = {"msgtype": "markdown", "markdown": {"content": content}}
         try:
-            r = httpx.post(WX_BRIEFING_URL, json=payload, timeout=15)
+            r = httpx.post(webhook_url, json=payload, timeout=15)
             resp = r.json()
             if resp.get("errcode") == 0:
                 log.info("推送成功 (%d 字节)", len(content_bytes))
@@ -360,7 +364,7 @@ def push_to_wecom(content: str) -> bool:
         header = f"## 📊 晚报 ({i+1}/{n})\n\n"
         payload = {"msgtype": "markdown", "markdown": {"content": header + part}}
         try:
-            r = httpx.post(WX_BRIEFING_URL, json=payload, timeout=15)
+            r = httpx.post(webhook_url, json=payload, timeout=15)
             if r.json().get("errcode") == 0:
                 ok += 1
                 log.info("  第 %d/%d 段 ✓", i + 1, n)
@@ -388,15 +392,8 @@ def _find_latest_trade_date(engine) -> str:
 
 def analyze_with_deepseek(data: dict, date_str: str) -> str:
     """用 DeepSeek 对盘面数据进行 AI 复盘分析"""
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        env_file = ROOT / ".env"
-        if env_file.is_file():
-            for line in env_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("DEEPSEEK_API_KEY="):
-                    api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+    settings = get_settings()
+    api_key = (settings.deepseek_api_key or "").strip()
     if not api_key:
         log.warning("未配置 DEEPSEEK_API_KEY，跳过 AI 分析")
         return ""
@@ -478,7 +475,7 @@ def analyze_with_deepseek(data: dict, date_str: str) -> str:
     try:
         resp = httpx.post(
             DEEPSEEK_URL,
-            json={"model": "deepseek-chat", "messages": [
+            json={"model": settings.deepseek_model, "messages": [
                 {"role": "system", "content": "你是资深A股首席分析师，擅长大盘复盘和趋势研判。用简洁专业的语言，给出明确的分析结论。控制在400字以内。"},
                 {"role": "user", "content": "\n".join(prompt_parts)},
             ], "temperature": 0.6, "max_tokens": 800},

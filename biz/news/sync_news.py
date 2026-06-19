@@ -5,18 +5,22 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 from sqlalchemy import create_engine, text
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from server.common.config import get_mysql_url, get_wecom_webhook
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-WX_NEWS_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=ba832a31-8ab8-4981-8491-42cf4650cddd"
-WX_BRIEFING_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b1110965-119d-438b-856d-0d87c751cf13"
 
 IMPORTANT_KEYWORDS = [
     "央行", "降息", "加息", "降准", "LPR", "MLF", "逆回购", "公开市场",
@@ -51,7 +55,7 @@ SRC_COLORS = {"cls": "warning", "eastmoney": "info", "sina": "comment"}
 
 
 def get_engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    url = get_mysql_url(required=True)
     return create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
 
 
@@ -271,7 +275,10 @@ def save_to_db(engine, items):
 
 def push_to_wecom(content_md, webhook_url=None):
     if webhook_url is None:
-        webhook_url = WX_NEWS_URL
+        webhook_url = get_wecom_webhook("news", required=False)
+    if not webhook_url:
+        log.warning("WECOM news webhook is not configured; skip push.")
+        return True
     payload = {"msgtype": "markdown", "markdown": {"content": content_md}}
     try:
         with httpx.Client(timeout=10) as client:
@@ -288,7 +295,10 @@ def push_to_wecom(content_md, webhook_url=None):
 
 def push_wecom_batched(blocks, header=None, webhook_url=None):
     if webhook_url is None:
-        webhook_url = WX_NEWS_URL
+        webhook_url = get_wecom_webhook("news", required=False)
+    if not webhook_url:
+        log.warning("WECOM webhook is not configured; skip %d batched message(s).", len(blocks))
+        return True
     MAX_BYTES = 4000
     messages = []
     current_parts = []
@@ -570,7 +580,7 @@ def push_daily_briefing(engine):
     footer = f'<font color="comment">来源: {src_tag} · ProBigA 每日早报</font>'
     blocks.append(footer)
 
-    ok = push_wecom_batched(blocks, header=header, webhook_url=WX_BRIEFING_URL)
+    ok = push_wecom_batched(blocks, header=header, webhook_url=get_wecom_webhook("briefing", required=False))
     if ok:
         log.info("每日早报推送成功: %d 条重要资讯", len(important))
         return len(important)
@@ -686,7 +696,7 @@ def push_weekly_preview(engine):
 
     blocks.append(f'<font color="comment">ProBigA 每周前瞻 · {today_str} 生成</font>')
 
-    ok = push_wecom_batched(blocks, header=header, webhook_url=WX_BRIEFING_URL)
+    ok = push_wecom_batched(blocks, header=header, webhook_url=get_wecom_webhook("briefing", required=False))
     if ok:
         log.info("每周前瞻推送成功: %d 条相关信息", len(weekly_relevant))
         return len(weekly_relevant)

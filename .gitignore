@@ -23,6 +23,7 @@ Thumbs.db
 *.sqlite3
 
 # Project specific
+runtime/
 *.zip
 *.tar
 *.sql

@@ -19,7 +19,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import numpy as np
@@ -34,17 +34,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.config import get_mysql_url
+from biz.stock_market.realtime_quotes import _ensure_rt_snapshot_table
 
 def _load_mysql_url() -> str:
-    url = os.environ.get("MYSQL_URL")
-    if url:
-        return url
-    for env_path in [ROOT / ".env", Path("/opt/ProBigA/.env")]:
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("MYSQL_URL="):
-                    return line.split("=", 1)[1].strip()
-    return "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+    return get_mysql_url(required=True)
 
 
 MYSQL_URL = _load_mysql_url()
@@ -59,6 +53,76 @@ SESSION.trust_env = False
 SESSION.verify = False
 
 BATCH_API = "https://push2delay.eastmoney.com/api/qt/clist/get"
+
+
+def _is_trade_day(engine, day: date | None = None) -> bool:
+    day = day or date.today()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM si_trade_calendar
+                    WHERE trade_date = :d
+                      AND trade_status = 1
+                    """
+                ),
+                {"d": day.isoformat()},
+            ).scalar()
+        return bool(row)
+    except Exception:
+        return day.weekday() < 5
+
+
+def is_trading_time(engine, now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    if not _is_trade_day(engine, now.date()):
+        return False
+    current = now.hour * 100 + now.minute
+    return (925 <= current <= 1135) or (1255 <= current <= 1505)
+
+
+def _latest_stock_universe_count(engine) -> int:
+    queries = [
+        """
+        SELECT COUNT(DISTINCT stock_code)
+        FROM sm_stock_kline
+        WHERE trade_date = (
+            SELECT MAX(trade_date)
+            FROM sm_stock_kline
+            WHERE k_type = 1
+        )
+          AND k_type = 1
+        """,
+        "SELECT COUNT(*) FROM si_all_code WHERE stock_code REGEXP '^(0|3|6)'",
+    ]
+    with engine.connect() as conn:
+        for sql in queries:
+            count = int(conn.execute(text(sql)).scalar() or 0)
+            if count > 0:
+                return count
+    return 0
+
+
+def _latest_open_trade_date(engine) -> str:
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(
+                text(
+                    """
+                    SELECT MAX(trade_date)
+                    FROM si_trade_calendar
+                    WHERE trade_status = 1
+                      AND trade_date <= CURDATE()
+                    """
+                )
+            ).scalar()
+        if value is not None:
+            return str(value)[:10]
+    except Exception:
+        pass
+    return date.today().isoformat()
 
 
 def safe_float(val) -> float:
@@ -103,7 +167,12 @@ def fetch_batch(fs: str, fields: str, page_size: int = 100) -> list[dict]:
     return all_items
 
 
-def refresh_snapshot(engine) -> int:
+def refresh_snapshot(
+    engine,
+    *,
+    min_coverage: float = 0.0,
+    archive_snapshot: bool = False,
+) -> int:
     """刷新个股行情快照 sm_stock_current"""
     items = fetch_batch(
         "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,"
@@ -136,16 +205,49 @@ def refresh_snapshot(engine) -> int:
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code"], keep="last")
 
+    expected = _latest_stock_universe_count(engine)
+    coverage = len(df) / max(expected, 1)
+    if min_coverage > 0 and coverage < min_coverage:
+        raise RuntimeError(
+            f"sm_stock_current coverage below threshold: "
+            f"{len(df)}/{expected} ({coverage:.1%}) < {min_coverage:.1%}"
+        )
+
     with engine.begin() as conn:
         conn.execute(text("TRUNCATE TABLE sm_stock_current"))
 
     df["etl_sync_at"] = now
     df.to_sql("sm_stock_current", engine, if_exists="append",
               index=False, chunksize=1000, method="multi")
+    if archive_snapshot:
+        _ensure_rt_snapshot_table(engine)
+        archive_cols = [
+            "stock_code",
+            "short_name",
+            "price",
+            "change",
+            "change_pct",
+            "volume",
+            "amount",
+            "snapshot_at",
+        ]
+        df[archive_cols].to_sql(
+            "sm_rt_quote_snapshot",
+            engine,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
     return len(df)
 
 
-def refresh_flow(engine) -> int:
+def refresh_flow(
+    engine,
+    *,
+    trade_date: str | None = None,
+    min_coverage: float = 0.0,
+) -> int:
     """刷新资金流向 sm_stock_capital_flow_daily（今天的数据）"""
     items = fetch_batch(
         "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,"
@@ -155,7 +257,7 @@ def refresh_flow(engine) -> int:
     if not items:
         return 0
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = (trade_date or _latest_open_trade_date(engine)).strip()
     now = datetime.now().replace(microsecond=0)
     rows = []
     for item in items:
@@ -177,6 +279,14 @@ def refresh_flow(engine) -> int:
 
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code"], keep="last")
+
+    expected = _latest_stock_universe_count(engine)
+    coverage = len(df) / max(expected, 1)
+    if min_coverage > 0 and coverage < min_coverage:
+        raise RuntimeError(
+            f"sm_stock_capital_flow_daily coverage below threshold: "
+            f"{len(df)}/{expected} ({coverage:.1%}) < {min_coverage:.1%}"
+        )
 
     with engine.begin() as conn:
         conn.execute(
@@ -287,36 +397,73 @@ def main():
     parser = argparse.ArgumentParser(description="盘中批量数据刷新")
     parser.add_argument("--only", choices=["snapshot", "flow", "concept", "index", "all"],
                         default="all")
+    parser.add_argument("--min-coverage", type=float, default=0.0)
+    parser.add_argument("--archive-snapshot", action="store_true")
+    parser.add_argument("--skip-closed", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--trade-date", default="")
     args = parser.parse_args()
 
     engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    if args.skip_closed and not is_trading_time(engine):
+        result = {
+            "status": "skipped",
+            "reason": "market_closed",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, default=str))
+        else:
+            print(f"  skipped: {result['reason']}", flush=True)
+        return 0
     t0 = time.time()
     results = {}
 
     if args.only in ("snapshot", "all"):
-        n = refresh_snapshot(engine)
+        n = refresh_snapshot(
+            engine,
+            min_coverage=args.min_coverage,
+            archive_snapshot=args.archive_snapshot,
+        )
         results["snapshot"] = n
-        print(f"  snapshot: {n} stocks", flush=True)
+        if not args.json:
+            print(f"  snapshot: {n} stocks", flush=True)
 
     if args.only in ("flow", "all"):
-        n = refresh_flow(engine)
+        n = refresh_flow(
+            engine,
+            trade_date=args.trade_date.strip() or None,
+            min_coverage=args.min_coverage,
+        )
         results["flow"] = n
-        print(f"  flow: {n} stocks", flush=True)
+        if not args.json:
+            print(f"  flow: {n} stocks", flush=True)
 
     if args.only in ("concept", "all"):
         n = refresh_concept_east(engine)
         results["concept"] = n
-        print(f"  concept_east: {n}", flush=True)
+        if not args.json:
+            print(f"  concept_east: {n}", flush=True)
 
     if args.only in ("index", "all"):
         n = refresh_index(engine)
         results["index"] = n
-        print(f"  index: {n}", flush=True)
+        if not args.json:
+            print(f"  index: {n}", flush=True)
 
     elapsed = time.time() - t0
-    print(f"  Done in {elapsed:.1f}s", flush=True)
-    return results
+    result = {
+        "status": "success",
+        "results": results,
+        "elapsed_seconds": round(elapsed, 1),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, default=str))
+    else:
+        print(f"  Done in {elapsed:.1f}s", flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

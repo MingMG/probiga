@@ -26,9 +26,10 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from server.common.config import get_mysql_url
 
 _SESSION = http.Session()
+_SESSION.trust_env = False
 _SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -37,7 +38,7 @@ _SESSION.headers.update({
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
 
 
 def _ensure_snapshot_date_column(engine):

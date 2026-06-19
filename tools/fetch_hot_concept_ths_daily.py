@@ -8,12 +8,14 @@
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from requests.exceptions import RequestException
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -22,11 +24,26 @@ if _ROOT_STR not in sys.path:
 if str(ROOT / "adata") not in sys.path:
     sys.path.insert(0, str(ROOT / "adata"))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+from server.common.config import get_mysql_url
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
+
+
+def _call_with_retry(fn, *args, retries: int = 3, delay: float = 3.0, **kwargs):
+    last = None
+    for i in range(max(1, retries)):
+        try:
+            return fn(*args, **kwargs)
+        except RequestException as e:
+            last = e
+            if i == retries - 1:
+                break
+            wait = delay * (i + 1)
+            print(f"  网络请求失败，{wait:.0f}s 后重试({i + 1}/{retries}): {e}")
+            time.sleep(wait)
+    raise last
 
 
 def fetch_hot_concept_ths_daily(snapshot_date: str):
@@ -39,7 +56,7 @@ def fetch_hot_concept_ths_daily(snapshot_date: str):
     hot = Hot()
     parts = []
     for plate_type in (1, 2):
-        df = hot.hot_concept_20_ths(plate_type=plate_type, snapshot_date=snapshot_date)
+        df = _call_with_retry(hot.hot_concept_20_ths, plate_type=plate_type, snapshot_date=snapshot_date)
         if df is not None and not df.empty:
             df = df.copy()
             df["plate_type"] = plate_type

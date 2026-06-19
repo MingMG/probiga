@@ -36,16 +36,15 @@ if str(ROOT / "adata") not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("briefing")
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-WX_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=b1110965-119d-438b-856d-0d87c751cf13"
+from server.common.config import get_mysql_url, get_settings, get_wecom_webhook
+
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"  # deepseek-v3
 
 HEADERS_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 
 def get_engine():
-    return create_engine(os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL, pool_pre_ping=True)
+    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
 
 
 def _read_sql(engine, sql: str, params: dict = None) -> list[dict]:
@@ -223,13 +222,14 @@ def crawl_all_news() -> list[str]:
 # ═══════════════════════════════════════════
 
 def call_deepseek(messages: list[dict]) -> str:
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    settings = get_settings()
+    api_key = (settings.deepseek_api_key or "").strip()
     if not api_key:
         raise RuntimeError("未配置 DEEPSEEK_API_KEY，请在 .env 中设置")
 
     resp = httpx.post(
         DEEPSEEK_URL,
-        json={"model": DEEPSEEK_MODEL, "messages": messages, "temperature": 0.7, "max_tokens": 8000},
+        json={"model": settings.deepseek_model, "messages": messages, "temperature": 0.7, "max_tokens": 8000},
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         timeout=180,
     )
@@ -333,6 +333,10 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 def push_to_wecom(content: str) -> bool:
     """推送到企业微信：超长自动分段 + 文件兜底"""
     MAX = 4000
+    webhook_url = get_wecom_webhook("briefing", required=False)
+    if not webhook_url:
+        log.warning("WECOM briefing webhook is not configured; skip push.")
+        return True
 
     # 按段落边界分块（优先在空行处断开）
     paragraphs = content.split("\n\n")
@@ -366,7 +370,7 @@ def push_to_wecom(content: str) -> bool:
         payload = {"msgtype": "markdown", "markdown": {"content": header + part}}
 
         try:
-            r = httpx.post(WX_WEBHOOK_URL, json=payload, timeout=15)
+            r = httpx.post(webhook_url, json=payload, timeout=15)
             resp = r.json()
             if resp.get("errcode") == 0:
                 ok += 1
@@ -393,14 +397,16 @@ def push_to_wecom(content: str) -> bool:
                 f.write(content)
 
             # 企微文件上传
-            upload_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key=b1110965-119d-438b-856d-0d87c751cf13&type=file"
+            upload_url = webhook_url.replace("/send?", "/upload_media?")
+            if "type=file" not in upload_url:
+                upload_url += "&type=file"
             with open(file_path, "rb") as f:
                 r = httpx.post(upload_url, files={"media": (os.path.basename(file_path), f, "text/markdown")}, timeout=30)
             upload_resp = r.json()
             if upload_resp.get("errcode") == 0:
                 media_id = upload_resp.get("media_id")
                 file_payload = {"msgtype": "file", "file": {"media_id": media_id}}
-                r2 = httpx.post(WX_WEBHOOK_URL, json=file_payload, timeout=15)
+                r2 = httpx.post(webhook_url, json=file_payload, timeout=15)
                 log.info("文件方式推送: %s", r2.text[:100])
             else:
                 log.error("文件上传失败: %s", upload_resp)
@@ -419,16 +425,6 @@ def main():
     p.add_argument("--test", action="store_true", help="不推送，仅打印")
     p.add_argument("--output", default="")
     args, unknown = p.parse_known_args()
-
-    # 从 .env 加载环境变量（调度器环境下可能没有）
-    _env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
-    if os.path.isfile(_env_file):
-        for line in open(_env_file):
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                if k.strip() not in os.environ:
-                    os.environ[k.strip()] = v.strip()
 
     engine = get_engine()
 
@@ -452,7 +448,7 @@ def main():
     log.info("  共 %d 条（DB:%d + crawl:%d）", len(deduped_news), len(db_news), len(news))
 
     # DeepSeek 分析
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    api_key = (get_settings().deepseek_api_key or "").strip()
     if args.test:
         briefing = _generate_fallback(market_data, deduped_news)
         log.info("3/4 跳过 AI（--test模式），使用模板生成")

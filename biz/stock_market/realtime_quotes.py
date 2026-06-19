@@ -15,14 +15,13 @@ A 股多股「最新价」快照（新浪 ``hq.sinajs.cn``，与 adata 文档中
     python -m biz.stock_market.realtime_quotes --mysql
     python -m biz.stock_market.realtime_quotes --mysql --no-rt-ddl
 
-``--mysql``：追加写入 ``probiga.sm_rt_quote_snapshot``（见 ``biz/stock_market/sql/01_sm_rt_quote_snapshot.sql``），连接串同 STOCK-INFO：环境变量 ``MYSQL_URL``，默认 ``mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4``。
+``--mysql``：追加写入 ``probiga.sm_rt_quote_snapshot``（见 ``biz/stock_market/sql/01_sm_rt_quote_snapshot.sql``），连接串使用 ``MYSQL_URL`` 或项目根目录 ``.env``。
 
 与官方文档对齐的字段：stock_code, short_name, price, change, change_pct, volume, amount。
 """
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 from datetime import datetime
@@ -31,6 +30,12 @@ from pathlib import Path
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from server.common.config import get_mysql_url
 
 # 与 adata.common.utils.code_utils.exchange_suffix 一致（6 位代码前两位 -> 交易所字母）
 _EXCHANGE_SUFFIX = {
@@ -114,9 +119,6 @@ def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
 
 
 _RT_DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_sm_rt_quote_snapshot.sql"
-_DEFAULT_MYSQL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-
-
 def _ensure_rt_snapshot_table(engine) -> None:
     if not _RT_DDL_PATH.is_file():
         raise FileNotFoundError(f"缺少建表 SQL：{_RT_DDL_PATH}")
@@ -135,8 +137,7 @@ def _ensure_rt_snapshot_table(engine) -> None:
 
 
 def save_to_mysql(df: pd.DataFrame, *, run_ddl: bool) -> int:
-    url = os.environ.get("MYSQL_URL", _DEFAULT_MYSQL)
-    engine = create_engine(url, pool_pre_ping=True, future=True)
+    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
     if run_ddl:
         _ensure_rt_snapshot_table(engine)
     ts = datetime.now().replace(microsecond=0)

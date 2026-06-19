@@ -29,7 +29,7 @@ ADJUST_TO_INT = {"": 0, "qfq": 1, "hfq": 2}
 _EAST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ),
     "Referer": "https://quote.eastmoney.com/",
     "Accept": "application/json, text/plain, */*",
@@ -103,11 +103,13 @@ def _klines_json_to_df(data_json: dict[str, Any]) -> Optional[pd.DataFrame]:
             "收盘": "close",
             "成交量": "volume",
             "成交额": "amount",
+            "涨跌幅": "change_pct",
+            "涨跌额": "change",
             "换手率": "turnover",
         }
     )
     temp_df["date"] = pd.to_datetime(temp_df["date"], errors="coerce").dt.normalize()
-    for col in ("open", "high", "low", "close", "volume", "amount", "turnover"):
+    for col in ("open", "high", "low", "close", "volume", "amount", "change_pct", "change", "turnover"):
         temp_df[col] = pd.to_numeric(temp_df[col], errors="coerce")
     temp_df["volume"] = temp_df["volume"] * 100
     temp_df["outstanding_share"] = None
@@ -156,9 +158,16 @@ def _to_yyyy_mm_dd(d: str) -> str:
 def _east_secid(stock_code: str) -> str:
     """东财 secid，与 AkShare stock_zh_a_hist / adata 东财 K 线一致。"""
     c = str(stock_code).strip().zfill(6)
+    if c.startswith(("43", "83", "87", "88", "82", "92")):
+        return f"0.{c}"
     if c.startswith("6") or c.startswith("9"):
         return f"1.{c}"
     return f"0.{c}"
+
+
+def _is_bj_code(stock_code: str) -> bool:
+    c = str(stock_code).strip().zfill(6)
+    return c.startswith(("43", "83", "87", "88", "82", "92"))
 
 
 def _kline_engine() -> str:
@@ -180,6 +189,11 @@ def fetch_stock_daily_kline(
     """
     eng = _kline_engine()
     if eng in ("east", "em", "eastmoney"):
+        return _fetch_eastmoney_daily_kline(
+            stock_code, start_date, end_date, adjust, timeout=timeout
+        )
+    if _is_bj_code(stock_code):
+        logger.info("北交所 K 线 %s 优先使用东财源，避免新浪源缺失除权参考价。", stock_code)
         return _fetch_eastmoney_daily_kline(
             stock_code, start_date, end_date, adjust, timeout=timeout
         )
@@ -226,6 +240,7 @@ def _fetch_eastmoney_daily_kline(
     parts: list[pd.DataFrame] = []
 
     with requests.Session() as session:
+        session.trust_env = os.environ.get("SM_TRUST_ENV_PROXY") == "1"
         session.headers.update(_EAST_HEADERS)
         for cbeg, cend in _iter_yyyymmdd_chunks(start_date, end_date, chunk_days):
             params = {**params_fixed, "beg": cbeg, "end": cend}
@@ -269,10 +284,34 @@ def akshare_daily_to_sm_kline(
         raise ValueError("K 线 DataFrame 缺少 date 列")
     work = df.copy()
     work["date"] = pd.to_datetime(work["date"], errors="coerce")
-    work = work.dropna(subset=["date"]).sort_values("date")
-    work["prev_close_calc"] = work["close"].shift(1)
+    work = work.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    if "pre_close" in work.columns:
+        source_pre_close = pd.to_numeric(work["pre_close"], errors="coerce")
+    elif "prevclose" in work.columns:
+        source_pre_close = pd.to_numeric(work["prevclose"], errors="coerce")
+    else:
+        source_pre_close = pd.Series([None] * len(work), index=work.index)
+    has_source_change = "change" in work.columns
+    has_source_change_pct = "change_pct" in work.columns
+    work["prev_close_calc"] = source_pre_close.fillna(work["close"].shift(1))
     work["change_calc"] = work["close"] - work["prev_close_calc"]
     work["change_pct_calc"] = (work["change_calc"] / work["prev_close_calc"]) * 100
+    if not has_source_change:
+        work["change"] = work["change_calc"]
+    else:
+        work["change"] = pd.to_numeric(work["change"], errors="coerce").fillna(work["change_calc"])
+    if not has_source_change_pct:
+        work["change_pct"] = work["change_pct_calc"]
+    else:
+        work["change_pct"] = pd.to_numeric(work["change_pct"], errors="coerce").fillna(work["change_pct_calc"])
+    work["pre_close"] = work["close"] - work["change"]
+    invalid_pre_close = work["pre_close"].isna() | (work["pre_close"] <= 0)
+    pct_base = 1 + (work["change_pct"] / 100)
+    work.loc[invalid_pre_close & pct_base.ne(0), "pre_close"] = work["close"] / pct_base
+    work["pre_close"] = work["pre_close"].fillna(work["prev_close_calc"])
+    if not has_source_change and not has_source_change_pct:
+        suspicious_gap = source_pre_close.isna() & work["change_pct"].abs().gt(30)
+        work.loc[suspicious_gap, ["change", "change_pct", "pre_close"]] = None
     work["turnover_ratio"] = work["turnover"] if "turnover" in work.columns else None
 
     rows: list[dict[str, Any]] = []
@@ -303,10 +342,10 @@ def akshare_daily_to_sm_kline(
                 "low": num(r.get("low")),
                 "volume": num(r.get("volume")),
                 "amount": num(r.get("amount")),
-                "change": num(r.get("change_calc")),
-                "change_pct": num(r.get("change_pct_calc")),
+                "change": num(r.get("change")),
+                "change_pct": num(r.get("change_pct")),
                 "turnover_ratio": num(r.get("turnover_ratio")),
-                "pre_close": num(r.get("prev_close_calc")),
+                "pre_close": num(r.get("pre_close")),
             }
         )
     return pd.DataFrame(rows)

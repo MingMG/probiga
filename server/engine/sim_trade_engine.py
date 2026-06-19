@@ -2,7 +2,7 @@
 """
 模拟交易引擎
 
-三种策略的买入/卖出信号检测，以及交易执行逻辑。
+多策略的买入/卖出信号检测，以及交易执行逻辑。
 盘中实时检测信号，以当前价模拟交易。
 """
 
@@ -16,6 +16,11 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.api.routers.portfolio_math import portfolio_trade_fee
+from server.common.minute_data import (
+    get_first_stock_minute_price,
+    get_max_stock_minute_price,
+    get_stock_minute_prices,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +73,203 @@ STRATEGY_CONFIG = {
         "min_fundamental_score": 60,
         "max_risk_level": "LOW",
     },
+    "main_wave": {
+        "name": "主升浪",
+        "max_holding": 2,
+        "max_days": 60,
+        "take_profit": 80.0,
+        "stop_loss": -10.0,
+        "trailing_activate": 35.0,
+        "trailing_drawdown": 8.0,
+        "buy_amount": 100000,
+        "min_ai_score": 74,
+        "min_short_score": 0,
+        "min_capital_score": 0,
+        "min_technical_score": 0,
+        "min_main_wave_score": 74,
+        "min_trend_hold_score": 58,
+        "max_risk_level": "LOW",
+    },
 }
 
 RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+VALID_TRADE_MODES = {"live", "backtest", "forward"}
+SNAPSHOT_FALLBACK_MAX_AGE_MINUTES = 5
+
+
+def _safe_float(v, default=0.0) -> float:
+    try:
+        return float(v) if v is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _sina_symbol(stock_code: str) -> str:
+    code = str(stock_code).strip().zfill(6)
+    if code.startswith(("43", "83", "87", "92")):
+        return "bj" + code
+    if code.startswith(("6", "9")):
+        return "sh" + code
+    return "sz" + code
+
+
+def _score_value(data: dict, *keys: str, default=0.0) -> float:
+    for key in keys:
+        if key in data and data.get(key) is not None:
+            return _safe_float(data.get(key), default)
+    return default
+
+
+def build_buy_decision(strategy_type: str, candidate: dict) -> dict:
+    """
+    将 AI 推荐记录转换成明确的买入判断。
+
+    规则口径：
+    - 推荐资格必须是 ALLOW
+    - AI 综合评分达到策略阈值，当前默认为 >=70
+    - 风险等级不超过策略允许上限
+    - 再按超短/短线/波段分别检查资金、技术、基本面等确认项
+    """
+    cfg = STRATEGY_CONFIG.get(strategy_type)
+    if not cfg:
+        return {"allowed": False, "analysis": {}, "reason": f"未知策略: {strategy_type}"}
+
+    short_score = _score_value(candidate, "short_score", "short_term_score")
+    ai_score = _score_value(candidate, "ai_score", default=short_score)
+    if ai_score <= 0:
+        ai_score = short_score
+    final_trade_score = _score_value(candidate, "final_trade_score", default=ai_score)
+    if final_trade_score <= 0:
+        final_trade_score = ai_score
+    quality_score = _score_value(candidate, "quality_score", default=ai_score)
+    entry_score = _score_value(candidate, "entry_score", default=final_trade_score)
+    expected_return_pct = _score_value(candidate, "expected_return_pct", default=0)
+    heat_overload_score = _score_value(candidate, "heat_overload_score", default=60)
+    confidence_score = _score_value(candidate, "confidence_score", default=62)
+    main_wave_score = _score_value(candidate, "main_wave_score", default=0)
+    trend_hold_score = _score_value(candidate, "trend_hold_score", default=0)
+    main_wave_signal = str(candidate.get("main_wave_signal") or "NONE").upper()
+    if strategy_type == "main_wave" and main_wave_score > 0:
+        final_trade_score = main_wave_score
+    long_score = _score_value(candidate, "long_score", "long_term_score")
+    capital_score = _score_value(candidate, "capital_score")
+    technical_score = _score_value(candidate, "technical_score", "technical")
+    fundamental_score = _score_value(candidate, "fundamental_score", "fundamental")
+    risk_level = str(candidate.get("event_risk_level") or "LOW").upper()
+    recommend_status = str(candidate.get("recommend_status") or "ALLOW").upper()
+    signal_status = str(candidate.get("signal_status") or "CONFIRM").upper()
+
+    analysis = {
+        "ai_score": ai_score,
+        "quality_score": quality_score,
+        "entry_score": entry_score,
+        "final_trade_score": final_trade_score,
+        "expected_return_pct": expected_return_pct,
+        "heat_overload_score": heat_overload_score,
+        "confidence_score": confidence_score,
+        "main_wave_score": main_wave_score,
+        "trend_hold_score": trend_hold_score,
+        "main_wave_signal": main_wave_signal,
+        "short_score": short_score,
+        "long_score": long_score,
+        "capital_score": capital_score,
+        "technical_score": technical_score,
+        "fundamental_score": fundamental_score,
+        "event_risk_level": risk_level,
+        "signal_status": signal_status,
+        "short_name": candidate.get("short_name") or candidate.get("stock_name") or "",
+        "orig_reason": candidate.get("reason") or candidate.get("summary") or "",
+        "sources": candidate.get("sources") or "",
+    }
+
+    blockers = []
+    reason_parts = []
+
+    if recommend_status != "ALLOW":
+        blockers.append(f"推荐资格为{recommend_status}，不是ALLOW")
+    else:
+        reason_parts.append("推荐资格ALLOW")
+
+    if signal_status in {"BLOCK", "WATCH", "SELL_ALERT"}:
+        blockers.append(f"AI signal status is {signal_status}; waiting for confirmation")
+    elif signal_status:
+        reason_parts.append(f"AI signal status {signal_status}")
+
+    if final_trade_score < cfg["min_ai_score"]:
+        blockers.append(f"最终交易评分{final_trade_score:.0f}分低于{cfg['min_ai_score']}分")
+    else:
+        reason_parts.append(f"最终交易评分{final_trade_score:.0f}分>={cfg['min_ai_score']}分")
+
+    if entry_score < 55:
+        blockers.append(f"买点评分{entry_score:.0f}分不足")
+    else:
+        reason_parts.append(f"买点评分{entry_score:.0f}分确认")
+
+    if strategy_type != "main_wave" and expected_return_pct and expected_return_pct < 5:
+        blockers.append(f"预期上涨空间{expected_return_pct:.1f}%不足5%")
+    if heat_overload_score < 50:
+        blockers.append(f"热度拥挤度健康分{heat_overload_score:.0f}过低")
+    if confidence_score < 45:
+        blockers.append(f"推荐一致性{confidence_score:.0f}分过低")
+
+    if not _check_risk_level(risk_level, cfg["max_risk_level"]):
+        blockers.append(f"风险等级{risk_level}超过允许上限{cfg['max_risk_level']}")
+    else:
+        reason_parts.append(f"风险等级{risk_level}(允许{cfg['max_risk_level']})")
+
+    if strategy_type == "ultra_short":
+        if short_score < cfg["min_short_score"]:
+            blockers.append(f"短期评分{short_score:.0f}分低于{cfg['min_short_score']}分")
+        else:
+            reason_parts.append(f"短期评分{short_score:.0f}分>={cfg['min_short_score']}分")
+        if capital_score < cfg["min_capital_score"]:
+            blockers.append(f"资金面{capital_score:.0f}分低于{cfg['min_capital_score']}分")
+        else:
+            reason_parts.append(f"资金面{capital_score:.0f}分>={cfg['min_capital_score']}分")
+    elif strategy_type == "short_term":
+        if short_score < cfg["min_short_score"]:
+            blockers.append(f"短期评分{short_score:.0f}分低于{cfg['min_short_score']}分")
+        else:
+            reason_parts.append(f"短期评分{short_score:.0f}分>={cfg['min_short_score']}分")
+        if technical_score < cfg["min_technical_score"]:
+            blockers.append(f"技术面{technical_score:.0f}分低于{cfg['min_technical_score']}分")
+        else:
+            reason_parts.append(f"技术面{technical_score:.0f}分>={cfg['min_technical_score']}分")
+    elif strategy_type == "swing":
+        min_long = cfg.get("min_long_score", 0)
+        min_fundamental = cfg.get("min_fundamental_score", 0)
+        if long_score < min_long:
+            blockers.append(f"长期评分{long_score:.0f}分低于{min_long}分")
+        else:
+            reason_parts.append(f"长期评分{long_score:.0f}分>={min_long}分")
+        if fundamental_score < min_fundamental:
+            blockers.append(f"基本面{fundamental_score:.0f}分低于{min_fundamental}分")
+        else:
+            reason_parts.append(f"基本面{fundamental_score:.0f}分>={min_fundamental}分")
+    elif strategy_type == "main_wave":
+        min_main_wave = cfg.get("min_main_wave_score", 0)
+        min_hold = cfg.get("min_trend_hold_score", 0)
+        if main_wave_score < min_main_wave:
+            blockers.append(f"主升浪评分{main_wave_score:.0f}分低于{min_main_wave}分")
+        else:
+            reason_parts.append(f"主升浪评分{main_wave_score:.0f}分>={min_main_wave}分")
+        if trend_hold_score < min_hold:
+            blockers.append(f"趋势持有评分{trend_hold_score:.0f}分低于{min_hold}分")
+        else:
+            reason_parts.append(f"趋势持有评分{trend_hold_score:.0f}分>={min_hold}分")
+        if main_wave_signal not in {"BUY_READY", "WATCH"}:
+            blockers.append(f"主升浪信号为{main_wave_signal}，不是买点")
+        elif main_wave_signal == "BUY_READY":
+            reason_parts.append("主升浪买点就绪")
+
+    if analysis["sources"]:
+        reason_parts.append(f"来源:{analysis['sources']}")
+    if analysis["orig_reason"]:
+        reason_parts.append(f"AI摘要:{analysis['orig_reason']}")
+
+    if blockers:
+        return {"allowed": False, "analysis": analysis, "reason": "；".join(blockers)}
+    return {"allowed": True, "analysis": analysis, "reason": "；".join(reason_parts)}
 
 
 def _random_intraday_time(seed: str, session: str = "any") -> str:
@@ -115,6 +314,93 @@ def _exec_sql(sql: str, params: dict = None):
         c.execute(text(sql), params)
 
 
+def _table_columns(table_name: str) -> set[str]:
+    rows = _read_sql("""
+        SELECT COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = :table_name
+    """, {"table_name": table_name})
+    return {str(r.get("COLUMN_NAME")) for r in rows}
+
+
+def _select_expr(columns: set[str], column: str, default: str, alias: str = "") -> str:
+    alias = alias or column
+    if column in columns:
+        return f"`{column}` AS `{alias}`"
+    return f"{default} AS `{alias}`"
+
+
+def fetch_recommended_candidates(pick_date: str) -> list[dict]:
+    """读取推荐表，兼容旧版 st_recommended_stocks 缺少新评分列的情况。"""
+    columns = _table_columns("st_recommended_stocks")
+    if not columns:
+        return []
+
+    long_expr = (
+        "`long_term_score` AS `long_term_score`"
+        if "long_term_score" in columns else
+        "`fundamental` AS `long_term_score`"
+        if "fundamental" in columns else
+        "0 AS `long_term_score`"
+    )
+    short_expr = (
+        "`short_term_score` AS `short_term_score`"
+        if "short_term_score" in columns else
+        "`ai_score` AS `short_term_score`"
+        if "ai_score" in columns else
+        "0 AS `short_term_score`"
+    )
+    status_filter = "AND (recommend_status IS NULL OR recommend_status = 'ALLOW')" if "recommend_status" in columns else ""
+
+    return _read_sql(f"""
+        SELECT
+            {_select_expr(columns, "stock_code", "''")},
+            {_select_expr(columns, "short_name", "''")},
+            {_select_expr(columns, "ai_score", "0")},
+            {long_expr},
+            {short_expr},
+            {_select_expr(columns, "fundamental", "0")},
+            {_select_expr(columns, "capital_score", "0")},
+            {_select_expr(columns, "valuation", "0")},
+            {_select_expr(columns, "technical", "0")},
+            {_select_expr(columns, "reason", "''")},
+            {_select_expr(columns, "sources", "''")},
+            {_select_expr(columns, "recommend_status", "'ALLOW'")},
+            {_select_expr(columns, "recommend_reason", "''")},
+            {_select_expr(columns, "event_risk_level", "'LOW'")},
+            {_select_expr(columns, "sentiment_score", "0")},
+            {_select_expr(columns, "market_mood_score", "0")},
+            {_select_expr(columns, "event_score", "0")},
+            {_select_expr(columns, "signal_status", "'CONFIRM'")},
+            {_select_expr(columns, "primary_strategy", "''")},
+            {_select_expr(columns, "entry_price_low", "NULL")},
+            {_select_expr(columns, "entry_price_high", "NULL")},
+            {_select_expr(columns, "stop_loss_price", "NULL")},
+            {_select_expr(columns, "take_profit_1", "NULL")},
+            {_select_expr(columns, "take_profit_2", "NULL")},
+            {_select_expr(columns, "position_weight", "NULL")},
+            {_select_expr(columns, "max_holding_days", "NULL")},
+            {_select_expr(columns, "quality_score", "0")},
+            {_select_expr(columns, "entry_score", "0")},
+            {_select_expr(columns, "final_trade_score", "0")},
+            {_select_expr(columns, "expected_return_pct", "0")},
+            {_select_expr(columns, "heat_overload_score", "0")},
+            {_select_expr(columns, "confidence_score", "0")},
+            {_select_expr(columns, "main_wave_score", "0")},
+            {_select_expr(columns, "trend_hold_score", "0")},
+            {_select_expr(columns, "main_wave_signal", "'NONE'")},
+            {_select_expr(columns, "main_wave_reason", "''")},
+            {_select_expr(columns, "trend_stop_price", "NULL")},
+            {_select_expr(columns, "trend_reduce_price", "NULL")},
+            {_select_expr(columns, "suitable_strategies", "''")}
+        FROM st_recommended_stocks
+        WHERE pick_date = :d
+          {status_filter}
+        ORDER BY ai_score DESC
+    """, {"d": pick_date})
+
+
 def _ensure_tables():
     """确保模拟交易相关表存在"""
     try:
@@ -124,6 +410,7 @@ def _ensure_tables():
                 `stock_code`      VARCHAR(10)  NOT NULL,
                 `short_name`      VARCHAR(20)  DEFAULT '',
                 `strategy_type`   VARCHAR(20)  NOT NULL,
+                `trade_mode`      VARCHAR(20)  DEFAULT 'live',
                 `buy_price`       DECIMAL(12,4) NOT NULL,
                 `buy_amount`      DECIMAL(14,2) NOT NULL,
                 `buy_shares`      INT          NOT NULL,
@@ -146,14 +433,27 @@ def _ensure_tables():
                 `profit_rate`     DECIMAL(8,4) DEFAULT 0,
                 `holding_days`    INT          DEFAULT 0,
                 `fee_total`       DECIMAL(10,2) DEFAULT 0,
-                `created_at`      DATETIME     DEFAULT CURRENT_TIMESTAMP,
-                `updated_at`      DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                `created_at`      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                `updated_at`      DATETIME     DEFAULT NULL,
                 INDEX `idx_strategy_status` (`strategy_type`, `status`),
+                INDEX `idx_trade_mode` (`trade_mode`, `strategy_type`, `status`),
                 INDEX `idx_stock_code` (`stock_code`),
                 INDEX `idx_buy_date` (`buy_date`),
                 INDEX `idx_status` (`status`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+        try:
+            _exec_sql("ALTER TABLE `st_sim_position` ADD COLUMN `trade_mode` VARCHAR(20) DEFAULT 'live' AFTER `strategy_type`")
+        except Exception:
+            pass
+        try:
+            _exec_sql("ALTER TABLE `st_sim_position` ADD INDEX `idx_trade_mode` (`trade_mode`, `strategy_type`, `status`)")
+        except Exception:
+            pass
+        try:
+            _exec_sql("ALTER TABLE `st_sim_position` MODIFY COLUMN `sell_reason` TEXT")
+        except Exception:
+            pass
         _exec_sql("""
             CREATE TABLE IF NOT EXISTS `st_trade_flow` (
                 `id`              BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -162,6 +462,7 @@ def _ensure_tables():
                 `flow_type`       VARCHAR(20)  NOT NULL,
                 `source`          VARCHAR(20)  NOT NULL,
                 `strategy_type`   VARCHAR(20)  DEFAULT '',
+                `trade_mode`      VARCHAR(20)  DEFAULT 'live',
                 `trans_type`      VARCHAR(10)  NOT NULL,
                 `price`           DECIMAL(12,4) NOT NULL,
                 `shares`          INT          NOT NULL,
@@ -171,7 +472,7 @@ def _ensure_tables():
                 `ai_score`        DECIMAL(5,2) DEFAULT 0,
                 `trans_date`      DATE         NOT NULL,
                 `trans_time`      VARCHAR(20)  DEFAULT '',
-                `created_at`      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                `created_at`      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
                 INDEX `idx_flow_type` (`flow_type`),
                 INDEX `idx_source` (`source`),
                 INDEX `idx_stock_date` (`stock_code`, `trans_date`),
@@ -179,6 +480,18 @@ def _ensure_tables():
                 INDEX `idx_strategy` (`strategy_type`, `trans_date`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+        try:
+            _exec_sql("ALTER TABLE `st_trade_flow` ADD COLUMN `trade_mode` VARCHAR(20) DEFAULT 'live' AFTER `strategy_type`")
+        except Exception:
+            pass
+        try:
+            _exec_sql("ALTER TABLE `st_trade_flow` ADD INDEX `idx_trade_mode` (`trade_mode`, `strategy_type`, `trans_date`)")
+        except Exception:
+            pass
+        try:
+            _exec_sql("ALTER TABLE `st_trade_flow` MODIFY COLUMN `reason` TEXT")
+        except Exception:
+            pass
         _exec_sql("""
             CREATE TABLE IF NOT EXISTS `st_strategy_snapshot` (
                 `id`              BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -195,7 +508,7 @@ def _ensure_tables():
                 `max_loss_rate`   DECIMAL(8,4) DEFAULT 0,
                 `holding_count`   INT          DEFAULT 0,
                 `holding_amount`  DECIMAL(14,2) DEFAULT 0,
-                `created_at`      DATETIME     DEFAULT CURRENT_TIMESTAMP,
+                `created_at`      TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY `uk_date_strategy` (`snapshot_date`, `strategy_type`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
@@ -218,8 +531,7 @@ def _fetch_live_price_sina(stock_code: str) -> dict | None:
     try:
         import requests
         code = str(stock_code).strip().zfill(6)
-        prefix = "sh" if code.startswith("6") else "sz"
-        url = f"https://hq.sinajs.cn/list={prefix}{code}"
+        url = f"https://hq.sinajs.cn/list={_sina_symbol(code)}"
         resp = requests.get(url, headers={
             "User-Agent": "Mozilla/5.0 ProBigA",
             "Referer": "https://finance.sina.com.cn",
@@ -252,7 +564,7 @@ def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
         clean = [str(c).strip().zfill(6) for c in stock_codes if c]
         if not clean:
             return {}
-        symbols = ",".join([("sh" + c if c.startswith("6") else "sz" + c) for c in clean])
+        symbols = ",".join(_sina_symbol(c) for c in clean)
         resp = requests.get(
             f"https://hq.sinajs.cn/list={symbols}",
             headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn"},
@@ -297,14 +609,15 @@ def _get_current_price(stock_code: str) -> dict | None:
             return live
         # 接口失败时降级到数据库快照
         try:
-            rows = _read_sql("""
+            rows = _read_sql(f"""
                 SELECT price, snapshot_at FROM sm_rt_quote_snapshot
-                WHERE stock_code = :c LIMIT 1
+                WHERE stock_code = :c
+                  AND snapshot_at >= NOW() - INTERVAL {SNAPSHOT_FALLBACK_MAX_AGE_MINUTES} MINUTE
+                ORDER BY snapshot_at DESC
+                LIMIT 1
             """, {"c": code})
             if rows and rows[0].get("price") and float(rows[0]["price"]) > 0:
-                snap = str(rows[0].get("snapshot_at") or "")
-                if snap[:10] == date.today().isoformat():
-                    return {"price": float(rows[0]["price"]), "source": "snapshot_fallback"}
+                return {"price": float(rows[0]["price"]), "source": "snapshot_fallback"}
         except Exception:
             pass
 
@@ -324,6 +637,42 @@ def _get_current_price(stock_code: str) -> dict | None:
     return None
 
 
+def _minute_time_text(value) -> str:
+    """Return HH:MM:SS from a DB datetime/time value."""
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M:%S")
+    s = str(value)
+    if " " in s:
+        s = s.split(" ", 1)[1]
+    if len(s) == 5:
+        return s + ":00"
+    return s[:8]
+
+
+def get_first_minute_price(stock_code: str, trade_date: str) -> dict | None:
+    """Get the first available intraday minute price on a validation date."""
+    code = str(stock_code).strip().zfill(6)
+    row = get_first_stock_minute_price(code, trade_date)
+    if not row:
+        return None
+    return {
+        "price": float(row["price"]),
+        "change_pct": _safe_float(row.get("change_pct")),
+        "time": _minute_time_text(row.get("trade_time")),
+        "source": row.get("source") or "minute_open",
+        "trade_time": str(row.get("trade_time") or ""),
+    }
+
+
+def get_minute_prices(stock_code: str, start_date: str, end_date: str = "") -> list[dict]:
+    """Read ordered minute prices for a stock over a date range."""
+    code = str(stock_code).strip().zfill(6)
+    end_date = end_date or start_date
+    return get_stock_minute_prices(code, start_date, end_date)
+
+
 def _calc_shares(price: float, amount: int) -> int:
     """计算可买股数(100的整数倍)"""
     if price <= 0:
@@ -337,6 +686,28 @@ def _check_risk_level(stock_risk: str, max_risk: str) -> bool:
     r = RISK_ORDER.get(stock_risk, 99)
     m = RISK_ORDER.get(max_risk, 99)
     return r <= m
+
+
+def _is_near_limit_up(price_info: dict | None) -> bool:
+    """A股模拟撮合：接近涨停时不模拟追价买入。"""
+    if not price_info:
+        return False
+    return _safe_float(price_info.get("change_pct")) >= 9.7
+
+
+def _is_near_limit_down(price_info: dict | None) -> bool:
+    """A股模拟撮合：接近跌停时认为卖出流动性不足。"""
+    if not price_info:
+        return False
+    return _safe_float(price_info.get("change_pct")) <= -9.7
+
+
+def _open_change_pct(row: dict) -> float | None:
+    open_price = _safe_float(row.get("open"))
+    pre_close = _safe_float(row.get("pre_close"))
+    if open_price > 0 and pre_close > 0:
+        return (open_price - pre_close) / pre_close * 100
+    return None
 
 
 class SimTradeEngine:
@@ -361,16 +732,19 @@ class SimTradeEngine:
         cfg = STRATEGY_CONFIG.get(strategy_type)
         if not cfg:
             return []
+        if not _is_trading_time():
+            logger.info("非交易时间，跳过实时模拟买入扫描: %s", strategy_type)
+            return []
 
         _ensure_tables()
 
         # 检查当前持仓数
-        holding_count = self._get_holding_count(strategy_type)
+        holding_count = self._get_holding_count(strategy_type, trade_mode="live")
         if holding_count >= cfg["max_holding"]:
             return []
 
         # 获取已持仓的股票代码
-        holding_codes = self._get_holding_codes(strategy_type)
+        holding_codes = self._get_holding_codes(strategy_type, trade_mode="live")
 
         # 从推荐表获取最新数据
         latest_pick = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
@@ -378,15 +752,7 @@ class SimTradeEngine:
             return []
         pick_date = str(latest_pick[0]["d"])[:10]
 
-        candidates = _read_sql("""
-            SELECT stock_code, short_name, ai_score, long_term_score, short_term_score,
-                   fundamental, capital_score, valuation, technical, reason,
-                   recommend_status, event_risk_level, sentiment_score, event_score
-            FROM st_recommended_stocks
-            WHERE pick_date = :d
-              AND recommend_status = 'ALLOW'
-            ORDER BY ai_score DESC
-        """, {"d": pick_date})
+        candidates = fetch_recommended_candidates(pick_date)
 
         if not candidates:
             return []
@@ -403,40 +769,10 @@ class SimTradeEngine:
             if code in holding_codes:
                 continue
 
-            ai_score = float(c.get("ai_score") or c.get("short_term_score") or 0)
-            short_score = float(c.get("short_term_score") or 0)
-            long_score = float(c.get("long_term_score") or 0)
-            capital_score = float(c.get("capital_score") or 0)
-            technical_score = float(c.get("technical") or 0)
-            fundamental_score = float(c.get("fundamental") or 0)
-            risk_level = str(c.get("event_risk_level") or "LOW")
-
-            # 基础门槛: AI评分
-            if ai_score < cfg["min_ai_score"]:
+            decision = build_buy_decision(strategy_type, c)
+            if not decision["allowed"]:
                 continue
-
-            # 策略特定条件
-            if strategy_type == "ultra_short":
-                if short_score < cfg["min_short_score"]:
-                    continue
-                if capital_score < cfg["min_capital_score"]:
-                    continue
-
-            elif strategy_type == "short_term":
-                if short_score < cfg["min_short_score"]:
-                    continue
-                if technical_score < cfg["min_technical_score"]:
-                    continue
-
-            elif strategy_type == "swing":
-                if long_score < cfg.get("min_long_score", 0):
-                    continue
-                if fundamental_score < cfg.get("min_fundamental_score", 0):
-                    continue
-
-            # 风险等级过滤
-            if not _check_risk_level(risk_level, cfg["max_risk_level"]):
-                continue
+            analysis = decision["analysis"]
 
             # 获取当前价格：优先用批量行情
             price_info = live_prices.get(code)
@@ -446,44 +782,43 @@ class SimTradeEngine:
                 continue
 
             price = price_info["price"]
+            if _is_near_limit_up(price_info):
+                continue
+            entry_low = _safe_float(c.get("entry_price_low"), 0.0)
+            entry_high = _safe_float(c.get("entry_price_high"), 0.0)
+            if entry_low > 0 and entry_high > 0 and not (entry_low <= price <= entry_high):
+                continue
             shares = _calc_shares(price, cfg["buy_amount"])
             if shares <= 0:
                 continue
-
-            # ── 构建买入理由 ──
-            reason_parts = []
-            reason_parts.append(f"AI综合评分{ai_score:.0f}分(阈值{cfg['min_ai_score']})")
-            if strategy_type == "ultra_short":
-                reason_parts.append(f"短期评分{short_score:.0f}分>={cfg['min_short_score']}")
-                reason_parts.append(f"资金面{capital_score:.0f}分>={cfg['min_capital_score']}(主力资金进场)")
-            elif strategy_type == "short_term":
-                reason_parts.append(f"短期评分{short_score:.0f}分>={cfg['min_short_score']}")
-                reason_parts.append(f"技术面{technical_score:.0f}分>={cfg['min_technical_score']}(均线/MACD向好)")
-            elif strategy_type == "swing":
-                reason_parts.append(f"长期评分{long_score:.0f}分>={cfg.get('min_long_score',0)}")
-                reason_parts.append(f"基本面{fundamental_score:.0f}分>={cfg.get('min_fundamental_score',0)}(ROE/毛利率健康)")
-            reason_parts.append(f"风险等级{risk_level}(允许{cfg['max_risk_level']})")
-            sources = c.get("sources") or ""
-            if sources:
-                reason_parts.append(f"来源:{sources}")
-            buy_reason = "；".join(reason_parts)
 
             signals.append({
                 "stock_code": code,
                 "short_name": c.get("short_name") or code,
                 "strategy_type": strategy_type,
+                "trade_mode": "live",
                 "price": price,
                 "shares": shares,
                 "amount": round(price * shares, 2),
-                "ai_score": ai_score,
-                "short_score": short_score,
-                "long_score": long_score,
-                "capital_score": capital_score,
-                "technical_score": technical_score,
-                "fundamental_score": fundamental_score,
-                "event_risk_level": risk_level,
-                "reason": buy_reason,
-                "orig_reason": c.get("reason") or "",
+                "ai_score": analysis["ai_score"],
+                "quality_score": analysis.get("quality_score"),
+                "entry_score": analysis.get("entry_score"),
+                "final_trade_score": analysis.get("final_trade_score"),
+                "expected_return_pct": analysis.get("expected_return_pct"),
+                "short_score": analysis["short_score"],
+                "long_score": analysis["long_score"],
+                "capital_score": analysis["capital_score"],
+                "technical_score": analysis["technical_score"],
+                "fundamental_score": analysis["fundamental_score"],
+                "event_risk_level": analysis["event_risk_level"],
+                "signal_status": analysis.get("signal_status"),
+                "entry_price_low": c.get("entry_price_low"),
+                "entry_price_high": c.get("entry_price_high"),
+                "stop_loss_price": c.get("stop_loss_price"),
+                "take_profit_1": c.get("take_profit_1"),
+                "take_profit_2": c.get("take_profit_2"),
+                "reason": decision["reason"],
+                "orig_reason": analysis["orig_reason"],
                 "price_source": price_info.get("source", ""),
                 "slots_left": cfg["max_holding"] - holding_count - len(signals),
             })
@@ -503,6 +838,9 @@ class SimTradeEngine:
         检查所有持仓的卖出信号。
         盘中批量拉实时行情，一次请求拿所有持仓价格。
         """
+        if not _is_trading_time():
+            logger.info("非交易时间，跳过实时模拟卖出扫描")
+            return []
         _ensure_tables()
         holdings = _read_sql("""
             SELECT id, stock_code, short_name, strategy_type,
@@ -510,6 +848,7 @@ class SimTradeEngine:
                    ai_score, profit_rate
             FROM st_sim_position
             WHERE status = 'holding'
+              AND COALESCE(trade_mode, 'live') = 'live'
         """)
         if not holdings:
             return []
@@ -539,6 +878,8 @@ class SimTradeEngine:
 
             # 计算收益率
             profit_rate = ((current_price - buy_price) / buy_price) * 100 if buy_price > 0 else 0
+            if _is_near_limit_down(price_info):
+                continue
 
             # 计算持仓天数
             buy_date = h["buy_date"]
@@ -547,6 +888,10 @@ class SimTradeEngine:
             else:
                 buy_d = buy_date
             holding_days = (date.today() - buy_d).days
+
+            # A股 T+1：当天买入的仓位不能当天卖出。
+            if holding_days < 1:
+                continue
 
             reason = ""
             reason_detail = ""
@@ -591,6 +936,7 @@ class SimTradeEngine:
                     "stock_code": code,
                     "short_name": h.get("short_name") or code,
                     "strategy_type": h["strategy_type"],
+                    "trade_mode": "live",
                     "buy_price": buy_price,
                     "sell_price": current_price,
                     "shares": shares,
@@ -640,6 +986,11 @@ class SimTradeEngine:
         """执行模拟买入"""
         _ensure_tables()
         now = datetime.now()
+        trade_mode = signal.get("trade_mode") or "live"
+        if trade_mode not in VALID_TRADE_MODES:
+            raise ValueError(f"不允许写入未知模拟交易模式: {trade_mode}")
+        buy_date = signal.get("buy_date") or now.date()
+        buy_time = signal.get("buy_time") or now.strftime("%H:%M:%S")
         price = signal["price"]
         shares = signal["shares"]
         amount = round(price * shares, 2)
@@ -648,21 +999,22 @@ class SimTradeEngine:
         # 写入持仓表
         _exec_sql("""
             INSERT INTO st_sim_position
-            (stock_code, short_name, strategy_type, buy_price, buy_amount, buy_shares,
+            (stock_code, short_name, strategy_type, trade_mode, buy_price, buy_amount, buy_shares,
              buy_date, buy_time, buy_reason, ai_score, short_score, long_score,
              capital_score, technical_score, fundamental_score, event_risk_level, status)
-            VALUES (:code, :name, :st, :price, :amount, :shares,
+            VALUES (:code, :name, :st, :mode, :price, :amount, :shares,
                     :date, :time, :reason, :ai, :ss, :ls,
                     :cs, :ts, :fs, :risk, 'holding')
         """, {
             "code": signal["stock_code"],
             "name": signal.get("short_name", ""),
             "st": signal["strategy_type"],
+            "mode": trade_mode,
             "price": price,
             "amount": amount,
             "shares": shares,
-            "date": now.date(),
-            "time": now.strftime("%H:%M:%S"),
+            "date": buy_date,
+            "time": buy_time,
             "reason": signal.get("reason", ""),
             "ai": signal.get("ai_score", 0),
             "ss": signal.get("short_score", 0),
@@ -676,23 +1028,24 @@ class SimTradeEngine:
         # 写入流水表
         _exec_sql("""
             INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trans_type,
+            (stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, :ft, 'simulation', :st, 'buy',
+            VALUES (:code, :name, :ft, 'simulation', :st, :mode, 'buy',
                     :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
         """, {
             "code": signal["stock_code"],
             "name": signal.get("short_name", ""),
             "ft": "sim_buy",
             "st": signal["strategy_type"],
+            "mode": trade_mode,
             "price": price,
             "shares": shares,
             "amount": amount,
             "fee": round(fee, 2),
             "reason": signal.get("reason", ""),
             "ai": signal.get("ai_score", 0),
-            "date": now.date(),
-            "time": now.strftime("%H:%M:%S"),
+            "date": buy_date,
+            "time": buy_time,
         })
 
         return {"status": "ok", "stock_code": signal["stock_code"], "price": price,
@@ -702,6 +1055,10 @@ class SimTradeEngine:
         """执行模拟卖出"""
         _ensure_tables()
         now = datetime.now()
+        trade_mode = sell_signal.get("trade_mode") or "live"
+        if trade_mode not in VALID_TRADE_MODES:
+            raise ValueError(f"不允许写入未知模拟交易模式: {trade_mode}")
+        sell_date = sell_signal.get("sell_date") or now.date()
         position_id = sell_signal["position_id"]
         price = sell_signal["sell_price"]
         shares = sell_signal["shares"]
@@ -724,7 +1081,7 @@ class SimTradeEngine:
             WHERE id = :id
         """, {
             "price": price,
-            "date": now.date(),
+            "date": sell_date,
             "time": sell_time,
             "reason": reason_detail,
             "profit": profit,
@@ -737,22 +1094,23 @@ class SimTradeEngine:
         # 写入流水表
         _exec_sql("""
             INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trans_type,
+            (stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, :ft, 'simulation', :st, 'sell',
+            VALUES (:code, :name, :ft, 'simulation', :st, :mode, 'sell',
                     :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
         """, {
             "code": sell_signal["stock_code"],
             "name": sell_signal.get("short_name", ""),
             "ft": "sim_sell",
             "st": sell_signal["strategy_type"],
+            "mode": trade_mode,
             "price": price,
             "shares": shares,
             "amount": amount,
             "fee": round(fee, 2),
             "reason": reason_detail,
             "ai": sell_signal.get("ai_score", 0),
-            "date": now.date(),
+            "date": sell_date,
             "time": sell_time,
         })
 
@@ -763,26 +1121,381 @@ class SimTradeEngine:
     # 辅助方法
     # ────────────────────────────────────────
 
-    def _get_holding_count(self, strategy_type: str) -> int:
+    def _get_holding_count(self, strategy_type: str, trade_mode: str = "live") -> int:
         rows = _read_sql("""
             SELECT COUNT(*) AS cnt FROM st_sim_position
             WHERE strategy_type = :st AND status = 'holding'
-        """, {"st": strategy_type})
+              AND COALESCE(trade_mode, 'live') = :mode
+        """, {"st": strategy_type, "mode": trade_mode})
         return int(rows[0]["cnt"]) if rows else 0
 
-    def _get_holding_codes(self, strategy_type: str) -> set:
+    def _get_holding_codes(self, strategy_type: str, trade_mode: str = "live") -> set:
         rows = _read_sql("""
             SELECT stock_code FROM st_sim_position
             WHERE strategy_type = :st AND status = 'holding'
-        """, {"st": strategy_type})
+              AND COALESCE(trade_mode, 'live') = :mode
+        """, {"st": strategy_type, "mode": trade_mode})
         return {r["stock_code"] for r in rows}
+
+    # ────────────────────────────────────────
+    # 盘中验证执行(推荐日T -> 验证日T+1分时)
+    # ────────────────────────────────────────
+
+    def forward_buy(self, stock_code: str, strategy_type: str, trade_date: str,
+                    analysis: dict = None, signal_date: str = "",
+                    allow_live_price: bool = True) -> dict | None:
+        """Forward validation buy: use first minute price on validation date."""
+        cfg = STRATEGY_CONFIG.get(strategy_type)
+        if not cfg:
+            return None
+
+        code = str(stock_code).strip().zfill(6)
+        duplicate = _read_sql("""
+            SELECT id
+            FROM st_sim_position
+            WHERE stock_code = :c
+              AND strategy_type = :st
+              AND buy_date = :d
+              AND COALESCE(trade_mode, 'live') = 'forward'
+              AND buy_reason LIKE :needle
+            LIMIT 1
+        """, {
+            "c": code,
+            "st": strategy_type,
+            "d": trade_date,
+            "needle": f"%信号日{signal_date}%",
+        })
+        if duplicate:
+            return {"status": "skip", "reason": "duplicate_session", "stock_code": code}
+
+        holding_count = self._get_holding_count(strategy_type, trade_mode="forward")
+        if holding_count >= cfg["max_holding"]:
+            return {"status": "skip", "reason": "max_holding", "stock_code": code}
+
+        holding_codes = self._get_holding_codes(strategy_type, trade_mode="forward")
+        if code in holding_codes:
+            return {"status": "skip", "reason": "already_holding", "stock_code": code}
+
+        price_info = get_first_minute_price(code, trade_date)
+        if not price_info and allow_live_price and trade_date[:10] == date.today().isoformat() and _is_trading_time():
+            live = _get_current_price(code)
+            if live and live.get("price", 0) > 0 and live.get("source") != "kline_close":
+                price_info = {
+                    "price": float(live["price"]),
+                    "change_pct": _safe_float(live.get("change_pct")),
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "source": live.get("source", "live"),
+                    "trade_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+        if not price_info:
+            return {"status": "skip", "reason": "no_minute_price", "stock_code": code}
+
+        buy_price = float(price_info["price"])
+        if buy_price <= 0:
+            return {"status": "skip", "reason": "bad_price", "stock_code": code}
+        if _is_near_limit_up(price_info):
+            return {"status": "skip", "reason": "limit_up_not_buyable", "stock_code": code}
+
+        shares = _calc_shares(buy_price, cfg["buy_amount"])
+        if shares <= 0:
+            return {"status": "skip", "reason": "bad_shares", "stock_code": code}
+
+        analysis = analysis or {}
+        buy_time = price_info.get("time") or "09:30:00"
+        base_reason = analysis.get("reason", "")
+        reason = (
+            f"盘中验证：信号日{signal_date}，验证日{trade_date}，"
+            f"{buy_time}首条分时/实时价买入；价格来源{price_info.get('source', '')}；{base_reason}"
+        )
+        signal = {
+            "stock_code": code,
+            "short_name": analysis.get("short_name", code),
+            "strategy_type": strategy_type,
+            "trade_mode": "forward",
+            "buy_date": trade_date,
+            "buy_time": buy_time,
+            "price": buy_price,
+            "shares": shares,
+            "amount": round(buy_price * shares, 2),
+            "ai_score": analysis.get("ai_score", 0),
+            "short_score": analysis.get("short_score", 0),
+            "long_score": analysis.get("long_score", 0),
+            "capital_score": analysis.get("capital_score", 0),
+            "technical_score": analysis.get("technical_score", 0),
+            "fundamental_score": analysis.get("fundamental_score", 0),
+            "event_risk_level": analysis.get("event_risk_level", "LOW"),
+            "reason": reason,
+            "price_source": price_info.get("source", ""),
+        }
+        ret = self.execute_buy(signal)
+        return {**ret, "trade_date": trade_date, "signal_date": signal_date, "buy_time": buy_time}
+
+    def check_forward_sell_signals(self) -> list[dict]:
+        """
+        Check forward-validation holdings with current intraday price.
+        This is for real-time paper validation after forward_buy has created positions.
+        """
+        _ensure_tables()
+        holdings = _read_sql("""
+            SELECT id, stock_code, short_name, strategy_type,
+                   buy_price, buy_shares, buy_date, buy_amount, ai_score
+            FROM st_sim_position
+            WHERE status = 'holding'
+              AND COALESCE(trade_mode, 'live') = 'forward'
+        """)
+        if not holdings:
+            return []
+
+        if not _is_trading_time():
+            return []
+
+        live_prices = _fetch_live_prices_batch([h["stock_code"] for h in holdings])
+
+        signals = []
+        today = date.today()
+        for h in holdings:
+            code = h["stock_code"]
+            cfg = STRATEGY_CONFIG.get(h["strategy_type"])
+            if not cfg:
+                continue
+
+            price_info = live_prices.get(code)
+            if not price_info or price_info.get("price", 0) <= 0:
+                price_info = _get_current_price(code)
+            if not price_info or price_info.get("price", 0) <= 0 or price_info.get("source") == "kline_close":
+                continue
+
+            buy_date = h["buy_date"]
+            if isinstance(buy_date, str):
+                buy_d = datetime.strptime(buy_date[:10], "%Y-%m-%d").date()
+            else:
+                buy_d = buy_date
+            holding_days = (today - buy_d).days
+            if holding_days < 1:
+                continue
+
+            current_price = float(price_info["price"])
+            buy_price = float(h["buy_price"])
+            if buy_price <= 0:
+                continue
+            if _is_near_limit_down(price_info):
+                continue
+            profit_rate = ((current_price - buy_price) / buy_price) * 100
+
+            reason = ""
+            reason_detail = ""
+            should_sell = False
+
+            if profit_rate >= cfg["take_profit"]:
+                reason = "take_profit"
+                reason_detail = (
+                    f"盘中验证卖出：实时收益{profit_rate:.2f}%达到止盈线{cfg['take_profit']}%, "
+                    f"买入价{buy_price:.2f}→现价{current_price:.2f}, 持仓{holding_days}天"
+                )
+                should_sell = True
+            elif profit_rate <= cfg["stop_loss"]:
+                reason = "stop_loss"
+                reason_detail = (
+                    f"盘中验证卖出：实时收益{profit_rate:.2f}%触及止损线{cfg['stop_loss']}%, "
+                    f"买入价{buy_price:.2f}→现价{current_price:.2f}, 持仓{holding_days}天"
+                )
+                should_sell = True
+            elif holding_days >= cfg["max_days"]:
+                reason = "time_limit"
+                reason_detail = (
+                    f"盘中验证卖出：持仓{holding_days}天达到{cfg['name']}策略最大持仓{cfg['max_days']}天, "
+                    f"当前收益{profit_rate:.2f}%"
+                )
+                should_sell = True
+            elif cfg["trailing_activate"] and profit_rate >= cfg["trailing_activate"]:
+                max_rate = self._get_max_profit_rate(h["id"], code, buy_price)
+                if max_rate is not None and (max_rate - profit_rate) >= cfg["trailing_drawdown"]:
+                    reason = "trailing_stop"
+                    reason_detail = (
+                        f"盘中验证卖出：最高盈利{max_rate:.2f}%回撤至{profit_rate:.2f}%, "
+                        f"回撤{max_rate - profit_rate:.2f}%超过阈值{cfg['trailing_drawdown']}%"
+                    )
+                    should_sell = True
+
+            if should_sell:
+                shares = int(h["buy_shares"])
+                sell_fee = portfolio_trade_fee("sell", current_price, shares)
+                buy_fee = portfolio_trade_fee("buy", buy_price, shares)
+                total_fee = round(buy_fee + sell_fee, 2)
+                net_profit = round((current_price - buy_price) * shares - total_fee, 2)
+                signals.append({
+                    "position_id": h["id"],
+                    "stock_code": code,
+                    "short_name": h.get("short_name") or code,
+                    "strategy_type": h["strategy_type"],
+                    "trade_mode": "forward",
+                    "buy_price": buy_price,
+                    "sell_price": current_price,
+                    "shares": shares,
+                    "profit_rate": round(profit_rate, 2),
+                    "profit": net_profit,
+                    "fee": total_fee,
+                    "holding_days": holding_days,
+                    "reason": reason,
+                    "reason_detail": reason_detail,
+                    "sell_date": today.isoformat(),
+                    "sell_time": datetime.now().strftime("%H:%M:%S"),
+                    "reason_label": self._reason_label(reason),
+                    "ai_score": float(h.get("ai_score") or 0),
+                })
+
+        return signals
+
+    def forward_check_sell_by_minute(self, trade_date: str) -> list[dict]:
+        """Replay forward-validation sell rules with ordered minute prices."""
+        _ensure_tables()
+        holdings = _read_sql("""
+            SELECT id, stock_code, short_name, strategy_type,
+                   buy_price, buy_shares, buy_date, buy_time, buy_amount, ai_score
+            FROM st_sim_position
+            WHERE status = 'holding'
+              AND COALESCE(trade_mode, 'live') = 'forward'
+        """)
+
+        signals = []
+        td = datetime.strptime(trade_date[:10], "%Y-%m-%d").date()
+        for h in holdings:
+            code = h["stock_code"]
+            cfg = STRATEGY_CONFIG.get(h["strategy_type"])
+            if not cfg:
+                continue
+
+            buy_date = h["buy_date"]
+            if isinstance(buy_date, str):
+                buy_d = datetime.strptime(buy_date[:10], "%Y-%m-%d").date()
+            else:
+                buy_d = buy_date
+            holding_days = (td - buy_d).days
+            if holding_days < 1:
+                continue
+
+            rows = get_minute_prices(code, trade_date, trade_date)
+            if not rows:
+                continue
+
+            buy_price = float(h["buy_price"])
+            if buy_price <= 0:
+                continue
+
+            prior_max_rate = 0.0
+            if cfg["trailing_activate"]:
+                try:
+                    max_price = get_max_stock_minute_price(code, str(buy_d), trade_date)
+                    if max_price > 0:
+                        prior_max_rate = ((max_price - buy_price) / buy_price) * 100
+                except Exception:
+                    prior_max_rate = 0.0
+
+            max_rate = prior_max_rate
+            latest_row = None
+            for row in rows:
+                latest_row = row
+                price = float(row["price"])
+                minute_time = _minute_time_text(row.get("trade_time"))
+                if _is_near_limit_down(row):
+                    continue
+                profit_rate = ((price - buy_price) / buy_price) * 100
+                max_rate = max(max_rate, profit_rate)
+
+                reason = ""
+                reason_detail = ""
+                should_sell = False
+
+                if profit_rate <= cfg["stop_loss"]:
+                    reason = "stop_loss"
+                    reason_detail = (
+                        f"分钟线验证卖出：{trade_date} {minute_time} 分时收益{profit_rate:.2f}%"
+                        f"触及止损线{cfg['stop_loss']}%, 买入价{buy_price:.2f}→分时价{price:.2f}, "
+                        f"持仓{holding_days}天"
+                    )
+                    should_sell = True
+                elif profit_rate >= cfg["take_profit"]:
+                    reason = "take_profit"
+                    reason_detail = (
+                        f"分钟线验证卖出：{trade_date} {minute_time} 分时收益{profit_rate:.2f}%"
+                        f"达到止盈线{cfg['take_profit']}%, 买入价{buy_price:.2f}→分时价{price:.2f}, "
+                        f"持仓{holding_days}天"
+                    )
+                    should_sell = True
+                elif cfg["trailing_activate"] and max_rate >= cfg["trailing_activate"]:
+                    drawdown = max_rate - profit_rate
+                    if drawdown >= cfg["trailing_drawdown"]:
+                        reason = "trailing_stop"
+                        reason_detail = (
+                            f"分钟线验证卖出：最高盈利{max_rate:.2f}%回撤到{profit_rate:.2f}%, "
+                            f"回撤{drawdown:.2f}%超过阈值{cfg['trailing_drawdown']}%, "
+                            f"{trade_date} {minute_time} 离场"
+                        )
+                        should_sell = True
+
+                if should_sell:
+                    signals.append(self._build_forward_minute_sell_signal(
+                        h, price, profit_rate, holding_days, reason, reason_detail,
+                        trade_date, minute_time,
+                    ))
+                    break
+
+            if not any(sig["position_id"] == h["id"] for sig in signals):
+                if latest_row is not None and holding_days >= cfg["max_days"]:
+                    price = float(latest_row["price"])
+                    minute_time = _minute_time_text(latest_row.get("trade_time"))
+                    profit_rate = ((price - buy_price) / buy_price) * 100
+                    reason = "time_limit"
+                    reason_detail = (
+                        f"分钟线验证卖出：持仓{holding_days}天达到{cfg['name']}策略最大持仓"
+                        f"{cfg['max_days']}天，按{trade_date} {minute_time}分时价{price:.2f}离场，"
+                        f"收益{profit_rate:.2f}%"
+                    )
+                    signals.append(self._build_forward_minute_sell_signal(
+                        h, price, profit_rate, holding_days, reason, reason_detail,
+                        trade_date, minute_time,
+                    ))
+
+        return signals
+
+    def _build_forward_minute_sell_signal(self, holding: dict, sell_price: float,
+                                          profit_rate: float, holding_days: int,
+                                          reason: str, reason_detail: str,
+                                          sell_date: str, sell_time: str) -> dict:
+        buy_price = float(holding["buy_price"])
+        shares = int(holding["buy_shares"])
+        sell_fee = portfolio_trade_fee("sell", sell_price, shares)
+        buy_fee = portfolio_trade_fee("buy", buy_price, shares)
+        total_fee = round(buy_fee + sell_fee, 2)
+        net_profit = round((sell_price - buy_price) * shares - total_fee, 2)
+        return {
+            "position_id": holding["id"],
+            "stock_code": holding["stock_code"],
+            "short_name": holding.get("short_name") or holding["stock_code"],
+            "strategy_type": holding["strategy_type"],
+            "trade_mode": "forward",
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "shares": shares,
+            "profit_rate": round(profit_rate, 2),
+            "profit": net_profit,
+            "fee": total_fee,
+            "holding_days": holding_days,
+            "reason": reason,
+            "reason_detail": reason_detail,
+            "sell_date": sell_date,
+            "sell_time": sell_time,
+            "reason_label": self._reason_label(reason),
+            "ai_score": float(holding.get("ai_score") or 0),
+        }
 
     # ────────────────────────────────────────
     # 回测执行(使用K线历史数据)
     # ────────────────────────────────────────
 
     def backtest_buy(self, stock_code: str, strategy_type: str, trade_date: str,
-                     analysis: dict = None) -> dict | None:
+                     analysis: dict = None, signal_date: str = "") -> dict | None:
         """
         回测模式买入：使用指定日期的开盘价买入。
         analysis: 可选的评分数据 dict
@@ -792,18 +1505,18 @@ class SimTradeEngine:
             return None
 
         # 检查持仓上限
-        holding_count = self._get_holding_count(strategy_type)
+        holding_count = self._get_holding_count(strategy_type, trade_mode="backtest")
         if holding_count >= cfg["max_holding"]:
             return None
 
         # 检查是否已持仓
-        holding_codes = self._get_holding_codes(strategy_type)
+        holding_codes = self._get_holding_codes(strategy_type, trade_mode="backtest")
         if stock_code in holding_codes:
             return None
 
         # 获取开盘价
         rows = _read_sql("""
-            SELECT open, close, high, low FROM sm_stock_kline
+            SELECT open, close, high, low, change_pct, pre_close FROM sm_stock_kline
             WHERE stock_code = :c AND k_type = 1 AND trade_date = :d
         """, {"c": stock_code, "d": trade_date})
         if not rows or not rows[0].get("open"):
@@ -812,16 +1525,26 @@ class SimTradeEngine:
         open_price = float(rows[0]["open"])
         if open_price <= 0:
             return None
+        open_chg = _open_change_pct(rows[0])
+        if open_chg is not None and open_chg >= 9.7:
+            return None
 
         shares = _calc_shares(open_price, cfg["buy_amount"])
         if shares <= 0:
             return None
 
         analysis = analysis or {}
+        buy_time = _random_intraday_time(stock_code + trade_date + "buy", "am")
+        reason = analysis.get("reason", "")
+        if signal_date:
+            reason = f"信号日{signal_date}，次交易日开盘买入；{reason}"
         signal = {
             "stock_code": stock_code,
             "short_name": analysis.get("short_name", stock_code),
             "strategy_type": strategy_type,
+            "trade_mode": "backtest",
+            "buy_date": trade_date,
+            "buy_time": buy_time,
             "price": open_price,
             "shares": shares,
             "amount": round(open_price * shares, 2),
@@ -832,63 +1555,14 @@ class SimTradeEngine:
             "technical_score": analysis.get("technical_score", 0),
             "fundamental_score": analysis.get("fundamental_score", 0),
             "event_risk_level": analysis.get("event_risk_level", "LOW"),
-            "reason": analysis.get("reason", ""),
+            "reason": reason,
             "price_source": "backtest_open",
         }
 
-        # 直接写入(回测模式)
-        now = datetime.now()
-        fee = portfolio_trade_fee("buy", open_price, shares)
-
-        _exec_sql("""
-            INSERT INTO st_sim_position
-            (stock_code, short_name, strategy_type, buy_price, buy_amount, buy_shares,
-             buy_date, buy_time, buy_reason, ai_score, short_score, long_score,
-             capital_score, technical_score, fundamental_score, event_risk_level, status)
-            VALUES (:code, :name, :st, :price, :amount, :shares,
-                    :date, :time, :reason, :ai, :ss, :ls,
-                    :cs, :ts, :fs, :risk, 'holding')
-        """, {
-            "code": stock_code,
-            "name": analysis.get("short_name", ""),
-            "st": strategy_type,
-            "price": open_price,
-            "amount": round(open_price * shares, 2),
-            "shares": shares,
-            "date": trade_date,
-            "time": _random_intraday_time(stock_code + trade_date + "buy", "am"),
-            "reason": analysis.get("reason", ""),
-            "ai": analysis.get("ai_score", 0),
-            "ss": analysis.get("short_score", 0),
-            "ls": analysis.get("long_score", 0),
-            "cs": analysis.get("capital_score", 0),
-            "ts": analysis.get("technical_score", 0),
-            "fs": analysis.get("fundamental_score", 0),
-            "risk": analysis.get("event_risk_level", "LOW"),
-        })
-
-        _exec_sql("""
-            INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trans_type,
-             price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, 'sim_buy', 'simulation', :st, 'buy',
-                    :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
-        """, {
-            "code": stock_code,
-            "name": analysis.get("short_name", ""),
-            "st": strategy_type,
-            "price": open_price,
-            "shares": shares,
-            "amount": round(open_price * shares, 2),
-            "fee": round(fee, 2),
-            "reason": analysis.get("reason", ""),
-            "ai": analysis.get("ai_score", 0),
-            "date": trade_date,
-            "time": _random_intraday_time(stock_code + trade_date + "buy", "am"),
-        })
+        self.execute_buy(signal)
 
         return {"status": "ok", "stock_code": stock_code, "price": open_price,
-                "shares": shares, "trade_date": trade_date}
+                "shares": shares, "trade_date": trade_date, "signal_date": signal_date}
 
     def backtest_check_sell(self, trade_date: str) -> list[dict]:
         """
@@ -900,6 +1574,7 @@ class SimTradeEngine:
                    buy_price, buy_shares, buy_date, buy_amount, ai_score
             FROM st_sim_position
             WHERE status = 'holding'
+              AND COALESCE(trade_mode, 'live') = 'backtest'
         """)
 
         signals = []
@@ -928,6 +1603,8 @@ class SimTradeEngine:
             profit_rate = ((close_price - buy_price) / buy_price) * 100
             # 当日最高收益率
             high_rate = ((high_price - buy_price) / buy_price) * 100
+            low_price = float(rows[0].get("low") or 0)
+            low_rate = ((low_price - buy_price) / buy_price) * 100 if low_price > 0 else None
 
             buy_date = h["buy_date"]
             if isinstance(buy_date, str):
@@ -947,41 +1624,40 @@ class SimTradeEngine:
 
             sell_time = _random_intraday_time(code + trade_date + "sell", "any")
 
+            # 日K无法知道高低点先后；同日同时触发止盈/止损时按保守口径先止损。
+            if low_rate is not None and low_rate <= cfg["stop_loss"]:
+                reason = "stop_loss"
+                detail_suffix = ""
+                if high_rate >= cfg["take_profit"]:
+                    detail_suffix = "；同日也触及止盈线，因日K无法判断先后，按保守口径先止损"
+                reason_detail = (
+                    f"亏损{low_rate:.2f}%已触及止损线{cfg['stop_loss']}%, "
+                    f"买入价{buy_price:.2f}→盘中低点{low_price:.2f}, "
+                    f"持仓{holding_days}天, 及时止损{detail_suffix}"
+                )
+                should_sell = True
+                sell_price = round(buy_price * (1 + cfg["stop_loss"] / 100), 2)
+                sell_time = _random_intraday_time(code + trade_date + "sl", "am")
             # 止盈: 当日最高价达到止盈线(假设盘中触发)
-            if high_rate >= cfg["take_profit"]:
+            elif high_rate >= cfg["take_profit"]:
                 reason = "take_profit"
                 reason_detail = f"盈利{high_rate:.2f}%已达止盈线{cfg['take_profit']}%, 买入价{buy_price:.2f}→盘中高点{high_price:.2f}, 持仓{holding_days}天"
                 should_sell = True
                 sell_price = round(buy_price * (1 + cfg["take_profit"] / 100), 2)
                 sell_time = _random_intraday_time(code + trade_date + "tp", "am")
-            # 止损: 当日最低价触及止损线
-            elif float(rows[0].get("low") or 0) > 0:
-                low_rate = ((float(rows[0]["low"]) - buy_price) / buy_price) * 100
-                if low_rate <= cfg["stop_loss"]:
-                    reason = "stop_loss"
-                    reason_detail = f"亏损{low_rate:.2f}%已触及止损线{cfg['stop_loss']}%, 买入价{buy_price:.2f}→盘中低点{float(rows[0]['low']):.2f}, 持仓{holding_days}天, 及时止损"
-                    should_sell = True
-                    sell_price = round(buy_price * (1 + cfg["stop_loss"] / 100), 2)
-                    sell_time = _random_intraday_time(code + trade_date + "sl", "am")
-                elif holding_days >= cfg["max_days"]:
-                    reason = "time_limit"
-                    reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
-                    should_sell = True
-                    sell_price = close_price
-                    sell_time = _random_intraday_time(code + trade_date + "tl", "pm")
-                elif cfg["trailing_activate"] and high_rate >= cfg["trailing_activate"]:
-                    if (high_rate - profit_rate) >= cfg["trailing_drawdown"]:
-                        reason = "trailing_stop"
-                        reason_detail = f"最高盈利{high_rate:.2f}%回撤至{profit_rate:.2f}%, 回撤{high_rate-profit_rate:.2f}%超阈值{cfg['trailing_drawdown']}%, 保护利润"
-                        should_sell = True
-                        sell_price = close_price
-                        sell_time = _random_intraday_time(code + trade_date + "ts", "pm")
             elif holding_days >= cfg["max_days"]:
                 reason = "time_limit"
                 reason_detail = f"持仓已达{holding_days}天, 超过{cfg['name']}策略最大持仓{cfg['max_days']}天, 收益率{profit_rate:.2f}%, 尾盘清仓"
                 should_sell = True
                 sell_price = close_price
                 sell_time = _random_intraday_time(code + trade_date + "tl2", "pm")
+            elif cfg["trailing_activate"] and high_rate >= cfg["trailing_activate"]:
+                if (high_rate - profit_rate) >= cfg["trailing_drawdown"]:
+                    reason = "trailing_stop"
+                    reason_detail = f"最高盈利{high_rate:.2f}%回撤至{profit_rate:.2f}%, 回撤{high_rate-profit_rate:.2f}%超阈值{cfg['trailing_drawdown']}%, 保护利润"
+                    should_sell = True
+                    sell_price = close_price
+                    sell_time = _random_intraday_time(code + trade_date + "ts", "pm")
 
             if should_sell:
                 shares = int(h["buy_shares"])
@@ -997,6 +1673,7 @@ class SimTradeEngine:
                     "stock_code": code,
                     "short_name": h.get("short_name") or code,
                     "strategy_type": h["strategy_type"],
+                    "trade_mode": "backtest",
                     "buy_price": buy_price,
                     "sell_price": sell_price,
                     "shares": shares,
@@ -1006,6 +1683,7 @@ class SimTradeEngine:
                     "holding_days": holding_days,
                     "reason": reason,
                     "reason_detail": reason_detail,
+                    "sell_date": trade_date,
                     "sell_time": sell_time,
                     "reason_label": self._reason_label(reason),
                     "ai_score": float(h.get("ai_score") or 0),

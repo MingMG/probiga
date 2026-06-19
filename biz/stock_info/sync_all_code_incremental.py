@@ -34,11 +34,11 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "adata") not in sys.path:
     sys.path.insert(0, str(ROOT / "adata"))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from server.common.config import get_mysql_url
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
 
 
 def _fetch_all_code_df():

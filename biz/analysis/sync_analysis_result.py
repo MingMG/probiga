@@ -53,6 +53,20 @@ def get_all_active_stocks(limit: int = None) -> list:
     return df.to_dict(orient='records')
 
 
+def resolve_trade_date(trade_date: str = "") -> str:
+    """Resolve the analysis cutoff date against available daily K-line data."""
+    sql = "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1"
+    params = {}
+    trade_date = (trade_date or "").strip()
+    if trade_date:
+        sql += " AND trade_date <= :trade_date"
+        params["trade_date"] = trade_date
+    rows = pd.read_sql(text(sql), get_engine(), params=params)
+    if rows.empty or not rows.iloc[0]["d"]:
+        raise RuntimeError(f"未找到 {trade_date or '最新'} 对应的日线数据")
+    return str(rows.iloc[0]["d"])[:10]
+
+
 def save_analysis_result(result) -> bool:
     """保存分析结果到数据库"""
     try:
@@ -186,10 +200,13 @@ def main():
     parser = argparse.ArgumentParser(description='盘后全量分析')
     parser.add_argument('--limit', type=int, help='只分析前N只股票')
     parser.add_argument('--code', type=str, help='只分析单只股票')
+    parser.add_argument('--trade-date', type=str, default="", help='分析截止交易日，如 2026-06-13；默认使用最新交易日')
     args = parser.parse_args()
 
     start_time = datetime.now()
     logger.info(f"开始盘后全量分析，时间：{start_time}")
+    trade_date = resolve_trade_date(args.trade_date)
+    logger.info(f"分析交易日：{trade_date}")
 
     # 初始化引擎
     engine = StockAnalysisEngine()
@@ -211,7 +228,7 @@ def main():
     for i, stock in enumerate(stocks, 1):
         code = stock['stock_code']
         try:
-            result = engine.analyze(code, full_data=True)
+            result = engine.analyze(code, full_data=True, trade_date=trade_date)
 
             if save_analysis_result(result):
                 success_count += 1

@@ -14,6 +14,7 @@ STOCK-INFO 的 si_* 在本脚本内直接调函数；STOCK-MARKET / 舆情走子
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 import subprocess
 import sys
@@ -57,6 +58,79 @@ def _sub_run_sentiment(only: str) -> int:
     env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
     env.setdefault("SE_SKIP_GLOBAL_TRUNCATE", "1")
     cmd = [sys.executable, "-m", "biz.sentiment.sync_sentiment", "--only", only]
+    print("执行:", " ".join(cmd), flush=True)
+    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+
+
+def _sub_run_flow_daily(date_str: str = "") -> int:
+    env = os.environ.copy()
+    pp = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    env.setdefault("FLOW_SOURCES", "efinance,push2his,baidu")
+    env.setdefault("FLOW_WORKERS", "4")
+    env.setdefault("FLOW_REQUEST_DELAY", "0.15")
+    env.setdefault("FLOW_REQUEST_JITTER", "0.15")
+    env.setdefault("FLOW_BATCH_PAUSE_EVERY", "0")
+    target_date = date_str.strip() or datetime.now().strftime("%Y-%m-%d")
+    cmd = [sys.executable, "tools/fetch_sm_stock_capital_flow_daily.py", target_date]
+    print("执行:", " ".join(cmd), flush=True)
+    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+
+
+def _sub_run_kline_daily(date_str: str = "") -> int:
+    env = os.environ.copy()
+    pp = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    if env.get("SM_STOCK_KLINE_SOURCE", "").strip().lower() in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
+        cmd = [
+            sys.executable,
+            "-m",
+            "biz.stock_market.sync_stock_market",
+            "--only",
+            "stock_kline",
+            "--kline-source",
+            env.get("SM_STOCK_KLINE_SOURCE", "myquant").strip().lower(),
+            "--kline-incremental",
+            "--limit",
+            "-1",
+        ]
+        if date_str.strip():
+            cmd.extend(["--kline-start", date_str.strip(), "--kline-end", date_str.strip()])
+        print("鎵ц:", " ".join(cmd), flush=True)
+        return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    env.setdefault("KLINE_DAILY_WORKERS", "4")
+    env.setdefault("KLINE_DAILY_REQUEST_DELAY", "0.3")
+    env.setdefault("KLINE_DAILY_REQUEST_JITTER", "0.2")
+    env.setdefault("KLINE_DAILY_MIN_COVERAGE", "0.90")
+    cmd = [sys.executable, "tools/fetch_sm_stock_kline_daily.py"]
+    if date_str.strip():
+        cmd.append(date_str.strip())
+    print("执行:", " ".join(cmd), flush=True)
+    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+
+
+def _sub_run_minute(minute_type: str) -> int:
+    env = os.environ.copy()
+    pp = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    source = env.get("SM_STOCK_MINUTE_SOURCE", env.get("SM_MARKET_DATA_SOURCE", "")).strip().lower()
+    if minute_type == "stock" and source in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
+        cmd = [
+            sys.executable,
+            "-m",
+            "biz.stock_market.sync_stock_market",
+            "--only",
+            "stock_minute",
+            "--limit",
+            "-1",
+        ]
+        print("鎵ц:", " ".join(cmd), flush=True)
+        return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    env.setdefault("MINUTE_REQUEST_DELAY", "0.12")
+    env.setdefault("MINUTE_REQUEST_JITTER", "0.08")
+    env.setdefault("MINUTE_BATCH_EVERY", "0")
+    env.setdefault("MINUTE_MIN_COVERAGE", "0.70")
+    cmd = [sys.executable, "tools/crawl_minute_kline.py", "--type", minute_type]
     print("执行:", " ".join(cmd), flush=True)
     return subprocess.call(cmd, cwd=str(ROOT), env=env)
 
@@ -152,21 +226,21 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
     "sm_concept_capital_flow_east": ("subprocess_sm", ["concept_flow_east"]),
     "sm_concept_east_current": ("subprocess_sm", ["concept_east_current"]),
     "sm_concept_east_kline": ("subprocess_sm", ["concept_east_kline"]),
-    "sm_concept_east_minute": ("subprocess_sm", ["concept_east_minute"]),
+    "sm_concept_east_minute": ("subprocess_minute", ["concept"]),
     "sm_concept_ths_current": ("subprocess_sm", ["concept_ths_current"]),
     "sm_concept_ths_kline": ("subprocess_sm", ["concept_ths_kline"]),
     "sm_concept_ths_minute": ("subprocess_sm", ["concept_ths_minute"]),
     "sm_dividend": ("subprocess_sm", ["dividend"]),
     "sm_index_current": ("subprocess_sm", ["index_current"]),
     "sm_index_kline": ("subprocess_sm", ["index_kline"]),
-    "sm_index_minute": ("subprocess_sm", ["index_minute"]),
+    "sm_index_minute": ("subprocess_minute", ["index"]),
     "sm_stock_bar": ("subprocess_sm", ["stock_bar"]),
-    "sm_stock_capital_flow_daily": ("subprocess_sm", ["stock_flow_daily"]),
-    "sm_stock_capital_flow_min": ("subprocess_sm", ["stock_flow_min"]),
-    "sm_stock_kline": ("subprocess_sm_akshare", None),
+    "sm_stock_capital_flow_daily": ("subprocess_flow_daily", None),
+    "sm_stock_capital_flow_min": ("subprocess_minute", ["flow"]),
+    "sm_stock_kline": ("subprocess_kline_daily", None),
     "sm_stock_current": ("subprocess_sm", ["stock_current"]),
     "sm_stock_five_level": ("subprocess_sm", ["stock_five"]),
-    "sm_stock_minute": ("subprocess_sm", ["stock_minute"]),
+    "sm_stock_minute": ("subprocess_minute", ["stock"]),
     "st_a_list_daily": ("subprocess_se", ["a_list_daily"]),
     "st_a_list_info": ("subprocess_se", ["a_list_daily", "a_list_info"]),
 }
@@ -207,11 +281,18 @@ def _run_one_table(key: str, date_str: str = "") -> int:
     if kind == "subprocess_sm":
         assert payload
         return _sub_run_stock_market(",".join(payload), extra_args=extra or None)
+    if kind == "subprocess_flow_daily":
+        return _sub_run_flow_daily(date_str)
+    if kind == "subprocess_kline_daily":
+        return _sub_run_kline_daily(date_str)
+    if kind == "subprocess_minute":
+        assert payload
+        return _sub_run_minute(payload[0])
     if kind == "subprocess_se":
         assert payload
         return _sub_run_sentiment(",".join(payload))
     if kind == "subprocess_sm_akshare":
-        return _sub_run_stock_market("stock_kline", extra_args=["--kline-source", "akshare"])
+        return _sub_run_stock_market("stock_kline", extra_args=["--kline-source", "akshare"] + extra)
     if kind == "py_si_index_list":
         return run_si_all_index_code()
     if kind == "py_si_index_const":

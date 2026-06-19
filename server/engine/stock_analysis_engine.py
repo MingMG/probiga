@@ -39,22 +39,23 @@ class StockAnalysisEngine:
         self.event_risk = EventRiskEngine()
         self.gate = RecommendationGate()
 
-    def analyze(self, stock_code: str, full_data: bool = True) -> StockAnalysisResult:
+    def analyze(self, stock_code: str, full_data: bool = True, trade_date: str | None = None) -> StockAnalysisResult:
         """
         统一分析入口
 
         Args:
             stock_code: 股票代码
             full_data: 是否加载完整数据（False时使用精简数据）
+            trade_date: 分析截止交易日；为空时默认使用最新交易日。
 
         Returns:
             StockAnalysisResult: 统一分析结果
         """
         # 1. 加载数据
         if full_data:
-            data = self.data_loader.load_full_data(stock_code)
+            data = self.data_loader.load_full_data(stock_code, trade_date, use_realtime=trade_date is None)
         else:
-            data = self.data_loader.load_light_data(stock_code)
+            data = self.data_loader.load_light_data(stock_code, trade_date, use_realtime=trade_date is None)
 
         # 2. 长线分析
         long_term_result = self.long_term.analyze(data)
@@ -128,7 +129,7 @@ class StockAnalysisEngine:
             risks=risks,
         )
 
-    def analyze_batch(self, stock_codes: List[str], full_data: bool = True) -> List[StockAnalysisResult]:
+    def analyze_batch(self, stock_codes: List[str], full_data: bool = True, trade_date: str | None = None) -> List[StockAnalysisResult]:
         """
         批量分析（用于AI推荐筛选）
 
@@ -142,7 +143,7 @@ class StockAnalysisEngine:
         results = []
         for code in stock_codes:
             try:
-                result = self.analyze(code, full_data=full_data)
+                result = self.analyze(code, full_data=full_data, trade_date=trade_date)
                 results.append(result)
             except Exception as e:
                 logger.error(f"分析 {code} 失败: {e}")

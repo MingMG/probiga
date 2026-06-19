@@ -15,7 +15,6 @@
 """
 
 import argparse
-import json
 import os
 import random
 import sys
@@ -35,26 +34,62 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.config import get_mysql_url
+
 def _load_mysql_url() -> str:
     """从环境变量或 .env 文件加载 MySQL 连接串"""
-    url = os.environ.get("MYSQL_URL")
-    if url:
-        return url
-    # 尝试从 .env 文件读取
-    for env_path in [ROOT / ".env", Path("/opt/ProBigA/.env")]:
-        if env_path.exists():
-            for line in env_path.read_text().splitlines():
-                if line.startswith("MYSQL_URL="):
-                    return line.split("=", 1)[1].strip()
-    return "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+    return get_mysql_url(required=True)
 
 
 MYSQL_URL = _load_mysql_url()
 
-DELAY = 0.5
-JITTER = 0.3
-BATCH_EVERY = 100
-BATCH_PAUSE = 20
+
+def _is_trade_day(engine, day: datetime | None = None) -> bool:
+    day = day or datetime.now()
+    try:
+        with engine.connect() as conn:
+            count = conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM si_trade_calendar
+                    WHERE trade_date = :d
+                      AND trade_status = 1
+                    """
+                ),
+                {"d": day.strftime("%Y-%m-%d")},
+            ).scalar()
+        return bool(count)
+    except Exception:
+        return day.weekday() < 5
+
+
+def is_trading_time(engine, now: datetime | None = None) -> bool:
+    now = now or datetime.now()
+    if not _is_trade_day(engine, now):
+        return False
+    current = now.hour * 100 + now.minute
+    return (925 <= current <= 1135) or (1255 <= current <= 1505)
+
+
+def _env_float(name: str, default: str) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def _env_int(name: str, default: str) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return int(default)
+
+
+DELAY = _env_float("MINUTE_REQUEST_DELAY", "0.5")
+JITTER = _env_float("MINUTE_REQUEST_JITTER", "0.3")
+BATCH_EVERY = _env_int("MINUTE_BATCH_EVERY", "100")
+BATCH_PAUSE = _env_float("MINUTE_BATCH_PAUSE", "20")
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -75,11 +110,42 @@ def safe_float(val) -> float:
         return 0.0
 
 
+def _market_candidates(code: str, market: int | None = None) -> list[int]:
+    """Eastmoney market ids to try for a stock/index/concept code."""
+    if market == 90 or str(code).upper().startswith("BK"):
+        return [90]
+
+    candidates: list[int] = []
+    if market is not None:
+        candidates.append(int(market))
+
+    code = str(code).strip()
+    if code.startswith("6"):
+        candidates.extend([1, 0])
+    elif code.startswith(("4", "8")):
+        candidates.extend([2, 0, 1])
+    else:
+        candidates.extend([0, 1, 2])
+
+    out: list[int] = []
+    for item in candidates:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _primary_market(code: str) -> int:
+    if str(code).startswith("6"):
+        return 1
+    if str(code).startswith(("4", "8")):
+        return 2
+    return 0
+
+
 def fetch_minute_kline(code: str, market: int) -> list[str] | None:
     """获取分钟K线，自动尝试两个 market 值"""
     url = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
-    markets = [market, 1 - market]  # 先试指定的，再试另一个
-    for m in markets:
+    for m in _market_candidates(code, market):
         params = {
             "secid": f"{m}.{code}",
             "klt": "1", "fqt": "1",
@@ -101,19 +167,23 @@ def fetch_minute_kline(code: str, market: int) -> list[str] | None:
 def fetch_minute_flow(code: str, market: int) -> list[str] | None:
     """获取分钟资金流向"""
     url = "https://push2delay.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": f"{market}.{code}",
-        "klt": "1",
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "lmt": "300",
-    }
-    try:
-        resp = SESSION.get(url, params=params, timeout=10)
-        data = resp.json()
-        return (data.get("data") or {}).get("klines")
-    except Exception:
-        return None
+    for m in _market_candidates(code, market):
+        params = {
+            "secid": f"{m}.{code}",
+            "klt": "1",
+            "fields1": "f1,f2,f3,f7",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "lmt": "300",
+        }
+        try:
+            resp = SESSION.get(url, params=params, timeout=10)
+            data = resp.json()
+            klines = (data.get("data") or {}).get("klines")
+            if klines:
+                return klines
+        except Exception:
+            pass
+    return None
 
 
 def parse_kline(code: str, klines: list[str]) -> list[dict]:
@@ -174,27 +244,47 @@ def get_codes(engine, table: str, code_col: str) -> list[tuple[str, int]]:
     result = []
     for r in rows:
         code = str(r[0]).strip().zfill(6)
-        if code.startswith("6"):
-            market = 1
-        elif code.startswith(("0", "3")):
-            market = 0
-        else:
-            market = 0
-        result.append((code, market))
+        result.append((code, _primary_market(code)))
     return result
 
 
-def save_kline(engine, rows: list[dict], table: str):
+def get_latest_kline_stock_codes(engine) -> list[tuple[str, int]]:
+    """Use the latest daily-kline universe so delisted/stale codes do not dominate minute sync."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT stock_code
+            FROM sm_stock_kline
+            WHERE trade_date = (
+                SELECT MAX(trade_date)
+                FROM sm_stock_kline
+                WHERE k_type = 1
+            )
+              AND k_type = 1
+            ORDER BY stock_code
+        """)).fetchall()
     if not rows:
-        return
+        return get_codes(engine, "si_all_code", "stock_code")
+    return [(str(r[0]).strip().zfill(6), _primary_market(str(r[0]).strip())) for r in rows]
+
+
+def _minute_code_column(table: str) -> str:
+    return "index_code" if table in ("sm_index_minute", "sm_concept_east_minute") else "stock_code"
+
+
+def save_kline(engine, rows: list[dict], table: str) -> int:
+    if not rows:
+        return 0
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
 
-    dates = sorted(df["trade_date"].unique())
-    code_col = "index_code" if table in ("sm_index_minute", "sm_concept_east_minute") else "stock_code"
+    code_col = _minute_code_column(table)
+    date_codes = df[["stock_code", "trade_date"]].drop_duplicates().to_dict("records")
     with engine.begin() as conn:
-        for d in dates:
-            conn.execute(text(f"DELETE FROM {table} WHERE trade_date = :d"), {"d": d})
+        for item in date_codes:
+            conn.execute(
+                text(f"DELETE FROM {table} WHERE {code_col} = :code AND trade_date = :d"),
+                {"code": item["stock_code"], "d": item["trade_date"]},
+            )
 
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
     # sm_index_minute / sm_concept_east_minute 用 index_code 列，有 snapshot_at
@@ -203,11 +293,12 @@ def save_kline(engine, rows: list[dict], table: str):
         df["snapshot_at"] = datetime.now().replace(microsecond=0)
 
     df.to_sql(table, engine, if_exists="append", index=False, chunksize=1000, method="multi")
+    return len(df)
 
 
-def save_flow(engine, rows: list[dict]):
+def save_flow(engine, rows: list[dict]) -> int:
     if not rows:
-        return
+        return 0
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
 
@@ -222,9 +313,10 @@ def save_flow(engine, rows: list[dict]):
 
     df.to_sql("sm_stock_capital_flow_min", engine, if_exists="append",
               index=False, chunksize=1000, method="multi")
+    return len(df)
 
 
-def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, limit: int):
+def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, limit: int) -> dict:
     if limit > 0:
         codes = codes[:limit]
     total = len(codes)
@@ -232,12 +324,14 @@ def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, li
 
     buffer = []
     ok = fail = 0
+    written_rows = 0
     t0 = time.time()
 
     for i, (code, market) in enumerate(codes):
         klines = fetch_minute_kline(code, market)
-        if klines:
-            buffer.extend(parse_kline(code, klines))
+        rows = parse_kline(code, klines or []) if klines else []
+        if rows:
+            buffer.extend(rows)
             ok += 1
         else:
             fail += 1
@@ -249,23 +343,33 @@ def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, li
             eta = (total - i - 1) / (i + 1) * elapsed
             print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
 
-        if (i + 1) % BATCH_EVERY == 0:
+        if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
             time.sleep(BATCH_PAUSE + random.uniform(0, 5))
 
         if len(buffer) >= 5000:
             print(f"    Writing {len(buffer)} rows...", flush=True)
-            save_kline(engine, buffer, table)
+            written_rows += save_kline(engine, buffer, table)
             buffer.clear()
 
     if buffer:
         print(f"    Writing {len(buffer)} rows...", flush=True)
-        save_kline(engine, buffer, table)
+        written_rows += save_kline(engine, buffer, table)
 
     elapsed = time.time() - t0
-    print(f"    Done! OK={ok} Fail={fail} Time={elapsed/60:.1f}min", flush=True)
+    coverage = ok / total if total else 0
+    print(f"    Done! OK={ok} Fail={fail} Rows={written_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
+    return {
+        "label": label,
+        "table": table,
+        "total": total,
+        "ok": ok,
+        "fail": fail,
+        "rows": written_rows,
+        "coverage": round(coverage, 4),
+    }
 
 
-def crawl_flow(engine, codes: list[tuple[str, int]], limit: int):
+def crawl_flow(engine, codes: list[tuple[str, int]], limit: int) -> dict:
     if limit > 0:
         codes = codes[:limit]
     total = len(codes)
@@ -273,12 +377,14 @@ def crawl_flow(engine, codes: list[tuple[str, int]], limit: int):
 
     buffer = []
     ok = fail = 0
+    written_rows = 0
     t0 = time.time()
 
     for i, (code, market) in enumerate(codes):
         klines = fetch_minute_flow(code, market)
-        if klines:
-            buffer.extend(parse_flow(code, klines))
+        rows = parse_flow(code, klines or []) if klines else []
+        if rows:
+            buffer.extend(rows)
             ok += 1
         else:
             fail += 1
@@ -290,20 +396,30 @@ def crawl_flow(engine, codes: list[tuple[str, int]], limit: int):
             eta = (total - i - 1) / (i + 1) * elapsed
             print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
 
-        if (i + 1) % BATCH_EVERY == 0:
+        if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
             time.sleep(BATCH_PAUSE + random.uniform(0, 5))
 
         if len(buffer) >= 5000:
             print(f"    Writing {len(buffer)} rows...", flush=True)
-            save_flow(engine, buffer)
+            written_rows += save_flow(engine, buffer)
             buffer.clear()
 
     if buffer:
         print(f"    Writing {len(buffer)} rows...", flush=True)
-        save_flow(engine, buffer)
+        written_rows += save_flow(engine, buffer)
 
     elapsed = time.time() - t0
-    print(f"    Done! OK={ok} Fail={fail} Time={elapsed/60:.1f}min", flush=True)
+    coverage = ok / total if total else 0
+    print(f"    Done! OK={ok} Fail={fail} Rows={written_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
+    return {
+        "label": "Minute flow",
+        "table": "sm_stock_capital_flow_min",
+        "total": total,
+        "ok": ok,
+        "fail": fail,
+        "rows": written_rows,
+        "coverage": round(coverage, 4),
+    }
 
 
 def main():
@@ -311,36 +427,66 @@ def main():
     parser.add_argument("--type", required=True,
                         choices=["stock", "index", "concept", "flow", "all"])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=_env_float("MINUTE_MIN_COVERAGE", "0.70"),
+        help="最低成功覆盖率，低于该值返回非0，避免调度假成功",
+    )
+    parser.add_argument(
+        "--skip-closed",
+        action="store_true",
+        help="盘中调度使用：非交易时段直接成功跳过，不写入数据。",
+    )
     args = parser.parse_args()
 
     engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    if args.skip_closed and not is_trading_time(engine):
+        print("Minute sync skipped: market closed", flush=True)
+        return 0
 
     print(f"\n{'='*60}")
     print(f"  Minute data: {args.type}")
     print(f"{'='*60}")
 
+    summaries: list[dict] = []
+
     if args.type in ("stock", "all"):
-        codes = get_codes(engine, "si_all_code", "stock_code")
-        crawl_kline(engine, codes, "sm_stock_minute", "Stock 1-min", args.limit)
+        codes = get_latest_kline_stock_codes(engine)
+        summaries.append(crawl_kline(engine, codes, "sm_stock_minute", "Stock 1-min", args.limit))
 
     if args.type in ("index", "all"):
         codes = get_codes(engine, "si_all_index_code", "index_code")
-        crawl_kline(engine, codes, "sm_index_minute", "Index 1-min", args.limit)
+        summaries.append(crawl_kline(engine, codes, "sm_index_minute", "Index 1-min", args.limit))
 
     if args.type in ("concept", "all"):
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT index_code FROM si_concept_code_east ORDER BY index_code")).fetchall()
         codes = [(str(r[0]), 90) for r in rows]
-        crawl_kline(engine, codes, "sm_concept_east_minute", "Concept 1-min", args.limit)
+        summaries.append(crawl_kline(engine, codes, "sm_concept_east_minute", "Concept 1-min", args.limit))
 
     if args.type in ("flow", "all"):
-        codes = get_codes(engine, "si_all_code", "stock_code")
-        crawl_flow(engine, codes, args.limit)
+        codes = get_latest_kline_stock_codes(engine)
+        summaries.append(crawl_flow(engine, codes, args.limit))
 
     print(f"\n{'='*60}")
     print(f"  All done!")
     print(f"{'='*60}\n")
 
+    failed = [
+        s for s in summaries
+        if s["total"] <= 0 or s["ok"] <= 0 or s["coverage"] < args.min_coverage
+    ]
+    if failed:
+        print(
+            "Minute sync coverage below threshold: "
+            + "; ".join(f"{s['table']} {s['ok']}/{s['total']} ({s['coverage']:.1%})" for s in failed),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

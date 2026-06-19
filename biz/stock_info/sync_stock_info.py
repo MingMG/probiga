@@ -11,7 +11,7 @@
   python -m biz.stock_info.sync_stock_info
 
 环境变量（可选）：
-  MYSQL_URL  默认 ``mysql+pymysql://root:123456@127.0.0.1:3306/probiga?charset=utf8mb4``
+  MYSQL_URL  必填，MySQL 连接串；也可写入项目根目录 ``.env``
   SI_REQUEST_SLEEP  每次远程请求后的休眠秒数，默认 ``0.2``
   SI_YEAR_START / SI_YEAR_END  交易日历年份范围，默认 ``2010`` 至 ``当年+1``
   SI_MAX_STOCKS  仅调试：大于 0 时只处理前 N 只股票（股本/概念等循环）
@@ -68,12 +68,14 @@ logging.basicConfig(
 logger = logging.getLogger("sync_stock_info")
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "adata") not in sys.path:
     sys.path.insert(0, str(ROOT / "adata"))
 
-DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_stock_info_tables.sql"
+from server.common.config import get_mysql_url
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_stock_info_tables.sql"
 
 TABLES_TRUNCATE_ORDER = [
     "si_trade_calendar",
@@ -94,7 +96,7 @@ TABLES_TRUNCATE_ORDER = [
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
 
 
 def _sleep() -> None:

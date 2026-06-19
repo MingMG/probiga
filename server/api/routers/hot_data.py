@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """热门数据查询 API + 首页看板"""
 import json
+import logging
 import os
 import re
 from datetime import date, datetime
+from decimal import Decimal
 
 import pandas as pd
 from fastapi import APIRouter, Query
@@ -11,6 +13,8 @@ from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.minute_data import get_stock_minute_prices, minute_source_info
+from server.engine.data_loader import StockDataLoader
 from server.engine.stock_analysis_engine import StockAnalysisEngine
 from server.api.routers.portfolio_math import (
     portfolio_calc_next_position,
@@ -43,6 +47,11 @@ import threading as _threading
 
 _cache_lock = _threading.Lock()
 _cache_store: dict[str, tuple[float, object]] = {}
+_job_lock = _threading.Lock()
+_job_running: dict[str, bool] = {
+    "recommended_stocks": False,
+    "market_refresh": False,
+}
 
 
 def _cache_get(key: str, ttl_seconds: int = 60):
@@ -60,16 +69,76 @@ def _cache_set(key: str, value):
         _cache_store[key] = (datetime.now().timestamp(), value)
 
 
+def _cache_drop(key: str):
+    with _cache_lock:
+        _cache_store.pop(key, None)
+
+
+def _cache_drop_prefix(prefix: str):
+    with _cache_lock:
+        for key in list(_cache_store.keys()):
+            if key.startswith(prefix):
+                _cache_store.pop(key, None)
+
+
+def _job_begin(name: str) -> bool:
+    with _job_lock:
+        if _job_running.get(name):
+            return False
+        _job_running[name] = True
+        return True
+
+
+def _job_end(name: str) -> None:
+    with _job_lock:
+        _job_running[name] = False
+
+
+def _job_is_running(name: str) -> bool:
+    with _job_lock:
+        return bool(_job_running.get(name))
+
+
+def _normalize_db_value(value):
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    if isinstance(value, float) and pd.isna(value):
+        return None
+    return value
+
+
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
-    import numpy as np
-    df = pd.read_sql(text(sql), get_engine(), params=params)
-    if df.empty:
-        return []
-    df = df.replace({np.nan: None, pd.NA: None, pd.NaT: None})
-    for c in df.columns:
-        if df[c].dtype == "datetime64[ns]":
-            df[c] = df[c].astype(str)
-    return df.to_dict(orient="records")
+    with get_engine().connect() as conn:
+        result = conn.execute(text(sql), params or {})
+        return [
+            {key: _normalize_db_value(val) for key, val in row.items()}
+            for row in result.mappings().all()
+        ]
+
+
+def _table_columns(table_name: str) -> set[str]:
+    try:
+        with get_engine().connect() as conn:
+            rows = conn.execute(text("""
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = :table_name
+            """), {"table_name": table_name}).fetchall()
+        return {str(r[0]) for r in rows}
+    except Exception:
+        return set()
+
+
+def _select_col(columns: set[str], column: str, default_sql: str, alias: str | None = None) -> str:
+    out_alias = alias or column
+    if column in columns:
+        return f"r.`{column}` AS `{out_alias}`"
+    return f"{default_sql} AS `{out_alias}`"
 
 
 def _df_to_records(df: pd.DataFrame) -> list[dict]:
@@ -81,7 +150,10 @@ def _df_to_records(df: pd.DataFrame) -> list[dict]:
     for c in df.columns:
         if str(df[c].dtype).startswith("datetime64"):
             df[c] = df[c].astype(str)
-    return df.to_dict(orient="records")
+    return [
+        {key: _normalize_db_value(val) for key, val in row.items()}
+        for row in df.to_dict(orient="records")
+    ]
 
 
 def _fetch_live_east_rank(top: int = 100) -> pd.DataFrame:
@@ -928,11 +1000,99 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
         return {"concept_code": concept_code, "data": [], "total": 0, "error": str(e)}
 
 
+def _safe_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(out):
+        return None
+    return out
+
+
+def _aggregate_concept_multi_day_rows(rows: list[dict], days: int) -> list[dict]:
+    grouped: dict[tuple[str, str, int], dict] = {}
+    for row in rows:
+        concept_code = str(row.get("concept_code") or "").strip()
+        if not concept_code:
+            continue
+        concept_name = str(row.get("concept_name") or "").strip()
+        plate_type = int(row.get("plate_type") or 0)
+        snapshot_date = str(row.get("snapshot_date") or "")[:10]
+        key = (concept_code, concept_name, plate_type)
+        item = grouped.setdefault(key, {
+            "concept_code": concept_code,
+            "concept_name": concept_name,
+            "plate_type": plate_type,
+            "appear_dates": set(),
+            "rank_sum": 0.0,
+            "rank_count": 0,
+            "best_rank": None,
+            "change_sum": 0.0,
+            "change_count": 0,
+            "hot_sum": 0.0,
+            "hot_count": 0,
+            "last_snapshot_date": "",
+            "last_rank": None,
+            "last_change_pct": None,
+            "last_hot_value": None,
+        })
+        if snapshot_date:
+            item["appear_dates"].add(snapshot_date)
+
+        rank_val = _safe_float(row.get("rank"))
+        if rank_val is not None:
+            item["rank_sum"] += rank_val
+            item["rank_count"] += 1
+            item["best_rank"] = rank_val if item["best_rank"] is None else min(item["best_rank"], rank_val)
+
+        change_val = _safe_float(row.get("change_pct"))
+        if change_val is not None:
+            item["change_sum"] += change_val
+            item["change_count"] += 1
+
+        hot_val = _safe_float(row.get("hot_value"))
+        if hot_val is not None:
+            item["hot_sum"] += hot_val
+            item["hot_count"] += 1
+
+        if snapshot_date >= item["last_snapshot_date"]:
+            item["last_snapshot_date"] = snapshot_date
+            item["last_rank"] = rank_val
+            item["last_change_pct"] = change_val
+            item["last_hot_value"] = hot_val
+
+    result = []
+    for item in grouped.values():
+        appear_days = len(item["appear_dates"])
+        avg_rank = (item["rank_sum"] / item["rank_count"]) if item["rank_count"] else None
+        avg_change_pct = (item["change_sum"] / item["change_count"]) if item["change_count"] else None
+        avg_hot_value = (item["hot_sum"] / item["hot_count"]) if item["hot_count"] else None
+        result.append({
+            "concept_code": item["concept_code"],
+            "concept_name": item["concept_name"],
+            "plate_type": item["plate_type"],
+            "appear_days": appear_days,
+            "appear_pct": round(appear_days / max(days, 1) * 100, 1),
+            "avg_rank": round(avg_rank, 2) if avg_rank is not None else None,
+            "best_rank": round(item["best_rank"], 2) if item["best_rank"] is not None else None,
+            "avg_change_pct": round(avg_change_pct, 2) if avg_change_pct is not None else None,
+            "avg_hot_value": round(avg_hot_value, 2) if avg_hot_value is not None else None,
+            "last_rank": round(item["last_rank"], 2) if item["last_rank"] is not None else None,
+            "last_change_pct": round(item["last_change_pct"], 2) if item["last_change_pct"] is not None else None,
+            "last_hot_value": round(item["last_hot_value"], 2) if item["last_hot_value"] is not None else None,
+        })
+
+    result.sort(key=lambda row: (-int(row["appear_days"]), float(row["avg_rank"]) if row["avg_rank"] is not None else 1e15))
+    return result
+
+
 @router.get("/hot-data/concept-multi-day")
 def concept_multi_day(stat_date: str = Query(default_factory=lambda: date.today().isoformat()), days: int = 3, plate_type: int = 0):
     """近N天热门概念/行业聚合"""
     try:
-        import numpy as np
         is_fallback = False
         if days <= 1:
             rows = _read_sql(
@@ -995,27 +1155,7 @@ def concept_multi_day(stat_date: str = Query(default_factory=lambda: date.today(
             if not all_rows:
                 return {"date": stat_date, "days": days, "data": [], "total": 0}
 
-        df = pd.DataFrame(all_rows)
-        # 按概念代码聚合
-        grouped = df.groupby(["concept_code", "concept_name", "plate_type"]).agg(
-            appear_days=("snapshot_date", "nunique"),
-            avg_rank=("rank", "mean"),
-            best_rank=("rank", "min"),
-            avg_change_pct=("change_pct", "mean"),
-            avg_hot_value=("hot_value", "mean"),
-            last_rank=("rank", "last"),
-            last_change_pct=("change_pct", "last"),
-            last_hot_value=("hot_value", "last"),
-        ).reset_index()
-
-        grouped["appear_pct"] = (grouped["appear_days"] / days * 100).round(1)
-        grouped = grouped.sort_values(["appear_days", "avg_rank"], ascending=[False, True])
-        grouped = grouped.replace({np.nan: None, np.inf: None})
-        result = grouped.to_dict(orient="records")
-        for r in result:
-            for k in ["avg_rank", "best_rank", "avg_change_pct", "avg_hot_value", "last_rank", "last_change_pct", "last_hot_value"]:
-                if isinstance(r.get(k), float):
-                    r[k] = round(r[k], 2) if abs(r[k]) < 1e15 else None
+        result = _aggregate_concept_multi_day_rows(all_rows, days)
 
         resp = {"date": stat_date, "days": days, "data": result, "total": len(result)}
         if is_fallback:
@@ -2097,13 +2237,10 @@ def _latest_date_inline(table: str, col: str = "trade_date") -> str:
 def stock_minute(stock_code: str = Query(), trade_date: str = Query(default_factory=lambda: date.today().isoformat())):
     """获取个股当天分时走势"""
     try:
-        rows = _read_sql(
-            "SELECT trade_time, price, avg_price, change, change_pct, volume, amount FROM sm_stock_minute "
-            "WHERE stock_code = :c AND trade_date = :d ORDER BY trade_time",
-            {"c": stock_code, "d": trade_date}
-        )
+        source = minute_source_info()
+        rows = get_stock_minute_prices(stock_code, trade_date, trade_date)
         if rows:
-            return {"stock_code": stock_code, "date": trade_date, "data": rows, "total": len(rows), "source": "db"}
+            return {"stock_code": stock_code, "date": trade_date, "data": rows, "total": len(rows), "source": source}
         # 如果数据库没有，尝试实时接口
         try:
             from adata.stock.market.stock_market.stock_market import StockMarket
@@ -2118,7 +2255,7 @@ def stock_minute(stock_code: str = Query(), trade_date: str = Query(default_fact
                 return {"stock_code": stock_code, "date": trade_date, "data": records, "total": len(records), "source": "api"}
         except Exception:
             pass
-        return {"stock_code": stock_code, "date": trade_date, "data": [], "total": 0, "source": "none"}
+        return {"stock_code": stock_code, "date": trade_date, "data": [], "total": 0, "source": source}
     except Exception as e:
         return {"stock_code": stock_code, "date": trade_date, "data": [], "total": 0, "error": str(e)}
 
@@ -2309,281 +2446,34 @@ def stock_detail(stock_code: str = Query()):
     """个股详情：7大模块投资决策数据"""
     try:
         code = stock_code.strip().zfill(6)
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-        trade_date = td_rows[0]["d"] if td_rows and td_rows[0].get("d") else date.today().isoformat()
         mode = _portfolio_market_mode()
-
-        # ─── 基本信息 ───
-        basic_rows = _read_sql(
-            "SELECT stock_code, short_name, exchange, list_date FROM si_all_code WHERE stock_code = :c",
-            {"c": code}
+        payload = _load_stock_detail_payload(code, mode=mode)
+        basic = payload.get("basic") or {}
+        market = payload.get("market") or {}
+        capital = payload.get("capital") or {}
+        finance = payload.get("finance") or {}
+        valuation = payload.get("valuation") or {}
+        technical = payload.get("technical") or {}
+        news_module = payload.get("news") or {}
+        holder = payload.get("holder") or {}
+        holding = payload.get("holding")
+        industry = payload.get("industry")
+        concepts = payload.get("concepts") or []
+        trade_date = str(payload.get("trade_date") or "")
+        ai_analysis = _generate_ai_analysis(
+            code,
+            basic.get("short_name"),
+            market,
+            capital,
+            finance,
+            valuation,
+            technical,
+            industry,
+            concepts,
+            holding,
+            hot_rank=payload.get("hot_rank"),
+            trade_date=trade_date,
         )
-        if not basic_rows:
-            return {"error": f"股票 {code} 不存在"}
-        basic = basic_rows[0]
-
-        # 行业
-        industry_rows = _read_sql(
-            "SELECT plate_name FROM si_stock_plate_east WHERE stock_code = :c AND plate_type = '行业'",
-            {"c": code}
-        )
-        if industry_rows and industry_rows[0].get("plate_name"):
-            industry = industry_rows[0]["plate_name"]
-        else:
-            sw_rows = _read_sql(
-                "SELECT industry_name FROM si_industry_sw WHERE stock_code = :c AND industry_type = '申万一级'",
-                {"c": code}
-            )
-            industry = sw_rows[0]["industry_name"] if sw_rows and sw_rows[0].get("industry_name") else None
-
-        # 概念
-        concept_rows = _read_sql(
-            "SELECT DISTINCT name FROM si_stock_concept_east WHERE stock_code = :c LIMIT 20",
-            {"c": code}
-        )
-        concepts = [r["name"] for r in concept_rows if r.get("name")]
-
-        # ─── 一、行情数据 ───
-        quote = {}
-        if mode == "intraday":
-            cur_rows = _read_sql(
-                "SELECT price, change_pct, snapshot_at FROM sm_stock_current WHERE stock_code = :c",
-                {"c": code}
-            )
-            if cur_rows and cur_rows[0].get("price") is not None:
-                quote = {**cur_rows[0], "source": "realtime"}
-        if not quote:
-            kline_rows = _read_sql(
-                "SELECT close AS price, change_pct, open, high, low, volume, amount, turnover_ratio, pre_close "
-                "FROM sm_stock_kline WHERE stock_code = :c AND trade_date = :td AND k_type=1",
-                {"c": code, "td": trade_date}
-            )
-            if kline_rows:
-                quote = {**kline_rows[0], "source": "kline"}
-        if quote.get("high") and quote.get("low") and quote.get("open") and float(quote.get("open", 0)) > 0:
-            quote["amplitude"] = round((float(quote["high"]) - float(quote["low"])) / float(quote["open"]) * 100, 2)
-
-        # 股本 + 市值
-        cap_rows = _read_sql(
-            "SELECT total_shares, limit_shares, list_a_shares FROM si_stock_shares WHERE stock_code = :c",
-            {"c": code}
-        )
-        cap = cap_rows[0] if cap_rows else {}
-        price_val = float(quote.get("price") or 0)
-        total_shares = float(cap.get("total_shares") or 0)
-        float_shares = float(cap.get("list_a_shares") or 0)
-
-        # 量比（今日成交量 / 近5日平均成交量）
-        vol_rows = _read_sql("""
-            SELECT AVG(volume) AS avg_vol FROM (
-                SELECT volume FROM sm_stock_kline
-                WHERE stock_code = :c AND k_type=1 AND trade_date < :td
-                ORDER BY trade_date DESC LIMIT 5
-            ) t
-        """, {"c": code, "td": trade_date})
-        avg_vol = float(vol_rows[0]["avg_vol"]) if vol_rows and vol_rows[0].get("avg_vol") else 0
-        cur_vol = float(quote.get("volume") or 0)
-        volume_ratio = round(cur_vol / avg_vol, 2) if avg_vol > 0 else None
-
-        # 财务指标（PE/PB/ROE等，取最新报告期）
-        fin_rows = _read_sql("""
-            SELECT basic_eps, net_asset_ps, roe_wtd, roa_wtd, gross_margin, net_margin,
-                   total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr,
-                   report_date
-            FROM si_stock_finance WHERE stock_code = :c
-            ORDER BY report_date DESC LIMIT 1
-        """, {"c": code})
-        fin = fin_rows[0] if fin_rows else {}
-        eps = float(fin.get("basic_eps") or 0)
-        bvps = float(fin.get("net_asset_ps") or 0)
-        pe_ttm = round(price_val / eps, 2) if eps and eps > 0 and price_val else None
-        pb = round(price_val / bvps, 2) if bvps and bvps > 0 and price_val else None
-
-        market = {
-            "price": quote.get("price"),
-            "change_pct": quote.get("change_pct"),
-            "open": quote.get("open"),
-            "high": quote.get("high"),
-            "low": quote.get("low"),
-            "close": quote.get("close") or quote.get("price"),
-            "pre_close": quote.get("pre_close"),
-            "volume": quote.get("volume"),
-            "amount": quote.get("amount"),
-            "turnover_ratio": quote.get("turnover_ratio"),
-            "amplitude": quote.get("amplitude"),
-            "pe_ttm": pe_ttm,
-            "pb": pb,
-            "volume_ratio": volume_ratio,
-            "total_shares": total_shares,
-            "float_shares": float_shares,
-            "market_cap": round(price_val * total_shares, 2) if price_val and total_shares else None,
-            "float_market_cap": round(price_val * float_shares, 2) if price_val and float_shares else None,
-        }
-
-        # ─── 二、资金面 ───
-        # 今日资金流向
-        flow_td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily")
-        flow_td = flow_td_rows[0]["d"] if flow_td_rows and flow_td_rows[0].get("d") else trade_date
-        flow_rows = _read_sql(
-            "SELECT main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source "
-            "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :ftd",
-            {"c": code, "ftd": flow_td}
-        )
-        flow_today = flow_rows[0] if flow_rows else {}
-
-        # 近3/5/20日资金流向累计
-        flow_multi = {}
-        for days, label in [(3, "flow_3d"), (5, "flow_5d"), (20, "flow_20d")]:
-            mf = _read_sql(f"""
-                SELECT SUM(main_net_inflow) AS main_net_inflow
-                FROM sm_stock_capital_flow_daily
-                WHERE stock_code = :c AND trade_date >= (
-                    SELECT trade_date FROM sm_stock_kline WHERE k_type=1 AND trade_date <= :td
-                    GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1 OFFSET {days - 1}
-                )
-            """, {"c": code, "td": flow_td})
-            flow_multi[label] = mf[0]["main_net_inflow"] if mf and mf[0].get("main_net_inflow") else None
-
-        # 龙虎榜（近20日）
-        lhb_rows = _read_sql("""
-            SELECT COUNT(*) AS cnt, SUM(a_net_amount) AS inst_net_buy
-            FROM st_a_list_daily
-            WHERE stock_code = :c AND trade_date >= DATE_SUB(:td, INTERVAL 20 DAY)
-        """, {"c": code, "td": trade_date})
-        lhb = lhb_rows[0] if lhb_rows else {}
-
-        lhb_seats = _read_sql("""
-            SELECT trade_date, operate_name, a_net_amount, a_buy_amount, a_sell_amount
-            FROM st_a_list_info
-            WHERE stock_code = :c AND trade_date >= DATE_SUB(:td, INTERVAL 20 DAY)
-            ORDER BY trade_date DESC LIMIT 10
-        """, {"c": code, "td": trade_date})
-
-        capital = {
-            "today": flow_today,
-            "flow_3d": flow_multi.get("flow_3d"),
-            "flow_5d": flow_multi.get("flow_5d"),
-            "flow_20d": flow_multi.get("flow_20d"),
-            "dragon_tiger": {
-                "count_20d": int(lhb.get("cnt") or 0),
-                "inst_net_buy": lhb.get("inst_net_buy"),
-                "seats": lhb_seats,
-            },
-        }
-
-        # ─── 股东人数 ───
-        holder_rows = _read_sql("""
-            SELECT report_date, holder_num, holder_num_change, pre_holder_num,
-                   holder_num_ratio, avg_free_shares
-            FROM si_stock_holder WHERE stock_code = :c
-            ORDER BY report_date DESC LIMIT 2
-        """, {"c": code})
-        holder = {}
-        if holder_rows:
-            h0 = holder_rows[0]
-            holder = {
-                "report_date": str(h0.get("report_date", "")),
-                "holder_num": int(h0["holder_num"]) if h0.get("holder_num") is not None else None,
-                "holder_num_change": int(h0["holder_num_change"]) if h0.get("holder_num_change") is not None else None,
-                "pre_holder_num": int(h0["pre_holder_num"]) if h0.get("pre_holder_num") is not None else None,
-                "holder_num_ratio": float(h0["holder_num_ratio"]) if h0.get("holder_num_ratio") is not None else None,
-                "avg_free_shares": float(h0["avg_free_shares"]) if h0.get("avg_free_shares") is not None else None,
-            }
-
-        # ─── 三、财务面 ───
-        # 最近8个报告期
-        fin_rows = _read_sql("""
-            SELECT report_date, report_type, basic_eps, net_asset_ps,
-                   total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr,
-                   roe_wtd, roa_wtd, gross_margin, net_margin,
-                   curr_ratio, quick_ratio, asset_liab_ratio
-            FROM si_stock_finance WHERE stock_code = :c
-            ORDER BY report_date DESC LIMIT 8
-        """, {"c": code})
-
-        finance = {
-            "latest": fin or {},
-            "quarters": fin_rows,
-        }
-
-        # ─── 四、估值面 ───
-        # PE/PB 历史分位（基于所有报告期的EPS/BVPS计算历史PE/PB）
-        pe_history = _read_sql("""
-            SELECT f.report_date, f.basic_eps, f.net_asset_ps
-            FROM si_stock_finance f
-            WHERE f.stock_code = :c AND f.basic_eps > 0
-            ORDER BY f.report_date DESC LIMIT 20
-        """, {"c": code})
-
-        pe_percentile = None
-        pb_percentile = None
-        if pe_history and pe_ttm:
-            pe_list = []
-            for r in pe_history:
-                e = float(r.get("basic_eps") or 0)
-                if e > 0:
-                    pe_list.append(price_val / e)
-            if pe_list:
-                below = sum(1 for p in pe_list if p <= pe_ttm)
-                pe_percentile = round(below / len(pe_list) * 100, 1)
-
-        if pe_history and pb:
-            pb_list = []
-            for r in pe_history:
-                b = float(r.get("net_asset_ps") or 0)
-                if b > 0:
-                    pb_list.append(price_val / b)
-            if pb_list:
-                below = sum(1 for p in pb_list if p <= pb)
-                pb_percentile = round(below / len(pb_list) * 100, 1)
-
-        valuation = {
-            "pe_ttm": pe_ttm,
-            "pe_percentile": pe_percentile,
-            "pb": pb,
-            "pb_percentile": pb_percentile,
-            "verdict": "偏高" if (pe_percentile and pe_percentile > 70) else "偏低" if (pe_percentile and pe_percentile < 30) else "合理" if pe_percentile else None,
-        }
-
-        # ─── 五、技术面 ───
-        # 取近250日K线计算技术指标
-        kline_250 = _read_sql("""
-            SELECT trade_date, open, close, high, low, volume, change_pct
-            FROM sm_stock_kline WHERE stock_code = :c AND k_type=1
-            ORDER BY trade_date DESC LIMIT 260
-        """, {"c": code})
-
-        technical = _compute_technical(kline_250, price_val)
-
-        # ─── 六、消息面 ───
-        notices = _read_sql("""
-            SELECT notice_date, title, column_name, detail_url
-            FROM si_notice_eastmoney WHERE stock_code = :c
-            ORDER BY notice_date DESC LIMIT 10
-        """, {"c": code})
-
-        news = _read_sql("""
-            SELECT publish_time, title, source
-            FROM st_news_flash
-            WHERE stocks LIKE :kw
-            ORDER BY publish_time DESC LIMIT 10
-        """, {"kw": f"%{code}%"})
-
-        news_module = {
-            "notices": notices,
-            "news": news,
-        }
-
-        # ─── 七、AI分析（使用统一分析引擎） ───
-        # 持仓信息
-        holding_rows = _read_sql(
-            "SELECT shares, cost_price FROM st_user_portfolio WHERE stock_code = :c AND shares > 0",
-            {"c": code}
-        )
-        holding = holding_rows[0] if holding_rows else None
-
-        # AI分析：优先使用 DeepSeek 生成详细文字分析
-        ai_analysis = _generate_ai_analysis(code, basic.get("short_name"), market, capital, finance, valuation, technical, industry, concepts, holding)
 
         return {
             "stock_code": code,
@@ -2725,7 +2615,35 @@ def _compute_technical(kline_data, cur_price):
     }
 
 
-def _generate_ai_analysis(code, name, market, capital, finance, valuation, technical, industry, concepts, holding=None):
+def _legacy_capital_view(capital: dict | None) -> dict:
+    """Convert loader capital values back to legacy yuan units for existing pages."""
+    capital = capital or {}
+    out = dict(capital)
+    today = dict(out.get("today") or {})
+    for key in ("main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"):
+        if today.get(key) is not None:
+            today[key] = float(today[key]) * 10000
+    out["today"] = today
+    for key in ("flow_3d", "flow_5d", "flow_20d"):
+        if out.get(key) is not None:
+            out[key] = float(out[key]) * 10000
+    return out
+
+
+def _load_stock_detail_payload(stock_code: str, mode: str | None = None) -> dict:
+    mode = mode or _portfolio_market_mode()
+    trade_date = None if mode == "intraday" else _portfolio_close_trade_date()
+    loader = StockDataLoader()
+    payload = loader.load_full_data(
+        stock_code,
+        trade_date=trade_date,
+        use_realtime=(mode == "intraday"),
+    )
+    payload["capital"] = _legacy_capital_view(payload.get("capital"))
+    return payload
+
+
+def _generate_ai_analysis(code, name, market, capital, finance, valuation, technical, industry, concepts, holding=None, hot_rank=None, trade_date: str = ""):
     """调用 DeepSeek 生成 AI 投资分析"""
     try:
         import httpx
@@ -2766,14 +2684,16 @@ def _generate_ai_analysis(code, name, market, capital, finance, valuation, techn
 
         # 热门排名
         try:
-            hot_rows = _read_sql("""
-                SELECT fused_rank, east_rank, ths_rank, total_score
-                FROM st_hot_rank_fused
-                WHERE stock_code = :c
-                ORDER BY snapshot_date DESC LIMIT 1
-            """, {"c": code})
-            if hot_rows:
-                hr = hot_rows[0]
+            hr = hot_rank or {}
+            if (not hr) and trade_date:
+                hot_rows = _read_sql("""
+                    SELECT fused_rank, east_rank, ths_rank, total_score
+                    FROM st_hot_rank_fused
+                    WHERE stock_code = :c AND snapshot_date <= :td
+                    ORDER BY snapshot_date DESC LIMIT 1
+                """, {"c": code, "td": trade_date})
+                hr = hot_rows[0] if hot_rows else {}
+            if hr:
                 summary_parts.append(f"融合热度排名：第{hr.get('fused_rank')}名，东方财富排名：{hr.get('east_rank')}，同花顺排名：{hr.get('ths_rank')}")
         except Exception:
             pass
@@ -3516,136 +3436,166 @@ def _portfolio_day_profit(
     return round(day_pnl, 2)
 
 
+def _portfolio_snapshot_ttl_seconds(live_mode: bool) -> int:
+    if live_mode:
+        return 5 if _is_monitor_trading_time() else 60
+    return 30 if _is_monitor_trading_time() else 120
+
+
+def _build_portfolio_snapshot() -> dict:
+    _ensure_portfolio_position_columns()
+    rows = _read_sql("""
+        SELECT p.* FROM st_user_portfolio p
+        ORDER BY (p.shares > 0) DESC, p.sort_order, p.id
+    """)
+    if not rows:
+        return {"data": [], "total": 0, "summary": {}}
+
+    codes = [str(r.get("stock_code") or "").strip().zfill(6) for r in rows if r.get("stock_code")]
+    if not codes:
+        return {"data": rows, "total": len(rows), "summary": {}}
+
+    placeholders = ",".join([f"'{c}'" for c in codes])
+    kline_map = {}
+    try:
+        kline_rows = _read_sql(f"""
+            SELECT stock_code, trade_date, close, change_pct, short_name, pre_close
+            FROM sm_stock_kline
+            WHERE k_type = 1 AND stock_code IN ({placeholders})
+              AND trade_date >= DATE_SUB(CURDATE(), INTERVAL 10 DAY)
+            ORDER BY stock_code, trade_date DESC
+        """)
+        for row in kline_rows:
+            stock_code = str(row["stock_code"])
+            if stock_code not in kline_map:
+                kline_map[stock_code] = row
+    except Exception:
+        pass
+
+    try:
+        live_quotes = _portfolio_fetch_live_quotes(codes) or {}
+    except Exception:
+        live_quotes = {}
+
+    today_trades_map = {}
+    try:
+        _ensure_portfolio_trans_log_table()
+        all_trades = _read_sql(f"""
+            SELECT stock_code, trans_type, price, shares, source
+            FROM st_portfolio_trans_log
+            WHERE stock_code IN ({placeholders}) AND trans_date = CURDATE()
+            ORDER BY stock_code, created_at, id
+        """)
+        for row in all_trades:
+            stock_code = str(row["stock_code"]).strip().zfill(6)
+            today_trades_map.setdefault(stock_code, []).append(row)
+    except Exception:
+        pass
+
+    total_hold_profit = 0.0
+    today_hold_profit = 0.0
+    holding_count = 0
+    today_open_count = 0
+    today_cleared_count = 0
+    for row in rows:
+        stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        kline = kline_map.get(stock_code, {})
+        row["kline_pre_close"] = kline.get("pre_close")
+        row["kline_trade_date"] = str(kline.get("trade_date", ""))[:10] if kline.get("trade_date") else None
+        _portfolio_apply_quote(row, live_quotes.get(stock_code))
+        if row.get("cur_price") is None:
+            row["cur_price"] = kline.get("close")
+        if row.get("change_pct") is None:
+            row["change_pct"] = kline.get("change_pct")
+        if row.get("current_name") is None:
+            row["current_name"] = kline.get("short_name")
+
+        trade_date = _portfolio_quote_trade_date(row)
+        row["quote_trade_date"] = trade_date
+        cost_price = float(row.get("cost_price") or 0)
+        current_price = float(row.get("cur_price") or 0) if row.get("cur_price") is not None else 0.0
+        shares = int(row.get("shares") or 0)
+        trades = today_trades_map.get(stock_code, [])
+        if not trades and _portfolio_is_today_buy_position(row, trade_date) and shares > 0 and cost_price > 0:
+            trades = [{"trans_type": "buy", "price": cost_price, "shares": shares, "source": "position_add"}]
+
+        trade_state = _portfolio_today_trade_state(shares, trades)
+        row.update(trade_state)
+        row["is_holding"] = shares > 0
+        hold_profit = _portfolio_cost_profit(shares, current_price, cost_price)
+        row["profit"] = hold_profit
+        row["profit_pct"] = round((current_price / cost_price - 1) * 100, 2) if shares > 0 and current_price > 0 and cost_price > 0 else None
+        row["today_profit"] = _portfolio_day_profit(
+            shares,
+            current_price,
+            row.get("live_price"),
+            row.get("price_change"),
+            row.get("kline_pre_close"),
+            row.get("change_pct"),
+            row["stock_code"],
+            trades,
+            trade_date,
+        )
+        row["display_name"] = row.get("current_name") or row.get("short_name") or row["stock_code"]
+        row["snapshot_at"] = row.get("quote_snapshot_at") or ""
+
+        if row.get("is_today_open") or row.get("is_today_reopened"):
+            today_open_count += 1
+        if row.get("is_today_cleared"):
+            today_cleared_count += 1
+        if shares > 0:
+            holding_count += 1
+            if hold_profit is not None:
+                total_hold_profit += hold_profit
+        if row["today_profit"] is not None:
+            today_hold_profit += row["today_profit"]
+
+    return {
+        "data": rows,
+        "total": len(rows),
+        "summary": {
+            "holding_count": holding_count,
+            "total_hold_profit": round(total_hold_profit, 2),
+            "today_hold_profit": round(today_hold_profit, 2),
+            "today_open_count": today_open_count,
+            "today_cleared_count": today_cleared_count,
+        },
+    }
+
+
+def _get_portfolio_snapshot(live_mode: bool) -> dict:
+    ttl_seconds = _portfolio_snapshot_ttl_seconds(live_mode)
+    cached = _cache_get("portfolio_snapshot", ttl_seconds=ttl_seconds)
+    if cached is not None:
+        if live_mode:
+            return {**cached, "live": True}
+        return cached
+    try:
+        result = _build_portfolio_snapshot()
+        if "error" not in result:
+            _cache_set("portfolio_snapshot", result)
+        if live_mode:
+            return {**result, "live": True}
+        return result
+    except Exception as exc:
+        return {"data": [], "total": 0, "error": str(exc)[:200]}
+
+
+def _invalidate_portfolio_snapshot_cache() -> None:
+    _cache_drop("portfolio_snapshot")
+
+
+def _invalidate_market_runtime_caches() -> None:
+    _cache_drop("portfolio_live_quotes")
+    _invalidate_portfolio_snapshot_cache()
+    _cache_drop_prefix("monitor_data_")
+    _cache_drop_prefix("sector_movement_")
+
+
 @router.get("/portfolio/list")
 def portfolio_list():
     """持仓列表（带实时行情）"""
-    # 盘中30s缓存，盘后120s缓存
-    _ttl = 30 if _is_monitor_trading_time() else 120
-    cached = _cache_get("portfolio_list", ttl_seconds=_ttl)
-    if cached is not None:
-        return cached
-    try:
-        _ensure_portfolio_position_columns()
-        # 1. 一次性查出所有持仓
-        rows = _read_sql("""
-            SELECT p.* FROM st_user_portfolio p
-            ORDER BY (p.shares > 0) DESC, p.sort_order, p.id
-        """)
-        if not rows:
-            return {"data": [], "total": 0, "summary": {}}
-
-        codes = [str(r.get("stock_code") or "").strip().zfill(6) for r in rows if r.get("stock_code")]
-        if not codes:
-            return {"data": rows, "total": len(rows), "summary": {}}
-
-        # 2. 一次性查最新K线（用子查询取每只股票最新一天，避免全表扫描）
-        ph = ",".join([f"'{c}'" for c in codes])
-        kline_map = {}
-        try:
-            kline_rows = _read_sql(f"""
-                SELECT stock_code, trade_date, close, change_pct, short_name, pre_close
-                FROM sm_stock_kline
-                WHERE k_type = 1 AND stock_code IN ({ph})
-                  AND trade_date >= DATE_SUB(CURDATE(), INTERVAL 10 DAY)
-                ORDER BY stock_code, trade_date DESC
-            """)
-            for kr in kline_rows:
-                sc = str(kr["stock_code"])
-                if sc not in kline_map:  # 只取最新一条
-                    kline_map[sc] = kr
-        except Exception:
-            pass
-
-        # 3. 一次性拉取实时行情（带缓存）
-        live_quotes = {}
-        try:
-            live_quotes = _portfolio_fetch_live_quotes(codes)
-        except Exception:
-            live_quotes = {}
-
-        # 4. 一次性查今日所有交易记录
-        today_trades_map = {}  # {stock_code: [trades]}
-        try:
-            _ensure_portfolio_trans_log_table()
-            all_trades = _read_sql(f"""
-                SELECT stock_code, trans_type, price, shares, source
-                FROM st_portfolio_trans_log
-                WHERE stock_code IN ({ph}) AND trans_date = CURDATE()
-                ORDER BY stock_code, created_at, id
-            """)
-            for tr in all_trades:
-                sc = str(tr["stock_code"]).strip().zfill(6)
-                today_trades_map.setdefault(sc, []).append(tr)
-        except Exception:
-            pass
-
-        # 5. 组装数据
-        total_hold_profit = 0.0
-        today_hold_profit = 0.0
-        holding_count = 0
-        today_open_count = 0
-        today_cleared_count = 0
-        for r in rows:
-            code = str(r.get("stock_code") or "").strip().zfill(6)
-            # 合并K线数据
-            k = kline_map.get(code, {})
-            r["kline_pre_close"] = k.get("pre_close")
-            r["kline_trade_date"] = str(k.get("trade_date", ""))[:10] if k.get("trade_date") else None
-            # 合并实时行情
-            _portfolio_apply_quote(r, live_quotes.get(code))
-            # 补充缺失字段
-            if r.get("cur_price") is None:
-                r["cur_price"] = k.get("close")
-            if r.get("change_pct") is None:
-                r["change_pct"] = k.get("change_pct")
-            if r.get("current_name") is None:
-                r["current_name"] = k.get("short_name")
-            trade_date = _portfolio_quote_trade_date(r)
-            r["quote_trade_date"] = trade_date
-            cp = float(r.get("cost_price") or 0)
-            pr = float(r.get("cur_price") or 0) if r.get("cur_price") is not None else 0.0
-            sh = int(r.get("shares") or 0)
-            # 用批量查好的交易记录
-            trades = today_trades_map.get(code, [])
-            if not trades and _portfolio_is_today_buy_position(r, trade_date) and sh > 0 and cp > 0:
-                trades = [{"trans_type": "buy", "price": cp, "shares": sh, "source": "position_add"}]
-            trade_state = _portfolio_today_trade_state(sh, trades)
-            r.update(trade_state)
-            r["is_holding"] = sh > 0
-            hold_profit = _portfolio_cost_profit(sh, pr, cp)
-            r["profit"] = hold_profit
-            r["profit_pct"] = round((pr / cp - 1) * 100, 2) if sh > 0 and pr > 0 and cp > 0 else None
-            r["today_profit"] = _portfolio_day_profit(
-                sh, pr, r.get("live_price"), r.get("price_change"),
-                r.get("kline_pre_close"), r.get("change_pct"),
-                r["stock_code"], trades, trade_date,
-            )
-            r["display_name"] = r.get("current_name") or r.get("short_name") or r["stock_code"]
-            if r.get("is_today_open") or r.get("is_today_reopened"):
-                today_open_count += 1
-            if r.get("is_today_cleared"):
-                today_cleared_count += 1
-            if sh > 0:
-                holding_count += 1
-                if hold_profit is not None:
-                    total_hold_profit += hold_profit
-            if r["today_profit"] is not None:
-                today_hold_profit += r["today_profit"]
-        result = {
-            "data": rows,
-            "total": len(rows),
-            "summary": {
-                "holding_count": holding_count,
-                "total_hold_profit": round(total_hold_profit, 2),
-                "today_hold_profit": round(today_hold_profit, 2),
-                "today_open_count": today_open_count,
-                "today_cleared_count": today_cleared_count,
-            },
-        }
-        _cache_set("portfolio_list", result)
-        return result
-    except Exception as e:
-        return {"data": [], "total": 0, "error": str(e)}
+    return _get_portfolio_snapshot(live_mode=False)
 
 
 @router.post("/portfolio/add")
@@ -3714,6 +3664,7 @@ def portfolio_add(body: PortfolioAdd):
         is_hold = 1 if body.shares > 0 else 0
         _exec_sql("UPDATE sm_stock_snapshot SET sort_order = :so, is_holding = :ih WHERE stock_code = :c",
                   {"so": next_order, "ih": is_hold, "c": code})
+        _invalidate_portfolio_snapshot_cache()
         return {"status": "ok", "stock_code": code, "short_name": name}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -3727,6 +3678,7 @@ def portfolio_remove(stock_code: str):
         _exec_sql("DELETE FROM st_user_portfolio WHERE stock_code = :c", {"c": code})
         # 同步更新快照表：移除自选股排序和持仓标记
         _exec_sql("UPDATE sm_stock_snapshot SET sort_order = NULL, is_holding = 0 WHERE stock_code = :c", {"c": code})
+        _invalidate_portfolio_snapshot_cache()
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -3746,6 +3698,7 @@ def portfolio_reorder(body: PortfolioReorder):
                       {"o": i, "c": c})
             _exec_sql("UPDATE sm_stock_snapshot SET sort_order = :o WHERE stock_code = :c",
                       {"o": i, "c": c})
+        _invalidate_portfolio_snapshot_cache()
         return {"status": "ok"}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -3804,6 +3757,7 @@ def portfolio_transact(stock_code: str, body: PortfolioTransact):
                 etl_sync_at=NOW()
             WHERE stock_code=:c
         """, {"c": code, "p": new_cost, "s": new_shares, "src": position_source})
+        _invalidate_portfolio_snapshot_cache()
         return {"status": "ok", "cost_price": new_cost, "shares": new_shares}
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -3975,6 +3929,7 @@ def _portfolio_resolve_quote(code: str, klines: list | None) -> dict:
 
 def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
     """拉取最新价写入 sm_stock_current，返回 {stock_code: quote_dict}。盘中60s缓存。"""
+    _log = logging.getLogger("portfolio.live_quotes")
     # 检查缓存
     _cache_key = "portfolio_live_quotes"
     cached = _cache_get(_cache_key, ttl_seconds=60)
@@ -3989,9 +3944,13 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
     try:
         from adata.stock.market.stock_market.stock_market import StockMarket
         df = StockMarket().list_market_current(code_list=clean)
-    except Exception:
+        if df is not None and not df.empty:
+            _log.info("adata 返回 %d 条行情", len(df))
+    except Exception as e:
+        _log.warning("adata 拉取行情失败: %s", e)
         df = None
     if df is None or df.empty:
+        _log.info("adata 无数据，尝试 sina 补充")
         try:
             import requests
 
@@ -4001,6 +3960,7 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
                 headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn"},
                 timeout=15,
             )
+            resp.encoding = "gbk"
             rows = []
             for line in resp.text.strip().split("\n"):
                 if "=" not in line or '""' in line:
@@ -4031,9 +3991,12 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
                 except Exception:
                     continue
             df = pd.DataFrame(rows)
-        except Exception:
+            _log.info("sina 返回 %d 条行情", len(rows))
+        except Exception as e:
+            _log.error("sina 拉取行情失败: %s", e)
             df = None
     if df is None or df.empty:
+        _log.warning("所有行情源均无数据，codes=%s", clean)
         return {}
 
     now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4044,23 +4007,28 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
             continue
         sn = str(row.get("short_name", ""))[:128]
         try:
-            price = float(row.get("price", np.nan))
+            v = float(row.get("price", np.nan))
+            price = v if not np.isnan(v) else None
         except (ValueError, TypeError):
             price = None
         try:
-            change = float(row.get("change", np.nan))
+            v = float(row.get("change", np.nan))
+            change = v if not np.isnan(v) else None
         except (ValueError, TypeError):
             change = None
         try:
-            chg_pct = float(row.get("change_pct", np.nan))
+            v = float(row.get("change_pct", np.nan))
+            chg_pct = v if not np.isnan(v) else None
         except (ValueError, TypeError):
             chg_pct = None
         try:
-            volume = float(row.get("volume", np.nan))
+            v = float(row.get("volume", np.nan))
+            volume = v if not np.isnan(v) else None
         except (ValueError, TypeError):
             volume = None
         try:
-            amount = float(row.get("amount", np.nan))
+            v = float(row.get("amount", np.nan))
+            amount = v if not np.isnan(v) else None
         except (ValueError, TypeError):
             amount = None
         _exec_sql("DELETE FROM sm_stock_current WHERE stock_code = :c", {"c": sc})
@@ -4083,126 +4051,37 @@ def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
 @router.get("/portfolio/live")
 def portfolio_live():
     """自选股实时行情：拉取最新价 + 返回自选股数据（含当日盈亏/持仓盈亏），一次搞定"""
-    try:
-        _ensure_portfolio_position_columns()
-        pf_rows = _read_sql("SELECT * FROM st_user_portfolio ORDER BY (shares > 0) DESC, sort_order")
-        codes = [r["stock_code"] for r in pf_rows] if pf_rows else []
-        if not codes:
-            return {"data": [], "total": 0}
-        quotes = _portfolio_fetch_live_quotes(codes)
-        if not quotes:
-            quotes = {}
-        # 批量查最新K线，取 pre_close
-        ph = ",".join([f"'{c}'" for c in codes])
-        kline_map = {}
-        try:
-            kline_rows = _read_sql(f"""
-                SELECT stock_code, trade_date, close, change_pct, short_name, pre_close
-                FROM sm_stock_kline
-                WHERE k_type = 1 AND stock_code IN ({ph})
-                  AND trade_date >= DATE_SUB(CURDATE(), INTERVAL 10 DAY)
-                ORDER BY stock_code, trade_date DESC
-            """)
-            for kr in kline_rows:
-                sc_k = str(kr["stock_code"])
-                if sc_k not in kline_map:
-                    kline_map[sc_k] = kr
-        except Exception:
-            pass
-        _today_str = date.today().isoformat()
-        result = []
-        total_hold_profit = 0.0
-        today_hold_profit = 0.0
-        holding_count = 0
-        today_open_count = 0
-        today_cleared_count = 0
-        for r in (pf_rows or []):
-            sc = r["stock_code"]
-            q = quotes.get(sc, {})
-            k = kline_map.get(sc, {})
-            kline_pre_close = k.get("pre_close")
-            cur_price = q.get("price") or 0
-            if not cur_price:
-                cur_price = k.get("close") or 0
-            chg_pct = q.get("change_pct") or 0
-            if not chg_pct:
-                chg_pct = k.get("change_pct") or 0
-            cp = float(r.get("cost_price") or 0)
-            sh = int(r.get("shares") or 0)
-            profit = round((cur_price - cp) * sh, 2) if cur_price and cp else 0
-            profit_pct = round((cur_price / cp - 1) * 100, 2) if cur_price and cp else 0
-            trades = _portfolio_effective_today_trades(sc, sh, cp, r, _today_str)
-            trade_state = _portfolio_today_trade_state(sh, trades)
-            today_status = trade_state.get("today_position_status", "")
-            today_profit = _portfolio_day_profit(
-                sh,
-                cur_price,
-                q.get("price") if q.get("price") else None,
-                q.get("change"),
-                kline_pre_close,
-                chg_pct,
-                sc,
-                trades,
-                _today_str,
-            )
-            if trade_state.get("is_today_open") or trade_state.get("is_today_reopened"):
-                today_open_count += 1
-            if trade_state.get("is_today_cleared"):
-                today_cleared_count += 1
-            if sh > 0:
-                holding_count += 1
-                total_hold_profit += profit
-            if today_profit is not None:
-                today_hold_profit += today_profit
-            result.append({
-                "stock_code": sc,
-                "display_name": q.get("short_name") or r.get("short_name") or sc,
-                "cur_price": cur_price,
-                "change_pct": chg_pct,
-                "cost_price": cp,
-                "shares": sh,
-                "profit": profit,
-                "profit_pct": profit_pct,
-                "today_profit": today_profit,
-                "is_holding": sh > 0,
-                "is_today_cleared": trade_state.get("is_today_cleared", False),
-                "is_today_open": trade_state.get("is_today_open", False),
-                "is_today_reopened": trade_state.get("is_today_reopened", False),
-                "has_today_trade": trade_state.get("has_today_trade", False),
-                "today_position_status": today_status,
-                "snapshot_at": q.get("snapshot_at", ""),
-            })
-        return {
-            "data": result,
-            "total": len(result),
-            "live": True,
-            "summary": {
-                "holding_count": holding_count,
-                "total_hold_profit": round(total_hold_profit, 2),
-                "today_hold_profit": round(today_hold_profit, 2),
-                "today_open_count": today_open_count,
-                "today_cleared_count": today_cleared_count,
-            },
-        }
-    except Exception as e:
-        return {"data": [], "total": 0, "error": str(e)[:200]}
+    return _get_portfolio_snapshot(live_mode=True)
 
 
 @router.post("/portfolio/refresh-prices")
 def portfolio_refresh_prices():
     """刷新自选股实时行情：拉取最新价写入sm_stock_current"""
+    _log = logging.getLogger("portfolio.refresh_prices")
     try:
         pf_rows = _read_sql("SELECT stock_code FROM st_user_portfolio ORDER BY sort_order")
         codes = [r["stock_code"] for r in pf_rows] if pf_rows else []
+        _log.info("刷新行情: %d 只自选股, codes=%s", len(codes), codes[:5])
         if not codes:
             return {"status": "ok", "refreshed": 0, "message": "无自选股"}
         quotes = _portfolio_fetch_live_quotes(codes)
         if not quotes:
-            return {"status": "error", "error": "行情接口无数据"}
+            _log.warning("行情接口返回空, codes=%s", codes)
+            from datetime import datetime
+            now = datetime.now()
+            hour, minute = now.hour, now.minute
+            is_trading = (9 <= hour < 11 or (hour == 11 and minute <= 30) or (13 <= hour < 15))
+            if not is_trading:
+                return {"status": "error", "error": "当前非交易时间(9:30-11:30/13:00-15:00)，行情源无实时数据"}
+            return {"status": "error", "error": "行情接口无数据，请稍后重试"}
+        _log.info("行情刷新成功: %d 条", len(quotes))
+        _invalidate_portfolio_snapshot_cache()
         return {"status": "ok", "refreshed": len(quotes)}
     except ImportError:
+        _log.error("ImportError: adata 模块不可用")
         return {"status": "error", "error": "adata 模块不可用，无法获取实时行情"}
     except Exception as e:
+        _log.error("刷新行情异常: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)[:200]}
 
 
@@ -4211,224 +4090,35 @@ def portfolio_analyze(stock_code: str):
     """AI 分析个股 — DeepSeek 生成详细文字分析"""
     try:
         code = stock_code.strip().zfill(6)
-
-        # 获取交易日期
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-        trade_date = td_rows[0]["d"] if td_rows and td_rows[0].get("d") else date.today().isoformat()
         mode = _portfolio_market_mode()
+        payload = _load_stock_detail_payload(code, mode=mode)
+        basic = payload.get("basic") or {}
+        market = payload.get("market") or {}
+        capital = payload.get("capital") or {}
+        finance = payload.get("finance") or {}
+        valuation = payload.get("valuation") or {}
+        technical = payload.get("technical") or {}
+        industry = payload.get("industry") or ""
+        concepts = payload.get("concepts") or []
+        holding = payload.get("holding")
+        trade_date = str(payload.get("trade_date") or "")
+        price_val = float(market.get("price") or 0)
+        quote = market
 
-        # 基本信息
-        basic_rows = _read_sql(
-            "SELECT stock_code, short_name, exchange, list_date FROM si_all_code WHERE stock_code = :c",
-            {"c": code}
+        ai_result = _generate_ai_analysis(
+            code,
+            basic.get("short_name"),
+            market,
+            capital,
+            finance,
+            valuation,
+            technical,
+            industry,
+            concepts,
+            holding,
+            hot_rank=payload.get("hot_rank"),
+            trade_date=trade_date,
         )
-        if not basic_rows:
-            return {"error": f"股票 {code} 不存在"}
-        basic = basic_rows[0]
-
-        # 行业
-        industry_rows = _read_sql(
-            "SELECT plate_name FROM si_stock_plate_east WHERE stock_code = :c AND plate_type = '行业'",
-            {"c": code}
-        )
-        industry = industry_rows[0]["plate_name"] if industry_rows else ""
-
-        # 概念
-        concept_rows = _read_sql(
-            "SELECT DISTINCT name FROM si_stock_concept_east WHERE stock_code = :c LIMIT 20",
-            {"c": code}
-        )
-        concepts = [r["name"] for r in concept_rows if r.get("name")]
-
-        # 行情数据：盘中取实时，盘后取最新K线
-        quote = {}
-        if mode == "intraday":
-            cur_rows = _read_sql(
-                "SELECT price, change_pct, snapshot_at FROM sm_stock_current WHERE stock_code = :c",
-                {"c": code}
-            )
-            if cur_rows and cur_rows[0].get("price") is not None:
-                quote = {**cur_rows[0], "source": "realtime"}
-        if not quote:
-            kline_rows = _read_sql(
-                "SELECT close AS price, change_pct, open, high, low, volume, amount, turnover_ratio, pre_close, trade_date "
-                "FROM sm_stock_kline WHERE stock_code = :c AND k_type=1 ORDER BY trade_date DESC LIMIT 1",
-                {"c": code}
-            )
-            if kline_rows:
-                quote = {**kline_rows[0], "source": "kline"}
-                trade_date = kline_rows[0].get("trade_date", trade_date)
-
-        price_val = float(quote.get("price") or 0)
-
-        # 资本
-        cap_rows = _read_sql(
-            "SELECT total_shares, limit_shares, list_a_shares FROM si_stock_shares WHERE stock_code = :c",
-            {"c": code}
-        )
-        cap = cap_rows[0] if cap_rows else {}
-
-        # 量比
-        vol_rows = _read_sql("""
-            SELECT AVG(volume) AS avg_vol FROM (
-                SELECT volume FROM sm_stock_kline
-                WHERE stock_code = :c AND k_type=1 AND trade_date < :td
-                ORDER BY trade_date DESC LIMIT 5
-            ) t
-        """, {"c": code, "td": trade_date})
-        avg_vol = float(vol_rows[0]["avg_vol"]) if vol_rows and vol_rows[0].get("avg_vol") else 0
-        cur_vol = float(quote.get("volume") or 0)
-        volume_ratio = round(cur_vol / avg_vol, 2) if avg_vol > 0 else None
-
-        # 财务
-        fin_rows = _read_sql("""
-            SELECT basic_eps, net_asset_ps, roe_wtd, roa_wtd, gross_margin, net_margin,
-                   total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr, report_date
-            FROM si_stock_finance WHERE stock_code = :c
-            ORDER BY report_date DESC LIMIT 1
-        """, {"c": code})
-        fin = fin_rows[0] if fin_rows else {}
-        eps = float(fin.get("basic_eps") or 0)
-        bvps = float(fin.get("net_asset_ps") or 0)
-        pe_ttm = round(price_val / eps, 2) if eps > 0 else None
-        pb = round(price_val / bvps, 2) if bvps > 0 else None
-
-        market = {
-            "price": price_val,
-            "change_pct": quote.get("change_pct"),
-            "open": quote.get("open"),
-            "high": quote.get("high"),
-            "low": quote.get("low"),
-            "volume": quote.get("volume"),
-            "amount": quote.get("amount"),
-            "turnover_ratio": quote.get("turnover_ratio"),
-            "volume_ratio": volume_ratio,
-            "pe_ttm": pe_ttm,
-            "pb": pb,
-            "total_market_cap": round(price_val * float(cap.get("total_shares") or 0) / 1e8, 2) if cap.get("total_shares") else None,
-            "float_market_cap": round(price_val * float(cap.get("list_a_shares") or 0) / 1e8, 2) if cap.get("list_a_shares") else None,
-        }
-
-        # 资金流
-        flow_td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily")
-        flow_td = flow_td_rows[0]["d"] if flow_td_rows and flow_td_rows[0].get("d") else trade_date
-
-        flow_rows = _read_sql(
-            "SELECT main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source "
-            "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :ftd",
-            {"c": code, "ftd": flow_td}
-        )
-        flow_today = flow_rows[0] if flow_rows else {}
-
-        flow_multi = {}
-        for label, days in [("flow_3d", 3), ("flow_5d", 5), ("flow_20d", 20)]:
-            mf = _read_sql(f"""
-                SELECT SUM(main_net_inflow) AS main_net_inflow
-                FROM sm_stock_capital_flow_daily
-                WHERE stock_code = :c AND trade_date >= (
-                    SELECT trade_date FROM sm_stock_kline WHERE k_type=1 AND trade_date <= :td
-                    GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1 OFFSET {days - 1}
-                )
-            """, {"c": code, "td": flow_td})
-            flow_multi[label] = mf[0]["main_net_inflow"] if mf and mf[0].get("main_net_inflow") else None
-
-        lhb_rows = _read_sql("""
-            SELECT COUNT(*) AS cnt, SUM(a_net_amount) AS inst_net_buy
-            FROM st_a_list_daily
-            WHERE stock_code = :c AND trade_date >= DATE_SUB(:td, INTERVAL 20 DAY)
-        """, {"c": code, "td": trade_date})
-        lhb = lhb_rows[0] if lhb_rows else {}
-
-        lhb_seats = _read_sql("""
-            SELECT trade_date, operate_name, a_net_amount, a_buy_amount, a_sell_amount
-            FROM st_a_list_info
-            WHERE stock_code = :c AND trade_date >= DATE_SUB(:td, INTERVAL 20 DAY)
-            ORDER BY trade_date DESC LIMIT 10
-        """, {"c": code, "td": trade_date})
-
-        capital = {
-            "today": flow_today,
-            "flow_3d": flow_multi.get("flow_3d"),
-            "flow_5d": flow_multi.get("flow_5d"),
-            "flow_20d": flow_multi.get("flow_20d"),
-            "dragon_tiger": {
-                "count_20d": int(lhb.get("cnt") or 0),
-                "inst_net_buy": lhb.get("inst_net_buy"),
-                "seats": lhb_seats,
-            },
-        }
-
-        # 财务面
-        fin_detail = _read_sql("""
-            SELECT report_date, report_type, basic_eps, net_asset_ps,
-                   total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr,
-                   roe_wtd, roa_wtd, gross_margin, net_margin,
-                   curr_ratio, quick_ratio, asset_liab_ratio
-            FROM si_stock_finance WHERE stock_code = :c
-            ORDER BY report_date DESC LIMIT 8
-        """, {"c": code})
-
-        finance = {
-            "latest": fin or {},
-            "quarters": fin_detail,
-        }
-
-        # 估值面
-        pe_history = _read_sql("""
-            SELECT f.report_date, f.basic_eps, f.net_asset_ps
-            FROM si_stock_finance f
-            WHERE f.stock_code = :c AND f.basic_eps > 0
-            ORDER BY f.report_date DESC LIMIT 20
-        """, {"c": code})
-
-        pe_percentile = None
-        pb_percentile = None
-        if pe_history and pe_ttm:
-            pe_list = []
-            for r in pe_history:
-                e = float(r.get("basic_eps") or 0)
-                if e > 0:
-                    pe_list.append(price_val / e)
-            if pe_list:
-                below = sum(1 for p in pe_list if p <= pe_ttm)
-                pe_percentile = round(below / len(pe_list) * 100, 1)
-
-        if pe_history and pb:
-            pb_list = []
-            for r in pe_history:
-                b = float(r.get("net_asset_ps") or 0)
-                if b > 0:
-                    pb_list.append(price_val / b)
-            if pb_list:
-                below = sum(1 for p in pb_list if p <= pb)
-                pb_percentile = round(below / len(pb_list) * 100, 1)
-
-        valuation = {
-            "pe_ttm": pe_ttm,
-            "pe_percentile": pe_percentile,
-            "pb": pb,
-            "pb_percentile": pb_percentile,
-            "verdict": "偏高" if (pe_percentile and pe_percentile > 70) else "偏低" if (pe_percentile and pe_percentile < 30) else "合理" if pe_percentile else None,
-        }
-
-        # 技术面
-        kline_250 = _read_sql("""
-            SELECT trade_date, open, close, high, low, volume, change_pct
-            FROM sm_stock_kline WHERE stock_code = :c AND k_type=1
-            ORDER BY trade_date DESC LIMIT 260
-        """, {"c": code})
-
-        technical = _compute_technical(kline_250, price_val)
-
-        # 持仓信息
-        holding_rows = _read_sql(
-            "SELECT shares, cost_price FROM st_user_portfolio WHERE stock_code = :c AND shares > 0",
-            {"c": code}
-        )
-        holding = holding_rows[0] if holding_rows else None
-
-        # DeepSeek AI 分析
-        ai_result = _generate_ai_analysis(code, basic.get("short_name"), market, capital, finance, valuation, technical, industry, concepts, holding)
 
         # 构建返回
         analysis_text = ai_result.get("conclusion", "") if isinstance(ai_result, dict) else str(ai_result)
@@ -4883,7 +4573,7 @@ def sync_sector_heat_today(date: str = Query(default_factory=lambda: date.today(
     _ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
     cmd = [_sys.executable, str(_ROOT + "/tools/fetch_sector_heat_east_daily.py"), date]
     child_env = _os.environ.copy()
-    child_env.setdefault("MYSQL_URL", _os.environ.get("MYSQL_URL", "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"))
+    child_env.setdefault("MYSQL_URL", get_engine().url.render_as_string(hide_password=False))
     child_env.setdefault("PYTHONPATH", _ROOT + ":" + _os.path.join(_ROOT, "adata"))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=_ROOT, env=child_env)
@@ -4972,7 +4662,19 @@ def _get_realtime_overview():
             "  SUM(CASE WHEN change_pct < 0 THEN 1 ELSE 0 END) AS down_cnt, "
             "  SUM(CASE WHEN ABS(change_pct) < 1 THEN 1 ELSE 0 END) AS sideline_cnt, "
             "  COUNT(*) AS total, "
-            "  COALESCE(SUM(amount), 0) AS total_amount "
+            "  COALESCE(SUM(amount), 0) AS total_amount, "
+            "  SUM(CASE "
+            "        WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%') "
+            "         AND change_pct > 0 THEN 1 ELSE 0 "
+            "      END) AS small_up_cnt, "
+            "  SUM(CASE "
+            "        WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%') "
+            "        THEN 1 ELSE 0 "
+            "      END) AS small_total, "
+            "  AVG(CASE "
+            "        WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%') "
+            "        THEN change_pct "
+            "      END) AS small_avg_chg "
             "FROM sm_rt_quote_snapshot WHERE snapshot_at = :sa",
             {"sa": sa},
         )
@@ -4981,6 +4683,139 @@ def _get_realtime_overview():
     except Exception:
         pass
     return None
+
+
+def _sql_in_params(values: list[str], prefix: str) -> tuple[str, dict[str, str]]:
+    params: dict[str, str] = {}
+    placeholders: list[str] = []
+    for idx, value in enumerate(values):
+        key = f"{prefix}{idx}"
+        placeholders.append(f":{key}")
+        params[key] = value
+    return ",".join(placeholders), params
+
+
+def _monitor_resolve_trade_date(requested_date: str | None = None) -> str:
+    requested = str(requested_date or "").strip() or date.today().isoformat()
+    rows = _read_sql(
+        "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1 AND trade_date <= :d",
+        {"d": requested[:10]},
+    )
+    if rows and rows[0].get("d"):
+        return str(rows[0]["d"])[:10]
+    latest_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1")
+    if latest_rows and latest_rows[0].get("d"):
+        return str(latest_rows[0]["d"])[:10]
+    return requested[:10]
+
+
+def _monitor_history_trade_dates(trade_date: str, limit: int = 20) -> list[str]:
+    limit = max(1, min(int(limit), 60))
+    rows = _read_sql(f"""
+        SELECT trade_date
+        FROM (
+            SELECT trade_date
+            FROM sm_stock_kline
+            WHERE k_type = 1 AND trade_date <= :d
+            GROUP BY trade_date
+            ORDER BY trade_date DESC
+            LIMIT {limit}
+        ) t
+        ORDER BY trade_date
+    """, {"d": trade_date[:10]})
+    return [str(row.get("trade_date") or "")[:10] for row in rows if row.get("trade_date")]
+
+
+def _monitor_overview_map(trade_dates: list[str]) -> dict[str, dict]:
+    if not trade_dates:
+        return {}
+    placeholders, params = _sql_in_params(trade_dates, "td")
+    rows = _read_sql(f"""
+        SELECT trade_date,
+               SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) AS up_cnt,
+               SUM(CASE WHEN change_pct < 0 THEN 1 ELSE 0 END) AS down_cnt,
+               SUM(CASE WHEN ABS(change_pct) < 1 THEN 1 ELSE 0 END) AS sideline_cnt,
+               COUNT(*) AS total,
+               COALESCE(SUM(amount), 0) AS total_amount,
+               SUM(CASE
+                     WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%')
+                      AND change_pct > 0 THEN 1 ELSE 0
+                   END) AS small_up_cnt,
+               SUM(CASE
+                     WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%')
+                     THEN 1 ELSE 0
+                   END) AS small_total,
+               AVG(CASE
+                     WHEN (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%')
+                     THEN change_pct
+                   END) AS small_avg_chg
+        FROM sm_stock_kline
+        WHERE k_type = 1 AND trade_date IN ({placeholders})
+        GROUP BY trade_date
+        ORDER BY trade_date
+    """, params)
+    return {str(row["trade_date"])[:10]: row for row in rows if row.get("trade_date")}
+
+
+def _monitor_hot_rows_map(trade_dates: list[str]) -> dict[tuple[str, int], list[dict]]:
+    if not trade_dates:
+        return {}
+    placeholders, params = _sql_in_params(trade_dates, "hd")
+    rows = _read_sql(f"""
+        SELECT snapshot_date, plate_type, concept_name, hot_value, change_pct
+        FROM st_hot_concept_ths_daily
+        WHERE snapshot_date IN ({placeholders}) AND plate_type IN (1, 2, 3)
+        ORDER BY snapshot_date, plate_type, hot_value DESC
+    """, params)
+    grouped: dict[tuple[str, int], list[dict]] = {}
+    for row in rows:
+        snapshot_date = str(row.get("snapshot_date") or "")[:10]
+        plate_type = int(row.get("plate_type") or 0)
+        grouped.setdefault((snapshot_date, plate_type), []).append(row)
+    return grouped
+
+
+def _monitor_pick_rows(
+    hot_rows_map: dict[tuple[str, int], list[dict]],
+    trade_dates: list[str],
+    preferred_plate_types: tuple[int, ...],
+    limit: int = 10,
+) -> list[dict]:
+    for trade_date in trade_dates:
+        for plate_type in preferred_plate_types:
+            rows = hot_rows_map.get((trade_date, plate_type)) or []
+            if rows:
+                return rows[:limit]
+    return []
+
+
+def _monitor_tmt_ratio(industry_rows: list[dict]) -> float:
+    if not industry_rows:
+        return 0.0
+    tmt_children = {
+        "电子化学品", "半导体", "消费电子", "其他电子", "光学光电子", "元件",
+        "软件开发", "IT服务", "计算机设备",
+        "通信服务", "通信设备",
+        "广告营销", "影视院线", "数字媒体", "游戏", "出版", "电视广播",
+    }
+    tmt_hot = sum(float(row.get("hot_value") or 0) for row in industry_rows if row.get("concept_name") in tmt_children)
+    total_hot = sum(float(row.get("hot_value") or 0) for row in industry_rows)
+    if total_hot <= 0:
+        return 0.0
+    return round(tmt_hot / total_hot * 100, 2)
+
+
+def _monitor_index_price_map(trade_dates: list[str]) -> dict[str, dict]:
+    if not trade_dates:
+        return {}
+    placeholders, params = _sql_in_params(trade_dates, "idx")
+    rows = _read_sql(f"""
+        SELECT trade_date, close AS price, change_pct
+        FROM sm_index_kline
+        WHERE index_code = '000852' AND k_type = 1 AND trade_date IN ({placeholders})
+        ORDER BY trade_date
+    """, params)
+    return {str(row["trade_date"])[:10]: row for row in rows if row.get("trade_date")}
 
 
 @router.get("/sector/movement")
@@ -5134,38 +4969,32 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
 @router.get("/monitor/data")
 def monitor_data(date: str = Query(default_factory=lambda: date.today().isoformat())):
     """市场监控中心数据接口（盘中使用实时快照数据）"""
-    # 盘中 30s 缓存，盘后 120s 缓存
+    requested_date = str(date or "").strip() or datetime.now().strftime("%Y-%m-%d")
     _ttl = 30 if _is_monitor_trading_time() else 120
-    _ckey = f"monitor_data_{date}"
+    _ckey = f"monitor_data_{requested_date}"
     cached = _cache_get(_ckey, ttl_seconds=_ttl)
     if cached is not None:
         return cached
     try:
-        latest_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1")
-        if not latest_rows or not latest_rows[0].get("d"):
+        trade_date = _monitor_resolve_trade_date(requested_date)
+        history_trade_dates = _monitor_history_trade_dates(trade_date, limit=20)
+        if not history_trade_dates:
             return {"error": "无交易数据"}
-        trade_date = str(latest_rows[0]["d"])[:10]
+        prev_date = history_trade_dates[-2] if len(history_trade_dates) >= 2 else None
+        overview_map = _monitor_overview_map(history_trade_dates)
+        base_cur = overview_map.get(trade_date)
+        if not base_cur or int(base_cur.get("total") or 0) <= 0:
+            return {"error": f"交易日 {trade_date} 无数据"}
 
+        latest_trade_date = _monitor_resolve_trade_date(datetime.now().strftime("%Y-%m-%d"))
+        allow_realtime = _is_monitor_trading_time() and trade_date == latest_trade_date and requested_date[:10] >= latest_trade_date
         is_realtime = False
-        rt_overview = _get_realtime_overview() if _is_monitor_trading_time() else None
-
+        rt_overview = _get_realtime_overview() if allow_realtime else None
         if rt_overview:
             cur = rt_overview
             is_realtime = True
         else:
-            overview_sql = """
-            SELECT
-                SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) AS up_cnt,
-                SUM(CASE WHEN change_pct < 0 THEN 1 ELSE 0 END) AS down_cnt,
-                SUM(CASE WHEN ABS(change_pct) < 1 THEN 1 ELSE 0 END) AS sideline_cnt,
-                COUNT(*) AS total,
-                COALESCE(SUM(amount), 0) AS total_amount
-            FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
-            """
-            cur_rows = _read_sql(overview_sql, {"d": trade_date})
-            if not cur_rows or cur_rows[0]["total"] == 0:
-                return {"error": f"交易日 {trade_date} 无数据"}
-            cur = cur_rows[0]
+            cur = base_cur
 
         up_cnt = int(cur["up_cnt"] or 0)
         down_cnt = int(cur["down_cnt"] or 0)
@@ -5174,89 +5003,40 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
         total_amount = float(cur["total_amount"] or 0)
         sideline_ratio = round(sideline_cnt / total * 100, 2)
         market_heat = round(up_cnt / total * 1000, 0)
-
-        prev_date_rows = _read_sql(
-            "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1 AND trade_date < :d",
-            {"d": trade_date},
-        )
-        prev_date = str(prev_date_rows[0]["d"])[:10] if prev_date_rows and prev_date_rows[0].get("d") else None
+        small_total = int(cur.get("small_total") or 0)
+        csi1000_heat = round(int(cur.get("small_up_cnt") or 0) / small_total * 1000, 0) if small_total > 0 else 0
+        csi1000_chg = round(float(cur.get("small_avg_chg") or 0), 2) if small_total > 0 else 0.0
 
         prev_heat = 0
         if prev_date:
-            prev_overview = _read_sql(overview_sql, {"d": prev_date})
-            if prev_overview and prev_overview[0].get("total"):
-                prev_up = int(prev_overview[0]["up_cnt"] or 0)
-                prev_total = int(prev_overview[0]["total"] or 1)
+            prev_overview = overview_map.get(prev_date)
+            if prev_overview and prev_overview.get("total"):
+                prev_up = int(prev_overview.get("up_cnt") or 0)
+                prev_total = int(prev_overview.get("total") or 1)
                 prev_heat = round(prev_up / prev_total * 1000, 0)
 
         heat_change = round(((market_heat - prev_heat) / prev_heat * 100) if prev_heat > 0 else 0, 2)
 
-        # 一次性查询所有板块类型和日期的数据（替代4次顺序查询+回退）
-        _query_dates = [trade_date] + ([prev_date] if prev_date else [])
-        _ph_dates = ",".join([f"'{d}'" for d in _query_dates])
-        all_hot_rows = _read_sql(
-            f"SELECT snapshot_date, plate_type, concept_name, hot_value, change_pct "
-            f"FROM st_hot_concept_ths_daily "
-            f"WHERE snapshot_date IN ({_ph_dates}) AND plate_type IN (1, 2, 3) "
-            f"ORDER BY plate_type, snapshot_date, hot_value DESC"
-        )
+        hot_rows_map = _monitor_hot_rows_map(history_trade_dates)
+        current_hot_dates = [trade_date] + ([prev_date] if prev_date else [])
+        industry_rows = _monitor_pick_rows(hot_rows_map, current_hot_dates, (3, 2), limit=10)
+        concept_rows = _monitor_pick_rows(hot_rows_map, current_hot_dates, (1,), limit=10)
+        tmt_ratio = _monitor_tmt_ratio(industry_rows)
 
-        # 按优先级提取行业数据：plate_type=3（东财）> plate_type=2（THS），先当日再前日
-        industry_rows = []
-        for _pt in (3, 2):
-            for _qd in _query_dates:
-                _filtered = [r for r in all_hot_rows if r["plate_type"] == _pt and str(r["snapshot_date"])[:10] == _qd]
-                if _filtered:
-                    industry_rows = _filtered[:10]
-                    break
-            if industry_rows:
-                break
-
-        # 概念数据：plate_type=1，先当日再前日
-        concept_rows = []
-        for _qd in _query_dates:
-            _filtered = [r for r in all_hot_rows if r["plate_type"] == 1 and str(r["snapshot_date"])[:10] == _qd]
-            if _filtered:
-                concept_rows = _filtered[:10]
-                break
-
-        TMT_CHILDREN = (
-            "电子化学品", "半导体", "消费电子", "其他电子", "光学光电子", "元件",
-            "软件开发", "IT服务", "计算机设备",
-            "通信服务", "通信设备",
-            "广告营销", "影视院线", "数字媒体", "游戏", "出版", "电视广播",
-        )
-        tmt_ratio = 0
-        if industry_rows:
-            tmt_hot = sum(float(r["hot_value"] or 0) for r in industry_rows if r.get("concept_name") in TMT_CHILDREN)
-            total_hot = sum(float(r["hot_value"] or 0) for r in industry_rows)
-            if total_hot > 0:
-                tmt_ratio = round(tmt_hot / total_hot * 100, 2)
-
-        csi1000_rows = _read_sql(
-            "SELECT close AS price, change_pct FROM sm_index_kline "
-            "WHERE trade_date = :d AND index_code = '000852' AND k_type = 1",
-            {"d": trade_date},
-        )
-        csi1000_price = float(csi1000_rows[0]["price"] or 0) if csi1000_rows else 0
-        csi1000_chg = float(csi1000_rows[0]["change_pct"] or 0) if csi1000_rows else 0
-
-        if csi1000_price == 0:
-            small_cap_sql = """
-            SELECT
-                SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) AS up_cnt,
-                COUNT(*) AS total,
-                AVG(change_pct) AS avg_chg
-            FROM sm_stock_kline
-            WHERE trade_date = :d AND k_type = 1
-              AND (stock_code LIKE '002%%' OR stock_code LIKE '300%%' OR stock_code LIKE '301%%')
-            """
-            sc_rows = _read_sql(small_cap_sql, {"d": trade_date})
-            if sc_rows and sc_rows[0].get("total") and int(sc_rows[0]["total"] or 0) > 0:
-                sc = sc_rows[0]
-                sc_total = int(sc["total"] or 1)
-                csi1000_price = round(int(sc["up_cnt"] or 0) / sc_total * 1000, 0)
-                csi1000_chg = round(float(sc["avg_chg"] or 0), 2)
+        index_price_map = _monitor_index_price_map(history_trade_dates)
+        csi1000_price = float((index_price_map.get(trade_date) or {}).get("price") or 0)
+        if is_realtime:
+            try:
+                current_index_rows = _read_sql(
+                    "SELECT price, change_pct, snapshot_at FROM sm_index_current WHERE index_code = '000852' LIMIT 1"
+                )
+                if current_index_rows and current_index_rows[0].get("price") is not None:
+                    current_index = current_index_rows[0]
+                    snapshot_date = str(current_index.get("snapshot_at") or "")[:10]
+                    if snapshot_date == datetime.now().strftime("%Y-%m-%d"):
+                        csi1000_price = float(current_index.get("price") or csi1000_price or 0)
+            except Exception:
+                pass
 
         history_dates = []
         history_heat = []
@@ -5265,34 +5045,21 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
         history_tmt = []
         history_csi1000_heat = []
 
-        # 一次性 GROUP BY 查询 20 个交易日的历史数据（加日期范围避免全表扫描）
-        _hist_start = str(trade_date)[:8] + "01"  # 月初起始，覆盖足够天数
-        history_batch_sql = """
-        SELECT trade_date,
-            SUM(CASE WHEN change_pct > 0 THEN 1 ELSE 0 END) AS up_cnt,
-            COUNT(*) AS total,
-            COALESCE(SUM(amount), 0) AS amt,
-            SUM(CASE WHEN ABS(change_pct) < 1 THEN 1 ELSE 0 END) AS sideline_cnt
-        FROM sm_stock_kline
-        WHERE k_type = 1 AND trade_date >= :hist_start
-        GROUP BY trade_date
-        ORDER BY trade_date DESC
-        LIMIT 20
-        """
-        history_batch = _read_sql(history_batch_sql, {"hist_start": _hist_start})
-        # 按日期正序排列（从旧到新）
-        history_batch = list(reversed(history_batch))
-        for dr in history_batch:
-            d = str(dr["trade_date"])[:10]
-            history_dates.append(d[-5:])
-            day_total = int(dr.get("total") or 0)
+        for history_date in history_trade_dates:
+            history_row = cur if (is_realtime and history_date == trade_date) else (overview_map.get(history_date) or {})
+            history_dates.append(history_date[-5:])
+            day_total = int(history_row.get("total") or 0)
             if day_total > 0:
-                h = round(int(dr["up_cnt"] or 0) / day_total * 1000, 0)
+                h = round(int(history_row.get("up_cnt") or 0) / day_total * 1000, 0)
                 history_heat.append(h)
-                history_amount.append(round(float(dr["amt"] or 0) / 1e8, 0))
-                history_sideline.append(round(int(dr["sideline_cnt"] or 0) / day_total * 100, 2))
-                history_tmt.append(round(25 + h * 0.045, 1))
-                history_csi1000_heat.append(round(400 + h * 0.6, 0))
+                history_amount.append(round(float(history_row.get("total_amount") or 0) / 1e8, 0))
+                history_sideline.append(round(int(history_row.get("sideline_cnt") or 0) / day_total * 100, 2))
+                history_tmt.append(_monitor_tmt_ratio(_monitor_pick_rows(hot_rows_map, [history_date], (3, 2), limit=10)))
+                small_day_total = int(history_row.get("small_total") or 0)
+                history_csi1000_heat.append(
+                    round(int(history_row.get("small_up_cnt") or 0) / small_day_total * 1000, 0)
+                    if small_day_total > 0 else 0
+                )
             else:
                 history_heat.append(0)
                 history_amount.append(0)
@@ -5325,6 +5092,7 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
 
         _result = {
             "trade_date": trade_date,
+            "requested_date": requested_date[:10],
             "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "is_realtime": is_realtime,
             "up_count": up_cnt,
@@ -5341,7 +5109,7 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
             "csi1000": {
                 "price": csi1000_price,
                 "change": csi1000_chg,
-                "heat": round(market_heat * 0.9, 0),
+                "heat": csi1000_heat,
             },
             "top_industries": top_industries,
             "concept_rows": [
@@ -5496,121 +5264,207 @@ def strategy_picks_data(
 @router.post("/monitor/sync-realtime")
 def sync_realtime_data():
     """盘中同步实时行情数据到数据库"""
+    if not _job_begin("market_refresh"):
+        return {"success": False, "busy": True, "error": "market_refresh_running"}
     try:
-        from biz.stock_market.realtime_quotes import fetch_list_market_current, save_to_mysql
-        from sqlalchemy import text
+        from tools.crawl_realtime_batch import is_trading_time, refresh_snapshot
         
         engine = get_engine()
-        
-        codes_sql = "SELECT DISTINCT stock_code FROM si_all_code WHERE stock_code REGEXP '^[0-9]{6}$'"
-        codes_rows = _read_sql(codes_sql)
-        if not codes_rows:
-            return {"error": "无股票代码", "synced": 0}
-        
-        all_codes = [str(r["stock_code"]).zfill(6) for r in codes_rows]
-        
-        batch_size = 500
-        total_synced = 0
-        
-        for i in range(0, len(all_codes), batch_size):
-            batch = all_codes[i:i+batch_size]
-            try:
-                df = fetch_list_market_current(batch)
-                if not df.empty:
-                    ts = datetime.now().replace(microsecond=0)
-                    df["snapshot_at"] = ts
-                    df.to_sql(
-                        "sm_rt_quote_snapshot",
-                        engine,
-                        if_exists="append",
-                        index=False,
-                        chunksize=500,
-                        method="multi"
-                    )
-                    total_synced += len(df)
-            except Exception as e:
-                continue
-        
+        if not is_trading_time(engine):
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "market_closed",
+                "synced": 0,
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+        total_synced = refresh_snapshot(
+            engine,
+            min_coverage=0.70,
+            archive_snapshot=True,
+        )
+        _invalidate_market_runtime_caches()
         return {
             "success": True,
             "synced": total_synced,
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
     except Exception as e:
         import traceback
         return {"error": str(e), "trace": traceback.format_exc()}
+    finally:
+        _job_end("market_refresh")
 
 
 # ═══════════════════════════════════════════
 # AI 推荐买入股票
 # ═══════════════════════════════════════════
 
+def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: str = ""):
+    columns = _table_columns("st_recommended_stocks")
+    strategy = (strategy or "").strip()
+    signal_status = (signal_status or "").strip().upper()
+
+    select_cols = [
+        _select_col(columns, "stock_code", "''"),
+        _select_col(columns, "short_name", "''"),
+        _select_col(columns, "ai_score", "0"),
+        _select_col(columns, "fundamental", "0"),
+        _select_col(columns, "capital_score", "0"),
+        _select_col(columns, "valuation", "0"),
+        _select_col(columns, "technical", "0"),
+        _select_col(columns, "reason", "''"),
+        _select_col(columns, "sources", "''"),
+        _select_col(columns, "pick_date", "NULL"),
+        _select_col(columns, "long_term_score", "0"),
+        _select_col(columns, "short_term_score", "0"),
+        _select_col(columns, "recommend_status", "'ALLOW'"),
+        _select_col(columns, "recommend_reason", "''"),
+        _select_col(columns, "event_risk_level", "'LOW'"),
+        _select_col(columns, "sentiment_score", "0"),
+        _select_col(columns, "market_mood_score", "0"),
+        _select_col(columns, "event_score", "0"),
+        _select_col(columns, "ultra_short_score", "0"),
+        _select_col(columns, "swing_score", "0"),
+        _select_col(columns, "primary_strategy", "''"),
+        _select_col(columns, "strategy_profile", "''"),
+        _select_col(columns, "suitable_strategies", "'[]'"),
+        _select_col(columns, "signal_status", "'WATCH'"),
+        _select_col(columns, "signal_reason", "''"),
+        _select_col(columns, "entry_price_low", "NULL"),
+        _select_col(columns, "entry_price_high", "NULL"),
+        _select_col(columns, "stop_loss_price", "NULL"),
+        _select_col(columns, "take_profit_1", "NULL"),
+        _select_col(columns, "take_profit_2", "NULL"),
+        _select_col(columns, "position_weight", "NULL"),
+        _select_col(columns, "max_holding_days", "NULL"),
+        _select_col(columns, "entry_conditions_json", "'[]'"),
+        _select_col(columns, "sell_rules_json", "'[]'"),
+        _select_col(columns, "invalidation_reason", "''"),
+        _select_col(columns, "quality_score", "0"),
+        _select_col(columns, "entry_score", "0"),
+        _select_col(columns, "final_trade_score", "0"),
+        _select_col(columns, "expected_return_score", "0"),
+        _select_col(columns, "expected_return_pct", "0"),
+        _select_col(columns, "resistance_price", "NULL"),
+        _select_col(columns, "heat_overload_score", "0"),
+        _select_col(columns, "confidence_score", "0"),
+        _select_col(columns, "sector_rotation_score", "0"),
+        _select_col(columns, "failure_penalty_score", "0"),
+        _select_col(columns, "cooldown_days_left", "0"),
+        _select_col(columns, "cooldown_until", "NULL"),
+        _select_col(columns, "main_wave_score", "0"),
+        _select_col(columns, "trend_hold_score", "0"),
+        _select_col(columns, "main_wave_stage", "''"),
+        _select_col(columns, "main_wave_signal", "''"),
+        _select_col(columns, "main_wave_reason", "''"),
+        _select_col(columns, "trend_stop_price", "NULL"),
+        _select_col(columns, "trend_reduce_price", "NULL"),
+        _select_col(columns, "model_version", "''"),
+    ]
+
+    def _query_for_date(d: str) -> list[dict]:
+        conditions = ["r.pick_date = :d"]
+        params = {"d": d}
+        if strategy:
+            if "suitable_strategies" in columns:
+                conditions.append("r.suitable_strategies LIKE :strategy_like")
+                params["strategy_like"] = f"%{strategy}%"
+            elif strategy == "ultra_short" and "ultra_short_score" in columns:
+                conditions.append("r.ultra_short_score >= 68")
+            elif strategy == "swing" and "swing_score" in columns:
+                conditions.append("r.swing_score >= 66")
+            else:
+                conditions.append("r.short_term_score >= 68")
+        if signal_status and "signal_status" in columns:
+            conditions.append("r.signal_status = :signal_status")
+            params["signal_status"] = signal_status
+
+        if "final_trade_score" in columns:
+            strategy_score = {
+                "ultra_short": "r.ultra_short_score",
+                "short_term": "r.short_term_score",
+                "swing": "r.swing_score",
+                "main_wave": "r.main_wave_score",
+            }.get(strategy, "r.final_trade_score")
+            order_sql = f"{strategy_score} DESC, r.final_trade_score DESC, r.entry_score DESC"
+        elif strategy == "ultra_short" and "ultra_short_score" in columns:
+            order_sql = "r.ultra_short_score DESC, r.ai_score DESC"
+        elif strategy == "swing" and "swing_score" in columns:
+            order_sql = "r.swing_score DESC, r.ai_score DESC"
+        elif strategy == "short_term" and "short_term_score" in columns:
+            order_sql = "r.short_term_score DESC, r.ai_score DESC"
+        else:
+            order_sql = "r.ai_score DESC"
+
+        return _read_sql(f"""
+            SELECT {", ".join(select_cols)}
+            FROM st_recommended_stocks r
+            WHERE {" AND ".join(conditions)}
+            ORDER BY {order_sql}
+        """, params)
+
+    if not trade_date:
+        trade_date = _latest_date("st_recommended_stocks", "pick_date")
+    rows = _query_for_date(trade_date) if trade_date else []
+    if not rows:
+        fallback = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
+        if fallback and fallback[0].get("d"):
+            trade_date = str(fallback[0]["d"])[:10]
+            rows = _query_for_date(trade_date)
+    if not rows:
+        return {"date": trade_date, "data": [], "total": 0, "note": "no recommendation data"}
+
+    empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
+    if empty_name_codes:
+        ph = ",".join(f"'{c}'" for c in empty_name_codes)
+        name_rows = _read_sql(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({ph})")
+        name_map = {nr["stock_code"]: nr["short_name"] for nr in name_rows if nr.get("short_name")}
+        for r in rows:
+            if not r.get("short_name"):
+                r["short_name"] = name_map.get(r["stock_code"]) or r["stock_code"]
+
+    codes = [r["stock_code"] for r in rows]
+    placeholders = ",".join(f"'{c}'" for c in codes)
+    quotes = {}
+    try:
+        latest_date = _latest_date("sm_stock_kline")
+        q_rows = _read_sql(f"""
+            SELECT stock_code, close AS price, change_pct, amount
+            FROM sm_stock_kline
+            WHERE stock_code IN ({placeholders}) AND k_type=1
+              AND trade_date = :d
+        """, {"d": latest_date})
+        for q in q_rows:
+            quotes[q["stock_code"]] = q
+    except Exception:
+        pass
+    for r in rows:
+        q = quotes.get(r["stock_code"], {})
+        r["price"] = q.get("price")
+        r["change_pct"] = q.get("change_pct")
+        r["amount"] = q.get("amount")
+
+    return {
+        "date": trade_date,
+        "data": rows,
+        "total": len(rows),
+        "strategy": strategy or "all",
+        "signal_status": signal_status or "all",
+        "model_version": rows[0].get("model_version") if rows else "",
+    }
+
+
 @router.get("/hot-data/recommended-stocks")
-def recommended_stocks(trade_date: str = Query(default="")):
+def recommended_stocks(
+    trade_date: str = Query(default=""),
+    strategy: str = Query(default=""),
+    signal_status: str = Query(default=""),
+):
     """获取 AI 推荐买入股票列表"""
     try:
-        if not trade_date:
-            trade_date = _latest_date("st_recommended_stocks", "pick_date")
-        rows = _read_sql("""
-            SELECT r.stock_code, r.short_name, r.ai_score, r.fundamental,
-                   r.capital_score, r.valuation, r.technical, r.reason,
-                   r.sources, r.pick_date,
-                   r.long_term_score, r.short_term_score,
-                   r.recommend_status, r.recommend_reason, r.event_risk_level,
-                   r.sentiment_score, r.market_mood_score, r.event_score
-            FROM st_recommended_stocks r
-            WHERE r.pick_date = :d
-            ORDER BY r.ai_score DESC
-        """, {"d": trade_date})
-        # 如果当天没数据，自动回退到最近有数据的日期
-        if not rows:
-            fallback = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
-            if fallback and fallback[0].get("d"):
-                trade_date = str(fallback[0]["d"])
-                rows = _read_sql("""
-                    SELECT r.stock_code, r.short_name, r.ai_score, r.fundamental,
-                           r.capital_score, r.valuation, r.technical, r.reason,
-                           r.sources, r.pick_date,
-                           r.long_term_score, r.short_term_score,
-                           r.recommend_status, r.recommend_reason, r.event_risk_level,
-                           r.sentiment_score, r.market_mood_score
-                    FROM st_recommended_stocks r
-                    WHERE r.pick_date = :d
-                    ORDER BY r.ai_score DESC
-                """, {"d": trade_date})
-        if not rows:
-            return {"date": trade_date, "data": [], "total": 0, "note": "暂无推荐数据，请先运行筛选"}
-        # 补全缺失的股票名称
-        empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
-        if empty_name_codes:
-            ph = ",".join(f"'{c}'" for c in empty_name_codes)
-            name_rows = _read_sql(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({ph})")
-            name_map = {nr["stock_code"]: nr["short_name"] for nr in name_rows if nr.get("short_name")}
-            for r in rows:
-                if not r.get("short_name"):
-                    r["short_name"] = name_map.get(r["stock_code"]) or r["stock_code"]
-        # 关联最新行情
-        codes = [r["stock_code"] for r in rows]
-        placeholders = ",".join(f"'{c}'" for c in codes)
-        quotes = {}
-        try:
-            latest_date = _latest_date("sm_stock_kline")
-            q_rows = _read_sql(f"""
-                SELECT stock_code, close AS price, change_pct, amount
-                FROM sm_stock_kline
-                WHERE stock_code IN ({placeholders}) AND k_type=1
-                  AND trade_date = :d
-            """, {"d": latest_date})
-            for q in q_rows:
-                quotes[q["stock_code"]] = q
-        except Exception:
-            pass
-        for r in rows:
-            q = quotes.get(r["stock_code"], {})
-            r["price"] = q.get("price")
-            r["change_pct"] = q.get("change_pct")
-            r["amount"] = q.get("amount")
-        return {"date": trade_date, "data": rows, "total": len(rows)}
+        return _recommended_stocks_v2(trade_date, strategy, signal_status)
     except Exception as e:
         return {"date": trade_date, "data": [], "total": 0, "error": str(e)}
 
@@ -5620,10 +5474,8 @@ def _smart_trade_date() -> str:
     - 盘中（工作日 9:30-15:00）：使用今天日期
     - 盘后/周末：使用最新已有数据的交易日
     """
-    from datetime import datetime, timedelta
-    import pytz
-    tz = pytz.timezone("Asia/Shanghai")
-    now = datetime.now(tz)
+    from datetime import datetime
+    now = datetime.now()
     weekday = now.weekday()  # 0=周一, 6=周日
     hour_min = now.hour * 60 + now.minute
     # 盘中判断：工作日 9:30(570) - 15:00(900)
@@ -5633,172 +5485,151 @@ def _smart_trade_date() -> str:
     return _latest_date("sm_stock_kline")
 
 
+def _set_recommendation_progress(**payload) -> None:
+    base = {
+        "status": "idle",
+        "percent": 0,
+        "step": "",
+        "total": 0,
+        "done": 0,
+        "passed": 0,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    base.update(payload)
+    _cache_set("rec_screen_progress", base)
+
+
 @router.get("/hot-data/recommended-stocks/progress")
 def recommended_stocks_progress():
     """查询 AI 推荐筛选进度"""
-    return _cache_get("rec_screen_progress") or {"status": "idle", "percent": 0, "step": "未启动"}
+    cached = _cache_get("rec_screen_progress", ttl_seconds=7200)
+    if cached is not None:
+        return {**cached, "is_running": _job_is_running("recommended_stocks")}
+    return {"status": "idle", "percent": 0, "step": "未启动", "is_running": False}
 
 
 @router.post("/hot-data/recommended-stocks/run")
-def run_recommended_stocks(trade_date: str = Query(default=""), min_score: int = Query(default=50)):
+def run_recommended_stocks(
+    trade_date: str = Query(default=""),
+    min_score: float = Query(default=62.0, ge=0, le=100),
+    top_n: int = Query(default=80, ge=20, le=200),
+):
     """触发 AI 推荐股票筛选（使用统一分析引擎）"""
     import threading
 
     if not trade_date:
         trade_date = _smart_trade_date()
+    trade_date = str(trade_date)[:10]
 
-    # 初始化进度
-    _cache_set("rec_screen_progress", {"status": "running", "percent": 0, "step": "正在初始化...", "total": 0, "done": 0, "passed": 0})
+    if not _job_begin("recommended_stocks"):
+        return {
+            "status": "running",
+            "date": trade_date,
+            "min_score": min_score,
+            "top_n": top_n,
+            "progress": recommended_stocks_progress(),
+            "note": "已有推荐筛选任务在运行",
+        }
+
+    _set_recommendation_progress(
+        status="running",
+        percent=0,
+        step="正在初始化...",
+        total=0,
+        done=0,
+        passed=0,
+        trade_date=trade_date,
+        min_score=min_score,
+        top_n=top_n,
+        started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
     def _run_screen():
         try:
-            from tools.screen_stocks import run_trend_strong, run_low_start, run_trend, run_flow
+            from biz.analysis.sync_analysis_fast import run_batch
 
             engine = get_engine()
-            top_per_mode = 30
 
-            # 阶段1: 量化初选 (0-30%)
-            _cache_set("rec_screen_progress", {"status": "running", "percent": 5, "step": "量化初选：趋势启动...", "total": 0, "done": 0, "passed": 0})
-            all_dfs = []
-            screeners = [
-                ("trend_strong", lambda: run_trend_strong(engine, trade_date, top_per_mode, 1, 0, 5, 0.2, 0.5, 3.0, 200.0, 0.90)),
-                ("low_start", lambda: run_low_start(engine, trade_date, top_per_mode, 1, 0, 60, 0.28, 1.25, 2.0, 10.5)),
-                ("trend", lambda: run_trend(engine, trade_date, top_per_mode, 1, 0, 0)),
-                ("flow", lambda: run_flow(engine, trade_date, top_per_mode, 5_000_000)),
-            ]
-            step_labels = {"trend_strong": "强势趋势票", "low_start": "低位放量", "trend": "多头趋势", "flow": "资金流入"}
-            for i, (name, fn) in enumerate(screeners):
-                _cache_set("rec_screen_progress", {"status": "running", "percent": 5 + i * 7, "step": f"量化初选：{step_labels.get(name, name)}...", "total": 0, "done": 0, "passed": 0})
-                try:
-                    df = fn()
-                    if df is not None and not df.empty:
-                        df["_source"] = name
-                        all_dfs.append(df)
-                except Exception:
-                    pass
+            def _progress_callback(event: dict):
+                stage = str(event.get("stage") or "")
+                if stage == "done":
+                    _set_recommendation_progress(
+                        status="done",
+                        percent=100,
+                        step=f"V3筛选完成，通过 {int(event.get('recommendation_count') or 0)} 只",
+                        total=int(event.get("analysis_count") or 0),
+                        done=int(event.get("analysis_count") or 0),
+                        passed=int(event.get("recommendation_count") or 0),
+                        trade_date=trade_date,
+                        min_score=min_score,
+                        top_n=top_n,
+                        flow_date=event.get("flow_date") or "",
+                        hot_date=event.get("hot_date") or "",
+                        market_mood_score=event.get("market_mood_score"),
+                        finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    return
+                _set_recommendation_progress(
+                    status="running",
+                    percent=int(event.get("percent") or 0),
+                    step=str(event.get("step") or "运行中..."),
+                    total=int(event.get("analysis_count") or 0),
+                    done=int(event.get("done") or 0),
+                    passed=int(event.get("recommendation_count") or 0),
+                    trade_date=trade_date,
+                    min_score=min_score,
+                    top_n=top_n,
+                )
 
-            if not all_dfs:
-                _cache_set("rec_screen_progress", {"status": "done", "percent": 100, "step": "量化初选无结果", "total": 0, "done": 0, "passed": 0})
-                return
-
-            _cache_set("rec_screen_progress", {"status": "running", "percent": 30, "step": "合并去重...", "total": 0, "done": 0, "passed": 0})
-            combined = pd.concat(all_dfs, ignore_index=True)
-            combined["stock_code"] = combined["stock_code"].astype(str).str.strip().str.zfill(6)
-            if "short_name" in combined.columns:
-                combined = combined[~combined["short_name"].fillna("").str.contains("ST", case=False)]
-            combined = combined[combined["stock_code"].str.match(r"^(0|6)")]
-            dedup = combined.drop_duplicates(subset=["stock_code"])
-            sources = combined.groupby("stock_code")["_source"].apply(lambda x: "+".join(sorted(set(x)))).reset_index()
-            sources.columns = ["stock_code", "sources"]
-            dedup = dedup.merge(sources, on="stock_code", how="left")
-
-            total = len(dedup)
-            # 阶段2: AI逐只分析 (30-90%)
-            _cache_set("rec_screen_progress", {"status": "running", "percent": 30, "step": f"AI分析中 (0/{total})...", "total": total, "done": 0, "passed": 0})
-
-            from server.engine.stock_analysis_engine import StockAnalysisEngine
-            analysis_engine = StockAnalysisEngine()
-
-            results = []
-            for idx, (_, row) in enumerate(dedup.iterrows()):
-                code = str(row["stock_code"]).zfill(6)
-                name = row.get("short_name") or code
-
-                try:
-                    result = analysis_engine.analyze(code, full_data=True)
-
-                    if result.short_term_score >= min_score:
-                        results.append({
-                            "stock_code": code,
-                            "short_name": name,
-                            "ai_score": result.short_term_score,
-                            "long_term_score": result.long_term_score,
-                            "short_term_score": result.short_term_score,
-                            "fundamental": result.scores.fundamental,
-                            "capital_score": result.scores.capital,
-                            "valuation": result.scores.valuation,
-                            "technical": result.scores.technical,
-                            "reason": result.summary,
-                            "sources": row.get("sources", ""),
-                            "pick_date": trade_date,
-                            "recommend_status": result.recommend.status,
-                            "recommend_reason": result.recommend.reason,
-                            "event_risk_level": result.event_risk.level,
-                            "sentiment_score": result.scores.sentiment,
-                            "market_mood_score": result.scores.market_mood,
-                            "event_score": result.scores.event,
-                        })
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).warning(f"分析 {code} 失败: {e}")
-                    continue
-
-                # 每分析3只或最后一只能更新进度
-                if (idx + 1) % 3 == 0 or idx + 1 == total:
-                    pct = 30 + int((idx + 1) / total * 60)
-                    _cache_set("rec_screen_progress", {
-                        "status": "running", "percent": pct,
-                        "step": f"AI分析中 ({idx + 1}/{total}) 通过{len(results)}只...",
-                        "total": total, "done": idx + 1, "passed": len(results),
-                    })
-
-            # 阶段3: 写入数据库 (90-100%)
-            _cache_set("rec_screen_progress", {"status": "running", "percent": 92, "step": "写入数据库...", "total": total, "done": total, "passed": len(results)})
-
-            results.sort(key=lambda x: x.get("short_term_score", 0), reverse=True)
-
-            if results:
-                with engine.begin() as conn:
-                    for col, dtype in [("sentiment_score", "FLOAT"), ("market_mood_score", "FLOAT"), ("event_score", "FLOAT")]:
-                        try:
-                            conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN {col} {dtype}"))
-                        except Exception:
-                            pass
-
-                    conn.execute(text("DELETE FROM st_recommended_stocks WHERE pick_date = :d"), {"d": trade_date})
-                    for r in results:
-                        conn.execute(text("""
-                            INSERT INTO st_recommended_stocks
-                            (stock_code, short_name, ai_score, long_term_score, short_term_score,
-                             fundamental, capital_score, valuation, technical,
-                             reason, sources, pick_date,
-                             recommend_status, recommend_reason, event_risk_level,
-                             sentiment_score, market_mood_score, event_score, created_at)
-                            VALUES (:code, :name, :score, :lt_score, :st_score,
-                                    :fund, :cap, :val, :tech,
-                                    :reason, :sources, :pick,
-                                    :rec_status, :rec_reason, :risk_level,
-                                    :sentiment, :market_mood, :event, NOW())
-                        """), {
-                            "code": r["stock_code"], "name": r["short_name"], "score": r["ai_score"],
-                            "lt_score": r.get("long_term_score"), "st_score": r.get("short_term_score"),
-                            "fund": r["fundamental"], "cap": r["capital_score"], "val": r["valuation"],
-                            "tech": r["technical"], "reason": r["reason"], "sources": r["sources"],
-                            "pick": r["pick_date"],
-                            "rec_status": r.get("recommend_status", "ALLOW"),
-                            "rec_reason": r.get("recommend_reason", ""),
-                            "risk_level": r.get("event_risk_level", "LOW"),
-                            "sentiment": r.get("sentiment_score"),
-                            "market_mood": r.get("market_mood_score"),
-                            "event": r.get("event_score"),
-                        })
-
-                    import logging
-                    logging.getLogger(__name__).info(f"推荐筛选完成，共 {len(results)} 只股票")
-
-            _cache_set("rec_screen_progress", {
-                "status": "done", "percent": 100,
-                "step": f"筛选完成，共 {len(results)} 只股票通过",
-                "total": total, "done": total, "passed": len(results),
-            })
+            stats = run_batch(
+                engine=engine,
+                trade_date=trade_date,
+                top_n=top_n,
+                min_score=float(min_score),
+                progress_callback=_progress_callback,
+            )
+            _set_recommendation_progress(
+                status="done",
+                percent=100,
+                step=f"V3筛选完成，通过 {stats.recommendation_count} 只",
+                total=stats.analysis_count,
+                done=stats.analysis_count,
+                passed=stats.recommendation_count,
+                trade_date=trade_date,
+                min_score=min_score,
+                top_n=top_n,
+                flow_date=stats.flow_date,
+                hot_date=stats.hot_date,
+                market_mood_score=stats.market_mood_score,
+                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
         except Exception as ex:
             import logging
             logging.getLogger(__name__).error(f"recommended-stocks error: {ex}", exc_info=True)
-            _cache_set("rec_screen_progress", {"status": "error", "percent": 0, "step": f"筛选失败: {str(ex)[:80]}", "total": 0, "done": 0, "passed": 0})
+            _set_recommendation_progress(
+                status="error",
+                percent=0,
+                step=f"筛选失败: {str(ex)[:80]}",
+                total=0,
+                done=0,
+                passed=0,
+                trade_date=trade_date,
+                min_score=min_score,
+                top_n=top_n,
+                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        finally:
+            _job_end("recommended_stocks")
 
     t = threading.Thread(target=_run_screen, daemon=True)
     t.start()
-    return {"status": "started", "date": trade_date, "min_score": min_score, "note": "筛选已启动，完成后刷新页面查看结果"}
+    return {
+        "status": "started",
+        "date": trade_date,
+        "min_score": min_score,
+        "top_n": top_n,
+        "note": "筛选已启动，完成后刷新页面查看结果",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -6605,14 +6436,31 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
 def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow|concept|index)$")):
     """手动刷新盘中数据（行情快照、资金流向、概念行情、指数行情）"""
     import subprocess as _sp
+    if not _job_begin("market_refresh"):
+        return {"success": False, "busy": True, "error": "market_refresh_running"}
     script = str(_ROOT / "tools" / "crawl_realtime_batch.py")
-    env = {**os.environ, "MYSQL_URL": str(get_engine().url)}
+    cmd = [
+        sys.executable,
+        script,
+        "--only",
+        only,
+        "--json",
+        "--min-coverage",
+        "0.70",
+    ]
+    if only in ("snapshot", "all"):
+        cmd.append("--archive-snapshot")
+    if only in ("snapshot", "all", "concept", "index"):
+        cmd.append("--skip-closed")
+    env = {**os.environ, "MYSQL_URL": get_engine().url.render_as_string(hide_password=False)}
     try:
         result = _sp.run(
-            [sys.executable, script, "--only", only],
+            cmd,
             capture_output=True, text=True, timeout=120, env=env,
             cwd=str(_ROOT),
         )
+        if result.returncode == 0:
+            _invalidate_market_runtime_caches()
         return {
             "success": result.returncode == 0,
             "output": result.stdout[-500:] if result.stdout else "",
@@ -6622,4 +6470,6 @@ def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow
         return {"success": False, "error": "timeout"}
     except Exception as e:
         return {"success": False, "error": str(e)}
+    finally:
+        _job_end("market_refresh")
 

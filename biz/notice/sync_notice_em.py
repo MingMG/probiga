@@ -12,7 +12,7 @@
   python -m biz.notice.sync_notice_em --from-si-all-code --offset 0 --limit 100 --max-pages 2 --sleep 0.35
 
 环境变量：
-  MYSQL_URL  默认 ``mysql+pymysql://root:123456@127.0.0.1:3306/probiga?charset=utf8mb4``
+  MYSQL_URL  必填，MySQL 连接串；也可写入项目根目录 ``.env``
 说明：
   - 接口为 ``https://np-anotice-stock.eastmoney.com/api/security/ann``，需网络；请控制 ``--limit``、``--sleep``，避免封 IP。
   - ``art_code`` 全局唯一，重复运行同一公告为 upsert 更新。
@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 import time
 from datetime import datetime
@@ -44,8 +43,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.config import get_mysql_url
+
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_notice_eastmoney.sql"
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3306/probiga?charset=utf8mb4"
 
 UPSERT_SQL = text(
     """
@@ -66,7 +66,7 @@ UPSERT_SQL = text(
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
 
 
 def run_ddl(engine: Engine) -> None:
@@ -118,6 +118,14 @@ def _parse_notice_date(raw: Any) -> datetime | None:
     return None
 
 
+def _notice_date_from_item(item: dict[str, Any]) -> datetime | None:
+    for key in ("display_time", "notice_date", "eiTime", "art_date"):
+        parsed = _parse_notice_date(item.get(key))
+        if parsed:
+            return parsed
+    return None
+
+
 def _parse_item(stock_code: str, item: dict[str, Any], etl: datetime) -> dict[str, Any]:
     art = (item.get("art_code") or "").strip()
     title = (item.get("title") or item.get("title_ch") or "").strip()[:1024]
@@ -126,7 +134,7 @@ def _parse_item(stock_code: str, item: dict[str, Any], etl: datetime) -> dict[st
     if isinstance(cols, list) and cols and isinstance(cols[0], dict):
         col_name = str(cols[0].get("column_name") or "")[:256]
     disp = str(item.get("display_time") or "")[:64]
-    nd = _parse_notice_date(item.get("notice_date"))
+    nd = _notice_date_from_item(item)
     return {
         "stock_code": str(stock_code).strip().zfill(6),
         "art_code": art,
@@ -153,8 +161,19 @@ def fetch_pages(
             "https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1"
             f"&page_size={page_size}&page_index={page}&client_source=web&stock_list={code}"
         )
-        r = client.get(url, timeout=20.0)
-        r.raise_for_status()
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                r = client.get(url, timeout=20.0)
+                r.raise_for_status()
+                break
+            except httpx.HTTPError as e:
+                last_error = e
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        if last_error is not None and "r" not in locals():
+            raise last_error
         data = r.json()
         if not data.get("success"):
             logger.warning("%s 第 %s 页 success!=1：%s", code, page, data.get("error"))
@@ -218,7 +237,7 @@ def main() -> int:
 
     etl = datetime.now().replace(microsecond=0)
     total_items = 0
-    with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA-notice-sync"}) as client:
+    with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA-notice-sync"}, trust_env=False) as client:
         for i, code in enumerate(codes):
             try:
                 raw = fetch_pages(

@@ -41,6 +41,20 @@ def _read_sql(sql: str, params: dict = None) -> list[dict]:
         raise
 
 
+def _latest_kline_trade_date(trade_date: str | None = None) -> str:
+    sql = "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1"
+    params = {}
+    if trade_date:
+        sql += " AND trade_date <= :td"
+        params["td"] = trade_date
+    rows = _read_sql(sql, params)
+    if rows and rows[0].get("d"):
+        return str(rows[0]["d"])[:10]
+    if trade_date:
+        raise RuntimeError(f"sm_stock_kline 在 {trade_date} 及之前没有可用日线数据")
+    return date.today().isoformat()
+
+
 def _compute_technical(kline_data, cur_price):
     """计算技术指标：MA/MACD/KDJ/RSI/BOLL/支撑压力"""
     if not kline_data or len(kline_data) < 20:
@@ -163,7 +177,7 @@ class StockDataLoader:
     从数据库加载股票全量分析数据，供四层引擎使用。
     """
 
-    def load_full_data(self, stock_code: str) -> dict:
+    def load_full_data(self, stock_code: str, trade_date: str | None = None, use_realtime: bool | None = None) -> dict:
         """
         加载7大模块数据（复用 stock-detail 的逻辑）
 
@@ -184,10 +198,10 @@ class StockDataLoader:
         }
         """
         code = stock_code.strip().zfill(6)
+        use_realtime = (trade_date is None) if use_realtime is None else bool(use_realtime)
 
         # 获取最新交易日
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-        trade_date = td_rows[0]["d"] if td_rows and td_rows[0].get("d") else date.today().isoformat()
+        trade_date = _latest_kline_trade_date(trade_date)
 
         # ─── 基本信息 ───
         basic_rows = _read_sql(
@@ -221,12 +235,14 @@ class StockDataLoader:
 
         # ─── 一、行情数据 ───
         quote = {}
-        cur_rows = _read_sql(
-            "SELECT price, change_pct, snapshot_at FROM sm_stock_current WHERE stock_code = :c",
-            {"c": code}
-        )
-        if cur_rows and cur_rows[0].get("price") is not None:
-            quote = {**cur_rows[0], "source": "realtime"}
+        if use_realtime:
+            cur_rows = _read_sql(
+                "SELECT price, change_pct, snapshot_at FROM sm_stock_current WHERE stock_code = :c "
+                "ORDER BY snapshot_at DESC LIMIT 1",
+                {"c": code}
+            )
+            if cur_rows and cur_rows[0].get("price") is not None:
+                quote = {**cur_rows[0], "source": "realtime"}
         if not quote:
             kline_rows = _read_sql(
                 "SELECT close AS price, change_pct, open, high, low, volume, amount, turnover_ratio, pre_close "
@@ -265,9 +281,9 @@ class StockDataLoader:
             SELECT basic_eps, net_asset_ps, roe_wtd, roa_wtd, gross_margin, net_margin,
                    total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr,
                    report_date
-            FROM si_stock_finance WHERE stock_code = :c
+            FROM si_stock_finance WHERE stock_code = :c AND report_date <= :td
             ORDER BY report_date DESC LIMIT 1
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
         fin = fin_rows[0] if fin_rows else {}
         eps = float(fin.get("basic_eps") or 0)
         bvps = float(fin.get("net_asset_ps") or 0)
@@ -297,8 +313,11 @@ class StockDataLoader:
 
         # ─── 二、资金面 ───
         # 注意：数据库中存储的单位是"元"，需要转换为"万元"供评分使用
-        flow_td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily")
-        flow_td = flow_td_rows[0]["d"] if flow_td_rows and flow_td_rows[0].get("d") else trade_date
+        flow_td_rows = _read_sql(
+            "SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily WHERE trade_date <= :td",
+            {"td": trade_date},
+        )
+        flow_td = str(flow_td_rows[0]["d"])[:10] if flow_td_rows and flow_td_rows[0].get("d") else trade_date
         flow_rows = _read_sql(
             "SELECT main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source "
             "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :ftd",
@@ -322,11 +341,11 @@ class StockDataLoader:
             mf = _read_sql(f"""
                 SELECT SUM(main_net_inflow) AS main_net_inflow
                 FROM sm_stock_capital_flow_daily
-                WHERE stock_code = :c AND trade_date >= (
+                WHERE stock_code = :c AND trade_date <= :ftd AND trade_date >= (
                     SELECT trade_date FROM sm_stock_kline WHERE k_type=1 AND trade_date <= :td
                     GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1 OFFSET {days - 1}
                 )
-            """, {"c": code, "td": flow_td})
+            """, {"c": code, "td": flow_td, "ftd": flow_td})
             # 从元转换为万元
             flow_multi[label] = float(mf[0]["main_net_inflow"] or 0) / 10000 if mf and mf[0].get("main_net_inflow") else None
 
@@ -361,9 +380,9 @@ class StockDataLoader:
         holder_rows = _read_sql("""
             SELECT report_date, holder_num, holder_num_change, pre_holder_num,
                    holder_num_ratio, avg_free_shares
-            FROM si_stock_holder WHERE stock_code = :c
+            FROM si_stock_holder WHERE stock_code = :c AND report_date <= :td
             ORDER BY report_date DESC LIMIT 2
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
         holder = {}
         if holder_rows:
             h0 = holder_rows[0]
@@ -382,9 +401,9 @@ class StockDataLoader:
                    total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr,
                    roe_wtd, roa_wtd, gross_margin, net_margin,
                    curr_ratio, quick_ratio, asset_liab_ratio
-            FROM si_stock_finance WHERE stock_code = :c
+            FROM si_stock_finance WHERE stock_code = :c AND report_date <= :td
             ORDER BY report_date DESC LIMIT 8
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
 
         finance = {
             "latest": fin or {},
@@ -395,9 +414,9 @@ class StockDataLoader:
         pe_history = _read_sql("""
             SELECT f.report_date, f.basic_eps, f.net_asset_ps
             FROM si_stock_finance f
-            WHERE f.stock_code = :c AND f.basic_eps > 0
+            WHERE f.stock_code = :c AND f.basic_eps > 0 AND f.report_date <= :td
             ORDER BY f.report_date DESC LIMIT 20
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
 
         pe_percentile = None
         pb_percentile = None
@@ -432,25 +451,26 @@ class StockDataLoader:
         # ─── 五、技术面 ───
         kline_250 = _read_sql("""
             SELECT trade_date, open, close, high, low, volume, change_pct
-            FROM sm_stock_kline WHERE stock_code = :c AND k_type=1
+            FROM sm_stock_kline WHERE stock_code = :c AND k_type=1 AND trade_date <= :td
             ORDER BY trade_date DESC LIMIT 260
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
 
         technical = _compute_technical(kline_250, price_val)
 
         # ─── 六、消息面 ───
         notices = _read_sql("""
             SELECT notice_date, title, column_name, detail_url
-            FROM si_notice_eastmoney WHERE stock_code = :c
+            FROM si_notice_eastmoney WHERE stock_code = :c AND notice_date <= :td
             ORDER BY notice_date DESC LIMIT 10
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
 
         news = _read_sql("""
             SELECT publish_time, title, source
             FROM st_news_flash
             WHERE stocks LIKE :kw
+              AND publish_time < DATE_ADD(:td, INTERVAL 1 DAY)
             ORDER BY publish_time DESC LIMIT 10
-        """, {"kw": f"%{code}%"})
+        """, {"kw": f"%{code}%", "td": trade_date})
 
         news_module = {
             "notices": notices,
@@ -461,18 +481,18 @@ class StockDataLoader:
         hot_rank_rows = _read_sql("""
             SELECT fused_rank, east_rank, ths_rank, total_score
             FROM st_hot_rank_fused
-            WHERE stock_code = :c
+            WHERE stock_code = :c AND snapshot_date <= :td
             ORDER BY snapshot_date DESC LIMIT 1
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
         hot_rank = hot_rank_rows[0] if hot_rank_rows else {}
 
         # ─── 八、解禁信息 ───
         lifting_rows = _read_sql("""
             SELECT lift_date, volume, amount, ratio
             FROM st_stock_lifting_last_month
-            WHERE stock_code = :c AND lift_date >= CURDATE()
+            WHERE stock_code = :c AND lift_date >= :td
             ORDER BY lift_date ASC LIMIT 3
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
         lifting = {
             "has_lifting_soon": len(lifting_rows) > 0,
             "records": lifting_rows,
@@ -577,17 +597,17 @@ class StockDataLoader:
             "market_mood": market_mood,
         }
 
-    def load_light_data(self, stock_code: str) -> dict:
+    def load_light_data(self, stock_code: str, trade_date: str | None = None, use_realtime: bool | None = None) -> dict:
         """
         加载精简数据（K线+资金+基础财务+估值）
 
         用于批量筛选场景，减少数据库查询量。
         """
         code = stock_code.strip().zfill(6)
+        _ = use_realtime  # 轻量模式暂不使用实时快照，保留参数以统一接口。
 
         # 获取最新交易日
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-        trade_date = td_rows[0]["d"] if td_rows and td_rows[0].get("d") else date.today().isoformat()
+        trade_date = _latest_kline_trade_date(trade_date)
 
         # 基本信息
         basic_rows = _read_sql(
@@ -608,10 +628,15 @@ class StockDataLoader:
         price_val = float(quote.get("price") or 0)
 
         # 资金流向（数据库存储单位：元，转换为万元供评分使用）
+        flow_td_rows = _read_sql(
+            "SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily WHERE trade_date <= :td",
+            {"td": trade_date},
+        )
+        flow_trade_date = str(flow_td_rows[0]["d"])[:10] if flow_td_rows and flow_td_rows[0].get("d") else trade_date
         flow_rows = _read_sql(
             "SELECT main_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow "
             "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :td",
-            {"c": code, "td": trade_date}
+            {"c": code, "td": flow_trade_date}
         )
         if flow_rows:
             flow_today = {
@@ -627,9 +652,9 @@ class StockDataLoader:
         fin_rows = _read_sql("""
             SELECT basic_eps, net_asset_ps, roe_wtd, gross_margin, asset_liab_ratio,
                    total_rev_yoy_gr, net_profit_yoy_gr, report_date
-            FROM si_stock_finance WHERE stock_code = :c
+            FROM si_stock_finance WHERE stock_code = :c AND report_date <= :td
             ORDER BY report_date DESC LIMIT 1
-        """, {"c": code})
+        """, {"c": code, "td": trade_date})
         fin = fin_rows[0] if fin_rows else {}
 
         # 估值

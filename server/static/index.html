@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 复盘分析平台</title>
-<link rel="stylesheet" href="/static/css/style.css?v=16">
+<link rel="stylesheet" href="/static/css/style.css?v=17">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -53,6 +53,7 @@
 
   <div class="sidebar-group">
     <div class="sidebar-group-title">系统</div>
+    <button class="sidebar-item" data-tab="datasource" onclick="switchTab('datasource')">🔌 数据源管理</button>
     <button class="sidebar-item" data-tab="scheduler" onclick="switchTab('scheduler')">⚙️ 调度管理</button>
     <button class="sidebar-item" data-tab="stock-list" onclick="switchTab('stock-list')">📋 全市场股票</button>
   </div>
@@ -70,6 +71,7 @@
 
   <div class="content" id="contentArea">
     <!-- 新版 tab -->
+    <div id="tab-command" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-monitor" class="tab-content active"><div class="loading">加载中...</div></div>
     <div id="tab-fused" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-sector" class="tab-content"><div class="loading">加载中...</div></div>
@@ -85,6 +87,7 @@
     <div id="tab-sim-trade" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-news" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-notice" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-datasource" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-scheduler" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-stock-list" class="tab-content"><div class="loading">加载中...</div></div>
     <!-- 老版额外 tab -->
@@ -221,7 +224,9 @@
 <script>
 var API_BASE = '/api/hot-data';
 var PAGE_TITLES = {
+  command:'🧭 智能决策',
   monitor:'📺 市场监控',
+  review:'📋 每日复盘',
   fused:'📊 热股排行',
   sector:'🌊 板块分析',
   strong:'🔥 强势股',
@@ -239,6 +244,6 @@ var PAGE_TITLES = {
   'stock-list':'📋 全市场股票'
 };
 </script>
-<script src="/static/js/app.js?v=21"></script>
+<script src="/static/js/app.js?v=23"></script>
 </body>
 </html>

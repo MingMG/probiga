@@ -16,7 +16,7 @@
     --start-date 20200101 --end-date 20260417 --offset 0 --limit 0 --skip-progress
 
 环境变量（常用）：
-  MYSQL_URL                 默认 mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4
+  MYSQL_URL                 必填，MySQL 连接串；也可写入项目根目录 ``.env``
   SM_SKIP_DDL               1=跳过 DDL
   SM_SKIP_GLOBAL_TRUNCATE   1=跳过全量 TRUNCATE（单步内仍会清理目标表）
   SM_REQUEST_SLEEP          请求后休眠秒数，默认 0.2
@@ -90,11 +90,14 @@ logging.basicConfig(
 logger = logging.getLogger("sync_stock_market")
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 if str(ROOT / "adata") not in sys.path:
     sys.path.insert(0, str(ROOT / "adata"))
 
+from server.common.config import get_mysql_url
+
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "02_sm_stock_market_tables.sql"
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 TABLES_TRUNCATE_ORDER = [
     "sm_index_current",
@@ -140,7 +143,7 @@ STEP_NAMES = {
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return get_mysql_url(required=True)
 
 
 def _log_mysql_target(url_str: str) -> None:
@@ -687,6 +690,120 @@ def _step_stock_kline_akshare(
         )
 
 
+def _is_myquant_source(source: str) -> bool:
+    return (source or "").strip().lower() in {"myquant", "gm", "emquant", "goldminer"}
+
+
+def _myquant_batch_size(kind: str, default: int) -> int:
+    specific = os.environ.get(f"MYQUANT_{kind.upper()}_BATCH_SIZE", "").strip()
+    raw = specific or os.environ.get("MYQUANT_BATCH_SIZE", "").strip()
+    if not raw:
+        return default
+    return max(1, int(raw))
+
+
+def _myquant_timeout(default: int = 180) -> int:
+    return max(30, int(os.environ.get("MYQUANT_TIMEOUT", str(default))))
+
+
+def _to_local_naive_datetime(values: Any) -> pd.Series:
+    series = pd.to_datetime(values, errors="coerce", utc=True)
+    return series.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+
+
+def _myquant_daily_to_sm_kline(df: pd.DataFrame, name_map: dict[str, str]) -> pd.DataFrame:
+    from biz.stock_market.stock_kline_akshare import akshare_daily_to_sm_kline
+    from integrations.myquant import to_stock_code
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["stock_code"] = work["symbol"].map(to_stock_code).astype(str).str.zfill(6)
+    work["date"] = _to_local_naive_datetime(work["eob"]).dt.strftime("%Y-%m-%d")
+    if "change_percent" in work.columns and "change_pct" not in work.columns:
+        work["change_pct"] = work["change_percent"]
+
+    parts: list[pd.DataFrame] = []
+    for code, one in work.groupby("stock_code", sort=False):
+        cols = ["date", "open", "high", "low", "close", "volume", "amount", "pre_close"]
+        cols += [c for c in ["change", "change_pct"] if c in one.columns]
+        raw = one[cols].copy()
+        parts.append(akshare_daily_to_sm_kline(raw, code, 1, 0, short_name=name_map.get(code, "")))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def _step_stock_kline_myquant(
+    engine: Engine,
+    stock_codes: list[str],
+    kline_start: str | None,
+    kline_end: str | None,
+    *,
+    incremental: bool = False,
+) -> None:
+    from integrations.myquant import history, is_configured, to_gm_symbol
+
+    if not is_configured():
+        raise RuntimeError("MyQuant source selected but GM_TOKEN or runtime/emquant-py36/python.exe is not configured")
+
+    start = kline_start or os.environ.get("SM_MARKET_START", "2020-01-01")
+    end = kline_end or os.environ.get("SM_MARKET_END") or datetime.now().strftime("%Y-%m-%d")
+    if incremental:
+        with engine.begin() as conn:
+            deleted = conn.execute(
+                text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1 AND `adjust_type` = 0"),
+                {"s": start},
+            ).rowcount
+        logger.info("MyQuant K-line incremental: deleted %d rows from %s", deleted, start)
+    else:
+        truncate_only(engine, "sm_stock_kline")
+
+    supported = [c for c in stock_codes if to_gm_symbol(c)]
+    skipped = len(stock_codes) - len(supported)
+    logger.info(
+        "Stock K-line (MyQuant): %d supported stocks, %d skipped, range %s ~ %s, adjust_type=0",
+        len(supported),
+        skipped,
+        start,
+        end,
+    )
+
+    name_map = _load_stock_short_name_map(engine)
+    batch_size = _myquant_batch_size("kline", 80)
+    fields = "symbol,eob,open,high,low,close,pre_close,volume,amount"
+    written_rows = 0
+    written_stocks: set[str] = set()
+    for i, batch in enumerate(_chunked(supported, batch_size), start=1):
+        raw = history(
+            batch,
+            frequency="1d",
+            start_time=start,
+            end_time=end,
+            fields=fields,
+            adjust=None,
+            timeout=_myquant_timeout(300),
+        )
+        sm_df = _myquant_daily_to_sm_kline(raw, name_map)
+        if sm_df is not None and not sm_df.empty:
+            sm_df = _to_numeric(
+                sm_df,
+                ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"],
+            )
+            df_to_table(engine, _with_etl(sm_df), "sm_stock_kline")
+            written_rows += len(sm_df)
+            written_stocks.update(sm_df["stock_code"].astype(str).unique().tolist())
+        logger.info(
+            "Stock K-line (MyQuant): batch %d/%d, rows=%d, stocks=%d",
+            i,
+            (len(supported) + batch_size - 1) // batch_size,
+            written_rows,
+            len(written_stocks),
+        )
+        _sleep()
+    if supported and not written_rows:
+        raise RuntimeError("MyQuant stock K-line returned no rows")
+
+
 def step_stock_kline(
     engine: Engine,
     stock_codes: list[str],
@@ -703,7 +820,57 @@ def step_stock_kline(
         logger.warning("个股K线：si_all_code 未读到代码，跳过 truncate 与写入。请先执行 sync_stock_info 写入 si_all_code。")
         return
 
+    # --- registry 统一数据源入口 ---
+    if kline_source:
+        os.environ["SM_STOCK_KLINE_SOURCE"] = kline_source
+    try:
+        from integrations.registry import get_backend
+        backend = get_backend("kline")
+    except Exception as exc:
+        logger.error("数据源 registry 错误: %s", exc)
+        return
+    if backend is not None:
+        logger.info("个股K线: 使用 registry backend '%s'", backend.name)
+        short_name_map = _load_stock_short_name_map(engine)
+        start = kline_start or os.environ.get("SM_MARKET_START", "2020-01-01")
+        end = kline_end or os.environ.get("SM_MARKET_END") or datetime.now().strftime("%Y-%m-%d")
+        if incremental:
+            with engine.begin() as conn:
+                deleted = conn.execute(
+                    text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1 AND `adjust_type` = 0"),
+                    {"s": start},
+                ).rowcount
+            logger.info("增量模式：已删除 %d 条 trade_date >= %s 的旧数据", deleted, start)
+        else:
+            truncate_only(engine, "sm_stock_kline")
+        df = backend.fetch_kline(stock_codes, start, end, short_name_map=short_name_map)
+        if df is not None and not df.empty:
+            kline_cols = [
+                "stock_code", "short_name", "trade_time", "trade_date", "k_type", "adjust_type",
+                "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
+                "turnover_ratio", "pre_close",
+            ]
+            for col in kline_cols:
+                if col not in df.columns:
+                    df[col] = None
+            df = _to_numeric(df, ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"])
+            df_to_table(engine, _with_etl(df), "sm_stock_kline")
+            logger.info("个股K线(%s): 写入 %d 行", backend.name, len(df))
+        else:
+            logger.warning("个股K线(%s): 未获取到数据", backend.name)
+        return
+    # --- end registry ---
+
     src = (kline_source or os.environ.get("SM_STOCK_KLINE_SOURCE", "adata")).strip().lower()
+    if _is_myquant_source(src):
+        _step_stock_kline_myquant(
+            engine,
+            stock_codes,
+            kline_start,
+            kline_end,
+            incremental=incremental,
+        )
+        return
     if src == "akshare":
         _step_stock_kline_akshare(
             engine,
@@ -724,6 +891,36 @@ def step_stock_kline(
 
 
 def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
+    # --- registry 统一数据源入口 ---
+    try:
+        from integrations.registry import get_backend
+        backend = get_backend("minute")
+    except Exception as exc:
+        logger.error("数据源 registry 错误: %s", exc)
+        return
+    if backend is not None:
+        logger.info("分钟K线: 使用 registry backend '%s'", backend.name)
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        truncate_only(engine, "sm_stock_minute")
+        df = backend.fetch_minute(stock_codes, trade_date)
+        if df is not None and not df.empty:
+            minute_cols = ["stock_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount"]
+            for col in minute_cols:
+                if col not in df.columns:
+                    df[col] = None
+            df = _to_numeric(df, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
+            df_to_table(engine, _with_etl(df), "sm_stock_minute")
+            logger.info("分钟K线(%s): 写入 %d 行", backend.name, len(df))
+        else:
+            logger.warning("分钟K线(%s): 未获取到数据", backend.name)
+        return
+    # --- end registry ---
+
+    source = os.environ.get("SM_STOCK_MINUTE_SOURCE", os.environ.get("SM_MARKET_DATA_SOURCE", "")).strip().lower()
+    if _is_myquant_source(source):
+        _step_stock_minute_myquant(engine, stock_codes)
+        return
+
     from adata.stock.market.stock_market.stock_market import StockMarket
 
     truncate_only(engine, "sm_stock_minute")
@@ -744,7 +941,120 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_minute")
 
 
+def _default_myquant_minute_date(engine: Engine) -> str:
+    raw = os.environ.get("MYQUANT_MINUTE_DATE", "").strip()
+    if raw:
+        return _normalize_cli_date(raw)
+    today = datetime.now().date()
+    if today.weekday() < 5:
+        return today.isoformat()
+    try:
+        with engine.connect() as conn:
+            d = conn.execute(text("SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1")).scalar()
+        if d:
+            return str(d)[:10]
+    except Exception:  # pylint: disable=broad-except
+        pass
+    return today.isoformat()
+
+
+def _myquant_minute_to_sm(df: pd.DataFrame) -> pd.DataFrame:
+    from integrations.myquant import to_stock_code
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["stock_code"] = df["symbol"].map(to_stock_code).astype(str).str.zfill(6)
+    trade_time = _to_local_naive_datetime(df["eob"])
+    out["trade_time"] = trade_time.dt.strftime("%Y-%m-%d %H:%M:%S")
+    out["trade_date"] = trade_time.dt.strftime("%Y-%m-%d")
+    out["price"] = pd.to_numeric(df.get("close"), errors="coerce")
+    out["avg_price"] = None
+    out["change"] = None
+    out["change_pct"] = None
+    out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+    out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+    return out.dropna(subset=["stock_code", "trade_time"])
+
+
+def _step_stock_minute_myquant(engine: Engine, stock_codes: list[str]) -> None:
+    from integrations.myquant import history, is_configured, to_gm_symbol
+
+    if not is_configured():
+        raise RuntimeError("MyQuant minute source selected but GM_TOKEN or runtime/emquant-py36/python.exe is not configured")
+
+    trade_date = _default_myquant_minute_date(engine)
+    start = os.environ.get("MYQUANT_MINUTE_START", f"{trade_date} 09:30:00")
+    end = os.environ.get("MYQUANT_MINUTE_END", f"{trade_date} 15:00:00")
+    frequency = os.environ.get("MYQUANT_MINUTE_FREQUENCY", "60s").strip() or "60s"
+
+    supported = [c for c in stock_codes if to_gm_symbol(c)]
+    truncate_only(engine, "sm_stock_minute")
+    logger.info(
+        "Stock minute (MyQuant): %d supported stocks, date=%s, frequency=%s",
+        len(supported),
+        trade_date,
+        frequency,
+    )
+    batch_size = _myquant_batch_size("minute", 50)
+    fields = "symbol,eob,open,high,low,close,volume,amount"
+    written_rows = 0
+    for i, batch in enumerate(_chunked(supported, batch_size), start=1):
+        raw = history(
+            batch,
+            frequency=frequency,
+            start_time=start,
+            end_time=end,
+            fields=fields,
+            timeout=_myquant_timeout(300),
+        )
+        sm_df = _myquant_minute_to_sm(raw)
+        if sm_df is not None and not sm_df.empty:
+            sm_df = _to_numeric(sm_df, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
+            df_to_table(engine, _with_etl(sm_df), "sm_stock_minute")
+            written_rows += len(sm_df)
+        logger.info(
+            "Stock minute (MyQuant): batch %d/%d, rows=%d",
+            i,
+            (len(supported) + batch_size - 1) // batch_size,
+            written_rows,
+        )
+        _sleep()
+    if supported and not written_rows:
+        raise RuntimeError("MyQuant stock minute returned no rows")
+
+
 def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
+    # --- registry 统一数据源入口 ---
+    try:
+        from integrations.registry import get_backend
+        backend = get_backend("current")
+    except Exception as exc:
+        logger.error("数据源 registry 错误: %s", exc)
+        return
+    if backend is not None:
+        logger.info("实时行情: 使用 registry backend '%s'", backend.name)
+        truncate_only(engine, "sm_stock_current")
+        short_name_map = _load_stock_short_name_map(engine)
+        df = backend.fetch_current(stock_codes, short_name_map=short_name_map)
+        if df is not None and not df.empty:
+            current_cols = ["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount", "snapshot_at"]
+            for col in current_cols:
+                if col not in df.columns:
+                    df[col] = None
+            df = _to_numeric(df, ["price", "change", "change_pct", "volume", "amount"])
+            df_to_table(engine, _with_etl(df), "sm_stock_current")
+            logger.info("实时行情(%s): 写入 %d 行", backend.name, len(df))
+        else:
+            logger.warning("实时行情(%s): 未获取到数据", backend.name)
+        return
+    # --- end registry ---
+
+    source = os.environ.get("SM_STOCK_CURRENT_SOURCE", os.environ.get("SM_MARKET_DATA_SOURCE", "")).strip().lower()
+    if _is_myquant_source(source):
+        _step_stock_current_myquant(engine, stock_codes)
+        return
+
     from adata.stock.market.stock_market.stock_market import StockMarket
 
     truncate_only(engine, "sm_stock_current")
@@ -761,6 +1071,82 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
         _sleep()
     if parts:
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_current")
+
+
+def _load_prev_close_map(engine: Engine, snapshot_date: str) -> dict[str, float]:
+    try:
+        with engine.connect() as conn:
+            d = conn.execute(
+                text("SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1 AND trade_date < :d"),
+                {"d": snapshot_date},
+            ).scalar()
+            if not d:
+                d = conn.execute(text("SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1")).scalar()
+            if not d:
+                return {}
+            rows = conn.execute(
+                text("SELECT stock_code, close FROM sm_stock_kline WHERE k_type = 1 AND trade_date = :d"),
+                {"d": str(d)[:10]},
+            ).fetchall()
+        return {str(r[0]).strip().zfill(6): float(r[1]) for r in rows if r[1] is not None}
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("Failed to load previous close map for MyQuant current: %s", e)
+        return {}
+
+
+def _myquant_current_to_sm(df: pd.DataFrame, name_map: dict[str, str], prev_close_map: dict[str, float]) -> pd.DataFrame:
+    from integrations.myquant import to_stock_code
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["stock_code"] = df["symbol"].map(to_stock_code).astype(str).str.zfill(6)
+    out["short_name"] = out["stock_code"].map(name_map).fillna("")
+    out["price"] = pd.to_numeric(df.get("price"), errors="coerce")
+    prev = out["stock_code"].map(prev_close_map)
+    out["change"] = out["price"] - prev
+    out["change_pct"] = (out["change"] / prev) * 100
+    out.loc[prev.isna() | (prev <= 0), ["change", "change_pct"]] = None
+    out["volume"] = pd.to_numeric(df.get("cum_volume"), errors="coerce")
+    out["amount"] = pd.to_numeric(df.get("cum_amount"), errors="coerce")
+    if "created_at" in df.columns:
+        out["snapshot_at"] = _to_local_naive_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        out["snapshot_at"] = _now()
+    return out[["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount", "snapshot_at"]]
+
+
+def _step_stock_current_myquant(engine: Engine, stock_codes: list[str]) -> None:
+    from integrations.myquant import current, is_configured, to_gm_symbol
+
+    if not is_configured():
+        raise RuntimeError("MyQuant current source selected but GM_TOKEN or runtime/emquant-py36/python.exe is not configured")
+
+    supported = [c for c in stock_codes if to_gm_symbol(c)]
+    truncate_only(engine, "sm_stock_current")
+    name_map = _load_stock_short_name_map(engine)
+    prev_close_cache: dict[str, dict[str, float]] = {}
+    batch_size = _myquant_batch_size("current", max(10, int(os.environ.get("SM_CURRENT_BATCH", "300"))))
+    fields = "symbol,price,open,high,low,cum_volume,cum_amount,created_at"
+    parts: list[pd.DataFrame] = []
+    for batch in _chunked(supported, batch_size):
+        raw = current(batch, fields=fields, timeout=_myquant_timeout(120))
+        snapshot_date = datetime.now().strftime("%Y-%m-%d")
+        if raw is not None and not raw.empty and "created_at" in raw.columns:
+            dates = _to_local_naive_datetime(raw["created_at"]).dt.strftime("%Y-%m-%d").dropna()
+            if not dates.empty:
+                snapshot_date = str(dates.iloc[0])[:10]
+        if snapshot_date not in prev_close_cache:
+            prev_close_cache[snapshot_date] = _load_prev_close_map(engine, snapshot_date)
+        prev_close_map = prev_close_cache[snapshot_date]
+        sm_df = _myquant_current_to_sm(raw, name_map, prev_close_map)
+        if sm_df is not None and not sm_df.empty:
+            parts.append(sm_df)
+        _sleep()
+    if parts:
+        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_current")
+    elif supported:
+        raise RuntimeError("MyQuant current returned no rows")
 
 
 def step_stock_five(engine: Engine, stock_codes: list[str]) -> None:
@@ -1223,9 +1609,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kline-source",
         type=str,
-        choices=["adata", "akshare"],
+        choices=["adata", "akshare", "myquant", "qmt"],
         default=os.environ.get("SM_STOCK_KLINE_SOURCE", "adata").strip().lower() or "adata",
-        help="个股 K 线数据源：adata（东财/百度）或 akshare（东财日 K API，支持区间/断点；不依赖 akshare 包）",
+        help="个股 K 线数据源：adata（东财/百度）、akshare（东财日 K）、myquant（掘金）、qmt（迅投）",
     )
     parser.add_argument(
         "--kline-adjust",

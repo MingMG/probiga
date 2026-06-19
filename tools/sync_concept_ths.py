@@ -17,6 +17,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 SLEEP_SEC = float(os.environ.get("SI_REQUEST_SLEEP", "0.3"))
+MAX_CONCEPTS = int(os.environ.get("THS_CONCEPT_MAX_CONCEPTS", "0"))
+FRESH_HOURS = int(os.environ.get("THS_CONCEPT_FRESH_HOURS", "72"))
 
 
 def _now():
@@ -70,6 +72,32 @@ def retry_remote(fn, *args, max_retries=3, **kwargs):
     return None
 
 
+def _has_fresh_constituents(engine, fresh_hours: int = FRESH_HOURS) -> bool:
+    if fresh_hours <= 0:
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT COUNT(*) AS cnt, MAX(etl_sync_at) AS max_sync
+            FROM si_concept_constituent_ths
+        """)).mappings().first()
+    if not row:
+        return False
+    cnt = int(row.get("cnt") or 0)
+    max_sync = row.get("max_sync")
+    if cnt < 50000 or max_sync is None:
+        return False
+    age_hours = (datetime.now() - max_sync).total_seconds() / 3600
+    if age_hours <= fresh_hours:
+        logger.info(
+            "si_concept_constituent_ths is fresh enough: %s rows, last_sync=%s, age=%.1fh; skip full refresh.",
+            cnt,
+            max_sync,
+            age_hours,
+        )
+        return True
+    return False
+
+
 def _is_bad_ths_result(res):
     if res is None:
         return True
@@ -116,6 +144,8 @@ def sync_concept_constituent_ths(engine, info, df_ths):
         parts.append(d)
 
     idx_series = df_ths["index_code"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
+    if MAX_CONCEPTS > 0:
+        idx_series = idx_series[:MAX_CONCEPTS]
     logger.info("按 index_code 同步: %d 个", len(idx_series))
     for i, ic in enumerate(idx_series):
         res = retry_remote(info.concept_constituent_ths, index_code=str(ic), wait_time=300)
@@ -125,6 +155,8 @@ def sync_concept_constituent_ths(engine, info, df_ths):
         _sleep()
 
     cc_series = df_ths["concept_code"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
+    if MAX_CONCEPTS > 0:
+        cc_series = cc_series[:MAX_CONCEPTS]
     logger.info("按 concept_code 同步: %d 个", len(cc_series))
     for i, cc in enumerate(cc_series):
         res = retry_remote(info.concept_constituent_ths, concept_code=str(cc), wait_time=300)
@@ -146,6 +178,9 @@ def main():
     logger.info("数据库: %s", mysql_url.split("@")[-1] if "@" in mysql_url else mysql_url)
 
     from adata.stock.info import info
+
+    if _has_fresh_constituents(engine):
+        return
 
     df_ths = sync_concept_code_ths(engine, info)
     sync_concept_constituent_ths(engine, info, df_ths)
