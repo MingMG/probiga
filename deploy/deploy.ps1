@@ -50,4 +50,6 @@ Write-Host "`n============================================" -ForegroundColor Cya
 Write-Host "  ✅ 部署完成！" -ForegroundColor Green
 Write-Host "  访问: http://47.113.123.190" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
-pause
+if ($env:PROBIGA_NONINTERACTIVE -ne "1") {
+    pause
+}

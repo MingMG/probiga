@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>部署控制台 - ProBigA</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  background: #f4f6f8;
+  color: #202733;
+}
+.topbar {
+  height: 58px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 24px;
+  background: #132238;
+  color: #fff;
+  border-bottom: 1px solid #22344f;
+}
+.brand {
+  font-size: 17px;
+  font-weight: 800;
+}
+.topbar a {
+  color: #b9d6ff;
+  text-decoration: none;
+  font-size: 13px;
+}
+.page {
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 22px 24px 40px;
+}
+.hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(300px, 0.8fr);
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.panel {
+  background: #fff;
+  border: 1px solid #dde5ef;
+  border-radius: 8px;
+  box-shadow: 0 1px 5px rgba(18, 34, 56, 0.05);
+}
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px;
+  border-bottom: 1px solid #edf1f5;
+}
+.panel-title {
+  font-size: 16px;
+  font-weight: 800;
+}
+.panel-body {
+  padding: 18px;
+}
+.repo-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.metric {
+  padding: 12px;
+  background: #f8fafc;
+  border: 1px solid #edf1f5;
+  border-radius: 8px;
+}
+.metric-label {
+  font-size: 12px;
+  color: #667085;
+  margin-bottom: 8px;
+}
+.metric-value {
+  font-size: 18px;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.badge.ok {
+  color: #067647;
+  background: #e7f6ec;
+}
+.badge.warn {
+  color: #b54708;
+  background: #fff2d7;
+}
+.badge.fail {
+  color: #b42318;
+  background: #fdeaea;
+}
+.actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.action {
+  padding: 14px;
+  border: 1px solid #dde5ef;
+  border-radius: 8px;
+  background: #fff;
+}
+.action h3 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+.action p {
+  min-height: 42px;
+  margin: 0 0 14px;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.6;
+}
+button {
+  height: 36px;
+  border: 0;
+  border-radius: 7px;
+  padding: 0 14px;
+  background: #1769e0;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+button:hover {
+  background: #1058c3;
+}
+button.secondary {
+  background: #eff4fb;
+  color: #2458a6;
+}
+button.secondary:hover {
+  background: #e0ebfa;
+}
+button.danger {
+  background: #b42318;
+}
+button.danger:hover {
+  background: #951c13;
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.form-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.form-row input {
+  flex: 1;
+  height: 36px;
+  border: 1px solid #cfd8e3;
+  border-radius: 7px;
+  padding: 0 11px;
+  font-size: 13px;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #475467;
+  font-size: 13px;
+}
+.changed-list,
+.history-list {
+  display: grid;
+  gap: 8px;
+  max-height: 280px;
+  overflow: auto;
+}
+.changed-item,
+.history-item {
+  padding: 9px 10px;
+  border-radius: 7px;
+  background: #f8fafc;
+  border: 1px solid #edf1f5;
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+  color: #344054;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.history-item {
+  font-family: inherit;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.log {
+  min-height: 320px;
+  max-height: 520px;
+  overflow: auto;
+  margin: 0;
+  padding: 14px;
+  background: #111827;
+  color: #d1e7dd;
+  border-radius: 8px;
+  font-family: Consolas, Monaco, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  gap: 16px;
+}
+.muted {
+  color: #667085;
+  font-size: 12px;
+}
+@media (max-width: 960px) {
+  .hero,
+  .layout,
+  .actions,
+  .repo-grid {
+    grid-template-columns: 1fr;
+  }
+  .page {
+    padding: 16px;
+  }
+}
+</style>
+</head>
+<body data-page="probiga-deploy-console">
+<div class="topbar">
+  <div class="brand">ProBigA 部署控制台</div>
+  <a href="/">返回系统首页</a>
+</div>
+
+<main class="page">
+  <section class="hero">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">仓库状态</div>
+        <button class="secondary" id="refreshBtn">刷新</button>
+      </div>
+      <div class="panel-body">
+        <div class="repo-grid">
+          <div class="metric">
+            <div class="metric-label">分支</div>
+            <div class="metric-value" id="branch">-</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">提交</div>
+            <div class="metric-value" id="commit">-</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">工作区</div>
+            <div class="metric-value"><span class="badge" id="dirtyBadge">-</span></div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">远端</div>
+            <div class="metric-value" id="remote">-</div>
+          </div>
+        </div>
+        <div class="muted" style="margin-top:12px;" id="subject">-</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">当前任务</div>
+        <span class="badge ok" id="runStatus">空闲</span>
+      </div>
+      <div class="panel-body">
+        <div class="muted">任务 ID</div>
+        <div class="metric-value" id="runId">-</div>
+        <div class="muted" style="margin-top:12px;">开始时间</div>
+        <div id="startedAt">-</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" style="margin-bottom:16px;">
+    <div class="panel-head">
+      <div class="panel-title">发布动作</div>
+      <span class="muted">默认走 GitHub Actions：push 到 main 后由现有 deploy.yml 自动部署</span>
+    </div>
+    <div class="panel-body">
+      <div class="actions">
+        <div class="action">
+          <h3>发布当前提交</h3>
+          <p>执行 git push origin HEAD:main，触发 GitHub Actions 自动部署。</p>
+          <button id="pushBtn">发布</button>
+        </div>
+        <div class="action">
+          <h3>提交并发布</h3>
+          <p>把当前工作区提交后推送，适合你在页面上一键完成收尾。</p>
+          <div class="form-row">
+            <input id="commitMessage" maxlength="160" placeholder="提交说明，例如：add deploy console">
+          </div>
+          <label class="check-row"><input type="checkbox" id="addAll" checked> 自动 git add -A</label>
+          <div style="margin-top:12px;"><button id="commitPushBtn">提交并发布</button></div>
+        </div>
+        <div class="action">
+          <h3>本地部署脚本</h3>
+          <p>执行 deploy/deploy.ps1，适合不走 GitHub Actions 的临时发布。</p>
+          <button class="danger" id="localBtn">本地部署</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="layout">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">任务日志</div>
+        <button class="secondary" id="clearLogBtn">清空显示</button>
+      </div>
+      <div class="panel-body">
+        <pre class="log" id="logBox">等待部署任务...</pre>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" style="margin-bottom:16px;">
+        <div class="panel-head">
+          <div class="panel-title">未提交文件</div>
+          <span class="muted" id="changedCount">0</span>
+        </div>
+        <div class="panel-body">
+          <div class="changed-list" id="changedList"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <div class="panel-title">最近任务</div>
+        </div>
+        <div class="panel-body">
+          <div class="history-list" id="historyList"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+let activeRunId = null;
+let pollTimer = null;
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+function setBusy(busy) {
+  ["pushBtn", "commitPushBtn", "localBtn"].forEach(id => $(id).disabled = busy);
+}
+
+function statusClass(status) {
+  if (status === "success" || status === "空闲") return "badge ok";
+  if (status === "failed") return "badge fail";
+  return "badge warn";
+}
+
+function renderStatus(payload) {
+  const repo = payload.repo;
+  $("branch").textContent = repo.branch || "-";
+  $("commit").textContent = repo.commit || "-";
+  $("remote").textContent = repo.remote || "-";
+  $("subject").textContent = repo.subject ? `最新提交：${repo.subject}` : "-";
+  $("dirtyBadge").className = repo.dirty ? "badge warn" : "badge ok";
+  $("dirtyBadge").textContent = repo.dirty ? `${repo.changed_count} 个变更` : "干净";
+  $("changedCount").textContent = String(repo.changed_count || 0);
+
+  const changed = repo.changed_files || [];
+  $("changedList").innerHTML = changed.length
+    ? changed.map(item => `<div class="changed-item" title="${escapeHtml(item)}">${escapeHtml(item)}</div>`).join("")
+    : `<div class="muted">暂无未提交文件</div>`;
+
+  const history = payload.history || [];
+  $("historyList").innerHTML = history.length
+    ? history.map(item => `
+      <div class="history-item">
+        <div>
+          <strong>${escapeHtml(item.action)}</strong>
+          <div class="muted">${escapeHtml(item.started_at || "")}</div>
+        </div>
+        <span class="${statusClass(item.status)}">${escapeHtml(item.status)}</span>
+      </div>
+    `).join("")
+    : `<div class="muted">暂无历史任务</div>`;
+}
+
+function renderRun(run) {
+  $("runStatus").className = statusClass(run.status);
+  $("runStatus").textContent = run.status || "空闲";
+  $("runId").textContent = run.id || "-";
+  $("startedAt").textContent = run.started_at || "-";
+  $("logBox").textContent = run.log || "等待部署任务...";
+  $("logBox").scrollTop = $("logBox").scrollHeight;
+  setBusy(run.status === "running" || run.status === "queued");
+}
+
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function refreshStatus() {
+  const resp = await fetch("/api/deploy/status");
+  const payload = await resp.json();
+  renderStatus(payload);
+}
+
+async function pollRun() {
+  if (!activeRunId) return;
+  const resp = await fetch(`/api/deploy/runs/${activeRunId}`);
+  const run = await resp.json();
+  renderRun(run);
+  if (!["running", "queued"].includes(run.status)) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    await refreshStatus();
+  }
+}
+
+async function startRun(action) {
+  const body = {
+    action,
+    commit_message: $("commitMessage").value.trim(),
+    add_all: $("addAll").checked
+  };
+  if (action === "commit_push" && !body.commit_message) {
+    alert("请输入提交说明");
+    $("commitMessage").focus();
+    return;
+  }
+  const resp = await fetch("/api/deploy/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) {
+    const error = await resp.json().catch(() => ({}));
+    alert(error.detail || "启动任务失败");
+    return;
+  }
+  const run = await resp.json();
+  activeRunId = run.id;
+  setBusy(true);
+  $("logBox").textContent = "任务已启动，正在获取日志...";
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollRun, 1200);
+  await pollRun();
+}
+
+$("refreshBtn").addEventListener("click", refreshStatus);
+$("pushBtn").addEventListener("click", () => startRun("push"));
+$("commitPushBtn").addEventListener("click", () => startRun("commit_push"));
+$("localBtn").addEventListener("click", () => {
+  if (confirm("确定要在本机执行 deploy/deploy.ps1 吗？")) startRun("local");
+});
+$("clearLogBtn").addEventListener("click", () => $("logBox").textContent = "等待部署任务...");
+
+refreshStatus().catch(err => {
+  $("logBox").textContent = `加载失败：${err}`;
+});
+</script>
+</body>
+</html>

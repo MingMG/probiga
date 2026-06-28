@@ -1,0 +1,16 @@
+#!/bin/sh
+set -u
+
+if command -v pwsh >/dev/null 2>&1; then
+  powershell_cmd="pwsh"
+elif command -v powershell.exe >/dev/null 2>&1; then
+  powershell_cmd="powershell.exe"
+elif command -v powershell >/dev/null 2>&1; then
+  powershell_cmd="powershell"
+else
+  echo "[post-commit] PowerShell not found; skip ProBigA auto deploy."
+  exit 0
+fi
+
+"$powershell_cmd" -NoProfile -ExecutionPolicy Bypass -File "tools/post_commit_deploy.ps1"
+
