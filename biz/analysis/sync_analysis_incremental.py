@@ -1,39 +1,29 @@
 # -*- coding: utf-8 -*-
-"""
-盘中增量更新任务
+"""Intraday incremental refresh using the unified fast-analysis pipeline."""
 
-在交易时间内运行，只更新自选股和推荐股票的分析结果。
-相比全量分析，增量更新更快，适合盘中频繁运行。
+from __future__ import annotations
 
-使用方法：
-    python -m biz.analysis.sync_analysis_incremental
-"""
-
-import sys
 import logging
-from pathlib import Path as _Path
+import sys
 from datetime import datetime
+from pathlib import Path as _Path
 
-# 添加项目根目录到 path
+import pandas as pd
+from sqlalchemy import text
+
 _ROOT = _Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-import pandas as pd
-from sqlalchemy import text
+from biz.analysis.sync_analysis_fast import run_batch_for_codes
+from biz.analysis.sync_analysis_result import resolve_trade_date
 from server.api.routers._engine import get_engine
-from server.engine.stock_analysis_engine import StockAnalysisEngine
-from biz.analysis.sync_analysis_result import save_analysis_result
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def get_portfolio_stocks() -> list:
-    """获取自选股列表"""
+def get_portfolio_stocks() -> list[str]:
     sql = """
         SELECT stock_code
         FROM st_user_portfolio
@@ -43,11 +33,10 @@ def get_portfolio_stocks() -> list:
     df = pd.read_sql(text(sql), get_engine())
     if df.empty:
         return []
-    return df['stock_code'].tolist()
+    return df["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
 
 
-def get_recommended_stocks() -> list:
-    """获取推荐股票列表"""
+def get_recommended_stocks() -> list[str]:
     sql = """
         SELECT DISTINCT stock_code
         FROM st_recommended_stocks
@@ -57,95 +46,45 @@ def get_recommended_stocks() -> list:
     df = pd.read_sql(text(sql), get_engine())
     if df.empty:
         return []
-    return df['stock_code'].tolist()
+    return df["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
 
 
-def update_recommendation_status(result) -> bool:
-    """更新推荐股票的状态"""
-    try:
-        engine = get_engine()
-
-        if result.recommend.status != 'ALLOW':
-            update_sql = """
-                UPDATE st_recommended_stocks SET
-                    recommend_status = :status,
-                    recommend_reason = :reason,
-                    event_risk_level = :risk_level,
-                    last_check_time = NOW()
-                WHERE stock_code = :code
-                  AND (recommend_status IS NULL OR recommend_status = 'ALLOW')
-            """
-            with engine.connect() as conn:
-                conn.execute(text(update_sql), {
-                    'code': result.stock_code,
-                    'status': result.recommend.status,
-                    'reason': result.recommend.reason,
-                    'risk_level': result.event_risk.level,
-                })
-                conn.commit()
-
-        return True
-    except Exception as e:
-        logger.error(f"更新推荐状态失败 {result.stock_code}: {e}")
-        return False
-
-
-def main():
+def main() -> int:
     start_time = datetime.now()
-    logger.info(f"开始盘中增量更新，时间：{start_time}")
-
-    # 初始化引擎
-    engine = StockAnalysisEngine()
-
-    # 获取需要更新的股票
     portfolio_codes = get_portfolio_stocks()
     recommended_codes = get_recommended_stocks()
+    stock_codes = sorted(set(portfolio_codes + recommended_codes))
+    if not stock_codes:
+        logger.info("Incremental refresh skipped: no holdings or recommended stocks")
+        return 0
 
-    # 合并去重
-    all_codes = list(set(portfolio_codes + recommended_codes))
-    logger.info(f"自选股：{len(portfolio_codes)}只，推荐股：{len(recommended_codes)}只，合计：{len(all_codes)}只")
+    trade_date = resolve_trade_date("")
+    logger.info(
+        "Unified incremental refresh started: trade_date=%s portfolio=%s recommended=%s total=%s",
+        trade_date,
+        len(portfolio_codes),
+        len(recommended_codes),
+        len(stock_codes),
+    )
+    stats = run_batch_for_codes(
+        engine=get_engine(),
+        stock_codes=stock_codes,
+        trade_date=trade_date,
+        top_n=max(80, len(stock_codes)),
+        min_score=62.0,
+    )
 
-    # 统计
-    success_count = 0
-    fail_count = 0
-    status_changes = []
-
-    # 逐只分析
-    for i, code in enumerate(all_codes, 1):
-        try:
-            result = engine.analyze(code, full_data=True)
-
-            # 保存分析结果
-            if save_analysis_result(result):
-                success_count += 1
-
-                # 检查推荐状态是否变化
-                if result.recommend.status != 'ALLOW':
-                    update_recommendation_status(result)
-                    status_changes.append({
-                        'code': code,
-                        'name': result.stock_name,
-                        'status': result.recommend.status,
-                        'reason': result.recommend.reason,
-                    })
-            else:
-                fail_count += 1
-
-        except Exception as e:
-            logger.error(f"分析 {code} 失败: {e}")
-            fail_count += 1
-
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-
-    logger.info(f"增量更新完成，耗时：{duration:.1f}秒")
-    logger.info(f"成功：{success_count}，失败：{fail_count}")
-
-    if status_changes:
-        logger.warning(f"有 {len(status_changes)} 只股票推荐状态发生变化：")
-        for change in status_changes:
-            logger.warning(f"  {change['code']} {change['name']}: {change['status']} - {change['reason']}")
+    duration = (datetime.now() - start_time).total_seconds()
+    logger.info(
+        "Unified incremental refresh completed: date=%s analysis=%s recommendations=%s market_mood=%.1f cost=%.1fs",
+        stats.trade_date,
+        stats.analysis_count,
+        stats.recommendation_count,
+        stats.market_mood_score,
+        duration,
+    )
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

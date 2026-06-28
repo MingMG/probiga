@@ -1,18 +1,7 @@
-# -*- coding: utf-8 -*-
-"""QMT (xtquant) 数据源后端。
-
-需要：
-  - xtquant 包（pip install xtquant，或从 QMT 安装目录复制）
-  - QMT 客户端以 miniQMT 模式运行
-
-环境变量：
-  QMT_PYTHON       指向 xtquant 所在 Python 路径（可选，默认用系统 Python）
-"""
 from __future__ import annotations
 
 import logging
-import time
-from datetime import datetime
+import os
 from typing import Any
 
 import pandas as pd
@@ -20,16 +9,12 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# 符号转换
-# ---------------------------------------------------------------------------
 def to_qmt_symbol(code: str) -> str | None:
-    """6位 A 股代码 -> QMT 格式（000001.SZ、600519.SH）。"""
     text = str(code or "").strip()
     if not text:
         return None
     if "." in text:
-        return text
+        return text.upper()
     digits = "".join(ch for ch in text if ch.isdigit())
     if len(digits) != 6:
         return None
@@ -43,60 +28,75 @@ def to_qmt_symbol(code: str) -> str | None:
 
 
 def from_qmt_symbol(symbol: str) -> str:
-    """QMT 格式 -> 6位代码。"""
-    return str(symbol).split(".")[0].zfill(6)
+    return str(symbol or "").split(".", 1)[0].zfill(6)
+
+
+def dividend_type_to_adjust_type(dividend_type: str) -> int:
+    text = str(dividend_type or "").strip().lower()
+    if text in {"front", "forward", "qfq"}:
+        return 1
+    if text in {"back", "backward", "hfq"}:
+        return 2
+    return 0
 
 
 def is_configured() -> bool:
-    """检查 xtquant 是否可导入且 QMT 客户端可达。"""
     try:
-        from xtquant import xtdata  # type: ignore[import-untyped]
-        xtdata.connect()
+        from integrations.qmt import bridge
+
+        if not bridge.is_configured():
+            return False
+        bridge.ping(timeout=int(os.environ.get("QMT_PING_TIMEOUT", "20")))
         return True
     except Exception:
         return False
 
 
-# ---------------------------------------------------------------------------
-# QMT 后端
-# ---------------------------------------------------------------------------
-class QmtBackend:
-    """QMT 数据源后端，基于 xtquant SDK。"""
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    batch_size = max(1, int(size))
+    return [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
 
+
+def _normalize_qmt_date(value: str, *, include_time: bool, end_of_day: bool = False) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) >= 14:
+        return digits[:14]
+    if len(digits) == 8:
+        if include_time:
+            return digits + ("235959" if end_of_day else "000000")
+        return digits
+    return digits
+
+
+class QmtBackend:
     @property
     def name(self) -> str:
         return "qmt"
 
-    def _get_xtdata(self):
-        try:
-            from xtquant import xtdata  # type: ignore[import-untyped]
-            xtdata.connect()
-            return xtdata
-        except ImportError:
+    def _bridge(self):
+        from integrations.qmt import bridge
+
+        if not bridge.is_configured():
             raise RuntimeError(
-                "xtquant 未安装。安装方式: pip install xtquant，"
-                "或从 QMT 安装目录复制 xtquant/ 到 site-packages。"
+                "QMT runtime is not configured. Expected a compatible Python at "
+                "runtime/qmt-py313/Scripts/python.exe or set QMT_PYTHON."
             )
+        return bridge
 
     def _to_qmt_codes(self, stock_codes: list[str]) -> list[str]:
-        result = []
+        result: list[str] = []
         for code in stock_codes:
-            sym = to_qmt_symbol(code)
-            if sym:
-                result.append(sym)
+            mapped = to_qmt_symbol(code)
+            if mapped:
+                result.append(mapped)
         return result
 
-    def _subscribe(self, xtdata, codes: list[str], period: str) -> None:
-        """订阅行情，忽略已订阅的错误。"""
-        for code in codes:
-            try:
-                xtdata.subscribe_quote(code, period=period, count=-1)
-            except Exception:
-                pass
+    def _batch_size(self, env_name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(env_name, str(default)) or default))
+        except ValueError:
+            return default
 
-    # -----------------------------------------------------------------------
-    # fetch_kline
-    # -----------------------------------------------------------------------
     def fetch_kline(
         self,
         stock_codes: list[str],
@@ -104,211 +104,269 @@ class QmtBackend:
         end_date: str,
         **kwargs,
     ) -> pd.DataFrame:
-        """获取日K线，返回 sm_stock_kline schema。"""
-        xtdata = self._get_xtdata()
+        bridge = self._bridge()
         qmt_codes = self._to_qmt_codes(stock_codes)
         if not qmt_codes:
             return pd.DataFrame()
 
-        self._subscribe(xtdata, qmt_codes, "1d")
-        time.sleep(1)
-
-        data = xtdata.get_market_data_ex(
-            field_list=[],
-            stock_list=qmt_codes,
-            period="1d",
-            count=0,  # 0 = 全部可用
-            dividend_type=kwargs.get("dividend_type", "front"),
-            fill_data=False,
+        short_name_map = kwargs.get("short_name_map", {})
+        dividend_type = kwargs.get("dividend_type", os.environ.get("QMT_DIVIDEND_TYPE", "none"))
+        adjust_type = dividend_type_to_adjust_type(dividend_type)
+        batch_size = self._batch_size("QMT_KLINE_BATCH_SIZE", 300)
+        df = bridge.kline(
+            qmt_codes,
+            start_date=start_date,
+            end_date=end_date,
+            dividend_type=dividend_type,
+            batch_size=batch_size,
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
         )
-        if data is None:
+        if df is None or df.empty:
             return pd.DataFrame()
-        if isinstance(data, pd.DataFrame) and data.empty:
-            return pd.DataFrame()
-
-        return self._transform_kline(data, kwargs.get("short_name_map", {}))
+        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["short_name"] = df["stock_code"].map(short_name_map).fillna("")
+        df["adjust_type"] = adjust_type
+        cols = [
+            "stock_code",
+            "short_name",
+            "trade_time",
+            "trade_date",
+            "k_type",
+            "adjust_type",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "change",
+            "change_pct",
+            "turnover_ratio",
+            "pre_close",
+        ]
+        return df.reindex(columns=cols)
 
     def _transform_kline(
-        self, data: Any, short_name_map: dict[str, str]
+        self,
+        data: Any,
+        *,
+        short_name_map: dict[str, str],
+        start_date: str,
+        end_date: str,
     ) -> pd.DataFrame:
-        rows = []
-        if isinstance(data, dict):
-            for qmt_code, df in data.items():
-                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                    continue
-                code = from_qmt_symbol(qmt_code)
-                for idx, row in df.iterrows():
-                    trade_date = pd.Timestamp(idx).strftime("%Y-%m-%d")
-                    rows.append({
+        rows: list[dict[str, Any]] = []
+        start_ts = pd.Timestamp(start_date).normalize() if start_date else None
+        end_ts = pd.Timestamp(end_date).normalize() if end_date else None
+
+        if not isinstance(data, dict):
+            return pd.DataFrame()
+
+        for qmt_code, frame in data.items():
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            df = frame.copy()
+            df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[df.index.notna()].sort_index()
+            prev_close = pd.to_numeric(df.get("close"), errors="coerce").shift(1)
+            close = pd.to_numeric(df.get("close"), errors="coerce")
+            change = close - prev_close
+            change_pct = change / prev_close.replace({0: pd.NA}) * 100
+            df["_pre_close"] = prev_close
+            df["_change"] = change
+            df["_change_pct"] = change_pct
+            if start_ts is not None:
+                df = df[df.index >= start_ts]
+            if end_ts is not None:
+                df = df[df.index <= end_ts]
+            if df.empty:
+                continue
+
+            code = from_qmt_symbol(qmt_code)
+
+            for idx, row in df.iterrows():
+                trade_date = idx.strftime("%Y-%m-%d")
+                rows.append(
+                    {
                         "stock_code": code,
                         "short_name": short_name_map.get(code, ""),
                         "trade_time": f"{trade_date} 15:00:00",
                         "trade_date": trade_date,
                         "k_type": 1,
                         "adjust_type": 1,
-                        "open": float(row.get("open", 0)),
-                        "close": float(row.get("close", 0)),
-                        "high": float(row.get("high", 0)),
-                        "low": float(row.get("low", 0)),
-                        "volume": float(row.get("volume", 0)),
-                        "amount": float(row.get("amount", 0)),
-                        "change": None,
-                        "change_pct": None,
-                        "turnover_ratio": None,
-                        "pre_close": None,
-                    })
-        if not rows:
-            return pd.DataFrame()
+                        "open": row.get("open"),
+                        "close": row.get("close"),
+                        "high": row.get("high"),
+                        "low": row.get("low"),
+                        "volume": row.get("volume"),
+                        "amount": row.get("amount"),
+                        "change": row.get("_change"),
+                        "change_pct": row.get("_change_pct"),
+                        "turnover_ratio": row.get("turnover"),
+                        "pre_close": row.get("_pre_close"),
+                    }
+                )
         return pd.DataFrame(rows)
 
-    # -----------------------------------------------------------------------
-    # fetch_minute
-    # -----------------------------------------------------------------------
     def fetch_minute(
         self,
         stock_codes: list[str],
         trade_date: str,
         **kwargs,
     ) -> pd.DataFrame:
-        """获取分钟K线，返回 sm_stock_minute schema。"""
-        xtdata = self._get_xtdata()
+        bridge = self._bridge()
         qmt_codes = self._to_qmt_codes(stock_codes)
         if not qmt_codes:
             return pd.DataFrame()
 
-        self._subscribe(xtdata, qmt_codes, "1m")
-        time.sleep(1)
-
-        count = kwargs.get("count", 0)
-        data = xtdata.get_market_data_ex(
-            field_list=[],
-            stock_list=qmt_codes,
-            period="1m",
+        batch_size = self._batch_size("QMT_MINUTE_BATCH_SIZE", 200)
+        count = int(kwargs.get("count", os.environ.get("QMT_MINUTE_COUNT", "0")) or 0)
+        start_date = kwargs.get("start_date", trade_date)
+        end_date = kwargs.get("end_date", trade_date)
+        df = bridge.minute(
+            qmt_codes,
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
             count=count,
-            dividend_type="none",
-            fill_data=True,
+            batch_size=batch_size,
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
         )
-        if data is None:
+        if df is None or df.empty:
             return pd.DataFrame()
-        if isinstance(data, pd.DataFrame) and data.empty:
+        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        cols = [
+            "stock_code",
+            "trade_time",
+            "trade_date",
+            "price",
+            "avg_price",
+            "change",
+            "change_pct",
+            "volume",
+            "amount",
+        ]
+        return df.reindex(columns=cols)
+
+    def _transform_minute(self, data: Any, *, trade_date: str) -> pd.DataFrame:
+        rows: list[dict[str, Any]] = []
+        if not isinstance(data, dict):
             return pd.DataFrame()
 
-        return self._transform_minute(data, trade_date)
+        for qmt_code, frame in data.items():
+            if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            code = from_qmt_symbol(qmt_code)
+            df = frame.copy()
+            df.index = pd.to_datetime(df.index, errors="coerce")
+            df = df[df.index.notna()].sort_index()
+            df = df[df.index.strftime("%Y-%m-%d") == trade_date]
+            if df.empty:
+                continue
 
-    def _transform_minute(
-        self, data: Any, trade_date: str
-    ) -> pd.DataFrame:
-        rows = []
-        if isinstance(data, dict):
-            for qmt_code, df in data.items():
-                if df is None or (isinstance(df, pd.DataFrame) and df.empty):
-                    continue
-                code = from_qmt_symbol(qmt_code)
-                for idx, row in df.iterrows():
-                    ts = pd.Timestamp(idx)
-                    if str(ts.date()) != trade_date:
-                        continue
-                    rows.append({
+            for idx, row in df.iterrows():
+                rows.append(
+                    {
                         "stock_code": code,
-                        "trade_time": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "trade_time": idx.strftime("%Y-%m-%d %H:%M:%S"),
                         "trade_date": trade_date,
-                        "price": float(row.get("close", 0)),
-                        "avg_price": None,
+                        "price": row.get("close"),
+                        "avg_price": row.get("avgPrice"),
                         "change": None,
                         "change_pct": None,
-                        "volume": float(row.get("volume", 0)),
-                        "amount": float(row.get("amount", 0)),
-                    })
-        if not rows:
-            return pd.DataFrame()
+                        "volume": row.get("volume"),
+                        "amount": row.get("amount"),
+                    }
+                )
         return pd.DataFrame(rows)
 
-    # -----------------------------------------------------------------------
-    # fetch_current
-    # -----------------------------------------------------------------------
     def fetch_current(
         self,
         stock_codes: list[str],
         **kwargs,
     ) -> pd.DataFrame:
-        """获取实时行情快照，返回 sm_stock_current schema。"""
-        xtdata = self._get_xtdata()
+        bridge = self._bridge()
         qmt_codes = self._to_qmt_codes(stock_codes)
         if not qmt_codes:
             return pd.DataFrame()
 
-        self._subscribe(xtdata, qmt_codes, "1m")
-        time.sleep(0.5)
-
-        tick = xtdata.get_full_tick(qmt_codes)
-        if tick is None or not isinstance(tick, dict):
+        short_name_map = kwargs.get("short_name_map", {})
+        batch_size = self._batch_size("QMT_CURRENT_BATCH_SIZE", 500)
+        df = bridge.current(
+            qmt_codes,
+            batch_size=batch_size,
+            timeout=int(os.environ.get("QMT_TIMEOUT", "120")),
+        )
+        if df is None or df.empty:
             return pd.DataFrame()
-
-        return self._transform_current(tick, kwargs.get("short_name_map", {}))
+        df["stock_code"] = df["stock_code"].astype(str).str.zfill(6)
+        df["short_name"] = df["stock_code"].map(short_name_map).fillna("")
+        cols = [
+            "stock_code",
+            "short_name",
+            "price",
+            "change",
+            "change_pct",
+            "volume",
+            "amount",
+            "snapshot_at",
+        ]
+        return df.reindex(columns=cols)
 
     def _transform_current(
-        self, tick: dict, short_name_map: dict[str, str]
+        self,
+        tick: Any,
+        *,
+        short_name_map: dict[str, str],
     ) -> pd.DataFrame:
-        rows = []
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not isinstance(tick, dict):
+            return pd.DataFrame()
+
+        rows: list[dict[str, Any]] = []
         for qmt_code, info in tick.items():
             if not isinstance(info, dict):
                 continue
             code = from_qmt_symbol(qmt_code)
-            last_price = float(info.get("lastPrice", 0))
-            last_close = float(info.get("lastClose", 0))
-            change = last_price - last_close
-            change_pct = (change / max(last_close, 0.001)) * 100
-            rows.append({
-                "stock_code": code,
-                "short_name": short_name_map.get(code, ""),
-                "price": last_price,
-                "change": change,
-                "change_pct": change_pct,
-                "volume": float(info.get("volume", 0)),
-                "amount": float(info.get("amount", 0)),
-                "snapshot_at": now,
-            })
-        if not rows:
-            return pd.DataFrame()
+            last_price = float(info.get("lastPrice") or info.get("last_price") or 0)
+            last_close = float(info.get("lastClose") or info.get("last_close") or 0)
+            if last_price <= 0 and last_close <= 0:
+                continue
+            if last_price <= 0:
+                last_price = last_close
+            change = (last_price - last_close) if last_close > 0 else None
+            change_pct = ((change / last_close) * 100) if change is not None and last_close > 0 else None
+            rows.append(
+                {
+                    "stock_code": code,
+                    "short_name": short_name_map.get(code, ""),
+                    "price": last_price,
+                    "change": change,
+                    "change_pct": change_pct,
+                    "volume": info.get("volume"),
+                    "amount": info.get("amount"),
+                    "snapshot_at": str(info.get("snapshot_at") or ""),
+                }
+                )
         return pd.DataFrame(rows)
 
-    # -----------------------------------------------------------------------
-    # fetch_tick（QMT 扩展，非 Protocol 标准方法）
-    # -----------------------------------------------------------------------
     def fetch_tick(
         self,
         stock_codes: list[str],
         count: int = 100,
         **kwargs,
     ) -> pd.DataFrame:
-        """获取逐笔成交数据。QMT 专有扩展。"""
-        xtdata = self._get_xtdata()
+        bridge = self._bridge()
         qmt_codes = self._to_qmt_codes(stock_codes)
         if not qmt_codes:
             return pd.DataFrame()
-
-        self._subscribe(xtdata, qmt_codes, "tick")
-        time.sleep(2)
-
-        data = xtdata.get_market_data_ex(
-            field_list=[],
-            stock_list=qmt_codes,
-            period="tick",
+        batch_size = self._batch_size("QMT_TICK_BATCH_SIZE", 100)
+        return bridge.tick(
+            qmt_codes,
             count=count,
-            dividend_type="none",
-            fill_data=True,
+            batch_size=batch_size,
+            timeout=int(os.environ.get("QMT_TIMEOUT", "180")),
         )
-        if data is None:
-            return pd.DataFrame()
-        if isinstance(data, pd.DataFrame):
-            return data
-        return pd.DataFrame()
 
 
-# ---------------------------------------------------------------------------
-# 注册
-# ---------------------------------------------------------------------------
 from integrations.registry import register  # noqa: E402
 
 register("qmt", lambda: QmtBackend())

@@ -17,6 +17,12 @@ DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=
 # 需要确保存在的任务列表
 REQUIRED_TASKS = [
     # (task_name, task_type, script_path, script_args, cron_time, sort_order)
+    ('股票代码列表', 'all_code', 'tools/run_single_table.py', 'si_all_code', '05:00', 1),
+    ('指数代码列表', 'all_index_code', 'tools/run_single_table.py', 'si_all_index_code', '05:02', 2),
+    ('指数成分股', 'index_constituent', 'tools/run_single_table.py', 'si_index_constituent', '05:05', 3),
+    ('概念目录(QMT)', 'concept_code_east', 'tools/run_single_table.py', 'si_concept_code_east', '05:10', 4),
+    ('概念成分股(QMT)', 'concept_constituent_east', 'tools/run_single_table.py', 'si_concept_constituent_east', '05:15', 5),
+    ('个股行业/概念/板块归属(QMT)', 'stock_relations_qmt', 'tools/run_single_table.py', 'si_stock_plate_east', '05:20', 6),
     ('东财板块热度', 'sector_heat_east', 'tools/fetch_sector_heat_east_daily.py', '', '17:08', 10),
     ('同花顺热门概念', 'hot_concept', 'tools/fetch_hot_concept_ths_daily.py', '', '17:10', 11),
     ('同花顺热股TOP100', 'hot_rank_ths', 'tools/fetch_hot_rank_ths.py', '', '17:12', 12),
@@ -27,7 +33,7 @@ REQUIRED_TASKS = [
     ('融合榜单(5天)', 'hot_fused_5', 'tools/merge_hot_rank.py', '--top 100 --days 5', '17:24', 17),
     ('龙虎榜列表', 'alist_daily', 'tools/run_single_table.py', 'st_a_list_daily', '17:40', 20),
     ('龙虎榜明细', 'alist_info', 'tools/run_single_table.py', 'st_a_list_info', '17:45', 21),
-    ('个股资金流向(全量)', 'capital_flow', 'tools/fetch_sm_stock_capital_flow_daily.py', '', '17:30', 30),
+    ('个股资金流向(全量)', 'capital_flow', 'tools/run_single_table.py', 'sm_stock_capital_flow_daily', '17:30', 30),
     ('概念资金流向', 'concept_flow', 'tools/run_single_table.py', 'sm_concept_capital_flow_east', '19:30', 54),
     ('A股晚报推送', 'evening_review', 'biz/evening_review/generate.py', '', '20:00', 90),
 ]

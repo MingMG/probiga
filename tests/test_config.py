@@ -8,6 +8,7 @@ from server.common.config import (
     get_api_mysql_pool_config,
     get_minute_mysql_pool_config,
     get_mysql_url,
+    get_qmt_history_mysql_url,
     get_scheduler_runtime_config,
     get_settings,
     get_wecom_webhook,
@@ -65,6 +66,33 @@ class ConfigTest(unittest.TestCase):
                 get_minute_mysql_pool_config(),
                 {"pool_size": 4, "max_overflow": 2, "pool_recycle": 2400},
             )
+
+    def test_qmt_history_mysql_url_prefers_explicit_local_url(self):
+        with patch.dict(os.environ, {
+            "QMT_HISTORY_MYSQL_URL": "mysql://local-history",
+            "MINUTE_MYSQL_URL": "mysql://minute",
+        }):
+            get_settings.cache_clear()
+            self.assertEqual(get_qmt_history_mysql_url(), "mysql://local-history")
+
+    def test_qmt_history_mysql_url_falls_back_to_minute_url_only(self):
+        with patch.dict(os.environ, {
+            "QMT_HISTORY_MYSQL_URL": "",
+            "MINUTE_MYSQL_URL": "mysql://minute",
+            "MYSQL_URL": "mysql://production",
+        }):
+            get_settings.cache_clear()
+            self.assertEqual(get_qmt_history_mysql_url(), "mysql://minute")
+
+    def test_qmt_history_mysql_url_does_not_fall_back_to_production(self):
+        with patch.dict(os.environ, {
+            "QMT_HISTORY_MYSQL_URL": "",
+            "MINUTE_MYSQL_URL": "",
+            "MYSQL_URL": "mysql://production",
+        }):
+            get_settings.cache_clear()
+            with self.assertRaises(RuntimeError):
+                get_qmt_history_mysql_url()
 
     def test_scheduler_runtime_config_defaults_to_safe_limits(self):
         with patch("server.common.config.get_settings", return_value=SimpleNamespace(

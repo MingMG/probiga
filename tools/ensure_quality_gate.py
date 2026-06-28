@@ -42,6 +42,32 @@ NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
 
 TASKS = [
     {
+        "task_name": "Guojin QMT API catalog capability refresh",
+        "task_type": "qmt_catalog_capability_refresh",
+        "group_name": "Guojin QMT",
+        "script_path": "tools/setup_guojin_qmt_catalog.py",
+        "script_args": "",
+        "cron_time": "01:10",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 86,
+        "date_param": "",
+        "description": "Refresh official QMT API registry and capability ledger every night; unverified sample probes are recorded explicitly.",
+    },
+    {
+        "task_name": "Guojin QMT local history gap repair execute",
+        "task_type": "qmt_local_gap_repair_execute",
+        "group_name": "Guojin QMT",
+        "script_path": "tools/backfill_guojin_qmt_local_history.py",
+        "script_args": "from-gaps --gap-limit 2 --apply --json",
+        "cron_time": "07:05",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 90,
+        "date_param": "",
+        "description": "After the 00:00-07:00 bulk local-history window, repair a small number of registered QMT history gaps into the local history DB and update sys_data_gap status.",
+    },
+    {
         "task_name": "盘中实时行情同步",
         "task_type": "intraday_realtime",
         "group_name": "盘中交易",
@@ -53,6 +79,19 @@ TASKS = [
         "sort_order": 70,
         "date_param": "",
         "description": "交易时段每分钟刷新 sm_stock_current，并归档到 sm_rt_quote_snapshot；覆盖率不足时失败。",
+    },
+    {
+        "task_name": "国金QMT盘中实时行情同步",
+        "task_type": "qmt_intraday_realtime",
+        "group_name": "国金QMT",
+        "script_path": "tools/sync_qmt_realtime.py",
+        "script_args": "--min-coverage 0.60 --no-archive-snapshot --json",
+        "cron_time": "09:25",
+        "interval_minutes": 1,
+        "enabled": 1,
+        "sort_order": 71,
+        "date_param": "",
+        "description": "国金QMT独立实时行情通道；写入 sm_stock_current 使用安全 Upsert，不清空正式表。",
     },
     {
         "task_name": "盘中分钟K线同步",
@@ -94,17 +133,30 @@ TASKS = [
         "description": "交易时段严格检查实时、分钟、资金流基础数据；非交易时段跳过。",
     },
     {
-        "task_name": "盘中模拟交易扫描",
+        "task_name": "盘中模拟交易执行Tick",
         "task_type": "sim_trade",
         "group_name": "盘中交易",
         "script_path": "biz/analysis/sync_sim_trade.py",
-        "script_args": "",
+        "script_args": "--tick --skip-outside-intraday --json",
         "cron_time": "09:31",
         "interval_minutes": 1,
         "enabled": 1,
         "sort_order": 78,
         "date_param": "",
-        "description": "交易时段每分钟扫描模拟买卖信号；非交易时段由策略引擎跳过。",
+        "description": "事件驱动模拟交易tick：买入只执行信号池NEW信号，卖出做风控检查；非盘中时段快速跳过。",
+    },
+    {
+        "task_name": "盘前模拟交易信号池准备",
+        "task_type": "sim_trade_signal_prepare",
+        "group_name": "盘中交易",
+        "script_path": "biz/analysis/sync_sim_trade.py",
+        "script_args": "--prepare-signals --ensure-recommendations --json",
+        "cron_time": "09:20",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 77,
+        "date_param": "",
+        "description": "开盘前将上一交易日AI推荐转换为今日模拟交易信号池；若上一交易日推荐缺失则先严格补生成，日期不匹配则禁止自动新开仓。",
     },
     {
         "task_name": "盘后快速资金流同步",
@@ -133,6 +185,62 @@ TASKS = [
         "description": "盘前只读体检；有 WARN/FAIL 时任务失败，提醒不要信任过期推荐。",
     },
     {
+        "task_name": "国金QMT凌晨缺口扫描",
+        "task_type": "qmt_nightly_reconciliation",
+        "group_name": "国金QMT",
+        "script_path": "tools/nightly_guojin_qmt_reconciliation.py",
+        "script_args": "--scan-days 20 --json",
+        "cron_time": "01:30",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 87,
+        "date_param": "",
+        "description": "每天凌晨扫描国金QMT待写队列、最近20个交易日覆盖率和质量规则；历史缺口登记到 sys_data_gap 后续补。",
+    },
+    {
+        "task_name": "国金QMT本地历史补数(2026)",
+        "task_type": "qmt_local_history_2026",
+        "group_name": "国金QMT",
+        "script_path": "tools/run_guojin_qmt_full_market_history.py",
+        "script_args": (
+            "--start-date 2026-01-01 --mode all --daily-batch-size 120 "
+            "--minute-batch-size 80 --sleep-seconds 0.2 --stop-at 07:00 "
+            "--log-path data/logs/qmt_full_market_history_2026.jsonl --json"
+        ),
+        "cron_time": "00:00",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 88,
+        "date_param": "",
+        "description": "每天00:00启动国金QMT本地历史补数，只补2026年至最新交易日；07:00自然停止，次日按本地覆盖率续跑。",
+    },
+    {
+        "task_name": "国金QMT基础目录增量同步",
+        "task_type": "qmt_reference_incremental",
+        "group_name": "国金QMT",
+        "script_path": "tools/sync_guojin_qmt_reference_data.py",
+        "script_args": "--skip-refresh --json",
+        "cron_time": "03:20",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 89,
+        "date_param": "",
+        "description": "每天凌晨同步国金QMT板块列表、板块成分、股票/指数基础信息、指数权重；通过安全Upsert只更新新增或变化数据，交易日历不处理。",
+    },
+    {
+        "task_name": "国金QMT历史缺口修复队列",
+        "task_type": "qmt_gap_repair_plan",
+        "group_name": "国金QMT",
+        "script_path": "tools/repair_guojin_qmt_gaps.py",
+        "script_args": "--limit 50 --json",
+        "cron_time": "02:00",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 89,
+        "date_param": "",
+        "description": "每天凌晨列出待修复历史缺口；当前仅计划不自动拉取，避免在QMT历史下载未完全验收前误写。",
+    },
+    {
         "task_name": "盘后快速分析推荐",
         "task_type": "analysis_fast",
         "group_name": "系统管理",
@@ -144,6 +252,19 @@ TASKS = [
         "sort_order": 90,
         "date_param": "",
         "description": "基于最新日K批量生成 stock_analysis_result 与 st_recommended_stocks。",
+    },
+    {
+        "task_name": "AI推荐盘前严格生成",
+        "task_type": "analysis_morning_strict",
+        "group_name": "AI推荐",
+        "script_path": "biz/analysis/sync_analysis_fast.py",
+        "script_args": "--strict-prev-trade-day --top-n 80 --min-score 62 --min-kline-coverage 0.80 --auto-repair-missing-kline",
+        "cron_time": "08:30",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 91,
+        "date_param": "",
+        "description": "每天08:30按执行日上一交易日严格生成AI推荐；上一交易日K线不足时先用国金QMT补目标日，仍不足则失败，不回退更早日期。",
     },
     {
         "task_name": "盘后数据质量体检",
@@ -211,7 +332,7 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         ).scalar()
 
         if existing_id:
-            assignments = ", ".join(f"`{key}` = :{key}" for key in payload if key != "task_name")
+            assignments = ", ".join(f"`{key}` = :{key}" for key in payload)
             if "updated_at" in columns:
                 assignments += ", `updated_at` = NOW()"
             conn.execute(

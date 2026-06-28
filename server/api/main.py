@@ -6,14 +6,19 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from server.api.routers import datasource, health, hot_data, jq_minute, notify, scheduler, sim_trade
+from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
+from server.api.routers import commentary, datasource, health, hot_data, jq_minute, notify, scheduler, sim_trade
 from server.api.scheduler_runtime import start_embedded_scheduler
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     start_embedded_scheduler()
-    yield
+    start_qmt_live_runtime()
+    try:
+        yield
+    finally:
+        stop_qmt_live_runtime()
 
 
 app = FastAPI(
@@ -29,6 +34,7 @@ app.include_router(jq_minute.router, prefix="/api")
 app.include_router(scheduler.router, prefix="/api")
 app.include_router(sim_trade.router, prefix="/api")
 app.include_router(datasource.router, prefix="/api")
+app.include_router(commentary.router, prefix="/api")
 
 static_dir = Path(__file__).resolve().parent.parent / "static"
 

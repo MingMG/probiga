@@ -55,6 +55,50 @@ def _latest_kline_trade_date(trade_date: str | None = None) -> str:
     return date.today().isoformat()
 
 
+def _calc_percentile(current_value: float | None, history_values: list[float]) -> float | None:
+    if current_value is None:
+        return None
+    valid_values = [float(v) for v in history_values if v is not None and float(v) > 0]
+    if not valid_values:
+        return None
+    below = sum(1 for value in valid_values if value <= current_value)
+    return round(below / len(valid_values) * 100, 1)
+
+
+def _load_historical_valuation_samples(stock_code: str, trade_date: str) -> tuple[list[float], list[float]]:
+    rows = _read_sql("""
+        SELECT
+            f.report_date,
+            f.basic_eps,
+            f.net_asset_ps,
+            (
+                SELECT k.close
+                FROM sm_stock_kline k
+                WHERE k.stock_code = f.stock_code
+                  AND k.k_type = 1
+                  AND k.trade_date <= f.report_date
+                ORDER BY k.trade_date DESC
+                LIMIT 1
+            ) AS ref_close
+        FROM si_stock_finance f
+        WHERE f.stock_code = :c AND f.report_date <= :td
+        ORDER BY f.report_date DESC
+        LIMIT 20
+    """, {"c": stock_code, "td": trade_date})
+
+    pe_values: list[float] = []
+    pb_values: list[float] = []
+    for row in rows:
+        ref_close = float(row.get("ref_close") or 0)
+        eps = float(row.get("basic_eps") or 0)
+        bvps = float(row.get("net_asset_ps") or 0)
+        if ref_close > 0 and eps > 0:
+            pe_values.append(ref_close / eps)
+        if ref_close > 0 and bvps > 0:
+            pb_values.append(ref_close / bvps)
+    return pe_values, pb_values
+
+
 def _compute_technical(kline_data, cur_price):
     """计算技术指标：MA/MACD/KDJ/RSI/BOLL/支撑压力"""
     if not kline_data or len(kline_data) < 20:
@@ -177,7 +221,13 @@ class StockDataLoader:
     从数据库加载股票全量分析数据，供四层引擎使用。
     """
 
-    def load_full_data(self, stock_code: str, trade_date: str | None = None, use_realtime: bool | None = None) -> dict:
+    def load_full_data(
+        self,
+        stock_code: str,
+        trade_date: str | None = None,
+        use_realtime: bool | None = None,
+        include_market_mood: bool = True,
+    ) -> dict:
         """
         加载7大模块数据（复用 stock-detail 的逻辑）
 
@@ -289,6 +339,10 @@ class StockDataLoader:
         bvps = float(fin.get("net_asset_ps") or 0)
         pe_ttm = round(price_val / eps, 2) if eps and eps > 0 and price_val else None
         pb = round(price_val / bvps, 2) if bvps and bvps > 0 and price_val else None
+        pe_history, pb_history = _load_historical_valuation_samples(code, trade_date)
+        pe_percentile = _calc_percentile(pe_ttm, pe_history)
+        pb_percentile = _calc_percentile(pb, pb_history)
+        verdict = "偏高" if (pe_percentile is not None and pe_percentile > 70) else "偏低" if (pe_percentile is not None and pe_percentile < 30) else "合理" if pe_percentile is not None else None
 
         market = {
             "price": quote.get("price"),
@@ -411,41 +465,16 @@ class StockDataLoader:
         }
 
         # ─── 四、估值面 ───
-        pe_history = _read_sql("""
-            SELECT f.report_date, f.basic_eps, f.net_asset_ps
-            FROM si_stock_finance f
-            WHERE f.stock_code = :c AND f.basic_eps > 0 AND f.report_date <= :td
-            ORDER BY f.report_date DESC LIMIT 20
-        """, {"c": code, "td": trade_date})
-
-        pe_percentile = None
-        pb_percentile = None
-        if pe_history and pe_ttm:
-            pe_list = []
-            for r in pe_history:
-                e = float(r.get("basic_eps") or 0)
-                if e > 0:
-                    pe_list.append(price_val / e)
-            if pe_list:
-                below = sum(1 for p in pe_list if p <= pe_ttm)
-                pe_percentile = round(below / len(pe_list) * 100, 1)
-
-        if pe_history and pb:
-            pb_list = []
-            for r in pe_history:
-                b = float(r.get("net_asset_ps") or 0)
-                if b > 0:
-                    pb_list.append(price_val / b)
-            if pb_list:
-                below = sum(1 for p in pb_list if p <= pb)
-                pb_percentile = round(below / len(pb_list) * 100, 1)
+        pe_history, pb_history = _load_historical_valuation_samples(code, trade_date)
+        pe_percentile = _calc_percentile(pe_ttm, pe_history)
+        pb_percentile = _calc_percentile(pb, pb_history)
 
         valuation = {
             "pe_ttm": pe_ttm,
             "pe_percentile": pe_percentile,
             "pb": pb,
             "pb_percentile": pb_percentile,
-            "verdict": "偏高" if (pe_percentile and pe_percentile > 70) else "偏低" if (pe_percentile and pe_percentile < 30) else "合理" if pe_percentile else None,
+            "verdict": "偏高" if (pe_percentile is not None and pe_percentile > 70) else "偏低" if (pe_percentile is not None and pe_percentile < 30) else "合理" if pe_percentile is not None else None,
         }
 
         # ─── 五、技术面 ───
@@ -662,6 +691,10 @@ class StockDataLoader:
         bvps = float(fin.get("net_asset_ps") or 0)
         pe_ttm = round(price_val / eps, 2) if eps and eps > 0 and price_val else None
         pb = round(price_val / bvps, 2) if bvps and bvps > 0 and price_val else None
+        pe_history, pb_history = _load_historical_valuation_samples(code, trade_date)
+        pe_percentile = _calc_percentile(pe_ttm, pe_history)
+        pb_percentile = _calc_percentile(pb, pb_history)
+        verdict = "偏高" if (pe_percentile is not None and pe_percentile > 70) else "偏低" if (pe_percentile is not None and pe_percentile < 30) else "合理" if pe_percentile is not None else None
 
         return {
             "stock_code": code,
@@ -670,5 +703,11 @@ class StockDataLoader:
             "market": {"price": quote.get("price"), "change_pct": quote.get("change_pct")},
             "capital": {"today": flow_today},
             "finance": {"latest": fin},
-            "valuation": {"pe_ttm": pe_ttm, "pb": pb},
+            "valuation": {
+                "pe_ttm": pe_ttm,
+                "pe_percentile": pe_percentile,
+                "pb": pb,
+                "pb_percentile": pb_percentile,
+                "verdict": verdict,
+            },
         }

@@ -121,6 +121,10 @@ def _read_sql(sql: str, params: dict = None) -> list[dict]:
 
 
 def _table_columns(table_name: str) -> set[str]:
+    cache_key = f"table_columns_{table_name}"
+    cached = _cache_get(cache_key, ttl_seconds=3600)
+    if cached is not None:
+        return cached
     try:
         with get_engine().connect() as conn:
             rows = conn.execute(text("""
@@ -129,7 +133,9 @@ def _table_columns(table_name: str) -> set[str]:
                 WHERE TABLE_SCHEMA = DATABASE()
                   AND TABLE_NAME = :table_name
             """), {"table_name": table_name}).fetchall()
-        return {str(r[0]) for r in rows}
+        result = {str(r[0]) for r in rows}
+        _cache_set(cache_key, result)
+        return result
     except Exception:
         return set()
 
@@ -139,6 +145,39 @@ def _select_col(columns: set[str], column: str, default_sql: str, alias: str | N
     if column in columns:
         return f"r.`{column}` AS `{out_alias}`"
     return f"{default_sql} AS `{out_alias}`"
+
+
+def _analysis_result_select_list(columns: set[str]) -> str:
+    return ",\n                   ".join([
+        "r.stock_code",
+        "r.stock_name",
+        "r.analysis_date",
+        "r.last_news_time",
+        "r.long_term_score",
+        "r.fundamental_score",
+        "r.growth_score",
+        "r.valuation_score",
+        "r.risk_score",
+        "r.short_term_score",
+        "r.capital_score",
+        "r.technical_score",
+        "r.sentiment_score",
+        "r.event_score",
+        "r.event_risk_score",
+        "r.event_risk_level",
+        "r.event_risk_detail",
+        "r.recommend_status",
+        "r.recommend_reason",
+        "r.summary",
+        "r.recommendation",
+        "r.strengths",
+        "r.risks",
+        _select_col(columns, "data_quality_score", "NULL"),
+        _select_col(columns, "data_quality_flags", "NULL"),
+        _select_col(columns, "flow_trade_date", "NULL"),
+        _select_col(columns, "hot_trade_date", "NULL"),
+        _select_col(columns, "model_version", "''"),
+    ])
 
 
 def _df_to_records(df: pd.DataFrame) -> list[dict]:
@@ -1663,13 +1702,41 @@ def _compute_indicators(codes: list, td: str) -> dict:
 
 
 def _latest_date(table: str, col: str = "trade_date") -> str:
+    cache_key = f"latest_date_{table}_{col}"
+    cached = _cache_get(cache_key, ttl_seconds=300)
+    if cached is not None:
+        return cached
     try:
         rows = _read_sql(f"SELECT MAX({col}) AS md FROM {table}", {})
         if rows and rows[0].get("md"):
-            return str(rows[0]["md"])
+            result = str(rows[0]["md"])
+            _cache_set(cache_key, result)
+            return result
     except Exception:
         pass
     return date.today().isoformat()
+
+
+def _latest_date_not_after(table: str, requested: str, col: str = "trade_date") -> str:
+    requested = str(requested or "").strip()[:10]
+    if not requested:
+        return _latest_date(table, col)
+    cache_key = f"latest_date_not_after_{table}_{col}_{requested}"
+    cached = _cache_get(cache_key, ttl_seconds=300)
+    if cached is not None:
+        return cached
+    try:
+        rows = _read_sql(
+            f"SELECT {col} AS d FROM {table} WHERE {col} <= :d ORDER BY {col} DESC LIMIT 1",
+            {"d": requested},
+        )
+        if rows and rows[0].get("d"):
+            result = str(rows[0]["d"])
+            _cache_set(cache_key, result)
+            return result
+    except Exception:
+        pass
+    return ""
 
 
 @router.get("/hot-data/screen-stocks")
@@ -2401,16 +2468,13 @@ def get_analysis_result(
         count_rows = _read_sql(count_sql, params)
         total = count_rows[0]["total"] if count_rows else 0
 
+        columns = _table_columns("stock_analysis_result")
+
         # 分页查询
         offset = (page - 1) * page_size
         query_sql = f"""
-            SELECT stock_code, stock_name, analysis_date, last_news_time,
-                   long_term_score, fundamental_score, growth_score, valuation_score, risk_score,
-                   short_term_score, capital_score, technical_score, sentiment_score, event_score,
-                   event_risk_score, event_risk_level, event_risk_detail,
-                   recommend_status, recommend_reason,
-                   summary, recommendation, strengths, risks
-            FROM stock_analysis_result
+            SELECT {_analysis_result_select_list(columns)}
+            FROM stock_analysis_result r
             WHERE {where_clause}
             ORDER BY {order_clause}
             LIMIT :limit OFFSET :offset
@@ -2423,7 +2487,7 @@ def get_analysis_result(
         # 解析JSON字段
         import json
         for row in rows:
-            for json_field in ["event_risk_detail", "strengths", "risks"]:
+            for json_field in ["event_risk_detail", "strengths", "risks", "data_quality_flags"]:
                 if row.get(json_field) and isinstance(row[json_field], str):
                     try:
                         row[json_field] = json.loads(row[json_field])
@@ -2444,10 +2508,14 @@ def get_analysis_result(
 @router.get("/hot-data/stock-detail")
 def stock_detail(stock_code: str = Query()):
     """个股详情：7大模块投资决策数据"""
+    code = stock_code.strip().zfill(6)
+    mode = _portfolio_market_mode()
+    cache_key = f"stock_detail_{code}_{mode}"
+    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300))
+    if cached is not None:
+        return cached
     try:
-        code = stock_code.strip().zfill(6)
-        mode = _portfolio_market_mode()
-        payload = _load_stock_detail_payload(code, mode=mode)
+        payload = _load_stock_detail_payload(code, mode=mode, light=True)
         basic = payload.get("basic") or {}
         market = payload.get("market") or {}
         capital = payload.get("capital") or {}
@@ -2460,6 +2528,10 @@ def stock_detail(stock_code: str = Query()):
         industry = payload.get("industry")
         concepts = payload.get("concepts") or []
         trade_date = str(payload.get("trade_date") or "")
+        requested_trade_date = str(payload.get("requested_trade_date") or trade_date or "")
+        quote_trade_date = str(payload.get("quote_trade_date") or trade_date or "")
+        flow_trade_date = str(payload.get("flow_trade_date") or quote_trade_date or "")
+        analysis_snapshot = _load_latest_analysis_snapshot(code, trade_date=trade_date or None)
         ai_analysis = _generate_ai_analysis(
             code,
             basic.get("short_name"),
@@ -2473,9 +2545,17 @@ def stock_detail(stock_code: str = Query()):
             holding,
             hot_rank=payload.get("hot_rank"),
             trade_date=trade_date,
+            analysis_snapshot=analysis_snapshot,
+            prefer_snapshot=True,
         )
+        analysis_trade_date = ""
+        if isinstance(ai_analysis, dict):
+            analysis_trade_date = str(ai_analysis.get("analysis_date") or "")
+        if not analysis_trade_date and isinstance(analysis_snapshot, dict):
+            analysis_trade_date = str(analysis_snapshot.get("analysis_date") or "")
+        data_mode_label = "盘中实时" if mode == "intraday" else "盘后收盘"
 
-        return {
+        result = {
             "stock_code": code,
             "short_name": basic.get("short_name"),
             "industry": industry,
@@ -2489,11 +2569,25 @@ def stock_detail(stock_code: str = Query()):
             "technical": technical,
             "news": news_module,
             "holder": holder,
+            "analysis_snapshot": analysis_snapshot,
             "ai_analysis": ai_analysis,
             "holding": holding,
             "mode": mode,
+            "data_mode_label": data_mode_label,
             "date": trade_date,
+            "requested_trade_date": requested_trade_date,
+            "quote_trade_date": quote_trade_date,
+            "flow_trade_date": flow_trade_date,
+            "analysis_trade_date": analysis_trade_date,
+            "quote_source": payload.get("quote_source") or "",
+            "detail_source": payload.get("detail_source") or "",
+            "quote_is_stale": bool(requested_trade_date and quote_trade_date and quote_trade_date < requested_trade_date),
+            "flow_is_stale": bool(requested_trade_date and flow_trade_date and flow_trade_date < requested_trade_date),
+            "analysis_is_stale": bool(requested_trade_date and analysis_trade_date and analysis_trade_date < requested_trade_date),
         }
+        if not result.get("error"):
+            _cache_set(cache_key, result)
+        return result
     except Exception as e:
         return {"stock_code": stock_code, "error": str(e)}
 
@@ -2630,26 +2724,402 @@ def _legacy_capital_view(capital: dict | None) -> dict:
     return out
 
 
-def _load_stock_detail_payload(stock_code: str, mode: str | None = None) -> dict:
+def _parse_snapshot_json_fields(row: dict | None, json_fields: tuple[str, ...]) -> dict | None:
+    if not row:
+        return None
+    parsed = dict(row)
+    for field in json_fields:
+        value = parsed.get(field)
+        if isinstance(value, str) and value:
+            try:
+                parsed[field] = json.loads(value)
+            except Exception:
+                pass
+    for field in ("analysis_date", "flow_trade_date", "hot_trade_date", "last_news_time"):
+        if parsed.get(field) is not None:
+            parsed[field] = str(parsed[field])
+    return parsed
+
+
+def _load_latest_analysis_snapshot(stock_code: str, trade_date: str | None = None) -> dict | None:
+    columns = _table_columns("stock_analysis_result")
+    sql = """
+        SELECT {select_list}
+        FROM stock_analysis_result r
+        WHERE stock_code = :stock_code
+    """.format(select_list=_analysis_result_select_list(columns))
+    params = {"stock_code": stock_code}
+    if trade_date:
+        sql += " AND analysis_date <= :trade_date"
+        params["trade_date"] = trade_date
+    sql += " ORDER BY analysis_date DESC LIMIT 1"
+    rows = _read_sql(sql, params)
+    if not rows:
+        return None
+    snapshot = _parse_snapshot_json_fields(
+        rows[0],
+        ("event_risk_detail", "strengths", "risks", "data_quality_flags"),
+    )
+    if snapshot and snapshot.get("stock_name") and not snapshot.get("short_name"):
+        snapshot["short_name"] = snapshot.get("stock_name")
+    return snapshot
+
+
+def _as_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _avg_scores(*values):
+    numbers = [float(v) for v in values if _as_float(v) is not None]
+    if not numbers:
+        return None
+    return round(sum(numbers) / len(numbers), 1)
+
+
+def _localize_recommend_status_label(status: str) -> str:
+    mapping = {
+        "ALLOW": "可跟踪",
+        "BLOCK": "回避",
+        "SUSPENDED": "观察",
+        "WATCH": "观察",
+        "CONFIRM": "确认",
+        "BUY_READY": "买入就绪",
+        "SELL_ALERT": "卖出提醒",
+    }
+    return mapping.get(str(status or "").upper(), str(status or "-"))
+
+
+def _localize_risk_level_label(level: str) -> str:
+    mapping = {
+        "LOW": "低",
+        "MEDIUM": "中",
+        "HIGH": "高",
+        "CRITICAL": "极高",
+    }
+    return mapping.get(str(level or "").upper(), str(level or "-"))
+
+
+def _build_snapshot_ai_analysis(
+    code,
+    name,
+    market,
+    technical,
+    holding=None,
+    trade_date: str = "",
+    analysis_snapshot: dict | None = None,
+    fallback_reason: str = "",
+):
+    snapshot = analysis_snapshot or {}
+    if not snapshot:
+        reason = fallback_reason or "未配置 DEEPSEEK_API_KEY，且当前没有可用的综合分析快照。"
+        return {
+            "source": "snapshot_fallback",
+            "analysis_date": trade_date or "",
+            "score": None,
+            "scores": None,
+            "action": "观望",
+            "action_reason": reason,
+            "conclusion": reason,
+        }
+
+    short_score = _as_float(snapshot.get("short_term_score"))
+    long_score = _as_float(snapshot.get("long_term_score"))
+    event_score = _as_float(snapshot.get("event_risk_score"))
+    quality_score = _as_float(snapshot.get("data_quality_score"))
+    overall_score = _avg_scores(short_score, long_score)
+    if overall_score is None:
+        overall_score = _avg_scores(short_score, long_score, event_score, quality_score)
+
+    recommend_status = str(snapshot.get("recommend_status") or "SUSPENDED").upper()
+    risk_level = str(snapshot.get("event_risk_level") or "LOW").upper()
+    status_label = _localize_recommend_status_label(recommend_status)
+    risk_label = _localize_risk_level_label(risk_level)
+    has_position = bool(holding and int(holding.get("shares") or 0) > 0)
+    if risk_level == "CRITICAL" or recommend_status == "BLOCK":
+        action = "减仓" if has_position else "回避"
+    elif recommend_status == "ALLOW":
+        action = "持有" if has_position else "关注"
+    else:
+        action = "持有观察" if has_position else "观望"
+
+    action_reason = (
+        str(snapshot.get("recommend_reason") or "").strip()
+        or str(snapshot.get("recommendation") or "").strip()
+        or str(snapshot.get("summary") or "").strip()
+        or fallback_reason
+        or "当前建议来自综合分析快照回退结果。"
+    )
+    strengths = [str(item) for item in (snapshot.get("strengths") or []) if str(item).strip()]
+    risks = [str(item) for item in (snapshot.get("risks") or []) if str(item).strip()]
+    quality_flags = [str(item) for item in (snapshot.get("data_quality_flags") or []) if str(item).strip()]
+    analysis_date = str(snapshot.get("analysis_date") or trade_date or "")
+
+    price = _as_float((market or {}).get("price"))
+    support = _as_float((technical or {}).get("support"))
+    resistance = _as_float((technical or {}).get("resistance"))
+
+    lines = [f"统一分析快照回退，基于 {analysis_date or '最近可用日期'} 的正式分析结果。"]
+    if snapshot.get("summary"):
+        lines.append(f"摘要：{snapshot.get('summary')}")
+    if snapshot.get("recommendation"):
+        lines.append(f"建议：{snapshot.get('recommendation')}")
+    lines.append(
+        "状态："
+        f"{status_label}，风险等级 {risk_label}，"
+        f"短线 {short_score if short_score is not None else '-'}，"
+        f"长线 {long_score if long_score is not None else '-'}，"
+        f"事件 {event_score if event_score is not None else '-'}，"
+        f"数据质量 {quality_score if quality_score is not None else '-'}。"
+    )
+    if price is not None or support is not None or resistance is not None:
+        lines.append(
+            "位置："
+            f"现价 {price if price is not None else '-'}，"
+            f"支撑 {support if support is not None else '-'}，"
+            f"压力 {resistance if resistance is not None else '-'}。"
+        )
+    if strengths:
+        lines.append(f"优势：{'；'.join(strengths[:4])}")
+    risk_parts = risks[:4]
+    if quality_flags:
+        risk_parts.extend([f"数据标记 {flag}" for flag in quality_flags[:3]])
+    if risk_parts:
+        lines.append(f"风险：{'；'.join(risk_parts)}")
+    if has_position:
+        shares = int(holding.get("shares") or 0)
+        cost = _as_float(holding.get("cost_price"))
+        if shares > 0:
+            holding_line = f"持仓：{shares}股"
+            if cost is not None and price is not None and cost > 0:
+                profit_pct = round((price / cost - 1) * 100, 2)
+                holding_line += f"，成本 {cost}，现价 {price}，浮盈 {profit_pct}%"
+            lines.append(holding_line)
+    if fallback_reason:
+        lines.append(f"说明：{fallback_reason}")
+
+    return {
+        "source": "snapshot_fallback",
+        "analysis_date": analysis_date,
+        "score": overall_score,
+        "scores": {
+            "short_term_score": short_score,
+            "long_term_score": long_score,
+            "event_risk_score": event_score,
+            "data_quality_score": quality_score,
+        },
+        "action": action,
+        "action_reason": action_reason,
+        "recommend_status": recommend_status,
+        "event_risk_level": risk_level,
+        "conclusion": "\n".join(line for line in lines if line),
+    }
+
+
+def _merge_ai_analysis_with_snapshot(
+    ai_result: dict | None,
+    code,
+    name,
+    market,
+    technical,
+    holding=None,
+    trade_date: str = "",
+    analysis_snapshot: dict | None = None,
+):
+    result = dict(ai_result or {})
+    base = _build_snapshot_ai_analysis(
+        code,
+        name,
+        market,
+        technical,
+        holding=holding,
+        trade_date=trade_date,
+        analysis_snapshot=analysis_snapshot,
+    )
+    if not analysis_snapshot:
+        result.setdefault("source", "deepseek")
+        result.setdefault("analysis_date", trade_date or "")
+        return result
+    merged = dict(base)
+    merged.update({k: v for k, v in result.items() if v is not None})
+    merged["source"] = result.get("source") or "deepseek+snapshot"
+    merged["analysis_date"] = result.get("analysis_date") or base.get("analysis_date") or trade_date or ""
+    return merged
+
+
+def _load_stock_detail_payload(stock_code: str, mode: str | None = None, light: bool = False) -> dict:
     mode = mode or _portfolio_market_mode()
     trade_date = None if mode == "intraday" else _portfolio_close_trade_date()
     loader = StockDataLoader()
-    payload = loader.load_full_data(
-        stock_code,
-        trade_date=trade_date,
-        use_realtime=(mode == "intraday"),
-    )
+    if light:
+        code = stock_code.strip().zfill(6)
+        td = trade_date or _portfolio_close_trade_date()
+        snapshot_trade_date = _latest_date_not_after("sm_stock_snapshot", td)
+        basic_rows = _read_sql(
+            "SELECT stock_code, short_name, exchange, list_date FROM si_all_code WHERE stock_code = :c",
+            {"c": code},
+        )
+        basic = basic_rows[0] if basic_rows else {"stock_code": code, "short_name": code}
+        industry_rows = _read_sql(
+            "SELECT plate_name FROM si_stock_plate_east WHERE stock_code = :c AND plate_type = '行业' LIMIT 1",
+            {"c": code},
+        )
+        concept_rows = _read_sql(
+            "SELECT DISTINCT name FROM si_stock_concept_east WHERE stock_code = :c LIMIT 8",
+            {"c": code},
+        )
+        market_rows = _read_sql(
+            "SELECT price, close, change_pct, open, high, low, volume, amount, turnover_ratio, pre_close, "
+            "market_cap, main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow "
+            "FROM sm_stock_snapshot WHERE stock_code = :c AND trade_date = :td LIMIT 1",
+            {"c": code, "td": snapshot_trade_date},
+        )
+        share_rows = _read_sql(
+            "SELECT total_shares, list_a_shares FROM si_stock_shares WHERE stock_code = :c",
+            {"c": code},
+        )
+        flow_td_rows = _read_sql(
+            "SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily WHERE trade_date <= :td",
+            {"td": td},
+        )
+        flow_trade_date = str(flow_td_rows[0]["d"])[:10] if flow_td_rows and flow_td_rows[0].get("d") else td
+        flow_rows = _read_sql(
+            "SELECT main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source "
+            "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :td",
+            {"c": code, "td": flow_trade_date},
+        )
+        fin_rows = _read_sql(
+            "SELECT basic_eps, net_asset_ps, roe_wtd, roa_wtd, gross_margin, net_margin, "
+            "total_rev, net_profit_attr_sh, total_rev_yoy_gr, net_profit_yoy_gr, report_date "
+            "FROM si_stock_finance WHERE stock_code = :c AND report_date <= :td "
+            "ORDER BY report_date DESC LIMIT 1",
+            {"c": code, "td": td},
+        )
+        holder_rows = _read_sql(
+            "SELECT report_date, holder_num, holder_num_change, pre_holder_num, holder_num_ratio, avg_free_shares "
+            "FROM si_stock_holder WHERE stock_code = :c AND report_date <= :td "
+            "ORDER BY report_date DESC LIMIT 1",
+            {"c": code, "td": td},
+        )
+        quote = market_rows[0] if market_rows else {}
+        shares = share_rows[0] if share_rows else {}
+        fin = fin_rows[0] if fin_rows else {}
+        holder = holder_rows[0] if holder_rows else {}
+        price_val = float(quote.get("price") or 0)
+        eps = float(fin.get("basic_eps") or 0)
+        bvps = float(fin.get("net_asset_ps") or 0)
+        total_shares = float(shares.get("total_shares") or 0)
+        float_shares = float(shares.get("list_a_shares") or 0)
+        payload = {
+            "basic": basic,
+            "market": {
+                "price": quote.get("price"),
+                "change_pct": quote.get("change_pct"),
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "close": quote.get("price"),
+                "pre_close": quote.get("pre_close"),
+                "volume": quote.get("volume"),
+                "amount": quote.get("amount"),
+                "turnover_ratio": quote.get("turnover_ratio"),
+                "total_shares": total_shares,
+                "float_shares": float_shares,
+                "market_cap": quote.get("market_cap") or (round(price_val * total_shares, 2) if price_val and total_shares else None),
+                "float_market_cap": round(price_val * float_shares, 2) if price_val and float_shares else None,
+            },
+            "capital": {
+                "today": ({
+                    "main_net_inflow": float(flow_rows[0].get("main_net_inflow") or 0) / 10000,
+                    "max_net_inflow": float(flow_rows[0].get("max_net_inflow") or 0) / 10000,
+                    "lg_net_inflow": float(flow_rows[0].get("lg_net_inflow") or 0) / 10000,
+                    "mid_net_inflow": float(flow_rows[0].get("mid_net_inflow") or 0) / 10000,
+                    "sm_net_inflow": float(flow_rows[0].get("sm_net_inflow") or 0) / 10000,
+                    "data_source": flow_rows[0].get("data_source") or "east",
+                } if flow_rows else {}),
+                "flow_3d": None,
+                "flow_5d": None,
+                "flow_20d": None,
+                "dragon_tiger": {"count_20d": 0, "inst_net_buy": None, "seats": []},
+            },
+            "finance": {"latest": fin, "quarters": [fin] if fin else []},
+            "valuation": {
+                "pe_ttm": round(price_val / eps, 2) if eps and eps > 0 and price_val else None,
+                "pe_percentile": None,
+                "pb": round(price_val / bvps, 2) if bvps and bvps > 0 and price_val else None,
+                "pb_percentile": None,
+                "verdict": None,
+            },
+            "technical": {},
+            "news": {"notices": [], "news": []},
+            "holder": holder,
+            "holding": None,
+            "industry": industry_rows[0].get("plate_name") if industry_rows else None,
+            "concepts": [row.get("name") for row in concept_rows if row.get("name")],
+            "trade_date": snapshot_trade_date or td,
+            "requested_trade_date": td,
+            "quote_trade_date": snapshot_trade_date or td,
+            "flow_trade_date": flow_trade_date,
+            "quote_source": "snapshot",
+            "detail_source": "snapshot_light",
+            "hot_rank": {},
+        }
+    else:
+        payload = loader.load_full_data(
+            stock_code,
+            trade_date=trade_date,
+            use_realtime=(mode == "intraday"),
+        )
     payload["capital"] = _legacy_capital_view(payload.get("capital"))
     return payload
 
 
-def _generate_ai_analysis(code, name, market, capital, finance, valuation, technical, industry, concepts, holding=None, hot_rank=None, trade_date: str = ""):
+def _generate_ai_analysis(
+    code,
+    name,
+    market,
+    capital,
+    finance,
+    valuation,
+    technical,
+    industry,
+    concepts,
+    holding=None,
+    hot_rank=None,
+    trade_date: str = "",
+    analysis_snapshot: dict | None = None,
+    prefer_snapshot: bool = False,
+):
     """调用 DeepSeek 生成 AI 投资分析"""
     try:
         import httpx
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        api_key = (os.getenv("DEEPSEEK_API_KEY", "").strip() or _read_dotenv_key())
         if not api_key:
-            return {"score": None, "conclusion": "未配置 DEEPSEEK_API_KEY"}
+            return _build_snapshot_ai_analysis(
+                code,
+                name,
+                market,
+                technical,
+                holding=holding,
+                trade_date=trade_date,
+                analysis_snapshot=analysis_snapshot,
+                fallback_reason="未配置 DEEPSEEK_API_KEY，当前改用分析快照回退结果。",
+            )
+        if prefer_snapshot and analysis_snapshot:
+            return _build_snapshot_ai_analysis(
+                code,
+                name,
+                market,
+                technical,
+                holding=holding,
+                trade_date=trade_date,
+                analysis_snapshot=analysis_snapshot,
+                fallback_reason="当前详情页启用快照优先模式，以保证响应速度和稳定性。",
+            )
 
         # 构建摘要给AI
         summary_parts = []
@@ -2749,9 +3219,27 @@ def _generate_ai_analysis(code, name, market, capital, finance, valuation, techn
         if "```" in content:
             content = content.split("```")[1] if content.startswith("```") else content
             content = content.split("```")[0]
-        return {"conclusion": content.strip()}
+        return _merge_ai_analysis_with_snapshot(
+            {"conclusion": content.strip(), "source": "deepseek"},
+            code,
+            name,
+            market,
+            technical,
+            holding=holding,
+            trade_date=trade_date,
+            analysis_snapshot=analysis_snapshot,
+        )
     except Exception as e:
-        return {"conclusion": f"AI分析生成失败: {str(e)}"}
+        return _build_snapshot_ai_analysis(
+            code,
+            name,
+            market,
+            technical,
+            holding=holding,
+            trade_date=trade_date,
+            analysis_snapshot=analysis_snapshot,
+            fallback_reason=f"AI 分析请求失败，已切换为快照回退结果：{str(e)}",
+        )
 
 
 # ═══════════════════════════════════════════
@@ -3228,6 +3716,282 @@ def _portfolio_apply_quote(row: dict, quote: dict | None) -> None:
         row["quote_snapshot_at"] = quote.get("snapshot_at")
     if quote.get("source"):
         row["quote_source"] = quote.get("source")
+    if quote.get("amount") is not None:
+        row["quote_amount"] = quote.get("amount")
+    if quote.get("volume") is not None:
+        row["quote_volume"] = quote.get("volume")
+
+
+def _portfolio_flow_attitude(flow_value, amount_value=None) -> dict:
+    value = float(flow_value or 0)
+    amount = float(amount_value or 0)
+    ratio = (value / amount * 100) if amount > 0 else None
+    score = ratio if ratio is not None else (value / 1_000_000)
+    if score >= 8:
+        label, level = "强进", "strong_in"
+    elif score >= 3:
+        label, level = "流入", "in"
+    elif score <= -8:
+        label, level = "强出", "strong_out"
+    elif score <= -3:
+        label, level = "流出", "out"
+    else:
+        label, level = "中性", "neutral"
+    return {
+        "label": label,
+        "level": level,
+        "ratio": round(ratio, 2) if ratio is not None else None,
+    }
+
+
+def _portfolio_num(value, default=0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _portfolio_daily_flow_attitude(main_net_inflow, amount_value=None) -> dict:
+    value = _portfolio_num(main_net_inflow)
+    amount = _portfolio_num(amount_value)
+    ratio = (value / amount * 100) if amount > 0 else None
+    if ratio is not None:
+        return _portfolio_flow_attitude(value, amount)
+    abs_value = abs(value)
+    if value >= 100_000_000:
+        label, level = "强进", "strong_in"
+    elif value >= 20_000_000:
+        label, level = "流入", "in"
+    elif value <= -100_000_000:
+        label, level = "强出", "strong_out"
+    elif value <= -20_000_000:
+        label, level = "流出", "out"
+    else:
+        label, level = "中性", "neutral"
+    return {
+        "label": label,
+        "level": level,
+        "ratio": round(value / 100_000_000, 2) if abs_value else 0,
+    }
+
+
+def _portfolio_build_watch_analysis(row: dict) -> dict:
+    """Compact intraday watch analysis for the portfolio table."""
+    change_pct = _portfolio_num(row.get("change_pct"))
+    price = _portfolio_num(row.get("cur_price"))
+    shares = int(row.get("shares") or 0)
+    is_holding = bool(row.get("is_holding") or shares > 0)
+    main_flow = _portfolio_num(row.get("main_net_inflow"))
+    quote_amount = _portfolio_num(row.get("quote_amount") or row.get("amount"))
+    minute_level = str(row.get("flow_attitude") or "")
+    minute_label = str(row.get("flow_attitude_label") or "")
+    flow_att = (
+        {"level": minute_level, "label": minute_label, "ratio": row.get("flow_attitude_ratio")}
+        if minute_level and minute_label
+        else _portfolio_daily_flow_attitude(main_flow, quote_amount)
+    )
+    flow_level = str(flow_att.get("level") or "neutral")
+    flow_label = str(flow_att.get("label") or "中性")
+
+    if price <= 0:
+        trend = "缺价"
+    elif change_pct >= 5:
+        trend = "强势"
+    elif change_pct >= 1:
+        trend = "偏强"
+    elif change_pct <= -5:
+        trend = "弱势"
+    elif change_pct <= -1:
+        trend = "偏弱"
+    else:
+        trend = "震荡"
+
+    heat_score = 50
+    if abs(change_pct) >= 7:
+        heat_score += 20
+    elif abs(change_pct) >= 3:
+        heat_score += 10
+    if abs(main_flow) >= 100_000_000:
+        heat_score += 20
+    elif abs(main_flow) >= 20_000_000:
+        heat_score += 10
+    if quote_amount >= 1_000_000_000:
+        heat_score += 10
+    heat_score = max(0, min(100, heat_score))
+    heat = "高" if heat_score >= 75 else "中" if heat_score >= 55 else "低"
+
+    if price <= 0:
+        advice = "等价"
+    elif flow_level in {"strong_out", "out"} and change_pct <= -2:
+        advice = "控仓" if is_holding else "观望"
+    elif flow_level in {"strong_in", "in"} and change_pct >= 1:
+        advice = "持有" if is_holding else "关注"
+    elif change_pct >= 8:
+        advice = "防追高" if not is_holding else "盯卖点"
+    elif is_holding and change_pct <= -4:
+        advice = "看止损"
+    elif is_holding:
+        advice = "持有"
+    else:
+        advice = "观察"
+
+    risk_parts: list[str] = []
+    if price <= 0:
+        risk_parts.append("实时价缺失")
+    if row.get("flow_trade_date") and row.get("quote_trade_date") and str(row.get("flow_trade_date"))[:10] < str(row.get("quote_trade_date"))[:10]:
+        risk_parts.append("资金滞后")
+    if flow_level in {"strong_out", "out"}:
+        risk_parts.append("资金外流")
+    if change_pct >= 9.5:
+        risk_parts.append("接近涨停")
+    if change_pct <= -7:
+        risk_parts.append("跌幅较大")
+    if is_holding and row.get("profit_pct") is not None and _portfolio_num(row.get("profit_pct")) <= -5:
+        risk_parts.append("持仓亏损扩大")
+    if not risk_parts:
+        risk_parts.append("暂无明显")
+
+    freshness = "实时" if row.get("quote_snapshot_at") or row.get("live_price") is not None else "收盘"
+    if row.get("flow_latest_time"):
+        freshness += "/分资"
+    elif row.get("flow_trade_date"):
+        freshness += "/日资"
+
+    return {
+        "trend": trend,
+        "funds": flow_label,
+        "funds_level": flow_level,
+        "funds_ratio": flow_att.get("ratio"),
+        "heat": heat,
+        "heat_score": heat_score,
+        "operation_advice": advice,
+        "risk_tip": "、".join(risk_parts[:3]),
+        "freshness": freshness,
+    }
+
+
+def _portfolio_refresh_qmt_min_flow(codes: list[str], *, force: bool = False) -> dict[str, object]:
+    clean = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
+    if not clean:
+        return {"status": "empty", "rows": 0}
+    cache_key = f"portfolio_qmt_flow_min_{','.join(clean)}"
+    if not force:
+        cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(60, intraday_seconds=30))
+        if cached is not None:
+            return cached
+
+    try:
+        from integrations.qmt import bridge
+        from integrations.qmt.backend import to_qmt_symbol
+    except Exception as exc:
+        result = {"status": "unavailable", "rows": 0, "error": str(exc)[:160]}
+        _cache_set(cache_key, result)
+        return result
+
+    qmt_codes = [symbol for symbol in (to_qmt_symbol(code) for code in clean) if symbol]
+    if not qmt_codes:
+        result = {"status": "empty", "rows": 0}
+        _cache_set(cache_key, result)
+        return result
+
+    trade_date = date.today().isoformat()
+    try:
+        df = bridge.flow_min(qmt_codes, trade_date=trade_date, batch_size=80, timeout=180)
+    except Exception as exc:
+        result = {"status": "error", "rows": 0, "error": str(exc)[:200]}
+        _cache_set(cache_key, result)
+        return result
+    if df is None or df.empty:
+        result = {"status": "empty", "rows": 0}
+        _cache_set(cache_key, result)
+        return result
+
+    now = datetime.now().replace(microsecond=0)
+    out = df.copy()
+    out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
+    if "qmt_code" not in out.columns:
+        out["qmt_code"] = out["stock_code"].map(lambda code: to_qmt_symbol(str(code)) or "")
+    out["trade_time"] = pd.to_datetime(out["trade_time"], errors="coerce")
+    out = out[out["trade_time"].notna()]
+    out = out[out["stock_code"].isin(clean)]
+    if out.empty:
+        result = {"status": "empty", "rows": 0}
+        _cache_set(cache_key, result)
+        return result
+    out["snapshot_at"] = now
+    out["etl_sync_at"] = now
+    out["data_source"] = "gj_qmt"
+    out["source_time"] = out["trade_time"]
+    out["received_at"] = now
+    out["batch_id"] = f"qmt_flow_min_{now.strftime('%Y%m%d%H%M%S')}"
+    out["quality_status"] = "PENDING"
+    out["permission_status"] = "SUPPORTED"
+    keep_cols = [
+        "stock_code", "trade_time", "main_net_inflow", "max_net_inflow", "lg_net_inflow",
+        "mid_net_inflow", "sm_net_inflow", "snapshot_at", "etl_sync_at", "qmt_code",
+        "data_source", "source_time", "received_at", "batch_id", "quality_status", "permission_status",
+    ]
+    out = out[[col for col in keep_cols if col in out.columns]]
+    rows = _df_to_records(out)
+    if not rows:
+        result = {"status": "empty", "rows": 0}
+        _cache_set(cache_key, result)
+        return result
+
+    with get_engine().begin() as conn:
+        for chunk_start in range(0, len(rows), 1000):
+            chunk = rows[chunk_start : chunk_start + 1000]
+            clauses = []
+            params = {}
+            for idx, row in enumerate(chunk):
+                clauses.append(f"(stock_code = :c{idx} AND trade_time = :t{idx})")
+                params[f"c{idx}"] = row["stock_code"]
+                params[f"t{idx}"] = row["trade_time"]
+            if clauses:
+                conn.execute(text("DELETE FROM sm_stock_capital_flow_min WHERE " + " OR ".join(clauses)), params)
+    pd.DataFrame(rows).to_sql("sm_stock_capital_flow_min", get_engine(), if_exists="append", index=False, chunksize=1000, method="multi")
+    result = {"status": "success", "rows": len(rows), "generated_at": now.isoformat(timespec="seconds")}
+    _cache_set(cache_key, result)
+    return result
+
+
+def _portfolio_min_flow_summary(codes: list[str]) -> dict[str, dict]:
+    clean = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
+    if not clean:
+        return {}
+    placeholders = ", ".join([f":code_{idx}" for idx, _ in enumerate(clean)])
+    params = {f"code_{idx}": code for idx, code in enumerate(clean)}
+    rows = _read_sql(
+        f"""
+        SELECT stock_code,
+               MAX(trade_time) AS latest_time,
+               SUM(CASE WHEN trade_time >= NOW() - INTERVAL 1 MINUTE THEN main_net_inflow ELSE 0 END) AS flow_1m,
+               SUM(CASE WHEN trade_time >= NOW() - INTERVAL 5 MINUTE THEN main_net_inflow ELSE 0 END) AS flow_5m,
+               SUM(CASE WHEN trade_time >= NOW() - INTERVAL 15 MINUTE THEN main_net_inflow ELSE 0 END) AS flow_15m,
+               SUM(CASE WHEN trade_time >= NOW() - INTERVAL 5 MINUTE THEN ABS(main_net_inflow) ELSE 0 END) AS flow_5m_abs
+        FROM sm_stock_capital_flow_min
+        WHERE stock_code IN ({placeholders})
+          AND trade_time >= NOW() - INTERVAL 30 MINUTE
+        GROUP BY stock_code
+        """,
+        params,
+    )
+    out: dict[str, dict] = {}
+    for item in rows:
+        code = str(item.get("stock_code") or "").strip().zfill(6)
+        attitude = _portfolio_flow_attitude(item.get("flow_5m"), item.get("flow_5m_abs"))
+        out[code] = {
+            "flow_1m": item.get("flow_1m"),
+            "flow_5m": item.get("flow_5m"),
+            "flow_15m": item.get("flow_15m"),
+            "flow_latest_time": str(item.get("latest_time") or "")[:19],
+            "flow_attitude": attitude["level"],
+            "flow_attitude_label": attitude["label"],
+            "flow_attitude_ratio": attitude["ratio"],
+        }
+    return out
 
 
 def _portfolio_prev_close(cur_price: float, price_change, pre_close, change_pct) -> float | None:
@@ -3438,11 +4202,11 @@ def _portfolio_day_profit(
 
 def _portfolio_snapshot_ttl_seconds(live_mode: bool) -> int:
     if live_mode:
-        return 5 if _is_monitor_trading_time() else 60
+        return _trading_live_ttl_seconds(15)
     return 30 if _is_monitor_trading_time() else 120
 
 
-def _build_portfolio_snapshot() -> dict:
+def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     _ensure_portfolio_position_columns()
     rows = _read_sql("""
         SELECT p.* FROM st_user_portfolio p
@@ -3473,9 +4237,29 @@ def _build_portfolio_snapshot() -> dict:
         pass
 
     try:
-        live_quotes = _portfolio_fetch_live_quotes(codes) or {}
+        live_quotes = _portfolio_fetch_live_quotes(codes, force=force_live) or {}
     except Exception:
         live_quotes = {}
+    flow_min_refresh = _portfolio_refresh_qmt_min_flow(codes, force=force_live) if (force_live or _is_monitor_trading_time()) else {"status": "skipped", "rows": 0}
+    flow_min_map = _portfolio_min_flow_summary(codes)
+
+    flow_map: dict[str, dict] = {}
+    try:
+        flow_rows = _read_sql(f"""
+            SELECT f.stock_code, f.trade_date, f.main_net_inflow, f.max_net_inflow,
+                   f.lg_net_inflow, f.mid_net_inflow, f.sm_net_inflow, f.data_source
+            FROM sm_stock_capital_flow_daily f
+            INNER JOIN (
+                SELECT stock_code, MAX(trade_date) AS trade_date
+                FROM sm_stock_capital_flow_daily
+                WHERE stock_code IN ({placeholders})
+                GROUP BY stock_code
+            ) x ON f.stock_code = x.stock_code AND f.trade_date = x.trade_date
+        """)
+        for item in flow_rows:
+            flow_map[str(item.get("stock_code") or "").strip().zfill(6)] = item
+    except Exception:
+        flow_map = {}
 
     today_trades_map = {}
     try:
@@ -3497,12 +4281,29 @@ def _build_portfolio_snapshot() -> dict:
     holding_count = 0
     today_open_count = 0
     today_cleared_count = 0
+    watch_advice_counts: dict[str, int] = {}
     for row in rows:
         stock_code = str(row.get("stock_code") or "").strip().zfill(6)
         kline = kline_map.get(stock_code, {})
         row["kline_pre_close"] = kline.get("pre_close")
         row["kline_trade_date"] = str(kline.get("trade_date", ""))[:10] if kline.get("trade_date") else None
         _portfolio_apply_quote(row, live_quotes.get(stock_code))
+        flow = flow_map.get(stock_code) or {}
+        row["main_net_inflow"] = flow.get("main_net_inflow")
+        row["max_net_inflow"] = flow.get("max_net_inflow")
+        row["lg_net_inflow"] = flow.get("lg_net_inflow")
+        row["mid_net_inflow"] = flow.get("mid_net_inflow")
+        row["sm_net_inflow"] = flow.get("sm_net_inflow")
+        row["flow_trade_date"] = str(flow.get("trade_date", ""))[:10] if flow.get("trade_date") else ""
+        row["flow_source"] = flow.get("data_source") or ""
+        min_flow = flow_min_map.get(stock_code) or {}
+        row["flow_1m"] = min_flow.get("flow_1m")
+        row["flow_5m"] = min_flow.get("flow_5m")
+        row["flow_15m"] = min_flow.get("flow_15m")
+        row["flow_latest_time"] = min_flow.get("flow_latest_time") or ""
+        row["flow_attitude"] = min_flow.get("flow_attitude") or ""
+        row["flow_attitude_label"] = min_flow.get("flow_attitude_label") or ""
+        row["flow_attitude_ratio"] = min_flow.get("flow_attitude_ratio")
         if row.get("cur_price") is None:
             row["cur_price"] = kline.get("close")
         if row.get("change_pct") is None:
@@ -3538,6 +4339,10 @@ def _build_portfolio_snapshot() -> dict:
         )
         row["display_name"] = row.get("current_name") or row.get("short_name") or row["stock_code"]
         row["snapshot_at"] = row.get("quote_snapshot_at") or ""
+        row["watch_analysis"] = _portfolio_build_watch_analysis(row)
+        advice = str((row["watch_analysis"] or {}).get("operation_advice") or "")
+        if advice:
+            watch_advice_counts[advice] = watch_advice_counts.get(advice, 0) + 1
 
         if row.get("is_today_open") or row.get("is_today_reopened"):
             today_open_count += 1
@@ -3559,23 +4364,27 @@ def _build_portfolio_snapshot() -> dict:
             "today_hold_profit": round(today_hold_profit, 2),
             "today_open_count": today_open_count,
             "today_cleared_count": today_cleared_count,
+            "quote_source": "gj_qmt",
+            "quote_generated_at": datetime.now().isoformat(timespec="seconds"),
+            "flow_min_refresh": flow_min_refresh,
+            "watch_advice_counts": watch_advice_counts,
         },
     }
 
 
-def _get_portfolio_snapshot(live_mode: bool) -> dict:
+def _get_portfolio_snapshot(live_mode: bool, *, force_live: bool = False) -> dict:
     ttl_seconds = _portfolio_snapshot_ttl_seconds(live_mode)
-    cached = _cache_get("portfolio_snapshot", ttl_seconds=ttl_seconds)
+    cached = None if force_live else _cache_get("portfolio_snapshot", ttl_seconds=ttl_seconds)
     if cached is not None:
         if live_mode:
             return {**cached, "live": True}
         return cached
     try:
-        result = _build_portfolio_snapshot()
+        result = _build_portfolio_snapshot(force_live=force_live)
         if "error" not in result:
             _cache_set("portfolio_snapshot", result)
         if live_mode:
-            return {**result, "live": True}
+            return {**result, "live": True, "force": force_live}
         return result
     except Exception as exc:
         return {"data": [], "total": 0, "error": str(exc)[:200]}
@@ -3586,7 +4395,7 @@ def _invalidate_portfolio_snapshot_cache() -> None:
 
 
 def _invalidate_market_runtime_caches() -> None:
-    _cache_drop("portfolio_live_quotes")
+    _cache_drop_prefix("portfolio_live_quotes_")
     _invalidate_portfolio_snapshot_cache()
     _cache_drop_prefix("monitor_data_")
     _cache_drop_prefix("sector_movement_")
@@ -3927,130 +4736,46 @@ def _portfolio_resolve_quote(code: str, klines: list | None) -> dict:
     return {"mode": mode, "mode_label": "数据不可用", "price": None, "change_pct": None, "trade_date": target}
 
 
-def _portfolio_fetch_live_quotes(codes: list[str]) -> dict[str, dict]:
-    """拉取最新价写入 sm_stock_current，返回 {stock_code: quote_dict}。盘中60s缓存。"""
+def _portfolio_fetch_live_quotes(codes: list[str], *, force: bool = False) -> dict[str, dict]:
+    """Prefer QMT-backed current rows, then pull missing codes on demand."""
     _log = logging.getLogger("portfolio.live_quotes")
-    # 检查缓存
-    _cache_key = "portfolio_live_quotes"
-    cached = _cache_get(_cache_key, ttl_seconds=60)
-    if cached is not None:
-        return cached
-    import numpy as np
 
     clean = [str(c).strip().zfill(6) for c in codes if str(c).strip()]
     if not clean:
         return {}
-    df = None
-    try:
-        from adata.stock.market.stock_market.stock_market import StockMarket
-        df = StockMarket().list_market_current(code_list=clean)
-        if df is not None and not df.empty:
-            _log.info("adata 返回 %d 条行情", len(df))
-    except Exception as e:
-        _log.warning("adata 拉取行情失败: %s", e)
-        df = None
-    if df is None or df.empty:
-        _log.info("adata 无数据，尝试 sina 补充")
+    _cache_key = f"portfolio_live_quotes_{','.join(clean)}"
+    if force:
+        _cache_drop(_cache_key)
+    cached = None if force else _cache_get(_cache_key, ttl_seconds=_trading_live_ttl_seconds(15))
+    if cached is not None:
+        return cached
+    out = {} if force else _live_quotes_from_current_table(clean, max_age_seconds=20)
+    missing_codes = clean if force else [code for code in clean if code not in out]
+    if missing_codes and (_is_monitor_trading_time() or force):
         try:
-            import requests
+            from tools.sync_qmt_realtime import sync_qmt_realtime
 
-            symbols = ",".join([("sh" + c if c.startswith("6") else "sz" + c) for c in clean])
-            resp = requests.get(
-                f"https://hq.sinajs.cn/list={symbols}",
-                headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn"},
-                timeout=15,
+            sync_qmt_realtime(
+                engine=get_engine(),
+                codes=missing_codes,
+                archive_snapshot=False,
+                run_rt_ddl=False,
+                skip_closed=False,
+                min_coverage=0.0,
+                replace_scope="subset",
             )
-            resp.encoding = "gbk"
-            rows = []
-            for line in resp.text.strip().split("\n"):
-                if "=" not in line or '""' in line:
-                    continue
-                var_part, val_part = line.split("=", 1)
-                code = var_part.split("_")[-1][2:]
-                fields = val_part.strip('";\r ').split(",")
-                if len(fields) < 4:
-                    continue
-                try:
-                    short_name = fields[0]
-                    pre_close = float(fields[2] or 0)
-                    price = float(fields[3] or 0)
-                    if price <= 0:
-                        price = pre_close
-                    change = price - pre_close if pre_close > 0 else None
-                    change_pct = change / pre_close * 100 if pre_close > 0 and change is not None else None
-                    rows.append({
-                        "stock_code": code,
-                        "short_name": short_name,
-                        "price": price,
-                        "change": change,
-                        "change_pct": change_pct,
-                        "volume": float(fields[8] or 0) if len(fields) > 8 else None,
-                        "amount": float(fields[9] or 0) if len(fields) > 9 else None,
-                        "_quote_source": "sina",
-                    })
-                except Exception:
-                    continue
-            df = pd.DataFrame(rows)
-            _log.info("sina 返回 %d 条行情", len(rows))
-        except Exception as e:
-            _log.error("sina 拉取行情失败: %s", e)
-            df = None
-    if df is None or df.empty:
-        _log.warning("所有行情源均无数据，codes=%s", clean)
-        return {}
-
-    now_str = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    out: dict[str, dict] = {}
-    for _, row in df.iterrows():
-        sc = str(row.get("stock_code", "")).strip().zfill(6)
-        if not sc:
-            continue
-        sn = str(row.get("short_name", ""))[:128]
-        try:
-            v = float(row.get("price", np.nan))
-            price = v if not np.isnan(v) else None
-        except (ValueError, TypeError):
-            price = None
-        try:
-            v = float(row.get("change", np.nan))
-            change = v if not np.isnan(v) else None
-        except (ValueError, TypeError):
-            change = None
-        try:
-            v = float(row.get("change_pct", np.nan))
-            chg_pct = v if not np.isnan(v) else None
-        except (ValueError, TypeError):
-            chg_pct = None
-        try:
-            v = float(row.get("volume", np.nan))
-            volume = v if not np.isnan(v) else None
-        except (ValueError, TypeError):
-            volume = None
-        try:
-            v = float(row.get("amount", np.nan))
-            amount = v if not np.isnan(v) else None
-        except (ValueError, TypeError):
-            amount = None
-        _exec_sql("DELETE FROM sm_stock_current WHERE stock_code = :c", {"c": sc})
-        _exec_sql("""
-            INSERT INTO sm_stock_current (stock_code, short_name, price, `change`, change_pct, volume, amount, snapshot_at, etl_sync_at)
-            VALUES (:c, :n, :p, :ch, :cp, :v, :a, :sn, :et)
-        """, {"c": sc, "n": sn, "p": price, "ch": change, "cp": chg_pct, "v": volume, "a": amount, "sn": now_str, "et": now_str})
-        out[sc] = {
-            "price": price,
-            "change": change,
-            "change_pct": chg_pct,
-            "short_name": sn,
-            "snapshot_at": now_str,
-            "source": str(row.get("_quote_source") or "live"),
-        }
+            out.update(_live_quotes_from_current_table(missing_codes, max_age_seconds=30))
+        except Exception as exc:
+            _log.warning("QMT live quote refresh failed for %s codes: %s", len(missing_codes), exc)
     _cache_set(_cache_key, out)
     return out
 
 
 @router.get("/portfolio/live")
-def portfolio_live():
+def portfolio_live(force: bool = False):
     """自选股实时行情：拉取最新价 + 返回自选股数据（含当日盈亏/持仓盈亏），一次搞定"""
+    if force:
+        return _get_portfolio_snapshot(live_mode=True, force_live=True)
     return _get_portfolio_snapshot(live_mode=True)
 
 
@@ -4064,7 +4789,7 @@ def portfolio_refresh_prices():
         _log.info("刷新行情: %d 只自选股, codes=%s", len(codes), codes[:5])
         if not codes:
             return {"status": "ok", "refreshed": 0, "message": "无自选股"}
-        quotes = _portfolio_fetch_live_quotes(codes)
+        quotes = _portfolio_fetch_live_quotes(codes, force=True)
         if not quotes:
             _log.warning("行情接口返回空, codes=%s", codes)
             from datetime import datetime
@@ -4091,7 +4816,7 @@ def portfolio_analyze(stock_code: str):
     try:
         code = stock_code.strip().zfill(6)
         mode = _portfolio_market_mode()
-        payload = _load_stock_detail_payload(code, mode=mode)
+        payload = _load_stock_detail_payload(code, mode=mode, light=True)
         basic = payload.get("basic") or {}
         market = payload.get("market") or {}
         capital = payload.get("capital") or {}
@@ -4102,8 +4827,12 @@ def portfolio_analyze(stock_code: str):
         concepts = payload.get("concepts") or []
         holding = payload.get("holding")
         trade_date = str(payload.get("trade_date") or "")
+        requested_trade_date = str(payload.get("requested_trade_date") or trade_date or "")
+        quote_trade_date = str(payload.get("quote_trade_date") or trade_date or "")
+        flow_trade_date = str(payload.get("flow_trade_date") or quote_trade_date or "")
         price_val = float(market.get("price") or 0)
         quote = market
+        analysis_snapshot = _load_latest_analysis_snapshot(code, trade_date=trade_date or None)
 
         ai_result = _generate_ai_analysis(
             code,
@@ -4118,6 +4847,8 @@ def portfolio_analyze(stock_code: str):
             holding,
             hot_rank=payload.get("hot_rank"),
             trade_date=trade_date,
+            analysis_snapshot=analysis_snapshot,
+            prefer_snapshot=True,
         )
 
         # 构建返回
@@ -4130,11 +4861,27 @@ def portfolio_analyze(stock_code: str):
             "analysis": analysis_text,
             "data_mode": mode,
             "data_mode_label": data_mode_label,
-            "quote_trade_date": str(trade_date),
+            "quote_trade_date": quote_trade_date,
+            "requested_trade_date": requested_trade_date,
+            "flow_trade_date": flow_trade_date,
+            "quote_source": payload.get("quote_source") or "",
+            "detail_source": payload.get("detail_source") or "",
+            "analysis_snapshot": analysis_snapshot,
+            "ai_source": ai_result.get("source") if isinstance(ai_result, dict) else None,
+            "ai_analysis_date": ai_result.get("analysis_date") if isinstance(ai_result, dict) else None,
             "ai_scores": ai_result.get("scores") if isinstance(ai_result, dict) else None,
             "ai_score": ai_result.get("score") if isinstance(ai_result, dict) else None,
             "ai_action": ai_result.get("action") if isinstance(ai_result, dict) else None,
             "ai_action_reason": ai_result.get("action_reason") if isinstance(ai_result, dict) else None,
+            "ai_recommend_status": ai_result.get("recommend_status") if isinstance(ai_result, dict) else None,
+            "ai_event_risk_level": ai_result.get("event_risk_level") if isinstance(ai_result, dict) else None,
+            "quote_is_stale": bool(requested_trade_date and quote_trade_date and quote_trade_date < requested_trade_date),
+            "flow_is_stale": bool(requested_trade_date and flow_trade_date and flow_trade_date < requested_trade_date),
+            "analysis_is_stale": bool(
+                requested_trade_date
+                and isinstance(ai_result, dict)
+                and str(ai_result.get("analysis_date") or "") < requested_trade_date
+            ),
         }
 
         # 持仓信息
@@ -4647,6 +5394,59 @@ def _is_monitor_trading_time():
     return (925 <= t <= 1135) or (1255 <= t <= 1505)
 
 
+def _market_live_cache_ttl() -> int:
+    """Keep full-market views reasonably fresh without pretending they are tick-by-tick."""
+    return 30 if _is_monitor_trading_time() else 120
+
+
+def _trading_live_ttl_seconds(default_off_hours: int = 60, *, intraday_seconds: int = 0) -> int:
+    return intraday_seconds if _is_monitor_trading_time() else default_off_hours
+
+
+def _live_quotes_from_current_table(codes: list[str], *, max_age_seconds: int = 20) -> dict[str, dict]:
+    clean = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
+    if not clean:
+        return {}
+    placeholders = ", ".join([f":code_{idx}" for idx, _ in enumerate(clean)])
+    params = {f"code_{idx}": code for idx, code in enumerate(clean)}
+    rows = _read_sql(
+        f"""
+        SELECT stock_code, short_name, price, `change`, change_pct, volume, amount, snapshot_at
+        FROM sm_stock_current
+        WHERE stock_code IN ({placeholders})
+        """,
+        params,
+    )
+    if not rows:
+        return {}
+    out: dict[str, dict] = {}
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    for row in rows:
+        stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        snapshot_at = str(row.get("snapshot_at") or "")
+        if not stock_code or not snapshot_at.startswith(today):
+            continue
+        try:
+            age_seconds = (now - datetime.strptime(snapshot_at[:19], "%Y-%m-%d %H:%M:%S")).total_seconds()
+        except Exception:
+            age_seconds = float(max_age_seconds + 1)
+        if age_seconds > max_age_seconds:
+            continue
+        out[stock_code] = {
+            "stock_code": stock_code,
+            "short_name": row.get("short_name"),
+            "price": row.get("price"),
+            "change": row.get("change"),
+            "change_pct": row.get("change_pct"),
+            "volume": row.get("volume"),
+            "amount": row.get("amount"),
+            "snapshot_at": snapshot_at,
+            "source": "qmt_live_table",
+        }
+    return out
+
+
 def _get_realtime_overview():
     try:
         snap = _read_sql(
@@ -4824,7 +5624,7 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
 
     group_by: industry=按行业分组(申万一级), concept=按概念分组, all=同时展示两组
     """
-    _ttl = 30 if _is_monitor_trading_time() else 120
+    _ttl = _market_live_cache_ttl()
     _ckey = f"sector_movement_{group_by}"
     cached = _cache_get(_ckey, ttl_seconds=_ttl)
     if cached is not None:
@@ -4970,7 +5770,7 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
 def monitor_data(date: str = Query(default_factory=lambda: date.today().isoformat())):
     """市场监控中心数据接口（盘中使用实时快照数据）"""
     requested_date = str(date or "").strip() or datetime.now().strftime("%Y-%m-%d")
-    _ttl = 30 if _is_monitor_trading_time() else 120
+    _ttl = _market_live_cache_ttl()
     _ckey = f"monitor_data_{requested_date}"
     cached = _cache_get(_ckey, ttl_seconds=_ttl)
     if cached is not None:
@@ -5301,7 +6101,13 @@ def sync_realtime_data():
 # AI 推荐买入股票
 # ═══════════════════════════════════════════
 
-def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: str = ""):
+def _recommended_stocks_v2(
+    trade_date: str,
+    strategy: str = "",
+    signal_status: str = "",
+    start_date: str = "",
+    end_date: str = "",
+):
     columns = _table_columns("st_recommended_stocks")
     strategy = (strategy or "").strip()
     signal_status = (signal_status or "").strip().upper()
@@ -5362,11 +6168,29 @@ def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: s
         _select_col(columns, "trend_stop_price", "NULL"),
         _select_col(columns, "trend_reduce_price", "NULL"),
         _select_col(columns, "model_version", "''"),
+        _select_col(columns, "price", "NULL"),
+        _select_col(columns, "change_pct", "NULL"),
+        _select_col(columns, "amount", "NULL"),
     ]
 
-    def _query_for_date(d: str) -> list[dict]:
-        conditions = ["r.pick_date = :d"]
-        params = {"d": d}
+    def _order_sql() -> str:
+        if "final_trade_score" in columns:
+            strategy_score = {
+                "ultra_short": "r.ultra_short_score",
+                "short_term": "r.short_term_score",
+                "swing": "r.swing_score",
+                "main_wave": "r.main_wave_score",
+            }.get(strategy, "r.final_trade_score")
+            return f"{strategy_score} DESC, r.final_trade_score DESC, r.entry_score DESC"
+        if strategy == "ultra_short" and "ultra_short_score" in columns:
+            return "r.ultra_short_score DESC, r.ai_score DESC"
+        if strategy == "swing" and "swing_score" in columns:
+            return "r.swing_score DESC, r.ai_score DESC"
+        if strategy == "short_term" and "short_term_score" in columns:
+            return "r.short_term_score DESC, r.ai_score DESC"
+        return "r.ai_score DESC"
+
+    def _add_filters(conditions: list[str], params: dict) -> None:
         if strategy:
             if "suitable_strategies" in columns:
                 conditions.append("r.suitable_strategies LIKE :strategy_like")
@@ -5381,40 +6205,62 @@ def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: s
             conditions.append("r.signal_status = :signal_status")
             params["signal_status"] = signal_status
 
-        if "final_trade_score" in columns:
-            strategy_score = {
-                "ultra_short": "r.ultra_short_score",
-                "short_term": "r.short_term_score",
-                "swing": "r.swing_score",
-                "main_wave": "r.main_wave_score",
-            }.get(strategy, "r.final_trade_score")
-            order_sql = f"{strategy_score} DESC, r.final_trade_score DESC, r.entry_score DESC"
-        elif strategy == "ultra_short" and "ultra_short_score" in columns:
-            order_sql = "r.ultra_short_score DESC, r.ai_score DESC"
-        elif strategy == "swing" and "swing_score" in columns:
-            order_sql = "r.swing_score DESC, r.ai_score DESC"
-        elif strategy == "short_term" and "short_term_score" in columns:
-            order_sql = "r.short_term_score DESC, r.ai_score DESC"
-        else:
-            order_sql = "r.ai_score DESC"
+    def _query_for_date(d: str) -> list[dict]:
+        conditions = ["r.pick_date = :d"]
+        params = {"d": d}
+        _add_filters(conditions, params)
 
         return _read_sql(f"""
             SELECT {", ".join(select_cols)}
             FROM st_recommended_stocks r
             WHERE {" AND ".join(conditions)}
-            ORDER BY {order_sql}
+            ORDER BY {_order_sql()}
         """, params)
 
-    if not trade_date:
-        trade_date = _latest_date("st_recommended_stocks", "pick_date")
-    rows = _query_for_date(trade_date) if trade_date else []
+    def _query_for_range(start: str, end: str) -> list[dict]:
+        conditions = ["r.pick_date >= :start_date", "r.pick_date <= :end_date"]
+        params = {"start_date": start, "end_date": end}
+        _add_filters(conditions, params)
+        return _read_sql(f"""
+            SELECT {", ".join(select_cols)}
+            FROM st_recommended_stocks r
+            WHERE {" AND ".join(conditions)}
+            ORDER BY r.pick_date DESC, {_order_sql()}
+            LIMIT 1000
+        """, params)
+
+    start_date = str(start_date or "").strip()[:10]
+    end_date = str(end_date or "").strip()[:10]
+    start_date = start_date if isinstance(start_date, str) else ""
+    end_date = end_date if isinstance(end_date, str) else ""
+    if start_date or end_date:
+        if not end_date:
+            end_date = start_date
+        if not start_date:
+            start_date = end_date
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+        rows = _query_for_range(start_date, end_date)
+        trade_date = end_date
+    else:
+        requested_trade_date = str(trade_date or "").strip()[:10]
+        resolved_trade_date = (
+            _latest_date_not_after("st_recommended_stocks", requested_trade_date, "pick_date")
+            if requested_trade_date
+            else _latest_date("st_recommended_stocks", "pick_date")
+        )
+        trade_date = resolved_trade_date or requested_trade_date
+        rows = _query_for_date(trade_date) if trade_date else []
+        if not rows and not requested_trade_date:
+            fallback = _latest_date("st_recommended_stocks", "pick_date")
+            if fallback and fallback != trade_date:
+                trade_date = fallback
+                rows = _query_for_date(trade_date)
     if not rows:
-        fallback = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
-        if fallback and fallback[0].get("d"):
-            trade_date = str(fallback[0]["d"])[:10]
-            rows = _query_for_date(trade_date)
-    if not rows:
-        return {"date": trade_date, "data": [], "total": 0, "note": "no recommendation data"}
+        payload = {"date": trade_date, "data": [], "total": 0, "note": "no recommendation data"}
+        if start_date or end_date:
+            payload.update({"start_date": start_date, "end_date": end_date, "note": "no recommendation data in date range"})
+        return payload
 
     empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
     if empty_name_codes:
@@ -5425,28 +6271,47 @@ def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: s
             if not r.get("short_name"):
                 r["short_name"] = name_map.get(r["stock_code"]) or r["stock_code"]
 
-    codes = [r["stock_code"] for r in rows]
-    placeholders = ",".join(f"'{c}'" for c in codes)
-    quotes = {}
-    try:
-        latest_date = _latest_date("sm_stock_kline")
-        q_rows = _read_sql(f"""
-            SELECT stock_code, close AS price, change_pct, amount
-            FROM sm_stock_kline
-            WHERE stock_code IN ({placeholders}) AND k_type=1
-              AND trade_date = :d
-        """, {"d": latest_date})
-        for q in q_rows:
-            quotes[q["stock_code"]] = q
-    except Exception:
-        pass
-    for r in rows:
-        q = quotes.get(r["stock_code"], {})
-        r["price"] = q.get("price")
-        r["change_pct"] = q.get("change_pct")
-        r["amount"] = q.get("amount")
+    current_quotes = {}
+    if _is_monitor_trading_time():
+        try:
+            current_quotes = _portfolio_fetch_live_quotes([r["stock_code"] for r in rows])
+        except Exception:
+            current_quotes = {}
+        for r in rows:
+            q = current_quotes.get(r["stock_code"], {})
+            if q:
+                r["price"] = q.get("price")
+                r["change_pct"] = q.get("change_pct")
+                r["amount"] = q.get("amount")
+                if q.get("short_name") and not r.get("short_name"):
+                    r["short_name"] = q.get("short_name")
 
-    return {
+    missing_quote_codes = [r["stock_code"] for r in rows if r.get("price") is None]
+    if missing_quote_codes:
+        placeholders = ",".join(f"'{c}'" for c in missing_quote_codes)
+        quotes = {}
+        try:
+            snapshot_date = _latest_date("sm_stock_snapshot")
+            q_rows = _read_sql(f"""
+                SELECT stock_code, price, change_pct, amount
+                FROM sm_stock_snapshot
+                WHERE trade_date = :d
+                  AND stock_code IN ({placeholders})
+            """, {"d": snapshot_date})
+            for q in q_rows:
+                quotes[q["stock_code"]] = q
+        except Exception:
+            quotes = {}
+        for r in rows:
+            if r.get("price") is not None:
+                continue
+            q = quotes.get(r["stock_code"], {})
+            if q:
+                r["price"] = q.get("price")
+                r["change_pct"] = q.get("change_pct")
+                r["amount"] = q.get("amount")
+
+    payload = {
         "date": trade_date,
         "data": rows,
         "total": len(rows),
@@ -5454,6 +6319,9 @@ def _recommended_stocks_v2(trade_date: str, strategy: str = "", signal_status: s
         "signal_status": signal_status or "all",
         "model_version": rows[0].get("model_version") if rows else "",
     }
+    if start_date or end_date:
+        payload.update({"start_date": start_date, "end_date": end_date})
+    return payload
 
 
 @router.get("/hot-data/recommended-stocks")
@@ -5461,10 +6329,27 @@ def recommended_stocks(
     trade_date: str = Query(default=""),
     strategy: str = Query(default=""),
     signal_status: str = Query(default=""),
+    start_date: str = Query(default=""),
+    end_date: str = Query(default=""),
 ):
     """获取 AI 推荐买入股票列表"""
+    start_date = start_date if isinstance(start_date, str) else ""
+    end_date = end_date if isinstance(end_date, str) else ""
+    if start_date or end_date:
+        cache_key = f"recommended_stocks_range_{start_date or 'open'}_{end_date or 'open'}_{strategy or 'all'}_{signal_status or 'all'}"
+    else:
+        cache_key = f"recommended_stocks_{trade_date or 'latest'}_{strategy or 'all'}_{signal_status or 'all'}"
+    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300))
+    if cached is not None:
+        return cached
     try:
-        return _recommended_stocks_v2(trade_date, strategy, signal_status)
+        if start_date or end_date:
+            result = _recommended_stocks_v2(trade_date, strategy, signal_status, start_date, end_date)
+        else:
+            result = _recommended_stocks_v2(trade_date, strategy, signal_status)
+        if isinstance(result, dict) and not result.get("error"):
+            _cache_set(cache_key, result)
+        return result
     except Exception as e:
         return {"date": trade_date, "data": [], "total": 0, "error": str(e)}
 
@@ -5483,6 +6368,129 @@ def _smart_trade_date() -> str:
     if is_trading:
         return now.strftime("%Y-%m-%d")
     return _latest_date("sm_stock_kline")
+
+
+def _recommendation_gate_status(
+    execution_time: str = "",
+    min_kline_coverage: float = 0.80,
+) -> dict:
+    """Return the strict premarket recommendation gate state.
+
+    The morning job must use the previous trading day of the execution date.
+    This helper reports that target date and whether local data is fresh enough
+    to generate recommendations without silently falling back to older data.
+    """
+    from biz.analysis.sync_analysis_fast import assert_trade_date_ready, previous_trade_date
+
+    engine = get_engine()
+    execution_time = (execution_time or "").strip()
+    if not execution_time:
+        execution_time = datetime.now().replace(microsecond=0).isoformat(sep=" ")
+    min_kline_coverage = max(0.0, min(1.0, float(min_kline_coverage or 0.80)))
+
+    expected_trade_date = previous_trade_date(engine, execution_time)
+    payload = {
+        "status": "ok",
+        "execution_time": execution_time,
+        "expected_trade_date": expected_trade_date,
+        "min_kline_coverage": min_kline_coverage,
+        "ready": False,
+        "error": "",
+    }
+
+    try:
+        payload["readiness"] = assert_trade_date_ready(
+            engine,
+            expected_trade_date,
+            min_coverage=min_kline_coverage,
+        )
+        payload["ready"] = True
+    except Exception as exc:
+        payload["error"] = str(exc)
+        payload["readiness"] = {
+            "trade_date": expected_trade_date,
+            "min_coverage": min_kline_coverage,
+        }
+
+    try:
+        rows = _read_sql("""
+            SELECT
+                COUNT(*) AS rec_count,
+                MAX(created_at) AS latest_created_at,
+                SUM(CASE WHEN COALESCE(signal_status, recommend_status, '') IN ('BUY_READY', 'CONFIRM', 'ALLOW') THEN 1 ELSE 0 END) AS actionable_count
+            FROM st_recommended_stocks
+            WHERE pick_date = :d
+        """, {"d": expected_trade_date})
+        rec = rows[0] if rows else {}
+        payload["recommendation"] = {
+            "date": expected_trade_date,
+            "count": int(rec.get("rec_count") or 0),
+            "actionable_count": int(rec.get("actionable_count") or 0),
+            "latest_created_at": str(rec.get("latest_created_at") or ""),
+        }
+    except Exception as exc:
+        payload["recommendation"] = {"date": expected_trade_date, "count": 0, "error": str(exc)}
+
+    try:
+        analysis_rows = _read_sql("""
+            SELECT COUNT(*) AS analysis_count, MAX(updated_at) AS latest_updated_at
+            FROM stock_analysis_result
+            WHERE analysis_date = :d
+        """, {"d": expected_trade_date})
+        ar = analysis_rows[0] if analysis_rows else {}
+        payload["analysis"] = {
+            "date": expected_trade_date,
+            "count": int(ar.get("analysis_count") or 0),
+            "latest_updated_at": str(ar.get("latest_updated_at") or ""),
+        }
+    except Exception as exc:
+        payload["analysis"] = {"date": expected_trade_date, "count": 0, "error": str(exc)}
+
+    try:
+        news_rows = _read_sql("""
+            SELECT COUNT(*) AS news_count, MAX(publish_time) AS latest_news_time
+            FROM st_news_flash
+            WHERE publish_time >= CONCAT(:d, ' 00:00:00')
+              AND publish_time <= :execution_time
+        """, {"d": expected_trade_date, "execution_time": execution_time[:19]})
+        nr = news_rows[0] if news_rows else {}
+        payload["news"] = {
+            "from_date": expected_trade_date,
+            "cutoff_time": execution_time[:19],
+            "count": int(nr.get("news_count") or 0),
+            "latest_news_time": str(nr.get("latest_news_time") or ""),
+        }
+    except Exception as exc:
+        payload["news"] = {
+            "from_date": expected_trade_date,
+            "cutoff_time": execution_time[:19],
+            "count": 0,
+            "error": str(exc),
+        }
+
+    payload["has_recommendation"] = bool((payload.get("recommendation") or {}).get("count"))
+    payload["strict_ok"] = bool(payload["ready"])
+    return payload
+
+
+@router.get("/hot-data/recommended-stocks/gate")
+def recommended_stocks_gate(
+    execution_time: str = Query(default=""),
+    min_kline_coverage: float = Query(default=0.80, ge=0, le=1),
+):
+    """Check the strict previous-trading-day gate for AI recommendations."""
+    try:
+        return _recommendation_gate_status(
+            execution_time=execution_time,
+            min_kline_coverage=min_kline_coverage,
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "ready": False,
+            "strict_ok": False,
+            "error": str(e),
+        }
 
 
 def _set_recommendation_progress(**payload) -> None:
@@ -5513,11 +6521,59 @@ def run_recommended_stocks(
     trade_date: str = Query(default=""),
     min_score: float = Query(default=62.0, ge=0, le=100),
     top_n: int = Query(default=80, ge=20, le=200),
+    strict_prev_trade_day: bool = Query(default=False),
+    execution_time: str = Query(default=""),
+    min_kline_coverage: float = Query(default=0.80, ge=0, le=1),
+    auto_repair_missing_kline: bool = Query(default=True),
 ):
     """触发 AI 推荐股票筛选（使用统一分析引擎）"""
     import threading
 
-    if not trade_date:
+    strict_gate = None
+    if strict_prev_trade_day:
+        try:
+            strict_gate = _recommendation_gate_status(
+                execution_time=execution_time,
+                min_kline_coverage=min_kline_coverage,
+            )
+            trade_date = strict_gate["expected_trade_date"]
+            execution_time = strict_gate["execution_time"]
+            if not strict_gate.get("ready") and not auto_repair_missing_kline:
+                _set_recommendation_progress(
+                    status="error",
+                    percent=0,
+                    step=f"strict gate failed: {strict_gate.get('error') or 'data not ready'}",
+                    total=0,
+                    done=0,
+                    passed=0,
+                    trade_date=trade_date,
+                    min_score=min_score,
+                    top_n=top_n,
+                    strict_prev_trade_day=True,
+                    auto_repair_missing_kline=False,
+                    gate=strict_gate,
+                    finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                return {
+                    "status": "error",
+                    "date": trade_date,
+                    "min_score": min_score,
+                    "top_n": top_n,
+                    "strict_prev_trade_day": True,
+                    "auto_repair_missing_kline": False,
+                    "gate": strict_gate,
+                    "error": strict_gate.get("error") or "strict gate failed",
+                }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "date": trade_date,
+                "min_score": min_score,
+                "top_n": top_n,
+                "strict_prev_trade_day": True,
+                "error": str(exc),
+            }
+    elif not trade_date:
         trade_date = _smart_trade_date()
     trade_date = str(trade_date)[:10]
 
@@ -5527,20 +6583,32 @@ def run_recommended_stocks(
             "date": trade_date,
             "min_score": min_score,
             "top_n": top_n,
+            "strict_prev_trade_day": strict_prev_trade_day,
+            "auto_repair_missing_kline": auto_repair_missing_kline,
+            "gate": strict_gate,
             "progress": recommended_stocks_progress(),
             "note": "已有推荐筛选任务在运行",
         }
 
+    initial_step = "正在初始化..."
+    if strict_prev_trade_day and strict_gate and not strict_gate.get("ready") and auto_repair_missing_kline:
+        initial_step = f"目标日 {trade_date} 数据未就绪，后台先用国金QMT补K线..."
+
     _set_recommendation_progress(
         status="running",
         percent=0,
-        step="正在初始化...",
+        step=initial_step,
         total=0,
         done=0,
         passed=0,
         trade_date=trade_date,
         min_score=min_score,
         top_n=top_n,
+        strict_prev_trade_day=strict_prev_trade_day,
+        execution_time=execution_time,
+        min_kline_coverage=min_kline_coverage,
+        auto_repair_missing_kline=auto_repair_missing_kline,
+        gate=strict_gate,
         started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
@@ -5563,6 +6631,11 @@ def run_recommended_stocks(
                         trade_date=trade_date,
                         min_score=min_score,
                         top_n=top_n,
+                        strict_prev_trade_day=strict_prev_trade_day,
+                        execution_time=execution_time,
+                        min_kline_coverage=min_kline_coverage,
+                        auto_repair_missing_kline=auto_repair_missing_kline,
+                        gate=strict_gate,
                         flow_date=event.get("flow_date") or "",
                         hot_date=event.get("hot_date") or "",
                         market_mood_score=event.get("market_mood_score"),
@@ -5579,7 +6652,11 @@ def run_recommended_stocks(
                     trade_date=trade_date,
                     min_score=min_score,
                     top_n=top_n,
-                )
+                    strict_prev_trade_day=strict_prev_trade_day,
+                    execution_time=execution_time,
+                    min_kline_coverage=min_kline_coverage,
+                    auto_repair_missing_kline=auto_repair_missing_kline,
+                    )
 
             stats = run_batch(
                 engine=engine,
@@ -5587,6 +6664,10 @@ def run_recommended_stocks(
                 top_n=top_n,
                 min_score=float(min_score),
                 progress_callback=_progress_callback,
+                strict_prev_trade_day=bool(strict_prev_trade_day),
+                execution_time=execution_time or None,
+                min_kline_coverage=float(min_kline_coverage),
+                auto_repair_missing_kline=bool(auto_repair_missing_kline),
             )
             _set_recommendation_progress(
                 status="done",
@@ -5598,11 +6679,24 @@ def run_recommended_stocks(
                 trade_date=trade_date,
                 min_score=min_score,
                 top_n=top_n,
+                strict_prev_trade_day=strict_prev_trade_day,
+                execution_time=execution_time,
+                min_kline_coverage=min_kline_coverage,
+                auto_repair_missing_kline=auto_repair_missing_kline,
+                gate=strict_gate,
                 flow_date=stats.flow_date,
                 hot_date=stats.hot_date,
                 market_mood_score=stats.market_mood_score,
                 finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
+            try:
+                _cache_drop_prefix(f"recommended_stocks_{trade_date}_")
+                _cache_drop_prefix("recommended_stocks_latest_")
+                default_result = _recommended_stocks_v2(trade_date, "", "")
+                _cache_set(f"recommended_stocks_{trade_date}_all_all", default_result)
+                _cache_set("recommended_stocks_latest_all_all", default_result)
+            except Exception:
+                pass
         except Exception as ex:
             import logging
             logging.getLogger(__name__).error(f"recommended-stocks error: {ex}", exc_info=True)
@@ -5616,6 +6710,11 @@ def run_recommended_stocks(
                 trade_date=trade_date,
                 min_score=min_score,
                 top_n=top_n,
+                strict_prev_trade_day=strict_prev_trade_day,
+                execution_time=execution_time,
+                min_kline_coverage=min_kline_coverage,
+                auto_repair_missing_kline=auto_repair_missing_kline,
+                gate=strict_gate,
                 finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
         finally:
@@ -5628,6 +6727,11 @@ def run_recommended_stocks(
         "date": trade_date,
         "min_score": min_score,
         "top_n": top_n,
+        "strict_prev_trade_day": strict_prev_trade_day,
+        "execution_time": execution_time,
+        "min_kline_coverage": min_kline_coverage,
+        "auto_repair_missing_kline": auto_repair_missing_kline,
+        "gate": strict_gate,
         "note": "筛选已启动，完成后刷新页面查看结果",
     }
 
@@ -5635,6 +6739,245 @@ def run_recommended_stocks(
 # ──────────────────────────────────────────────────────────────────────
 #  主力行为分析 (建仓 / 洗盘 / 出货)
 # ──────────────────────────────────────────────────────────────────────
+
+def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) -> dict:
+    """Fast mainforce view based on snapshot + recent capital flow.
+
+    This path avoids sm_stock_kline, which is frequently blocked by metadata locks
+    during ingestion and should not sit on the interactive UI critical path.
+    """
+    trade_date = _latest_date_not_after("sm_stock_snapshot", trade_date or date.today().isoformat())
+    name_rows = _read_sql("SELECT short_name FROM si_all_code WHERE stock_code = :c", {"c": stock_code})
+    short_name = name_rows[0]["short_name"] if name_rows else stock_code
+
+    snapshot_rows = _read_sql("""
+        SELECT stock_code, short_name, trade_date, price, change_pct, change_3d, change_5d, change_10d,
+               turnover_ratio, amount, main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow
+        FROM sm_stock_snapshot
+        WHERE stock_code = :c AND trade_date = :td
+        LIMIT 1
+    """, {"c": stock_code, "td": trade_date})
+    snapshot = snapshot_rows[0] if snapshot_rows else {}
+    if snapshot.get("short_name"):
+        short_name = snapshot.get("short_name")
+
+    flow_rows = _read_sql("""
+        SELECT trade_date, main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow
+        FROM sm_stock_capital_flow_daily
+        WHERE stock_code = :c AND trade_date <= :td
+        ORDER BY trade_date DESC
+        LIMIT 20
+    """, {"c": stock_code, "td": trade_date})
+    flows = list(reversed(flow_rows)) if flow_rows else []
+    flow_dates = [str(r["trade_date"])[:10] for r in flows]
+    main_flows = [float(r.get("main_net_inflow") or 0) for r in flows]
+    sm_flows = [float(r.get("sm_net_inflow") or 0) for r in flows]
+
+    holder_rows = _read_sql("""
+        SELECT holder_num, holder_num_change, holder_num_ratio, avg_free_shares
+        FROM si_stock_holder WHERE stock_code = :c
+        ORDER BY report_date DESC LIMIT 2
+    """, {"c": stock_code})
+    holder = holder_rows[0] if holder_rows else {}
+    holder_change = float(holder.get("holder_num_ratio") or 0) if holder else 0
+
+    lhb_rows = _read_sql("""
+        SELECT COUNT(*) AS cnt, SUM(a_net_amount) AS inst_net_buy
+        FROM st_a_list_daily
+        WHERE stock_code = :c AND trade_date >= DATE_SUB(:td, INTERVAL 30 DAY)
+    """, {"c": stock_code, "td": trade_date})
+    lhb = lhb_rows[0] if lhb_rows else {}
+    lhb_count = int(lhb.get("cnt") or 0)
+    lhb_net_buy = float(lhb.get("inst_net_buy") or 0)
+
+    price_chg = float(snapshot.get("change_pct") or 0)
+    chg3 = float(snapshot.get("change_3d") or 0)
+    chg5 = float(snapshot.get("change_5d") or 0)
+    chg10 = float(snapshot.get("change_10d") or 0)
+    turnover_ratio = float(snapshot.get("turnover_ratio") or 0)
+    amount = float(snapshot.get("amount") or 0)
+    day_main_flow = float(snapshot.get("main_net_inflow") or (main_flows[-1] if main_flows else 0))
+
+    vp_score = 50
+    vp_direction = "中性"
+    if day_main_flow > 0 and -2 <= price_chg <= 4:
+        vp_score = 72
+        vp_direction = "建仓"
+        vp_detail = f"当日主力净流入{day_main_flow/1e8:.2f}亿，股价变动{price_chg:+.1f}%，量价配合偏吸筹"
+    elif day_main_flow < 0 and price_chg >= 4:
+        vp_score = 30
+        vp_direction = "出货"
+        vp_detail = f"当日主力净流出{abs(day_main_flow)/1e8:.2f}亿，但股价上涨{price_chg:+.1f}%，高位承接偏弱"
+    elif price_chg < 0 and turnover_ratio <= 3:
+        vp_score = 61
+        vp_direction = "洗盘"
+        vp_detail = f"当日回调{price_chg:+.1f}%，换手率{turnover_ratio:.2f}%，缩量震荡偏洗盘"
+    elif price_chg > 0 and turnover_ratio >= 5 and amount > 1e8:
+        vp_score = 64
+        vp_direction = "建仓"
+        vp_detail = f"当日上涨{price_chg:+.1f}%，换手率{turnover_ratio:.2f}%，成交额{amount/1e8:.1f}亿"
+    else:
+        vp_detail = f"当日涨跌{price_chg:+.1f}%，换手率{turnover_ratio:.2f}%，暂无强量价背离"
+
+    cf_score = 50
+    cf_direction = "中性"
+    flow_5d = sum(main_flows[-5:]) if len(main_flows) >= 5 else sum(main_flows)
+    flow_10d = sum(main_flows[-10:]) if len(main_flows) >= 10 else sum(main_flows)
+    sm_5d = sum(sm_flows[-5:]) if len(sm_flows) >= 5 else sum(sm_flows)
+    consecutive_in = 0
+    for flow in main_flows[::-1]:
+        if flow > 0:
+            consecutive_in += 1
+        else:
+            break
+    consecutive_out = 0
+    for flow in main_flows[::-1]:
+        if flow < 0:
+            consecutive_out += 1
+        else:
+            break
+    if flow_5d > 0 and flow_10d >= 0:
+        cf_score = 68 + min(12, consecutive_in * 3)
+        cf_direction = "建仓"
+        cf_detail = f"5日主力净流入{flow_5d/1e8:.2f}亿，10日净流入{flow_10d/1e8:.2f}亿"
+    elif flow_5d < 0 and sm_5d > 0:
+        cf_score = 24
+        cf_direction = "出货"
+        cf_detail = f"5日主力净流出{abs(flow_5d)/1e8:.2f}亿，散户净流入{sm_5d/1e8:.2f}亿"
+    elif consecutive_out >= 3:
+        cf_score = 28
+        cf_direction = "出货"
+        cf_detail = f"主力连续{consecutive_out}日净流出"
+    elif consecutive_in >= 3:
+        cf_score = 76
+        cf_direction = "建仓"
+        cf_detail = f"主力连续{consecutive_in}日净流入"
+    else:
+        cf_detail = f"5日主力净流入{flow_5d/1e8:.2f}亿，方向暂不明确"
+
+    kl_score = 50
+    kl_direction = "中性"
+    momentum = chg10 * 0.25 + chg5 * 0.45 + chg3 * 0.3
+    if 3 <= chg5 <= 18 and chg10 > 0:
+        kl_score = 66
+        kl_direction = "建仓"
+        kl_detail = f"3/5/10日涨幅为{chg3:+.1f}% / {chg5:+.1f}% / {chg10:+.1f}%，趋势温和上行"
+    elif chg3 < 0 and chg10 > 0:
+        kl_score = 60
+        kl_direction = "洗盘"
+        kl_detail = f"短线3日回调{chg3:+.1f}%，但10日仍上涨{chg10:+.1f}%，偏趋势内洗盘"
+    elif chg10 < -8:
+        kl_score = 30
+        kl_direction = "出货"
+        kl_detail = f"10日跌幅{chg10:+.1f}%，趋势明显走弱"
+    elif chg5 > 20 and day_main_flow < 0:
+        kl_score = 34
+        kl_direction = "出货"
+        kl_detail = f"5日涨幅{chg5:+.1f}%过快，且资金转弱，警惕冲高派发"
+    else:
+        kl_detail = f"3/5/10日涨幅为{chg3:+.1f}% / {chg5:+.1f}% / {chg10:+.1f}%"
+
+    chip_score = 50
+    chip_direction = "中性"
+    if holder_change < -5:
+        chip_score = 78
+        chip_direction = "建仓"
+        chip_detail = f"股东人数减少{abs(holder_change):.1f}%，筹码集中明显"
+    elif holder_change > 5:
+        chip_score = 28
+        chip_direction = "出货"
+        chip_detail = f"股东人数增加{holder_change:.1f}%，筹码趋于分散"
+    elif turnover_ratio <= 2.5 and chg5 >= 0:
+        chip_score = 63
+        chip_direction = "建仓"
+        chip_detail = f"换手率{turnover_ratio:.2f}%偏低，筹码稳定"
+    elif turnover_ratio >= 8 and price_chg > 0:
+        chip_score = 36
+        chip_direction = "出货"
+        chip_detail = f"换手率{turnover_ratio:.2f}%偏高，高位换手较剧烈"
+    else:
+        chip_detail = f"换手率{turnover_ratio:.2f}%，股东变化{holder_change:+.1f}%"
+
+    inst_score = 50
+    inst_direction = "中性"
+    if lhb_count > 0 and lhb_net_buy > 0:
+        inst_score = 72
+        inst_direction = "建仓"
+        inst_detail = f"近30日{lhb_count}次龙虎榜，机构净买入{lhb_net_buy/1e8:.2f}亿"
+    elif lhb_count > 0 and lhb_net_buy < 0:
+        inst_score = 26
+        inst_direction = "出货"
+        inst_detail = f"近30日{lhb_count}次龙虎榜，机构净卖出{abs(lhb_net_buy)/1e8:.2f}亿"
+    else:
+        inst_detail = "近30日无显著龙虎榜机构信号"
+
+    weights = {"volume_price": 0.25, "capital_flow": 0.30, "kline_pattern": 0.20,
+               "chip_concentration": 0.15, "institutional": 0.10}
+    scores = {
+        "volume_price": vp_score,
+        "capital_flow": cf_score,
+        "kline_pattern": kl_score,
+        "chip_concentration": chip_score,
+        "institutional": inst_score,
+    }
+    total_score = round(sum(scores[k] * weights[k] for k in weights), 1)
+
+    direction_votes = {"建仓": 0, "洗盘": 0, "出货": 0, "中性": 0}
+    for name, direction in [("volume_price", vp_direction), ("capital_flow", cf_direction),
+                             ("kline_pattern", kl_direction), ("chip_concentration", chip_direction),
+                             ("institutional", inst_direction)]:
+        direction_votes[direction] += weights[name]
+    if total_score >= 62:
+        behavior = "建仓"
+    elif total_score <= 38:
+        behavior = "出货"
+    elif total_score >= 55:
+        behavior = "洗盘" if direction_votes["洗盘"] > direction_votes["出货"] else "建仓"
+    elif total_score <= 45:
+        behavior = "洗盘" if direction_votes["洗盘"] > direction_votes["建仓"] else "出货"
+    else:
+        if direction_votes["洗盘"] >= direction_votes["建仓"] and direction_votes["洗盘"] >= direction_votes["出货"]:
+            behavior = "洗盘"
+        elif direction_votes["建仓"] > direction_votes["出货"]:
+            behavior = "建仓"
+        else:
+            behavior = "出货"
+    max_vote = max(direction_votes["建仓"], direction_votes["洗盘"], direction_votes["出货"])
+    confidence = round(min(92, max_vote * 100 + 18))
+
+    history = []
+    history_source = flows[-10:] if flows else []
+    for row in history_source:
+        row_flow = float(row.get("main_net_inflow") or 0)
+        row_score = 50
+        if row_flow > 0:
+            row_score = 64
+        elif row_flow < 0:
+            row_score = 36
+        row_behavior = "建仓" if row_score >= 60 else "出货" if row_score <= 40 else "洗盘"
+        history.append({"date": str(row.get("trade_date") or "")[:10], "score": row_score, "behavior": row_behavior})
+    if not history and trade_date:
+        history.append({"date": trade_date, "score": total_score, "behavior": behavior})
+
+    return {
+        "stock_code": stock_code,
+        "short_name": short_name,
+        "trade_date": trade_date,
+        "behavior": behavior,
+        "confidence": confidence,
+        "score": total_score,
+        "signals": {
+            "volume_price": {"score": round(vp_score), "direction": vp_direction, "detail": vp_detail},
+            "capital_flow": {"score": round(cf_score), "direction": cf_direction, "detail": cf_detail},
+            "kline_pattern": {"score": round(kl_score), "direction": kl_direction, "detail": kl_detail},
+            "chip_concentration": {"score": round(chip_score), "direction": chip_direction, "detail": chip_detail},
+            "institutional": {"score": round(inst_score), "direction": inst_direction, "detail": inst_detail},
+        },
+        "history": history,
+        "source": "snapshot_fast",
+        "note": f"基于 {trade_date} 的快照生成主力快速分析，动量合成值 {momentum:+.1f}。",
+    }
+
 
 def _compute_mainforce_behavior(stock_code: str, trade_date: str = None) -> dict:
     """
@@ -6071,7 +7414,18 @@ def _compute_mainforce_behavior(stock_code: str, trade_date: str = None) -> dict
 @router.get("/hot-data/mainforce-analysis")
 def mainforce_analysis(stock_code: str = Query(...), trade_date: str = Query(default=None)):
     """单只股票主力行为分析"""
-    return _compute_mainforce_behavior(stock_code, trade_date)
+    trade_date = trade_date if isinstance(trade_date, str) else ""
+    if not trade_date:
+        trade_date = _latest_date("sm_stock_snapshot")
+
+    cache_key = f"mainforce_analysis_{stock_code}_{trade_date}"
+    cached = _cache_get(cache_key, ttl_seconds=300)
+    if cached is not None:
+        return cached
+
+    result = _compute_mainforce_behavior_fast(stock_code, trade_date)
+    _cache_set(cache_key, result)
+    return result
 
 
 @router.get("/hot-data/mainforce-scan")
@@ -6085,9 +7439,9 @@ def mainforce_scan(trade_date: str = Query(default=None), top: int = Query(defau
     cached = _cache_get(_ckey, ttl_seconds=120)
     if cached is not None:
         return cached
+    trade_date = trade_date if isinstance(trade_date, str) else ""
     if not trade_date:
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-        trade_date = str(td_rows[0]["d"]) if td_rows and td_rows[0].get("d") else str(date.today())
+        trade_date = _latest_date("sm_stock_snapshot")
 
     # 取有资金流向数据的活跃股（排除ST，排除北交所）
     candidates = _read_sql(f"""
@@ -6112,7 +7466,7 @@ def mainforce_scan(trade_date: str = Query(default=None), top: int = Query(defau
     def _analyze_one(row):
         code = row["stock_code"]
         try:
-            analysis = _compute_mainforce_behavior(code, trade_date)
+            analysis = _compute_mainforce_behavior_fast(code, trade_date)
             if analysis.get("behavior") in ("建仓", "洗盘", "出货"):
                 return {
                     "stock_code": code,
@@ -6472,4 +7826,3 @@ def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow
         return {"success": False, "error": str(e)}
     finally:
         _job_end("market_refresh")
-

@@ -59,6 +59,40 @@ class SyncAnalysisFastTest(unittest.TestCase):
         )
         self.assertEqual(status, "ALLOW")
 
+    def test_recommend_gate_suspends_missing_core_data(self):
+        status, reason = choose_recommend_status(
+            stock_code="300001",
+            short_name="娴嬭瘯鑲′唤",
+            ai_score=78,
+            short_term_score=72,
+            long_term_score=66,
+            event_risk_level="LOW",
+            amount=120_000_000,
+            change_pct=3,
+            min_score=62,
+            data_quality_score=58,
+            data_quality_flags=["missing_flow"],
+        )
+        self.assertEqual(status, "SUSPENDED")
+        self.assertTrue(reason)
+
+    def test_recommend_gate_suspends_stale_flow_when_score_not_strong_enough(self):
+        status, reason = choose_recommend_status(
+            stock_code="300001",
+            short_name="娴嬭瘯鑲′唤",
+            ai_score=65,
+            short_term_score=68,
+            long_term_score=66,
+            event_risk_level="LOW",
+            amount=120_000_000,
+            change_pct=3,
+            min_score=62,
+            data_quality_score=88,
+            data_quality_flags=["stale_flow"],
+        )
+        self.assertEqual(status, "SUSPENDED")
+        self.assertTrue(reason)
+
     def test_primary_strategy_prefers_highest_qualified_score(self):
         strategy = select_primary_strategy({
             "ultra_short_score": 82,
@@ -226,6 +260,44 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(progress_events[0]["stage"], "load_kline")
         self.assertEqual(progress_events[-1]["stage"], "done")
         self.assertEqual(progress_events[-1]["analysis_count"], 0)
+
+    def test_strict_run_repairs_missing_qmt_kline_before_analysis(self):
+        progress_events = []
+
+        with patch("biz.analysis.sync_analysis_fast.previous_trade_date", return_value="2026-06-26"), \
+             patch(
+                 "biz.analysis.sync_analysis_fast.assert_trade_date_ready",
+                 side_effect=[
+                     RuntimeError("K-line latest date is 2026-06-25, earlier than required 2026-06-26"),
+                     {
+                         "trade_date": "2026-06-26",
+                         "latest_kline_date": "2026-06-26",
+                         "kline_count": 4200,
+                         "expected_count": 5000,
+                         "min_coverage": 0.8,
+                     },
+                 ],
+             ) as ready_mock, \
+             patch("biz.analysis.sync_analysis_fast.repair_missing_qmt_kline_for_trade_date") as repair_mock, \
+             patch("biz.analysis.sync_analysis_fast._prepare_batch_outputs", return_value=([], [], 55.0, "2026-06-26", "2026-06-26")), \
+             patch("biz.analysis.sync_analysis_fast.save_outputs"):
+            from biz.analysis.sync_analysis_fast import run_batch
+
+            stats = run_batch(
+                engine=object(),
+                trade_date="2026-06-26",
+                strict_prev_trade_day=True,
+                execution_time="2026-06-28 08:30:00",
+                auto_repair_missing_kline=True,
+                progress_callback=progress_events.append,
+            )
+
+        self.assertEqual(stats.trade_date, "2026-06-26")
+        self.assertEqual(ready_mock.call_count, 2)
+        repair_mock.assert_called_once_with("2026-06-26", progress_callback=progress_events.append)
+        stages = [event["stage"] for event in progress_events]
+        self.assertIn("strict_date_missing", stages)
+        self.assertIn("strict_date_ready", stages)
 
 
 if __name__ == "__main__":

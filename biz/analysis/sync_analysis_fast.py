@@ -14,6 +14,8 @@ import argparse
 import json
 import logging
 import math
+import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -150,6 +152,40 @@ def classify_notice_title(title: str | None) -> dict[str, Any]:
     }
 
 
+def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> tuple[float, list[str]]:
+    """Score whether one row has enough fresh source data to trust the ranking."""
+    flags: list[str] = []
+    score = 100.0
+
+    finance_fields = ("roe_wtd", "gross_margin", "net_margin", "asset_liab_ratio")
+    if not any(_safe_number(row.get(field), 0.0) for field in finance_fields):
+        flags.append("missing_finance")
+        score -= 28.0
+
+    if _safe_number(row.get("main_net_inflow"), 0.0) == 0.0 and _safe_number(row.get("main_net_inflow_5d"), 0.0) == 0.0:
+        flags.append("missing_flow")
+        score -= 24.0
+    elif flow_date and flow_date != trade_date:
+        flags.append("stale_flow")
+        score -= 12.0
+
+    fused_rank = row.get("fused_rank")
+    if fused_rank is None or pd.isna(fused_rank):
+        flags.append("missing_hot_rank")
+        score -= 10.0
+
+    industry_name = str(row.get("industry_name") or "").strip()
+    if not industry_name:
+        flags.append("missing_industry")
+        score -= 6.0
+
+    if row.get("latest_notice_date") is None and int(_safe_number(row.get("notice_count"), 0.0)) == 0:
+        flags.append("missing_notice_context")
+        score -= 4.0
+
+    return clamp_score(score), flags
+
+
 def choose_recommend_status(
     stock_code: str,
     short_name: str,
@@ -160,12 +196,15 @@ def choose_recommend_status(
     amount: float | None,
     change_pct: float | None,
     min_score: float,
+    data_quality_score: float = 100.0,
+    data_quality_flags: list[str] | None = None,
 ) -> tuple[str, str]:
     """Gate recommendation eligibility. It is intentionally conservative."""
     name = short_name or ""
     amount = float(amount or 0)
     change_pct = float(change_pct or 0)
     code = str(stock_code).zfill(6)
+    flags = set(data_quality_flags or [])
 
     if "ST" in name.upper() or "退" in name:
         return "BLOCK", "ST或退市风险标的，不进入推荐池"
@@ -173,12 +212,18 @@ def choose_recommend_status(
         return "BLOCK", "非沪深A股主代码，不进入推荐池"
     if event_risk_level == "CRITICAL":
         return "BLOCK", "公告存在重大事件风险"
+    if "missing_finance" in flags or "missing_flow" in flags:
+        return "SUSPENDED", "关键数据缺失，财务或资金流不完整"
+    if data_quality_score < 70:
+        return "SUSPENDED", f"数据质量分为{data_quality_score:.1f}，暂不进入推荐池"
     if short_term_score < 40 or long_term_score < 35:
         return "BLOCK", "基础评分过低"
     if event_risk_level == "HIGH":
         return "SUSPENDED", "公告风险较高，等待风险消化"
     if ai_score < min_score:
         return "SUSPENDED", "综合评分未达到推荐阈值"
+    if "stale_flow" in flags and ai_score < min_score + 6:
+        return "SUSPENDED", "资金流数据不是当日，暂缓推荐"
     if amount < 30_000_000:
         return "SUSPENDED", "成交额偏低，流动性不足"
     if change_pct >= 9.7:
@@ -298,6 +343,8 @@ def _ensure_recommended_columns(engine: Engine) -> None:
         "confidence_score": "DECIMAL(5,1) DEFAULT NULL",
         "sector_rotation_score": "DECIMAL(5,1) DEFAULT NULL",
         "failure_penalty_score": "DECIMAL(5,1) DEFAULT NULL",
+        "data_quality_score": "DECIMAL(5,1) DEFAULT NULL",
+        "data_quality_flags": "TEXT NULL",
         "cooldown_days_left": "INT DEFAULT 0",
         "cooldown_until": "DATE DEFAULT NULL",
         "main_wave_score": "DECIMAL(5,1) DEFAULT NULL",
@@ -317,6 +364,22 @@ def _ensure_recommended_columns(engine: Engine) -> None:
                 conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN `{column}` {ddl}"))
 
 
+def _ensure_analysis_columns(engine: Engine) -> None:
+    required = {
+        "model_version": "VARCHAR(20) DEFAULT ''",
+        "data_quality_score": "DECIMAL(5,1) DEFAULT NULL",
+        "data_quality_flags": "TEXT NULL",
+        "flow_trade_date": "DATE DEFAULT NULL",
+        "hot_trade_date": "DATE DEFAULT NULL",
+    }
+    existing = _table_columns(engine, "stock_analysis_result")
+    with engine.begin() as conn:
+        for column, ddl in required.items():
+            if column not in existing:
+                logger.info("Adding stock_analysis_result.%s", column)
+                conn.execute(text(f"ALTER TABLE stock_analysis_result ADD COLUMN `{column}` {ddl}"))
+
+
 def latest_trade_date(engine: Engine) -> str:
     with engine.connect() as conn:
         value = conn.execute(text("""
@@ -327,6 +390,206 @@ def latest_trade_date(engine: Engine) -> str:
     if not value:
         raise RuntimeError("sm_stock_kline has no daily K-line data")
     return str(value)[:10]
+
+
+def _parse_execution_date(execution_time: str | None = None) -> date:
+    raw = (execution_time or "").strip()
+    if not raw:
+        return date.today()
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise ValueError(f"Invalid execution_time: {execution_time}") from exc
+
+
+def previous_trade_date(engine: Engine, execution_time: str | None = None) -> str:
+    """Resolve the strict previous trading day for morning recommendation runs."""
+    ref_date = _parse_execution_date(execution_time).isoformat()
+    with engine.connect() as conn:
+        has_calendar = bool(conn.execute(text("""
+            SELECT COUNT(*)
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'si_trade_calendar'
+        """)).scalar())
+        if has_calendar:
+            cal_columns = _table_columns(engine, "si_trade_calendar")
+            status_filter = ""
+            if "trade_status" in cal_columns:
+                status_filter = "AND trade_status = 1"
+            elif "is_open" in cal_columns:
+                status_filter = "AND is_open = 1"
+            value = conn.execute(text(f"""
+                SELECT MAX(trade_date)
+                FROM si_trade_calendar
+                WHERE trade_date < :ref_date
+                  {status_filter}
+            """), {"ref_date": ref_date}).scalar()
+            if value:
+                return str(value)[:10]
+        value = conn.execute(text("""
+            SELECT MAX(trade_date)
+            FROM sm_stock_kline
+            WHERE k_type = 1
+              AND trade_date < :ref_date
+        """), {"ref_date": ref_date}).scalar()
+    if not value:
+        raise RuntimeError(f"Cannot resolve previous trade date before {ref_date}")
+    return str(value)[:10]
+
+
+def assert_trade_date_ready(engine: Engine, trade_date: str, min_coverage: float = 0.80) -> dict[str, Any]:
+    """Fail fast when the target trading day is missing or clearly incomplete."""
+    trade_date = str(trade_date or "").strip()[:10]
+    if not trade_date:
+        raise ValueError("trade_date is required")
+    min_coverage = max(0.0, min(1.0, float(min_coverage)))
+    with engine.connect() as conn:
+        latest = conn.execute(text("""
+            SELECT MAX(trade_date)
+            FROM sm_stock_kline
+            WHERE k_type = 1
+        """)).scalar()
+        kline_count = int(conn.execute(text("""
+            SELECT COUNT(DISTINCT stock_code)
+            FROM sm_stock_kline
+            WHERE k_type = 1
+              AND trade_date = :trade_date
+        """), {"trade_date": trade_date}).scalar() or 0)
+        expected_count = int(conn.execute(text("""
+            SELECT COUNT(DISTINCT stock_code)
+            FROM si_all_code
+            WHERE stock_code REGEXP '^(0|3|6)'
+        """)).scalar() or 0)
+    latest_s = str(latest)[:10] if latest else ""
+    if latest_s and latest_s < trade_date:
+        raise RuntimeError(f"K-line latest date is {latest_s}, earlier than required {trade_date}")
+    minimum = int(expected_count * min_coverage) if expected_count else 1
+    if kline_count < minimum:
+        raise RuntimeError(
+            f"K-line coverage for {trade_date} is incomplete: {kline_count}/{expected_count or '?'} "
+            f"(required >= {minimum})"
+        )
+    return {
+        "trade_date": trade_date,
+        "latest_kline_date": latest_s,
+        "kline_count": kline_count,
+        "expected_count": expected_count,
+        "min_coverage": min_coverage,
+    }
+
+
+def _tail_text(value: str | None, limit: int = 4000) -> str:
+    text_value = value or ""
+    if len(text_value) <= limit:
+        return text_value
+    return text_value[-limit:]
+
+
+def repair_missing_qmt_kline_for_trade_date(
+    trade_date: str,
+    progress_callback: ProgressCallback | None = None,
+    timeout_seconds: int = 7200,
+) -> dict[str, Any]:
+    """Fetch one full-market daily K-line date from Guojin QMT before strict recommendation runs."""
+    trade_date = str(trade_date or "").strip()[:10]
+    if not trade_date:
+        raise ValueError("trade_date is required for QMT K-line repair")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "biz.stock_market.sync_stock_market",
+        "--only",
+        "stock_kline",
+        "--kline-source",
+        "qmt",
+        "--kline-start",
+        trade_date,
+        "--kline-end",
+        trade_date,
+        "--kline-incremental",
+        "--max-stocks",
+        "0",
+        "--skip-progress",
+    ]
+    env = os.environ.copy()
+    env["SM_STOCK_KLINE_SOURCE"] = "qmt"
+    env["SM_MAX_STOCKS"] = "0"
+    env["SM_SKIP_GLOBAL_TRUNCATE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(ROOT) if not existing_pythonpath else f"{ROOT}{os.pathsep}{existing_pythonpath}"
+
+    _emit_progress(
+        progress_callback,
+        stage="repair_kline_start",
+        percent=3,
+        step=f"strict data missing; repairing Guojin QMT K-line for {trade_date}",
+        trade_date=trade_date,
+        command=" ".join(cmd),
+    )
+    started_at = datetime.now()
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=max(300, int(timeout_seconds or 7200)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        _emit_progress(
+            progress_callback,
+            stage="repair_kline_failed",
+            percent=3,
+            step=f"Guojin QMT K-line repair timed out for {trade_date}",
+            trade_date=trade_date,
+            error=str(exc),
+        )
+        raise RuntimeError(f"Guojin QMT K-line repair timed out for {trade_date}") from exc
+
+    elapsed = (datetime.now() - started_at).total_seconds()
+    payload = {
+        "trade_date": trade_date,
+        "returncode": completed.returncode,
+        "elapsed_seconds": round(elapsed, 1),
+        "stdout_tail": _tail_text(completed.stdout),
+        "stderr_tail": _tail_text(completed.stderr),
+        "command": " ".join(cmd),
+    }
+    if completed.returncode != 0:
+        _emit_progress(
+            progress_callback,
+            stage="repair_kline_failed",
+            percent=3,
+            step=f"Guojin QMT K-line repair failed for {trade_date}",
+            trade_date=trade_date,
+            returncode=completed.returncode,
+            error=_tail_text(completed.stderr or completed.stdout, 1200),
+        )
+        raise RuntimeError(
+            f"Guojin QMT K-line repair failed for {trade_date}, returncode={completed.returncode}: "
+            f"{_tail_text(completed.stderr or completed.stdout, 1200)}"
+        )
+
+    _emit_progress(
+        progress_callback,
+        stage="repair_kline_done",
+        percent=6,
+        step=f"Guojin QMT K-line repair finished for {trade_date}",
+        trade_date=trade_date,
+        elapsed_seconds=payload["elapsed_seconds"],
+    )
+    return payload
 
 
 def _recent_dates(engine: Engine, table: str, column: str, end_date: str, limit: int) -> list[str]:
@@ -699,6 +962,113 @@ def load_notice_features(engine: Engine, trade_date: str, lookback_days: int = 1
             rec["positive_titles"].append(title[:80])
 
     return pd.DataFrame(records.values())
+
+
+def load_news_features(
+    engine: Engine,
+    trade_date: str,
+    cutoff_time: str | None = None,
+    lookback_days: int = 3,
+) -> pd.DataFrame:
+    try:
+        has_news_table = _table_exists(engine, "st_news_flash")
+    except Exception:
+        has_news_table = False
+    if not has_news_table:
+        return pd.DataFrame({"stock_code": []})
+    cutoff = cutoff_time or f"{trade_date} 23:59:59"
+    sql = """
+        SELECT title, content, publish_time, stocks
+        FROM st_news_flash
+        WHERE publish_time >= DATE_SUB(:cutoff_time, INTERVAL :lookback_days DAY)
+          AND publish_time <= :cutoff_time
+        ORDER BY publish_time DESC
+        LIMIT 3000
+    """
+    df = pd.read_sql(
+        text(sql),
+        engine,
+        params={"cutoff_time": cutoff, "lookback_days": int(lookback_days)},
+    )
+    if df.empty:
+        return pd.DataFrame({"stock_code": []})
+
+    records: dict[str, dict[str, Any]] = {}
+    for row in df.to_dict(orient="records"):
+        raw_stocks = row.get("stocks")
+        try:
+            stocks = json.loads(raw_stocks) if isinstance(raw_stocks, str) else (raw_stocks or [])
+        except Exception:
+            stocks = []
+        codes: list[str] = []
+        for item in stocks if isinstance(stocks, list) else []:
+            if isinstance(item, dict):
+                code = str(item.get("code") or item.get("symbol") or "").strip()
+            else:
+                code = str(item or "").strip()
+            digits = "".join(ch for ch in code if ch.isdigit())
+            if len(digits) >= 6:
+                codes.append(digits[-6:])
+        if not codes:
+            continue
+        title = str(row.get("title") or "")
+        content = str(row.get("content") or "")
+        cls = classify_notice_title(f"{title} {content}"[:500])
+        publish_time = str(row.get("publish_time") or "")[:19]
+        for code in sorted(set(codes)):
+            rec = records.setdefault(code, {
+                "stock_code": code,
+                "news_count": 0,
+                "news_positive": 0,
+                "news_negative": 0,
+                "news_critical": 0,
+                "latest_news_time": None,
+                "news_risk_titles": [],
+                "news_positive_titles": [],
+            })
+            rec["news_count"] += 1
+            rec["news_positive"] += cls["positive"]
+            rec["news_negative"] += cls["negative"]
+            rec["news_critical"] += cls["critical"]
+            if publish_time and (rec["latest_news_time"] is None or publish_time > str(rec["latest_news_time"])):
+                rec["latest_news_time"] = publish_time
+            if (cls["negative"] or cls["critical"]) and len(rec["news_risk_titles"]) < 3:
+                rec["news_risk_titles"].append(title[:80] or content[:80])
+            if cls["positive"] and len(rec["news_positive_titles"]) < 3:
+                rec["news_positive_titles"].append(title[:80] or content[:80])
+    return pd.DataFrame(records.values()) if records else pd.DataFrame({"stock_code": []})
+
+
+def merge_event_features(notices: pd.DataFrame, news: pd.DataFrame) -> pd.DataFrame:
+    if notices is None or notices.empty:
+        base = pd.DataFrame({"stock_code": []})
+    else:
+        base = notices.copy()
+    if news is None or news.empty or "stock_code" not in news.columns:
+        return base
+    if base.empty or "stock_code" not in base.columns:
+        base = pd.DataFrame({"stock_code": news["stock_code"].astype(str).str.zfill(6).unique()})
+    out = base.merge(news, on="stock_code", how="outer")
+    def _num_col(name: str) -> pd.Series:
+        if name not in out.columns:
+            return pd.Series(0, index=out.index, dtype="float64")
+        return pd.to_numeric(out[name], errors="coerce").fillna(0)
+    for col in ("notice_count", "notice_positive", "notice_negative", "notice_critical"):
+        out[col] = _num_col(col)
+    out["notice_count"] = out["notice_count"] + _num_col("news_count")
+    out["notice_positive"] = out["notice_positive"] + _num_col("news_positive")
+    out["notice_negative"] = out["notice_negative"] + _num_col("news_negative")
+    out["notice_critical"] = out["notice_critical"] + _num_col("news_critical")
+    latest_notice = out.get("latest_notice_date")
+    latest_news = out.get("latest_news_time")
+    if latest_notice is not None and latest_news is not None:
+        out["latest_notice_date"] = latest_notice.fillna("").astype(str).combine(
+            latest_news.fillna("").astype(str).str[:10],
+            lambda a, b: max(a, b) if a and b else (a or b or None),
+        )
+    elif latest_news is not None:
+        out["latest_notice_date"] = latest_news.fillna("").astype(str).str[:10]
+    return out
 
 
 def compute_market_mood(kline: pd.DataFrame) -> float:
@@ -1535,6 +1905,15 @@ def compute_scores(
     event_score = 58 + df["notice_positive"] * 8 - df["notice_negative"] * 10 - df["notice_critical"] * 25
     df["event_score"] = _round_score(event_score)
 
+    quality_scores: list[float] = []
+    quality_flags: list[str] = []
+    for row in df.to_dict(orient="records"):
+        score, flags = build_data_quality(row, trade_date=trade_date, flow_date=flow_date)
+        quality_scores.append(score)
+        quality_flags.append(json.dumps(flags, ensure_ascii=False))
+    df["data_quality_score"] = quality_scores
+    df["data_quality_flags"] = quality_flags
+
     df["long_term_score"] = _round_score(
         df["fundamental_score"] * 0.34
         + df["growth_score"] * 0.28
@@ -1562,6 +1941,8 @@ def compute_scores(
             row.get("amount"),
             row.get("change_pct"),
             min_score,
+            row.get("data_quality_score", 100.0),
+            json.loads(row.get("data_quality_flags") or "[]"),
         )
         statuses.append(status)
         reasons.append(reason)
@@ -1680,6 +2061,8 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
             "stock_name": str(row.get("short_name") or "")[:20],
             "analysis_date": trade_date,
             "last_news_time": last_news_time,
+            "flow_trade_date": row.get("flow_trade_date"),
+            "hot_trade_date": row.get("hot_trade_date"),
             "event_risk_level": str(row.get("event_risk_level") or "LOW"),
             "event_risk_detail": row.get("event_risk_detail") or "[]",
             "recommend_status": str(row.get("recommend_status") or "SUSPENDED"),
@@ -1688,6 +2071,9 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
             "recommendation": str(row.get("recommendation") or "")[:500],
             "strengths": row.get("strengths") or "[]",
             "risks": row.get("risks") or "[]",
+            "data_quality_score": _none_if_nan(row.get("data_quality_score")),
+            "data_quality_flags": row.get("data_quality_flags") or "[]",
+            "model_version": row.get("model_version") or MODEL_VERSION,
         }
         for col in score_cols:
             item[col] = _none_if_nan(row.get(col))
@@ -1793,6 +2179,8 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "confidence_score": round(float(row.get("confidence_score") or 0), 1),
             "sector_rotation_score": round(float(row.get("sector_rotation_score") or 0), 1),
             "failure_penalty_score": round(float(row.get("failure_penalty_score") or 0), 1),
+            "data_quality_score": round(float(row.get("data_quality_score") or 0), 1),
+            "data_quality_flags": row.get("data_quality_flags") or "[]",
             "cooldown_days_left": int(row.get("cooldown_days_left") or 0),
             "cooldown_until": _none_if_nan(row.get("cooldown_until")),
             "main_wave_score": round(float(row.get("main_wave_score") or 0), 1),
@@ -1817,7 +2205,59 @@ def _execute_batches(conn, sql: str, rows: list[dict[str, Any]], chunk_size: int
             conn.execute(statement, row)
 
 
-def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: list[dict[str, Any]], trade_date: str) -> None:
+def _normalize_stock_codes(stock_codes: list[str] | None) -> list[str]:
+    if not stock_codes:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for code in stock_codes:
+        value = str(code or "").strip().zfill(6)
+        if value and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
+
+
+def _filter_frame_by_codes(df: pd.DataFrame, stock_codes: list[str] | None) -> pd.DataFrame:
+    codes = _normalize_stock_codes(stock_codes)
+    if not codes or df is None or df.empty or "stock_code" not in df.columns:
+        return df
+    return df[df["stock_code"].astype(str).str.strip().str.zfill(6).isin(codes)].copy()
+
+
+def _delete_scope_rows(
+    conn,
+    table_name: str,
+    date_column: str,
+    trade_date: str,
+    stock_codes: list[str] | None = None,
+) -> None:
+    codes = _normalize_stock_codes(stock_codes)
+    if not codes:
+        conn.execute(
+            text(f"DELETE FROM {table_name} WHERE {date_column} = :trade_date"),
+            {"trade_date": trade_date},
+        )
+        return
+
+    placeholders = ", ".join(f":code_{idx}" for idx in range(len(codes)))
+    params = {"trade_date": trade_date, **{f"code_{idx}": code for idx, code in enumerate(codes)}}
+    conn.execute(
+        text(
+            f"DELETE FROM {table_name} "
+            f"WHERE {date_column} = :trade_date AND stock_code IN ({placeholders})"
+        ),
+        params,
+    )
+
+
+def save_outputs(
+    engine: Engine,
+    analysis_rows: list[dict[str, Any]],
+    rec_rows: list[dict[str, Any]],
+    trade_date: str,
+    stock_codes: list[str] | None = None,
+) -> None:
     analysis_sql = """
         INSERT INTO stock_analysis_result (
             stock_code, stock_name, analysis_date, last_news_time,
@@ -1826,6 +2266,7 @@ def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: 
             event_risk_score, event_risk_level, event_risk_detail,
             recommend_status, recommend_reason,
             summary, recommendation, strengths, risks,
+            data_quality_score, data_quality_flags, flow_trade_date, hot_trade_date, model_version,
             created_at, updated_at
         ) VALUES (
             :stock_code, :stock_name, :analysis_date, :last_news_time,
@@ -1834,6 +2275,7 @@ def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: 
             :event_risk_score, :event_risk_level, :event_risk_detail,
             :recommend_status, :recommend_reason,
             :summary, :recommendation, :strengths, :risks,
+            :data_quality_score, :data_quality_flags, :flow_trade_date, :hot_trade_date, :model_version,
             NOW(), NOW()
         )
         ON DUPLICATE KEY UPDATE
@@ -1858,6 +2300,11 @@ def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: 
             recommendation = VALUES(recommendation),
             strengths = VALUES(strengths),
             risks = VALUES(risks),
+            data_quality_score = VALUES(data_quality_score),
+            data_quality_flags = VALUES(data_quality_flags),
+            flow_trade_date = VALUES(flow_trade_date),
+            hot_trade_date = VALUES(hot_trade_date),
+            model_version = VALUES(model_version),
             updated_at = NOW()
     """
     rec_sql = """
@@ -1875,7 +2322,7 @@ def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: 
             quality_score, entry_score, final_trade_score,
             expected_return_score, expected_return_pct, resistance_price,
             heat_overload_score, confidence_score, sector_rotation_score,
-            failure_penalty_score, cooldown_days_left, cooldown_until,
+            failure_penalty_score, data_quality_score, data_quality_flags, cooldown_days_left, cooldown_until,
             main_wave_score, trend_hold_score, main_wave_stage, main_wave_signal,
             main_wave_reason, trend_stop_price, trend_reduce_price,
             model_version,
@@ -1894,20 +2341,34 @@ def save_outputs(engine: Engine, analysis_rows: list[dict[str, Any]], rec_rows: 
             :quality_score, :entry_score, :final_trade_score,
             :expected_return_score, :expected_return_pct, :resistance_price,
             :heat_overload_score, :confidence_score, :sector_rotation_score,
-            :failure_penalty_score, :cooldown_days_left, :cooldown_until,
+            :failure_penalty_score, :data_quality_score, :data_quality_flags, :cooldown_days_left, :cooldown_until,
             :main_wave_score, :trend_hold_score, :main_wave_stage, :main_wave_signal,
             :main_wave_reason, :trend_stop_price, :trend_reduce_price,
             :model_version,
             NOW()
         )
     """
+    _ensure_analysis_columns(engine)
     _ensure_recommended_columns(engine)
+    scoped_codes = _normalize_stock_codes(stock_codes)
     with engine.begin() as conn:
         logger.info("Writing %s analysis rows for %s", len(analysis_rows), trade_date)
-        conn.execute(text("DELETE FROM stock_analysis_result WHERE analysis_date = :trade_date"), {"trade_date": trade_date})
+        _delete_scope_rows(
+            conn,
+            table_name="stock_analysis_result",
+            date_column="analysis_date",
+            trade_date=trade_date,
+            stock_codes=scoped_codes,
+        )
         _execute_batches(conn, analysis_sql, analysis_rows)
         logger.info("Refreshing %s recommendation rows for %s", len(rec_rows), trade_date)
-        conn.execute(text("DELETE FROM st_recommended_stocks WHERE pick_date = :trade_date"), {"trade_date": trade_date})
+        _delete_scope_rows(
+            conn,
+            table_name="st_recommended_stocks",
+            date_column="pick_date",
+            trade_date=trade_date,
+            stock_codes=scoped_codes,
+        )
         if rec_rows:
             _execute_batches(conn, rec_sql, rec_rows)
 
@@ -1921,43 +2382,53 @@ def _emit_progress(progress_callback: ProgressCallback | None, **payload: Any) -
         logger.debug("progress callback failed", exc_info=True)
 
 
-def run_batch(
+def _prepare_batch_outputs(
     engine: Engine,
-    trade_date: str | None = None,
-    top_n: int = 80,
-    min_score: float = 62.0,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    stock_codes: list[str] | None = None,
     progress_callback: ProgressCallback | None = None,
-) -> BatchStats:
-    trade_date = trade_date or latest_trade_date(engine)
-    logger.info("Fast analysis batch started for %s", trade_date)
+    news_cutoff_time: str | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, str, str]:
+    scoped_codes = _normalize_stock_codes(stock_codes)
 
-    _emit_progress(progress_callback, stage="load_kline", percent=5, step="加载日K特征...", trade_date=trade_date)
-    kline = load_kline_features(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_finance", percent=14, step="加载财务因子...", trade_date=trade_date)
-    finance = load_finance(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_flow", percent=23, step="加载资金流数据...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_kline", percent=5, step="鍔犺浇鏃鐗瑰緛...", trade_date=trade_date)
+    kline_all = load_kline_features(engine, trade_date)
+    kline = _filter_frame_by_codes(kline_all, scoped_codes)
+    if scoped_codes and kline.empty:
+        raise RuntimeError(f"No K-line rows found for requested stock codes on {trade_date}")
+
+    _emit_progress(progress_callback, stage="load_finance", percent=14, step="鍔犺浇璐㈠姟鍥犲瓙...", trade_date=trade_date)
+    finance = _filter_frame_by_codes(load_finance(engine, trade_date), scoped_codes)
+    _emit_progress(progress_callback, stage="load_flow", percent=23, step="鍔犺浇璧勯噾娴佹暟鎹?..", trade_date=trade_date)
     flow, flow_date = load_flow_features(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_hot", percent=32, step="加载热度排行...", trade_date=trade_date)
+    flow = _filter_frame_by_codes(flow, scoped_codes)
+    _emit_progress(progress_callback, stage="load_hot", percent=32, step="鍔犺浇鐑害鎺掕...", trade_date=trade_date)
     hot, hot_date = load_hot_rank(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_notices", percent=40, step="加载公告事件...", trade_date=trade_date)
-    notices = load_notice_features(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_confidence", percent=48, step="加载交易置信度...", trade_date=trade_date)
-    confidence = load_confidence_features(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_history", percent=56, step="加载历史推荐表现...", trade_date=trade_date)
-    rec_history = load_recommendation_history(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_failures", percent=62, step="加载失败惩罚因子...", trade_date=trade_date)
-    failures = load_failure_features(engine, trade_date)
-    _emit_progress(progress_callback, stage="load_sector", percent=68, step="加载板块轮动因子...", trade_date=trade_date)
-    sector = load_sector_rotation_features(engine, trade_date)
-    market_mood_score = compute_market_mood(kline)
+    hot = _filter_frame_by_codes(hot, scoped_codes)
+    _emit_progress(progress_callback, stage="load_notices", percent=40, step="鍔犺浇鍏憡浜嬩欢...", trade_date=trade_date)
+    notices = _filter_frame_by_codes(load_notice_features(engine, trade_date), scoped_codes)
+    news = _filter_frame_by_codes(load_news_features(engine, trade_date, cutoff_time=news_cutoff_time), scoped_codes)
+    notices = merge_event_features(notices, news)
+    _emit_progress(progress_callback, stage="load_confidence", percent=48, step="鍔犺浇浜ゆ槗缃俊搴?..", trade_date=trade_date)
+    confidence = _filter_frame_by_codes(load_confidence_features(engine, trade_date), scoped_codes)
+    _emit_progress(progress_callback, stage="load_history", percent=56, step="鍔犺浇鍘嗗彶鎺ㄨ崘琛ㄧ幇...", trade_date=trade_date)
+    rec_history = _filter_frame_by_codes(load_recommendation_history(engine, trade_date), scoped_codes)
+    _emit_progress(progress_callback, stage="load_failures", percent=62, step="鍔犺浇澶辫触鎯╃綒鍥犲瓙...", trade_date=trade_date)
+    failures = _filter_frame_by_codes(load_failure_features(engine, trade_date), scoped_codes)
+    _emit_progress(progress_callback, stage="load_sector", percent=68, step="鍔犺浇鏉垮潡杞姩鍥犲瓙...", trade_date=trade_date)
+    sector = _filter_frame_by_codes(load_sector_rotation_features(engine, trade_date), scoped_codes)
+    market_mood_score = compute_market_mood(kline_all)
 
     logger.info(
-        "Loaded data: kline=%s finance=%s flow=%s notices=%s hot=%s confidence=%s history=%s failures=%s sector=%s market_mood=%.1f",
+        "Loaded data: scope=%s kline=%s finance=%s flow=%s notices=%s hot=%s confidence=%s history=%s failures=%s sector=%s market_mood=%.1f",
+        "all" if not scoped_codes else len(scoped_codes),
         len(kline), len(finance), len(flow), len(notices), len(hot),
         len(confidence), len(rec_history), len(failures), len(sector), market_mood_score,
     )
 
-    _emit_progress(progress_callback, stage="compute_scores", percent=78, step="计算全市场评分...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="compute_scores", percent=78, step="璁＄畻鍏ㄥ競鍦鸿瘎鍒?..", trade_date=trade_date)
     scored = compute_scores(
         kline=kline,
         finance=finance,
@@ -1973,15 +2444,81 @@ def run_batch(
         rec_history=rec_history,
         failures=failures,
     )
-    _emit_progress(progress_callback, stage="build_rows", percent=88, step="生成分析与推荐结果...", trade_date=trade_date)
+    scored["flow_trade_date"] = flow_date
+    scored["hot_trade_date"] = hot_date
+    _emit_progress(progress_callback, stage="build_rows", percent=88, step="鐢熸垚鍒嗘瀽涓庢帹鑽愮粨鏋?..", trade_date=trade_date)
     scored = _build_text_fields(scored, flow_date=flow_date, trade_date=trade_date)
     analysis_rows = build_analysis_rows(scored, trade_date)
     rec_rows = build_recommendation_rows(scored, trade_date, top_n=top_n, min_score=min_score)
+    return analysis_rows, rec_rows, market_mood_score, flow_date, hot_date
+
+
+def run_batch(
+    engine: Engine,
+    trade_date: str | None = None,
+    top_n: int = 80,
+    min_score: float = 62.0,
+    progress_callback: ProgressCallback | None = None,
+    strict_prev_trade_day: bool = False,
+    execution_time: str | None = None,
+    min_kline_coverage: float = 0.80,
+    auto_repair_missing_kline: bool = False,
+) -> BatchStats:
+    if strict_prev_trade_day:
+        execution_time = execution_time or datetime.now().replace(microsecond=0).isoformat(sep=" ")
+        resolved_trade_date = previous_trade_date(engine, execution_time)
+        if trade_date and str(trade_date)[:10] != resolved_trade_date:
+            raise RuntimeError(
+                f"Strict morning run requires previous trade date {resolved_trade_date}, "
+                f"got {str(trade_date)[:10]}"
+            )
+        trade_date = resolved_trade_date
+        try:
+            readiness = assert_trade_date_ready(engine, trade_date, min_coverage=min_kline_coverage)
+        except Exception as exc:
+            if not auto_repair_missing_kline:
+                raise
+            _emit_progress(
+                progress_callback,
+                stage="strict_date_missing",
+                percent=2,
+                step=f"strict previous trade date missing; repairing before analysis: {exc}",
+                trade_date=trade_date,
+                error=str(exc),
+            )
+            repair_missing_qmt_kline_for_trade_date(
+                trade_date,
+                progress_callback=progress_callback,
+            )
+            readiness = assert_trade_date_ready(engine, trade_date, min_coverage=min_kline_coverage)
+        _emit_progress(
+            progress_callback,
+            stage="strict_date_ready",
+            percent=2,
+            step="strict previous trade date ready",
+            trade_date=trade_date,
+            latest_kline_date=readiness.get("latest_kline_date"),
+            kline_count=readiness.get("kline_count"),
+            expected_count=readiness.get("expected_count"),
+        )
+    else:
+        trade_date = trade_date or latest_trade_date(engine)
+    logger.info("Fast analysis batch started for %s", trade_date)
+
+    analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
+        engine=engine,
+        trade_date=trade_date,
+        min_score=min_score,
+        top_n=top_n,
+        stock_codes=None,
+        progress_callback=progress_callback,
+        news_cutoff_time=execution_time if strict_prev_trade_day else None,
+    )
     _emit_progress(
         progress_callback,
         stage="save_outputs",
         percent=94,
-        step="写入分析结果与推荐池...",
+        step="save outputs",
         trade_date=trade_date,
         analysis_count=len(analysis_rows),
         recommendation_count=len(rec_rows),
@@ -2000,7 +2537,7 @@ def run_batch(
         progress_callback,
         stage="done",
         percent=100,
-        step="完成",
+        step="done",
         trade_date=stats.trade_date,
         analysis_count=stats.analysis_count,
         recommendation_count=stats.recommendation_count,
@@ -2013,11 +2550,74 @@ def run_batch(
     return stats
 
 
+def run_batch_for_codes(
+    engine: Engine,
+    stock_codes: list[str],
+    trade_date: str | None = None,
+    top_n: int = 80,
+    min_score: float = 62.0,
+    progress_callback: ProgressCallback | None = None,
+) -> BatchStats:
+    scoped_codes = _normalize_stock_codes(stock_codes)
+    if not scoped_codes:
+        raise ValueError("stock_codes must not be empty")
+
+    trade_date = trade_date or latest_trade_date(engine)
+    logger.info("Fast scoped analysis started for %s with %s codes", trade_date, len(scoped_codes))
+    analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
+        engine=engine,
+        trade_date=trade_date,
+        min_score=min_score,
+        top_n=max(int(top_n), len(scoped_codes)),
+        stock_codes=scoped_codes,
+        progress_callback=progress_callback,
+    )
+    _emit_progress(
+        progress_callback,
+        stage="save_outputs",
+        percent=94,
+        step="save outputs",
+        trade_date=trade_date,
+        analysis_count=len(analysis_rows),
+        recommendation_count=len(rec_rows),
+        done=len(analysis_rows),
+    )
+    save_outputs(engine, analysis_rows, rec_rows, trade_date, stock_codes=scoped_codes)
+
+    stats = BatchStats(
+        trade_date=trade_date,
+        analysis_count=len(analysis_rows),
+        recommendation_count=len(rec_rows),
+        market_mood_score=market_mood_score,
+        flow_date=flow_date,
+        hot_date=hot_date,
+    )
+    _emit_progress(
+        progress_callback,
+        stage="done",
+        percent=100,
+        step="done",
+        trade_date=stats.trade_date,
+        analysis_count=stats.analysis_count,
+        recommendation_count=stats.recommendation_count,
+        market_mood_score=stats.market_mood_score,
+        flow_date=stats.flow_date,
+        hot_date=stats.hot_date,
+        done=stats.analysis_count,
+    )
+    logger.info("Fast scoped analysis completed: %s", stats)
+    return stats
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fast full-market EOD analysis and recommendation batch")
     parser.add_argument("--date", default="", help="Analysis trade date, default latest sm_stock_kline date")
     parser.add_argument("--top-n", type=int, default=80, help="Number of recommendation rows to keep")
     parser.add_argument("--min-score", type=float, default=62.0, help="Minimum AI score for recommendation eligibility")
+    parser.add_argument("--strict-prev-trade-day", action="store_true", help="Use only the previous trading day of execution time and fail if data is incomplete")
+    parser.add_argument("--execution-time", default="", help="Execution timestamp/date used by --strict-prev-trade-day, default today")
+    parser.add_argument("--min-kline-coverage", type=float, default=0.80, help="Minimum K-line coverage ratio for strict runs")
+    parser.add_argument("--auto-repair-missing-kline", action="store_true", help="For strict runs, first repair the target day full-market K-line from Guojin QMT when missing")
     parser.add_argument("--json", action="store_true", help="Print JSON summary")
     args = parser.parse_args()
 
@@ -2028,6 +2628,10 @@ def main() -> int:
         trade_date=args.date.strip() or None,
         top_n=args.top_n,
         min_score=args.min_score,
+        strict_prev_trade_day=args.strict_prev_trade_day,
+        execution_time=args.execution_time.strip() or None,
+        min_kline_coverage=args.min_kline_coverage,
+        auto_repair_missing_kline=args.auto_repair_missing_kline,
     )
     payload = {
         "trade_date": stats.trade_date,

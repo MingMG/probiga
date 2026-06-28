@@ -15,6 +15,8 @@
 
 from datetime import datetime, timedelta
 
+from .date_context import extract_analysis_date
+
 
 class EventRiskEngine:
     """事件风险引擎"""
@@ -64,6 +66,7 @@ class EventRiskEngine:
         risk_score = 100  # 初始满分（无风险）
         risk_level = self.LEVEL_LOW
         triggered_events = []
+        analysis_date = extract_analysis_date(data)
 
         # 1. 检查最新公告（24小时内）
         news = data.get('news', {})
@@ -101,7 +104,8 @@ class EventRiskEngine:
             if lift_date_str:
                 try:
                     lift_date = datetime.strptime(str(lift_date_str), '%Y-%m-%d').date()
-                    days_to_lift = (lift_date - datetime.now().date()).days
+                    anchor_date = analysis_date or datetime.now().date()
+                    days_to_lift = (lift_date - anchor_date).days
                     if days_to_lift <= 7:
                         triggered_events.append({
                             'type': 'lifting',

@@ -10,6 +10,10 @@
 - BLOCK: 禁止推荐
 """
 
+from datetime import date
+
+from .date_context import coerce_date
+
 
 class RecommendationGate:
     """推荐资格引擎"""
@@ -18,7 +22,13 @@ class RecommendationGate:
     STATUS_SUSPENDED = "SUSPENDED"
     STATUS_BLOCK = "BLOCK"
 
-    def evaluate(self, long_term: dict, short_term: dict, event_risk: dict) -> dict:
+    def evaluate(
+        self,
+        long_term: dict,
+        short_term: dict,
+        event_risk: dict,
+        analysis_date: str | None = None,
+    ) -> dict:
         """
         综合评估推荐资格
 
@@ -68,7 +78,7 @@ class RecommendationGate:
             }
 
         # 2. 检查是否有新公告（可能导致推荐失效）
-        has_new_notice = self._has_new_announcement(triggered_events)
+        has_new_notice = self._has_new_announcement(triggered_events, analysis_date)
         if has_new_notice:
             return {
                 'status': self.STATUS_SUSPENDED,
@@ -120,24 +130,25 @@ class RecommendationGate:
             'risks': risks,
         }
 
-    def _has_new_announcement(self, events: list) -> bool:
+    def _has_new_announcement(self, events: list, analysis_date: str | None = None) -> bool:
         """
         检查是否有新公告发布
 
         如果公告时间晚于上次分析时间，需要暂停推荐
         """
+        anchor_date = coerce_date(analysis_date, default=date.today())
         for event in events:
             if event.get('type') == 'notice':
                 # 检查公告日期是否是今天
                 notice_date = event.get('date', '')
                 if notice_date:
-                    from datetime import datetime, date
+                    from datetime import datetime
                     try:
                         if isinstance(notice_date, str):
                             nd = datetime.strptime(notice_date[:10], '%Y-%m-%d').date()
                         else:
                             nd = notice_date
-                        if nd >= date.today():
+                        if nd >= anchor_date:
                             return True
                     except (ValueError, TypeError):
                         pass

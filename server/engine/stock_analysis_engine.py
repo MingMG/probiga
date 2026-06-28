@@ -15,12 +15,13 @@
 import logging
 from typing import List, Optional
 
-from .schemas import StockAnalysisResult, ScoreDetail, EventRisk, RecommendResult
 from .data_loader import StockDataLoader
-from .long_term_engine import LongTermEngine
-from .short_term_engine import ShortTermEngine
+from .date_context import coerce_date
 from .event_risk_engine import EventRiskEngine
+from .long_term_engine import LongTermEngine
 from .recommendation_gate import RecommendationGate
+from .schemas import StockAnalysisResult, ScoreDetail, EventRisk, RecommendResult
+from .short_term_engine import ShortTermEngine
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,9 @@ class StockAnalysisEngine:
         event_risk_result = self.event_risk.analyze(data)
 
         # 5. 推荐资格判断
+        analysis_date = data.get('trade_date')
         recommend_result = self.gate.evaluate(
-            long_term_result, short_term_result, event_risk_result
+            long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
         )
 
         # 6. 生成文本结论
@@ -175,8 +177,9 @@ class StockAnalysisEngine:
         event_risk_result = self.event_risk.analyze(data)
 
         # 推荐资格判断
+        analysis_date = data.get('trade_date')
         recommend_result = self.gate.evaluate(
-            long_term_result, short_term_result, event_risk_result
+            long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
         )
 
         # 生成文本结论
@@ -198,7 +201,7 @@ class StockAnalysisEngine:
         return StockAnalysisResult(
             stock_code=data.get('stock_code', stock_code),
             stock_name=data.get('short_name', ''),
-            analysis_date=data.get('trade_date', ''),
+            analysis_date=str(coerce_date(data.get('trade_date')) or data.get('trade_date', '')),
             last_news_time=data.get('last_news_time'),
             long_term_score=long_term_result['long_term_score'],
             short_term_score=short_term_result['short_term_score'],

@@ -95,6 +95,30 @@ STRATEGY_CONFIG = {
 RISK_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 VALID_TRADE_MODES = {"live", "backtest", "forward"}
 SNAPSHOT_FALLBACK_MAX_AGE_MINUTES = 5
+SIM_INITIAL_CAPITAL = 1_000_000.0
+
+SIM_RISK_CONFIG = {
+    "max_total_position_pct": 0.70,
+    "cash_buffer_pct": 0.10,
+    "max_single_stock_pct": 0.10,
+    "per_trade_risk_pct": 0.012,
+    "min_order_amount": 8_000,
+    "slippage_buy_pct": 0.05,
+    "slippage_sell_pct": 0.05,
+    "liquidity_volume_pct": 0.02,
+    "strategy_budget_pct": {
+        "ultra_short": 0.25,
+        "short_term": 0.30,
+        "swing": 0.25,
+        "main_wave": 0.35,
+    },
+    "risk_multiplier": {
+        "LOW": 1.00,
+        "MEDIUM": 0.70,
+        "HIGH": 0.35,
+        "CRITICAL": 0.0,
+    },
+}
 
 
 def _safe_float(v, default=0.0) -> float:
@@ -314,6 +338,13 @@ def _exec_sql(sql: str, params: dict = None):
         c.execute(text(sql), params)
 
 
+def _exec_insert_get_id(sql: str, params: dict = None) -> int:
+    e = get_engine()
+    with e.begin() as c:
+        c.execute(text(sql), params or {})
+        return int(c.execute(text("SELECT LAST_INSERT_ID()")).scalar() or 0)
+
+
 def _table_columns(table_name: str) -> set[str]:
     rows = _read_sql("""
         SELECT COLUMN_NAME
@@ -322,6 +353,31 @@ def _table_columns(table_name: str) -> set[str]:
           AND TABLE_NAME = :table_name
     """, {"table_name": table_name})
     return {str(r.get("COLUMN_NAME")) for r in rows}
+
+
+def _ensure_column(table_name: str, column_name: str, ddl: str) -> None:
+    try:
+        columns = _table_columns(table_name)
+        if column_name not in columns:
+            _exec_sql(f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {ddl}")
+    except Exception as e:
+        logger.warning("ensure column %s.%s failed: %s", table_name, column_name, e)
+
+
+def _ensure_index(table_name: str, index_name: str, ddl: str) -> None:
+    try:
+        rows = _read_sql("""
+            SELECT INDEX_NAME
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = :table_name
+              AND INDEX_NAME = :index_name
+            LIMIT 1
+        """, {"table_name": table_name, "index_name": index_name})
+        if not rows:
+            _exec_sql(f"ALTER TABLE `{table_name}` ADD {ddl}")
+    except Exception as e:
+        logger.warning("ensure index %s.%s failed: %s", table_name, index_name, e)
 
 
 def _select_expr(columns: set[str], column: str, default: str, alias: str = "") -> str:
@@ -493,6 +549,153 @@ def _ensure_tables():
         except Exception:
             pass
         _exec_sql("""
+            CREATE TABLE IF NOT EXISTS `st_sim_signal` (
+                `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+                `trade_mode` VARCHAR(20) DEFAULT 'live',
+                `signal_date` DATE NOT NULL,
+                `trade_date` DATE NOT NULL,
+                `stock_code` VARCHAR(10) NOT NULL,
+                `short_name` VARCHAR(20) DEFAULT '',
+                `strategy_type` VARCHAR(20) NOT NULL,
+                `status` VARCHAR(20) DEFAULT 'NEW',
+                `reason` TEXT,
+                `last_check_reason` TEXT,
+                `ai_score` DECIMAL(5,2) DEFAULT 0,
+                `quality_score` DECIMAL(5,2) DEFAULT 0,
+                `entry_score` DECIMAL(5,2) DEFAULT 0,
+                `final_trade_score` DECIMAL(5,2) DEFAULT 0,
+                `expected_return_pct` DECIMAL(8,4) DEFAULT 0,
+                `short_score` DECIMAL(5,2) DEFAULT 0,
+                `long_score` DECIMAL(5,2) DEFAULT 0,
+                `capital_score` DECIMAL(5,2) DEFAULT 0,
+                `technical_score` DECIMAL(5,2) DEFAULT 0,
+                `fundamental_score` DECIMAL(5,2) DEFAULT 0,
+                `main_wave_score` DECIMAL(5,2) DEFAULT 0,
+                `trend_hold_score` DECIMAL(5,2) DEFAULT 0,
+                `event_risk_level` VARCHAR(10) DEFAULT 'LOW',
+                `entry_price_low` DECIMAL(12,4) DEFAULT NULL,
+                `entry_price_high` DECIMAL(12,4) DEFAULT NULL,
+                `stop_loss_price` DECIMAL(12,4) DEFAULT NULL,
+                `take_profit_1` DECIMAL(12,4) DEFAULT NULL,
+                `take_profit_2` DECIMAL(12,4) DEFAULT NULL,
+                `filled_order_id` BIGINT DEFAULT NULL,
+                `filled_position_id` BIGINT DEFAULT NULL,
+                `last_check_at` DATETIME DEFAULT NULL,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` DATETIME DEFAULT NULL,
+                UNIQUE KEY `uk_sim_signal` (`trade_mode`, `signal_date`, `trade_date`, `stock_code`, `strategy_type`),
+                INDEX `idx_sim_signal_status` (`trade_mode`, `trade_date`, `status`),
+                INDEX `idx_sim_signal_stock` (`stock_code`, `trade_date`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        _exec_sql("""
+            CREATE TABLE IF NOT EXISTS `st_sim_order` (
+                `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+                `signal_id` BIGINT DEFAULT NULL,
+                `trade_mode` VARCHAR(20) DEFAULT 'live',
+                `order_date` DATE NOT NULL,
+                `order_time` VARCHAR(20) DEFAULT '',
+                `stock_code` VARCHAR(10) NOT NULL,
+                `short_name` VARCHAR(20) DEFAULT '',
+                `strategy_type` VARCHAR(20) NOT NULL,
+                `side` VARCHAR(10) NOT NULL,
+                `order_type` VARCHAR(20) DEFAULT 'SIM_LIMIT',
+                `limit_price` DECIMAL(12,4) DEFAULT NULL,
+                `target_price` DECIMAL(12,4) DEFAULT NULL,
+                `requested_shares` INT DEFAULT 0,
+                `remaining_shares` INT DEFAULT 0,
+                `status` VARCHAR(20) DEFAULT 'PENDING',
+                `filled_price` DECIMAL(12,4) DEFAULT NULL,
+                `filled_shares` INT DEFAULT 0,
+                `filled_amount` DECIMAL(14,2) DEFAULT 0,
+                `fee` DECIMAL(10,2) DEFAULT 0,
+                `position_id` BIGINT DEFAULT NULL,
+                `source_event` VARCHAR(40) DEFAULT '',
+                `price_source` VARCHAR(40) DEFAULT '',
+                `risk_budget_amount` DECIMAL(14,2) DEFAULT 0,
+                `risk_budget_note` TEXT,
+                `match_count` INT DEFAULT 0,
+                `reason` TEXT,
+                `reject_reason` TEXT,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` DATETIME DEFAULT NULL,
+                `filled_at` DATETIME DEFAULT NULL,
+                INDEX `idx_sim_order_signal` (`signal_id`),
+                INDEX `idx_sim_order_status` (`trade_mode`, `order_date`, `status`),
+                INDEX `idx_sim_order_stock` (`stock_code`, `order_date`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        for column, ddl in {
+            "requested_shares": "INT DEFAULT 0 AFTER `target_price`",
+            "remaining_shares": "INT DEFAULT 0 AFTER `requested_shares`",
+            "source_event": "VARCHAR(40) DEFAULT '' AFTER `position_id`",
+            "price_source": "VARCHAR(40) DEFAULT '' AFTER `source_event`",
+            "risk_budget_amount": "DECIMAL(14,2) DEFAULT 0 AFTER `price_source`",
+            "risk_budget_note": "TEXT AFTER `risk_budget_amount`",
+            "match_count": "INT DEFAULT 0 AFTER `risk_budget_note`",
+            "last_match_reason": "TEXT AFTER `reject_reason`",
+            "cancel_reason": "TEXT AFTER `last_match_reason`",
+        }.items():
+            _ensure_column("st_sim_order", column, ddl)
+        for column, ddl in {
+            "pending_order_id": "BIGINT DEFAULT NULL AFTER `filled_position_id`",
+            "intended_amount": "DECIMAL(14,2) DEFAULT 0 AFTER `take_profit_2`",
+            "intended_shares": "INT DEFAULT 0 AFTER `intended_amount`",
+            "risk_budget_amount": "DECIMAL(14,2) DEFAULT 0 AFTER `intended_shares`",
+            "risk_budget_note": "TEXT AFTER `risk_budget_amount`",
+        }.items():
+            _ensure_column("st_sim_signal", column, ddl)
+        for column, ddl in {
+            "signal_id": "BIGINT DEFAULT NULL AFTER `id`",
+            "entry_order_id": "BIGINT DEFAULT NULL AFTER `signal_id`",
+            "exit_order_id": "BIGINT DEFAULT NULL AFTER `entry_order_id`",
+        }.items():
+            _ensure_column("st_sim_position", column, ddl)
+        _ensure_column("st_trade_flow", "order_id", "BIGINT DEFAULT NULL AFTER `id`")
+        _ensure_index("st_sim_position", "idx_sim_position_signal", "INDEX `idx_sim_position_signal` (`signal_id`)")
+        _ensure_index("st_trade_flow", "idx_trade_flow_order", "INDEX `idx_trade_flow_order` (`order_id`)")
+        _exec_sql("""
+            CREATE TABLE IF NOT EXISTS `st_sim_event` (
+                `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+                `trade_mode` VARCHAR(20) DEFAULT 'live',
+                `event_date` DATE NOT NULL,
+                `event_time` VARCHAR(20) DEFAULT '',
+                `event_type` VARCHAR(40) NOT NULL,
+                `signal_id` BIGINT DEFAULT NULL,
+                `order_id` BIGINT DEFAULT NULL,
+                `position_id` BIGINT DEFAULT NULL,
+                `stock_code` VARCHAR(10) DEFAULT '',
+                `strategy_type` VARCHAR(20) DEFAULT '',
+                `severity` VARCHAR(20) DEFAULT 'INFO',
+                `message` TEXT,
+                `payload` LONGTEXT,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX `idx_sim_event_date` (`trade_mode`, `event_date`, `event_type`),
+                INDEX `idx_sim_event_stock` (`stock_code`, `event_date`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        _exec_sql("""
+            CREATE TABLE IF NOT EXISTS `st_sim_risk_budget` (
+                `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
+                `trade_mode` VARCHAR(20) DEFAULT 'live',
+                `budget_date` DATE NOT NULL,
+                `strategy_type` VARCHAR(20) NOT NULL,
+                `initial_capital` DECIMAL(14,2) DEFAULT 0,
+                `total_equity` DECIMAL(14,2) DEFAULT 0,
+                `cash_available` DECIMAL(14,2) DEFAULT 0,
+                `max_total_position_amount` DECIMAL(14,2) DEFAULT 0,
+                `max_strategy_amount` DECIMAL(14,2) DEFAULT 0,
+                `used_strategy_amount` DECIMAL(14,2) DEFAULT 0,
+                `pending_strategy_amount` DECIMAL(14,2) DEFAULT 0,
+                `available_strategy_amount` DECIMAL(14,2) DEFAULT 0,
+                `risk_budget_note` TEXT,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                `updated_at` DATETIME DEFAULT NULL,
+                UNIQUE KEY `uk_sim_risk_budget` (`trade_mode`, `budget_date`, `strategy_type`),
+                INDEX `idx_sim_risk_budget_date` (`trade_mode`, `budget_date`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        _exec_sql("""
             CREATE TABLE IF NOT EXISTS `st_strategy_snapshot` (
                 `id`              BIGINT AUTO_INCREMENT PRIMARY KEY,
                 `snapshot_date`   DATE         NOT NULL,
@@ -526,6 +729,93 @@ def _is_trading_time(now=None) -> bool:
     return (_t(9, 25) <= t <= _t(11, 31)) or (_t(12, 59) <= t <= _t(15, 1))
 
 
+def _is_buy_execution_time(now=None) -> bool:
+    """模拟新开仓窗口：连续竞价阶段，14:30 后不再新开仓。"""
+    from datetime import datetime as _dt, time as _t
+    now = now or _dt.now()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return (_t(9, 30) <= t <= _t(11, 30)) or (_t(13, 0) <= t <= _t(14, 30))
+
+
+def _is_signal_expire_time(now=None) -> bool:
+    from datetime import datetime as _dt, time as _t
+    now = now or _dt.now()
+    return now.time() > _t(14, 30)
+
+
+def _previous_trade_date(trade_date: str) -> str:
+    trade_date = str(trade_date or "")[:10]
+    if not trade_date:
+        return ""
+    try:
+        rows = _read_sql("""
+            SELECT trade_date
+            FROM si_trade_calendar
+            WHERE trade_status = 1 AND trade_date < :d
+            ORDER BY trade_date DESC
+            LIMIT 1
+        """, {"d": trade_date})
+        if rows:
+            return str(rows[0]["trade_date"])[:10]
+    except Exception:
+        pass
+    try:
+        rows = _read_sql("""
+            SELECT MAX(trade_date) AS trade_date
+            FROM sm_stock_kline
+            WHERE k_type = 1
+              AND trade_date < :d
+        """, {"d": trade_date})
+        if rows and rows[0].get("trade_date"):
+            return str(rows[0]["trade_date"])[:10]
+    except Exception:
+        pass
+    try:
+        d = datetime.strptime(trade_date, "%Y-%m-%d").date()
+        d -= timedelta(days=1)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d.isoformat()
+    except Exception:
+        return ""
+
+
+def _is_trade_date(trade_date: str) -> bool:
+    trade_date = str(trade_date or "")[:10]
+    if not trade_date:
+        return False
+    try:
+        rows = _read_sql("""
+            SELECT trade_status
+            FROM si_trade_calendar
+            WHERE trade_date = :d
+            LIMIT 1
+        """, {"d": trade_date})
+        if rows:
+            return int(rows[0].get("trade_status") or 0) == 1
+    except Exception:
+        pass
+    try:
+        rows = _read_sql("""
+            SELECT 1 AS ok
+            FROM sm_stock_kline
+            WHERE k_type = 1
+              AND trade_date = :d
+            LIMIT 1
+        """, {"d": trade_date})
+        if rows:
+            return True
+    except Exception:
+        pass
+    try:
+        d = datetime.strptime(trade_date, "%Y-%m-%d").date()
+        return d.weekday() < 5
+    except Exception:
+        return False
+
+
 def _fetch_live_price_sina(stock_code: str) -> dict | None:
     """通过新浪财经接口获取单只股票实时价格"""
     try:
@@ -551,7 +841,9 @@ def _fetch_live_price_sina(stock_code: str) -> dict | None:
             return None
         return {"price": price, "source": "sina_live",
                 "short_name": fields[0],
-                "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0}
+                "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
+                "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
+                "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0}
     except Exception as e:
         logger.warning(f"新浪行情获取 {stock_code} 失败: {e}")
         return None
@@ -589,6 +881,8 @@ def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
                         "price": price, "source": "sina_live",
                         "short_name": fields[0],
                         "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
+                        "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
+                        "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0,
                     }
             except (ValueError, IndexError):
                 continue
@@ -596,6 +890,90 @@ def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
     except Exception as e:
         logger.warning(f"批量新浪行情获取失败: {e}")
         return {}
+
+
+def _fetch_qmt_snapshot_prices(stock_codes: list[str]) -> dict[str, dict]:
+    clean = [str(c).strip().zfill(6) for c in stock_codes if c]
+    if not clean:
+        return {}
+    try:
+        placeholders = ",".join(f":c{i}" for i in range(len(clean)))
+        params = {f"c{i}": code for i, code in enumerate(clean)}
+        rows = _read_sql(f"""
+            SELECT stock_code, short_name, price, change_pct, volume, amount, snapshot_at
+            FROM sm_rt_quote_snapshot
+            WHERE stock_code IN ({placeholders})
+              AND snapshot_at >= NOW() - INTERVAL {SNAPSHOT_FALLBACK_MAX_AGE_MINUTES} MINUTE
+            ORDER BY snapshot_at DESC
+        """, params)
+        result: dict[str, dict] = {}
+        for row in rows:
+            code = str(row.get("stock_code") or "").zfill(6)
+            if code in result:
+                continue
+            price = _safe_float(row.get("price"))
+            if price <= 0:
+                continue
+            result[code] = {
+                "price": price,
+                "source": "qmt_snapshot",
+                "short_name": row.get("short_name") or code,
+                "change_pct": _safe_float(row.get("change_pct")),
+                "volume": _safe_float(row.get("volume")),
+                "turnover": _safe_float(row.get("amount")),
+                "snapshot_at": str(row.get("snapshot_at") or ""),
+            }
+        return result
+    except Exception as e:
+        logger.warning("QMT realtime snapshot read failed: %s", e)
+        return {}
+
+
+def _fetch_live_prices_batch(stock_codes: list[str]) -> dict[str, dict]:
+    """Batch quote reader: local QMT snapshot first, external realtime fallback for gaps."""
+    clean = [str(c).strip().zfill(6) for c in stock_codes if c]
+    if not clean:
+        return {}
+    result = _fetch_qmt_snapshot_prices(clean)
+    missing = [code for code in clean if code not in result]
+    if not missing:
+        return result
+    try:
+        import requests
+        symbols = ",".join(_sina_symbol(c) for c in missing)
+        resp = requests.get(
+            f"https://hq.sinajs.cn/list={symbols}",
+            headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn"},
+            timeout=15,
+        )
+        for line in resp.text.strip().split("\n"):
+            if "=" not in line or '""' in line:
+                continue
+            var_part, val_part = line.split("=", 1)
+            code = var_part.split("_")[-1][2:]
+            fields = val_part.strip('";\r ').split(",")
+            if len(fields) < 4:
+                continue
+            try:
+                price = float(fields[3] or 0)
+                pre_close = float(fields[2] or 0)
+                if price <= 0:
+                    price = pre_close
+                if price > 0:
+                    result[code] = {
+                        "price": price,
+                        "source": "sina_live_fallback",
+                        "short_name": fields[0],
+                        "change_pct": round((price - pre_close) / pre_close * 100, 2) if pre_close > 0 else 0,
+                        "volume": _safe_float(fields[8]) if len(fields) > 8 else 0,
+                        "turnover": _safe_float(fields[9]) if len(fields) > 9 else 0,
+                    }
+            except (ValueError, IndexError):
+                continue
+        return result
+    except Exception as e:
+        logger.warning("Realtime fallback batch quote failed: %s", e)
+        return result
 
 
 def _get_current_price(stock_code: str) -> dict | None:
@@ -634,6 +1012,40 @@ def _get_current_price(stock_code: str) -> dict | None:
     except Exception as e:
         logger.warning(f"获取 {code} 收盘价失败: {e}")
 
+    return None
+
+
+def _get_current_price(stock_code: str) -> dict | None:
+    """Single quote reader used by simulated order matching.
+
+    Priority: local Guojin QMT snapshot -> external realtime fallback during session ->
+    latest daily close only outside realtime execution.
+    """
+    code = str(stock_code).strip().zfill(6)
+    qmt = _fetch_qmt_snapshot_prices([code]).get(code)
+    if qmt and qmt.get("price", 0) > 0:
+        return qmt
+
+    if _is_trading_time():
+        live = _fetch_live_price_sina(code)
+        if live and live.get("price", 0) > 0:
+            live["source"] = "sina_live_fallback"
+            return live
+
+    try:
+        rows = _read_sql("""
+            SELECT close AS price, trade_date FROM sm_stock_kline
+            WHERE stock_code = :c AND k_type = 1
+            ORDER BY trade_date DESC LIMIT 1
+        """, {"c": code})
+        if rows and rows[0].get("price") and float(rows[0]["price"]) > 0:
+            return {
+                "price": float(rows[0]["price"]),
+                "source": "kline_close",
+                "trade_date": str(rows[0].get("trade_date", ""))[:10],
+            }
+    except Exception as e:
+        logger.warning("daily close fallback failed for %s: %s", code, e)
     return None
 
 
@@ -717,8 +1129,1312 @@ class SimTradeEngine:
         _ensure_tables()
 
     # ────────────────────────────────────────
+    # 事件驱动模拟交易：信号池 → 模拟订单 → 持仓
+    # ────────────────────────────────────────
+
+    def prepare_signal_pool(
+        self,
+        trade_date: str = "",
+        signal_date: str = "",
+        *,
+        strict: bool = True,
+        reset: bool = False,
+    ) -> dict:
+        """把 AI 推荐转换成今日可执行信号池。
+
+        strict=True 时，信号日必须是交易日 trade_date 的上一交易日；
+        否则只生成候选，不允许自动新开仓。
+        """
+        _ensure_tables()
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        if not _is_trade_date(trade_date):
+            return {
+                "status": "skipped",
+                "reason": f"{trade_date} 不是交易日，不生成模拟交易信号池",
+                "trade_date": trade_date,
+                "signal_date": signal_date[:10] if signal_date else "",
+                "counts": self.signal_pool_counts(trade_date),
+            }
+        expected_signal_date = _previous_trade_date(trade_date)
+        signal_date = (signal_date or expected_signal_date)[:10]
+
+        if strict and expected_signal_date and signal_date != expected_signal_date:
+            return {
+                "status": "error",
+                "error": f"信号日必须是交易日上一交易日: {trade_date} 对应 {expected_signal_date}, 当前 {signal_date}",
+                "trade_date": trade_date,
+                "signal_date": signal_date,
+                "expected_signal_date": expected_signal_date,
+            }
+        if not signal_date:
+            return {
+                "status": "error",
+                "error": "无法确定信号日，不能生成模拟交易信号池",
+                "trade_date": trade_date,
+                "signal_date": "",
+                "expected_signal_date": expected_signal_date,
+            }
+
+        if reset:
+            _exec_sql("""
+                DELETE FROM st_sim_signal
+                WHERE trade_mode = 'live'
+                  AND signal_date = :signal_date
+                  AND trade_date = :trade_date
+                  AND status NOT IN ('FILLED')
+            """, {"signal_date": signal_date, "trade_date": trade_date})
+
+        recs = fetch_recommended_candidates(signal_date)
+        if not recs:
+            return {
+                "status": "error",
+                "error": f"{signal_date} 没有 AI 推荐数据，今日禁止自动新开仓",
+                "trade_date": trade_date,
+                "signal_date": signal_date,
+                "expected_signal_date": expected_signal_date,
+                "counts": self.signal_pool_counts(trade_date),
+            }
+
+        total_recommendations = 0
+        allowed_count = 0
+        rejected_count = 0
+        for rec in recs:
+            total_recommendations += 1
+            code = str(rec.get("stock_code") or "").zfill(6)
+            if not code:
+                continue
+            for stype in STRATEGY_CONFIG:
+                decision = build_buy_decision(stype, rec)
+                if not decision.get("allowed"):
+                    rejected_count += 1
+                    continue
+
+                allowed_count += 1
+                analysis = decision.get("analysis") or {}
+                _exec_sql("""
+                    INSERT INTO st_sim_signal
+                    (trade_mode, signal_date, trade_date, stock_code, short_name, strategy_type,
+                     status, reason, ai_score, quality_score, entry_score, final_trade_score,
+                     expected_return_pct, short_score, long_score, capital_score, technical_score,
+                     fundamental_score, main_wave_score, trend_hold_score, event_risk_level,
+                     entry_price_low, entry_price_high, stop_loss_price, take_profit_1, take_profit_2,
+                     updated_at)
+                    VALUES
+                    ('live', :signal_date, :trade_date, :code, :name, :strategy_type,
+                     'NEW', :reason, :ai_score, :quality_score, :entry_score, :final_trade_score,
+                     :expected_return_pct, :short_score, :long_score, :capital_score, :technical_score,
+                     :fundamental_score, :main_wave_score, :trend_hold_score, :risk_level,
+                     :entry_low, :entry_high, :stop_loss, :take_profit_1, :take_profit_2,
+                     NOW())
+                    ON DUPLICATE KEY UPDATE
+                     short_name = VALUES(short_name),
+                     reason = VALUES(reason),
+                     ai_score = VALUES(ai_score),
+                     quality_score = VALUES(quality_score),
+                     entry_score = VALUES(entry_score),
+                     final_trade_score = VALUES(final_trade_score),
+                     expected_return_pct = VALUES(expected_return_pct),
+                     short_score = VALUES(short_score),
+                     long_score = VALUES(long_score),
+                     capital_score = VALUES(capital_score),
+                     technical_score = VALUES(technical_score),
+                     fundamental_score = VALUES(fundamental_score),
+                     main_wave_score = VALUES(main_wave_score),
+                     trend_hold_score = VALUES(trend_hold_score),
+                     event_risk_level = VALUES(event_risk_level),
+                     entry_price_low = VALUES(entry_price_low),
+                     entry_price_high = VALUES(entry_price_high),
+                     stop_loss_price = VALUES(stop_loss_price),
+                     take_profit_1 = VALUES(take_profit_1),
+                     take_profit_2 = VALUES(take_profit_2),
+                     updated_at = NOW()
+                """, {
+                    "signal_date": signal_date,
+                    "trade_date": trade_date,
+                    "code": code,
+                    "name": rec.get("short_name") or code,
+                    "strategy_type": stype,
+                    "reason": decision.get("reason", ""),
+                    "ai_score": analysis.get("ai_score", 0),
+                    "quality_score": analysis.get("quality_score", 0),
+                    "entry_score": analysis.get("entry_score", 0),
+                    "final_trade_score": analysis.get("final_trade_score", 0),
+                    "expected_return_pct": analysis.get("expected_return_pct", 0),
+                    "short_score": analysis.get("short_score", 0),
+                    "long_score": analysis.get("long_score", 0),
+                    "capital_score": analysis.get("capital_score", 0),
+                    "technical_score": analysis.get("technical_score", 0),
+                    "fundamental_score": analysis.get("fundamental_score", 0),
+                    "main_wave_score": analysis.get("main_wave_score", 0),
+                    "trend_hold_score": analysis.get("trend_hold_score", 0),
+                    "risk_level": analysis.get("event_risk_level", "LOW"),
+                    "entry_low": rec.get("entry_price_low"),
+                    "entry_high": rec.get("entry_price_high"),
+                    "stop_loss": rec.get("stop_loss_price"),
+                    "take_profit_1": rec.get("take_profit_1"),
+                    "take_profit_2": rec.get("take_profit_2"),
+                })
+
+        return {
+            "status": "ok",
+            "trade_date": trade_date,
+            "signal_date": signal_date,
+            "expected_signal_date": expected_signal_date,
+            "total_recommendations": total_recommendations,
+            "allowed_count": allowed_count,
+            "rejected_count": rejected_count,
+            "counts": self.signal_pool_counts(trade_date),
+        }
+
+    def signal_pool_counts(self, trade_date: str = "", trade_mode: str = "live") -> dict:
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        rows = _read_sql("""
+            SELECT status, COUNT(*) AS cnt
+            FROM st_sim_signal
+            WHERE trade_mode = :mode AND trade_date = :trade_date
+            GROUP BY status
+        """, {"mode": trade_mode, "trade_date": trade_date})
+        counts = {str(r.get("status") or ""): int(r.get("cnt") or 0) for r in rows}
+        counts["total"] = sum(counts.values())
+        return counts
+
+    def order_counts(self, trade_date: str = "", trade_mode: str = "live") -> dict:
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        rows = _read_sql("""
+            SELECT status, side, COUNT(*) AS cnt
+            FROM st_sim_order
+            WHERE trade_mode = :mode AND order_date = :trade_date
+            GROUP BY status, side
+        """, {"mode": trade_mode, "trade_date": trade_date})
+        counts: dict[str, int] = {"total": 0}
+        for r in rows:
+            status = str(r.get("status") or "")
+            side = str(r.get("side") or "")
+            cnt = int(r.get("cnt") or 0)
+            counts[status] = counts.get(status, 0) + cnt
+            counts[f"{side}_{status}"] = counts.get(f"{side}_{status}", 0) + cnt
+            counts["total"] += cnt
+        return counts
+
+    def _log_event(
+        self,
+        event_type: str,
+        *,
+        trade_mode: str = "live",
+        signal_id: int | None = None,
+        order_id: int | None = None,
+        position_id: int | None = None,
+        stock_code: str = "",
+        strategy_type: str = "",
+        severity: str = "INFO",
+        message: str = "",
+        payload: dict | None = None,
+        event_date: str = "",
+    ) -> None:
+        now = datetime.now()
+        payload_text = None
+        if payload is not None:
+            try:
+                payload_text = json.dumps(payload, ensure_ascii=False, default=str)
+            except Exception:
+                payload_text = json.dumps({"raw": str(payload)}, ensure_ascii=False)
+        _exec_sql("""
+            INSERT INTO st_sim_event
+            (trade_mode, event_date, event_time, event_type, signal_id, order_id, position_id,
+             stock_code, strategy_type, severity, message, payload, created_at)
+            VALUES
+            (:mode, :event_date, :event_time, :event_type, :signal_id, :order_id, :position_id,
+             :stock_code, :strategy_type, :severity, :message, :payload, NOW())
+        """, {
+            "mode": trade_mode,
+            "event_date": (event_date or now.date().isoformat())[:10],
+            "event_time": now.strftime("%H:%M:%S"),
+            "event_type": event_type,
+            "signal_id": signal_id,
+            "order_id": order_id,
+            "position_id": position_id,
+            "stock_code": stock_code,
+            "strategy_type": strategy_type,
+            "severity": severity,
+            "message": message,
+            "payload": payload_text,
+        })
+
+    def portfolio_state(
+        self,
+        trade_mode: str = "live",
+        trade_date: str = "",
+        price_map: dict[str, dict] | None = None,
+    ) -> dict:
+        """Return current simulated portfolio state used by risk budgeting."""
+        _ensure_tables()
+        trade_mode = trade_mode or "live"
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        price_map = price_map or {}
+
+        holdings = _read_sql("""
+            SELECT id, stock_code, short_name, strategy_type, buy_price, buy_amount,
+                   buy_shares, buy_date, ai_score
+            FROM st_sim_position
+            WHERE status = 'holding'
+              AND COALESCE(trade_mode, 'live') = :mode
+        """, {"mode": trade_mode})
+        closed_rows = _read_sql("""
+            SELECT SUM(profit) AS realized_profit, SUM(fee_total) AS realized_fee
+            FROM st_sim_position
+            WHERE status = 'sold'
+              AND COALESCE(trade_mode, 'live') = :mode
+        """, {"mode": trade_mode})
+        order_rows = _read_sql("""
+            SELECT side, strategy_type, stock_code, limit_price, target_price,
+                   requested_shares, remaining_shares, filled_shares
+            FROM st_sim_order
+            WHERE COALESCE(trade_mode, 'live') = :mode
+              AND status IN ('PENDING', 'PARTIAL')
+        """, {"mode": trade_mode})
+
+        realized_profit = _safe_float((closed_rows[0] if closed_rows else {}).get("realized_profit"))
+        realized_fee = _safe_float((closed_rows[0] if closed_rows else {}).get("realized_fee"))
+
+        used_by_strategy = {stype: 0.0 for stype in STRATEGY_CONFIG}
+        used_by_stock: dict[str, float] = {}
+        holding_value = 0.0
+        holding_cost = 0.0
+        holding_details = []
+
+        missing_prices = []
+        for h in holdings:
+            code = str(h.get("stock_code") or "").zfill(6)
+            buy_price = _safe_float(h.get("buy_price"))
+            shares = int(h.get("buy_shares") or 0)
+            price_info = price_map.get(code)
+            cur_price = _safe_float((price_info or {}).get("price"), buy_price)
+            if cur_price <= 0:
+                missing_prices.append(code)
+                cur_price = buy_price
+            value = round(cur_price * shares, 2)
+            cost = round(buy_price * shares, 2)
+            holding_value += value
+            holding_cost += cost
+            stype = str(h.get("strategy_type") or "")
+            used_by_strategy[stype] = used_by_strategy.get(stype, 0.0) + value
+            used_by_stock[code] = used_by_stock.get(code, 0.0) + value
+            holding_details.append({
+                "id": h.get("id"),
+                "stock_code": code,
+                "short_name": h.get("short_name") or code,
+                "strategy_type": stype,
+                "buy_price": buy_price,
+                "cur_price": cur_price,
+                "shares": shares,
+                "market_value": value,
+                "cost": cost,
+                "unrealized_profit": round(value - cost, 2),
+            })
+
+        pending_buy_amount = 0.0
+        pending_by_strategy = {stype: 0.0 for stype in STRATEGY_CONFIG}
+        pending_by_stock: dict[str, float] = {}
+        for o in order_rows:
+            if str(o.get("side") or "").upper() != "BUY":
+                continue
+            remain = int(o.get("remaining_shares") or 0)
+            if remain <= 0:
+                requested = int(o.get("requested_shares") or 0)
+                filled = int(o.get("filled_shares") or 0)
+                remain = max(0, requested - filled)
+            px = _safe_float(o.get("limit_price"), _safe_float(o.get("target_price")))
+            amount = round(px * remain, 2) if px > 0 and remain > 0 else 0.0
+            pending_buy_amount += amount
+            stype = str(o.get("strategy_type") or "")
+            code = str(o.get("stock_code") or "").zfill(6)
+            pending_by_strategy[stype] = pending_by_strategy.get(stype, 0.0) + amount
+            pending_by_stock[code] = pending_by_stock.get(code, 0.0) + amount
+
+        unrealized_profit = round(holding_value - holding_cost, 2)
+        total_equity = round(SIM_INITIAL_CAPITAL + realized_profit + unrealized_profit, 2)
+        cash_before_pending = round(SIM_INITIAL_CAPITAL + realized_profit - holding_cost, 2)
+        cash_available = round(cash_before_pending - pending_buy_amount, 2)
+        cash_buffer_amount = round(total_equity * SIM_RISK_CONFIG["cash_buffer_pct"], 2)
+        max_total_position_amount = round(total_equity * SIM_RISK_CONFIG["max_total_position_pct"], 2)
+        total_available_for_position = max(
+            0.0,
+            max_total_position_amount - holding_value - pending_buy_amount,
+            0.0,
+        )
+        cash_available_after_buffer = max(0.0, cash_available - cash_buffer_amount)
+
+        return {
+            "trade_mode": trade_mode,
+            "trade_date": trade_date,
+            "initial_capital": round(SIM_INITIAL_CAPITAL, 2),
+            "realized_profit": round(realized_profit, 2),
+            "realized_fee": round(realized_fee, 2),
+            "unrealized_profit": unrealized_profit,
+            "total_equity": total_equity,
+            "holding_value": round(holding_value, 2),
+            "holding_cost": round(holding_cost, 2),
+            "pending_buy_amount": round(pending_buy_amount, 2),
+            "cash_before_pending": cash_before_pending,
+            "cash_available": cash_available,
+            "cash_buffer_amount": cash_buffer_amount,
+            "cash_available_after_buffer": round(cash_available_after_buffer, 2),
+            "max_total_position_amount": max_total_position_amount,
+            "total_available_for_position": round(total_available_for_position, 2),
+            "position_usage_rate": round(holding_value / total_equity * 100, 2) if total_equity > 0 else 0.0,
+            "used_by_strategy": {k: round(v, 2) for k, v in used_by_strategy.items()},
+            "pending_by_strategy": {k: round(v, 2) for k, v in pending_by_strategy.items()},
+            "used_by_stock": {k: round(v, 2) for k, v in used_by_stock.items()},
+            "pending_by_stock": {k: round(v, 2) for k, v in pending_by_stock.items()},
+            "holdings": holding_details,
+            "missing_prices": missing_prices,
+        }
+
+    def _save_risk_budget_snapshot(self, state: dict, trade_date: str) -> None:
+        for stype in STRATEGY_CONFIG:
+            equity = _safe_float(state.get("total_equity"), SIM_INITIAL_CAPITAL)
+            max_strategy_amount = equity * SIM_RISK_CONFIG["strategy_budget_pct"].get(stype, 0.25)
+            used = _safe_float((state.get("used_by_strategy") or {}).get(stype))
+            pending = _safe_float((state.get("pending_by_strategy") or {}).get(stype))
+            available = max(
+                0.0,
+                max_strategy_amount - used - pending,
+                _safe_float(state.get("total_available_for_position")),
+                0.0,
+            )
+            available = min(
+                max_strategy_amount - used - pending,
+                _safe_float(state.get("total_available_for_position")),
+                _safe_float(state.get("cash_available_after_buffer")),
+            )
+            available = max(0.0, available)
+            _exec_sql("""
+                INSERT INTO st_sim_risk_budget
+                (trade_mode, budget_date, strategy_type, initial_capital, total_equity,
+                 cash_available, max_total_position_amount, max_strategy_amount,
+                 used_strategy_amount, pending_strategy_amount, available_strategy_amount,
+                 risk_budget_note, created_at, updated_at)
+                VALUES
+                (:mode, :budget_date, :strategy_type, :initial_capital, :total_equity,
+                 :cash_available, :max_total_position_amount, :max_strategy_amount,
+                 :used_strategy_amount, :pending_strategy_amount, :available_strategy_amount,
+                 :risk_budget_note, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                 initial_capital = VALUES(initial_capital),
+                 total_equity = VALUES(total_equity),
+                 cash_available = VALUES(cash_available),
+                 max_total_position_amount = VALUES(max_total_position_amount),
+                 max_strategy_amount = VALUES(max_strategy_amount),
+                 used_strategy_amount = VALUES(used_strategy_amount),
+                 pending_strategy_amount = VALUES(pending_strategy_amount),
+                 available_strategy_amount = VALUES(available_strategy_amount),
+                 risk_budget_note = VALUES(risk_budget_note),
+                 updated_at = NOW()
+            """, {
+                "mode": state.get("trade_mode") or "live",
+                "budget_date": trade_date,
+                "strategy_type": stype,
+                "initial_capital": state.get("initial_capital"),
+                "total_equity": state.get("total_equity"),
+                "cash_available": state.get("cash_available"),
+                "max_total_position_amount": state.get("max_total_position_amount"),
+                "max_strategy_amount": round(max_strategy_amount, 2),
+                "used_strategy_amount": used,
+                "pending_strategy_amount": pending,
+                "available_strategy_amount": round(available, 2),
+                "risk_budget_note": (
+                    f"总仓位上限{SIM_RISK_CONFIG['max_total_position_pct']:.0%}，"
+                    f"现金缓冲{SIM_RISK_CONFIG['cash_buffer_pct']:.0%}，"
+                    f"单票上限{SIM_RISK_CONFIG['max_single_stock_pct']:.0%}"
+                ),
+            })
+
+    def _risk_budget_for_signal(self, signal: dict, price: float, state: dict) -> dict:
+        stype = str(signal.get("strategy_type") or "")
+        cfg = STRATEGY_CONFIG.get(stype) or {}
+        code = str(signal.get("stock_code") or "").zfill(6)
+        equity = max(_safe_float(state.get("total_equity")), SIM_INITIAL_CAPITAL)
+        risk_level = str(signal.get("event_risk_level") or "LOW").upper()
+        risk_multiplier = SIM_RISK_CONFIG["risk_multiplier"].get(risk_level, 0.5)
+        if risk_multiplier <= 0:
+            return {"allowed": False, "reason": f"风险等级{risk_level}禁止新开仓", "shares": 0, "amount": 0}
+
+        stop_price = _safe_float(signal.get("stop_loss_price"))
+        if stop_price <= 0 and cfg.get("stop_loss") is not None:
+            stop_price = price * (1 + float(cfg["stop_loss"]) / 100.0)
+        if stop_price <= 0 or stop_price >= price:
+            stop_price = price * 0.97
+        per_share_risk = max(price - stop_price, price * 0.015)
+
+        final_score = _safe_float(signal.get("final_trade_score"), _safe_float(signal.get("ai_score"), 70))
+        quality_multiplier = max(0.60, min(1.25, final_score / 80.0 if final_score > 0 else 0.85))
+        raw_amount = min(_safe_float(cfg.get("buy_amount"), 100000), equity * SIM_RISK_CONFIG["max_single_stock_pct"])
+        strategy_cap = equity * SIM_RISK_CONFIG["strategy_budget_pct"].get(stype, 0.25)
+        used_strategy = _safe_float((state.get("used_by_strategy") or {}).get(stype))
+        pending_strategy = _safe_float((state.get("pending_by_strategy") or {}).get(stype))
+        strategy_available = max(0.0, strategy_cap - used_strategy - pending_strategy)
+
+        single_cap = equity * SIM_RISK_CONFIG["max_single_stock_pct"]
+        used_stock = _safe_float((state.get("used_by_stock") or {}).get(code))
+        pending_stock = _safe_float((state.get("pending_by_stock") or {}).get(code))
+        single_available = max(0.0, single_cap - used_stock - pending_stock)
+
+        total_available = _safe_float(state.get("total_available_for_position"))
+        cash_available = _safe_float(state.get("cash_available_after_buffer"))
+        risk_cash = equity * SIM_RISK_CONFIG["per_trade_risk_pct"] * risk_multiplier * quality_multiplier
+        risk_sized_amount = max(0.0, (risk_cash / per_share_risk) * price) if per_share_risk > 0 else 0.0
+
+        max_amount = min(raw_amount, strategy_available, single_available, total_available, cash_available, risk_sized_amount)
+        shares = int(max_amount / price / 100) * 100 if price > 0 else 0
+        amount = round(shares * price, 2)
+
+        note = (
+            f"raw={raw_amount:.0f}; strategy_avail={strategy_available:.0f}; "
+            f"single_avail={single_available:.0f}; total_avail={total_available:.0f}; "
+            f"cash_after_buffer={cash_available:.0f}; risk_sized={risk_sized_amount:.0f}; "
+            f"risk_level={risk_level}; score={final_score:.0f}; stop={stop_price:.2f}"
+        )
+        if amount < SIM_RISK_CONFIG["min_order_amount"] or shares < 100:
+            return {
+                "allowed": False,
+                "reason": "组合风险预算不足，未达到最小下单金额/100股整手",
+                "shares": 0,
+                "amount": 0,
+                "budget_amount": round(max_amount, 2),
+                "note": note,
+                "stop_price": round(stop_price, 4),
+                "per_share_risk": round(per_share_risk, 4),
+            }
+        return {
+            "allowed": True,
+            "shares": shares,
+            "amount": amount,
+            "budget_amount": round(max_amount, 2),
+            "note": note,
+            "stop_price": round(stop_price, 4),
+            "per_share_risk": round(per_share_risk, 4),
+        }
+
+    def _mark_signal_check(self, signal_id: int, reason: str, status: str = "") -> None:
+        if status:
+            _exec_sql("""
+                UPDATE st_sim_signal
+                SET status = :status, last_check_reason = :reason,
+                    last_check_at = NOW(), updated_at = NOW()
+                WHERE id = :id
+            """, {"id": signal_id, "status": status, "reason": reason})
+        else:
+            _exec_sql("""
+                UPDATE st_sim_signal
+                SET last_check_reason = :reason, last_check_at = NOW(), updated_at = NOW()
+                WHERE id = :id
+            """, {"id": signal_id, "reason": reason})
+
+    def _expire_unfilled_signals(self, trade_date: str) -> int:
+        e = get_engine()
+        with e.begin() as c:
+            result = c.execute(text("""
+                UPDATE st_sim_signal
+                SET status = 'EXPIRED',
+                    last_check_reason = '14:30后未触发买入，信号过期',
+                    last_check_at = NOW(),
+                    updated_at = NOW()
+                WHERE trade_mode = 'live'
+                  AND trade_date = :trade_date
+                  AND status = 'NEW'
+            """), {"trade_date": trade_date})
+            return int(result.rowcount or 0)
+
+    def _create_order(
+        self,
+        signal: dict,
+        price: float,
+        shares: int,
+        reason: str,
+        *,
+        side: str = "BUY",
+        trade_mode: str = "live",
+        order_type: str = "SIM_LIMIT",
+        position_id: int | None = None,
+        risk_budget: dict | None = None,
+        price_source: str = "",
+    ) -> int:
+        now = datetime.now()
+        side = str(side or "BUY").upper()
+        risk_budget = risk_budget or {}
+        limit_price = signal.get("entry_price_high") or price
+        if side == "SELL" and order_type == "SIM_MARKET":
+            limit_price = None
+        return _exec_insert_get_id("""
+            INSERT INTO st_sim_order
+            (signal_id, trade_mode, order_date, order_time, stock_code, short_name,
+             strategy_type, side, order_type, limit_price, target_price, requested_shares,
+             remaining_shares, status, position_id, source_event, price_source,
+             risk_budget_amount, risk_budget_note, reason, created_at, updated_at)
+            VALUES
+            (:signal_id, :trade_mode, :order_date, :order_time, :code, :name,
+             :strategy_type, :side, :order_type, :limit_price, :target_price, :requested_shares,
+             :remaining_shares, 'PENDING', :position_id, :source_event, :price_source,
+             :risk_budget_amount, :risk_budget_note, :reason, NOW(), NOW())
+        """, {
+            "signal_id": signal.get("id"),
+            "trade_mode": trade_mode,
+            "order_date": str(signal.get("trade_date") or date.today().isoformat())[:10],
+            "order_time": now.strftime("%H:%M:%S"),
+            "code": signal["stock_code"],
+            "name": signal.get("short_name") or signal["stock_code"],
+            "strategy_type": signal["strategy_type"],
+            "side": side,
+            "order_type": order_type,
+            "limit_price": limit_price,
+            "target_price": price,
+            "requested_shares": shares,
+            "remaining_shares": shares,
+            "position_id": position_id,
+            "source_event": "SIGNAL_BUY" if side == "BUY" else "RISK_SELL",
+            "price_source": price_source,
+            "risk_budget_amount": risk_budget.get("budget_amount", 0),
+            "risk_budget_note": risk_budget.get("note", ""),
+            "reason": reason,
+        })
+
+    def _mark_signal_ordered(self, signal_id: int, order_id: int, shares: int, amount: float, budget: dict, reason: str) -> None:
+        _exec_sql("""
+            UPDATE st_sim_signal
+            SET status = 'ORDERED',
+                pending_order_id = :order_id,
+                intended_shares = :shares,
+                intended_amount = :amount,
+                risk_budget_amount = :budget_amount,
+                risk_budget_note = :risk_budget_note,
+                last_check_reason = :reason,
+                last_check_at = NOW(),
+                updated_at = NOW()
+            WHERE id = :id
+        """, {
+            "id": signal_id,
+            "order_id": order_id,
+            "shares": shares,
+            "amount": amount,
+            "budget_amount": budget.get("budget_amount", amount),
+            "risk_budget_note": budget.get("note", ""),
+            "reason": reason,
+        })
+
+    def _fill_order(self, order_id: int, price: float, shares: int, amount: float, fee: float, position_id: int) -> None:
+        _exec_sql("""
+            UPDATE st_sim_order
+            SET status = CASE
+                    WHEN GREATEST(remaining_shares - :shares, 0) = 0 THEN 'FILLED'
+                    ELSE 'PARTIAL'
+                END,
+                filled_price = CASE
+                    WHEN filled_shares + :shares > 0
+                    THEN ((COALESCE(filled_price, 0) * filled_shares) + (:price * :shares)) / (filled_shares + :shares)
+                    ELSE :price
+                END,
+                filled_shares = filled_shares + :shares,
+                remaining_shares = GREATEST(remaining_shares - :shares, 0),
+                filled_amount = filled_amount + :amount,
+                fee = fee + :fee,
+                position_id = :position_id,
+                filled_at = CASE WHEN GREATEST(remaining_shares - :shares, 0) = 0 THEN NOW() ELSE filled_at END,
+                match_count = match_count + 1,
+                last_match_reason = 'matched',
+                updated_at = NOW()
+            WHERE id = :id
+        """, {
+            "id": order_id,
+            "price": price,
+            "shares": shares,
+            "amount": amount,
+            "fee": fee,
+            "position_id": position_id,
+        })
+
+    def _mark_order_waiting(self, order_id: int, reason: str) -> None:
+        _exec_sql("""
+            UPDATE st_sim_order
+            SET last_match_reason = :reason, updated_at = NOW()
+            WHERE id = :id
+              AND status IN ('PENDING', 'PARTIAL')
+        """, {"id": order_id, "reason": reason})
+
+    def _mark_order_closed(self, order_id: int, status: str, reason: str) -> None:
+        _exec_sql("""
+            UPDATE st_sim_order
+            SET status = :status,
+                reject_reason = CASE WHEN :status = 'REJECTED' THEN :reason ELSE reject_reason END,
+                cancel_reason = CASE WHEN :status IN ('CANCELLED', 'EXPIRED') THEN :reason ELSE cancel_reason END,
+                last_match_reason = :reason,
+                updated_at = NOW()
+            WHERE id = :id
+        """, {"id": order_id, "status": status, "reason": reason})
+
+    def _expire_open_orders(self, trade_date: str) -> int:
+        now = datetime.now()
+        buy_expired = 0
+        e = get_engine()
+        with e.begin() as c:
+            if _is_signal_expire_time(now):
+                result = c.execute(text("""
+                    UPDATE st_sim_order
+                    SET status = 'EXPIRED',
+                        cancel_reason = '14:30后买入订单未成交，自动过期',
+                        last_match_reason = '14:30后买入订单未成交，自动过期',
+                        updated_at = NOW()
+                    WHERE trade_mode = 'live'
+                      AND order_date = :trade_date
+                      AND side = 'BUY'
+                      AND status IN ('PENDING', 'PARTIAL')
+                """), {"trade_date": trade_date})
+                buy_expired += int(result.rowcount or 0)
+            if now.time() > datetime.strptime("15:01:00", "%H:%M:%S").time():
+                result = c.execute(text("""
+                    UPDATE st_sim_order
+                    SET status = 'EXPIRED',
+                        cancel_reason = '收盘后订单未成交，自动过期',
+                        last_match_reason = '收盘后订单未成交，自动过期',
+                        updated_at = NOW()
+                    WHERE trade_mode = 'live'
+                      AND order_date = :trade_date
+                      AND status IN ('PENDING', 'PARTIAL')
+                """), {"trade_date": trade_date})
+                buy_expired += int(result.rowcount or 0)
+        _exec_sql("""
+            UPDATE st_sim_signal s
+            JOIN st_sim_order o ON o.id = s.pending_order_id
+            SET s.status = 'EXPIRED',
+                s.last_check_reason = COALESCE(o.cancel_reason, o.last_match_reason, '订单过期'),
+                s.last_check_at = NOW(),
+                s.updated_at = NOW()
+            WHERE s.trade_mode = 'live'
+              AND s.trade_date = :trade_date
+              AND s.status = 'ORDERED'
+              AND o.status = 'EXPIRED'
+        """, {"trade_date": trade_date})
+        return buy_expired
+
+    def _slipped_price(self, side: str, price: float) -> float:
+        side = str(side or "").upper()
+        pct = SIM_RISK_CONFIG["slippage_buy_pct"] if side == "BUY" else SIM_RISK_CONFIG["slippage_sell_pct"]
+        sign = 1 if side == "BUY" else -1
+        return round(price * (1 + sign * pct / 100.0), 4)
+
+    def _liquidity_shares(self, order: dict, price_info: dict | None) -> int:
+        remaining = int(order.get("remaining_shares") or 0)
+        if remaining <= 0:
+            requested = int(order.get("requested_shares") or 0)
+            filled = int(order.get("filled_shares") or 0)
+            remaining = max(0, requested - filled)
+        volume = _safe_float((price_info or {}).get("volume"))
+        if volume <= 0:
+            return remaining
+        max_shares = int(volume * SIM_RISK_CONFIG["liquidity_volume_pct"] / 100) * 100
+        return min(remaining, max(0, max_shares))
+
+    def _create_sell_order_from_signal(self, sell_signal: dict, trade_date: str) -> dict | None:
+        position_id = int(sell_signal.get("position_id") or 0)
+        if position_id <= 0:
+            return None
+        existing = _read_sql("""
+            SELECT id, status
+            FROM st_sim_order
+            WHERE trade_mode = :mode
+              AND side = 'SELL'
+              AND position_id = :position_id
+              AND status IN ('PENDING', 'PARTIAL')
+            ORDER BY id DESC
+            LIMIT 1
+        """, {"mode": sell_signal.get("trade_mode") or "live", "position_id": position_id})
+        if existing:
+            return {"status": "exists", "order_id": existing[0]["id"], "position_id": position_id}
+
+        order_signal = {
+            "id": None,
+            "trade_date": trade_date,
+            "stock_code": sell_signal["stock_code"],
+            "short_name": sell_signal.get("short_name") or sell_signal["stock_code"],
+            "strategy_type": sell_signal["strategy_type"],
+        }
+        reason = sell_signal.get("reason_detail") or sell_signal.get("reason") or "risk_sell"
+        order_id = self._create_order(
+            order_signal,
+            _safe_float(sell_signal.get("sell_price")),
+            int(sell_signal.get("shares") or 0),
+            reason,
+            side="SELL",
+            trade_mode=sell_signal.get("trade_mode") or "live",
+            order_type="SIM_MARKET",
+            position_id=position_id,
+            price_source=sell_signal.get("price_source", ""),
+        )
+        self._log_event(
+            "SELL_ORDER_CREATED",
+            trade_mode=sell_signal.get("trade_mode") or "live",
+            order_id=order_id,
+            position_id=position_id,
+            stock_code=sell_signal["stock_code"],
+            strategy_type=sell_signal["strategy_type"],
+            message=reason,
+            payload=sell_signal,
+            event_date=trade_date,
+        )
+        return {"status": "created", "order_id": order_id, "position_id": position_id}
+
+    def _match_buy_order(self, order: dict, price_info: dict, state: dict) -> dict:
+        price = _safe_float(price_info.get("price"))
+        if price <= 0:
+            self._mark_order_waiting(order["id"], "未获取到可用实时价格")
+            return {"order_id": order["id"], "status": "waiting", "reason": "no_price"}
+        if price_info.get("source") == "kline_close":
+            self._mark_order_waiting(order["id"], "实时撮合禁止使用日K收盘价")
+            return {"order_id": order["id"], "status": "waiting", "reason": "stale_price"}
+        if _is_near_limit_up(price_info):
+            self._mark_order_waiting(order["id"], "接近涨停，买入订单等待")
+            return {"order_id": order["id"], "status": "waiting", "reason": "limit_up"}
+        limit_price = _safe_float(order.get("limit_price"), _safe_float(order.get("target_price")))
+        if limit_price > 0 and price > limit_price:
+            self._mark_order_waiting(order["id"], f"当前价{price:.2f}高于限价{limit_price:.2f}")
+            return {"order_id": order["id"], "status": "waiting", "reason": "above_limit"}
+
+        liquidity_shares = self._liquidity_shares(order, price_info)
+        if liquidity_shares < 100:
+            self._mark_order_waiting(order["id"], "可模拟流动性不足100股")
+            return {"order_id": order["id"], "status": "waiting", "reason": "liquidity"}
+
+        fill_price = self._slipped_price("BUY", price)
+        shares = int(liquidity_shares / 100) * 100
+        amount = round(fill_price * shares, 2)
+        if amount > _safe_float(state.get("cash_available_after_buffer")):
+            affordable = int(_safe_float(state.get("cash_available_after_buffer")) / fill_price / 100) * 100
+            shares = max(0, min(shares, affordable))
+            amount = round(fill_price * shares, 2)
+        if shares < 100:
+            self._mark_order_waiting(order["id"], "现金缓冲后可用资金不足")
+            return {"order_id": order["id"], "status": "waiting", "reason": "cash"}
+
+        buy_signal = {
+            "stock_code": order["stock_code"],
+            "short_name": order.get("short_name") or order["stock_code"],
+            "strategy_type": order["strategy_type"],
+            "trade_mode": order.get("trade_mode") or "live",
+            "buy_date": str(order.get("order_date") or date.today().isoformat())[:10],
+            "buy_time": datetime.now().strftime("%H:%M:%S"),
+            "price": fill_price,
+            "shares": shares,
+            "amount": amount,
+            "ai_score": _safe_float(order.get("ai_score")),
+            "reason": (order.get("reason") or "") + f"；撮合成交价{fill_price:.2f}",
+            "price_source": price_info.get("source", ""),
+            "signal_id": order.get("signal_id"),
+            "order_id": order["id"],
+        }
+        ret = self.execute_buy(buy_signal)
+        self._fill_order(order["id"], fill_price, shares, ret.get("amount", amount), ret.get("fee", 0), ret.get("position_id", 0))
+        if order.get("signal_id"):
+            order_after = _read_sql("SELECT status FROM st_sim_order WHERE id = :id", {"id": order["id"]})
+            final_status = str((order_after[0] if order_after else {}).get("status") or "")
+            _exec_sql("""
+                UPDATE st_sim_signal
+                SET status = CASE WHEN :order_status = 'FILLED' THEN 'FILLED' ELSE 'ORDERED' END,
+                    filled_order_id = :order_id,
+                    filled_position_id = :position_id,
+                    last_check_reason = :reason,
+                    last_check_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = :signal_id
+            """, {
+                "order_status": final_status,
+                "order_id": order["id"],
+                "position_id": ret.get("position_id", 0),
+                "reason": f"模拟订单撮合{final_status}",
+                "signal_id": order.get("signal_id"),
+            })
+        self._log_event(
+            "ORDER_FILLED",
+            trade_mode=order.get("trade_mode") or "live",
+            signal_id=order.get("signal_id"),
+            order_id=order["id"],
+            position_id=ret.get("position_id", 0),
+            stock_code=order["stock_code"],
+            strategy_type=order["strategy_type"],
+            message=f"BUY {shares} @ {fill_price:.2f}",
+            payload={**ret, "price_source": price_info.get("source", "")},
+            event_date=str(order.get("order_date") or date.today().isoformat())[:10],
+        )
+        return {"order_id": order["id"], "status": "filled", "side": "BUY", **ret}
+
+    def _match_sell_order(self, order: dict, price_info: dict) -> dict:
+        position_id = int(order.get("position_id") or 0)
+        rows = _read_sql("""
+            SELECT id, stock_code, short_name, strategy_type, trade_mode,
+                   buy_price, buy_shares, buy_date, buy_amount, ai_score
+            FROM st_sim_position
+            WHERE id = :id AND status = 'holding'
+        """, {"id": position_id})
+        if not rows:
+            self._mark_order_closed(order["id"], "CANCELLED", "持仓不存在或已平仓")
+            return {"order_id": order["id"], "status": "cancelled", "reason": "position_closed"}
+        h = rows[0]
+        price = _safe_float(price_info.get("price"))
+        if price <= 0:
+            self._mark_order_waiting(order["id"], "未获取到可用实时价格")
+            return {"order_id": order["id"], "status": "waiting", "reason": "no_price"}
+        if _is_near_limit_down(price_info):
+            self._mark_order_waiting(order["id"], "接近跌停，卖出订单等待")
+            return {"order_id": order["id"], "status": "waiting", "reason": "limit_down"}
+
+        buy_date = h.get("buy_date")
+        if isinstance(buy_date, str):
+            buy_d = datetime.strptime(buy_date[:10], "%Y-%m-%d").date()
+        else:
+            buy_d = buy_date
+        td = date.today()
+        holding_days = (td - buy_d).days if buy_d else 0
+        if holding_days < 1:
+            self._mark_order_waiting(order["id"], "A股T+1约束：当日买入不能当日卖出")
+            return {"order_id": order["id"], "status": "waiting", "reason": "t_plus_1"}
+
+        liquidity_shares = self._liquidity_shares(order, price_info)
+        shares = min(int(h.get("buy_shares") or 0), int(order.get("remaining_shares") or 0), liquidity_shares)
+        shares = int(shares / 100) * 100
+        if shares < int(h.get("buy_shares") or 0):
+            self._mark_order_waiting(order["id"], "流动性不足以一次性卖出整笔持仓，等待下一tick")
+            return {"order_id": order["id"], "status": "waiting", "reason": "liquidity"}
+
+        fill_price = self._slipped_price("SELL", price)
+        buy_price = _safe_float(h.get("buy_price"))
+        sell_fee = portfolio_trade_fee("sell", fill_price, shares)
+        buy_fee = portfolio_trade_fee("buy", buy_price, shares)
+        total_fee = round(buy_fee + sell_fee, 2)
+        profit = round((fill_price - buy_price) * shares - total_fee, 2)
+        profit_rate = round(((fill_price - buy_price) / buy_price * 100) if buy_price > 0 else 0, 2)
+        sell_signal = {
+            "position_id": position_id,
+            "stock_code": h["stock_code"],
+            "short_name": h.get("short_name") or h["stock_code"],
+            "strategy_type": h["strategy_type"],
+            "trade_mode": h.get("trade_mode") or order.get("trade_mode") or "live",
+            "buy_price": buy_price,
+            "sell_price": fill_price,
+            "shares": shares,
+            "profit_rate": profit_rate,
+            "profit": profit,
+            "fee": total_fee,
+            "holding_days": holding_days,
+            "reason": "sim_order_match",
+            "reason_detail": (order.get("reason") or "") + f"；撮合成交价{fill_price:.2f}",
+            "sell_date": date.today().isoformat(),
+            "sell_time": datetime.now().strftime("%H:%M:%S"),
+            "ai_score": _safe_float(h.get("ai_score")),
+            "order_id": order["id"],
+        }
+        ret = self.execute_sell(sell_signal)
+        self._fill_order(order["id"], fill_price, shares, round(fill_price * shares, 2), total_fee, position_id)
+        _exec_sql("UPDATE st_sim_position SET exit_order_id = :order_id WHERE id = :position_id", {
+            "order_id": order["id"],
+            "position_id": position_id,
+        })
+        self._log_event(
+            "ORDER_FILLED",
+            trade_mode=sell_signal["trade_mode"],
+            order_id=order["id"],
+            position_id=position_id,
+            stock_code=h["stock_code"],
+            strategy_type=h["strategy_type"],
+            message=f"SELL {shares} @ {fill_price:.2f}",
+            payload={**ret, "price_source": price_info.get("source", "")},
+            event_date=date.today().isoformat(),
+        )
+        return {"order_id": order["id"], "status": "filled", "side": "SELL", **ret}
+
+    def match_open_orders(self, trade_date: str = "", trade_mode: str = "live") -> list[dict]:
+        _ensure_tables()
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        if not _is_trading_time():
+            return []
+        orders = _read_sql("""
+            SELECT o.*, r.ai_score, r.short_score, r.long_score, r.capital_score,
+                   r.technical_score, r.fundamental_score, r.event_risk_level
+            FROM st_sim_order o
+            LEFT JOIN st_sim_signal r ON r.id = o.signal_id
+            WHERE COALESCE(o.trade_mode, 'live') = :mode
+              AND o.order_date <= :trade_date
+              AND o.status IN ('PENDING', 'PARTIAL')
+            ORDER BY CASE WHEN o.side = 'SELL' THEN 0 ELSE 1 END, o.id ASC
+            LIMIT 300
+        """, {"mode": trade_mode, "trade_date": trade_date})
+        if not orders:
+            return []
+        price_map = _fetch_live_prices_batch([o["stock_code"] for o in orders])
+        state = self.portfolio_state(trade_mode, trade_date, price_map)
+        matched = []
+        for order in orders:
+            code = str(order.get("stock_code") or "").zfill(6)
+            price_info = price_map.get(code)
+            if not price_info:
+                price_info = _get_current_price(code)
+            if not price_info:
+                self._mark_order_waiting(order["id"], "未获取到行情，等待下一tick")
+                matched.append({"order_id": order["id"], "status": "waiting", "reason": "no_quote"})
+                continue
+            if str(order.get("side") or "").upper() == "SELL":
+                ret = self._match_sell_order(order, price_info)
+            else:
+                ret = self._match_buy_order(order, price_info, state)
+                if ret.get("status") == "filled":
+                    state = self.portfolio_state(trade_mode, trade_date, price_map)
+            matched.append(ret)
+        return matched
+
+    def run_event_tick(self, trade_date: str = "", *, auto_prepare: bool = True, strict: bool = True) -> dict:
+        """自动模拟交易 tick。
+
+        - 卖出：盘中每次 tick 做风控检查。
+        - 买入：只执行 signal pool 中 NEW 状态的信号；每个信号最多成交一次。
+        """
+        _ensure_tables()
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        result = {
+            "status": "ok",
+            "mode": "live",
+            "trade_date": trade_date,
+            "is_trade_date": _is_trade_date(trade_date),
+            "is_trading_time": _is_trading_time(),
+            "is_buy_window": _is_buy_execution_time(),
+            "prepare": None,
+            "sell_signals": [],
+            "forward_sell_signals": [],
+            "buy_signals": {stype: [] for stype in STRATEGY_CONFIG},
+            "expired_count": 0,
+            "signal_counts": self.signal_pool_counts(trade_date),
+        }
+
+        if not result["is_trade_date"]:
+            result["status"] = "skipped"
+            result["reason"] = f"{trade_date} 不是交易日，模拟交易tick跳过"
+            return result
+
+        if auto_prepare:
+            prepare = self.prepare_signal_pool(trade_date=trade_date, strict=strict)
+            result["prepare"] = prepare
+
+        sell_signals = self.check_sell_signals()
+        for sig in sell_signals:
+            ret = self.execute_sell(sig)
+            result["sell_signals"].append({**sig, **ret})
+
+        forward_sell_signals = self.check_forward_sell_signals()
+        for sig in forward_sell_signals:
+            ret = self.execute_sell(sig)
+            result["forward_sell_signals"].append({**sig, **ret})
+
+        if _is_signal_expire_time():
+            result["expired_count"] = self._expire_unfilled_signals(trade_date)
+            result["signal_counts"] = self.signal_pool_counts(trade_date)
+            return result
+
+        if not _is_buy_execution_time():
+            result["signal_counts"] = self.signal_pool_counts(trade_date)
+            return result
+
+        rows = _read_sql("""
+            SELECT *
+            FROM st_sim_signal
+            WHERE trade_mode = 'live'
+              AND trade_date = :trade_date
+              AND status = 'NEW'
+            ORDER BY final_trade_score DESC, ai_score DESC, id ASC
+            LIMIT 200
+        """, {"trade_date": trade_date})
+        if not rows:
+            result["signal_counts"] = self.signal_pool_counts(trade_date)
+            return result
+
+        live_prices = _fetch_live_prices_batch([r["stock_code"] for r in rows])
+        holding_count_cache: dict[str, int] = {}
+        holding_codes_cache: dict[str, set] = {}
+
+        for row in rows:
+            stype = row["strategy_type"]
+            cfg = STRATEGY_CONFIG.get(stype)
+            if not cfg:
+                self._mark_signal_check(row["id"], "未知策略", "REJECTED")
+                continue
+
+            if stype not in holding_count_cache:
+                holding_count_cache[stype] = self._get_holding_count(stype, trade_mode="live")
+                holding_codes_cache[stype] = self._get_holding_codes(stype, trade_mode="live")
+            if holding_count_cache[stype] >= cfg["max_holding"]:
+                self._mark_signal_check(row["id"], f"{cfg['name']}策略已满仓")
+                continue
+            if row["stock_code"] in holding_codes_cache[stype]:
+                self._mark_signal_check(row["id"], "同策略已持仓，信号不重复成交", "REJECTED")
+                continue
+
+            price_info = live_prices.get(row["stock_code"])
+            if not price_info or price_info.get("price", 0) <= 0:
+                price_info = _get_current_price(row["stock_code"])
+            if not price_info or price_info.get("price", 0) <= 0:
+                self._mark_signal_check(row["id"], "未获取到可用实时价格")
+                continue
+            if price_info.get("source") == "kline_close":
+                self._mark_signal_check(row["id"], "当前无实时价，不能用收盘价自动买入")
+                continue
+            if _is_near_limit_up(price_info):
+                self._mark_signal_check(row["id"], "接近涨停，模拟执行不追入")
+                continue
+
+            price = float(price_info["price"])
+            entry_low = _safe_float(row.get("entry_price_low"), 0.0)
+            entry_high = _safe_float(row.get("entry_price_high"), 0.0)
+            if entry_low > 0 and entry_high > 0 and not (entry_low <= price <= entry_high):
+                self._mark_signal_check(row["id"], f"当前价{price:.2f}不在买入区间{entry_low:.2f}~{entry_high:.2f}")
+                continue
+
+            shares = _calc_shares(price, cfg["buy_amount"])
+            if shares <= 0:
+                self._mark_signal_check(row["id"], "按每笔金额无法买入100股整数手")
+                continue
+
+            order_reason = (
+                f"信号日{str(row['signal_date'])[:10]}，交易日{trade_date}，"
+                f"事件驱动模拟订单；价格来源{price_info.get('source', '')}；{row.get('reason') or ''}"
+            )
+            try:
+                order_id = self._create_order(row, price, shares, order_reason)
+                buy_signal = {
+                    "stock_code": row["stock_code"],
+                    "short_name": row.get("short_name") or row["stock_code"],
+                    "strategy_type": stype,
+                    "trade_mode": "live",
+                    "buy_date": trade_date,
+                    "buy_time": datetime.now().strftime("%H:%M:%S"),
+                    "price": price,
+                    "shares": shares,
+                    "amount": round(price * shares, 2),
+                    "ai_score": _safe_float(row.get("ai_score")),
+                    "short_score": _safe_float(row.get("short_score")),
+                    "long_score": _safe_float(row.get("long_score")),
+                    "capital_score": _safe_float(row.get("capital_score")),
+                    "technical_score": _safe_float(row.get("technical_score")),
+                    "fundamental_score": _safe_float(row.get("fundamental_score")),
+                    "event_risk_level": row.get("event_risk_level") or "LOW",
+                    "reason": order_reason + f"；模拟订单#{order_id}",
+                    "price_source": price_info.get("source", ""),
+                    "signal_id": row["id"],
+                    "order_id": order_id,
+                }
+                ret = self.execute_buy(buy_signal)
+                self._fill_order(
+                    order_id,
+                    price,
+                    shares,
+                    ret.get("amount", round(price * shares, 2)),
+                    ret.get("fee", 0),
+                    ret.get("position_id", 0),
+                )
+                _exec_sql("""
+                    UPDATE st_sim_signal
+                    SET status = 'FILLED',
+                        filled_order_id = :order_id,
+                        filled_position_id = :position_id,
+                        last_check_reason = '已生成模拟订单并成交',
+                        last_check_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = :id
+                """, {"id": row["id"], "order_id": order_id, "position_id": ret.get("position_id", 0)})
+                holding_count_cache[stype] += 1
+                holding_codes_cache[stype].add(row["stock_code"])
+                result["buy_signals"][stype].append({**buy_signal, **ret})
+            except Exception as exc:
+                self._mark_signal_check(row["id"], f"模拟订单执行失败: {exc}")
+
+        result["signal_counts"] = self.signal_pool_counts(trade_date)
+        return result
+
+    # ────────────────────────────────────────
     # 买入信号检测
     # ────────────────────────────────────────
+
+    def run_event_tick(self, trade_date: str = "", *, auto_prepare: bool = True, strict: bool = True) -> dict:
+        """Three-stage event-driven simulated trading tick.
+
+        Stage 1 creates/updates signals and trading intents.
+        Stage 2 creates simulated orders and matches open orders.
+        Stage 3 sizes every new buy order through portfolio/risk budget.
+        """
+        _ensure_tables()
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        result = {
+            "status": "ok",
+            "mode": "live",
+            "trade_date": trade_date,
+            "is_trade_date": _is_trade_date(trade_date),
+            "is_trading_time": _is_trading_time(),
+            "is_buy_window": _is_buy_execution_time(),
+            "prepare": None,
+            "sell_signals": [],
+            "sell_orders": [],
+            "forward_sell_signals": [],
+            "buy_signals": {stype: [] for stype in STRATEGY_CONFIG},
+            "buy_orders": [],
+            "match_results": [],
+            "expired_count": 0,
+            "expired_order_count": 0,
+            "signal_counts": self.signal_pool_counts(trade_date),
+            "order_counts": self.order_counts(trade_date),
+            "portfolio_state": self.portfolio_state("live", trade_date),
+        }
+
+        if not result["is_trade_date"]:
+            result["status"] = "skipped"
+            result["reason"] = f"{trade_date} 不是交易日，模拟交易tick跳过"
+            return result
+
+        if auto_prepare:
+            result["prepare"] = self.prepare_signal_pool(trade_date=trade_date, strict=strict)
+
+        sell_signals = self.check_sell_signals()
+        for sig in sell_signals:
+            created = self._create_sell_order_from_signal(sig, trade_date)
+            if created:
+                result["sell_orders"].append({**sig, **created})
+            result["sell_signals"].append(sig)
+
+        forward_sell_signals = self.check_forward_sell_signals()
+        for sig in forward_sell_signals:
+            ret = self.execute_sell(sig)
+            result["forward_sell_signals"].append({**sig, **ret})
+
+        if _is_signal_expire_time():
+            result["expired_count"] = self._expire_unfilled_signals(trade_date)
+            result["expired_order_count"] = self._expire_open_orders(trade_date)
+        elif result["is_buy_window"]:
+            rows = _read_sql("""
+                SELECT *
+                FROM st_sim_signal
+                WHERE trade_mode = 'live'
+                  AND trade_date = :trade_date
+                  AND status = 'NEW'
+                ORDER BY final_trade_score DESC, ai_score DESC, id ASC
+                LIMIT 200
+            """, {"trade_date": trade_date})
+            live_prices = _fetch_live_prices_batch([r["stock_code"] for r in rows]) if rows else {}
+            state = self.portfolio_state("live", trade_date, live_prices)
+            self._save_risk_budget_snapshot(state, trade_date)
+            holding_count_cache: dict[str, int] = {}
+            holding_codes_cache: dict[str, set] = {}
+
+            for row in rows:
+                stype = row["strategy_type"]
+                cfg = STRATEGY_CONFIG.get(stype)
+                if not cfg:
+                    self._mark_signal_check(row["id"], "未知策略", "REJECTED")
+                    continue
+
+                if stype not in holding_count_cache:
+                    holding_count_cache[stype] = self._get_holding_count(stype, trade_mode="live")
+                    holding_codes_cache[stype] = self._get_holding_codes(stype, trade_mode="live")
+                if holding_count_cache[stype] >= cfg["max_holding"]:
+                    self._mark_signal_check(row["id"], f"{cfg['name']}策略已满仓", "RISK_BLOCKED")
+                    continue
+                if row["stock_code"] in holding_codes_cache[stype]:
+                    self._mark_signal_check(row["id"], "同策略已持仓，信号不重复成交", "REJECTED")
+                    continue
+
+                price_info = live_prices.get(row["stock_code"])
+                if not price_info or price_info.get("price", 0) <= 0:
+                    price_info = _get_current_price(row["stock_code"])
+                if not price_info or price_info.get("price", 0) <= 0:
+                    self._mark_signal_check(row["id"], "未获取到可用实时价格")
+                    continue
+                if price_info.get("source") == "kline_close":
+                    self._mark_signal_check(row["id"], "当前无实时价，不能用收盘价自动买入")
+                    continue
+                if _is_near_limit_up(price_info):
+                    self._mark_signal_check(row["id"], "接近涨停，模拟订单等待下一tick")
+                    continue
+
+                price = float(price_info["price"])
+                entry_low = _safe_float(row.get("entry_price_low"), 0.0)
+                entry_high = _safe_float(row.get("entry_price_high"), 0.0)
+                if entry_low > 0 and entry_high > 0 and not (entry_low <= price <= entry_high):
+                    self._mark_signal_check(row["id"], f"当前价{price:.2f}不在买入区间{entry_low:.2f}~{entry_high:.2f}")
+                    continue
+
+                budget = self._risk_budget_for_signal(row, price, state)
+                if not budget.get("allowed"):
+                    self._mark_signal_check(row["id"], budget.get("reason", "组合风险预算不足"), "RISK_BLOCKED")
+                    self._log_event(
+                        "RISK_BLOCKED",
+                        signal_id=row["id"],
+                        stock_code=row["stock_code"],
+                        strategy_type=stype,
+                        severity="WARN",
+                        message=budget.get("reason", "组合风险预算不足"),
+                        payload=budget,
+                        event_date=trade_date,
+                    )
+                    continue
+
+                order_reason = (
+                    f"信号日{str(row['signal_date'])[:10]}，交易日{trade_date}；"
+                    f"事件驱动生成模拟买单；价格来源{price_info.get('source', '')}；"
+                    f"风险预算：{budget.get('note', '')}；{row.get('reason') or ''}"
+                )
+                try:
+                    order_id = self._create_order(
+                        row,
+                        price,
+                        int(budget["shares"]),
+                        order_reason,
+                        side="BUY",
+                        trade_mode="live",
+                        order_type="SIM_LIMIT",
+                        risk_budget=budget,
+                        price_source=price_info.get("source", ""),
+                    )
+                    self._mark_signal_ordered(
+                        row["id"],
+                        order_id,
+                        int(budget["shares"]),
+                        budget["amount"],
+                        budget,
+                        "已生成模拟买入订单，等待撮合",
+                    )
+                    self._log_event(
+                        "BUY_ORDER_CREATED",
+                        signal_id=row["id"],
+                        order_id=order_id,
+                        stock_code=row["stock_code"],
+                        strategy_type=stype,
+                        message=f"BUY order {budget['shares']} shares @ target {price:.2f}",
+                        payload={"budget": budget, "price_info": price_info},
+                        event_date=trade_date,
+                    )
+                    result["buy_orders"].append({
+                        "order_id": order_id,
+                        "signal_id": row["id"],
+                        "stock_code": row["stock_code"],
+                        "short_name": row.get("short_name") or row["stock_code"],
+                        "strategy_type": stype,
+                        "price": price,
+                        "shares": int(budget["shares"]),
+                        "amount": budget["amount"],
+                        "risk_budget": budget,
+                    })
+                    state = self.portfolio_state("live", trade_date, live_prices)
+                except Exception as exc:
+                    self._mark_signal_check(row["id"], f"模拟订单创建失败: {exc}")
+
+        result["match_results"] = self.match_open_orders(trade_date, "live")
+        result["signal_counts"] = self.signal_pool_counts(trade_date)
+        result["order_counts"] = self.order_counts(trade_date)
+        result["portfolio_state"] = self.portfolio_state("live", trade_date)
+        self._save_risk_budget_snapshot(result["portfolio_state"], trade_date)
+        return result
 
     def check_buy_signals(self, strategy_type: str) -> list[dict]:
         """
@@ -997,15 +2713,17 @@ class SimTradeEngine:
         fee = portfolio_trade_fee("buy", price, shares)
 
         # 写入持仓表
-        _exec_sql("""
+        position_id = _exec_insert_get_id("""
             INSERT INTO st_sim_position
-            (stock_code, short_name, strategy_type, trade_mode, buy_price, buy_amount, buy_shares,
+            (signal_id, entry_order_id, stock_code, short_name, strategy_type, trade_mode, buy_price, buy_amount, buy_shares,
              buy_date, buy_time, buy_reason, ai_score, short_score, long_score,
              capital_score, technical_score, fundamental_score, event_risk_level, status)
-            VALUES (:code, :name, :st, :mode, :price, :amount, :shares,
+            VALUES (:signal_id, :order_id, :code, :name, :st, :mode, :price, :amount, :shares,
                     :date, :time, :reason, :ai, :ss, :ls,
                     :cs, :ts, :fs, :risk, 'holding')
         """, {
+            "signal_id": signal.get("signal_id"),
+            "order_id": signal.get("order_id"),
             "code": signal["stock_code"],
             "name": signal.get("short_name", ""),
             "st": signal["strategy_type"],
@@ -1026,13 +2744,14 @@ class SimTradeEngine:
         })
 
         # 写入流水表
-        _exec_sql("""
+        flow_id = _exec_insert_get_id("""
             INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
+            (order_id, stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, :ft, 'simulation', :st, :mode, 'buy',
+            VALUES (:order_id, :code, :name, :ft, 'simulation', :st, :mode, 'buy',
                     :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
         """, {
+            "order_id": signal.get("order_id"),
             "code": signal["stock_code"],
             "name": signal.get("short_name", ""),
             "ft": "sim_buy",
@@ -1049,7 +2768,8 @@ class SimTradeEngine:
         })
 
         return {"status": "ok", "stock_code": signal["stock_code"], "price": price,
-                "shares": shares, "amount": amount, "fee": round(fee, 2)}
+                "shares": shares, "amount": amount, "fee": round(fee, 2),
+                "position_id": position_id, "flow_id": flow_id}
 
     def execute_sell(self, sell_signal: dict) -> dict:
         """执行模拟卖出"""
@@ -1094,11 +2814,12 @@ class SimTradeEngine:
         # 写入流水表
         _exec_sql("""
             INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
+            (order_id, stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, :ft, 'simulation', :st, :mode, 'sell',
+            VALUES (:order_id, :code, :name, :ft, 'simulation', :st, :mode, 'sell',
                     :price, :shares, :amount, :fee, :reason, :ai, :date, :time)
         """, {
+            "order_id": sell_signal.get("order_id"),
             "code": sell_signal["stock_code"],
             "name": sell_signal.get("short_name", ""),
             "ft": "sim_sell",

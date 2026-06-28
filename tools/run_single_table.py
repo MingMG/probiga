@@ -27,6 +27,35 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 
+def _load_project_env() -> None:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+_load_project_env()
+
+
+def _first_env(env: dict[str, str], *names: str, default: str = "") -> str:
+    for name in names:
+        value = env.get(name, "").strip()
+        if value:
+            return value
+    return default
+
+
 def _sub_run_stock_market(only: str, extra_args: list[str] | None = None) -> int:
     env = os.environ.copy()
     pp = env.get("PYTHONPATH", "").strip()
@@ -66,6 +95,26 @@ def _sub_run_flow_daily(date_str: str = "") -> int:
     env = os.environ.copy()
     pp = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    flow_source = _first_env(
+        env,
+        "DATA_SOURCE_FLOW_DAILY",
+        "SM_STOCK_FLOW_DAILY_SOURCE",
+        "DATA_SOURCE_STOCK_FLOW_DAILY",
+    ).strip().lower()
+    if flow_source == "qmt":
+        cmd = [
+            sys.executable,
+            "-m",
+            "biz.stock_market.sync_stock_market",
+            "--only",
+            "stock_flow_daily",
+            "--limit",
+            "-1",
+        ]
+        if date_str.strip():
+            cmd.extend(["--flow-date", date_str.strip()])
+        print("执行:", " ".join(cmd), flush=True)
+        return subprocess.call(cmd, cwd=str(ROOT), env=env)
     env.setdefault("FLOW_SOURCES", "efinance,push2his,baidu")
     env.setdefault("FLOW_WORKERS", "4")
     env.setdefault("FLOW_REQUEST_DELAY", "0.15")
@@ -81,7 +130,8 @@ def _sub_run_kline_daily(date_str: str = "") -> int:
     env = os.environ.copy()
     pp = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
-    if env.get("SM_STOCK_KLINE_SOURCE", "").strip().lower() in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
+    kline_source = _first_env(env, "DATA_SOURCE_KLINE", "SM_STOCK_KLINE_SOURCE").strip().lower()
+    if kline_source in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
         cmd = [
             sys.executable,
             "-m",
@@ -89,7 +139,7 @@ def _sub_run_kline_daily(date_str: str = "") -> int:
             "--only",
             "stock_kline",
             "--kline-source",
-            env.get("SM_STOCK_KLINE_SOURCE", "myquant").strip().lower(),
+            kline_source or "myquant",
             "--kline-incremental",
             "--limit",
             "-1",
@@ -113,7 +163,12 @@ def _sub_run_minute(minute_type: str) -> int:
     env = os.environ.copy()
     pp = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
-    source = env.get("SM_STOCK_MINUTE_SOURCE", env.get("SM_MARKET_DATA_SOURCE", "")).strip().lower()
+    source = _first_env(
+        env,
+        "DATA_SOURCE_MINUTE",
+        "SM_STOCK_MINUTE_SOURCE",
+        "SM_MARKET_DATA_SOURCE",
+    ).strip().lower()
     if minute_type == "stock" and source in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
         cmd = [
             sys.executable,
@@ -126,6 +181,24 @@ def _sub_run_minute(minute_type: str) -> int:
         ]
         print("鎵ц:", " ".join(cmd), flush=True)
         return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    if minute_type == "index":
+        source = _first_env(env, "DATA_SOURCE_INDEX_MINUTE", "SM_INDEX_MINUTE_SOURCE").strip().lower()
+        if source == "qmt":
+            cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "index_minute", "--limit", "-1"]
+            print("执行:", " ".join(cmd), flush=True)
+            return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    if minute_type == "concept":
+        source = _first_env(env, "DATA_SOURCE_CONCEPT_MINUTE", "SM_CONCEPT_MINUTE_SOURCE").strip().lower()
+        if source == "qmt":
+            cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "concept_east_minute", "--limit", "-1"]
+            print("执行:", " ".join(cmd), flush=True)
+            return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    if minute_type == "flow":
+        source = _first_env(env, "DATA_SOURCE_FLOW_MIN", "SM_STOCK_FLOW_MIN_SOURCE", "DATA_SOURCE_STOCK_FLOW_MIN").strip().lower()
+        if source == "qmt":
+            cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "stock_flow_min", "--limit", "-1"]
+            print("执行:", " ".join(cmd), flush=True)
+            return subprocess.call(cmd, cwd=str(ROOT), env=env)
     env.setdefault("MINUTE_REQUEST_DELAY", "0.12")
     env.setdefault("MINUTE_REQUEST_JITTER", "0.08")
     env.setdefault("MINUTE_BATCH_EVERY", "0")
@@ -151,7 +224,8 @@ def _si_engine_info():
 
 def run_si_all_index_code() -> int:
     # 东财 push2 常不可用：默认先只拉新浪；若要仍试东财再设 SI_INDEX_TRY_EAST_FIRST=1
-    if os.environ.get("SI_INDEX_TRY_EAST_FIRST") != "1":
+    qmt_index_source = _first_env(os.environ, "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST").strip().lower()
+    if qmt_index_source != "qmt" and os.environ.get("SI_INDEX_TRY_EAST_FIRST") != "1":
         os.environ.setdefault("SI_INDEX_PRIMARY", "sina")
 
     from biz.stock_info.sync_stock_info import sync_all_index_code
@@ -166,6 +240,15 @@ def run_si_all_index_code() -> int:
         )
     else:
         print(f"【结果】si_all_index_code 已更新，约 {len(df)} 条指数（去重后）。", flush=True)
+    return 0
+
+
+def run_si_all_code() -> int:
+    from biz.stock_info.sync_stock_info import sync_all_code
+
+    eng, info = _si_engine_info()
+    df = sync_all_code(eng, info)
+    print(f"【结果】si_all_code 已更新，约 {0 if df is None else len(df)} 条。", flush=True)
     return 0
 
 
@@ -194,6 +277,15 @@ def run_si_index_constituent() -> int:
     return 0
 
 
+def run_si_concept_code_east() -> int:
+    from biz.stock_info.sync_stock_info import sync_concept_code_east
+
+    eng, info = _si_engine_info()
+    df = sync_concept_code_east(eng, info)
+    print(f"【结果】si_concept_code_east 已更新，约 {0 if df is None else len(df)} 条。", flush=True)
+    return 0
+
+
 def run_si_concept_constituent_east() -> int:
     import pandas as pd
     from sqlalchemy import create_engine, text
@@ -219,10 +311,40 @@ def run_si_concept_constituent_east() -> int:
     return 0
 
 
+def run_si_stock_relations() -> int:
+    import pandas as pd
+    from sqlalchemy import create_engine, text
+
+    from biz.stock_info.sync_stock_info import (
+        _mysql_url,
+        load_info,
+        run_ddl,
+        sync_all_code,
+        sync_per_stock_tables,
+    )
+
+    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
+    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    run_ddl(eng)
+    info = load_info()
+    df = pd.read_sql(text("SELECT stock_code FROM si_all_code ORDER BY stock_code"), eng)
+    if df.empty:
+        print("si_all_code 为空，先同步股票代码列表…", flush=True)
+        df = sync_all_code(eng, info)
+    sync_per_stock_tables(eng, info, df)
+    print("【结果】si_industry_sw / si_stock_concept_east / si_stock_plate_east 已更新。", flush=True)
+    return 0
+
+
 HANDLERS: dict[str, tuple[str, list[str] | None]] = {
+    "si_all_code": ("py_si_all_code", None),
     "si_all_index_code": ("py_si_index_list", None),
+    "si_concept_code_east": ("py_si_concept_code_east", None),
     "si_index_constituent": ("py_si_index_const", None),
     "si_concept_constituent_east": ("py_si_east_const", None),
+    "si_industry_sw": ("py_si_stock_rel", None),
+    "si_stock_concept_east": ("py_si_stock_rel", None),
+    "si_stock_plate_east": ("py_si_stock_rel", None),
     "sm_concept_capital_flow_east": ("subprocess_sm", ["concept_flow_east"]),
     "sm_concept_east_current": ("subprocess_sm", ["concept_east_current"]),
     "sm_concept_east_kline": ("subprocess_sm", ["concept_east_kline"]),
@@ -247,9 +369,12 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
 
 # --run-all 顺序：先 SI 基础，再个股/指数/概念（全市场较慢），最后舆情
 RUN_ALL_ORDER: list[str] = [
+    "si_all_code",
     "si_all_index_code",
+    "si_concept_code_east",
     "si_index_constituent",
     "si_concept_constituent_east",
+    "si_stock_plate_east",
     "sm_dividend",
     "sm_stock_capital_flow_daily",
     "sm_stock_capital_flow_min",
@@ -293,12 +418,18 @@ def _run_one_table(key: str, date_str: str = "") -> int:
         return _sub_run_sentiment(",".join(payload))
     if kind == "subprocess_sm_akshare":
         return _sub_run_stock_market("stock_kline", extra_args=["--kline-source", "akshare"] + extra)
+    if kind == "py_si_all_code":
+        return run_si_all_code()
     if kind == "py_si_index_list":
         return run_si_all_index_code()
+    if kind == "py_si_concept_code_east":
+        return run_si_concept_code_east()
     if kind == "py_si_index_const":
         return run_si_index_constituent()
     if kind == "py_si_east_const":
         return run_si_concept_constituent_east()
+    if kind == "py_si_stock_rel":
+        return run_si_stock_relations()
     print("内部错误:", kind, file=sys.stderr)
     return 3
 

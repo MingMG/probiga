@@ -7,6 +7,7 @@
 
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -28,6 +29,8 @@ from server.engine.sim_trade_engine import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+SIM_INITIAL_CAPITAL = 1_000_000.0
 
 
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
@@ -65,6 +68,192 @@ def _safe_int(v, default=0) -> int:
 def _normalize_trade_mode(trade_mode: str) -> str:
     trade_mode = (trade_mode or "live").strip().lower()
     return trade_mode if trade_mode in ("live", "backtest", "forward") else "live"
+
+
+def _extract_signal_date_from_reason(reason: str) -> str:
+    text = str(reason or "")
+    m = re.search(r"信号日\s*(\d{4}-\d{2}-\d{2})", text)
+    return m.group(1) if m else ""
+
+
+def _infer_position_signal_date(row: dict, trade_mode: str) -> str:
+    if row.get("signal_date"):
+        return str(row.get("signal_date"))[:10]
+    inferred = _extract_signal_date_from_reason(row.get("buy_reason") or row.get("reason") or "")
+    if inferred:
+        return inferred
+    if trade_mode == "live":
+        buy_date = row.get("buy_date")
+        return str(buy_date)[:10] if buy_date else ""
+    return ""
+
+
+def _candidate_action_rows(signal_date: str, limit: int = 80) -> list[dict]:
+    recs = fetch_recommended_candidates(signal_date)
+    rows = []
+    max_rows = max(1, min(int(limit or 80), 500))
+    for rec in recs[:max_rows]:
+        code = str(rec.get("stock_code") or "").zfill(6)
+        primary = str(rec.get("primary_strategy") or "").strip()
+        evaluations = []
+        allowed = []
+        rejected = []
+        for stype, cfg in STRATEGY_CONFIG.items():
+            decision = build_buy_decision(stype, rec)
+            item = {
+                "strategy_type": stype,
+                "strategy_name": cfg["name"],
+                "allowed": bool(decision.get("allowed")),
+                "reason": decision.get("reason", ""),
+            }
+            evaluations.append(item)
+            if item["allowed"]:
+                allowed.append(item)
+            elif len(rejected) < 2:
+                rejected.append(item)
+
+        preferred = None
+        if primary:
+            preferred = next((x for x in allowed if x["strategy_type"] == primary), None)
+        if not preferred and allowed:
+            preferred = allowed[0]
+
+        signal_status = str(rec.get("signal_status") or "").upper()
+        main_wave_signal = str(rec.get("main_wave_signal") or "").upper()
+        if preferred:
+            action = "BUY_READY"
+            action_label = "可模拟买入"
+            action_reason = preferred["reason"]
+        elif signal_status == "SELL_ALERT" or main_wave_signal in {"REDUCE", "SELL_ALERT"}:
+            action = "SELL_ALERT"
+            action_label = "卖点提醒"
+            action_reason = rec.get("main_wave_reason") or rec.get("reason") or "AI提示卖点/减仓"
+        else:
+            action = "WAIT"
+            action_label = "等待买点"
+            action_reason = (rejected[0]["reason"] if rejected else rec.get("reason") or "")
+
+        rows.append({
+            "stock_code": code,
+            "short_name": rec.get("short_name") or code,
+            "primary_strategy": primary,
+            "preferred_strategy": (preferred or {}).get("strategy_type", ""),
+            "preferred_strategy_name": (preferred or {}).get("strategy_name", ""),
+            "allowed_strategies": allowed,
+            "rejected_samples": rejected,
+            "action": action,
+            "action_label": action_label,
+            "action_reason": action_reason,
+            "ai_score": round(_safe_float(rec.get("ai_score")), 2),
+            "quality_score": round(_safe_float(rec.get("quality_score")), 2),
+            "entry_score": round(_safe_float(rec.get("entry_score")), 2),
+            "final_trade_score": round(_safe_float(rec.get("final_trade_score")), 2),
+            "expected_return_pct": round(_safe_float(rec.get("expected_return_pct")), 2),
+            "main_wave_score": round(_safe_float(rec.get("main_wave_score")), 2),
+            "trend_hold_score": round(_safe_float(rec.get("trend_hold_score")), 2),
+            "signal_status": signal_status or "-",
+            "main_wave_signal": main_wave_signal or "-",
+            "entry_price_low": rec.get("entry_price_low"),
+            "entry_price_high": rec.get("entry_price_high"),
+            "stop_loss_price": rec.get("stop_loss_price"),
+            "take_profit_1": rec.get("take_profit_1"),
+            "take_profit_2": rec.get("take_profit_2"),
+            "trend_stop_price": rec.get("trend_stop_price"),
+            "trend_reduce_price": rec.get("trend_reduce_price"),
+            "evaluations": evaluations,
+        })
+
+    rows.sort(key=lambda r: (
+        0 if r["action"] == "BUY_READY" else 1 if r["action"] == "WAIT" else 2,
+        -max(_safe_float(r.get("final_trade_score")), _safe_float(r.get("main_wave_score"))),
+    ))
+    return rows
+
+
+def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dict:
+    candidate_rows = _candidate_action_rows(signal_date, limit=500)
+    positions = _read_sql("""
+        SELECT stock_code, short_name, strategy_type, status, buy_date, buy_reason,
+               sell_date, profit, profit_rate
+        FROM st_sim_position
+        WHERE COALESCE(trade_mode, 'live') = :mode
+        ORDER BY id DESC
+    """, {"mode": trade_mode})
+
+    matched_positions = []
+    for row in positions:
+        if _infer_position_signal_date(row, trade_mode) == signal_date:
+            matched_positions.append(row)
+
+    win_count = 0
+    closed_count = 0
+    total_profit = 0.0
+    closed_rates = []
+    bought_codes = set()
+    bought_pairs = set()
+    by_strategy = {}
+
+    for row in matched_positions:
+        stype = str(row.get("strategy_type") or "")
+        code = str(row.get("stock_code") or "").zfill(6)
+        bought_codes.add(code)
+        bought_pairs.add((code, stype))
+        info = by_strategy.setdefault(stype, {
+            "strategy_type": stype,
+            "bought_count": 0,
+            "closed_count": 0,
+            "win_count": 0,
+            "win_rate": 0.0,
+            "avg_profit_rate": 0.0,
+            "total_profit": 0.0,
+        })
+        info["bought_count"] += 1
+        if row.get("status") == "sold":
+            profit = _safe_float(row.get("profit"))
+            profit_rate = _safe_float(row.get("profit_rate"))
+            total_profit += profit
+            closed_count += 1
+            closed_rates.append(profit_rate)
+            info["closed_count"] += 1
+            info["total_profit"] += profit
+            if profit > 0:
+                win_count += 1
+                info["win_count"] += 1
+            if profit_rate or profit_rate == 0:
+                info.setdefault("_rates", []).append(profit_rate)
+
+    for stype, info in by_strategy.items():
+        cnt = info["closed_count"]
+        rates = info.pop("_rates", [])
+        info["win_rate"] = round(info["win_count"] / cnt * 100, 1) if cnt else 0.0
+        info["avg_profit_rate"] = round(sum(rates) / len(rates), 2) if rates else 0.0
+        info["total_profit"] = round(info["total_profit"], 2)
+
+    buy_ready_rows = [r for r in candidate_rows if r["action"] == "BUY_READY"]
+    wait_rows = [r for r in candidate_rows if r["action"] == "WAIT"]
+    sell_alert_rows = [r for r in candidate_rows if r["action"] == "SELL_ALERT"]
+
+    return {
+        "signal_date": signal_date,
+        "trade_mode": trade_mode,
+        "total_recommendations": len(candidate_rows),
+        "buy_ready_count": len(buy_ready_rows),
+        "wait_count": len(wait_rows),
+        "sell_alert_count": len(sell_alert_rows),
+        "bought_count": len(matched_positions),
+        "bought_stock_count": len(bought_codes),
+        "closed_count": closed_count,
+        "win_count": win_count,
+        "win_rate": round(win_count / closed_count * 100, 1) if closed_count else 0.0,
+        "avg_profit_rate": round(sum(closed_rates) / len(closed_rates), 2) if closed_rates else 0.0,
+        "total_profit": round(total_profit, 2),
+        "buy_ready_ratio": round(len(buy_ready_rows) / len(candidate_rows) * 100, 1) if candidate_rows else 0.0,
+        "buy_ready_rows": buy_ready_rows[:5],
+        "wait_rows": wait_rows[:3],
+        "sell_alert_rows": sell_alert_rows[:3],
+        "by_strategy": sorted(by_strategy.values(), key=lambda x: (-x["bought_count"], x["strategy_type"])),
+        "bought_pairs": [{"stock_code": code, "strategy_type": stype} for code, stype in sorted(bought_pairs)],
+    }
 
 
 def _recent_closed_trade_rows(trade_mode: str, strategy_type: str = "", days: int = 90) -> list[dict]:
@@ -230,6 +419,218 @@ def _trade_mode_stats(trade_mode: str) -> dict:
 # 总览仪表盘
 # ═══════════════════════════════════════════
 
+def _normalize_strategy_filter(strategy_types: str = "") -> list[str]:
+    tokens = [x.strip() for x in re.split(r"[,;|，、\s]+", strategy_types or "") if x.strip()]
+    selected = []
+    for token in tokens:
+        if token in STRATEGY_CONFIG and token not in selected:
+            selected.append(token)
+    return selected or list(STRATEGY_CONFIG.keys())
+
+
+def _strategy_filter_sql(selected: list[str]) -> tuple[str, dict]:
+    selected = [s for s in selected if s in STRATEGY_CONFIG]
+    if not selected or len(selected) == len(STRATEGY_CONFIG):
+        return "", {}
+    params = {}
+    placeholders = []
+    for i, stype in enumerate(selected):
+        key = f"strategy_{i}"
+        params[key] = stype
+        placeholders.append(f":{key}")
+    return f" AND strategy_type IN ({', '.join(placeholders)})", params
+
+
+def _date_text(v) -> str:
+    if not v:
+        return ""
+    if hasattr(v, "isoformat"):
+        return v.isoformat()[:10]
+    return str(v)[:10]
+
+
+def _profit_distribution(rates: list[float]) -> list[dict]:
+    buckets = {"<-10": 0, "-10~-5": 0, "-5~0": 0, "0~5": 0, "5~10": 0, ">10": 0}
+    for rate in rates:
+        if rate < -10:
+            buckets["<-10"] += 1
+        elif rate < -5:
+            buckets["-10~-5"] += 1
+        elif rate < 0:
+            buckets["-5~0"] += 1
+        elif rate < 5:
+            buckets["0~5"] += 1
+        elif rate < 10:
+            buckets["5~10"] += 1
+        else:
+            buckets[">10"] += 1
+    return [{"range": k, "count": v} for k, v in buckets.items()]
+
+
+def _calc_trade_metrics(rows: list[dict], initial_capital: float = SIM_INITIAL_CAPITAL) -> dict:
+    profits = [_safe_float(r.get("profit")) for r in rows]
+    rates = [_safe_float(r.get("profit_rate")) for r in rows]
+    wins = [p for p in profits if p > 0]
+    losses = [p for p in profits if p < 0]
+    win_rates = [r for r in rates if r > 0]
+    loss_rates = [r for r in rates if r < 0]
+
+    closed_count = len(rows)
+    win_count = len(wins)
+    lose_count = closed_count - win_count
+    total_profit = sum(profits)
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    avg_win_rate = sum(win_rates) / len(win_rates) if win_rates else 0.0
+    avg_loss_rate = abs(sum(loss_rates) / len(loss_rates)) if loss_rates else 0.0
+
+    return {
+        "closed_count": closed_count,
+        "win_count": win_count,
+        "lose_count": lose_count,
+        "win_rate": round(win_count / closed_count * 100, 2) if closed_count else 0,
+        "total_profit": round(total_profit, 2),
+        "total_return_rate": round(total_profit / initial_capital * 100, 2) if initial_capital else 0,
+        "avg_profit": round(total_profit / closed_count, 2) if closed_count else 0,
+        "avg_profit_rate": round(sum(rates) / closed_count, 2) if closed_count else 0,
+        "max_profit_rate": round(max(rates), 2) if rates else 0,
+        "max_loss_rate": round(min(rates), 2) if rates else 0,
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else (round(gross_profit, 2) if gross_profit > 0 else 0),
+        "profit_loss_ratio": round(avg_win_rate / avg_loss_rate, 2) if avg_loss_rate > 0 else (round(avg_win_rate, 2) if avg_win_rate > 0 else 0),
+        "avg_holding_days": round(sum(_safe_float(r.get("holding_days")) for r in rows) / closed_count, 1) if closed_count else 0,
+        "total_fee": round(sum(_safe_float(r.get("fee_total")) for r in rows), 2),
+    }
+
+
+def _equity_curve(rows: list[dict], initial_capital: float = SIM_INITIAL_CAPITAL) -> tuple[list[dict], list[dict], float, list[dict]]:
+    daily = {}
+    for row in rows:
+        sell_date = _date_text(row.get("sell_date"))
+        if not sell_date:
+            continue
+        if sell_date not in daily:
+            daily[sell_date] = {"date": sell_date, "pnl": 0.0, "count": 0}
+        daily[sell_date]["pnl"] += _safe_float(row.get("profit"))
+        daily[sell_date]["count"] += 1
+
+    daily_pnl = []
+    equity_curve = []
+    drawdown_curve = []
+    equity = float(initial_capital or SIM_INITIAL_CAPITAL)
+    peak = equity
+    max_drawdown = 0.0
+
+    for day in sorted(daily):
+        pnl = round(daily[day]["pnl"], 2)
+        equity += pnl
+        peak = max(peak, equity)
+        drawdown = ((peak - equity) / peak * 100) if peak > 0 else 0.0
+        max_drawdown = max(max_drawdown, drawdown)
+        daily_pnl.append({"date": day, "pnl": pnl, "count": daily[day]["count"]})
+        equity_curve.append({"date": day, "equity": round(equity, 2), "pnl": pnl})
+        drawdown_curve.append({"date": day, "drawdown": round(drawdown, 2)})
+
+    return daily_pnl, equity_curve, drawdown_curve, round(max_drawdown, 2)
+
+
+def _format_backtest_trade(row: dict) -> dict:
+    stype = row.get("strategy_type") or ""
+    return {
+        "id": row.get("id"),
+        "stock_code": str(row.get("stock_code") or "").zfill(6),
+        "short_name": row.get("short_name") or row.get("stock_code") or "",
+        "strategy_type": stype,
+        "strategy_name": STRATEGY_CONFIG.get(stype, {}).get("name", stype),
+        "status": row.get("status") or "",
+        "buy_price": round(_safe_float(row.get("buy_price")), 4),
+        "buy_amount": round(_safe_float(row.get("buy_amount")), 2),
+        "buy_shares": _safe_int(row.get("buy_shares")),
+        "buy_date": _date_text(row.get("buy_date")),
+        "sell_price": round(_safe_float(row.get("sell_price")), 4) if row.get("sell_price") is not None else None,
+        "sell_date": _date_text(row.get("sell_date")),
+        "profit": round(_safe_float(row.get("profit")), 2),
+        "profit_rate": round(_safe_float(row.get("profit_rate")), 2),
+        "holding_days": _safe_int(row.get("holding_days")),
+        "fee_total": round(_safe_float(row.get("fee_total")), 2),
+        "ai_score": round(_safe_float(row.get("ai_score")), 2),
+        "signal_date": _infer_position_signal_date(row, "backtest"),
+        "buy_reason": row.get("buy_reason") or "",
+        "sell_reason": row.get("sell_reason") or "",
+    }
+
+
+def _sim_backtest_report(strategy_types: str = "", initial_capital: float = SIM_INITIAL_CAPITAL) -> dict:
+    selected = _normalize_strategy_filter(strategy_types)
+    filter_sql, filter_params = _strategy_filter_sql(selected)
+    params = {"mode": "backtest", **filter_params}
+
+    closed_rows = _read_sql(f"""
+        SELECT id, stock_code, short_name, strategy_type, status,
+               buy_price, buy_amount, buy_shares, buy_date, buy_reason,
+               sell_price, sell_date, sell_reason, profit, profit_rate,
+               holding_days, fee_total, ai_score
+        FROM st_sim_position
+        WHERE status = 'sold'
+          AND COALESCE(trade_mode, 'live') = :mode
+          {filter_sql}
+        ORDER BY sell_date ASC, id ASC
+    """, params)
+
+    open_rows = _read_sql(f"""
+        SELECT id, stock_code, short_name, strategy_type, status,
+               buy_price, buy_amount, buy_shares, buy_date, buy_reason,
+               sell_price, sell_date, sell_reason, profit, profit_rate,
+               holding_days, fee_total, ai_score
+        FROM st_sim_position
+        WHERE status = 'holding'
+          AND COALESCE(trade_mode, 'live') = :mode
+          {filter_sql}
+        ORDER BY buy_date DESC, id DESC
+        LIMIT 200
+    """, params)
+
+    summary = _calc_trade_metrics(closed_rows, initial_capital)
+    daily_pnl, curve, drawdowns, max_drawdown = _equity_curve(closed_rows, initial_capital)
+    holding_amount = sum(_safe_float(r.get("buy_amount")) for r in open_rows)
+
+    by_strategy = {}
+    for stype in selected:
+        strategy_rows = [r for r in closed_rows if r.get("strategy_type") == stype]
+        strategy_holding = [r for r in open_rows if r.get("strategy_type") == stype]
+        item = _calc_trade_metrics(strategy_rows, initial_capital)
+        item.update({
+            "name": STRATEGY_CONFIG.get(stype, {}).get("name", stype),
+            "holding_count": len(strategy_holding),
+            "holding_amount": round(sum(_safe_float(r.get("buy_amount")) for r in strategy_holding), 2),
+        })
+        by_strategy[stype] = item
+
+    summary.update({
+        "initial_capital": round(float(initial_capital or SIM_INITIAL_CAPITAL), 2),
+        "ending_equity": round(float(initial_capital or SIM_INITIAL_CAPITAL) + _safe_float(summary.get("total_profit")), 2),
+        "holding_count": len(open_rows),
+        "holding_amount": round(holding_amount, 2),
+        "max_drawdown": max_drawdown,
+    })
+
+    rates = [_safe_float(r.get("profit_rate")) for r in closed_rows]
+    return {
+        "status": "ok",
+        "mode": "backtest",
+        "strategy_types": selected,
+        "summary": summary,
+        "by_strategy": by_strategy,
+        "profit_distribution": _profit_distribution(rates),
+        "daily_pnl": daily_pnl,
+        "equity_curve": curve,
+        "drawdown_curve": drawdowns,
+        "recent_trades": [_format_backtest_trade(r) for r in reversed(closed_rows[-80:])],
+        "open_positions": [_format_backtest_trade(r) for r in open_rows],
+    }
+
+
 @router.get("/sim-trade/dashboard")
 def sim_trade_dashboard(trade_mode: str = Query(default="live")):
     """模拟交易总览数据"""
@@ -376,6 +777,24 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
             "total_holding_amount": round(total_holding_amount, 2),
             **_return_metrics(_recent_closed_trade_rows(trade_mode)),
         }
+        result["summary"]["initial_capital"] = round(SIM_INITIAL_CAPITAL, 2)
+        result["summary"]["cash_available"] = round(SIM_INITIAL_CAPITAL + total_profit - total_holding_amount, 2)
+        result["summary"]["total_equity"] = round(SIM_INITIAL_CAPITAL + total_profit, 2)
+        result["summary"]["total_return_rate"] = round(total_profit / SIM_INITIAL_CAPITAL * 100, 2) if SIM_INITIAL_CAPITAL else 0
+        result["summary"]["position_usage_rate"] = round(total_holding_amount / SIM_INITIAL_CAPITAL * 100, 2) if SIM_INITIAL_CAPITAL else 0
+        if trade_mode == "live":
+            result["summary"]["signal_counts"] = engine.signal_pool_counts(date.today().isoformat())
+            result["summary"]["order_counts"] = engine.order_counts(date.today().isoformat())
+        try:
+            result["portfolio_state"] = engine.portfolio_state(trade_mode)
+            result["summary"]["risk_budget"] = {
+                "cash_buffer_amount": result["portfolio_state"].get("cash_buffer_amount", 0),
+                "cash_available_after_buffer": result["portfolio_state"].get("cash_available_after_buffer", 0),
+                "max_total_position_amount": result["portfolio_state"].get("max_total_position_amount", 0),
+                "pending_buy_amount": result["portfolio_state"].get("pending_buy_amount", 0),
+            }
+        except Exception:
+            result["portfolio_state"] = {}
 
         return result
     except Exception as e:
@@ -492,6 +911,61 @@ def sim_trade_candidates(
 # ═══════════════════════════════════════════
 # 当前持仓
 # ═══════════════════════════════════════════
+
+@router.get("/sim-trade/recommendation-summary")
+def sim_trade_recommendation_summary(
+    signal_date: str = Query(default=""),
+    trade_mode: str = Query(default="backtest"),
+    days: int = Query(default=20),
+):
+    """按 AI 推荐日汇总：可买数量、实际买入数量、以及买后胜率。"""
+    try:
+        _ensure_tables()
+        trade_mode = _normalize_trade_mode(trade_mode)
+        days = max(1, min(int(days or 20), 120))
+
+        latest_row = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
+        latest_signal_date = str((latest_row[0] if latest_row else {}).get("d") or "")[:10]
+        signal_date = (signal_date or latest_signal_date or "")[:10]
+
+        if not signal_date:
+            return {
+                "mode": trade_mode,
+                "signal_date": "",
+                "latest": {},
+                "recent": [],
+                "error": "暂无 AI 推荐数据",
+            }
+
+        recent_dates = _read_sql(f"""
+            SELECT DISTINCT pick_date
+            FROM st_recommended_stocks
+            WHERE pick_date <= :d
+            ORDER BY pick_date DESC
+            LIMIT {days}
+        """, {"d": signal_date})
+        ordered_dates = [str(r.get("pick_date"))[:10] for r in recent_dates if r.get("pick_date")]
+        if signal_date not in ordered_dates:
+            ordered_dates.insert(0, signal_date)
+
+        latest_summary = _summarize_recommendation_outcomes(signal_date, trade_mode)
+        recent = []
+        for d in ordered_dates:
+            try:
+                recent.append(_summarize_recommendation_outcomes(d, trade_mode))
+            except Exception:
+                logger.warning("summary skipped for %s", d, exc_info=True)
+
+        return {
+            "mode": trade_mode,
+            "signal_date": signal_date,
+            "latest": latest_summary,
+            "recent": recent,
+        }
+    except Exception as e:
+        logger.error("AI推荐决策摘要失败: %s", e, exc_info=True)
+        return {"mode": trade_mode, "signal_date": signal_date, "latest": {}, "recent": [], "error": str(e)}
+
 
 @router.get("/sim-trade/positions")
 def sim_trade_positions(
@@ -750,32 +1224,10 @@ def sim_trade_stats(trade_mode: str = Query(default="live")):
 
 @router.post("/sim-trade/scan")
 def sim_trade_scan():
-    """手动触发一次模拟交易信号扫描"""
+    """手动触发一次事件驱动模拟交易 tick"""
     try:
         engine = SimTradeEngine()
-        results = {"sell_signals": [], "buy_signals": {}}
-
-        # 先检查卖出
-        sell_signals = engine.check_sell_signals()
-        for sig in sell_signals:
-            ret = engine.execute_sell(sig)
-            results["sell_signals"].append({**sig, **ret})
-
-        forward_sell_signals = engine.check_forward_sell_signals()
-        results["forward_sell_signals"] = []
-        for sig in forward_sell_signals:
-            ret = engine.execute_sell(sig)
-            results["forward_sell_signals"].append({**sig, **ret})
-
-        # 再检查买入(三种策略)
-        for stype in STRATEGY_CONFIG:
-            buy_signals = engine.check_buy_signals(stype)
-            executed = []
-            for sig in buy_signals:
-                ret = engine.execute_buy(sig)
-                executed.append({**sig, **ret})
-            results["buy_signals"][stype] = executed
-
+        results = engine.run_event_tick(auto_prepare=True, strict=True)
         return {"status": "ok", "results": results}
     except Exception as e:
         logger.error(f"模拟交易扫描失败: {e}", exc_info=True)
@@ -785,6 +1237,105 @@ def sim_trade_scan():
 # ═══════════════════════════════════════════
 # 盘中验证
 # ═══════════════════════════════════════════
+
+@router.get("/sim-trade/orders")
+def sim_trade_orders(
+    trade_mode: str = Query(default="live"),
+    status: str = Query(default=""),
+    side: str = Query(default=""),
+    limit: int = Query(default=100),
+):
+    """List simulated orders created by the event-driven trading loop."""
+    try:
+        _ensure_tables()
+        trade_mode = _normalize_trade_mode(trade_mode)
+        limit = max(1, min(int(limit or 100), 500))
+        where = "WHERE COALESCE(trade_mode, 'live') = :mode"
+        params = {"mode": trade_mode, "limit": limit}
+        if status:
+            where += " AND status = :status"
+            params["status"] = status.strip().upper()
+        if side:
+            where += " AND side = :side"
+            params["side"] = side.strip().upper()
+        rows = _read_sql(f"""
+            SELECT id, signal_id, trade_mode, order_date, order_time, stock_code, short_name,
+                   strategy_type, side, order_type, limit_price, target_price,
+                   requested_shares, remaining_shares, status, filled_price, filled_shares,
+                   filled_amount, fee, position_id, source_event, price_source,
+                   risk_budget_amount, risk_budget_note, reason, reject_reason,
+                   last_match_reason, cancel_reason, created_at, updated_at, filled_at
+            FROM st_sim_order
+            {where}
+            ORDER BY id DESC
+            LIMIT :limit
+        """, params)
+        return {"status": "ok", "mode": trade_mode, "data": rows}
+    except Exception as e:
+        logger.error("模拟订单查询失败: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+@router.get("/sim-trade/risk-budget")
+def sim_trade_risk_budget(
+    trade_mode: str = Query(default="live"),
+    trade_date: str = Query(default=""),
+):
+    """Return portfolio state and latest strategy risk budgets."""
+    try:
+        _ensure_tables()
+        trade_mode = _normalize_trade_mode(trade_mode)
+        trade_date = (trade_date or date.today().isoformat())[:10]
+        engine = SimTradeEngine()
+        state = engine.portfolio_state(trade_mode, trade_date)
+        if trade_mode == "live":
+            engine._save_risk_budget_snapshot(state, trade_date)
+        rows = _read_sql("""
+            SELECT strategy_type, initial_capital, total_equity, cash_available,
+                   max_total_position_amount, max_strategy_amount,
+                   used_strategy_amount, pending_strategy_amount,
+                   available_strategy_amount, risk_budget_note, updated_at
+            FROM st_sim_risk_budget
+            WHERE trade_mode = :mode AND budget_date = :trade_date
+            ORDER BY FIELD(strategy_type, 'ultra_short', 'short_term', 'swing', 'main_wave'), strategy_type
+        """, {"mode": trade_mode, "trade_date": trade_date})
+        return {"status": "ok", "mode": trade_mode, "trade_date": trade_date, "portfolio_state": state, "budgets": rows}
+    except Exception as e:
+        logger.error("模拟交易风险预算查询失败: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+@router.get("/sim-trade/events")
+def sim_trade_events(
+    trade_mode: str = Query(default="live"),
+    limit: int = Query(default=100),
+):
+    """Recent event-driven simulated trading log."""
+    try:
+        _ensure_tables()
+        trade_mode = _normalize_trade_mode(trade_mode)
+        limit = max(1, min(int(limit or 100), 500))
+        rows = _read_sql("""
+            SELECT id, trade_mode, event_date, event_time, event_type, signal_id,
+                   order_id, position_id, stock_code, strategy_type, severity,
+                   message, payload, created_at
+            FROM st_sim_event
+            WHERE trade_mode = :mode
+            ORDER BY id DESC
+            LIMIT :limit
+        """, {"mode": trade_mode, "limit": limit})
+        for row in rows:
+            payload = row.get("payload")
+            if isinstance(payload, str) and payload:
+                try:
+                    row["payload"] = json.loads(payload)
+                except Exception:
+                    pass
+        return {"status": "ok", "mode": trade_mode, "data": rows}
+    except Exception as e:
+        logger.error("模拟交易事件查询失败: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}
+
 
 @router.post("/sim-trade/forward/start")
 def sim_trade_forward_start(
@@ -973,6 +1524,8 @@ def sim_trade_forward_scan():
 def sim_trade_backtest(
     start_date: str = Query(default=""),
     end_date: str = Query(default=""),
+    strategy_types: str = Query(default=""),
+    initial_capital: float = Query(default=SIM_INITIAL_CAPITAL),
 ):
     """基于历史数据回测。
 
@@ -982,6 +1535,7 @@ def sim_trade_backtest(
     try:
         _ensure_tables()
         engine = SimTradeEngine()
+        selected_strategies = _normalize_strategy_filter(strategy_types)
 
         if not end_date:
             end_date = date.today().isoformat()
@@ -993,7 +1547,7 @@ def sim_trade_backtest(
             else:
                 return {"status": "error", "error": "无推荐数据，无法回测"}
 
-        max_holding_days = max(cfg.get("max_days", 0) for cfg in STRATEGY_CONFIG.values())
+        max_holding_days = max(STRATEGY_CONFIG[stype].get("max_days", 0) for stype in selected_strategies)
         run_end_date = (
             datetime.strptime(end_date[:10], "%Y-%m-%d").date()
             + timedelta(days=max_holding_days + 10)
@@ -1058,7 +1612,7 @@ def sim_trade_backtest(
                     total_recommendations += 1
                     code = str(rec["stock_code"]).zfill(6)
 
-                    for stype in STRATEGY_CONFIG:
+                    for stype in selected_strategies:
                         decision = build_buy_decision(stype, rec)
                         if not decision["allowed"]:
                             total_rejected_signals += 1
@@ -1083,6 +1637,7 @@ def sim_trade_backtest(
 
         return {
             "status": "ok",
+            "strategy_types": selected_strategies,
             "signal_start_date": signal_dates[0] if signal_dates else "",
             "signal_end_date": signal_dates[-1] if signal_dates else "",
             "run_start_date": dates[0] if dates else "",
@@ -1098,9 +1653,27 @@ def sim_trade_backtest(
             "total_sold": total_sold,
             "skipped_no_next_day": skipped_no_next_day,
             "stats": stats,
+            "report": _sim_backtest_report(
+                strategy_types=",".join(selected_strategies),
+                initial_capital=initial_capital,
+            ),
         }
     except Exception as e:
         logger.error(f"回测失败: {e}", exc_info=True)
+        return {"status": "error", "error": str(e)}
+
+
+@router.get("/sim-trade/backtest/report")
+def sim_trade_backtest_report(
+    strategy_types: str = Query(default=""),
+    initial_capital: float = Query(default=SIM_INITIAL_CAPITAL),
+):
+    """Return the latest strategy-backtest report without mutating positions."""
+    try:
+        _ensure_tables()
+        return _sim_backtest_report(strategy_types=strategy_types, initial_capital=initial_capital)
+    except Exception as e:
+        logger.error("策略回测报告查询失败: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)}
 
 

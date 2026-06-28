@@ -163,6 +163,43 @@ def _log_mysql_target(url_str: str) -> None:
 def _sleep() -> None:
     time.sleep(float(os.environ.get("SM_REQUEST_SLEEP", "0.2")))
 
+
+def _source_value(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip().lower()
+        if value:
+            return value
+    return default
+
+
+def _index_source(kind: str) -> str:
+    upper = str(kind or "").strip().upper()
+    return _source_value(
+        f"DATA_SOURCE_INDEX_{upper}",
+        f"SM_INDEX_{upper}_SOURCE",
+        f"DATA_SOURCE_{upper}",
+    )
+
+
+def _concept_source(kind: str) -> str:
+    upper = str(kind or "").strip().upper()
+    return _source_value(
+        f"DATA_SOURCE_CONCEPT_{upper}",
+        f"SM_CONCEPT_{upper}_SOURCE",
+        "DATA_SOURCE_CONCEPT_LIST",
+        "SI_CONCEPT_SOURCE",
+    )
+
+
+def _stock_flow_source(kind: str) -> str:
+    upper = str(kind or "").strip().upper()
+    return _source_value(
+        f"DATA_SOURCE_FLOW_{upper}",
+        f"SM_STOCK_FLOW_{upper}_SOURCE",
+        f"DATA_SOURCE_STOCK_FLOW_{upper}",
+    )
+
+
 def _max_workers() -> int:
     return max(1, int(os.environ.get("SM_MAX_WORKERS", "4")))
 
@@ -435,18 +472,92 @@ def read_concept_ths_codes(engine: Engine) -> list[str]:
 
 def read_concept_east_codes(engine: Engine) -> list[str]:
     limit = int(os.environ.get("SM_MAX_CONCEPTS", "50"))
-    sql = """
-    SELECT DISTINCT concept_code AS code
-    FROM si_concept_code_east
-    WHERE concept_code IS NOT NULL
-      AND concept_code <> ''
-      AND concept_code LIKE 'BK%%'
-    ORDER BY concept_code
-    """
+    if _concept_source("list") == "qmt":
+        sql = """
+        SELECT DISTINCT concept_code AS code
+        FROM si_concept_code_east
+        WHERE concept_code IS NOT NULL
+          AND concept_code <> ''
+        ORDER BY concept_code
+        """
+    else:
+        sql = """
+        SELECT DISTINCT concept_code AS code
+        FROM si_concept_code_east
+        WHERE concept_code IS NOT NULL
+          AND concept_code <> ''
+          AND concept_code LIKE 'BK%%'
+        ORDER BY concept_code
+        """
     if limit > 0:
         sql += f" LIMIT {limit}"
     with engine.connect() as conn:
         return [r[0] for r in conn.execute(text(sql)).fetchall()]
+
+
+def _read_qmt_concept_meta(engine: Engine, concept_codes: list[str]) -> tuple[pd.DataFrame, dict[str, str]]:
+    if not concept_codes:
+        return pd.DataFrame(columns=["concept_code", "stock_code"]), {}
+    placeholders = ", ".join(f":c{i}" for i in range(len(concept_codes)))
+    params = {f"c{i}": code for i, code in enumerate(concept_codes)}
+    with engine.connect() as conn:
+        members = pd.read_sql(
+            text(
+                f"""
+                SELECT concept_code, stock_code
+                FROM si_concept_constituent_east
+                WHERE concept_code IN ({placeholders})
+                """
+            ),
+            conn,
+            params=params,
+        )
+        names = pd.read_sql(
+            text(
+                f"""
+                SELECT concept_code, name
+                FROM si_concept_code_east
+                WHERE concept_code IN ({placeholders})
+                """
+            ),
+            conn,
+            params=params,
+        )
+    if members.empty:
+        return pd.DataFrame(columns=["concept_code", "stock_code"]), {}
+    members["stock_code"] = members["stock_code"].astype(str).str.zfill(6)
+    name_map = (
+        names.drop_duplicates(subset=["concept_code"], keep="first")
+        .set_index("concept_code")["name"]
+        .fillna("")
+        .astype(str)
+        .to_dict()
+        if not names.empty
+        else {}
+    )
+    return members.drop_duplicates(subset=["concept_code", "stock_code"], keep="first"), name_map
+
+
+def _concept_snapshot_change_pct(concept_kline: pd.DataFrame, concept_code: str, days: int) -> float | None:
+    if concept_kline is None or concept_kline.empty:
+        return None
+    df = concept_kline[concept_kline["index_code"].astype(str) == str(concept_code)].copy()
+    if df.empty:
+        return None
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    df = df[df["trade_date"].notna()].sort_values("trade_date")
+    if df.empty:
+        return None
+    if days <= 1:
+        value = pd.to_numeric(df.iloc[-1].get("change_pct"), errors="coerce")
+        return None if pd.isna(value) else float(value)
+    tail = df.tail(days)
+    if tail.empty:
+        return None
+    factor = 1.0
+    for value in pd.to_numeric(tail["change_pct"], errors="coerce").fillna(0):
+        factor *= 1 + float(value) / 100
+    return (factor - 1) * 100
 
 
 def _chunked(items: list[str], size: int) -> list[list[str]]:
@@ -837,7 +948,7 @@ def step_stock_kline(
         if incremental:
             with engine.begin() as conn:
                 deleted = conn.execute(
-                    text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1 AND `adjust_type` = 0"),
+                    text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1"),
                     {"s": start},
                 ).rowcount
             logger.info("增量模式：已删除 %d 条 trade_date >= %s 的旧数据", deleted, start)
@@ -900,7 +1011,7 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
         return
     if backend is not None:
         logger.info("分钟K线: 使用 registry backend '%s'", backend.name)
-        trade_date = datetime.now().strftime("%Y-%m-%d")
+        trade_date = _default_myquant_minute_date(engine)
         truncate_only(engine, "sm_stock_minute")
         df = backend.fetch_minute(stock_codes, trade_date)
         if df is not None and not df.empty:
@@ -1193,6 +1304,38 @@ def step_stock_bar(engine: Engine, stock_codes: list[str]) -> None:
 
 
 def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
+    if _stock_flow_source("min") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        qmt_codes = to_qmt_stock_symbols(stock_codes)
+        if not qmt_codes:
+            raise RuntimeError("个股分时资金流(QMT): no valid QMT stock codes")
+        else:
+            df = bridge.flow_min(
+                qmt_codes,
+                trade_date=trade_date,
+                start_date=trade_date,
+                end_date=trade_date,
+                batch_size=int(os.environ.get("QMT_FLOW_MIN_BATCH_SIZE", "200")),
+                timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+            )
+            if df is not None and not df.empty:
+                truncate_only(engine, "sm_stock_capital_flow_min")
+                out = df.copy()
+                out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
+                out["trade_time"] = pd.to_datetime(out["trade_time"], errors="coerce")
+                out["snapshot_at"] = _now()
+                cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
+                out = _to_numeric(out, cols)
+                df_to_table(engine, _with_etl(out[["stock_code", "trade_time"] + cols + ["snapshot_at"]]), "sm_stock_capital_flow_min")
+                return
+            raise RuntimeError(
+                "QMT stock flow minute returned no rows from transactioncount1m; "
+                "refusing to fall back to a non-QMT capital-flow source."
+            )
+
     from adata.stock.market.capital_flow.stock_capital_flow import StockCapitalFlow
 
     truncate_only(engine, "sm_stock_capital_flow_min")
@@ -1214,6 +1357,45 @@ def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
 
 
 def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str = "") -> None:
+    if _stock_flow_source("daily") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        target_date = (flow_date or "").strip()
+        end_date = target_date or datetime.now().strftime("%Y-%m-%d")
+        start_date = end_date
+        qmt_codes = to_qmt_stock_symbols(stock_codes)
+        if not qmt_codes:
+            raise RuntimeError("个股日资金流(QMT): no valid QMT stock codes")
+        else:
+            df = bridge.flow_daily(
+                qmt_codes,
+                start_date=start_date,
+                end_date=end_date,
+                batch_size=int(os.environ.get("QMT_FLOW_DAILY_BATCH_SIZE", "250")),
+                timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+            )
+            if df is not None and not df.empty:
+                if target_date:
+                    with engine.begin() as conn:
+                        conn.execute(text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"), {"d": target_date[:10]})
+                else:
+                    truncate_only(engine, "sm_stock_capital_flow_daily")
+                out = df.copy()
+                out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
+                out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                if target_date:
+                    out = out[out["trade_date"] == target_date[:10]].copy()
+                cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
+                out = _to_numeric(out, cols)
+                out = out.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
+                df_to_table(engine, _with_etl(out[["stock_code", "trade_date"] + cols]), "sm_stock_capital_flow_daily")
+                return
+            raise RuntimeError(
+                "QMT stock flow daily returned no rows from transactioncount1d; "
+                "refusing to fall back to a non-QMT capital-flow source."
+            )
+
     from adata.stock.market.capital_flow.stock_capital_flow import StockCapitalFlow
 
     if flow_date:
@@ -1336,6 +1518,35 @@ def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
 def step_concept_east_kline(
     engine: Engine, concept_codes: list[str], kline_start: str | None = None, kline_end: str | None = None
 ) -> None:
+    if _concept_source("kline") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.aggregate import aggregate_concept_kline
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        truncate_only(engine, "sm_concept_east_kline")
+        members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
+        if members.empty:
+            logger.warning("QMT 概念K线: no concept members")
+            return
+        start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
+        end = kline_end or os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
+        qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
+        df = bridge.kline(
+            qmt_codes,
+            start_date=start,
+            end_date=end,
+            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+            batch_size=int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT concept kline source returned no stock rows")
+        out = aggregate_concept_kline(members, df)
+        if out.empty:
+            raise RuntimeError("QMT concept kline aggregation returned no rows")
+        df_to_table(engine, _with_etl(out), "sm_concept_east_kline")
+        return
+
     truncate_only(engine, "sm_concept_east_kline")
     ins = _concept_east_instance()
     k_type = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
@@ -1362,6 +1573,35 @@ def step_concept_east_kline(
 
 
 def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
+    if _concept_source("minute") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.aggregate import aggregate_concept_minute
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        truncate_only(engine, "sm_concept_east_minute")
+        members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
+        if members.empty:
+            logger.warning("QMT 概念分钟: no concept members")
+            return
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
+        df = bridge.minute(
+            qmt_codes,
+            trade_date=trade_date,
+            start_date=trade_date,
+            end_date=trade_date,
+            count=int(os.environ.get("QMT_CONCEPT_MINUTE_COUNT", os.environ.get("QMT_MINUTE_COUNT", "0")) or 0),
+            batch_size=int(os.environ.get("QMT_CONCEPT_MINUTE_BATCH_SIZE", os.environ.get("QMT_MINUTE_BATCH_SIZE", "200"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT concept minute source returned no stock rows")
+        out = aggregate_concept_minute(members, df, snapshot_at=pd.Timestamp(_now()))
+        if out.empty:
+            raise RuntimeError("QMT concept minute aggregation returned no rows")
+        df_to_table(engine, _with_etl(out), "sm_concept_east_minute")
+        return
+
     truncate_only(engine, "sm_concept_east_minute")
     ins = _concept_east_instance()
     now = _now()
@@ -1381,6 +1621,30 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
 
 
 def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
+    if _concept_source("current") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.aggregate import aggregate_concept_current
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        truncate_only(engine, "sm_concept_east_current")
+        members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
+        if members.empty:
+            logger.warning("QMT 概念快照: no concept members")
+            return
+        qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
+        df = bridge.current(
+            qmt_codes,
+            batch_size=int(os.environ.get("QMT_CONCEPT_CURRENT_BATCH_SIZE", os.environ.get("QMT_CURRENT_BATCH_SIZE", "500"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "180")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT concept current source returned no stock rows")
+        out = aggregate_concept_current(members, df)
+        if out.empty:
+            raise RuntimeError("QMT concept current aggregation returned no rows")
+        df_to_table(engine, _with_etl(out), "sm_concept_east_current")
+        return
+
     truncate_only(engine, "sm_concept_east_current")
     ins = _concept_east_instance()
     now = _now()
@@ -1402,6 +1666,132 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
 
 
 def step_concept_flow_east(engine: Engine) -> None:
+    if _concept_source("flow") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.aggregate import aggregate_concept_kline
+        from integrations.qmt.info import to_qmt_stock_symbols
+
+        concept_codes = read_concept_east_codes(engine)
+        truncate_only(engine, "sm_concept_capital_flow_east")
+        members, name_map = _read_qmt_concept_meta(engine, concept_codes)
+        if members.empty:
+            logger.warning("QMT 概念资金流: no concept members")
+            return
+
+        unique_stock_codes = members["stock_code"].astype(str).str.zfill(6).drop_duplicates().tolist()
+        qmt_codes = to_qmt_stock_symbols(unique_stock_codes)
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
+
+        flow_df = bridge.flow_daily(
+            qmt_codes,
+            start_date=start_date,
+            end_date=end_date,
+            batch_size=int(os.environ.get("QMT_FLOW_DAILY_BATCH_SIZE", "250")),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if flow_df is None or flow_df.empty:
+            logger.warning("QMT concept flow source returned no stock flow rows; concept flow will be skipped.")
+            return
+
+        kline_df = bridge.kline(
+            qmt_codes,
+            start_date=start_date,
+            end_date=end_date,
+            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+            batch_size=int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if kline_df is None or kline_df.empty:
+            raise RuntimeError("QMT concept flow source returned no stock kline rows")
+
+        flow_df = flow_df.copy()
+        flow_df["stock_code"] = flow_df["stock_code"].astype(str).str.zfill(6)
+        flow_df["trade_date"] = pd.to_datetime(flow_df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        flow_df = _to_numeric(flow_df, ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"])
+        flow_df = flow_df.dropna(subset=["trade_date"])
+        if flow_df.empty:
+            logger.warning("QMT concept flow rows became empty after normalization; concept flow will be skipped.")
+            return
+
+        kline_df = kline_df.copy()
+        kline_df["stock_code"] = kline_df["stock_code"].astype(str).str.zfill(6)
+        kline_df["trade_date"] = pd.to_datetime(kline_df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        kline_df = _to_numeric(kline_df, ["amount", "change_pct"])
+        concept_kline = aggregate_concept_kline(members, kline_df)
+
+        stock_name_map = _load_stock_short_name_map(engine)
+        all_dates = sorted(flow_df["trade_date"].dropna().astype(str).unique().tolist())
+        if not all_dates:
+            raise RuntimeError("QMT concept flow has no trade dates")
+
+        rows: list[dict[str, Any]] = []
+        now = _now()
+        for days_type in (1, 5, 10):
+            window_dates = all_dates[-days_type:]
+            window_flow = flow_df[flow_df["trade_date"].isin(window_dates)].copy()
+            if window_flow.empty:
+                continue
+            stock_flow = (
+                window_flow.groupby("stock_code", as_index=False)[
+                    ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
+                ]
+                .sum()
+            )
+            stock_amount = (
+                kline_df[kline_df["trade_date"].isin(window_dates)]
+                .groupby("stock_code", as_index=False)[["amount"]]
+                .sum()
+                .rename(columns={"amount": "window_amount"})
+            )
+            merged = members.merge(stock_flow, on="stock_code", how="left").merge(stock_amount, on="stock_code", how="left")
+            merged = merged.fillna(
+                {
+                    "main_net_inflow": 0,
+                    "max_net_inflow": 0,
+                    "lg_net_inflow": 0,
+                    "mid_net_inflow": 0,
+                    "sm_net_inflow": 0,
+                    "window_amount": 0,
+                }
+            )
+
+            for concept_code, frame in merged.groupby("concept_code", sort=False):
+                top = frame.sort_values("main_net_inflow", ascending=False).iloc[0]
+                amount_total = float(pd.to_numeric(frame["window_amount"], errors="coerce").fillna(0).sum())
+                main_net = float(pd.to_numeric(frame["main_net_inflow"], errors="coerce").fillna(0).sum())
+                max_net = float(pd.to_numeric(frame["max_net_inflow"], errors="coerce").fillna(0).sum())
+                lg_net = float(pd.to_numeric(frame["lg_net_inflow"], errors="coerce").fillna(0).sum())
+                mid_net = float(pd.to_numeric(frame["mid_net_inflow"], errors="coerce").fillna(0).sum())
+                sm_net = float(pd.to_numeric(frame["sm_net_inflow"], errors="coerce").fillna(0).sum())
+                rows.append(
+                    {
+                        "days_type": days_type,
+                        "index_code": concept_code,
+                        "index_name": name_map.get(concept_code, concept_code),
+                        "change_pct": _concept_snapshot_change_pct(concept_kline, concept_code, days_type),
+                        "main_net_inflow": main_net,
+                        "main_net_inflow_rate": (main_net / amount_total * 100) if amount_total > 0 else None,
+                        "max_net_inflow": max_net,
+                        "max_net_inflow_rate": (max_net / amount_total * 100) if amount_total > 0 else None,
+                        "lg_net_inflow": lg_net,
+                        "lg_net_inflow_rate": (lg_net / amount_total * 100) if amount_total > 0 else None,
+                        "mid_net_inflow": mid_net,
+                        "mid_net_inflow_rate": (mid_net / amount_total * 100) if amount_total > 0 else None,
+                        "sm_net_inflow": sm_net,
+                        "sm_net_inflow_rate": (sm_net / amount_total * 100) if amount_total > 0 else None,
+                        "stock_code": str(top["stock_code"]).zfill(6),
+                        "stock_name": stock_name_map.get(str(top["stock_code"]).zfill(6), ""),
+                        "snapshot_at": now,
+                    }
+                )
+
+        if not rows:
+            logger.warning("QMT concept flow aggregation returned no rows")
+            return
+        df_to_table(engine, _with_etl(pd.DataFrame(rows)), "sm_concept_capital_flow_east")
+        return
+
     from adata.stock.market.concept_capital_flow.capital_flow_east import CapitalFlowEast
 
     truncate_only(engine, "sm_concept_capital_flow_east")
@@ -1434,6 +1824,43 @@ def step_concept_flow_east(engine: Engine) -> None:
 
 
 def step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | None = None, kline_end: str | None = None) -> None:
+    if _index_source("kline") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_index_symbols
+
+        truncate_only(engine, "sm_index_kline")
+        start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
+        end = kline_end or os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
+        qmt_codes = to_qmt_index_symbols(index_codes)
+        if not qmt_codes:
+            logger.warning("指数K线(QMT): no valid index codes")
+            return
+        df = bridge.kline(
+            qmt_codes,
+            start_date=start,
+            end_date=end,
+            dividend_type="none",
+            batch_size=int(os.environ.get("QMT_INDEX_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT index kline returned no rows")
+        out = pd.DataFrame()
+        out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+        out["trade_time"] = df["trade_time"]
+        out["trade_date"] = df["trade_date"]
+        out["k_type"] = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+        out["open"] = pd.to_numeric(df.get("open"), errors="coerce")
+        out["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+        out["high"] = pd.to_numeric(df.get("high"), errors="coerce")
+        out["low"] = pd.to_numeric(df.get("low"), errors="coerce")
+        out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+        out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+        out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
+        out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
+        df_to_table(engine, _with_etl(out), "sm_index_kline")
+        return
+
     from adata.stock.market.index_market.market_index import StockMarketIndex
 
     truncate_only(engine, "sm_index_kline")
@@ -1460,6 +1887,41 @@ def step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | 
 
 
 def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
+    if _index_source("minute") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_index_symbols
+
+        truncate_only(engine, "sm_index_minute")
+        qmt_codes = to_qmt_index_symbols(index_codes)
+        if not qmt_codes:
+            logger.warning("指数分钟(QMT): no valid index codes")
+            return
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        df = bridge.minute(
+            qmt_codes,
+            trade_date=trade_date,
+            start_date=trade_date,
+            end_date=trade_date,
+            count=int(os.environ.get("QMT_INDEX_MINUTE_COUNT", os.environ.get("QMT_MINUTE_COUNT", "0")) or 0),
+            batch_size=int(os.environ.get("QMT_INDEX_MINUTE_BATCH_SIZE", os.environ.get("QMT_MINUTE_BATCH_SIZE", "200"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT index minute returned no rows")
+        out = pd.DataFrame()
+        out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+        out["trade_time"] = df["trade_time"]
+        out["trade_date"] = df["trade_date"]
+        out["price"] = pd.to_numeric(df.get("price"), errors="coerce")
+        out["avg_price"] = None
+        out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
+        out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
+        out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+        out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+        out["snapshot_at"] = _now()
+        df_to_table(engine, _with_etl(out), "sm_index_minute")
+        return
+
     from adata.stock.market.index_market.market_index import StockMarketIndex
 
     truncate_only(engine, "sm_index_minute")
@@ -1573,6 +2035,38 @@ def _fetch_sina_index_current(index_codes: list[str], snapshot_at: datetime) -> 
 
 
 def step_index_current(engine: Engine, index_codes: list[str]) -> None:
+    if _index_source("current") == "qmt":
+        from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_index_symbols
+
+        qmt_codes = to_qmt_index_symbols(index_codes)
+        if not qmt_codes:
+            logger.warning("指数快照(QMT): no valid index codes")
+            return
+        df = bridge.current(
+            qmt_codes,
+            batch_size=int(os.environ.get("QMT_INDEX_CURRENT_BATCH_SIZE", os.environ.get("QMT_CURRENT_BATCH_SIZE", "500"))),
+            timeout=int(os.environ.get("QMT_TIMEOUT", "120")),
+        )
+        if df is None or df.empty:
+            raise RuntimeError("QMT index current returned no rows")
+        out = pd.DataFrame()
+        out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+        out["trade_time"] = df["snapshot_at"]
+        out["trade_date"] = pd.to_datetime(df["snapshot_at"], errors="coerce").dt.strftime("%Y-%m-%d")
+        out["open"] = pd.to_numeric(df.get("open"), errors="coerce")
+        out["price"] = pd.to_numeric(df.get("price"), errors="coerce")
+        out["high"] = pd.to_numeric(df.get("high"), errors="coerce")
+        out["low"] = pd.to_numeric(df.get("low"), errors="coerce")
+        out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+        out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+        out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
+        out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
+        out["snapshot_at"] = df["snapshot_at"]
+        truncate_only(engine, "sm_index_current")
+        df_to_table(engine, _with_etl(out), "sm_index_current")
+        return
+
     from adata.stock.market.index_market.market_index import StockMarketIndex
 
     ins = StockMarketIndex()

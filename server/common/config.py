@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     database_url: str | None = None
     mysql_url: str | None = None
+    qmt_history_mysql_url: str | None = None
     minute_mysql_url: str | None = None
     minute_data_source: str = "legacy"
     minute_stock_table: str | None = None
@@ -25,6 +26,15 @@ class Settings(BaseSettings):
     api_mysql_pool_size: int = 3
     api_mysql_max_overflow: int = 1
     api_mysql_pool_recycle: int = 1800
+    gj_qmt_home: str | None = None
+    gj_qmt_exe: str | None = None
+    gj_qmt_provider_id: str = "gj_qmt"
+    qmt_ping_timeout: int = 8
+    qmt_live_poll_enabled: bool = False
+    qmt_live_poll_seconds: int = 5
+    qmt_live_idle_sleep_seconds: int = 30
+    qmt_live_trading_hours_only: bool = True
+    qmt_live_candidate_limit: int = 60
     minute_mysql_pool_size: int = 2
     minute_mysql_max_overflow: int = 1
     minute_mysql_pool_recycle: int = 1800
@@ -66,6 +76,20 @@ def get_minute_mysql_url() -> str:
     return (settings.minute_mysql_url or get_mysql_url(required=True)).strip()
 
 
+def get_qmt_history_mysql_url(required: bool = True) -> str:
+    """Return the local MySQL URL used for bulky Guojin QMT historical data.
+
+    This intentionally does not fall back to MYSQL_URL directly. Historical QMT
+    data is large and should live in a local/off-production database unless the
+    operator explicitly points QMT_HISTORY_MYSQL_URL or MINUTE_MYSQL_URL there.
+    """
+    settings = get_settings()
+    url = (settings.qmt_history_mysql_url or settings.minute_mysql_url or "").strip()
+    if required and not url:
+        raise RuntimeError("未配置 QMT_HISTORY_MYSQL_URL 或 MINUTE_MYSQL_URL，本地历史库禁止回退到生产 MYSQL_URL")
+    return url
+
+
 def get_api_mysql_pool_config() -> dict[str, int]:
     """Return small-server-friendly pool settings for the FastAPI process."""
     settings = get_settings()
@@ -93,6 +117,29 @@ def get_scheduler_runtime_config() -> dict[str, int | bool]:
         "embedded_enabled": bool(settings.api_embedded_scheduler_enabled),
         "max_concurrent_tasks": _bounded_int(settings.api_scheduler_max_concurrent_tasks, default=1, minimum=1),
         "poll_seconds": _bounded_int(settings.api_scheduler_poll_seconds, default=60, minimum=15),
+    }
+
+
+def get_qmt_live_runtime_config() -> dict[str, int | bool]:
+    """Return runtime settings for the QMT intraday polling worker."""
+    settings = get_settings()
+    return {
+        "enabled": bool(settings.qmt_live_poll_enabled),
+        "poll_seconds": _bounded_int(settings.qmt_live_poll_seconds, default=5, minimum=2),
+        "idle_sleep_seconds": _bounded_int(settings.qmt_live_idle_sleep_seconds, default=30, minimum=5),
+        "trading_hours_only": bool(settings.qmt_live_trading_hours_only),
+        "candidate_limit": _bounded_int(settings.qmt_live_candidate_limit, default=60, minimum=20),
+    }
+
+
+def get_gj_qmt_config() -> dict[str, str | int | None]:
+    """Return the Guojin QMT client and diagnostics settings."""
+    settings = get_settings()
+    return {
+        "provider_id": (settings.gj_qmt_provider_id or "gj_qmt").strip() or "gj_qmt",
+        "home": (settings.gj_qmt_home or "").strip() or None,
+        "exe": (settings.gj_qmt_exe or "").strip() or None,
+        "ping_timeout": _bounded_int(settings.qmt_ping_timeout, default=8, minimum=1),
     }
 
 

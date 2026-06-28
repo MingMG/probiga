@@ -26,10 +26,20 @@ Thumbs.db
 runtime/
 *.zip
 *.tar
+*.dmp
 *.sql
 probiga_dump.sql
 deploy/*.tar
 _archive/
+server*.log
+data/*.log
+data/*.err.log
+data/*.out.log
+data/logs/
+data/qmt_raw/
+data/ui_previews/
+data/task*.json
+data/task_status.txt
 
 # adata (external library, tracked separately)
 adata/

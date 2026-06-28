@@ -3,7 +3,13 @@
 import unittest
 from unittest.mock import patch
 
-from server.engine.sim_trade_engine import SimTradeEngine, _sina_symbol, build_buy_decision
+from server.engine.sim_trade_engine import (
+    SimTradeEngine,
+    _is_trade_date,
+    _previous_trade_date,
+    _sina_symbol,
+    build_buy_decision,
+)
 
 
 def _candidate(**overrides):
@@ -134,6 +140,71 @@ class SimTradeRuleTest(unittest.TestCase):
         engine = SimTradeEngine()
 
         self.assertEqual(engine.check_sell_signals(), [])
+
+    @patch("server.engine.sim_trade_engine._ensure_tables")
+    def test_risk_budget_sizes_order_by_portfolio_constraints(self, _mock_tables):
+        engine = SimTradeEngine()
+        state = {
+            "total_equity": 1_000_000,
+            "total_available_for_position": 200_000,
+            "cash_available_after_buffer": 180_000,
+            "used_by_strategy": {"short_term": 120_000},
+            "pending_by_strategy": {"short_term": 0},
+            "used_by_stock": {},
+            "pending_by_stock": {},
+        }
+        signal = {
+            "stock_code": "000001",
+            "strategy_type": "short_term",
+            "event_risk_level": "LOW",
+            "final_trade_score": 80,
+            "stop_loss_price": 9.5,
+        }
+
+        budget = engine._risk_budget_for_signal(signal, 10.0, state)
+
+        self.assertTrue(budget["allowed"])
+        self.assertGreaterEqual(budget["shares"], 100)
+        self.assertEqual(budget["shares"] % 100, 0)
+        self.assertLessEqual(budget["amount"], 100_000)
+
+    @patch("server.engine.sim_trade_engine._ensure_tables")
+    def test_risk_budget_blocks_critical_risk(self, _mock_tables):
+        engine = SimTradeEngine()
+        state = {
+            "total_equity": 1_000_000,
+            "total_available_for_position": 200_000,
+            "cash_available_after_buffer": 180_000,
+            "used_by_strategy": {},
+            "pending_by_strategy": {},
+            "used_by_stock": {},
+            "pending_by_stock": {},
+        }
+        signal = {
+            "stock_code": "000001",
+            "strategy_type": "short_term",
+            "event_risk_level": "CRITICAL",
+            "final_trade_score": 90,
+        }
+
+        budget = engine._risk_budget_for_signal(signal, 10.0, state)
+
+        self.assertFalse(budget["allowed"])
+        self.assertEqual(budget["shares"], 0)
+
+    @patch(
+        "server.engine.sim_trade_engine._read_sql",
+        side_effect=[RuntimeError("calendar not available"), [{"trade_date": "2026-06-26"}]],
+    )
+    def test_previous_trade_date_falls_back_to_local_kline(self, _mock_read):
+        self.assertEqual(_previous_trade_date("2026-06-29"), "2026-06-26")
+
+    @patch(
+        "server.engine.sim_trade_engine._read_sql",
+        side_effect=[RuntimeError("calendar not available"), [{"ok": 1}]],
+    )
+    def test_is_trade_date_falls_back_to_local_kline(self, _mock_read):
+        self.assertTrue(_is_trade_date("2026-06-26"))
 
 
 if __name__ == "__main__":

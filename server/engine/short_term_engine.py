@@ -14,6 +14,7 @@
 
 from datetime import datetime, date, timedelta
 
+from .date_context import extract_analysis_date
 from .scoring import (
     score_capital_flow, score_hot_rank, score_rsi,
     score_ma_trend, score_macd,
@@ -474,8 +475,8 @@ class ShortTermEngine:
         notices = news.get('notices', [])
         news_items = news.get('news', [])
 
-        today = date.today()
-        yesterday = today - timedelta(days=1)
+        analysis_date = extract_analysis_date(data, default=date.today())
+        yesterday = analysis_date - timedelta(days=1)
 
         positive_count = 0.0
         negative_count = 0.0
@@ -489,7 +490,7 @@ class ShortTermEngine:
                     d = datetime.strptime(item_date_str[:10], '%Y-%m-%d').date()
                 else:
                     d = item_date_str
-                if d >= today:
+                if d >= analysis_date:
                     return 3.0
                 elif d >= yesterday:
                     return 2.0

@@ -94,6 +94,8 @@ TABLES_TRUNCATE_ORDER = [
     "si_all_code",
 ]
 
+_QMT_SECTOR_CACHE: dict[str, pd.DataFrame] | None = None
+
 
 def _mysql_url() -> str:
     return get_mysql_url(required=True)
@@ -101,6 +103,32 @@ def _mysql_url() -> str:
 
 def _sleep() -> None:
     time.sleep(float(os.environ.get("SI_REQUEST_SLEEP", "0.2")))
+
+
+def _source_value(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip().lower()
+        if value:
+            return value
+    return default
+
+
+def _use_qmt_sector_data() -> bool:
+    return _source_value(
+        "SI_CONCEPT_SOURCE",
+        "SI_INDUSTRY_SOURCE",
+        "DATA_SOURCE_CONCEPT_LIST",
+        "DATA_SOURCE_CODE_LIST",
+    ) == "qmt"
+
+
+def _qmt_sector_tables() -> dict[str, pd.DataFrame]:
+    global _QMT_SECTOR_CACHE
+    if _QMT_SECTOR_CACHE is None:
+        from integrations.qmt.sectors import fetch_sector_datasets
+
+        _QMT_SECTOR_CACHE = fetch_sector_datasets()
+    return _QMT_SECTOR_CACHE
 
 
 def retry_remote(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
@@ -223,6 +251,20 @@ def load_info():
 
 
 def sync_all_code(engine: Engine, info) -> pd.DataFrame:
+    if _source_value("SI_ALL_CODE_SOURCE", "DATA_SOURCE_CODE_LIST") == "qmt":
+        from integrations.qmt.info import fetch_all_stock_codes
+
+        truncate_only(engine, "si_all_code")
+        ts = _now()
+        df = fetch_all_stock_codes()
+        if df is None or df.empty:
+            raise RuntimeError("QMT stock code list returned no rows")
+        df = _clean_object_df(df)
+        df["etl_sync_at"] = ts
+        df_to_table(engine, df, "si_all_code")
+        _sleep()
+        return df
+
     truncate_only(engine, "si_all_code")
     ts = _now()
     df = retry_remote(info.all_code)
@@ -449,6 +491,20 @@ def sync_trade_calendar(engine: Engine, info) -> None:
 
 
 def sync_all_index_code(engine: Engine, info) -> pd.DataFrame:
+    if _source_value("SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST") == "qmt":
+        from integrations.qmt.info import fetch_all_index_codes
+
+        ts = _now()
+        df = fetch_all_index_codes(engine=engine)
+        if df is None or df.empty:
+            raise RuntimeError("QMT index code list returned no rows")
+        df = _clean_object_df(df)
+        df["etl_sync_at"] = ts
+        truncate_only(engine, "si_all_index_code")
+        df_to_table(engine, df, "si_all_index_code")
+        _sleep()
+        return df
+
     """
     报错栈若指向本函数：说明卡在 **东财指数列表**（adata 内 ``stock_index.py`` → ``push2*.eastmoney.com``），
     不是你的 MySQL。控制台里 ``('Connection aborted.', ...)`` 多为 urllib3/requests 对断连的打印/封装。
@@ -515,6 +571,32 @@ def sync_all_index_code(engine: Engine, info) -> pd.DataFrame:
 
 
 def sync_index_constituent(engine: Engine, info, df_index: pd.DataFrame) -> None:
+    if _source_value("SI_INDEX_CONSTITUENT_SOURCE", "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST") == "qmt":
+        from integrations.qmt.info import fetch_index_constituents
+
+        ts = _now()
+        if df_index is None or df_index.empty:
+            return
+        truncate_only(engine, "si_index_constituent")
+        codes = (
+            df_index["index_code"]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .replace("", np.nan)
+            .dropna()
+            .unique()
+        )
+        df = fetch_index_constituents(codes)
+        if df is None or df.empty:
+            logger.warning("QMT index constituents returned no rows")
+            return
+        df = _clean_object_df(df)
+        df["etl_sync_at"] = ts
+        df_to_table(engine, df, "si_index_constituent")
+        _sleep()
+        return
+
     ts = _now()
     if df_index is None or df_index.empty:
         return
@@ -550,6 +632,18 @@ def sync_index_constituent(engine: Engine, info, df_index: pd.DataFrame) -> None
 
 
 def sync_concept_code_east(engine: Engine, info) -> pd.DataFrame:
+    if _use_qmt_sector_data():
+        truncate_only(engine, "si_concept_code_east")
+        ts = _now()
+        df = _qmt_sector_tables().get("concept_catalog", pd.DataFrame()).copy()
+        if df.empty:
+            logger.warning("QMT concept catalog returned no rows")
+            return df
+        df["etl_sync_at"] = ts
+        df_to_table(engine, _clean_object_df(df), "si_concept_code_east")
+        _sleep()
+        return df
+
     truncate_only(engine, "si_concept_code_east")
     ts = _now()
     df = retry_remote(info.all_concept_code_east)
@@ -563,6 +657,24 @@ def sync_concept_code_east(engine: Engine, info) -> pd.DataFrame:
 
 
 def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) -> None:
+    if _use_qmt_sector_data():
+        truncate_only(engine, "si_concept_constituent_east")
+        ts = _now()
+        df = _qmt_sector_tables().get("concept_constituents", pd.DataFrame()).copy()
+        if df_codes is not None and not df_codes.empty and "concept_code" in df_codes.columns:
+            allowed = set(
+                df_codes["concept_code"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique().tolist()
+            )
+            if allowed:
+                df = df[df["concept_code"].astype(str).isin(allowed)].copy()
+        if df.empty:
+            logger.warning("QMT concept constituents returned no rows")
+            return
+        df["etl_sync_at"] = ts
+        df_to_table(engine, _clean_object_df(df), "si_concept_constituent_east")
+        _sleep()
+        return
+
     truncate_only(engine, "si_concept_constituent_east")
     ts = _now()
     if df_codes is None or df_codes.empty:
@@ -663,6 +775,45 @@ def _stock_limit(codes: list[str]) -> list[str]:
 def sync_per_stock_tables(engine: Engine, info, df_codes: pd.DataFrame) -> None:
     if df_codes is None or df_codes.empty:
         return
+    if _use_qmt_sector_data():
+        truncate_only(
+            engine,
+            "si_stock_shares",
+            "si_industry_sw",
+            "si_stock_concept_east",
+            "si_stock_plate_east",
+            "si_stock_concept_baidu",
+            "si_stock_concept_ths",
+        )
+        ts = _now()
+        codes = df_codes["stock_code"].astype(str).str.zfill(6).tolist()
+        codes = set(_stock_limit(codes))
+        tables = _qmt_sector_tables()
+
+        industry_df = tables.get("industry_sw", pd.DataFrame()).copy()
+        if not industry_df.empty:
+            industry_df = industry_df[industry_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
+            if not industry_df.empty:
+                industry_df["etl_sync_at"] = ts
+                df_to_table(engine, _clean_object_df(industry_df), "si_industry_sw")
+
+        concept_df = tables.get("stock_concepts", pd.DataFrame()).copy()
+        if not concept_df.empty:
+            concept_df = concept_df[concept_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
+            if not concept_df.empty:
+                concept_df["etl_sync_at"] = ts
+                df_to_table(engine, _clean_object_df(concept_df), "si_stock_concept_east")
+
+        plate_df = tables.get("stock_plates", pd.DataFrame()).copy()
+        if not plate_df.empty:
+            plate_df = plate_df[plate_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
+            if not plate_df.empty:
+                plate_df["etl_sync_at"] = ts
+                df_to_table(engine, _clean_object_df(plate_df), "si_stock_plate_east")
+
+        logger.info("QMT 个股维表已写入：industry=%s concept=%s plate=%s", len(industry_df), len(concept_df), len(plate_df))
+        return
+
     truncate_only(
         engine,
         "si_stock_shares",
@@ -823,10 +974,11 @@ def main() -> None:
     if not isinstance(df_east, pd.DataFrame):
         df_east = pd.DataFrame()
     _step("东财概念成分", sync_concept_constituent_east, engine, info, df_east)
-    df_ths = _step("同花顺概念列表", sync_concept_code_ths, engine, info)
-    if not isinstance(df_ths, pd.DataFrame):
-        df_ths = pd.DataFrame()
-    _step("同花顺概念成分", sync_concept_constituent_ths, engine, info, df_ths)
+    if not _use_qmt_sector_data():
+        df_ths = _step("同花顺概念列表", sync_concept_code_ths, engine, info)
+        if not isinstance(df_ths, pd.DataFrame):
+            df_ths = pd.DataFrame()
+        _step("同花顺概念成分", sync_concept_constituent_ths, engine, info, df_ths)
     _step("个股维度表", sync_per_stock_tables, engine, info, df_code)
 
     logger.info("STOCK-INFO 同步流程结束（若某步失败见上方 ERROR 日志，可单独重跑或调环境变量）。")

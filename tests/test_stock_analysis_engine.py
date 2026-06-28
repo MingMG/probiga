@@ -45,12 +45,15 @@ class StockAnalysisEngineDateTest(unittest.TestCase):
              patch.object(engine.long_term, "analyze", return_value=long_term), \
              patch.object(engine.short_term, "analyze", return_value=short_term), \
              patch.object(engine.event_risk, "analyze", return_value=event_risk), \
-             patch.object(engine.gate, "evaluate", return_value=recommend), \
+             patch.object(engine.gate, "evaluate", return_value=recommend) as mock_evaluate, \
              patch.object(engine.gate, "generate_summary", return_value="summary"), \
              patch.object(engine.gate, "generate_recommendation", return_value="recommendation"):
             result = engine.analyze("000001", full_data=True, trade_date="2026-06-10")
 
         mock_load.assert_called_once_with("000001", "2026-06-10", use_realtime=False)
+        mock_evaluate.assert_called_once_with(
+            long_term, short_term, event_risk, analysis_date="2026-06-10"
+        )
         self.assertEqual(result.analysis_date, "2026-06-10")
 
 
