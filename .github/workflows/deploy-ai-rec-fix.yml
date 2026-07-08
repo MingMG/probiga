@@ -18,7 +18,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -euo pipefail
+            set -eu
             cd /opt/ProBigA
             stamp="$(date +%Y%m%d_%H%M%S)"
             backup="/root/probiga_ai_rec_fix_backup_${stamp}"
