@@ -1,0 +1,44 @@
+name: Deploy AI Recommendation Fix
+
+on:
+  push:
+    branches:
+      - codex/deploy-ai-rec-worker-prod
+
+jobs:
+  deploy-ai-rec-fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch production files
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -euo pipefail
+            cd /opt/ProBigA
+            stamp="$(date +%Y%m%d_%H%M%S)"
+            backup="/root/probiga_ai_rec_fix_backup_${stamp}"
+            files="server/api/routers/hot_data.py server/static/js/app.js tools/run_ai_recommendation_worker.py tools/run_ai_recommendation_premarket.py"
+
+            mkdir -p "$backup"
+            git fetch origin codex/deploy-ai-rec-worker-prod
+
+            for file in $files; do
+              if [ -f "$file" ]; then
+                mkdir -p "$backup/$(dirname "$file")"
+                cp -p "$file" "$backup/$file"
+              fi
+              mkdir -p "$(dirname "$file")"
+              git show FETCH_HEAD:"$file" > "$file"
+            done
+
+            source venv/bin/activate
+            python -m py_compile $files
+            systemctl restart probiga
+            sleep 3
+            systemctl is-active probiga
+            curl -sS http://127.0.0.1:8000/api/hot-data/recommended-stocks/progress | head -c 1200

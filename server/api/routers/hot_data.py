@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import time as _time
+from collections import OrderedDict
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -13,8 +15,21 @@ from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.kline_data import get_kline_engine, should_use_kline_engine
 from server.common.minute_data import get_stock_minute_prices, minute_source_info
+from server.common.process_env import build_child_env
+from server.common.config import get_api_cache_config, get_settings
+from server.common.batch_db import quote_identifier, write_frame
+from server.common.sql_reader import read_sql_rows
+from server.common.tech_risk import (
+    build_tech_risk_signal,
+    fetch_tech_risk_signal,
+    holding_matches_signal,
+    is_tech_exposed,
+)
 from server.engine.data_loader import StockDataLoader
+
+logger = logging.getLogger(__name__)
 from server.engine.stock_analysis_engine import StockAnalysisEngine
 from server.api.routers.portfolio_math import (
     portfolio_calc_next_position,
@@ -34,10 +49,16 @@ try:
         chart_market_heat, chart_sector_bars, chart_index_position, chart_volume_tags,
     )
     _CHARTS_AVAILABLE = True
-except Exception:
+except Exception as exc:
+    logger.debug("review chart helpers are unavailable: %s", exc)
     _CHARTS_AVAILABLE = False
 
 router = APIRouter()
+
+PORTFOLIO_LIVE_FRESH_SECONDS = 90
+PORTFOLIO_LIVE_STALE_SECONDS = 300
+PORTFOLIO_FLOW_FRESH_SECONDS = 180
+NEWS_REQUEST_TIMEOUT_SECONDS = 10.0
 
 LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 雪球热股 / 新浪热股 / 同花顺热股"
 
@@ -46,27 +67,83 @@ LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 雪球热股 / 新浪热股 / 同�
 import threading as _threading
 
 _cache_lock = _threading.Lock()
-_cache_store: dict[str, tuple[float, object]] = {}
+_cache_store: OrderedDict[str, tuple[float, object]] = OrderedDict()
+_market_sentiment_locks_lock = _threading.Lock()
+_market_sentiment_locks: dict[str, object] = {}
 _job_lock = _threading.Lock()
 _job_running: dict[str, bool] = {
     "recommended_stocks": False,
     "market_refresh": False,
 }
+_fallback_lock = _threading.Lock()
+_fallback_events: OrderedDict[str, dict[str, object]] = OrderedDict()
+MAX_FALLBACK_EVENTS = 200
+
+
+def _record_fallback(context: str, exc: BaseException | None = None) -> None:
+    """Record a non-fatal fallback path without changing API behavior."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    key = str(context or "unknown")
+    error = f"{type(exc).__name__}: {exc}"[:300] if exc is not None else ""
+    with _fallback_lock:
+        item = _fallback_events.get(key)
+        if item is None:
+            item = {"context": key, "count": 0, "first_at": now, "last_at": now, "last_error": ""}
+            _fallback_events[key] = item
+        item["count"] = int(item.get("count") or 0) + 1
+        item["last_at"] = now
+        item["last_error"] = error
+        _fallback_events.move_to_end(key)
+        while len(_fallback_events) > MAX_FALLBACK_EVENTS:
+            _fallback_events.popitem(last=False)
+    if exc is not None:
+        logger.debug("hot_data fallback [%s]: %s", key, exc)
+
+
+def _cache_now() -> float:
+    return _time.monotonic()
+
+
+def _cache_ttl_seconds(value: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 60
+
+
+def _cache_trim_locked() -> None:
+    try:
+        max_entries = int(get_api_cache_config()["max_entries"])
+    except Exception as exc:
+        logger.debug("api cache max_entries config invalid, using default: %s", exc)
+        max_entries = 512
+    max_entries = max(1, max_entries)
+    while len(_cache_store) > max_entries:
+        _cache_store.popitem(last=False)
 
 
 def _cache_get(key: str, ttl_seconds: int = 60):
     """获取缓存，未过期返回值，否则返回 None"""
+    now = _cache_now()
+    ttl_seconds = _cache_ttl_seconds(ttl_seconds)
     with _cache_lock:
         entry = _cache_store.get(key)
-        if entry and (datetime.now().timestamp() - entry[0]) < ttl_seconds:
-            return entry[1]
+        if not entry:
+            return None
+        if ttl_seconds <= 0 or (now - entry[0]) >= ttl_seconds:
+            _cache_store.pop(key, None)
+            return None
+        _cache_store.move_to_end(key)
+        return entry[1]
     return None
 
 
 def _cache_set(key: str, value):
     """写入缓存"""
     with _cache_lock:
-        _cache_store[key] = (datetime.now().timestamp(), value)
+        _cache_store[key] = (_cache_now(), value)
+        _cache_store.move_to_end(key)
+        _cache_trim_locked()
 
 
 def _cache_drop(key: str):
@@ -79,6 +156,77 @@ def _cache_drop_prefix(prefix: str):
         for key in list(_cache_store.keys()):
             if key.startswith(prefix):
                 _cache_store.pop(key, None)
+
+
+def _cache_key_market_sentiment(date_value: str, days: int, top: int) -> str:
+    return f"market_sentiment_{date_value}_{days}_{top}"
+
+
+def _market_sentiment_cache_ttl() -> int:
+    return 120 if _is_monitor_trading_time() else 300
+
+
+def _market_sentiment_key_lock(key: str):
+    with _market_sentiment_locks_lock:
+        lock = _market_sentiment_locks.get(key)
+        if lock is None:
+            lock = _threading.Lock()
+            _market_sentiment_locks[key] = lock
+        return lock
+
+
+def _json_safe_value(value):
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, Decimal):
+        value = float(value)
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(item) for item in value]
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception as exc:
+            _record_fallback('_json_safe_value:193', exc)
+    if isinstance(value, float):
+        import math
+        return value if math.isfinite(value) else None
+    return value
+
+
+def _market_sentiment_result(date_value: str, days: int, top: int) -> dict:
+    cache_key = _cache_key_market_sentiment(date_value, days, top)
+    ttl = _market_sentiment_cache_ttl()
+    cached = _cache_get(cache_key, ttl_seconds=ttl)
+    if cached is not None:
+        return cached
+
+    with _market_sentiment_key_lock(cache_key):
+        cached = _cache_get(cache_key, ttl_seconds=ttl)
+        if cached is not None:
+            return cached
+
+        from tools.market_sentiment import run_full_analysis
+
+        result = run_full_analysis(lookback_days=days, end_date=date_value, top_n=top, engine=get_engine())
+        result = _json_safe_value(result)
+        if "error" not in result:
+            _cache_set(cache_key, result)
+        return result
+
+
+def _invalidate_recommended_stocks_cache() -> None:
+    for prefix in (
+        "recommended_stocks_",
+        "latest_date_st_recommended_stocks_",
+        "latest_date_not_after_st_recommended_stocks_",
+    ):
+        _cache_drop_prefix(prefix)
 
 
 def _job_begin(name: str) -> bool:
@@ -112,12 +260,8 @@ def _normalize_db_value(value):
 
 
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
-    with get_engine().connect() as conn:
-        result = conn.execute(text(sql), params or {})
-        return [
-            {key: _normalize_db_value(val) for key, val in row.items()}
-            for row in result.mappings().all()
-        ]
+    engine = get_kline_engine() if should_use_kline_engine(sql) else get_engine()
+    return read_sql_rows(engine, sql, params, context="hot_data")
 
 
 def _table_columns(table_name: str) -> set[str]:
@@ -246,8 +390,8 @@ def _fetch_live_east_rank(top: int = 100) -> pd.DataFrame:
         names = _read_sql(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({placeholders})")
         name_map = {str(r["stock_code"]): r.get("short_name") or "" for r in names}
         df["short_name"] = df["stock_code"].map(name_map).fillna("")
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_fetch_live_east_rank:392', exc)
 
     try:
         sina_codes = ",".join([("sh" + c if c.startswith("6") else "sz" + c) for c in codes])
@@ -273,12 +417,12 @@ def _fetch_live_east_rank(top: int = 100) -> pd.DataFrame:
                         "price_change": round(price_change, 2),
                         "change_pct": round(price_change / prev_close * 100, 2) if prev_close else None,
                     }
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to parse Sina quote line for live rank: %s", exc)
         for col in ("price", "price_change", "change_pct"):
             df[col] = df["stock_code"].map(lambda code: quote_map.get(code, {}).get(col))
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_fetch_live_east_rank:423', exc)
     return df
 
 
@@ -421,8 +565,54 @@ def _live_fused_rank(top: int = 100) -> dict:
 
 # ========== API ==========
 
+@router.get("/hot-data/fallback-health")
+def fallback_health():
+    with _fallback_lock:
+        events = [dict(item) for item in _fallback_events.values()]
+    total = sum(int(item.get("count") or 0) for item in events)
+    events.sort(key=lambda item: (-int(item.get("count") or 0), str(item.get("context") or "")))
+    return {
+        "status": "ok" if total == 0 else "observed",
+        "total_fallbacks": total,
+        "contexts": events[:100],
+    }
+
+
 @router.get("/hot-data/latest-trade-date")
 def latest_trade_date():
+    try:
+        rows = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM sm_market_overview_daily
+            WHERE total >= 3000
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        )
+        if rows and rows[0].get("d"):
+            return {"latest_date": str(rows[0]["d"])[:10], "source": "market_overview"}
+    except Exception as exc:
+        logger.debug("market overview latest trade date lookup failed: %s", exc)
+    try:
+        rows = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM (
+                SELECT trade_date, COUNT(*) AS cnt
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND adjust_type = 0
+                GROUP BY trade_date
+            ) t
+            WHERE cnt >= 3000
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        )
+        if rows and rows[0].get("d"):
+            return {"latest_date": str(rows[0]["d"])[:10], "source": "stock_kline"}
+    except Exception as exc:
+        logger.debug("kline latest trade date lookup failed: %s", exc)
     try:
         row = _read_sql(
             "SELECT GREATEST("
@@ -434,20 +624,175 @@ def latest_trade_date():
         if d and d > date(1000, 1, 1):
             return {"latest_date": str(d)}
         return {"latest_date": date.today().isoformat()}
-    except Exception:
+    except Exception as exc:
+        logger.debug("fallback latest hot-rank date lookup failed: %s", exc)
         return {"latest_date": date.today().isoformat()}
+
+
+def _market_clock_trade_date_from_calendar(today: str) -> str:
+    try:
+        row = _read_sql(
+            """
+            SELECT MAX(trade_date) AS d
+            FROM si_trade_calendar
+            WHERE trade_status = 1 AND trade_date <= :today
+            """,
+            {"today": today},
+        )
+        if row and row[0].get("d"):
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("trade calendar lookup failed for market clock: %s", exc)
+    return today
+
+
+def _market_clock_latest_data_date(today: str) -> str:
+    try:
+        row = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM sm_market_overview_daily
+            WHERE total >= 3000
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        )
+        if row and row[0].get("d"):
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("market overview data-date lookup failed for market clock: %s", exc)
+    try:
+        row = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM (
+                SELECT trade_date, COUNT(*) AS cnt
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND adjust_type = 0
+                GROUP BY trade_date
+            ) t
+            WHERE cnt >= 3000
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """
+        )
+        if row and row[0].get("d"):
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("kline data-date lookup failed for market clock: %s", exc)
+    try:
+        row = _read_sql(
+            """
+            SELECT GREATEST(
+                COALESCE((SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1), '1000-01-01'),
+                COALESCE((SELECT MAX(trade_date) FROM sm_stock_snapshot), '1000-01-01'),
+                COALESCE((SELECT MAX(snapshot_date) FROM st_hot_rank_fused), '1000-01-01'),
+                COALESCE((SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily), '1000-01-01')
+            ) AS d
+            """
+        )
+        if row and row[0].get("d") and str(row[0]["d"])[:10] > "1000-01-01":
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("combined data-date lookup failed for market clock: %s", exc)
+    return today
+
+
+def _market_clock_recommendation_trade_date(today: str, expected_trade_date: str, latest_data_date: str) -> str:
+    if expected_trade_date != today:
+        return expected_trade_date or latest_data_date or today
+    try:
+        row = _read_sql(
+            """
+            SELECT MAX(trade_date) AS d
+            FROM si_trade_calendar
+            WHERE trade_status = 1 AND trade_date < :today
+            """,
+            {"today": today},
+        )
+        if row and row[0].get("d"):
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("recommendation trade-date calendar lookup failed: %s", exc)
+    try:
+        row = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM (
+                SELECT trade_date, COUNT(*) AS cnt
+                FROM sm_stock_kline
+                WHERE k_type = 1 AND adjust_type = 0 AND trade_date < :today
+                GROUP BY trade_date
+            ) t
+            WHERE cnt >= 3000
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            {"today": today},
+        )
+        if row and row[0].get("d"):
+            return str(row[0]["d"])[:10]
+    except Exception as exc:
+        logger.debug("recommendation trade-date kline lookup failed: %s", exc)
+    return latest_data_date or expected_trade_date or today
+
+
+def _market_phase(now: datetime, is_trade_day: bool) -> tuple[str, str, bool]:
+    hhmm = now.hour * 100 + now.minute
+    if not is_trade_day:
+        return "closed", "非交易日", False
+    if hhmm < 925:
+        return "premarket", "盘前", False
+    if 925 <= hhmm <= 1135:
+        return "intraday", "盘中", True
+    if 1135 < hhmm < 1255:
+        return "midday_break", "午间休市", False
+    if 1255 <= hhmm <= 1505:
+        return "intraday", "盘中", True
+    return "postmarket", "盘后", False
+
+
+@router.get("/hot-data/market-clock")
+def market_clock():
+    now = datetime.now()
+    today = now.date().isoformat()
+    expected_trade_date = _market_clock_trade_date_from_calendar(today)
+    latest_data_date = _market_clock_latest_data_date(today)
+    is_trade_day = expected_trade_date == today
+    phase, phase_label, is_intraday = _market_phase(now, is_trade_day)
+    active_trade_date = today if is_trade_day and phase in {"premarket", "intraday", "midday_break", "postmarket"} else expected_trade_date
+    data_date = active_trade_date if is_trade_day and phase in {"intraday", "midday_break", "postmarket"} else (latest_data_date or expected_trade_date)
+    if data_date > expected_trade_date and not is_trade_day:
+        data_date = expected_trade_date
+    recommendation_trade_date = _market_clock_recommendation_trade_date(today, expected_trade_date, latest_data_date)
+    return {
+        "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "today": today,
+        "phase": phase,
+        "phase_label": phase_label,
+        "is_trade_day": is_trade_day,
+        "is_intraday": is_intraday,
+        "active_trade_date": active_trade_date,
+        "recommendation_trade_date": recommendation_trade_date,
+        "expected_trade_date": expected_trade_date,
+        "latest_data_date": latest_data_date,
+        "ui_trade_date": data_date,
+        "data_policy": "盘中使用实时行情和当日交易日；盘后/休市使用最新已落库交易日。",
+    }
 
 
 def _fallback_date(table: str, col: str, requested: str) -> str:
     try:
+        quoted_table = quote_identifier(table)
+        quoted_col = quote_identifier(col)
         rows = _read_sql(
-            f"SELECT {col} AS d FROM {table} WHERE {col} <= :d ORDER BY {col} DESC LIMIT 1",
+            f"SELECT {quoted_col} AS d FROM {quoted_table} WHERE {quoted_col} <= :d ORDER BY {quoted_col} DESC LIMIT 1",
             {"d": requested},
         )
         if rows and rows[0].get("d"):
             return str(rows[0]["d"])
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_fallback_date:793', exc)
     return requested
 
 
@@ -465,7 +810,9 @@ def available_dates():
         ("sm_stock_capital_flow_daily", "trade_date"),
     ]:
         try:
-            rows = _read_sql(f"SELECT DISTINCT {col} AS d FROM {tbl} ORDER BY {col} DESC")
+            quoted_tbl = quote_identifier(tbl)
+            quoted_col = quote_identifier(col)
+            rows = _read_sql(f"SELECT DISTINCT {quoted_col} AS d FROM {quoted_tbl} ORDER BY {quoted_col} DESC")
             result[tbl] = [r["d"] for r in rows]
         except Exception:
             result[tbl] = []
@@ -665,7 +1012,7 @@ def rank_sina(top: int = Query(default=100, ge=1, le=200)):
         url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
         params = {"page": 1, "num": top, "sort": "attention", "asc": 0, "node": "hs_a"}
         with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn/"}) as c:
-            r = c.get(url, params=params)
+            r = c.get(url, params=params, timeout=10)
             data = r.json()
         items = []
         for i, item in enumerate(data, 1):
@@ -735,8 +1082,28 @@ def a_list_daily(trade_date: str = Query(default_factory=lambda: date.today().is
 @router.get("/hot-data/a-list-info")
 def a_list_info(trade_date: str = Query(), stock_code: str = Query()):
     try:
+        summary_rows = _read_sql("""
+            SELECT trade_date, stock_code, short_name, close, change_cpt, turnover_ratio,
+                   a_net_amount, a_buy_amount, a_sell_amount, a_amount, amount,
+                   net_amount_rate, a_amount_rate, reason
+            FROM st_a_list_daily
+            WHERE trade_date = :d AND stock_code = :c
+            LIMIT 1
+        """, {"d": trade_date, "c": stock_code})
         rows = _read_sql("SELECT id, trade_date, stock_code, operate_name, a_net_amount, a_buy_amount, a_sell_amount, a_buy_amount_rate, a_sell_amount_rate, reason FROM st_a_list_info WHERE trade_date = :d AND stock_code = :c ORDER BY a_net_amount DESC", {"d": trade_date, "c": stock_code})
-        return {"date": trade_date, "stock_code": stock_code, "data": rows, "total": len(rows)}
+        summary = summary_rows[0] if summary_rows else {}
+        if not summary:
+            buy_sum = sum(float(r.get("a_buy_amount") or 0) for r in rows)
+            sell_sum = sum(float(r.get("a_sell_amount") or 0) for r in rows)
+            summary = {
+                "trade_date": trade_date,
+                "stock_code": stock_code,
+                "a_buy_amount": buy_sum,
+                "a_sell_amount": sell_sum,
+                "a_net_amount": buy_sum - sell_sum,
+                "reason": rows[0].get("reason") if rows else "",
+            }
+        return {"date": trade_date, "stock_code": stock_code, "summary": summary, "data": rows, "total": len(rows)}
     except Exception as e:
         return {"date": trade_date, "stock_code": stock_code, "data": [], "total": 0, "error": str(e)}
 
@@ -832,8 +1199,8 @@ def _capital_flow_daily_time(trade_date: str) -> str:
         )
         if rows and rows[0].get("data_time"):
             return str(rows[0]["data_time"])[:19]
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_capital_flow_daily_time:1201', exc)
     return f"{trade_date} 15:00:00"
 
 
@@ -892,19 +1259,65 @@ def capital_flow(
 @router.get("/hot-data/capital-flow-realtime")
 def capital_flow_realtime(stock_code: str = Query()):
     try:
+        code = stock_code.strip().zfill(6)
+        qmt_refresh = {"status": "skipped"}
+        qmt_rows = []
+        if _is_monitor_trading_time():
+            qmt_refresh = _portfolio_refresh_qmt_min_flow([code], force=True)
+        try:
+            qmt_rows = _read_sql(
+                """
+                SELECT stock_code, trade_time, main_net_inflow, max_net_inflow,
+                       lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source
+                FROM sm_stock_capital_flow_min
+                WHERE stock_code = :code
+                  AND trade_time >= CONCAT(CURDATE(), ' 00:00:00')
+                ORDER BY trade_time
+                """,
+                {"code": code},
+            )
+        except Exception:
+            qmt_rows = []
+        if qmt_rows:
+            records = []
+            for row in qmt_rows:
+                item = dict(row)
+                item["trade_time"] = str(item.get("trade_time") or "")[:19]
+                records.append(item)
+            latest = dict(records[-1])
+            age_seconds = _portfolio_time_age_seconds(latest.get("trade_time"))
+            latest["flow_age_seconds"] = age_seconds
+            latest["flow_status"] = (
+                "fresh"
+                if age_seconds is not None and age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
+                else "stale"
+            )
+            return {
+                "stock_code": code,
+                "data": records,
+                "latest": latest,
+                "total": len(records),
+                "source": "qmt_min_flow",
+                "refresh": qmt_refresh,
+                "flow_status": latest["flow_status"],
+                "flow_age_seconds": age_seconds,
+            }
+
         from adata.stock.market.capital_flow.stock_capital_flow import StockCapitalFlow
         cf = StockCapitalFlow()
-        df = cf.get_capital_flow_min(stock_code=stock_code.strip())
+        df = cf.get_capital_flow_min(stock_code=code)
         if df is None or df.empty:
-            return {"stock_code": stock_code, "data": [], "latest": None, "total": 0}
+            return {"stock_code": code, "data": [], "latest": None, "total": 0, "source": "adata", "refresh": qmt_refresh}
         import numpy as np
         df = df.replace({np.nan: None, pd.NaT: None})
         latest = df.iloc[-1].to_dict()
         latest["trade_time"] = str(latest["trade_time"])
+        latest["flow_age_seconds"] = _portfolio_time_age_seconds(latest.get("trade_time"))
+        latest["flow_status"] = "fresh" if latest["flow_age_seconds"] is not None and latest["flow_age_seconds"] <= PORTFOLIO_FLOW_FRESH_SECONDS else "stale"
         records = df.to_dict(orient="records")
         for r in records:
             r["trade_time"] = str(r["trade_time"])
-        return {"stock_code": stock_code, "data": records, "latest": latest, "total": len(records)}
+        return {"stock_code": code, "data": records, "latest": latest, "total": len(records), "source": "adata", "refresh": qmt_refresh, "flow_status": latest["flow_status"], "flow_age_seconds": latest["flow_age_seconds"]}
     except Exception as e:
         return {"stock_code": stock_code, "data": [], "latest": None, "total": 0, "error": str(e)}
 
@@ -948,8 +1361,8 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
                     v = str(r.get("index_code", "")).strip()
                     if v and v not in keys:
                         keys.append(v)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('_resolve_ths_keys:1363', exc)
             return keys
 
         def _resolve_east_codes(code: str) -> list[str]:
@@ -973,8 +1386,8 @@ def concept_stocks(concept_code: str = Query(), trade_date: str = Query(default_
                             v = str(r.get("concept_code", "")).strip()
                             if v and v not in codes:
                                 codes.append(v)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('_resolve_east_codes:1388', exc)
             return codes
 
         ths_keys = _resolve_ths_keys(concept_code)
@@ -1212,7 +1625,7 @@ def _fetch_cls_news(client, pages=2):
         url = "https://www.cls.cn/nodeapi/updateTelegraphList?app=CailianpressWeb&os=web&sv=8.4.6&rn=50"
         if last_time:
             url += f"&last_time={last_time}"
-        r = client.get(url)
+        r = client.get(url, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         roll_data = (r.json().get("data") or {}).get("roll_data") or []
         if not roll_data:
@@ -1259,7 +1672,7 @@ def _fetch_eastmoney_news(client, pages=1):
     items = []
     for page in range(1, pages + 1):
         url = f"https://np-listapi.eastmoney.com/comm/web/getFastNewsList?client=web&biz=web_724&fastColumn=102&sortEnd=&pageSize=20&page={page}&req_trace=1"
-        r = client.get(url)
+        r = client.get(url, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         fl = (r.json().get("data") or {}).get("fastNewsList") or []
         if not fl:
@@ -1271,8 +1684,8 @@ def _fetch_eastmoney_news(client, pages=1):
                 from datetime import datetime as _dt
                 try:
                     dt_obj = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('_fetch_eastmoney_news:1686', exc)
             stock_raw = it.get("stockList") or []
             stock_info = []
             for s in stock_raw:
@@ -1303,7 +1716,7 @@ def _fetch_sina_news(client, pages=1):
     items = []
     for page in range(1, pages + 1):
         url = f"https://zhibo.sina.com.cn/api/zhibo/feed?page={page}&page_size=20&zhibo_id=152&tag_id=0&type=0"
-        r = client.get(url)
+        r = client.get(url, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         feed = (r.json().get("result") or {}).get("data") or {}
         lst = (feed.get("feed") or {}).get("list") or []
@@ -1316,8 +1729,8 @@ def _fetch_sina_news(client, pages=1):
                 from datetime import datetime as _dt
                 try:
                     dt_obj = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('_fetch_sina_news:1731', exc)
             tag_list = it.get("tag") or []
             subjects = [{"name": t.get("name", "")} for t in tag_list if t.get("name")]
             stock_info = []
@@ -1329,8 +1742,8 @@ def _fetch_sina_news(client, pages=1):
                     for s in (ext.get("stocks") or []):
                         if isinstance(s, dict) and s.get("symbol"):
                             stock_info.append({"name": s.get("key", ""), "code": s.get("symbol", "")})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('_fetch_sina_news:1744', exc)
             items.append({
                 "source": "sina",
                 "source_id": str(it.get("id") or ""),
@@ -1455,10 +1868,10 @@ def _save_news_to_db(engine, items: list):
                         "etl_sync_at": etl,
                     })
                     saved += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as exc:
+                    _record_fallback('_save_news_to_db:1870', exc)
+    except Exception as exc:
+        _record_fallback('_save_news_to_db:1872', exc)
     return saved
 
 
@@ -1476,18 +1889,18 @@ def news_flash(
             if source in ("all", "cls"):
                 try:
                     all_items.extend(_fetch_cls_news(client, pages))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('news_flash:1891', exc)
             if source in ("all", "eastmoney"):
                 try:
                     all_items.extend(_fetch_eastmoney_news(client, max(1, pages // 2)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('news_flash:1896', exc)
             if source in ("all", "sina"):
                 try:
                     all_items.extend(_fetch_sina_news(client, max(1, pages // 2)))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _record_fallback('news_flash:1901', exc)
 
         if source == "all":
             merged = _merge_and_dedup(all_items)
@@ -1517,16 +1930,16 @@ def news_important(pages: int = Query(default=2, ge=1, le=5)):
         with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA"}, timeout=10.0) as client:
             try:
                 all_items.extend(_fetch_cls_news(client, pages))
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('news_important:1932', exc)
             try:
                 all_items.extend(_fetch_eastmoney_news(client, max(1, pages // 2)))
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('news_important:1936', exc)
             try:
                 all_items.extend(_fetch_sina_news(client, max(1, pages // 2)))
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('news_important:1940', exc)
 
         merged = _merge_and_dedup(all_items)
         important = [it for it in merged if it.get("importance_score", 0) >= 2]
@@ -1561,22 +1974,32 @@ def news_history(source: str = Query(default=""), limit: int = Query(default=200
 
 
 @router.get("/hot-data/stock-notices")
-def stock_notices(stock_code: str = Query(default=""), limit: int = Query(default=50)):
+def stock_notices(
+    stock_code: str = Query(default=""),
+    limit: int = Query(default=50),
+    include_future: bool = Query(default=False),
+):
     """查询个股公告（si_notice_eastmoney）"""
     try:
+        future_clause = "" if include_future else " AND notice_date <= CURDATE()"
+        try:
+            limit_n = min(max(1, int(limit)), 200)
+        except Exception:
+            limit_n = 50
         if stock_code.strip():
             rows = _read_sql(
                 "SELECT stock_code, notice_date, title, column_name, display_time, detail_url "
-                "FROM si_notice_eastmoney WHERE stock_code = :c ORDER BY notice_date DESC LIMIT :n",
-                {"c": stock_code.strip().zfill(6), "n": min(limit, 200)}
+                f"FROM si_notice_eastmoney WHERE stock_code = :c{future_clause} "
+                "ORDER BY notice_date DESC LIMIT :n",
+                {"c": stock_code.strip().zfill(6), "n": limit_n}
             )
         else:
             rows = _read_sql(
                 "SELECT stock_code, notice_date, title, column_name, display_time, detail_url "
-                "FROM si_notice_eastmoney ORDER BY notice_date DESC LIMIT :n",
-                {"n": min(limit, 200)}
+                f"FROM si_notice_eastmoney WHERE 1=1{future_clause} ORDER BY notice_date DESC LIMIT :n",
+                {"n": limit_n}
             )
-        return {"data": rows, "total": len(rows)}
+        return {"data": rows, "total": len(rows), "include_future": bool(include_future)}
     except Exception as e:
         return {"data": [], "total": 0, "error": str(e)}
 
@@ -1707,13 +2130,13 @@ def _latest_date(table: str, col: str = "trade_date") -> str:
     if cached is not None:
         return cached
     try:
-        rows = _read_sql(f"SELECT MAX({col}) AS md FROM {table}", {})
+        rows = _read_sql(f"SELECT MAX({quote_identifier(col)}) AS md FROM {quote_identifier(table)}", {})
         if rows and rows[0].get("md"):
             result = str(rows[0]["md"])
             _cache_set(cache_key, result)
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to enrich live rank short names: %s", exc)
     return date.today().isoformat()
 
 
@@ -1726,17 +2149,34 @@ def _latest_date_not_after(table: str, requested: str, col: str = "trade_date") 
     if cached is not None:
         return cached
     try:
+        quoted_table = quote_identifier(table)
+        quoted_col = quote_identifier(col)
         rows = _read_sql(
-            f"SELECT {col} AS d FROM {table} WHERE {col} <= :d ORDER BY {col} DESC LIMIT 1",
+            f"SELECT {quoted_col} AS d FROM {quoted_table} WHERE {quoted_col} <= :d ORDER BY {quoted_col} DESC LIMIT 1",
             {"d": requested},
         )
         if rows and rows[0].get("d"):
             result = str(rows[0]["d"])
             _cache_set(cache_key, result)
             return result
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to enrich live rank quotes from Sina: %s", exc)
     return ""
+
+
+def _latest_market_analysis_date(requested: str = "") -> str:
+    """Return the latest available market date across snapshot and daily K-line."""
+    requested = str(requested or "").strip()[:10]
+    dates: list[str] = []
+    for table in ("sm_stock_snapshot", "sm_stock_kline"):
+        try:
+            d = _latest_date_not_after(table, requested) if requested else _latest_date(table)
+        except Exception:
+            d = ""
+        d = str(d or "")[:10]
+        if d:
+            dates.append(d)
+    return max(dates) if dates else (requested or date.today().isoformat())
 
 
 @router.get("/hot-data/screen-stocks")
@@ -2116,8 +2556,8 @@ def screen_stocks(
                         )
                         if cnt_rows:
                             news_map[code] = cnt_rows[0]["cnt"]
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _record_fallback('screen_stocks:2543', exc)
                 for r in rows:
                     ind = inds.get(str(r["stock_code"]), {})
                     r["k"] = ind.get("k", 50)
@@ -2292,11 +2732,11 @@ k.stock_code REGEXP '^(0|60)' AND k.short_name NOT LIKE '%ST%'
 
 def _latest_date_inline(table: str, col: str = "trade_date") -> str:
     try:
-        rows = _read_sql(f"SELECT MAX({col}) AS md FROM {table}", {})
+        rows = _read_sql(f"SELECT MAX({quote_identifier(col)}) AS md FROM {quote_identifier(table)}", {})
         if rows and rows[0].get("md"):
             return str(rows[0]["md"])
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_latest_date_inline:2722', exc)
     return date.today().isoformat()
 
 
@@ -2320,8 +2760,8 @@ def stock_minute(stock_code: str = Query(), trade_date: str = Query(default_fact
                         df[c] = df[c].astype(str)
                 records = df.to_dict(orient="records")
                 return {"stock_code": stock_code, "date": trade_date, "data": records, "total": len(records), "source": "api"}
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('stock_minute:2747', exc)
         return {"stock_code": stock_code, "date": trade_date, "data": [], "total": 0, "source": source}
     except Exception as e:
         return {"stock_code": stock_code, "date": trade_date, "data": [], "total": 0, "error": str(e)}
@@ -2491,8 +2931,8 @@ def get_analysis_result(
                 if row.get(json_field) and isinstance(row[json_field], str):
                     try:
                         row[json_field] = json.loads(row[json_field])
-                    except:
-                        pass
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        logger.debug("Failed to parse analysis JSON field %s: %s", json_field, exc)
 
         return {
             "date": str(analysis_date),
@@ -2511,11 +2951,14 @@ def stock_detail(stock_code: str = Query()):
     code = stock_code.strip().zfill(6)
     mode = _portfolio_market_mode()
     cache_key = f"stock_detail_{code}_{mode}"
-    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300))
+    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=12))
     if cached is not None:
         return cached
     try:
-        payload = _load_stock_detail_payload(code, mode=mode, light=True)
+        try:
+            payload = _load_stock_detail_payload(code, mode=mode, light=True)
+        except Exception:
+            payload = _load_stock_detail_payload(code, mode=mode, light=False)
         basic = payload.get("basic") or {}
         market = payload.get("market") or {}
         capital = payload.get("capital") or {}
@@ -2532,6 +2975,7 @@ def stock_detail(stock_code: str = Query()):
         quote_trade_date = str(payload.get("quote_trade_date") or trade_date or "")
         flow_trade_date = str(payload.get("flow_trade_date") or quote_trade_date or "")
         analysis_snapshot = _load_latest_analysis_snapshot(code, trade_date=trade_date or None)
+        recommendation_snapshot = _load_latest_recommendation_snapshot(code, trade_date=trade_date or None)
         ai_analysis = _generate_ai_analysis(
             code,
             basic.get("short_name"),
@@ -2570,6 +3014,7 @@ def stock_detail(stock_code: str = Query()):
             "news": news_module,
             "holder": holder,
             "analysis_snapshot": analysis_snapshot,
+            "recommendation_snapshot": recommendation_snapshot,
             "ai_analysis": ai_analysis,
             "holding": holding,
             "mode": mode,
@@ -2733,8 +3178,8 @@ def _parse_snapshot_json_fields(row: dict | None, json_fields: tuple[str, ...]) 
         if isinstance(value, str) and value:
             try:
                 parsed[field] = json.loads(value)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('_parse_snapshot_json_fields:3165', exc)
     for field in ("analysis_date", "flow_trade_date", "hot_trade_date", "last_news_time"):
         if parsed.get(field) is not None:
             parsed[field] = str(parsed[field])
@@ -2772,6 +3217,78 @@ def _as_float(value):
         return float(value)
     except Exception:
         return None
+
+
+def _load_latest_recommendation_snapshot(stock_code: str, trade_date: str | None = None) -> dict | None:
+    columns = _table_columns("st_recommended_stocks")
+    if not columns:
+        return None
+    select_cols = [
+        _select_col(columns, "stock_code", "''"),
+        _select_col(columns, "short_name", "''"),
+        _select_col(columns, "pick_date", "NULL"),
+        _select_col(columns, "ai_score", "NULL"),
+        _select_col(columns, "final_trade_score", "NULL"),
+        _select_col(columns, "quality_score", "NULL"),
+        _select_col(columns, "entry_score", "NULL"),
+        _select_col(columns, "risk_reward_ratio", "NULL"),
+        _select_col(columns, "sector_gate_status", "''"),
+        _select_col(columns, "sector_gate_reason", "''"),
+        _select_col(columns, "sector_flow_3d", "NULL"),
+        _select_col(columns, "sector_width_pct", "NULL"),
+        _select_col(columns, "technical_evidence_json", "'{}'"),
+        _select_col(columns, "evidence_chain_json", "'[]'"),
+        _select_col(columns, "review_1d_pct", "NULL"),
+        _select_col(columns, "review_3d_pct", "NULL"),
+        _select_col(columns, "review_5d_pct", "NULL"),
+        _select_col(columns, "review_10d_pct", "NULL"),
+        _select_col(columns, "failure_tags_json", "'[]'"),
+        _select_col(columns, "short_term_score", "NULL"),
+        _select_col(columns, "long_term_score", "NULL"),
+        _select_col(columns, "capital_score", "NULL"),
+        _select_col(columns, "chip_capital_score", "NULL"),
+        _select_col(columns, "technical", "NULL"),
+        _select_col(columns, "signal_status", "''"),
+        _select_col(columns, "recommend_status", "''"),
+        _select_col(columns, "recommend_reason", "''"),
+        _select_col(columns, "investment_rating", "'中性'"),
+        _select_col(columns, "rating_reason", "''"),
+        _select_col(columns, "primary_strategy", "''"),
+        _select_col(columns, "model_version", "''"),
+        _select_col(columns, "last_check_time", "NULL"),
+        _select_col(columns, "created_at", "NULL"),
+    ]
+    sql = f"""
+        SELECT {", ".join(select_cols)}
+        FROM st_recommended_stocks r
+        WHERE r.stock_code = :stock_code
+    """
+    params = {"stock_code": stock_code}
+    if trade_date:
+        sql += " AND r.pick_date <= :trade_date"
+        params["trade_date"] = trade_date
+    order_cols = ["r.pick_date DESC"]
+    if "last_check_time" in columns:
+        order_cols.append("r.last_check_time DESC")
+    if "created_at" in columns:
+        order_cols.append("r.created_at DESC")
+    sql += f" ORDER BY {', '.join(order_cols)} LIMIT 1"
+    rows = _read_sql(sql, params)
+    if not rows:
+        return None
+    out = dict(rows[0])
+    out = _parse_snapshot_json_fields(
+        out,
+        ("technical_evidence_json", "evidence_chain_json", "failure_tags_json"),
+    ) or out
+    for field in ("pick_date", "last_check_time", "created_at"):
+        if out.get(field) is not None:
+            out[field] = str(out[field])
+    final_score = _as_float(out.get("final_trade_score"))
+    ai_score = _as_float(out.get("ai_score"))
+    out["recommendation_score"] = final_score if final_score is not None else ai_score
+    out["recommendation_score_source"] = "final_trade_score" if final_score is not None else "ai_score"
+    return out
 
 
 def _avg_scores(*values):
@@ -2918,6 +3435,136 @@ def _build_snapshot_ai_analysis(
         "event_risk_level": risk_level,
         "conclusion": "\n".join(line for line in lines if line),
     }
+
+
+def _fmt_analysis_money_cn(value) -> str:
+    n = _as_float(value)
+    if n is None:
+        return "-"
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 100_000_000:
+        return f"{sign}{n / 100_000_000:.2f}亿"
+    if n >= 10_000:
+        return f"{sign}{n / 10_000:.1f}万"
+    return f"{sign}{n:.0f}"
+
+
+def _fmt_analysis_num(value, digits: int = 2) -> str:
+    n = _as_float(value)
+    if n is None:
+        return "-"
+    return f"{n:.{digits}f}"
+
+
+def _has_portfolio_analysis_sections(text_value: str) -> bool:
+    text_value = str(text_value or "")
+    return all(label in text_value for label in ("趋势判断", "资金态度", "热度评估", "操作建议", "风险提示"))
+
+
+def _build_portfolio_section_analysis(
+    *,
+    market: dict,
+    capital: dict,
+    technical: dict,
+    concepts: list,
+    holding: dict | None,
+    hot_rank: dict | None,
+    ai_result: dict | None,
+    analysis_snapshot: dict | None,
+    recommendation_snapshot: dict | None,
+) -> str:
+    market = market or {}
+    capital = capital or {}
+    technical = technical or {}
+    holding = holding or {}
+    hot_rank = hot_rank or {}
+    ai_result = ai_result or {}
+    analysis_snapshot = analysis_snapshot or {}
+    recommendation_snapshot = recommendation_snapshot or {}
+
+    price = _as_float(market.get("price") or market.get("close"))
+    change_pct = _as_float(market.get("change_pct"))
+    ma = technical.get("ma") or {}
+    trend = technical.get("trend") or {}
+    support = _as_float(technical.get("support"))
+    resistance = _as_float(technical.get("resistance"))
+    main_flow = _as_float((capital.get("today") or {}).get("main_net_inflow"))
+    rank = hot_rank.get("fused_rank") or hot_rank.get("rank") or analysis_snapshot.get("hot_rank")
+    strengths = [str(item) for item in (analysis_snapshot.get("strengths") or []) if str(item).strip()]
+    risks = [str(item) for item in (analysis_snapshot.get("risks") or []) if str(item).strip()]
+    quality_flags = [str(item) for item in (analysis_snapshot.get("data_quality_flags") or []) if str(item).strip()]
+
+    ma_parts = []
+    for key in ("ma5", "ma10", "ma20"):
+        if ma.get(key) is not None:
+            ma_parts.append(f"{key.upper()}（{_fmt_analysis_num(ma.get(key))}）")
+    if ma_parts:
+        trend_text = f"现价{_fmt_analysis_num(price)}，涨跌幅{_fmt_analysis_num(change_pct)}%，位置参考{'、'.join(ma_parts)}。"
+    else:
+        trend_text = f"现价{_fmt_analysis_num(price)}，涨跌幅{_fmt_analysis_num(change_pct)}%，均线数据暂缺，先结合价格、资金和正式分析快照判断。"
+    if trend:
+        trend_text += f" 短期趋势{trend.get('short') or '-'}，中期趋势{trend.get('mid') or '-'}。"
+    if support is not None or resistance is not None:
+        trend_text += f" 参考支撑{_fmt_analysis_num(support)}，压力{_fmt_analysis_num(resistance)}。"
+
+    if main_flow is not None:
+        flow_word = "净流入" if main_flow >= 0 else "净流出"
+        funds_text = f"今日主力资金{flow_word}{_fmt_analysis_money_cn(main_flow)}，"
+        funds_text += "资金态度偏积极。" if main_flow >= 0 else "资金态度偏谨慎，需观察承接力度。"
+    else:
+        funds_text = "今日主力资金数据暂缺，资金态度先参考最近快照和盘面表现。"
+
+    heat_bits = []
+    if rank:
+        heat_bits.append(f"融合热度第{rank}名")
+    if concepts:
+        heat_bits.append("概念：" + "、".join(str(x) for x in concepts[:4] if x))
+    if strengths:
+        heat_bits.append("亮点：" + "、".join(strengths[:3]))
+    if analysis_snapshot.get("summary"):
+        heat_bits.append(str(analysis_snapshot.get("summary")))
+    heat_text = "，".join(heat_bits) + "。" if heat_bits else "暂无明确热度标签，按自选股跟踪级别观察。"
+
+    action = str(ai_result.get("action") or "").strip()
+    action_reason = (
+        str(ai_result.get("action_reason") or "").strip()
+        or str(recommendation_snapshot.get("recommend_reason") or "").strip()
+        or str(analysis_snapshot.get("recommendation") or analysis_snapshot.get("recommend_reason") or "").strip()
+    )
+    if not action:
+        action = "持有" if int(holding.get("shares") or 0) > 0 else "观望"
+    advice_text = f"{action}。"
+    shares = int(holding.get("shares") or 0)
+    cost = _as_float(holding.get("cost_price"))
+    if shares > 0:
+        advice_text += f" 当前持有{shares}股"
+        if cost is not None and price is not None and cost > 0:
+            profit_pct = (price / cost - 1) * 100
+            advice_text += f"，成本价{_fmt_analysis_num(cost)}元，现价{_fmt_analysis_num(price)}元，浮盈{profit_pct:.2f}%"
+        advice_text += "。"
+    if action_reason:
+        advice_text += f" {action_reason}"
+    elif support is not None:
+        advice_text += f" 若跌破支撑{_fmt_analysis_num(support)}且放量，应优先控制仓位。"
+
+    risk_parts = risks[:3]
+    if quality_flags:
+        risk_parts.extend([f"数据标记：{flag}" for flag in quality_flags[:2]])
+    if change_pct is not None and abs(change_pct) >= 5:
+        risk_parts.append("短线波动较大")
+    if main_flow is not None and main_flow < 0:
+        risk_parts.append("主力资金流出")
+    if not risk_parts:
+        risk_parts = ["短线涨跌幅扩大时注意获利盘或恐慌盘扰动", "若跌破关键均线/支撑位需重新评估"]
+
+    return "\n\n".join([
+        "### 趋势判断\n" + trend_text,
+        "### 资金态度\n" + funds_text,
+        "### 热度评估\n" + heat_text,
+        "### 操作建议\n" + advice_text,
+        "### 风险提示\n" + "；".join(risk_parts) + "。",
+    ])
 
 
 def _merge_ai_analysis_with_snapshot(
@@ -3165,8 +3812,8 @@ def _generate_ai_analysis(
                 hr = hot_rows[0] if hot_rows else {}
             if hr:
                 summary_parts.append(f"融合热度排名：第{hr.get('fused_rank')}名，东方财富排名：{hr.get('east_rank')}，同花顺排名：{hr.get('ths_rank')}")
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('_generate_ai_analysis:3799', exc)
 
         # 持仓信息
         holding_prompt = ""
@@ -3194,19 +3841,22 @@ def _generate_ai_analysis(
 {'chr(10)'.join(summary_parts)}
 {holding_prompt}
 
-请严格按照以下格式返回分析文本（不要返回JSON，直接返回文本）：
+请严格按照以下格式返回分析文本（不要返回JSON，直接返回文本；每段标题和顺序必须一致）：
 
-### 操作建议：[一句话操作建议，如"持有观望，暂不加仓"或"逢低加仓"或"减仓锁定利润"]
+### 趋势判断
+[结合均线、量能、波动率分析当前走势格局，要引用具体数字如MA5价格、涨跌幅等]
 
-趋势判断：[结合均线、量能、波动率分析当前走势格局，要引用具体数字如MA5价格、涨跌幅等]
+### 资金态度
+[分析主力资金流向，引用具体金额如"主力净流入XX亿"，判断资金态度]
 
-资金态度：[分析主力资金流向，引用具体金额如"主力净流入XX亿"，判断资金态度]
+### 热度评估
+[分析市场关注度、概念热度、排名等]
 
-热度评估：[分析市场关注度、概念热度、排名等]
+### 操作建议
+[如有持仓，给出详细的持仓操作建议，引用成本价、现价、盈亏比例、支撑压力位；如无持仓，给出买入/观望建议]
 
-操作建议：[如有持仓，给出详细的持仓操作建议，引用成本价、现价、盈亏比例、支撑压力位；如无持仓，给出买入/观望建议]
-
-风险提示：[列出2-3个具体风险点，要具体不要泛泛而谈]"""
+### 风险提示
+[列出2-3个具体风险点，要具体不要泛泛而谈]"""
 
         resp = httpx.post(
             "https://api.deepseek.com/chat/completions",
@@ -3261,6 +3911,25 @@ def daily_review(review_date: str = Query(default_factory=lambda: date.today().i
         return {"date": review_date, "data": [], "total": 0, "error": str(e)}
 
 
+@router.get("/hot-data/research-radar")
+def research_radar(trade_date: str = Query(default=None)):
+    """研报/博主/财报趋势雷达，用于网站、早报和晚报统一展示。"""
+    try:
+        from biz.research_radar.radar import build_research_radar
+
+        return build_research_radar(get_engine(), trade_date)
+    except Exception as e:
+        return {
+            "trade_date": trade_date or date.today().isoformat(),
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_signals": [],
+            "report_sources": [],
+            "themes": [],
+            "stock_pool": [],
+            "error": str(e),
+        }
+
+
 @router.get("/hot-data/daily-review-dates")
 def daily_review_dates():
     """复盘数据可用日期列表"""
@@ -3277,11 +3946,10 @@ def generate_daily_review(review_date: str = Query(default_factory=lambda: date.
     try:
         import subprocess
         import sys
-        _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        root = _Path(__file__).resolve().parents[3]
         cmd = [sys.executable, "-m", "biz.review.generate", review_date]
-        child_env = os.environ.copy()
-        child_env.setdefault("PYTHONPATH", _ROOT + ":" + os.path.join(_ROOT, "adata"))
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=_ROOT, env=child_env)
+        child_env = build_child_env(root, extra_python_paths=[root / "adata"])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=str(root), env=child_env)
         return {"date": review_date, "status": "success" if r.returncode == 0 else "failed",
                 "output": (r.stdout or "")[-500:] + (r.stderr or "")[-500:]}
     except Exception as e:
@@ -3303,8 +3971,11 @@ def print_daily_review(review_date: str = Query(default_factory=lambda: date.tod
             if isinstance(v, list): return v
             if isinstance(v, dict): return [v]
             if isinstance(v, str):
-                try: return json.loads(v)
-                except Exception: return []
+                try:
+                    return json.loads(v)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    logger.debug("Failed to parse review sector JSON field %s: %s", key, exc)
+                    return []
             return []
 
         hot = jl("hot_sectors")
@@ -3434,16 +4105,16 @@ th{{color:#888;font-weight:500;font-size:12px}}
         max_len = max(len(hot), len(cold))
         for i in range(max_len):
             h = hot[i] if i < len(hot) else None
-            c = cold[i] if i < len(cold) else None
+            cold_item = cold[i] if i < len(cold) else None
             html += "<tr>"
             if h and isinstance(h, dict):
                 chg = h.get("change_pct")
                 html += f"<td>{h.get('name','-')}</td><td class=\"{'up' if (chg or 0) >= 0 else 'down'}\">{chg:+.2f}%</td>"
             else:
                 html += "<td></td><td></td>"
-            if c and isinstance(c, dict):
-                chg = c.get("change_pct")
-                html += f"<td>{c.get('name','-')}</td><td class=\"{'up' if (chg or 0) >= 0 else 'down'}\">{chg:+.2f}%</td>"
+            if cold_item and isinstance(cold_item, dict):
+                chg = cold_item.get("change_pct")
+                html += f"<td>{cold_item.get('name','-')}</td><td class=\"{'up' if (chg or 0) >= 0 else 'down'}\">{chg:+.2f}%</td>"
             else:
                 html += "<td></td><td></td>"
             html += "</tr>"
@@ -3515,6 +4186,11 @@ def export_daily_review(review_date: str = Query(default_factory=lambda: date.to
         text_lines.append("## 市场总览")
         text_lines.append(f"- 市场热度: {safe_get('market_heat')}%")
         text_lines.append(f"- 热度变化: {safe_get('market_heat_note')}")
+        text_lines.append(f"- 情绪周期: {safe_get('sentiment_cycle')} / {safe_get('sentiment_cycle_desc')}")
+        text_lines.append(
+            f"- 接力环境: 涨停{safe_get('limit_up_count')}家，跌停{safe_get('limit_down_count')}家，"
+            f"炸板{safe_get('broken_board_count')}家，炸板率{safe_get('broken_rate')}%，最高{safe_get('max_boards')}板"
+        )
         text_lines.append(f"- 成交额: {float(r.get('total_amount', 0)) / 1e8:.0f}亿")
         text_lines.append(f"- 量能变化: {safe_get('total_amount_change')}")
         text_lines.append(f"- 主要指数: {safe_get('index_name')} {safe_get('index_price')} ({safe_get('index_change_pct')}%)")
@@ -3610,8 +4286,8 @@ def _ensure_portfolio_trans_log_table():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
         _portfolio_ensure_column("st_portfolio_trans_log", "source", "ALTER TABLE `st_portfolio_trans_log` ADD COLUMN `source` VARCHAR(16) DEFAULT 'trade' COMMENT '来源：trade/position_add' AFTER `shares`")
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_ensure_portfolio_trans_log_table:4273', exc)
 
 
 def _portfolio_ensure_column(table: str, column: str, ddl: str) -> None:
@@ -3623,8 +4299,8 @@ def _portfolio_ensure_column(table: str, column: str, ddl: str) -> None:
         """, {"t": table, "c": column})
         if not rows or int(rows[0].get("cnt") or 0) == 0:
             _exec_sql(ddl)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_ensure_column:4286', exc)
 
 
 def _ensure_portfolio_position_columns() -> None:
@@ -3646,8 +4322,8 @@ def _portfolio_ensure_cost_price_precision() -> None:
         scale = int(rows[0].get("numeric_scale") or 0)
         if precision < 12 or scale < 4:
             _exec_sql("ALTER TABLE `st_user_portfolio` MODIFY COLUMN `cost_price` DECIMAL(12,4) NOT NULL DEFAULT 0 COMMENT '成本价'")
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_ensure_cost_price_precision:4309', exc)
 
 
 def _portfolio_log_trans(code: str, trans_type: str, price: float, shares: int, source: str = "trade"):
@@ -3673,8 +4349,8 @@ def _watchlist_write_flow(code: str, short_name: str, trans_type: str, price: fl
                     :price, :shares, :amount, :fee, '自选股操作', 0, CURDATE(), DATE_FORMAT(NOW(), '%H:%i'))
         """, {"code": code, "name": short_name or "", "ft": flow_type, "tt": trans_type,
               "price": price, "shares": shares, "amount": amount, "fee": fee})
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_watchlist_write_flow:4336', exc)
 
 
 def _portfolio_cost_profit(shares: int, cur_price: float, cost_price: float) -> float | None:
@@ -3714,12 +4390,55 @@ def _portfolio_apply_quote(row: dict, quote: dict | None) -> None:
         row["current_name"] = quote.get("short_name")
     if quote.get("snapshot_at"):
         row["quote_snapshot_at"] = quote.get("snapshot_at")
+        row["quote_trade_date"] = str(quote.get("snapshot_at") or "")[:10]
     if quote.get("source"):
         row["quote_source"] = quote.get("source")
+    row["quote_status"] = quote.get("quote_status") or "fresh"
+    row["quote_age_seconds"] = quote.get("quote_age_seconds")
     if quote.get("amount") is not None:
         row["quote_amount"] = quote.get("amount")
     if quote.get("volume") is not None:
         row["quote_volume"] = quote.get("volume")
+
+
+def _portfolio_apply_kline_quote(row: dict, kline: dict | None, *, status: str = "closed") -> None:
+    if not kline or kline.get("close") is None:
+        return
+    row["cur_price"] = kline.get("close")
+    row["change_pct"] = kline.get("change_pct")
+    if kline.get("short_name"):
+        row["current_name"] = kline.get("short_name")
+    row["quote_source"] = "daily_kline"
+    row["quote_status"] = status
+    row["quote_trade_date"] = str(kline.get("trade_date") or "")[:10]
+    row["quote_snapshot_at"] = ""
+    row["quote_age_seconds"] = None
+
+
+def _portfolio_rebase_quote_change(row: dict, kline: dict | None) -> None:
+    """Recompute intraday change from live price and the latest daily close."""
+    if not row or not kline or row.get("cur_price") is None:
+        return
+    price = _portfolio_num(row.get("cur_price"))
+    if price <= 0:
+        return
+    quote_trade_date = str(row.get("quote_trade_date") or row.get("quote_snapshot_at") or "")[:10]
+    kline_trade_date = str(kline.get("trade_date") or "")[:10]
+    prev_close = 0.0
+    if quote_trade_date and kline_trade_date and quote_trade_date > kline_trade_date:
+        prev_close = _portfolio_num(kline.get("close"))
+    elif quote_trade_date and kline_trade_date and quote_trade_date == kline_trade_date:
+        prev_close = _portfolio_num(kline.get("pre_close"))
+    elif str(row.get("quote_source") or "") == "daily_kline":
+        prev_close = _portfolio_num(kline.get("pre_close"))
+    elif kline_trade_date:
+        prev_close = _portfolio_num(kline.get("close"))
+    if prev_close <= 0:
+        return
+    change = price - prev_close
+    row["quote_prev_close"] = round(prev_close, 4)
+    row["price_change"] = round(change, 2)
+    row["change_pct"] = round(change / prev_close * 100, 2)
 
 
 def _portfolio_flow_attitude(flow_value, amount_value=None) -> dict:
@@ -3777,6 +4496,23 @@ def _portfolio_daily_flow_attitude(main_net_inflow, amount_value=None) -> dict:
     }
 
 
+def _portfolio_time_age_seconds(value) -> int | None:
+    dt = None
+    if isinstance(value, datetime):
+        dt = value.replace(tzinfo=None)
+    elif value:
+        text_value = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text_value[:len(fmt)], fmt)
+                break
+            except Exception:
+                continue
+    if not dt:
+        return None
+    return max(0, int((datetime.now() - dt).total_seconds()))
+
+
 def _portfolio_build_watch_analysis(row: dict) -> dict:
     """Compact intraday watch analysis for the portfolio table."""
     change_pct = _portfolio_num(row.get("change_pct"))
@@ -3787,13 +4523,17 @@ def _portfolio_build_watch_analysis(row: dict) -> dict:
     quote_amount = _portfolio_num(row.get("quote_amount") or row.get("amount"))
     minute_level = str(row.get("flow_attitude") or "")
     minute_label = str(row.get("flow_attitude_label") or "")
+    flow_status = str(row.get("flow_status") or "")
     flow_att = (
         {"level": minute_level, "label": minute_label, "ratio": row.get("flow_attitude_ratio")}
-        if minute_level and minute_label
+        if flow_status == "fresh" and minute_level and minute_label
         else _portfolio_daily_flow_attitude(main_flow, quote_amount)
     )
+    flow_basis = "minute_5m_fresh" if flow_status == "fresh" and minute_level and minute_label else "daily_flow"
     flow_level = str(flow_att.get("level") or "neutral")
     flow_label = str(flow_att.get("label") or "中性")
+    macro_risk_triggered = bool(row.get("macro_risk_triggered"))
+    macro_risk_reason = str(row.get("macro_risk_reason") or "")
 
     if price <= 0:
         trend = "缺价"
@@ -3824,26 +4564,40 @@ def _portfolio_build_watch_analysis(row: dict) -> dict:
 
     if price <= 0:
         advice = "等价"
+        decision_rule = "实时价格缺失，先不做买卖判断。"
     elif flow_level in {"strong_out", "out"} and change_pct <= -2:
         advice = "控仓" if is_holding else "观望"
+        decision_rule = "资金外流且跌幅超过 2%，优先控制风险。"
     elif flow_level in {"strong_in", "in"} and change_pct >= 1:
         advice = "持有" if is_holding else "关注"
+        decision_rule = "资金流入且涨幅超过 1%，说明短线承接偏强。"
     elif change_pct >= 8:
         advice = "防追高" if not is_holding else "盯卖点"
+        decision_rule = "涨幅超过 8%，追高风险上升，持仓优先盯卖点。"
+    elif is_holding and macro_risk_triggered:
+        advice = "先跑"
+        decision_rule = "事件/板块风险命中当前持仓，优先降低暴露。"
     elif is_holding and change_pct <= -4:
         advice = "看止损"
+        decision_rule = "持仓股跌幅超过 4%，需要复核止损与承接。"
     elif is_holding:
         advice = "持有"
+        decision_rule = "仍有持仓且未触发强风险条件，默认继续观察持有。"
     else:
         advice = "观察"
+        decision_rule = "未持仓且没有形成明确资金/价格共振，先观察。"
 
     risk_parts: list[str] = []
     if price <= 0:
         risk_parts.append("实时价缺失")
     if row.get("flow_trade_date") and row.get("quote_trade_date") and str(row.get("flow_trade_date"))[:10] < str(row.get("quote_trade_date"))[:10]:
         risk_parts.append("资金滞后")
+    if flow_status == "stale":
+        risk_parts.append("分时资金滞后")
     if flow_level in {"strong_out", "out"}:
         risk_parts.append("资金外流")
+    if macro_risk_triggered:
+        risk_parts.insert(0, "事件风险命中")
     if change_pct >= 9.5:
         risk_parts.append("接近涨停")
     if change_pct <= -7:
@@ -3853,22 +4607,194 @@ def _portfolio_build_watch_analysis(row: dict) -> dict:
     if not risk_parts:
         risk_parts.append("暂无明显")
 
-    freshness = "实时" if row.get("quote_snapshot_at") or row.get("live_price") is not None else "收盘"
+    guard_level = "LOW"
+    guard_action = "正常持有" if is_holding else "未持仓观察"
+    guard_reason = "暂无明显回撤压力"
+    profit_pct = _portfolio_num(row.get("profit_pct")) if row.get("profit_pct") is not None else None
+    stop_loss_line = round(float(row.get("cost_price") or 0) * 0.95, 3) if is_holding and _portfolio_num(row.get("cost_price")) > 0 else None
+    reduce_line = round(price * 0.97, 3) if is_holding and price > 0 else None
+
+    if price <= 0:
+        guard_level = "DATA"
+        guard_action = "等行情"
+        guard_reason = "实时价缺失，先不做交易判断"
+    elif is_holding:
+        if macro_risk_triggered:
+            guard_level = "HIGH"
+            guard_action = "事件先跑"
+            guard_reason = macro_risk_reason or "黑天鹅/板块风险命中持仓，优先降仓防守"
+        elif profit_pct is not None and (profit_pct <= -8 or (profit_pct <= -5 and (flow_level in {"strong_out", "out"} or change_pct <= -3))):
+            guard_level = "HIGH"
+            guard_action = "止损复核"
+            guard_reason = "持仓亏损已扩大，且价格或资金未确认修复"
+        elif change_pct <= -7 or (flow_level == "strong_out" and change_pct <= -4):
+            guard_level = "HIGH"
+            guard_action = "减仓防守"
+            guard_reason = "盘中急跌叠加资金压力，优先控制回撤"
+        elif profit_pct is not None and profit_pct >= 20 and change_pct <= -4:
+            guard_level = "HIGH"
+            guard_action = "止盈保护"
+            guard_reason = "盈利较厚但出现明显回吐，先保护利润"
+        elif profit_pct is not None and profit_pct >= 10 and flow_level in {"strong_out", "out"} and change_pct <= -2:
+            guard_level = "MEDIUM"
+            guard_action = "分批止盈"
+            guard_reason = "已有利润且资金外流，避免盈利回撤"
+        elif profit_pct is not None and profit_pct <= -3 and flow_level in {"strong_out", "out"}:
+            guard_level = "MEDIUM"
+            guard_action = "降仓观察"
+            guard_reason = "小亏叠加资金外流，先降低暴露"
+        elif change_pct <= -4:
+            guard_level = "MEDIUM"
+            guard_action = "看止损线"
+            guard_reason = "跌幅偏大，观察是否跌破防守线"
+
+    quote_status_for_label = str(row.get("quote_status") or "")
+    if quote_status_for_label == "fresh":
+        freshness = "实时"
+    elif quote_status_for_label == "closed":
+        freshness = "收盘"
+    elif quote_status_for_label == "previous_close":
+        freshness = "上一收盘"
+    elif row.get("quote_snapshot_at") or row.get("live_price") is not None:
+        freshness = "快照"
+    else:
+        freshness = "收盘"
     if row.get("flow_latest_time"):
-        freshness += "/分资"
+        freshness += "/分资" if flow_status == "fresh" else "/分资旧"
     elif row.get("flow_trade_date"):
         freshness += "/日资"
+
+    confidence = 50
+    data_flags: list[str] = []
+    if price > 0:
+        confidence += 10
+    else:
+        confidence -= 25
+        data_flags.append("实时价缺失")
+    if flow_basis == "minute_5m_fresh":
+        confidence += 16
+    elif row.get("flow_trade_date"):
+        confidence += 7
+        data_flags.append("资金使用日级数据")
+    else:
+        confidence -= 10
+        data_flags.append("资金数据缺失")
+    if row.get("quote_status") == "fresh":
+        confidence += 8
+    elif row.get("quote_status") == "closed":
+        confidence += 6
+    elif row.get("quote_status") == "previous_close":
+        confidence -= 6
+        data_flags.append("行情使用上一交易日收盘")
+    elif row.get("quote_status") == "stale":
+        confidence -= 8
+        data_flags.append("行情可能滞后")
+    if flow_status == "stale":
+        confidence -= 10
+    if macro_risk_triggered:
+        confidence += 6
+    if risk_parts != ["暂无明显"]:
+        confidence -= min(12, len(risk_parts) * 3)
+    confidence = int(max(15, min(92, confidence)))
+    confidence_label = "高" if confidence >= 75 else "中" if confidence >= 55 else "低"
+    if not data_flags:
+        data_flags.append("行情/资金数据可用于盘中判断")
+
+    flow_ratio_text = ""
+    if flow_att.get("ratio") is not None:
+        try:
+            flow_ratio_text = f"，占成交额 {float(flow_att.get('ratio')):.1f}%"
+        except Exception:
+            flow_ratio_text = ""
+    evidence = [
+        {
+            "label": "价格",
+            "value": f"现价 {price:.2f}，涨跌 {change_pct:+.2f}%" if price > 0 else "实时价缺失",
+            "tone": "good" if change_pct >= 1 else "bad" if change_pct <= -2 else "neutral",
+            "explain": f"按涨跌幅分层，当前归类为“{trend}”。",
+        },
+        {
+            "label": "资金",
+            "value": f"{flow_label} / {_fmt_analysis_money_cn(main_flow)}{flow_ratio_text}",
+            "tone": "good" if flow_level in {"strong_in", "in"} else "bad" if flow_level in {"strong_out", "out"} else "neutral",
+            "explain": f"资金来源：{'5分钟实时资金' if flow_basis == 'minute_5m_fresh' else '最近日级资金'}。",
+        },
+        {
+            "label": "热度",
+            "value": f"{heat}（{heat_score}/100）",
+            "tone": "good" if heat_score >= 75 else "neutral" if heat_score >= 55 else "muted",
+            "explain": "由涨跌幅、主力净流、成交额共同加权，不等于买入信号。",
+        },
+        {
+            "label": "持仓",
+            "value": f"{shares} 股" if is_holding else "未持仓",
+            "tone": "neutral",
+            "explain": (
+                f"成本 {float(row.get('cost_price') or 0):.2f}，浮盈 {profit_pct:+.2f}%。"
+                if is_holding and profit_pct is not None
+                else "未持仓时建议偏向观察/关注，不直接给仓位动作。"
+            ),
+        },
+    ]
+    if macro_risk_triggered:
+        evidence.insert(0, {
+            "label": "事件风险",
+            "value": "命中",
+            "tone": "bad",
+            "explain": macro_risk_reason or "当前持仓匹配到事件/板块风险信号。",
+        })
+
+    next_checks = []
+    if guard_reason:
+        next_checks.append(f"复核回撤守门：{guard_reason}")
+    if stop_loss_line:
+        next_checks.append(f"若跌破止损线 {stop_loss_line}，优先复核减仓/止损。")
+    if reduce_line:
+        next_checks.append(f"若跌破减仓观察线 {reduce_line} 且资金继续外流，降低仓位。")
+    if flow_level in {"strong_out", "out"}:
+        next_checks.append("观察后续 5m/15m 资金能否由流出转为中性或流入。")
+    elif flow_level in {"strong_in", "in"}:
+        next_checks.append("观察资金流入是否能延续，并避免价格冲高回落。")
+    if not next_checks:
+        next_checks.append("继续观察价格是否突破压力或跌破支撑，等待资金/价格共振。")
 
     return {
         "trend": trend,
         "funds": flow_label,
         "funds_level": flow_level,
         "funds_ratio": flow_att.get("ratio"),
+        "funds_source": flow_basis,
+        "funds_source_label": "5分钟实时资金" if flow_basis == "minute_5m_fresh" else "日资金",
+        "funds_latest_time": row.get("flow_latest_time") or row.get("flow_trade_date") or "",
+        "funds_age_seconds": row.get("flow_age_seconds"),
         "heat": heat,
         "heat_score": heat_score,
         "operation_advice": advice,
         "risk_tip": "、".join(risk_parts[:3]),
+        "drawdown_guard": {
+            "level": guard_level,
+            "action": guard_action,
+            "reason": guard_reason,
+            "stop_loss_line": stop_loss_line,
+            "reduce_line": reduce_line,
+        },
         "freshness": freshness,
+        "confidence": {"score": confidence, "label": confidence_label},
+        "decision_path": [
+            f"结论：{advice}",
+            f"触发规则：{decision_rule}",
+            f"回撤规则：{guard_action} - {guard_reason}",
+        ],
+        "evidence": evidence,
+        "data_quality": {
+            "label": "可用" if confidence >= 55 else "谨慎",
+            "flags": data_flags,
+            "quote_status": row.get("quote_status") or "missing",
+            "flow_status": flow_status or "missing",
+            "quote_time": row.get("quote_snapshot_at") or row.get("snapshot_at") or row.get("quote_trade_date") or "",
+            "flow_time": row.get("flow_latest_time") or row.get("flow_trade_date") or "",
+        },
+        "next_checks": next_checks,
     }
 
 
@@ -3951,7 +4877,15 @@ def _portfolio_refresh_qmt_min_flow(codes: list[str], *, force: bool = False) ->
                 params[f"t{idx}"] = row["trade_time"]
             if clauses:
                 conn.execute(text("DELETE FROM sm_stock_capital_flow_min WHERE " + " OR ".join(clauses)), params)
-    pd.DataFrame(rows).to_sql("sm_stock_capital_flow_min", get_engine(), if_exists="append", index=False, chunksize=1000, method="multi")
+    write_frame(
+        pd.DataFrame(rows),
+        "sm_stock_capital_flow_min",
+        get_engine(),
+        if_exists="append",
+        index=False,
+        chunksize=1000,
+        method="multi",
+    )
     result = {"status": "success", "rows": len(rows), "generated_at": now.isoformat(timespec="seconds")}
     _cache_set(cache_key, result)
     return result
@@ -3981,15 +4915,30 @@ def _portfolio_min_flow_summary(codes: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for item in rows:
         code = str(item.get("stock_code") or "").strip().zfill(6)
-        attitude = _portfolio_flow_attitude(item.get("flow_5m"), item.get("flow_5m_abs"))
+        latest_time = str(item.get("latest_time") or "")[:19]
+        flow_age_seconds = _portfolio_time_age_seconds(latest_time)
+        is_fresh = (
+            flow_age_seconds is not None
+            and flow_age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
+            and latest_time[:10] == datetime.now().date().isoformat()
+        )
+        has_flow_5m = item.get("flow_5m") is not None
+        attitude = _portfolio_flow_attitude(item.get("flow_5m"), item.get("flow_5m_abs")) if has_flow_5m else {
+            "level": "",
+            "label": "",
+            "ratio": None,
+        }
         out[code] = {
             "flow_1m": item.get("flow_1m"),
             "flow_5m": item.get("flow_5m"),
             "flow_15m": item.get("flow_15m"),
-            "flow_latest_time": str(item.get("latest_time") or "")[:19],
+            "flow_latest_time": latest_time,
+            "flow_age_seconds": flow_age_seconds,
+            "flow_status": "fresh" if is_fresh else "stale",
             "flow_attitude": attitude["level"],
             "flow_attitude_label": attitude["label"],
             "flow_attitude_ratio": attitude["ratio"],
+            "flow_attitude_basis": "minute_5m_fresh" if is_fresh else ("minute_5m_stale" if has_flow_5m else ""),
         }
     return out
 
@@ -4233,11 +5182,13 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
             stock_code = str(row["stock_code"])
             if stock_code not in kline_map:
                 kline_map[stock_code] = row
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_build_portfolio_snapshot:5137', exc)
 
+    portfolio_mode = _portfolio_market_mode()
+    close_trade_date = _portfolio_close_trade_date()
     try:
-        live_quotes = _portfolio_fetch_live_quotes(codes, force=force_live) or {}
+        live_quotes = _portfolio_fetch_live_quotes(codes, force=force_live) if portfolio_mode == "intraday" else {}
     except Exception:
         live_quotes = {}
     flow_min_refresh = _portfolio_refresh_qmt_min_flow(codes, force=force_live) if (force_live or _is_monitor_trading_time()) else {"status": "skipped", "rows": 0}
@@ -4261,6 +5212,48 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     except Exception:
         flow_map = {}
 
+    profile_map: dict[str, dict] = {}
+    try:
+        profile_rows = _read_sql(f"""
+            SELECT stock_code, industry AS industry_name
+            FROM sm_stock_snapshot
+            WHERE stock_code IN ({placeholders})
+        """)
+        for item in profile_rows:
+            profile_map[str(item.get("stock_code") or "").strip().zfill(6)] = {
+                "industry_name": item.get("industry_name") or "",
+            }
+    except Exception:
+        profile_map = {}
+    try:
+        concept_rows = _read_sql(f"""
+            SELECT stock_code, concept_tag, pop_tag
+            FROM st_hot_rank_ths
+            WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_rank_ths)
+              AND stock_code IN ({placeholders})
+        """)
+        for item in concept_rows:
+            stock_code = str(item.get("stock_code") or "").strip().zfill(6)
+            profile_map.setdefault(stock_code, {})
+            profile_map[stock_code]["concept_tag"] = item.get("concept_tag") or ""
+            profile_map[stock_code]["pop_tag"] = item.get("pop_tag") or ""
+    except Exception as exc:
+        _record_fallback('_build_portfolio_snapshot:5196', exc)
+
+    tech_cache_key = "portfolio_tech_risk_signal"
+    tech_risk_news_signal = _cache_get(
+        tech_cache_key,
+        ttl_seconds=_trading_live_ttl_seconds(900, intraday_seconds=900),
+    )
+    if tech_risk_news_signal is None:
+        tech_risk_news_signal = {
+            "status": "skipped",
+            "triggered": False,
+            "headline": "自选股刷新跳过慢风险扫描",
+            "summary": "行情刷新优先返回，技术风险信号由独立页面/缓存更新。",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
     today_trades_map = {}
     try:
         _ensure_portfolio_trans_log_table()
@@ -4273,8 +5266,8 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         for row in all_trades:
             stock_code = str(row["stock_code"]).strip().zfill(6)
             today_trades_map.setdefault(stock_code, []).append(row)
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_build_portfolio_snapshot:5216', exc)
 
     total_hold_profit = 0.0
     today_hold_profit = 0.0
@@ -4282,12 +5275,37 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     today_open_count = 0
     today_cleared_count = 0
     watch_advice_counts: dict[str, int] = {}
+    drawdown_guard_counts: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "DATA": 0}
+    quote_status_counts: dict[str, int] = {}
     for row in rows:
         stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        profile = profile_map.get(stock_code) or {}
+        row["industry_name"] = profile.get("industry_name") or row.get("industry_name") or ""
+        row["concept_tag"] = profile.get("concept_tag") or row.get("concept_tag") or ""
+        row["pop_tag"] = profile.get("pop_tag") or row.get("pop_tag") or ""
+        row["macro_risk_triggered"] = bool(
+            tech_risk_news_signal.get("triggered")
+            and int(row.get("shares") or 0) > 0
+            and holding_matches_signal(row, tech_risk_news_signal)
+        )
+        row["macro_risk_reason"] = (
+            tech_risk_news_signal.get("action") if row["macro_risk_triggered"] else ""
+        )
         kline = kline_map.get(stock_code, {})
         row["kline_pre_close"] = kline.get("pre_close")
+        row["kline_close"] = kline.get("close")
         row["kline_trade_date"] = str(kline.get("trade_date", ""))[:10] if kline.get("trade_date") else None
-        _portfolio_apply_quote(row, live_quotes.get(stock_code))
+        target_trade_date = _portfolio_quote_trade_date(row)
+        kline_trade_date = str(kline.get("trade_date", ""))[:10] if kline.get("trade_date") else ""
+        kline_is_close = bool(kline and kline_trade_date == close_trade_date)
+        if portfolio_mode == "intraday":
+            _portfolio_apply_quote(row, live_quotes.get(stock_code))
+        elif kline_is_close:
+            quote_status = "closed" if target_trade_date == close_trade_date else "previous_close"
+            _portfolio_apply_kline_quote(row, kline, status=quote_status)
+        else:
+            _portfolio_apply_kline_quote(row, kline, status="previous_close")
+        _portfolio_rebase_quote_change(row, kline)
         flow = flow_map.get(stock_code) or {}
         row["main_net_inflow"] = flow.get("main_net_inflow")
         row["max_net_inflow"] = flow.get("max_net_inflow")
@@ -4301,17 +5319,30 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         row["flow_5m"] = min_flow.get("flow_5m")
         row["flow_15m"] = min_flow.get("flow_15m")
         row["flow_latest_time"] = min_flow.get("flow_latest_time") or ""
+        row["flow_age_seconds"] = min_flow.get("flow_age_seconds")
+        row["flow_status"] = min_flow.get("flow_status") or ("missing" if not min_flow else "")
         row["flow_attitude"] = min_flow.get("flow_attitude") or ""
         row["flow_attitude_label"] = min_flow.get("flow_attitude_label") or ""
         row["flow_attitude_ratio"] = min_flow.get("flow_attitude_ratio")
+        row["flow_attitude_basis"] = min_flow.get("flow_attitude_basis") or ""
+        if not row["flow_attitude_label"]:
+            daily_attitude = _portfolio_daily_flow_attitude(row.get("main_net_inflow"), row.get("quote_amount") or row.get("amount"))
+            row["flow_attitude"] = daily_attitude["level"]
+            row["flow_attitude_label"] = daily_attitude["label"]
+            row["flow_attitude_ratio"] = daily_attitude["ratio"]
+            row["flow_attitude_basis"] = "daily_flow"
         if row.get("cur_price") is None:
-            row["cur_price"] = kline.get("close")
+            fallback_status = "stale" if portfolio_mode == "intraday" else "previous_close"
+            _portfolio_apply_kline_quote(row, kline, status=fallback_status)
         if row.get("change_pct") is None:
             row["change_pct"] = kline.get("change_pct")
         if row.get("current_name") is None:
             row["current_name"] = kline.get("short_name")
+        row["quote_status"] = row.get("quote_status") or "missing"
+        quote_status = str(row.get("quote_status") or "missing")
+        quote_status_counts[quote_status] = quote_status_counts.get(quote_status, 0) + 1
 
-        trade_date = _portfolio_quote_trade_date(row)
+        trade_date = str(row.get("quote_trade_date") or target_trade_date or _portfolio_quote_trade_date(row))[:10]
         row["quote_trade_date"] = trade_date
         cost_price = float(row.get("cost_price") or 0)
         current_price = float(row.get("cur_price") or 0) if row.get("cur_price") is not None else 0.0
@@ -4331,7 +5362,7 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
             current_price,
             row.get("live_price"),
             row.get("price_change"),
-            row.get("kline_pre_close"),
+            row.get("quote_prev_close") or row.get("kline_pre_close"),
             row.get("change_pct"),
             row["stock_code"],
             trades,
@@ -4343,6 +5374,8 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         advice = str((row["watch_analysis"] or {}).get("operation_advice") or "")
         if advice:
             watch_advice_counts[advice] = watch_advice_counts.get(advice, 0) + 1
+        guard_level = str(((row["watch_analysis"] or {}).get("drawdown_guard") or {}).get("level") or "LOW").upper()
+        drawdown_guard_counts[guard_level] = drawdown_guard_counts.get(guard_level, 0) + 1
 
         if row.get("is_today_open") or row.get("is_today_reopened"):
             today_open_count += 1
@@ -4355,6 +5388,19 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         if row["today_profit"] is not None:
             today_hold_profit += row["today_profit"]
 
+    tech_risk_signal = dict(tech_risk_news_signal or {})
+    exposed_holdings = [
+        {
+            "stock_code": str(row.get("stock_code") or ""),
+            "short_name": row.get("display_name") or row.get("short_name") or "",
+            "reason": row.get("macro_risk_reason") or tech_risk_signal.get("headline") or "",
+        }
+        for row in rows
+        if row.get("macro_risk_triggered")
+    ]
+    tech_risk_signal["exposed_holdings"] = exposed_holdings
+    tech_risk_signal["exposed_holding_count"] = len(exposed_holdings)
+
     return {
         "data": rows,
         "total": len(rows),
@@ -4366,8 +5412,13 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
             "today_cleared_count": today_cleared_count,
             "quote_source": "gj_qmt",
             "quote_generated_at": datetime.now().isoformat(timespec="seconds"),
+            "quote_status_counts": quote_status_counts,
             "flow_min_refresh": flow_min_refresh,
             "watch_advice_counts": watch_advice_counts,
+            "drawdown_guard_counts": drawdown_guard_counts,
+            "drawdown_guard_alerts": int(drawdown_guard_counts.get("HIGH", 0) + drawdown_guard_counts.get("MEDIUM", 0)),
+            "tech_risk_signal": tech_risk_signal,
+            "tech_risk_alerts": int(tech_risk_signal.get("exposed_holding_count") or 0) if tech_risk_signal.get("triggered") else 0,
         },
     }
 
@@ -4540,8 +5591,8 @@ def portfolio_transact(stock_code: str, body: PortfolioTransact):
         # 同步写入操作流水表(st_trade_flow)
         try:
             _watchlist_write_flow(code, old.get("short_name", ""), trans_type, price, trade_shares)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('portfolio_transact:5522', exc)
 
         recalc = portfolio_recalc_cost_from_history(code, _read_sql)
         if recalc.get("status") != "ok":
@@ -4580,8 +5631,8 @@ def _portfolio_is_trading_day(d: date) -> bool:
         )
         if rows:
             return int(rows[0].get("trade_status") or 0) == 1
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_is_trading_day:5562', exc)
     return d.weekday() < 5
 
 
@@ -4596,8 +5647,8 @@ def _portfolio_last_trade_date(on_or_before: date | None = None) -> str:
         )
         if rows and rows[0].get("d"):
             return str(rows[0]["d"])[:10]
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_last_trade_date:5578', exc)
     try:
         rows = _read_sql(
             "SELECT MAX(trade_date) AS d FROM sm_stock_kline "
@@ -4606,8 +5657,8 @@ def _portfolio_last_trade_date(on_or_before: date | None = None) -> str:
         )
         if rows and rows[0].get("d"):
             return str(rows[0]["d"])[:10]
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_last_trade_date:5588', exc)
     return d_str
 
 
@@ -4660,8 +5711,8 @@ def _portfolio_kline_bar(code: str, trade_date: str, klines: list | None = None)
             if "trade_date" in row:
                 row["trade_date"] = str(row["trade_date"])[:10]
             return row
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_kline_bar:5642', exc)
     return None
 
 
@@ -4721,8 +5772,8 @@ def _portfolio_resolve_quote(code: str, klines: list | None) -> dict:
                 "trade_date": target,
                 "snapshot_at": live.get("snapshot_at"),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_portfolio_resolve_quote:5703', exc)
 
     if klines and klines[0].get("close") is not None:
         return {
@@ -4749,7 +5800,7 @@ def _portfolio_fetch_live_quotes(codes: list[str], *, force: bool = False) -> di
     cached = None if force else _cache_get(_cache_key, ttl_seconds=_trading_live_ttl_seconds(15))
     if cached is not None:
         return cached
-    out = {} if force else _live_quotes_from_current_table(clean, max_age_seconds=20)
+    out = {} if force else _live_quotes_from_current_table(clean, max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS)
     missing_codes = clean if force else [code for code in clean if code not in out]
     if missing_codes and (_is_monitor_trading_time() or force):
         try:
@@ -4764,9 +5815,19 @@ def _portfolio_fetch_live_quotes(codes: list[str], *, force: bool = False) -> di
                 min_coverage=0.0,
                 replace_scope="subset",
             )
-            out.update(_live_quotes_from_current_table(missing_codes, max_age_seconds=30))
+            out.update(_live_quotes_from_current_table(missing_codes, max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS))
         except Exception as exc:
             _log.warning("QMT live quote refresh failed for %s codes: %s", len(missing_codes), exc)
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
+            _live_quotes_from_current_table(
+                still_missing,
+                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+                allow_stale=True,
+                max_stale_age_seconds=PORTFOLIO_LIVE_STALE_SECONDS,
+            )
+        )
     _cache_set(_cache_key, out)
     return out
 
@@ -4790,6 +5851,16 @@ def portfolio_refresh_prices():
         if not codes:
             return {"status": "ok", "refreshed": 0, "message": "无自选股"}
         quotes = _portfolio_fetch_live_quotes(codes, force=True)
+        if not quotes:
+            _log.warning("portfolio quote refresh returned no rows; codes=%s", codes)
+            _invalidate_portfolio_snapshot_cache()
+            return {
+                "status": "ok",
+                "refreshed": 0,
+                "quote_status": "missing",
+                "warning": "quote_unavailable",
+                "message": "No live quote returned; kept existing portfolio data.",
+            }
         if not quotes:
             _log.warning("行情接口返回空, codes=%s", codes)
             from datetime import datetime
@@ -4833,6 +5904,7 @@ def portfolio_analyze(stock_code: str):
         price_val = float(market.get("price") or 0)
         quote = market
         analysis_snapshot = _load_latest_analysis_snapshot(code, trade_date=trade_date or None)
+        recommendation_snapshot = _load_latest_recommendation_snapshot(code, trade_date=trade_date or None)
 
         ai_result = _generate_ai_analysis(
             code,
@@ -4853,12 +5925,27 @@ def portfolio_analyze(stock_code: str):
 
         # 构建返回
         analysis_text = ai_result.get("conclusion", "") if isinstance(ai_result, dict) else str(ai_result)
+        if not analysis_text:
+            analysis_text = _build_portfolio_section_analysis(
+                market=market,
+                capital=capital,
+                technical=technical,
+                concepts=concepts,
+                holding=holding,
+                hot_rank=payload.get("hot_rank"),
+                ai_result=ai_result if isinstance(ai_result, dict) else {},
+                analysis_snapshot=analysis_snapshot,
+                recommendation_snapshot=recommendation_snapshot,
+            )
         data_mode_label = "盘中实时" if mode == "intraday" else "盘后收盘"
 
         response = {
             "stock_code": code,
             "short_name": basic.get("short_name"),
             "analysis": analysis_text,
+            "analysis_time": datetime.now().strftime("%m月%d日 %H:%M"),
+            "cur_price": price_val,
+            "change_pct": quote.get("change_pct"),
             "data_mode": mode,
             "data_mode_label": data_mode_label,
             "quote_trade_date": quote_trade_date,
@@ -4867,6 +5954,7 @@ def portfolio_analyze(stock_code: str):
             "quote_source": payload.get("quote_source") or "",
             "detail_source": payload.get("detail_source") or "",
             "analysis_snapshot": analysis_snapshot,
+            "recommendation_snapshot": recommendation_snapshot,
             "ai_source": ai_result.get("source") if isinstance(ai_result, dict) else None,
             "ai_analysis_date": ai_result.get("analysis_date") if isinstance(ai_result, dict) else None,
             "ai_scores": ai_result.get("scores") if isinstance(ai_result, dict) else None,
@@ -4911,8 +5999,8 @@ def portfolio_analyze(stock_code: str):
                    "pr": price_val,
                    "chg": quote.get("change_pct"),
                    "pi": f"持仓{holding.get('shares')}股" if holding else "无持仓"})
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('portfolio_analyze:5930', exc)
 
         return response
     except Exception as e:
@@ -5036,6 +6124,21 @@ def sector_heat_matrix(
     from collections import defaultdict
 
     try:
+        requested_end_date = end_date
+        try:
+            fallback_rows = _read_sql(
+                """
+                SELECT MAX(snapshot_date) AS d
+                FROM st_hot_concept_ths_daily
+                WHERE snapshot_date <= :d AND plate_type IN (1,2,3,4)
+                """,
+                {"d": end_date},
+            )
+            fallback_date = str(fallback_rows[0]["d"])[:10] if fallback_rows and fallback_rows[0].get("d") else ""
+            if fallback_date:
+                end_date = fallback_date
+        except Exception:
+            fallback_date = ""
         end_dt = date.fromisoformat(end_date)
         begin = end_dt - timedelta(days=days * 2 + 10)
 
@@ -5051,8 +6154,8 @@ def sector_heat_matrix(
                 {"b": begin.isoformat(), "e": end_dt.isoformat()},
             )
             all_plate2_rows.extend(plate2)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('sector_heat_matrix:6085', exc)
 
         try:
             plate1 = _read_sql(
@@ -5062,8 +6165,8 @@ def sector_heat_matrix(
                 {"b": begin.isoformat(), "e": end_dt.isoformat()},
             )
             all_plate1_rows.extend(plate1)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('sector_heat_matrix:6096', exc)
 
         if not any(str(r.get("snapshot_date", "")) == today_str for r in all_plate2_rows):
             pass  # 由定时任务同步
@@ -5089,8 +6192,8 @@ def sector_heat_matrix(
                 {"b": begin.isoformat(), "e": end_dt.isoformat()},
             )
             all_plate4_rows.extend(plate4)
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('sector_heat_matrix:6123', exc)
 
         groups = {}
         data = []
@@ -5276,9 +6379,16 @@ def sector_heat_matrix(
                 if children:
                     east_tree[l1] = list(children)
 
-        return {"date": end_date, "dates": [r["date"] for r in data],
+        warnings = []
+        if not groups.get("东财一级行业"):
+            warnings.append("东财一级行业热度缺失")
+        if not groups.get("东财二级行业"):
+            warnings.append("东财二级行业热度缺失")
+
+        return {"date": end_date, "requested_date": requested_end_date, "fallback": end_date != requested_end_date,
+                "dates": [r["date"] for r in data],
                 "groups": groups, "data": data, "total": len(data), "east_tree": east_tree,
-                "daily_totals": daily_totals, "raw_data": raw_data}
+                "daily_totals": daily_totals, "raw_data": raw_data, "warnings": warnings}
     except Exception as e:
         return {"date": end_date, "data": [], "groups": {}, "total": 0, "error": str(e)}
 
@@ -5319,9 +6429,12 @@ def sync_sector_heat_today(date: str = Query(default_factory=lambda: date.today(
     import re as _re
     _ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
     cmd = [_sys.executable, str(_ROOT + "/tools/fetch_sector_heat_east_daily.py"), date]
-    child_env = _os.environ.copy()
-    child_env.setdefault("MYSQL_URL", get_engine().url.render_as_string(hide_password=False))
-    child_env.setdefault("PYTHONPATH", _ROOT + ":" + _os.path.join(_ROOT, "adata"))
+    child_env = build_child_env(
+        _ROOT,
+        engine=get_engine(),
+        override_mysql_url=False,
+        extra_python_paths=(_os.path.join(_ROOT, "adata"),),
+    )
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=_ROOT, env=child_env)
         output = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
@@ -5350,22 +6463,184 @@ def market_sentiment(
     days: int = Query(default=20, ge=5, le=60),
     date: str = Query(default_factory=lambda: date.today().isoformat()),
     top: int = Query(default=5, ge=1, le=15),
+    include_signal: bool = Query(default=False),
 ):
     """市场情绪与风格分析 — 主线/轮动/大小盘"""
-    # 盘中 120s 缓存，盘后 300s 缓存（情绪分析计算量大，缓存更长）
-    _ttl = 120 if _is_monitor_trading_time() else 300
-    _ckey = f"market_sentiment_{date}_{days}_{top}"
-    cached = _cache_get(_ckey, ttl_seconds=_ttl)
-    if cached is not None:
-        return cached
     try:
-        from tools.market_sentiment import run_full_analysis
-        result = run_full_analysis(lookback_days=days, end_date=date, top_n=top, engine=get_engine())
-        if "error" not in result:
-            _cache_set(_ckey, result)
+        result = _market_sentiment_result(date, days, top)
+        if include_signal and "error" not in result:
+            result = dict(result)
+            result["style_switch_signal"] = _build_style_switch_signal(date, days, result)
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> dict:
+    theme = sentiment.get("theme_analysis") or {}
+    style = sentiment.get("style_analysis") or {}
+    cap = sentiment.get("capital_analysis") or {}
+    rotation_score = float(theme.get("rotation_score") or 0)
+    risk_off_score = 20.0
+    switch_score = min(100.0, rotation_score)
+    evidence: list[str] = []
+
+    phase_desc = str(theme.get("phase_desc") or "")
+    style_bias = str(style.get("bias") or "")
+    style_desc = str(style.get("bias_desc") or "")
+    flow_style = str(cap.get("flow_style") or "")
+    recent_trend = str(cap.get("recent_trend") or "")
+
+    if rotation_score >= 60:
+        switch_score += 18
+        evidence.append(f"轮动强度{rotation_score:.0f}偏高")
+    elif rotation_score >= 40:
+        switch_score += 8
+        evidence.append(f"轮动强度{rotation_score:.0f}中等")
+    if "轮动" in str(theme.get("phase") or "") or "切换" in phase_desc:
+        switch_score += 12
+        evidence.append("主线阶段提示轮动/切换")
+
+    if "大盘" in style_bias or "核心资产" in style_desc or "避险" in style_desc:
+        risk_off_score += 22
+        evidence.append("风格偏向大盘/核心资产")
+    if "流出" in flow_style or "流出" in recent_trend:
+        risk_off_score += 20
+        evidence.append("主力资金偏流出")
+
+    risk_keywords = ["监管", "制裁", "加息", "冲突", "战争", "暴跌", "违约", "退市", "关税", "汇率"]
+    policy_keywords = ["降准", "降息", "稳增长", "财政", "专项债", "国常会", "政策", "会议"]
+    tech_keywords = ["芯片", "半导体", "AI", "人工智能", "算力", "机器人", "新能源"]
+    risk_news = 0
+    policy_news = 0
+    tech_news = 0
+    hot_subjects: dict[str, int] = {}
+    for row in news_rows[:80]:
+        text_blob = str(row.get("title") or "") + str(row.get("content") or "")
+        if any(kw in text_blob for kw in risk_keywords):
+            risk_news += 1
+        if any(kw in text_blob for kw in policy_keywords):
+            policy_news += 1
+        if any(kw in text_blob for kw in tech_keywords):
+            tech_news += 1
+        for item in row.get("subjects") or []:
+            name = item.get("name") if isinstance(item, dict) else str(item)
+            if name:
+                hot_subjects[name] = hot_subjects.get(name, 0) + 1
+
+    if risk_news >= 2:
+        risk_off_score += min(24, risk_news * 6)
+        evidence.append(f"风险/监管/外部扰动新闻{risk_news}条")
+    if policy_news >= 2:
+        switch_score += min(16, policy_news * 4)
+        evidence.append(f"政策类新闻{policy_news}条，可能触发方向切换")
+    if tech_news >= 3 and risk_news >= 2:
+        switch_score += 8
+        evidence.append("科技热度高但风险新闻增多，警惕高弹性板块分歧")
+
+    tech_risk_signal = build_tech_risk_signal(news_rows, [])
+    if tech_risk_signal.get("triggered"):
+        risk_off_score += min(28, float(tech_risk_signal.get("score") or 0) * 0.28)
+        switch_score += 10
+        evidence.append(str(tech_risk_signal.get("headline") or "事件/板块风险触发"))
+
+    risk_off_score = round(max(0, min(100, risk_off_score)), 1)
+    switch_score = round(max(0, min(100, switch_score)), 1)
+    status = "risk_off" if risk_off_score >= 65 else "switching" if switch_score >= 65 else "balanced"
+    if status == "risk_off":
+        summary = "风险偏好下降，优先控制回撤，关注防御/避险方向"
+        action = "降低高波动、高拥挤仓位；优先观察银行、公用事业、电力、煤炭、石油石化、贵金属等防御线。"
+    elif status == "switching":
+        summary = "板块切换概率升高，注意主线从旧热点向政策/低位方向轮动"
+        action = "旧主线冲高不追，跟踪资金新进板块和首批放量个股，先小仓试错。"
+    else:
+        summary = "暂未出现强切换信号，维持主线跟踪"
+        action = "保持仓位纪律，等资金和情绪方向进一步确认。"
+
+    top_subjects = sorted(hot_subjects.items(), key=lambda kv: kv[1], reverse=True)[:8]
+    return {
+        "status": status,
+        "summary": summary,
+        "action": action,
+        "risk_off_score": risk_off_score,
+        "switch_score": switch_score,
+        "defensive_sectors": ["银行", "公用事业", "电力", "煤炭", "石油石化", "贵金属"],
+        "evidence": evidence[:8],
+        "news_counts": {"risk": risk_news, "policy": policy_news, "tech": tech_news},
+        "hot_subjects": [{"name": name, "count": count} for name, count in top_subjects],
+        "tech_risk_signal": tech_risk_signal,
+        "decision_radar": tech_risk_signal,
+    }
+
+
+def _market_sentiment_news_rows() -> list[dict]:
+    news_rows = _read_sql(
+        """
+        SELECT title, content, publish_time, subjects
+        FROM st_news_flash
+        WHERE publish_time >= DATE_SUB(NOW(), INTERVAL 36 HOUR)
+        ORDER BY publish_time DESC
+        LIMIT 120
+        """
+    )
+    for row in news_rows:
+        try:
+            row["subjects"] = json.loads(row.get("subjects") or "[]")
+        except Exception:
+            row["subjects"] = []
+    return news_rows
+
+
+def _build_style_switch_signal(date_value: str, days: int, sentiment: dict | None = None) -> dict:
+    if sentiment is None:
+        sentiment = _market_sentiment_result(date_value, days, 8)
+    news_rows = _market_sentiment_news_rows()
+    signal = _style_switch_signal_from_inputs(sentiment if isinstance(sentiment, dict) else {}, news_rows)
+    try:
+        signal["tech_risk_signal"] = fetch_tech_risk_signal(_read_sql, date_value)
+        signal["decision_radar"] = signal["tech_risk_signal"]
+    except Exception as exc:
+        _record_fallback('_build_style_switch_signal:6530', exc)
+    return {
+        "date": date_value,
+        "sentiment_date": sentiment.get("latest_date") if isinstance(sentiment, dict) else "",
+        **signal,
+    }
+
+
+@router.get("/hot-data/style-switch-signal")
+def style_switch_signal(
+    date: str = Query(default_factory=lambda: date.today().isoformat()),
+    days: int = Query(default=20, ge=5, le=60),
+):
+    try:
+        return _build_style_switch_signal(date, days)
+    except Exception as e:
+        return {"date": date, "error": str(e)}
+
+
+@router.get("/hot-data/tech-risk-signal")
+def tech_risk_signal(
+    date: str = Query(default_factory=lambda: date.today().isoformat()),
+    days: int = Query(default=2, ge=1, le=7),
+):
+    """兼容旧入口：当前返回通用风险/机会决策雷达。"""
+    try:
+        return fetch_tech_risk_signal(_read_sql, date, days=days)
+    except Exception as e:
+        return {"date": date, "status": "error", "triggered": False, "error": str(e)[:200]}
+
+
+@router.get("/hot-data/decision-radar")
+def decision_radar(
+    date: str = Query(default_factory=lambda: date.today().isoformat()),
+    days: int = Query(default=2, ge=1, le=7),
+):
+    """风险/机会决策雷达：新闻 + 外围/A股盘面 + 持仓/推荐池。"""
+    try:
+        return fetch_tech_risk_signal(_read_sql, date, days=days)
+    except Exception as e:
+        return {"date": date, "status": "error", "triggered": False, "error": str(e)[:200]}
 
 
 def _exec_sql(sql: str, params: dict = None):
@@ -5376,13 +6651,7 @@ def _exec_sql(sql: str, params: dict = None):
 
 
 def _read_dotenv_key():
-    for p in [_Path(__file__).resolve().parents[3] / ".env", _Path("/opt/ProBigA/.env")]:
-        if p.is_file():
-            for line in open(p):
-                line = line.strip()
-                if line.startswith("DEEPSEEK_API_KEY="):
-                    return line.split("=", 1)[1].strip()
-    return ""
+    return (get_settings().deepseek_api_key or "").strip()
 
 
 def _is_monitor_trading_time():
@@ -5396,14 +6665,20 @@ def _is_monitor_trading_time():
 
 def _market_live_cache_ttl() -> int:
     """Keep full-market views reasonably fresh without pretending they are tick-by-tick."""
-    return 30 if _is_monitor_trading_time() else 120
+    return 10 if _is_monitor_trading_time() else 120
 
 
 def _trading_live_ttl_seconds(default_off_hours: int = 60, *, intraday_seconds: int = 0) -> int:
     return intraday_seconds if _is_monitor_trading_time() else default_off_hours
 
 
-def _live_quotes_from_current_table(codes: list[str], *, max_age_seconds: int = 20) -> dict[str, dict]:
+def _live_quotes_from_current_table(
+    codes: list[str],
+    *,
+    max_age_seconds: int = 20,
+    allow_stale: bool = False,
+    max_stale_age_seconds: int = 300,
+) -> dict[str, dict]:
     clean = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
     if not clean:
         return {}
@@ -5432,7 +6707,11 @@ def _live_quotes_from_current_table(codes: list[str], *, max_age_seconds: int = 
         except Exception:
             age_seconds = float(max_age_seconds + 1)
         if age_seconds > max_age_seconds:
-            continue
+            if not allow_stale or age_seconds > max_stale_age_seconds:
+                continue
+            quote_status = "stale"
+        else:
+            quote_status = "fresh"
         out[stock_code] = {
             "stock_code": stock_code,
             "short_name": row.get("short_name"),
@@ -5442,9 +6721,89 @@ def _live_quotes_from_current_table(codes: list[str], *, max_age_seconds: int = 
             "volume": row.get("volume"),
             "amount": row.get("amount"),
             "snapshot_at": snapshot_at,
-            "source": "qmt_live_table",
+            "source": "qmt_live_table" if quote_status == "fresh" else "qmt_live_table_stale",
+            "quote_status": quote_status,
+            "quote_age_seconds": int(max(0, age_seconds)),
         }
     return out
+
+
+def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: str) -> dict[str, dict]:
+    """Return stable close/off-hours quotes from the latest stored quote snapshot for a trade date."""
+    clean = [str(code).strip().zfill(6) for code in codes if str(code).strip()]
+    td = str(trade_date or "")[:10]
+    if not clean or not td:
+        return {}
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+
+        td_start = _dt.strptime(td, "%Y-%m-%d")
+        td_end = td_start + _td(days=1)
+    except Exception:
+        return {}
+    placeholders = ", ".join([f":code_{idx}" for idx, _ in enumerate(clean)])
+    params = {f"code_{idx}": code for idx, code in enumerate(clean)}
+    params["td"] = td
+    params["td_start"] = td_start.strftime("%Y-%m-%d %H:%M:%S")
+    params["td_end"] = td_end.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _coerce_rows(rows: list[dict], source: str) -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        for row in rows or []:
+            stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+            if not stock_code or row.get("price") is None:
+                continue
+            snapshot_at = str(row.get("snapshot_at") or "")
+            out[stock_code] = {
+                "stock_code": stock_code,
+                "short_name": row.get("short_name"),
+                "price": row.get("price"),
+                "change": row.get("change"),
+                "change_pct": row.get("change_pct"),
+                "volume": row.get("volume"),
+                "amount": row.get("amount"),
+                "snapshot_at": snapshot_at,
+                "source": source,
+                "quote_status": "closed",
+                "quote_age_seconds": None,
+            }
+        return out
+
+    try:
+        rows = _read_sql(
+            f"""
+            SELECT stock_code, short_name, price, `change`, change_pct, volume, amount, snapshot_at
+            FROM sm_stock_current
+            WHERE stock_code IN ({placeholders})
+              AND snapshot_at >= :td_start AND snapshot_at < :td_end
+            """,
+            params,
+        )
+        out = _coerce_rows(rows, "qmt_close_table")
+        if out:
+            return out
+    except Exception as exc:
+        _record_fallback('_portfolio_closed_quotes_from_current_table:6704', exc)
+
+    try:
+        rows = _read_sql(
+            f"""
+            SELECT q.stock_code, q.short_name, q.price, q.`change`, q.change_pct,
+                   q.volume, q.amount, q.snapshot_at
+            FROM sm_rt_quote_snapshot q
+            INNER JOIN (
+                SELECT stock_code, MAX(snapshot_at) AS snapshot_at
+                FROM sm_rt_quote_snapshot
+                WHERE stock_code IN ({placeholders})
+                  AND snapshot_at >= :td_start AND snapshot_at < :td_end
+                GROUP BY stock_code
+            ) x ON q.stock_code = x.stock_code AND q.snapshot_at = x.snapshot_at
+            """,
+            params,
+        )
+        return _coerce_rows(rows, "qmt_close_archive")
+    except Exception:
+        return {}
 
 
 def _get_realtime_overview():
@@ -5480,8 +6839,8 @@ def _get_realtime_overview():
         )
         if rows and rows[0].get("total") and int(rows[0]["total"]) > 100:
             return rows[0]
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_fallback('_get_realtime_overview:6761', exc)
     return None
 
 
@@ -5497,13 +6856,46 @@ def _sql_in_params(values: list[str], prefix: str) -> tuple[str, dict[str, str]]
 
 def _monitor_resolve_trade_date(requested_date: str | None = None) -> str:
     requested = str(requested_date or "").strip() or date.today().isoformat()
-    rows = _read_sql(
-        "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1 AND trade_date <= :d",
+    if "trade_date" in _table_columns("sm_market_overview_daily"):
+        rows = _read_sql(
+            """
+            SELECT trade_date AS d
+            FROM sm_market_overview_daily
+            WHERE total >= 3000 AND trade_date <= :d
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            {"d": requested[:10]},
+        )
+        if rows and rows[0].get("d"):
+            return str(rows[0]["d"])[:10]
+    kline_rows = _read_sql(
+        """
+        SELECT trade_date AS d
+        FROM (
+            SELECT trade_date, COUNT(*) AS cnt
+            FROM sm_stock_kline
+            WHERE k_type = 1 AND adjust_type = 0 AND trade_date <= :d
+            GROUP BY trade_date
+        ) t
+        WHERE cnt >= 3000
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
         {"d": requested[:10]},
     )
-    if rows and rows[0].get("d"):
-        return str(rows[0]["d"])[:10]
-    latest_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1")
+    kline_date = str(kline_rows[0]["d"])[:10] if kline_rows and kline_rows[0].get("d") else ""
+    if kline_date:
+        return kline_date
+    latest_rows = _read_sql(
+        """
+        SELECT trade_date AS d
+        FROM sm_stock_kline
+        WHERE k_type = 1
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """
+    )
     if latest_rows and latest_rows[0].get("d"):
         return str(latest_rows[0]["d"])[:10]
     return requested[:10]
@@ -5511,22 +6903,41 @@ def _monitor_resolve_trade_date(requested_date: str | None = None) -> str:
 
 def _monitor_history_trade_dates(trade_date: str, limit: int = 20) -> list[str]:
     limit = max(1, min(int(limit), 60))
-    rows = _read_sql(f"""
+    kline_rows = _read_sql(f"""
         SELECT trade_date
         FROM (
-            SELECT trade_date
+            SELECT trade_date, COUNT(*) AS cnt
             FROM sm_stock_kline
-            WHERE k_type = 1 AND trade_date <= :d
+            WHERE k_type = 1 AND adjust_type = 0 AND trade_date <= :d
             GROUP BY trade_date
+            HAVING cnt >= 3000
             ORDER BY trade_date DESC
             LIMIT {limit}
         ) t
         ORDER BY trade_date
     """, {"d": trade_date[:10]})
-    return [str(row.get("trade_date") or "")[:10] for row in rows if row.get("trade_date")]
+    kline_result = [str(row.get("trade_date") or "")[:10] for row in kline_rows if row.get("trade_date")]
+    if "trade_date" in _table_columns("sm_market_overview_daily"):
+        rows = _read_sql(f"""
+            SELECT trade_date
+            FROM (
+                SELECT trade_date
+                FROM sm_market_overview_daily
+                WHERE total >= 3000 AND trade_date <= :d
+                ORDER BY trade_date DESC
+                LIMIT {limit}
+            ) t
+            ORDER BY trade_date
+        """, {"d": trade_date[:10]})
+        result = [str(row.get("trade_date") or "")[:10] for row in rows if row.get("trade_date")]
+        if result:
+            if kline_result and kline_result[-1] > result[-1]:
+                return kline_result
+            return result
+    return kline_result
 
 
-def _monitor_overview_map(trade_dates: list[str]) -> dict[str, dict]:
+def _monitor_overview_map_from_kline(trade_dates: list[str]) -> dict[str, dict]:
     if not trade_dates:
         return {}
     placeholders, params = _sql_in_params(trade_dates, "td")
@@ -5557,21 +6968,155 @@ def _monitor_overview_map(trade_dates: list[str]) -> dict[str, dict]:
     return {str(row["trade_date"])[:10]: row for row in rows if row.get("trade_date")}
 
 
+def _monitor_overview_map(trade_dates: list[str]) -> dict[str, dict]:
+    if not trade_dates:
+        return {}
+    if "trade_date" in _table_columns("sm_market_overview_daily"):
+        placeholders, params = _sql_in_params(trade_dates, "mo")
+        rows = _read_sql(f"""
+            SELECT trade_date,
+                   up_cnt,
+                   down_cnt,
+                   sideline_cnt,
+                   total,
+                   total_amount,
+                   small_up_cnt,
+                   small_total,
+                   small_avg_chg
+            FROM sm_market_overview_daily
+            WHERE trade_date IN ({placeholders})
+        """, params)
+        result = {str(row["trade_date"])[:10]: row for row in rows if row.get("trade_date")}
+        missing = [d for d in trade_dates if d not in result]
+        if missing:
+            result.update(_monitor_overview_map_from_kline(missing))
+        return result
+    return _monitor_overview_map_from_kline(trade_dates)
+
+
+def _monitor_qmt_plate_rows(trade_date: str) -> list[dict]:
+    if not trade_date:
+        return []
+    try:
+        kline_rows = _read_sql("""
+            SELECT stock_code, trade_date, amount, change_pct
+            FROM sm_stock_kline
+            WHERE trade_date = :trade_date AND k_type = 1 AND adjust_type = 0
+        """, {"trade_date": trade_date})
+        plate_rows = _read_sql("""
+            SELECT stock_code, plate_type, plate_name
+            FROM si_stock_plate_east
+            WHERE source = 'qmt'
+        """)
+    except Exception:
+        return []
+
+    if not kline_rows or not plate_rows:
+        return []
+
+    kline_df = pd.DataFrame(kline_rows)
+    plate_df = pd.DataFrame(plate_rows)
+    required_kline = {"stock_code", "trade_date", "amount", "change_pct"}
+    required_plate = {"stock_code", "plate_type", "plate_name"}
+    if not required_kline.issubset(kline_df.columns) or not required_plate.issubset(plate_df.columns):
+        return []
+
+    qmt_type_map = {"\u6982\u5ff5": 1, "\u884c\u4e1a": 3}
+    plate_df = plate_df[plate_df["plate_type"].isin(qmt_type_map.keys())].copy()
+    if plate_df.empty:
+        return []
+
+    kline_df["stock_code"] = kline_df["stock_code"].astype(str)
+    plate_df["stock_code"] = plate_df["stock_code"].astype(str)
+    merged = kline_df.merge(plate_df, on="stock_code", how="inner")
+    if merged.empty:
+        return []
+
+    merged["amount"] = pd.to_numeric(merged["amount"], errors="coerce").fillna(0.0)
+    merged["change_pct"] = pd.to_numeric(merged["change_pct"], errors="coerce").fillna(0.0)
+    merged["plate_name"] = merged["plate_name"].astype(str)
+    merged = merged[merged["plate_name"].str.len() > 0].copy()
+    if merged.empty:
+        return []
+
+    merged["weighted_change"] = merged["amount"] * merged["change_pct"]
+    grouped_df = (
+        merged.groupby(["trade_date", "plate_type", "plate_name"], dropna=False)
+        .agg(
+            hot_amount=("amount", "sum"),
+            weighted_change=("weighted_change", "sum"),
+            avg_change=("change_pct", "mean"),
+            stock_count=("stock_code", "nunique"),
+        )
+        .reset_index()
+    )
+    grouped_df = grouped_df[grouped_df["stock_count"] >= 2].copy()
+    if grouped_df.empty:
+        return []
+
+    grouped_df["hot_value"] = (grouped_df["hot_amount"] / 100000000).round(2)
+    grouped_df["change_pct"] = grouped_df.apply(
+        lambda row: round(
+            row["weighted_change"] / row["hot_amount"]
+            if float(row["hot_amount"] or 0) > 0
+            else row["avg_change"],
+            2,
+        ),
+        axis=1,
+    )
+
+    rows: list[dict] = []
+    for _, row in grouped_df.iterrows():
+        plate_type = qmt_type_map.get(str(row.get("plate_type") or ""))
+        if not plate_type:
+            continue
+        rows.append({
+            "snapshot_date": str(row.get("trade_date") or "")[:10],
+            "plate_type": int(plate_type),
+            "concept_name": str(row.get("plate_name") or ""),
+            "hot_value": float(row.get("hot_value") or 0),
+            "change_pct": float(row.get("change_pct") or 0),
+            "stock_count": int(row.get("stock_count") or 0),
+            "data_source": "qmt_plate_aggregate",
+        })
+    rows.sort(key=lambda item: (item["plate_type"], -float(item.get("hot_value") or 0), item.get("concept_name") or ""))
+    return rows
+
+
 def _monitor_hot_rows_map(trade_dates: list[str]) -> dict[tuple[str, int], list[dict]]:
     if not trade_dates:
         return {}
     placeholders, params = _sql_in_params(trade_dates, "hd")
-    rows = _read_sql(f"""
-        SELECT snapshot_date, plate_type, concept_name, hot_value, change_pct
-        FROM st_hot_concept_ths_daily
-        WHERE snapshot_date IN ({placeholders}) AND plate_type IN (1, 2, 3)
-        ORDER BY snapshot_date, plate_type, hot_value DESC
-    """, params)
     grouped: dict[tuple[str, int], list[dict]] = {}
-    for row in rows:
+
+    try:
+        fallback_rows = _read_sql(f"""
+            SELECT snapshot_date, plate_type, concept_name, hot_value, change_pct, 'hot_rank_fallback' AS data_source
+            FROM st_hot_concept_ths_daily
+            WHERE snapshot_date IN ({placeholders}) AND plate_type IN (1, 2, 3)
+            ORDER BY snapshot_date, plate_type, hot_value DESC
+        """, params)
+    except Exception:
+        fallback_rows = []
+
+    for row in fallback_rows:
         snapshot_date = str(row.get("snapshot_date") or "")[:10]
         plate_type = int(row.get("plate_type") or 0)
         grouped.setdefault((snapshot_date, plate_type), []).append(row)
+
+    latest_date = trade_dates[-1]
+    qmt_keys: set[tuple[str, int]] = set()
+    for row in _monitor_qmt_plate_rows(latest_date):
+        snapshot_date = str(row.get("snapshot_date") or "")[:10]
+        plate_type = int(row.get("plate_type") or 0)
+        if snapshot_date and plate_type:
+            key = (snapshot_date, plate_type)
+            if key not in qmt_keys:
+                grouped[key] = []
+                qmt_keys.add(key)
+            grouped[key].append(row)
+    for key, rows in list(grouped.items()):
+        rows.sort(key=lambda item: float(item.get("hot_value") or 0), reverse=True)
     return grouped
 
 
@@ -5593,6 +7138,7 @@ def _monitor_tmt_ratio(industry_rows: list[dict]) -> float:
     if not industry_rows:
         return 0.0
     tmt_children = {
+        "电子", "计算机", "通信", "传媒",
         "电子化学品", "半导体", "消费电子", "其他电子", "光学光电子", "元件",
         "软件开发", "IT服务", "计算机设备",
         "通信服务", "通信设备",
@@ -5645,60 +7191,94 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
         has_prev = bool(prev_snap and prev_snap[0].get("sa"))
         prev_sa = prev_snap[0]["sa"] if has_prev else None
 
+        stock_limit = 1200
+        min_abs_change = 0.3
+        min_amount = 30_000_000
+        raw = _read_sql("""
+            SELECT stock_code, short_name, change_pct AS now_pct, amount AS now_amt
+            FROM sm_rt_quote_snapshot
+            WHERE snapshot_at = :nsa
+              AND (ABS(COALESCE(change_pct, 0)) >= :min_abs_change OR COALESCE(amount, 0) >= :min_amount)
+            ORDER BY ABS(COALESCE(change_pct, 0)) DESC, COALESCE(amount, 0) DESC
+            LIMIT :stock_limit
+        """, {"nsa": now_sa, "min_abs_change": min_abs_change, "min_amount": min_amount, "stock_limit": stock_limit})
+
+        prev_pct_map = {}
         if has_prev:
-            raw = _read_sql("""
-                SELECT
-                    n.stock_code,
-                    n.short_name,
-                    n.change_pct AS now_pct,
-                    n.amount AS now_amt,
-                    p.change_pct AS prev_pct
-                FROM sm_rt_quote_snapshot n
-                JOIN sm_rt_quote_snapshot p
-                    ON p.stock_code = n.stock_code AND p.snapshot_at = :psa
-                WHERE n.snapshot_at = :nsa
-            """, {"nsa": now_sa, "psa": prev_sa})
+            prev_rows = _read_sql("""
+                SELECT stock_code, change_pct AS prev_pct
+                FROM sm_rt_quote_snapshot
+                WHERE snapshot_at = :psa
+            """, {"psa": prev_sa})
+            prev_pct_map = {str(r["stock_code"]): r.get("prev_pct") for r in prev_rows}
+            for row in raw:
+                row["prev_pct"] = prev_pct_map.get(str(row["stock_code"]))
         else:
-            raw = _read_sql("""
-                SELECT stock_code, short_name, change_pct AS now_pct, amount AS now_amt, NULL AS prev_pct
-                FROM sm_rt_quote_snapshot WHERE snapshot_at = :nsa
-            """, {"nsa": now_sa})
+            for row in raw:
+                row["prev_pct"] = None
 
         codes = [str(r["stock_code"]) for r in raw]
         if not codes:
             return {"sectors": []}
 
-        ph = ",".join([f"'{c}'" for c in codes])
+        ph, code_params = _sql_in_params(codes, "mv")
+        mapping_source: list[str] = []
+
+        def _load_qmt_plate_map(plate_type: str):
+            result_map = defaultdict(set)
+            try:
+                params = dict(code_params)
+                params["pt"] = plate_type
+                plate_rows = _read_sql(f"""
+                    SELECT stock_code, plate_name
+                    FROM si_stock_plate_east
+                    WHERE stock_code IN ({ph}) AND plate_type = :pt
+                """, params)
+                for sr in plate_rows:
+                    name = str(sr.get("plate_name") or "").strip()
+                    if name:
+                        result_map[str(sr["stock_code"])].add(name)
+            except Exception:
+                return defaultdict(set)
+            return result_map
 
         # 获取概念板块映射
         concept_map = defaultdict(set)
         if group_by in ("concept", "all"):
+            concept_map = _load_qmt_plate_map("概念")
+            if concept_map:
+                mapping_source.append("qmt_concept")
+        if group_by in ("concept", "all") and not concept_map:
             try:
                 concept_rows = _read_sql(f"""
                     SELECT stock_code, name AS plate_name
                     FROM si_stock_concept_map
                     WHERE stock_code IN ({ph})
-                """)
+                """, code_params)
                 for sr in concept_rows:
                     concept_map[str(sr["stock_code"])].add(str(sr["plate_name"]))
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('sector_movement:7179', exc)
 
         # 获取行业板块映射（申万一级行业）
         industry_map = defaultdict(set)
         if group_by in ("industry", "all"):
+            industry_map = _load_qmt_plate_map("行业")
+            if industry_map:
+                mapping_source.append("qmt_industry")
+        if group_by in ("industry", "all") and not industry_map:
             try:
                 industry_rows = _read_sql(f"""
                     SELECT stock_code, industry_name
                     FROM si_industry_sw
                     WHERE stock_code IN ({ph}) AND industry_type = '申万一级'
-                """)
+                """, code_params)
                 for sr in industry_rows:
                     name = str(sr["industry_name"] or "").strip()
                     if name:
                         industry_map[str(sr["stock_code"])].add(name)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('sector_movement:7199', exc)
 
         code_data = {}
         for r in raw:
@@ -5749,6 +7329,7 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
             "snapshot_time": str(now_sa),
             "has_momentum": has_prev,
             "group_by": group_by,
+            "mapping_source": mapping_source or ["fallback"],
         }
 
         if group_by == "all":
@@ -5835,8 +7416,8 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
                     snapshot_date = str(current_index.get("snapshot_at") or "")[:10]
                     if snapshot_date == datetime.now().strftime("%Y-%m-%d"):
                         csi1000_price = float(current_index.get("price") or csi1000_price or 0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('monitor_data:7338', exc)
 
         history_dates = []
         history_heat = []
@@ -5927,8 +7508,8 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
             "analysis": {
                 "market_temp": f"全A热度{market_heat:.0f}，较昨日{heat_dir}{abs(heat_change):.2f}%，位于P{heat_percentile:.0f}{'低位' if heat_percentile < 30 else '高位' if heat_percentile > 70 else '中位'}，市场情绪{heat_status}",
                 "industry_focus": f"热门行业：{', '.join(r['name'] for r in top_industries[:5])}" if top_industries else "暂无行业数据",
-                "style_judge": f"小盘热度{csi1000_price:.0f}，{'偏弱' if csi1000_chg < 0 else '偏强'}，平均涨跌{csi1000_chg:+.2f}%",
-                "capital_flow": f"观望资金占比{sideline_ratio:.2f}%，TMT合计占比{tmt_ratio:.2f}%",
+                "style_judge": f"中证1000 {csi1000_price:.0f}点，小盘热度{csi1000_heat:.0f}，涨跌{csi1000_chg:+.2f}%",
+                "capital_flow": f"小波动个股占比{sideline_ratio:.2f}%，TMT成交占比{tmt_ratio:.2f}%",
                 "signal": f"全A{signal}，关注{'周期股补涨机会' if market_heat < 400 else '科技板块轮动'}",
             },
         }
@@ -5937,6 +7518,12 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
     except Exception as e:
         import traceback
         return {"error": str(e), "trace": traceback.format_exc()}
+
+
+@router.get("/hot-data/command-monitor")
+def command_monitor_data(date: str = Query(default_factory=lambda: date.today().isoformat())):
+    """Fallback market monitor payload for the command dashboard."""
+    return monitor_data(date)
 
 
 @router.post("/strategy/picks/sync")
@@ -6138,6 +7725,8 @@ def _recommended_stocks_v2(
         _select_col(columns, "suitable_strategies", "'[]'"),
         _select_col(columns, "signal_status", "'WATCH'"),
         _select_col(columns, "signal_reason", "''"),
+        _select_col(columns, "investment_rating", "'中性'"),
+        _select_col(columns, "rating_reason", "''"),
         _select_col(columns, "entry_price_low", "NULL"),
         _select_col(columns, "entry_price_high", "NULL"),
         _select_col(columns, "stop_loss_price", "NULL"),
@@ -6153,9 +7742,22 @@ def _recommended_stocks_v2(
         _select_col(columns, "final_trade_score", "0"),
         _select_col(columns, "expected_return_score", "0"),
         _select_col(columns, "expected_return_pct", "0"),
+        _select_col(columns, "risk_reward_ratio", "0"),
         _select_col(columns, "resistance_price", "NULL"),
+        _select_col(columns, "sector_gate_status", "'WATCH'"),
+        _select_col(columns, "sector_gate_reason", "''"),
+        _select_col(columns, "sector_flow_3d", "NULL"),
+        _select_col(columns, "sector_width_pct", "NULL"),
+        _select_col(columns, "technical_evidence_json", "'{}'"),
+        _select_col(columns, "evidence_chain_json", "'[]'"),
+        _select_col(columns, "review_1d_pct", "NULL"),
+        _select_col(columns, "review_3d_pct", "NULL"),
+        _select_col(columns, "review_5d_pct", "NULL"),
+        _select_col(columns, "review_10d_pct", "NULL"),
+        _select_col(columns, "failure_tags_json", "'[]'"),
         _select_col(columns, "heat_overload_score", "0"),
         _select_col(columns, "confidence_score", "0"),
+        _select_col(columns, "chip_capital_score", "0"),
         _select_col(columns, "sector_rotation_score", "0"),
         _select_col(columns, "failure_penalty_score", "0"),
         _select_col(columns, "cooldown_days_left", "0"),
@@ -6233,6 +7835,7 @@ def _recommended_stocks_v2(
     end_date = str(end_date or "").strip()[:10]
     start_date = start_date if isinstance(start_date, str) else ""
     end_date = end_date if isinstance(end_date, str) else ""
+    requested_trade_date = str(trade_date or "").strip()[:10]
     if start_date or end_date:
         if not end_date:
             end_date = start_date
@@ -6243,7 +7846,6 @@ def _recommended_stocks_v2(
         rows = _query_for_range(start_date, end_date)
         trade_date = end_date
     else:
-        requested_trade_date = str(trade_date or "").strip()[:10]
         resolved_trade_date = (
             _latest_date_not_after("st_recommended_stocks", requested_trade_date, "pick_date")
             if requested_trade_date
@@ -6257,7 +7859,19 @@ def _recommended_stocks_v2(
                 trade_date = fallback
                 rows = _query_for_date(trade_date)
     if not rows:
-        payload = {"date": trade_date, "data": [], "total": 0, "note": "no recommendation data"}
+        payload = {
+            "date": trade_date,
+            "data": [],
+            "total": 0,
+            "note": "no recommendation data",
+            "freshness": _recommended_data_freshness(
+                requested_date=requested_trade_date,
+                result_date=trade_date,
+                start_date=start_date,
+                end_date=end_date,
+                total=0,
+            ),
+        }
         if start_date or end_date:
             payload.update({"start_date": start_date, "end_date": end_date, "note": "no recommendation data in date range"})
         return payload
@@ -6272,6 +7886,7 @@ def _recommended_stocks_v2(
                 r["short_name"] = name_map.get(r["stock_code"]) or r["stock_code"]
 
     current_quotes = {}
+    live_quote_count = 0
     if _is_monitor_trading_time():
         try:
             current_quotes = _portfolio_fetch_live_quotes([r["stock_code"] for r in rows])
@@ -6280,36 +7895,72 @@ def _recommended_stocks_v2(
         for r in rows:
             q = current_quotes.get(r["stock_code"], {})
             if q:
+                live_quote_count += 1
                 r["price"] = q.get("price")
                 r["change_pct"] = q.get("change_pct")
                 r["amount"] = q.get("amount")
                 if q.get("short_name") and not r.get("short_name"):
                     r["short_name"] = q.get("short_name")
 
-    missing_quote_codes = [r["stock_code"] for r in rows if r.get("price") is None]
-    if missing_quote_codes:
-        placeholders = ",".join(f"'{c}'" for c in missing_quote_codes)
-        quotes = {}
+    quote_codes = [str(r["stock_code"]).zfill(6) for r in rows if r.get("stock_code")]
+    if quote_codes:
+        placeholders = ",".join(f"'{c}'" for c in quote_codes)
+        quotes: dict[str, dict] = {}
         try:
-            snapshot_date = _latest_date("sm_stock_snapshot")
-            q_rows = _read_sql(f"""
-                SELECT stock_code, price, change_pct, amount
-                FROM sm_stock_snapshot
-                WHERE trade_date = :d
-                  AND stock_code IN ({placeholders})
-            """, {"d": snapshot_date})
-            for q in q_rows:
-                quotes[q["stock_code"]] = q
+            snapshot_date = _latest_date_not_after("sm_stock_snapshot", trade_date) or _latest_date("sm_stock_snapshot")
+            if snapshot_date:
+                q_rows = _read_sql(f"""
+                    SELECT stock_code, price, change_pct, amount, trade_date
+                    FROM sm_stock_snapshot
+                    WHERE trade_date = :d
+                      AND stock_code IN ({placeholders})
+                """, {"d": snapshot_date})
+                for q in q_rows:
+                    q["quote_trade_date"] = str(q.get("trade_date") or snapshot_date)[:10]
+                    q["quote_source"] = "snapshot"
+                    quotes[str(q["stock_code"]).zfill(6)] = q
         except Exception:
             quotes = {}
+        try:
+            kline_date = _latest_date_not_after("sm_stock_kline", trade_date) or _latest_date("sm_stock_kline")
+            if kline_date:
+                k_rows = _read_sql(f"""
+                    SELECT stock_code, close AS price, change_pct, amount, trade_date
+                    FROM sm_stock_kline
+                    WHERE k_type = 1
+                      AND trade_date = :d
+                      AND stock_code IN ({placeholders})
+                """, {"d": kline_date})
+                for q in k_rows:
+                    code = str(q["stock_code"]).zfill(6)
+                    q["quote_trade_date"] = str(q.get("trade_date") or kline_date)[:10]
+                    q["quote_source"] = "daily_kline"
+                    old = quotes.get(code)
+                    if not old or str(q.get("quote_trade_date") or "") >= str(old.get("quote_trade_date") or ""):
+                        quotes[code] = q
+        except Exception as exc:
+            _record_fallback('strategy_picks_quote_kline:7924', exc)
         for r in rows:
-            if r.get("price") is not None:
+            code = str(r.get("stock_code") or "").zfill(6)
+            if code in current_quotes:
+                r["quote_source"] = "live"
+                r["quote_trade_date"] = date.today().isoformat()
                 continue
-            q = quotes.get(r["stock_code"], {})
+            q = quotes.get(code, {})
             if q:
                 r["price"] = q.get("price")
                 r["change_pct"] = q.get("change_pct")
                 r["amount"] = q.get("amount")
+                r["quote_trade_date"] = q.get("quote_trade_date")
+                r["quote_source"] = q.get("quote_source")
+
+    for r in rows:
+        parsed = _parse_snapshot_json_fields(
+            r,
+            ("technical_evidence_json", "evidence_chain_json", "failure_tags_json", "entry_conditions_json", "sell_rules_json"),
+        )
+        if parsed:
+            r.update(parsed)
 
     payload = {
         "date": trade_date,
@@ -6318,6 +7969,14 @@ def _recommended_stocks_v2(
         "strategy": strategy or "all",
         "signal_status": signal_status or "all",
         "model_version": rows[0].get("model_version") if rows else "",
+        "freshness": _recommended_data_freshness(
+            requested_date=requested_trade_date,
+            result_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+            live_quote_count=live_quote_count,
+            total=len(rows),
+        ),
     }
     if start_date or end_date:
         payload.update({"start_date": start_date, "end_date": end_date})
@@ -6339,7 +7998,7 @@ def recommended_stocks(
         cache_key = f"recommended_stocks_range_{start_date or 'open'}_{end_date or 'open'}_{strategy or 'all'}_{signal_status or 'all'}"
     else:
         cache_key = f"recommended_stocks_{trade_date or 'latest'}_{strategy or 'all'}_{signal_status or 'all'}"
-    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300))
+    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=30))
     if cached is not None:
         return cached
     try:
@@ -6352,6 +8011,95 @@ def recommended_stocks(
         return result
     except Exception as e:
         return {"date": trade_date, "data": [], "total": 0, "error": str(e)}
+
+
+def _strategy_runtime_params_snapshot(as_of_date: str = "") -> dict:
+    as_of_date = str(as_of_date or "").strip()[:10]
+    if not as_of_date:
+        try:
+            as_of_date = _latest_date("st_recommended_stocks", "pick_date") or date.today().isoformat()
+        except Exception:
+            as_of_date = date.today().isoformat()
+    try:
+        from biz.analysis.sync_analysis_fast import DEFAULT_RUNTIME_PARAMS
+    except Exception:
+        DEFAULT_RUNTIME_PARAMS = {
+            "min_risk_reward": 3.0,
+            "min_sector_flow_amount_3d": 500_000_000.0,
+            "min_sector_rotation_score": 50.0,
+            "price_crosscheck_tolerance_pct": 1.0,
+        }
+
+    params = {
+        key: {
+            "param_key": key,
+            "param_value": float(value),
+            "source": "default",
+            "effective_date": "",
+            "updated_at": "",
+            "metadata": {},
+        }
+        for key, value in DEFAULT_RUNTIME_PARAMS.items()
+    }
+    try:
+        rows = _read_sql("""
+            SELECT param_key, param_value, source, effective_date, updated_at, metadata_json
+            FROM st_strategy_runtime_params
+            WHERE status = 'active'
+              AND (effective_date IS NULL OR effective_date <= :as_of_date)
+            ORDER BY effective_date DESC, updated_at DESC
+        """, {"as_of_date": as_of_date})
+        for row in rows:
+            key = str(row.get("param_key") or "")
+            if key not in params:
+                continue
+            metadata = {}
+            raw_metadata = row.get("metadata_json")
+            if isinstance(raw_metadata, str) and raw_metadata:
+                try:
+                    metadata = json.loads(raw_metadata)
+                except Exception:
+                    metadata = {}
+            params[key].update({
+                "param_value": float(row.get("param_value") or params[key]["param_value"]),
+                "source": row.get("source") or "runtime",
+                "effective_date": str(row.get("effective_date") or "")[:10],
+                "updated_at": str(row.get("updated_at") or ""),
+                "metadata": metadata,
+            })
+    except Exception as exc:
+        _record_fallback('_strategy_runtime_params_snapshot:7962', exc)
+
+    calibration = {}
+    try:
+        cal_rows = _read_sql("""
+            SELECT calibration_date, window_days, scope_type, scope_key,
+                   sample_count, avg_return_5d, win_rate_5d, suggestion
+            FROM st_strategy_threshold_calibration
+            WHERE calibration_date <= :as_of_date
+            ORDER BY calibration_date DESC, sample_count DESC
+            LIMIT 1
+        """, {"as_of_date": as_of_date})
+        calibration = cal_rows[0] if cal_rows else {}
+    except Exception:
+        calibration = {}
+
+    return {
+        "as_of_date": as_of_date,
+        "params": list(params.values()),
+        "params_map": {key: item["param_value"] for key, item in params.items()},
+        "calibration": calibration,
+        "source": "st_strategy_runtime_params",
+    }
+
+
+@router.get("/hot-data/strategy-runtime-params")
+def strategy_runtime_params(as_of_date: str = Query(default="")):
+    """Return currently active stock strategy runtime thresholds."""
+    try:
+        return _strategy_runtime_params_snapshot(as_of_date)
+    except Exception as e:
+        return {"as_of_date": as_of_date, "params": [], "params_map": {}, "error": str(e)}
 
 
 def _smart_trade_date() -> str:
@@ -6370,9 +8118,83 @@ def _smart_trade_date() -> str:
     return _latest_date("sm_stock_kline")
 
 
+def _recommended_data_freshness(
+    *,
+    requested_date: str = "",
+    result_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    live_quote_count: int = 0,
+    total: int = 0,
+) -> dict:
+    requested_date = str(requested_date or "").strip()[:10]
+    result_date = str(result_date or "").strip()[:10]
+    start_date = str(start_date or "").strip()[:10]
+    end_date = str(end_date or "").strip()[:10]
+    reference_date = result_date or end_date or requested_date
+    source_defs = [
+        ("kline", "K线", "sm_stock_kline", "trade_date"),
+        ("snapshot", "行情快照", "sm_stock_snapshot", "trade_date"),
+        ("capital_flow", "资金流", "sm_stock_capital_flow_daily", "trade_date"),
+        ("hot_rank", "热度榜", "st_hot_rank_fused", "snapshot_date"),
+    ]
+    sources = []
+    stale_sources = []
+    for key, label, table, col in source_defs:
+        latest = ""
+        try:
+            latest = str(_latest_date(table, col) or "")[:10]
+        except Exception:
+            latest = ""
+        stale = bool(reference_date and latest and latest < reference_date)
+        if stale:
+            stale_sources.append(label)
+        sources.append({
+            "key": key,
+            "label": label,
+            "table": table,
+            "latest_date": latest,
+            "stale": stale,
+        })
+    is_range = bool(start_date or end_date)
+    is_fallback_date = bool(requested_date and result_date and result_date != requested_date and not is_range)
+    status = "fresh"
+    status_label = "数据日期匹配"
+    if stale_sources:
+        kline_source = next((s for s in sources if s.get("key") == "kline"), {})
+        if stale_sources == ["行情快照"] and reference_date and str(kline_source.get("latest_date") or "") >= reference_date:
+            status = "fresh"
+            status_label = "日K已补行情"
+        else:
+            status = "stale"
+            status_label = "基础数据滞后"
+    elif is_fallback_date:
+        status = "fallback"
+        status_label = "已回退到最近推荐日"
+    return {
+        "status": status,
+        "status_label": status_label,
+        "requested_date": requested_date,
+        "result_date": result_date,
+        "start_date": start_date,
+        "end_date": end_date,
+        "is_range": is_range,
+        "is_fallback_date": is_fallback_date,
+        "reference_date": reference_date,
+        "sources": sources,
+        "stale_sources": stale_sources,
+        "live_quote_count": int(live_quote_count or 0),
+        "total": int(total or 0),
+        "quote_mode": "live" if live_quote_count else "stored",
+        "is_intraday": bool(_is_monitor_trading_time()),
+    }
+
+
 def _recommendation_gate_status(
     execution_time: str = "",
     min_kline_coverage: float = 0.80,
+    target_trade_date: str = "",
+    check_readiness: bool = True,
 ) -> dict:
     """Return the strict premarket recommendation gate state.
 
@@ -6388,28 +8210,40 @@ def _recommendation_gate_status(
         execution_time = datetime.now().replace(microsecond=0).isoformat(sep=" ")
     min_kline_coverage = max(0.0, min(1.0, float(min_kline_coverage or 0.80)))
 
-    expected_trade_date = previous_trade_date(engine, execution_time)
+    target_trade_date = str(target_trade_date or "").strip()[:10]
+    expected_trade_date = target_trade_date or previous_trade_date(engine, execution_time)
     payload = {
         "status": "ok",
         "execution_time": execution_time,
         "expected_trade_date": expected_trade_date,
+        "target_source": "request" if target_trade_date else "previous_trade_date",
         "min_kline_coverage": min_kline_coverage,
         "ready": False,
+        "ready_source": "",
         "error": "",
     }
 
-    try:
-        payload["readiness"] = assert_trade_date_ready(
-            engine,
-            expected_trade_date,
-            min_coverage=min_kline_coverage,
-        )
-        payload["ready"] = True
-    except Exception as exc:
-        payload["error"] = str(exc)
+    if check_readiness:
+        try:
+            payload["readiness"] = assert_trade_date_ready(
+                engine,
+                expected_trade_date,
+                min_coverage=min_kline_coverage,
+            )
+            payload["ready"] = True
+            payload["ready_source"] = "strict_readiness"
+        except Exception as exc:
+            payload["error"] = str(exc)
+            payload["readiness"] = {
+                "trade_date": expected_trade_date,
+                "min_coverage": min_kline_coverage,
+            }
+    else:
         payload["readiness"] = {
             "trade_date": expected_trade_date,
             "min_coverage": min_kline_coverage,
+            "skipped": True,
+            "reason": "summary mode",
         }
 
     try:
@@ -6469,7 +8303,10 @@ def _recommendation_gate_status(
         }
 
     payload["has_recommendation"] = bool((payload.get("recommendation") or {}).get("count"))
-    payload["strict_ok"] = bool(payload["ready"])
+    if not check_readiness and payload["has_recommendation"]:
+        payload["ready"] = True
+        payload["ready_source"] = "existing_recommendation"
+    payload["strict_ok"] = bool(payload["ready"] and check_readiness)
     return payload
 
 
@@ -6477,12 +8314,16 @@ def _recommendation_gate_status(
 def recommended_stocks_gate(
     execution_time: str = Query(default=""),
     min_kline_coverage: float = Query(default=0.80, ge=0, le=1),
+    target_trade_date: str = Query(default=""),
+    check_readiness: bool = Query(default=True),
 ):
     """Check the strict previous-trading-day gate for AI recommendations."""
     try:
         return _recommendation_gate_status(
             execution_time=execution_time,
             min_kline_coverage=min_kline_coverage,
+            target_trade_date=target_trade_date,
+            check_readiness=check_readiness,
         )
     except Exception as e:
         return {
@@ -6507,13 +8348,558 @@ def _set_recommendation_progress(**payload) -> None:
     _cache_set("rec_screen_progress", base)
 
 
+def _ensure_recommended_run_history_table() -> None:
+    _exec_sql("""
+        CREATE TABLE IF NOT EXISTS `st_recommended_run_history` (
+            `id` BIGINT NOT NULL AUTO_INCREMENT,
+            `run_uid` VARCHAR(40) NOT NULL,
+            `trade_date` DATE NULL,
+            `status` VARCHAR(20) NOT NULL DEFAULT 'running',
+            `min_score` DECIMAL(8,2) NULL,
+            `top_n` INT NULL,
+            `strict_prev_trade_day` TINYINT(1) NOT NULL DEFAULT 0,
+            `execution_time` DATETIME NULL,
+            `started_at` DATETIME NULL,
+            `finished_at` DATETIME NULL,
+            `duration_seconds` INT NULL,
+            `progress_percent` INT NULL,
+            `done_count` INT NULL,
+            `total` INT NULL,
+            `passed` INT NULL,
+            `flow_date` VARCHAR(20) NULL,
+            `hot_date` VARCHAR(20) NULL,
+            `market_mood_score` DECIMAL(8,2) NULL,
+            `message` VARCHAR(500) NULL,
+            `error` VARCHAR(500) NULL,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uk_rec_run_uid` (`run_uid`),
+            KEY `idx_rec_run_date` (`trade_date`, `started_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """, {})
+    _recommended_history_ensure_column(
+        "progress_percent",
+        "ALTER TABLE `st_recommended_run_history` ADD COLUMN `progress_percent` INT NULL AFTER `duration_seconds`",
+    )
+    _recommended_history_ensure_column(
+        "done_count",
+        "ALTER TABLE `st_recommended_run_history` ADD COLUMN `done_count` INT NULL AFTER `progress_percent`",
+    )
+
+
+def _recommended_history_ensure_column(column: str, ddl: str) -> None:
+    try:
+        rows = _read_sql("""
+            SELECT COUNT(*) AS cnt
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'st_recommended_run_history'
+              AND column_name = :column
+        """, {"column": column})
+        if not rows or int(rows[0].get("cnt") or 0) == 0:
+            _exec_sql(ddl)
+            _cache_drop("table_columns_st_recommended_run_history")
+    except Exception as exc:
+        _record_fallback(f'_recommended_history_ensure_column:{column}', exc)
+
+
+def _recommended_run_history_start(
+    *,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    strict_prev_trade_day: bool,
+    execution_time: str,
+    message: str = "",
+    status: str = "running",
+) -> str:
+    import uuid
+
+    run_uid = uuid.uuid4().hex
+    try:
+        _ensure_recommended_run_history_table()
+        _exec_sql("""
+            INSERT INTO st_recommended_run_history
+            (run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+             execution_time, started_at, progress_percent, done_count, message)
+            VALUES (:uid, :trade_date, :status, :min_score, :top_n, :strict_prev,
+                    :execution_time, NOW(), :progress_percent, 0, :message)
+        """, {
+            "uid": run_uid,
+            "status": status[:20] if status else "running",
+            "trade_date": trade_date,
+            "min_score": float(min_score),
+            "top_n": int(top_n),
+            "strict_prev": 1 if strict_prev_trade_day else 0,
+            "execution_time": execution_time[:19] if execution_time else None,
+            "progress_percent": 5 if status == "queued" else 0,
+            "message": message[:500] if message else "",
+        })
+    except Exception as exc:
+        _record_fallback('_recommended_run_history_start:8297', exc)
+    return run_uid
+
+
+def _recommended_run_history_update(run_uid: str, *, status: str = "running", payload: dict | None = None) -> None:
+    if not run_uid:
+        return
+    payload = payload or {}
+    try:
+        _ensure_recommended_run_history_table()
+        _exec_sql("""
+            UPDATE st_recommended_run_history
+            SET status = COALESCE(:status, status),
+                progress_percent = COALESCE(:progress_percent, progress_percent),
+                done_count = COALESCE(:done_count, done_count),
+                total = COALESCE(:total, total),
+                passed = COALESCE(:passed, passed),
+                flow_date = COALESCE(:flow_date, flow_date),
+                hot_date = COALESCE(:hot_date, hot_date),
+                market_mood_score = COALESCE(:market_mood_score, market_mood_score),
+                message = COALESCE(:message, message),
+                error = COALESCE(:error, error)
+            WHERE run_uid = :uid
+        """, {
+            "uid": run_uid,
+            "status": status[:20] if status else None,
+            "progress_percent": payload.get("progress_percent"),
+            "done_count": payload.get("done_count"),
+            "total": payload.get("total"),
+            "passed": payload.get("passed"),
+            "flow_date": str(payload.get("flow_date") or "")[:20] if "flow_date" in payload else None,
+            "hot_date": str(payload.get("hot_date") or "")[:20] if "hot_date" in payload else None,
+            "market_mood_score": payload.get("market_mood_score"),
+            "message": str(payload.get("message") or "")[:500] if "message" in payload else None,
+            "error": str(payload.get("error") or "")[:500] if "error" in payload else None,
+        })
+    except Exception as exc:
+        _record_fallback('_recommended_run_history_update', exc)
+
+
+def _recommended_run_history_finish(run_uid: str, *, status: str, payload: dict | None = None) -> None:
+    if not run_uid:
+        return
+    payload = payload or {}
+    progress_percent = payload.get("progress_percent")
+    if progress_percent is None and status == "done":
+        progress_percent = 100
+    done_count = payload.get("done_count")
+    if done_count is None and status == "done":
+        done_count = payload.get("total")
+    try:
+        _ensure_recommended_run_history_table()
+        _exec_sql("""
+            UPDATE st_recommended_run_history
+            SET status = :status,
+                trade_date = COALESCE(:trade_date, trade_date),
+                finished_at = NOW(),
+                duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
+                progress_percent = :progress_percent,
+                done_count = :done_count,
+                total = :total,
+                passed = :passed,
+                flow_date = :flow_date,
+                hot_date = :hot_date,
+                market_mood_score = :market_mood_score,
+                message = :message,
+                error = :error
+            WHERE run_uid = :uid
+        """, {
+            "uid": run_uid,
+            "status": status,
+            "trade_date": payload.get("trade_date"),
+            "progress_percent": progress_percent,
+            "done_count": done_count,
+            "total": payload.get("total"),
+            "passed": payload.get("passed"),
+            "flow_date": str(payload.get("flow_date") or "")[:20],
+            "hot_date": str(payload.get("hot_date") or "")[:20],
+            "market_mood_score": payload.get("market_mood_score"),
+            "message": str(payload.get("message") or "")[:500],
+            "error": str(payload.get("error") or "")[:500],
+        })
+    except Exception as exc:
+        _record_fallback('_recommended_run_history_finish:8334', exc)
+
+
+def _recommended_run_history_expire_stale(max_age_minutes: int = 20) -> None:
+    try:
+        minutes = max(5, min(1440, int(max_age_minutes)))
+    except (TypeError, ValueError):
+        minutes = 20
+    try:
+        _ensure_recommended_run_history_table()
+        _exec_sql(f"""
+            UPDATE st_recommended_run_history
+            SET status = 'error',
+                finished_at = NOW(),
+                duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
+                progress_percent = 0,
+                message = '任务已中断或超时，已自动清理，避免生产卡死',
+                error = 'stale running recommendation job expired'
+            WHERE status = 'running'
+              AND started_at < DATE_SUB(NOW(), INTERVAL {minutes} MINUTE)
+        """, {})
+    except Exception as exc:
+        _record_fallback('_recommended_run_history_expire_stale', exc)
+
+
+def _web_ai_recommendation_run_enabled() -> bool:
+    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_RUN", "").strip() == "1"
+
+
+def _web_ai_recommendation_queue_enabled() -> bool:
+    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_QUEUE", "1").strip() != "0"
+
+
+def _web_ai_recommendation_queue_autostart_enabled() -> bool:
+    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_QUEUE_AUTOSTART", "1").strip() != "0"
+
+
+def _web_ai_recommendation_queue_worker_allow_intraday() -> bool:
+    return os.environ.get("PROBIGA_AI_RECOMMEND_QUEUE_WORKER_ALLOW_INTRADAY", "1").strip() != "0"
+
+
+def _start_recommended_queue_worker(*, run_uid: str, refresh_realtime: bool) -> dict:
+    from server.api.scheduler_runtime import start_detached_python_job
+
+    cmd = [
+        sys.executable,
+        str(_ROOT / "tools" / "run_ai_recommendation_worker.py"),
+        "--once",
+        "--force",
+    ]
+    if refresh_realtime:
+        cmd.append("--refresh-realtime")
+    if _web_ai_recommendation_queue_worker_allow_intraday():
+        cmd.append("--allow-intraday")
+
+    env = build_child_env(_ROOT, engine=get_engine())
+    env.update({
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+        "PROBIGA_AI_RECOMMEND_WORKER_ENABLED": "1",
+    })
+    return start_detached_python_job(
+        cmd=cmd,
+        root=_ROOT,
+        env=env,
+        log_name=f"recommended_queue_worker_{run_uid}",
+        nice=10,
+    )
+
+
+def _protected_recommended_run_response(
+    *,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    strict_prev_trade_day: bool,
+    execution_time: str,
+) -> dict:
+    message = "生产保护模式：Web 端全市场 AI 推荐已暂停，避免 2核4G 服务器再次卡死；请改用独立 worker 或低峰手工任务生成。"
+    progress = {
+        "status": "protected",
+        "percent": 0,
+        "step": message,
+        "total": 0,
+        "done": 0,
+        "passed": 0,
+        "trade_date": trade_date,
+        "min_score": float(min_score),
+        "top_n": int(top_n),
+        "strict_prev_trade_day": bool(strict_prev_trade_day),
+        "execution_time": execution_time,
+        "is_running": False,
+    }
+    _cache_set("rec_screen_progress", progress)
+    return {
+        "status": "protected",
+        "date": trade_date,
+        "min_score": float(min_score),
+        "top_n": int(top_n),
+        "strict_prev_trade_day": bool(strict_prev_trade_day),
+        "execution_time": execution_time,
+        "progress": progress,
+        "note": message,
+    }
+
+
+def _queued_recommended_run_response(
+    *,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    strict_prev_trade_day: bool,
+    execution_time: str,
+    refresh_realtime: bool = True,
+) -> dict:
+    message = "AI 推荐任务已入队；将由独立低优先级 worker 后台执行，避免生产 API 卡死。"
+    run_uid = _recommended_run_history_start(
+        trade_date=trade_date,
+        min_score=min_score,
+        top_n=top_n,
+        strict_prev_trade_day=strict_prev_trade_day,
+        execution_time=execution_time,
+        message=message,
+        status="queued",
+    )
+    worker_info = None
+    worker_error = ""
+    if run_uid and _web_ai_recommendation_queue_autostart_enabled():
+        try:
+            worker_info = _start_recommended_queue_worker(
+                run_uid=run_uid,
+                refresh_realtime=bool(refresh_realtime),
+            )
+            message = "AI 推荐任务已入队，worker 已自动启动；正在等待后台领取任务。"
+            _recommended_run_history_update(run_uid, status="queued", payload={
+                "progress_percent": 5,
+                "done_count": 0,
+                "message": message,
+                "error": "",
+            })
+        except Exception as exc:
+            worker_error = str(exc)[:500]
+            message = "AI 推荐任务已入队，但自动启动 worker 失败；请检查后台 worker。"
+            _recommended_run_history_update(run_uid, status="queued", payload={
+                "progress_percent": 5,
+                "done_count": 0,
+                "message": message,
+                "error": worker_error,
+            })
+    progress = {
+        "status": "queued",
+        "percent": 5,
+        "step": message,
+        "total": 0,
+        "done": 0,
+        "passed": 0,
+        "trade_date": trade_date,
+        "min_score": float(min_score),
+        "top_n": int(top_n),
+        "strict_prev_trade_day": bool(strict_prev_trade_day),
+        "execution_time": execution_time,
+        "run_uid": run_uid,
+        "is_running": True,
+    }
+    if worker_info:
+        progress["worker"] = worker_info
+    if worker_error:
+        progress["worker_error"] = worker_error
+    _cache_set("rec_screen_progress", progress)
+    return {
+        "status": "queued",
+        "date": trade_date,
+        "min_score": float(min_score),
+        "top_n": int(top_n),
+        "strict_prev_trade_day": bool(strict_prev_trade_day),
+        "execution_time": execution_time,
+        "run_uid": run_uid,
+        "progress": progress,
+        "worker": worker_info,
+        "worker_error": worker_error,
+        "note": message,
+    }
+
+
+def _recommended_history_progress(run_uid: str = "") -> dict | None:
+    try:
+        _ensure_recommended_run_history_table()
+        if run_uid:
+            rows = _read_sql("""
+                SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+                        execution_time, started_at, finished_at, duration_seconds,
+                        progress_percent, done_count, total, passed,
+                        flow_date, hot_date, market_mood_score, message, error
+                FROM st_recommended_run_history
+                WHERE run_uid = :run_uid
+                LIMIT 1
+            """, {"run_uid": run_uid})
+        else:
+            rows = _read_sql("""
+                SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+                        execution_time, started_at, finished_at, duration_seconds,
+                        progress_percent, done_count, total, passed,
+                        flow_date, hot_date, market_mood_score, message, error
+                FROM st_recommended_run_history
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+            """, {})
+        if not rows:
+            return None
+        row = rows[0]
+        status = str(row.get("status") or "idle")
+        is_running = status == "running"
+        is_active = status in {"running", "queued"}
+        fallback_percent = 20 if is_running else (5 if status == "queued" else (100 if status == "done" else 0))
+        try:
+            percent = int(row.get("progress_percent") if row.get("progress_percent") is not None else fallback_percent)
+        except (TypeError, ValueError):
+            percent = fallback_percent
+        percent = max(0, min(100, percent))
+        step = str(row.get("message") or row.get("error") or "")
+        if not step:
+            step = "离线推荐任务运行中" if is_running else ("离线推荐任务排队中" if status == "queued" else status)
+        done_count = row.get("done_count")
+        if done_count is None and status == "done":
+            done_count = row.get("total")
+        return {
+            "status": status,
+            "percent": percent,
+            "step": step,
+            "total": int(row.get("total") or 0),
+            "done": int(done_count or 0),
+            "passed": int(row.get("passed") or 0),
+            "trade_date": str(row.get("trade_date") or "")[:10],
+            "min_score": float(row.get("min_score") or 0),
+            "top_n": int(row.get("top_n") or 0),
+            "strict_prev_trade_day": bool(row.get("strict_prev_trade_day")),
+            "execution_time": str(row.get("execution_time") or "")[:19],
+            "flow_date": str(row.get("flow_date") or ""),
+            "hot_date": str(row.get("hot_date") or ""),
+            "market_mood_score": row.get("market_mood_score"),
+            "run_uid": str(row.get("run_uid") or ""),
+            "started_at": str(row.get("started_at") or "")[:19],
+            "finished_at": str(row.get("finished_at") or "")[:19],
+            "duration_seconds": row.get("duration_seconds"),
+            "error": str(row.get("error") or ""),
+            "is_running": is_active,
+            "is_active": is_active,
+        }
+    except Exception as exc:
+        _record_fallback('_recommended_history_progress', exc)
+        return None
+
+
 @router.get("/hot-data/recommended-stocks/progress")
 def recommended_stocks_progress():
     """查询 AI 推荐筛选进度"""
+    _recommended_run_history_expire_stale()
     cached = _cache_get("rec_screen_progress", ttl_seconds=7200)
     if cached is not None:
-        return {**cached, "is_running": _job_is_running("recommended_stocks")}
+        if isinstance(cached, dict) and str(cached.get("status") or "") == "protected":
+            return {**cached, "is_running": False}
+        cached_run_uid = str(cached.get("run_uid") or "") if isinstance(cached, dict) else ""
+        history = _recommended_history_progress(cached_run_uid) if cached_run_uid else None
+        if history and history.get("run_uid"):
+            history_status = str(history.get("status") or "")
+            cached_status = str(cached.get("status") or "") if isinstance(cached, dict) else ""
+            cached_percent = int(cached.get("percent") or 0) if isinstance(cached, dict) else 0
+            history_percent = int(history.get("percent") or 0)
+            if history_status in {"done", "error", "protected"}:
+                return history
+            if cached_status != history_status:
+                return history
+            if history_status == "running" and history_percent >= cached_percent:
+                return history
+        return {
+            **cached,
+            "is_running": (
+                _job_is_running("recommended_stocks")
+                or bool(history and history.get("is_running"))
+                or (isinstance(cached, dict) and str(cached.get("status") or "") == "queued")
+            ),
+        }
+    history = _recommended_history_progress()
+    if history and (history.get("is_running") or history.get("status") in {"queued", "protected"}):
+        return history
     return {"status": "idle", "percent": 0, "step": "未启动", "is_running": False}
+
+
+@router.get("/hot-data/recommended-stocks/run-history")
+def recommended_stocks_run_history(limit: int = Query(default=10, ge=1, le=50)):
+    """查询 AI 推荐筛选执行历史"""
+    try:
+        _recommended_run_history_expire_stale()
+        _ensure_recommended_run_history_table()
+        rows = _read_sql("""
+            SELECT id, run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+                   execution_time, started_at, finished_at, duration_seconds,
+                   total, passed, flow_date, hot_date, market_mood_score, message, error
+            FROM st_recommended_run_history
+            ORDER BY started_at DESC, id DESC
+            LIMIT :limit
+        """, {"limit": limit})
+        return {"data": rows, "total": len(rows)}
+    except Exception as e:
+        return {"data": [], "total": 0, "error": str(e)}
+
+
+def _active_recommended_run() -> dict | None:
+    try:
+        _recommended_run_history_expire_stale()
+        _ensure_recommended_run_history_table()
+        rows = _read_sql("""
+            SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+                   execution_time, started_at, message
+            FROM st_recommended_run_history
+            WHERE status IN ('running', 'queued')
+              AND started_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR)
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+        """, {})
+        return rows[0] if rows else None
+    except Exception as exc:
+        _record_fallback('_active_recommended_run', exc)
+        return None
+
+
+def _start_recommended_offline_process(
+    *,
+    run_uid: str,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    strict_prev_trade_day: bool,
+    execution_time: str,
+    min_kline_coverage: float,
+    auto_repair_missing_kline: bool,
+    refresh_realtime: bool,
+) -> dict:
+    from server.api.scheduler_runtime import start_detached_python_job
+
+    cmd = [
+        sys.executable,
+        str(_ROOT / "tools" / "run_ai_recommendation_premarket.py"),
+        "--date",
+        trade_date,
+        "--top-n",
+        str(int(top_n)),
+        "--min-score",
+        str(float(min_score)),
+        "--execution-time",
+        execution_time,
+        "--min-kline-coverage",
+        str(float(min_kline_coverage)),
+        "--run-uid",
+        run_uid,
+        "--json",
+    ]
+    if strict_prev_trade_day:
+        cmd.append("--strict-prev-trade-day")
+    if auto_repair_missing_kline:
+        cmd.append("--auto-repair-missing-kline")
+    if refresh_realtime:
+        cmd.append("--refresh-realtime")
+
+    env = build_child_env(_ROOT, engine=get_engine())
+    env.update({
+        "OMP_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    })
+    return start_detached_python_job(
+        cmd=cmd,
+        root=_ROOT,
+        env=env,
+        log_name=f"recommended_stocks_{run_uid}",
+        nice=10,
+    )
 
 
 @router.post("/hot-data/recommended-stocks/run")
@@ -6525,9 +8911,178 @@ def run_recommended_stocks(
     execution_time: str = Query(default=""),
     min_kline_coverage: float = Query(default=0.80, ge=0, le=1),
     auto_repair_missing_kline: bool = Query(default=True),
+    refresh_realtime: bool = Query(default=True),
 ):
     """触发 AI 推荐股票筛选（使用统一分析引擎）"""
     import threading
+
+    if os.environ.get("PROBIGA_ALLOW_INLINE_AI_RECOMMENDATION_RUN", "").strip() != "1":
+        _recommended_run_history_expire_stale()
+        active = _active_recommended_run()
+        if active:
+            progress = _recommended_history_progress(str(active.get("run_uid") or "")) or recommended_stocks_progress()
+            active_status = str(active.get("status") or progress.get("status") or "running")
+            process_info = None
+            worker_error = ""
+            if active_status == "queued" and _web_ai_recommendation_queue_autostart_enabled():
+                try:
+                    process_info = _start_recommended_queue_worker(
+                        run_uid=str(active.get("run_uid") or ""),
+                        refresh_realtime=bool(refresh_realtime),
+                    )
+                    _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
+                        "progress_percent": 5,
+                        "message": "已有 AI 推荐任务在排队，worker 已重新唤起。",
+                        "error": "",
+                    })
+                    progress = _recommended_history_progress(str(active.get("run_uid") or "")) or progress
+                except Exception as exc:
+                    worker_error = str(exc)[:500]
+                    _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
+                        "message": "已有 AI 推荐任务在排队，但自动唤起 worker 失败。",
+                        "error": worker_error,
+                    })
+            return {
+                "status": active_status,
+                "date": str(active.get("trade_date") or "")[:10],
+                "min_score": float(active.get("min_score") or min_score),
+                "top_n": int(active.get("top_n") or top_n),
+                "strict_prev_trade_day": bool(active.get("strict_prev_trade_day")),
+                "run_uid": str(active.get("run_uid") or ""),
+                "progress": progress,
+                "process": process_info,
+                "worker_error": worker_error,
+                "note": "已有 AI 推荐任务在排队" if active_status == "queued" else "已有离线 AI 推荐任务在运行",
+            }
+
+        strict_gate = None
+        if strict_prev_trade_day:
+            try:
+                strict_gate = _recommendation_gate_status(
+                    execution_time=execution_time,
+                    min_kline_coverage=min_kline_coverage,
+                )
+                trade_date = strict_gate["expected_trade_date"]
+                execution_time = strict_gate["execution_time"]
+                if not strict_gate.get("ready") and not auto_repair_missing_kline:
+                    gate_error = strict_gate.get("error") or "目标日基础数据未就绪"
+                    return {
+                        "status": "error",
+                        "date": trade_date,
+                        "min_score": min_score,
+                        "top_n": top_n,
+                        "strict_prev_trade_day": True,
+                        "gate": strict_gate,
+                        "error": gate_error,
+                    }
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "date": str(trade_date or "")[:10],
+                    "min_score": min_score,
+                    "top_n": top_n,
+                    "strict_prev_trade_day": True,
+                    "error": str(exc),
+                }
+        elif not trade_date:
+            trade_date = _smart_trade_date()
+        trade_date = str(trade_date or "")[:10]
+        execution_time = execution_time or datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+        if not _web_ai_recommendation_run_enabled():
+            if _web_ai_recommendation_queue_enabled():
+                return _queued_recommended_run_response(
+                    trade_date=trade_date,
+                    min_score=min_score,
+                    top_n=top_n,
+                    strict_prev_trade_day=strict_prev_trade_day,
+                    execution_time=execution_time,
+                    refresh_realtime=refresh_realtime,
+                )
+            return _protected_recommended_run_response(
+                trade_date=trade_date,
+                min_score=min_score,
+                top_n=top_n,
+                strict_prev_trade_day=strict_prev_trade_day,
+                execution_time=execution_time,
+            )
+        run_uid = _recommended_run_history_start(
+            trade_date=trade_date,
+            min_score=min_score,
+            top_n=top_n,
+            strict_prev_trade_day=strict_prev_trade_day,
+            execution_time=execution_time,
+            message="离线 AI 推荐任务已启动；先刷新点击时实时数据",
+        )
+        _set_recommendation_progress(
+            status="running",
+            percent=0,
+            step="离线 AI 推荐任务已启动；正在刷新点击时实时数据",
+            total=0,
+            done=0,
+            passed=0,
+            trade_date=trade_date,
+            min_score=min_score,
+            top_n=top_n,
+            strict_prev_trade_day=strict_prev_trade_day,
+            execution_time=execution_time,
+            min_kline_coverage=min_kline_coverage,
+            auto_repair_missing_kline=auto_repair_missing_kline,
+            refresh_realtime=refresh_realtime,
+            gate=strict_gate,
+            run_uid=run_uid,
+            started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        try:
+            process_info = _start_recommended_offline_process(
+                run_uid=run_uid,
+                trade_date=trade_date,
+                min_score=min_score,
+                top_n=top_n,
+                strict_prev_trade_day=strict_prev_trade_day,
+                execution_time=execution_time,
+                min_kline_coverage=min_kline_coverage,
+                auto_repair_missing_kline=auto_repair_missing_kline,
+                refresh_realtime=refresh_realtime,
+            )
+        except Exception as exc:
+            _recommended_run_history_finish(run_uid, status="error", payload={
+                "trade_date": trade_date,
+                "message": "离线 AI 推荐任务启动失败",
+                "error": str(exc)[:500],
+            })
+            _set_recommendation_progress(
+                status="error",
+                percent=0,
+                step=f"离线任务启动失败: {str(exc)[:80]}",
+                trade_date=trade_date,
+                run_uid=run_uid,
+                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            return {
+                "status": "error",
+                "date": trade_date,
+                "min_score": min_score,
+                "top_n": top_n,
+                "strict_prev_trade_day": strict_prev_trade_day,
+                "run_uid": run_uid,
+                "error": str(exc),
+            }
+        return {
+            "status": "started",
+            "date": trade_date,
+            "min_score": min_score,
+            "top_n": top_n,
+            "strict_prev_trade_day": strict_prev_trade_day,
+            "execution_time": execution_time,
+            "min_kline_coverage": min_kline_coverage,
+            "auto_repair_missing_kline": auto_repair_missing_kline,
+            "refresh_realtime": refresh_realtime,
+            "gate": strict_gate,
+            "run_uid": run_uid,
+            "process": process_info,
+            "progress": recommended_stocks_progress(),
+            "note": "离线 AI 推荐任务已启动，完成后页面会读取今天的新结果",
+        }
 
     strict_gate = None
     if strict_prev_trade_day:
@@ -6539,10 +9094,23 @@ def run_recommended_stocks(
             trade_date = strict_gate["expected_trade_date"]
             execution_time = strict_gate["execution_time"]
             if not strict_gate.get("ready") and not auto_repair_missing_kline:
+                gate_error = strict_gate.get("error") or "目标日基础数据未就绪"
+                run_uid = _recommended_run_history_start(
+                    trade_date=trade_date,
+                    min_score=min_score,
+                    top_n=top_n,
+                    strict_prev_trade_day=True,
+                    execution_time=execution_time,
+                    message="严格门禁未通过",
+                )
+                _recommended_run_history_finish(run_uid, status="error", payload={
+                    "message": "严格门禁未通过",
+                    "error": gate_error,
+                })
                 _set_recommendation_progress(
                     status="error",
                     percent=0,
-                    step=f"strict gate failed: {strict_gate.get('error') or 'data not ready'}",
+                    step=f"严格门禁未通过：{gate_error}",
                     total=0,
                     done=0,
                     passed=0,
@@ -6552,6 +9120,7 @@ def run_recommended_stocks(
                     strict_prev_trade_day=True,
                     auto_repair_missing_kline=False,
                     gate=strict_gate,
+                    run_uid=run_uid,
                     finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 )
                 return {
@@ -6562,7 +9131,8 @@ def run_recommended_stocks(
                     "strict_prev_trade_day": True,
                     "auto_repair_missing_kline": False,
                     "gate": strict_gate,
-                    "error": strict_gate.get("error") or "strict gate failed",
+                    "run_uid": run_uid,
+                    "error": gate_error,
                 }
         except Exception as exc:
             return {
@@ -6593,6 +9163,14 @@ def run_recommended_stocks(
     initial_step = "正在初始化..."
     if strict_prev_trade_day and strict_gate and not strict_gate.get("ready") and auto_repair_missing_kline:
         initial_step = f"目标日 {trade_date} 数据未就绪，后台先用国金QMT补K线..."
+    run_uid = _recommended_run_history_start(
+        trade_date=trade_date,
+        min_score=min_score,
+        top_n=top_n,
+        strict_prev_trade_day=strict_prev_trade_day,
+        execution_time=execution_time,
+        message=initial_step,
+    )
 
     _set_recommendation_progress(
         status="running",
@@ -6609,6 +9187,7 @@ def run_recommended_stocks(
         min_kline_coverage=min_kline_coverage,
         auto_repair_missing_kline=auto_repair_missing_kline,
         gate=strict_gate,
+        run_uid=run_uid,
         started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
@@ -6636,6 +9215,7 @@ def run_recommended_stocks(
                         min_kline_coverage=min_kline_coverage,
                         auto_repair_missing_kline=auto_repair_missing_kline,
                         gate=strict_gate,
+                        run_uid=run_uid,
                         flow_date=event.get("flow_date") or "",
                         hot_date=event.get("hot_date") or "",
                         market_mood_score=event.get("market_mood_score"),
@@ -6656,6 +9236,7 @@ def run_recommended_stocks(
                     execution_time=execution_time,
                     min_kline_coverage=min_kline_coverage,
                     auto_repair_missing_kline=auto_repair_missing_kline,
+                    run_uid=run_uid,
                     )
 
             stats = run_batch(
@@ -6684,19 +9265,28 @@ def run_recommended_stocks(
                 min_kline_coverage=min_kline_coverage,
                 auto_repair_missing_kline=auto_repair_missing_kline,
                 gate=strict_gate,
+                run_uid=run_uid,
                 flow_date=stats.flow_date,
                 hot_date=stats.hot_date,
                 market_mood_score=stats.market_mood_score,
                 finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
+            _recommended_run_history_finish(run_uid, status="done", payload={
+                "trade_date": stats.trade_date,
+                "total": stats.analysis_count,
+                "passed": stats.recommendation_count,
+                "flow_date": stats.flow_date,
+                "hot_date": stats.hot_date,
+                "market_mood_score": stats.market_mood_score,
+                "message": f"V3筛选完成，通过 {stats.recommendation_count} 只",
+            })
             try:
-                _cache_drop_prefix(f"recommended_stocks_{trade_date}_")
-                _cache_drop_prefix("recommended_stocks_latest_")
+                _invalidate_recommended_stocks_cache()
                 default_result = _recommended_stocks_v2(trade_date, "", "")
                 _cache_set(f"recommended_stocks_{trade_date}_all_all", default_result)
                 _cache_set("recommended_stocks_latest_all_all", default_result)
-            except Exception:
-                pass
+            except Exception as exc:
+                _record_fallback('_run_screen:8578', exc)
         except Exception as ex:
             import logging
             logging.getLogger(__name__).error(f"recommended-stocks error: {ex}", exc_info=True)
@@ -6715,8 +9305,13 @@ def run_recommended_stocks(
                 min_kline_coverage=min_kline_coverage,
                 auto_repair_missing_kline=auto_repair_missing_kline,
                 gate=strict_gate,
+                run_uid=run_uid,
                 finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
+            _recommended_run_history_finish(run_uid, status="error", payload={
+                "message": "筛选失败",
+                "error": str(ex)[:500],
+            })
         finally:
             _job_end("recommended_stocks")
 
@@ -6732,6 +9327,7 @@ def run_recommended_stocks(
         "min_kline_coverage": min_kline_coverage,
         "auto_repair_missing_kline": auto_repair_missing_kline,
         "gate": strict_gate,
+        "run_uid": run_uid,
         "note": "筛选已启动，完成后刷新页面查看结果",
     }
 
@@ -6746,7 +9342,8 @@ def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) ->
     This path avoids sm_stock_kline, which is frequently blocked by metadata locks
     during ingestion and should not sit on the interactive UI critical path.
     """
-    trade_date = _latest_date_not_after("sm_stock_snapshot", trade_date or date.today().isoformat())
+    requested_trade_date = str(trade_date or date.today().isoformat()).strip()[:10]
+    trade_date = _latest_market_analysis_date(requested_trade_date)
     name_rows = _read_sql("SELECT short_name FROM si_all_code WHERE stock_code = :c", {"c": stock_code})
     short_name = name_rows[0]["short_name"] if name_rows else stock_code
 
@@ -6760,6 +9357,46 @@ def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) ->
     snapshot = snapshot_rows[0] if snapshot_rows else {}
     if snapshot.get("short_name"):
         short_name = snapshot.get("short_name")
+
+    data_basis = "行情快照"
+    if not snapshot:
+        kline_rows = _read_sql("""
+            SELECT trade_date, close, amount, change_pct, turnover_ratio
+            FROM sm_stock_kline
+            WHERE stock_code = :c AND k_type = 1 AND trade_date <= :td
+            ORDER BY trade_date DESC
+            LIMIT 11
+        """, {"c": stock_code, "td": trade_date})
+        klines = list(reversed(kline_rows)) if kline_rows else []
+        if klines:
+            latest_k = klines[-1]
+
+            def _period_change(days: int) -> float:
+                if len(klines) <= days:
+                    return 0.0
+                base = float(klines[-1 - days].get("close") or 0)
+                close = float(latest_k.get("close") or 0)
+                return (close / base - 1.0) * 100 if base > 0 and close > 0 else 0.0
+
+            snapshot = {
+                "stock_code": stock_code,
+                "short_name": short_name,
+                "trade_date": str(latest_k.get("trade_date") or trade_date)[:10],
+                "price": latest_k.get("close"),
+                "change_pct": latest_k.get("change_pct"),
+                "change_3d": _period_change(3),
+                "change_5d": _period_change(5),
+                "change_10d": _period_change(10),
+                "turnover_ratio": latest_k.get("turnover_ratio"),
+                "amount": latest_k.get("amount"),
+                "main_net_inflow": 0,
+                "max_net_inflow": 0,
+                "lg_net_inflow": 0,
+                "mid_net_inflow": 0,
+                "sm_net_inflow": 0,
+            }
+            trade_date = str(snapshot.get("trade_date") or trade_date)[:10]
+            data_basis = "日K线"
 
     flow_rows = _read_sql("""
         SELECT trade_date, main_net_inflow, max_net_inflow, lg_net_inflow, mid_net_inflow, sm_net_inflow
@@ -6911,6 +9548,46 @@ def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) ->
     else:
         inst_detail = "近30日无显著龙虎榜机构信号"
 
+    evidence: list[dict[str, object]] = []
+
+    def _add_evidence(kind: str, direction: str, strength: int, text: str) -> None:
+        evidence.append({
+            "kind": kind,
+            "direction": direction,
+            "strength": max(0, min(100, int(strength))),
+            "text": text,
+        })
+
+    flow_ratio = (day_main_flow / amount * 100) if amount else 0
+    if day_main_flow > 0:
+        _add_evidence("当日资金", "建仓", 60 + min(30, abs(flow_ratio) * 2), f"主力净流入{day_main_flow/1e8:.2f}亿，占成交额{flow_ratio:.1f}%")
+    elif day_main_flow < 0:
+        _add_evidence("当日资金", "出货", 60 + min(30, abs(flow_ratio) * 2), f"主力净流出{abs(day_main_flow)/1e8:.2f}亿，占成交额{abs(flow_ratio):.1f}%")
+    if consecutive_in >= 3:
+        _add_evidence("连续资金", "建仓", 70 + min(20, consecutive_in * 4), f"主力连续{consecutive_in}日净流入")
+    if consecutive_out >= 3:
+        _add_evidence("连续资金", "出货", 70 + min(20, consecutive_out * 4), f"主力连续{consecutive_out}日净流出")
+    if flow_5d < 0 and sm_5d > 0:
+        _add_evidence("对手盘", "出货", 82, f"5日主力流出{abs(flow_5d)/1e8:.2f}亿，散户流入{sm_5d/1e8:.2f}亿")
+    if chg3 < 0 and chg10 > 0:
+        _add_evidence("趋势回撤", "洗盘", 70, f"3日回调{chg3:+.1f}%，10日仍上涨{chg10:+.1f}%")
+    if chg5 > 20 and day_main_flow < 0:
+        _add_evidence("冲高派发", "出货", 78, f"5日涨幅{chg5:+.1f}%过快且资金转弱")
+    if 3 <= chg5 <= 18 and chg10 > 0 and flow_5d >= 0:
+        _add_evidence("温和上行", "建仓", 68, f"5日涨幅{chg5:+.1f}%，10日趋势向上且资金未明显撤退")
+    if turnover_ratio >= 8 and price_chg > 0:
+        _add_evidence("高换手", "出货", 66, f"换手率{turnover_ratio:.2f}%偏高，上涨中承接压力需观察")
+    elif turnover_ratio <= 2.5 and chg5 >= 0:
+        _add_evidence("筹码稳定", "建仓", 62, f"换手率{turnover_ratio:.2f}%偏低，筹码相对稳定")
+    if holder_change < -5:
+        _add_evidence("筹码集中", "建仓", 80, f"股东人数减少{abs(holder_change):.1f}%")
+    elif holder_change > 5:
+        _add_evidence("筹码分散", "出货", 78, f"股东人数增加{holder_change:.1f}%")
+    if lhb_count > 0 and lhb_net_buy > 0:
+        _add_evidence("龙虎榜", "建仓", 72, f"近30日机构净买入{lhb_net_buy/1e8:.2f}亿")
+    elif lhb_count > 0 and lhb_net_buy < 0:
+        _add_evidence("龙虎榜", "出货", 72, f"近30日机构净卖出{abs(lhb_net_buy)/1e8:.2f}亿")
+
     weights = {"volume_price": 0.25, "capital_flow": 0.30, "kline_pattern": 0.20,
                "chip_concentration": 0.15, "institutional": 0.10}
     scores = {
@@ -6973,9 +9650,10 @@ def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) ->
             "chip_concentration": {"score": round(chip_score), "direction": chip_direction, "detail": chip_detail},
             "institutional": {"score": round(inst_score), "direction": inst_direction, "detail": inst_detail},
         },
+        "evidence": sorted(evidence, key=lambda item: int(item.get("strength") or 0), reverse=True)[:8],
         "history": history,
-        "source": "snapshot_fast",
-        "note": f"基于 {trade_date} 的快照生成主力快速分析，动量合成值 {momentum:+.1f}。",
+        "source": "snapshot_fast" if data_basis == "行情快照" else "daily_kline_fast",
+        "note": f"基于 {trade_date} 的{data_basis}生成主力快速分析，动量合成值 {momentum:+.1f}。",
     }
 
 
@@ -7416,7 +10094,7 @@ def mainforce_analysis(stock_code: str = Query(...), trade_date: str = Query(def
     """单只股票主力行为分析"""
     trade_date = trade_date if isinstance(trade_date, str) else ""
     if not trade_date:
-        trade_date = _latest_date("sm_stock_snapshot")
+        trade_date = _latest_market_analysis_date()
 
     cache_key = f"mainforce_analysis_{stock_code}_{trade_date}"
     cached = _cache_get(cache_key, ttl_seconds=300)
@@ -7481,8 +10159,8 @@ def mainforce_scan(trade_date: str = Query(default=None), top: int = Query(defau
                     "signals": {k: {"score": v["score"], "direction": v["direction"]}
                                 for k, v in analysis.get("signals", {}).items()},
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_fallback('_analyze_one:9411', exc)
         return None
 
     results = []
@@ -7509,6 +10187,68 @@ def mainforce_scan(trade_date: str = Query(default=None), top: int = Query(defau
 #  板块轮动分析（调仓换股决策辅助）
 # ──────────────────────────────────────────────────────────────────────
 
+def _sector_rotation_signal(
+    rising_sectors: list[dict],
+    falling_sectors: list[dict],
+    flow_in_top: list[dict],
+    flow_out_top: list[dict],
+    *,
+    flow_snapshot_at: str | None = None,
+) -> dict:
+    rising = [s for s in (rising_sectors or []) if float(s.get("momentum") or 0) > 3]
+    falling = [s for s in (falling_sectors or []) if float(s.get("momentum") or 0) < -3]
+    flow_in = [f for f in (flow_in_top or []) if float(f.get("main_net_inflow") or 0) > 0]
+    flow_out = [f for f in (flow_out_top or []) if float(f.get("main_net_inflow") or 0) < 0]
+
+    rising_names = {str(s.get("name") or "") for s in rising}
+    falling_names = {str(s.get("name") or "") for s in falling}
+    to_candidates = [dict(s, flow_match=any(str(f.get("name") or "") == str(s.get("name") or "") for f in flow_in)) for s in rising[:5]]
+    from_candidates = [dict(s, flow_match=any(str(f.get("name") or "") == str(s.get("name") or "") for f in flow_out)) for s in falling[:5]]
+
+    fund_in_names = [str(f.get("name") or "") for f in flow_in[:5]]
+    fund_out_names = [str(f.get("name") or "") for f in flow_out[:5]]
+    aligned_in = [name for name in fund_in_names if name in rising_names]
+    aligned_out = [name for name in fund_out_names if name in falling_names]
+
+    if to_candidates and from_candidates and (flow_in or flow_out):
+        status = "switching"
+        risk_level = "medium"
+        summary = f"板块切换中：{from_candidates[0]['name']}等退潮，{to_candidates[0]['name']}等走强"
+    elif to_candidates and flow_in:
+        status = "inflow"
+        risk_level = "low"
+        summary = f"资金偏进攻：{to_candidates[0]['name']}等走强，观察能否持续放量"
+    elif from_candidates and flow_out:
+        status = "outflow"
+        risk_level = "high"
+        summary = f"资金偏防守：{from_candidates[0]['name']}等退潮，优先控制回撤"
+    else:
+        status = "balanced"
+        risk_level = "low"
+        summary = "板块轮动不明显，暂未形成清晰切换方向"
+
+    action = {
+        "switching": "从退潮板块降仓，优先观察资金流入且动量上升的板块",
+        "inflow": "可跟踪流入板块中的龙头强弱，避免追高一次性满仓",
+        "outflow": "优先控制回撤，降低高波动仓位，等资金重新回流后再加仓",
+        "balanced": "维持现有仓位，等待主线确认",
+    }[status]
+
+    return {
+        "status": status,
+        "summary": summary,
+        "action": action,
+        "risk_level": risk_level,
+        "to_sectors": to_candidates,
+        "from_sectors": from_candidates,
+        "fund_in_sectors": flow_in[:5],
+        "fund_out_sectors": flow_out[:5],
+        "aligned_in": aligned_in,
+        "aligned_out": aligned_out,
+        "flow_snapshot_at": flow_snapshot_at or "",
+    }
+
+
 @router.get("/hot-data/sector-rotation")
 def sector_rotation(trade_date: str = Query(default=None), days: int = Query(default=10, ge=3, le=30)):
     """
@@ -7518,6 +10258,12 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
     if not trade_date:
         td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
         trade_date = str(td_rows[0]["d"]) if td_rows and td_rows[0].get("d") else str(date.today())
+
+    _ttl = _market_live_cache_ttl()
+    _ckey = f"sector_rotation_{trade_date}_{days}"
+    cached = _cache_get(_ckey, ttl_seconds=_ttl)
+    if cached is not None:
+        return cached
 
     # ── 1. 获取近 N 天的行业热度排名数据 ──
     # 优先使用东财数据（plate_type=3行业/4二级行业，真实成交额），回退到THS数据（plate_type=1概念/2行业，搜索热度）
@@ -7555,7 +10301,9 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         data_source = "ths"
 
     if not rank_rows:
-        return {"trade_date": trade_date, "error": "暂无板块排名数据"}
+        result = {"trade_date": trade_date, "error": "暂无板块排名数据"}
+        _cache_set(_ckey, result)
+        return result
 
     # 分离行业和概念数据
     industry_data = {}  # {snapshot_date: [{rank, name, change_pct, hot_value}]}
@@ -7575,7 +10323,9 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
     recent_dates = all_dates[-days:] if len(all_dates) >= days else all_dates
 
     if len(recent_dates) < 2:
-        return {"trade_date": trade_date, "error": "数据天数不足"}
+        result = {"trade_date": trade_date, "error": "数据天数不足"}
+        _cache_set(_ckey, result)
+        return result
 
     # ── 2. 分析行业排名变化趋势 ──
     # 对每个行业，计算近 N 天的排名趋势
@@ -7768,10 +10518,19 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
     flow_in_top = [{"name": k, **v} for k, v in flow_sorted[:10]]
     flow_out_top = [{"name": k, **v} for k, v in flow_sorted[-10:]]
     flow_out_top.reverse()
+    rotation_signal = _sector_rotation_signal(
+        rising_sectors,
+        falling_sectors,
+        flow_in_top,
+        flow_out_top,
+        flow_snapshot_at=str(flow_snap or "")[:19],
+    )
 
-    return {
+    result = {
         "trade_date": trade_date,
         "data_source": data_source,
+        "flow_snapshot_at": str(flow_snap or "")[:19],
+        "rotation_signal": rotation_signal,
         "lookback_days": len(recent_dates),
         "group_momentum": group_momentum,
         "advice": advice,
@@ -7783,6 +10542,8 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
         "industry_trends": industry_trends[:20],
         "concept_trends": concept_trends[:20],
     }
+    _cache_set(_ckey, result)
+    return result
 
 
 # ── 盘中实时数据刷新 ──
@@ -7806,7 +10567,7 @@ def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow
         cmd.append("--archive-snapshot")
     if only in ("snapshot", "all", "concept", "index"):
         cmd.append("--skip-closed")
-    env = {**os.environ, "MYSQL_URL": get_engine().url.render_as_string(hide_password=False)}
+    env = build_child_env(_ROOT, engine=get_engine())
     try:
         result = _sp.run(
             cmd,
