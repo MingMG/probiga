@@ -3,7 +3,7 @@ name: Deploy AI Recommendation Fix
 on:
   push:
     branches:
-      - codex/deploy-ai-rec-worker-prod
+      - main
 
 jobs:
   deploy-ai-rec-fix:
@@ -25,7 +25,7 @@ jobs:
             files="server/api/routers/hot_data.py server/static/js/app.js tools/run_ai_recommendation_worker.py tools/run_ai_recommendation_premarket.py"
 
             mkdir -p "$backup"
-            git fetch origin codex/deploy-ai-rec-worker-prod
+            git fetch origin main
 
             for file in $files; do
               if [ -f "$file" ]; then
