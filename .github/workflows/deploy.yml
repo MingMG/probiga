@@ -22,6 +22,12 @@ jobs:
             source venv/bin/activate
             pip install -e ./adata --quiet
             pip install -r requirements-platform.txt --quiet
+            mkdir -p /etc/systemd/system/probiga.service.d
+            cat > /etc/systemd/system/probiga.service.d/market-radar.conf <<'EOF'
+            [Service]
+            Environment=MARKET_RADAR_ENABLED=true
+            EOF
+            systemctl daemon-reload
             systemctl restart probiga
 
       - name: Verify deployment
