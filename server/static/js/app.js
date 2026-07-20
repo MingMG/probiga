@@ -3201,6 +3201,109 @@
         if (info) info.textContent = '显示 ' + shown + ' / ' + cards.length;
     };
 
+    function loadMarketRadarPage(d, c) {
+        if (window._marketRadarTimer) {
+            clearInterval(window._marketRadarTimer);
+            window._marketRadarTimer = null;
+        }
+        var loading = false;
+        c.innerHTML = '<style>' +
+            '.market-radar-panel{padding:4px 0}.market-radar-head{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px}' +
+            '.market-radar-pill{background:#f0f3f7;border-radius:14px;padding:6px 10px;color:#667085;font-size:12px}' +
+            '.market-radar-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}' +
+            '.market-radar-card{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 5px rgba(16,24,40,.08);overflow:auto}' +
+            '.market-radar-card.wide{grid-column:1/-1}.market-radar-card h3{margin:0 0 10px;font-size:15px}' +
+            '.market-radar-card h3.up{color:#d92d20}.market-radar-card h3.down{color:#079455}' +
+            '.market-radar-table{width:100%;border-collapse:collapse;font-size:12px}.market-radar-table th,.market-radar-table td{padding:7px 6px;border-bottom:1px solid #edf0f3;text-align:left;white-space:nowrap}' +
+            '.market-radar-table th{color:#667085;font-weight:600}.market-radar-up{color:#d92d20}.market-radar-down{color:#079455}' +
+            '.market-radar-muted{color:#98a2b3}.market-radar-event{padding:8px 10px;border-left:3px solid #1769e0;background:#f8fafc;margin-bottom:7px;font-size:12px}' +
+            '@media(max-width:900px){.market-radar-grid{grid-template-columns:1fr}}' +
+            '</style><div class="market-radar-panel"><div class="market-radar-head">' +
+            '<button onclick="window.marketRadarScan()">立即扫描</button><span id="marketRadarStatus" class="market-radar-pill">读取中...</span>' +
+            '<span id="marketRadarMethod" class="market-radar-pill"></span></div>' +
+            '<div class="market-radar-grid"><section class="market-radar-card wide"><h3>最近事件</h3><div id="marketRadarEvents" class="market-radar-muted">暂无</div></section>' +
+            '<section class="market-radar-card"><h3 class="up">上涨板块 / 带头股</h3><div id="marketRadarUpSectors" class="market-radar-muted">暂无</div></section>' +
+            '<section class="market-radar-card"><h3 class="down">下跌板块 / 带头股</h3><div id="marketRadarDownSectors" class="market-radar-muted">暂无</div></section>' +
+            '<section class="market-radar-card"><h3 class="up">上涨个股</h3><div id="marketRadarUpStocks" class="market-radar-muted">暂无</div></section>' +
+            '<section class="market-radar-card"><h3 class="down">下跌个股</h3><div id="marketRadarDownStocks" class="market-radar-muted">暂无</div></section></div></div>';
+
+        function radarGet(path) {
+            var joiner = path.indexOf('?') >= 0 ? '&' : '?';
+            return fetchRawJsonWithTimeout(path + joiner + '_=' + Date.now(), 15000);
+        }
+        function radarPct(value) {
+            var n = Number(value || 0);
+            return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+        }
+        function radarScore(value) {
+            var n = Number(value);
+            return isNaN(n) ? '-' : n.toFixed(1);
+        }
+        function radarRows(rows, kind) {
+            if (!rows || !rows.length) return '<div class="market-radar-muted">暂无数据</div>';
+            if (kind === 'stock') {
+                var stockHtml = '<table class="market-radar-table"><thead><tr><th>代码</th><th>名称</th><th>涨跌</th><th>评分</th><th>成交额增量</th><th>五档压力</th><th>标签</th></tr></thead><tbody>';
+                rows.forEach(function (r) {
+                    var cls = r.direction === 'DOWN' ? 'market-radar-down' : 'market-radar-up';
+                    stockHtml += '<tr><td>' + escHtml(r.stock_code || '-') + '</td><td>' + escHtml(r.short_name || '-') + '</td><td class="' + cls + '">' + radarPct(r.change_pct) + '</td><td>' + radarScore(r.score) + '</td><td>' + fmtMoney(r.amount_delta) + '</td><td>' + radarPct(r.five_pressure) + '</td><td class="market-radar-muted">' + escHtml((r.signal_tags || []).join(' / ')) + '</td></tr>';
+                });
+                return stockHtml + '</tbody></table>';
+            }
+            var sectorHtml = '<table class="market-radar-table"><thead><tr><th>板块</th><th>评分</th><th>宽度</th><th>涨跌均值</th><th>龙一</th><th>龙二</th><th>龙三</th><th>中军</th></tr></thead><tbody>';
+            rows.forEach(function (r) {
+                var dragons = Array.isArray(r.dragon_json) ? r.dragon_json : [];
+                var core = r.core_json || {};
+                sectorHtml += '<tr><td>' + escHtml(r.sector_name || '-') + '<span class="market-radar-muted"> ' + escHtml(r.sector_type || '') + '</span></td><td>' + radarScore(r.score) + '</td><td>' + radarPct(r.breadth_pct) + '</td><td>' + radarPct(r.avg_change_pct) + '</td><td>' + escHtml((dragons[0] && (dragons[0].short_name || dragons[0].stock_code)) || '-') + '</td><td>' + escHtml((dragons[1] && (dragons[1].short_name || dragons[1].stock_code)) || '-') + '</td><td>' + escHtml((dragons[2] && (dragons[2].short_name || dragons[2].stock_code)) || '-') + '</td><td>' + escHtml(core.short_name || core.stock_code || '-') + '</td></tr>';
+            });
+            return sectorHtml + '</tbody></table>';
+        }
+        function render(data) {
+            var status = data[0] || {};
+            var latest = status.latest || {};
+            el('marketRadarStatus').textContent = (latest.latest_stock_at || '未扫描') + '｜个股 ' + (latest.stock_rows || 0) + '｜板块 ' + (latest.sector_rows || 0) + '｜事件 ' + (latest.event_rows || 0);
+            el('marketRadarMethod').textContent = status.flow_note || 'QMT 五档压力代理';
+            el('marketRadarEvents').innerHTML = (data[5].rows || []).map(function (item) {
+                var cls = item.direction === 'DOWN' ? 'market-radar-down' : 'market-radar-up';
+                return '<div class="market-radar-event"><b class="' + cls + '">' + escHtml(item.direction || '-') + '</b> ' + escHtml(item.sector_name || item.stock_code || '市场') + '｜评分 ' + radarScore(item.score) + '｜' + escHtml(item.snapshot_at || '') + '</div>';
+            }).join('') || '暂无事件';
+            el('marketRadarUpSectors').innerHTML = radarRows(data[1].rows, 'sector');
+            el('marketRadarDownSectors').innerHTML = radarRows(data[2].rows, 'sector');
+            el('marketRadarUpStocks').innerHTML = radarRows(data[3].rows, 'stock');
+            el('marketRadarDownStocks').innerHTML = radarRows(data[4].rows, 'stock');
+        }
+        function refresh() {
+            if (loading || activeTabId() !== 'market-radar') return;
+            loading = true;
+            Promise.all([
+                radarGet('/api/market-radar/status'),
+                radarGet('/api/market-radar/sectors?direction=UP&limit=20'),
+                radarGet('/api/market-radar/sectors?direction=DOWN&limit=20'),
+                radarGet('/api/market-radar/stocks?direction=UP&limit=30'),
+                radarGet('/api/market-radar/stocks?direction=DOWN&limit=30'),
+                radarGet('/api/market-radar/events?limit=15')
+            ]).then(render).catch(function (e) {
+                el('marketRadarStatus').textContent = '读取失败：' + e.message;
+            }).finally(function () { loading = false; });
+        }
+        window.marketRadarRefresh = refresh;
+        window.marketRadarScan = function () {
+            el('marketRadarStatus').textContent = '扫描中...';
+            fetch('/api/market-radar/scan', {method:'POST'}).then(function (r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            }).then(refresh).catch(function (e) { el('marketRadarStatus').textContent = '扫描失败：' + e.message; });
+        };
+        refresh();
+        window._marketRadarTimer = setInterval(function () {
+            if (activeTabId() !== 'market-radar') {
+                clearInterval(window._marketRadarTimer);
+                window._marketRadarTimer = null;
+                return;
+            }
+            refresh();
+        }, 5000);
+    }
+
     /* ===== Tabs ===== */
     var LOADERS = {
         /* ── 市场概览 ── */
@@ -3250,6 +3353,9 @@
                 else if (vid === 'heat') loadSectorHeatPage(d, body);
             };
             state['_handler_sector'](prepared.activeId);
+        },
+        'market-radar': function (d, c) {
+            loadMarketRadarPage(d, c);
         },
         /* ── 强势股（3天/5天切换） ── */
         strong: function (d, c) {
@@ -4347,10 +4453,13 @@
         PAGE_TITLES['intraday-battle'] = '⚡ 盘中作战';
         PAGE_TITLES['strategy-backtest'] = '📊 策略回测';
         PAGE_TITLES['research-radar'] = '🧭 研报趋势雷达';
+        PAGE_TITLES['market-radar'] = '📡 异动雷达';
         PAGE_TITLES['hunter'] = '🏹 狩猎场';
     }
     ensureLayoutItem(LAYOUT_OLD, 1, {id:'strategy-backtest', icon:'📊', label:'策略回测'});
     ensureLayoutItem(LAYOUT_NEW, 4, {id:'strategy-backtest', icon:'📊', label:'策略回测'});
+    ensureLayoutItem(LAYOUT_OLD, 0, {id:'market-radar', icon:'📡', label:'异动雷达'});
+    ensureLayoutItem(LAYOUT_NEW, 0, {id:'market-radar', icon:'📡', label:'异动雷达'});
     var ALL_OLD_IDS = []; LAYOUT_OLD.forEach(function(g){ g.items.forEach(function(it){ ALL_OLD_IDS.push(it.id); }); });
     var ALL_NEW_IDS = []; LAYOUT_NEW.forEach(function(g){ g.items.forEach(function(it){ ALL_NEW_IDS.push(it.id); }); });
 

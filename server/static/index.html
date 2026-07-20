@@ -17,7 +17,7 @@
     <button class="sidebar-item active" data-tab="monitor" onclick="switchTab('monitor')">📺 市场监控</button>
     <button class="sidebar-item" data-tab="fused" onclick="switchTab('fused')">📊 热股排行</button>
     <button class="sidebar-item" data-tab="sector" onclick="switchTab('sector')">🌊 板块分析</button>
-    <button class="sidebar-item" data-tab="market-radar" onclick="window.location.href='/market-radar'">📡 异动雷达</button>
+    <button class="sidebar-item" data-tab="market-radar" onclick="switchTab('market-radar')">📡 异动雷达</button>
   </div>
 
   <div class="sidebar-group">
@@ -76,6 +76,7 @@
     <div id="tab-monitor" class="tab-content active"><div class="loading">加载中...</div></div>
     <div id="tab-fused" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-sector" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-market-radar" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-strong" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-concept" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-alist" class="tab-content"><div class="loading">加载中...</div></div>
@@ -222,6 +223,7 @@ var PAGE_TITLES = {
   review:'📚 每日复盘',
   fused:'📊 热股排行',
   sector:'🌊 板块分析',
+  'market-radar':'📡 异动雷达',
   strong:'🔥 强势股',
   concept:'🏷️ 概念 / 行业',
   alist:'🐲 龙虎榜',
@@ -239,6 +241,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 模拟交易'
 };
 </script>
-<script src="/static/js/app.js?v=37"></script>
+<script src="/static/js/app.js?v=38"></script>
 </body>
 </html>
