@@ -7,7 +7,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
-from server.api.routers import commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade
+from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
+from server.api.routers import commentary, datasource, deploy, health, hot_data, jq_minute, market_radar, notify, scheduler, sim_trade
 from server.api.scheduler_runtime import start_embedded_scheduler
 
 
@@ -15,10 +16,13 @@ from server.api.scheduler_runtime import start_embedded_scheduler
 async def lifespan(_: FastAPI):
     start_embedded_scheduler()
     start_qmt_live_runtime()
+    radar_thread = start_market_radar_runtime()
     try:
         yield
     finally:
         stop_qmt_live_runtime()
+        if radar_thread is not None:
+            stop_market_radar_runtime()
 
 
 app = FastAPI(
@@ -35,6 +39,7 @@ app.include_router(scheduler.router, prefix="/api")
 app.include_router(sim_trade.router, prefix="/api")
 app.include_router(datasource.router, prefix="/api")
 app.include_router(commentary.router, prefix="/api")
+app.include_router(market_radar.router, prefix="/api")
 app.include_router(deploy.router, prefix="/api")
 
 static_dir = Path(__file__).resolve().parent.parent / "static"
@@ -54,6 +59,14 @@ def deploy_console():
     if page_path.is_file():
         return HTMLResponse(content=page_path.read_text(encoding="utf-8"))
     return HTMLResponse(content="<h1>ProBigA Deploy</h1>")
+
+
+@app.get("/market-radar", response_class=HTMLResponse)
+def market_radar_page():
+    page_path = static_dir / "market_radar.html"
+    if page_path.is_file():
+        return HTMLResponse(content=page_path.read_text(encoding="utf-8"))
+    return HTMLResponse(content="<h1>Market Radar</h1>")
 
 
 if static_dir.is_dir():

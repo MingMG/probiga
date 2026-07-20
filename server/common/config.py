@@ -35,6 +35,17 @@ class Settings(BaseSettings):
     qmt_live_idle_sleep_seconds: int = 30
     qmt_live_trading_hours_only: bool = True
     qmt_live_candidate_limit: int = 60
+    market_radar_enabled: bool = False
+    market_radar_poll_seconds: int = 5
+    market_radar_trading_hours_only: bool = True
+    market_radar_stock_limit: int = 0
+    market_radar_batch_size: int = 500
+    market_radar_qmt_timeout: int = 120
+    market_radar_sector_limit: int = 500
+    market_radar_min_sector_members: int = 5
+    market_radar_metadata_refresh_seconds: int = 900
+    market_radar_event_cooldown_seconds: int = 60
+    market_radar_alert_enabled: bool = False
     minute_mysql_pool_size: int = 2
     minute_mysql_max_overflow: int = 1
     minute_mysql_pool_recycle: int = 1800
@@ -129,6 +140,23 @@ def get_qmt_live_runtime_config() -> dict[str, int | bool]:
         "idle_sleep_seconds": _bounded_int(settings.qmt_live_idle_sleep_seconds, default=30, minimum=5),
         "trading_hours_only": bool(settings.qmt_live_trading_hours_only),
         "candidate_limit": _bounded_int(settings.qmt_live_candidate_limit, default=60, minimum=20),
+    }
+
+
+def get_market_radar_runtime_config() -> dict[str, int | bool]:
+    settings = get_settings()
+    return {
+        "enabled": bool(settings.market_radar_enabled),
+        "poll_seconds": _bounded_int(settings.market_radar_poll_seconds, default=5, minimum=2),
+        "trading_hours_only": bool(settings.market_radar_trading_hours_only),
+        "stock_limit": _bounded_int(settings.market_radar_stock_limit, default=0, minimum=0),
+        "batch_size": _bounded_int(settings.market_radar_batch_size, default=500, minimum=50),
+        "qmt_timeout": _bounded_int(settings.market_radar_qmt_timeout, default=120, minimum=30),
+        "sector_limit": _bounded_int(settings.market_radar_sector_limit, default=500, minimum=50),
+        "min_sector_members": _bounded_int(settings.market_radar_min_sector_members, default=5, minimum=3),
+        "metadata_refresh_seconds": _bounded_int(settings.market_radar_metadata_refresh_seconds, default=900, minimum=60),
+        "event_cooldown_seconds": _bounded_int(settings.market_radar_event_cooldown_seconds, default=60, minimum=10),
+        "alert_enabled": bool(settings.market_radar_alert_enabled),
     }
 
 

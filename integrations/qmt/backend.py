@@ -309,6 +309,13 @@ class QmtBackend:
             "volume",
             "amount",
             "snapshot_at",
+            "pre_close",
+            "timetag",
+            "ask_price",
+            "ask_vol",
+            "bid_price",
+            "bid_vol",
+            "stock_status",
         ]
         return df.reindex(columns=cols)
 

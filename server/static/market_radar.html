@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>异动雷达｜ProBigA</title>
+  <style>
+    :root { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; color:#17202a; background:#f4f6f8; }
+    body { margin:0; padding:22px; } .wrap { max-width:1500px; margin:auto; }
+    h1 { margin:0 0 6px; } .sub { color:#667085; font-size:13px; margin-bottom:18px; }
+    .bar { display:flex; gap:9px; align-items:center; flex-wrap:wrap; margin-bottom:15px; }
+    button { border:0; border-radius:6px; padding:8px 13px; cursor:pointer; background:#1769e0; color:#fff; }
+    .pill { border-radius:15px; padding:5px 10px; background:#e9eef5; font-size:12px; }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:15px; }
+    .card { background:#fff; border-radius:10px; padding:15px; box-shadow:0 1px 5px #10182812; overflow:auto; }
+    .card h2 { font-size:16px; margin:0 0 10px; } table { width:100%; border-collapse:collapse; font-size:12px; }
+    th,td { padding:7px 6px; border-bottom:1px solid #edf0f3; text-align:left; white-space:nowrap; }
+    th { color:#667085; font-weight:600; } .up { color:#d92d20; } .down { color:#079455; }
+    .muted { color:#98a2b3; } .wide { grid-column:1/-1; } .event { padding:9px; border-left:3px solid #1769e0; background:#f8fafc; margin-bottom:7px; font-size:13px; }
+    @media(max-width:900px){ .grid{grid-template-columns:1fr;} body{padding:12px;} }
+  </style>
+</head>
+<body><div class="wrap">
+  <h1>异动雷达</h1>
+  <div class="sub">QMT 普通全量行情 + 五档盘口压力代理｜无 VIP/L2，不把代理指标冒充真实主力净流入</div>
+  <div class="bar"><button onclick="scan()">立即扫描</button><span id="status" class="pill">读取中…</span><span id="method" class="pill"></span><a href="/" class="pill">返回首页</a></div>
+  <div class="grid">
+    <section class="card wide"><h2>最近事件</h2><div id="events" class="muted">暂无</div></section>
+    <section class="card"><h2 class="up">上涨板块 / 带头股</h2><div id="upSectors" class="muted">暂无</div></section>
+    <section class="card"><h2 class="down">下跌板块 / 带头股</h2><div id="downSectors" class="muted">暂无</div></section>
+    <section class="card"><h2 class="up">上涨个股</h2><div id="upStocks" class="muted">暂无</div></section>
+    <section class="card"><h2 class="down">下跌个股</h2><div id="downStocks" class="muted">暂无</div></section>
+  </div>
+</div>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct = n => `${Number(n||0)>=0?'+':''}${Number(n||0).toFixed(2)}%`;
+const score = n => Number(n||0).toFixed(1);
+function stockRows(rows){ return `<table><thead><tr><th>代码</th><th>名称</th><th>涨跌</th><th>评分</th><th>成交额增量</th><th>五档压力</th><th>标签</th></tr></thead><tbody>${(rows||[]).map(r=>`<tr><td>${esc(r.stock_code)}</td><td>${esc(r.short_name||'-')}</td><td class="${r.direction==='UP'?'up':'down'}">${pct(r.change_pct)}</td><td>${score(r.score)}</td><td>${Number(r.amount_delta||0).toLocaleString()}</td><td>${pct(r.five_pressure)}</td><td class="muted">${esc((r.signal_tags||[]).join(' / '))}</td></tr>`).join('')}</tbody></table>`; }
+function sectorRows(rows){ return `<table><thead><tr><th>板块</th><th>评分</th><th>宽度</th><th>涨跌均值</th><th>龙一</th><th>龙二</th><th>龙三</th><th>中军</th></tr></thead><tbody>${(rows||[]).map(r=>{const d=r.dragon_json||[]; const c=r.core_json||{}; return `<tr><td>${esc(r.sector_name)} <span class="muted">${esc(r.sector_type)}</span></td><td>${score(r.score)}</td><td>${pct(r.breadth_pct)}</td><td>${pct(r.avg_change_pct)}</td><td>${esc(d[0]?.short_name||d[0]?.stock_code||'-')}</td><td>${esc(d[1]?.short_name||d[1]?.stock_code||'-')}</td><td>${esc(d[2]?.short_name||d[2]?.stock_code||'-')}</td><td>${esc(c.short_name||c.stock_code||'-')}</td></tr>`}).join('')}</tbody></table>`; }
+async function get(url){ const r=await fetch(url+(url.includes('?')?'&':'?')+`_=${Date.now()}`); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function refresh(){ try { const st=await get('/api/market-radar/status'); const [upS,downS,up,down,ev]=await Promise.all([get('/api/market-radar/sectors?direction=UP&limit=20'),get('/api/market-radar/sectors?direction=DOWN&limit=20'),get('/api/market-radar/stocks?direction=UP&limit=30'),get('/api/market-radar/stocks?direction=DOWN&limit=30'),get('/api/market-radar/events?limit=15')]); document.getElementById('status').textContent=`${st.latest?.latest_stock_at||'未扫描'}｜个股 ${st.latest?.stock_rows||0}｜板块 ${st.latest?.sector_rows||0}`; document.getElementById('method').textContent=st.flow_note; document.getElementById('upSectors').innerHTML=sectorRows(upS.rows); document.getElementById('downSectors').innerHTML=sectorRows(downS.rows); document.getElementById('upStocks').innerHTML=stockRows(up.rows); document.getElementById('downStocks').innerHTML=stockRows(down.rows); document.getElementById('events').innerHTML=(ev.rows||[]).map(e=>`<div class="event"><b class="${e.direction==='UP'?'up':'down'}">${esc(e.direction)}</b> ${esc(e.sector_name||e.stock_code||'市场')}｜评分 ${score(e.score)}｜${esc(e.snapshot_at)}</div>`).join('')||'暂无事件'; } catch(e) { document.getElementById('status').textContent='读取失败：'+e.message; } }
+async function scan(){ document.getElementById('status').textContent='扫描中…'; try { const r=await fetch('/api/market-radar/scan',{method:'POST'}); if(!r.ok) throw new Error(await r.text()); await refresh(); } catch(e){ document.getElementById('status').textContent='扫描失败：'+e.message; } }
+refresh(); setInterval(refresh,5000);
+</script></body></html>

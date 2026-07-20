@@ -96,8 +96,16 @@ def _json_value(value: Any) -> Any:
             pass
     if isinstance(value, list):
         return [_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
     if isinstance(value, dict):
         return {str(k): _json_value(v) for k, v in value.items()}
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            return _json_value(tolist())
+        except Exception:
+            return str(value)
     return value
 
 
@@ -315,6 +323,15 @@ def _transform_current(tick: Any) -> list[dict[str, Any]]:
                 "amount": info.get("amount"),
                 "snapshot_at": snapshot_at,
                 "pre_close": last_close,
+                "timetag": timetag,
+                "last_close": last_close,
+                "ask_price": info.get("askPrice") if info.get("askPrice") is not None else info.get("ask_price"),
+                "ask_vol": info.get("askVol") if info.get("askVol") is not None else info.get("ask_vol"),
+                "bid_price": info.get("bidPrice") if info.get("bidPrice") is not None else info.get("bid_price"),
+                "bid_vol": info.get("bidVol") if info.get("bidVol") is not None else info.get("bid_vol"),
+                "stock_status": info.get("stockStatus") if info.get("stockStatus") is not None else info.get("stock_status"),
+                "last_settlement_price": info.get("lastSettlementPrice"),
+                "settlement_price": info.get("settlementPrice"),
             }
         )
     return rows

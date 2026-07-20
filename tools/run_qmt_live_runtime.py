@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
+from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
 
 
 def _configure_logging() -> None:
@@ -22,9 +23,10 @@ def _configure_logging() -> None:
 
 def main() -> int:
     _configure_logging()
-    thread = start_qmt_live_runtime()
-    if thread is None:
-        print("QMT live runtime is disabled by configuration.")
+    qmt_thread = start_qmt_live_runtime()
+    radar_thread = start_market_radar_runtime()
+    if qmt_thread is None and radar_thread is None:
+        print("QMT live runtime and market radar are disabled by configuration.")
         return 1
 
     stop_requested = False
@@ -38,10 +40,11 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _handle_stop)
 
     try:
-        while not stop_requested and thread.is_alive():
+        while not stop_requested and any(thread and thread.is_alive() for thread in (qmt_thread, radar_thread)):
             time.sleep(1)
     finally:
         stop_qmt_live_runtime()
+        stop_market_radar_runtime()
     return 0
 
 
