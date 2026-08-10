@@ -96,8 +96,10 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_linux_scheduler_delegates_all_qmt_launchers_to_windows(self):
         for task_type in (
             "all_code",
+            "concept_code_east",
             "concept_constituent_east",
             "stock_kline",
+            "stock_relations_qmt",
             "intraday_realtime",
         ):
             self.assertTrue(

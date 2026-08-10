@@ -7,11 +7,13 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from server.common.batch_db import create_batch_engine
+from server.common.config import get_mysql_url
+
+mysql_url = (os.environ.get("MYSQL_URL") or get_mysql_url(required=True)).strip()
+engine = create_batch_engine(mysql_url)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)

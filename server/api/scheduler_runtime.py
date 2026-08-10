@@ -39,6 +39,7 @@ _scheduler_thread: threading.Thread | None = None
 WINDOWS_QMT_BRIDGE_TASK_TYPES = {
     "all_code",
     "all_index_code",
+    "concept_code_east",
     "concept_constituent_east",
     "etf_forward_daily",
     "index_constituent",
@@ -51,6 +52,7 @@ WINDOWS_QMT_BRIDGE_TASK_TYPES = {
     "qmt_membership_snapshot",
     "stock_current",
     "stock_kline",
+    "stock_relations_qmt",
 }
 WINDOWS_QMT_BRIDGE_SCRIPT_PATHS = {
     "tools/run_etf_forward_daily.py",
