@@ -13,6 +13,10 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
+from server.common.scheduler_script_policy import (
+    SchedulerScriptPolicyError,
+    resolve_scheduler_script,
+)
 
 logger = logging.getLogger("scheduler_daemon")
 if not logger.handlers:
@@ -101,9 +105,20 @@ def _run_task(row: dict, root: Path, engine) -> None:
     date_param_raw = str(row["date_param"] or "").strip()
     today = datetime.now().strftime("%Y-%m-%d")
 
-    script = root / script_path
-    if not script.exists():
-        logger.warning("脚本不存在: %s", script)
+    try:
+        script = resolve_scheduler_script(root, script_path)
+    except SchedulerScriptPolicyError as exc:
+        output = f"SCHEDULER_SCRIPT_BLOCKED: {exc}"
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE st_scheduled_tasks "
+                    "SET last_run_status='failed', last_run_output=:o, "
+                    "last_run_duration=0, updated_at=NOW() WHERE id=:id"
+                ),
+                {"o": output, "id": task_id},
+            )
+        logger.warning("任务 %s 脚本被安全策略拦截: %s", task_name, exc)
         return
 
     if script_args_raw:

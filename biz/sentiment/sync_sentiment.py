@@ -441,7 +441,25 @@ def _finalize_a_list_info_df(df: pd.DataFrame) -> pd.DataFrame:
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
     for c in ("a_net_amount", "a_buy_amount", "a_sell_amount", "a_buy_amount_rate", "a_sell_amount_rate"):
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            # The target schema stores DECIMAL(..., 6).  Round before duplicate
+            # detection so rows that differ only beyond database precision do
+            # not become physical duplicates after INSERT.
+            df[c] = pd.to_numeric(df[c], errors="coerce").round(6)
+    # The Eastmoney BUY and SELL reports overlap: a seat that appears on both
+    # lists is returned twice with identical combined buy/sell amounts.  Keep
+    # one physical row so downstream SUM(a_net_amount) does not double count
+    # the same seat.
+    business_columns = [
+        column
+        for column in (
+            "trade_date", "stock_code", "operate_code", "operate_name",
+            "a_net_amount", "a_buy_amount", "a_sell_amount",
+            "a_buy_amount_rate", "a_sell_amount_rate", "reason",
+        )
+        if column in df.columns
+    ]
+    if business_columns:
+        df = df.drop_duplicates(subset=business_columns, keep="first")
     return df
 
 

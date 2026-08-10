@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -28,6 +28,10 @@ from server.common.kline_data import get_kline_engine  # noqa: E402
 
 def _date(value: Any) -> str:
     return str(value or "")[:10]
+
+
+def _identity(value: Any) -> str:
+    return "<NULL>" if value is None else str(value)
 
 
 def audit_inputs(
@@ -73,12 +77,29 @@ def audit_inputs(
             "start_date": start_date,
             "end_date": end_date,
         }).mappings().all()
+        lhb_info_rows = conn.execute(text("""
+            SELECT
+              stock_code, trade_date, operate_code, operate_name,
+              a_net_amount, a_buy_amount, a_sell_amount,
+              a_buy_amount_rate, a_sell_amount_rate, reason
+            FROM st_a_list_info
+            WHERE trade_date BETWEEN :start_date AND :end_date
+            ORDER BY trade_date, stock_code
+        """), {
+            "start_date": start_date,
+            "end_date": end_date,
+        }).mappings().all()
         master_rows = conn.execute(text("""
             SELECT stock_code, list_date
             FROM si_all_code
             WHERE stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
         """)).fetchall()
 
+    lhb_candidate_codes = sorted({
+        str(row["stock_code"] or "").strip().zfill(6)
+        for row in lhb_rows
+        if row["stock_code"] is not None
+    })
     with kline_engine.connect() as conn:
         traded_rows = conn.execute(text("""
             SELECT DISTINCT stock_code, trade_date
@@ -93,6 +114,19 @@ def audit_inputs(
             "start_date": start_date,
             "end_date": end_date,
         }).fetchall()
+        historical_master_rows = []
+        if lhb_candidate_codes:
+            historical_master_rows = conn.execute(
+                text("""
+                    SELECT stock_code, MIN(trade_date) AS first_trade_date
+                    FROM sm_stock_kline
+                    WHERE stock_code IN :codes
+                      AND trade_date <= :end_date
+                      AND k_type = 1 AND adjust_type = 0
+                    GROUP BY stock_code
+                """).bindparams(bindparam("codes", expanding=True)),
+                {"codes": lhb_candidate_codes, "end_date": end_date},
+            ).fetchall()
 
     expected_by_date: dict[str, set[str]] = {
         trade_date: set()
@@ -109,6 +143,7 @@ def audit_inputs(
     }
     flow_keys: list[tuple[str, str]] = []
     source_counts: dict[str, int] = {}
+    missing_data_source_rows = 0
     non_finite_rows = 0
     main_component_identity_failures = 0
     market_balance_identity_failures = 0
@@ -119,6 +154,8 @@ def audit_inputs(
         flow_keys.append((code, trade_date))
         source = str(row["data_source"] or "")
         source_counts[source] = source_counts.get(source, 0) + 1
+        if not source.strip():
+            missing_data_source_rows += 1
         values = [
             float(row[column])
             for column in (
@@ -163,6 +200,8 @@ def audit_inputs(
         str(code).strip().zfill(6): _date(list_date)
         for code, list_date in master_rows
     }
+    for code, first_trade_date in historical_master_rows:
+        master.setdefault(str(code).strip().zfill(6), _date(first_trade_date))
     lhb_keys: list[tuple[str, str]] = []
     out_of_scope_lhb_codes: set[str] = set()
     out_of_scope_lhb_rows = 0
@@ -192,6 +231,37 @@ def audit_inputs(
 
     flow_duplicate_count = len(flow_keys) - len(set(flow_keys))
     lhb_duplicate_count = len(lhb_keys) - len(set(lhb_keys))
+    lhb_key_set = set(lhb_keys)
+    lhb_info_keys: list[tuple[str, str]] = []
+    lhb_info_row_keys: list[tuple[Any, ...]] = []
+    for row in lhb_info_rows:
+        code = str(row["stock_code"] or "").strip().zfill(6)
+        trade_date = _date(row["trade_date"])
+        if (
+            len(code) != 6
+            or not code.isdigit()
+            or code[:2] not in {"00", "30", "60", "68", "92"}
+        ):
+            continue
+        lhb_info_keys.append((code, trade_date))
+        lhb_info_row_keys.append((
+            code,
+            trade_date,
+            _identity(row["operate_code"]),
+            _identity(row["operate_name"]),
+            _identity(row["a_net_amount"]),
+            _identity(row["a_buy_amount"]),
+            _identity(row["a_sell_amount"]),
+            _identity(row["a_buy_amount_rate"]),
+            _identity(row["a_sell_amount_rate"]),
+            _identity(row["reason"]),
+        ))
+    lhb_info_key_set = set(lhb_info_keys)
+    missing_lhb_info_keys = sorted(lhb_key_set - lhb_info_key_set)
+    orphan_lhb_info_keys = sorted(lhb_info_key_set - lhb_key_set)
+    duplicate_lhb_info_rows = (
+        len(lhb_info_row_keys) - len(set(lhb_info_row_keys))
+    )
     missing_lhb_dates = [
         trade_date
         for trade_date in trade_dates
@@ -216,17 +286,27 @@ def audit_inputs(
         "flow_market_balance_identity_failures": (
             market_balance_identity_failures
         ),
-        "flow_source_count": len(source_counts),
+        "flow_missing_data_source_rows": missing_data_source_rows,
         "missing_lhb_trade_dates": missing_lhb_dates,
         "lhb_duplicate_business_keys": lhb_duplicate_count,
         "unknown_lhb_codes": sorted(unknown_lhb_codes),
         "prelisting_lhb_rows": prelisting_lhb_rows,
+        "missing_lhb_info_keys": [
+            {"stock_code": code, "trade_date": trade_date}
+            for code, trade_date in missing_lhb_info_keys[:200]
+        ],
+        "missing_lhb_info_key_count": len(missing_lhb_info_keys),
+        "orphan_lhb_info_keys": [
+            {"stock_code": code, "trade_date": trade_date}
+            for code, trade_date in orphan_lhb_info_keys[:200]
+        ],
+        "orphan_lhb_info_key_count": len(orphan_lhb_info_keys),
+        "lhb_info_duplicate_rows": duplicate_lhb_info_rows,
     }
     failed = any(
         bool(value)
-        for key, value in hard_failures.items()
-        if key != "flow_source_count"
-    ) or hard_failures["flow_source_count"] != 1
+        for value in hard_failures.values()
+    )
     return {
         "status": "fail" if failed else "pass",
         "start_date": start_date,
@@ -255,6 +335,9 @@ def audit_inputs(
             "rows_by_date": lhb_by_date,
             "out_of_scope_row_count": out_of_scope_lhb_rows,
             "out_of_scope_codes": sorted(out_of_scope_lhb_codes),
+            "info_source_row_count": len(lhb_info_rows),
+            "info_a_share_key_count": len(lhb_info_keys),
+            "info_distinct_stock_date_count": len(lhb_info_key_set),
         },
         "hard_failures": hard_failures,
     }

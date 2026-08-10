@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from server.api import scheduler_runtime
+from server.common.scheduler_script_policy import SchedulerScriptPolicyError
 
 
 class SchedulerRuntimeTest(unittest.TestCase):
@@ -67,6 +69,28 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     "api_mysql_pool_recycle": 1800,
                 },
             )
+
+    def test_run_task_fails_closed_when_script_is_not_clean_git_content(self):
+        engine = MagicMock()
+        conn = engine.begin.return_value.__enter__.return_value
+        row = {
+            "id": 12,
+            "task_name": "capital flow",
+            "script_path": "tools/crawl_realtime_batch.py",
+            "script_args": "--only flow",
+            "date_param": "",
+        }
+
+        with patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            side_effect=SchedulerScriptPolicyError("not clean"),
+        ), patch("server.api.scheduler_runtime.subprocess.Popen") as popen:
+            scheduler_runtime._run_task(row, Path("/opt/ProBigA-current"), engine)
+
+        popen.assert_not_called()
+        params = conn.execute.call_args.args[1]
+        self.assertEqual(params["id"], 12)
+        self.assertIn("SCHEDULER_SCRIPT_BLOCKED", params["o"])
 
 
 if __name__ == "__main__":
