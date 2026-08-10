@@ -174,7 +174,10 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     workflow = workflow_source + "\n" + deploy_script
 
     assert "pip install -e ./adata" not in workflow
-    assert "vars.ADATA_RELEASE_SHA" in workflow
+    assert (
+        "ADATA_RELEASE_SHA: b14f4e57b2175302f18b6eaf934f7dff9207a141"
+        in workflow
+    )
     assert "https://github.com/1nchaos/adata.git" in workflow
     assert "EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "server.common.adata_release seal" in workflow

@@ -44,7 +44,7 @@ jobs:
         id: adata_release
         shell: bash
         env:
-          ADATA_RELEASE_SHA: ${{ vars.ADATA_RELEASE_SHA }}
+          ADATA_RELEASE_SHA: b14f4e57b2175302f18b6eaf934f7dff9207a141
         run: |
           set -euo pipefail
           if [[ ! "$ADATA_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
