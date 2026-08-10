@@ -159,32 +159,40 @@ jobs:
       - name: Validate production SSH identity
         shell: bash
         env:
-          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_HOST: 47.113.123.190
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}
         run: |
           set -euo pipefail
+          identity_errors=0
           if [ -z "$SERVER_HOST" ]; then
             echo "::error title=Production SSH identity::SERVER_HOST secret is missing"
+            identity_errors=1
           fi
-          test -n "$SERVER_HOST"
           if [ -z "$SERVER_USER" ]; then
             echo "::error title=Production SSH identity::SERVER_USER secret is missing"
+            identity_errors=1
           fi
-          test -n "$SERVER_USER"
           if [ "$SERVER_USER" = root ]; then
             echo "::error title=Production SSH identity::SERVER_USER must be an unprivileged account, not root"
+            identity_errors=1
           fi
-          test "$SERVER_USER" != root
           if [ -z "$SSH_PRIVATE_KEY" ]; then
             echo "::error title=Production SSH identity::SSH_PRIVATE_KEY secret is missing"
+            identity_errors=1
           fi
-          test -n "$SSH_PRIVATE_KEY"
           if [[ ! "$SERVER_HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
-            echo "SERVER_HOST_FINGERPRINT must be an exact SHA256 fingerprint" >&2
+            echo "::error title=Production SSH identity::SERVER_HOST_FINGERPRINT must be an exact SHA256 fingerprint"
+            identity_errors=1
+          fi
+          if [ "$identity_errors" -ne 0 ]; then
             exit 2
           fi
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_USER"
+          test "$SERVER_USER" != root
+          test -n "$SSH_PRIVATE_KEY"
 
       - name: Deploy to Alibaba Cloud ECS
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
