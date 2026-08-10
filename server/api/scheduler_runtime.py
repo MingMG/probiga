@@ -52,6 +52,11 @@ WINDOWS_QMT_BRIDGE_TASK_TYPES = {
     "stock_current",
     "stock_kline",
 }
+WINDOWS_QMT_BRIDGE_SCRIPT_PATHS = {
+    "tools/run_etf_forward_daily.py",
+    "tools/sync_bigqmt_reference.py",
+    "tools/sync_qmt_primary.py",
+}
 INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_capital_flow_fast",
     "intraday_minute_flow",
@@ -95,10 +100,13 @@ def _should_delegate_to_windows_qmt_bridge(
     platform_name: str | None = None,
 ) -> bool:
     current_platform = platform_name or os.name
+    if current_platform == "nt":
+        return False
+    task_type = str(row.get("task_type") or "").strip()
+    script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
     return (
-        current_platform != "nt"
-        and str(row.get("task_type") or "").strip()
-        in WINDOWS_QMT_BRIDGE_TASK_TYPES
+        task_type in WINDOWS_QMT_BRIDGE_TASK_TYPES
+        or script_path in WINDOWS_QMT_BRIDGE_SCRIPT_PATHS
     )
 
 
@@ -311,7 +319,7 @@ def _check_and_run_tasks() -> None:
 
             with engine.connect() as conn:
                 result = conn.execute(
-                    text("SELECT id, task_name, script_path, script_args, cron_time, interval_minutes, "
+                    text("SELECT id, task_name, task_type, script_path, script_args, cron_time, interval_minutes, "
                          "enabled, date_param, last_run_at, last_triggered_at "
                          "FROM st_scheduled_tasks WHERE enabled = 1 ORDER BY sort_order")
                 )

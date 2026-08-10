@@ -111,6 +111,16 @@ class SchedulerRuntimeTest(unittest.TestCase):
                 )
             )
 
+        self.assertTrue(
+            scheduler_runtime._should_delegate_to_windows_qmt_bridge(
+                {
+                    "task_type": "legacy_or_missing_type",
+                    "script_path": "tools\\sync_qmt_primary.py",
+                },
+                platform_name="posix",
+            )
+        )
+
     def test_intraday_interval_tasks_do_not_run_before_market_window(self):
         row = {"task_type": "intraday_minute_flow"}
 
