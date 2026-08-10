@@ -952,8 +952,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["total"], 1)
 
     def test_live_quotes_from_current_table_can_return_stale_rows(self):
-        snapshot_at = (hot_data.datetime.now() - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
-        with patch("server.api.routers.hot_data._read_sql", return_value=[{
+        snapshot_at = (_FakeIntradayDatetime.now() - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
+        with patch("server.api.routers.hot_data.datetime", _FakeIntradayDatetime), patch("server.api.routers.hot_data._read_sql", return_value=[{
             "stock_code": "000001",
             "short_name": "Ping An",
             "price": 10.5,
@@ -2022,6 +2022,55 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(exec_mock.call_count, 2)
         self.assertEqual(exec_mock.call_args_list[0].args[1]["trade_date"], "2026-06-28")
         self.assertEqual(exec_mock.call_args_list[1].args[1]["status"], "done")
+
+    def test_startup_screen_applies_requested_range_volume_and_full_a_share_universe(self):
+        captured = {}
+
+        def fake_read(sql, params=None):
+            if "FROM sm_stock_kline t" in sql and "t.volume > base.avg_vol" in sql:
+                captured["sql"] = sql
+                captured["params"] = dict(params or {})
+                return [{"stock_code": "920001", "short_name": "北证样本", "change_pct": 5.0}]
+            return []
+
+        with patch("server.api.routers.hot_data._latest_date_not_after", return_value="2026-08-07"), \
+             patch("server.api.routers.hot_data._read_sql", side_effect=fake_read), \
+             patch("server.api.routers.hot_data._compute_indicators", return_value={}), \
+             patch("server.api.routers.hot_data._news_counts_for_codes", return_value={}):
+            out = hot_data.screen_stocks(
+                mode="startup",
+                trade_date="2026-08-07",
+                top=123,
+                min_change=1.2,
+                max_change=8.5,
+                vol_boost=1.7,
+            )
+
+        self.assertEqual(out["total"], 1)
+        self.assertIn("^(00|30|60|68|92)[0-9]{4}$", captured["sql"])
+        self.assertIn("t.volume > base.avg_vol * :vboost", captured["sql"])
+        self.assertIn("t.change_pct >= :cmin AND t.change_pct <= :cmax", captured["sql"])
+        self.assertEqual(captured["params"]["vboost"], 1.7)
+        self.assertEqual(captured["params"]["cmin"], 1.2)
+        self.assertEqual(captured["params"]["cmax"], 8.5)
+        self.assertEqual(captured["params"]["lim"], 123)
+
+    def test_lhb_screen_exposes_net_buy_and_net_sell_direction(self):
+        with patch("server.api.routers.hot_data._latest_date_not_after", return_value="2026-08-07"), \
+             patch(
+                 "server.api.routers.hot_data._read_sql",
+                 side_effect=[
+                     [{"exists": 1}],
+                     [
+                         {"stock_code": "600001", "a_net_amount": 100},
+                         {"stock_code": "600002", "a_net_amount": -50},
+                     ],
+                 ],
+             ):
+            out = hot_data.screen_stocks(mode="lhb", trade_date="2026-08-07", top=20)
+
+        self.assertEqual([row["lhb_direction"] for row in out["data"]], ["NET_BUY", "NET_SELL"])
+        self.assertEqual([row["lhb_direction_score"] for row in out["data"]], [100.0, 0.0])
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from server.common.tech_risk import (
     is_tech_exposed,
 )
 from server.engine.data_loader import StockDataLoader
+from server.engine.production_selector import board_limit_trigger_pct
 
 logger = logging.getLogger(__name__)
 from server.engine.stock_analysis_engine import StockAnalysisEngine
@@ -2402,6 +2403,12 @@ def screen_stocks(
                 WHERE d.trade_date = :d ORDER BY ABS(d.change_cpt) DESC LIMIT :lim
             """
             rows = _read_sql(sql, {"d": td, "lim": top})
+            for row in rows:
+                net = float(row.get("a_net_amount") or 0)
+                row["lhb_direction"] = (
+                    "NET_BUY" if net > 0 else ("NET_SELL" if net < 0 else "NEUTRAL")
+                )
+                row["lhb_direction_score"] = 100.0 if net > 0 else (0.0 if net < 0 else 50.0)
         elif mode == "flow":
             td = screen_date("sm_stock_capital_flow_daily")
             sql = """
@@ -2475,7 +2482,7 @@ def screen_stocks(
                   GROUP BY stock_code
                 ) ma20 ON t.stock_code = ma20.stock_code
                 WHERE t.trade_date = :d AND t.k_type=1 AND t.adjust_type=0
-                  AND t.stock_code REGEXP '^(0|60)'
+                  AND t.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%ST%'
                   AND ma5.avg_c > ma10.avg_c AND ma10.avg_c > ma20.avg_c AND t.close > ma5.avg_c
                   AND t.change_pct >= :cmin
@@ -2518,15 +2525,15 @@ def screen_stocks(
                     GROUP BY stock_code HAVING COUNT(*) >= 30
                 ) ma60 ON t.stock_code = ma60.stock_code
                 WHERE t.trade_date = :d AND t.k_type=1 AND t.adjust_type=0
-                  AND t.stock_code REGEXP '^(0|60)'
+                  AND t.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%%ST%%'
                   AND t.short_name NOT LIKE '%%ST%%'
                   AND ma5.v > ma10.v AND ma10.v > ma20.v AND ma20.v > ma60.v
                   AND t.close > ma5.v
                 ORDER BY t.close / NULLIF(ma60.v, 0) DESC
-                LIMIT 800
+                LIMIT :scan_lim
             """
-            raw_rows = _read_sql(sql, {"d": td})
+            raw_rows = _read_sql(sql, {"d": td, "scan_lim": top})
             if not raw_rows:
                 rows = []
             else:
@@ -2616,8 +2623,20 @@ def screen_stocks(
                 FROM sm_stock_kline t
                 LEFT JOIN si_all_code c ON t.stock_code = c.stock_code
                 WHERE t.trade_date = :d AND t.k_type=1 AND t.adjust_type=0
-                  AND t.change_pct >= :pct
-            """, {"d": td, "pct": limit_pct})
+                  AND t.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
+                  AND t.change_pct >= 4.5
+            """, {"d": td})
+            tolerance = max(0.8, min(1.0, float(limit_pct) / 10.0))
+            today_limit = [
+                row
+                for row in today_limit
+                if float(row.get("change_pct") or 0)
+                >= board_limit_trigger_pct(
+                    row.get("stock_code"),
+                    row.get("short_name"),
+                    tolerance=tolerance,
+                )
+            ]
             if not today_limit:
                 rows = []
             else:
@@ -2639,16 +2658,20 @@ def screen_stocks(
                 rows = []
                 for r in today_limit:
                     code = str(r["stock_code"])
+                    trigger_pct = board_limit_trigger_pct(
+                        code, r.get("short_name"), tolerance=tolerance
+                    )
                     boards = 1
                     for h in hist_map.get(code, []):
                         if str(h["trade_date"]) == str(td):
                             continue
-                        if float(h["change_pct"] or 0) >= limit_pct:
+                        if float(h["change_pct"] or 0) >= trigger_pct:
                             boards += 1
                         else:
                             break
                     if min_boards <= boards <= max_boards:
                         r["boards"] = boards
+                        r["limit_trigger_pct"] = trigger_pct
                         rows.append(r)
                 rows.sort(key=lambda x: (-x["boards"], -float(x["change_pct"] or 0)))
                 rows = rows[:top]
@@ -2663,7 +2686,7 @@ def screen_stocks(
                 FROM sm_stock_kline t
                 LEFT JOIN si_all_code c ON t.stock_code = c.stock_code
                 WHERE t.trade_date = :d AND t.k_type=1 AND t.adjust_type=0
-                  AND t.stock_code REGEXP '^(0|60)'
+                  AND t.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%ST%'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%*ST%'
                 ORDER BY t.change_pct DESC
@@ -2706,18 +2729,28 @@ def screen_stocks(
                   GROUP BY stock_code
                 ) base ON t.stock_code = base.stock_code
                 WHERE t.trade_date = :d AND t.k_type=1 AND t.adjust_type=0
-                  AND t.stock_code REGEXP '^(0|60)'
+                  AND t.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%ST%'
                   AND COALESCE(NULLIF(t.short_name,''), c.short_name) NOT LIKE '%*ST%'
                   AND t.close > ma20.avg_c
                   AND t.close < ma20.avg_c * 1.2
-                  AND t.volume > base.avg_vol * 1.3
+                  AND t.volume > base.avg_vol * :vboost
                   AND t.close >= base.max_high
                   AND (base.max_high - base.min_low) / NULLIF(base.min_low, 0) < 0.18
+                  AND t.change_pct >= :cmin AND t.change_pct <= :cmax
                 ORDER BY COALESCE(f.main_net_inflow, 0) DESC, t.volume / NULLIF(base.avg_vol, 0) DESC
                 LIMIT :lim
             """
-            rows = _read_sql(sql, {"d": td, "lim": top})
+            rows = _read_sql(
+                sql,
+                {
+                    "d": td,
+                    "lim": top,
+                    "vboost": vol_boost,
+                    "cmin": min_change,
+                    "cmax": max_change,
+                },
+            )
             if rows:
                 codes = [str(r["stock_code"]).strip().zfill(6) for r in rows]
                 inds = _compute_indicators(codes, td)
