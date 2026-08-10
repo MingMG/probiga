@@ -19,6 +19,7 @@ import os
 import random
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import numpy as np
 import pandas as pd
 import requests
 import urllib3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -34,14 +35,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
-
-def _load_mysql_url() -> str:
-    """从环境变量或 .env 文件加载 MySQL 连接串"""
-    return get_mysql_url(required=True)
-
-
-MYSQL_URL = _load_mysql_url()
+from server.common.batch_db import create_batch_engine, quote_identifier, write_frame
+from server.common.kline_data import get_kline_engine
+from server.common.minute_data import get_minute_engine
+from server.common.mysql_lock import mysql_named_lock
 
 
 def _is_trade_day(engine, day: datetime | None = None) -> bool:
@@ -90,6 +87,21 @@ DELAY = _env_float("MINUTE_REQUEST_DELAY", "0.5")
 JITTER = _env_float("MINUTE_REQUEST_JITTER", "0.3")
 BATCH_EVERY = _env_int("MINUTE_BATCH_EVERY", "100")
 BATCH_PAUSE = _env_float("MINUTE_BATCH_PAUSE", "20")
+FETCH_ATTEMPTS = _env_int("MINUTE_FETCH_ATTEMPTS", "3")
+RETRY_DELAY = _env_float("MINUTE_RETRY_DELAY", "1.0")
+
+FLOW_TABLE = "sm_stock_capital_flow_min"
+FLOW_WRITE_COLUMNS = (
+    "stock_code",
+    "trade_time",
+    "main_net_inflow",
+    "max_net_inflow",
+    "lg_net_inflow",
+    "mid_net_inflow",
+    "sm_net_inflow",
+    "snapshot_at",
+    "etl_sync_at",
+)
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -122,7 +134,7 @@ def _market_candidates(code: str, market: int | None = None) -> list[int]:
     code = str(code).strip()
     if code.startswith("6"):
         candidates.extend([1, 0])
-    elif code.startswith(("4", "8")):
+    elif code.startswith(("4", "8", "92")):
         candidates.extend([2, 0, 1])
     else:
         candidates.extend([0, 1, 2])
@@ -137,7 +149,7 @@ def _market_candidates(code: str, market: int | None = None) -> list[int]:
 def _primary_market(code: str) -> int:
     if str(code).startswith("6"):
         return 1
-    if str(code).startswith(("4", "8")):
+    if str(code).startswith(("4", "8", "92")):
         return 2
     return 0
 
@@ -183,6 +195,18 @@ def fetch_minute_flow(code: str, market: int) -> list[str] | None:
                 return klines
         except Exception:
             pass
+    return None
+
+
+def fetch_with_retries(fetcher, code: str, market: int) -> list[str] | None:
+    """Retry one stock without turning a transient source miss into stale data."""
+    attempts = max(1, int(FETCH_ATTEMPTS))
+    for attempt in range(attempts):
+        rows = fetcher(code, market)
+        if rows:
+            return rows
+        if attempt < attempts - 1:
+            time.sleep(RETRY_DELAY * (attempt + 1))
     return None
 
 
@@ -248,7 +272,7 @@ def get_codes(engine, table: str, code_col: str) -> list[tuple[str, int]]:
     return result
 
 
-def get_latest_kline_stock_codes(engine) -> list[tuple[str, int]]:
+def get_latest_kline_stock_codes(engine, *, fallback_engine=None) -> list[tuple[str, int]]:
     """Use the latest daily-kline universe so delisted/stale codes do not dominate minute sync."""
     with engine.connect() as conn:
         rows = conn.execute(text("""
@@ -263,7 +287,7 @@ def get_latest_kline_stock_codes(engine) -> list[tuple[str, int]]:
             ORDER BY stock_code
         """)).fetchall()
     if not rows:
-        return get_codes(engine, "si_all_code", "stock_code")
+        return get_codes(fallback_engine or engine, "si_all_code", "stock_code")
     return [(str(r[0]).strip().zfill(6), _primary_market(str(r[0]).strip())) for r in rows]
 
 
@@ -296,24 +320,70 @@ def save_kline(engine, rows: list[dict], table: str) -> int:
     return len(df)
 
 
-def save_flow(engine, rows: list[dict]) -> int:
+def _create_flow_stage(engine) -> str:
+    stage = f"{FLOW_TABLE}_stage_{uuid.uuid4().hex[:12]}"
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"CREATE TABLE {quote_identifier(stage)} "
+                f"LIKE {quote_identifier(FLOW_TABLE)}"
+            )
+        )
+    return stage
+
+
+def _drop_flow_stage(engine, stage: str) -> None:
+    if not stage:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage)}"))
+
+
+def _append_flow_stage(engine, stage: str, rows: list[dict]) -> int:
     if not rows:
         return 0
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
-
-    # 按 stock_code 删除旧数据（表没有 trade_date 列）
-    codes = sorted(df["stock_code"].unique())
-    with engine.begin() as conn:
-        for c in codes:
-            conn.execute(text("DELETE FROM sm_stock_capital_flow_min WHERE stock_code = :c"), {"c": c})
-
-    df["snapshot_at"] = datetime.now().replace(microsecond=0)
-    df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-
-    df.to_sql("sm_stock_capital_flow_min", engine, if_exists="append",
-              index=False, chunksize=1000, method="multi")
+    now = datetime.now().replace(microsecond=0)
+    df["snapshot_at"] = now
+    df["etl_sync_at"] = now
+    write_frame(
+        df[list(FLOW_WRITE_COLUMNS)],
+        stage,
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=1000,
+        method="multi",
+    )
     return len(df)
+
+
+def _publish_flow_stage(engine, stage: str, trade_date: str) -> int:
+    """Replace today's minute-flow slice only after the staged run is complete."""
+    columns = ", ".join(quote_identifier(column) for column in FLOW_WRITE_COLUMNS)
+    lock_timeout = max(0, _env_int("FLOW_MINUTE_LOCK_TIMEOUT", "0"))
+    with mysql_named_lock(
+        engine,
+        "probiga:capital_flow_minute",
+        timeout_seconds=lock_timeout,
+    ):
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"DELETE FROM {quote_identifier(FLOW_TABLE)} "
+                    "WHERE trade_time >= :trade_date "
+                    "AND trade_time < DATE_ADD(:trade_date, INTERVAL 1 DAY)"
+                ),
+                {"trade_date": trade_date},
+            )
+            result = conn.execute(
+                text(
+                    f"INSERT INTO {quote_identifier(FLOW_TABLE)} ({columns}) "
+                    f"SELECT {columns} FROM {quote_identifier(stage)}"
+                )
+            )
+    return int(result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0)
 
 
 def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, limit: int) -> dict:
@@ -369,7 +439,14 @@ def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, li
     }
 
 
-def crawl_flow(engine, codes: list[tuple[str, int]], limit: int) -> dict:
+def crawl_flow(
+    engine,
+    codes: list[tuple[str, int]],
+    limit: int,
+    min_coverage: float,
+    *,
+    trade_date: str,
+) -> dict:
     if limit > 0:
         codes = codes[:limit]
     total = len(codes)
@@ -377,56 +454,84 @@ def crawl_flow(engine, codes: list[tuple[str, int]], limit: int) -> dict:
 
     buffer = []
     ok = fail = 0
-    written_rows = 0
+    staged_rows = 0
+    published_rows = 0
     t0 = time.time()
+    stage = _create_flow_stage(engine)
+    try:
+        for i, (code, market) in enumerate(codes):
+            klines = fetch_with_retries(fetch_minute_flow, code, market)
+            parsed = parse_flow(code, klines or []) if klines else []
+            rows = [
+                row for row in parsed
+                if str(row.get("trade_time") or "")[:10] == trade_date
+            ]
+            if rows:
+                buffer.extend(rows)
+                ok += 1
+            else:
+                fail += 1
 
-    for i, (code, market) in enumerate(codes):
-        klines = fetch_minute_flow(code, market)
-        rows = parse_flow(code, klines or []) if klines else []
-        if rows:
-            buffer.extend(rows)
-            ok += 1
-        else:
-            fail += 1
+            time.sleep(DELAY + random.uniform(0, JITTER))
 
-        time.sleep(DELAY + random.uniform(0, JITTER))
+            if (i + 1) % 200 == 0:
+                elapsed = time.time() - t0
+                eta = (total - i - 1) / (i + 1) * elapsed
+                print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
 
-        if (i + 1) % 200 == 0:
-            elapsed = time.time() - t0
-            eta = (total - i - 1) / (i + 1) * elapsed
-            print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
+            if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
+                time.sleep(BATCH_PAUSE + random.uniform(0, 5))
 
-        if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
-            time.sleep(BATCH_PAUSE + random.uniform(0, 5))
+            if len(buffer) >= 5000:
+                print(f"    Staging {len(buffer)} rows...", flush=True)
+                staged_rows += _append_flow_stage(engine, stage, buffer)
+                buffer.clear()
 
-        if len(buffer) >= 5000:
-            print(f"    Writing {len(buffer)} rows...", flush=True)
-            written_rows += save_flow(engine, buffer)
-            buffer.clear()
+        if buffer:
+            print(f"    Staging {len(buffer)} rows...", flush=True)
+            staged_rows += _append_flow_stage(engine, stage, buffer)
 
-    if buffer:
-        print(f"    Writing {len(buffer)} rows...", flush=True)
-        written_rows += save_flow(engine, buffer)
+        coverage = ok / total if total else 0
+        if total > 0 and coverage >= min_coverage:
+            published_rows = _publish_flow_stage(engine, stage, trade_date)
+    except BaseException:
+        # Preserve the collection/publish failure if cleanup also fails.
+        try:
+            _drop_flow_stage(engine, stage)
+        except Exception:
+            pass
+        raise
+    else:
+        _drop_flow_stage(engine, stage)
 
     elapsed = time.time() - t0
     coverage = ok / total if total else 0
-    print(f"    Done! OK={ok} Fail={fail} Rows={written_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
+    print(f"    Done! OK={ok} Fail={fail} Rows={published_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
     return {
         "label": "Minute flow",
-        "table": "sm_stock_capital_flow_min",
+        "table": FLOW_TABLE,
         "total": total,
         "ok": ok,
         "fail": fail,
-        "rows": written_rows,
+        "rows": published_rows,
+        "staged_rows": staged_rows,
         "coverage": round(coverage, 4),
     }
 
 
 def main():
+    global DELAY, JITTER, BATCH_EVERY, BATCH_PAUSE, FETCH_ATTEMPTS, RETRY_DELAY
+
     parser = argparse.ArgumentParser(description="分钟数据爬取")
     parser.add_argument("--type", required=True,
                         choices=["stock", "index", "concept", "flow", "all"])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--request-delay", type=float, default=None)
+    parser.add_argument("--request-jitter", type=float, default=None)
+    parser.add_argument("--batch-every", type=int, default=None)
+    parser.add_argument("--batch-pause", type=float, default=None)
+    parser.add_argument("--fetch-attempts", type=int, default=None)
+    parser.add_argument("--retry-delay", type=float, default=None)
     parser.add_argument(
         "--min-coverage",
         type=float,
@@ -440,7 +545,20 @@ def main():
     )
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    if args.request_delay is not None:
+        DELAY = max(0.0, float(args.request_delay))
+    if args.request_jitter is not None:
+        JITTER = max(0.0, float(args.request_jitter))
+    if args.batch_every is not None:
+        BATCH_EVERY = max(0, int(args.batch_every))
+    if args.batch_pause is not None:
+        BATCH_PAUSE = max(0.0, float(args.batch_pause))
+    if args.fetch_attempts is not None:
+        FETCH_ATTEMPTS = max(1, int(args.fetch_attempts))
+    if args.retry_delay is not None:
+        RETRY_DELAY = max(0.0, float(args.retry_delay))
+
+    engine = create_batch_engine()
     if args.skip_closed and not is_trading_time(engine):
         print("Minute sync skipped: market closed", flush=True)
         return 0
@@ -466,8 +584,18 @@ def main():
         summaries.append(crawl_kline(engine, codes, "sm_concept_east_minute", "Concept 1-min", args.limit))
 
     if args.type in ("flow", "all"):
-        codes = get_latest_kline_stock_codes(engine)
-        summaries.append(crawl_flow(engine, codes, args.limit))
+        kline_engine = get_kline_engine()
+        flow_engine = get_minute_engine()
+        codes = get_latest_kline_stock_codes(kline_engine, fallback_engine=engine)
+        summaries.append(
+            crawl_flow(
+                flow_engine,
+                codes,
+                args.limit,
+                args.min_coverage,
+                trade_date=datetime.now().date().isoformat(),
+            )
+        )
 
     print(f"\n{'='*60}")
     print(f"  All done!")

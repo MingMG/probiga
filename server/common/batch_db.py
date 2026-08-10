@@ -28,9 +28,20 @@ def create_batch_engine(url: str | None = None, **kwargs: Any) -> Engine:
 
 
 def routed_read_engine(sql: object, engine: Engine) -> Engine:
-    """Route pure K-line reads to the configured K-line database."""
+    """Route pure market-history reads to their configured databases."""
     sql_text = str(sql)
-    return get_kline_engine() if should_use_kline_engine(sql_text) else engine
+    if should_use_kline_engine(sql_text):
+        return get_kline_engine()
+
+    # Import lazily because minute_data uses quote_identifier from this module.
+    from server.common.minute_data import (  # pylint: disable=import-outside-toplevel
+        get_minute_engine,
+        should_use_capital_flow_engine,
+    )
+
+    if should_use_capital_flow_engine(sql_text):
+        return get_minute_engine()
+    return engine
 
 
 def _transient_db_errno(exc: BaseException) -> int | None:
