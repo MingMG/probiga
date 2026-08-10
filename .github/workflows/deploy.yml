@@ -165,9 +165,21 @@ jobs:
           SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}
         run: |
           set -euo pipefail
+          if [ -z "$SERVER_HOST" ]; then
+            echo "::error title=Production SSH identity::SERVER_HOST secret is missing"
+          fi
           test -n "$SERVER_HOST"
+          if [ -z "$SERVER_USER" ]; then
+            echo "::error title=Production SSH identity::SERVER_USER secret is missing"
+          fi
           test -n "$SERVER_USER"
+          if [ "$SERVER_USER" = root ]; then
+            echo "::error title=Production SSH identity::SERVER_USER must be an unprivileged account, not root"
+          fi
           test "$SERVER_USER" != root
+          if [ -z "$SSH_PRIVATE_KEY" ]; then
+            echo "::error title=Production SSH identity::SSH_PRIVATE_KEY secret is missing"
+          fi
           test -n "$SSH_PRIVATE_KEY"
           if [[ ! "$SERVER_HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
             echo "SERVER_HOST_FINGERPRINT must be an exact SHA256 fingerprint" >&2
