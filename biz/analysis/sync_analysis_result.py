@@ -9,7 +9,6 @@ import sys
 from datetime import datetime
 from pathlib import Path as _Path
 
-import pandas as pd
 from sqlalchemy import text
 
 _ROOT = _Path(__file__).resolve().parents[2]
@@ -17,10 +16,14 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from biz.analysis.sync_analysis_fast import run_batch, run_batch_for_codes
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, read_frame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def get_engine():
+    return create_batch_engine()
 
 
 def get_all_active_stocks(limit: int | None = None) -> list[str]:
@@ -34,7 +37,7 @@ def get_all_active_stocks(limit: int | None = None) -> list[str]:
     """
     if limit:
         sql += f" LIMIT {int(limit)}"
-    df = pd.read_sql(text(sql), get_engine())
+    df = read_frame(text(sql), get_engine())
     if df.empty:
         return []
     return df["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
@@ -47,7 +50,7 @@ def resolve_trade_date(trade_date: str = "") -> str:
     if trade_date:
         sql += " AND trade_date <= :trade_date"
         params["trade_date"] = trade_date
-    rows = pd.read_sql(text(sql), get_engine(), params=params)
+    rows = read_frame(text(sql), get_engine(), params=params)
     if rows.empty or not rows.iloc[0]["d"]:
         raise RuntimeError(f"No daily K-line data found for {trade_date or 'latest'}")
     return str(rows.iloc[0]["d"])[:10]

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-<link rel="stylesheet" href="/static/css/style.css?v=19">
+<link rel="stylesheet" href="/static/css/style.css?v=20">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 </head>
 <body>
@@ -35,7 +35,7 @@
 
   <div class="sidebar-group">
     <div class="sidebar-group-title">选股工具</div>
-    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 选股策略</button>
+    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 V2-V6 统一选股</button>
     <button class="sidebar-item" data-tab="jq-picks" onclick="switchTab('jq-picks')">🤖 聚宽策略</button>
     <button class="sidebar-item" data-tab="recommended" onclick="switchTab('recommended')">💎 AI推荐</button>
   </div>
@@ -229,7 +229,7 @@ var PAGE_TITLES = {
   alist:'🐲 龙虎榜',
   capital:'💰 个股资金',
   mainforce:'🔍 主力行为分析',
-  screen:'🎯 选股策略',
+  screen:'🎯 V2-V6 统一选股',
   'jq-picks':'🤖 聚宽策略',
   recommended:'💎 AI推荐买入',
   portfolio:'📈 自选股',
@@ -241,6 +241,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 模拟交易'
 };
 </script>
-<script src="/static/js/app.js?v=38"></script>
+<script src="/static/js/app.js?v=39"></script>
 </body>
 </html>

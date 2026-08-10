@@ -258,12 +258,15 @@ def test_event_risk_engine_lifting():
 
     # 手动设置解禁日期为未来7天内
     from datetime import datetime, timedelta
+    lift_date = (
+        datetime.strptime(data['trade_date'], '%Y-%m-%d') + timedelta(days=3)
+    ).strftime('%Y-%m-%d')
     data['lifting'] = {
         'has_lifting_soon': True,
-        'lift_date': (datetime.now() + timedelta(days=3)).strftime('%Y-%m-%d'),
+        'lift_date': lift_date,
         'amount': 100000000,
         'ratio': 5.0,
-        'records': [{'lift_date': (datetime.now() + timedelta(days=3)).strftime('%Y-%m-%d'), 'volume': 10000000, 'amount': 100000000, 'ratio': 5.0}],
+        'records': [{'lift_date': lift_date, 'volume': 10000000, 'amount': 100000000, 'ratio': 5.0}],
     }
 
     result = engine.analyze(data)

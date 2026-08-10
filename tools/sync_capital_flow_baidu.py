@@ -17,12 +17,17 @@ from datetime import datetime, date
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
+
+ensure_adata_import_path(ROOT)
 
 import pandas as pd
 from sqlalchemy import text
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, read_frame, write_frame
+
+
+def get_engine():
+    return create_batch_engine()
 
 try:
     from adata.stock.market.capital_flow.stock_capital_flow_baidu import StockCapitalFlowBaidu
@@ -74,7 +79,7 @@ def sync_single_stock(engine, stock_code: str, start_date: str = None, end_date:
             )
 
         # 写入新数据（不包含 id 列，让它自增）
-        df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
+        write_frame(df, "sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
 
         print(f"  {stock_code}: 同步 {len(df)} 条数据")
         return len(df)
@@ -89,7 +94,7 @@ def sync_all_stocks(engine, trade_date: str = None, max_workers: int = 4):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     # 获取所有股票代码
-    df = pd.read_sql(text("SELECT stock_code FROM si_all_code WHERE stock_code NOT LIKE '4%' AND stock_code NOT LIKE '8%' AND stock_code NOT LIKE '9%' ORDER BY stock_code"), engine)
+    df = read_frame(text("SELECT stock_code FROM si_all_code WHERE stock_code NOT LIKE '4%' AND stock_code NOT LIKE '8%' AND stock_code NOT LIKE '9%' ORDER BY stock_code"), engine)
     stock_codes = df["stock_code"].tolist()
 
     print(f"共 {len(stock_codes)} 只股票待同步，使用 {max_workers} 个线程并发")

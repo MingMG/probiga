@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -18,8 +18,7 @@ from biz.stock_market.realtime_quotes import save_to_mysql
 from integrations.qmt import QmtBackend
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.safe_upsert import safe_upsert_rows
-from server.common.config import get_mysql_url
-from tools.crawl_realtime_batch import is_trading_time
+from server.common.batch_db import create_batch_engine
 
 
 def _read_codes(engine, limit: int) -> list[str]:
@@ -70,7 +69,9 @@ def sync_qmt_realtime(
     skip_closed: bool = True,
     replace_scope: str = "all",
 ) -> dict[str, Any]:
-    engine = engine or create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = engine or create_batch_engine(future=True)
+    from tools.crawl_realtime_batch import is_trading_time
+
     if skip_closed and not is_trading_time(engine):
         return {
             "status": "skipped",
@@ -102,7 +103,11 @@ def sync_qmt_realtime(
     written_snapshot = 0
     if archive_snapshot:
         snapshot_cols = ["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount"]
-        written_snapshot = save_to_mysql(df[snapshot_cols], run_ddl=run_rt_ddl)
+        written_snapshot = save_to_mysql(
+            df[snapshot_cols],
+            run_ddl=run_rt_ddl,
+            engine=engine,
+        )
 
     return {
         "status": "success",

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import wraps
 import os
 import subprocess
 import sys
@@ -26,26 +27,15 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-
-def _load_project_env() -> None:
-    env_path = ROOT / ".env"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
+from tools.env_config import load_project_env
 
 
-_load_project_env()
+load_project_env()
+
+from sqlalchemy import text
+
+from server.common.batch_db import create_batch_engine, read_frame
+from server.common.process_env import build_child_env, child_process_timeout, temporary_env
 
 
 def _first_env(env: dict[str, str], *names: str, default: str = "") -> str:
@@ -56,13 +46,131 @@ def _first_env(env: dict[str, str], *names: str, default: str = "") -> str:
     return default
 
 
+def _enabled(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _run_subprocess(cmd: list[str], env: dict[str, str]) -> int:
+    print("Run:", " ".join(cmd), flush=True)
+    timeout = child_process_timeout(2 * 60 * 60, env_name="PROBIGA_RUN_SINGLE_TABLE_TIMEOUT")
+    try:
+        return subprocess.run(cmd, cwd=str(ROOT), env=env, timeout=timeout).returncode
+    except subprocess.TimeoutExpired:
+        print(f"TIMEOUT after {timeout}s: {' '.join(cmd)}", file=sys.stderr, flush=True)
+        return 124
+
+
+def _child_env() -> dict[str, str]:
+    return build_child_env(ROOT)
+
+
+_SI_STEP_DEFAULTS = {
+    "SI_SKIP_GLOBAL_TRUNCATE": "1",
+    "SI_SYNC_SKIP_ALL_CODE": "1",
+}
+
+
+def _si_env(extra: dict[str, str] | None = None):
+    values = dict(_SI_STEP_DEFAULTS)
+    if extra:
+        values.update(extra)
+    return temporary_env(values, overwrite=False)
+
+
+def _with_temporary_env(defaults):
+    def decorate(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            values = defaults() if callable(defaults) else defaults
+            with temporary_env(values, overwrite=False):
+                return fn(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _with_si_env(extra=None):
+    def decorate(fn):
+        @wraps(fn)
+        def wrapped(*args, **kwargs):
+            values = None
+            dynamic_extra = extra() if callable(extra) else extra
+            if dynamic_extra:
+                values = dynamic_extra
+            with _si_env(values):
+                return fn(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _si_index_extra_env() -> dict[str, str]:
+    qmt_index_source = _first_env(os.environ, "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST").strip().lower()
+    if qmt_index_source not in {"qmt", "bigqmt", "big_qmt", "qmt_big"} and os.environ.get("SI_INDEX_TRY_EAST_FIRST") != "1":
+        return {"SI_INDEX_PRIMARY": "sina"}
+    return {}
+
+
+def _run_minute_crawl(minute_type: str, env: dict[str, str]) -> int:
+    env.setdefault("MINUTE_REQUEST_DELAY", "0.12")
+    env.setdefault("MINUTE_REQUEST_JITTER", "0.08")
+    env.setdefault("MINUTE_BATCH_EVERY", "0")
+    env.setdefault("MINUTE_MIN_COVERAGE", "0.70")
+    cmd = [sys.executable, "tools/crawl_minute_kline.py", "--type", minute_type]
+    if _enabled(env.get("MINUTE_SKIP_CLOSED")):
+        cmd.append("--skip-closed")
+    return _run_subprocess(cmd, env)
+
+
+def _run_flow_daily_fallback(date_str: str, env: dict[str, str]) -> int:
+    env.setdefault("FLOW_SOURCES", "efinance,push2his,baidu")
+    env.setdefault("FLOW_WORKERS", "4")
+    env.setdefault("FLOW_REQUEST_DELAY", "0.15")
+    env.setdefault("FLOW_REQUEST_JITTER", "0.15")
+    env.setdefault("FLOW_BATCH_PAUSE_EVERY", "0")
+    target_date = date_str.strip() or datetime.now().strftime("%Y-%m-%d")
+    cmd = [sys.executable, "tools/fetch_sm_stock_capital_flow_daily.py", target_date]
+    return _run_subprocess(cmd, env)
+
+
+def _run_flow_daily_fast_current(env: dict[str, str]) -> int:
+    env.setdefault("FLOW_FAST_MIN_COVERAGE", "0.70")
+    cmd = [
+        sys.executable,
+        "tools/crawl_realtime_batch.py",
+        "--only",
+        "flow",
+        "--min-coverage",
+        env["FLOW_FAST_MIN_COVERAGE"],
+        "--json",
+    ]
+    return _run_subprocess(cmd, env)
+
+
+def _latest_trade_date() -> str:
+    engine = create_batch_engine()
+    queries = [
+        "SELECT MAX(trade_date) FROM si_trade_calendar WHERE trade_status = 1 AND trade_date <= CURDATE()",
+        "SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1 AND trade_date <= CURDATE()",
+    ]
+    with engine.connect() as conn:
+        for sql in queries:
+            try:
+                value = conn.execute(text(sql)).scalar()
+            except Exception:
+                continue
+            if value:
+                return str(value)[:10]
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def _sub_run_stock_market(only: str, extra_args: list[str] | None = None) -> int:
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "").strip()
-    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
-    env.setdefault("SM_MAX_STOCKS", "500")
-    env.setdefault("SM_MAX_INDEXES", "200")
-    env.setdefault("SM_MAX_CONCEPTS", "100")
+    env = _child_env()
+    env.setdefault("SM_MAX_STOCKS", "0")
+    env.setdefault("SM_MAX_INDEXES", "0")
+    env.setdefault("SM_MAX_CONCEPTS", "0")
     env.setdefault("SM_HTTP_RETRIES", "3")
     env.setdefault("SM_HTTP_BACKOFF", "2")
     env.setdefault("SM_REQUEST_SLEEP", "0.3")
@@ -77,24 +185,28 @@ def _sub_run_stock_market(only: str, extra_args: list[str] | None = None) -> int
     ]
     if extra_args:
         cmd.extend(extra_args)
-    print("执行:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    return _run_subprocess(cmd, env)
 
 
-def _sub_run_sentiment(only: str) -> int:
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "").strip()
-    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+def _sub_run_script(script_path: str, extra_args: list[str] | None = None) -> int:
+    env = _child_env()
+    cmd = [sys.executable, script_path]
+    if extra_args:
+        cmd.extend(extra_args)
+    return _run_subprocess(cmd, env)
+
+
+def _sub_run_sentiment(only: str, date_str: str = "") -> int:
+    env = _child_env()
     env.setdefault("SE_SKIP_GLOBAL_TRUNCATE", "1")
+    if date_str.strip() and "a_list" in only:
+        env["SE_A_LIST_DATE"] = date_str.strip()
     cmd = [sys.executable, "-m", "biz.sentiment.sync_sentiment", "--only", only]
-    print("执行:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    return _run_subprocess(cmd, env)
 
 
 def _sub_run_flow_daily(date_str: str = "") -> int:
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "").strip()
-    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    env = _child_env()
     flow_source = _first_env(
         env,
         "DATA_SOURCE_FLOW_DAILY",
@@ -113,25 +225,26 @@ def _sub_run_flow_daily(date_str: str = "") -> int:
         ]
         if date_str.strip():
             cmd.extend(["--flow-date", date_str.strip()])
-        print("执行:", " ".join(cmd), flush=True)
-        return subprocess.call(cmd, cwd=str(ROOT), env=env)
-    env.setdefault("FLOW_SOURCES", "efinance,push2his,baidu")
-    env.setdefault("FLOW_WORKERS", "4")
-    env.setdefault("FLOW_REQUEST_DELAY", "0.15")
-    env.setdefault("FLOW_REQUEST_JITTER", "0.15")
-    env.setdefault("FLOW_BATCH_PAUSE_EVERY", "0")
-    target_date = date_str.strip() or datetime.now().strftime("%Y-%m-%d")
-    cmd = [sys.executable, "tools/fetch_sm_stock_capital_flow_daily.py", target_date]
-    print("执行:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+        rc = _run_subprocess(cmd, env)
+        if rc == 0:
+            return 0
+        print(f"QMT daily flow failed with exit={rc}; falling back to external flow fetch.", flush=True)
+    if not date_str.strip():
+        rc = _run_flow_daily_fast_current(env)
+        if rc == 0:
+            return 0
+        print(f"Fast current-day flow failed with exit={rc}; falling back to historical flow fetch.", flush=True)
+    return _run_flow_daily_fallback(date_str, env)
 
 
 def _sub_run_kline_daily(date_str: str = "") -> int:
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "").strip()
-    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+    env = _child_env()
     kline_source = _first_env(env, "DATA_SOURCE_KLINE", "SM_STOCK_KLINE_SOURCE").strip().lower()
-    if kline_source in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
+    if kline_source in {"myquant", "gm", "emquant", "goldminer", "qmt", "bigqmt", "big_qmt", "qmt_big"}:
+        target_date = date_str.strip() or (
+            _latest_trade_date() if kline_source in {"qmt", "bigqmt", "big_qmt", "qmt_big"} else ""
+        )
+        canonical_source = "bigqmt" if kline_source in {"bigqmt", "big_qmt", "qmt_big"} else kline_source
         cmd = [
             sys.executable,
             "-m",
@@ -139,37 +252,51 @@ def _sub_run_kline_daily(date_str: str = "") -> int:
             "--only",
             "stock_kline",
             "--kline-source",
-            kline_source or "myquant",
+            canonical_source or "myquant",
             "--kline-incremental",
             "--limit",
-            "-1",
+            "0",
         ]
-        if date_str.strip():
-            cmd.extend(["--kline-start", date_str.strip(), "--kline-end", date_str.strip()])
-        print("鎵ц:", " ".join(cmd), flush=True)
-        return subprocess.call(cmd, cwd=str(ROOT), env=env)
-    env.setdefault("KLINE_DAILY_WORKERS", "4")
-    env.setdefault("KLINE_DAILY_REQUEST_DELAY", "0.3")
-    env.setdefault("KLINE_DAILY_REQUEST_JITTER", "0.2")
+        if target_date:
+            cmd.extend(["--kline-start", target_date, "--kline-end", target_date])
+        rc = _run_subprocess(cmd, env)
+        if rc == 0:
+            return 0
+        if canonical_source not in {"qmt", "bigqmt"}:
+            return rc
+        if not _enabled(
+            env.get("QMT_PRIMARY_ALLOW_EXTERNAL_FALLBACK", "1")
+        ):
+            print(
+                f"QMT daily kline failed with exit={rc}; "
+                "external fallback is disabled for this provenance-strict run.",
+                flush=True,
+            )
+            return rc
+        print(f"QMT daily kline failed with exit={rc}; falling back to external daily kline fetch.", flush=True)
+    env.setdefault("KLINE_DAILY_WORKERS", "2")
+    env.setdefault("KLINE_DAILY_REQUEST_DELAY", "0.25")
+    env.setdefault("KLINE_DAILY_REQUEST_JITTER", "0.1")
     env.setdefault("KLINE_DAILY_MIN_COVERAGE", "0.90")
     cmd = [sys.executable, "tools/fetch_sm_stock_kline_daily.py"]
     if date_str.strip():
         cmd.append(date_str.strip())
-    print("执行:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+    return _run_subprocess(cmd, env)
 
 
-def _sub_run_minute(minute_type: str) -> int:
-    env = os.environ.copy()
-    pp = env.get("PYTHONPATH", "").strip()
-    env["PYTHONPATH"] = _ROOT_STR if not pp else f"{_ROOT_STR}{os.pathsep}{pp}"
+def _sub_run_minute(minute_type: str, date_str: str = "") -> int:
+    env = _child_env()
+    if date_str.strip():
+        # All registered minute backends, including QMT, resolve their target
+        # day through this existing canonical override.
+        env["MYQUANT_MINUTE_DATE"] = date_str.strip()
     source = _first_env(
         env,
         "DATA_SOURCE_MINUTE",
         "SM_STOCK_MINUTE_SOURCE",
         "SM_MARKET_DATA_SOURCE",
     ).strip().lower()
-    if minute_type == "stock" and source in {"myquant", "gm", "emquant", "goldminer", "qmt"}:
+    if minute_type == "stock" and source in {"myquant", "gm", "emquant", "goldminer", "qmt", "bigqmt", "big_qmt", "qmt_big"}:
         cmd = [
             sys.executable,
             "-m",
@@ -179,59 +306,76 @@ def _sub_run_minute(minute_type: str) -> int:
             "--limit",
             "-1",
         ]
-        print("鎵ц:", " ".join(cmd), flush=True)
-        return subprocess.call(cmd, cwd=str(ROOT), env=env)
+        rc = _run_subprocess(cmd, env)
+        if rc == 0:
+            return 0
+        if not _enabled(env.get("QMT_PRIMARY_ALLOW_EXTERNAL_FALLBACK", "1")):
+            print(
+                f"QMT stock minute failed with exit={rc}; "
+                "external fallback is disabled for this provenance-strict run.",
+                flush=True,
+            )
+            return rc
+        print(f"QMT stock minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
+        return _run_minute_crawl("stock", env)
     if minute_type == "index":
         source = _first_env(env, "DATA_SOURCE_INDEX_MINUTE", "SM_INDEX_MINUTE_SOURCE").strip().lower()
-        if source == "qmt":
+        if source in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:
             cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "index_minute", "--limit", "-1"]
-            print("执行:", " ".join(cmd), flush=True)
-            return subprocess.call(cmd, cwd=str(ROOT), env=env)
+            rc = _run_subprocess(cmd, env)
+            if rc == 0:
+                return 0
+            print(f"QMT index minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
+            return _run_minute_crawl("index", env)
     if minute_type == "concept":
         source = _first_env(env, "DATA_SOURCE_CONCEPT_MINUTE", "SM_CONCEPT_MINUTE_SOURCE").strip().lower()
         if source == "qmt":
             cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "concept_east_minute", "--limit", "-1"]
-            print("执行:", " ".join(cmd), flush=True)
-            return subprocess.call(cmd, cwd=str(ROOT), env=env)
+            rc = _run_subprocess(cmd, env)
+            if rc == 0:
+                return 0
+            print(f"QMT concept minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
+            return _run_minute_crawl("concept", env)
     if minute_type == "flow":
         source = _first_env(env, "DATA_SOURCE_FLOW_MIN", "SM_STOCK_FLOW_MIN_SOURCE", "DATA_SOURCE_STOCK_FLOW_MIN").strip().lower()
         if source == "qmt":
             cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "stock_flow_min", "--limit", "-1"]
-            print("执行:", " ".join(cmd), flush=True)
-            return subprocess.call(cmd, cwd=str(ROOT), env=env)
-    env.setdefault("MINUTE_REQUEST_DELAY", "0.12")
-    env.setdefault("MINUTE_REQUEST_JITTER", "0.08")
-    env.setdefault("MINUTE_BATCH_EVERY", "0")
-    env.setdefault("MINUTE_MIN_COVERAGE", "0.70")
-    cmd = [sys.executable, "tools/crawl_minute_kline.py", "--type", minute_type]
-    print("执行:", " ".join(cmd), flush=True)
-    return subprocess.call(cmd, cwd=str(ROOT), env=env)
+            rc = _run_subprocess(cmd, env)
+            if rc == 0:
+                return 0
+            print(f"QMT minute flow failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
+            return _run_minute_crawl("flow", env)
+    return _run_minute_crawl(minute_type, env)
 
 
 def _si_engine_info():
-    sys.path.insert(0, str(ROOT / "adata"))
-    from sqlalchemy import create_engine
+    from server.common.adata_release import ensure_adata_import_path
 
-    from biz.stock_info.sync_stock_info import _mysql_url, load_info, run_ddl
+    ensure_adata_import_path(ROOT)
 
-    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
-    os.environ.setdefault("SI_SYNC_SKIP_ALL_CODE", "1")
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    from biz.stock_info.sync_stock_info import load_info, run_ddl
+
+    eng = create_batch_engine()
     run_ddl(eng)
     info = load_info()
     return eng, info
 
 
+@_with_si_env(_si_index_extra_env)
 def run_si_all_index_code() -> int:
     # 东财 push2 常不可用：默认先只拉新浪；若要仍试东财再设 SI_INDEX_TRY_EAST_FIRST=1
-    qmt_index_source = _first_env(os.environ, "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST").strip().lower()
-    if qmt_index_source != "qmt" and os.environ.get("SI_INDEX_TRY_EAST_FIRST") != "1":
-        os.environ.setdefault("SI_INDEX_PRIMARY", "sina")
-
     from biz.stock_info.sync_stock_info import sync_all_index_code
 
     eng, info = _si_engine_info()
-    df = sync_all_index_code(eng, info)
+    try:
+        df = sync_all_index_code(eng, info)
+    except Exception as exc:
+        source = _first_env(os.environ, "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST").lower()
+        if source not in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:
+            raise
+        print(f"QMT index list failed; falling back to the external index list: {exc}", flush=True)
+        with temporary_env({"SI_ALL_INDEX_CODE_SOURCE": "sina"}):
+            df = sync_all_index_code(eng, info)
     if df is None or getattr(df, "empty", True):
         print(
             "【结果】本次未写入 si_all_index_code（东财限流/断连时常见）。"
@@ -243,33 +387,37 @@ def run_si_all_index_code() -> int:
     return 0
 
 
+@_with_si_env()
 def run_si_all_code() -> int:
     from biz.stock_info.sync_stock_info import sync_all_code
 
     eng, info = _si_engine_info()
-    df = sync_all_code(eng, info)
+    try:
+        df = sync_all_code(eng, info)
+    except Exception as exc:
+        source = _first_env(os.environ, "SI_ALL_CODE_SOURCE", "DATA_SOURCE_CODE_LIST").lower()
+        if source not in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:
+            raise
+        print(f"QMT stock list failed; falling back to the external stock list: {exc}", flush=True)
+        with temporary_env({"SI_ALL_CODE_SOURCE": "adata"}):
+            df = sync_all_code(eng, info)
     print(f"【结果】si_all_code 已更新，约 {0 if df is None else len(df)} 条。", flush=True)
     return 0
 
 
+@_with_si_env()
 def run_si_index_constituent() -> int:
-    import pandas as pd
-    from sqlalchemy import create_engine, text
-
     from biz.stock_info.sync_stock_info import (
-        _mysql_url,
         load_info,
         run_ddl,
         sync_all_index_code,
         sync_index_constituent,
     )
 
-    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
-    os.environ.setdefault("SI_SYNC_SKIP_ALL_CODE", "1")
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    eng = create_batch_engine()
     run_ddl(eng)
     info = load_info()
-    df = pd.read_sql(text("SELECT * FROM si_all_index_code"), eng)
+    df = read_frame(text("SELECT * FROM si_all_index_code"), eng)
     if df.empty:
         print("si_all_index_code 为空，先拉指数列表…", flush=True)
         df = sync_all_index_code(eng, info)
@@ -277,6 +425,7 @@ def run_si_index_constituent() -> int:
     return 0
 
 
+@_with_si_env()
 def run_si_concept_code_east() -> int:
     from biz.stock_info.sync_stock_info import sync_concept_code_east
 
@@ -286,24 +435,19 @@ def run_si_concept_code_east() -> int:
     return 0
 
 
+@_with_si_env()
 def run_si_concept_constituent_east() -> int:
-    import pandas as pd
-    from sqlalchemy import create_engine, text
-
     from biz.stock_info.sync_stock_info import (
-        _mysql_url,
         load_info,
         run_ddl,
         sync_concept_code_east,
         sync_concept_constituent_east,
     )
 
-    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
-    os.environ.setdefault("SI_SYNC_SKIP_ALL_CODE", "1")
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    eng = create_batch_engine()
     run_ddl(eng)
     info = load_info()
-    df = pd.read_sql(text("SELECT * FROM si_concept_code_east"), eng)
+    df = read_frame(text("SELECT * FROM si_concept_code_east"), eng)
     if df.empty:
         print("si_concept_code_east 为空，先拉东财概念列表…", flush=True)
         df = sync_concept_code_east(eng, info)
@@ -311,23 +455,19 @@ def run_si_concept_constituent_east() -> int:
     return 0
 
 
+@_with_temporary_env({"SI_SKIP_GLOBAL_TRUNCATE": "1"})
 def run_si_stock_relations() -> int:
-    import pandas as pd
-    from sqlalchemy import create_engine, text
-
     from biz.stock_info.sync_stock_info import (
-        _mysql_url,
         load_info,
         run_ddl,
         sync_all_code,
         sync_per_stock_tables,
     )
 
-    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    eng = create_batch_engine()
     run_ddl(eng)
     info = load_info()
-    df = pd.read_sql(text("SELECT stock_code FROM si_all_code ORDER BY stock_code"), eng)
+    df = read_frame(text("SELECT stock_code FROM si_all_code ORDER BY stock_code"), eng)
     if df.empty:
         print("si_all_code 为空，先同步股票代码列表…", flush=True)
         df = sync_all_code(eng, info)
@@ -346,7 +486,7 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
     "si_stock_concept_east": ("py_si_stock_rel", None),
     "si_stock_plate_east": ("py_si_stock_rel", None),
     "sm_concept_capital_flow_east": ("subprocess_sm", ["concept_flow_east"]),
-    "sm_concept_east_current": ("subprocess_sm", ["concept_east_current"]),
+    "sm_concept_east_current": ("subprocess_script", ["tools/crawl_concept_east_current.py"]),
     "sm_concept_east_kline": ("subprocess_sm", ["concept_east_kline"]),
     "sm_concept_east_minute": ("subprocess_minute", ["concept"]),
     "sm_concept_ths_current": ("subprocess_sm", ["concept_ths_current"]),
@@ -403,19 +543,44 @@ def _run_one_table(key: str, date_str: str = "") -> int:
     if date_str:
         if key in ("sm_stock_capital_flow_daily", "sm_concept_capital_flow_east"):
             extra.append(f"--flow-date={date_str}")
+    if key == "sm_index_kline":
+        index_source = _first_env(
+            os.environ,
+            "DATA_SOURCE_INDEX_KLINE",
+            "SM_INDEX_KLINE_SOURCE",
+        ).strip().lower()
+        if index_source == "qmt":
+            # A scheduled incremental run must never silently expand into the
+            # multi-year SM_INDEX_START default.
+            target_date = date_str.strip() or _latest_trade_date()
+            extra.extend(["--kline-start", target_date, "--kline-end", target_date])
     if kind == "subprocess_sm":
         assert payload
-        return _sub_run_stock_market(",".join(payload), extra_args=extra or None)
+        rc = _sub_run_stock_market(",".join(payload), extra_args=extra or None)
+        if rc == 0 or key != "sm_index_kline":
+            return rc
+        index_source = _first_env(os.environ, "DATA_SOURCE_INDEX_KLINE", "SM_INDEX_KLINE_SOURCE").lower()
+        if index_source != "qmt":
+            return rc
+        print(f"QMT index kline failed with exit={rc}; falling back to external index K-line.", flush=True)
+        with temporary_env(
+            {"DATA_SOURCE_INDEX_KLINE": "tencent", "SM_INDEX_KLINE_SOURCE": "tencent"},
+            overwrite=True,
+        ):
+            return _sub_run_stock_market(",".join(payload), extra_args=extra or None)
     if kind == "subprocess_flow_daily":
         return _sub_run_flow_daily(date_str)
     if kind == "subprocess_kline_daily":
         return _sub_run_kline_daily(date_str)
     if kind == "subprocess_minute":
         assert payload
-        return _sub_run_minute(payload[0])
+        return _sub_run_minute(payload[0], date_str)
     if kind == "subprocess_se":
         assert payload
-        return _sub_run_sentiment(",".join(payload))
+        return _sub_run_sentiment(",".join(payload), date_str)
+    if kind == "subprocess_script":
+        assert payload
+        return _sub_run_script(payload[0])
     if kind == "subprocess_sm_akshare":
         return _sub_run_stock_market("stock_kline", extra_args=["--kline-source", "akshare"] + extra)
     if kind == "py_si_all_code":

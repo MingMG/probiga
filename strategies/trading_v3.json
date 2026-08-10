@@ -1,0 +1,257 @@
+{
+  "schema_version": "probiga.trading-v3.v1",
+  "strategy_version": "trading_v3.6.0-paper",
+  "calibration_version_token": "v3.3.0",
+  "calibration_version_tokens": {
+    "right_side_trend": "v3.4.1",
+    "theme_diffusion": "v3.6.0",
+    "low_base_ignition": "v3.4.4",
+    "event_drift": "v3.3.0",
+    "quality_momentum": "v3.3.0",
+    "intraday_surprise": "v3.3.0",
+    "oversold_reversal": "v3.3.0",
+    "weak_market_structural_mainline": "v3.6.0"
+  },
+  "frozen_at": "2026-08-02T15:00:00+08:00",
+  "lifecycle_status": "PAPER_TRIAL",
+  "automatic_real_order_submission": false,
+  "production_routes": {
+    "decision_engine": "V3_ONLY",
+    "legacy_v2_entry_enabled": false,
+    "validated_intraday_entry_enabled": false
+  },
+  "data_quality": {
+    "minimum_market_stock_count": 2000,
+    "minimum_market_coverage_ratio": 0.85,
+    "maximum_concept_snapshot_age_days": 5,
+    "require_current_qmt_attestation": true
+  },
+  "account": {
+    "initial_cash_cny": 200000.0,
+    "commission_rate": 0.0001,
+    "minimum_commission_cny": 5.0,
+    "transfer_fee_rate": 0.00001,
+    "sell_stamp_duty_rate": 0.0005,
+    "default_slippage_rate": 0.0005
+  },
+  "profit_gate": {
+    "minimum_oos_samples": 80,
+    "minimum_expected_return_net_pct": 0.0,
+    "minimum_profit_factor": 1.3,
+    "minimum_payoff_ratio": 1.0,
+    "minimum_portfolio_trades": 80,
+    "minimum_portfolio_net_expectancy_pct": 0.0,
+    "minimum_portfolio_profit_factor": 1.3,
+    "minimum_portfolio_payoff_ratio": 1.0,
+    "target_payoff_ratio": 1.5,
+    "minimum_edge_to_roundtrip_cost_multiple": 3.0,
+    "maximum_drawdown_pct": 12.0
+  },
+  "calibration": {
+    "bucket_count": 5,
+    "minimum_bucket_count": 3,
+    "top_per_day": 10,
+    "reject_out_of_range_scores": true
+  },
+  "portfolio": {
+    "minimum_positions": 4,
+    "maximum_positions": 12,
+    "initial_probe_position_weight": 0.05,
+    "normal_position_weight": 0.08,
+    "maximum_single_position_weight": 0.12,
+    "maximum_theme_weight": 0.25,
+    "maximum_correlated_theme_weight": 0.35,
+    "standard_trade_risk": 0.004,
+    "maximum_open_risk": 0.02,
+    "minimum_economic_order_cny": 8000.0,
+    "maximum_daily_turnover": 0.30,
+    "maximum_add_count": 0
+  },
+  "paper_discovery": {
+    "enabled": true,
+    "allowed_strategy_keys": [
+      "theme_diffusion",
+      "right_side_trend",
+      "oversold_reversal",
+      "low_base_ignition",
+      "event_drift",
+      "quality_momentum",
+      "weak_market_structural_mainline",
+      "intraday_surprise"
+    ],
+    "single_sleeve_strategy_keys": [
+      "oversold_reversal",
+      "low_base_ignition",
+      "event_drift",
+      "quality_momentum",
+      "intraday_surprise"
+    ],
+    "minimum_single_sleeve_score": 0.76,
+    "minimum_primary_score": 0.82,
+    "minimum_theme_score": 0.72,
+    "minimum_trend_score": 0.72,
+    "position_weight": 0.025,
+    "maximum_positions": 10,
+    "maximum_total_weight": 0.20,
+    "maximum_theme_weight": 0.075,
+    "maximum_same_theme_positions": 2,
+    "minimum_order_cny": 4500.0,
+    "absolute_minimum_lot_order_cny": 2500.0,
+    "maximum_lot_rounding_overweight": 0.002,
+    "maximum_stop_pct": 6.0,
+    "cooldown_trade_days_after_exit": 5,
+    "real_order_allowed": false
+  },
+  "paper_execution": {
+    "maximum_live_positions": 12,
+    "maximum_entry_premium_pct": 0.5,
+    "worst_price_premium_pct": 1.0,
+    "entry_order_valid_sessions": 1,
+    "real_order_allowed": false
+  },
+  "shadow_portfolios": {
+    "enabled": true,
+    "strategy_top_k": 20,
+    "theme_top_k": 10,
+    "maximum_theme_groups": 3000,
+    "maximum_rows_per_run": 40000,
+    "evidence_kind": "SHADOW",
+    "order_allowed": false,
+    "can_activate_model": false
+  },
+  "forward_learning": {
+    "protocol_version": "PAPER_EXECUTED_LEDGER_V1",
+    "attribution_version": "V3_PRIMARY_FORECAST_THEME_SIGNAL_V2",
+    "evidence_source": "ACTUAL_INTERNAL_PAPER_FILLS",
+    "executed_evidence_only": true,
+    "one_primary_owner_per_entry_fill": true,
+    "ambiguous_ownership_is_quarantined": true,
+    "minimum_mature_trades": 80,
+    "cancelled_or_unfilled_orders_are_samples": false,
+    "shadow_evidence_can_activate_model": false
+  },
+  "theme_signals": {
+    "protocol_version": "GENERIC_THEME_SIGNAL_LEDGER_V2",
+    "strategy_keys": [
+      "theme_diffusion",
+      "weak_market_structural_mainline"
+    ],
+    "maximum_rows_per_run": 75000,
+    "evidence_top_k_per_theme_strategy": 10,
+    "all_observed_themes_enabled": true,
+    "special_theme_allowlist_required": false
+  },
+  "counterfactual": {
+    "protocol_version": "COUNTERFACTUAL_TECHNICAL_PROXY_V2",
+    "backlog_protocol_version": "MATURED_DRAIN_QUEUE_V1",
+    "evidence_kind": "SHADOW",
+    "require_valid_until_elapsed": true,
+    "batch_size": 10000,
+    "maximum_batches_per_run": 10,
+    "maximum_rows_per_run": 100000,
+    "unresolved_rows_are_deferred": true,
+    "recall_rebuilt_from_complete_ledger": true,
+    "can_activate_model": false
+  },
+  "theme_research": {
+    "minimum_alert_score": 0.82,
+    "maximum_audit_theme_rows": 20,
+    "maximum_audit_unselected_rows": 20,
+    "groups": {
+      "AI应用": {
+        "strategy_key": "ai_application_research",
+        "keywords": [
+          "人工智能",
+          "AIGC",
+          "CHATGPT",
+          "大模型",
+          "智能体",
+          "AI应用",
+          "生成式AI",
+          "多模态",
+          "机器学习",
+          "深度学习",
+          "自然语言处理",
+          "语音识别"
+        ]
+      },
+      "机器人": {
+        "strategy_key": "robotics_research",
+        "keywords": [
+          "机器人",
+          "智能机器",
+          "机器视觉",
+          "具身智能",
+          "工业自动化",
+          "人形机器人",
+          "减速器",
+          "伺服系统"
+        ]
+      }
+    }
+  },
+  "sleeves": {
+    "theme_diffusion": {
+      "enabled": true,
+      "horizon_days": 5,
+      "default_risk_weight": 1.0
+    },
+    "low_base_ignition": {
+      "enabled": true,
+      "horizon_days": 5,
+      "default_risk_weight": 0.6
+    },
+    "right_side_trend": {
+      "enabled": true,
+      "horizon_days": 10,
+      "default_risk_weight": 1.0
+    },
+    "event_drift": {
+      "enabled": true,
+      "horizon_days": 10,
+      "default_risk_weight": 0.7
+    },
+    "quality_momentum": {
+      "enabled": true,
+      "horizon_days": 20,
+      "default_risk_weight": 0.8
+    },
+    "intraday_surprise": {
+      "enabled": true,
+      "horizon_days": 1,
+      "default_risk_weight": 0.5
+    },
+    "oversold_reversal": {
+      "enabled": true,
+      "horizon_days": 5,
+      "default_risk_weight": 0.4,
+      "lifecycle": "PAPER_DISCOVERY_ONLY",
+      "minimum_forward_samples_before_calibration": 80
+    },
+    "weak_market_structural_mainline": {
+      "enabled": true,
+      "horizon_days": 5,
+      "default_risk_weight": 0.55,
+      "lifecycle": "SHADOW_RESEARCH_ONLY",
+      "minimum_forward_samples_before_calibration": 80,
+      "real_order_allowed": false
+    }
+  },
+  "regime": {
+    "states": [
+      "TREND_UP",
+      "THEME_ROTATION",
+      "RANGE",
+      "PANIC_RECOVERY",
+      "RISK_OFF"
+    ],
+    "risk_asset_caps": {
+      "TREND_UP": 0.75,
+      "THEME_ROTATION": 0.65,
+      "RANGE": 0.45,
+      "PANIC_RECOVERY": 0.30,
+      "RISK_OFF": 0.10
+    }
+  },
+  "change_policy": "any formula, threshold, feature or calibration change requires a new immutable version"
+}

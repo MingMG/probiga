@@ -13,26 +13,29 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
 
-# 复用 adata 中已封装的东财接口
-from adata.stock.info.stock_info import StockInfo
+from server.common.batch_db import create_batch_engine, read_frame
+
+log = logging.getLogger(__name__)
 
 
 def _engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, pool_size=3, max_overflow=5)
+    return create_batch_engine(pool_size=3, max_overflow=5)
 
 
 def run_ddl(engine):
@@ -98,7 +101,7 @@ def sync_one(engine, info: StockInfo, stock_code: str, ts: str) -> int:
                 })
                 rows += 1
             except Exception:
-                pass
+                log.debug("Skipped malformed stock-holder row.", exc_info=True)
     return rows
 
 
@@ -112,17 +115,19 @@ def main() -> int:
     engine = _engine()
     run_ddl(engine)
 
+    from adata.stock.info.stock_info import StockInfo
+
     info = StockInfo()
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if args.code.strip():
         codes = [args.code.strip().zfill(6)]
     else:
-        rows = pd.read_sql(
+        rows = read_frame(
             text("SELECT stock_code FROM si_all_code WHERE stock_code REGEXP '^(0|3|6)' ORDER BY stock_code"),
             engine,
         )
-        codes = rows["stock_code"].tolist()
+        codes = [str(code).strip().zfill(6) for code in rows["stock_code"].tolist() if str(code).strip()]
         if args.limit > 0:
             codes = codes[: args.limit]
 

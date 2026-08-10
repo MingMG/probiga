@@ -8,33 +8,42 @@ tunnel.  Business code should call this module instead of hard-coding
 """
 from __future__ import annotations
 
-import re
-from datetime import date, datetime
-from decimal import Decimal
+import threading
 from typing import Any
 
-from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from server.common.batch_db import quote_identifier
 from server.common.config import get_minute_mysql_pool_config, get_minute_mysql_url, get_settings
+from server.common.engine_factory import create_pooled_engine
+from server.common.sql_reader import read_sql_rows
 
 _MINUTE_ENGINE: Engine | None = None
-_TABLE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_MINUTE_ENGINE_LOCK = threading.Lock()
 
 
 def get_minute_engine() -> Engine:
     """Return the engine used for stock-minute reads."""
     global _MINUTE_ENGINE
     if _MINUTE_ENGINE is None:
-        pool = get_minute_mysql_pool_config()
-        _MINUTE_ENGINE = create_engine(
-            get_minute_mysql_url(),
-            pool_pre_ping=True,
-            pool_size=pool["pool_size"],
-            max_overflow=pool["max_overflow"],
-            pool_recycle=pool["pool_recycle"],
-        )
+        with _MINUTE_ENGINE_LOCK:
+            if _MINUTE_ENGINE is None:
+                pool = get_minute_mysql_pool_config()
+                _MINUTE_ENGINE = create_pooled_engine(
+                    get_minute_mysql_url(),
+                    pool_config=pool,
+                )
     return _MINUTE_ENGINE
+
+
+def dispose_minute_engine() -> None:
+    """Dispose the shared minute-data engine if it has been initialized."""
+    global _MINUTE_ENGINE
+    with _MINUTE_ENGINE_LOCK:
+        engine = _MINUTE_ENGINE
+        _MINUTE_ENGINE = None
+        if engine is not None:
+            engine.dispose()
 
 
 def _configured_source() -> str:
@@ -53,8 +62,10 @@ def get_minute_stock_table() -> str:
             table = "sm_stock_minute_gml"
         else:
             table = "sm_stock_minute"
-    if not _TABLE_RE.fullmatch(table):
-        raise ValueError(f"Invalid minute table name: {table}")
+    try:
+        quote_identifier(table)
+    except ValueError as exc:
+        raise ValueError(f"Invalid minute table name: {table}") from exc
     return table
 
 
@@ -77,27 +88,18 @@ def minute_source_info() -> dict[str, Any]:
     }
 
 
-def _normalize_value(value: Any) -> Any:
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(value, date):
-        return value.isoformat()
-    return value
-
-
 def _read_rows(sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
-    with get_minute_engine().connect() as conn:
-        result = conn.execute(text(sql), params)
-        rows = []
-        for row in result.mappings().all():
-            rows.append({k: _normalize_value(v) for k, v in dict(row).items()})
-        return rows
+    return read_sql_rows(
+        get_minute_engine(),
+        sql,
+        params,
+        context="minute_data",
+        stringify_datetime=True,
+    )
 
 
 def _minute_select_sql(table: str, *, single_day: bool, limit: int | None = None) -> str:
-    quoted = f"`{table}`"
+    quoted = quote_identifier(table)
     date_filter = "trade_date = :d" if single_day else "trade_date >= :s AND trade_date <= :e"
     limit_sql = f"\n        LIMIT {int(limit)}" if limit else ""
     if _table_kind(table) == "ohlc":

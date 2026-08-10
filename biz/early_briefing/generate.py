@@ -24,19 +24,25 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
-import pandas as pd
-from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
+
+ensure_adata_import_path(ROOT)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("briefing")
 
-from server.common.config import get_mysql_url, get_settings, get_wecom_webhook
+from server.common.batch_db import create_batch_engine, read_records
+from server.common.config import get_settings, get_wecom_webhook
+from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
+try:
+    from biz.research_radar.radar import build_research_radar, format_radar_markdown
+except Exception:
+    build_research_radar = None
+    format_radar_markdown = None
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
@@ -44,15 +50,11 @@ HEADERS_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebK
 
 
 def get_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    return create_batch_engine()
 
 
 def _read_sql(engine, sql: str, params: dict = None) -> list[dict]:
-    try:
-        df = pd.read_sql(text(sql), engine, params=params)
-        return [] if df.empty else df.replace({pd.NA: None, float("nan"): None}).to_dict(orient="records")
-    except Exception:
-        return []
+    return read_records(sql, engine, params=params, ignore_errors=True)
 
 
 def _fmt_pct(v) -> str:
@@ -92,6 +94,7 @@ def collect_market_data(engine) -> dict:
             data["美股"] = us
     except Exception as e:
         log.warning("美股: %s", e)
+        data["美股"] = {"数据状态": f"暂不可用：{e}"}
 
     # 1.2 A股指数
     rows = _read_sql(engine, """SELECT i.index_code, i.price, i.change_pct FROM sm_index_current i WHERE i.index_code IN
@@ -104,7 +107,7 @@ def collect_market_data(engine) -> dict:
     latest_trade_date = _read_sql(engine, "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
     trade_date = latest_trade_date[0]["d"] if latest_trade_date and latest_trade_date[0].get("d") else None
 
-    rows = _read_sql(engine, "SELECT * FROM st_hot_concept_ths_daily WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_concept_ths_daily WHERE snapshot_date >= :d) ORDER BY plate_type, rank LIMIT 20", {"d": trade_date})
+    rows = _read_sql(engine, "SELECT * FROM st_hot_concept_ths_daily WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_concept_ths_daily WHERE snapshot_date >= :d) ORDER BY plate_type, `rank` LIMIT 20", {"d": trade_date})
     concepts = [f"{r['concept_name']}({_fmt_pct(r.get('change_pct'))})" for r in rows if r.get("plate_type") == 1][:8]
     industries = [f"{r['concept_name']}({_fmt_pct(r.get('change_pct'))})" for r in rows if r.get("plate_type") == 2][:5]
     data["热门概念"] = concepts
@@ -142,6 +145,15 @@ def collect_market_data(engine) -> dict:
     rows = _read_sql(engine, """SELECT source, title, content FROM st_news_flash
         WHERE DATE(publish_time) >= :d ORDER BY is_top DESC, publish_time DESC LIMIT 30""", {"d": yesterday})
     data["DB快讯"] = [f"[{r.get('source','')}] {r.get('title','') or r.get('content','')}" for r in rows]
+    if build_research_radar is not None:
+        data["研报趋势雷达"] = build_research_radar(engine, str(trade_date)[:10] if trade_date else None)
+    else:
+        data["研报趋势雷达"] = {}
+    data["风险机会决策雷达"] = fetch_tech_risk_signal(
+        lambda sql, params=None: _read_sql(engine, sql, params),
+        str(trade_date)[:10] if trade_date else None,
+    )
+    data["科技风险雷达"] = data["风险机会决策雷达"]
 
     return data
 
@@ -185,7 +197,7 @@ def crawl_cls_telegraph() -> list[str]:
                 if t and len(t) > 10:
                     items.append(f"[财联社] {t}")
         except Exception:
-            pass
+            log.debug("Failed to crawl CLS headlines.", exc_info=True)
     return items
 
 
@@ -249,6 +261,7 @@ def build_system_prompt() -> str:
 5. **情绪指标量化**：涨停家数、连板高度、炸板率、量比等微观情绪信号
 6. **多空博弈推演**：针对每个主线，列出多方逻辑和空方逻辑，给出倾向性判断
 7. **风险全景扫描**：政策风险、业绩雷、解禁、减持、外围黑天鹅
+8. **风险/机会自主判断**：必须综合「风险机会决策雷达」、外围映射、A股涨跌家数、板块强弱、资金流和实际持仓；若 risk.triggered=true，要醒目写出需要先跑/先减仓的板块和命中持仓；若 opportunity.status=focus/watch，要列出机会板块和具体观察个股
 
 写作风格：
 - 标题格式："## 📰 A股早报 | X月X日 星期X"
@@ -291,11 +304,28 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 ### 📈 隔夜外盘深度
 美股三指涨跌 + VIX/美债/美元 + 中概股表现 + 对A股映射（北向资金预期、开盘情绪、板块联动）
 
-### 🎯 核心主线推演
-今天最核心 2-3 条主线，每条主线必须包含：
+### 🗺️ 全市场催化候选池（不得省略）
+先完成全市场扫描，再做优先级排序。必须逐项检查：外盘与风险偏好、政策与流动性、供给扰动、涨价、
+国产替代/贸易摩擦、订单与资本开支、需求景气、技术/产品发布、财报业绩、并购重组、会议展会和消费事件。
+- 凡是能形成“消息催化→产业传导→A股环节/个股映射→盘面验证”的方向都要列出，不得因为排名靠后而删除
+- 按 S/A/B/观察/逻辑转弱 分层；没有合格个股的主题仍须保留，并注明“暂无合格标的”
+- 对无法归类但重要的消息，单列“未归类高优先级催化”，不能静默丢弃
+- 每条写明：催化证据、产业链受益/受损环节、具体标的、盘面验证、证伪条件
+
+### 🎯 今日优先主线
+从上述全量候选池中再选 2-3 条最高优先级主线，但这只是交易优先级，不代替也不删减全市场候选池。
+每条主线必须包含：
 - 逻辑链：从消息→产业链受益环节→具体标的
 - 多方逻辑 vs 空方逻辑
-- 倾向性判断
+- 倾向性判断与今日验证点
+
+### 🧭 研报趋势雷达
+必须单独列出这一节，基于“研报趋势雷达”数据说明：
+- 博主/公众号热度只是情绪入口，券商/投行研报和财报公告是验证层
+- 展示全部已扫描主题及 S/A/B/观察/逻辑转弱排序，不得只截取前几名
+- 每条主线对应的核心股票池、验证指标、主要风险
+- 做覆盖审计：列出扫描维度数、活跃主题数、逻辑转弱主题数、暂无合格标的主题和未归类催化
+- 明确说明这不是买卖建议
 
 ### 🔥 板块轮动全景
 结合热门概念/行业数据，分析：
@@ -317,6 +347,7 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 
 ### ⚠️ 风险全景
 分点列出：政策风险、业绩雷、解禁减持、高位回调、外围黑天鹅
+如果「风险机会决策雷达」的 risk 触发，必须把“对应板块先跑/先减仓、命中持仓先处理”列为第一风险；同时给出机会侧板块和候选个股，但不能用机会掩盖风险。
 
 ### 📌 今日重点观测
 列出 5-8 个今日必须盯盘的变量（个股/板块/数据）
@@ -416,6 +447,24 @@ def push_to_wecom(content: str) -> bool:
     return ok == n
 
 
+def append_research_radar(content: str, market_data: dict) -> str:
+    radar = market_data.get("研报趋势雷达")
+    if not radar or format_radar_markdown is None or "研报趋势雷达" in content:
+        return content
+    return content.rstrip() + "\n\n" + format_radar_markdown(radar, title="🧭 研报趋势雷达")
+
+
+def append_tech_risk(content: str, market_data: dict) -> str:
+    return append_tech_risk_markdown(content, market_data.get("风险机会决策雷达") or market_data.get("科技风险雷达"))
+
+
+def _safe_print(text_value: str) -> None:
+    try:
+        print(text_value)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write((text_value + "\n").encode("utf-8", errors="replace"))
+
+
 # ═══════════════════════════════════════════
 # 5. 主函数
 # ═══════════════════════════════════════════
@@ -467,14 +516,17 @@ def main():
             log.error("DeepSeek 调用失败: %s", e)
             briefing = _generate_fallback(market_data, deduped_news)
 
+    briefing = append_tech_risk(briefing, market_data)
+    briefing = append_research_radar(briefing, market_data)
+
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(briefing)
 
     if args.test:
-        print("\n" + "=" * 60)
-        print(briefing)
-        print("=" * 60)
+        _safe_print("\n" + "=" * 60)
+        _safe_print(briefing)
+        _safe_print("=" * 60)
         return 0
 
     log.info("4/4 推送到企业微信...")
@@ -503,6 +555,8 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
             if k in us:
                 techs.append(f"{k.upper()} {us[k]}")
         if techs: lines.append("科技: " + " ".join(techs))
+        if not parts and not techs and us.get("数据状态"):
+            lines.append(us["数据状态"])
         lines.append("")
 
     a_idx = market_data.get("A股指数", {})
@@ -538,6 +592,16 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
         lines.append("**📢 热点资讯**")
         for n in news[:8]:
             lines.append(f"- {n[:100]}")
+        lines.append("")
+
+    decision_radar = append_tech_risk_markdown("", market_data.get("风险机会决策雷达") or market_data.get("科技风险雷达")).strip()
+    if decision_radar:
+        lines.append(decision_radar)
+        lines.append("")
+
+    radar = market_data.get("研报趋势雷达")
+    if radar and format_radar_markdown is not None:
+        lines.append(format_radar_markdown(radar, title="🧭 研报趋势雷达"))
         lines.append("")
 
     amt = market_data.get("成交额", "暂无")

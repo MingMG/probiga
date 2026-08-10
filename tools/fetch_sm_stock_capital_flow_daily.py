@@ -29,14 +29,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests as http
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
+
+from server.common.batch_db import create_batch_engine, write_frame
+from server.common.kline_data import get_kline_engine
+from server.common.mysql_lock import mysql_named_lock
+from integrations.qmt.backend import to_qmt_symbol
 
 _MAX_RETRIES = int(os.environ.get("FLOW_MAX_RETRIES", "1"))
 _RETRY_BASE_DELAY = 3.0
@@ -79,26 +85,31 @@ class FetchOutcome:
     no_data: bool = False
 
 
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
-
-
 def _read_stock_codes(engine):
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT stock_code FROM si_all_code ORDER BY stock_code")).fetchall()
-    return [str(r[0]).strip().zfill(6) for r in rows]
+    return [
+        code
+        for r in rows
+        if to_qmt_symbol(code := str(r[0]).strip().zfill(6))
+    ]
 
 
-def _read_target_stock_codes(engine, target_date: str) -> list[str]:
+def _read_target_stock_codes(engine, target_date: str, *, kline_engine=None) -> list[str]:
     """资金流以目标交易日已有日K为股票池，避免历史/退市代码拖慢补数。"""
-    with engine.connect() as conn:
+    source_engine = kline_engine or get_kline_engine()
+    with source_engine.connect() as conn:
         rows = conn.execute(text("""
             SELECT DISTINCT stock_code
             FROM sm_stock_kline
-            WHERE trade_date = :d AND k_type = 1
+            WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
             ORDER BY stock_code
         """), {"d": target_date}).fetchall()
-    codes = [str(r[0]).strip().zfill(6) for r in rows]
+    codes = [
+        code
+        for r in rows
+        if to_qmt_symbol(code := str(r[0]).strip().zfill(6))
+    ]
     return codes or _read_stock_codes(engine)
 
 
@@ -130,13 +141,164 @@ def _build_sources(raw: str = ""):
     return out
 
 
-def _read_kline_stock_count(engine, target_date: str) -> int:
+def _filter_source_supported_codes(
+    stock_codes: list[str],
+    sources,
+) -> list[str]:
+    """Keep only the market scope supported by the selected provider chain."""
+    source_keys = {str(item[0]).strip().lower() for item in sources}
+    if source_keys and source_keys.issubset({"baidu", "efinance"}):
+        # These two historical endpoints expose Shanghai/Shenzhen A shares,
+        # not Beijing Stock Exchange securities.
+        return [
+            code
+            for code in stock_codes
+            if re.fullmatch(r"(?:00|30|60|68)[0-9]{4}", code)
+        ]
+    return stock_codes
+
+
+def _read_kline_stock_count(engine, target_date: str, *, kline_engine=None) -> int:
+    return len(_read_target_stock_codes(engine, target_date, kline_engine=kline_engine))
+
+
+def _read_minute_close_fallback(
+    engine,
+    target_date: str,
+    target_codes: list[str] | set[str],
+    *,
+    require_complete: bool = True,
+) -> pd.DataFrame:
+    """Read Eastmoney's cumulative flow at the final minute for daily fallback."""
+    wanted = {
+        code
+        for raw in target_codes
+        if to_qmt_symbol(code := str(raw).strip().zfill(6))
+    }
+    columns = [
+        "stock_code", "trade_date", "main_net_inflow", "max_net_inflow",
+        "lg_net_inflow", "mid_net_inflow", "sm_net_inflow", "data_source",
+    ]
+    if not wanted:
+        return pd.DataFrame(columns=columns)
     with engine.connect() as conn:
-        return int(conn.execute(text("""
-            SELECT COUNT(DISTINCT stock_code)
-            FROM sm_stock_kline
-            WHERE trade_date = :d AND k_type = 1
-        """), {"d": target_date}).scalar() or 0)
+        rows = conn.execute(text("""
+            SELECT f.stock_code, f.main_net_inflow, f.max_net_inflow,
+                   f.lg_net_inflow, f.mid_net_inflow, f.sm_net_inflow,
+                   x.bar_count, x.last_time
+            FROM sm_stock_capital_flow_min f
+            JOIN (
+                SELECT stock_code, COUNT(*) AS bar_count, MAX(trade_time) AS last_time
+                FROM sm_stock_capital_flow_min
+                WHERE trade_time >= :d
+                  AND trade_time < DATE_ADD(:d, INTERVAL 1 DAY)
+                GROUP BY stock_code
+            ) x ON x.stock_code = f.stock_code AND x.last_time = f.trade_time
+        """), {"d": target_date}).mappings().all()
+    output = []
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        if code not in wanted:
+            continue
+        bar_count = int(row.get("bar_count") or 0)
+        last_time = str(row.get("last_time") or "")
+        if require_complete and (bar_count != 240 or not last_time.endswith("15:00:00")):
+            continue
+        output.append({
+            "stock_code": code,
+            "trade_date": target_date,
+            "main_net_inflow": row.get("main_net_inflow"),
+            "max_net_inflow": row.get("max_net_inflow"),
+            "lg_net_inflow": row.get("lg_net_inflow"),
+            "mid_net_inflow": row.get("mid_net_inflow"),
+            "sm_net_inflow": row.get("sm_net_inflow"),
+            "data_source": "east_min_close",
+        })
+    return pd.DataFrame(output, columns=columns)
+
+
+def _merge_missing_daily_rows(
+    primary: pd.DataFrame,
+    fallback: pd.DataFrame,
+    target_codes: list[str] | set[str],
+) -> pd.DataFrame:
+    wanted = {str(code).strip().zfill(6) for code in target_codes}
+    primary = primary.copy() if primary is not None else pd.DataFrame()
+    fallback = fallback.copy() if fallback is not None else pd.DataFrame()
+    if not primary.empty:
+        primary["stock_code"] = primary["stock_code"].astype(str).str.zfill(6)
+        primary = primary[primary["stock_code"].isin(wanted)]
+    existing = set(primary["stock_code"].tolist()) if not primary.empty else set()
+    if not fallback.empty:
+        fallback["stock_code"] = fallback["stock_code"].astype(str).str.zfill(6)
+        fallback = fallback[fallback["stock_code"].isin(wanted - existing)]
+    frames = [frame for frame in (primary, fallback) if not frame.empty]
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).drop_duplicates(
+        subset=["stock_code", "trade_date"], keep="first"
+    )
+
+
+def reconcile_daily_flow_from_minute_close(
+    engine,
+    target_date: str,
+    target_codes: list[str] | set[str],
+) -> dict[str, int]:
+    """Fill missing daily rows from complete 240-bar cumulative minute data."""
+    wanted = {
+        code
+        for raw in target_codes
+        if to_qmt_symbol(code := str(raw).strip().zfill(6))
+    }
+    if not wanted:
+        raise RuntimeError("refusing daily-flow reconciliation: target universe is empty")
+    fallback = _read_minute_close_fallback(
+        engine, target_date, wanted, require_complete=True,
+    )
+    with engine.connect() as conn:
+        existing = {
+            str(row[0]).strip().zfill(6)
+            for row in conn.execute(
+                text("SELECT stock_code FROM sm_stock_capital_flow_daily WHERE trade_date=:d"),
+                {"d": target_date},
+            ).fetchall()
+        }
+    outside = sorted(existing - wanted)
+    missing = wanted - existing
+    fill = fallback[fallback["stock_code"].isin(missing)] if not fallback.empty else fallback
+    if not fill.empty:
+        fill = fill.copy()
+        fill["etl_sync_at"] = datetime.now().replace(microsecond=0)
+    lock_timeout = max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30")))
+    with mysql_named_lock(engine, "probiga:capital_flow_daily", timeout_seconds=lock_timeout):
+        with engine.begin() as conn:
+            if outside:
+                statement = text(
+                    "DELETE FROM sm_stock_capital_flow_daily "
+                    "WHERE trade_date=:d AND stock_code IN :codes"
+                ).bindparams(bindparam("codes", expanding=True))
+                conn.execute(statement, {"d": target_date, "codes": outside})
+            if not fill.empty:
+                write_frame(
+                    fill[[
+                        "stock_code", "trade_date", "main_net_inflow", "max_net_inflow",
+                        "lg_net_inflow", "mid_net_inflow", "sm_net_inflow",
+                        "etl_sync_at", "data_source",
+                    ]],
+                    "sm_stock_capital_flow_daily",
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    chunksize=1000,
+                    method="multi",
+                )
+    return {
+        "target_codes": len(wanted),
+        "complete_minute_codes": len(fallback),
+        "filled_rows": len(fill),
+        "pruned_rows": len(outside),
+    }
 
 
 def _convert_value(val):
@@ -205,8 +367,19 @@ def _fetch_baidu(stock_code: str, target_date: str) -> pd.DataFrame | None:
         f"code={stock_code}&market=ab&finance_type=stock&tab=day"
         f"&from=history&date={next_date}&pn=0&rn=1&finClientType=pc"
     )
-    from adata.common.headers import baidu_headers
-    resp = _SESSION.get(url, timeout=15, headers=baidu_headers.json_headers)
+    try:
+        from adata.common.headers import baidu_headers
+        headers = baidu_headers.json_headers
+    except Exception:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://gushitong.baidu.com/",
+        }
+    resp = _SESSION.get(url, timeout=15, headers=headers)
     resp.raise_for_status()
     j = resp.json()
     content = j.get("Result", {}).get("content", [])
@@ -290,25 +463,26 @@ def _write_flow_daily(engine, target_date: str, df: pd.DataFrame) -> None:
     for col in numeric_cols:
         full_df[col] = pd.to_numeric(full_df[col], errors="coerce").fillna(0)
 
+    full_df["etl_sync_at"] = datetime.now().replace(microsecond=0)
+    columns = ["stock_code", "trade_date", *numeric_cols, "etl_sync_at", "data_source"]
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"),
-            {"d": target_date}
+            {"d": target_date},
+        )
+        write_frame(
+            full_df[columns],
+            "sm_stock_capital_flow_daily",
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
         )
 
-    full_df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-    columns = ["stock_code", "trade_date", *numeric_cols, "etl_sync_at", "data_source"]
-    full_df[columns].to_sql(
-        "sm_stock_capital_flow_daily",
-        engine,
-        if_exists="append",
-        index=False,
-        chunksize=1000,
-        method="multi",
-    )
 
-
-def fetch_capital_flow_daily(
+def _fetch_capital_flow_daily_unlocked(
+    engine,
     target_date: str,
     *,
     sources_raw: str = "",
@@ -316,13 +490,16 @@ def fetch_capital_flow_daily(
     dry_run: bool = False,
 ) -> int:
     target_date = _normalize_date(target_date)
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
-    stock_codes = _read_target_stock_codes(engine, target_date)
+    kline_engine = get_kline_engine()
+    stock_codes = _read_target_stock_codes(
+        engine, target_date, kline_engine=kline_engine,
+    )
     max_stocks = int(os.environ.get("SM_MAX_STOCKS", "0"))
     if max_stocks > 0:
         stock_codes = stock_codes[:max_stocks]
 
     sources = _build_sources(sources_raw)
+    stock_codes = _filter_source_supported_codes(stock_codes, sources)
     min_coverage = _MIN_COVERAGE if min_coverage is None else min_coverage
 
     total = len(stock_codes)
@@ -402,15 +579,31 @@ def fetch_capital_flow_daily(
     print(f"  无数据: {no_data} ({no_data/total*100:.1f}%)")
     print(f"  耗时: {elapsed_total:.0f}s ({elapsed_total/60:.1f}min)")
 
-    if not parts:
+    full_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if not full_df.empty:
+        full_df = full_df.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
+    direct_codes = (
+        set(full_df["stock_code"].astype(str).str.zfill(6))
+        if not full_df.empty else set()
+    )
+    missing_codes = sorted(set(stock_codes) - direct_codes)
+    if missing_codes:
+        fallback_df = _read_minute_close_fallback(
+            engine,
+            target_date,
+            missing_codes,
+            require_complete=True,
+        )
+        full_df = _merge_missing_daily_rows(full_df, fallback_df, stock_codes)
+        if not fallback_df.empty:
+            print(f"  分钟收盘累计值兜底: {len(fallback_df)} 只")
+    if full_df.empty:
         print("未获取到任何资金流向数据")
         return 2
-
-    full_df = pd.concat(parts, ignore_index=True)
-    full_df = full_df.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
     got = len(full_df)
-    kline_count = _read_kline_stock_count(engine, target_date)
-    denom = kline_count or total
+    # ``stock_codes`` is already the target-date K-line universe intersected
+    # with the selected providers' supported market scope.
+    denom = total
     coverage = got / max(denom, 1)
     print(f"  覆盖率检查: {got}/{denom} ({coverage:.1%})")
 
@@ -427,6 +620,34 @@ def fetch_capital_flow_daily(
     print(f"写入完成: sm_stock_capital_flow_daily, 共 {len(full_df)} 行, 日期: {target_date}")
     print(f"  成功: {success} 只股票, 失败: {failed} 只")
     return 0
+
+
+def fetch_capital_flow_daily(
+    target_date: str,
+    *,
+    sources_raw: str = "",
+    min_coverage: float | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Fetch one day while excluding concurrent daily-flow writers."""
+    engine = create_batch_engine()
+    lock_timeout = max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30")))
+    try:
+        with mysql_named_lock(
+            engine,
+            "probiga:capital_flow_daily",
+            timeout_seconds=lock_timeout,
+        ):
+            return _fetch_capital_flow_daily_unlocked(
+                engine,
+                target_date,
+                sources_raw=sources_raw,
+                min_coverage=min_coverage,
+                dry_run=dry_run,
+            )
+    except TimeoutError as exc:
+        print(f"Capital-flow daily sync skipped: {exc}", file=sys.stderr)
+        return 4
 
 
 def main():

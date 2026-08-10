@@ -3439,25 +3439,7 @@
         },
         /* ── 选股工具 ── */
         screen: function (d, c) {
-            var modes = [
-                {id:'startup',label:'🚀 趋势启动',desc:'盘整突破+放量+均线上翘+非垃圾板块'},
-                {id:'macd',label:'📉 MACD金叉',desc:'EMA12>EMA26多头 + KDJ低位+代码0/60'},
-                {id:'flow',label:'💰 资金流入',desc:'主力净流入 ≥ 500万'},
-                {id:'k_day',label:'📊 K线筛选',desc:'涨幅+换手率区间'},
-                {id:'trend',label:'📈 多头趋势',desc:'MA5>MA10>MA20 多头排列'},
-                {id:'trend_strong',label:'🔥 强势趋势票',desc:'四线多头+连续站MA5≥5天+距新高10%+温和量比'},
-                {id:'low_start',label:'🚀 低位放量',desc:'距近20日低点≤5% + 放量1.5倍'},
-                {id:'ladder',label:'🔗 连板股',desc:'2~5连板'},
-                {id:'lhb',label:'🏦 龙虎榜',desc:'上榜个股，游资/机构动向'},
-            ];
-            var h = '<div class="stats-bar">' + card('🎯 选股策略', modes.length, 'blue') + '</div>';
-            h += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">';
-            modes.forEach(function(m) {
-                h += '<div class="stat-card screen-card" id="scard_' + m.id + '" style="cursor:pointer;flex:1;min-width:140px;border:2px solid transparent;transition:all 0.2s" onclick="runScreen(\'' + m.id + '\')"><div class="label">' + m.label + '</div><div class="value" style="font-size:13px;color:#666">' + m.desc + '</div></div>';
-            });
-            h += '</div><div id="screenResult" style="margin-top:8px"><div class="loading">加载中...</div></div>';
-            c.innerHTML = h;
-            setTimeout(function() { runScreen('macd'); }, 100);
+            window.loadUnifiedScreener(d, c);
         },
         'jq-picks': function (d, c) {
             loadJqPicksPage(c);
@@ -5533,6 +5515,96 @@
             }
             window['_s_' + tableId] = res.data;
             window.renderTable(r, tableId, cols, res.data, renderFn, 30, html);
+        });
+    };
+
+    /* ===== V2-V6 unified production-safe screener ===== */
+    window.loadUnifiedScreener = function (tradeDate, container) {
+        container.innerHTML = '<div class="loading">正在读取选股版本、数据水位和生产门禁...</div>';
+        Promise.all([
+            fetch('/api/screener/catalog').then(function (r) { if (!r.ok) throw new Error('版本目录加载失败 ' + r.status); return r.json(); }),
+            fetch('/api/screener/status').then(function (r) { if (!r.ok) throw new Error('数据状态加载失败 ' + r.status); return r.json(); })
+        ]).then(function (parts) {
+            var catalog = parts[0] || {};
+            var status = parts[1] || {};
+            window._unifiedScreenerCatalog = catalog;
+            window._unifiedScreenerStatus = status;
+            var gateOk = status.selection_ready === true;
+            var recommendationOk = status.recommendation_ready === true;
+            var gateColor = !gateOk ? '#b91c1c' : (recommendationOk ? '#166534' : '#92400e');
+            var gateBg = !gateOk ? '#fef2f2' : (recommendationOk ? '#f0fdf4' : '#fffbeb');
+            var versions = catalog.versions || [];
+            var presets = catalog.presets || [];
+            var dates = status.data_dates || {};
+            var html = '<div style="display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px">';
+            html += '<div><div style="font-size:12px;font-weight:800;color:#2563eb;letter-spacing:.08em">SCREENER / V2-V6 统一选股</div><h2 style="margin:4px 0 6px;color:#111827">选股工作台</h2><div style="font-size:13px;color:#64748b">版本状态、数据日期、规则筛选和安全门禁放在同一页；任何研究版本都不会自动下单。</div></div>';
+            html += '<div style="background:#111827;color:#fff;border-radius:12px;padding:10px 16px;text-align:center"><strong style="font-size:22px">' + presets.length + '</strong><div style="font-size:11px;color:#cbd5e1">生产规则预设</div></div></div>';
+            var gateTitle = !gateOk ? '⛔ 基础选股门禁阻断' : (recommendationOk ? '✅ 数据门禁通过' : '⚠️ 基础选股可用，AI 推荐封锁');
+            html += '<div style="background:' + gateBg + ';border:1px solid ' + gateColor + ';border-radius:12px;padding:12px 16px;margin-bottom:14px;color:' + gateColor + '"><strong>' + gateTitle + '</strong><span style="margin-left:10px;font-size:13px">' + escHtml(status.message || '') + '</span><div style="margin-top:6px;font-size:12px;color:#475569">最近完整交易日要求：' + escHtml(status.expected_completed_session || '-') + '；日 K：' + escHtml(dates.daily_kline || '-') + '；资金流：' + escHtml(dates.capital_flow || '-') + '；分析：' + escHtml(dates.analysis || '-') + '；推荐：' + escHtml(dates.recommendation || '-') + '；新闻：' + escHtml(dates.news || '-') + '；公告：' + escHtml(dates.notice || '-') + '</div></div>';
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:16px">';
+            versions.forEach(function (v) {
+                var blocked = v.decision === 'BLOCK';
+                var color = blocked ? '#b91c1c' : (v.production_selector ? '#166534' : '#92400e');
+                var bg = blocked ? '#fff1f2' : (v.production_selector ? '#f0fdf4' : '#fffbeb');
+                html += '<div style="border:1px solid ' + color + ';background:' + bg + ';border-radius:12px;padding:12px"><div style="display:flex;justify-content:space-between;gap:8px"><strong style="font-size:18px;color:#111827">' + escHtml(v.version) + '</strong><span style="font-size:11px;font-weight:800;color:' + color + '">' + escHtml(v.decision) + '</span></div><div style="font-size:12px;font-weight:700;color:#334155;margin:5px 0">' + escHtml(v.role) + '</div><div style="font-size:11px;color:#64748b;line-height:1.5">' + escHtml(v.reason) + '</div></div>';
+            });
+            html += '</div>';
+            html += '<div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;margin-bottom:14px"><div style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:12px"><label style="font-size:12px;color:#475569">返回数量<br><input id="screenTop" type="number" min="1" max="200" value="50" style="width:90px;padding:7px;border:1px solid #cbd5e1;border-radius:7px"></label><label style="font-size:12px;color:#475569">最低涨幅<br><input id="screenMinChange" type="number" step="0.1" placeholder="不限" style="width:100px;padding:7px;border:1px solid #cbd5e1;border-radius:7px"></label><label style="font-size:12px;color:#475569">最高涨幅<br><input id="screenMaxChange" type="number" step="0.1" placeholder="预设默认" style="width:100px;padding:7px;border:1px solid #cbd5e1;border-radius:7px"></label><label style="font-size:12px;color:#475569">最低主力净流入<br><input id="screenMinFlow" type="number" step="1000000" placeholder="元" style="width:140px;padding:7px;border:1px solid #cbd5e1;border-radius:7px"></label><span style="font-size:12px;color:#64748b;padding-bottom:7px">结果固定为 WATCH；V4/V5/V6 只展示研究治理状态。</span></div>';
+            html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px">';
+            presets.forEach(function (p) {
+                html += '<button class="screen-card" id="scard_' + escAttr(p.key) + '" onclick="runScreen(\'' + escAttr(p.key) + '\')" style="text-align:left;border:1px solid #cbd5e1;background:#f8fafc;border-radius:10px;padding:11px;cursor:pointer"><strong style="display:block;color:#111827;margin-bottom:4px">' + escHtml(p.name) + '</strong><span style="font-size:11px;color:#64748b;line-height:1.4">' + escHtml(p.description) + '</span></button>';
+            });
+            html += '</div></div><div id="screenResult"><div class="loading">请选择一个预设开始筛选</div></div>';
+            container.innerHTML = html;
+            if (presets.length) setTimeout(function () { window.runScreen(presets[0].key); }, 50);
+        }).catch(function (error) {
+            container.innerHTML = '<div class="loading" style="color:#b91c1c">选股工作台加载失败：' + escHtml(error.message || error) + '</div>';
+        });
+    };
+
+    window.runScreen = function (presetKey) {
+        document.querySelectorAll('.screen-card').forEach(function (node) { node.style.borderColor = '#cbd5e1'; node.style.background = '#f8fafc'; });
+        var active = document.getElementById('scard_' + presetKey);
+        if (active) { active.style.borderColor = '#2563eb'; active.style.background = '#eff6ff'; }
+        var result = document.getElementById('screenResult');
+        if (!result) return;
+        result.innerHTML = '<div class="loading">正在运行统一筛选并核对数据门禁...</div>';
+        function inputNumber(id) {
+            var node = document.getElementById(id);
+            if (!node || node.value === '') return null;
+            var value = Number(node.value);
+            return isFinite(value) ? value : null;
+        }
+        var payload = {
+            preset: presetKey,
+            as_of_date: (el('datePicker') || {}).value || '',
+            top: inputNumber('screenTop') || 50,
+            filters: {}
+        };
+        var minChange = inputNumber('screenMinChange');
+        var maxChange = inputNumber('screenMaxChange');
+        var minFlow = inputNumber('screenMinFlow');
+        if (minChange !== null) payload.filters.min_change = minChange;
+        if (maxChange !== null) payload.filters.max_change = maxChange;
+        if (minFlow !== null) payload.filters.min_main_flow = minFlow;
+        fetch('/api/screener/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(function (response) {
+            if (!response.ok) return response.json().then(function (body) { throw new Error(body.detail || ('筛选失败 ' + response.status)); });
+            return response.json();
+        }).then(function (data) {
+            var rows = data.data || [];
+            var blocked = data.status !== 'ok';
+            var color = blocked ? '#b91c1c' : '#166534';
+            var html = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px"><span style="font-weight:800;color:#111827">' + escHtml((data.preset || {}).name || presetKey) + '</span><span style="color:' + color + ';font-weight:800">' + (blocked ? 'DATA BLOCKED' : 'WATCH ONLY') + '</span><span style="font-size:12px;color:#64748b">数据日期 ' + escHtml(data.data_date || '-') + ' · ' + rows.length + ' 只 · 不允许自动下单</span></div>';
+            if (data.error) html += '<div style="color:#b91c1c;font-size:12px;margin-bottom:8px">' + escHtml(data.error) + '</div>';
+            if (!rows.length) { result.innerHTML = html + '<div class="loading">当前条件没有候选；请先检查数据日期，再调整参数。</div>'; return; }
+            result.innerHTML = html;
+            var tableId = 'unified_screener';
+            var cols = ['排名','代码','名称','综合分','收盘价','涨跌幅','主力净流入','状态','分时'];
+            window.renderTable(result, tableId, cols, rows, function (row) {
+                return '<tr><td>' + rankBadge(row.rank || '-') + '</td><td>' + escHtml(row.stock_code || '-') + '</td><td>' + nameLink(row.stock_code, row.stock_name || row.short_name) + '</td><td style="font-weight:800;color:#2563eb">' + fmt(row.score, 1) + '</td><td>' + fmt(row.close, 2) + '</td><td class="' + clsPct(row.change_pct) + '">' + pct(row.change_pct) + '</td><td class="' + clsPct(row.main_net_inflow) + '">' + fmtMoney(row.main_net_inflow) + '</td><td><span style="font-weight:800;color:#92400e">WATCH</span></td><td>' + minuteBtn(row.stock_code) + '</td></tr>';
+            }, 30, html);
+        }).catch(function (error) {
+            result.innerHTML = '<div class="loading" style="color:#b91c1c">筛选失败：' + escHtml(error.message || error) + '</div>';
         });
     };
 

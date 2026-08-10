@@ -1,0 +1,5 @@
+tests/test_trading_v4_research_kernel.py
+tests/architecture/test_v4_dependency_boundaries.py
+tests/architecture/test_v4_artifact_namespace.py
+tests/test_trading_v4_domain.py
+tests/test_trading_v4_chase_risk.py

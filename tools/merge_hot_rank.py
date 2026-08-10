@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 融合东财人气榜 + 同花顺热股 + 雪球热股 + 新浪热股 → 统一榜单，支持单日和 N 天统计。
@@ -15,7 +16,6 @@
 """
 
 import argparse
-import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -23,20 +23,20 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.common.batch_db import read_frame, write_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+ensure_adata_import_path(ROOT)
 
 
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+def _warn(message: str, exc: Exception) -> None:
+    print(f"[WARN] {message}: {exc}", file=sys.stderr)
 
 
 def _load_sql(file_name: str) -> str:
@@ -95,7 +95,7 @@ def source_tag(flag: str) -> str:
 def _load_industry_map(engine) -> dict[str, str]:
     mapping: dict[str, str] = {}
     try:
-        df = pd.read_sql(
+        df = read_frame(
             text("SELECT stock_code, plate_name FROM si_stock_plate_east WHERE plate_type = '行业'"),
             engine
         )
@@ -104,10 +104,10 @@ def _load_industry_map(engine) -> dict[str, str]:
             if code and code not in mapping:
                 mapping[code] = str(row["plate_name"])
     except Exception as e:
-        pass
+        _warn("failed to load east industry map", e)
     if not mapping:
         try:
-            df = pd.read_sql(
+            df = read_frame(
                 text("SELECT stock_code, industry_name, industry_type FROM si_industry_sw WHERE industry_name IS NOT NULL"),
                 engine
             )
@@ -119,7 +119,7 @@ def _load_industry_map(engine) -> dict[str, str]:
                     if code and code not in mapping:
                         mapping[code] = str(row["industry_name"])
         except Exception as e:
-            pass
+            _warn("failed to load SW industry map", e)
     print(f"  [板块] 加载了 {len(mapping)} 个股的行业映射")
     return mapping
 
@@ -140,36 +140,38 @@ def _attach_industry(df: pd.DataFrame, industry_map: dict[str, str]) -> pd.DataF
 
 
 def _read_day_data(engine, dt: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    east = pd.read_sql(
-        text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY rank"),
+    east = read_frame(
+        text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY `rank`"),
         engine, params={"d": dt}
     )
     if east.empty:
-        fallback = pd.read_sql(
-            text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date <= :d ORDER BY snapshot_date DESC, rank LIMIT 200"),
+        fallback = read_frame(
+            text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date <= :d ORDER BY snapshot_date DESC, `rank` LIMIT 200"),
             engine, params={"d": dt}
         )
         if not fallback.empty:
             fb_date = fallback.iloc[0]["snapshot_date"]
             east = fallback[fallback["snapshot_date"] == fb_date].copy()
             print(f"  [兜底] 东财当日({dt})无数据，使用 {fb_date} 的 {len(east)} 条数据")
-    ths = pd.read_sql(
-        text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY rank"),
+    ths = read_frame(
+        text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY `rank`"),
         engine, params={"d": dt}
     )
     try:
-        xq = pd.read_sql(
+        xq = read_frame(
             text("SELECT * FROM st_hot_rank_xq WHERE snapshot_date = :d ORDER BY `rank`"),
             engine, params={"d": dt}
         )
-    except Exception:
+    except Exception as exc:
+        _warn(f"failed to read xq hot rank for {dt}", exc)
         xq = pd.DataFrame()
     try:
-        sina = pd.read_sql(
+        sina = read_frame(
             text("SELECT * FROM st_hot_rank_sina WHERE snapshot_date = :d ORDER BY `rank`"),
             engine, params={"d": dt}
         )
-    except Exception:
+    except Exception as exc:
+        _warn(f"failed to read sina hot rank for {dt}", exc)
         sina = pd.DataFrame()
     east = _filter_hs_a(east)
     ths = _filter_hs_a(ths)
@@ -335,7 +337,7 @@ def run_single_day(engine, snapshot_date: str, top_n: int, save: bool):
     if save:
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM `st_hot_rank_fused` WHERE `snapshot_date` = :d"), {"d": snapshot_date})
-        top_df.to_sql("st_hot_rank_fused", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(top_df, "st_hot_rank_fused", engine, if_exists="append", index=False, chunksize=500, method="multi")
         print(f"  已写入 st_hot_rank_fused，共 {len(top_df)} 行")
 
 
@@ -520,7 +522,7 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
                 text("DELETE FROM `st_hot_rank_multi_day` WHERE `stat_date` = :d AND `stat_days` = :n"),
                 {"d": end_date, "n": num_days}
             )
-        top_df.to_sql("st_hot_rank_multi_day", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(top_df, "st_hot_rank_multi_day", engine, if_exists="append", index=False, chunksize=500, method="multi")
         print(f"  已写入 st_hot_rank_multi_day，共 {len(top_df)} 行")
 
 
@@ -540,7 +542,7 @@ def main():
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {snapshot_date}")
         return
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     run_ddl(engine, "02_hot_rank_extra_tables.sql")
 
     if args.days > 1:

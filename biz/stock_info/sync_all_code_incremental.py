@@ -23,7 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -31,14 +31,11 @@ logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
 
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
+from server.common.batch_db import create_batch_engine
 
 
 def _fetch_all_code_df():
@@ -95,8 +92,7 @@ def main() -> None:
     if df is None or df.empty:
         logger.error("未获取到代码表数据。")
         sys.exit(1)
-    url = _mysql_url()
-    engine = create_engine(url, pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     cnt = upsert_si_all_code(engine, df)
     logger.info("完成：si_all_code 增量 upsert 共 %s 行（含新增与更新）。", cnt)
 

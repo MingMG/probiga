@@ -1,0 +1,2953 @@
+{
+  "schema_version": "probiga.trading-v4-broad-qfbr-oos.v1",
+  "campaign_id": "trading_v4_broad_qfbr_research_20260801",
+  "research_contract_sha256": "bdbaa656f4712ecfa6616d1df4fb4c78e9d1c026353d660cee8248f4864cbc19",
+  "execution_boundary": {
+    "research_only": true,
+    "paper_orders_only": true,
+    "real_order_submission": false,
+    "historical_success_ceiling": "PAPER_CANDIDATE"
+  },
+  "feature_cache": "E:\\My Code\\ProBigA\\artifacts\\trading_v4\\research_features_20200102_20260731_4c574aeddb40f5c1.pkl",
+  "candidate_order": [
+    "broad_qfbr_moderate_5_v1",
+    "strict_qfbr_moderate_5_v1",
+    "broad_qfbr_moderate_7_v1"
+  ],
+  "ranking": [
+    "strict_qfbr_moderate_5_v1",
+    "broad_qfbr_moderate_5_v1",
+    "broad_qfbr_moderate_7_v1"
+  ],
+  "multiple_testing": {
+    "method": "calendar_month_joint_block_bootstrap_max_t",
+    "iterations": 2000,
+    "seed": 20260801,
+    "observed_t": {
+      "broad_qfbr_moderate_5_v1": 2.1103775235437743,
+      "strict_qfbr_moderate_5_v1": 1.5905907898834404,
+      "broad_qfbr_moderate_7_v1": 1.2147263504877808
+    },
+    "adjusted_p_values": {
+      "broad_qfbr_moderate_5_v1": 0.12843578210894552,
+      "strict_qfbr_moderate_5_v1": 0.2193903048475762,
+      "broad_qfbr_moderate_7_v1": 0.30484757621189407
+    }
+  },
+  "results": {
+    "broad_qfbr_moderate_5_v1": {
+      "eligible_signal_count": 175,
+      "selected_signal_count": 165,
+      "episode_count": 93,
+      "mature_episode_count": 93,
+      "outer_folds": [
+        {
+          "name": "oos_2022",
+          "training_sample_count": 22,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_5_v1",
+            "model_version": "broad_qfbr_moderate_5_v1-oos_2022",
+            "dataset_hash": "e11d29c4bc5a87bfe45a310eefc88ab77f4cf6fe453a0b3a5d685f6ad28c4ca0",
+            "buckets": [
+              {
+                "lower_score": 0.6818622453795052,
+                "upper_score": 0.7348046139941873,
+                "sample_count": 8,
+                "expected_return_net_pct": 1.7943758975754664,
+                "q10_pct": -3.350085141686095,
+                "q50_pct": 2.4161442165475613,
+                "q90_pct": 6.912450589313567,
+                "probability_positive": 0.625,
+                "expected_mae_pct": -3.092145411529733,
+                "expected_mfe_pct": 4.7195105878138826,
+                "profit_factor": 2.575276794177913,
+                "payoff_ratio": 1.5451660765067474
+              },
+              {
+                "lower_score": 0.7440302241826526,
+                "upper_score": 0.7971216123688221,
+                "sample_count": 8,
+                "expected_return_net_pct": 3.5363930990199983,
+                "q10_pct": -4.156149666117115,
+                "q50_pct": 3.360544509008763,
+                "q90_pct": 9.340418758428687,
+                "probability_positive": 0.75,
+                "expected_mae_pct": -2.3591272379188952,
+                "expected_mfe_pct": 8.133353302227746,
+                "profit_factor": 4.399119795888965,
+                "payoff_ratio": 1.4663732652963217
+              },
+              {
+                "lower_score": 0.797578140612258,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 6,
+                "expected_return_net_pct": 3.1307565148460017,
+                "q10_pct": -3.1872949750795447,
+                "q50_pct": 4.667731323880798,
+                "q90_pct": 7.911833195736753,
+                "probability_positive": 0.6666666666666666,
+                "expected_mae_pct": -2.675798894275775,
+                "expected_mfe_pct": 6.12160543505668,
+                "profit_factor": 3.946783908603754,
+                "payoff_ratio": 1.973391954301877
+              }
+            ]
+          },
+          "calibration_direction_valid": false,
+          "raw_validation": {
+            "trade_count": 17,
+            "win_rate": 0.47058823529411764,
+            "net_expectancy_pct": 0.4424467348786312,
+            "average_win_pct": 6.324156471571484,
+            "average_loss_pct": 4.785739697737238,
+            "payoff_ratio": 1.321458514461543,
+            "profit_factor": 1.1746297906324825,
+            "gross_profit_pct": 50.593251772571875,
+            "gross_loss_pct": 43.07165727963515,
+            "sample_count": 17,
+            "total_net_return_pct": 7.52159449293673
+          },
+          "raw_portfolio": {
+            "trade_count": 7,
+            "win_rate": 0.14285714285714285,
+            "net_expectancy_pct": -4.640809954107751,
+            "average_win_pct": 3.6263480282167944,
+            "average_loss_pct": 6.018669617828508,
+            "payoff_ratio": 0.6025165457620107,
+            "profit_factor": 0.10041942429366846,
+            "gross_profit_pct": 3.6263480282167944,
+            "gross_loss_pct": 36.11201770697105,
+            "sample_count": 7,
+            "total_net_return_pct": -32.485669678754256,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 197880.84926659297,
+            "net_profit_cny": -2119.150733407034,
+            "total_return_pct": -1.0595753667035135,
+            "maximum_drawdown_pct": 1.4934821244654617,
+            "total_cost_cny": 220.15047019290924
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603416",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-13",
+              "net_return_pct": -9.39821222379277,
+              "net_pnl_cny": -820.4639558181764,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300275",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-15",
+              "net_return_pct": -5.062781737608576,
+              "net_pnl_cny": -450.0812897138595,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603678",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-16",
+              "net_return_pct": 3.6263480282167944,
+              "net_pnl_cny": 314.4769054336548,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300130",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -3.6976393831340846,
+              "net_pnl_cny": -331.3084936656952,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300945",
+              "entry_date": "2022-09-09",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -6.084304360013603,
+              "net_pnl_cny": -551.2379889430999,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300660",
+              "entry_date": "2022-09-13",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -7.501009360061294,
+              "net_pnl_cny": -652.5878143253326,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603987",
+              "entry_date": "2022-09-13",
+              "exit_date": "2022-09-20",
+              "net_return_pct": -4.368070642360721,
+              "net_pnl_cny": -407.8030861682892,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2023",
+          "training_sample_count": 30,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_5_v1",
+            "model_version": "broad_qfbr_moderate_5_v1-oos_2023",
+            "dataset_hash": "042a5478905f430d4147973b2d689331ea06dd1b43d1e0ee98580b7872a44b05",
+            "buckets": [
+              {
+                "lower_score": 0.6769359457019035,
+                "upper_score": 0.7239226062040297,
+                "sample_count": 10,
+                "expected_return_net_pct": -0.6445604216285998,
+                "q10_pct": -4.956629105996477,
+                "q50_pct": -2.582476804572064,
+                "q90_pct": 3.9134322010103566,
+                "probability_positive": 0.4,
+                "expected_mae_pct": -4.411424684158086,
+                "expected_mfe_pct": 3.3951573216908826,
+                "profit_factor": 0.7330603754499512,
+                "payoff_ratio": 1.0995905631749268
+              },
+              {
+                "lower_score": 0.7252982905784672,
+                "upper_score": 0.7880737012431527,
+                "sample_count": 10,
+                "expected_return_net_pct": 2.280663712339711,
+                "q10_pct": -4.26379186961625,
+                "q50_pct": 2.725093814883131,
+                "q90_pct": 7.0488135369504725,
+                "probability_positive": 0.6,
+                "expected_mae_pct": -3.181174529923201,
+                "expected_mfe_pct": 7.010423963544967,
+                "profit_factor": 2.3157475448990326,
+                "payoff_ratio": 1.5438316965993548
+              },
+              {
+                "lower_score": 0.7926900485633244,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 10,
+                "expected_return_net_pct": 0.7752656620424238,
+                "q10_pct": -7.690729646434442,
+                "q50_pct": 2.692697378652216,
+                "q90_pct": 7.015043629303747,
+                "probability_positive": 0.6,
+                "expected_mae_pct": -3.5144786326126587,
+                "expected_mfe_pct": 5.415758863788763,
+                "profit_factor": 1.3331064449453944,
+                "payoff_ratio": 0.8887376299635963
+              }
+            ]
+          },
+          "calibration_direction_valid": false,
+          "raw_validation": {
+            "trade_count": 39,
+            "win_rate": 0.5897435897435898,
+            "net_expectancy_pct": 2.1078076216347665,
+            "average_win_pct": 5.44545944887435,
+            "average_loss_pct": 2.690066880022135,
+            "payoff_ratio": 2.0242840389267727,
+            "profit_factor": 2.9099083059572357,
+            "gross_profit_pct": 125.24556732411004,
+            "gross_loss_pct": 43.04107008035416,
+            "sample_count": 39,
+            "total_net_return_pct": 82.20449724375588
+          },
+          "raw_portfolio": {
+            "trade_count": 24,
+            "win_rate": 0.6666666666666666,
+            "net_expectancy_pct": 2.6184553465291596,
+            "average_win_pct": 5.149144010822965,
+            "average_loss_pct": 2.4429219820584525,
+            "payoff_ratio": 2.1077807840937264,
+            "profit_factor": 4.215561568187453,
+            "gross_profit_pct": 82.38630417316745,
+            "gross_loss_pct": 19.54337585646762,
+            "sample_count": 24,
+            "total_net_return_pct": 62.842928316699826,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 205760.1037672761,
+            "net_profit_cny": 5760.103767276101,
+            "total_return_pct": 2.880051883638046,
+            "maximum_drawdown_pct": 0.7264389011166439,
+            "total_cost_cny": 585.8923383947612
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603067",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 8.382992888172067,
+              "net_pnl_cny": 786.9115334587096,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603987",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 5.524204256165947,
+              "net_pnl_cny": 548.3325262680054,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002444",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 1.6236486718160237,
+              "net_pnl_cny": 159.84821607589723,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002145",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 7.463744370062529,
+              "net_pnl_cny": 709.8021066761016,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002469",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 1.898055284719615,
+              "net_pnl_cny": 183.12438024139402,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002705",
+              "entry_date": "2023-01-05",
+              "exit_date": "2023-01-12",
+              "net_return_pct": 4.059770999240006,
+              "net_pnl_cny": 341.8327212333679,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300408",
+              "entry_date": "2023-03-29",
+              "exit_date": "2023-04-04",
+              "net_return_pct": 9.12307600825527,
+              "net_pnl_cny": 800.8236182689667,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "002675",
+              "entry_date": "2023-03-29",
+              "exit_date": "2023-04-06",
+              "net_return_pct": 1.9000336115873089,
+              "net_pnl_cny": 179.43917166900636,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000786",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-12",
+              "net_return_pct": 1.4416838412128015,
+              "net_pnl_cny": 118.37666383171083,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688187",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-12",
+              "net_return_pct": 3.335130335513977,
+              "net_pnl_cny": 324.8416997680664,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000739",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-12",
+              "net_return_pct": 2.085806638278153,
+              "net_pnl_cny": 180.6308516921997,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300718",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-12",
+              "net_return_pct": -1.502856980552136,
+              "net_pnl_cny": -133.37855702400208,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000913",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-14",
+              "net_return_pct": 5.463510547152099,
+              "net_pnl_cny": 480.13329187774656,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300347",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-14",
+              "net_return_pct": 11.004699546297106,
+              "net_pnl_cny": 1073.0682762680053,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "000755",
+              "entry_date": "2023-04-14",
+              "exit_date": "2023-04-21",
+              "net_return_pct": -3.405876365804038,
+              "net_pnl_cny": -330.43811682510375,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603678",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-21",
+              "net_return_pct": 12.258989387210773,
+              "net_pnl_cny": 1123.9041273784637,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "300261",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -2.139992058975528,
+              "net_pnl_cny": -211.85921383857726,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002437",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -6.682173901411234,
+              "net_pnl_cny": -661.4015665165186,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603339",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": 3.507183075617484,
+              "net_pnl_cny": 306.38752231597897,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603707",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -0.5838891271098023,
+              "net_pnl_cny": -51.33553377056121,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688401",
+              "entry_date": "2023-08-03",
+              "exit_date": "2023-08-10",
+              "net_return_pct": -2.6482546214063083,
+              "net_pnl_cny": -249.0683501739502,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300718",
+              "entry_date": "2023-08-03",
+              "exit_date": "2023-08-10",
+              "net_return_pct": -1.2920350328884076,
+              "net_pnl_cny": -124.55218160629273,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002020",
+              "entry_date": "2023-08-04",
+              "exit_date": "2023-08-11",
+              "net_return_pct": -1.288297768320166,
+              "net_pnl_cny": -120.0693480758667,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688403",
+              "entry_date": "2023-10-09",
+              "exit_date": "2023-10-16",
+              "net_return_pct": 3.3137747118662872,
+              "net_pnl_cny": 324.74992808341983,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2024",
+          "training_sample_count": 77,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_5_v1",
+            "model_version": "broad_qfbr_moderate_5_v1-oos_2024",
+            "dataset_hash": "e34f9e7158cac89472c8fb9a8e8d3dc564cdb055872780ae6bf9cee1618164af",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.710225689914071,
+                "sample_count": 26,
+                "expected_return_net_pct": 1.0431928552709961,
+                "q10_pct": -3.551757874469061,
+                "q50_pct": -0.081872335425068,
+                "q90_pct": 7.900743196637811,
+                "probability_positive": 0.5,
+                "expected_mae_pct": -2.79608846656433,
+                "expected_mfe_pct": 4.59069331562346,
+                "profit_factor": 1.8868336832766268,
+                "payoff_ratio": 1.8868336832766266
+              },
+              {
+                "lower_score": 0.7102322194191139,
+                "upper_score": 0.7696578042905632,
+                "sample_count": 26,
+                "expected_return_net_pct": 1.861524546125753,
+                "q10_pct": -4.61889847761284,
+                "q50_pct": 2.0898797831386093,
+                "q90_pct": 9.234221958179818,
+                "probability_positive": 0.6153846153846154,
+                "expected_mae_pct": -2.627632054093089,
+                "expected_mfe_pct": 5.498111506912494,
+                "profit_factor": 2.337891320213704,
+                "payoff_ratio": 1.4611820751335647
+              },
+              {
+                "lower_score": 0.7725814488540956,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 25,
+                "expected_return_net_pct": 3.2779638297504428,
+                "q10_pct": -5.210000913745848,
+                "q50_pct": 3.6263480282167944,
+                "q90_pct": 11.461506556571909,
+                "probability_positive": 0.68,
+                "expected_mae_pct": -2.5187904002828656,
+                "expected_mfe_pct": 6.9050211042943275,
+                "profit_factor": 3.223979508322431,
+                "payoff_ratio": 1.51716682744585
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 6,
+            "win_rate": 0.8333333333333334,
+            "net_expectancy_pct": 5.250828079228617,
+            "average_win_pct": 6.617171342408829,
+            "average_loss_pct": 1.5808882366724453,
+            "payoff_ratio": 4.185730014878898,
+            "profit_factor": 20.92865007439449,
+            "gross_profit_pct": 33.08585671204415,
+            "gross_loss_pct": 1.5808882366724453,
+            "sample_count": 6,
+            "total_net_return_pct": 31.5049684753717
+          },
+          "raw_portfolio": {
+            "trade_count": 6,
+            "win_rate": 0.8333333333333334,
+            "net_expectancy_pct": 5.250828079228617,
+            "average_win_pct": 6.617171342408829,
+            "average_loss_pct": 1.5808882366724453,
+            "payoff_ratio": 4.185730014878898,
+            "profit_factor": 20.92865007439449,
+            "gross_profit_pct": 33.08585671204415,
+            "gross_loss_pct": 1.5808882366724453,
+            "sample_count": 6,
+            "total_net_return_pct": 31.5049684753717,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 203035.4743739586,
+            "net_profit_cny": 3035.4743739585974,
+            "total_return_pct": 1.5177371869792955,
+            "maximum_drawdown_pct": 0.5121071486529849,
+            "total_cost_cny": 147.52619061660766
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603801",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-04-30",
+              "net_return_pct": 9.936219498810871,
+              "net_pnl_cny": 968.1852332706451,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "603816",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-04-30",
+              "net_return_pct": 8.953274777611098,
+              "net_pnl_cny": 859.5143786506653,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "300257",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-05-07",
+              "net_return_pct": 8.568248493274053,
+              "net_pnl_cny": 822.5518553543092,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "600732",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-05-08",
+              "net_return_pct": 5.026103002112974,
+              "net_pnl_cny": 471.24742821502684,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002459",
+              "entry_date": "2024-04-29",
+              "exit_date": "2024-05-09",
+              "net_return_pct": -1.5808882366724453,
+              "net_pnl_cny": -137.063008310318,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603197",
+              "entry_date": "2024-04-29",
+              "exit_date": "2024-05-09",
+              "net_return_pct": 0.6020109402351488,
+              "net_pnl_cny": 51.03848677825928,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025_h1",
+          "training_sample_count": 62,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_5_v1",
+            "model_version": "broad_qfbr_moderate_5_v1-oos_2025_h1",
+            "dataset_hash": "d86b494b802260ffc7ac006f5d1b7f59e1edc63705cee6caf3b9ec6ac91252b5",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.707690930891562,
+                "sample_count": 21,
+                "expected_return_net_pct": 0.793229665828122,
+                "q10_pct": -3.6976393831340846,
+                "q50_pct": -0.7556651599407197,
+                "q90_pct": 6.678410385020353,
+                "probability_positive": 0.47619047619047616,
+                "expected_mae_pct": -2.694501366884371,
+                "expected_mfe_pct": 4.600499999193266,
+                "profit_factor": 1.6499268435930359,
+                "payoff_ratio": 1.8149195279523394
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7725814488540956,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.9954774354860838,
+                "q10_pct": -5.062781737608576,
+                "q50_pct": 1.898055284719615,
+                "q90_pct": 11.004699546297106,
+                "probability_positive": 0.5714285714285714,
+                "expected_mae_pct": -2.520929830431669,
+                "expected_mfe_pct": 5.358026412704537,
+                "profit_factor": 2.3062243934381654,
+                "payoff_ratio": 1.7296682950786242
+              },
+              {
+                "lower_score": 0.7742639754494504,
+                "upper_score": 0.8433342398360278,
+                "sample_count": 20,
+                "expected_return_net_pct": 3.1334105542232997,
+                "q10_pct": -6.433569779395905,
+                "q50_pct": 3.8430595137284,
+                "q90_pct": 10.464653018273324,
+                "probability_positive": 0.7,
+                "expected_mae_pct": -2.718253851943315,
+                "expected_mfe_pct": 7.0706828330423654,
+                "profit_factor": 3.0901750151360625,
+                "payoff_ratio": 1.3243607207725983
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "raw_portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "raw_trades": [],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025h2_2026h1",
+          "training_sample_count": 62,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_5_v1",
+            "model_version": "broad_qfbr_moderate_5_v1-oos_2025h2_2026h1",
+            "dataset_hash": "d86b494b802260ffc7ac006f5d1b7f59e1edc63705cee6caf3b9ec6ac91252b5",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.707690930891562,
+                "sample_count": 21,
+                "expected_return_net_pct": 0.793229665828122,
+                "q10_pct": -3.6976393831340846,
+                "q50_pct": -0.7556651599407197,
+                "q90_pct": 6.678410385020353,
+                "probability_positive": 0.47619047619047616,
+                "expected_mae_pct": -2.694501366884371,
+                "expected_mfe_pct": 4.600499999193266,
+                "profit_factor": 1.6499268435930359,
+                "payoff_ratio": 1.8149195279523394
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7725814488540956,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.9954774354860838,
+                "q10_pct": -5.062781737608576,
+                "q50_pct": 1.898055284719615,
+                "q90_pct": 11.004699546297106,
+                "probability_positive": 0.5714285714285714,
+                "expected_mae_pct": -2.520929830431669,
+                "expected_mfe_pct": 5.358026412704537,
+                "profit_factor": 2.3062243934381654,
+                "payoff_ratio": 1.7296682950786242
+              },
+              {
+                "lower_score": 0.7742639754494504,
+                "upper_score": 0.8433342398360278,
+                "sample_count": 20,
+                "expected_return_net_pct": 3.1334105542232997,
+                "q10_pct": -6.433569779395905,
+                "q50_pct": 3.8430595137284,
+                "q90_pct": 10.464653018273324,
+                "probability_positive": 0.7,
+                "expected_mae_pct": -2.718253851943315,
+                "expected_mfe_pct": 7.0706828330423654,
+                "profit_factor": 3.0901750151360625,
+                "payoff_ratio": 1.3243607207725983
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 9,
+            "win_rate": 0.4444444444444444,
+            "net_expectancy_pct": 1.581159141723602,
+            "average_win_pct": 5.645647558987705,
+            "average_loss_pct": 1.6704315920876809,
+            "payoff_ratio": 3.3797538227422157,
+            "profit_factor": 2.7038030581937726,
+            "gross_profit_pct": 22.58259023595082,
+            "gross_loss_pct": 8.352157960438404,
+            "sample_count": 9,
+            "total_net_return_pct": 14.230432275512417
+          },
+          "raw_portfolio": {
+            "trade_count": 9,
+            "win_rate": 0.4444444444444444,
+            "net_expectancy_pct": 1.581159141723602,
+            "average_win_pct": 5.645647558987705,
+            "average_loss_pct": 1.6704315920876809,
+            "payoff_ratio": 3.3797538227422157,
+            "profit_factor": 2.7038030581937726,
+            "gross_profit_pct": 22.58259023595082,
+            "gross_loss_pct": 8.352157960438404,
+            "sample_count": 9,
+            "total_net_return_pct": 14.230432275512417,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 201278.67446395016,
+            "net_profit_cny": 1278.6744639501558,
+            "total_return_pct": 0.6393372319750679,
+            "maximum_drawdown_pct": 0.6099207891968828,
+            "total_cost_cny": 217.32592133426664
+          },
+          "raw_trades": [
+            {
+              "stock_code": "000963",
+              "entry_date": "2025-10-09",
+              "exit_date": "2025-10-16",
+              "net_return_pct": -1.5744221121916864,
+              "net_pnl_cny": -130.48810033416748,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002946",
+              "entry_date": "2025-10-09",
+              "exit_date": "2025-10-16",
+              "net_return_pct": 6.688663921691068,
+              "net_pnl_cny": 566.5298520278931,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300973",
+              "entry_date": "2025-10-14",
+              "exit_date": "2025-10-21",
+              "net_return_pct": -2.7756384162743224,
+              "net_pnl_cny": -243.09041757965088,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300174",
+              "entry_date": "2025-10-14",
+              "exit_date": "2025-10-21",
+              "net_return_pct": -2.808775522878175,
+              "net_pnl_cny": -276.72056579971314,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002956",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-23",
+              "net_return_pct": 6.446445064894288,
+              "net_pnl_cny": 629.4953827190399,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "301230",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-23",
+              "net_return_pct": -0.8235018492423507,
+              "net_pnl_cny": -82.09489822006225,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300016",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-23",
+              "net_return_pct": -0.3698200598518701,
+              "net_pnl_cny": -35.63586189842224,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300545",
+              "entry_date": "2025-10-22",
+              "exit_date": "2025-10-29",
+              "net_return_pct": 0.6994539045176185,
+              "net_pnl_cny": 63.18167247581482,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002345",
+              "entry_date": "2025-10-27",
+              "exit_date": "2025-10-30",
+              "net_return_pct": 8.748027344847847,
+              "net_pnl_cny": 787.4974005594254,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        }
+      ],
+      "raw_aggregate": {
+        "trade_count": 46,
+        "win_rate": 0.5652173913043478,
+        "net_expectancy_pct": 1.6541882475832541,
+        "average_win_pct": 5.449273044206892,
+        "average_loss_pct": 3.279421988027476,
+        "payoff_ratio": 1.66165655536284,
+        "profit_factor": 2.160153521971692,
+        "gross_profit_pct": 141.6810991493792,
+        "gross_loss_pct": 65.58843976054952,
+        "sample_count": 46,
+        "total_net_return_pct": 76.09265938882969,
+        "net_profit_cny": 7955.101871777821,
+        "maximum_drawdown_pct": 1.4934821244654617,
+        "positive_outer_folds": 3,
+        "multiple_testing_adjusted_p": 0.12843578210894552
+      },
+      "aggregate": {
+        "validation": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0
+        },
+        "portfolio": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0,
+          "net_profit_cny": 0.0,
+          "maximum_drawdown_pct": 0.0
+        },
+        "positive_outer_folds": 0,
+        "outer_fold_count": 5,
+        "gate_status": "BLOCK",
+        "block_reasons": [
+          "OOS_SAMPLE_COUNT_TOO_LOW",
+          "OOS_NET_EXPECTANCY_MISSING",
+          "OOS_PROFIT_FACTOR_MISSING",
+          "OOS_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_TRADE_COUNT_TOO_LOW",
+          "PORTFOLIO_NET_EXPECTANCY_MISSING",
+          "PORTFOLIO_PROFIT_FACTOR_MISSING",
+          "PORTFOLIO_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_NET_PROFIT_NOT_POSITIVE",
+          "POSITIVE_OUTER_FOLD_COUNT_TOO_LOW",
+          "CALIBRATION_DIRECTION_FAILED_IN_OUTER_FOLD"
+        ]
+      }
+    },
+    "strict_qfbr_moderate_5_v1": {
+      "eligible_signal_count": 48,
+      "selected_signal_count": 48,
+      "episode_count": 27,
+      "mature_episode_count": 27,
+      "outer_folds": [
+        {
+          "name": "oos_2022",
+          "training_sample_count": 7,
+          "calibration": {
+            "strategy_key": "strict_qfbr_moderate_5_v1",
+            "model_version": "strict_qfbr_moderate_5_v1-oos_2022",
+            "dataset_hash": "4650f3bf28ce4a495665f245480ac149865b02b4345ce07f32161976ae9eb548",
+            "buckets": [
+              {
+                "lower_score": 0.6864772786496484,
+                "upper_score": 0.7348046139941873,
+                "sample_count": 3,
+                "expected_return_net_pct": 1.4604526727557499,
+                "q10_pct": -1.519730981975818,
+                "q50_pct": 0.6853618811442563,
+                "q90_pct": 4.750672644131916,
+                "probability_positive": 0.6666666666666666,
+                "expected_mae_pct": -4.234248717192731,
+                "expected_mfe_pct": 4.117287236635439,
+                "profit_factor": 3.1155717709384363,
+                "payoff_ratio": 1.5577858854692181
+              },
+              {
+                "lower_score": 0.7440302241826526,
+                "upper_score": 0.7979785470639255,
+                "sample_count": 3,
+                "expected_return_net_pct": 6.213634326036554,
+                "q10_pct": 5.765410005865738,
+                "q50_pct": 6.191058977442658,
+                "q90_pct": 6.67088878564493,
+                "probability_positive": 1.0,
+                "expected_mae_pct": -1.2548594627081282,
+                "expected_mfe_pct": 7.569750699214151,
+                "profit_factor": Infinity,
+                "payoff_ratio": Infinity
+              },
+              {
+                "lower_score": 0.8075904989711291,
+                "upper_score": 0.8075904989711291,
+                "sample_count": 1,
+                "expected_return_net_pct": -5.857418558731875,
+                "q10_pct": -5.857418558731875,
+                "q50_pct": -5.857418558731875,
+                "q90_pct": -5.857418558731875,
+                "probability_positive": 0.0,
+                "expected_mae_pct": -5.3962914065934005,
+                "expected_mfe_pct": 2.698148919736254,
+                "profit_factor": 0.0,
+                "payoff_ratio": null
+              }
+            ]
+          },
+          "calibration_direction_valid": false,
+          "raw_validation": {
+            "trade_count": 4,
+            "win_rate": 0.75,
+            "net_expectancy_pct": 1.6094634635139036,
+            "average_win_pct": 3.6019748321387786,
+            "average_loss_pct": 4.368070642360721,
+            "payoff_ratio": 0.824614601514799,
+            "profit_factor": 2.473843804544397,
+            "gross_profit_pct": 10.805924496416335,
+            "gross_loss_pct": 4.368070642360721,
+            "sample_count": 4,
+            "total_net_return_pct": 6.437853854055614
+          },
+          "raw_portfolio": {
+            "trade_count": 2,
+            "win_rate": 0.5,
+            "net_expectancy_pct": -0.3708613070719635,
+            "average_win_pct": 3.6263480282167944,
+            "average_loss_pct": 4.368070642360721,
+            "payoff_ratio": 0.8301944554305414,
+            "profit_factor": 0.8301944554305414,
+            "gross_profit_pct": 3.6263480282167944,
+            "gross_loss_pct": 4.368070642360721,
+            "sample_count": 2,
+            "total_net_return_pct": -0.741722614143927,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 199995.73552876854,
+            "net_profit_cny": -4.264471231464995,
+            "total_return_pct": -0.002132235615737166,
+            "maximum_drawdown_pct": 0.3630577717096406,
+            "total_cost_cny": 57.26453989601134
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603678",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-16",
+              "net_return_pct": 3.6263480282167944,
+              "net_pnl_cny": 314.4769054336548,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603987",
+              "entry_date": "2022-09-13",
+              "exit_date": "2022-09-20",
+              "net_return_pct": -4.368070642360721,
+              "net_pnl_cny": -407.8030861682892,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2023",
+          "training_sample_count": 9,
+          "calibration": {
+            "strategy_key": "strict_qfbr_moderate_5_v1",
+            "model_version": "strict_qfbr_moderate_5_v1-oos_2023",
+            "dataset_hash": "1fc056c6df6e5f8fbf210da530f479f09011e4ce69f1489b576106ad34f04479",
+            "buckets": [
+              {
+                "lower_score": 0.6864772786496484,
+                "upper_score": 0.7000028730376634,
+                "sample_count": 3,
+                "expected_return_net_pct": -1.917904319657434,
+                "q10_pct": -3.908657353439745,
+                "q50_pct": -2.0710041977558364,
+                "q90_pct": 0.13408866536423786,
+                "probability_positive": 0.3333333333333333,
+                "expected_mae_pct": -6.05785254932543,
+                "expected_mfe_pct": 1.9547437516627502,
+                "profit_factor": 0.10643794305267777,
+                "payoff_ratio": 0.21287588610535554
+              },
+              {
+                "lower_score": 0.7348046139941873,
+                "upper_score": 0.7926900485633244,
+                "sample_count": 3,
+                "expected_return_net_pct": 5.017448708689044,
+                "q10_pct": 4.032877975167738,
+                "q50_pct": 5.658997762971508,
+                "q90_pct": 5.745399820497365,
+                "probability_positive": 1.0,
+                "expected_mae_pct": -0.7405426466357298,
+                "expected_mfe_pct": 8.622647788454422,
+                "profit_factor": Infinity,
+                "payoff_ratio": Infinity
+              },
+              {
+                "lower_score": 0.797578140612258,
+                "upper_score": 0.8075904989711291,
+                "sample_count": 3,
+                "expected_return_net_pct": 2.37482888546876,
+                "q10_pct": -3.4477230514969683,
+                "q50_pct": 6.191058977442658,
+                "q90_pct": 6.67088878564493,
+                "probability_positive": 0.6666666666666666,
+                "expected_mae_pct": -2.9601360392282077,
+                "expected_mfe_pct": 5.965757920976696,
+                "profit_factor": 2.216318517273371,
+                "payoff_ratio": 1.1081592586366855
+              }
+            ]
+          },
+          "calibration_direction_valid": false,
+          "raw_validation": {
+            "trade_count": 11,
+            "win_rate": 0.45454545454545453,
+            "net_expectancy_pct": 1.918379163829525,
+            "average_win_pct": 6.77827190666769,
+            "average_loss_pct": 2.1315314552022797,
+            "payoff_ratio": 3.1800008815841947,
+            "profit_factor": 2.6500007346534953,
+            "gross_profit_pct": 33.89135953333845,
+            "gross_loss_pct": 12.78918873121368,
+            "sample_count": 11,
+            "total_net_return_pct": 21.102170802124775
+          },
+          "raw_portfolio": {
+            "trade_count": 11,
+            "win_rate": 0.45454545454545453,
+            "net_expectancy_pct": 1.918379163829525,
+            "average_win_pct": 6.77827190666769,
+            "average_loss_pct": 2.1315314552022797,
+            "payoff_ratio": 3.1800008815841947,
+            "profit_factor": 2.6500007346534953,
+            "gross_profit_pct": 33.89135953333845,
+            "gross_loss_pct": 12.78918873121368,
+            "sample_count": 11,
+            "total_net_return_pct": 21.102170802124775,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 201760.90623941706,
+            "net_profit_cny": 1760.9062394170614,
+            "total_return_pct": 0.8804531197085241,
+            "maximum_drawdown_pct": 0.5272143225922621,
+            "total_cost_cny": 258.0914298028946
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603738",
+              "entry_date": "2023-01-06",
+              "exit_date": "2023-01-11",
+              "net_return_pct": 13.766661639194593,
+              "net_pnl_cny": 1148.1396017150878,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "002182",
+              "entry_date": "2023-01-06",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 3.1614734354141314,
+              "net_pnl_cny": 257.3439424667359,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688337",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-11",
+              "net_return_pct": 12.014357541899443,
+              "net_pnl_cny": 1075.285,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "000786",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-12",
+              "net_return_pct": 1.4416838412128015,
+              "net_pnl_cny": 118.37666383171083,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603416",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-14",
+              "net_return_pct": -2.8827958999478915,
+              "net_pnl_cny": -238.34956588745115,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603067",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-14",
+              "net_return_pct": -2.3012026896970945,
+              "net_pnl_cny": -205.3823400554657,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "301238",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-14",
+              "net_return_pct": -0.8146861851731031,
+              "net_pnl_cny": -76.15686732482911,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000755",
+              "entry_date": "2023-04-14",
+              "exit_date": "2023-04-21",
+              "net_return_pct": -3.405876365804038,
+              "net_pnl_cny": -330.43811682510375,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603339",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": 3.507183075617484,
+              "net_pnl_cny": 306.38752231597897,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603707",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -0.5838891271098023,
+              "net_pnl_cny": -51.33553377056121,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "600062",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -2.80073846348175,
+              "net_pnl_cny": -242.96406704902648,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2024",
+          "training_sample_count": 22,
+          "calibration": {
+            "strategy_key": "strict_qfbr_moderate_5_v1",
+            "model_version": "strict_qfbr_moderate_5_v1-oos_2024",
+            "dataset_hash": "eddf69a7b1a864d0a040bffd0435298ac71d238ca5a817b4b41aa577145a87bf",
+            "buckets": [
+              {
+                "lower_score": 0.6301605808597537,
+                "upper_score": 0.7026659638448012,
+                "sample_count": 8,
+                "expected_return_net_pct": -1.6089421170671794,
+                "q10_pct": -3.694534648771043,
+                "q50_pct": -2.1861034437264655,
+                "q90_pct": 1.1411572347782344,
+                "probability_positive": 0.25,
+                "expected_mae_pct": -4.158916912182733,
+                "expected_mfe_pct": 2.442583646766763,
+                "profit_factor": 0.18335990901021101,
+                "payoff_ratio": 0.550079727030633
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7518866364958834,
+                "sample_count": 8,
+                "expected_return_net_pct": 3.7371792838913827,
+                "q10_pct": -1.273561158961229,
+                "q50_pct": 4.241039908613088,
+                "q90_pct": 7.641207496985013,
+                "probability_positive": 0.75,
+                "expected_mae_pct": -1.5371201785748108,
+                "expected_mfe_pct": 6.867176641260114,
+                "profit_factor": 9.624214209765153,
+                "payoff_ratio": 3.2080714032550515
+              },
+              {
+                "lower_score": 0.7926900485633244,
+                "upper_score": 0.820109555519266,
+                "sample_count": 6,
+                "expected_return_net_pct": 4.613161626538633,
+                "q10_pct": -1.3479725616588718,
+                "q50_pct": 4.908703502829726,
+                "q90_pct": 10.278753938445046,
+                "probability_positive": 0.8333333333333334,
+                "expected_mae_pct": -1.8227609164503666,
+                "expected_mfe_pct": 7.401813413421495,
+                "profit_factor": 5.725455331849167,
+                "payoff_ratio": 1.1450910663698333
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 3,
+            "win_rate": 0.6666666666666666,
+            "net_expectancy_pct": 4.4604780880838,
+            "average_win_pct": 7.4811612504619225,
+            "average_loss_pct": 1.5808882366724453,
+            "payoff_ratio": 4.732251829647837,
+            "profit_factor": 9.464503659295675,
+            "gross_profit_pct": 14.962322500923845,
+            "gross_loss_pct": 1.5808882366724453,
+            "sample_count": 3,
+            "total_net_return_pct": 13.3814342642514
+          },
+          "raw_portfolio": {
+            "trade_count": 3,
+            "win_rate": 0.6666666666666666,
+            "net_expectancy_pct": 4.4604780880838,
+            "average_win_pct": 7.4811612504619225,
+            "average_loss_pct": 1.5808882366724453,
+            "payoff_ratio": 4.732251829647837,
+            "profit_factor": 9.464503659295675,
+            "gross_profit_pct": 14.962322500923845,
+            "gross_loss_pct": 1.5808882366724453,
+            "sample_count": 3,
+            "total_net_return_pct": 13.3814342642514,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 201302.36965317538,
+            "net_profit_cny": 1302.3696531753812,
+            "total_return_pct": 0.6511848265876807,
+            "maximum_drawdown_pct": 0.48710319288713944,
+            "total_cost_cny": 73.63056044769287
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603801",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-04-30",
+              "net_return_pct": 9.936219498810871,
+              "net_pnl_cny": 968.1852332706451,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "600732",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-05-08",
+              "net_return_pct": 5.026103002112974,
+              "net_pnl_cny": 471.24742821502684,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002459",
+              "entry_date": "2024-04-29",
+              "exit_date": "2024-05-09",
+              "net_return_pct": -1.5808882366724453,
+              "net_pnl_cny": -137.063008310318,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025_h1",
+          "training_sample_count": 18,
+          "calibration": {
+            "strategy_key": "strict_qfbr_moderate_5_v1",
+            "model_version": "strict_qfbr_moderate_5_v1-oos_2025_h1",
+            "dataset_hash": "a95c7b5123f1a3a3ba70222b25ead37fd649797834e3caea76968f05dd618947",
+            "buckets": [
+              {
+                "lower_score": 0.6301605808597537,
+                "upper_score": 0.7026659638448012,
+                "sample_count": 6,
+                "expected_return_net_pct": -1.9143157699876425,
+                "q10_pct": -3.8869735040823796,
+                "q50_pct": -2.550970576589422,
+                "q90_pct": 0.694996770708874,
+                "probability_positive": 0.16666666666666666,
+                "expected_mae_pct": -3.651686582359609,
+                "expected_mfe_pct": 2.847100962829304,
+                "profit_factor": 0.1610363211059723,
+                "payoff_ratio": 0.8051816055298615
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7518866364958834,
+                "sample_count": 6,
+                "expected_return_net_pct": 3.0785726955467876,
+                "q10_pct": -1.733342513528847,
+                "q50_pct": 2.4744334584151426,
+                "q90_pct": 8.494627141754066,
+                "probability_positive": 0.6666666666666666,
+                "expected_mae_pct": -1.7791615672152243,
+                "expected_mfe_pct": 6.25558126048071,
+                "profit_factor": 6.328270676196426,
+                "payoff_ratio": 3.164135338098213
+              },
+              {
+                "lower_score": 0.7924626741007559,
+                "upper_score": 0.8241814113662822,
+                "sample_count": 6,
+                "expected_return_net_pct": 5.655986227846153,
+                "q10_pct": 0.7902925993708431,
+                "q50_pct": 4.326225515164884,
+                "q90_pct": 11.851440569002733,
+                "probability_positive": 0.8333333333333334,
+                "expected_mae_pct": -1.522343552312792,
+                "expected_mfe_pct": 8.78635475939513,
+                "profit_factor": 22.466360859580693,
+                "payoff_ratio": 4.493272171916138
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "raw_portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "raw_trades": [],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025h2_2026h1",
+          "training_sample_count": 18,
+          "calibration": {
+            "strategy_key": "strict_qfbr_moderate_5_v1",
+            "model_version": "strict_qfbr_moderate_5_v1-oos_2025h2_2026h1",
+            "dataset_hash": "a95c7b5123f1a3a3ba70222b25ead37fd649797834e3caea76968f05dd618947",
+            "buckets": [
+              {
+                "lower_score": 0.6301605808597537,
+                "upper_score": 0.7026659638448012,
+                "sample_count": 6,
+                "expected_return_net_pct": -1.9143157699876425,
+                "q10_pct": -3.8869735040823796,
+                "q50_pct": -2.550970576589422,
+                "q90_pct": 0.694996770708874,
+                "probability_positive": 0.16666666666666666,
+                "expected_mae_pct": -3.651686582359609,
+                "expected_mfe_pct": 2.847100962829304,
+                "profit_factor": 0.1610363211059723,
+                "payoff_ratio": 0.8051816055298615
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7518866364958834,
+                "sample_count": 6,
+                "expected_return_net_pct": 3.0785726955467876,
+                "q10_pct": -1.733342513528847,
+                "q50_pct": 2.4744334584151426,
+                "q90_pct": 8.494627141754066,
+                "probability_positive": 0.6666666666666666,
+                "expected_mae_pct": -1.7791615672152243,
+                "expected_mfe_pct": 6.25558126048071,
+                "profit_factor": 6.328270676196426,
+                "payoff_ratio": 3.164135338098213
+              },
+              {
+                "lower_score": 0.7924626741007559,
+                "upper_score": 0.8241814113662822,
+                "sample_count": 6,
+                "expected_return_net_pct": 5.655986227846153,
+                "q10_pct": 0.7902925993708431,
+                "q50_pct": 4.326225515164884,
+                "q90_pct": 11.851440569002733,
+                "probability_positive": 0.8333333333333334,
+                "expected_mae_pct": -1.522343552312792,
+                "expected_mfe_pct": 8.78635475939513,
+                "profit_factor": 22.466360859580693,
+                "payoff_ratio": 4.493272171916138
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 2,
+            "win_rate": 0.5,
+            "net_expectancy_pct": 1.8354033243099828,
+            "average_win_pct": 6.446445064894288,
+            "average_loss_pct": 2.7756384162743224,
+            "payoff_ratio": 2.32250895040832,
+            "profit_factor": 2.32250895040832,
+            "gross_profit_pct": 6.446445064894288,
+            "gross_loss_pct": 2.7756384162743224,
+            "sample_count": 2,
+            "total_net_return_pct": 3.6708066486199655
+          },
+          "raw_portfolio": {
+            "trade_count": 2,
+            "win_rate": 0.5,
+            "net_expectancy_pct": 1.8354033243099828,
+            "average_win_pct": 6.446445064894288,
+            "average_loss_pct": 2.7756384162743224,
+            "payoff_ratio": 2.32250895040832,
+            "profit_factor": 2.32250895040832,
+            "gross_profit_pct": 6.446445064894288,
+            "gross_loss_pct": 2.7756384162743224,
+            "sample_count": 2,
+            "total_net_return_pct": 3.6708066486199655,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200386.4049651394,
+            "net_profit_cny": 386.4049651394016,
+            "total_return_pct": 0.19320248256970984,
+            "maximum_drawdown_pct": 0.24573620125858398,
+            "total_cost_cny": 48.5943100681305
+          },
+          "raw_trades": [
+            {
+              "stock_code": "300973",
+              "entry_date": "2025-10-14",
+              "exit_date": "2025-10-21",
+              "net_return_pct": -2.7756384162743224,
+              "net_pnl_cny": -243.09041757965088,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002956",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-23",
+              "net_return_pct": 6.446445064894288,
+              "net_pnl_cny": 629.4953827190399,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        }
+      ],
+      "raw_aggregate": {
+        "trade_count": 18,
+        "win_rate": 0.5,
+        "net_expectancy_pct": 2.078482727825123,
+        "average_win_pct": 6.547386125263709,
+        "average_loss_pct": 2.390420669613463,
+        "payoff_ratio": 2.7390100029223885,
+        "profit_factor": 2.7390100029223885,
+        "gross_profit_pct": 58.92647512737338,
+        "gross_loss_pct": 21.513786026521167,
+        "sample_count": 18,
+        "total_net_return_pct": 37.41268910085221,
+        "net_profit_cny": 3445.4163865003793,
+        "maximum_drawdown_pct": 0.5272143225922621,
+        "positive_outer_folds": 3,
+        "multiple_testing_adjusted_p": 0.2193903048475762
+      },
+      "aggregate": {
+        "validation": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0
+        },
+        "portfolio": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0,
+          "net_profit_cny": 0.0,
+          "maximum_drawdown_pct": 0.0
+        },
+        "positive_outer_folds": 0,
+        "outer_fold_count": 5,
+        "gate_status": "BLOCK",
+        "block_reasons": [
+          "OOS_SAMPLE_COUNT_TOO_LOW",
+          "OOS_NET_EXPECTANCY_MISSING",
+          "OOS_PROFIT_FACTOR_MISSING",
+          "OOS_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_TRADE_COUNT_TOO_LOW",
+          "PORTFOLIO_NET_EXPECTANCY_MISSING",
+          "PORTFOLIO_PROFIT_FACTOR_MISSING",
+          "PORTFOLIO_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_NET_PROFIT_NOT_POSITIVE",
+          "POSITIVE_OUTER_FOLD_COUNT_TOO_LOW",
+          "CALIBRATION_DIRECTION_FAILED_IN_OUTER_FOLD"
+        ]
+      }
+    },
+    "broad_qfbr_moderate_7_v1": {
+      "eligible_signal_count": 175,
+      "selected_signal_count": 165,
+      "episode_count": 93,
+      "mature_episode_count": 93,
+      "outer_folds": [
+        {
+          "name": "oos_2022",
+          "training_sample_count": 22,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_7_v1",
+            "model_version": "broad_qfbr_moderate_7_v1-oos_2022",
+            "dataset_hash": "f1298a19f456e86c747c4631894a307090c60ffd8d6bbdad04390087e8aa5060",
+            "buckets": [
+              {
+                "lower_score": 0.6818622453795052,
+                "upper_score": 0.7348046139941873,
+                "sample_count": 8,
+                "expected_return_net_pct": 1.2812780631983067,
+                "q10_pct": -4.259929047023917,
+                "q50_pct": -0.38259796242162425,
+                "q90_pct": 9.74639100920587,
+                "probability_positive": 0.375,
+                "expected_mae_pct": -2.9161305483233075,
+                "expected_mfe_pct": 5.1879448136034405,
+                "profit_factor": 1.8680817078189222,
+                "payoff_ratio": 3.1134695130315375
+              },
+              {
+                "lower_score": 0.7440302241826526,
+                "upper_score": 0.7971216123688221,
+                "sample_count": 8,
+                "expected_return_net_pct": 3.2547737331656754,
+                "q10_pct": -4.330580759198202,
+                "q50_pct": 3.8701992991358733,
+                "q90_pct": 10.280978364865376,
+                "probability_positive": 0.625,
+                "expected_mae_pct": -2.86673029410274,
+                "expected_mfe_pct": 9.276809256688589,
+                "profit_factor": 3.1320192805411917,
+                "payoff_ratio": 1.879211568324715
+              },
+              {
+                "lower_score": 0.797578140612258,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 6,
+                "expected_return_net_pct": 4.699999462766895,
+                "q10_pct": -1.1246375066844765,
+                "q50_pct": 4.453538555167102,
+                "q90_pct": 10.77109733981806,
+                "probability_positive": 0.8333333333333334,
+                "expected_mae_pct": -2.64769257327944,
+                "expected_mfe_pct": 7.649321288877598,
+                "profit_factor": 9.38248811495066,
+                "payoff_ratio": 1.876497622990132
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 17,
+            "win_rate": 0.5882352941176471,
+            "net_expectancy_pct": 0.2757766432652161,
+            "average_win_pct": 4.097068717307686,
+            "average_loss_pct": 5.183212033938313,
+            "payoff_ratio": 0.7904497617464142,
+            "profit_factor": 1.1292139453520202,
+            "gross_profit_pct": 40.97068717307686,
+            "gross_loss_pct": 36.28248423756819,
+            "sample_count": 17,
+            "total_net_return_pct": 4.688202935508674
+          },
+          "raw_portfolio": {
+            "trade_count": 8,
+            "win_rate": 0.125,
+            "net_expectancy_pct": -4.027297660316588,
+            "average_win_pct": 4.064102955035488,
+            "average_loss_pct": 5.183212033938313,
+            "payoff_ratio": 0.7840896587723613,
+            "profit_factor": 0.1120128083960516,
+            "gross_profit_pct": 4.064102955035488,
+            "gross_loss_pct": 36.28248423756819,
+            "sample_count": 8,
+            "total_net_return_pct": -32.218381282532704,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 197900.43594721888,
+            "net_profit_cny": -2099.5640527811192,
+            "total_return_pct": -1.0497820263905555,
+            "maximum_drawdown_pct": 1.5266195439829766,
+            "total_cost_cny": 243.56382008457186
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603416",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-09",
+              "net_return_pct": -5.507527910386691,
+              "net_pnl_cny": -480.80720338439943,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300275",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-13",
+              "net_return_pct": -5.928053480801351,
+              "net_pnl_cny": -527.0039465284348,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300130",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -3.6976393831340846,
+              "net_pnl_cny": -331.3084936656952,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300945",
+              "entry_date": "2022-09-09",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -6.084304360013603,
+              "net_pnl_cny": -551.2379889430999,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300660",
+              "entry_date": "2022-09-13",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -7.501009360061294,
+              "net_pnl_cny": -652.5878143253326,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300771",
+              "entry_date": "2022-09-14",
+              "exit_date": "2022-09-16",
+              "net_return_pct": -3.195879100810445,
+              "net_pnl_cny": -281.10952278137205,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603678",
+              "entry_date": "2022-09-08",
+              "exit_date": "2022-09-20",
+              "net_return_pct": 4.064102955035488,
+              "net_pnl_cny": 352.4390132217407,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603987",
+              "entry_date": "2022-09-13",
+              "exit_date": "2022-09-20",
+              "net_return_pct": -4.368070642360721,
+              "net_pnl_cny": -407.8030861682892,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2023",
+          "training_sample_count": 30,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_7_v1",
+            "model_version": "broad_qfbr_moderate_7_v1-oos_2023",
+            "dataset_hash": "8aa258b04e1cdc44b5d954b7886665de2475b3b1d9ef66ecbb0b406f93a58518",
+            "buckets": [
+              {
+                "lower_score": 0.6769359457019035,
+                "upper_score": 0.7239226062040297,
+                "sample_count": 10,
+                "expected_return_net_pct": -1.5516442961670893,
+                "q10_pct": -5.735511617794179,
+                "q50_pct": -3.420012397852587,
+                "q90_pct": 3.0738598320111308,
+                "probability_positive": 0.2,
+                "expected_mae_pct": -4.127365835657921,
+                "expected_mfe_pct": 3.596623832272998,
+                "profit_factor": 0.43477897793492687,
+                "payoff_ratio": 1.7391159117397075
+              },
+              {
+                "lower_score": 0.7252982905784672,
+                "upper_score": 0.7880737012431527,
+                "sample_count": 10,
+                "expected_return_net_pct": 3.1330693126823004,
+                "q10_pct": -5.674696405104137,
+                "q50_pct": 3.8701992991358733,
+                "q90_pct": 10.846424246689148,
+                "probability_positive": 0.6,
+                "expected_mae_pct": -3.2768720043511435,
+                "expected_mfe_pct": 8.098469597163172,
+                "profit_factor": 2.8383321233158125,
+                "payoff_ratio": 1.8922214155438752
+              },
+              {
+                "lower_score": 0.7926900485633244,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 10,
+                "expected_return_net_pct": 1.645577969982841,
+                "q10_pct": -5.706876055354151,
+                "q50_pct": 2.2371377943744752,
+                "q90_pct": 9.380475590986016,
+                "probability_positive": 0.6,
+                "expected_mae_pct": -3.251893843246253,
+                "expected_mfe_pct": 6.394657853471315,
+                "profit_factor": 1.858302274871987,
+                "payoff_ratio": 1.2388681832479913
+              }
+            ]
+          },
+          "calibration_direction_valid": false,
+          "raw_validation": {
+            "trade_count": 39,
+            "win_rate": 0.6153846153846154,
+            "net_expectancy_pct": 2.2734196970100875,
+            "average_win_pct": 5.755415119843999,
+            "average_loss_pct": 3.297772979524171,
+            "payoff_ratio": 1.745242973236574,
+            "profit_factor": 2.792388757178518,
+            "gross_profit_pct": 138.12996287625597,
+            "gross_loss_pct": 49.466594692862564,
+            "sample_count": 39,
+            "total_net_return_pct": 88.66336818339342
+          },
+          "raw_portfolio": {
+            "trade_count": 24,
+            "win_rate": 0.5833333333333334,
+            "net_expectancy_pct": 1.7560443353661404,
+            "average_win_pct": 5.306176810164689,
+            "average_loss_pct": 3.2141411293518276,
+            "payoff_ratio": 1.6508848232295097,
+            "profit_factor": 2.3112387525213136,
+            "gross_profit_pct": 74.28647534230564,
+            "gross_loss_pct": 32.141411293518274,
+            "sample_count": 24,
+            "total_net_return_pct": 42.14506404878737,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 203746.639042961,
+            "net_profit_cny": 3746.6390429610037,
+            "total_return_pct": 1.8733195214805098,
+            "maximum_drawdown_pct": 0.8536319680355953,
+            "total_cost_cny": 581.3583196526769
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603067",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 6.2971096933644946,
+              "net_pnl_cny": 591.1096801900864,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603987",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 2.776627143394029,
+              "net_pnl_cny": 275.60801618480684,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002444",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 0.05083832096753431,
+              "net_pnl_cny": 5.005032835006716,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002145",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 9.03943683574981,
+              "net_pnl_cny": 859.6504637694359,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002469",
+              "entry_date": "2023-01-04",
+              "exit_date": "2023-01-13",
+              "net_return_pct": 5.045785808077242,
+              "net_pnl_cny": 486.81743170166015,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002705",
+              "entry_date": "2023-01-05",
+              "exit_date": "2023-01-16",
+              "net_return_pct": 11.00049763597504,
+              "net_pnl_cny": 926.2419093418121,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "300408",
+              "entry_date": "2023-03-29",
+              "exit_date": "2023-04-04",
+              "net_return_pct": 9.12307600825527,
+              "net_pnl_cny": 800.8236182689667,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "002675",
+              "entry_date": "2023-03-29",
+              "exit_date": "2023-04-10",
+              "net_return_pct": 6.723620903143729,
+              "net_pnl_cny": 634.9787488594055,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000786",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-14",
+              "net_return_pct": -0.23729451731479234,
+              "net_pnl_cny": -19.484253414154054,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688187",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-14",
+              "net_return_pct": 0.42226019297668027,
+              "net_pnl_cny": 41.12814344024658,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000739",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-14",
+              "net_return_pct": 2.1780942024969967,
+              "net_pnl_cny": 188.62295461273192,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300718",
+              "entry_date": "2023-04-04",
+              "exit_date": "2023-04-14",
+              "net_return_pct": -1.6717042253521128,
+              "net_pnl_cny": -148.36375,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "000913",
+              "entry_date": "2023-04-07",
+              "exit_date": "2023-04-18",
+              "net_return_pct": 0.7345681636677073,
+              "net_pnl_cny": 64.5538482055664,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002955",
+              "entry_date": "2023-04-10",
+              "exit_date": "2023-04-19",
+              "net_return_pct": -4.821228447625475,
+              "net_pnl_cny": -390.95342474937434,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "000755",
+              "entry_date": "2023-04-14",
+              "exit_date": "2023-04-21",
+              "net_return_pct": -3.405876365804038,
+              "net_pnl_cny": -330.43811682510375,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "603678",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-21",
+              "net_return_pct": 12.258989387210773,
+              "net_pnl_cny": 1123.9041273784637,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "002437",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-27",
+              "net_return_pct": -6.682173901411234,
+              "net_pnl_cny": -661.4015665165186,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300261",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-29",
+              "net_return_pct": -2.3619843322002527,
+              "net_pnl_cny": -233.83644888782501,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603339",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-29",
+              "net_return_pct": 6.594725996036706,
+              "net_pnl_cny": 576.1152796173095,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603707",
+              "entry_date": "2023-06-16",
+              "exit_date": "2023-06-29",
+              "net_return_pct": 2.0408450509896294,
+              "net_pnl_cny": 179.43110287761687,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002020",
+              "entry_date": "2023-08-04",
+              "exit_date": "2023-08-08",
+              "net_return_pct": -5.061303735702047,
+              "net_pnl_cny": -471.7134927215576,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "688401",
+              "entry_date": "2023-08-03",
+              "exit_date": "2023-08-14",
+              "net_return_pct": -4.592064836143341,
+              "net_pnl_cny": -431.8837030944824,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300718",
+              "entry_date": "2023-08-03",
+              "exit_date": "2023-08-14",
+              "net_return_pct": -3.0537401176244447,
+              "net_pnl_cny": -294.38055782318116,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "688403",
+              "entry_date": "2023-10-09",
+              "exit_date": "2023-10-18",
+              "net_return_pct": -0.2540408143405366,
+              "net_pnl_cny": -24.89600028991699,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2024",
+          "training_sample_count": 77,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_7_v1",
+            "model_version": "broad_qfbr_moderate_7_v1-oos_2024",
+            "dataset_hash": "3cb801ae93a69acf72284d909d430e33cc71b1205d8efaec89d7a678d1ddbf3b",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.710225689914071,
+                "sample_count": 26,
+                "expected_return_net_pct": 1.2333351039926672,
+                "q10_pct": -4.714687189031384,
+                "q50_pct": 1.6132932291031752,
+                "q90_pct": 7.923348455699499,
+                "probability_positive": 0.5769230769230769,
+                "expected_mae_pct": -2.79570490797988,
+                "expected_mfe_pct": 4.986944689143397,
+                "profit_factor": 1.8796502856853283,
+                "payoff_ratio": 1.3784102095025739
+              },
+              {
+                "lower_score": 0.7102322194191139,
+                "upper_score": 0.7696578042905632,
+                "sample_count": 26,
+                "expected_return_net_pct": 1.832255712712625,
+                "q10_pct": -5.260059158472346,
+                "q50_pct": 1.4993585741809705,
+                "q90_pct": 9.581007608613186,
+                "probability_positive": 0.5769230769230769,
+                "expected_mae_pct": -2.762013907869836,
+                "expected_mfe_pct": 6.435956022746581,
+                "profit_factor": 2.3071404104235183,
+                "payoff_ratio": 1.6919029676439135
+              },
+              {
+                "lower_score": 0.7725814488540956,
+                "upper_score": 0.8680360105211421,
+                "sample_count": 25,
+                "expected_return_net_pct": 3.3779834565448765,
+                "q10_pct": -5.233008125282204,
+                "q50_pct": 2.776627143394029,
+                "q90_pct": 12.409220470399177,
+                "probability_positive": 0.68,
+                "expected_mae_pct": -2.646257723458298,
+                "expected_mfe_pct": 7.460150743383581,
+                "profit_factor": 3.489652717230374,
+                "payoff_ratio": 1.6421895139907643
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 6,
+            "win_rate": 0.6666666666666666,
+            "net_expectancy_pct": 5.471016508144343,
+            "average_win_pct": 8.611079270306444,
+            "average_loss_pct": 0.8091090161798562,
+            "payoff_ratio": 10.642668785181717,
+            "profit_factor": 21.285337570363435,
+            "gross_profit_pct": 34.444317081225776,
+            "gross_loss_pct": 1.6182180323597124,
+            "sample_count": 6,
+            "total_net_return_pct": 32.82609904886606
+          },
+          "raw_portfolio": {
+            "trade_count": 6,
+            "win_rate": 0.6666666666666666,
+            "net_expectancy_pct": 5.471016508144343,
+            "average_win_pct": 8.611079270306444,
+            "average_loss_pct": 0.8091090161798562,
+            "payoff_ratio": 10.642668785181717,
+            "profit_factor": 21.285337570363435,
+            "gross_profit_pct": 34.444317081225776,
+            "gross_loss_pct": 1.6182180323597124,
+            "sample_count": 6,
+            "total_net_return_pct": 32.82609904886606,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 203167.34140455633,
+            "net_profit_cny": 3167.341404556326,
+            "total_return_pct": 1.5836707022781615,
+            "maximum_drawdown_pct": 0.5121071486529849,
+            "total_cost_cny": 147.65951097106935
+          },
+          "raw_trades": [
+            {
+              "stock_code": "603801",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-04-30",
+              "net_return_pct": 9.936219498810871,
+              "net_pnl_cny": 968.1852332706451,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "603816",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-04-30",
+              "net_return_pct": 8.953274777611098,
+              "net_pnl_cny": 859.5143786506653,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "300257",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-05-07",
+              "net_return_pct": 8.568248493274053,
+              "net_pnl_cny": 822.5518553543092,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "600732",
+              "entry_date": "2024-04-26",
+              "exit_date": "2024-05-10",
+              "net_return_pct": 6.986574311529751,
+              "net_pnl_cny": 655.0612223739624,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "002459",
+              "entry_date": "2024-04-29",
+              "exit_date": "2024-05-13",
+              "net_return_pct": -0.40560534076543725,
+              "net_pnl_cny": -35.16598258018494,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "603197",
+              "entry_date": "2024-04-29",
+              "exit_date": "2024-05-13",
+              "net_return_pct": -1.2126126915942752,
+              "net_pnl_cny": -102.80530251312256,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025_h1",
+          "training_sample_count": 62,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_7_v1",
+            "model_version": "broad_qfbr_moderate_7_v1-oos_2025_h1",
+            "dataset_hash": "d58ea7ec860364c566799705ba377411af90c35daa3f8289ecad2478b1d6ba84",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.707690930891562,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.5100062164234331,
+                "q10_pct": -3.6976393831340846,
+                "q50_pct": 2.150767728487824,
+                "q90_pct": 6.723620903143729,
+                "probability_positive": 0.6190476190476191,
+                "expected_mae_pct": -2.6678170096961225,
+                "expected_mfe_pct": 4.995160504226466,
+                "profit_factor": 2.274780844980067,
+                "payoff_ratio": 1.399865135372349
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7725814488540956,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.5797519654232408,
+                "q10_pct": -5.928053480801351,
+                "q50_pct": 0.9578720973723117,
+                "q90_pct": 9.03943683574981,
+                "probability_positive": 0.5714285714285714,
+                "expected_mae_pct": -2.841611123445703,
+                "expected_mfe_pct": 6.001050273442833,
+                "profit_factor": 1.965298334106092,
+                "payoff_ratio": 1.473973750579569
+              },
+              {
+                "lower_score": 0.7742639754494504,
+                "upper_score": 0.8433342398360278,
+                "sample_count": 20,
+                "expected_return_net_pct": 3.0646374174494,
+                "q10_pct": -5.588271657502441,
+                "q50_pct": 2.5517815595923334,
+                "q90_pct": 11.126346811098616,
+                "probability_positive": 0.65,
+                "expected_mae_pct": -2.6188856261534488,
+                "expected_mfe_pct": 7.418243612557434,
+                "profit_factor": 3.1793028746914485,
+                "payoff_ratio": 1.7119323171415493
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "raw_portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "raw_trades": [],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        },
+        {
+          "name": "oos_2025h2_2026h1",
+          "training_sample_count": 62,
+          "calibration": {
+            "strategy_key": "broad_qfbr_moderate_7_v1",
+            "model_version": "broad_qfbr_moderate_7_v1-oos_2025h2_2026h1",
+            "dataset_hash": "d58ea7ec860364c566799705ba377411af90c35daa3f8289ecad2478b1d6ba84",
+            "buckets": [
+              {
+                "lower_score": 0.6020962004311836,
+                "upper_score": 0.707690930891562,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.5100062164234331,
+                "q10_pct": -3.6976393831340846,
+                "q50_pct": 2.150767728487824,
+                "q90_pct": 6.723620903143729,
+                "probability_positive": 0.6190476190476191,
+                "expected_mae_pct": -2.6678170096961225,
+                "expected_mfe_pct": 4.995160504226466,
+                "profit_factor": 2.274780844980067,
+                "payoff_ratio": 1.399865135372349
+              },
+              {
+                "lower_score": 0.710225689914071,
+                "upper_score": 0.7725814488540956,
+                "sample_count": 21,
+                "expected_return_net_pct": 1.5797519654232408,
+                "q10_pct": -5.928053480801351,
+                "q50_pct": 0.9578720973723117,
+                "q90_pct": 9.03943683574981,
+                "probability_positive": 0.5714285714285714,
+                "expected_mae_pct": -2.841611123445703,
+                "expected_mfe_pct": 6.001050273442833,
+                "profit_factor": 1.965298334106092,
+                "payoff_ratio": 1.473973750579569
+              },
+              {
+                "lower_score": 0.7742639754494504,
+                "upper_score": 0.8433342398360278,
+                "sample_count": 20,
+                "expected_return_net_pct": 3.0646374174494,
+                "q10_pct": -5.588271657502441,
+                "q50_pct": 2.5517815595923334,
+                "q90_pct": 11.126346811098616,
+                "probability_positive": 0.65,
+                "expected_mae_pct": -2.6188856261534488,
+                "expected_mfe_pct": 7.418243612557434,
+                "profit_factor": 3.1793028746914485,
+                "payoff_ratio": 1.7119323171415493
+              }
+            ]
+          },
+          "calibration_direction_valid": true,
+          "raw_validation": {
+            "trade_count": 9,
+            "win_rate": 0.5555555555555556,
+            "net_expectancy_pct": 0.4478627913218278,
+            "average_win_pct": 4.430117457618521,
+            "average_loss_pct": 4.529955541549038,
+            "payoff_ratio": 0.9779604715731103,
+            "profit_factor": 1.2224505894663877,
+            "gross_profit_pct": 22.150587288092602,
+            "gross_loss_pct": 18.11982216619615,
+            "sample_count": 9,
+            "total_net_return_pct": 4.03076512189645
+          },
+          "raw_portfolio": {
+            "trade_count": 9,
+            "win_rate": 0.5555555555555556,
+            "net_expectancy_pct": 0.4478627913218278,
+            "average_win_pct": 4.430117457618521,
+            "average_loss_pct": 4.529955541549038,
+            "payoff_ratio": 0.9779604715731103,
+            "profit_factor": 1.2224505894663877,
+            "gross_profit_pct": 22.150587288092602,
+            "gross_loss_pct": 18.11982216619615,
+            "sample_count": 9,
+            "total_net_return_pct": 4.03076512189645,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200386.57445804117,
+            "net_profit_cny": 386.57445804117015,
+            "total_return_pct": 0.19328722902058892,
+            "maximum_drawdown_pct": 0.6900053639223525,
+            "total_cost_cny": 216.4239893770218
+          },
+          "raw_trades": [
+            {
+              "stock_code": "000963",
+              "entry_date": "2025-10-09",
+              "exit_date": "2025-10-15",
+              "net_return_pct": -5.238672371897647,
+              "net_pnl_cny": -434.1811517944336,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "002946",
+              "entry_date": "2025-10-09",
+              "exit_date": "2025-10-20",
+              "net_return_pct": 4.978463181022804,
+              "net_pnl_cny": 421.6758447265625,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300973",
+              "entry_date": "2025-10-14",
+              "exit_date": "2025-10-23",
+              "net_return_pct": -6.562629082854107,
+              "net_pnl_cny": -574.7550670928955,
+              "exit_reason": "BOUNDED_STOP_TOUCH"
+            },
+            {
+              "stock_code": "300174",
+              "entry_date": "2025-10-14",
+              "exit_date": "2025-10-23",
+              "net_return_pct": -2.8696167445849166,
+              "net_pnl_cny": -282.7146429901123,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002956",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-27",
+              "net_return_pct": 4.963045144684548,
+              "net_pnl_cny": 484.64137541770936,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "301230",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-27",
+              "net_return_pct": 0.4391342523964309,
+              "net_pnl_cny": 43.77729301834107,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "300016",
+              "entry_date": "2025-10-16",
+              "exit_date": "2025-10-27",
+              "net_return_pct": -3.4489039668594823,
+              "net_pnl_cny": -332.3363949298859,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            },
+            {
+              "stock_code": "002345",
+              "entry_date": "2025-10-27",
+              "exit_date": "2025-10-30",
+              "net_return_pct": 8.748027344847847,
+              "net_pnl_cny": 787.4974005594254,
+              "exit_reason": "BOUNDED_TARGET_TOUCH"
+            },
+            {
+              "stock_code": "300545",
+              "entry_date": "2025-10-22",
+              "exit_date": "2025-10-31",
+              "net_return_pct": 3.021917365140973,
+              "net_pnl_cny": 272.9698011264801,
+              "exit_reason": "BOUNDED_TIME_EXIT"
+            }
+          ],
+          "accepted_validation": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0
+          },
+          "portfolio": {
+            "trade_count": 0,
+            "win_rate": null,
+            "net_expectancy_pct": null,
+            "average_win_pct": null,
+            "average_loss_pct": null,
+            "payoff_ratio": null,
+            "profit_factor": null,
+            "gross_profit_pct": 0,
+            "gross_loss_pct": 0,
+            "sample_count": 0,
+            "total_net_return_pct": 0,
+            "initial_cash_cny": 200000.0,
+            "final_equity_cny": 200000.0,
+            "net_profit_cny": 0.0,
+            "total_return_pct": 0.0,
+            "maximum_drawdown_pct": 0.0,
+            "total_cost_cny": 0.0
+          },
+          "trades": []
+        }
+      ],
+      "raw_aggregate": {
+        "trade_count": 47,
+        "win_rate": 0.5106382978723404,
+        "net_expectancy_pct": 0.9953946156812165,
+        "average_win_pct": 5.622728444444146,
+        "average_loss_pct": 3.8331276404192316,
+        "payoff_ratio": 1.4668774358448404,
+        "profit_factor": 1.5306547156641812,
+        "gross_profit_pct": 134.9454826666595,
+        "gross_loss_pct": 88.16193572964234,
+        "sample_count": 47,
+        "total_net_return_pct": 46.78354693701718,
+        "net_profit_cny": 5200.9908527773805,
+        "maximum_drawdown_pct": 1.5266195439829766,
+        "positive_outer_folds": 3,
+        "multiple_testing_adjusted_p": 0.30484757621189407
+      },
+      "aggregate": {
+        "validation": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0
+        },
+        "portfolio": {
+          "trade_count": 0,
+          "win_rate": null,
+          "net_expectancy_pct": null,
+          "average_win_pct": null,
+          "average_loss_pct": null,
+          "payoff_ratio": null,
+          "profit_factor": null,
+          "gross_profit_pct": 0,
+          "gross_loss_pct": 0,
+          "sample_count": 0,
+          "total_net_return_pct": 0,
+          "net_profit_cny": 0.0,
+          "maximum_drawdown_pct": 0.0
+        },
+        "positive_outer_folds": 0,
+        "outer_fold_count": 5,
+        "gate_status": "BLOCK",
+        "block_reasons": [
+          "OOS_SAMPLE_COUNT_TOO_LOW",
+          "OOS_NET_EXPECTANCY_MISSING",
+          "OOS_PROFIT_FACTOR_MISSING",
+          "OOS_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_TRADE_COUNT_TOO_LOW",
+          "PORTFOLIO_NET_EXPECTANCY_MISSING",
+          "PORTFOLIO_PROFIT_FACTOR_MISSING",
+          "PORTFOLIO_PAYOFF_RATIO_MISSING",
+          "PORTFOLIO_NET_PROFIT_NOT_POSITIVE",
+          "POSITIVE_OUTER_FOLD_COUNT_TOO_LOW",
+          "CALIBRATION_DIRECTION_FAILED_IN_OUTER_FOLD"
+        ]
+      }
+    }
+  },
+  "real_order_submission": false
+}

@@ -27,8 +27,11 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-CACHE_FILE = ROOT / "data" / "east_sector_heat_cache.json"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+
+CACHE_FILE = ROOT / "runtime" / "cache" / "east_sector_heat_cache.json"
+
+from server.common.process_env import build_child_env
 
 EASTMONEY_CLIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -38,6 +41,55 @@ EASTMONEY_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://data.eastmoney.com/",
 }
+
+
+def _warn(message: str, exc: Exception) -> None:
+    print(f"[WARN] {message}: {exc}", file=sys.stderr)
+
+
+def _node_binary_candidates() -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str | os.PathLike[str] | None) -> None:
+        if not path:
+            return
+        value = str(path).strip()
+        if not value:
+            return
+        try:
+            resolved = str(Path(value).expanduser())
+        except Exception:
+            resolved = value
+        key = os.path.normcase(os.path.abspath(resolved))
+        if key in seen or not os.path.exists(resolved):
+            return
+        seen.add(key)
+        candidates.append(resolved)
+
+    add(os.environ.get("NODE_BINARY", "").strip())
+    add(os.environ.get("PROBIGA_NODE_BINARY", "").strip())
+    add(shutil.which("node"))
+    add(shutil.which("node.exe"))
+
+    for env_name in ("CODEX_PRIMARY_RUNTIME", "CODEX_RUNTIME_DIR"):
+        root = os.environ.get(env_name, "").strip()
+        if root:
+            add(Path(root) / "dependencies" / "node" / "bin" / "node")
+            add(Path(root) / "dependencies" / "node" / "bin" / "node.exe")
+
+    cache_root = Path.home() / ".cache" / "codex-runtimes"
+    if cache_root.is_dir():
+        for pattern in (
+            "codex-primary-runtime/dependencies/node/bin/node",
+            "codex-primary-runtime/dependencies/node/bin/node.exe",
+            "*/dependencies/node/bin/node",
+            "*/dependencies/node/bin/node.exe",
+        ):
+            for path in cache_root.glob(pattern):
+                add(path)
+
+    return candidates
 
 
 def _fetch_json(url: str, timeout: int = 30, retries: int = 5) -> dict:
@@ -52,17 +104,7 @@ def _fetch_json(url: str, timeout: int = 30, retries: int = 5) -> dict:
             if attempt < retries:
                 time.sleep(1.2 * attempt)
 
-    node_candidates: list[str] = []
-    env_node = os.environ.get("NODE_BINARY", "").strip()
-    if env_node:
-        node_candidates.append(env_node)
-    codex_node = r"C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe"
-    if os.path.exists(codex_node):
-        node_candidates.append(codex_node)
-    sys_node = shutil.which("node")
-    if sys_node:
-        node_candidates.append(sys_node)
-    for node_exe in node_candidates:
+    for node_exe in _node_binary_candidates():
         node_script = r"""
 const url = process.env.EASTMONEY_URL;
 const timeoutMs = Number(process.env.EASTMONEY_TIMEOUT_MS || 30000);
@@ -89,7 +131,7 @@ fetch(url, {
   process.exit(1);
 });
 """
-        env = os.environ.copy()
+        env = build_child_env(ROOT)
         env["EASTMONEY_URL"] = url
         env["EASTMONEY_TIMEOUT_MS"] = str(timeout * 1000)
         for attempt in range(1, retries + 1):
@@ -101,6 +143,7 @@ fetch(url, {
                     encoding="utf-8",
                     errors="replace",
                     env=env,
+                    cwd=str(ROOT),
                     timeout=timeout + 10,
                 )
                 if proc.returncode == 0 and proc.stdout.strip():
@@ -112,10 +155,6 @@ fetch(url, {
                 time.sleep(1.2 * attempt)
 
     raise RuntimeError(f"东财请求失败: {last_error}")
-
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
 
 
 def _cache_rows(db_rows: list[dict], snapshot_date: str, requested_date: str) -> None:
@@ -135,9 +174,13 @@ def _cache_rows(db_rows: list[dict], snapshot_date: str, requested_date: str) ->
                 for row in db_rows
             ],
         }
-        CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        _warn("failed to save east sector heat cache", exc)
 
 
 def _load_cached_rows() -> dict | None:
@@ -162,7 +205,8 @@ def _load_cached_rows() -> dict | None:
             "requested_date": str(payload.get("requested_date") or ""),
             "db_rows": db_rows,
         }
-    except Exception:
+    except Exception as exc:
+        _warn("failed to load east sector heat cache", exc)
         return None
 
 
@@ -175,7 +219,8 @@ def _industry_map() -> dict[str, list[str]]:
                 if any(isinstance(t, ast.Name) and t.id == "EAST_INDUSTRY_MAP" for t in node.targets):
                     value = ast.literal_eval(node.value)
                     return value if isinstance(value, dict) else {}
-    except Exception:
+    except Exception as exc:
+        _warn("failed to load EAST_INDUSTRY_MAP", exc)
         return {}
     return {}
 
@@ -477,16 +522,20 @@ def _latest_east_trade_date(rows_l2: list[dict], end_date: str | None = None) ->
         klines = _fetch_industry_kline(str(rows_l2[0]["concept_code"]), target, limit=10)
         dates = [r["trade_date"] for r in klines if r.get("trade_date") and r["trade_date"] <= target]
         return dates[-1] if dates else target
-    except Exception:
+    except Exception as exc:
+        _warn("failed to resolve latest east trade date", exc)
         return target
 
 
 def _apply_historical_values(rows_l2: list[dict], snapshot_date: str) -> list[dict]:
     updated = []
+    failures: list[tuple[str, Exception]] = []
     for row in rows_l2:
+        concept_code = str(row["concept_code"])
         try:
-            klines = _fetch_industry_kline(str(row["concept_code"]), snapshot_date)
-        except Exception:
+            klines = _fetch_industry_kline(concept_code, snapshot_date)
+        except Exception as exc:
+            failures.append((concept_code, exc))
             klines = []
         matched = None
         for kline in reversed(klines):
@@ -499,6 +548,12 @@ def _apply_historical_values(rows_l2: list[dict], snapshot_date: str) -> list[di
         item["change_pct"] = matched.get("change_pct")
         item["hot_value"] = float(matched.get("amount") or matched.get("volume") or row.get("hot_value") or 0)
         updated.append(item)
+
+    if failures:
+        sample = "; ".join(f"{code}: {exc}" for code, exc in failures[:3])
+        if len(failures) > 3:
+            sample = f"{sample}; ... +{len(failures) - 3} more"
+        _warn(f"failed to fetch historical industry kline for {len(failures)} rows", RuntimeError(sample))
 
     updated.sort(key=lambda r: float(r.get("hot_value") or 0), reverse=True)
     for idx, row in enumerate(updated, start=1):
@@ -636,12 +691,12 @@ def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> d
         print(f"SYNCED={len(db_rows)}")
         return {"synced": len(db_rows), "raw_count": raw_count, "l1_count": len(rows_l1), "l2_count": len(rows_l2), "date": snapshot_date}
 
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import text
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     insert_sql = text(
         "INSERT INTO st_hot_concept_ths_daily "
-        "(snapshot_date, plate_type, rank, concept_code, concept_name, change_pct, hot_value, hot_tag, etl_sync_at) "
+        "(snapshot_date, plate_type, `rank`, concept_code, concept_name, change_pct, hot_value, hot_tag, etl_sync_at) "
         "VALUES (:snapshot_date, :plate_type, :rank, :concept_code, :concept_name, :change_pct, :hot_value, :hot_tag, :etl_sync_at)"
     )
 

@@ -1,0 +1,80 @@
+{
+  "schema_version": "probiga.trading-v4.release-runtime.v1",
+  "system": "trading_v4",
+  "system_version": "4.1.0-research",
+  "release_id": "trading_v4.1.0-research",
+  "created_on": "2026-08-07",
+  "lifecycle_status": "RESEARCH_ONLY",
+  "release_decision": "BLOCK",
+  "immutable": true,
+  "activation_eligible": false,
+  "paper_eligible": false,
+  "production_eligible": false,
+  "package": "server.trading_v4",
+  "entrypoint": "tools/trading_v4/run_research.py",
+  "default_kernel": "v4:kernel:blocked:v1",
+  "explicit_research_kernel": "v4:kernel:research-observation:v1",
+  "research_contract": {
+    "input_schema": "probiga.trading-v4.forward-research-input.v1",
+    "output_schema": "probiga.trading-v4.forward-research-result.v1",
+    "feature_set_version": "v4:daily-bar-chase-risk-v2",
+    "feature_builder_version": "v4:daily-bar-chase-risk-builder-v2",
+    "screening_policy_version": "v4:transparent-screening-policy:v1",
+    "evidence_ceiling": "FORWARD_ONLY",
+    "score_semantics": "UNCALIBRATED_ORDERING_HEURISTIC_NOT_A_FORECAST",
+    "score_formula": "clamp(50 + 1.5*clamp(return_5d_pct,-15,15) + 0.5*clamp(return_20d_pct,-30,30) - 2*max(ma20_extension_pct-12,0) - max(-15-ma20_extension_pct,0),0,100)",
+    "watch_threshold": 65,
+    "prefix_invariant": true,
+    "decision_time_must_equal_dataset_as_of": true,
+    "maximum_validity_seconds": 86400,
+    "dataset_as_of_must_equal_latest_selected_knowledge_time": true,
+    "maximum_per_instrument_latest_record_age_seconds": 21600,
+    "latest_completed_session_must_equal_decision_date": true,
+    "decision_clock": "AFTER_CLOSE",
+    "after_close_local_time_minimum": "15:00:00",
+    "timestamp_offset_policy": "ASIA_SHANGHAI_PLUS_08_ONLY"
+  },
+  "execution_boundary": {
+    "expected_return_estimation": false,
+    "probability_estimation": false,
+    "forecast_emission": false,
+    "action_emission": false,
+    "execution_intent_emission": false,
+    "paper_order_submission": false,
+    "real_order_submission": false,
+    "v2_or_v3_runtime_write": false
+  },
+  "evidence_gates": {
+    "historical_oos": {
+      "status": "BLOCK",
+      "evidence": "artifacts/trading_v4/final_acceptance_20260801.json",
+      "candidate_pass_count": 0,
+      "candidate_search_count": 77
+    },
+    "prospective_forward": {
+      "status": "NOT_SATISFIED",
+      "minimum_trading_days": 120,
+      "minimum_mature_portfolio_trades": 80,
+      "recorded_trading_days": 0,
+      "recorded_mature_portfolio_trades": 0
+    },
+    "database": {
+      "status": "DEFERRED_MIGRATION_IN_PROGRESS",
+      "tests_run": false,
+      "counts_as_pass": false,
+      "migration_head_recorded_only": "20260804_007_v4_factor_lineage"
+    }
+  },
+  "artifact_namespace": "artifacts/trading_v4/releases/trading_v4.1.0-research",
+  "task_namespace": null,
+  "task_status": "NOT_IMPLEMENTED",
+  "api_prefix": null,
+  "api_status": "NOT_IMPLEMENTED",
+  "database_namespace_reserved": "st_*_v4",
+  "canonical_execution_ledger_owner": "V2",
+  "notes": [
+    "This release fixes independent forward-research execution only.",
+    "It does not claim PIT certification, OOS success, paper readiness or production readiness.",
+    "Database acceptance is intentionally deferred while the external migration is in progress."
+  ]
+}

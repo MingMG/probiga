@@ -48,7 +48,7 @@ from typing import Any, TypeVar
 import numpy as np
 import pandas as pd
 from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 try:
@@ -70,10 +70,17 @@ logger = logging.getLogger("sync_stock_info")
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
+
+from server.common.batch_db import (
+    create_batch_engine,
+    quote_identifier,
+    read_frame,
+    replace_table_rows,
+    write_frame,
+)
 
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_stock_info_tables.sql"
 
@@ -95,20 +102,66 @@ TABLES_TRUNCATE_ORDER = [
 ]
 
 _QMT_SECTOR_CACHE: dict[str, pd.DataFrame] | None = None
+_QMT_SECTOR_CACHE_SOURCE = ""
 
 
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
+def _stock_pool_name_map(engine: Engine) -> dict[str, str]:
+    """Return the canonical A-share universe used by all membership tables."""
+    frame = read_frame(
+        text("SELECT stock_code, short_name FROM si_all_code"),
+        engine,
+    )
+    if frame is None or frame.empty:
+        return {}
+    frame = frame.copy()
+    frame["stock_code"] = frame["stock_code"].astype(str).str.strip().str.zfill(6)
+    frame["short_name"] = frame["short_name"].fillna("").astype(str).str.strip()
+    frame = frame[frame["stock_code"].str.fullmatch(r"[0-9]{6}", na=False)]
+    return (
+        frame.drop_duplicates(subset=["stock_code"], keep="last")
+        .set_index("stock_code")["short_name"]
+        .to_dict()
+    )
 
 
 def _sleep() -> None:
     time.sleep(float(os.environ.get("SI_REQUEST_SLEEP", "0.2")))
 
 
+def _qmt_runtime_available() -> bool:
+    """Return True only when the local QMT bridge can run on this host."""
+    try:
+        from integrations.qmt import bridge
+
+        return bool(bridge.is_configured())
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("QMT runtime availability check failed: %s", exc)
+        return False
+
+
+def _big_qmt_runtime_available() -> bool:
+    """Return True when the standard-QMT built-in strategy is alive."""
+    try:
+        from integrations.bigqmt import bridge
+
+        return bool(bridge.is_configured())
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("standard QMT runtime availability check failed: %s", exc)
+        return False
+
+
 def _source_value(*names: str, default: str = "") -> str:
     for name in names:
         value = os.environ.get(name, "").strip().lower()
         if value:
+            if value in {"big_qmt", "qmt_big"}:
+                value = "bigqmt"
+            if value == "qmt" and not _qmt_runtime_available():
+                logger.warning("QMT source %s requested but QMT runtime is unavailable; falling back.", name)
+                continue
+            if value == "bigqmt" and not _big_qmt_runtime_available():
+                logger.warning("standard QMT source %s requested but its built-in strategy is unavailable; falling back.", name)
+                continue
             return value
     return default
 
@@ -119,15 +172,25 @@ def _use_qmt_sector_data() -> bool:
         "SI_INDUSTRY_SOURCE",
         "DATA_SOURCE_CONCEPT_LIST",
         "DATA_SOURCE_CODE_LIST",
-    ) == "qmt"
+    ) in {"qmt", "bigqmt"}
 
 
 def _qmt_sector_tables() -> dict[str, pd.DataFrame]:
-    global _QMT_SECTOR_CACHE
-    if _QMT_SECTOR_CACHE is None:
-        from integrations.qmt.sectors import fetch_sector_datasets
+    global _QMT_SECTOR_CACHE, _QMT_SECTOR_CACHE_SOURCE
+    source = _source_value(
+        "SI_CONCEPT_SOURCE",
+        "SI_INDUSTRY_SOURCE",
+        "DATA_SOURCE_CONCEPT_LIST",
+        "DATA_SOURCE_CODE_LIST",
+    )
+    if _QMT_SECTOR_CACHE is None or _QMT_SECTOR_CACHE_SOURCE != source:
+        if source == "bigqmt":
+            from integrations.bigqmt.reference import fetch_sector_datasets
+        else:
+            from integrations.qmt.sectors import fetch_sector_datasets
 
         _QMT_SECTOR_CACHE = fetch_sector_datasets()
+        _QMT_SECTOR_CACHE_SOURCE = source
     return _QMT_SECTOR_CACHE
 
 
@@ -211,7 +274,7 @@ def truncate_all(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in TABLES_TRUNCATE_ORDER:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 共 %s 张表。", len(TABLES_TRUNCATE_ORDER))
 
@@ -223,7 +286,7 @@ def truncate_only(engine: Engine, *table_names: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in table_names:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 表：%s", ", ".join(table_names))
 
@@ -238,8 +301,7 @@ def df_to_table(engine: Engine, df: pd.DataFrame, table: str) -> None:
     written = 0
     for start in range(0, total, 500):
         chunk = df.iloc[start:start + 500]
-        chunk.to_sql(table, engine, if_exists="append", index=False, chunksize=100)
-        written += len(chunk)
+        written += write_frame(chunk, table, engine, if_exists="append", index=False, chunksize=100)
     logger.info("表 %s：写入 %s/%s 行。", table, written, total)
 
 
@@ -251,26 +313,35 @@ def load_info():
 
 
 def sync_all_code(engine: Engine, info) -> pd.DataFrame:
-    if _source_value("SI_ALL_CODE_SOURCE", "DATA_SOURCE_CODE_LIST") == "qmt":
-        from integrations.qmt.info import fetch_all_stock_codes
+    min_rows = int(os.environ.get("SI_ALL_CODE_MIN_ROWS", "1000"))
+    source = _source_value("SI_ALL_CODE_SOURCE", "DATA_SOURCE_CODE_LIST")
+    if source in {"qmt", "bigqmt"}:
+        if source == "bigqmt":
+            from integrations.bigqmt.reference import fetch_all_stock_codes
+        else:
+            from integrations.qmt.info import fetch_all_stock_codes
 
-        truncate_only(engine, "si_all_code")
         ts = _now()
         df = fetch_all_stock_codes()
         if df is None or df.empty:
             raise RuntimeError("QMT stock code list returned no rows")
         df = _clean_object_df(df)
+        if len(df) < min_rows:
+            raise RuntimeError(f"QMT stock code list returned too few rows: {len(df)} < {min_rows}")
         df["etl_sync_at"] = ts
-        df_to_table(engine, df, "si_all_code")
+        replace_table_rows(df, "si_all_code", engine)
         _sleep()
         return df
 
-    truncate_only(engine, "si_all_code")
     ts = _now()
     df = retry_remote(info.all_code)
     df = _clean_object_df(df)
+    if df is None or df.empty:
+        raise RuntimeError("stock code source returned no rows")
+    if len(df) < min_rows:
+        raise RuntimeError(f"stock code source returned too few rows: {len(df)} < {min_rows}")
     df["etl_sync_at"] = ts
-    df_to_table(engine, df, "si_all_code")
+    replace_table_rows(df, "si_all_code", engine)
     _sleep()
     return df
 
@@ -491,8 +562,12 @@ def sync_trade_calendar(engine: Engine, info) -> None:
 
 
 def sync_all_index_code(engine: Engine, info) -> pd.DataFrame:
-    if _source_value("SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST") == "qmt":
-        from integrations.qmt.info import fetch_all_index_codes
+    source = _source_value("SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST")
+    if source in {"qmt", "bigqmt"}:
+        if source == "bigqmt":
+            from integrations.bigqmt.reference import fetch_all_index_codes
+        else:
+            from integrations.qmt.info import fetch_all_index_codes
 
         ts = _now()
         df = fetch_all_index_codes(engine=engine)
@@ -571,13 +646,16 @@ def sync_all_index_code(engine: Engine, info) -> pd.DataFrame:
 
 
 def sync_index_constituent(engine: Engine, info, df_index: pd.DataFrame) -> None:
-    if _source_value("SI_INDEX_CONSTITUENT_SOURCE", "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST") == "qmt":
-        from integrations.qmt.info import fetch_index_constituents
+    source = _source_value("SI_INDEX_CONSTITUENT_SOURCE", "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST")
+    if source in {"qmt", "bigqmt"}:
+        if source == "bigqmt":
+            from integrations.bigqmt.reference import fetch_index_constituents
+        else:
+            from integrations.qmt.info import fetch_index_constituents
 
         ts = _now()
         if df_index is None or df_index.empty:
             return
-        truncate_only(engine, "si_index_constituent")
         codes = (
             df_index["index_code"]
             .dropna()
@@ -589,18 +667,49 @@ def sync_index_constituent(engine: Engine, info, df_index: pd.DataFrame) -> None
         )
         df = fetch_index_constituents(codes)
         if df is None or df.empty:
-            logger.warning("QMT index constituents returned no rows")
-            return
-        df = _clean_object_df(df)
+            raise RuntimeError("QMT index constituents returned no rows; preserving previous snapshot")
+        allowed_indexes = {str(code).strip().zfill(6) for code in codes}
+        stock_names = _stock_pool_name_map(engine)
+        if not stock_names:
+            raise RuntimeError("canonical stock pool is empty; preserving previous index constituents")
+        df = df.copy()
+        df["index_code"] = df["index_code"].astype(str).str.strip().str.zfill(6)
+        df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
+        before_filter = len(df)
+        df = df[
+            df["index_code"].isin(allowed_indexes)
+            & df["stock_code"].isin(stock_names)
+        ].drop_duplicates(subset=["index_code", "stock_code"], keep="last")
+        if df.empty:
+            raise RuntimeError("QMT index constituents failed stock-pool validation; preserving previous snapshot")
+        coverage = df["index_code"].nunique() / max(len(allowed_indexes), 1)
+        min_coverage = min(
+            1.0,
+            max(0.0, float(os.environ.get("QMT_INDEX_CONSTITUENT_MIN_COVERAGE", "0.80"))),
+        )
+        if coverage < min_coverage:
+            raise RuntimeError(
+                "QMT index constituent coverage below threshold: "
+                f"{df['index_code'].nunique()}/{len(allowed_indexes)} "
+                f"({coverage:.1%}) < {min_coverage:.1%}; preserving previous snapshot"
+            )
+        df["short_name"] = df["stock_code"].map(stock_names).fillna("")
         df["etl_sync_at"] = ts
-        df_to_table(engine, df, "si_index_constituent")
+        clean = _clean_object_df(df[["index_code", "stock_code", "short_name", "etl_sync_at"]])
+        replace_table_rows(clean, "si_index_constituent", engine, chunksize=2000, method="multi")
+        logger.info(
+            "QMT index constituents atomically replaced: rows=%d indexes=%d coverage=%.2f%% filtered=%d",
+            len(clean),
+            df["index_code"].nunique(),
+            coverage * 100,
+            before_filter - len(df),
+        )
         _sleep()
         return
 
     ts = _now()
     if df_index is None or df_index.empty:
         return
-    truncate_only(engine, "si_index_constituent")
     codes = (
         df_index["index_code"]
         .dropna()
@@ -627,20 +736,59 @@ def sync_index_constituent(engine: Engine, info, df_index: pd.DataFrame) -> None
         if (i + 1) % 20 == 0:
             logger.info("指数成分进度：%s/%s", i + 1, len(codes))
         _sleep()
-    if parts:
-        df_to_table(engine, pd.concat(parts, ignore_index=True), "si_index_constituent")
+    if not parts:
+        raise RuntimeError(
+            "external index constituents returned no rows; preserving previous snapshot"
+        )
+    combined = pd.concat(parts, ignore_index=True)
+    combined["index_code"] = combined["index_code"].astype(str).str.strip().str.zfill(6)
+    combined["stock_code"] = combined["stock_code"].astype(str).str.strip().str.zfill(6)
+    combined = combined.dropna(subset=["index_code", "stock_code"])
+    combined = combined.drop_duplicates(subset=["index_code", "stock_code"], keep="last")
+    covered_indexes = int(combined["index_code"].nunique())
+    coverage = covered_indexes / max(len(codes), 1)
+    min_coverage = min(
+        1.0,
+        max(
+            0.0,
+            float(os.environ.get("SI_INDEX_CONSTITUENT_MIN_COVERAGE", "0.05")),
+        ),
+    )
+    if combined.empty or coverage < min_coverage:
+        raise RuntimeError(
+            "external index constituent coverage below threshold: "
+            f"{covered_indexes}/{len(codes)} ({coverage:.1%}) < {min_coverage:.1%}; "
+            "preserving previous snapshot"
+        )
+    if "short_name" not in combined.columns:
+        combined["short_name"] = ""
+    combined["etl_sync_at"] = ts
+    clean = _clean_object_df(
+        combined[["index_code", "stock_code", "short_name", "etl_sync_at"]]
+    )
+    replace_table_rows(
+        clean,
+        "si_index_constituent",
+        engine,
+        chunksize=2000,
+        method="multi",
+    )
+    logger.info(
+        "External index constituents atomically replaced: rows=%d indexes=%d coverage=%.2f%%",
+        len(clean),
+        covered_indexes,
+        coverage * 100,
+    )
 
 
 def sync_concept_code_east(engine: Engine, info) -> pd.DataFrame:
     if _use_qmt_sector_data():
-        truncate_only(engine, "si_concept_code_east")
         ts = _now()
         df = _qmt_sector_tables().get("concept_catalog", pd.DataFrame()).copy()
         if df.empty:
-            logger.warning("QMT concept catalog returned no rows")
-            return df
+            raise RuntimeError("QMT concept catalog returned no rows; preserving previous snapshot")
         df["etl_sync_at"] = ts
-        df_to_table(engine, _clean_object_df(df), "si_concept_code_east")
+        replace_table_rows(_clean_object_df(df), "si_concept_code_east", engine)
         _sleep()
         return df
 
@@ -658,7 +806,6 @@ def sync_concept_code_east(engine: Engine, info) -> pd.DataFrame:
 
 def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) -> None:
     if _use_qmt_sector_data():
-        truncate_only(engine, "si_concept_constituent_east")
         ts = _now()
         df = _qmt_sector_tables().get("concept_constituents", pd.DataFrame()).copy()
         if df_codes is not None and not df_codes.empty and "concept_code" in df_codes.columns:
@@ -668,10 +815,9 @@ def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) 
             if allowed:
                 df = df[df["concept_code"].astype(str).isin(allowed)].copy()
         if df.empty:
-            logger.warning("QMT concept constituents returned no rows")
-            return
+            raise RuntimeError("QMT concept constituents returned no rows; preserving previous snapshot")
         df["etl_sync_at"] = ts
-        df_to_table(engine, _clean_object_df(df), "si_concept_constituent_east")
+        replace_table_rows(_clean_object_df(df), "si_concept_constituent_east", engine)
         _sleep()
         return
 
@@ -703,6 +849,70 @@ def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) 
         _sleep()
     if parts:
         df_to_table(engine, pd.concat(parts, ignore_index=True), "si_concept_constituent_east")
+
+
+def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
+    """Fetch the QMT concept catalog and membership once, then replace both atomically."""
+    tables = _qmt_sector_tables()
+    catalog = tables.get("concept_catalog", pd.DataFrame()).copy()
+    constituents = tables.get("concept_constituents", pd.DataFrame()).copy()
+    if catalog.empty:
+        raise RuntimeError("QMT concept catalog returned no rows; preserving previous snapshots")
+    if constituents.empty:
+        raise RuntimeError("QMT concept constituents returned no rows; preserving previous snapshots")
+
+    catalog_codes = {
+        str(code).strip()
+        for code in catalog["concept_code"].dropna().astype(str).tolist()
+        if str(code).strip()
+    }
+    constituents["concept_code"] = constituents["concept_code"].astype(str).str.strip()
+    constituents["stock_code"] = constituents["stock_code"].astype(str).str.zfill(6)
+    stock_names = _stock_pool_name_map(engine)
+    if not stock_names:
+        raise RuntimeError("canonical stock pool is empty; preserving previous concept snapshots")
+    constituents = constituents[
+        constituents["concept_code"].isin(catalog_codes)
+        & constituents["stock_code"].str.fullmatch(r"[0-9]{6}", na=False)
+        & constituents["stock_code"].isin(stock_names)
+    ].drop_duplicates(subset=["concept_code", "stock_code"], keep="last")
+    if constituents.empty:
+        raise RuntimeError("QMT concept memberships failed validation; preserving previous snapshots")
+    membership_coverage = constituents["concept_code"].nunique() / max(len(catalog_codes), 1)
+    min_coverage = min(
+        1.0,
+        max(0.0, float(os.environ.get("QMT_CONCEPT_MEMBERSHIP_MIN_COVERAGE", "0.80"))),
+    )
+    if membership_coverage < min_coverage:
+        raise RuntimeError(
+            "QMT concept membership coverage below threshold: "
+            f"{constituents['concept_code'].nunique()}/{len(catalog_codes)} "
+            f"({membership_coverage:.1%}) < {min_coverage:.1%}; preserving previous snapshots"
+        )
+
+    ts = _now()
+    catalog["etl_sync_at"] = ts
+    constituents["short_name"] = constituents["stock_code"].map(stock_names).fillna("")
+    constituents["etl_sync_at"] = ts
+    clean_catalog = _clean_object_df(catalog)
+    clean_constituents = _clean_object_df(constituents)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM `si_concept_constituent_east`"))
+        conn.execute(text("DELETE FROM `si_concept_code_east`"))
+        write_frame(clean_catalog, "si_concept_code_east", conn, chunksize=1000, method="multi")
+        write_frame(
+            clean_constituents,
+            "si_concept_constituent_east",
+            conn,
+            chunksize=2000,
+            method="multi",
+        )
+    logger.info(
+        "QMT concept reference atomically replaced: concepts=%d memberships=%d",
+        len(clean_catalog),
+        len(clean_constituents),
+    )
+    return {"concepts": int(len(clean_catalog)), "memberships": int(len(clean_constituents))}
 
 
 def sync_concept_code_ths(engine: Engine, info) -> pd.DataFrame:
@@ -776,15 +986,6 @@ def sync_per_stock_tables(engine: Engine, info, df_codes: pd.DataFrame) -> None:
     if df_codes is None or df_codes.empty:
         return
     if _use_qmt_sector_data():
-        truncate_only(
-            engine,
-            "si_stock_shares",
-            "si_industry_sw",
-            "si_stock_concept_east",
-            "si_stock_plate_east",
-            "si_stock_concept_baidu",
-            "si_stock_concept_ths",
-        )
         ts = _now()
         codes = df_codes["stock_code"].astype(str).str.zfill(6).tolist()
         codes = set(_stock_limit(codes))
@@ -793,25 +994,43 @@ def sync_per_stock_tables(engine: Engine, info, df_codes: pd.DataFrame) -> None:
         industry_df = tables.get("industry_sw", pd.DataFrame()).copy()
         if not industry_df.empty:
             industry_df = industry_df[industry_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
-            if not industry_df.empty:
-                industry_df["etl_sync_at"] = ts
-                df_to_table(engine, _clean_object_df(industry_df), "si_industry_sw")
 
         concept_df = tables.get("stock_concepts", pd.DataFrame()).copy()
         if not concept_df.empty:
             concept_df = concept_df[concept_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
-            if not concept_df.empty:
-                concept_df["etl_sync_at"] = ts
-                df_to_table(engine, _clean_object_df(concept_df), "si_stock_concept_east")
 
         plate_df = tables.get("stock_plates", pd.DataFrame()).copy()
         if not plate_df.empty:
             plate_df = plate_df[plate_df["stock_code"].astype(str).str.zfill(6).isin(codes)].copy()
-            if not plate_df.empty:
-                plate_df["etl_sync_at"] = ts
-                df_to_table(engine, _clean_object_df(plate_df), "si_stock_plate_east")
 
-        logger.info("QMT 个股维表已写入：industry=%s concept=%s plate=%s", len(industry_df), len(concept_df), len(plate_df))
+        empty_targets = [
+            table_name
+            for table_name, frame in (
+                ("si_industry_sw", industry_df),
+                ("si_stock_concept_east", concept_df),
+                ("si_stock_plate_east", plate_df),
+            )
+            if frame.empty
+        ]
+        if empty_targets:
+            raise RuntimeError(
+                "QMT stock relations returned empty datasets; preserving previous snapshots: "
+                + ", ".join(empty_targets)
+            )
+
+        industry_df["etl_sync_at"] = ts
+        concept_df["etl_sync_at"] = ts
+        plate_df["etl_sync_at"] = ts
+        replace_table_rows(_clean_object_df(industry_df), "si_industry_sw", engine)
+        replace_table_rows(_clean_object_df(concept_df), "si_stock_concept_east", engine)
+        replace_table_rows(_clean_object_df(plate_df), "si_stock_plate_east", engine)
+
+        logger.info(
+            "QMT 个股维表已原表替换：industry=%s concept=%s plate=%s；其它 si_* 表未改动",
+            len(industry_df),
+            len(concept_df),
+            len(plate_df),
+        )
         return
 
     truncate_only(
@@ -943,9 +1162,8 @@ def _step(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 def main() -> None:
-    url = _mysql_url()
-    logger.info("连接：%s", re.sub(r":([^:@]+)@", r":***@", url))
-    engine = create_engine(url, pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
+    logger.info("连接：%s", re.sub(r":([^:@]+)@", r":***@", str(engine.url)))
     run_ddl(engine)
     if os.environ.get("SI_SKIP_GLOBAL_TRUNCATE") == "1":
         logger.info(
@@ -957,7 +1175,7 @@ def main() -> None:
     info = load_info()
 
     if os.environ.get("SI_SYNC_SKIP_ALL_CODE") == "1":
-        df_code = pd.read_sql_query("SELECT stock_code FROM si_all_code ORDER BY stock_code", engine)
+        df_code = read_frame(text("SELECT stock_code FROM si_all_code ORDER BY stock_code"), engine)
         if df_code.empty:
             logger.error("SI_SYNC_SKIP_ALL_CODE=1 但 si_all_code 为空，无法继续。")
             sys.exit(1)

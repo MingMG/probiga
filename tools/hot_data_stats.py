@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 热门数据统计：从 st_hot_concept_ths_daily、st_hot_rank_ths、st_hot_pop_rank_east
@@ -6,27 +7,22 @@
 """
 
 import argparse
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+ensure_adata_import_path(ROOT)
 
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-
+from server.common.batch_db import read_frame, write_frame
 
 def _ensure_stats_table(engine):
     sql = """
@@ -53,8 +49,8 @@ def stats_hot_concept_ths(engine, stat_date: str, save: bool):
     print(f"【同花顺热门概念/行业TOP20】统计日期: {stat_date}")
     print(f"{'='*60}")
 
-    q = text("SELECT * FROM st_hot_concept_ths_daily WHERE snapshot_date = :d ORDER BY plate_type, rank")
-    df = pd.read_sql(q, engine, params={"d": stat_date})
+    q = text("SELECT * FROM st_hot_concept_ths_daily WHERE snapshot_date = :d ORDER BY plate_type, `rank`")
+    df = read_frame(q, engine, params={"d": stat_date})
     if df.empty:
         print(f"  {stat_date} 无数据")
         return
@@ -80,7 +76,7 @@ def stats_hot_concept_ths(engine, stat_date: str, save: bool):
         for _, r in df.iterrows():
             label = "概念板块" if r["plate_type"] == 1 else "行业板块"
             rows.append({"stat_date": stat_date, "stat_type": f"同花顺热门{label}TOP20", "stat_name": r["concept_name"], "stat_value": r["hot_value"], "stat_desc": f"排名{int(r['rank'])} 涨跌幅{r['change_pct']:.2f}%", "etl_sync_at": now})
-        pd.DataFrame(rows).to_sql("st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(pd.DataFrame(rows), "st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
         print(f"\n  已保存 {len(rows)} 条到 st_hot_stats")
 
 
@@ -89,8 +85,8 @@ def stats_hot_rank_ths(engine, stat_date: str, save: bool):
     print(f"【同花顺热股TOP100】统计日期: {stat_date}")
     print(f"{'='*60}")
 
-    q = text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY rank")
-    df = pd.read_sql(q, engine, params={"d": stat_date})
+    q = text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY `rank`")
+    df = read_frame(q, engine, params={"d": stat_date})
     if df.empty:
         print(f"  {stat_date} 无数据")
         return
@@ -112,7 +108,7 @@ def stats_hot_rank_ths(engine, stat_date: str, save: bool):
         rows = [{"stat_date": stat_date, "stat_type": "同花顺热股TOP100-涨跌统计", "stat_name": "上涨家数", "stat_value": up_count, "stat_desc": f"下跌家数: {down_count}", "etl_sync_at": now}]
         for _, r in df.iterrows():
             rows.append({"stat_date": stat_date, "stat_type": "同花顺热股TOP100", "stat_name": r["short_name"], "stat_value": r["hot_value"], "stat_desc": f"排名{int(r['rank'])} 涨跌幅{r['change_pct']:.2f}%", "etl_sync_at": now})
-        pd.DataFrame(rows).to_sql("st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(pd.DataFrame(rows), "st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
         print(f"  已保存 {len(rows)} 条到 st_hot_stats")
 
 
@@ -121,8 +117,8 @@ def stats_hot_pop_rank_east(engine, stat_date: str, save: bool):
     print(f"【东财人气榜TOP100】统计日期: {stat_date}")
     print(f"{'='*60}")
 
-    q = text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY rank")
-    df = pd.read_sql(q, engine, params={"d": stat_date})
+    q = text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY `rank`")
+    df = read_frame(q, engine, params={"d": stat_date})
     if df.empty:
         print(f"  {stat_date} 无数据")
         return
@@ -144,7 +140,7 @@ def stats_hot_pop_rank_east(engine, stat_date: str, save: bool):
         rows = [{"stat_date": stat_date, "stat_type": "东财人气榜TOP100-涨跌统计", "stat_name": "上涨家数", "stat_value": up_count, "stat_desc": f"下跌家数: {down_count}", "etl_sync_at": now}]
         for _, r in df.iterrows():
             rows.append({"stat_date": stat_date, "stat_type": "东财人气榜TOP100", "stat_name": r["short_name"], "stat_value": r["change_pct"], "stat_desc": f"排名{int(r['rank'])} 价格{r['price']:.2f}", "etl_sync_at": now})
-        pd.DataFrame(rows).to_sql("st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(pd.DataFrame(rows), "st_hot_stats", engine, if_exists="append", index=False, chunksize=500, method="multi")
         print(f"  已保存 {len(rows)} 条到 st_hot_stats")
 
 
@@ -155,7 +151,7 @@ def stats_recent_summary(engine, days: int):
 
     print(f"\n  st_hot_concept_ths_daily 各日期记录数:")
     q = text("SELECT snapshot_date, COUNT(*) as cnt FROM st_hot_concept_ths_daily WHERE snapshot_date >= DATE_SUB(CURDATE(), INTERVAL :d DAY) GROUP BY snapshot_date ORDER BY snapshot_date DESC")
-    df = pd.read_sql(q, engine, params={"d": days})
+    df = read_frame(q, engine, params={"d": days})
     if not df.empty:
         for _, r in df.iterrows():
             print(f"    {r['snapshot_date']}: {r['cnt']} 条")
@@ -164,7 +160,7 @@ def stats_recent_summary(engine, days: int):
 
     print(f"\n  st_hot_rank_ths 各日期记录数:")
     q = text("SELECT snapshot_date, COUNT(*) as cnt FROM st_hot_rank_ths WHERE snapshot_date >= DATE_SUB(CURDATE(), INTERVAL :d DAY) GROUP BY snapshot_date ORDER BY snapshot_date DESC")
-    df = pd.read_sql(q, engine, params={"d": days})
+    df = read_frame(q, engine, params={"d": days})
     if not df.empty:
         for _, r in df.iterrows():
             print(f"    {r['snapshot_date']}: {r['cnt']} 条")
@@ -173,7 +169,7 @@ def stats_recent_summary(engine, days: int):
 
     print(f"\n  st_hot_pop_rank_east 各日期记录数:")
     q = text("SELECT snapshot_date, COUNT(*) as cnt FROM st_hot_pop_rank_east WHERE snapshot_date >= DATE_SUB(CURDATE(), INTERVAL :d DAY) GROUP BY snapshot_date ORDER BY snapshot_date DESC")
-    df = pd.read_sql(q, engine, params={"d": days})
+    df = read_frame(q, engine, params={"d": days})
     if not df.empty:
         for _, r in df.iterrows():
             print(f"    {r['snapshot_date']}: {r['cnt']} 条")
@@ -188,7 +184,7 @@ def main():
     parser.add_argument("--recent", type=int, default=0, help="查看最近 N 天数据概况（与日期参数互斥）")
     args = parser.parse_args()
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     _ensure_stats_table(engine)
 
     if args.recent > 0:

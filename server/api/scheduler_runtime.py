@@ -52,6 +52,46 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
     }
 
 
+def start_detached_python_job(
+    *,
+    cmd: list[str],
+    root: Path,
+    env: dict[str, str],
+    log_name: str,
+    nice: int = 10,
+) -> dict[str, object]:
+    """Start a long-running Python job outside the API request lifecycle."""
+    data_dir = root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    safe_log_name = "".join(
+        ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in log_name
+    ).strip("_")
+    safe_log_name = safe_log_name or "detached_job"
+    out_path = data_dir / f"{safe_log_name}.out.log"
+    err_path = data_dir / f"{safe_log_name}.err.log"
+    stdout_handle = open(out_path, "a", encoding="utf-8")
+    stderr_handle = open(err_path, "a", encoding="utf-8")
+    try:
+        popen_kwargs = {
+            "cwd": str(root),
+            "env": env,
+            "stdout": stdout_handle,
+            "stderr": stderr_handle,
+            "text": True,
+        }
+        if os.name != "nt":
+            popen_kwargs["preexec_fn"] = lambda: os.nice(max(0, int(nice)))
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
+    return {
+        "pid": proc.pid,
+        "stdout_log": str(out_path),
+        "stderr_log": str(err_path),
+    }
+
+
 def _run_task(row: dict, root: Path, engine) -> None:
     """执行单个定时任务"""
     task_id = row["id"]

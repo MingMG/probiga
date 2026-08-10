@@ -1,0 +1,16 @@
+{
+  "schema_version": "probiga.trading-v5-research-environment.v1",
+  "release_id": "trading_v5.0.0-research",
+  "observed_environment": {
+    "python": "3.14.3",
+    "numpy": "2.4.5",
+    "pandas": "3.0.3"
+  },
+  "scope": "MODEL_RESEARCH_TEST_ENVIRONMENT_ONLY",
+  "observed_environment_evidence_status": "SELF_REPORTED_NOT_INDEPENDENT_EVIDENCE",
+  "wheel_or_lockfile_hashes_present": false,
+  "environment_fully_reproducible": false,
+  "counts_as_model_evidence": false,
+  "database_dependency": false,
+  "note": "Versions record the environment used for local verification; no wheel hashes or complete lockfile are available, so this is not a reproducible environment claim."
+}

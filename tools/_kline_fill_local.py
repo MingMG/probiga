@@ -4,18 +4,23 @@ import sys
 import os
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'adata'))
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, ROOT)
+from server.common.adata_release import ensure_adata_import_path
+
+ensure_adata_import_path(ROOT)
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import write_frame
 
-REMOTE_MYSQL = "mysql+pymysql://root:ProBigA%4070966@47.113.123.190:3306/probiga?charset=utf8mb4"
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
 
 def main():
-    engine = create_engine(REMOTE_MYSQL, connect_args={"connect_timeout": 30})
+    remote_mysql = os.environ.get("REMOTE_MYSQL_URL") or resolve_tool_mysql_url()
+    engine = create_tool_engine(remote_mysql, connect_args={"connect_timeout": 30})
 
     with engine.connect() as conn:
         all_codes = [r[0] for r in conn.execute(text("SELECT stock_code FROM si_all_code ORDER BY stock_code")).fetchall()]
@@ -55,7 +60,7 @@ def main():
                 conn.execute(text(
                     "DELETE FROM sm_stock_kline WHERE stock_code = :c AND trade_date >= :s AND trade_date <= :e"
                 ), {"c": row["stock_code"], "s": START_DATE, "e": END_DATE})
-        combined.to_sql("sm_stock_kline", engine, if_exists="append", index=False)
+        write_frame(combined, "sm_stock_kline", engine, if_exists="append", index=False)
         print(f"  [BATCH] Wrote {len(combined)} rows ({len(batch)} stocks)", flush=True)
         batch = []
 

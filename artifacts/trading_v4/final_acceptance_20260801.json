@@ -1,0 +1,84 @@
+{
+  "schema_version": "probiga.trading-v4-final-acceptance.v1",
+  "checked_on": "2026-08-01",
+  "decision": "BLOCK",
+  "decision_reason": "No stock-selection candidate passed the frozen OOS profit, stability, calibration, and multiplicity gates.",
+  "research": {
+    "campaign_count": 7,
+    "new_candidate_count": 28,
+    "prior_candidate_search_count": 49,
+    "familywise_candidate_search_count": 77,
+    "candidate_pass_count": 0,
+    "candidate_block_count": 28,
+    "historical_data_end": "2026-07-31",
+    "historical_success_ceiling": "PAPER_CANDIDATE"
+  },
+  "best_raw_candidate": {
+    "candidate_id": "broad_qfbr_moderate_5_v1",
+    "portfolio_trades": 46,
+    "net_expectancy_pct": 1.6541882475832541,
+    "profit_factor": 2.160153521971692,
+    "payoff_ratio": 1.66165655536284,
+    "net_profit_cny": 7955.10,
+    "maximum_drawdown_pct": 1.4934821244654617,
+    "positive_outer_folds": 3,
+    "outer_fold_count": 5,
+    "max_t_adjusted_p": 0.12843578210894552,
+    "gate_status": "BLOCK",
+    "block_reasons": [
+      "PORTFOLIO_TRADE_COUNT_TOO_LOW",
+      "POSITIVE_OUTER_FOLD_COUNT_TOO_LOW",
+      "MULTIPLE_TESTING_NOT_SIGNIFICANT",
+      "CALIBRATION_NOT_ACCEPTABLE"
+    ]
+  },
+  "best_coverage_candidate": {
+    "candidate_id": "bounded_qfbr_5_v1",
+    "portfolio_trades": 121,
+    "net_expectancy_pct": 0.21576305970760068,
+    "profit_factor": 1.1018065356891775,
+    "payoff_ratio": 1.6189810320330773,
+    "maximum_drawdown_pct": 2.8081073248921506,
+    "positive_outer_folds": 4,
+    "outer_fold_count": 5,
+    "max_t_adjusted_p": 0.8715642178910544,
+    "gate_status": "BLOCK",
+    "block_reasons": [
+      "PROFIT_FACTOR_TOO_LOW",
+      "MULTIPLE_TESTING_NOT_SIGNIFICANT",
+      "CALIBRATION_NOT_ACCEPTABLE"
+    ]
+  },
+  "production": {
+    "acceptance_passed_checks": 14,
+    "acceptance_total_checks": 16,
+    "acceptance_status": "BLOCKED",
+    "failed_checks": [
+      "active_oos_model_present",
+      "latest_validation_pass"
+    ],
+    "model_registered": false,
+    "paper_active_model_created": false,
+    "real_order_submission": false,
+    "real_trading_enabled_count": 0,
+    "real_order_allowed_count": 0,
+    "database_guard_probe": "PASS",
+    "services": {
+      "probiga": "active",
+      "probiga-scheduler": "active"
+    },
+    "deployment_backup": "/opt/ProBigA/.codex_backups/acceptance_20260801_104101"
+  },
+  "verification": {
+    "local_relevant_tests_passed": 85,
+    "production_relevant_tests_passed": 29,
+    "production_file_hashes_match_local": true
+  },
+  "prospective_requirement": {
+    "start_date": "2026-08-03",
+    "minimum_trading_days": 120,
+    "minimum_mature_portfolio_trades": 80,
+    "current_trading_days": 0,
+    "current_mature_portfolio_trades": 0
+  }
+}

@@ -1,0 +1,94 @@
+{
+  "schema_version": "probiga.trading-v5-release-runtime.v1",
+  "system": "trading_v5",
+  "system_version": "5.0.0-research",
+  "release_id": "trading_v5.0.0-research",
+  "created_on": "2026-08-08",
+  "lifecycle_status": "RESEARCH_ONLY",
+  "release_decision": "BLOCK",
+  "purpose": "Independent model-research primitives plus byte-frozen legacy evidence auditing; this is not an active stock selector.",
+  "owned_campaigns": [
+    {
+      "name": "regime_expert",
+      "campaign_path": "strategies/trading_v5/releases/trading_v5.0.0-research/campaigns/regime_expert/campaign.json",
+      "campaign_sha256": "9bafc682995480b41b85ab0ef45e4b45e7415e4cf45743e1a703eef276eb8198",
+      "research_contract_sha256": "b7ed63588e427d337e9a660c06138b78f69fda3cf8195c38e27fdf35bc9037e8",
+      "historical_artifact_path": "artifacts/trading_v5/regime_expert_capacity_oos_20260802.json",
+      "historical_artifact_sha256": "1a4f8c5fa229352ad20324f8cf4cc9ad85891d5d6aed78d1eb76795a64ba6259",
+      "historical_gate_status": "BLOCK",
+      "governance_status": "LEGACY_UNGOVERNED",
+      "json_status": "LEGACY_NON_STRICT_JSON",
+      "current_source_reproducible": false
+    },
+    {
+      "name": "unified_router",
+      "campaign_path": "strategies/trading_v5/releases/trading_v5.0.0-research/campaigns/unified_router/campaign.json",
+      "campaign_sha256": "4cbaea2ea7fc4639605c8c6facd3eb3cf2a6a03ba5085406e5197622b0d9cafd",
+      "research_contract_sha256": "3a6180d6dc43d0d12406f60dc8a7cdfde0a445b8c8af10747dd14dd5f5c6d095",
+      "historical_artifact_path": "artifacts/trading_v5/unified_router_capacity_oos_20260802.json",
+      "historical_artifact_sha256": "2702acf26801020b0f6ffae1081d9641bd50b1b7f5461afc7731f25d6ea58477",
+      "historical_gate_status": "BLOCK",
+      "governance_status": "RECORDED_GOVERNED_EXPLORATORY_BYTE_FROZEN_NOT_RECOMPUTED",
+      "json_status": "STRICT_JSON",
+      "current_source_reproducible": false
+    }
+  ],
+  "historical_evidence": {
+    "classification": "HISTORICAL_EXPLORATORY_BLOCK",
+    "all_history_through_2026_07_31_contaminated_by_prior_inspection": true,
+    "historical_pass_cannot_activate_model": true,
+    "source_snapshot_bound": false,
+    "raw_data_snapshot_bound": false,
+    "complete_runtime_config_bound": false,
+    "full_stress_matrix_executed": false,
+    "fold_equity_curves_preserved": false,
+    "bootstrap_seed_preregistered": false,
+    "counts_as_activation_evidence": false
+  },
+  "prospective_gate": {
+    "start_date": "2026-08-03",
+    "minimum_trading_days": 120,
+    "minimum_mature_portfolio_trades": 80,
+    "recorded_evidence_trading_days": 0,
+    "recorded_evidence_mature_portfolio_trades": 0,
+    "status": "NOT_EVALUATED",
+    "counts_as_pass": false
+  },
+  "model_research": {
+    "ridge_protocol": "v5:point-in-time-ridge:v2",
+    "regime_expert_protocol": "v5:point-in-time-regime-expert-ridge:v2",
+    "regime_router_protocol": "v5:market-regime-softmax:v1",
+    "training_input": "EXPLICIT_TIMEZONE_AWARE_DATAFRAME_ONLY",
+    "target_and_result_features_forbidden": true,
+    "caller_supplied_regime_labels_forbidden": true,
+    "caller_supplied_regime_probabilities_forbidden": true,
+    "prediction_samples_must_be_strictly_after_training_cutoff": true,
+    "model_activation_claim_forbidden": true,
+    "prediction_requires_process_local_fit_attestation": true,
+    "serialized_model_reload_supported": false,
+    "model_integrity_scope": "SELF_CONSISTENCY_PLUS_PROCESS_LOCAL_FIT_ATTESTATION_NOT_EXTERNAL_TRUST",
+    "registered_model_count": 0,
+    "environment_path": "strategies/trading_v5/releases/trading_v5.0.0-research/environment.json",
+    "environment_sha256": "763c452f9f39f44650bd3033472adffe57ca18f62f056802522725e53dad6027",
+    "environment_fully_reproducible": false
+  },
+  "database": {
+    "status": "DEFERRED_MIGRATION_IN_PROGRESS",
+    "tests_run": false,
+    "counts_as_pass": false
+  },
+  "execution_boundary": {
+    "actionable_output_allowed": false,
+    "paper_orders_allowed": false,
+    "real_orders_allowed": false,
+    "order_intents_allowed": false,
+    "v2_v3_v4_runtime_imports_allowed": false
+  },
+  "entrypoint": "tools/trading_v5/audit_release.py",
+  "artifact_namespace": "artifacts/trading_v5/releases/trading_v5.0.0-research",
+  "api_prefix": null,
+  "task_namespace": null,
+  "activation_eligible": false,
+  "paper_eligible": false,
+  "production_eligible": false
+}

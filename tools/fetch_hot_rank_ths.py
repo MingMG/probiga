@@ -14,21 +14,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from requests.exceptions import RequestException
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
 
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
+from server.common.batch_db import create_batch_engine, replace_table_rows
 
 
 def _call_with_retry(fn, *args, retries: int = 3, delay: float = 3.0, **kwargs):
@@ -62,15 +59,14 @@ def fetch_hot_rank_ths(snapshot_date: str):
 
     print(f"开始获取同花顺热股TOP100，快照日期: {snapshot_date}")
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
     _ensure_snapshot_date_column(engine)
 
     hot = Hot()
     df = _call_with_retry(hot.hot_rank_100_ths, snapshot_date=snapshot_date)
 
     if df is None or df.empty:
-        print("未获取到热股TOP100数据")
-        return
+        raise RuntimeError("no THS hot rank rows fetched")
 
     df = df.copy()
     df["snapshot_date"] = snapshot_date
@@ -81,14 +77,17 @@ def fetch_hot_rank_ths(snapshot_date: str):
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
     df = df[["snapshot_date", "rank", "stock_code", "short_name", "change_pct", "hot_value", "pop_tag", "concept_tag", "etl_sync_at"]]
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM st_hot_rank_ths WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_rank_ths", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    if len(df) < int(os.environ.get("HOT_RANK_MIN_ROWS", "50")):
+        raise RuntimeError(f"THS hot rank returned too few rows: {len(df)}")
+    replace_table_rows(
+        df, "st_hot_rank_ths", engine,
+        where_sql="snapshot_date = :d", params={"d": snapshot_date}, chunksize=500,
+    )
 
     print(f"写入完成: st_hot_rank_ths, 共 {len(df)} 行, 快照日期: {snapshot_date}")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="获取指定日期的同花顺热股TOP100（写入 st_hot_rank_ths）")
     parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
     args = parser.parse_args()
@@ -97,10 +96,15 @@ def main():
         datetime.strptime(args.date, "%Y-%m-%d")
     except ValueError:
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {args.date}")
-        return
+        return 1
 
-    fetch_hot_rank_ths(args.date)
+    try:
+        fetch_hot_rank_ths(args.date)
+    except Exception as exc:
+        print(f"THS hot rank sync failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

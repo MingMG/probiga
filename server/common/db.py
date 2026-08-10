@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from server.common.config import get_settings
+from server.common.engine_factory import create_pooled_engine
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
@@ -23,7 +24,5 @@ def get_engine():
     if not url:
         return None
     if _engine is None:
-        from sqlalchemy import create_engine
-
-        _engine = create_engine(url, echo=False, future=True)
+        _engine = create_pooled_engine(url, echo=False, future=True)
     return _engine

@@ -1,0 +1,115 @@
+{
+  "schema_version": "probiga.trading-v5-unified-router-research.v1",
+  "artifact_schema_version": "probiga.trading-v5-unified-router-oos.v1",
+  "campaign_id": "trading_v5_unified_router_capacity_20260802",
+  "created_on": "2026-08-02",
+  "parent_campaign": "trading_v5_regime_expert_capacity_aligned_20260802",
+  "diagnostic_basis": "The previous regime expert used research-only hard states while production used probabilistic routing. This new candidate freezes the shared production/research core router and state probabilities before a new run.",
+  "execution_boundary": {
+    "research_only": true,
+    "shadow_only": true,
+    "paper_orders_only_after_full_gate": true,
+    "real_order_submission": false,
+    "historical_success_ceiling": "PAPER_CANDIDATE"
+  },
+  "research_governance": {
+    "data_cutoff": "2026-07-31",
+    "preregistered_at": "2026-08-02T15:32:00+08:00",
+    "research_classification": "exploratory"
+  },
+  "candidate_control": {
+    "prior_recorded_candidate_searches": 80,
+    "maximum_new_candidate_count": 1,
+    "maximum_familywise_candidate_count": 81,
+    "candidate_specs_must_be_frozen_before_backtest": true,
+    "post_result_edits_create_a_new_campaign": true,
+    "multiple_testing_control": "CALENDAR_MONTH_JOINT_BLOCK_BOOTSTRAP_MAX_T_WITH_CUMULATIVE_BONFERRONI_ALPHA",
+    "fallback_bonferroni_one_sided_alpha": 0.0006172839506172839,
+    "candidates": [
+      {
+        "id": "regime_expert_trend_l30_unified_router_v1",
+        "family": "regime_expert_trend",
+        "base_universe": "rs_hpb_no_health_v1 eligible rows; Top50/day before labels",
+        "regime_experts": true,
+        "ridge_lambda": 30.0,
+        "target_clip_pct": [-12.0, 20.0],
+        "score": "sigmoid(shared_router_regime_expert_predicted_after_cost_net_return_pct/3)",
+        "exit_policy": "PRODUCTION_DYNAMIC_TREND_NEXT_OPEN"
+      }
+    ]
+  },
+  "predictor_protocol": {
+    "algorithm": "POINT_IN_TIME_SHARED_PRODUCTION_ROUTER_REGIME_EXPERT_L2_RIDGE",
+    "regime_experts": true,
+    "regime_column": "research_regime",
+    "states": ["TREND_UP", "THEME_ROTATION", "RANGE", "PANIC_RECOVERY", "RISK_OFF"],
+    "minimum_regime_fit_samples": 160,
+    "minimum_fit_samples": 300,
+    "minimum_feature_coverage": 0.8,
+    "feature_availability": "TRAINING_FOLD_ONLY_FAIL_CLOSED",
+    "feature_imputation": "training_median_only_after_coverage_gate",
+    "feature_standardization": "training_mean_and_population_std_only",
+    "portfolio_aligned_training": true,
+    "training_objective": "AFTER_COST_PRODUCTION_CAPACITY_FILTER_V1",
+    "features": [
+      "return_2d_pct", "return_5d_pct", "return_20d_pct", "return_60d_pct",
+      "ma20_slope_5d_pct", "breakout_20d_proximity", "amount_ratio_5_20",
+      "amount_ratio_1_20", "relative_strength_20d_pct", "distance_ma20_pct",
+      "distance_ma5_pct", "drawdown_20d_pct", "rebound_from_low_pct",
+      "previous_change_pct", "atr_14d_pct", "close_location_value",
+      "market_return_20d_pct", "market_return_60d_pct",
+      "market_breadth_pct", "breadth_change_5d_pct",
+      "realized_volatility_20d_pct", "limit_down_ratio_pct",
+      "regime_probability_trend_up", "regime_probability_theme_rotation",
+      "regime_probability_range", "regime_probability_panic_recovery",
+      "regime_probability_risk_off", "market_health",
+      "exit_sleeve_reversal", "quality_percentile",
+      "cashflow_percentile", "valuation_percentile"
+    ]
+  },
+  "nested_validation": {
+    "inner_oof_months": 12,
+    "inner_fit_signal_embargo_calendar_days": 35,
+    "inner_predictions_require_labels_mature_by_outer_training_end": true,
+    "inner_and_outer_top_per_day": 10,
+    "base_preselection_top_per_day": 50,
+    "calibration_bucket_count": 5,
+    "same_stock_cooldown_trading_days_after_exit": 5,
+    "right_censored_candidates_remain_in_portfolio": true
+  },
+  "outer_folds": [
+    {"name": "oos_2022", "training_start": "2020-01-02", "training_end": "2021-11-26", "validation_start": "2022-01-01", "validation_end": "2022-12-31"},
+    {"name": "oos_2023", "training_start": "2020-01-02", "training_end": "2022-11-26", "validation_start": "2023-01-01", "validation_end": "2023-12-31"},
+    {"name": "oos_2024", "training_start": "2021-01-01", "training_end": "2023-11-26", "validation_start": "2024-01-01", "validation_end": "2024-12-31"},
+    {"name": "oos_2025_h1", "training_start": "2022-01-01", "training_end": "2024-11-26", "validation_start": "2025-01-01", "validation_end": "2025-06-30"},
+    {"name": "oos_2025h2_2026h1", "training_start": "2022-07-01", "training_end": "2025-05-27", "validation_start": "2025-07-01", "validation_end": "2026-07-30"}
+  ],
+  "profit_gate": {
+    "minimum_oos_samples": 80,
+    "minimum_expected_return_net_pct": 0.0,
+    "minimum_profit_factor": 1.3,
+    "minimum_payoff_ratio": 1.0,
+    "minimum_portfolio_trades": 80,
+    "minimum_portfolio_net_expectancy_pct": 0.0,
+    "minimum_portfolio_profit_factor": 1.3,
+    "minimum_portfolio_payoff_ratio": 1.0,
+    "maximum_drawdown_pct": 12.0,
+    "minimum_positive_outer_folds": 4,
+    "minimum_outer_fold_profit_factor": 0.9
+  },
+  "stress_tests": {
+    "minimum_bootstrap_iterations": 2000,
+    "cost_multipliers": [1.0, 1.5, 2.0],
+    "execution_delay_sessions": [0, 1],
+    "remove_best_trade_counts": [0, 5],
+    "top_n_sensitivity": [5, 10, 20]
+  },
+  "evidence_status": {
+    "campaign_mode": "EXPLORATORY_ONLY",
+    "all_history_through_2026_07_31_is_contaminated_by_prior_inspection": true,
+    "historical_pass_cannot_activate_model": true,
+    "prospective_paper_start": "2026-08-03",
+    "minimum_prospective_trading_days": 120,
+    "minimum_prospective_mature_portfolio_trades": 80
+  }
+}

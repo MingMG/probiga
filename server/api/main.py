@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
 from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
-from server.api.routers import commentary, datasource, deploy, health, hot_data, jq_minute, market_radar, notify, scheduler, sim_trade
+from server.api.routers import commentary, datasource, deploy, health, hot_data, jq_minute, market_radar, notify, scheduler, screener, sim_trade
 from server.api.scheduler_runtime import start_embedded_scheduler
 
 
@@ -40,6 +40,7 @@ app.include_router(sim_trade.router, prefix="/api")
 app.include_router(datasource.router, prefix="/api")
 app.include_router(commentary.router, prefix="/api")
 app.include_router(market_radar.router, prefix="/api")
+app.include_router(screener.router, prefix="/api")
 app.include_router(deploy.router, prefix="/api")
 
 static_dir = Path(__file__).resolve().parent.parent / "static"

@@ -1,0 +1,115 @@
+{
+  "schema_version": "probiga.immutable-trading-release.v1",
+  "system": "trading_v6",
+  "system_version": "6.0.0-research",
+  "release_id": "trading_v6.0.0-research",
+  "created_on": "2026-08-08",
+  "lifecycle_status": "RESEARCH_ONLY",
+  "release_decision": "BLOCK",
+  "immutable": true,
+  "code_commit": "d00dd09caba7ae962b3ce66e85eac34c503b035e",
+  "code_commit_clean": false,
+  "git_anchor_status": "UNTRACKED_DIRTY_WORKTREE_NOT_COMMIT_REPRODUCIBLE",
+  "trusted_external_anchor_present": false,
+  "immutability_enforcement": "HASH_VERIFICATION_AND_APPEND_ONLY_POLICY",
+  "source_hashes_are_authoritative": true,
+  "source_coverage_required": true,
+  "source_tree_hash_algorithm": "sha256(sorted(path + NUL + file_sha256 + LF))",
+  "source_tree_sha256": "69b5aa52b313b5fd1a54b81e7457e81220e04f1852792c08367b2aeb56558911",
+  "source_files": {
+    "server/trading_v6/__init__.py": "2ec8879208b5e6b822895fc0040d748b98931ef779946df62048e9613de583d2",
+    "server/trading_v6/evidence.py": "ecfb982793827f91afb095edafc9ad46494200077ca0f81e8f17f7223ef52785",
+    "server/trading_v6/models.py": "91aa8a4ee9f5642520ecce697f872f2430ae1c0841e331bb2d94bdff235dcf86",
+    "server/trading_v6/pit_finance.py": "891a99202f6d92a2ebae35a8c0ec5360e357686484d5f0aa7ab2843cd215ad1e",
+    "tools/trading_v6/__init__.py": "e66606ca5a4b169092925a20c2bb5610b2fef70b43a7776b32de709dcc9c01f8",
+    "tools/trading_v6/audit_release.py": "eb9bf95305d2f7bb4fabc83f3c78b88a79ac2ba8783f9b841a958eb95c63ed90",
+    "tools/trading_v6/release_integrity.py": "9ce71a779ba722ee5a416f518ac240d66a04f9e1cdfa7169afcf7aa5fa978d30"
+  },
+  "config_path": "strategies/trading_v6/releases/trading_v6.0.0-research/runtime.json",
+  "config_sha256": "30a4bac57dd685adfe49cf1326f263a134ce47ea9f50fc76c499bb66c77bb525",
+  "config_files": {
+    "strategies/trading_v6/releases/trading_v6.0.0-research/environment.json": "14cd00a05b15d2be256c055d5704a49cc0acf1d973d252d38399cea34e4be775",
+    "strategies/trading_v6/releases/trading_v6.0.0-research/legacy_campaign.json": "b89c5bc54f2e12eb61f5d3b12f06bc62b6c49820fe01417be59aa647ba891caa",
+    "strategies/trading_v6/releases/trading_v6.0.0-research/runtime.json": "30a4bac57dd685adfe49cf1326f263a134ce47ea9f50fc76c499bb66c77bb525"
+  },
+  "test_manifest_path": "versions/trading_v6/releases/trading_v6.0.0-research/tests.txt",
+  "test_manifest_sha256": "825cb2788fa1d22ec389ed605e87965f5e9a564c69c98903191ed6bf68716ba2",
+  "test_files": {
+    "tests/architecture/test_v6_dependency_boundaries.py": "39046f26947bc10e6d6daaab4cf957dd9d5dbc33dd7378352e8d55935a7e348b",
+    "tests/test_trading_v6_evidence.py": "d2a56cb1088491ecf26d5a6f9f1192485d2730cd3030f2eba2b5fa89a02b8e92",
+    "tests/test_trading_v6_models.py": "8e04acba84ac84239641b50b4a2a535afe35de3160fab46e7e926975133d6172",
+    "tests/test_trading_v6_pit_finance.py": "5fe1937766e5d509a0694309a6fdf09eb1bf3f9f5cdda69ad48d4d8e733ed1e1",
+    "tests/test_trading_v6_release.py": "bbd367681dd372e2984e61a3f05386b77def3d6e0b8e30502af6e7663d8a2ff6"
+  },
+  "historical_evidence_files": {
+    "legacy_artifact": {
+      "path": "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.json",
+      "sha256": "4097c64da94417520771e129b6a0028c3387e52707f3c1dc48c04d2b65fa0137",
+      "decision": "BLOCK",
+      "evidence_type": "LEGACY_EXPLORATORY_RESULT",
+      "current_source_reproducible": false
+    },
+    "failed_stdout": {
+      "path": "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stdout.log",
+      "sha256": "45c16b525603605ea1cc4f1c85c18263f94ed4040e3fdc18e54bfb6732af5a8d",
+      "decision": "BLOCK",
+      "evidence_type": "FAILED_LEGACY_RUN_STDOUT",
+      "current_source_reproducible": false
+    },
+    "failed_stderr": {
+      "path": "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stderr.log",
+      "sha256": "40a709e6745a006e7271aba17f4750edbffc568b59184f8b2efd2cc2c61a3740",
+      "decision": "BLOCK",
+      "evidence_type": "FAILED_LEGACY_RUN_STDERR",
+      "current_source_reproducible": false
+    },
+    "completed_stdout": {
+      "path": "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stdout.log",
+      "sha256": "3cea8ce9d1ffd833e65771956dcf07a5f1b3d96d56f9430f0657564a2bb2b1a1",
+      "decision": "BLOCK",
+      "evidence_type": "COMPLETED_LEGACY_RUN_STDOUT",
+      "current_source_reproducible": false
+    },
+    "completed_stderr": {
+      "path": "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stderr.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "decision": "BLOCK",
+      "evidence_type": "COMPLETED_LEGACY_RUN_STDERR",
+      "current_source_reproducible": false
+    }
+  },
+  "historical_dependency_files": {
+    "legacy_runner": {
+      "path": "tools/research_trading_v4_ml_campaign.py",
+      "sha256": "cfae4b9dd18f5e612a03bfa197385818cd24cb71645c9a4341afb9b3827c424f",
+      "decision": "BLOCK",
+      "current_source_reproducible": false
+    }
+  },
+  "parent_release_id": "trading_v5.0.0-research",
+  "parent_manifest_path": "versions/trading_v5/releases/trading_v5.0.0-research/manifest.json",
+  "parent_manifest_sha256": "8aaf83919887095a7be1ffddba63868471b8a7660531a39c4d1d3c2418b62e3f",
+  "lineage_inherits_code": false,
+  "entrypoint": "tools/trading_v6/audit_release.py",
+  "artifact_namespace": "artifacts/trading_v6/releases/trading_v6.0.0-research",
+  "api_prefix": null,
+  "task_namespace": null,
+  "database_status": "DEFERRED_MIGRATION_IN_PROGRESS",
+  "database_tests_run": false,
+  "database_counts_as_pass": false,
+  "historical_candidate_count": 3,
+  "historical_candidate_pass_count": 0,
+  "historical_raw_closed_trade_count": 842,
+  "historical_final_trade_count": 0,
+  "full_stress_matrix_executed": false,
+  "declared_bootstrap_iterations": 2000,
+  "performed_bootstrap_iterations": 0,
+  "prospective_evidence_trading_days": 0,
+  "prospective_evidence_mature_portfolio_trades": 0,
+  "execution_contract": "NO_EXECUTION_EXACT_TIME_PIT_AND_MODEL_RESEARCH_WITH_HISTORICAL_AUDIT_ONLY",
+  "registered_model_count": 0,
+  "activation_eligible": false,
+  "paper_eligible": false,
+  "production_eligible": false,
+  "lineage_note": "The legacy V6 campaign and run logs remain byte-frozen BLOCK evidence. This release owns independent exact-time PIT-finance and true-logistic hurdle research primitives and explicitly does not claim to reproduce the historical raw-data-to-result pipeline."
+}

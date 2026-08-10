@@ -21,24 +21,31 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import create_engine, text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
+
+ensure_adata_import_path(ROOT)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("evening")
 
-from server.common.config import get_mysql_url, get_settings, get_wecom_webhook
+from server.common.batch_db import create_batch_engine, read_records
+from server.common.config import get_settings, get_wecom_webhook
+from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
+try:
+    from biz.research_radar.radar import build_research_radar, format_radar_markdown
+except Exception:
+    build_research_radar = None
+    format_radar_markdown = None
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 
 
 def get_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    return create_batch_engine()
 
 
 def _fmt_pct(v: float | None) -> str:
@@ -145,7 +152,7 @@ def collect_market_data(engine, date_str: str) -> dict:
         SELECT concept_name, change_pct, hot_value, plate_type
         FROM st_hot_concept_ths_daily
         WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_concept_ths_daily WHERE snapshot_date >= :d)
-        ORDER BY plate_type, rank
+        ORDER BY plate_type, `rank`
     """, {"d": date_str})
     data["热门行业"] = [r for r in rows if r.get("plate_type") == 2][:8]
     data["热门概念"] = [r for r in rows if r.get("plate_type") == 1][:10]
@@ -378,9 +385,7 @@ def push_to_wecom(content: str) -> bool:
 
 
 def _query(engine, sql: str, params: dict = None):
-    with engine.connect() as conn:
-        result = conn.execute(text(sql), params or {})
-        return [dict(zip(result.keys(), row)) for row in result.fetchall()]
+    return read_records(sql, engine, params=params)
 
 
 def _find_latest_trade_date(engine) -> str:
@@ -522,6 +527,25 @@ def pro_review_to_wecom(pro_text: str, date_str: str) -> str:
     return result
 
 
+def append_research_radar(content: str, engine, date_str: str) -> str:
+    if build_research_radar is None or format_radar_markdown is None:
+        return content
+    radar = build_research_radar(engine, date_str)
+    return content.rstrip() + "\n\n" + format_radar_markdown(radar, title="🧭 研报趋势雷达")
+
+
+def append_decision_radar(content: str, engine, date_str: str) -> str:
+    signal = fetch_tech_risk_signal(lambda sql, params=None: _query(engine, sql, params), date_str)
+    return append_tech_risk_markdown(content, signal)
+
+
+def _safe_print(text_value: str) -> None:
+    try:
+        print(text_value)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write((text_value + "\n").encode("utf-8", errors="replace"))
+
+
 def _colorize_pro_line(content: str) -> str:
     """给专业复盘行中的关键数据加企微颜色标签"""
     import re
@@ -564,8 +588,11 @@ def main():
         # ── 优先使用专业复盘 ──
         log.info("生成专业复盘...")
         try:
-            from biz.review.generate import generate_pro_review
-            pro_text = generate_pro_review(engine, date_str)
+            from biz.review.generate import generate_review
+            review_record = generate_review(engine, date_str)
+            pro_text = str(review_record.get("_pro_review_text") or "")
+            if not pro_text:
+                raise RuntimeError("专业复盘文本为空")
             log.info("专业复盘生成完成 (%d 字)", len(pro_text))
             report = pro_review_to_wecom(pro_text, date_str)
         except Exception as e:
@@ -584,8 +611,11 @@ def main():
         log.info("生成晚报报告...")
         report = build_report(data, date_str, ai_analysis)
 
+    report = append_decision_radar(report, engine, date_str)
+    report = append_research_radar(report, engine, date_str)
+
     if args.test:
-        print(report)
+        _safe_print(report)
         return
 
     log.info("推送到企微...")

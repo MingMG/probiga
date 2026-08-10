@@ -16,24 +16,27 @@ import time
 from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
+
+from server.common.batch_db import create_batch_engine, read_frame
 
 
 def get_engine():
-    return create_engine(get_mysql_url(required=True), pool_size=5, max_overflow=10)
+    return create_batch_engine(pool_size=5, max_overflow=10)
 
 
 def get_all_stock_codes(engine) -> list:
     """获取全市场股票代码"""
-    df = pd.read_sql(
+    df = read_frame(
         text("SELECT stock_code FROM si_all_code WHERE stock_code REGEXP '^(0|3|6)' ORDER BY stock_code"),
         engine,
     )

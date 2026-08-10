@@ -1,0 +1,4 @@
+tests/architecture/test_v5_dependency_boundaries.py
+tests/test_trading_v5_evidence.py
+tests/test_trading_v5_models.py
+tests/test_trading_v5_release.py

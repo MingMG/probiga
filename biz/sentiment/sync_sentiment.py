@@ -55,7 +55,7 @@ from typing import Any, TypeVar
 import numpy as np
 import pandas as pd
 from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 try:
@@ -77,10 +77,17 @@ logger = logging.getLogger("sync_sentiment")
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
+
+from server.common.batch_db import (
+    create_batch_engine,
+    quote_identifier,
+    read_frame,
+    replace_table_rows,
+    write_frame,
+)
 
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_sentiment_tables.sql"
 
@@ -97,10 +104,6 @@ TABLES_TRUNCATE_ORDER = [
     "st_securities_margin",
     "st_stock_lifting_last_month",
 ]
-
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
 
 
 def _sleep() -> None:
@@ -169,7 +172,7 @@ def truncate_all_sentiment(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in TABLES_TRUNCATE_ORDER:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 共 %s 张舆情表。", len(TABLES_TRUNCATE_ORDER))
 
@@ -180,7 +183,7 @@ def truncate_only(engine: Engine, *table_names: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in table_names:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 表：%s", ", ".join(table_names))
 
@@ -190,7 +193,7 @@ def df_to_table(engine: Engine, df: pd.DataFrame, table: str) -> None:
         logger.info("表 %s：无数据，跳过写入。", table)
         return
     df = _clean_object_df(df)
-    df.to_sql(table, engine, if_exists="append", index=False, chunksize=1000, method="multi")
+    write_frame(df, table, engine, if_exists="append", index=False, chunksize=1000, method="multi")
     logger.info("表 %s：写入 %s 行。", table, len(df))
 
 
@@ -406,7 +409,6 @@ def step_hot_concept(engine: Engine, sentiment: Any) -> None:
 
 
 def step_a_list_daily(engine: Engine, sentiment: Any) -> pd.DataFrame:
-    truncate_only(engine, "st_a_list_daily")
     dates = _a_list_report_dates(engine)
     parts: list[pd.DataFrame] = []
     for i, report in enumerate(dates):
@@ -423,13 +425,12 @@ def step_a_list_daily(engine: Engine, sentiment: Any) -> pd.DataFrame:
             logger.info("龙虎榜日列表历史进度：%s/%s（当前 %s）", i + 1, n, report)
 
     if not parts:
-        df_to_table(engine, pd.DataFrame(), "st_a_list_daily")
-        return pd.DataFrame()
+        raise RuntimeError("no a-list daily rows fetched")
     df = pd.concat(parts, ignore_index=True)
     if "trade_date" in df.columns and "stock_code" in df.columns:
         df = df.drop_duplicates(subset=["trade_date", "stock_code"], keep="last")
     df = _coerce_a_list_daily_columns(df)
-    df_to_table(engine, _with_etl(df), "st_a_list_daily")
+    replace_table_rows(_with_etl(df), "st_a_list_daily", engine)
     _sleep()
     return df
 
@@ -454,7 +455,6 @@ def step_a_list_info_batch_from_db(engine: Engine, sentiment: Any, start_s: str,
     if start_s > end_s:
         logger.warning("SE_A_LIST_DATE_END 早于 START，跳过批量明细。")
         return
-    truncate_only(engine, "st_a_list_info")
     with engine.connect() as conn:
         dates = conn.execute(
             text(
@@ -509,11 +509,10 @@ def step_a_list_info_batch_from_db(engine: Engine, sentiment: Any, start_s: str,
                 len(all_rows),
             )
     if not all_rows:
-        logger.info("表 st_a_list_info：无汇总数据。")
-        return
+        raise RuntimeError("no a-list info rows fetched")
     df = pd.concat(all_rows, ignore_index=True)
     df = _finalize_a_list_info_df(df)
-    df_to_table(engine, _with_etl(df), "st_a_list_info")
+    replace_table_rows(_with_etl(df), "st_a_list_info", engine)
 
 
 def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> None:
@@ -521,7 +520,7 @@ def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> 
         logger.info("已设置 SE_A_LIST_INFO!=1，跳过单股龙虎榜明细。")
         return
     if daily_df is None or daily_df.empty or "stock_code" not in daily_df.columns:
-        return
+        raise RuntimeError("st_a_list_daily is empty; cannot fetch a-list info")
     explicit_date = (os.environ.get("SE_A_LIST_DATE") or "").strip()
     codes_df = daily_df
     report = explicit_date or datetime.now().strftime("%Y-%m-%d")
@@ -543,7 +542,6 @@ def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> 
                 logger.warning("SE_A_LIST_DATE=%s 在日表数据中无对应行，跳过 st_a_list_info。", explicit_date)
                 return
             report = explicit_date[:10]
-    truncate_only(engine, "st_a_list_info")
     cap_raw = int(os.environ.get("SE_A_LIST_INFO_MAX", "80"))
     cap = 10**9 if cap_raw <= 0 else max(1, cap_raw)
     codes = codes_df["stock_code"].dropna().astype(str).unique().tolist()[:cap]
@@ -557,11 +555,10 @@ def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> 
         except Exception as e:  # pylint: disable=broad-except
             logger.warning("龙虎榜明细 %s 失败：%s", code, e)
     if not rows:
-        logger.info("表 st_a_list_info：无汇总数据。")
-        return
+        raise RuntimeError("no a-list info rows fetched")
     df = pd.concat(rows, ignore_index=True)
     df = _finalize_a_list_info_df(df)
-    df_to_table(engine, _with_etl(df), "st_a_list_info")
+    replace_table_rows(_with_etl(df), "st_a_list_info", engine)
 
 
 def step_mine(engine: Engine, sentiment: Any) -> None:
@@ -639,11 +636,11 @@ def _should_run(step: str, only_set: set[str]) -> bool:
     return not only_set or step in only_set
 
 
-def main() -> None:
+def main() -> int:
     args = _parse_args()
     only_set = _parse_only_set(args.only)
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
     run_ddl(engine)
     if not only_set and os.environ.get("SE_SKIP_GLOBAL_TRUNCATE") != "1":
         truncate_all_sentiment(engine)
@@ -660,6 +657,7 @@ def main() -> None:
         ("hot_ths", "同花顺热股", lambda: step_hot_ths(engine, sentiment)),
         ("hot_concept", "同花顺热门板块", lambda: step_hot_concept(engine, sentiment)),
     ]
+    failed_steps = 0
     for key, name, fn in steps:
         if not _should_run(key, only_set):
             continue
@@ -667,6 +665,7 @@ def main() -> None:
             fn()
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("步骤「%s」失败：%s", name, e)
+            failed_steps += 1
 
     explicit = (os.environ.get("SE_A_LIST_DATE") or "").strip()
     start_rng = (os.environ.get("SE_A_LIST_DATE_START") or "").strip()
@@ -697,16 +696,18 @@ def main() -> None:
             step_a_list_info_batch_from_db(engine, sentiment, start_rng, end_rng)
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("步骤「龙虎榜明细（批量）」失败：%s", e)
+            failed_steps += 1
     else:
         if _should_run("a_list_daily", only_set):
             try:
                 daily_df = step_a_list_daily(engine, sentiment)
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception("步骤「龙虎榜日列表」失败：%s", e)
+                failed_steps += 1
         elif _should_run("a_list_info", only_set):
             if os.environ.get("SE_A_LIST_FROM_DB", "0").strip() == "1":
                 try:
-                    daily_df = pd.read_sql(text("SELECT * FROM st_a_list_daily"), engine)
+                    daily_df = read_frame(text("SELECT * FROM st_a_list_daily"), engine)
                     if daily_df is None or daily_df.empty:
                         logger.warning(
                             "st_a_list_daily 无数据，无法拉 st_a_list_info。"
@@ -715,26 +716,31 @@ def main() -> None:
                 except Exception as e:  # pylint: disable=broad-except
                     logger.exception("从库读取 st_a_list_daily 失败：%s", e)
                     daily_df = pd.DataFrame()
+                    failed_steps += 1
             else:
                 try:
                     daily_df = step_a_list_daily(engine, sentiment)
                 except Exception as e:  # pylint: disable=broad-except
                     logger.exception("步骤「龙虎榜日列表」失败：%s", e)
+                    failed_steps += 1
 
         if _should_run("a_list_info", only_set):
             try:
                 step_a_list_info(engine, sentiment, daily_df)
             except Exception as e:  # pylint: disable=broad-except
                 logger.exception("步骤「龙虎榜明细」失败：%s", e)
+                failed_steps += 1
 
     if _should_run("mine", only_set):
         try:
             step_mine(engine, sentiment)
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("步骤「扫雷」失败：%s", e)
+            failed_steps += 1
 
     logger.info("舆情同步流程结束。")
+    return 1 if failed_steps else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

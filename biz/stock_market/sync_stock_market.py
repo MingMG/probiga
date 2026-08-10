@@ -52,6 +52,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import random
@@ -61,7 +63,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -69,7 +71,7 @@ import numpy as np
 import pandas as pd
 import requests
 from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
@@ -92,10 +94,19 @@ logger = logging.getLogger("sync_stock_market")
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
+
+from tools.env_config import load_project_env
+
+load_project_env()
+
+from server.common.batch_db import create_batch_engine, quote_identifier, read_frame, read_frame_direct, replace_table_rows, write_frame
+from server.common.kline_data import get_kline_engine
+from server.common.mysql_lock import mysql_named_lock
+from server.common.process_env import temporary_env
+from integrations.qmt.safe_upsert import safe_upsert_rows
 
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "02_sm_stock_market_tables.sql"
 
@@ -142,17 +153,12 @@ STEP_NAMES = {
 }
 
 
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
-
-
 def _log_mysql_target(url_str: str) -> None:
-    """启动时打印实际写入的库名，避免与 a_share_daily_import 等脚本默认的 biga 混淆。"""
+    """Log the primary metadata database without implying history write routing."""
     try:
         u = make_url(url_str)
         logger.info(
-            "MySQL 目标：database=%s host=%s（K 线落在本库的 `sm_stock_kline`；"
-            "若客户端连的是别的库会以为「全是空的」）",
+            "Primary MySQL: database=%s host=%s; K-line/minute writes follow the configured history route.",
             u.database,
             u.host,
         )
@@ -168,8 +174,24 @@ def _source_value(*names: str, default: str = "") -> str:
     for name in names:
         value = os.environ.get(name, "").strip().lower()
         if value:
+            if value in {"big_qmt", "qmt_big"}:
+                return "bigqmt"
             return value
     return default
+
+
+def _qmt_runtime_available(source: str = "qmt") -> bool:
+    """Return True only when the local QMT bridge can run on this host."""
+    try:
+        if str(source).strip().lower() == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
+
+        return bool(bridge.is_configured())
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        logger.debug("QMT runtime availability check failed: %s", exc)
+        return False
 
 
 def _index_source(kind: str) -> str:
@@ -258,6 +280,125 @@ def _load_stock_short_name_map(engine: Engine) -> dict[str, str]:
         return {}
 
 
+def _current_min_coverage() -> float:
+    """Return the minimum safe coverage for any realtime quote source."""
+    raw = os.environ.get(
+        "CURRENT_MIN_COVERAGE",
+        os.environ.get("QMT_CURRENT_MIN_COVERAGE", "0.98"),
+    )
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except (TypeError, ValueError):
+        return 0.98
+
+
+def _fetch_sina_stock_current(
+    stock_codes: list[str],
+    short_name_map: dict[str, str],
+) -> pd.DataFrame:
+    """Fetch a validated full-market fallback when QMT/adata is unavailable."""
+    from biz.stock_market.realtime_quotes import fetch_list_market_current
+
+    batch_size = max(50, int(os.environ.get("SINA_CURRENT_BATCH_SIZE", "500")))
+    parts: list[pd.DataFrame] = []
+    dropped = 0
+    snapshot_at = _now()
+    for batch in _chunked(stock_codes, batch_size):
+        frame = fetch_list_market_current(batch)
+        if frame is None or frame.empty:
+            continue
+        frame = frame.copy()
+        frame["stock_code"] = frame["stock_code"].astype(str).str.strip().str.zfill(6)
+        frame["short_name"] = frame.get("short_name", "").fillna("")
+        frame["short_name"] = frame["short_name"].where(
+            frame["short_name"].astype(str).str.strip().ne(""),
+            frame["stock_code"].map(short_name_map).fillna(""),
+        )
+        for column in ("price", "volume", "amount"):
+            frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+        valid = (
+            frame["price"].notna()
+            & (frame["price"] > 0)
+            & frame["volume"].fillna(0).ge(0)
+            & frame["amount"].fillna(0).ge(0)
+        )
+        dropped += int((~valid).sum())
+        frame = frame.loc[valid].copy()
+        if frame.empty:
+            continue
+        frame["snapshot_at"] = snapshot_at
+        parts.append(
+            frame.reindex(
+                columns=[
+                    "stock_code",
+                    "short_name",
+                    "price",
+                    "change",
+                    "change_pct",
+                    "volume",
+                    "amount",
+                    "snapshot_at",
+                ]
+            )
+        )
+    if not parts:
+        raise RuntimeError("Sina realtime fallback returned no valid rows")
+    result = pd.concat(parts, ignore_index=True)
+    if dropped:
+        logger.warning("Sina realtime fallback dropped %d invalid rows", dropped)
+    return result
+
+
+def _validate_stock_current_frame(
+    df: pd.DataFrame,
+    stock_codes: list[str],
+    *,
+    source: str,
+) -> tuple[int, float]:
+    """Validate a quote batch before it can replace the current snapshot."""
+    if df is None or df.empty or "stock_code" not in df.columns:
+        raise RuntimeError(f"{source} realtime source returned no valid rows")
+
+    expected = {str(code).strip().zfill(6) for code in stock_codes if str(code).strip()}
+    received_series = df["stock_code"].astype(str).str.strip().str.zfill(6)
+    received = set(received_series.tolist())
+    if not expected:
+        raise RuntimeError("unable to determine stock universe for realtime coverage validation")
+    if received_series.duplicated().any():
+        raise RuntimeError(f"{source} realtime source returned duplicate stock codes")
+
+    outside_pool = received - expected
+    if outside_pool:
+        raise RuntimeError(
+            f"{source} realtime source returned {len(outside_pool)} codes outside the canonical stock pool"
+        )
+
+    numeric = df.copy()
+    for column in ("price", "volume", "amount"):
+        if column not in numeric.columns:
+            numeric[column] = None
+        numeric[column] = pd.to_numeric(numeric[column], errors="coerce")
+    bad_price = int((numeric["price"].isna() | (numeric["price"] <= 0)).sum())
+    bad_volume_amount = int(
+        (numeric["volume"] < 0).fillna(False).sum()
+        + (numeric["amount"] < 0).fillna(False).sum()
+    )
+    if bad_price or bad_volume_amount:
+        raise RuntimeError(
+            f"{source} realtime source returned invalid values: bad_price={bad_price}, "
+            f"bad_volume_amount={bad_volume_amount}"
+        )
+
+    coverage = len(received) / max(len(expected), 1)
+    minimum = _current_min_coverage()
+    if coverage < minimum:
+        raise RuntimeError(
+            f"{source} realtime coverage below threshold: {len(received)}/{len(expected)} "
+            f"({coverage:.1%}) < {minimum:.1%}"
+        )
+    return len(received), coverage
+
+
 def _sleep_stock_kline_akshare() -> None:
     """AkShare 新浪日线：可单独限流；未配置则与全局 SM_REQUEST_SLEEP 一致。"""
     raw = os.environ.get("SM_STOCK_KLINE_AKSHARE_SLEEP", "").strip()
@@ -306,6 +447,598 @@ def _with_etl(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["etl_sync_at"] = _now()
     return out
+
+
+def _records_without_nan(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df is None or df.empty:
+        return []
+    return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
+
+
+def _upsert_qmt_kline_frame(engine: Engine, df: pd.DataFrame) -> int:
+    """Upsert a validated QMT K-line batch without deleting the last good data."""
+    stamped = _with_etl(df)
+    result = safe_upsert_rows(
+        engine,
+        table_name="sm_stock_kline",
+        rows=_records_without_nan(stamped),
+        key_columns=["stock_code", "trade_date", "k_type", "adjust_type"],
+        batch_id=f"qmt_kline_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+        permission_status="SUPPORTED",
+        quality_status="VERIFIED",
+    )
+    return int(result.accepted_rows)
+
+
+def _replace_qmt_minute_window(engine: Engine, df: pd.DataFrame) -> int:
+    """Atomically replace only the fetched time window for a small stock batch."""
+    if df is None or df.empty:
+        return 0
+    stamped = _with_etl(df).copy()
+    stamped["trade_time"] = pd.to_datetime(stamped["trade_time"], errors="coerce")
+    stamped["trade_date"] = pd.to_datetime(stamped["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    stamped = stamped.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
+    if stamped.empty:
+        return 0
+    stamped["stock_code"] = stamped["stock_code"].astype(str).str.zfill(6)
+    stamped = stamped.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
+    codes = sorted(stamped["stock_code"].unique().tolist())
+    placeholders = ", ".join(f":code_{idx}" for idx in range(len(codes)))
+    params: dict[str, Any] = {f"code_{idx}": code for idx, code in enumerate(codes)}
+    params["start_time"] = stamped["trade_time"].min().to_pydatetime()
+    params["end_time_exclusive"] = (
+        stamped["trade_time"].max() + pd.Timedelta(seconds=1)
+    ).to_pydatetime()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "DELETE FROM `sm_stock_minute` "
+                f"WHERE stock_code IN ({placeholders}) "
+                "AND trade_time >= :start_time AND trade_time < :end_time_exclusive"
+            ),
+            params,
+        )
+        write_frame(
+            _clean_df(stamped),
+            "sm_stock_minute",
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=max(500, int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000"))),
+            method="multi",
+        )
+    return int(len(stamped))
+
+
+def _create_qmt_minute_stage(engine: Engine, stage_table: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage_table)}"))
+        conn.execute(
+            text(
+                f"CREATE TABLE {quote_identifier(stage_table)} "
+                "LIKE `sm_stock_minute`"
+            )
+        )
+
+
+def _append_qmt_minute_stage(engine: Engine, stage_table: str, df: pd.DataFrame) -> int:
+    if df is None or df.empty:
+        return 0
+    stamped = _with_etl(df).copy()
+    write_frame(
+        _clean_df(stamped),
+        stage_table,
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=max(500, int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000"))),
+        method="multi",
+    )
+    return int(len(stamped))
+
+
+def _commit_qmt_minute_stage(
+    engine: Engine,
+    stage_table: str,
+    *,
+    first_trade_time: datetime,
+    last_trade_time: datetime,
+) -> int:
+    """Publish a validated minute stage in small per-code transactions.
+
+    A single DELETE/INSERT transaction for an entire trading day can retain
+    hundreds of thousands of InnoDB row locks and fail with MySQL error 1206.
+    The stage has already passed coverage validation, so publish it in small
+    stock-code groups while holding the existing application-level named lock.
+    Each group's old and new rows remain atomic and the business table/schema
+    stays unchanged.
+    """
+    target = quote_identifier("sm_stock_minute")
+    stage = quote_identifier(stage_table)
+    batch_size = max(
+        1,
+        min(100, int(os.environ.get("QMT_MINUTE_PUBLISH_CODE_BATCH_SIZE", "10"))),
+    )
+    with mysql_named_lock(engine, "probiga:stock_minute", timeout_seconds=0):
+        with engine.connect() as conn:
+            staged_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar() or 0)
+            if staged_rows <= 0:
+                return 0
+            codes = [
+                str(row[0]).zfill(6)
+                for row in conn.execute(
+                    text(f"SELECT DISTINCT stock_code FROM {stage} ORDER BY stock_code")
+                ).fetchall()
+                if row[0] is not None
+            ]
+            column_rows = conn.execute(
+                text(
+                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sm_stock_minute' "
+                    "AND COLUMN_NAME <> 'id' ORDER BY ORDINAL_POSITION"
+                ),
+            ).fetchall()
+        if not codes:
+            return 0
+        columns = [quote_identifier(str(row[0])) for row in column_rows]
+        if not columns:
+            raise RuntimeError("sm_stock_minute has no publishable columns")
+        column_list = ", ".join(columns)
+        inserted_rows = 0
+        total_batches = (len(codes) + batch_size - 1) // batch_size
+        for offset in range(0, len(codes), batch_size):
+            batch = codes[offset : offset + batch_size]
+            placeholders = ", ".join(f":code_{idx}" for idx in range(len(batch)))
+            params: dict[str, Any] = {
+                f"code_{idx}": code for idx, code in enumerate(batch)
+            }
+            params.update(
+                {
+                    "first_trade_time": first_trade_time,
+                    "last_trade_time": last_trade_time,
+                }
+            )
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"DELETE FROM {target} WHERE stock_code IN ({placeholders}) "
+                        "AND trade_time >= :first_trade_time "
+                        "AND trade_time <= :last_trade_time"
+                    ),
+                    params,
+                )
+                result = conn.execute(
+                    text(
+                        f"INSERT INTO {target} ({column_list}) "
+                        f"SELECT {column_list} FROM {stage} "
+                        f"WHERE stock_code IN ({placeholders})"
+                    ),
+                    params,
+                )
+                if result.rowcount is not None and result.rowcount >= 0:
+                    inserted_rows += int(result.rowcount)
+            batch_number = offset // batch_size + 1
+            if batch_number == total_batches or batch_number % 25 == 0:
+                logger.info(
+                    "QMT minute publish batch %s/%s: inserted=%s",
+                    batch_number,
+                    total_batches,
+                    inserted_rows,
+                )
+        return inserted_rows or staged_rows
+
+
+def _drop_qmt_minute_stage(engine: Engine, stage_table: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage_table)}"))
+
+
+def _record_qmt_minute_receipt(
+    engine: Engine,
+    *,
+    trade_date: str,
+    first_trade_time: datetime,
+    last_trade_time: datetime,
+    expected_count: int,
+    observed_count: int,
+    row_count: int,
+    source_provider: str,
+    capture_mode: str,
+    forward_eligible: bool,
+    evidence: dict[str, Any],
+) -> None:
+    """Attest which provider produced a published minute window.
+
+    ``sm_stock_minute`` predates row-level provenance columns.  The receipt
+    makes the source and coverage independently verifiable before an
+    intraday paper order can trust that window.
+    """
+    payload = {
+        "trade_date": trade_date,
+        "first_trade_time": first_trade_time.isoformat(),
+        "last_trade_time": last_trade_time.isoformat(),
+        "expected_count": int(expected_count),
+        "observed_count": int(observed_count),
+        "row_count": int(row_count),
+        "source_provider": source_provider,
+        "capture_mode": capture_mode,
+        "forward_eligible": bool(forward_eligible),
+        "evidence": evidence,
+    }
+    receipt_id = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    coverage = observed_count / max(expected_count, 1)
+    with engine.begin() as conn:
+        # Minute bars can live in the Windows data-plane database while V2
+        # business tables live on production. Keep the receipt beside the
+        # bars so both travel through the same configured minute-data route.
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS st_qmt_minute_sync_receipt_v2 (
+                    receipt_id VARCHAR(64) PRIMARY KEY,
+                    trade_date DATE NOT NULL,
+                    first_trade_time DATETIME NOT NULL,
+                    last_trade_time DATETIME NOT NULL,
+                    expected_count INT NOT NULL,
+                    observed_count INT NOT NULL,
+                    coverage DECIMAL(18,8) NOT NULL,
+                    row_count BIGINT NOT NULL,
+                    source_provider VARCHAR(80) NOT NULL,
+                    capture_mode VARCHAR(32) NOT NULL,
+                    forward_eligible TINYINT(1) NOT NULL DEFAULT 0,
+                    quality_status VARCHAR(16) NOT NULL,
+                    evidence_json LONGTEXT NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    UNIQUE KEY uk_qmt_minute_receipt_window
+                        (trade_date, first_trade_time, last_trade_time,
+                         source_provider, capture_mode),
+                    KEY idx_qmt_minute_receipt_latest
+                        (trade_date, last_trade_time)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+        )
+        columns = {
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME =
+                          'st_qmt_minute_sync_receipt_v2'
+                    """
+                )
+            ).fetchall()
+        }
+        if "capture_mode" not in columns:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE st_qmt_minute_sync_receipt_v2
+                    ADD COLUMN capture_mode VARCHAR(32) NOT NULL
+                        DEFAULT 'LEGACY_UNCLASSIFIED'
+                        AFTER source_provider
+                    """
+                )
+            )
+        if "forward_eligible" not in columns:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE st_qmt_minute_sync_receipt_v2
+                    ADD COLUMN forward_eligible TINYINT(1) NOT NULL
+                        DEFAULT 0
+                        AFTER capture_mode
+                    """
+                )
+            )
+        receipt_index_columns = tuple(
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME =
+                          'st_qmt_minute_sync_receipt_v2'
+                      AND INDEX_NAME =
+                          'uk_qmt_minute_receipt_window'
+                    ORDER BY SEQ_IN_INDEX
+                    """
+                )
+            ).fetchall()
+        )
+        expected_index_columns = (
+            "trade_date",
+            "first_trade_time",
+            "last_trade_time",
+            "source_provider",
+            "capture_mode",
+        )
+        if receipt_index_columns != expected_index_columns:
+            if receipt_index_columns:
+                conn.execute(
+                    text(
+                        """
+                        ALTER TABLE st_qmt_minute_sync_receipt_v2
+                        DROP INDEX uk_qmt_minute_receipt_window
+                        """
+                    )
+                )
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE st_qmt_minute_sync_receipt_v2
+                    ADD UNIQUE KEY uk_qmt_minute_receipt_window (
+                        trade_date, first_trade_time, last_trade_time,
+                        source_provider, capture_mode
+                    )
+                    """
+                )
+            )
+        conn.execute(
+            text(
+                """
+                INSERT INTO st_qmt_minute_sync_receipt_v2
+                (receipt_id, trade_date, first_trade_time,
+                 last_trade_time, expected_count, observed_count,
+                 coverage, row_count, source_provider, capture_mode,
+                 forward_eligible, quality_status, evidence_json, created_at)
+                VALUES
+                (:receipt_id, :trade_date, :first_trade_time,
+                 :last_trade_time, :expected_count, :observed_count,
+                 :coverage, :row_count, :source_provider, :capture_mode,
+                 :forward_eligible, 'PASS', :evidence_json, :created_at)
+                ON DUPLICATE KEY UPDATE
+                    expected_count=VALUES(expected_count),
+                    observed_count=VALUES(observed_count),
+                    coverage=VALUES(coverage),
+                    row_count=VALUES(row_count),
+                    forward_eligible=VALUES(forward_eligible),
+                    quality_status=VALUES(quality_status),
+                    evidence_json=VALUES(evidence_json),
+                    created_at=VALUES(created_at)
+                """
+            ),
+            {
+                "receipt_id": receipt_id,
+                "trade_date": trade_date,
+                "first_trade_time": first_trade_time,
+                "last_trade_time": last_trade_time,
+                "expected_count": expected_count,
+                "observed_count": observed_count,
+                "coverage": coverage,
+                "row_count": row_count,
+                "source_provider": source_provider,
+                "capture_mode": capture_mode,
+                "forward_eligible": int(bool(forward_eligible)),
+                "evidence_json": json.dumps(
+                    evidence,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+                "created_at": datetime.now(),
+            },
+        )
+
+
+def _classify_qmt_minute_capture(
+    *,
+    trade_date: str,
+    last_trade_time: datetime,
+    captured_at: datetime | None = None,
+) -> tuple[str, bool, float]:
+    """Separate real forward capture from after-close/history backfill."""
+
+    captured = (captured_at or datetime.now()).replace(microsecond=0)
+    last_bar = last_trade_time.replace(microsecond=0)
+    lag_seconds = (captured - last_bar).total_seconds()
+    hhmm = captured.hour * 100 + captured.minute
+    live_forward = bool(
+        trade_date == captured.date().isoformat()
+        and captured.weekday() < 5
+        and ((930 <= hhmm <= 1132) or (1300 <= hhmm <= 1502))
+        and -5 <= lag_seconds <= 120
+    )
+    return (
+        "LIVE_FORWARD" if live_forward else "AFTER_CLOSE_BACKFILL",
+        live_forward,
+        lag_seconds,
+    )
+
+
+def _is_complete_stock_universe(engine: Engine, stock_codes: list[str]) -> bool:
+    """Return whether this job was given the complete canonical stock pool."""
+    requested = {str(code).zfill(6) for code in stock_codes if str(code).strip()}
+    if not requested:
+        return False
+    canonical = read_frame(text("SELECT DISTINCT stock_code FROM `si_all_code`"), engine)
+    if canonical is None or canonical.empty or "stock_code" not in canonical.columns:
+        return False
+    expected = {
+        str(code).zfill(6)
+        for code in canonical["stock_code"].dropna().astype(str).tolist()
+        if str(code).strip()
+    }
+    return bool(expected) and requested == expected
+
+
+def _is_complete_index_universe(engine: Engine, index_codes: list[str]) -> bool:
+    """Return whether this job was given the complete canonical index pool."""
+    requested = {str(code).zfill(6) for code in index_codes if str(code).strip()}
+    if not requested:
+        return False
+    canonical = read_frame(text("SELECT DISTINCT index_code FROM `si_all_index_code`"), engine)
+    if canonical is None or canonical.empty or "index_code" not in canonical.columns:
+        return False
+    expected = {
+        str(code).zfill(6)
+        for code in canonical["index_code"].dropna().astype(str).tolist()
+        if str(code).strip()
+    }
+    return bool(expected) and requested == expected
+
+
+def _prune_snapshot_codes(
+    engine: Engine,
+    *,
+    table_name: str,
+    code_column: str,
+    date_column: str,
+    target_date: str,
+    keep_codes: set[str],
+) -> int:
+    """Delete stale symbols from one validated daily snapshot.
+
+    This function is deliberately called only after a complete-universe fetch
+    passes its coverage gate.  It computes the small stale set first, avoiding
+    a huge ``NOT IN`` predicate and keeping every deletion bounded.
+    """
+    table = quote_identifier(table_name)
+    code_col = quote_identifier(code_column)
+    date_col = quote_identifier(date_column)
+    existing = read_frame_direct(
+        text(f"SELECT DISTINCT {code_col} AS code FROM {table} WHERE {date_col} = :target_date"),
+        engine,
+        params={"target_date": target_date},
+    )
+    if existing is None or existing.empty:
+        return 0
+    existing_codes = {
+        str(code).zfill(6)
+        for code in existing["code"].dropna().astype(str).tolist()
+        if str(code).strip()
+    }
+    normalized_keep = {str(code).zfill(6) for code in keep_codes if str(code).strip()}
+    stale_codes = sorted(existing_codes - normalized_keep)
+    if not stale_codes:
+        return 0
+
+    deleted = 0
+    with engine.begin() as conn:
+        for stale_batch in _chunked(stale_codes, 500):
+            placeholders = ", ".join(f":stale_{idx}" for idx in range(len(stale_batch)))
+            params: dict[str, Any] = {f"stale_{idx}": code for idx, code in enumerate(stale_batch)}
+            params["target_date"] = target_date
+            result = conn.execute(
+                text(
+                    f"DELETE FROM {table} WHERE {date_col} = :target_date "
+                    f"AND {code_col} IN ({placeholders})"
+                ),
+                params,
+            )
+            deleted += max(0, int(result.rowcount or 0))
+    logger.info(
+        "%s: pruned %d stale rows (%d codes) for %s",
+        table_name,
+        deleted,
+        len(stale_codes),
+        target_date,
+    )
+    return deleted
+
+
+def _prune_snapshot_time_bounds(
+    engine: Engine,
+    *,
+    table_name: str,
+    date_column: str,
+    time_column: str,
+    target_date: str,
+    first_time: datetime,
+    last_time: datetime,
+) -> int:
+    """Remove leftover bars outside a complete provider snapshot's time range."""
+    table = quote_identifier(table_name)
+    date_col = quote_identifier(date_column)
+    time_col = quote_identifier(time_column)
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                f"DELETE FROM {table} WHERE {date_col} = :target_date "
+                f"AND ({time_col} < :first_time OR {time_col} > :last_time)"
+            ),
+            {
+                "target_date": target_date,
+                "first_time": first_time,
+                "last_time": last_time,
+            },
+        )
+    deleted = max(0, int(result.rowcount or 0))
+    if deleted:
+        logger.info(
+            "%s: pruned %d rows outside %s..%s for %s",
+            table_name,
+            deleted,
+            first_time,
+            last_time,
+            target_date,
+        )
+    return deleted
+
+
+def _replace_qmt_index_window(
+    engine: Engine,
+    df: pd.DataFrame,
+    *,
+    table_name: str,
+    time_column: str,
+    replace_date: str | None = None,
+) -> int:
+    """Atomically replace a validated index batch without clearing other data."""
+    if df is None or df.empty:
+        return 0
+    stamped = _with_etl(df).copy()
+    stamped[time_column] = pd.to_datetime(stamped[time_column], errors="coerce")
+    stamped["index_code"] = stamped["index_code"].astype(str).str.zfill(6)
+    stamped = stamped.dropna(subset=["index_code", time_column])
+    if stamped.empty:
+        return 0
+    key_columns = ["index_code", time_column]
+    if table_name == "sm_index_kline":
+        stamped["trade_date"] = pd.to_datetime(stamped["trade_date"], errors="coerce").dt.date
+        key_columns.append("k_type")
+    stamped = stamped.drop_duplicates(subset=key_columns, keep="last")
+    codes = sorted(stamped["index_code"].unique().tolist())
+    placeholders = ", ".join(f":code_{idx}" for idx in range(len(codes)))
+    params: dict[str, Any] = {f"code_{idx}": code for idx, code in enumerate(codes)}
+    start_value = stamped[time_column].min()
+    end_value = stamped[time_column].max()
+    params["start_value"] = start_value.to_pydatetime() if hasattr(start_value, "to_pydatetime") else start_value
+    params["end_value"] = end_value.to_pydatetime() if hasattr(end_value, "to_pydatetime") else end_value
+    if replace_date and table_name == "sm_index_minute":
+        params["replace_date"] = replace_date
+        predicate = f"index_code IN ({placeholders}) AND trade_date = :replace_date"
+    else:
+        predicate = (
+            f"index_code IN ({placeholders}) AND {quote_identifier(time_column)} "
+            "BETWEEN :start_value AND :end_value"
+        )
+    if table_name == "sm_index_kline":
+        params["k_type"] = int(stamped["k_type"].iloc[0])
+        predicate += " AND k_type = :k_type"
+    return replace_table_rows(
+        _clean_df(stamped),
+        table_name,
+        engine,
+        where_sql=predicate,
+        params=params,
+        chunksize=max(500, int(os.environ.get("QMT_INDEX_DB_CHUNK_SIZE", "1000"))),
+        method="multi",
+    )
 
 
 def _to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -401,7 +1134,10 @@ def truncate_all(engine: Engine) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in TABLES_TRUNCATE_ORDER:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            if t == "sm_stock_minute" and os.environ.get("SM_ALLOW_STOCK_MINUTE_TRUNCATE") != "1":
+                logger.warning("Skip TRUNCATE sm_stock_minute; set SM_ALLOW_STOCK_MINUTE_TRUNCATE=1 to allow.")
+                continue
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 共 %s 张 STOCK-MARKET 表。", len(TABLES_TRUNCATE_ORDER))
 
@@ -412,17 +1148,107 @@ def truncate_only(engine: Engine, *tables: str) -> None:
     with engine.begin() as conn:
         conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         for t in tables:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
+            if t == "sm_stock_minute" and os.environ.get("SM_ALLOW_STOCK_MINUTE_TRUNCATE") != "1":
+                logger.warning("Skip TRUNCATE sm_stock_minute; set SM_ALLOW_STOCK_MINUTE_TRUNCATE=1 to allow.")
+                continue
+            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
         conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
     logger.info("已 TRUNCATE 表：%s", ", ".join(tables))
+
+
+def delete_stock_minute_dates(engine: Engine, dates: list[str]) -> None:
+    clean_dates = sorted({str(d)[:10] for d in dates if str(d or "").strip()})
+    if not clean_dates:
+        return
+    with engine.begin() as conn:
+        for trade_date in clean_dates:
+            conn.execute(
+                text("DELETE FROM `sm_stock_minute` WHERE trade_date = :trade_date"),
+                {"trade_date": trade_date},
+            )
+    logger.info("sm_stock_minute: deleted existing rows for dates: %s", ", ".join(clean_dates))
 
 
 def df_to_table(engine: Engine, df: pd.DataFrame, table: str) -> None:
     if df is None or df.empty:
         logger.info("表 %s：无数据，跳过写入。", table)
         return
-    _clean_df(df).to_sql(table, engine, if_exists="append", index=False, chunksize=1000, method="multi")
+    cleaned = _clean_df(df)
+    with engine.begin() as conn:
+        write_frame(cleaned, table, conn, if_exists="append", index=False, chunksize=1000, method="multi")
     logger.info("表 %s：写入 %s 行。", table, len(df))
+
+
+def replace_stock_current_snapshot(engine: Engine, df: pd.DataFrame) -> int:
+    """Write a complete quote batch to staging, then atomically swap it in."""
+    if df is None or df.empty:
+        raise ValueError("sm_stock_current snapshot must not be empty")
+
+    cleaned = _clean_df(df)
+    stage_table = "sm_stock_current_stage"
+    backup_table = "sm_stock_current_backup"
+    lock_timeout = max(0, int(os.environ.get("CURRENT_SNAPSHOT_LOCK_TIMEOUT", "0")))
+    with mysql_named_lock(
+        engine,
+        "probiga:stock_current",
+        timeout_seconds=lock_timeout,
+    ):
+        with engine.begin() as conn:
+            conn.execute(text(f"DROP TABLE IF EXISTS {stage_table}"))
+            conn.execute(text(f"CREATE TABLE {stage_table} LIKE sm_stock_current"))
+
+        try:
+            write_frame(
+                cleaned,
+                stage_table,
+                engine,
+                if_exists="append",
+                index=False,
+                chunksize=1000,
+                method="multi",
+            )
+            with engine.connect() as conn:
+                staged_count = int(
+                    conn.execute(text(f"SELECT COUNT(*) FROM {stage_table}")).scalar() or 0
+                )
+            if staged_count != len(cleaned):
+                raise RuntimeError(
+                    f"sm_stock_current staging row mismatch: expected={len(cleaned)} actual={staged_count}"
+                )
+
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {backup_table}"))
+                conn.execute(
+                    text(
+                        f"RENAME TABLE sm_stock_current TO {backup_table}, "
+                        f"{stage_table} TO sm_stock_current"
+                    )
+                )
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {backup_table}"))
+        except Exception:
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {stage_table}"))
+            raise
+    logger.info("sm_stock_current: atomically replaced %s rows", len(cleaned))
+    return int(len(cleaned))
+
+
+def upsert_current_frame(engine: Engine, df: pd.DataFrame, table: str, key_columns: list[str]) -> int:
+    if df is None or df.empty:
+        logger.info("Table %s: no rows to upsert.", table)
+        return 0
+    cleaned = _clean_df(df)
+    batch_id = f"{table}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    result = safe_upsert_rows(
+        engine,
+        table_name=table,
+        rows=cleaned.to_dict(orient="records"),
+        key_columns=key_columns,
+        batch_id=batch_id,
+    )
+    logger.info("Table %s: upserted %s rows.", table, result.accepted_rows)
+    return result.accepted_rows
 
 
 def read_stock_codes(engine: Engine, *, slice_offset: int = 0, slice_limit: int = -1) -> list[str]:
@@ -500,29 +1326,28 @@ def _read_qmt_concept_meta(engine: Engine, concept_codes: list[str]) -> tuple[pd
         return pd.DataFrame(columns=["concept_code", "stock_code"]), {}
     placeholders = ", ".join(f":c{i}" for i in range(len(concept_codes)))
     params = {f"c{i}": code for i, code in enumerate(concept_codes)}
-    with engine.connect() as conn:
-        members = pd.read_sql(
-            text(
-                f"""
-                SELECT concept_code, stock_code
-                FROM si_concept_constituent_east
-                WHERE concept_code IN ({placeholders})
-                """
-            ),
-            conn,
-            params=params,
-        )
-        names = pd.read_sql(
-            text(
-                f"""
-                SELECT concept_code, name
-                FROM si_concept_code_east
-                WHERE concept_code IN ({placeholders})
-                """
-            ),
-            conn,
-            params=params,
-        )
+    members = read_frame(
+        text(
+            f"""
+            SELECT concept_code, stock_code
+            FROM si_concept_constituent_east
+            WHERE concept_code IN ({placeholders})
+            """
+        ),
+        engine,
+        params=params,
+    )
+    names = read_frame(
+        text(
+            f"""
+            SELECT concept_code, name
+            FROM si_concept_code_east
+            WHERE concept_code IN ({placeholders})
+            """
+        ),
+        engine,
+        params=params,
+    )
     if members.empty:
         return pd.DataFrame(columns=["concept_code", "stock_code"]), {}
     members["stock_code"] = members["stock_code"].astype(str).str.zfill(6)
@@ -915,6 +1740,198 @@ def _step_stock_kline_myquant(
         raise RuntimeError("MyQuant stock K-line returned no rows")
 
 
+def _step_stock_kline_qmt(
+    engine: Engine,
+    backend: Any,
+    stock_codes: list[str],
+    start: str,
+    end: str,
+    short_name_map: dict[str, str],
+) -> None:
+    """Fetch and upsert QMT daily bars in bounded batches.
+
+    A failed/empty batch never deletes canonical rows.  This is important when
+    the Windows terminal or reverse tunnel reconnects during a scheduled run.
+    """
+    batch_size = max(20, int(os.environ.get("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")))
+    history_engine = get_kline_engine()
+    min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_KLINE_MIN_COVERAGE", "0.90"))))
+    written = 0
+    received_codes: set[str] = set()
+    received_codes_by_date: dict[str, set[str]] = {}
+    normalized_start = pd.to_datetime(start, errors="coerce")
+    normalized_end = pd.to_datetime(end, errors="coerce")
+    total_batches = (len(stock_codes) + batch_size - 1) // batch_size
+    for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
+        frame = backend.fetch_kline(
+            batch,
+            start,
+            end,
+            short_name_map=short_name_map,
+            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+        )
+        if frame is None or frame.empty:
+            logger.warning("QMT daily K-line batch %d/%d returned no rows", batch_no, total_batches)
+            continue
+        frame = frame.copy()
+        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        if pd.notna(normalized_start):
+            frame = frame[frame["trade_date"] >= normalized_start.strftime("%Y-%m-%d")]
+        if pd.notna(normalized_end):
+            frame = frame[frame["trade_date"] <= normalized_end.strftime("%Y-%m-%d")]
+        for column in ("open", "close", "high", "low", "volume", "amount"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame = frame.dropna(subset=["stock_code", "trade_date", "open", "close", "high", "low"])
+        frame = frame[
+            (frame["open"] > 0)
+            & (frame["close"] > 0)
+            & (frame["high"] >= frame[["open", "close"]].max(axis=1))
+            & (frame["low"] <= frame[["open", "close"]].min(axis=1))
+            & (frame["volume"] >= 0)
+            & (frame["amount"] >= 0)
+        ]
+        if frame.empty:
+            logger.warning("QMT daily K-line batch %d/%d failed business validation", batch_no, total_batches)
+            continue
+        frame = frame.drop_duplicates(
+            subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+            keep="last",
+        )
+        if str(getattr(backend, "name", "")).lower() == "bigqmt":
+            from integrations.qmt.local_history import (
+                persist_daily_kline_capture,
+            )
+
+            captured = persist_daily_kline_capture(
+                frame,
+                source_engine=engine,
+                batch_id=(
+                    f"canonical_bigqmt_kline_"
+                    f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                ),
+            )
+            if captured != len(frame):
+                raise RuntimeError(
+                    "BigQMT raw daily capture mismatch: "
+                    f"{captured}/{len(frame)}"
+                )
+        written += _upsert_qmt_kline_frame(history_engine, frame)
+        received_codes.update(frame["stock_code"].astype(str).str.zfill(6).unique().tolist())
+        for trade_date, date_frame in frame.groupby("trade_date"):
+            received_codes_by_date.setdefault(str(trade_date), set()).update(
+                date_frame["stock_code"].astype(str).str.zfill(6).unique().tolist()
+            )
+        logger.info(
+            "QMT daily K-line batch %d/%d: rows=%d cumulative_codes=%d",
+            batch_no,
+            total_batches,
+            len(frame),
+            len(received_codes),
+        )
+
+    coverage = len(received_codes) / max(len(stock_codes), 1)
+    if written <= 0 or coverage < min_coverage:
+        raise RuntimeError(
+            f"QMT daily K-line coverage below threshold: {len(received_codes)}/{len(stock_codes)} "
+            f"({coverage:.1%}) < {min_coverage:.1%}"
+        )
+    if (
+        pd.notna(normalized_start)
+        and pd.notna(normalized_end)
+        and normalized_start.normalize() == normalized_end.normalize()
+        and _is_complete_stock_universe(engine, stock_codes)
+    ):
+        target_date = normalized_start.strftime("%Y-%m-%d")
+        _prune_snapshot_codes(
+            history_engine,
+            table_name="sm_stock_kline",
+            code_column="stock_code",
+            date_column="trade_date",
+            target_date=target_date,
+            keep_codes=received_codes_by_date.get(target_date, set()),
+        )
+    logger.info("QMT daily K-line complete: rows=%d coverage=%.2f%%", written, coverage * 100)
+
+
+def _try_step_stock_kline_registry(
+    engine: Engine,
+    stock_codes: list[str],
+    kline_start: str | None,
+    kline_end: str | None,
+    *,
+    incremental: bool,
+) -> bool:
+    try:
+        from integrations.registry import get_backend
+
+        backend = get_backend("kline")
+    except Exception as exc:
+        logger.error("Data-source registry error: %s", exc)
+        return True
+    if backend is None:
+        return False
+
+    logger.info("Stock K-line: using registry backend '%s'", backend.name)
+    short_name_map = _load_stock_short_name_map(engine)
+    start = kline_start or os.environ.get("SM_MARKET_START", "2020-01-01")
+    end = kline_end or os.environ.get("SM_MARKET_END") or datetime.now().strftime("%Y-%m-%d")
+    if backend.name in {"qmt", "bigqmt"}:
+        _step_stock_kline_qmt(engine, backend, stock_codes, start, end, short_name_map)
+        return True
+    if incremental:
+        with engine.begin() as conn:
+            deleted = conn.execute(
+                text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1"),
+                {"s": start},
+            ).rowcount
+        logger.info("Stock K-line incremental: deleted %d existing rows from %s", deleted, start)
+    else:
+        truncate_only(engine, "sm_stock_kline")
+    df = backend.fetch_kline(stock_codes, start, end, short_name_map=short_name_map)
+    if df is not None and not df.empty:
+        kline_cols = [
+            "stock_code",
+            "short_name",
+            "trade_time",
+            "trade_date",
+            "k_type",
+            "adjust_type",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "change",
+            "change_pct",
+            "turnover_ratio",
+            "pre_close",
+        ]
+        for col in kline_cols:
+            if col not in df.columns:
+                df[col] = None
+        df = _to_numeric(
+            df,
+            [
+                "open",
+                "close",
+                "high",
+                "low",
+                "volume",
+                "amount",
+                "change",
+                "change_pct",
+                "turnover_ratio",
+                "pre_close",
+            ],
+        )
+        df_to_table(engine, _with_etl(df), "sm_stock_kline")
+        logger.info("Stock K-line (%s): wrote %d rows", backend.name, len(df))
+    else:
+        logger.warning("Stock K-line (%s): no data returned", backend.name)
+    return True
+
+
 def step_stock_kline(
     engine: Engine,
     stock_codes: list[str],
@@ -931,46 +1948,17 @@ def step_stock_kline(
         logger.warning("个股K线：si_all_code 未读到代码，跳过 truncate 与写入。请先执行 sync_stock_info 写入 si_all_code。")
         return
 
-    # --- registry 统一数据源入口 ---
-    if kline_source:
-        os.environ["SM_STOCK_KLINE_SOURCE"] = kline_source
-    try:
-        from integrations.registry import get_backend
-        backend = get_backend("kline")
-    except Exception as exc:
-        logger.error("数据源 registry 错误: %s", exc)
+    source_override = {"SM_STOCK_KLINE_SOURCE": kline_source} if kline_source else {}
+    with temporary_env(source_override):
+        handled_by_registry = _try_step_stock_kline_registry(
+            engine,
+            stock_codes,
+            kline_start,
+            kline_end,
+            incremental=incremental,
+        )
+    if handled_by_registry:
         return
-    if backend is not None:
-        logger.info("个股K线: 使用 registry backend '%s'", backend.name)
-        short_name_map = _load_stock_short_name_map(engine)
-        start = kline_start or os.environ.get("SM_MARKET_START", "2020-01-01")
-        end = kline_end or os.environ.get("SM_MARKET_END") or datetime.now().strftime("%Y-%m-%d")
-        if incremental:
-            with engine.begin() as conn:
-                deleted = conn.execute(
-                    text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1"),
-                    {"s": start},
-                ).rowcount
-            logger.info("增量模式：已删除 %d 条 trade_date >= %s 的旧数据", deleted, start)
-        else:
-            truncate_only(engine, "sm_stock_kline")
-        df = backend.fetch_kline(stock_codes, start, end, short_name_map=short_name_map)
-        if df is not None and not df.empty:
-            kline_cols = [
-                "stock_code", "short_name", "trade_time", "trade_date", "k_type", "adjust_type",
-                "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
-                "turnover_ratio", "pre_close",
-            ]
-            for col in kline_cols:
-                if col not in df.columns:
-                    df[col] = None
-            df = _to_numeric(df, ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"])
-            df_to_table(engine, _with_etl(df), "sm_stock_kline")
-            logger.info("个股K线(%s): 写入 %d 行", backend.name, len(df))
-        else:
-            logger.warning("个股K线(%s): 未获取到数据", backend.name)
-        return
-    # --- end registry ---
 
     src = (kline_source or os.environ.get("SM_STOCK_KLINE_SOURCE", "adata")).strip().lower()
     if _is_myquant_source(src):
@@ -1001,6 +1989,150 @@ def step_stock_kline(
     _step_stock_kline_adata(engine, stock_codes, start, end, k_type, adjust_type, incremental=incremental)
 
 
+def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str]) -> None:
+    """Synchronize QMT minute bars in small atomic batches.
+
+    This avoids materializing roughly 1.3 million rows in one JSON response and
+    prevents a failed QMT call from clearing the canonical trading day.
+    """
+    trade_date = _default_myquant_minute_date(engine)
+    history_engine = get_kline_engine()
+    batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40")))
+    count = max(0, int(os.environ.get("QMT_MINUTE_COUNT", "0") or 0))
+    min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_MINUTE_MIN_COVERAGE", "0.85"))))
+    total_batches = (len(stock_codes) + batch_size - 1) // batch_size
+    written = 0
+    received_codes: set[str] = set()
+    first_trade_time: pd.Timestamp | None = None
+    last_trade_time: pd.Timestamp | None = None
+    stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
+    _create_qmt_minute_stage(history_engine, stage_table)
+    try:
+        for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
+            frame = backend.fetch_minute(
+                batch,
+                trade_date,
+                start_date=trade_date,
+                end_date=trade_date,
+                count=count,
+                # A live QMT subscription does not guarantee that every
+                # symbol's 1-minute cache is present.  Ask QMT to refresh the
+                # requested day incrementally even for a bounded last-N run;
+                # otherwise uncached symbols return padded zero-volume rows.
+                download_history=True,
+            )
+            if frame is None or frame.empty:
+                logger.warning("QMT minute batch %d/%d returned no rows", batch_no, total_batches)
+                continue
+            frame = frame.copy()
+            frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+            frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            frame = frame[frame["trade_date"] == trade_date]
+            for column in ("price", "avg_price", "change", "change_pct", "volume", "amount"):
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame = frame.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
+            frame = frame[(frame["price"] > 0) & (frame["volume"] >= 0) & (frame["amount"] >= 0)]
+            # Match canonical semantics: a zero-volume suspended symbol has no
+            # minute transaction rows for that day.
+            active_codes = set(
+                frame.groupby("stock_code")[["volume", "amount"]]
+                .sum(min_count=1)
+                .query("volume > 0 or amount > 0")
+                .index.astype(str)
+                .tolist()
+            )
+            frame = frame[frame["stock_code"].isin(active_codes)]
+            if frame.empty:
+                continue
+            batch_first = frame["trade_time"].min()
+            batch_last = frame["trade_time"].max()
+            first_trade_time = batch_first if first_trade_time is None else min(first_trade_time, batch_first)
+            last_trade_time = batch_last if last_trade_time is None else max(last_trade_time, batch_last)
+            batch_written = _append_qmt_minute_stage(history_engine, stage_table, frame)
+            written += batch_written
+            received_codes.update(active_codes)
+            logger.info(
+                "QMT minute batch %d/%d: rows=%d cumulative_codes=%d",
+                batch_no,
+                total_batches,
+                batch_written,
+                len(received_codes),
+            )
+
+        coverage = len(received_codes) / max(len(stock_codes), 1)
+        if written <= 0 or coverage < min_coverage:
+            raise RuntimeError(
+                f"QMT minute coverage below threshold: {len(received_codes)}/{len(stock_codes)} "
+                f"({coverage:.1%}) < {min_coverage:.1%}"
+            )
+        if first_trade_time is None or last_trade_time is None:
+            raise RuntimeError("QMT minute source returned no valid trade-time window")
+
+        _commit_qmt_minute_stage(
+            history_engine,
+            stage_table,
+            first_trade_time=first_trade_time.to_pydatetime(),
+            last_trade_time=last_trade_time.to_pydatetime(),
+        )
+        captured_at = datetime.now().replace(microsecond=0)
+        (
+            capture_mode,
+            forward_eligible,
+            capture_lag_seconds,
+        ) = _classify_qmt_minute_capture(
+            trade_date=trade_date,
+            last_trade_time=last_trade_time.to_pydatetime(),
+            captured_at=captured_at,
+        )
+        _record_qmt_minute_receipt(
+            engine,
+            trade_date=trade_date,
+            first_trade_time=first_trade_time.to_pydatetime(),
+            last_trade_time=last_trade_time.to_pydatetime(),
+            expected_count=len(stock_codes),
+            observed_count=len(received_codes),
+            row_count=written,
+            source_provider=(
+                "gj_big_qmt_inner"
+                if str(getattr(backend, "name", "")).lower() == "bigqmt"
+                else "guojin_miniqmt_gateway"
+            ),
+            capture_mode=capture_mode,
+            forward_eligible=forward_eligible,
+            evidence={
+                "backend": str(getattr(backend, "name", "")),
+                "batch_size": batch_size,
+                "minute_count": count,
+                "coverage_threshold": min_coverage,
+                "capture_mode": capture_mode,
+                "captured_at": captured_at.isoformat(sep=" "),
+                "capture_lag_seconds": capture_lag_seconds,
+            },
+        )
+        if count == 0 and _is_complete_stock_universe(engine, stock_codes):
+            _prune_snapshot_codes(
+                history_engine,
+                table_name="sm_stock_minute",
+                code_column="stock_code",
+                date_column="trade_date",
+                target_date=trade_date,
+                keep_codes=received_codes,
+            )
+            _prune_snapshot_time_bounds(
+                history_engine,
+                table_name="sm_stock_minute",
+                date_column="trade_date",
+                time_column="trade_time",
+                target_date=trade_date,
+                first_time=first_trade_time.to_pydatetime(),
+                last_time=last_trade_time.to_pydatetime(),
+            )
+        logger.info("QMT minute complete: rows=%d coverage=%.2f%%", written, coverage * 100)
+    finally:
+        _drop_qmt_minute_stage(history_engine, stage_table)
+
+
 def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
     # --- registry 统一数据源入口 ---
     try:
@@ -1011,8 +2143,11 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
         return
     if backend is not None:
         logger.info("分钟K线: 使用 registry backend '%s'", backend.name)
+        if backend.name in {"qmt", "bigqmt"}:
+            _step_stock_minute_qmt(engine, backend, stock_codes)
+            return
         trade_date = _default_myquant_minute_date(engine)
-        truncate_only(engine, "sm_stock_minute")
+        delete_stock_minute_dates(engine, [trade_date])
         df = backend.fetch_minute(stock_codes, trade_date)
         if df is not None and not df.empty:
             minute_cols = ["stock_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount"]
@@ -1034,7 +2169,6 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
 
     from adata.stock.market.stock_market.stock_market import StockMarket
 
-    truncate_only(engine, "sm_stock_minute")
     mk = StockMarket()
     minute_cols = ["stock_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount"]
 
@@ -1049,7 +2183,9 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
 
     parts = _concurrent_run(stock_codes, _fetch_minute, label="个股分钟", log_every=500)
     if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_minute")
+        out = pd.concat(parts, ignore_index=True)
+        delete_stock_minute_dates(engine, out["trade_date"].dropna().astype(str).tolist())
+        df_to_table(engine, _with_etl(out), "sm_stock_minute")
 
 
 def _default_myquant_minute_date(engine: Engine) -> str:
@@ -1065,7 +2201,7 @@ def _default_myquant_minute_date(engine: Engine) -> str:
         if d:
             return str(d)[:10]
     except Exception:  # pylint: disable=broad-except
-        pass
+        logger.debug("Failed to read latest kline trade date; using today.", exc_info=True)
     return today.isoformat()
 
 
@@ -1100,7 +2236,7 @@ def _step_stock_minute_myquant(engine: Engine, stock_codes: list[str]) -> None:
     frequency = os.environ.get("MYQUANT_MINUTE_FREQUENCY", "60s").strip() or "60s"
 
     supported = [c for c in stock_codes if to_gm_symbol(c)]
-    truncate_only(engine, "sm_stock_minute")
+    delete_stock_minute_dates(engine, [trade_date])
     logger.info(
         "Stock minute (MyQuant): %d supported stocks, date=%s, frequency=%s",
         len(supported),
@@ -1136,6 +2272,7 @@ def _step_stock_minute_myquant(engine: Engine, stock_codes: list[str]) -> None:
 
 
 def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
+    backend = None
     # --- registry 统一数据源入口 ---
     try:
         from integrations.registry import get_backend
@@ -1145,7 +2282,6 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
         return
     if backend is not None:
         logger.info("实时行情: 使用 registry backend '%s'", backend.name)
-        truncate_only(engine, "sm_stock_current")
         short_name_map = _load_stock_short_name_map(engine)
         df = backend.fetch_current(stock_codes, short_name_map=short_name_map)
         if df is not None and not df.empty:
@@ -1154,7 +2290,7 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
                 if col not in df.columns:
                     df[col] = None
             df = _to_numeric(df, ["price", "change", "change_pct", "volume", "amount"])
-            df_to_table(engine, _with_etl(df), "sm_stock_current")
+            replace_stock_current_snapshot(engine, _with_etl(df))
             logger.info("实时行情(%s): 写入 %d 行", backend.name, len(df))
         else:
             logger.warning("实时行情(%s): 未获取到数据", backend.name)
@@ -1168,7 +2304,6 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
 
     from adata.stock.market.stock_market.stock_market import StockMarket
 
-    truncate_only(engine, "sm_stock_current")
     mk = StockMarket()
     batch_size = max(10, int(os.environ.get("SM_CURRENT_BATCH", "300")))
     now = _now()
@@ -1181,7 +2316,7 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
             parts.append(df[["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount", "snapshot_at"]])
         _sleep()
     if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_current")
+        replace_stock_current_snapshot(engine, _with_etl(pd.concat(parts, ignore_index=True)))
 
 
 def _load_prev_close_map(engine: Engine, snapshot_date: str) -> dict[str, float]:
@@ -1234,7 +2369,6 @@ def _step_stock_current_myquant(engine: Engine, stock_codes: list[str]) -> None:
         raise RuntimeError("MyQuant current source selected but GM_TOKEN or runtime/emquant-py36/python.exe is not configured")
 
     supported = [c for c in stock_codes if to_gm_symbol(c)]
-    truncate_only(engine, "sm_stock_current")
     name_map = _load_stock_short_name_map(engine)
     prev_close_cache: dict[str, dict[str, float]] = {}
     batch_size = _myquant_batch_size("current", max(10, int(os.environ.get("SM_CURRENT_BATCH", "300"))))
@@ -1255,9 +2389,154 @@ def _step_stock_current_myquant(engine: Engine, stock_codes: list[str]) -> None:
             parts.append(sm_df)
         _sleep()
     if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_current")
+        frame = pd.concat(parts, ignore_index=True)
+        _validate_stock_current_frame(frame, stock_codes, source="myquant")
+        replace_stock_current_snapshot(engine, _with_etl(frame))
     elif supported:
         raise RuntimeError("MyQuant current returned no rows")
+
+
+def _step_stock_current_myquant_safe(engine: Engine, stock_codes: list[str]) -> None:
+    from integrations.myquant import current, is_configured, to_gm_symbol
+
+    if not is_configured():
+        raise RuntimeError("MyQuant current source selected but GM_TOKEN or runtime/emquant-py36/python.exe is not configured")
+
+    supported = [c for c in stock_codes if to_gm_symbol(c)]
+    name_map = _load_stock_short_name_map(engine)
+    prev_close_cache: dict[str, dict[str, float]] = {}
+    batch_size = _myquant_batch_size("current", max(10, int(os.environ.get("SM_CURRENT_BATCH", "300"))))
+    fields = "symbol,price,open,high,low,cum_volume,cum_amount,created_at"
+    parts: list[pd.DataFrame] = []
+    for batch in _chunked(supported, batch_size):
+        raw = current(batch, fields=fields, timeout=_myquant_timeout(120))
+        snapshot_date = datetime.now().strftime("%Y-%m-%d")
+        if raw is not None and not raw.empty and "created_at" in raw.columns:
+            dates = _to_local_naive_datetime(raw["created_at"]).dt.strftime("%Y-%m-%d").dropna()
+            if not dates.empty:
+                snapshot_date = str(dates.iloc[0])[:10]
+        if snapshot_date not in prev_close_cache:
+            prev_close_cache[snapshot_date] = _load_prev_close_map(engine, snapshot_date)
+        prev_close_map = prev_close_cache[snapshot_date]
+        sm_df = _myquant_current_to_sm(raw, name_map, prev_close_map)
+        if sm_df is not None and not sm_df.empty:
+            parts.append(sm_df)
+        _sleep()
+    if parts:
+        frame = pd.concat(parts, ignore_index=True)
+        _validate_stock_current_frame(frame, stock_codes, source="myquant")
+        replace_stock_current_snapshot(engine, _with_etl(frame))
+    elif supported:
+        raise RuntimeError("MyQuant current returned no rows")
+
+
+def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
+    backend = None
+    try:
+        from integrations.registry import get_backend
+
+        backend = get_backend("current")
+    except Exception as exc:
+        logger.warning("current registry backend unavailable, falling back to legacy source: %s", exc)
+
+    if backend is not None:
+        logger.info("stock current: using registry backend '%s'", backend.name)
+        try:
+            short_name_map = _load_stock_short_name_map(engine)
+            df = backend.fetch_current(stock_codes, short_name_map=short_name_map)
+        except Exception as exc:
+            logger.warning("stock current backend '%s' failed; falling back to legacy source: %s", backend.name, exc)
+        else:
+            if df is not None and not df.empty:
+                try:
+                    received, coverage = _validate_stock_current_frame(
+                        df,
+                        stock_codes,
+                        source=backend.name,
+                    )
+                    if backend.name == "qmt":
+                        now = datetime.now()
+                        hhmm = now.hour * 100 + now.minute
+                        trading_now = now.weekday() < 5 and ((925 <= hhmm <= 1135) or (1255 <= hhmm <= 1505))
+                        if trading_now:
+                            latest_source = pd.to_datetime(df["snapshot_at"], errors="coerce").max()
+                            max_age = max(30, int(os.environ.get("QMT_CURRENT_MAX_AGE_SECONDS", "180")))
+                            if pd.isna(latest_source) or (now - latest_source.to_pydatetime()).total_seconds() > max_age:
+                                raise RuntimeError(
+                                    f"QMT realtime snapshot is stale: latest={latest_source}, max_age={max_age}s"
+                                )
+                    current_cols = ["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount", "snapshot_at"]
+                    for col in current_cols:
+                        if col not in df.columns:
+                            df[col] = None
+                    df = _to_numeric(df, ["price", "change", "change_pct", "volume", "amount"])
+                    replace_stock_current_snapshot(engine, _with_etl(df))
+                except Exception as exc:
+                    logger.warning(
+                        "stock current backend '%s' failed validation/write; falling back to legacy source: %s",
+                        backend.name,
+                        exc,
+                    )
+                else:
+                    logger.info(
+                        "stock current(%s): wrote %d rows, coverage=%.2f%%",
+                        backend.name,
+                        len(df),
+                        coverage * 100,
+                    )
+                    return
+            logger.warning("stock current backend '%s' returned no rows; falling back to legacy source", backend.name)
+
+    source = os.environ.get("SM_STOCK_CURRENT_SOURCE", os.environ.get("SM_MARKET_DATA_SOURCE", "")).strip().lower()
+    if _is_myquant_source(source):
+        _step_stock_current_myquant_safe(engine, stock_codes)
+        return
+
+    from adata.stock.market.stock_market.stock_market import StockMarket
+
+    mk = StockMarket()
+    batch_size = max(10, int(os.environ.get("SM_CURRENT_BATCH", "300")))
+    now = _now()
+    parts: list[pd.DataFrame] = []
+    for batch in _chunked(stock_codes, batch_size):
+        df = retry_remote(mk.list_market_current, code_list=batch)
+        if df is not None and not df.empty:
+            df = _to_numeric(df, ["price", "change", "change_pct", "volume", "amount"])
+            df["snapshot_at"] = now
+            parts.append(df[["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount", "snapshot_at"]])
+        _sleep()
+    if not parts:
+        raise RuntimeError("stock_current fetched no rows from registry or legacy source")
+    fallback_df = pd.concat(parts, ignore_index=True)
+    source_name = "legacy"
+    try:
+        received, coverage = _validate_stock_current_frame(
+            fallback_df,
+            stock_codes,
+            source=source_name,
+        )
+    except RuntimeError as legacy_error:
+        logger.warning(
+            "legacy realtime source failed quality validation; trying Sina fallback: %s",
+            legacy_error,
+        )
+        fallback_df = _fetch_sina_stock_current(
+            stock_codes,
+            _load_stock_short_name_map(engine),
+        )
+        source_name = "sina"
+        received, coverage = _validate_stock_current_frame(
+            fallback_df,
+            stock_codes,
+            source=source_name,
+        )
+    replace_stock_current_snapshot(engine, _with_etl(fallback_df))
+    logger.info(
+        "stock current(%s): wrote %d rows, coverage=%.2f%%",
+        source_name,
+        received,
+        coverage * 100,
+    )
 
 
 def step_stock_five(engine: Engine, stock_codes: list[str]) -> None:
@@ -1308,7 +2587,7 @@ def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
         from integrations.qmt import bridge
         from integrations.qmt.info import to_qmt_stock_symbols
 
-        trade_date = datetime.now().strftime("%Y-%m-%d")
+        trade_date = _default_myquant_minute_date(engine)
         qmt_codes = to_qmt_stock_symbols(stock_codes)
         if not qmt_codes:
             raise RuntimeError("个股分时资金流(QMT): no valid QMT stock codes")
@@ -1474,7 +2753,6 @@ def step_concept_ths_kline(
 
 
 def step_concept_ths_minute(engine: Engine, concept_codes: list[str]) -> None:
-    truncate_only(engine, "sm_concept_ths_minute")
     ins = _concept_ths_instance()
     now = _now()
     cols = ["index_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount", "snapshot_at"]
@@ -1491,11 +2769,13 @@ def step_concept_ths_minute(engine: Engine, concept_codes: list[str]) -> None:
 
     parts = _concurrent_run(concept_codes, _fetch, label="THS概念分钟")
     if parts:
+        truncate_only(engine, "sm_concept_ths_minute")
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_ths_minute")
+    else:
+        raise RuntimeError("no THS concept minute rows fetched")
 
 
 def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
-    truncate_only(engine, "sm_concept_ths_current")
     ins = _concept_ths_instance()
     now = _now()
     cols = ["index_code", "trade_time", "trade_date", "open", "price", "high", "low", "volume", "amount", "change", "change_pct", "snapshot_at"]
@@ -1511,8 +2791,29 @@ def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
         return None
 
     parts = _concurrent_run(concept_codes, _fetch, label="THS概念实时")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_ths_current")
+    if not parts:
+        raise RuntimeError("no THS concept current rows fetched")
+    complete = pd.concat(parts, ignore_index=True).drop_duplicates(
+        subset=["index_code"], keep="last"
+    )
+    requested = {str(code).strip() for code in concept_codes if str(code).strip()}
+    received = set(complete["index_code"].astype(str).str.strip())
+    coverage = len(received & requested) / max(len(requested), 1)
+    min_coverage = min(
+        1.0,
+        max(0.0, float(os.environ.get("THS_CONCEPT_CURRENT_MIN_COVERAGE", "0.80"))),
+    )
+    if coverage < min_coverage:
+        raise RuntimeError(
+            "THS concept current coverage below threshold: "
+            f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
+            f"< {min_coverage:.1%}; preserving previous snapshot"
+        )
+    replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        "sm_concept_ths_current",
+        engine,
+    )
 
 
 def step_concept_east_kline(
@@ -1621,16 +2922,20 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
 
 
 def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
-    if _concept_source("current") == "qmt":
-        from integrations.qmt import bridge
+    concept_source = _concept_source("current")
+    if concept_source in {"qmt", "bigqmt"}:
+        if concept_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
         from integrations.qmt.aggregate import aggregate_concept_current
         from integrations.qmt.info import to_qmt_stock_symbols
 
-        truncate_only(engine, "sm_concept_east_current")
         members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
-            logger.warning("QMT 概念快照: no concept members")
-            return
+            raise RuntimeError(
+                "QMT concept current has no concept members; preserving previous snapshot"
+            )
         qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
         df = bridge.current(
             qmt_codes,
@@ -1642,10 +2947,26 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
         out = aggregate_concept_current(members, df)
         if out.empty:
             raise RuntimeError("QMT concept current aggregation returned no rows")
-        df_to_table(engine, _with_etl(out), "sm_concept_east_current")
+        requested = {str(code).strip() for code in concept_codes if str(code).strip()}
+        received = set(out["index_code"].astype(str).str.strip())
+        coverage = len(received & requested) / max(len(requested), 1)
+        min_coverage = min(
+            1.0,
+            max(0.0, float(os.environ.get("QMT_CONCEPT_CURRENT_MIN_COVERAGE", "0.80"))),
+        )
+        if coverage < min_coverage:
+            raise RuntimeError(
+                "QMT concept current coverage below threshold: "
+                f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
+                f"< {min_coverage:.1%}; preserving previous snapshot"
+            )
+        replace_table_rows(
+            _clean_df(_with_etl(out)),
+            "sm_concept_east_current",
+            engine,
+        )
         return
 
-    truncate_only(engine, "sm_concept_east_current")
     ins = _concept_east_instance()
     now = _now()
     cols = ["index_code", "trade_time", "trade_date", "open", "price", "high", "low", "volume", "amount", "change", "change_pct", "snapshot_at"]
@@ -1661,8 +2982,31 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
         return None
 
     parts = _concurrent_run(concept_codes, _fetch, label="东财概念实时")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_east_current")
+    if not parts:
+        raise RuntimeError(
+            "no Eastmoney concept current rows fetched; preserving previous snapshot"
+        )
+    complete = pd.concat(parts, ignore_index=True).drop_duplicates(
+        subset=["index_code"], keep="last"
+    )
+    requested = {str(code).strip() for code in concept_codes if str(code).strip()}
+    received = set(complete["index_code"].astype(str).str.strip())
+    coverage = len(received & requested) / max(len(requested), 1)
+    min_coverage = min(
+        1.0,
+        max(0.0, float(os.environ.get("EAST_CONCEPT_CURRENT_MIN_COVERAGE", "0.80"))),
+    )
+    if coverage < min_coverage:
+        raise RuntimeError(
+            "Eastmoney concept current coverage below threshold: "
+            f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
+            f"< {min_coverage:.1%}; preserving previous snapshot"
+        )
+    replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        "sm_concept_east_current",
+        engine,
+    )
 
 
 def step_concept_flow_east(engine: Engine) -> None:
@@ -1823,9 +3167,13 @@ def step_concept_flow_east(engine: Engine) -> None:
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_capital_flow_east")
 
 
-def step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | None = None, kline_end: str | None = None) -> None:
-    if _index_source("kline") == "qmt":
-        from integrations.qmt import bridge
+def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | None = None, kline_end: str | None = None) -> None:
+    index_source = _index_source("kline")
+    if index_source in {"qmt", "bigqmt"}:
+        if index_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
         from integrations.qmt.info import to_qmt_index_symbols
 
         truncate_only(engine, "sm_index_kline")
@@ -1886,17 +3234,20 @@ def step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | 
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_index_kline")
 
 
-def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
-    if _index_source("minute") == "qmt":
-        from integrations.qmt import bridge
+def _legacy_step_index_minute(engine: Engine, index_codes: list[str]) -> None:
+    index_source = _index_source("minute")
+    if index_source in {"qmt", "bigqmt"}:
+        if index_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
         from integrations.qmt.info import to_qmt_index_symbols
 
-        truncate_only(engine, "sm_index_minute")
         qmt_codes = to_qmt_index_symbols(index_codes)
         if not qmt_codes:
             logger.warning("指数分钟(QMT): no valid index codes")
             return
-        trade_date = datetime.now().strftime("%Y-%m-%d")
+        trade_date = _default_myquant_minute_date(engine)
         df = bridge.minute(
             qmt_codes,
             trade_date=trade_date,
@@ -1919,12 +3270,12 @@ def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
         out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
         out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
         out["snapshot_at"] = _now()
+        truncate_only(engine, "sm_index_minute")
         df_to_table(engine, _with_etl(out), "sm_index_minute")
         return
 
     from adata.stock.market.index_market.market_index import StockMarketIndex
 
-    truncate_only(engine, "sm_index_minute")
     ins = StockMarketIndex()
     now = _now()
     cols = ["index_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount", "snapshot_at"]
@@ -1939,7 +3290,826 @@ def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
 
     parts = _concurrent_run(index_codes, _fetch, label="指数分钟")
     if parts:
+        truncate_only(engine, "sm_index_minute")
         df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_index_minute")
+
+
+def _normalize_index_kline_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+    out["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
+    out["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    out["k_type"] = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+    for column in ("open", "close", "high", "low", "volume", "amount", "change", "change_pct"):
+        out[column] = pd.to_numeric(df.get(column), errors="coerce")
+    out = out.dropna(subset=["index_code", "trade_time", "trade_date", "open", "close", "high", "low"])
+    return out[
+        (out["open"] > 0)
+        & (out["close"] > 0)
+        & (out["high"] >= out[["open", "close", "low"]].max(axis=1))
+        & (out["low"] <= out[["open", "close", "high"]].min(axis=1))
+    ]
+
+
+_TENCENT_INDEX_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/kline/kline"
+_EAST_INDEX_KLINE_URLS = (
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://33.push2his.eastmoney.com/api/qt/stock/kline/get",
+    "https://63.push2his.eastmoney.com/api/qt/stock/kline/get",
+)
+_CNINDEX_INDEX_KLINE_URL = (
+    "https://hq.cnindex.com.cn/market/market/getIndexDailyDataWithDataFormat"
+)
+_CNINDEX_INDEX_CURRENT_URL = (
+    "https://hq.cnindex.com.cn/market/market/getIndexLatestRealTimeData"
+)
+
+
+def _tencent_index_symbol(index_code: str) -> str:
+    code = str(index_code or "").strip().zfill(6)
+    return f"sz{code}" if code.startswith(("399", "970", "980")) else f"sh{code}"
+
+
+def _fetch_tencent_index_kline(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Fetch one index's unadjusted daily bars from Tencent.
+
+    One prior calendar window is requested so ``change`` and ``change_pct`` can
+    be derived from the provider's own previous close.  Tencent reports index
+    volume in shares, matching the existing QMT rows in ``sm_index_kline``.
+    """
+    code = str(index_code or "").strip().zfill(6)
+    symbol = _tencent_index_symbol(code)
+    start_ts = pd.Timestamp(start_date).normalize()
+    end_ts = pd.Timestamp(end_date).normalize()
+    fetch_start = (start_ts - timedelta(days=14)).strftime("%Y-%m-%d")
+    span_days = max(1, (end_ts - pd.Timestamp(fetch_start)).days)
+    count = min(2000, max(30, span_days * 2))
+    request_params = {"param": f"{symbol},day,{fetch_start},{end_ts:%Y-%m-%d},{count}"}
+    attempts = max(1, int(os.environ.get("TENCENT_INDEX_KLINE_ATTEMPTS", "5")))
+    last_error: Exception | None = None
+    payload: dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                _TENCENT_INDEX_KLINE_URL,
+                params=request_params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=float(os.environ.get("TENCENT_INDEX_KLINE_TIMEOUT", "20")),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt < attempts:
+                time.sleep(0.25 * attempt)
+    if not payload and last_error:
+        raise last_error
+    if int(payload.get("code") or 0) != 0:
+        return pd.DataFrame()
+    rows = (((payload.get("data") or {}).get(symbol) or {}).get("day") or [])
+    records: list[dict[str, Any]] = []
+    for values in rows:
+        if not isinstance(values, list) or len(values) < 6:
+            continue
+        try:
+            records.append(
+                {
+                    "index_code": code,
+                    "trade_date": str(values[0])[:10],
+                    "open": float(values[1]),
+                    "close": float(values[2]),
+                    "high": float(values[3]),
+                    "low": float(values[4]),
+                    "volume": float(values[5]),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records).drop_duplicates(subset=["trade_date"], keep="last")
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date"]).sort_values("trade_date")
+    frame["pre_close"] = frame["close"].shift(1)
+    frame["change"] = frame["close"] - frame["pre_close"]
+    frame["change_pct"] = frame["change"] / frame["pre_close"] * 100.0
+    frame = frame[(frame["trade_date"] >= start_ts) & (frame["trade_date"] <= end_ts)].copy()
+    if frame.empty:
+        return frame
+    frame["trade_time"] = frame["trade_date"] + pd.Timedelta(hours=15)
+    frame["k_type"] = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+    frame["amount"] = None
+    return frame[
+        [
+            "index_code",
+            "trade_time",
+            "trade_date",
+            "k_type",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "change",
+            "change_pct",
+        ]
+    ]
+
+
+def _fetch_east_index_kline(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Fetch a second, amount-bearing daily-bar copy from Eastmoney."""
+    code = str(index_code or "").strip().zfill(6)
+    secid = f"0.{code}" if code.startswith(("399", "970", "980")) else f"1.{code}"
+    params = {
+        "secid": secid,
+        "klt": "101",
+        "fqt": "0",
+        "beg": str(start_date).replace("-", ""),
+        "end": str(end_date).replace("-", ""),
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+    }
+    last_error: Exception | None = None
+    payload: dict[str, Any] = {}
+    with requests.Session() as session:
+        session.trust_env = os.environ.get("SM_TRUST_ENV_PROXY") == "1"
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://quote.eastmoney.com/",
+            }
+        )
+        for url in _EAST_INDEX_KLINE_URLS:
+            try:
+                response = session.get(
+                    url,
+                    params=params,
+                    timeout=float(os.environ.get("EAST_INDEX_KLINE_TIMEOUT", "15")),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if ((payload.get("data") or {}).get("klines") or []):
+                    break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                continue
+    raw_rows = ((payload.get("data") or {}).get("klines") or [])
+    if not raw_rows:
+        if last_error:
+            raise last_error
+        return pd.DataFrame()
+    records: list[dict[str, Any]] = []
+    for raw in raw_rows:
+        values = str(raw).split(",")
+        if len(values) < 10:
+            continue
+        try:
+            records.append(
+                {
+                    "index_code": code,
+                    "trade_date": str(values[0])[:10],
+                    "open": float(values[1]),
+                    "close": float(values[2]),
+                    "high": float(values[3]),
+                    "low": float(values[4]),
+                    "volume": float(values[5]),
+                    "amount": float(values[6]),
+                    "change_pct": float(values[8]),
+                    "change": float(values[9]),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records).drop_duplicates(subset=["trade_date"], keep="last")
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date"]).sort_values("trade_date")
+    frame["trade_time"] = frame["trade_date"] + pd.Timedelta(hours=15)
+    frame["k_type"] = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+    return frame[
+        [
+            "index_code",
+            "trade_time",
+            "trade_date",
+            "k_type",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "change",
+            "change_pct",
+        ]
+    ]
+
+
+def _fetch_cnindex_index_kline(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Fetch daily bars from the official Shenzhen Securities Information source.
+
+    The CNINDEX endpoint publishes amount in CNY 100 millions and volume in
+    millions of shares.  Convert both to their base units before persisting.
+    """
+    code = str(index_code or "").strip().zfill(6)
+    params = {
+        "indexCode": code,
+        "startDate": str(start_date)[:10],
+        "endDate": str(end_date)[:10],
+        "frequency": "day",
+    }
+    attempts = max(1, int(os.environ.get("CNINDEX_KLINE_ATTEMPTS", "4")))
+    last_error: Exception | None = None
+    payload: dict[str, Any] = {}
+    with requests.Session() as session:
+        session.trust_env = os.environ.get("SM_TRUST_ENV_PROXY") == "1"
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.cnindex.com.cn/",
+            }
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                response = session.get(
+                    _CNINDEX_INDEX_KLINE_URL,
+                    params=params,
+                    timeout=float(os.environ.get("CNINDEX_KLINE_TIMEOUT", "20")),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt < attempts:
+                    time.sleep(0.25 * attempt)
+    if not payload and last_error:
+        raise last_error
+    if int(payload.get("code") or 0) != 200:
+        return pd.DataFrame()
+    data = payload.get("data") or {}
+    fields = data.get("item") or []
+    raw_rows = data.get("data") or []
+    if not isinstance(fields, list) or not isinstance(raw_rows, list):
+        return pd.DataFrame()
+
+    def _number(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    records: list[dict[str, Any]] = []
+    for values in raw_rows:
+        if not isinstance(values, list):
+            continue
+        raw = dict(zip(fields, values))
+        trade_date = str(raw.get("timestamp") or "")[:10]
+        open_price = _number(raw.get("open"))
+        close_price = _number(raw.get("close"))
+        high_price = _number(raw.get("high"))
+        low_price = _number(raw.get("low"))
+        if not trade_date or None in (open_price, close_price, high_price, low_price):
+            continue
+        change_pct_text = str(raw.get("percent") or "").strip().rstrip("%")
+        change_pct = _number(change_pct_text)
+        volume = _number(raw.get("volume"))
+        amount = _number(raw.get("amount"))
+        records.append(
+            {
+                "index_code": code,
+                "trade_date": trade_date,
+                "open": open_price,
+                "close": close_price,
+                "high": high_price,
+                "low": low_price,
+                "volume": None if volume is None else round(volume * 1_000_000.0),
+                "amount": None if amount is None else round(amount * 100_000_000.0),
+                "change": _number(raw.get("chg")),
+                "change_pct": change_pct,
+            }
+        )
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records).drop_duplicates(subset=["trade_date"], keep="last")
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame = frame.dropna(subset=["trade_date"]).sort_values("trade_date")
+    frame = frame[
+        (frame["open"] > 0)
+        & (frame["close"] > 0)
+        & (frame["high"] >= frame[["open", "close", "low"]].max(axis=1))
+        & (frame["low"] <= frame[["open", "close", "high"]].min(axis=1))
+    ].copy()
+    if frame.empty:
+        return frame
+    frame["trade_time"] = frame["trade_date"] + pd.Timedelta(hours=15)
+    frame["k_type"] = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+    return frame[
+        [
+            "index_code",
+            "trade_time",
+            "trade_date",
+            "k_type",
+            "open",
+            "close",
+            "high",
+            "low",
+            "volume",
+            "amount",
+            "change",
+            "change_pct",
+        ]
+    ]
+
+
+def _fetch_cnindex_index_current(
+    index_code: str,
+    snapshot_at: datetime,
+) -> pd.DataFrame:
+    """Fetch one real-time CNI index row from the official publisher."""
+    code = str(index_code or "").strip().zfill(6)
+    attempts = max(1, int(os.environ.get("CNINDEX_CURRENT_ATTEMPTS", "4")))
+    payload: dict[str, Any] = {}
+    last_error: Exception | None = None
+    with requests.Session() as session:
+        session.trust_env = os.environ.get("SM_TRUST_ENV_PROXY") == "1"
+        session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.cnindex.com.cn/",
+            }
+        )
+        for attempt in range(1, attempts + 1):
+            try:
+                response = session.get(
+                    _CNINDEX_INDEX_CURRENT_URL,
+                    params={"indexCode": code, "t": int(time.time() * 1000)},
+                    timeout=float(os.environ.get("CNINDEX_CURRENT_TIMEOUT", "20")),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except (requests.RequestException, ValueError) as exc:
+                last_error = exc
+                if attempt < attempts:
+                    time.sleep(0.25 * attempt)
+    if not payload and last_error:
+        raise last_error
+    if int(payload.get("code") or 0) != 200:
+        return pd.DataFrame()
+    data = payload.get("data") or {}
+    fields = data.get("item") or []
+    raw_rows = data.get("data") or []
+    if not isinstance(fields, list) or not isinstance(raw_rows, list) or not raw_rows:
+        return pd.DataFrame()
+    raw = dict(zip(fields, raw_rows[-1]))
+
+    def _number(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    timestamp = _number(raw.get("timestamp"))
+    price = _number(raw.get("current"))
+    if timestamp is None or price is None or price <= 0:
+        return pd.DataFrame()
+    trade_time = (
+        pd.to_datetime(timestamp, unit="ms", utc=True)
+        .tz_convert("Asia/Shanghai")
+        .tz_localize(None)
+    )
+    change_pct = _number(raw.get("percent"))
+    volume = _number(raw.get("volume"))
+    amount = _number(raw.get("amount"))
+    row = {
+        "index_code": code,
+        "trade_time": trade_time,
+        "trade_date": trade_time.strftime("%Y-%m-%d"),
+        "open": _number(raw.get("open")),
+        "price": price,
+        "high": _number(raw.get("high")),
+        "low": _number(raw.get("low")),
+        "volume": None if volume is None else round(volume),
+        "amount": None if amount is None else round(amount, 2),
+        "change": _number(raw.get("chg")),
+        "change_pct": None if change_pct is None else change_pct * 100.0,
+        "snapshot_at": snapshot_at,
+    }
+    return pd.DataFrame([row])
+
+
+def _fetch_verified_external_index_kline(
+    index_code: str,
+    start_date: str,
+    end_date: str,
+) -> tuple[pd.DataFrame, str]:
+    """Cross-check Eastmoney OHLCV against Tencent and retain Eastmoney amount."""
+    code = str(index_code or "").strip().zfill(6)
+    if code.startswith(("970", "980")):
+        try:
+            official = _fetch_cnindex_index_kline(code, start_date, end_date)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Official CNINDEX K-line unavailable for %s: %s", code, exc)
+        else:
+            if not official.empty:
+                return official, "cnindex_official"
+
+    tencent = _fetch_tencent_index_kline(index_code, start_date, end_date)
+    try:
+        east = _fetch_east_index_kline(index_code, start_date, end_date)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.debug("Eastmoney index K-line unavailable for %s: %s", index_code, exc)
+        east = pd.DataFrame()
+    if tencent.empty:
+        if not east.empty:
+            return east, "east_only"
+        try:
+            official = _fetch_cnindex_index_kline(code, start_date, end_date)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Official CNINDEX K-line unavailable for %s: %s", code, exc)
+            official = pd.DataFrame()
+        return official, "cnindex_official" if not official.empty else "unavailable"
+    if east.empty:
+        return tencent, "tencent_only"
+    merged = tencent.merge(
+        east,
+        on=["index_code", "trade_date"],
+        how="inner",
+        suffixes=("_tencent", "_east"),
+    )
+    if len(merged) != len(tencent) or len(merged) != len(east):
+        raise RuntimeError(
+            f"index K-line date coverage mismatch for {index_code}: "
+            f"Tencent={len(tencent)} Eastmoney={len(east)} matched={len(merged)}"
+        )
+    for column in ("open", "close", "high", "low", "volume"):
+        left = pd.to_numeric(merged[f"{column}_tencent"], errors="coerce")
+        right = pd.to_numeric(merged[f"{column}_east"], errors="coerce")
+        if not np.allclose(left, right, rtol=0, atol=1e-6, equal_nan=False):
+            raise RuntimeError(f"index K-line {column} mismatch for {index_code}")
+    return east, "cross_checked"
+
+
+def _latest_index_kline_date(engine: Engine) -> str:
+    try:
+        frame = read_frame_direct(text("SELECT MAX(trade_date) AS trade_date FROM sm_index_kline"), engine)
+    except Exception as exc:  # pragma: no cover - defensive database fallback
+        logger.warning("Unable to read latest index K-line date: %s", exc)
+        return ""
+    if frame is None or frame.empty or pd.isna(frame.iloc[0].get("trade_date")):
+        return ""
+    return str(frame.iloc[0]["trade_date"])[:10]
+
+
+def _latest_completed_stock_kline_date(engine: Engine) -> str:
+    """Return the latest completed stock daily-bar date used as index cutoff."""
+    try:
+        frame = read_frame_direct(
+            text(
+                "SELECT trade_date FROM sm_stock_kline "
+                "WHERE k_type = 1 AND adjust_type = 0 "
+                "ORDER BY trade_date DESC LIMIT 1"
+            ),
+            engine,
+        )
+    except Exception as exc:  # pragma: no cover - defensive database fallback
+        logger.warning("Unable to read latest completed stock K-line date: %s", exc)
+        return ""
+    if frame is None or frame.empty or pd.isna(frame.iloc[0].get("trade_date")):
+        return ""
+    return str(frame.iloc[0]["trade_date"])[:10]
+
+
+def _normalize_index_minute_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = pd.DataFrame()
+    out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+    out["trade_time"] = pd.to_datetime(df["trade_time"], errors="coerce")
+    out["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out["price"] = pd.to_numeric(df.get("price"), errors="coerce")
+    out["avg_price"] = None
+    for column in ("change", "change_pct", "volume", "amount"):
+        out[column] = pd.to_numeric(df.get(column), errors="coerce")
+    out["snapshot_at"] = _now()
+    out = out.dropna(subset=["index_code", "trade_time", "trade_date", "price"])
+    return out[(out["price"] > 0) & (out["volume"] >= 0) & (out["amount"] >= 0)]
+
+
+def step_index_kline(
+    engine: Engine,
+    index_codes: list[str],
+    kline_start: str | None = None,
+    kline_end: str | None = None,
+) -> None:
+    """Synchronize index K-lines without deleting the last good table first."""
+    history_engine = get_kline_engine()
+    index_source = _index_source("kline")
+    if kline_start:
+        start = kline_start
+    elif index_source in {"tencent", "qq"}:
+        start = _latest_index_kline_date(history_engine) or os.environ.get("SM_INDEX_START", "2020-01-01")
+    else:
+        start = os.environ.get("SM_INDEX_START", "2020-01-01")
+    if kline_end:
+        end = kline_end
+    elif index_source in {"tencent", "qq"}:
+        # Never compare or persist an unfinished intraday daily bar.  The
+        # stock daily table is the canonical completed-session watermark.
+        end = (
+            _latest_completed_stock_kline_date(history_engine)
+            or os.environ.get("SM_INDEX_END")
+            or datetime.now().strftime("%Y-%m-%d")
+        )
+    else:
+        end = os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
+    if pd.Timestamp(start) > pd.Timestamp(end):
+        start = end
+    if index_source in {"qmt", "bigqmt"}:
+        if index_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_index_symbols
+
+        qmt_codes = to_qmt_index_symbols(index_codes)
+        if not qmt_codes:
+            raise RuntimeError("QMT index K-line has no valid symbols")
+        batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_INDEX_KLINE_BATCH_SIZE", "40")))
+        timeout = int(os.environ.get("QMT_INDEX_KLINE_TIMEOUT", os.environ.get("QMT_TIMEOUT", "120")))
+        min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_INDEX_KLINE_MIN_COVERAGE", "0.50"))))
+        total_batches = (len(qmt_codes) + batch_size - 1) // batch_size
+        received_codes: set[str] = set()
+        written = 0
+        for batch_no, batch in enumerate(_chunked(qmt_codes, batch_size), start=1):
+            raw = bridge.kline(
+                batch,
+                start_date=start,
+                end_date=end,
+                dividend_type="none",
+                batch_size=batch_size,
+                timeout=timeout,
+            )
+            out = _normalize_index_kline_frame(raw)
+            if out.empty:
+                logger.warning("QMT index K batch %d/%d returned no valid rows", batch_no, total_batches)
+                continue
+            batch_written = _replace_qmt_index_window(
+                history_engine,
+                out,
+                table_name="sm_index_kline",
+                time_column="trade_date",
+            )
+            written += batch_written
+            received_codes.update(out["index_code"].astype(str).unique().tolist())
+            logger.info(
+                "QMT index K batch %d/%d: rows=%d cumulative_codes=%d",
+                batch_no,
+                total_batches,
+                batch_written,
+                len(received_codes),
+            )
+        coverage = len(received_codes) / max(len(qmt_codes), 1)
+        if written <= 0 or coverage < min_coverage:
+            raise RuntimeError(
+                f"QMT index kline coverage below threshold: {len(received_codes)}/{len(qmt_codes)} "
+                f"({coverage:.1%}) < {min_coverage:.1%}"
+            )
+        logger.info("QMT index K complete: rows=%d coverage=%.2f%%", written, coverage * 100)
+        return
+
+    if index_source in {"tencent", "qq"}:
+        workers = max(1, min(32, int(os.environ.get("TENCENT_INDEX_KLINE_WORKERS", "16"))))
+        parts: list[pd.DataFrame] = []
+        errors: list[str] = []
+        failed_codes: list[str] = []
+        source_counts: dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_fetch_verified_external_index_kline, code, start, end): str(code).zfill(6)
+                for code in index_codes
+            }
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    frame, source_status = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    errors.append(f"{code}:{exc}")
+                    failed_codes.append(code)
+                    continue
+                source_counts[source_status] = source_counts.get(source_status, 0) + 1
+                if frame is not None and not frame.empty:
+                    parts.append(frame)
+        if failed_codes:
+            logger.warning(
+                "Retrying %d transient index K-line failures after the first pass: %s",
+                len(failed_codes),
+                failed_codes[:10],
+            )
+            retry_errors: list[str] = []
+            for code in failed_codes:
+                try:
+                    frame, source_status = _fetch_verified_external_index_kline(code, start, end)
+                except Exception as exc:  # pylint: disable=broad-except
+                    retry_errors.append(f"{code}:{exc}")
+                    continue
+                source_counts[source_status] = source_counts.get(source_status, 0) + 1
+                if frame is not None and not frame.empty:
+                    parts.append(frame)
+            errors = retry_errors
+        if not parts:
+            raise RuntimeError(
+                "Tencent index K-line returned no rows"
+                + (f"; errors={errors[:3]}" if errors else "")
+            )
+        complete = pd.concat(
+            [frame.dropna(axis=1, how="all") for frame in parts],
+            ignore_index=True,
+        )
+        received_codes = set(complete["index_code"].astype(str).str.zfill(6).unique())
+        requested_codes = {str(code).zfill(6) for code in index_codes if str(code).strip()}
+        coverage = len(received_codes) / max(len(requested_codes), 1)
+        min_coverage = min(
+            1.0,
+            max(0.0, float(os.environ.get("TENCENT_INDEX_KLINE_MIN_COVERAGE", "0.978"))),
+        )
+        if coverage < min_coverage:
+            raise RuntimeError(
+                f"Tencent index K-line coverage below threshold: "
+                f"{len(received_codes)}/{len(requested_codes)} ({coverage:.1%}) < {min_coverage:.1%}; "
+                f"errors={errors[:3]}"
+            )
+        normalized = _with_etl(complete)
+        predicate = "trade_date >= :start_date AND trade_date <= :end_date"
+        replace_table_rows(
+            _clean_df(normalized),
+            "sm_index_kline",
+            history_engine,
+            where_sql=predicate,
+            params={"start_date": start, "end_date": end},
+        )
+        logger.info(
+            "Verified external index K complete: rows=%d coverage=%d/%d (%.2f%%), "
+            "range=%s..%s, sources=%s, errors=%d",
+            len(normalized),
+            len(received_codes),
+            len(requested_codes),
+            coverage * 100,
+            start,
+            end,
+            source_counts,
+            len(errors),
+        )
+        return
+
+    from adata.stock.market.index_market.market_index import StockMarketIndex
+
+    ins = StockMarketIndex()
+    k_type = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+    cols = ["index_code", "trade_time", "trade_date", "k_type", "open", "close", "high", "low", "volume", "amount", "change", "change_pct"]
+
+    def _fetch(code: str) -> pd.DataFrame | None:
+        frame = retry_remote(ins.get_market_index, index_code=code, start_date=start, k_type=k_type)
+        if frame is None or frame.empty:
+            return None
+        if end and "trade_date" in frame.columns:
+            frame = frame[frame["trade_date"] <= end]
+        frame = _to_numeric(frame, ["open", "close", "high", "low", "volume", "amount", "change", "change_pct"])
+        frame["k_type"] = k_type
+        return frame[cols]
+
+    parts = _concurrent_run(index_codes, _fetch, label="index K-line")
+    if not parts:
+        raise RuntimeError("external index K-line returned no rows")
+    complete = _with_etl(pd.concat(parts, ignore_index=True))
+    predicate = "trade_date >= :start_date AND trade_date <= :end_date" if end else "trade_date >= :start_date"
+    params = {"start_date": start, **({"end_date": end} if end else {})}
+    replace_table_rows(_clean_df(complete), "sm_index_kline", history_engine, where_sql=predicate, params=params)
+
+
+def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
+    """Synchronize index minutes in bounded, atomic batches."""
+    history_engine = get_kline_engine()
+    index_source = _index_source("minute")
+    if index_source in {"qmt", "bigqmt"}:
+        if index_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
+        from integrations.qmt.info import to_qmt_index_symbols
+
+        qmt_codes = to_qmt_index_symbols(index_codes)
+        if not qmt_codes:
+            raise RuntimeError("QMT index minute has no valid symbols")
+        trade_date = _default_myquant_minute_date(engine)
+        count = max(0, int(os.environ.get("QMT_INDEX_MINUTE_COUNT", os.environ.get("QMT_MINUTE_COUNT", "0")) or 0))
+        batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_INDEX_MINUTE_BATCH_SIZE", "40")))
+        timeout = int(os.environ.get("QMT_INDEX_MINUTE_TIMEOUT", os.environ.get("QMT_TIMEOUT", "120")))
+        min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_INDEX_MINUTE_MIN_COVERAGE", "0.50"))))
+        total_batches = (len(qmt_codes) + batch_size - 1) // batch_size
+        received_codes: set[str] = set()
+        written = 0
+        first_trade_time: pd.Timestamp | None = None
+        last_trade_time: pd.Timestamp | None = None
+        for batch_no, batch in enumerate(_chunked(qmt_codes, batch_size), start=1):
+            raw = bridge.minute(
+                batch,
+                trade_date=trade_date,
+                start_date=trade_date,
+                end_date=trade_date,
+                count=count,
+                download_history=(count == 0),
+                batch_size=batch_size,
+                timeout=timeout,
+            )
+            out = _normalize_index_minute_frame(raw)
+            if out.empty:
+                logger.warning("QMT index minute batch %d/%d returned no valid rows", batch_no, total_batches)
+                continue
+            batch_first = out["trade_time"].min()
+            batch_last = out["trade_time"].max()
+            first_trade_time = batch_first if first_trade_time is None else min(first_trade_time, batch_first)
+            last_trade_time = batch_last if last_trade_time is None else max(last_trade_time, batch_last)
+            batch_written = _replace_qmt_index_window(
+                history_engine,
+                out,
+                table_name="sm_index_minute",
+                time_column="trade_time",
+                replace_date=trade_date if count == 0 else None,
+            )
+            written += batch_written
+            received_codes.update(out["index_code"].astype(str).unique().tolist())
+            logger.info(
+                "QMT index minute batch %d/%d: rows=%d cumulative_codes=%d",
+                batch_no,
+                total_batches,
+                batch_written,
+                len(received_codes),
+            )
+        coverage = len(received_codes) / max(len(qmt_codes), 1)
+        if written <= 0 or coverage < min_coverage:
+            raise RuntimeError(
+                f"QMT index minute coverage below threshold: {len(received_codes)}/{len(qmt_codes)} "
+                f"({coverage:.1%}) < {min_coverage:.1%}"
+            )
+        if count == 0 and _is_complete_index_universe(engine, index_codes):
+            _prune_snapshot_codes(
+                history_engine,
+                table_name="sm_index_minute",
+                code_column="index_code",
+                date_column="trade_date",
+                target_date=trade_date,
+                keep_codes=received_codes,
+            )
+            if first_trade_time is not None and last_trade_time is not None:
+                _prune_snapshot_time_bounds(
+                    history_engine,
+                    table_name="sm_index_minute",
+                    date_column="trade_date",
+                    time_column="trade_time",
+                    target_date=trade_date,
+                    first_time=first_trade_time.to_pydatetime(),
+                    last_time=last_trade_time.to_pydatetime(),
+                )
+        logger.info("QMT index minute complete: rows=%d coverage=%.2f%%", written, coverage * 100)
+        return
+
+    from adata.stock.market.index_market.market_index import StockMarketIndex
+
+    ins = StockMarketIndex()
+    now = _now()
+    cols = ["index_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount", "snapshot_at"]
+
+    def _fetch(code: str) -> pd.DataFrame | None:
+        frame = retry_remote(ins.get_market_index_min, index_code=code)
+        if frame is None or frame.empty:
+            return None
+        frame = _to_numeric(frame, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
+        frame["snapshot_at"] = now
+        return frame[cols]
+
+    parts = _concurrent_run(index_codes, _fetch, label="index minute")
+    if not parts:
+        raise RuntimeError("external index minute returned no rows")
+    complete = pd.concat(parts, ignore_index=True)
+    _replace_qmt_index_window(history_engine, complete, table_name="sm_index_minute", time_column="trade_time")
 
 
 def _sina_index_symbol(index_code: str) -> str | None:
@@ -1951,7 +4121,7 @@ def _sina_index_symbol(index_code: str) -> str | None:
     digits = re.sub(r"\D", "", code)
     if len(digits) != 6:
         return None
-    if digits.startswith(("399", "395")):
+    if digits.startswith(("399", "395", "970", "980")):
         return "sz" + digits
     return "sh" + digits
 
@@ -2034,9 +4204,63 @@ def _fetch_sina_index_current(index_codes: list[str], snapshot_at: datetime) -> 
     return pd.DataFrame(rows, columns=cols)
 
 
-def step_index_current(engine: Engine, index_codes: list[str]) -> None:
-    if _index_source("current") == "qmt":
-        from integrations.qmt import bridge
+def _supplement_cnindex_index_current(
+    frame: pd.DataFrame,
+    index_codes: list[str],
+    snapshot_at: datetime,
+) -> pd.DataFrame:
+    """Fill missing CNI current rows with the publisher's completed daily bar."""
+    if frame is None or frame.empty:
+        return frame
+    expected = {
+        str(code).strip().zfill(6)
+        for code in index_codes
+        if str(code).strip().zfill(6).startswith(("970", "980"))
+    }
+    present = {
+        str(code).strip().zfill(6)
+        for code in frame.get("index_code", pd.Series(dtype=str)).dropna().tolist()
+    }
+    missing = sorted(expected - present)
+    trade_date_values = frame.get("trade_date")
+    if trade_date_values is None:
+        return frame
+    trade_dates = pd.to_datetime(trade_date_values, errors="coerce").dropna()
+    if not missing or trade_dates.empty:
+        return frame
+    target_date = trade_dates.max().strftime("%Y-%m-%d")
+    rows: list[dict[str, Any]] = []
+    for code in missing:
+        try:
+            official = _fetch_cnindex_index_current(code, snapshot_at)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Official CNINDEX current supplement unavailable for %s: %s", code, exc)
+            continue
+        if official.empty:
+            continue
+        official = official[
+            pd.to_datetime(official["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+            == target_date
+        ]
+        if not official.empty:
+            rows.append(official.sort_values("trade_time").iloc[-1].to_dict())
+    if not rows:
+        return frame
+    logger.info(
+        "index current: supplemented %d/%d missing CNI rows from the official publisher",
+        len(rows),
+        len(missing),
+    )
+    return pd.concat([frame, pd.DataFrame(rows)], ignore_index=True)
+
+
+def _legacy_step_index_current(engine: Engine, index_codes: list[str]) -> None:
+    index_source = _index_source("current")
+    if index_source in {"qmt", "bigqmt"}:
+        if index_source == "bigqmt":
+            from integrations.bigqmt import bridge
+        else:
+            from integrations.qmt import bridge
         from integrations.qmt.info import to_qmt_index_symbols
 
         qmt_codes = to_qmt_index_symbols(index_codes)
@@ -2063,8 +4287,7 @@ def step_index_current(engine: Engine, index_codes: list[str]) -> None:
         out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
         out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
         out["snapshot_at"] = df["snapshot_at"]
-        truncate_only(engine, "sm_index_current")
-        df_to_table(engine, _with_etl(out), "sm_index_current")
+        upsert_current_frame(engine, _with_etl(out), "sm_index_current", ["index_code"])
         return
 
     from adata.stock.market.index_market.market_index import StockMarketIndex
@@ -2089,8 +4312,119 @@ def step_index_current(engine: Engine, index_codes: list[str]) -> None:
         logger.info("index_current: Sina fallback fetched %s/%s rows.", len(df), len(index_codes))
     if df.empty:
         raise RuntimeError("index_current fetched no rows from adata or Sina fallback")
-    truncate_only(engine, "sm_index_current")
-    df_to_table(engine, _with_etl(df), "sm_index_current")
+    upsert_current_frame(engine, _with_etl(df), "sm_index_current", ["index_code"])
+
+
+def _replace_index_current_snapshot(
+    engine: Engine,
+    frame: pd.DataFrame,
+    index_codes: list[str],
+    *,
+    source: str,
+) -> int:
+    """Validate and atomically replace the complete index-current snapshot."""
+    if frame is None or frame.empty:
+        raise RuntimeError(f"{source} index current returned no rows")
+    expected_codes = {str(code).zfill(6) for code in index_codes if str(code).strip()}
+    out = frame.copy()
+    out["index_code"] = out["index_code"].astype(str).str.zfill(6)
+    out["price"] = pd.to_numeric(out.get("price"), errors="coerce")
+    out = out.dropna(subset=["index_code", "price"])
+    out = out[(out["price"] > 0) & out["index_code"].isin(expected_codes)]
+    out = out.drop_duplicates(subset=["index_code"], keep="last")
+    received_codes = set(out["index_code"].tolist())
+    min_coverage = min(
+        1.0,
+        max(0.0, float(os.environ.get("QMT_INDEX_CURRENT_MIN_COVERAGE", "0.90"))),
+    )
+    coverage = len(received_codes) / max(len(expected_codes), 1)
+    if out.empty or coverage < min_coverage:
+        raise RuntimeError(
+            f"{source} index current coverage below threshold: "
+            f"{len(received_codes)}/{len(expected_codes)} ({coverage:.1%}) < {min_coverage:.1%}"
+        )
+    written = replace_table_rows(
+        _clean_df(_with_etl(out)),
+        "sm_index_current",
+        engine,
+        chunksize=max(100, int(os.environ.get("QMT_INDEX_DB_CHUNK_SIZE", "1000"))),
+        method="multi",
+    )
+    logger.info(
+        "index current (%s): atomically replaced %d rows, coverage=%.2f%%",
+        source,
+        written,
+        coverage * 100,
+    )
+    return written
+
+
+def step_index_current(engine: Engine, index_codes: list[str]) -> None:
+    index_source = _index_source("current")
+    if index_source in {"qmt", "bigqmt"}:
+        if _qmt_runtime_available(index_source):
+            try:
+                if index_source == "bigqmt":
+                    from integrations.bigqmt import bridge
+                else:
+                    from integrations.qmt import bridge
+                from integrations.qmt.info import to_qmt_index_symbols
+
+                qmt_codes = to_qmt_index_symbols(index_codes)
+                if qmt_codes:
+                    df = bridge.current(
+                        qmt_codes,
+                        batch_size=int(os.environ.get("QMT_INDEX_CURRENT_BATCH_SIZE", os.environ.get("QMT_CURRENT_BATCH_SIZE", "500"))),
+                        timeout=int(os.environ.get("QMT_TIMEOUT", "120")),
+                    )
+                    if df is None or df.empty:
+                        raise RuntimeError("QMT index current returned no rows")
+                    out = pd.DataFrame()
+                    out["index_code"] = df["stock_code"].astype(str).str.zfill(6)
+                    out["trade_time"] = df["snapshot_at"]
+                    out["trade_date"] = pd.to_datetime(df["snapshot_at"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    out["open"] = pd.to_numeric(df.get("open"), errors="coerce")
+                    out["price"] = pd.to_numeric(df.get("price"), errors="coerce")
+                    out["high"] = pd.to_numeric(df.get("high"), errors="coerce")
+                    out["low"] = pd.to_numeric(df.get("low"), errors="coerce")
+                    out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
+                    out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
+                    out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
+                    out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
+                    out["snapshot_at"] = df["snapshot_at"]
+                    out = _supplement_cnindex_index_current(out, index_codes, _now())
+                    _replace_index_current_snapshot(engine, out, index_codes, source="QMT/CNINDEX")
+                    return
+                logger.warning("index current QMT returned no valid symbols; falling back to adata/Sina")
+            except Exception as exc:
+                logger.warning("index current QMT failed; falling back to adata/Sina: %s", exc)
+        else:
+            logger.warning("index current is configured for QMT, but QMT runtime is unavailable; falling back to adata/Sina")
+
+    from adata.stock.market.index_market.market_index import StockMarketIndex
+
+    ins = StockMarketIndex()
+    now = _now()
+    cols = ["index_code", "trade_time", "trade_date", "open", "price", "high", "low", "volume", "amount", "change", "change_pct", "snapshot_at"]
+
+    def _fetch(code: str) -> pd.DataFrame | None:
+        df = retry_remote(ins.get_market_index_current, index_code=code)
+        if df is not None and not df.empty:
+            df = _to_numeric(df, ["open", "price", "high", "low", "volume", "amount", "change", "change_pct"])
+            df["snapshot_at"] = now
+            return df[cols]
+        return None
+
+    parts = _concurrent_run(index_codes, _fetch, label="index current")
+    df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    if df.empty:
+        logger.warning("index_current: adata returned no rows; trying Sina quote fallback.")
+        df = _fetch_sina_index_current(index_codes, now)
+        logger.info("index_current: Sina fallback fetched %s/%s rows.", len(df), len(index_codes))
+    if df.empty:
+        raise RuntimeError("index_current fetched no rows from adata or Sina fallback")
+    df = _supplement_cnindex_index_current(df, index_codes, now)
+    _replace_index_current_snapshot(engine, df, index_codes, source="adata/Sina/CNINDEX")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -2103,7 +4437,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--kline-source",
         type=str,
-        choices=["adata", "akshare", "myquant", "qmt"],
+        choices=["adata", "akshare", "myquant", "qmt", "bigqmt"],
         default=os.environ.get("SM_STOCK_KLINE_SOURCE", "adata").strip().lower() or "adata",
         help="个股 K 线数据源：adata（东财/百度）、akshare（东财日 K）、myquant（掘金）、qmt（迅投）",
     )
@@ -2183,9 +4517,10 @@ def main() -> None:
     kline_source = (args.kline_source or "adata").strip().lower()
     kline_adjust = (args.kline_adjust or "").strip().lower()
     flow_date = (args.flow_date or "").strip()
+    max_stocks_limit = None
 
     if args.max_stocks is not None:
-        os.environ["SM_MAX_STOCKS"] = str(args.max_stocks)
+        max_stocks_limit = args.max_stocks
         logger.info("已设置 SM_MAX_STOCKS=%s（--max-stocks）", args.max_stocks)
 
     slice_limit = args.limit
@@ -2193,15 +4528,35 @@ def main() -> None:
     if slice_offset > 0 and slice_limit == -1:
         slice_limit = 0
         logger.info("已指定 --offset 但未指定 --limit，已按 --limit 0（从 offset 到 si_all_code 末尾）处理。")
+    elif max_stocks_limit is not None and slice_limit == -1:
+        slice_limit = max_stocks_limit
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
-    _log_mysql_target(_mysql_url())
+    engine = create_batch_engine()
+    _log_mysql_target(str(engine.url))
     run_ddl(engine)
     _ensure_sm_stock_kline_short_name(engine)
     if not only_set and os.environ.get("SM_SKIP_GLOBAL_TRUNCATE") != "1":
         truncate_all(engine)
 
-    stock_codes = read_stock_codes(engine, slice_offset=slice_offset, slice_limit=slice_limit)
+    stock_steps = {
+        "dividend",
+        "stock_kline",
+        "stock_minute",
+        "stock_current",
+        "stock_five",
+        "stock_bar",
+        "stock_flow_min",
+        "stock_flow_daily",
+    }
+    index_steps = {"index_kline", "index_minute", "index_current"}
+    concept_ths_steps = {"concept_ths_kline", "concept_ths_minute", "concept_ths_current"}
+    concept_east_steps = {"concept_east_kline", "concept_east_minute", "concept_east_current"}
+
+    stock_codes = (
+        read_stock_codes(engine, slice_offset=slice_offset, slice_limit=slice_limit)
+        if not only_set or bool(only_set & stock_steps)
+        else []
+    )
     progress_path = (args.progress_file or "").strip()
     if not args.skip_progress and progress_path:
         done = _kline_load_progress(progress_path)
@@ -2214,9 +4569,17 @@ def main() -> None:
             len(stock_codes),
         )
 
-    index_codes = read_index_codes(engine)
-    concept_ths_codes = read_concept_ths_codes(engine)
-    concept_east_codes = read_concept_east_codes(engine)
+    index_codes = read_index_codes(engine) if not only_set or bool(only_set & index_steps) else []
+    concept_ths_codes = (
+        read_concept_ths_codes(engine)
+        if not only_set or bool(only_set & concept_ths_steps)
+        else []
+    )
+    concept_east_codes = (
+        read_concept_east_codes(engine)
+        if not only_set or bool(only_set & concept_east_steps)
+        else []
+    )
 
     steps: list[tuple[str, str, Callable[[], None]]] = [
         ("dividend", "分红", lambda: step_dividend(engine, stock_codes)),

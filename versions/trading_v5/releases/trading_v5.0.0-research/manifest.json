@@ -1,0 +1,82 @@
+{
+  "schema_version": "probiga.immutable-trading-release.v1",
+  "system": "trading_v5",
+  "system_version": "5.0.0-research",
+  "release_id": "trading_v5.0.0-research",
+  "created_on": "2026-08-08",
+  "lifecycle_status": "RESEARCH_ONLY",
+  "release_decision": "BLOCK",
+  "immutable": true,
+  "code_commit": "d00dd09caba7ae962b3ce66e85eac34c503b035e",
+  "code_commit_clean": false,
+  "git_anchor_status": "UNTRACKED_DIRTY_WORKTREE_NOT_COMMIT_REPRODUCIBLE",
+  "trusted_external_anchor_present": false,
+  "immutability_enforcement": "HASH_VERIFICATION_AND_APPEND_ONLY_POLICY",
+  "source_hashes_are_authoritative": true,
+  "source_coverage_required": true,
+  "source_tree_hash_algorithm": "sha256(sorted(path + NUL + file_sha256 + LF))",
+  "source_tree_sha256": "29891fbf32dd8c75e5cd9000ec66ebf0a8894dcd91ef064f749e43d5cfbc4b4f",
+  "source_files": {
+    "server/trading_v5/__init__.py": "833e22393026e70c63ded6a43cea3d3031b102ac975b6e3c25ac65242577bde0",
+    "server/trading_v5/evidence.py": "5e656fc301ee9a11814825f240749dc6a225e6bcf175ea7692160307e282e523",
+    "server/trading_v5/models.py": "7be14f017fa7d8bf9f2d9436483348608bb620a930e5d075c26108d0f4425952",
+    "server/trading_v5/regime.py": "368eb6d45071c91e56351629b4ca51a80ee9e887a85bc8028de808fc24f64ba1",
+    "tools/trading_v5/__init__.py": "00bb7790d2cbd5c27c7c73a8d242c0ca525e08273b552f19b2d56a28cebbc085",
+    "tools/trading_v5/audit_release.py": "c1992ff326d866861397b06a1decb79d803720fcb804e92149b1512eb544dda0",
+    "tools/trading_v5/release_integrity.py": "0040c1f788d8e38a6f4bdc9c62c17d51cc0219f9907eaf7be593b177317776ba"
+  },
+  "config_path": "strategies/trading_v5/releases/trading_v5.0.0-research/runtime.json",
+  "config_sha256": "2dd2316848e58766a9d3c25d9bcf42a2c9c79186974f9f753e9e2d5143238d89",
+  "config_files": {
+    "strategies/trading_v5/releases/trading_v5.0.0-research/runtime.json": "2dd2316848e58766a9d3c25d9bcf42a2c9c79186974f9f753e9e2d5143238d89",
+    "strategies/trading_v5/releases/trading_v5.0.0-research/environment.json": "763c452f9f39f44650bd3033472adffe57ca18f62f056802522725e53dad6027",
+    "strategies/trading_v5/releases/trading_v5.0.0-research/campaigns/regime_expert/campaign.json": "9bafc682995480b41b85ab0ef45e4b45e7415e4cf45743e1a703eef276eb8198",
+    "strategies/trading_v5/releases/trading_v5.0.0-research/campaigns/unified_router/campaign.json": "4cbaea2ea7fc4639605c8c6facd3eb3cf2a6a03ba5085406e5197622b0d9cafd"
+  },
+  "test_manifest_path": "versions/trading_v5/releases/trading_v5.0.0-research/tests.txt",
+  "test_manifest_sha256": "a0f103420fb38f3bc7a10d597174c6855e2454c06a42905c443d61f8318e1060",
+  "test_files": {
+    "tests/architecture/test_v5_dependency_boundaries.py": "d17d6217475a13c86a21ce34a1c5339ce7293727eaa0dd3d2a6b603d1dce9034",
+    "tests/test_trading_v5_evidence.py": "dec3a5ca8adcf1c0cbfd3937da40ed7ff6afd04569a3789e8318b0359f6074ad",
+    "tests/test_trading_v5_models.py": "87d087a7a315a9c5ebbd6a3a0ae4bbe0f40531cf168fc6c29e960690d324c3d3",
+    "tests/test_trading_v5_release.py": "f640d98ae57fc16f7d38b93c2c67f435b2f6edf420bb9b627f399f884419f3aa"
+  },
+  "historical_evidence_files": {
+    "regime_expert_capacity": {
+      "path": "artifacts/trading_v5/regime_expert_capacity_oos_20260802.json",
+      "sha256": "1a4f8c5fa229352ad20324f8cf4cc9ad85891d5d6aed78d1eb76795a64ba6259",
+      "decision": "BLOCK",
+      "json_status": "LEGACY_NON_STRICT_JSON",
+      "current_source_reproducible": false
+    },
+    "unified_router_capacity": {
+      "path": "artifacts/trading_v5/unified_router_capacity_oos_20260802.json",
+      "sha256": "2702acf26801020b0f6ffae1081d9641bd50b1b7f5461afc7731f25d6ea58477",
+      "decision": "BLOCK",
+      "json_status": "STRICT_JSON",
+      "current_source_reproducible": false
+    }
+  },
+  "parent_release_id": "trading_v4.1.0-research",
+  "parent_manifest_path": "versions/trading_v4/releases/trading_v4.1.0-research/manifest.json",
+  "parent_manifest_sha256": "82915ddf459fb0d40a7a62854653f0e14698be04c42ecabdaed274e97b74a83b",
+  "lineage_inherits_code": false,
+  "entrypoint": "tools/trading_v5/audit_release.py",
+  "artifact_namespace": "artifacts/trading_v5/releases/trading_v5.0.0-research",
+  "api_prefix": null,
+  "task_namespace": null,
+  "database_status": "DEFERRED_MIGRATION_IN_PROGRESS",
+  "database_tests_run": false,
+  "database_counts_as_pass": false,
+  "historical_candidate_count": 4,
+  "historical_candidate_pass_count": 0,
+  "full_stress_matrix_executed": false,
+  "prospective_evidence_trading_days": 0,
+  "prospective_evidence_mature_portfolio_trades": 0,
+  "execution_contract": "NO_EXECUTION_MODEL_RESEARCH_AND_HISTORICAL_AUDIT_ONLY",
+  "registered_model_count": 0,
+  "activation_eligible": false,
+  "paper_eligible": false,
+  "production_eligible": false,
+  "lineage_note": "The old V5-labelled campaigns remain byte-frozen BLOCK evidence. This release owns new independent research primitives and does not claim to reproduce the old raw-data-to-model pipeline."
+}

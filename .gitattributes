@@ -1,0 +1,34 @@
+# Byte-frozen historical research evidence.  These hashes intentionally bind
+# the original bytes, so Git must not normalize CRLF/LF across platforms.
+artifacts/trading_v5/regime_expert_capacity_oos_20260802.json -text
+artifacts/trading_v5/unified_router_capacity_oos_20260802.json -text
+artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.json -text
+artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stdout.log -text
+artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stderr.log -text
+artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stdout.log -text
+artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stderr.log -text
+
+# Immutable release code, configuration, manifests, and their hash-bound tests
+# are authored with LF bytes.  Keep them identical on Windows checkouts so the
+# release validators audit the same bytes that were originally frozen.
+server/trading_v4/** -text
+server/trading_v5/** -text
+server/trading_v6/** -text
+tools/trading_v4/** -text
+tools/trading_v5/** -text
+tools/trading_v6/** -text
+strategies/trading_v4/** -text
+strategies/trading_v5/** -text
+strategies/trading_v6/** -text
+strategies/trading_v4_*.json -text
+strategies/trading_v5_*.json -text
+strategies/trading_v6_*.json -text
+versions/trading_v4/** -text
+versions/trading_v5/** -text
+versions/trading_v6/** -text
+tests/test_trading_v4_*.py -text
+tests/test_trading_v5_*.py -text
+tests/test_trading_v6_*.py -text
+tests/architecture/test_v4_*.py -text
+tests/architecture/test_v5_*.py -text
+tests/architecture/test_v6_*.py -text

@@ -24,22 +24,39 @@ Thumbs.db
 
 # Project specific
 runtime/
+tmp/
+.tmp/
+cache/
+.cache/
+logs/
+output/
+outputs/
+.codex_backups/
+# Multi-gigabyte research feature caches stay local. Release manifests retain
+# the small, immutable evidence outputs; production never loads these caches.
+artifacts/trading_v4/research_features_*.pkl
+stock.txt
 *.zip
 *.tar
 *.dmp
 *.sql
+*.log
+*.out.log
+*.err.log
+# Byte-bound V6 historical evidence is intentionally versioned.  These four
+# files are not operational logs; the release manifest verifies their SHA-256.
+!artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stdout.log
+!artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.stderr.log
+!artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stdout.log
+!artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.py313.stderr.log
 probiga_dump.sql
 deploy/*.tar
 _archive/
 server*.log
-data/*.log
-data/*.err.log
-data/*.out.log
-data/logs/
-data/qmt_raw/
-data/ui_previews/
-data/task*.json
-data/task_status.txt
+data/**
+!data/.gitkeep
 
 # adata (external library, tracked separately)
 adata/
+.release_venvs/
+.release_sources/

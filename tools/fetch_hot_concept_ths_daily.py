@@ -14,21 +14,18 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from requests.exceptions import RequestException
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-if str(ROOT / "adata") not in sys.path:
-    sys.path.insert(0, str(ROOT / "adata"))
+from server.common.adata_release import ensure_adata_import_path
 
-from server.common.config import get_mysql_url
+ensure_adata_import_path(ROOT)
 
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
+from server.common.batch_db import create_batch_engine, write_frame
 
 
 def _call_with_retry(fn, *args, retries: int = 3, delay: float = 3.0, **kwargs):
@@ -51,7 +48,7 @@ def fetch_hot_concept_ths_daily(snapshot_date: str):
 
     print(f"开始获取同花顺热门概念/行业TOP20，快照日期: {snapshot_date}")
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
 
     hot = Hot()
     parts = []
@@ -67,8 +64,7 @@ def fetch_hot_concept_ths_daily(snapshot_date: str):
             parts.append(df)
 
     if not parts:
-        print("未获取到任何数据")
-        return
+        raise RuntimeError("no THS hot concept rows fetched")
 
     full_df = pd.concat(parts, ignore_index=True)
     full_df = full_df.replace({np.nan: None, pd.NaT: None})
@@ -80,7 +76,15 @@ def fetch_hot_concept_ths_daily(snapshot_date: str):
             text("DELETE FROM `st_hot_concept_ths_daily` WHERE `snapshot_date` = :d AND `plate_type` IN (1, 2)"),
             {"d": snapshot_date},
         )
-        full_df.to_sql("st_hot_concept_ths_daily", conn, if_exists="append", index=False, chunksize=500, method="multi")
+        write_frame(
+            full_df,
+            "st_hot_concept_ths_daily",
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=500,
+            method="multi",
+        )
 
     print(f"写入完成: st_hot_concept_ths_daily, 共 {len(full_df)} 行, 快照日期: {snapshot_date}")
 
@@ -89,7 +93,7 @@ def fetch_hot_concept_ths_daily(snapshot_date: str):
     print(f"  概念板块: {concept_count} 条, 行业板块: {industry_count} 条")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="获取指定日期的同花顺热门概念/行业TOP20（写入 st_hot_concept_ths_daily）")
     parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
     args = parser.parse_args()
@@ -98,10 +102,15 @@ def main():
         datetime.strptime(args.date, "%Y-%m-%d")
     except ValueError:
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {args.date}")
-        return
+        return 1
 
-    fetch_hot_concept_ths_daily(args.date)
+    try:
+        fetch_hot_concept_ths_daily(args.date)
+    except Exception as exc:
+        print(f"THS hot concept sync failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
