@@ -117,8 +117,18 @@ def test_git_delivery_set_uses_dependency_paths_not_mapping_names() -> None:
 
 
 def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> None:
-    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    workflow_source = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = workflow_source + "\n" + deploy_script
 
+    assert len(workflow_source) < 21_000
+    assert "deploy/production_deploy.sh" in workflow_source
+    assert "envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64" in workflow_source
+    assert "${{" not in deploy_script
     assert "actions/checkout@v4" not in workflow
     assert "actions/setup-python@v5" not in workflow
     assert "appleboy/ssh-action@v1.0.3" not in workflow
@@ -155,7 +165,13 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
 
 
 def test_deploy_workflow_pins_separate_adata_runtime() -> None:
-    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(encoding="utf-8")
+    workflow_source = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = workflow_source + "\n" + deploy_script
 
     assert "pip install -e ./adata" not in workflow
     assert "vars.ADATA_RELEASE_SHA" in workflow
@@ -178,7 +194,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "probiga-scheduler.path" in workflow
     assert "probiga-scheduler.socket" in workflow
     assert "assert_scheduler_triggers_quiescent" in workflow
-    preflight = workflow.index("\n            assert_scheduler_triggers_quiescent\n")
+    preflight = workflow.index("\nassert_scheduler_triggers_quiescent\n")
     rollback_trap = workflow.index("trap 'rollback $?' ERR")
     assert preflight < rollback_trap
     assert ".git .github deploy server biz integrations tools scripts" in workflow
@@ -195,6 +211,7 @@ def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
     assert "artifacts/trading_v5/regime_expert_capacity_oos_20260802.json -text" in attributes
     assert "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.json -text" in attributes
+    assert "*.sh text eol=lf" in attributes
 
 
 def test_sector_heat_runtime_cache_is_outside_tracked_data() -> None:

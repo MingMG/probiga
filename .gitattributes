@@ -32,3 +32,4 @@ tests/test_trading_v6_*.py -text
 tests/architecture/test_v4_*.py -text
 tests/architecture/test_v5_*.py -text
 tests/architecture/test_v6_*.py -text
+*.sh text eol=lf
