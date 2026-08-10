@@ -33,6 +33,39 @@ _running_lock = threading.Lock()
 _task_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 
+# These jobs require the signed-in Windows QMT bridge.  Keep their scheduler
+# rows enabled and visible, but never execute their local-only launcher on the
+# production Linux host.
+WINDOWS_QMT_BRIDGE_TASK_TYPES = {
+    "all_code",
+    "all_index_code",
+    "concept_constituent_east",
+    "etf_forward_daily",
+    "index_constituent",
+    "index_current",
+    "index_kline",
+    "index_minute",
+    "intraday_capital_flow_fast",
+    "intraday_minute_kline",
+    "intraday_realtime",
+    "qmt_membership_snapshot",
+    "stock_current",
+    "stock_kline",
+}
+INTRADAY_WINDOW_TASK_TYPES = {
+    "intraday_capital_flow_fast",
+    "intraday_minute_flow",
+    "intraday_minute_kline",
+    "intraday_quality_check",
+    "intraday_realtime",
+    "public_quote_failover",
+    "qmt_intraday_realtime",
+    "sim_trade",
+    "stock_current",
+    "trading_v2_intraday_activation",
+    "trading_v2_paper_tick",
+}
+
 
 def _get_task_semaphore() -> threading.Semaphore:
     global _task_semaphore
@@ -54,6 +87,37 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
         "api_mysql_max_overflow": int(api_pool["max_overflow"]),
         "api_mysql_pool_recycle": int(api_pool["pool_recycle"]),
     }
+
+
+def _should_delegate_to_windows_qmt_bridge(
+    row: dict,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    current_platform = platform_name or os.name
+    return (
+        current_platform != "nt"
+        and str(row.get("task_type") or "").strip()
+        in WINDOWS_QMT_BRIDGE_TASK_TYPES
+    )
+
+
+def _should_skip_outside_intraday_window(row: dict, now: datetime) -> bool:
+    task_type = str(row.get("task_type") or "").strip()
+    if task_type not in INTRADAY_WINDOW_TASK_TYPES:
+        return False
+    start_text = os.environ.get("SCHEDULER_INTRADAY_START", "09:15")
+    end_text = os.environ.get("SCHEDULER_INTRADAY_END", "15:10")
+    try:
+        start_hour, start_minute = (int(part) for part in start_text.split(":"))
+        end_hour, end_minute = (int(part) for part in end_text.split(":"))
+    except (TypeError, ValueError):
+        start_hour, start_minute = 9, 15
+        end_hour, end_minute = 15, 10
+    current = now.hour * 60 + now.minute
+    start = start_hour * 60 + start_minute
+    end = end_hour * 60 + end_minute
+    return current < start or current > end
 
 
 def start_detached_python_job(
@@ -262,6 +326,11 @@ def _check_and_run_tasks() -> None:
                 cron_time = str(row["cron_time"] or "17:10")
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
+
+                if _should_delegate_to_windows_qmt_bridge(row):
+                    continue
+                if _should_skip_outside_intraday_window(row, now):
+                    continue
 
                 if interval_minutes > 0:
                     ref_time = last_triggered or row.get("last_run_at")

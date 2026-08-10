@@ -2,6 +2,7 @@
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from datetime import datetime
 
 from server.api import scheduler_runtime
 from server.common.scheduler_script_policy import SchedulerScriptPolicyError
@@ -91,6 +92,38 @@ class SchedulerRuntimeTest(unittest.TestCase):
         params = conn.execute.call_args.args[1]
         self.assertEqual(params["id"], 12)
         self.assertIn("SCHEDULER_SCRIPT_BLOCKED", params["o"])
+
+    def test_linux_scheduler_delegates_all_qmt_launchers_to_windows(self):
+        for task_type in (
+            "all_code",
+            "concept_constituent_east",
+            "stock_kline",
+            "intraday_realtime",
+        ):
+            self.assertTrue(
+                scheduler_runtime._should_delegate_to_windows_qmt_bridge(
+                    {"task_type": task_type}, platform_name="posix"
+                )
+            )
+            self.assertFalse(
+                scheduler_runtime._should_delegate_to_windows_qmt_bridge(
+                    {"task_type": task_type}, platform_name="nt"
+                )
+            )
+
+    def test_intraday_interval_tasks_do_not_run_before_market_window(self):
+        row = {"task_type": "intraday_minute_flow"}
+
+        self.assertTrue(
+            scheduler_runtime._should_skip_outside_intraday_window(
+                row, datetime(2026, 8, 11, 7, 30)
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._should_skip_outside_intraday_window(
+                row, datetime(2026, 8, 11, 10, 0)
+            )
+        )
 
 
 if __name__ == "__main__":
