@@ -1035,6 +1035,27 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["000001"]["flow_attitude"], "")
         self.assertEqual(out["000001"]["flow_attitude_basis"], "")
 
+    def test_portfolio_min_flow_summary_labels_fresh_flow_while_baseline_builds(self):
+        trade_date = datetime.now().strftime("%Y-%m-%d")
+        rows = [{
+            "stock_code": "000001",
+            "trade_time": f"{trade_date} 09:30:00",
+            "main_net_inflow": 12_500_000.0,
+        }]
+        with patch("server.api.routers.hot_data._read_sql", return_value=rows), \
+             patch("server.api.routers.hot_data._portfolio_time_age_seconds", return_value=12):
+            out = hot_data._portfolio_min_flow_summary(
+                ["000001"], trade_date=trade_date, market_mode="intraday",
+            )
+
+        item = out["000001"]
+        self.assertEqual(item["flow_status"], "fresh")
+        self.assertEqual(item["main_net_inflow"], 12_500_000.0)
+        self.assertIsNone(item["flow_5m"])
+        self.assertEqual(item["flow_attitude"], "neutral")
+        self.assertEqual(item["flow_attitude_label"], "基线建立中")
+        self.assertEqual(item["flow_attitude_basis"], "minute_current_fresh")
+
     def test_portfolio_min_flow_summary_keeps_target_day_close(self):
         rows = [
             {"stock_code": "000001", "trade_time": "2026-08-06 14:55:00", "main_net_inflow": 100_000_000.0},

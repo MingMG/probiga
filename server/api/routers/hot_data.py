@@ -5258,11 +5258,21 @@ def _portfolio_min_flow_summary(
         )
         status = "fresh" if is_fresh else "closed" if is_closed else "stale"
         has_flow_5m = flow_5m is not None
-        attitude = _portfolio_flow_attitude(flow_5m, flow_5m_abs) if is_fresh and has_flow_5m else {
-            "level": "",
-            "label": "",
-            "ratio": None,
-        }
+        attitude = (
+            _portfolio_flow_attitude(flow_5m, flow_5m_abs)
+            if is_fresh and has_flow_5m
+            else {
+                "level": "neutral",
+                "label": "基线建立中",
+                "ratio": None,
+            }
+            if is_fresh
+            else {
+                "level": "",
+                "label": "",
+                "ratio": None,
+            }
+        )
         out[code] = {
             "main_net_inflow": latest.get("main_net_inflow"),
             "max_net_inflow": latest.get("max_net_inflow"),
@@ -5279,7 +5289,15 @@ def _portfolio_min_flow_summary(
             "flow_attitude": attitude["level"],
             "flow_attitude_label": attitude["label"],
             "flow_attitude_ratio": attitude["ratio"],
-            "flow_attitude_basis": "minute_5m_fresh" if is_fresh else "minute_day_close" if is_closed else "",
+            "flow_attitude_basis": (
+                "minute_5m_fresh"
+                if is_fresh and has_flow_5m
+                else "minute_current_fresh"
+                if is_fresh
+                else "minute_day_close"
+                if is_closed
+                else ""
+            ),
             "flow_source": latest.get("data_source") or "minute_flow",
             "expected_flow_date": target_date,
         }
