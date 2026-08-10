@@ -1,0 +1,436 @@
+{
+  "schema_version": "probiga.stock-strategy-manifest.v2",
+  "manifest_version": "stock_strategy_v2.3.0",
+  "model_version": "ai-rec-v3-ext-v3",
+  "frozen_at": "2026-07-28T02:45:00+08:00",
+  "status": "frozen",
+  "automatic_order_submission": false,
+  "score_range": [0.0, 100.0],
+  "runtime_parameters": {
+    "min_risk_reward": 3.0,
+    "min_sector_flow_amount_3d": 500000000.0,
+    "min_sector_rotation_score": 50.0,
+    "price_crosscheck_tolerance_pct": 1.0,
+    "system_single_position_cap_pct": 12.0
+  },
+  "paper_trial_validation": {
+    "status": "PAPER_TRIAL",
+    "scope": "ProBigA internal paper account only",
+    "automatic_real_order_submission": false,
+    "expected_return_source": "paper_forward_trial_unproven",
+    "profitability_claim": "prohibited_until_forward_acceptance_passes",
+    "promotion_requirements": {
+      "minimum_closed_trades_per_strategy": 30,
+      "minimum_profit_factor": 1.15,
+      "minimum_net_expectancy_pct": 0.0,
+      "maximum_drawdown_pct": 12.0
+    }
+  },
+  "paper_trial_routing": {
+    "policy": "upstream_buy_only; hard event/data gates cannot be overridden; market-only downgrade may enter paper trial at reduced size",
+    "hard_block_flags": [
+      "negative_oper_cash_flow",
+      "negative_cash_flow_ratio",
+      "negative_free_cash_flow",
+      "negative_ebit_margin",
+      "mine_clearance_risk",
+      "unlock_risk",
+      "main_outflow_3d",
+      "downtrend_clock",
+      "liquidity_hard_floor",
+      "fundamental_loss",
+      "performance_deterioration",
+      "price_mismatch",
+      "missing_finance",
+      "missing_flow"
+    ],
+    "strategy_block_flags": {
+      "ultra_short": [
+        "main_outflow_10d",
+        "weak_sector",
+        "theme_continuity_low",
+        "weekly_overheat",
+        "positive_event_priced_in",
+        "market_extreme_overheat",
+        "bearish_kline_pattern",
+        "institutional_lhb_outflow",
+        "margin_deleveraging_3d",
+        "classic_top_breakdown",
+        "blowoff_volume_risk",
+        "order_book_depth_low",
+        "order_book_imbalance",
+        "float_market_cap_low"
+      ],
+      "short_term": [
+        "main_outflow_10d",
+        "weak_sector",
+        "theme_continuity_low",
+        "weekly_overheat",
+        "positive_event_priced_in",
+        "market_extreme_overheat",
+        "bearish_kline_pattern",
+        "institutional_lhb_outflow",
+        "margin_deleveraging_3d",
+        "classic_top_breakdown",
+        "blowoff_volume_risk",
+        "order_book_depth_low",
+        "order_book_imbalance",
+        "holder_spread"
+      ],
+      "swing": [
+        "pledge_ratio_high",
+        "shareholder_reduction_high",
+        "goodwill_ratio_high",
+        "goodwill_ratio_watch",
+        "holder_spread",
+        "valuation_overpriced",
+        "industry_relative_overvalued",
+        "industry_relative_ps_overvalued",
+        "valuation_history_percentile_high",
+        "business_purity_low",
+        "industry_prosperity_weak",
+        "classic_top_breakdown"
+      ],
+      "main_wave": [
+        "main_outflow_10d",
+        "weak_sector",
+        "theme_continuity_low",
+        "weekly_overheat",
+        "positive_event_priced_in",
+        "bearish_kline_pattern",
+        "classic_top_breakdown",
+        "blowoff_volume_risk",
+        "market_relative_weak",
+        "order_book_depth_low",
+        "order_book_imbalance"
+      ]
+    },
+    "regimes": {
+      "TREND_UP": {
+        "ultra_short": {"enabled": true, "min_score": 76.0, "min_risk_reward": 2.0, "min_data_quality": 75.0, "opening_target_fraction": 0.35, "allow_market_reduced_watch": false},
+        "short_term": {"enabled": true, "min_score": 74.0, "min_risk_reward": 2.5, "min_data_quality": 75.0, "opening_target_fraction": 0.45, "allow_market_reduced_watch": false},
+        "swing": {"enabled": true, "min_score": 72.0, "min_risk_reward": 2.5, "min_data_quality": 78.0, "opening_target_fraction": 0.50, "allow_market_reduced_watch": false},
+        "main_wave": {"enabled": true, "min_score": 74.0, "min_risk_reward": 3.0, "min_data_quality": 75.0, "opening_target_fraction": 0.50, "allow_market_reduced_watch": false}
+      },
+      "THEME_ROTATION": {
+        "ultra_short": {"enabled": true, "min_score": 78.0, "min_risk_reward": 2.2, "min_data_quality": 75.0, "opening_target_fraction": 0.30, "allow_market_reduced_watch": true},
+        "short_term": {"enabled": true, "min_score": 74.0, "min_risk_reward": 2.5, "min_data_quality": 75.0, "opening_target_fraction": 0.45, "allow_market_reduced_watch": true},
+        "swing": {"enabled": true, "min_score": 74.0, "min_risk_reward": 3.0, "min_data_quality": 78.0, "opening_target_fraction": 0.40, "allow_market_reduced_watch": true},
+        "main_wave": {"enabled": true, "min_score": 76.0, "min_risk_reward": 3.0, "min_data_quality": 75.0, "opening_target_fraction": 0.40, "allow_market_reduced_watch": true}
+      },
+      "RANGE": {
+        "ultra_short": {"enabled": true, "min_score": 80.0, "min_risk_reward": 2.2, "min_data_quality": 78.0, "opening_target_fraction": 0.20, "allow_market_reduced_watch": true},
+        "short_term": {"enabled": true, "min_score": 76.0, "min_risk_reward": 2.5, "min_data_quality": 78.0, "opening_target_fraction": 0.35, "allow_market_reduced_watch": true},
+        "swing": {"enabled": true, "min_score": 72.0, "min_risk_reward": 3.0, "min_data_quality": 80.0, "opening_target_fraction": 0.40, "allow_market_reduced_watch": true},
+        "main_wave": {"enabled": true, "min_score": 80.0, "min_risk_reward": 3.0, "min_data_quality": 78.0, "opening_target_fraction": 0.25, "allow_market_reduced_watch": true}
+      },
+      "PANIC_RECOVERY": {
+        "ultra_short": {"enabled": true, "min_score": 82.0, "min_risk_reward": 2.5, "min_data_quality": 80.0, "opening_target_fraction": 0.15, "allow_market_reduced_watch": true},
+        "short_term": {"enabled": true, "min_score": 80.0, "min_risk_reward": 3.0, "min_data_quality": 80.0, "opening_target_fraction": 0.20, "allow_market_reduced_watch": true},
+        "swing": {"enabled": true, "min_score": 76.0, "min_risk_reward": 3.0, "min_data_quality": 82.0, "opening_target_fraction": 0.25, "allow_market_reduced_watch": true},
+        "main_wave": {"enabled": true, "min_score": 82.0, "min_risk_reward": 3.5, "min_data_quality": 80.0, "opening_target_fraction": 0.15, "allow_market_reduced_watch": true}
+      },
+      "RISK_OFF": {
+        "ultra_short": {"enabled": false},
+        "short_term": {"enabled": false},
+        "swing": {"enabled": true, "min_score": 82.0, "min_risk_reward": 3.5, "min_data_quality": 85.0, "opening_target_fraction": 0.10, "allow_market_reduced_watch": true},
+        "main_wave": {"enabled": false}
+      }
+    }
+  },
+  "shared_formulas": {
+    "long_term_score": {
+      "expression": "clamp(fundamental_score*0.34 + growth_score*0.28 + valuation_score*0.20 + risk_score*0.18)",
+      "weights": {
+        "fundamental_score": 0.34,
+        "growth_score": 0.28,
+        "valuation_score": 0.20,
+        "risk_score": 0.18
+      }
+    },
+    "short_term_score": {
+      "expression": "clamp(technical_score*0.34 + capital_score*0.28 + sentiment_score*0.24 + event_score*0.14)",
+      "weights": {
+        "technical_score": 0.34,
+        "capital_score": 0.28,
+        "sentiment_score": 0.24,
+        "event_score": 0.14
+      }
+    },
+    "ai_score": {
+      "expression": "clamp(short_term_score*0.58 + long_term_score*0.42)",
+      "weights": {
+        "short_term_score": 0.58,
+        "long_term_score": 0.42
+      }
+    },
+    "entry_score": {
+      "expression": "clamp(chase_score*0.28 + expected_return_score*0.26 + heat_overload_score*0.16 + liquidity_score*0.12 + sector_rotation_score*0.10 + chip_capital_score*0.08 + confidence_score*0.04 + leadership_adjustment)",
+      "weights": {
+        "chase_score": 0.28,
+        "expected_return_score": 0.26,
+        "heat_overload_score": 0.16,
+        "liquidity_score": 0.12,
+        "sector_rotation_score": 0.10,
+        "chip_capital_score": 0.08,
+        "confidence_score": 0.04
+      },
+      "leadership_adjustment": {
+        "leader": 3.0,
+        "front": 1.5,
+        "middle": 0.0,
+        "follower": -2.0
+      }
+    },
+    "final_trade_score": {
+      "expression": "clamp(quality_score*0.70 + entry_score*0.30)",
+      "weights": {
+        "quality_score": 0.70,
+        "entry_score": 0.30
+      }
+    }
+  },
+  "strategies": [
+    {
+      "key": "ultra_short",
+      "name": "超短确认",
+      "category": "超短",
+      "enabled": true,
+      "base_weight": 0.80,
+      "score_field": "ultra_short_score",
+      "score_formula": {
+        "expression": "clamp(technical_score*0.30 + capital_score*0.28 + sentiment_score*0.20 + event_score*0.10 + liquidity_score*0.08 + ultra_volatility_fit*0.04 - ultra_penalty)",
+        "weights": {
+          "technical_score": 0.30,
+          "capital_score": 0.28,
+          "sentiment_score": 0.20,
+          "event_score": 0.10,
+          "liquidity_score": 0.08,
+          "ultra_volatility_fit": 0.04
+        },
+        "penalties": {
+          "change_pct_gte_7": 6.0,
+          "dist_ma20_gte_14": 6.0,
+          "amount_lt_50000000": 8.0
+        }
+      },
+      "parameters": {
+        "min_score": 68.0,
+        "confirm_score": 76.0,
+        "base_position_pct": 4.0,
+        "max_holding_days": 3,
+        "extension_days_when_trend_valid": 2,
+        "stop_loss_pct": -3.5,
+        "take_profit_1_pct": 5.0,
+        "take_profit_2_pct": 8.0,
+        "cooldown_days": 3
+      },
+      "entry_rules": [
+        "live_quote_fresh",
+        "near_vwap_or_ma5_or_intraday_breakout",
+        "main_capital_flow_non_negative",
+        "not_limit_up_or_extended_gap"
+      ],
+      "exit_rules": {
+        "immediate": [
+          "ma5_or_vwap_break",
+          "capital_flow_turns_negative",
+          "event_risk_high_or_critical"
+        ],
+        "extend_if": [
+          "score_still_confirmed",
+          "trend_not_broken",
+          "trailing_stop_not_triggered"
+        ]
+      }
+    },
+    {
+      "key": "short_term",
+      "name": "短线多因子",
+      "category": "短线",
+      "enabled": true,
+      "base_weight": 1.00,
+      "score_field": "short_term_score",
+      "score_formula": {
+        "expression": "short_term_score",
+        "reference": "shared_formulas.short_term_score"
+      },
+      "parameters": {
+        "min_score": 68.0,
+        "confirm_score": 74.0,
+        "base_position_pct": 6.0,
+        "max_holding_days": 10,
+        "extension_days_when_trend_valid": 5,
+        "stop_loss_pct": -5.5,
+        "take_profit_1_pct": 8.0,
+        "take_profit_2_pct": 15.0,
+        "cooldown_days": 5
+      },
+      "entry_rules": [
+        "pullback_holds_ma5_or_ma10_or_breaks_20d_platform",
+        "volume_above_recent_average",
+        "capital_flow_non_negative",
+        "avoid_sharp_daily_chase"
+      ],
+      "exit_rules": {
+        "immediate": [
+          "close_below_ma10_and_ma20",
+          "capital_flow_reversal",
+          "event_risk_high_or_critical"
+        ],
+        "extend_if": [
+          "final_trade_score_gte_confirm",
+          "trend_hold_score_gte_58",
+          "trailing_stop_not_triggered"
+        ]
+      }
+    },
+    {
+      "key": "swing",
+      "name": "波段价值质量",
+      "category": "波段",
+      "enabled": true,
+      "base_weight": 1.00,
+      "score_field": "swing_score",
+      "score_formula": {
+        "expression": "clamp(long_term_score*0.42 + technical_score*0.18 + capital_score*0.10 + event_score*0.10 + risk_score*0.12 + swing_trend*0.08 - swing_penalty)",
+        "weights": {
+          "long_term_score": 0.42,
+          "technical_score": 0.18,
+          "capital_score": 0.10,
+          "event_score": 0.10,
+          "risk_score": 0.12,
+          "swing_trend": 0.08
+        },
+        "penalties": {
+          "change_pct_gte_8": 5.0,
+          "drawdown_60_lte_minus_25": 6.0
+        }
+      },
+      "parameters": {
+        "min_score": 66.0,
+        "confirm_score": 72.0,
+        "base_position_pct": 8.0,
+        "max_holding_days": 30,
+        "extension_days_when_trend_valid": 15,
+        "stop_loss_pct": -8.0,
+        "take_profit_1_pct": 15.0,
+        "take_profit_2_pct": 30.0,
+        "cooldown_days": 10
+      },
+      "entry_rules": [
+        "price_holds_ma20_or_ma60",
+        "medium_trend_up",
+        "event_risk_low",
+        "market_breadth_not_sharply_weakening"
+      ],
+      "exit_rules": {
+        "immediate": [
+          "close_below_ma60",
+          "event_risk_high_or_critical",
+          "medium_trend_break"
+        ],
+        "extend_if": [
+          "swing_score_gte_min",
+          "ma20_trend_valid",
+          "trailing_stop_not_triggered"
+        ]
+      }
+    },
+    {
+      "key": "main_wave",
+      "name": "主升浪趋势",
+      "category": "趋势",
+      "enabled": true,
+      "base_weight": 1.00,
+      "score_field": "main_wave_score",
+      "score_formula": {
+        "expression": "clamp(trend_alignment_score*0.32 + breakout_score*0.18 + volume_wave_score*0.14 + capital_score*0.12 + sector_rotation_score*0.12 + sector_leadership_score*0.04 + strength_score*0.08 - over_extension_penalty)",
+        "weights": {
+          "trend_alignment_score": 0.32,
+          "breakout_score": 0.18,
+          "volume_wave_score": 0.14,
+          "capital_score": 0.12,
+          "sector_rotation_score": 0.12,
+          "sector_leadership_score": 0.04,
+          "strength_score": 0.08
+        },
+        "penalties": {
+          "dist_ma20_gte_35_and_from_low_60_gte_120": 10.0,
+          "change_pct_gte_9_7_and_amount_ratio_20_gte_2_5": 6.0
+        }
+      },
+      "hold_formula": {
+        "expression": "clamp(64 + hold_bonus - hold_penalty)",
+        "bonuses": {
+          "close_gt_ma10": 10.0,
+          "close_gt_ma20": 10.0,
+          "ma10_gt_ma20": 8.0,
+          "ma20_gte_ma60_times_0_96": 6.0
+        },
+        "penalties": {
+          "close_lt_ma10": 24.0,
+          "close_lt_ma20": 46.0,
+          "dist_ma20_gte_28_and_from_low_60_gte_120": 18.0,
+          "change_pct_lte_minus_6_and_amount_ratio_20_gte_1_15": 18.0
+        }
+      },
+      "parameters": {
+        "min_score": 70.0,
+        "confirm_score": 74.0,
+        "min_trend_hold_score": 58.0,
+        "base_position_pct": 7.0,
+        "max_holding_days": 60,
+        "extension_days_when_trend_valid": 30,
+        "stop_loss_pct": -10.0,
+        "take_profit_1_pct": 35.0,
+        "take_profit_2_pct": 80.0,
+        "cooldown_days": 15,
+        "trend_stop": "min(fixed_stop, ma20*0.97)",
+        "trend_reduce": "ma10*0.98"
+      },
+      "entry_rules": [
+        "main_wave_score_confirms",
+        "prefer_pullback_holding_ma5_or_ma10",
+        "volume_above_ma20_without_blowoff",
+        "sector_rotation_strong",
+        "trend_hold_score_not_deteriorating"
+      ],
+      "exit_rules": {
+        "immediate": [
+          "main_wave_signal_sell_alert_or_reduce",
+          "close_below_ma20",
+          "high_volume_long_bearish_bar",
+          "trend_hold_score_lt_58"
+        ],
+        "extend_if": [
+          "main_wave_score_gte_min",
+          "trend_hold_score_gte_58",
+          "main_wave_signal_buy_ready_or_watch",
+          "trailing_stop_not_triggered"
+        ]
+      }
+    }
+  ],
+  "legacy_merge_map": {
+    "multi_factor": "short_term",
+    "value_quality": "swing",
+    "trend_breakout": "main_wave",
+    "sector_rotation": "short_term",
+    "low_volatility": "swing",
+    "oversold_reversal": "short_term",
+    "event_driven": "short_term",
+    "machine_learning": null,
+    "intraday_entry": "ultra_short",
+    "etf_defense": null,
+    "trend": "main_wave",
+    "low_start": "short_term",
+    "low_vol": "swing",
+    "defensive": "swing"
+  },
+  "disabled_labels": {
+    "machine_learning": "没有已注册、可追溯的独立模型，禁止用其他分数冒充",
+    "etf_defense": "已迁移到独立ETF策略体系，不再作为股票策略"
+  },
+  "change_policy": "any_formula_or_parameter_change_requires_new_manifest_version_and_hash"
+}

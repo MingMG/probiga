@@ -1,0 +1,94 @@
+{
+  "schema_version": "probiga.market-regime.v2",
+  "config_version": "market_regime_v2.1.0",
+  "frozen_at": "2026-07-27T18:25:00+08:00",
+  "lifecycle_status": "RESEARCH",
+  "required_inputs": [
+    "risk_score",
+    "market_change_pct",
+    "breadth_pct",
+    "trend_score",
+    "switch_score"
+  ],
+  "input_feature_policy_version": "market_state_v2.1.0",
+  "priority": [
+    "DATA_BLOCKED",
+    "EXTREME",
+    "RISK_OFF",
+    "PANIC_RECOVERY",
+    "TREND_UP",
+    "THEME_ROTATION",
+    "RANGE"
+  ],
+  "thresholds": {
+    "EXTREME": {
+      "risk_score_gte": "82",
+      "market_change_pct_lte": "-4",
+      "exit_risk_score_lt": "70",
+      "exit_market_change_pct_gt": "-1.5"
+    },
+    "RISK_OFF": {
+      "risk_score_gte": "55",
+      "market_change_pct_lt": "-1",
+      "exit_risk_score_lt": "48",
+      "exit_market_change_pct_gte": "-0.3"
+    },
+    "PANIC_RECOVERY": {
+      "requires_previous_extreme_cooldown": true,
+      "risk_score_lt": "70",
+      "market_change_pct_gt": "-1.5",
+      "maximum_trade_days": 3
+    },
+    "TREND_UP": {
+      "trend_score_gte": "68",
+      "breadth_pct_gte": "55",
+      "risk_score_lt": "60",
+      "exit_trend_score_lt": "62",
+      "exit_breadth_pct_lt": "48",
+      "exit_risk_score_gte": "68"
+    },
+    "THEME_ROTATION": {
+      "switch_score_gte": "65",
+      "breadth_pct_gte": "45",
+      "breadth_pct_lt": "55",
+      "risk_score_lt": "55",
+      "exit_switch_score_lt": "55"
+    },
+    "RANGE": {
+      "fallback_when_all_required_inputs_pass": true
+    }
+  },
+  "transition": {
+    "confirm_days": {
+      "TREND_UP": 2,
+      "THEME_ROTATION": 2,
+      "RANGE": 2,
+      "PANIC_RECOVERY": 1,
+      "RISK_OFF": 1,
+      "EXTREME": 1,
+      "DATA_BLOCKED": 1
+    },
+    "minimum_state_days": {
+      "TREND_UP": 3,
+      "THEME_ROTATION": 2,
+      "RANGE": 2,
+      "PANIC_RECOVERY": 1,
+      "RISK_OFF": 2,
+      "EXTREME": 1,
+      "DATA_BLOCKED": 1
+    },
+    "extreme_cooldown_trade_days": 3,
+    "worsening_transition_is_immediate": true
+  },
+  "risk_asset_caps": {
+    "TREND_UP": "0.80",
+    "THEME_ROTATION": "0.60",
+    "RANGE": "0.40",
+    "PANIC_RECOVERY": "0.25",
+    "RISK_OFF": "0.10",
+    "EXTREME": "0.00",
+    "DATA_BLOCKED": "0.00"
+  },
+  "automatic_order_submission": false,
+  "change_policy": "any_threshold_or_transition_change_requires_new_config_version"
+}

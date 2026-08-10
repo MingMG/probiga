@@ -1,0 +1,77 @@
+{
+  "schema_version": "probiga.portfolio-policy.v2",
+  "policy_version": "portfolio_policy_v2.1.0-paper",
+  "frozen_at": "2026-07-26T15:40:00+08:00",
+  "initial_cash_cny": "200000.00",
+  "leverage": "0",
+  "short_selling": false,
+  "real_order_submission": false,
+  "maximum_positions": 4,
+  "single_position_initial_cap": "0.22",
+  "single_position_absolute_cap": "0.25",
+  "standard_trade_risk": "0.005",
+  "hard_trade_risk_cap": "0.006",
+  "portfolio_open_risk_cap": "0.02",
+  "theme_position_count_cap": 2,
+  "theme_exposure_cap": "0.44",
+  "minimum_cash_cny": "0.00",
+  "opening_target_fraction": "0.50",
+  "maximum_add_count": 1,
+  "quote_max_age_seconds": 15,
+  "visible_level1_participation": "0.20",
+  "paper_execution": {
+    "level1_preferred": true,
+    "snapshot_fallback": true,
+    "snapshot_max_age_seconds": 180,
+    "snapshot_slippage_rate": "0.0005",
+    "snapshot_max_volume_participation": "0.001"
+  },
+  "drawdown_gates": [
+    {
+      "drawdown_gte": "0.10",
+      "risk_asset_cap": "0.00",
+      "allow_open": false,
+      "allow_add": false,
+      "account_action": "SUSPEND_STRATEGIES"
+    },
+    {
+      "drawdown_gte": "0.08",
+      "risk_asset_cap": "0.10",
+      "allow_open": false,
+      "allow_add": false,
+      "account_action": "EXIT_ONLY"
+    },
+    {
+      "drawdown_gte": "0.06",
+      "risk_asset_cap": "0.40",
+      "allow_open": true,
+      "allow_add": false,
+      "account_action": "REDUCE_RISK"
+    },
+    {
+      "drawdown_gte": "0.00",
+      "risk_asset_cap": null,
+      "allow_open": true,
+      "allow_add": true,
+      "account_action": "REGIME_POLICY"
+    }
+  ],
+  "regime_risk_asset_caps": {
+    "TREND_UP": "0.80",
+    "THEME_ROTATION": "0.60",
+    "RANGE": "0.40",
+    "PANIC_RECOVERY": "0.25",
+    "RISK_OFF": "0.10",
+    "EXTREME": "0.00",
+    "DATA_BLOCKED": "0.00"
+  },
+  "fee_profile_version": "paper_fee_cn_v2.0.0",
+  "instrument_rule_version": "paper_instrument_qmt_v2.0.0",
+  "paper_configuration_scope": "PROBIGA_INTERNAL_PAPER_ONLY",
+  "real_trading_confirmation_blocks": [
+    "B-001_ACTUAL_BROKER_FEES",
+    "B-002_ACCOUNT_INSTRUMENT_PERMISSIONS",
+    "B-003_RELIABLE_LEVEL1_BID_ASK"
+  ],
+  "change_policy": "any_change_requires_new_version_and_full_revalidation"
+}

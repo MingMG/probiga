@@ -1,0 +1,144 @@
+{
+  "schema_version": "probiga.market-state-config.v2",
+  "config_version": "market_state_v2.1.0",
+  "frozen_at": "2026-07-27T18:25:00+08:00",
+  "status": "frozen_baseline",
+  "threshold_source": "qmt_tape_primary_with_price_confirmed_event_risk",
+  "automatic_order_submission": false,
+  "required_inputs": [
+    "risk_score",
+    "market_change_pct",
+    "breadth_pct",
+    "trend_score",
+    "switch_score"
+  ],
+  "feature_fallbacks": {
+    "source": "sm_stock_kline_equal_weight_a_share",
+    "universe": "stock_code starts with 0, 3 or 6 and k_type=1 and adjust_type=0",
+    "market_change_pct": "equal_weight_mean(change_pct) for the trade date",
+    "breadth_pct": "advancing_stock_count / valid_stock_count * 100",
+    "ret_5d_pct": "sum of latest 5 market_change_pct observations",
+    "ret_20d_pct": "sum of latest 20 market_change_pct observations",
+    "trend_score": "clamp(50 + ret_5d_pct*3 + ret_20d_pct + (breadth_pct-50)*0.4)",
+    "switch_score": "clamp(abs(breadth_pct-mean_5d_breadth_pct)*2 + abs(ret_5d_pct)*3)",
+    "risk_score": "clamp(20 + max(0,-market_change_pct)*10 + max(0,50-breadth_pct)*1.2 + max(0,-ret_5d_pct)*4)",
+    "minimum_daily_universe_count": 1000,
+    "staleness_policy": "latest aggregate trade_date must equal requested trade_date, otherwise source_status=degraded"
+  },
+  "event_fusion": {
+    "market_input_priority": "same-day QMT-attested equal-weight tape overrides auxiliary breadth/trend/switch adapters",
+    "event_alert_score_gte": 70.0,
+    "systemic_event_score_gte": 82.0,
+    "price_stress_market_change_lte": -1.5,
+    "price_stress_breadth_lte": 35.0,
+    "price_stress_kline_risk_gte": 70.0,
+    "unconfirmed_event_risk_score_cap": 54.0,
+    "unconfirmed_event_trend_score_cap": 67.0,
+    "unconfirmed_event_policy": "retain sector caution but do not classify the whole market as extreme without price confirmation"
+  },
+  "states": [
+    "trend_bullish",
+    "high_range",
+    "risk_declining",
+    "extreme_event"
+  ],
+  "priority": [
+    "extreme_event",
+    "risk_declining",
+    "high_range",
+    "trend_bullish"
+  ],
+  "thresholds": {
+    "extreme_event": {
+      "risk_score_enter_gte": 82.0,
+      "risk_score_exit_lt": 70.0,
+      "market_change_enter_lte": -4.0,
+      "market_change_exit_gt": -1.5,
+      "explicit_flags": [
+        "extreme_event",
+        "hard_event"
+      ]
+    },
+    "trend_bullish": {
+      "trend_score_enter_gte": 68.0,
+      "trend_score_exit_lt": 62.0,
+      "breadth_enter_gte": 55.0,
+      "breadth_exit_lt": 48.0,
+      "risk_score_enter_lt": 60.0,
+      "risk_score_exit_gte": 68.0,
+      "missing_breadth_policy": "block"
+    },
+    "high_range": {
+      "breadth_enter_lt": 45.0,
+      "breadth_exit_gte": 52.0,
+      "switch_score_enter_gte": 65.0,
+      "switch_score_exit_lt": 55.0,
+      "explicit_flags": [
+        "high_position",
+        "range_high"
+      ]
+    },
+    "risk_declining": {
+      "risk_score_enter_gte": 55.0,
+      "risk_score_exit_lt": 48.0,
+      "market_change_enter_lt": -1.0,
+      "market_change_exit_gte": -0.3,
+      "explicit_flags": [
+        "risk_off",
+        "tech_triggered"
+      ]
+    }
+  },
+  "transition": {
+    "confirm_days": {
+      "trend_bullish": 2,
+      "high_range": 2,
+      "risk_declining": 1,
+      "extreme_event": 1
+    },
+    "minimum_state_days": {
+      "trend_bullish": 3,
+      "high_range": 2,
+      "risk_declining": 2,
+      "extreme_event": 1
+    },
+    "cooldown_after_extreme_trade_days": 3,
+    "cooldown_state": "risk_declining",
+    "worsening_transition_is_immediate": true,
+    "missing_required_input_state": "unknown",
+    "missing_required_input_gate": "DATA_NOT_READY"
+  },
+  "strategy_multipliers": {
+    "trend_bullish": {
+      "ultra_short": 1.05,
+      "short_term": 1.00,
+      "swing": 0.95,
+      "main_wave": 1.15
+    },
+    "high_range": {
+      "ultra_short": 0.55,
+      "short_term": 0.85,
+      "swing": 1.05,
+      "main_wave": 0.70
+    },
+    "risk_declining": {
+      "ultra_short": 0.35,
+      "short_term": 0.65,
+      "swing": 0.90,
+      "main_wave": 0.50
+    },
+    "extreme_event": {
+      "ultra_short": 0.00,
+      "short_term": 0.00,
+      "swing": 0.00,
+      "main_wave": 0.00
+    }
+  },
+  "change_policy": "any_threshold_or_transition_change_requires_new_config_version_and_hash",
+  "calibration": {
+    "status": "baseline_frozen_pending_walk_forward_recalibration",
+    "minimum_history_start": "2020-01-01",
+    "minimum_out_of_sample_windows": 6,
+    "forbid_claiming_optimal_until_passed": true
+  }
+}

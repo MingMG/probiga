@@ -1,0 +1,107 @@
+{
+  "schema_version": "etf_forward_strategy.v1",
+  "strategy_version": "etf_trend_risk_v2.0.0",
+  "strategy_name": "ETF跨资产趋势风险预算组合V2",
+  "frozen_at": "2026-07-25T00:00:00+08:00",
+  "forward_start_date": "2026-07-27",
+  "mode": "research_paper_read_only",
+  "data": {
+    "primary_source": "gj_big_qmt_inner",
+    "adjust_type": 1,
+    "k_type": 1,
+    "validation_status": "passed",
+    "quality_status": "validated"
+  },
+  "universe": {
+    "cutoff_date": "2020-12-31",
+    "minimum_history_days_at_cutoff": 120,
+    "minimum_average_amount_20_at_cutoff": 5000000,
+    "eligible_codes": [
+      "159915",
+      "159985",
+      "510300",
+      "510500",
+      "510880",
+      "510900",
+      "511010",
+      "511380",
+      "511880",
+      "512100",
+      "513100",
+      "513500",
+      "518880"
+    ],
+    "cash_code": "511880",
+    "calendar_proxy": "510300",
+    "future_new_listings_policy": "prohibited_until_new_version"
+  },
+  "monthly_signal": {
+    "schedule": "last_trading_day_close",
+    "execution": "next_trading_day_open",
+    "minimum_live_history_days": 252,
+    "minimum_average_amount_20": 5000000,
+    "momentum_lookbacks_days": [
+      63,
+      126,
+      252
+    ],
+    "momentum_weights": [
+      0.2,
+      0.3,
+      0.5
+    ],
+    "trend_ma_days": 200,
+    "trend_requires_positive_returns_days": [
+      126,
+      252
+    ],
+    "volatility_lookback_days": 63,
+    "target_annual_volatility": 0.1,
+    "selection_limit": 4,
+    "max_pairwise_correlation": 0.85,
+    "max_single_asset_weight": 0.4,
+    "allocation": "inverse_volatility_then_portfolio_volatility_scaling"
+  },
+  "risk_overlay": {
+    "mode": "daily_volatility_scaled_trailing_stop",
+    "signal_time": "daily_close",
+    "execution": "next_trading_day_open",
+    "volatility_lookback_days": 20,
+    "volatility_multiplier": 3.0,
+    "minimum_stop": 0.06,
+    "maximum_stop": 0.15,
+    "reentry": "next_monthly_rebalance_only"
+  },
+  "execution": {
+    "paper_capital_cny": 1000000,
+    "board_lot_shares": 100,
+    "minimum_commission_cny": 5,
+    "cash_etf_commission_rate": 0.0001,
+    "other_etf_commission_rate": 0.0003,
+    "max_adv_participation": 0.02,
+    "impact_at_one_pct_adv": 0.0008,
+    "maximum_impact": 0.005,
+    "default_limit_lock_ratio": 0.098,
+    "limit_lock_ratio_overrides": {
+      "159915": 0.198
+    },
+    "stamp_tax": 0,
+    "capacity_policy": "retry_unfilled_quantity_on_later_trading_days"
+  },
+  "forward_protocol": {
+    "cold_start": "100_percent_cash_511880",
+    "first_risky_signal": "first_month_end_close_on_or_after_forward_start_date",
+    "backfill": "prohibited",
+    "parameter_changes": "require_new_strategy_version",
+    "automatic_order_submission": false,
+    "recording": "append_only_database_ledger"
+  },
+  "research_acceptance": {
+    "artifact": "artifacts/etf_robust_backtest_v3_20260725/report.json",
+    "realistic_total_return": 0.40488146322439045,
+    "realistic_cagr": 0.06571556188864403,
+    "realistic_max_drawdown": -0.08923094145069865,
+    "realistic_monthly_profit_factor": 1.970440650262029,
+    "recommended_initial_paper_capital_upper_bound_cny": 1000000
+  }
+}

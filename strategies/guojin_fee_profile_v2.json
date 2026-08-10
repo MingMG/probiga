@@ -1,0 +1,64 @@
+{
+  "schema_version": "probiga.broker-fee-profile.v2",
+  "fee_profile_version": "guojin_fee_v2.0.0",
+  "effective_from": "2026-07-27",
+  "broker": "国金证券",
+  "account_scope": "USER_CONFIRMED_ACCOUNT",
+  "profiles": [
+    {
+      "security_type": "A_SHARE",
+      "buy_commission_rate": "0.0001",
+      "sell_commission_rate": "0.0001",
+      "minimum_commission": "5.00",
+      "stamp_tax_sell_rate": "0.0005",
+      "transfer_fee_buy_rate": "0.00001",
+      "transfer_fee_sell_rate": "0.00001",
+      "other_fees": {}
+    },
+    {
+      "security_type": "ETF",
+      "buy_commission_rate": "0.0001",
+      "sell_commission_rate": "0.0001",
+      "minimum_commission": "5.00",
+      "stamp_tax_sell_rate": "0",
+      "transfer_fee_buy_rate": "0",
+      "transfer_fee_sell_rate": "0",
+      "other_fees": {}
+    }
+  ],
+  "evidence": {
+    "source": "USER_CONFIRMED_GUOJIN_ACCOUNT_FEE_2026-07-26",
+    "confirmed_at": "2026-07-26T00:00:00+08:00",
+    "confirmed_by_user": true,
+    "user_confirmed_terms": {
+      "a_share_buy_commission_rate": "0.0001",
+      "a_share_sell_commission_rate": "0.0001",
+      "etf_buy_commission_rate": "0.0001",
+      "etf_sell_commission_rate": "0.0001",
+      "minimum_commission_per_order": "5.00"
+    },
+    "statutory_fee_sources": [
+      {
+        "item": "A_SHARE_STAMP_TAX_SELL",
+        "rate": "0.0005",
+        "url": "https://www.mof.gov.cn/jrttts/202308/t20230828_3904235.htm"
+      },
+      {
+        "item": "A_SHARE_TRANSFER_FEE_BOTH_SIDES",
+        "rate": "0.00001",
+        "url": "https://www.chinaclear.cn/zdjs/editor_file/20220701154723234.pdf"
+      },
+      {
+        "item": "ETF_STAMP_TAX",
+        "rate": "0",
+        "url": "https://etf.sse.com.cn/fund/learning/knowledge/c/5704298.shtml"
+      }
+    ],
+    "notes": [
+      "Broker commission and statutory taxes/transfer fees are recorded separately.",
+      "A_SHARE and ETF commissions are both charged on buy and sell.",
+      "Minimum commission applies independently to each order.",
+      "Any later broker fee change requires a new immutable fee profile version."
+    ]
+  }
+}
