@@ -8,6 +8,7 @@ tunnel.  Business code should call this module instead of hard-coding
 """
 from __future__ import annotations
 
+import re
 import threading
 from typing import Any
 
@@ -20,6 +21,12 @@ from server.common.sql_reader import read_sql_rows
 
 _MINUTE_ENGINE: Engine | None = None
 _MINUTE_ENGINE_LOCK = threading.Lock()
+
+CAPITAL_FLOW_TABLES = {
+    "sm_stock_capital_flow_daily",
+    "sm_stock_capital_flow_min",
+}
+_TABLE_REF_RE = re.compile(r"\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?", re.IGNORECASE)
 
 
 def get_minute_engine() -> Engine:
@@ -44,6 +51,17 @@ def dispose_minute_engine() -> None:
         _MINUTE_ENGINE = None
         if engine is not None:
             engine.dispose()
+
+
+def should_use_capital_flow_engine(sql: str) -> bool:
+    """Route pure persisted capital-flow queries to the market-data DB.
+
+    Queries that join business tables deliberately stay on the primary engine;
+    cross-database joins are not safe when the configured URLs point at
+    different MySQL instances.
+    """
+    tables = {match.group(1).lower() for match in _TABLE_REF_RE.finditer(sql or "")}
+    return bool(tables) and tables.issubset(CAPITAL_FLOW_TABLES)
 
 
 def _configured_source() -> str:

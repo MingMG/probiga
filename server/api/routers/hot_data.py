@@ -17,7 +17,12 @@ from sqlalchemy import text
 from server.api.routers._engine import get_engine
 from server.common.current_data import get_current_engine, should_use_current_engine
 from server.common.kline_data import get_kline_engine, should_use_kline_engine
-from server.common.minute_data import get_stock_minute_prices, minute_source_info
+from server.common.minute_data import (
+    get_minute_engine,
+    get_stock_minute_prices,
+    minute_source_info,
+    should_use_capital_flow_engine,
+)
 from server.common.process_env import build_child_env
 from server.common.adata_release import ensure_adata_import_path
 from server.common.config import get_api_cache_config, get_settings
@@ -276,6 +281,8 @@ def _normalize_db_value(value):
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
     if should_use_current_engine(sql):
         engine = get_current_engine()
+    elif should_use_capital_flow_engine(sql):
+        engine = get_minute_engine()
     else:
         engine = get_kline_engine() if should_use_kline_engine(sql) else get_engine()
     return read_sql_rows(engine, sql, params, context="hot_data")
@@ -5126,7 +5133,8 @@ def _portfolio_refresh_qmt_min_flow(codes: list[str], *, force: bool = False) ->
         _cache_set(cache_key, result)
         return result
 
-    with get_engine().begin() as conn:
+    flow_engine = get_minute_engine()
+    with flow_engine.begin() as conn:
         for chunk_start in range(0, len(rows), 1000):
             chunk = rows[chunk_start : chunk_start + 1000]
             clauses = []
@@ -5140,7 +5148,7 @@ def _portfolio_refresh_qmt_min_flow(codes: list[str], *, force: bool = False) ->
     write_frame(
         pd.DataFrame(rows),
         "sm_stock_capital_flow_min",
-        get_engine(),
+        flow_engine,
         if_exists="append",
         index=False,
         chunksize=1000,
@@ -5731,7 +5739,10 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
             row["flow_attitude_ratio"] = daily_attitude["ratio"]
             row["flow_attitude_basis"] = row["flow_attitude_basis"] or "daily_close"
         if row["flow_status"] not in {"fresh", "closed"}:
-            for field in ("main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"):
+            for field in (
+                "main_net_inflow", "max_net_inflow", "lg_net_inflow",
+                "mid_net_inflow", "sm_net_inflow", "flow_1m", "flow_5m", "flow_15m",
+            ):
                 row[field] = None
         row["flow_is_stale"] = row["flow_status"] in {"stale", "missing"}
         if row.get("cur_price") is None:

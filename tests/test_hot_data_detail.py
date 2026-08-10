@@ -1049,6 +1049,113 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["000001"]["main_net_inflow"], 125_000_000.0)
         self.assertEqual(out["000001"]["flow_attitude_basis"], "minute_day_close")
 
+    def test_read_sql_routes_pure_capital_flow_to_minute_engine(self):
+        flow_engine = object()
+        with patch("server.api.routers.hot_data.get_minute_engine", return_value=flow_engine) as minute_engine_mock, \
+             patch("server.api.routers.hot_data.get_engine") as primary_engine_mock, \
+             patch("server.api.routers.hot_data.get_kline_engine") as kline_engine_mock, \
+             patch("server.api.routers.hot_data.read_sql_rows", return_value=[{"ok": 1}]) as read_mock:
+            out = hot_data._read_sql(
+                "SELECT stock_code FROM sm_stock_capital_flow_daily WHERE trade_date = :d",
+                {"d": "2026-08-10"},
+            )
+
+        self.assertEqual(out, [{"ok": 1}])
+        minute_engine_mock.assert_called_once_with()
+        primary_engine_mock.assert_not_called()
+        kline_engine_mock.assert_not_called()
+        self.assertIs(read_mock.call_args.args[0], flow_engine)
+
+    def test_portfolio_qmt_flow_refresh_writes_to_minute_engine(self):
+        flow_engine = MagicMock()
+        frame = hot_data.pd.DataFrame([{
+            "stock_code": "000001",
+            "trade_time": "2026-08-10 10:00:00",
+            "main_net_inflow": 12_000_000.0,
+            "max_net_inflow": 8_000_000.0,
+            "lg_net_inflow": 4_000_000.0,
+            "mid_net_inflow": -1_000_000.0,
+            "sm_net_inflow": -11_000_000.0,
+        }])
+
+        with patch("integrations.qmt.bridge.flow_min", return_value=frame), \
+             patch("integrations.qmt.backend.to_qmt_symbol", return_value="000001.SZ"), \
+             patch("server.api.routers.hot_data.get_minute_engine", return_value=flow_engine), \
+             patch("server.api.routers.hot_data.get_engine") as primary_engine_mock, \
+             patch("server.api.routers.hot_data.write_frame") as write_mock:
+            out = hot_data._portfolio_refresh_qmt_min_flow(["000001"], force=True)
+
+        self.assertEqual(out["status"], "success")
+        self.assertEqual(out["rows"], 1)
+        primary_engine_mock.assert_not_called()
+        flow_engine.begin.assert_called_once_with()
+        self.assertIs(write_mock.call_args.args[2], flow_engine)
+
+    def test_portfolio_snapshot_hides_stale_flow_values_and_attitude(self):
+        position = {
+            "id": 1,
+            "stock_code": "000001",
+            "shares": 0,
+            "cost_price": 0,
+            "sort_order": 1,
+        }
+        kline = {
+            "stock_code": "000001",
+            "trade_date": "2026-08-10",
+            "close": 10.0,
+            "pre_close": 9.8,
+            "change_pct": 2.04,
+            "short_name": "Ping An",
+        }
+        stale_flow = {
+            "000001": {
+                "main_net_inflow": 180_000_000.0,
+                "max_net_inflow": 80_000_000.0,
+                "lg_net_inflow": 60_000_000.0,
+                "mid_net_inflow": 10_000_000.0,
+                "sm_net_inflow": -150_000_000.0,
+                "flow_1m": 10_000_000.0,
+                "flow_5m": 50_000_000.0,
+                "flow_15m": 90_000_000.0,
+                "flow_status": "stale",
+                "flow_trade_date": "2026-08-09",
+                "flow_latest_time": "2026-08-09 15:00:00",
+                "flow_source": "old_snapshot",
+                "flow_attitude": "strong_in",
+                "flow_attitude_label": "Strong inflow",
+                "flow_attitude_ratio": 18.0,
+                "flow_attitude_basis": "minute_5m",
+            },
+        }
+
+        def read_rows(sql, params=None):
+            if "FROM st_user_portfolio" in sql:
+                return [dict(position)]
+            if "FROM sm_stock_kline" in sql:
+                return [dict(kline)]
+            return []
+
+        with patch("server.api.routers.hot_data._read_sql", side_effect=read_rows), \
+             patch("server.api.routers.hot_data._portfolio_market_mode", return_value="post_close"), \
+             patch("server.api.routers.hot_data._portfolio_close_trade_date", return_value="2026-08-10"), \
+             patch("server.api.routers.hot_data._portfolio_closed_quotes_from_current_table", return_value={}), \
+             patch("server.api.routers.hot_data._portfolio_min_flow_summary", return_value=stale_flow):
+            out = hot_data._build_portfolio_snapshot()
+
+        item = out["data"][0]
+        self.assertEqual(item["expected_flow_date"], "2026-08-10")
+        self.assertEqual(item["flow_status"], "stale")
+        self.assertEqual(item["flow_trade_date"], "2026-08-09")
+        for field in (
+            "main_net_inflow", "max_net_inflow", "lg_net_inflow",
+            "mid_net_inflow", "sm_net_inflow", "flow_1m", "flow_5m", "flow_15m",
+        ):
+            self.assertIsNone(item[field])
+        self.assertEqual(item["flow_attitude"], "")
+        self.assertEqual(item["flow_attitude_label"], "")
+        self.assertIsNone(item["flow_attitude_ratio"])
+        self.assertEqual(item["watch_analysis"]["funds"], "暂无")
+
     def test_portfolio_daily_flow_attitude_returns_neutral_label_for_zero_flow(self):
         out = hot_data._portfolio_daily_flow_attitude(0)
 
