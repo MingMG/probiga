@@ -881,7 +881,14 @@ def _fetch_external_concept_reference() -> dict[str, pd.DataFrame]:
 
 def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
     """Fetch one complete concept snapshot, then replace both tables atomically."""
-    source = "qmt" if _use_qmt_sector_data() else "external"
+    configured_source = _source_value(
+        "SI_CONCEPT_SOURCE",
+        "SI_INDUSTRY_SOURCE",
+        "DATA_SOURCE_CONCEPT_LIST",
+        "DATA_SOURCE_CODE_LIST",
+        default="qmt",
+    )
+    source = "qmt" if configured_source in {"qmt", "bigqmt"} else "external"
     tables = _qmt_sector_tables() if source == "qmt" else _fetch_external_concept_reference()
     catalog = tables.get("concept_catalog", pd.DataFrame()).copy()
     constituents = tables.get("concept_constituents", pd.DataFrame()).copy()
