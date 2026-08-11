@@ -85,6 +85,6 @@ def test_main_accepts_external_market_and_runs_batch() -> None:
 
     assert result == 0
     store.assert_called_once_with(engine, snapshot)
-    assert run_batch.call_args.kwargs["use_intraday_current"] is False
+    assert "use_intraday_current" not in run_batch.call_args.kwargs
     finish.assert_called_once()
     assert finish.call_args.kwargs["status"] == "done"
