@@ -113,6 +113,7 @@ body {
 ::-webkit-scrollbar-track { background: #0a0a0a; }
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
 </style>
+<script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
 <div class="container">
@@ -257,7 +258,7 @@ async function refresh() {
 
 document.addEventListener('DOMContentLoaded', async function() {
   await refresh();
-  setInterval(refresh, 30000);
+  setInterval(refresh, 10000);
 });
 </script>
 </body>

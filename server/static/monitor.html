@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>A股市场监控中心 - ProBigA</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="/static/js/auth.js?v=2"></script>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -632,7 +633,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     }
   }
   await refreshMonitor();
-  setInterval(refreshMonitor, 60000);
+  setInterval(refreshMonitor, 15000);
 });
 </script>
 </body>
