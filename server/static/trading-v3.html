@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ProBigA · 正期望交易主台</title>
+  <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=5">
+  <script src="/static/js/auth.js?v=2"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="/"><span>Pro</span>BigA</a>
+      <p class="rail-caption">POSITIVE EXPECTANCY DESK</p>
+      <nav>
+        <button class="nav active" data-view="overview"><i>01</i>执行总览</button>
+        <button class="nav" data-view="hypotheses"><i>02</i>交易假设</button>
+        <button class="nav" data-view="candidates"><i>03</i>候选与拒绝</button>
+        <button class="nav" data-view="intraday"><i>04</i>盘中机会</button>
+        <button class="nav" data-view="portfolio"><i>05</i>目标组合</button>
+        <button class="nav" data-view="positions"><i>06</i>当前持仓</button>
+        <button class="nav" data-view="orders"><i>07</i>模拟订单</button>
+        <button class="nav" data-view="validation"><i>08</i>回测验收</button>
+        <button class="nav" data-view="missed"><i>09</i>漏抓复盘</button>
+        <button class="nav" data-view="evidence"><i>10</i>数据与系统</button>
+      </nav>
+      <div class="rail-foot">
+        <span></span>
+        <div><strong>真实交易关闭</strong><small>仅 ProBigA 模拟盘</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">TRADING V3 · OUT-OF-SAMPLE FIRST</p>
+          <h1 id="pageTitle">执行总览</h1>
+        </div>
+        <div class="actions">
+          <span id="updatedAt">读取中</span>
+          <button id="refresh">刷新只读结果</button>
+        </div>
+      </header>
+
+      <section class="action-strip">
+        <div>
+          <strong>手动执行</strong>
+          <span id="actionStatus">正在读取今日自动执行状态</span>
+        </div>
+        <div class="action-buttons">
+          <button id="runDaily">手动重跑日级选股</button>
+          <button id="runIntraday">立即扫描盘中机会</button>
+        </div>
+      </section>
+
+      <section class="hero" id="hero">
+        <div>
+          <p>当前结论</p>
+          <h2 id="heroTitle">正在读取最新决策</h2>
+          <span id="heroReason">没有样本外证据的策略不会进入模拟买单。</span>
+        </div>
+        <div class="regime">
+          <small>市场状态（概率最高）</small>
+          <strong id="regime">—</strong>
+          <span id="riskCap">风险仓位上限 —</span>
+        </div>
+      </section>
+
+      <section class="metrics">
+        <article><span>账户权益</span><strong id="equity">—</strong><small>万一佣金，最低 5 元</small></article>
+        <article><span>可用现金</span><strong id="cash">—</strong><small>空仓也是主动决策</small></article>
+        <article><span>通过样本外闸门</span><strong id="validated">—</strong><small id="sleeves">策略独立记账</small></article>
+        <article><span>目标持仓</span><strong id="targetCount">—</strong><small id="targetPolicy">读取当前生产仓位规则</small></article>
+      </section>
+
+      <section class="view active" id="view-overview">
+        <div class="two">
+          <article class="panel">
+            <div class="panel-head"><div><p>WHY THIS DECISION</p><h3>为什么买 / 为什么不买</h3></div><span class="badge" id="decisionStatus">读取中</span></div>
+            <div id="decisionFacts" class="facts"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>INDEPENDENT STRATEGY SLEEVES</p><h3>策略不是一锅分数</h3></div></div>
+            <div id="sleeveCards" class="cards"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>THEME OPPORTUNITY AUDIT</p><h3>主题机会覆盖与高分漏选预警</h3></div><span class="badge" id="themeAuditStatus">等待审计</span></div>
+          <p class="note">每次决策先扫描完整股票池和全部策略预测，再单独审计纸面候选；AI应用、机器人目前是跨策略主题雷达，不冒充已经训练并通过 OOS 的独立模型。高分方向全部落选、候选没有拒绝原因或目标主题过度集中都会主动提示，且不绕过样本外和风控门槛。</p>
+          <div id="themeAuditFacts" class="facts"></div>
+          <div class="two">
+            <div class="table-wrap"><table><thead><tr><th>研究方向</th><th>覆盖股票</th><th>策略预测</th><th>纸面候选</th><th>入选</th><th>全量最高信号</th><th>状态 / 原因</th></tr></thead><tbody id="researchGroupRows"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>纸面候选主题</th><th>候选数</th><th>入选数</th><th>最高分候选</th></tr></thead><tbody id="opportunityThemeRows"></tbody></table></div>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>LEFT-SIDE OPPORTUNITY LAB</p><h3>超跌抄底实验：准备、触发与模拟试错</h3></div><span class="badge warning">只进模拟盘</span></div>
+          <p class="note">“准备”表示提前纳入视野，不是买点；只有止跌回拉、放量、相对市场转强和板块确认同时成立，才用最多 2.5% 仓位模拟试错。失败也会保留并在 5 个交易日后复盘。</p>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题</th><th>阶段</th><th>实验动作</th><th>评分</th><th>保护位</th><th>依据</th></tr></thead><tbody id="oversoldRows"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>TARGETS</p><h3>本次可执行目标</h3></div><span class="badge safe">先组合，后下单</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>目标仓位</th><th>股数</th><th>净期望</th><th>保守收益</th><th>往返成本</th><th>证据</th></tr></thead><tbody id="overviewTargets"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-hypotheses">
+        <div class="two">
+          <article class="panel">
+            <div class="panel-head"><div><p>MARKET HYPOTHESIS</p><h3>今天的市场假设会随盘中证据变化</h3></div><span class="badge" id="marketHypothesisState">等待日级决策</span></div>
+            <div id="marketHypothesisFacts" class="facts"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>HOW TO READ</p><h3>概率、触发与失效分开看</h3></div><span class="badge warning">结构化先验不冒充真实胜率</span></div>
+            <div class="facts">
+              <div><span>样本外校准</span><strong>真实历史样本校准，可进入正式模拟组合</strong></div>
+              <div><span>结构化先验</span><strong>只用于排序、观察和盘中提醒，必须继续验证</strong></div>
+              <div><span>触发条件</span><strong>满足才允许模拟试单，不满足就继续观察</strong></div>
+              <div><span>失效条件</span><strong>一旦发生立即降级；持仓受 T+1 时转待卖</strong></div>
+            </div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head wrap">
+            <div><p>LIVE THESIS LEDGER</p><h3>个股交易假设、正反证据与下一步动作</h3></div>
+            <div class="filters">
+              <label>历史日期<input type="date" id="hypothesisDate"></label>
+              <label>状态<select id="hypothesisState"><option value="">全部状态</option><option value="ACTIVE">已触发</option><option value="TRIGGER_READY">等待价格确认</option><option value="PREPARE">重点准备</option><option value="WATCH">普通观察</option><option value="WEAKEN">正在转弱</option><option value="INVALIDATED">已经失效</option></select></label>
+              <label>代码/中文/主题<input id="hypothesisSearch" placeholder="输入代码、中文名或主题"></label>
+            </div>
+          </div>
+          <p class="note">这里不是静态荐股榜。日线策略先形成假设，盘中 QMT 行情、板块宽度、相对强度、成交额倍率和盘口订单流会继续加证或证伪；盘中新发现的票也会进入本账本。</p>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题 / 角色</th><th>当前状态</th><th>当前概率</th><th>概率性质</th><th>建议动作</th><th>支持证据</th><th>反方证据</th><th>最近更新</th><th>详情</th></tr></thead><tbody id="hypothesisRows"></tbody></table></div>
+        </article>
+        <article class="panel" id="hypothesisDetailPanel">
+          <div class="panel-head"><div><p>EVIDENCE TIMELINE</p><h3 id="hypothesisDetailTitle">点击上方“看证据”查看完整推理链</h3></div></div>
+          <div id="hypothesisDetail" class="hypothesis-detail"></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-candidates">
+        <article class="panel">
+          <div class="panel-head wrap">
+            <div><p>FORECAST LEDGER</p><h3>候选、研究样本与拒绝原因</h3></div>
+            <div class="filters">
+              <label>历史日期<input type="date" id="candidateDate"></label>
+              <label>策略<select id="strategyFilter"><option value="">全部策略</option></select></label>
+              <label>状态<select id="statusFilter"><option value="">全部状态</option><option value="VALIDATED_POSITIVE">通过闸门</option><option value="PAPER_DISCOVERY_CANDIDATE">触发小仓模拟试错</option><option value="LEFT_SIDE_PREPARE">进入左侧准备区</option><option value="RESEARCH_ONLY_UNCALIBRATED">未校准，仅研究</option><option value="RESEARCH_ONLY_MODEL_VERSION_MISMATCH">旧模型已隔离</option><option value="RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED">分数排序失真</option><option value="RESEARCH_ONLY_PROFIT_GATE_FAILED">收益闸门失败</option><option value="WEAK_MARKET_THEME_WATCH">弱市结构性观察</option><option value="SETUP_NOT_READY">形态尚未同时确认</option><option value="MARKET_REGIME_BLOCKED">弱市且板块未确认</option><option value="INSUFFICIENT_DATA">数据不足</option></select></label>
+              <label>代码/中文/主题<input id="candidateSearch" placeholder="输入代码、中文名或主题"></label>
+            </div>
+          </div>
+          <div class="candidate-toolbar">
+            <p class="note">选择历史日期读取当时已落库的不可变决策，不用今天的数据重算过去。</p>
+            <span class="badge" id="candidateSummary">读取候选中</span>
+          </div>
+          <div id="candidateCards" class="candidate-list" aria-live="polite"></div>
+          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
+          <div class="candidate-pager" id="candidatePager"><button type="button" id="candidatePrev">上一页</button><span id="candidatePageStatus">第 1 / 1 页</span><button type="button" id="candidateNext">下一页</button></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-intraday">
+        <div class="two">
+          <article class="panel">
+            <div class="panel-head">
+              <div><p>CURRENT REALTIME STATE</p><h3>当前实时状态与市场确认</h3></div>
+              <span class="badge" id="intradayStatus">等待扫描</span>
+            </div>
+            <div id="intradayFacts" class="facts"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div><p>WHY WATCH ONLY</p><h3>能提醒与能下单是两道门</h3></div>
+              <span class="badge warning">真实交易固定关闭</span>
+            </div>
+            <div id="intradayEvidence" class="facts"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head">
+            <div><p>LATEST HISTORICAL SNAPSHOT</p><h3>最新历史快照</h3></div>
+            <span class="badge">只读复盘，绝不冒充实时</span>
+          </div>
+          <div id="intradayHistoricalFacts" class="facts"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head wrap">
+            <div><p>INTRADAY OPPORTUNITY RADAR</p><h3>水下修复、突然放量、极速上攻与龙二替补</h3></div>
+            <span class="badge" id="intradayCount">0 条</span>
+          </div>
+          <p class="note">观察信号会完整展示；只有实时数据、板块确认、盈亏比和模拟风控全部通过，才允许进入 ProBigA 模拟订单。</p>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题</th><th>角色</th><th>动作</th><th>现价</th><th>当前涨幅</th><th>相对强度</th><th>量能比</th><th>板块红盘</th><th>评分</th><th>盈亏比</th><th>判断原因</th><th>观察时间</th></tr></thead><tbody id="intradayRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-portfolio">
+        <article class="panel">
+          <div class="panel-head"><div><p>PORTFOLIO OPTIMIZER</p><h3>目标组合与资金约束</h3></div><span class="badge" id="portfolioStatus">—</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>策略来源</th><th>主题</th><th>目标市值</th><th>目标仓位</th><th>股数</th><th>预估最大不利</th><th>结论</th></tr></thead><tbody id="portfolioRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-positions">
+        <article class="panel">
+          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge safe">不按固定天数死拿</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>状态</th><th>数量</th><th>可卖</th><th>成本</th><th>保护位</th><th>加仓次数</th><th>失效条件</th></tr></thead><tbody id="positionRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-orders">
+        <article class="panel">
+          <div class="panel-head"><div><p>PAPER OMS</p><h3>ProBigA 模拟订单</h3></div><span class="badge danger">真实交易固定为 0</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>方向</th><th>数量</th><th>限价</th><th>状态</th><th>等待原因</th><th>有效时间</th></tr></thead><tbody id="orderRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-validation">
+        <div class="metrics acceptance">
+          <article><span>有效 OOS 模型</span><strong id="activeOosGate">—</strong><small>必须有与冻结公式匹配的有效模型</small></article>
+          <article><span>对应验证 PASS</span><strong id="validationGate">—</strong><small>最近验证必须属于当前有效模型</small></article>
+          <article><span>Level1 连续 5 日</span><strong id="level1Gate">—</strong><small>只计算有效交易日的连续采集证据</small></article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>CRITICAL ACCEPTANCE GATES</p><h3>最终生产验收三项硬门槛</h3></div><span class="badge" id="criticalAcceptanceStatus">读取中</span></div>
+          <div id="criticalAcceptanceFacts" class="facts"></div>
+        </article>
+        <div class="metrics validation">
+          <article><span>样本外交易数</span><strong id="oosSamples">—</strong></article>
+          <article><span>单笔净期望</span><strong id="oosExpectancy">—</strong></article>
+          <article><span>Profit Factor</span><strong id="oosPf">—</strong></article>
+          <article><span>平均盈亏比</span><strong id="oosPayoff">—</strong></article>
+          <article><span>最大回撤</span><strong id="oosDd">—</strong></article>
+          <article><span>模拟净利润</span><strong id="oosProfit">—</strong></article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>WALK-FORWARD ACCEPTANCE</p><h3>是否允许进入模拟盘</h3></div><span class="badge" id="validationStatus">暂无结果</span></div>
+          <div id="validationEvidence" class="facts"></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-missed">
+        <article class="panel">
+          <div class="panel-head"><div><p>COUNTERFACTUAL AUDIT</p><h3>哪些机会漏抓了，为什么漏</h3></div><span class="badge" id="recallStatus">影子复盘积累中</span></div>
+          <div class="metrics compact">
+            <article><span>Recall@20</span><strong id="recall20">—</strong></article>
+            <article><span>Recall@50</span><strong id="recall50">—</strong></article>
+            <article><span>未来强势股</span><strong id="winnerCount">—</strong></article>
+            <article><span>漏抓数量</span><strong id="missedCount">—</strong></article>
+          </div>
+          <div id="missedReasons" class="facts"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>EXPERIMENT LEARNING LEDGER</p><h3>超跌抄底实验学到了什么</h3></div><span class="badge" id="learningStatus">等待样本</span></div>
+          <div class="metrics compact">
+            <article><span>已观察样本</span><strong id="learningObserved">—</strong></article>
+            <article><span>模拟买入样本</span><strong id="learningAccepted">—</strong></article>
+            <article><span>胜率</span><strong id="learningWinRate">—</strong></article>
+            <article><span>Profit Factor</span><strong id="learningPf">—</strong></article>
+          </div>
+          <div id="learningFacts" class="facts"></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-evidence">
+        <div class="two">
+          <article class="panel"><div class="panel-head"><div><p>READINESS</p><h3>系统能力门禁</h3></div><span class="badge" id="readinessStatus">—</span></div><div id="blocks" class="facts"></div></article>
+          <article class="panel"><div class="panel-head"><div><p>PROVENANCE</p><h3>本次决策证据</h3></div></div><div id="provenance" class="facts"></div></article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>SCHEMA</p><h3>V3 业务账本</h3></div><span class="badge safe">技术明细默认收起</span></div>
+          <details><summary>查看数据库表状态</summary><div id="schema" class="schema"></div></details>
+        </article>
+      </section>
+    </main>
+  </div>
+  <script src="/static/js/trading-v3.js?v=12"></script>
+</body>
+</html>

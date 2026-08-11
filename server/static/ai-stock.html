@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="dark">
+  <title>股票问答｜ProBigA</title>
+  <script>if (new URLSearchParams(window.location.search).get('embedded') === '1') document.documentElement.classList.add('embedded');</script>
+  <link rel="stylesheet" href="/static/css/ai-chat.css?v=2">
+  <script src="/static/js/auth.js?v=2"></script>
+</head>
+<body data-channel="stock">
+  <div class="ai-shell">
+    <header class="ai-topbar">
+      <a class="brand" href="/" aria-label="返回 ProBigA 首页">Pro<span>Big</span>A</a>
+      <nav class="channel-nav" aria-label="问答频道">
+        <a class="active" href="/ai-stock">股票问答</a>
+        <a href="/ai-general">通用问答</a>
+      </nav>
+      <a class="back-home" href="/">返回系统</a>
+    </header>
+
+    <main class="ai-main">
+      <section class="hero">
+        <div class="hero-kicker">STOCK DESK</div>
+        <h1>股票问答</h1>
+        <p>个股、行业、公告、交易逻辑都可以问。问题会进入固定的 Codex 股票任务；GPT 不可用时再切换 DeepSeek 网页。</p>
+      </section>
+
+      <section class="source-panel" aria-live="polite">
+        <div>
+          <span class="source-caption">本条回答的数据源</span>
+          <strong id="sourceLabel" class="source-value waiting">等待提问</strong>
+        </div>
+        <div id="bridgeState" class="bridge-state">本机桥接状态将在提问后确认</div>
+      </section>
+
+      <section id="conversation" class="conversation" aria-label="问答记录">
+        <div id="emptyState" class="empty-state">
+          <div class="empty-mark">A</div>
+          <h2>直接输入你想研究的股票问题</h2>
+          <p>例如：结合基本面和近期催化，分析 600519 当前主要风险。回答仅供研究，不构成投资建议。</p>
+        </div>
+      </section>
+
+      <form id="questionForm" class="composer">
+        <label class="sr-only" for="questionInput">股票问题</label>
+        <textarea id="questionInput" maxlength="8000" rows="3" placeholder="输入股票、板块或交易相关问题……" required></textarea>
+        <div class="composer-footer">
+          <span id="inputHint">Enter 发送，Shift + Enter 换行</span>
+          <button id="sendButton" type="submit">
+            <span>发送问题</span><span aria-hidden="true">↑</span>
+          </button>
+        </div>
+      </form>
+    </main>
+  </div>
+  <script src="/static/js/ai-chat.js?v=1"></script>
+</body>
+</html>

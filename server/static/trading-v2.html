@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ProBigA V2 · 交易决策台</title>
+  <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v2-embedded');</script>
+  <link rel="stylesheet" href="/static/css/trading-v2.css?v=7">
+  <script src="/static/js/auth.js?v=2"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="/"><span>Pro</span>BigA</a>
+      <p class="rail-caption">V2 PAPER DESK</p>
+      <nav aria-label="V2 页面">
+        <button class="nav-item active" data-view="trust"><i>01</i>系统可信度</button>
+        <button class="nav-item" data-view="tomorrow"><i>02</i>明日动作</button>
+        <button class="nav-item" data-view="opportunity"><i>03</i>今日机会</button>
+        <button class="nav-item" data-view="plan"><i>04</i>组合计划</button>
+        <button class="nav-item" data-view="positions"><i>05</i>当前持仓</button>
+        <button class="nav-item" data-view="orders"><i>06</i>订单与成交</button>
+        <button class="nav-item" data-view="etf"><i>07</i>ETF 前向</button>
+        <button class="nav-item" data-view="evidence"><i>08</i>数据证据</button>
+        <button class="nav-item" data-view="operations"><i>09</i>运行状态</button>
+        <button class="nav-item" data-view="review"><i>10</i>复盘与验收</button>
+        <button class="nav-item" data-view="lab"><i>11</i>策略实验室</button>
+      </nav>
+      <div class="rail-foot">
+        <span class="dot"></span>
+        <div><strong>真实交易关闭</strong><small>只允许历史与模拟</small></div>
+      </div>
+    </aside>
+
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">DETERMINISTIC PAPER TRADING</p>
+          <h1 id="pageTitle">系统可信度</h1>
+        </div>
+        <div class="header-actions">
+          <span id="snapshotTag" class="snapshot">快照读取中</span>
+          <button id="refreshButton" class="refresh">刷新只读快照</button>
+        </div>
+      </header>
+
+      <section id="hero" class="hero">
+        <div>
+          <p class="hero-label">当前执行结论</p>
+          <h2 id="heroDecision">正在读取 V2 真值账本</h2>
+          <p id="heroReason">页面不会现场计算，也不会创建订单。</p>
+        </div>
+        <div class="regime">
+          <span>市场状态</span>
+          <strong id="regimeValue">—</strong>
+          <small id="regimeMeta">等待已完成决策</small>
+        </div>
+      </section>
+
+      <section class="metrics" aria-label="账户摘要">
+        <article><span>账户权益</span><strong id="equityMetric">¥—</strong><small>20 万元 V2 独立账户</small></article>
+        <article><span>可用现金</span><strong id="cashMetric">¥—</strong><small id="cashMeta">账本读取中</small></article>
+        <article><span>当前持仓</span><strong id="positionMetric">— / 12</strong><small>按证券去重；生产总上限 12 只</small></article>
+        <article><span>对账状态</span><strong id="reconMetric">—</strong><small>现金容差 ¥0.01，股数容差 0</small></article>
+      </section>
+
+      <section id="view-trust" class="view active">
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>READINESS</p><h3>能力门禁</h3></div><span id="readinessBadge" class="badge neutral">读取中</span></div>
+            <div id="blockList" class="block-list"><p class="empty">等待系统状态</p></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>PROVENANCE</p><h3>本次决策身份证</h3></div></div>
+            <dl id="provenanceList" class="facts"></dl>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>SCHEMA</p><h3>V2 独立账本</h3></div><span class="badge safe">新旧模拟账本已隔离</span></div>
+          <div id="schemaSummary" class="schema-summary">账本状态读取中</div>
+          <details class="technical-details">
+            <summary>查看技术表名</summary>
+            <div id="schemaGrid" class="schema-grid"></div>
+          </details>
+        </article>
+      </section>
+
+      <section id="view-tomorrow" class="view">
+        <article id="tomorrowBanner" class="decision-banner">
+          <div>
+            <p>NEXT TRADING DAY</p>
+            <h3 id="tomorrowDecision">等待已完成的组合计划</h3>
+            <span id="tomorrowReason">这里只展示后台已完成决策，不在页面临时选股。</span>
+          </div>
+          <strong id="tomorrowDate">—</strong>
+        </article>
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>EXECUTION PLAN</p><h3>计划买入与继续持有</h3></div><span class="badge neutral">不是盘中承诺</span></div>
+            <div class="table-wrap"><table><thead><tr><th>证券</th><th>目标数量</th><th>目标权重</th><th>策略</th><th>题材</th><th>执行说明</th></tr></thead><tbody id="tomorrowRows"></tbody></table></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>DECISION FACTS</p><h3>决策依据</h3></div></div>
+            <dl id="tomorrowFacts" class="facts"></dl>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>WATCH ONLY</p><h3>高分观察池</h3></div><span class="badge warning">观察，不是买入指令</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>策略</th><th>题材/角色</th><th>原始分</th><th>盈亏比</th><th>动作</th><th>为什么没买</th></tr></thead><tbody id="tomorrowWatchRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-opportunity" class="view">
+        <article class="panel">
+          <div class="panel-head">
+            <div><p>INTRADAY ACTIVATION</p><h3>盘中动态判断、全市场异动与观察股激活</h3></div>
+            <span id="intradayBadge" class="badge neutral">等待首个盘中判断</span>
+          </div>
+          <div class="notice-strip"><strong>执行边界：</strong>只从盘前观察池中选择；QMT覆盖、普涨确认、板块宽度、个股强度和动态盈亏比必须同时通过。龙一封板时，龙二或中军仅用更小试仓。只进入 ProBigA 模拟盘。</div>
+          <div class="status-grid">
+            <div>
+              <div class="panel-head"><div><p>CURRENT REALTIME STATE</p><h3>当前实时状态</h3></div><span id="intradayRealtimeBadge" class="badge neutral">未连接</span></div>
+              <dl id="intradayMarketFacts" class="facts compact-facts"></dl>
+            </div>
+            <div>
+              <div class="panel-head"><div><p>LATEST HISTORICAL SNAPSHOT</p><h3>最新历史快照</h3></div><span class="badge neutral">只读复盘</span></div>
+              <dl id="intradayHistoricalFacts" class="facts compact-facts"></dl>
+            </div>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>股票</th><th>题材/角色</th><th>盘中动作</th><th>当前涨幅</th><th>跑赢市场</th><th>分钟量能</th><th>板块宽度</th><th>动态盈亏比</th><th>判断原因</th></tr></thead><tbody id="intradayRows"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head">
+            <div><p>UNIFIED CANDIDATES</p><h3>统一候选与拒绝原因</h3></div>
+            <div class="candidate-tools">
+              <label>交易日
+                <select id="candidateDate" aria-label="候选池交易日"></select>
+              </label>
+              <label>决策批次
+                <select id="candidateRun" aria-label="候选池决策批次"></select>
+              </label>
+              <input id="candidateFilter" type="search" placeholder="输入代码、中文名或题材筛选">
+              <span id="candidateCount" class="badge neutral">0 条</span>
+            </div>
+          </div>
+          <div class="candidate-history-meta">
+            <span id="candidatePoolMeta" class="badge neutral">读取最新落库票池</span>
+            <small>历史查看只读取当时真实落库的决策快照，不会用今天的数据重算过去。</small>
+          </div>
+          <div class="table-wrap"><table><thead><tr><th>股票</th><th>策略版本</th><th>题材/角色</th><th>动作</th><th>综合分</th><th>期望下界</th><th>盈亏比</th><th>竞争状态</th><th>消息/资金/外围</th><th>拒绝原因</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-plan" class="view">
+        <div class="two-col">
+          <article class="panel"><div class="panel-head"><div><p>PORTFOLIO PLAN</p><h3>多仓竞争结果</h3></div></div><div id="slotGrid" class="slot-grid"></div></article>
+          <article class="panel"><div class="panel-head"><div><p>ACCOUNT RISK</p><h3>组合边界</h3></div></div><dl id="planFacts" class="facts"></dl></article>
+        </div>
+      </section>
+
+      <section id="view-positions" class="view">
+        <article class="panel"><div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>持仓逻辑状态</h3></div><span class="badge safe">持有天数不强制卖</span></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>批次</th><th>状态</th><th>数量</th><th>可卖日</th><th>成本</th><th>保护位</th><th>加仓次数</th><th>失效条件</th></tr></thead><tbody id="positionRows"></tbody></table></div>
+        </article>
+      </section>
+
+      <section id="view-orders" class="view">
+        <div class="two-col">
+          <article class="panel"><div class="panel-head"><div><p>OMS</p><h3>订单状态</h3></div></div><div id="orderList" class="stack-list"></div></article>
+          <article class="panel"><div class="panel-head"><div><p>FILLS</p><h3>逐次成交</h3></div><span class="badge safe">Level-1 优先 · QMT快照降级</span></div><div id="fillList" class="stack-list"></div></article>
+        </div>
+      </section>
+
+      <section id="view-etf" class="view">
+        <article class="panel">
+          <div class="panel-head"><div><p>TRUE FORWARD LEDGER</p><h3>ETF 真实前向验证</h3></div><span id="etfStatusBadge" class="badge neutral">读取中</span></div>
+          <div class="notice-strip"><strong>边界：</strong>只记录 2026-07-27 以后真实到达的数据，不回填成“前向记录”，也不自动下单。</div>
+          <div class="status-grid">
+            <dl id="etfFacts" class="facts"></dl>
+            <dl id="etfTaskFacts" class="facts"></dl>
+          </div>
+        </article>
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>REGISTERED TARGET</p><h3>冻结策略与当前目标</h3></div></div>
+            <div class="table-wrap"><table><thead><tr><th>策略版本</th><th>前向开始</th><th>状态</th><th>当前目标</th></tr></thead><tbody id="etfTargetRows"></tbody></table></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>OBSERVATIONS</p><h3>不可变观察记录</h3></div><span class="badge safe">只追加</span></div>
+            <div class="table-wrap"><table><thead><tr><th>数据日</th><th>信号</th><th>执行日</th><th>目标</th><th>来源</th></tr></thead><tbody id="etfObservationRows"></tbody></table></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="view-evidence" class="view">
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>ROW-LEVEL ATTESTATION</p><h3>旧 A 股日 K 的 QMT 补证</h3></div><span id="qmtEvidenceBadge" class="badge neutral">读取中</span></div>
+            <dl id="qmtEvidenceFacts" class="facts"></dl>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>LEVEL-1 CONTINUITY</p><h3>买一卖一连续性</h3></div><span class="badge warning">实盘门禁</span></div>
+            <dl id="level1Facts" class="facts"></dl>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>HISTORICAL MEMBERSHIP</p><h3>概念与行业成员快照</h3></div><span class="badge safe">逐日形成真实历史</span></div>
+          <div id="membershipGrid" class="evidence-grid"></div>
+        </article>
+      </section>
+
+      <section id="view-operations" class="view">
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>DATABASE GUARD</p><h3>真实交易硬关闭</h3></div><span id="guardBadge" class="badge neutral">读取中</span></div>
+            <dl id="guardFacts" class="facts"></dl>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>WORKERS</p><h3>执行器心跳</h3></div></div>
+            <div id="workerList" class="stack-list"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>SCHEDULER</p><h3>关键生产任务</h3></div><span class="badge safe">数据库调度真值</span></div>
+          <div class="table-wrap"><table><thead><tr><th>任务</th><th>计划</th><th>启用</th><th>最近状态</th><th>最近运行</th><th>输出</th></tr></thead><tbody id="taskRows"></tbody></table></div>
+        </article>
+        <div class="two-col">
+          <article class="panel">
+            <div class="panel-head"><div><p>BACKTEST RUNS</p><h3>最近回测</h3></div><span id="runningBacktestBadge" class="badge neutral">读取中</span></div>
+            <div id="backtestList" class="stack-list"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>ASYNC JOBS</p><h3>最近后台任务</h3></div></div>
+            <div id="jobList" class="stack-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="view-review" class="view">
+        <div class="two-col">
+          <article class="panel"><div class="panel-head"><div><p>RECONCILIATION</p><h3>日终对账</h3></div></div><div id="reconList" class="stack-list"></div></article>
+          <article class="panel"><div class="panel-head"><div><p>DAILY EQUITY</p><h3>权益与回撤</h3></div></div><div id="dailyList" class="stack-list"></div></article>
+        </div>
+      </section>
+
+      <section id="view-lab" class="view">
+        <article class="panel"><div class="panel-head"><div><p>STRATEGY REGISTRY</p><h3>冻结版本与生命周期</h3></div><span class="badge neutral">模拟试运行只证明前向模拟</span></div><div id="strategyGrid" class="strategy-grid"></div></article>
+      </section>
+    </main>
+  </div>
+  <script src="/static/js/trading-v2.js?v=14"></script>
+</body>
+</html>

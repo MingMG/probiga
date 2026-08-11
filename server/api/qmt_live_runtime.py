@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import datetime
 
-from sqlalchemy import create_engine, text
-
 from biz.stock_market.sync_stock_market import read_index_codes, step_index_current
-from integrations.qmt.info import CORE_INDEXES
-from server.common.config import get_mysql_url, get_qmt_live_runtime_config
-from tools.sync_qmt_realtime import sync_qmt_realtime
+from server.api.routers._engine import get_engine
+from server.common.current_data import get_current_engine
+from server.common.config import get_qmt_live_runtime_config
+from server.common.sql_reader import read_sql_rows
+from tools.sync_market_realtime import sync_market_realtime
 
-logger = logging.getLogger("qmt_live_runtime")
+logger = logging.getLogger("live_quote_runtime")
+
+CORE_INDEX_CODES = ["000001", "399001", "399006", "000300", "000905", "000852"]
 
 _live_thread: threading.Thread | None = None
 _stop_event: threading.Event | None = None
 _run_lock = threading.Lock()
+_last_index_poll = 0.0
 
 
 def _is_trading_time(now: datetime | None = None) -> bool:
@@ -38,7 +42,7 @@ def _load_index_codes(engine) -> list[str]:
         codes = []
     if codes:
         return codes
-    return [symbol.split(".", 1)[0] for symbol in CORE_INDEXES]
+    return list(CORE_INDEX_CODES)
 
 
 def _load_tracked_stock_codes(engine, candidate_limit: int) -> list[str]:
@@ -57,14 +61,17 @@ def _load_tracked_stock_codes(engine, candidate_limit: int) -> list[str]:
             {"limit": max(20, int(candidate_limit or 60))},
         ),
     ]
-    with engine.connect() as conn:
-        for sql, params in queries:
-            try:
-                rows = conn.execute(text(sql), params).fetchall()
-            except Exception as exc:
-                logger.warning("load tracked stocks failed for query: %s", exc)
-                continue
-            codes.extend(str(row[0]).strip().zfill(6) for row in rows if str(row[0] or "").strip())
+    for sql, params in queries:
+        try:
+            rows = read_sql_rows(engine, sql, params, context="qmt_live_runtime")
+        except Exception as exc:
+            logger.warning("load tracked stocks failed for query: %s", exc)
+            continue
+        codes.extend(
+            str(row.get("stock_code")).strip().zfill(6)
+            for row in rows
+            if str(row.get("stock_code") or "").strip()
+        )
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -77,39 +84,75 @@ def _load_tracked_stock_codes(engine, candidate_limit: int) -> list[str]:
 
 
 def _run_once(engine) -> None:
+    global _last_index_poll
     with _run_lock:
         config = get_qmt_live_runtime_config()
-        tracked_codes = _load_tracked_stock_codes(engine, int(config["candidate_limit"]))
+        # Business universes live in the primary application database.  The
+        # dedicated current-quote database can contain stale compatibility
+        # copies of those tables and must only be used for quote reads/writes.
+        tracked_codes = _load_tracked_stock_codes(get_engine(), int(config["candidate_limit"]))
         if tracked_codes:
-            result = sync_qmt_realtime(
-                engine=engine,
-                codes=tracked_codes,
-                archive_snapshot=True,
-                run_rt_ddl=False,
-                skip_closed=False,
-                min_coverage=0.0,
-                replace_scope="subset",
-            )
-            logger.info(
-                "qmt realtime synced tracked=%s current=%s snapshot=%s coverage=%s generated_at=%s",
-                len(tracked_codes),
-                result.get("current_rows"),
-                result.get("snapshot_rows"),
-                result.get("coverage"),
-                result.get("generated_at"),
-            )
+            placeholders = ",".join(f":code_{idx}" for idx, _ in enumerate(tracked_codes))
+            params = {f"code_{idx}": code for idx, code in enumerate(tracked_codes)}
+            fresh_codes = set()
+            try:
+                rows = read_sql_rows(
+                    engine,
+                    f"SELECT stock_code, snapshot_at FROM sm_stock_current WHERE stock_code IN ({placeholders})",
+                    params,
+                    context="qmt_live_runtime_current",
+                )
+                now = datetime.now()
+                for row in rows:
+                    snapshot_at = row.get("snapshot_at")
+                    if not snapshot_at:
+                        continue
+                    if not isinstance(snapshot_at, datetime):
+                        snapshot_at = datetime.strptime(str(snapshot_at)[:19], "%Y-%m-%d %H:%M:%S")
+                    if (now - snapshot_at).total_seconds() <= max(15, int(config["poll_seconds"]) * 2):
+                        fresh_codes.add(str(row.get("stock_code") or "").strip().zfill(6))
+            except Exception as exc:
+                logger.warning("read current QMT snapshot failed; using Sina fallback: %s", exc)
+
+            stale_codes = [code for code in tracked_codes if code not in fresh_codes]
+            if stale_codes:
+                result = sync_market_realtime(
+                    engine=engine,
+                    codes=stale_codes,
+                    source="sina",
+                    archive_snapshot=True,
+                    run_rt_ddl=False,
+                    skip_closed=False,
+                    min_coverage=0.60,
+                    replace_scope="subset",
+                )
+                logger.info(
+                    "Sina fallback synced stale=%s qmt_fresh=%s current=%s snapshot=%s coverage=%s generated_at=%s",
+                    len(stale_codes),
+                    len(fresh_codes),
+                    result.get("current_rows"),
+                    result.get("snapshot_rows"),
+                    result.get("coverage"),
+                    result.get("generated_at"),
+                )
+            else:
+                logger.info("Big QMT current snapshots are fresh tracked=%s; skipped Sina fallback", len(fresh_codes))
         else:
-            logger.info("qmt realtime skipped stock sync because tracked universe is empty")
-        step_index_current(engine, _load_index_codes(engine))
+            logger.info("public realtime skipped stock sync because tracked universe is empty")
+
+        now_monotonic = time.monotonic()
+        if now_monotonic - _last_index_poll >= float(config.get("index_poll_seconds", 60)):
+            step_index_current(engine, _load_index_codes(engine))
+            _last_index_poll = now_monotonic
 
 
 def _worker(stop_event: threading.Event) -> None:
     config = get_qmt_live_runtime_config()
     interval_seconds = float(config["poll_seconds"])
     idle_seconds = float(config["idle_sleep_seconds"])
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = get_current_engine()
     logger.info(
-        "QMT live runtime started interval=%ss idle=%ss trading_only=%s",
+        "Public live quote runtime started interval=%ss idle=%ss trading_only=%s",
         interval_seconds,
         idle_seconds,
         bool(config["trading_hours_only"]),
@@ -123,18 +166,17 @@ def _worker(stop_event: threading.Event) -> None:
                 continue
             _run_once(engine)
         except Exception as exc:
-            logger.exception("QMT live runtime sync failed: %s", exc)
+            logger.exception("Public live quote runtime sync failed: %s", exc)
         if _sleep_with_stop(interval_seconds, stop_event):
             break
-    engine.dispose()
-    logger.info("QMT live runtime stopped")
+    logger.info("Public live quote runtime stopped")
 
 
 def start_qmt_live_runtime() -> threading.Thread | None:
     global _live_thread, _stop_event
     config = get_qmt_live_runtime_config()
     if not bool(config["enabled"]):
-        logger.info("QMT live runtime disabled")
+        logger.info("Public live quote runtime disabled")
         return None
     if _live_thread and _live_thread.is_alive():
         return _live_thread
@@ -143,15 +185,22 @@ def start_qmt_live_runtime() -> threading.Thread | None:
         target=_worker,
         args=(_stop_event,),
         daemon=True,
-        name="qmt-live-runtime",
+        name="live-quote-runtime",
     )
     _live_thread.start()
     return _live_thread
 
 
-def stop_qmt_live_runtime() -> None:
+def stop_qmt_live_runtime(timeout_seconds: float = 5.0) -> None:
     global _live_thread, _stop_event
-    if _stop_event is not None:
-        _stop_event.set()
+    thread = _live_thread
+    stop_event = _stop_event
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, float(timeout_seconds)))
+        if thread.is_alive():
+            logger.warning("Public live quote runtime did not stop within %.1fs", float(timeout_seconds))
+            return
     _live_thread = None
     _stop_event = None

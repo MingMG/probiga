@@ -309,7 +309,7 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
     "intraday_minute_flow": (
         TableRequirement(
             "sm_stock_capital_flow_min",
-            # The first 09:40 run has only a few bars per stock.  Distinct
+            # The first 09:40 run has only a few bars per stock. Distinct
             # stock coverage is the useful early-session completeness gate.
             min_rows=5000,
             date_col="trade_time",
@@ -338,9 +338,13 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             target="latest_kline_date",
             distinct_col="stock_code",
             min_distinct=1000,
+            # A completed analysis can legitimately produce zero picks.  The
+            # per-stock recommendation decision is the durable completion
+            # evidence; requiring a row in st_recommended_stocks turns that
+            # valid zero-result outcome into a false scheduler failure.
+            where_sql="recommend_status IS NOT NULL AND TRIM(recommend_status) <> ''",
             freshness_col="updated_at",
         ),
-        TableRequirement("st_recommended_stocks", min_rows=1, date_col="pick_date", target="latest_kline_date", freshness_col="created_at"),
     ),
     "analysis_morning_strict": (
         TableRequirement(
@@ -350,9 +354,9 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             target="previous_trade_date",
             distinct_col="stock_code",
             min_distinct=1000,
+            where_sql="recommend_status IS NOT NULL AND TRIM(recommend_status) <> ''",
             freshness_col="updated_at",
         ),
-        TableRequirement("st_recommended_stocks", min_rows=1, date_col="pick_date", target="previous_trade_date", freshness_col="created_at"),
     ),
     "analysis_premarket_external": (
         TableRequirement(
@@ -362,9 +366,9 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             target="previous_trade_date",
             distinct_col="stock_code",
             min_distinct=1000,
+            where_sql="recommend_status IS NOT NULL AND TRIM(recommend_status) <> ''",
             freshness_col="updated_at",
         ),
-        TableRequirement("st_recommended_stocks", min_rows=1, date_col="pick_date", target="previous_trade_date", freshness_col="created_at"),
     ),
 }
 
@@ -470,8 +474,8 @@ def _validate_requirement(
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
-    # The information_schema query below does not contain the target table in
-    # its FROM clause, so route explicitly before inspecting external tables.
+    # The information_schema query does not contain the target table in its
+    # FROM clause, so route explicitly before inspecting external tables.
     metadata_engine = routed_read_engine(
         f"SELECT * FROM {quote_identifier(table_name)}",
         engine,

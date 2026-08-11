@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>登录 · ProBigA</title>
+  <link rel="stylesheet" href="/static/css/auth.css?v=1">
+</head>
+<body class="auth-page">
+  <main class="auth-shell">
+    <section class="auth-story" aria-label="ProBigA 介绍">
+      <div class="auth-brand">
+        <span class="auth-brand-mark">P</span>
+        <span>Pro<strong>Big</strong>A</span>
+      </div>
+      <div class="auth-story-copy">
+        <p class="auth-kicker">Private trading workspace</p>
+        <h1>把策略、数据和交易留在门内。</h1>
+        <p>账号登录统一保护选股、策略、模拟盘、调度和管理操作。系统每天轮换会话令牌，不再把长期管理密钥放在浏览器里。</p>
+        <div class="auth-points">
+          <div class="auth-point"><strong>24 小时会话</strong><span>到期前自动轮换令牌</span></div>
+          <div class="auth-point"><strong>首账号锁定</strong><span>初始化后自动关闭注册</span></div>
+          <div class="auth-point"><strong>操作留痕</strong><span>登录、退出和失败均有审计</span></div>
+        </div>
+      </div>
+      <div class="auth-story-foot">ProBigA · PRIVATE ACCESS</div>
+    </section>
+
+    <section class="auth-form-side">
+      <div class="auth-card">
+        <div id="loadingPanel" class="auth-loading"><span></span>正在确认账号状态…</div>
+        <div id="formPanel" hidden>
+          <div id="modeBadge" class="auth-mode">安全登录</div>
+          <h2 id="formTitle">欢迎回来</h2>
+          <p id="formDescription" class="auth-description">输入账号和密码进入 ProBigA。</p>
+
+          <form id="authForm" novalidate>
+            <div class="auth-field">
+              <label for="username">账号</label>
+              <div class="auth-input-wrap">
+                <input id="username" name="username" type="text" minlength="3" maxlength="32"
+                       autocomplete="username" autocapitalize="none" spellcheck="false" required>
+              </div>
+            </div>
+            <div class="auth-field">
+              <label for="password">密码</label>
+              <div class="auth-input-wrap">
+                <input id="password" name="password" type="password" minlength="10" maxlength="128"
+                       autocomplete="current-password" data-password required>
+                <button type="button" class="auth-password-toggle" data-toggle-password="password">显示</button>
+              </div>
+              <p class="auth-hint">至少 10 个字符；不要使用交易账户或银行卡密码。</p>
+            </div>
+            <div id="confirmWrap" class="auth-field" hidden>
+              <label for="confirmPassword">确认密码</label>
+              <div class="auth-input-wrap">
+                <input id="confirmPassword" name="confirmPassword" type="password" minlength="10" maxlength="128"
+                       autocomplete="new-password" data-password>
+                <button type="button" class="auth-password-toggle" data-toggle-password="confirmPassword">显示</button>
+              </div>
+            </div>
+            <p id="formError" class="auth-error" role="alert" hidden></p>
+            <button id="submitButton" class="auth-submit" type="submit">登录</button>
+          </form>
+
+          <p id="firstAccountNote" class="auth-first-note" hidden>
+            第一个账号会成为系统管理员。创建成功后，其他公网访问者不能再自行注册。
+          </p>
+          <p id="transportWarning" class="auth-transport-warning" hidden>
+            当前站点仍使用 HTTP。登录拦截已经生效，但公网传输尚未加密；后续应绑定域名并启用 HTTPS。
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="/static/js/login.js?v=1"></script>
+</body>
+</html>
