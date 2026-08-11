@@ -101,6 +101,27 @@ def expected_latest_trade_date(engine: Engine, as_of: date | None = None) -> str
     return _fmt_date(d)
 
 
+def expected_completed_trade_date(
+    engine: Engine,
+    now: datetime | None = None,
+    ready_time: str = "15:20",
+) -> str:
+    """Latest trade date whose end-of-day data should already be available."""
+    now = now or datetime.now()
+    try:
+        ready_hour, ready_minute = (int(part) for part in ready_time.split(":", 1))
+    except (TypeError, ValueError):
+        ready_hour, ready_minute = 15, 20
+    comparator = "<=" if (now.hour, now.minute) >= (ready_hour, ready_minute) else "<"
+    d = _scalar(engine, f"""
+        SELECT MAX(trade_date)
+        FROM si_trade_calendar
+        WHERE trade_status = 1
+          AND trade_date {comparator} :today
+    """, {"today": now.date().isoformat()})
+    return _fmt_date(d)
+
+
 def expected_intraday_date(engine: Engine, fallback_trade_date: str) -> str:
     """Today on trading days, otherwise the latest daily-kline trade date."""
     today = date.today().isoformat()
@@ -201,8 +222,12 @@ def _date_lag_days(actual: str, expected: str) -> int:
         return 9999
 
 
-def check_latest_trade_date_freshness(engine: Engine, trade_date: str) -> CheckResult:
-    expected = expected_latest_trade_date(engine)
+def check_latest_trade_date_freshness(
+    engine: Engine,
+    trade_date: str,
+    now: datetime | None = None,
+) -> CheckResult:
+    expected = expected_completed_trade_date(engine, now=now)
     if not expected:
         return CheckResult(
             name="latest_trade_date_freshness",

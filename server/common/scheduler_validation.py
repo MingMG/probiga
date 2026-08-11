@@ -180,7 +180,10 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             min_rows=3000,
             date_col="snapshot_at",
             distinct_col="stock_code",
-            min_distinct=5400,
+            # Suspended/delisted symbols are not present in the live quote
+            # universe.  Production currently has 5,280 valid A-share quotes;
+            # 5,000 still enforces broad-market coverage without a false fail.
+            min_distinct=5000,
         ),
     ),
     "stock_kline": (
@@ -291,7 +294,7 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             min_rows=3000,
             date_col="snapshot_at",
             distinct_col="stock_code",
-            min_distinct=5400,
+            min_distinct=5000,
         ),
     ),
     "intraday_minute_kline": (

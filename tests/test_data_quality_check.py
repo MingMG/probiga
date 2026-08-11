@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 from tools.data_quality_check import (
@@ -7,6 +8,8 @@ from tools.data_quality_check import (
     _date_lag_days,
     _scheduler_health_status,
     _status,
+    check_latest_trade_date_freshness,
+    expected_completed_trade_date,
     expected_intraday_date,
     intraday_readiness,
     is_intraday_session,
@@ -23,6 +26,39 @@ class DataQualityCheckTest(unittest.TestCase):
     def test_date_lag_days(self):
         self.assertEqual(_date_lag_days("2026-06-10", "2026-06-12"), 2)
         self.assertEqual(_date_lag_days("", "2026-06-12"), 9999)
+
+    def test_completed_trade_date_uses_previous_day_before_daily_ready_time(self):
+        with patch("tools.data_quality_check._scalar", return_value="2026-06-12") as scalar:
+            actual = expected_completed_trade_date(
+                object(),
+                now=datetime(2026, 6, 15, 11, 30),
+            )
+
+        self.assertEqual(actual, "2026-06-12")
+        self.assertIn("trade_date < :today", scalar.call_args.args[1])
+
+    def test_completed_trade_date_uses_today_after_daily_ready_time(self):
+        with patch("tools.data_quality_check._scalar", return_value="2026-06-15") as scalar:
+            actual = expected_completed_trade_date(
+                object(),
+                now=datetime(2026, 6, 15, 15, 20),
+            )
+
+        self.assertEqual(actual, "2026-06-15")
+        self.assertIn("trade_date <= :today", scalar.call_args.args[1])
+
+    def test_daily_freshness_accepts_previous_trade_day_intraday(self):
+        with patch(
+            "tools.data_quality_check.expected_completed_trade_date",
+            return_value="2026-06-12",
+        ):
+            result = check_latest_trade_date_freshness(
+                object(),
+                "2026-06-12",
+                now=datetime(2026, 6, 15, 11, 30),
+            )
+
+        self.assertEqual(result.status, "PASS")
 
     def test_check_result_as_dict(self):
         result = CheckResult("sample", "PASS", "ok", {"x": 1})
