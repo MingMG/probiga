@@ -107,6 +107,27 @@ tmpdir=F:/temporary
         validate_formal_config(config, expected_datadir=Path(r"E:\MySQL84\Data"))
 
 
+def test_checked_in_formal_config_keeps_runtime_writes_on_internal_e_drive() -> None:
+    config = (
+        Path(__file__).resolve().parents[1] / "ops" / "mysql84" / "my-production.ini"
+    ).read_text(encoding="utf-8")
+
+    expected_runtime_paths = (
+        "datadir=E:/MySQL84/Data",
+        "log-bin=E:/MySQL84/Logs/mysql-bin",
+        "log-bin-index=E:/MySQL84/Logs/mysql-bin.index",
+        "tmpdir=E:/MySQL84/Tmp",
+        "log-error=E:/MySQL84/Logs/mysql84.err",
+        "pid-file=E:/MySQL84/Logs/mysql84.pid",
+        "slow-query-log-file=E:/MySQL84/Logs/mysql84-slow.log",
+    )
+    for setting in expected_runtime_paths:
+        assert setting in config
+
+    assert "D:/MySQL84/logs" not in config
+    assert "D:/MySQL84/tmp" not in config
+
+
 def test_read_datadir_uuid_is_exact(tmp_path: Path) -> None:
     (tmp_path / "auto.cnf").write_text(
         f"[auto]\nserver-uuid={TARGET_UUID}\n", encoding="utf-8"
