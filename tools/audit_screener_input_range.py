@@ -5,7 +5,8 @@
 The command is read-only. Capital-flow coverage is measured against the
 Shanghai/Shenzhen stocks that actually traded on each date. Dragon-tiger rows
 are checked for date coverage, duplicate stock/date keys, valid A-share codes,
-and master-data/listing-date membership.
+and listing-date consistency. Codes absent from the current master remain
+visible as informational because valid delisted history must not fail an audit.
 """
 from __future__ import annotations
 
@@ -289,7 +290,6 @@ def audit_inputs(
         "flow_missing_data_source_rows": missing_data_source_rows,
         "missing_lhb_trade_dates": missing_lhb_dates,
         "lhb_duplicate_business_keys": lhb_duplicate_count,
-        "unknown_lhb_codes": sorted(unknown_lhb_codes),
         "prelisting_lhb_rows": prelisting_lhb_rows,
         "missing_lhb_info_keys": [
             {"stock_code": code, "trade_date": trade_date}
@@ -302,6 +302,12 @@ def audit_inputs(
         ],
         "orphan_lhb_info_key_count": len(orphan_lhb_info_keys),
         "lhb_info_duplicate_rows": duplicate_lhb_info_rows,
+    }
+    informational = {
+        "flow_source_count": len(source_counts),
+        "lhb_codes_absent_from_current_master_and_kline": sorted(
+            unknown_lhb_codes
+        ),
     }
     failed = any(
         bool(value)
@@ -340,6 +346,7 @@ def audit_inputs(
             "info_distinct_stock_date_count": len(lhb_info_key_set),
         },
         "hard_failures": hard_failures,
+        "informational": informational,
     }
 
 
