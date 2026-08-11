@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
@@ -8,6 +9,18 @@ from server.api import admin_auth as admin_auth_module
 from server.api.admin_auth import admin_auth_status, validate_admin_request
 from server.api.routers.health import health_security
 from server.common.config import get_settings
+
+
+@pytest.fixture(autouse=True)
+def _isolate_auth_environment(monkeypatch):
+    # Prevent the production host's /opt/ProBigA/.env from changing unit-test
+    # expectations when a setting is intentionally blank.
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
+    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def _client() -> TestClient:
@@ -49,7 +62,7 @@ def test_admin_auth_allows_public_health_without_token(monkeypatch):
 
 def test_admin_auth_rejects_admin_read_without_account_or_legacy_token(monkeypatch):
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
     get_settings.cache_clear()
     try:
         response = _client().get("/api/scheduler/tasks")
@@ -99,7 +112,7 @@ def test_admin_auth_accepts_bearer_token(monkeypatch):
 
 
 def test_admin_auth_can_be_disabled(monkeypatch):
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "false")
     get_settings.cache_clear()
     try:
@@ -113,7 +126,7 @@ def test_admin_auth_can_be_disabled(monkeypatch):
 def test_production_admin_auth_disabled_fails_closed(monkeypatch):
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "false")
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
     get_settings.cache_clear()
     try:
         response = _client().get("/api/scheduler/tasks")
@@ -172,8 +185,8 @@ def test_admin_auth_status_does_not_expose_token(monkeypatch):
 def test_production_auth_status_rejects_empty_account_without_token(monkeypatch):
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
-    monkeypatch.delenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
+    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
     monkeypatch.setattr(
         admin_auth_module,
         "registration_state",
@@ -201,7 +214,7 @@ def test_production_auth_status_allows_token_with_default_registration_closed(
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
     monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "secret")
-    monkeypatch.delenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", raising=False)
+    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
     monkeypatch.setattr(
         admin_auth_module,
         "registration_state",
@@ -229,8 +242,8 @@ def test_production_auth_status_accepts_initialized_account_without_token(
 ):
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
-    monkeypatch.delenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
+    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
     monkeypatch.setattr(
         admin_auth_module,
         "registration_state",
@@ -253,7 +266,7 @@ def test_production_auth_status_accepts_initialized_account_without_token(
 
 def test_health_security_warns_when_admin_token_missing(monkeypatch):
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
-    monkeypatch.delenv("PROBIGA_ADMIN_TOKEN", raising=False)
+    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
     monkeypatch.setattr(admin_auth_module, "registration_state", lambda engine: (_ for _ in ()).throw(RuntimeError()))
     monkeypatch.setattr(admin_auth_module, "get_engine", lambda: object())
     get_settings.cache_clear()
