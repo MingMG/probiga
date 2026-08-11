@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>资金流向看板</title>
+  <style>
+    :root{--bg:#f5f7fb;--panel:#fff;--line:#e6ebf2;--text:#182230;--muted:#738096;--red:#d94b55;--green:#15936d;--blue:#2f6fed;--orange:#e99b27;--shadow:0 8px 24px rgba(32,55,90,.07)}
+    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:"Microsoft YaHei",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    header{background:#17243a;color:#fff;padding:18px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+    header h1{margin:0;font-size:21px;font-weight:750} header p{margin:5px 0 0;color:#b9c7dc;font-size:12px}
+    main{max-width:1500px;margin:0 auto;padding:20px}.toolbar,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+    .toolbar{padding:12px 14px;display:flex;gap:9px;align-items:center;flex-wrap:wrap}.toolbar label{color:var(--muted);font-size:13px}.toolbar input,.toolbar select,.toolbar button{font:inherit;border:1px solid #cdd6e3;border-radius:7px;padding:8px 10px;background:#fff;color:var(--text)}
+    .toolbar input{width:125px}.toolbar button{cursor:pointer}.toolbar button.primary{background:var(--blue);border-color:var(--blue);color:#fff}.toolbar button:hover{filter:brightness(.98)}.status{margin-left:auto;color:var(--muted);font-size:12px}
+    .panel{padding:17px;margin-top:15px}.panel-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:13px}.panel-title h2{margin:0;font-size:16px}.panel-title span{font-size:12px;color:var(--muted)}
+    .cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.metric{padding:15px 16px;border:1px solid var(--line);border-radius:10px;background:linear-gradient(180deg,#fff,#fbfcfe)}.metric .label{display:flex;justify-content:space-between;gap:8px;color:#536176;font-size:13px}.metric .label small{color:#9aa6b8}.metric .value{font-size:25px;font-weight:800;letter-spacing:.2px;margin-top:9px}.metric .hint{font-size:11px;color:#8a96a9;margin-top:6px}.positive{color:var(--red)}.negative{color:var(--green)}.neutral{color:#64748b}
+    .selected-meta{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:-2px 0 14px;color:#56647a;font-size:13px}.badge{border-radius:999px;padding:4px 8px;background:#eef3ff;color:#3565c8;font-size:11px}.badge.warn{background:#fff6df;color:#9b6b13}
+    .table-wrap{overflow:auto;border:1px solid var(--line);border-radius:9px}table{width:100%;border-collapse:collapse;min-width:930px;font-size:13px}th,td{padding:10px 9px;border-bottom:1px solid #edf1f5;text-align:right;white-space:nowrap}th{background:#f8fafc;color:#66748b;font-weight:650}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){text-align:left}tbody tr{cursor:pointer}tbody tr:hover{background:#f2f6ff}tbody tr.selected{background:#eaf1ff}.code{color:#2d5ebd;font-weight:700}.name{max-width:135px;overflow:hidden;text-overflow:ellipsis}.caption{font-size:12px;line-height:1.7;color:#6f7d91;margin-top:12px}.caption strong{color:#435268}.empty,.error{padding:30px;text-align:center;color:var(--muted)}.error{color:#b33d4b}
+    .download-link{color:var(--blue);cursor:pointer;text-decoration:none;font-size:12px}.download-link:hover{text-decoration:underline}
+    @media(max-width:850px){main{padding:12px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.status{width:100%;margin-left:0}header{padding:15px}.metric .value{font-size:21px}}
+    @media(max-width:480px){.cards{grid-template-columns:1fr 1fr}.metric{padding:12px}.metric .value{font-size:18px}table{font-size:12px}}
+  </style>
+  <script src="/static/js/auth.js?v=2"></script>
+</head>
+<body>
+  <header>
+    <div><h1>资金流向看板</h1><p>本机数据服务 · 可查看最近可用交易日的个股资金流向</p></div>
+    <div id="updatedAt" style="font-size:12px;color:#b9c7dc">加载中…</div>
+  </header>
+  <main>
+    <div class="toolbar">
+      <label for="stockCode">股票代码</label><input id="stockCode" placeholder="如 000938">
+      <button class="primary" id="queryBtn">查询</button>
+      <label for="sort">排行</label><select id="sort"><option value="desc">主力净流入</option><option value="asc">主力净流出</option></select>
+      <label for="top">数量</label><select id="top"><option value="50">50</option><option value="100" selected>100</option><option value="500">500</option></select>
+      <button id="refreshBtn">刷新</button><button id="exportBtn">导出当前表格</button>
+      <span class="status" id="status">正在读取…</span>
+    </div>
+
+    <section class="panel">
+      <div class="panel-title"><h2>当前选中股票</h2><span id="selectedDate">—</span></div>
+      <div class="selected-meta"><span class="badge" id="selectedCode">未选择</span><strong id="selectedName">点击下方排行中的股票</strong><span id="selectedChange">—</span><span class="badge warn" id="mappingBadge">截图口径为公开字段近似</span></div>
+      <div class="cards">
+        <div class="metric"><div class="label">机构 <small>超大单</small></div><div class="value neutral" id="institutionValue">—</div><div class="hint">按超大单净流入近似，不代表真实账户身份</div></div>
+        <div class="metric"><div class="label">主力 <small>超大单 + 大单</small></div><div class="value neutral" id="mainValue">—</div><div class="hint">平台原始主力净流入字段</div></div>
+        <div class="metric"><div class="label">大户 <small>大单</small></div><div class="value neutral" id="largeValue">—</div><div class="hint">按大单净流入展示</div></div>
+        <div class="metric"><div class="label">散户 <small>中单 + 小单</small></div><div class="value neutral" id="retailValue">—</div><div class="hint">中单与小单合计的观察口径</div></div>
+      </div>
+      <div class="caption"><strong>口径说明：</strong>公开行情通常只提供“超大单/大单/中单/小单”，并不能识别成交者究竟是不是机构或散户。这里把它们映射成截图样式便于阅读；下方原始字段保留，主力 = 超大单 + 大单，散户观察值 = 中单 + 小单。</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title"><h2>个股资金流向排行</h2><span><a class="download-link" id="csvLink">下载 CSV</a></span></div>
+      <div id="tableMount" class="empty">正在读取…</div>
+      <div class="caption">数据源：本机行情服务已落库的东方财富资金流向字段；如果当天数据尚未完成入库，页面会显示最近可用交易日并标明日期。</div>
+    </section>
+  </main>
+  <script>
+    const state = { rows: [], date: '', selected: null };
+    const $ = id => document.getElementById(id);
+    const money = n => { const v = Number(n); if (!Number.isFinite(v)) return '—'; const sign = v > 0 ? '+' : ''; const a = Math.abs(v); if (a >= 1e8) return sign + (v / 1e8).toFixed(2) + '亿'; if (a >= 1e4) return sign + (v / 1e4).toFixed(1) + '万'; return sign + Math.round(v).toLocaleString('zh-CN'); };
+    const cls = n => Number(n) > 0 ? 'positive' : Number(n) < 0 ? 'negative' : 'neutral';
+    const cleanCode = v => String(v || '').trim().replace(/\D/g, '').slice(-6);
+    function setValue(id, value) { const e = $(id); e.textContent = money(value); e.className = 'value ' + cls(value); }
+    function rowInstitution(r) { return r.max_net_inflow; }
+    function rowMain(r) { return r.main_net_inflow != null ? r.main_net_inflow : Number(r.max_net_inflow || 0) + Number(r.lg_net_inflow || 0); }
+    function rowRetail(r) { return Number(r.mid_net_inflow || 0) + Number(r.sm_net_inflow || 0); }
+    function selectRow(r) {
+      state.selected = r; $('selectedCode').textContent = r.stock_code || '—'; $('selectedName').textContent = r.short_name || '—';
+      $('selectedDate').textContent = '交易日：' + (r.trade_date || state.date || '—'); $('selectedChange').textContent = r.change_pct == null ? '—' : '涨跌 ' + (Number(r.change_pct) >= 0 ? '+' : '') + Number(r.change_pct).toFixed(2) + '%';
+      setValue('institutionValue', rowInstitution(r)); setValue('mainValue', rowMain(r)); setValue('largeValue', r.lg_net_inflow); setValue('retailValue', rowRetail(r));
+      document.querySelectorAll('tbody tr[data-code]').forEach(x => x.classList.toggle('selected', x.dataset.code === r.stock_code));
+    }
+    function renderTable() {
+      const mount = $('tableMount'); if (!state.rows.length) { mount.className = 'empty'; mount.textContent = '暂无可用数据'; return; }
+      mount.className = 'table-wrap'; const headers = ['代码','名称','涨跌幅','主力净流入','超大单','大单','中单','小单','截图样式散户'];
+      const head = '<thead><tr>' + headers.map(x => '<th>' + x + '</th>').join('') + '</tr></thead>';
+      const body = state.rows.map(r => '<tr data-code="' + (r.stock_code || '') + '"><td class="code">' + (r.stock_code || '—') + '</td><td class="name" title="' + (r.short_name || '') + '">' + (r.short_name || '—') + '</td><td class="' + cls(r.change_pct) + '">' + (r.change_pct == null ? '—' : (Number(r.change_pct) >= 0 ? '+' : '') + Number(r.change_pct).toFixed(2) + '%') + '</td><td class="' + cls(rowMain(r)) + '"><strong>' + money(rowMain(r)) + '</strong></td><td class="' + cls(r.max_net_inflow) + '">' + money(r.max_net_inflow) + '</td><td class="' + cls(r.lg_net_inflow) + '">' + money(r.lg_net_inflow) + '</td><td class="' + cls(r.mid_net_inflow) + '">' + money(r.mid_net_inflow) + '</td><td class="' + cls(r.sm_net_inflow) + '">' + money(r.sm_net_inflow) + '</td><td class="' + cls(rowRetail(r)) + '">' + money(rowRetail(r)) + '</td></tr>').join('');
+      mount.innerHTML = '<table>' + head + '<tbody>' + body + '</tbody></table>';
+      mount.querySelectorAll('tbody tr[data-code]').forEach(tr => tr.addEventListener('click', () => { const r = state.rows.find(x => x.stock_code === tr.dataset.code); if (r) { $('stockCode').value = r.stock_code; selectRow(r); } }));
+      if (state.selected) selectRow(state.selected);
+    }
+    async function fetchRows() {
+      const code = cleanCode($('stockCode').value); const sort = $('sort').value; const top = $('top').value; $('status').textContent = '读取中…';
+      // On weekends/holidays the backend's direct-code path can target a date
+      // with no rows. Pull the latest complete ranking and filter locally.
+      const url = '/api/hot-data/capital-flow?sort=' + encodeURIComponent(sort) + '&top=' + encodeURIComponent(code ? '0' : top);
+      const res = await fetch(url, { cache: 'no-store' }); if (!res.ok) throw new Error('接口返回 ' + res.status); const data = await res.json();
+      const allRows = Array.isArray(data.data) ? data.data : []; state.rows = code ? allRows.filter(r => cleanCode(r.stock_code) === code).slice(0, 1) : allRows; state.date = data.date || ''; $('updatedAt').textContent = '可用交易日：' + (state.date || '—') + (data.data_time ? ' · 数据时间：' + data.data_time : ''); $('selectedDate').textContent = '交易日：' + (state.date || '—');
+      $('status').textContent = (data.mode_label || '本机落库') + ' · ' + state.rows.length + ' 条'; renderTable(); if (state.rows.length) selectRow(state.rows[0]);
+      if (code && !state.rows.length) { $('tableMount').className = 'empty'; $('tableMount').textContent = '没有找到该代码的资金流向记录'; }
+    }
+    function exportCsv() {
+      const rows = state.rows; if (!rows.length) return; const cols = [['股票代码','stock_code'],['名称','short_name'],['交易日','trade_date'],['涨跌幅','change_pct'],['主力净流入','main_net_inflow'],['超大单净流入','max_net_inflow'],['大单净流入','lg_net_inflow'],['中单净流入','mid_net_inflow'],['小单净流入','sm_net_inflow'],['截图样式散户观察值','retail_proxy']];
+      const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"'; const lines = [cols.map(x => q(x[0])).join(',')].concat(rows.map(r => cols.map(([_, k]) => q(k === 'retail_proxy' ? rowRetail(r) : r[k])).join(','))); const blob = new Blob(['\ufeff' + lines.join('\n')], {type:'text/csv;charset=utf-8'}); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'capital_flow_' + (state.date || 'latest') + '.csv'; a.click(); URL.revokeObjectURL(a.href);
+    }
+    $('queryBtn').addEventListener('click', () => fetchRows().catch(e => { $('status').textContent = '读取失败'; $('tableMount').className = 'error'; $('tableMount').textContent = e.message; })); $('refreshBtn').addEventListener('click', () => $('queryBtn').click()); $('exportBtn').addEventListener('click', exportCsv); $('csvLink').addEventListener('click', exportCsv); $('stockCode').addEventListener('keydown', e => { if (e.key === 'Enter') $('queryBtn').click(); }); $('sort').addEventListener('change', () => $('queryBtn').click()); $('top').addEventListener('change', () => $('queryBtn').click()); fetchRows().catch(e => { $('status').textContent = '读取失败'; $('tableMount').className = 'error'; $('tableMount').textContent = e.message; });
+  </script>
+</body>
+</html>
