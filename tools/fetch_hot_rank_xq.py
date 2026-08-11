@@ -12,6 +12,7 @@
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, replace_table_rows
 
 _SESSION = http.Session()
 _SESSION.trust_env = False
@@ -84,11 +85,16 @@ def _fetch_hot_rank_xq() -> pd.DataFrame | None:
         return None
 
     rows = []
-    for i, item in enumerate(items):
-        symbol = item.get("symbol", "")
-        stock_code = symbol[2:] if len(symbol) >= 6 else symbol
+    for item in items:
+        symbol = str(item.get("symbol", "")).upper().strip()
+        matched = re.fullmatch(r"(?:SH|SZ|BJ)([0-9]{6})", symbol)
+        if not matched:
+            continue
+        stock_code = matched.group(1)
+        if not stock_code.startswith(("0", "3", "6", "4", "8")):
+            continue
         rows.append({
-            "rank": i + 1,
+            "rank": len(rows) + 1,
             "stock_code": stock_code,
             "short_name": item.get("name", ""),
             "current": float(item.get("current", 0) or 0),
@@ -161,8 +167,7 @@ def fetch_hot_rank_xq(snapshot_date: str):
             _init_cookie()
 
     if df is None or df.empty:
-        print("未获取到雪球热股数据")
-        return
+        raise RuntimeError("no Xueqiu hot rank rows fetched")
 
     df = df.copy()
     df["snapshot_date"] = snapshot_date
@@ -179,16 +184,23 @@ def fetch_hot_rank_xq(snapshot_date: str):
              "chg", "amount", "market_capital", "followers", "sector", "exchange",
              "increment", "diff", "etl_sync_at"]]
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM st_hot_rank_xq WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_rank_xq", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    if len(df) < int(os.environ.get("HOT_RANK_XQ_MIN_ROWS", "50")):
+        raise RuntimeError(f"Xueqiu hot rank returned too few rows: {len(df)}")
+    replace_table_rows(
+        df,
+        "st_hot_rank_xq",
+        engine,
+        where_sql="snapshot_date = :d",
+        params={"d": snapshot_date},
+        chunksize=500,
+    )
 
     print(f"写入完成: st_hot_rank_xq, 共 {len(df)} 行, 快照日期: {snapshot_date}")
     if not df.empty:
         print(f"  示例: {df.iloc[0]['stock_code']} {df.iloc[0]['short_name']} 涨跌:{df.iloc[0]['percent']}%")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="获取指定日期的雪球热股TOP100（写入 st_hot_rank_xq）")
     parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
     args = parser.parse_args()
@@ -197,10 +209,15 @@ def main():
         datetime.strptime(args.date, "%Y-%m-%d")
     except ValueError:
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {args.date}")
-        return
+        return 1
 
-    fetch_hot_rank_xq(args.date)
+    try:
+        fetch_hot_rank_xq(args.date)
+    except Exception as exc:
+        print(f"Xueqiu hot rank sync failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -851,6 +851,10 @@ def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) 
         df_to_table(engine, pd.concat(parts, ignore_index=True), "si_concept_constituent_east")
 
 
+class ExternalConceptSourceUnavailable(RuntimeError):
+    """The external concept service is reachable but cannot serve members."""
+
+
 def _fetch_external_concept_reference() -> dict[str, pd.DataFrame]:
     """Fetch the Eastmoney concept snapshot fully before any table is touched."""
     info = load_info()
@@ -863,11 +867,52 @@ def _fetch_external_concept_reference() -> dict[str, pd.DataFrame]:
         keep="last",
     )
     parts: list[pd.DataFrame] = []
+    attempted = 0
+    consecutive_failures = 0
+    errors: list[str] = []
+    probe_limit = max(1, int(os.environ.get("EXTERNAL_CONCEPT_PROBE_LIMIT", "5")))
+    failure_limit = max(
+        probe_limit,
+        int(os.environ.get("EXTERNAL_CONCEPT_MAX_CONSECUTIVE_FAILURES", "10")),
+    )
     for concept_code in catalog["concept_code"].astype(str).str.strip().unique():
-        frame = retry_remote(info.concept_constituent_east, concept_code=concept_code)
-        if frame is None or frame.empty:
+        attempted += 1
+        try:
+            # The provider already applies its own bounded HTTP timeout.  A
+            # second generic eight-attempt retry here can turn a systemic WAF
+            # outage into an hours-long scheduler run.
+            frame = info.concept_constituent_east(concept_code=concept_code)
+        except Exception as exc:
+            consecutive_failures += 1
+            errors.append(f"{concept_code}: {type(exc).__name__}: {exc}")
+            logger.warning("External concept member fetch failed for %s: %s", concept_code, exc)
+            if (
+                (not parts and attempted >= probe_limit)
+                or consecutive_failures >= failure_limit
+            ):
+                raise ExternalConceptSourceUnavailable(
+                    "external concept member service is unavailable; "
+                    f"attempted={attempted}, consecutive_failures={consecutive_failures}; "
+                    "preserving previous snapshots; last_errors="
+                    + " | ".join(errors[-3:])
+                ) from exc
             _sleep()
             continue
+        if frame is None or frame.empty:
+            consecutive_failures += 1
+            errors.append(f"{concept_code}: empty response")
+            if (
+                (not parts and attempted >= probe_limit)
+                or consecutive_failures >= failure_limit
+            ):
+                raise ExternalConceptSourceUnavailable(
+                    "external concept member service returned no usable rows; "
+                    f"attempted={attempted}, consecutive_failures={consecutive_failures}; "
+                    "preserving previous snapshots"
+                )
+            _sleep()
+            continue
+        consecutive_failures = 0
         frame = frame.copy()
         frame["concept_code"] = concept_code
         parts.append(frame)

@@ -62,9 +62,11 @@ def scheduler_output_status(
     production prerequisite; treating it as ``failed`` would cause needless
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
-    if str(task.get("task_type") or "").strip() != (
-        "trading_v2_level1_validation"
-    ):
+    task_type = str(task.get("task_type") or "").strip()
+    if task_type not in {
+        "trading_v2_level1_validation",
+        "concept_constituent_east",
+    }:
         return None
     for line in str(output or "").splitlines():
         candidate = line.strip()
@@ -78,6 +80,8 @@ def scheduler_output_status(
             continue
         capability_status = str(payload.get("status") or "").upper()
         if capability_status == "PASS":
+            return "success"
+        if task_type == "concept_constituent_east" and capability_status == "SUCCESS":
             return "success"
         if capability_status == "BLOCK":
             return "blocked"

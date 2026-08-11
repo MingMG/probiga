@@ -31,3 +31,28 @@ def test_external_concept_reference_is_fetched_before_atomic_replace(monkeypatch
         {"concept_code": "BK001", "stock_code": "000001"},
         {"concept_code": "BK002", "stock_code": "600000"},
     ]
+
+
+def test_external_concept_reference_fails_fast_without_touching_tables(monkeypatch):
+    class BrokenInfo(_Info):
+        @staticmethod
+        def all_concept_code_east():
+            return pd.DataFrame(
+                [{"concept_code": f"BK{i:03d}", "name": str(i)} for i in range(8)]
+            )
+
+        @staticmethod
+        def concept_constituent_east(*, concept_code: str):
+            raise ValueError(f"non-json response for {concept_code}")
+
+    monkeypatch.setattr(sync_stock_info, "load_info", lambda: BrokenInfo())
+    monkeypatch.setattr(sync_stock_info, "_sleep", lambda: None)
+    monkeypatch.setenv("EXTERNAL_CONCEPT_PROBE_LIMIT", "3")
+
+    try:
+        sync_stock_info._fetch_external_concept_reference()
+    except sync_stock_info.ExternalConceptSourceUnavailable as exc:
+        assert "attempted=3" in str(exc)
+        assert "preserving previous snapshots" in str(exc)
+    else:
+        raise AssertionError("systemic concept outage must stop before a destructive replace")
