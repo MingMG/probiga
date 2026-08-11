@@ -22,7 +22,6 @@ from server.common.scheduler_script_policy import (
 from server.common.scheduler_args import build_scheduler_task_args
 from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
-    reset_stale_running_scheduler_tasks,
     update_scheduler_task,
 )
 from server.common.scheduler_validation import (
@@ -520,6 +519,12 @@ def _cleanup_stale_running_tasks(engine) -> int:
     cleaned = 0
     for row in rows:
         data = dict(row)
+        # The scheduler table is shared by the Linux production host and the
+        # Windows QMT bridge.  A process registry is necessarily host-local,
+        # so this scheduler must never time out or fail a task owned by the
+        # other host merely because it cannot see that host's child process.
+        if _should_skip_task_for_host(data):
+            continue
         started_at = _coerce_datetime(data.get("last_run_at")) or _coerce_datetime(data.get("last_triggered_at"))
         if not started_at:
             continue
@@ -999,7 +1004,10 @@ def _catchup_on_startup() -> None:
     """启动时将卡在 running 的任务重置"""
     try:
         engine = get_engine()
-        reset_stale_running_scheduler_tasks(engine)
+        # Cleanup is ownership-aware.  The old bulk reset touched every
+        # ``running`` row in the shared database and could therefore clear a
+        # healthy task still executing on the other scheduler host.
+        _cleanup_stale_running_tasks(engine)
         logger.info("启动重置已完成")
     except Exception as exc:
         logger.error("启动补跑异常: %s", exc)

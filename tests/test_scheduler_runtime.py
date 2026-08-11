@@ -433,6 +433,62 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIn("服务重启", updates[0][2]["last_run_output"])
         self.assertNotIn(39, remaining_ids)
 
+    def test_cleanup_does_not_touch_task_owned_by_other_host(self):
+        started_at = datetime.now() - timedelta(hours=2)
+        scheduler_runtime._running_procs.clear()
+        updates = []
+
+        class FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, *_args, **_kwargs):
+                class Result:
+                    def mappings(self):
+                        return self
+
+                    def all(self):
+                        return [{
+                            "id": 42,
+                            "task_name": "Windows-owned minute sync",
+                            "task_type": "intraday_minute_kline",
+                            "script_path": "tools/sync_qmt_primary.py",
+                            "interval_minutes": 15,
+                            "last_run_at": started_at,
+                            "last_triggered_at": started_at,
+                        }]
+
+                return Result()
+
+        class FakeEngine:
+            def connect(self):
+                return FakeConnection()
+
+        with patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task",
+            side_effect=lambda *args: updates.append(args),
+        ):
+            cleaned = scheduler_runtime._cleanup_stale_running_tasks(FakeEngine())
+
+        self.assertEqual(cleaned, 0)
+        self.assertEqual(updates, [])
+
+    def test_startup_cleanup_uses_host_aware_cleanup(self):
+        engine = MagicMock()
+        with patch("server.api.scheduler_runtime.get_engine", return_value=engine), patch(
+            "server.api.scheduler_runtime._cleanup_stale_running_tasks",
+            return_value=0,
+        ) as cleanup:
+            scheduler_runtime._catchup_on_startup()
+
+        cleanup.assert_called_once_with(engine)
+
     def test_cron_catchup_allows_only_recent_missed_tasks(self):
         now = datetime(2026, 7, 6, 9, 26, 30)
         startup = now - timedelta(seconds=30)
