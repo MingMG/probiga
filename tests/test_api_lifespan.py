@@ -13,10 +13,11 @@ def test_lifespan_stops_runtime_and_disposes_engines():
     async def _run_lifespan():
         with patch("server.api.main.start_embedded_scheduler", side_effect=lambda: events.append("scheduler")), \
              patch("server.api.main.stop_embedded_scheduler", side_effect=lambda: events.append("scheduler_stop")), \
-             patch("server.api.main.os.name", "nt"), \
+             patch("server.api.main._desktop_runtimes_allowed", return_value=True), \
              patch("server.api.main.get_api_lifespan_config", return_value={"qmt_live_runtime_enabled": True}), \
              patch("server.api.main.start_qmt_live_runtime", side_effect=lambda: events.append("qmt_start")), \
              patch("server.api.main.stop_qmt_live_runtime", side_effect=lambda: events.append("qmt_stop")), \
+             patch("server.api.main.start_market_radar_runtime", return_value=None), \
              patch("server.api.main.dispose_shared_engines", side_effect=lambda: events.append("dispose")):
             async with main.lifespan(FastAPI()):
                 events.append("inside")
@@ -24,6 +25,23 @@ def test_lifespan_stops_runtime_and_disposes_engines():
     asyncio.run(_run_lifespan())
 
     assert events == ["scheduler", "qmt_start", "inside", "scheduler_stop", "qmt_stop", "dispose"]
+
+
+def test_lifespan_skips_desktop_runtimes_on_linux_host():
+    async def _run_lifespan():
+        with patch("server.api.main.start_embedded_scheduler"), \
+             patch("server.api.main.stop_embedded_scheduler"), \
+             patch("server.api.main._desktop_runtimes_allowed", return_value=False), \
+             patch("server.api.main.get_api_lifespan_config", return_value={"qmt_live_runtime_enabled": True}), \
+             patch("server.api.main.start_qmt_live_runtime") as qmt_start, \
+             patch("server.api.main.start_market_radar_runtime") as radar_start, \
+             patch("server.api.main.dispose_shared_engines"):
+            async with main.lifespan(FastAPI()):
+                pass
+        qmt_start.assert_not_called()
+        radar_start.assert_not_called()
+
+    asyncio.run(_run_lifespan())
 
 
 def test_lifespan_leaves_qmt_live_to_standalone_by_default():
