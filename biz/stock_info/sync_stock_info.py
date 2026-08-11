@@ -851,15 +851,44 @@ def sync_concept_constituent_east(engine: Engine, info, df_codes: pd.DataFrame) 
         df_to_table(engine, pd.concat(parts, ignore_index=True), "si_concept_constituent_east")
 
 
+def _fetch_external_concept_reference() -> dict[str, pd.DataFrame]:
+    """Fetch the Eastmoney concept snapshot fully before any table is touched."""
+    info = load_info()
+    catalog = retry_remote(info.all_concept_code_east)
+    catalog = _clean_object_df(catalog)
+    if catalog is None or catalog.empty or "concept_code" not in catalog.columns:
+        raise RuntimeError("external concept catalog returned no rows; preserving previous snapshots")
+    catalog = catalog.dropna(subset=["concept_code"]).drop_duplicates(
+        subset=["concept_code"],
+        keep="last",
+    )
+    parts: list[pd.DataFrame] = []
+    for concept_code in catalog["concept_code"].astype(str).str.strip().unique():
+        frame = retry_remote(info.concept_constituent_east, concept_code=concept_code)
+        if frame is None or frame.empty:
+            _sleep()
+            continue
+        frame = frame.copy()
+        frame["concept_code"] = concept_code
+        parts.append(frame)
+        _sleep()
+    constituents = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    return {
+        "concept_catalog": catalog,
+        "concept_constituents": constituents,
+    }
+
+
 def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
-    """Fetch the QMT concept catalog and membership once, then replace both atomically."""
-    tables = _qmt_sector_tables()
+    """Fetch one complete concept snapshot, then replace both tables atomically."""
+    source = "qmt" if _use_qmt_sector_data() else "external"
+    tables = _qmt_sector_tables() if source == "qmt" else _fetch_external_concept_reference()
     catalog = tables.get("concept_catalog", pd.DataFrame()).copy()
     constituents = tables.get("concept_constituents", pd.DataFrame()).copy()
     if catalog.empty:
-        raise RuntimeError("QMT concept catalog returned no rows; preserving previous snapshots")
+        raise RuntimeError(f"{source} concept catalog returned no rows; preserving previous snapshots")
     if constituents.empty:
-        raise RuntimeError("QMT concept constituents returned no rows; preserving previous snapshots")
+        raise RuntimeError(f"{source} concept constituents returned no rows; preserving previous snapshots")
 
     catalog_codes = {
         str(code).strip()
@@ -877,7 +906,7 @@ def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
         & constituents["stock_code"].isin(stock_names)
     ].drop_duplicates(subset=["concept_code", "stock_code"], keep="last")
     if constituents.empty:
-        raise RuntimeError("QMT concept memberships failed validation; preserving previous snapshots")
+        raise RuntimeError(f"{source} concept memberships failed validation; preserving previous snapshots")
     membership_coverage = constituents["concept_code"].nunique() / max(len(catalog_codes), 1)
     min_coverage = min(
         1.0,
@@ -885,7 +914,7 @@ def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
     )
     if membership_coverage < min_coverage:
         raise RuntimeError(
-            "QMT concept membership coverage below threshold: "
+            f"{source} concept membership coverage below threshold: "
             f"{constituents['concept_code'].nunique()}/{len(catalog_codes)} "
             f"({membership_coverage:.1%}) < {min_coverage:.1%}; preserving previous snapshots"
         )
@@ -908,7 +937,8 @@ def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
             method="multi",
         )
     logger.info(
-        "QMT concept reference atomically replaced: concepts=%d memberships=%d",
+        "%s concept reference atomically replaced: concepts=%d memberships=%d",
+        source,
         len(clean_catalog),
         len(clean_constituents),
     )
