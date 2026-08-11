@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
 from biz.stock_market.realtime_quotes import fetch_list_market_current, save_to_mysql
 from integrations.qmt.safe_upsert import safe_upsert_rows
 from server.common.batch_db import create_batch_engine
+from tools.crawl_realtime_batch import is_trading_time, refresh_snapshot
 
 
 def _read_codes(engine, limit: int) -> list[str]:
@@ -130,8 +131,6 @@ def sync_market_realtime(
 
     del replace_scope
     engine = engine or create_batch_engine(future=True)
-    from tools.crawl_realtime_batch import is_trading_time, refresh_snapshot
-
     if skip_closed and not is_trading_time(engine):
         return {
             "status": "skipped",

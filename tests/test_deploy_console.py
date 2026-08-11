@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
@@ -45,22 +46,42 @@ class DeployConsoleTest(unittest.TestCase):
             "changed_files": [],
         }
 
-        with patch("server.api.routers.deploy._git_status_payload", return_value=repo), \
+        with patch.dict("os.environ", {"PROBIGA_IN_APP_DEPLOY_ENABLED": "1"}), \
+             patch("server.api.routers.deploy._git_status_payload", return_value=repo), \
              patch("server.api.routers.deploy._read_history", return_value=[]):
             payload = deploy.deploy_status()
 
         self.assertEqual(payload["repo"]["branch"], "main")
         self.assertIn("push", payload["actions"])
-        self.assertIn("commit_push", payload["actions"])
-        self.assertIn("local", payload["actions"])
+        self.assertNotIn("commit_push", payload["actions"])
+        self.assertNotIn("local", payload["actions"])
+
+    def test_deploy_control_defaults_to_disabled(self):
+        with patch.dict("os.environ", {}, clear=True), self.assertRaises(Exception):
+            deploy.deploy_status()
+
+    def test_deploy_control_forbids_commit_and_direct_host_actions(self):
+        with patch.dict("os.environ", {"PROBIGA_IN_APP_DEPLOY_ENABLED": "1"}):
+            with self.assertRaises(Exception):
+                deploy.deploy_run(deploy.DeployRunRequest(action="commit_push"))
+            with self.assertRaises(Exception):
+                deploy.deploy_run(deploy.DeployRunRequest(action="local"))
 
     def test_deploy_run_rejects_when_another_task_is_running(self):
         deploy._runs["running"] = {"id": "running", "status": "running"}
 
-        with self.assertRaises(Exception):
+        with patch.dict("os.environ", {"PROBIGA_IN_APP_DEPLOY_ENABLED": "1"}), \
+             self.assertRaises(Exception):
             deploy.deploy_run(deploy.DeployRunRequest(action="push"))
+
+    def test_legacy_cloud_publish_does_not_package_runtime_env(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "deploy" / "publish_to_cloud.bat").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertNotIn(".env", source.casefold())
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -8,12 +8,20 @@
 3. 去重后写入 si_stock_concept_map
 """
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from datetime import datetime
 import warnings
+import sys
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
-DB_URL = 'mysql+pymysql://root:ProBigA%4070966@47.113.123.190:3306/probiga'
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from server.common.batch_db import create_batch_engine, read_frame, write_frame
+from server.common.config import get_mysql_url
+
+DB_URL = get_mysql_url(required=True)
 
 # 需要过滤的概念关键词
 FILTER_KEYWORDS = (
@@ -27,10 +35,10 @@ FILTER_KEYWORDS = (
 
 
 def build_concept_map():
-    engine = create_engine(DB_URL)
+    engine = create_batch_engine(DB_URL)
 
     print("[1/4] 读取概念映射数据...")
-    df = pd.read_sql(text("""
+    df = read_frame(text("""
         SELECT ct.stock_code, ct.short_name, ct.query_type, ct.query_key,
                cc.name AS concept_name, cc.index_code, cc.concept_code
         FROM si_concept_constituent_ths ct
@@ -61,9 +69,9 @@ def build_concept_map():
         conn.execute(text("TRUNCATE TABLE si_stock_concept_map"))
         conn.commit()
 
-    result.to_sql('si_stock_concept_map', engine, if_exists='append', index=False, chunksize=200)
+    write_frame(result, "si_stock_concept_map", engine, if_exists="append", index=False, chunksize=200)
 
-    stats = pd.read_sql(text("""
+    stats = read_frame(text("""
         SELECT 
             COUNT(*) AS total,
             COUNT(DISTINCT stock_code) AS stock_count,

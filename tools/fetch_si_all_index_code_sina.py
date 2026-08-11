@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -26,17 +25,27 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.process_env import temporary_env
+
 
 def main() -> int:
-    os.environ.setdefault("SI_SKIP_GLOBAL_TRUNCATE", "1")
-    os.environ.setdefault("SI_SYNC_SKIP_ALL_CODE", "1")
-    os.environ.setdefault("SI_INDEX_PRIMARY", "sina")
+    with temporary_env(
+        {
+            "SI_SKIP_GLOBAL_TRUNCATE": "1",
+            "SI_SYNC_SKIP_ALL_CODE": "1",
+            "SI_INDEX_PRIMARY": "sina",
+        },
+        overwrite=False,
+    ):
+        return _main()
 
-    from sqlalchemy import create_engine
+
+def _main() -> int:
+
+    from server.common.batch_db import create_batch_engine
 
     from biz.stock_info.sync_stock_info import (
         _clean_object_df,
-        _mysql_url,
         df_to_table,
         fetch_all_index_code_sina,
         run_ddl,
@@ -44,7 +53,7 @@ def main() -> int:
         _now,
     )
 
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
+    eng = create_batch_engine()
     run_ddl(eng)
     ts = _now()
     df = fetch_all_index_code_sina()

@@ -6,15 +6,14 @@ if (!(Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
 }
 
-function Get-SupervisorProcesses {
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "powershell.exe" -and
-        $_.CommandLine -like "*run_local_live_supervisor.ps1*" -and
-        $_.ProcessId -ne $PID
-    }
-}
-
-if (Get-SupervisorProcesses) {
+$createdNew = $false
+$supervisorMutex = [System.Threading.Mutex]::new(
+    $true,
+    "Local\ProBigA.LocalLiveSupervisor",
+    [ref]$createdNew
+)
+if (!$createdNew) {
+    $supervisorMutex.Dispose()
     Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') supervisor already running; exit duplicate"
     exit 0
 }
@@ -22,12 +21,22 @@ if (Get-SupervisorProcesses) {
 $StartScript = Join-Path $Root "tools\start_local_live_services.ps1"
 Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') local live supervisor started"
 
-while ($true) {
-    try {
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $StartScript
+try {
+    while ($true) {
+        try {
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $StartScript
+        }
+        catch {
+            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') supervisor ensure failed: $($_.Exception.Message)"
+        }
+        # Five-second supervision keeps the 30-second heartbeat SLA meaningful:
+        # recovery begins on the first check after the threshold is crossed.
+        Start-Sleep -Seconds 5
     }
-    catch {
-        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') supervisor ensure failed: $($_.Exception.Message)"
+}
+finally {
+    if ($createdNew) {
+        $supervisorMutex.ReleaseMutex()
     }
-    Start-Sleep -Seconds 30
+    $supervisorMutex.Dispose()
 }

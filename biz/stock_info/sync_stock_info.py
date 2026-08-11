@@ -878,9 +878,6 @@ def _fetch_external_concept_reference() -> dict[str, pd.DataFrame]:
     for concept_code in catalog["concept_code"].astype(str).str.strip().unique():
         attempted += 1
         try:
-            # The provider already applies its own bounded HTTP timeout.  A
-            # second generic eight-attempt retry here can turn a systemic WAF
-            # outage into an hours-long scheduler run.
             frame = info.concept_constituent_east(concept_code=concept_code)
         except Exception as exc:
             consecutive_failures += 1

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """获取新浪热股榜（按关注热度），写入 st_hot_rank_sina。"""
 
@@ -16,8 +17,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine
-
+from server.common.batch_db import write_frame
 
 def _run_ddl(engine):
     sql_file = ROOT / "tools" / "02_hot_rank_sina.sql"
@@ -42,10 +42,12 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
 
     print(f"开始获取新浪热股榜，快照日期: {snapshot_date}，top={top}")
 
-    engine = create_batch_engine()
+    engine = create_tool_engine(resolve_tool_mysql_url())
     _run_ddl(engine)
 
     url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+    session = requests.Session()
+    session.trust_env = False
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://finance.sina.com.cn/",
@@ -59,7 +61,7 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
         data = None
         for attempt in range(1, 4):
             try:
-                r = requests.get(url, params=params, headers=headers, timeout=15)
+                r = session.get(url, params=params, headers=headers, timeout=15)
                 r.raise_for_status()
                 data = r.json()
                 if data:
@@ -80,8 +82,7 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
         _time.sleep(0.3)
 
     if not all_items:
-        print("未获取到新浪热股榜数据")
-        return
+        raise RuntimeError("未获取到新浪热股榜数据")
 
     rows = []
     for i, item in enumerate(all_items[:top], 1):
@@ -105,7 +106,7 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
 
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM st_hot_rank_sina WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_rank_sina", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    write_frame(df, "st_hot_rank_sina", engine, if_exists="append", index=False, chunksize=500, method="multi")
 
     print(f"写入完成: st_hot_rank_sina, 共 {len(df)} 行")
     print(f"  TOP5: {', '.join(df.head(5)['short_name'].tolist())}")
@@ -117,8 +118,13 @@ def main():
     parser.add_argument("--top", type=int, default=100, help="排行数量")
     args = parser.parse_args()
 
-    fetch_hot_rank_sina(args.snapshot_date, args.top)
+    try:
+        fetch_hot_rank_sina(args.snapshot_date, args.top)
+    except Exception as exc:
+        print(f"新浪热股榜同步失败: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

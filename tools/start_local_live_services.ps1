@@ -6,12 +6,157 @@ if (!(Test-Path $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
 }
 
+# The supervisor is long-lived, so inherited environment values can be stale
+# after an operational source switch.  Reload only service-control switches on
+# every pass; Python jobs continue to load their complete settings from .env.
+$serviceSwitchNames = @(
+    "BIG_QMT_BRIDGE_ENABLED",
+    "BIG_QMT_STRATEGY_AUTO_RECOVER",
+    "BIG_QMT_RECOVERY_MIN_BACKOFF_SECONDS",
+    "BIG_QMT_RECOVERY_MAX_BACKOFF_SECONDS",
+    "BIG_QMT_CONSUMER_STARTUP_GRACE_SECONDS",
+    "LEGACY_MINIQMT_ENABLED",
+    "QMT_CLIENT_AUTO_RESTART",
+    "QMT_CLIENT_MIN_BACKOFF_SECONDS",
+    "QMT_CLIENT_MAX_BACKOFF_SECONDS",
+    "QMT_ALERT_WEBHOOK_URL",
+    "WECOM_WEBHOOK_URL",
+    "LIVE_QUOTE_POLL_ENABLED"
+)
+$envFile = Join-Path $Root ".env"
+if (Test-Path -LiteralPath $envFile) {
+    foreach ($line in Get-Content -LiteralPath $envFile) {
+        $trimmed = ([string]$line).Trim()
+        if (!$trimmed -or $trimmed.StartsWith("#") -or !$trimmed.Contains("=")) {
+            continue
+        }
+        $parts = $trimmed.Split("=", 2)
+        $name = $parts[0].Trim()
+        if ($name -in $serviceSwitchNames) {
+            [Environment]::SetEnvironmentVariable($name, $parts[1].Trim(), "Process")
+        }
+    }
+}
+
+function Test-QmtClientAutoRestart {
+    return ([string]$env:QMT_CLIENT_AUTO_RESTART).Trim().ToLowerInvariant() -in @(
+        "1", "true", "yes", "on"
+    )
+}
+
+function Get-QmtRetryDelaySeconds {
+    param(
+        [int]$ConsecutiveFailures,
+        [int]$MinimumSeconds = 30,
+        [int]$MaximumSeconds = 900
+    )
+    $power = [Math]::Min(10, [Math]::Max(0, $ConsecutiveFailures - 1))
+    return [int][Math]::Min(
+        $MaximumSeconds,
+        $MinimumSeconds * [Math]::Pow(2, $power)
+    )
+}
+
+function Write-QmtAlert {
+    param(
+        [string]$Component,
+        [string]$Status,
+        [string]$Message
+    )
+    $payload = [ordered]@{
+        timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        component = $Component
+        status = $Status
+        message = $Message
+    }
+    $payload |
+        ConvertTo-Json -Compress |
+        Add-Content -LiteralPath (
+            Join-Path $DataDir "qmt_health_alerts.jsonl"
+        ) -Encoding UTF8
+    $webhook = if ($env:QMT_ALERT_WEBHOOK_URL) {
+        $env:QMT_ALERT_WEBHOOK_URL
+    }
+    else {
+        $env:WECOM_WEBHOOK_URL
+    }
+    if ($webhook) {
+        try {
+            $body = @{
+                msgtype = "markdown"
+                markdown = @{
+                    content = (
+                        "### ProBigA QMT $Status`n" +
+                        "> component: $Component`n" +
+                        "> time: $($payload.timestamp)`n" +
+                        "> $Message"
+                    )
+                }
+            } | ConvertTo-Json -Depth 5
+            Invoke-RestMethod `
+                -Uri $webhook `
+                -Method Post `
+                -ContentType "application/json" `
+                -Body $body `
+                -TimeoutSec 10 | Out-Null
+        }
+        catch {
+            Write-Warning "QMT alert delivery failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-QmtAutoStartWindow {
+    $now = Get-Date
+    if ($now.DayOfWeek -in @(
+        [System.DayOfWeek]::Saturday,
+        [System.DayOfWeek]::Sunday
+    )) {
+        return $false
+    }
+    $start = [TimeSpan]::FromHours(6.5)
+    $end = [TimeSpan]::FromHours(23)
+    return $now.TimeOfDay -ge $start -and $now.TimeOfDay -le $end
+}
+
+function Test-LegacyMiniQmtEnabled {
+    return ([string]$env:LEGACY_MINIQMT_ENABLED).Trim().ToLowerInvariant() -in @(
+        "1", "true", "yes", "on"
+    )
+}
+
+function Test-LiveQuoteRuntimeEnabled {
+    return ([string]$env:LIVE_QUOTE_POLL_ENABLED).Trim().ToLowerInvariant() -in @(
+        "1", "true", "yes", "on"
+    )
+}
+
+function Test-BigQmtBridgeEnabled {
+    return ([string]$env:BIG_QMT_BRIDGE_ENABLED).Trim().ToLowerInvariant() -in @(
+        "1", "true", "yes", "on"
+    )
+}
+
+function Test-BigQmtStrategyAutoRecover {
+    $configured = ([string]$env:BIG_QMT_STRATEGY_AUTO_RECOVER).Trim()
+    if (!$configured) {
+        return Test-QmtClientAutoRestart
+    }
+    return $configured.ToLowerInvariant() -in @("1", "true", "yes", "on")
+}
+
 function Resolve-QmtClientPath {
     $explicitCandidates = @()
     if ($env:GJ_QMT_EXE) { $explicitCandidates += $env:GJ_QMT_EXE }
     if ($env:QMT_CLIENT_EXE) { $explicitCandidates += $env:QMT_CLIENT_EXE }
-    if ($env:GJ_QMT_HOME) { $explicitCandidates += (Join-Path $env:GJ_QMT_HOME "bin.x64\XtMiniQmt.exe") }
-    if ($env:QMT_HOME) { $explicitCandidates += (Join-Path $env:QMT_HOME "bin.x64\XtMiniQmt.exe") }
+    if ($env:GJ_QMT_HOME) {
+        $explicitCandidates += (Join-Path $env:GJ_QMT_HOME "bin.x64\XtItClient.exe")
+        $explicitCandidates += (Join-Path $env:GJ_QMT_HOME "bin.x64\XtMiniQmt.exe")
+    }
+    if ($env:QMT_HOME) {
+        $explicitCandidates += (Join-Path $env:QMT_HOME "bin.x64\XtItClient.exe")
+        $explicitCandidates += (Join-Path $env:QMT_HOME "bin.x64\XtMiniQmt.exe")
+    }
     foreach ($candidate in $explicitCandidates) {
         if ($candidate -and (Test-Path -LiteralPath $candidate)) {
             return (Resolve-Path -LiteralPath $candidate).Path
@@ -21,16 +166,16 @@ function Resolve-QmtClientPath {
     foreach ($driveRoot in @("D:\", "C:\")) {
         if (!(Test-Path -LiteralPath $driveRoot)) { continue }
         foreach ($folder in Get-ChildItem -LiteralPath $driveRoot -Directory -ErrorAction SilentlyContinue) {
-            $candidate = Join-Path $folder.FullName "bin.x64\XtMiniQmt.exe"
-            if (Test-Path -LiteralPath $candidate) {
-                return (Resolve-Path -LiteralPath $candidate).Path
+            foreach ($exeName in @("XtItClient.exe", "XtMiniQmt.exe")) {
+                $candidate = Join-Path $folder.FullName "bin.x64\$exeName"
+                if (Test-Path -LiteralPath $candidate) {
+                    return (Resolve-Path -LiteralPath $candidate).Path
+                }
             }
         }
     }
 
     $candidates = @(
-        "D:\国金证券QMT交易端\bin.x64\XtMiniQmt.exe",
-        "C:\国金证券QMT交易端\bin.x64\XtMiniQmt.exe",
         "D:\QMT\bin.x64\XtMiniQmt.exe",
         "C:\QMT\bin.x64\XtMiniQmt.exe"
     )
@@ -49,58 +194,198 @@ function Resolve-QmtClientPath {
 }
 
 function Resolve-PythonPath {
-    $candidates = @(
-        "C:\Users\Administrator\AppData\Local\Python\pythoncore-3.14-64\python.exe",
-        "C:\Users\Administrator\AppData\Local\Python\bin\python.exe",
-        "C:\Users\Administrator\AppData\Local\Microsoft\WindowsApps\python.exe"
-    )
-    foreach ($candidate in $candidates) {
-        if (Test-Path $candidate) {
-            return $candidate
-        }
+    if ($env:PROBIGA_PYTHON_EXE -and (Test-Path -LiteralPath $env:PROBIGA_PYTHON_EXE)) {
+        return (Resolve-Path -LiteralPath $env:PROBIGA_PYTHON_EXE).Path
+    }
+    $venvPython = Join-Path $Root ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython) {
+        return (Resolve-Path -LiteralPath $venvPython).Path
     }
     $cmd = Get-Command python -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) {
         return $cmd.Source
     }
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py -and $py.Source) {
+        return $py.Source
+    }
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe")
+    )
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate)) {
+            return (Resolve-Path -LiteralPath $candidate).Path
+        }
+    }
     throw "python.exe not found"
 }
 
 function Get-QmtProcesses {
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "XtMiniQmt.exe"
+    # XtMiniQmt.exe is the launcher in current QMT builds; the logged-in
+    # terminal continues as XtItClient.exe after the launcher exits.
+    @(Get-Process -Name "XtMiniQmt", "XtItClient" -ErrorAction SilentlyContinue)
+}
+
+function Test-QmtClientLoggedIn {
+    param($Proc)
+    if (!$Proc -or $Proc.ProcessName -ne "XtItClient") {
+        return $false
+    }
+    # Guojin QMT prefixes the main-window title with the logged-in account.
+    # A bare "Guojin QMT Trading Terminal" title is only the login shell and
+    # must not suppress guarded recovery on the following trading morning.
+    return (
+        $Proc.MainWindowHandle -ne [IntPtr]::Zero -and
+        ([string]$Proc.MainWindowTitle) -match "^\s*\d+\s*-\s*.+QMT"
+    )
+}
+
+function Test-PythonLauncherProcess {
+    param($Proc)
+    $exe = [string]$Proc.ExecutablePath
+    $venvLauncher = Join-Path $Root ".venv\Scripts\python.exe"
+    $qmtLauncher = Join-Path $Root "runtime\qmt-py313\Scripts\python.exe"
+    return ($exe -ieq $venvLauncher) -or ($exe -ieq $qmtLauncher)
+}
+
+function Get-ServiceKeyFromScriptName {
+    param([string]$ScriptName)
+    switch -Wildcard ($ScriptName) {
+        "*run_big_qmt_bridge.py*" { return "big_qmt_bridge" }
+        "*run_guojin_qmt_gateway.py*" { return "qmt_gateway" }
+        "*run_qmt_live_runtime.py*" { return "qmt_live" }
+        "*run_remote_qmt_tunnel.py*" { return "qmt_tunnel" }
+        "*run_scheduler_daemon.py*" { return "scheduler" }
+        "*run_remote_mysql_tunnel.py*" { return "mysql_tunnel" }
+        default { throw "Unknown managed service script: $ScriptName" }
     }
 }
 
+function Get-ManagedPidPath {
+    param([string]$ServiceKey)
+    return (Join-Path $DataDir "$ServiceKey.pid")
+}
+
+function Get-ManagedProcess {
+    param([string]$ServiceKey)
+    $pidPath = Get-ManagedPidPath $ServiceKey
+    if (!(Test-Path -LiteralPath $pidPath)) {
+        return $null
+    }
+    try {
+        $parts = ([string](Get-Content -LiteralPath $pidPath -Raw)).Trim().Split("|", 3)
+        $processId = [int]$parts[0]
+        $expectedStart = if ($parts.Count -ge 2) { [long]$parts[1] } else { 0 }
+        $proc = Get-Process -Id $processId -ErrorAction Stop
+        $actualStart = $proc.StartTime.ToUniversalTime().ToFileTimeUtc()
+        if ($proc.ProcessName -notlike "python*" -or ($expectedStart -gt 0 -and $actualStart -ne $expectedStart)) {
+            throw "stale PID record"
+        }
+        return $proc
+    }
+    catch {
+        Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+function Set-ManagedProcess {
+    param([string]$ServiceKey, [string]$ScriptName, $Proc)
+    $pidPath = Get-ManagedPidPath $ServiceKey
+    $started = $Proc.StartTime.ToUniversalTime().ToFileTimeUtc()
+    Set-Content -LiteralPath $pidPath -Value "$($Proc.Id)|$started|$ScriptName" -Encoding Ascii
+}
+
+function Stop-ManagedProcess {
+    param([string]$ServiceKey)
+    $proc = Get-ManagedProcess $ServiceKey
+    if ($proc) {
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Get-ManagedPidPath $ServiceKey) -Force -ErrorAction SilentlyContinue
+}
+
+$script:ServiceProcessInventoryLoaded = $false
+$script:ServiceProcessInventory = @()
+$script:ServiceProcessInventoryError = $null
+
+function Reset-ServiceProcessInventory {
+    $script:ServiceProcessInventoryLoaded = $false
+    $script:ServiceProcessInventory = @()
+    $script:ServiceProcessInventoryError = $null
+}
+
 function Get-ServiceProcesses {
-    Get-CimInstance Win32_Process | Where-Object {
+    if (!$script:ServiceProcessInventoryLoaded) {
+        $script:ServiceProcessInventoryLoaded = $true
+        try {
+            # One constrained WMI snapshot per supervisor pass is enough.
+            # Repeated full Win32_Process scans caused provider memory/RPC
+            # failures on the always-on workstation.
+            $script:ServiceProcessInventory = @(
+                Get-CimInstance Win32_Process -Filter "Name = 'python.exe'"
+            )
+        }
+        catch {
+            $script:ServiceProcessInventoryError = $_.Exception
+        }
+    }
+    if ($script:ServiceProcessInventoryError) {
+        throw $script:ServiceProcessInventoryError
+    }
+    $script:ServiceProcessInventory | Where-Object {
         $_.Name -eq "python.exe" -and (
             (
                 $_.CommandLine -like "*run_guojin_qmt_gateway.py*" -and
                 $_.ExecutablePath -like "*runtime\qmt-py313\Scripts\python.exe"
             ) -or
+            $_.CommandLine -like "*run_big_qmt_bridge.py*" -or
             $_.CommandLine -like "*run_qmt_live_runtime.py*" -or
-            $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
-        )
+            $_.CommandLine -like "*run_remote_qmt_tunnel.py*" -or
+            $_.CommandLine -like "*run_remote_mysql_tunnel.py*" -or
+            $_.CommandLine -like "*run_scheduler_daemon.py*"
+        ) -and -not (Test-PythonLauncherProcess $_)
     }
 }
 
-function Stop-DuplicateProcesses {
-    $seen = @{}
-    foreach ($proc in Get-ServiceProcesses | Sort-Object ProcessId) {
-        $key = if ($proc.CommandLine -like "*run_guojin_qmt_gateway.py*") {
-            "qmt_gateway"
-        } elseif ($proc.CommandLine -like "*run_qmt_live_runtime.py*") {
-            "qmt_live"
-        } else {
-            "tunnel"
-        }
-        if ($seen.ContainsKey($key)) {
-            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-        } else {
-            $seen[$key] = $true
-        }
+function Get-ServiceKey {
+    param($Proc)
+    if ($Proc.CommandLine -like "*run_big_qmt_bridge.py*") {
+        return "big_qmt_bridge"
     }
+    if ($Proc.CommandLine -like "*run_guojin_qmt_gateway.py*") {
+        return "qmt_gateway"
+    }
+    if ($Proc.CommandLine -like "*run_qmt_live_runtime.py*") {
+        return "qmt_live"
+    }
+    if ($Proc.CommandLine -like "*run_remote_qmt_tunnel.py*") {
+        return "qmt_tunnel"
+    }
+    if ($Proc.CommandLine -like "*run_scheduler_daemon.py*") {
+        return "scheduler"
+    }
+    if ($Proc.CommandLine -like "*run_remote_mysql_tunnel.py*") {
+        return "mysql_tunnel"
+    }
+    return "unknown"
+}
+
+function Stop-DuplicateProcesses {
+    # Managed services use PID records with process start-time validation.
+    # This avoids the unstable Win32_Process provider on the always-on host.
+    return
+}
+
+function Stop-LegacyQmtServices {
+    Stop-ManagedProcess "qmt_gateway"
+    Stop-ManagedProcess "qmt_tunnel"
+}
+
+function Stop-PublicQuoteService {
+    Stop-ManagedProcess "qmt_live"
 }
 
 function Ensure-Process {
@@ -111,29 +396,154 @@ function Ensure-Process {
         [string]$StdOutPath,
         [string]$StdErrPath
     )
-    $running = Get-CimInstance Win32_Process | Where-Object {
-        $_.Name -eq "python.exe" -and $_.CommandLine -like "*$ScriptName*"
-    }
-    if ($running) {
+    $serviceKey = Get-ServiceKeyFromScriptName $ScriptName
+    if (Get-ManagedProcess $serviceKey) {
         return
     }
-    Start-Process -FilePath $PythonExe `
+    $proc = Start-Process -FilePath $PythonExe `
         -ArgumentList $ArgLine `
         -WorkingDirectory $Root `
         -WindowStyle Hidden `
         -RedirectStandardOutput $StdOutPath `
-        -RedirectStandardError $StdErrPath
+        -RedirectStandardError $StdErrPath `
+        -PassThru
+    Set-ManagedProcess $serviceKey $ScriptName $proc
+    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') started $serviceKey pid=$($proc.Id)"
 }
 
 function Ensure-QmtClient {
-    $running = Get-QmtProcesses | Select-Object -First 1
-    if ($running) {
+    $running = @(Get-QmtProcesses)
+    $loggedIn = $running |
+        Where-Object { Test-QmtClientLoggedIn $_ } |
+        Select-Object -First 1
+    $statePath = Join-Path $DataDir "qmt_client_autostart.state.json"
+    if ($loggedIn) {
+        $previousState = $null
+        if (Test-Path -LiteralPath $statePath) {
+            try {
+                $previousState = Get-Content `
+                    -LiteralPath $statePath `
+                    -Raw |
+                    ConvertFrom-Json
+            }
+            catch {
+                $previousState = $null
+            }
+        }
+        if (
+            $previousState -and
+            [string]$previousState.status -ne "healthy"
+        ) {
+            Write-QmtAlert `
+                "qmt_client_login" `
+                "RECOVERED" `
+                "Guojin QMT login recovered; retry counter reset."
+        }
+        @{
+            status = "healthy"
+            consecutive_failures = 0
+            attempts = 0
+            recovered_at = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            client_pid = [int]$loggedIn.Id
+        } |
+            ConvertTo-Json |
+            Set-Content -LiteralPath $statePath -Encoding UTF8
         return
+    }
+    if (!(Test-QmtAutoStartWindow)) {
+        return
+    }
+    $state = $null
+    if (Test-Path -LiteralPath $statePath) {
+        try {
+            $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        }
+        catch {
+            $state = $null
+        }
+    }
+    $failures = if ($state) {
+        [int]$state.consecutive_failures
+    }
+    else {
+        0
+    }
+    $nextAttempt = [DateTime]::MinValue
+    if ($state) {
+        [DateTime]::TryParse(
+            [string]$state.next_attempt_at,
+            [ref]$nextAttempt
+        ) | Out-Null
+    }
+    $minimumBackoff = 30
+    $maximumBackoff = 900
+    try {
+        if ($env:QMT_CLIENT_MIN_BACKOFF_SECONDS) {
+            $minimumBackoff = [Math]::Max(
+                15,
+                [int]$env:QMT_CLIENT_MIN_BACKOFF_SECONDS
+            )
+        }
+        if ($env:QMT_CLIENT_MAX_BACKOFF_SECONDS) {
+            $maximumBackoff = [Math]::Max(
+                $minimumBackoff,
+                [int]$env:QMT_CLIENT_MAX_BACKOFF_SECONDS
+            )
+        }
+    }
+    catch {
+        Write-Warning "Invalid QMT retry backoff; using 30s..900s."
+        $minimumBackoff = 30
+        $maximumBackoff = 900
+    }
+    if ((Get-Date) -lt $nextAttempt) {
+        return
+    }
+    if ($running.Count -gt 0) {
+        # Give a newly launched client time to complete automatic login.  If it
+        # remains at the login shell, recycle only that unusable process and
+        # continue the persistent backoff sequence if automatic login is stuck.
+        $youngestStart = (
+            $running |
+                Sort-Object StartTime -Descending |
+                Select-Object -First 1
+        ).StartTime
+        if (((Get-Date) - $youngestStart).TotalSeconds -lt 120) {
+            return
+        }
+        foreach ($staleClient in $running) {
+            Stop-Process -Id $staleClient.Id -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Seconds 2
     }
     $clientPath = Resolve-QmtClientPath
     if (!$clientPath) {
-        throw "XtMiniQmt.exe not found"
+        throw "QMT client executable not found"
     }
+    $failures += 1
+    $delaySeconds = Get-QmtRetryDelaySeconds `
+        $failures `
+        $minimumBackoff `
+        $maximumBackoff
+    $nextAttempt = (Get-Date).AddSeconds($delaySeconds)
+    @{
+        status = "retrying"
+        consecutive_failures = $failures
+        attempts = $failures
+        last_attempt = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        next_attempt_at = $nextAttempt.ToString(
+            "yyyy-MM-dd HH:mm:ss"
+        )
+        retry_delay_seconds = $delaySeconds
+        executable = [System.IO.Path]::GetFileName($clientPath)
+    } | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
+    Write-QmtAlert `
+        "qmt_client_login" `
+        "RETRYING" `
+        (
+            "QMT is not logged in. Persistent retry $failures started; " +
+            "next retry in $delaySeconds seconds with no daily attempt limit."
+        )
     $workingDir = Split-Path -Parent $clientPath
     Start-Process -FilePath $clientPath `
         -WorkingDirectory $workingDir `
@@ -143,39 +553,210 @@ function Ensure-QmtClient {
 
 $python = Resolve-PythonPath
 $qmtPython = Join-Path $Root "runtime\qmt-py313\Scripts\python.exe"
-if (!(Test-Path -LiteralPath $qmtPython)) {
-    throw "Guojin QMT Python runtime not found: $qmtPython"
+
+# QMT terminal recovery is opt-in, trading-session bounded and rate limited.
+if (
+    (Test-QmtClientAutoRestart) -and
+    ((Test-BigQmtBridgeEnabled) -or (Test-LegacyMiniQmtEnabled))
+) {
+    try {
+        Ensure-QmtClient
+    }
+    catch {
+        Write-Warning "Unable to recover Guojin QMT client: $($_.Exception.Message)"
+    }
 }
+
 Stop-DuplicateProcesses
-Ensure-QmtClient
 
-Ensure-Process `
-    -PythonExe $qmtPython `
-    -ScriptName "run_guojin_qmt_gateway.py" `
-    -ArgLine "tools/run_guojin_qmt_gateway.py" `
-    -StdOutPath (Join-Path $DataDir "qmt_gateway.out.log") `
-    -StdErrPath (Join-Path $DataDir "qmt_gateway.err.log")
-
-Start-Sleep -Seconds 2
-
+# The scheduler serves non-QMT data jobs too. Start it before optional QMT
+# services so a missing QMT installation cannot disable the whole data flow.
 Ensure-Process `
     -PythonExe $python `
-    -ScriptName "run_qmt_live_runtime.py" `
-    -ArgLine "tools/run_qmt_live_runtime.py" `
-    -StdOutPath (Join-Path $DataDir "qmt_live_runtime.out.log") `
-    -StdErrPath (Join-Path $DataDir "qmt_live_runtime.err.log")
+    -ScriptName "run_scheduler_daemon.py" `
+    -ArgLine "tools/run_scheduler_daemon.py" `
+    -StdOutPath (Join-Path $DataDir "scheduler_daemon.out.log") `
+    -StdErrPath (Join-Path $DataDir "scheduler_daemon.err.log")
 
-$sshHost = if ($env:PROBIGA_REMOTE_SSH_HOST) { $env:PROBIGA_REMOTE_SSH_HOST } else { "47.113.123.190" }
-$sshUser = if ($env:PROBIGA_REMOTE_SSH_USER) { $env:PROBIGA_REMOTE_SSH_USER } else { "root" }
+if (Test-BigQmtBridgeEnabled) {
+    Stop-PublicQuoteService
+    $existingBridge = Get-ManagedProcess "big_qmt_bridge"
+    if ($existingBridge) {
+        $bridgeScriptPath = Join-Path $Root "tools\run_big_qmt_bridge.py"
+        if (
+            (Test-Path -LiteralPath $bridgeScriptPath) -and
+            (Get-Item -LiteralPath $bridgeScriptPath).LastWriteTimeUtc -gt
+                $existingBridge.StartTime.ToUniversalTime()
+        ) {
+            Stop-ManagedProcess "big_qmt_bridge"
+            Write-QmtAlert `
+                "qmt_snapshot_consumer" `
+                "RESTARTING" `
+                "Bridge source changed after process start; loading the new collector."
+            $existingBridge = $null
+        }
+    }
+    if ($existingBridge) {
+        # A cold consumer must first load the watchlist and persist a full
+        # market snapshot before it can publish its first sync receipt.  The
+        # supervisor runs every five seconds; checking the receipt immediately
+        # used to kill that healthy startup repeatedly, so it never became
+        # ready.  Give the process a bounded, configurable startup window.
+        $consumerStartupGraceSeconds = 300
+        try {
+            if ($env:BIG_QMT_CONSUMER_STARTUP_GRACE_SECONDS) {
+                $consumerStartupGraceSeconds = [Math]::Max(
+                    30,
+                    [int]$env:BIG_QMT_CONSUMER_STARTUP_GRACE_SECONDS
+                )
+            }
+        }
+        catch {
+            Write-Warning "Invalid Big QMT consumer startup grace; using 300s."
+            $consumerStartupGraceSeconds = 300
+        }
+        $consumerAgeSeconds = ((Get-Date) - $existingBridge.StartTime).TotalSeconds
+        if ($consumerAgeSeconds -ge $consumerStartupGraceSeconds) {
+            try {
+                $healthJson = & $python `
+                    (Join-Path $Root "tools\check_big_qmt_end_to_end_health.py") `
+                    --json 2>$null
+                $health = ([string]$healthJson) | ConvertFrom-Json
+                if (
+                    !$health.healthy -and
+                    $health.checks.strategy_heartbeat -and
+                    $health.checks.full_market_snapshot -and
+                    !$health.checks.sync_receipt
+                ) {
+                    Stop-ManagedProcess "big_qmt_bridge"
+                    Write-QmtAlert `
+                        "qmt_snapshot_consumer" `
+                        "RESTARTING" `
+                        (
+                            "Heartbeat and full snapshot are healthy, but the " +
+                            "sync receipt is stale or mismatched after the startup " +
+                            "grace period. Restarting consumer."
+                        )
+                }
+            }
+            catch {
+                Write-Warning "Unable to evaluate Big QMT end-to-end health: $($_.Exception.Message)"
+            }
+        }
+    }
+    Ensure-Process `
+        -PythonExe $python `
+        -ScriptName "run_big_qmt_bridge.py" `
+        -ArgLine "tools/run_big_qmt_bridge.py" `
+        -StdOutPath (Join-Path $DataDir "big_qmt_bridge.out.log") `
+        -StdErrPath (Join-Path $DataDir "big_qmt_bridge.err.log")
+
+    if (Test-BigQmtStrategyAutoRecover) {
+        $strategyRecoveryScript = Join-Path $Root "tools\ensure_big_qmt_strategy_running.ps1"
+        $strategyMinBackoffSeconds = 30
+        $strategyMaxBackoffSeconds = 900
+        try {
+            if ($env:BIG_QMT_RECOVERY_MIN_BACKOFF_SECONDS) {
+                $strategyMinBackoffSeconds = [Math]::Max(
+                    15,
+                    [int]$env:BIG_QMT_RECOVERY_MIN_BACKOFF_SECONDS
+                )
+            }
+            if ($env:BIG_QMT_RECOVERY_MAX_BACKOFF_SECONDS) {
+                $strategyMaxBackoffSeconds = [Math]::Max(
+                    $strategyMinBackoffSeconds,
+                    [int]$env:BIG_QMT_RECOVERY_MAX_BACKOFF_SECONDS
+                )
+            }
+        }
+        catch {
+            Write-Warning "Invalid Big QMT strategy backoff; using 30s..900s."
+            $strategyMinBackoffSeconds = 30
+            $strategyMaxBackoffSeconds = 900
+        }
+        try {
+            $quotedRecoveryScript = '"' + $strategyRecoveryScript + '"'
+            $recoveryProcess = Start-Process `
+                -FilePath "powershell.exe" `
+                -ArgumentList @(
+                    "-NoProfile",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", $quotedRecoveryScript,
+                    "-MinimumBackoffSeconds", $strategyMinBackoffSeconds,
+                    "-MaximumBackoffSeconds", $strategyMaxBackoffSeconds
+                ) `
+                -WorkingDirectory $Root `
+                -WindowStyle Hidden `
+                -PassThru
+            if (!$recoveryProcess.WaitForExit(60000)) {
+                Stop-Process `
+                    -Id $recoveryProcess.Id `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+                Write-Warning (
+                    "Big QMT strategy recovery exceeded 60 seconds and " +
+                    "was terminated so the supervisor can continue."
+                )
+            }
+        }
+        catch {
+            Write-Warning "Unable to recover Big QMT strategy: $($_.Exception.Message)"
+        }
+    }
+}
+
+# Public quote polling is a fallback.  Never let it overwrite a healthy Big
+# QMT primary snapshot when both switches were accidentally enabled.
+if ((Test-LiveQuoteRuntimeEnabled) -and !(Test-BigQmtBridgeEnabled)) {
+    Ensure-Process `
+        -PythonExe $python `
+        -ScriptName "run_qmt_live_runtime.py" `
+        -ArgLine "tools/run_qmt_live_runtime.py" `
+        -StdOutPath (Join-Path $DataDir "live_quote_runtime.out.log") `
+        -StdErrPath (Join-Path $DataDir "live_quote_runtime.err.log")
+}
+
+if (!(Test-LegacyMiniQmtEnabled)) {
+    Stop-LegacyQmtServices
+} elseif (!(Test-Path -LiteralPath $qmtPython)) {
+    Write-Warning "Skip legacy miniQMT services: runtime not found at $qmtPython"
+} else {
+    try {
+        if (Test-QmtClientAutoRestart) {
+            Ensure-QmtClient
+        }
+
+        Ensure-Process `
+            -PythonExe $qmtPython `
+            -ScriptName "run_guojin_qmt_gateway.py" `
+            -ArgLine "tools/run_guojin_qmt_gateway.py" `
+            -StdOutPath (Join-Path $DataDir "qmt_gateway.out.log") `
+            -StdErrPath (Join-Path $DataDir "qmt_gateway.err.log")
+
+        Start-Sleep -Seconds 2
+
+        Ensure-Process `
+            -PythonExe $python `
+            -ScriptName "run_remote_qmt_tunnel.py" `
+            -ArgLine "tools/run_remote_qmt_tunnel.py" `
+            -StdOutPath (Join-Path $DataDir "qmt_tunnel.out.log") `
+            -StdErrPath (Join-Path $DataDir "qmt_tunnel.err.log")
+    } catch {
+        Write-Warning "Skip legacy miniQMT services: $($_.Exception.Message)"
+    }
+}
+
 $sshPassword = $env:PROBIGA_REMOTE_SSH_PASSWORD
 if ($sshPassword) {
     $env:PROBIGA_REMOTE_SSH_PASSWORD = $sshPassword
     Ensure-Process `
         -PythonExe $python `
         -ScriptName "run_remote_mysql_tunnel.py" `
-        -ArgLine "tools/run_remote_mysql_tunnel.py --ssh-host $sshHost --ssh-user $sshUser --remote-bind-port 13306 --local-port 3306" `
+        -ArgLine "tools/run_remote_mysql_tunnel.py --remote-bind-port 13306 --local-port 3306" `
         -StdOutPath (Join-Path $DataDir "mysql_tunnel.out.log") `
         -StdErrPath (Join-Path $DataDir "mysql_tunnel.err.log")
 } else {
     Write-Warning "Skip remote MySQL tunnel: set PROBIGA_REMOTE_SSH_PASSWORD to enable it."
 }
+
+Stop-DuplicateProcesses

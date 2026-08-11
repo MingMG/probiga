@@ -15,7 +15,8 @@ import json
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-PROBIGA_API = "http://47.113.123.190:5001/api/strategy/picks/sync"
+PROBIGA_BASE_URL = "http://YOUR_PROBIGA_HOST:5001"
+PROBIGA_API = f"{PROBIGA_BASE_URL.rstrip('/')}/api/strategy/picks/sync"
 STRATEGY_NAME = "动量选股策略"
 STRATEGY_DESC = "基于20日动量和成交量筛选强势股"
 

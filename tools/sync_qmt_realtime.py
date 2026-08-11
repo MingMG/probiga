@@ -19,6 +19,7 @@ from integrations.qmt import QmtBackend
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.safe_upsert import safe_upsert_rows
 from server.common.batch_db import create_batch_engine
+from tools.crawl_realtime_batch import is_trading_time
 
 
 def _read_codes(engine, limit: int) -> list[str]:
@@ -70,8 +71,6 @@ def sync_qmt_realtime(
     replace_scope: str = "all",
 ) -> dict[str, Any]:
     engine = engine or create_batch_engine(future=True)
-    from tools.crawl_realtime_batch import is_trading_time
-
     if skip_closed and not is_trading_time(engine):
         return {
             "status": "skipped",
@@ -103,11 +102,7 @@ def sync_qmt_realtime(
     written_snapshot = 0
     if archive_snapshot:
         snapshot_cols = ["stock_code", "short_name", "price", "change", "change_pct", "volume", "amount"]
-        written_snapshot = save_to_mysql(
-            df[snapshot_cols],
-            run_ddl=run_rt_ddl,
-            engine=engine,
-        )
+        written_snapshot = save_to_mysql(df[snapshot_cols], run_ddl=run_rt_ddl, engine=engine)
 
     return {
         "status": "success",

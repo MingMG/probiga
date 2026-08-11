@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
-
 import pandas as pd
+import pytest
 
 from biz.stock_info import sync_stock_info
 
@@ -49,10 +48,8 @@ def test_external_concept_reference_fails_fast_without_touching_tables(monkeypat
     monkeypatch.setattr(sync_stock_info, "_sleep", lambda: None)
     monkeypatch.setenv("EXTERNAL_CONCEPT_PROBE_LIMIT", "3")
 
-    try:
+    with pytest.raises(sync_stock_info.ExternalConceptSourceUnavailable) as exc_info:
         sync_stock_info._fetch_external_concept_reference()
-    except sync_stock_info.ExternalConceptSourceUnavailable as exc:
-        assert "attempted=3" in str(exc)
-        assert "preserving previous snapshots" in str(exc)
-    else:
-        raise AssertionError("systemic concept outage must stop before a destructive replace")
+
+    assert "attempted=3" in str(exc_info.value)
+    assert "preserving previous snapshots" in str(exc_info.value)

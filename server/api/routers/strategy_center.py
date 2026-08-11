@@ -131,6 +131,8 @@ def strategy_center_configuration():
         return versioned_strategy_configuration()
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:500]}
+
+
 @router.get("/strategy-center/etf-forward")
 def strategy_center_etf_forward(
     limit: int = Query(default=100, ge=1, le=500),
@@ -323,3 +325,4 @@ def strategy_center_run(payload: StrategyRunRequest | None = Body(default=None))
     except Exception as exc:
         logger.error("strategy center run failed: %s", exc, exc_info=True)
         return {"status": "error", "error": str(exc)[:500]}
+

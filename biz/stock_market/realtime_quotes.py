@@ -29,13 +29,13 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine, write_frame
 
 # 与 adata.common.utils.code_utils.exchange_suffix 一致（6 位代码前两位 -> 交易所字母）
 _EXCHANGE_SUFFIX = {
@@ -80,7 +80,11 @@ def _exchange_for_code(code: str) -> str:
     return _EXCHANGE_SUFFIX[p]
 
 
-def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
+def fetch_list_market_current(
+    code_list: list[str],
+    *,
+    timeout_seconds: float = 30,
+) -> pd.DataFrame:
     """拉取多股最新行情（新浪）。"""
     codes = [str(c).strip().zfill(6) for c in code_list if str(c).strip()]
     if not codes:
@@ -91,7 +95,7 @@ def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
         ex = _exchange_for_code(code).lower()
         api_url += f"s_{ex}{code},"
 
-    res = requests.get(api_url, headers=_HEADERS, timeout=30)
+    res = requests.get(api_url, headers=_HEADERS, timeout=max(1.0, float(timeout_seconds)))
     if res.status_code != 200 or len(res.text) < 1:
         return pd.DataFrame(columns=_MARKET_CURRENT_COLUMNS)
 
@@ -136,15 +140,14 @@ def _ensure_rt_snapshot_table(engine) -> None:
             conn.execute(text(stmt))
 
 
-def save_to_mysql(df: pd.DataFrame, *, run_ddl: bool) -> int:
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+def save_to_mysql(df: pd.DataFrame, *, run_ddl: bool, engine=None) -> int:
+    engine = engine or create_batch_engine(future=True)
     if run_ddl:
         _ensure_rt_snapshot_table(engine)
     ts = datetime.now().replace(microsecond=0)
     out = df.copy()
     out["snapshot_at"] = ts
-    out.to_sql("sm_rt_quote_snapshot", engine, if_exists="append", index=False, chunksize=500, method="multi")
-    return len(out)
+    return write_frame(out, "sm_rt_quote_snapshot", engine, if_exists="append", index=False, chunksize=500, method="multi")
 
 
 def main() -> None:

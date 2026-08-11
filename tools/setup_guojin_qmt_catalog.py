@@ -5,19 +5,17 @@ import json
 from pathlib import Path
 import sys
 
-from sqlalchemy import create_engine
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.qmt.catalog import complete_capability_ledger, ensure_catalog_tables, save_capabilities, seed_registry
 from integrations.qmt.diagnostics import capabilities, core_probe
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 def main() -> int:
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     ensure_catalog_tables(engine)
     registry_count = seed_registry(engine)
     capability_result = capabilities(timeout=30, force=True)

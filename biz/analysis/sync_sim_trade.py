@@ -24,7 +24,7 @@ if str(_ROOT) not in sys.path:
 
 from sqlalchemy import text
 
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine
 from server.engine.sim_trade_engine import SimTradeEngine, _is_trade_date, _previous_trade_date
 
 logging.basicConfig(
@@ -32,6 +32,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def get_engine():
+    return create_batch_engine()
 
 
 def _is_intraday_runtime() -> bool:

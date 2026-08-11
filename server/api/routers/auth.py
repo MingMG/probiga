@@ -104,6 +104,8 @@ def _error_response(exc: AuthError, request: Request | None = None) -> JSONRespo
     if request is not None and exc.code == "session_expired":
         _clear_session_cookie(response, request)
     return response
+
+
 def _success_payload(issued: IssuedSession) -> dict:
     return {"status": "ok", "authenticated": True, **issued.identity.as_dict()}
 
@@ -248,3 +250,4 @@ def me(request: Request):
     response = JSONResponse({"status": "ok", "authenticated": True, **identity.as_dict()})
     response.headers["Cache-Control"] = "no-store"
     return response
+

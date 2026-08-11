@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from server.common.config import (
+    get_api_cache_config,
+    get_api_lifespan_config,
+    get_api_observability_config,
     get_api_mysql_pool_config,
+    get_kline_mysql_url,
     get_minute_mysql_pool_config,
     get_mysql_url,
     get_qmt_history_mysql_url,
@@ -75,6 +79,26 @@ class ConfigTest(unittest.TestCase):
             get_settings.cache_clear()
             self.assertEqual(get_qmt_history_mysql_url(), "mysql://local-history")
 
+    def test_kline_mysql_url_prefers_explicit_url(self):
+        with patch.dict(os.environ, {
+            "KLINE_MYSQL_URL": "mysql://kline",
+            "QMT_HISTORY_MYSQL_URL": "mysql://local-history",
+            "MINUTE_MYSQL_URL": "mysql://minute",
+            "MYSQL_URL": "mysql://production",
+        }):
+            get_settings.cache_clear()
+            self.assertEqual(get_kline_mysql_url(), "mysql://kline")
+
+    def test_kline_mysql_url_can_share_minute_local_url(self):
+        with patch.dict(os.environ, {
+            "KLINE_MYSQL_URL": "",
+            "QMT_HISTORY_MYSQL_URL": "",
+            "MINUTE_MYSQL_URL": "mysql://minute",
+            "MYSQL_URL": "mysql://production",
+        }):
+            get_settings.cache_clear()
+            self.assertEqual(get_kline_mysql_url(), "mysql://minute")
+
     def test_qmt_history_mysql_url_falls_back_to_minute_url_only(self):
         with patch.dict(os.environ, {
             "QMT_HISTORY_MYSQL_URL": "",
@@ -108,6 +132,25 @@ class ConfigTest(unittest.TestCase):
                     "poll_seconds": 15,
                 },
             )
+
+    def test_api_observability_config_allows_disabling_slow_logs(self):
+        with patch("server.common.config.get_settings", return_value=SimpleNamespace(
+            api_slow_request_ms=-1,
+            api_slow_sql_ms=-1,
+        )):
+            self.assertEqual(get_api_observability_config(), {"slow_request_ms": 0, "slow_sql_ms": 0})
+
+    def test_api_lifespan_config_defaults_to_api_only(self):
+        with patch("server.common.config.get_settings", return_value=SimpleNamespace(
+            api_qmt_live_runtime_enabled=False,
+        )):
+            self.assertEqual(get_api_lifespan_config(), {"qmt_live_runtime_enabled": False})
+
+    def test_api_cache_config_has_safe_lower_bound(self):
+        with patch("server.common.config.get_settings", return_value=SimpleNamespace(
+            api_cache_max_entries=0,
+        )):
+            self.assertEqual(get_api_cache_config(), {"max_entries": 32})
 
 
 if __name__ == "__main__":

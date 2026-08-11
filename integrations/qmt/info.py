@@ -68,7 +68,15 @@ def fetch_all_stock_codes() -> pd.DataFrame:
         if members is not None and not members.empty:
             symbols.extend(members["qmt_code"].astype(str).tolist())
 
-    qmt_codes = _dedupe_qmt_codes(symbols)
+    # QMT sector membership is provider-maintained and can contain non-equity
+    # instruments (observed: 910xxx bonds, 810xxx BSE private-placement
+    # convertible bonds, and 899xxx BSE indexes in the A-share sector).
+    # Keep only symbols that round-trip through the canonical A-share mapper.
+    qmt_codes = [
+        symbol
+        for symbol in _dedupe_qmt_codes(symbols)
+        if to_qmt_symbol(symbol.split(".", 1)[0]) == symbol
+    ]
     if not qmt_codes:
         return pd.DataFrame(columns=["stock_code", "short_name", "exchange", "list_date", "etl_sync_at"])
 
@@ -139,6 +147,14 @@ def fetch_index_constituents(index_codes: Iterable[str]) -> pd.DataFrame:
         subset=["index_code", "stock_code"],
         keep="first",
     )
+    members["stock_code"] = members["stock_code"].astype(str).str.zfill(6)
+    members["qmt_code"] = members["qmt_code"].astype(str).str.upper()
+    # Index-weight responses can include funds, bonds, B-shares, and stale
+    # instruments.  Reject any symbol that is not canonical A-share syntax;
+    # the business sync applies the stricter current-stock-pool filter.
+    members = members[members["qmt_code"].eq(members["stock_code"].map(to_qmt_symbol))]
+    if members.empty:
+        return pd.DataFrame(columns=["index_code", "stock_code", "short_name", "etl_sync_at"])
     member_symbols = members["qmt_code"].astype(str).tolist()
     details = bridge.instrument_details(_dedupe_qmt_codes(member_symbols), batch_size=400, timeout=300)
     if details is None or details.empty:

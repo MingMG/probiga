@@ -49,8 +49,8 @@ def main() -> int:
 
     try:
         xtdata.enable_hello = False
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[WARN] failed to disable xtdata hello: {exc}", file=sys.stderr)
 
     print(f"connecting port={args.port}", flush=True)
     xtdata.connect(port=args.port, remember_if_success=False)

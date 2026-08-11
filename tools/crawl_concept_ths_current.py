@@ -13,7 +13,6 @@
 
 import argparse
 import json
-import os
 import random
 import sys
 import time
@@ -24,18 +23,15 @@ import numpy as np
 import pandas as pd
 import requests
 import urllib3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import write_frame
 
 DELAY = 0.6
 JITTER = 0.3
@@ -130,14 +126,15 @@ def save_to_db(engine, rows: list[dict]):
     df = pd.DataFrame(rows)
     df = df.replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["index_code"], keep="last")
+    if len(df) < 100:
+        raise RuntimeError(
+            f"同花顺概念实时覆盖不足: {len(df)} < 100; 保留上一份有效数据"
+        )
 
     now = datetime.now().replace(microsecond=0)
     df["trade_time"] = now
     df["snapshot_at"] = now
     df["etl_sync_at"] = now
-
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_concept_ths_current"))
 
     cols = [
         "index_code", "trade_time", "trade_date",
@@ -147,8 +144,13 @@ def save_to_db(engine, rows: list[dict]):
     ]
     df = df[[c for c in cols if c in df.columns]]
 
-    df.to_sql(
-        "sm_concept_ths_current", engine,
+    with engine.begin() as conn:
+        conn.execute(text("TRUNCATE TABLE sm_concept_ths_current"))
+
+    write_frame(
+        df,
+        "sm_concept_ths_current",
+        engine,
         if_exists="append", index=False,
         chunksize=500, method="multi",
     )
@@ -161,7 +163,7 @@ def main():
     parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     concepts = get_concept_codes(engine)
 
     if args.limit > 0:

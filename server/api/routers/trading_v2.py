@@ -685,6 +685,8 @@ def promote_strategy(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _envelope(data)
+
+
 @router.post("/admin/strategies/{strategy_id}/suspend")
 def suspend_strategy(
     payload: LifecycleRequest,
@@ -705,3 +707,4 @@ def suspend_strategy(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _envelope(data)
+

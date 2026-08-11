@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
-import os
-import sys
-from sqlalchemy import create_engine, text
-
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from sqlalchemy import text
 
 ALTERS = [
     "ALTER TABLE `st_hot_rank_fused` ADD COLUMN `xq_rank` INT DEFAULT NULL COMMENT '雪球热股排名' AFTER `ths_rank`",
@@ -16,16 +10,22 @@ ALTERS = [
     "ALTER TABLE `st_hot_rank_multi_day` ADD COLUMN `last_xq_rank` INT DEFAULT NULL COMMENT '最后一天雪球排名' AFTER `last_ths_rank`",
 ]
 
-with engine.begin() as conn:
-    for sql in ALTERS:
-        try:
-            conn.execute(text(sql))
-            print(f"  [OK] {sql}")
-        except Exception as e:
-            err = str(e)
-            if "Duplicate column" in err or "duplicate column" in err:
-                print(f"  [SKIP] 列已存在: {sql}")
-            else:
-                print(f"  [ERR] {err}")
+def main():
+    engine = create_tool_engine(resolve_tool_mysql_url())
+    with engine.begin() as conn:
+        for sql in ALTERS:
+            try:
+                conn.execute(text(sql))
+                print(f"  [OK] {sql}")
+            except Exception as e:
+                err = str(e)
+                if "Duplicate column" in err or "duplicate column" in err:
+                    print(f"  [SKIP] 列已存在: {sql}")
+                else:
+                    print(f"  [ERR] {err}")
 
-print("\nDone!")
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

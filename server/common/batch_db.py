@@ -28,20 +28,9 @@ def create_batch_engine(url: str | None = None, **kwargs: Any) -> Engine:
 
 
 def routed_read_engine(sql: object, engine: Engine) -> Engine:
-    """Route pure market-history reads to their configured databases."""
+    """Route pure K-line reads to the configured K-line database."""
     sql_text = str(sql)
-    if should_use_kline_engine(sql_text):
-        return get_kline_engine()
-
-    # Import lazily because minute_data uses quote_identifier from this module.
-    from server.common.minute_data import (  # pylint: disable=import-outside-toplevel
-        get_minute_engine,
-        should_use_capital_flow_engine,
-    )
-
-    if should_use_capital_flow_engine(sql_text):
-        return get_minute_engine()
-    return engine
+    return get_kline_engine() if should_use_kline_engine(sql_text) else engine
 
 
 def _transient_db_errno(exc: BaseException) -> int | None:
@@ -87,14 +76,9 @@ def read_frame(sql: object, engine: Engine, params: dict | None = None) -> pd.Da
 def read_frame_direct(sql: object, engine: Engine, params: dict | None = None) -> pd.DataFrame:
     """Read through the explicitly supplied engine without applying table routing."""
     attempts = _read_retry_attempts()
-    # pandas sends raw strings through ``exec_driver_sql``.  Named SQLAlchemy
-    # binds such as ``:trade_date`` are then passed to PyMySQL unchanged and
-    # MySQL reports a syntax error.  Promote parameterized strings to a
-    # TextClause so SQLAlchemy compiles them to the driver's parameter style.
-    statement = text(sql) if isinstance(sql, str) and params else sql
     for attempt in range(1, attempts + 1):
         try:
-            return pd.read_sql(statement, engine, params=params)
+            return pd.read_sql(sql, engine, params=params)
         except DBAPIError as exc:
             errno = _transient_db_errno(exc)
             if errno not in _TRANSIENT_DB_ERRNOS or attempt >= attempts:

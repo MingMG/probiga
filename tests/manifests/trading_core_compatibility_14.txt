@@ -1,0 +1,14 @@
+tests/test_trading_core_execution.py
+tests/test_trading_core_matcher.py
+tests/test_trading_core_protection.py
+tests/test_trading_core_risk_envelope.py
+tests/test_trading_core_session_gate.py
+tests/test_trading_core_session_window.py
+tests/test_trading_core_snapshot_batch.py
+tests/test_trading_core_v2_accounting_compatibility.py
+tests/test_trading_core_v2_compatibility.py
+tests/test_trading_core_v2_matcher_compatibility.py
+tests/test_trading_core_v2_snapshot_matcher_compatibility.py
+tests/test_trading_core_v3_projection.py
+tests/test_trading_core_v3_projection_subscriber.py
+tests/test_trading_core_waiting_reason_receipt.py

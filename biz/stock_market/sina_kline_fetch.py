@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -239,7 +240,10 @@ def _eval_factor_data(res_text: str) -> Any:
     blob = res_text.split("=", 1)[1].split("\n", 1)[0].strip().rstrip(";")
     if blob.endswith(";"):
         blob = blob[:-1]
-    return eval(blob, {"__builtins__": {}}, {})  # noqa: S307
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        return ast.literal_eval(blob)
 
 
 def fetch_sina_a_daily_kline(
@@ -287,6 +291,7 @@ def fetch_sina_a_daily_kline(
         amount_data_df = amount_data_df.reindex(data_df.index)
     temp_df = pd.merge(data_df, amount_data_df, left_index=True, right_index=True, how="outer")
     raw_pre_close = temp_df["pre_close"].copy() if "pre_close" in temp_df.columns else None
+    temp_df = temp_df.apply(pd.to_numeric, errors="coerce")
     temp_df.ffill(inplace=True)
     if raw_pre_close is not None:
         temp_df["pre_close"] = raw_pre_close

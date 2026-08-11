@@ -2,13 +2,16 @@
 # ============================================================================
 # ProBigA 历史数据拉取（2024-01-01 起，不含K线）
 # 使用方法：
-#   1. 先开隧道：ssh -L 3307:127.0.0.1:3306 root@47.113.123.190
+#   1. 先开隧道：ssh -L 3307:127.0.0.1:3306 $env:PROBIGA_REMOTE_SSH_USER@$env:PROBIGA_REMOTE_SSH_HOST
 #   2. 在本窗口执行（必须管理员权限）：Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #   3. 执行本脚本：.\tools\pull_2024.ps1
 # ============================================================================
 $ErrorActionPreference = "Continue"
 
-$ENV:MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3307/probiga?charset=utf8mb4"
+if (-not $ENV:MYSQL_URL) {
+    Write-Error "MYSQL_URL is not set. Point it at your local tunnel before running this script."
+    exit 1
+}
 $ENV:SM_MAX_STOCKS = "200"
 $ENV:SM_HTTP_RETRIES = "3"
 $ENV:SM_REQUEST_SLEEP = "0.5"
@@ -141,6 +144,6 @@ Write-Host "  🎉 全部数据拉取完成！" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  查看数据量："
-Write-Host "  python -c 'from sqlalchemy import create_engine,text; e=create_engine(\"mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3307/probiga?charset=utf8mb4\"); c=e.connect(); [print(f\"{t}: {c.execute(text(\"SELECT COUNT(*) FROM \"+t)).scalar()} 行\") for t in [\"st_hot_rank_ths\",\"st_hot_concept_ths_daily\",\"st_hot_rank_fused\",\"st_hot_rank_multi_day\",\"st_a_list_daily\",\"sm_stock_capital_flow_daily\"]]; c.close()'"
+Write-Host "  python -c 'from sqlalchemy import text; from server.common.batch_db import create_batch_engine; e=create_batch_engine(); c=e.connect(); [print(f\"{t}: {c.execute(text(\"SELECT COUNT(*) FROM \"+t)).scalar()} rows\") for t in [\"st_hot_rank_ths\",\"st_hot_concept_ths_daily\",\"st_hot_rank_fused\",\"st_hot_rank_multi_day\",\"st_a_list_daily\",\"sm_stock_capital_flow_daily\"]]; c.close()'"
 Write-Host ""
 pause

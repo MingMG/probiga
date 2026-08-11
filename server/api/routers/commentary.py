@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 from typing import Any, Literal
 
@@ -18,27 +19,21 @@ from server.api.commentary_utils import (
 from server.api.routers._engine import get_engine
 from server.common.config import get_wecom_webhook
 from server.common.minute_data import minute_source_info
+from server.common.scheduler_tasks import (
+    DEFAULT_SCHEDULER_COLUMNS,
+    ensure_scheduler_columns as ensure_shared_scheduler_columns,
+    update_scheduler_tasks,
+    upsert_scheduler_task as shared_upsert_scheduler_task,
+)
+from server.common.sql_reader import read_sql_rows
 from server.engine.data_loader import StockDataLoader
 
 router = APIRouter(tags=["commentary"])
+logger = logging.getLogger(__name__)
 
 PROFILE_TABLE = "st_commentary_profiles"
 SCRIPT_PATH = "tools/run_commentary_watch.py"
-SCHEDULER_COLUMNS = {
-    "task_type": "VARCHAR(50) DEFAULT 'python'",
-    "group_name": "VARCHAR(32) DEFAULT 'system'",
-    "script_args": "VARCHAR(500) DEFAULT ''",
-    "date_param": "VARCHAR(100) DEFAULT ''",
-    "interval_minutes": "INT DEFAULT 0",
-    "sort_order": "INT DEFAULT 0",
-    "last_triggered_at": "DATETIME DEFAULT NULL",
-    "last_run_output": "TEXT DEFAULT NULL",
-    "last_run_duration": "INT DEFAULT 0",
-    "etl_sync_at": "DATETIME DEFAULT NULL",
-    "updated_at": "DATETIME DEFAULT NULL",
-    "description": "VARCHAR(500) DEFAULT ''",
-}
-NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
+SCHEDULER_COLUMNS = DEFAULT_SCHEDULER_COLUMNS
 
 
 class CommentaryAssessRequest(BaseModel):
@@ -61,9 +56,7 @@ class CommentaryProfileBody(BaseModel):
 
 
 def _read_sql(sql: str, params: dict | None = None) -> list[dict]:
-    with get_engine().connect() as conn:
-        result = conn.execute(text(sql), params or {})
-        return [dict(row) for row in result.mappings().all()]
+    return read_sql_rows(get_engine(), sql, params, context="commentary")
 
 
 def _exec_sql(sql: str, params: dict | None = None) -> None:
@@ -112,15 +105,7 @@ def _ensure_profile_table() -> None:
 
 
 def _ensure_scheduler_columns() -> set[str]:
-    columns = _table_columns("st_scheduled_tasks")
-    if not columns:
-        raise RuntimeError("st_scheduled_tasks does not exist")
-    with get_engine().begin() as conn:
-        for column, ddl in SCHEDULER_COLUMNS.items():
-            if column not in columns:
-                conn.execute(text(f"ALTER TABLE st_scheduled_tasks ADD COLUMN `{column}` {ddl}"))
-                columns.add(column)
-    return columns
+    return ensure_shared_scheduler_columns(get_engine(), column_definitions=SCHEDULER_COLUMNS)
 
 
 def _profile_task_type(profile_id: int) -> str:
@@ -133,54 +118,27 @@ def _profile_task_name(profile_name: str) -> str:
 
 
 def _upsert_scheduler_task(payload: dict[str, Any], *, task_type: str) -> dict[str, Any]:
-    columns = _ensure_scheduler_columns()
-    allowed = {
-        "task_name", "task_type", "group_name", "script_path", "script_args",
-        "cron_time", "interval_minutes", "enabled", "description",
-        "sort_order", "date_param",
-    }
-    compatible = {key: value for key, value in payload.items() if key in allowed and key in columns}
-    if "task_type" in columns:
-        compatible["task_type"] = task_type
-    if not compatible:
-        raise RuntimeError("no compatible scheduler columns found")
-
-    with get_engine().begin() as conn:
-        task_id = conn.execute(
-            text("SELECT id FROM st_scheduled_tasks WHERE task_type = :task_type LIMIT 1"),
-            {"task_type": task_type},
-        ).scalar()
-        if task_id:
-            assignments = ", ".join(f"`{key}` = :{key}" for key in compatible if key != "task_type")
-            if "updated_at" in columns:
-                assignments += ", `updated_at` = NOW()"
-            conn.execute(
-                text(f"UPDATE st_scheduled_tasks SET {assignments} WHERE id = :id"),
-                {**compatible, "id": task_id},
-            )
-            action = "updated"
-        else:
-            insert_payload = dict(compatible)
-            for column in NOW_COLUMNS:
-                if column in columns:
-                    insert_payload[column] = None
-            names = ", ".join(f"`{key}`" for key in insert_payload)
-            values = ", ".join("NOW()" if key in NOW_COLUMNS else f":{key}" for key in insert_payload)
-            bind_payload = {key: value for key, value in insert_payload.items() if key not in NOW_COLUMNS}
-            conn.execute(text(f"INSERT INTO st_scheduled_tasks ({names}) VALUES ({values})"), bind_payload)
-            task_id = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
-            action = "inserted"
-    return {"id": int(task_id), "action": action}
+    return shared_upsert_scheduler_task(
+        get_engine(),
+        payload,
+        lookup_where="task_type = :task_type",
+        lookup_params={"task_type": task_type},
+        update_exclude={"task_type"},
+        forced_values={"task_type": task_type},
+        column_definitions=SCHEDULER_COLUMNS,
+    )
 
 
 def _toggle_scheduler_task(task_type: str, enabled: bool) -> None:
     try:
-        _exec_sql(
-            "UPDATE st_scheduled_tasks SET enabled = :e, updated_at = NOW() WHERE task_type = :t",
-            {"e": 1 if enabled else 0, "t": task_type},
+        update_scheduler_tasks(
+            get_engine(),
+            {"enabled": 1 if enabled else 0},
+            lookup_where="task_type = :task_type",
+            lookup_params={"task_type": task_type},
         )
     except Exception:
-        pass
+        logger.debug("Failed to update commentary scheduler enabled flag.", exc_info=True)
 
 
 def _latest_trade_date(as_of_date: str | None = None) -> str:
@@ -241,6 +199,7 @@ def _load_news_items(stock_code: str, stock_name: str) -> list[dict]:
         SELECT 'notice' AS source, title, column_name AS content, notice_date AS publish_time
         FROM si_notice_eastmoney
         WHERE stock_code = :code
+          AND association_validated = 1
         ORDER BY notice_date DESC
         LIMIT 3
         """,

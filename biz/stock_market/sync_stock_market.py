@@ -1281,7 +1281,7 @@ def read_index_codes(engine: Engine) -> list[str]:
 
 
 def read_concept_ths_codes(engine: Engine) -> list[str]:
-    limit = int(os.environ.get("SM_MAX_CONCEPTS", "50"))
+    limit = int(os.environ.get("SM_MAX_CONCEPTS", "0"))
     sql = """
     SELECT DISTINCT COALESCE(index_code, concept_code) AS code
     FROM si_concept_code_ths
@@ -1297,8 +1297,8 @@ def read_concept_ths_codes(engine: Engine) -> list[str]:
 
 
 def read_concept_east_codes(engine: Engine) -> list[str]:
-    limit = int(os.environ.get("SM_MAX_CONCEPTS", "50"))
-    if _concept_source("list") == "qmt":
+    limit = int(os.environ.get("SM_MAX_CONCEPTS", "0"))
+    if _concept_source("list") in {"qmt", "bigqmt"}:
         sql = """
         SELECT DISTINCT concept_code AS code
         FROM si_concept_code_east
@@ -1361,6 +1361,106 @@ def _read_qmt_concept_meta(engine: Engine, concept_codes: list[str]) -> tuple[pd
         else {}
     )
     return members.drop_duplicates(subset=["concept_code", "stock_code"], keep="first"), name_map
+
+
+def _latest_completed_stock_trade_date(engine: Engine, requested_end: str | None = None) -> str:
+    """Cap derived concept daily data at the latest completed stock session."""
+    del engine  # the canonical daily history may be routed to a dedicated engine
+    with get_kline_engine().connect() as conn:
+        value = conn.execute(text("""
+            SELECT MAX(trade_date)
+            FROM sm_stock_kline
+            WHERE k_type = 1 AND adjust_type = 0
+        """)).scalar()
+    completed = str(value or "")[:10]
+    if not completed:
+        raise RuntimeError("no completed daily stock K-line is available")
+    requested = str(requested_end or "").strip()[:10]
+    return min(completed, requested) if requested else completed
+
+
+def _validate_concept_kline_replacement(
+    frame: pd.DataFrame,
+    concept_codes: list[str],
+    *,
+    completed_end: str,
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise RuntimeError("concept K-line replacement is empty; preserving previous rows")
+    out = frame.copy()
+    required = {
+        "index_code", "trade_date", "k_type", "open", "close", "high", "low",
+        "volume", "amount", "change", "change_pct",
+    }
+    missing = sorted(required - set(out.columns))
+    if missing:
+        raise RuntimeError(f"concept K-line replacement missing columns {missing}; preserving previous rows")
+    out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    out = out[out["trade_date"].notna() & (out["trade_date"] <= completed_end)].copy()
+    out = out.drop_duplicates(subset=["index_code", "trade_date", "k_type"], keep="last")
+    if out.empty:
+        raise RuntimeError("concept K-line replacement has no completed rows; preserving previous rows")
+    for column in ("open", "close", "high", "low", "volume", "amount", "change", "change_pct"):
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    unavailable = out[["open", "close", "high", "low"]].isna().all(axis=1)
+    if unavailable.any():
+        logger.warning(
+            "Dropping %s unavailable concept K-line rows with no derived OHLC; no values will be fabricated",
+            int(unavailable.sum()),
+        )
+        out = out.loc[~unavailable].copy()
+    invalid = (
+        out[["open", "close", "high", "low"]].isna().any(axis=1)
+        | (out["open"] <= 0)
+        | (out["close"] <= 0)
+        | (out["high"] < out[["open", "close", "low"]].max(axis=1))
+        | (out["low"] > out[["open", "close", "high"]].min(axis=1))
+    )
+    if invalid.any():
+        raise RuntimeError(
+            f"concept K-line replacement has {int(invalid.sum())} invalid OHLC rows; preserving previous rows"
+        )
+    latest = str(out["trade_date"].max())
+    if latest != completed_end:
+        raise RuntimeError(
+            f"concept K-line latest date {latest} != completed session {completed_end}; preserving previous rows"
+        )
+    expected = {str(code).strip() for code in concept_codes if str(code).strip()}
+    received = set(out.loc[out["trade_date"] == completed_end, "index_code"].astype(str).str.strip())
+    coverage = len(received & expected) / max(len(expected), 1)
+    threshold = min(1.0, max(0.0, float(os.environ.get("QMT_CONCEPT_KLINE_MIN_COVERAGE", "0.80"))))
+    if coverage < threshold:
+        raise RuntimeError(
+            "concept K-line completed-date coverage below threshold: "
+            f"{len(received & expected)}/{len(expected)} ({coverage:.1%}) < {threshold:.1%}; preserving previous rows"
+        )
+    return out
+
+
+def _validate_concept_flow_replacement(
+    frame: pd.DataFrame,
+    concept_codes: list[str],
+) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise RuntimeError("concept flow replacement is empty; preserving previous snapshot")
+    out = frame.copy().drop_duplicates(subset=["days_type", "index_code"], keep="last")
+    expected = {str(code).strip() for code in concept_codes if str(code).strip()}
+    threshold = min(1.0, max(0.0, float(os.environ.get("QMT_CONCEPT_FLOW_MIN_COVERAGE", "0.80"))))
+    failures: list[str] = []
+    for days_type in (1, 5, 10):
+        received = set(
+            out.loc[out["days_type"] == days_type, "index_code"].astype(str).str.strip()
+        )
+        coverage = len(received & expected) / max(len(expected), 1)
+        if coverage < threshold:
+            failures.append(
+                f"{days_type}d={len(received & expected)}/{len(expected)} ({coverage:.1%})"
+            )
+    if failures:
+        raise RuntimeError(
+            "concept flow coverage below threshold: " + ", ".join(failures) + "; preserving previous snapshot"
+        )
+    return out
 
 
 def _concept_snapshot_change_pct(concept_kline: pd.DataFrame, concept_code: str, days: int) -> float | None:
@@ -2722,6 +2822,46 @@ def _concept_east_instance():
     return ConceptMarketEase()
 
 
+def _fetch_concept_kline_batches(
+    bridge_module: Any,
+    qmt_codes: list[str],
+    *,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """Keep each BigQMT history action bounded so its heartbeat can recover."""
+    request_batch_size = max(
+        1,
+        int(os.environ.get("QMT_CONCEPT_KLINE_REQUEST_BATCH_SIZE", "25")),
+    )
+    provider_batch_size = max(
+        1,
+        int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "200"))),
+    )
+    timeout = int(os.environ.get("QMT_TIMEOUT", "300"))
+    parts: list[pd.DataFrame] = []
+    batches = _chunked(qmt_codes, request_batch_size)
+    for index, batch in enumerate(batches, start=1):
+        frame = bridge_module.kline(
+            batch,
+            start_date=start_date,
+            end_date=end_date,
+            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+            batch_size=min(provider_batch_size, len(batch)),
+            timeout=timeout,
+        )
+        if frame is not None and not frame.empty:
+            parts.append(frame)
+        logger.info(
+            "Concept K-line source progress: batch %s/%s, requested=%s, rows=%s",
+            index,
+            len(batches),
+            len(batch),
+            0 if frame is None else len(frame),
+        )
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
 def step_concept_ths_kline(
     engine: Engine, concept_codes: list[str], kline_start: str | None = None, kline_end: str | None = None
 ) -> None:
@@ -2819,40 +2959,68 @@ def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
 def step_concept_east_kline(
     engine: Engine, concept_codes: list[str], kline_start: str | None = None, kline_end: str | None = None
 ) -> None:
-    if _concept_source("kline") == "qmt":
-        from integrations.qmt import bridge
+    concept_source = _concept_source("kline")
+    completed_end = _latest_completed_stock_trade_date(
+        engine,
+        kline_end or os.environ.get("SM_INDEX_END"),
+    )
+    if concept_source in {"qmt", "bigqmt"}:
         from integrations.qmt.aggregate import aggregate_concept_kline
-        from integrations.qmt.info import to_qmt_stock_symbols
 
-        truncate_only(engine, "sm_concept_east_kline")
         members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
             logger.warning("QMT 概念K线: no concept members")
             return
         start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
-        end = kline_end or os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
-        qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
-        df = bridge.kline(
-            qmt_codes,
-            start_date=start,
-            end_date=end,
-            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
-            batch_size=int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
-            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
-        )
+        if start > completed_end:
+            raise RuntimeError(f"concept K-line start {start} is after completed end {completed_end}")
+        if concept_source == "bigqmt":
+            # The canonical stock K-line table is already filled by the
+            # BigQMT daily job.  Reuse that complete local evidence instead of
+            # asking XtItClient to download the same history again.
+            df = read_frame(text("""
+                SELECT stock_code, trade_time, trade_date, open, close, high, low,
+                       pre_close, volume, amount, `change`, change_pct, k_type
+                FROM sm_stock_kline
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND k_type = 1 AND adjust_type = 0
+            """), get_kline_engine(), params={"start_date": start, "end_date": completed_end})
+        else:
+            from integrations.qmt import bridge
+            from integrations.qmt.info import to_qmt_stock_symbols
+
+            qmt_codes = to_qmt_stock_symbols(
+                members["stock_code"].astype(str).drop_duplicates().tolist()
+            )
+            df = _fetch_concept_kline_batches(
+                bridge,
+                qmt_codes,
+                start_date=start,
+                end_date=completed_end,
+            )
         if df is None or df.empty:
             raise RuntimeError("QMT concept kline source returned no stock rows")
         out = aggregate_concept_kline(members, df)
         if out.empty:
             raise RuntimeError("QMT concept kline aggregation returned no rows")
-        df_to_table(engine, _with_etl(out), "sm_concept_east_kline")
+        complete = _validate_concept_kline_replacement(
+            out,
+            concept_codes,
+            completed_end=completed_end,
+        )
+        replace_table_rows(
+            _clean_df(_with_etl(complete)),
+            "sm_concept_east_kline",
+            get_kline_engine(),
+            where_sql="trade_date >= :start_date AND trade_date <= :end_date AND k_type = :k_type",
+            params={"start_date": start, "end_date": completed_end, "k_type": 1},
+        )
         return
 
-    truncate_only(engine, "sm_concept_east_kline")
     ins = _concept_east_instance()
     k_type = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
     start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
-    end = kline_end or os.environ.get("SM_INDEX_END")
+    end = completed_end
     cols = ["index_code", "trade_time", "trade_date", "k_type", "open", "close", "high", "low", "volume", "amount", "change", "change_pct"]
     _start, _end, _kt = start, end, k_type
 
@@ -2869,8 +3037,20 @@ def step_concept_east_kline(
         return None
 
     parts = _concurrent_run(concept_codes, _fetch, label="东财概念K线")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_east_kline")
+    if not parts:
+        raise RuntimeError("no Eastmoney concept K-line rows fetched; preserving previous rows")
+    complete = _validate_concept_kline_replacement(
+        pd.concat(parts, ignore_index=True),
+        concept_codes,
+        completed_end=completed_end,
+    )
+    replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        "sm_concept_east_kline",
+        get_kline_engine(),
+        where_sql="trade_date >= :start_date AND trade_date <= :end_date AND k_type = :k_type",
+        params={"start_date": start, "end_date": completed_end, "k_type": k_type},
+    )
 
 
 def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
@@ -2924,24 +3104,51 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
 def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
     concept_source = _concept_source("current")
     if concept_source in {"qmt", "bigqmt"}:
-        if concept_source == "bigqmt":
-            from integrations.bigqmt import bridge
-        else:
-            from integrations.qmt import bridge
         from integrations.qmt.aggregate import aggregate_concept_current
-        from integrations.qmt.info import to_qmt_stock_symbols
 
         members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
             raise RuntimeError(
                 "QMT concept current has no concept members; preserving previous snapshot"
             )
-        qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
-        df = bridge.current(
-            qmt_codes,
-            batch_size=int(os.environ.get("QMT_CONCEPT_CURRENT_BATCH_SIZE", os.environ.get("QMT_CURRENT_BATCH_SIZE", "500"))),
-            timeout=int(os.environ.get("QMT_TIMEOUT", "180")),
-        )
+        if concept_source == "bigqmt":
+            current = read_frame(text("""
+                SELECT stock_code, price, `change`, change_pct, volume, amount, snapshot_at
+                FROM sm_stock_current
+                WHERE snapshot_at >= DATE((SELECT MAX(snapshot_at) FROM sm_stock_current))
+                  AND snapshot_at < DATE((SELECT MAX(snapshot_at) FROM sm_stock_current)) + INTERVAL 1 DAY
+            """), engine)
+            if current.empty:
+                raise RuntimeError("local BigQMT current snapshot is empty; preserving previous concept snapshot")
+            current_date = pd.to_datetime(current["snapshot_at"], errors="coerce").max()
+            if pd.isna(current_date):
+                raise RuntimeError("local BigQMT current snapshot has no valid timestamp")
+            daily = read_frame(text("""
+                SELECT stock_code, open, high, low, pre_close
+                FROM sm_stock_kline
+                WHERE trade_date = :trade_date
+                  AND k_type = 1 AND adjust_type = 0
+            """), get_kline_engine(), params={"trade_date": current_date.strftime("%Y-%m-%d")})
+            if daily.empty:
+                raise RuntimeError(
+                    "local completed stock K-line is unavailable for concept-current OHLC; "
+                    "preserving previous concept snapshot"
+                )
+            df = current.merge(
+                daily.drop_duplicates(subset=["stock_code"], keep="last"),
+                on="stock_code",
+                how="inner",
+            )
+        else:
+            from integrations.qmt import bridge
+            from integrations.qmt.info import to_qmt_stock_symbols
+
+            qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
+            df = bridge.current(
+                qmt_codes,
+                batch_size=int(os.environ.get("QMT_CONCEPT_CURRENT_BATCH_SIZE", os.environ.get("QMT_CURRENT_BATCH_SIZE", "500"))),
+                timeout=int(os.environ.get("QMT_TIMEOUT", "180")),
+            )
         if df is None or df.empty:
             raise RuntimeError("QMT concept current source returned no stock rows")
         out = aggregate_concept_current(members, df)
@@ -3010,13 +3217,12 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
 
 
 def step_concept_flow_east(engine: Engine) -> None:
-    if _concept_source("flow") == "qmt":
-        from integrations.qmt import bridge
+    concept_source = _concept_source("flow")
+    if concept_source in {"qmt", "bigqmt"}:
         from integrations.qmt.aggregate import aggregate_concept_kline
         from integrations.qmt.info import to_qmt_stock_symbols
 
         concept_codes = read_concept_east_codes(engine)
-        truncate_only(engine, "sm_concept_capital_flow_east")
         members, name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
             logger.warning("QMT 概念资金流: no concept members")
@@ -3024,28 +3230,53 @@ def step_concept_flow_east(engine: Engine) -> None:
 
         unique_stock_codes = members["stock_code"].astype(str).str.zfill(6).drop_duplicates().tolist()
         qmt_codes = to_qmt_stock_symbols(unique_stock_codes)
-        end_date = datetime.now().strftime("%Y-%m-%d")
+        end_date = _latest_completed_stock_trade_date(engine)
         start_date = (datetime.now() - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
 
-        flow_df = bridge.flow_daily(
-            qmt_codes,
-            start_date=start_date,
-            end_date=end_date,
-            batch_size=int(os.environ.get("QMT_FLOW_DAILY_BATCH_SIZE", "250")),
-            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
-        )
-        if flow_df is None or flow_df.empty:
-            logger.warning("QMT concept flow source returned no stock flow rows; concept flow will be skipped.")
-            return
+        if concept_source == "bigqmt":
+            date_rows = read_frame(text("""
+                SELECT DISTINCT trade_date
+                FROM sm_stock_capital_flow_daily
+                WHERE trade_date <= :end_date
+                ORDER BY trade_date DESC
+                LIMIT 10
+            """), engine, params={"end_date": end_date})
+            if date_rows.empty:
+                raise RuntimeError("no completed local stock-flow dates; preserving previous concept flow")
+            start_date = str(date_rows["trade_date"].min())[:10]
+            flow_df = read_frame(text("""
+                SELECT stock_code, trade_date, main_net_inflow, max_net_inflow,
+                       lg_net_inflow, mid_net_inflow, sm_net_inflow
+                FROM sm_stock_capital_flow_daily
+                WHERE trade_date BETWEEN :start_date AND :end_date
+            """), engine, params={"start_date": start_date, "end_date": end_date})
+            kline_df = read_frame(text("""
+                SELECT stock_code, trade_date, open, close, high, low, pre_close,
+                       volume, amount, change_pct
+                FROM sm_stock_kline
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND k_type = 1 AND adjust_type = 0
+            """), get_kline_engine(), params={"start_date": start_date, "end_date": end_date})
+        else:
+            from integrations.qmt import bridge
 
-        kline_df = bridge.kline(
-            qmt_codes,
-            start_date=start_date,
-            end_date=end_date,
-            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
-            batch_size=int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
-            timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
-        )
+            flow_df = bridge.flow_daily(
+                qmt_codes,
+                start_date=start_date,
+                end_date=end_date,
+                batch_size=int(os.environ.get("QMT_FLOW_DAILY_BATCH_SIZE", "250")),
+                timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+            )
+            kline_df = bridge.kline(
+                qmt_codes,
+                start_date=start_date,
+                end_date=end_date,
+                dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+                batch_size=int(os.environ.get("QMT_CONCEPT_KLINE_BATCH_SIZE", os.environ.get("QMT_KLINE_BATCH_SIZE", "300"))),
+                timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
+            )
+        if flow_df is None or flow_df.empty:
+            raise RuntimeError("QMT concept flow source returned no stock flow rows; preserving previous snapshot")
         if kline_df is None or kline_df.empty:
             raise RuntimeError("QMT concept flow source returned no stock kline rows")
 
@@ -3054,9 +3285,9 @@ def step_concept_flow_east(engine: Engine) -> None:
         flow_df["trade_date"] = pd.to_datetime(flow_df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
         flow_df = _to_numeric(flow_df, ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"])
         flow_df = flow_df.dropna(subset=["trade_date"])
+        flow_df = flow_df[flow_df["trade_date"] <= end_date].copy()
         if flow_df.empty:
-            logger.warning("QMT concept flow rows became empty after normalization; concept flow will be skipped.")
-            return
+            raise RuntimeError("QMT concept flow rows became empty after normalization; preserving previous snapshot")
 
         kline_df = kline_df.copy()
         kline_df["stock_code"] = kline_df["stock_code"].astype(str).str.zfill(6)
@@ -3068,6 +3299,11 @@ def step_concept_flow_east(engine: Engine) -> None:
         all_dates = sorted(flow_df["trade_date"].dropna().astype(str).unique().tolist())
         if not all_dates:
             raise RuntimeError("QMT concept flow has no trade dates")
+        if all_dates[-1] != end_date:
+            raise RuntimeError(
+                f"concept flow latest stock date {all_dates[-1]} != completed session {end_date}; "
+                "preserving previous snapshot"
+            )
 
         rows: list[dict[str, Any]] = []
         now = _now()
@@ -3131,14 +3367,27 @@ def step_concept_flow_east(engine: Engine) -> None:
                 )
 
         if not rows:
-            logger.warning("QMT concept flow aggregation returned no rows")
-            return
-        df_to_table(engine, _with_etl(pd.DataFrame(rows)), "sm_concept_capital_flow_east")
+            raise RuntimeError("QMT concept flow aggregation returned no rows; preserving previous snapshot")
+        complete = _validate_concept_flow_replacement(pd.DataFrame(rows), concept_codes)
+        replace_table_rows(
+            _clean_df(_with_etl(complete)),
+            "sm_concept_capital_flow_east",
+            engine,
+        )
         return
 
     from adata.stock.market.concept_capital_flow.capital_flow_east import CapitalFlowEast
 
-    truncate_only(engine, "sm_concept_capital_flow_east")
+    with engine.connect() as conn:
+        external_concept_codes = [
+            str(row[0])
+            for row in conn.execute(text("""
+                SELECT DISTINCT concept_code
+                FROM si_concept_code_east
+                WHERE concept_code LIKE 'BK%'
+                ORDER BY concept_code
+            """)).fetchall()
+        ]
     ins = CapitalFlowEast()
     now = _now()
     parts: list[pd.DataFrame] = []
@@ -3163,8 +3412,17 @@ def step_concept_flow_east(engine: Engine) -> None:
                 ]
             )
         _sleep()
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_capital_flow_east")
+    if not parts:
+        raise RuntimeError("no Eastmoney concept flow rows fetched; preserving previous snapshot")
+    complete = _validate_concept_flow_replacement(
+        pd.concat(parts, ignore_index=True),
+        external_concept_codes,
+    )
+    replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        "sm_concept_capital_flow_east",
+        engine,
+    )
 
 
 def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | None = None, kline_end: str | None = None) -> None:

@@ -166,6 +166,8 @@ def _login_redirect(request: Request) -> RedirectResponse:
         status_code=303,
         headers={"Cache-Control": "no-store"},
     )
+
+
 def _admin_auth_response(status_code: int, error: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -257,3 +259,4 @@ def validate_admin_request(request: Request) -> Response | None:
         "admin_auth_required",
         "请先登录后再访问 ProBigA。",
     )
+

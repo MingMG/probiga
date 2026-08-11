@@ -592,3 +592,4 @@ def prune_auth_data(engine: Engine, *, session_retention_days: int = 30, audit_r
             delete(auth_audit).where(auth_audit.c.created_at < now - timedelta(days=audit_retention_days))
         ).rowcount
     return {"sessions_deleted": int(sessions or 0), "audits_deleted": int(audits or 0)}
+

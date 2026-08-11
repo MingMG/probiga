@@ -24,6 +24,12 @@ from server.engine.recommendation_gate import RecommendationGate
 # 测试数据
 # ============================================================
 
+
+def test_schema_defaults_fail_closed_when_risk_and_recommendation_are_missing():
+    assert EventRisk().level == "DATA_BLOCKED"
+    assert EventRisk().score == 0
+    assert RecommendResult().status == "DATA_BLOCKED"
+
 def create_mock_data(
     roe=15, gross_margin=35, asset_liab_ratio=45,
     rev_growth=20, profit_growth=25,
@@ -288,10 +294,68 @@ def test_recommendation_gate_allow():
     short_term = {'short_term_score': 80, 'strengths': [], 'risks': []}
     event_risk = {'event_risk_level': 'LOW', 'event_risk_score': 90, 'triggered_events': [], 'risks': []}
 
-    result = gate.evaluate(long_term, short_term, event_risk)
+    result = gate.evaluate(
+        long_term,
+        short_term,
+        event_risk,
+        actionability={
+            'pit_status': 'PASS',
+            'chase_risk_status': 'ALLOW',
+            'ordinary_buy_eligible': True,
+        },
+    )
 
     assert result['status'] == 'ALLOW'
     print(f"允许推荐测试通过: {result['status']}")
+
+
+def test_recommendation_gate_missing_event_evidence_fails_closed():
+    gate = RecommendationGate()
+
+    result = gate.evaluate(
+        {'long_term_score': 90, 'strengths': [], 'risks': []},
+        {'short_term_score': 90, 'strengths': [], 'risks': []},
+        {'triggered_events': [], 'risks': []},
+    )
+
+    assert result['status'] == 'DATA_BLOCKED'
+
+
+def test_recommendation_gate_missing_pit_and_chase_evidence_fails_closed():
+    gate = RecommendationGate()
+
+    result = gate.evaluate(
+        {'long_term_score': 90, 'strengths': [], 'risks': []},
+        {'short_term_score': 90, 'strengths': [], 'risks': []},
+        {
+            'event_risk_level': 'LOW',
+            'triggered_events': [],
+            'risks': [],
+        },
+    )
+
+    assert result['status'] == 'DATA_BLOCKED'
+
+
+def test_recommendation_gate_chase_block_overrides_high_scores():
+    gate = RecommendationGate()
+
+    result = gate.evaluate(
+        {'long_term_score': 99, 'strengths': [], 'risks': []},
+        {'short_term_score': 99, 'strengths': [], 'risks': []},
+        {
+            'event_risk_level': 'LOW',
+            'triggered_events': [],
+            'risks': [],
+        },
+        actionability={
+            'pit_status': 'PASS',
+            'chase_risk_status': 'EXECUTION_BLOCKED',
+            'ordinary_buy_eligible': False,
+        },
+    )
+
+    assert result['status'] == 'BLOCK'
 
 
 def test_recommendation_gate_block_critical():
@@ -330,7 +394,16 @@ def test_recommendation_gate_block_low_score():
     short_term = {'short_term_score': 40, 'strengths': [], 'risks': []}
     event_risk = {'event_risk_level': 'LOW', 'event_risk_score': 90, 'triggered_events': [], 'risks': []}
 
-    result = gate.evaluate(long_term, short_term, event_risk)
+    result = gate.evaluate(
+        long_term,
+        short_term,
+        event_risk,
+        actionability={
+            'pit_status': 'PASS',
+            'chase_risk_status': 'ALLOW',
+            'ordinary_buy_eligible': True,
+        },
+    )
 
     assert result['status'] == 'BLOCK'
     print(f"低评分禁止推荐测试通过: {result['status']}")

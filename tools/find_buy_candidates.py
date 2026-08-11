@@ -15,10 +15,11 @@
   python tools/find_buy_candidates.py --skip-ai   # 只跑量化筛选，不调 AI
 
 环境变量：
-  MYSQL_URL      — 数据库连接（默认 mysql+pymysql://root:123456@localhost:3306/probiga）
+  MYSQL_URL      — 数据库连接；未设置时读取项目 .env
   DEEPSEEK_API_KEY — DeepSeek API Key（不设则跳过 AI 评分）
 """
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
 import json
@@ -29,22 +30,20 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
-
+from server.common.batch_db import quote_identifier, read_frame
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def _latest_trade_date(engine, table: str, col: str = "trade_date") -> str:
-    q = text(f"SELECT MAX({col}) FROM {table}")
+    q = text(f"SELECT MAX({quote_identifier(col)}) FROM {quote_identifier(table)}")
     with engine.connect() as conn:
         r = conn.execute(q).scalar()
     return str(r) if r else date.today().isoformat()
@@ -138,21 +137,21 @@ def collect_candidates(engine, trade_date: str, top_per_mode: int = 30) -> pd.Da
 def fetch_stock_summary(engine, code: str) -> dict:
     """从数据库拉取单只股票的多维度数据摘要"""
     # K线
-    klines = pd.read_sql(text("""
+    klines = read_frame(text("""
         SELECT trade_date, close, change_pct, volume, turnover_ratio
         FROM sm_stock_kline WHERE stock_code = :c AND k_type=1
         ORDER BY trade_date DESC LIMIT 20
     """), engine, params={"c": code})
 
     # 资金流
-    flow = pd.read_sql(text("""
+    flow = read_frame(text("""
         SELECT trade_date, main_net_inflow, lg_net_inflow
         FROM sm_stock_capital_flow_daily WHERE stock_code = :c
         ORDER BY trade_date DESC LIMIT 5
     """), engine, params={"c": code})
 
     # 基本信息
-    info = pd.read_sql(text("""
+    info = read_frame(text("""
         SELECT stock_code, short_name FROM si_all_code WHERE stock_code = :c LIMIT 1
     """), engine, params={"c": code})
 

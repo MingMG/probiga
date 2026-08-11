@@ -7,7 +7,6 @@ manual runs from the AI recommendation page.
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import logging
 import os
@@ -293,25 +292,17 @@ def main() -> int:
             except Exception:
                 logging.debug("Failed to update AI recommendation progress", exc_info=True)
 
-        batch_kwargs = {
-            "engine": engine,
-            "trade_date": target_trade_date,
-            "top_n": int(args.top_n),
-            "min_score": float(args.min_score),
-            "strict_prev_trade_day": bool(args.strict_prev_trade_day),
-            "execution_time": batch_execution_time,
-            "min_kline_coverage": float(args.min_kline_coverage),
-            "auto_repair_missing_kline": bool(args.auto_repair_missing_kline),
-            "progress_callback": _progress_callback,
-        }
-        if args.use_intraday_current:
-            if "use_intraday_current" not in inspect.signature(run_batch).parameters:
-                raise RuntimeError(
-                    "--use-intraday-current requires a screening engine that supports intraday inputs"
-                )
-            batch_kwargs["use_intraday_current"] = True
         stats = run_batch(
-            **batch_kwargs,
+            engine=engine,
+            trade_date=target_trade_date,
+            top_n=int(args.top_n),
+            min_score=float(args.min_score),
+            strict_prev_trade_day=bool(args.strict_prev_trade_day),
+            execution_time=batch_execution_time,
+            min_kline_coverage=float(args.min_kline_coverage),
+            auto_repair_missing_kline=bool(args.auto_repair_missing_kline),
+            use_intraday_current=bool(args.use_intraday_current),
+            progress_callback=_progress_callback,
         )
         payload = {
             "trade_date": stats.trade_date,

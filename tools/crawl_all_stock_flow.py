@@ -27,8 +27,8 @@
 """
 
 import argparse
+from contextlib import suppress
 import json
-import os
 import random
 import socket
 import ssl
@@ -39,16 +39,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import write_frame
 
 # ── 核心配置：通过 push2delay IP 访问 push2his ──
 PROXY_IP = "61.129.129.48"       # push2delay 的 IP
@@ -160,15 +157,11 @@ def fetch_one_stock(stock_code: str) -> list[dict] | None:
         return None
     finally:
         if ssock:
-            try:
+            with suppress(Exception):
                 ssock.close()
-            except Exception:
-                pass
         if sock:
-            try:
+            with suppress(Exception):
                 sock.close()
-            except Exception:
-                pass
 
 
 def save_to_db(engine, rows: list[dict]):
@@ -198,7 +191,8 @@ def save_to_db(engine, rows: list[dict]):
     chunk_size = 2000
     for start in range(0, len(df), chunk_size):
         chunk = df.iloc[start : start + chunk_size]
-        chunk.to_sql(
+        write_frame(
+            chunk,
             "sm_stock_capital_flow_daily",
             engine,
             if_exists="append",
@@ -217,7 +211,7 @@ def main():
     parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     stock_codes = get_stock_codes(engine)
 
     if args.resume:

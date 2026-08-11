@@ -11,28 +11,29 @@
 环境变量：MYSQL_URL（默认 root:123456@localhost/probiga）
 """
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
-import os
+import json
+import shutil
+import subprocess
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
-
+from server.common.batch_db import write_frame
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def fetch_flow_east(stock_code: str) -> pd.DataFrame | None:
@@ -45,8 +46,32 @@ def fetch_flow_east(stock_code: str) -> pd.DataFrame | None:
         f"secid={cid}.{stock_code}"
     )
     try:
-        resp = requests.get(url, headers={}, timeout=15)
-        data = resp.json().get("data")
+        data = None
+        urls = [url.replace("push2his.eastmoney.com", "push2delay.eastmoney.com"), url]
+        for candidate in urls:
+            try:
+                resp = requests.get(candidate, headers={}, timeout=15)
+                resp.raise_for_status()
+                data = resp.json().get("data")
+            except Exception:
+                # Eastmoney may reset Python TLS connections while curl still
+                # succeeds on the same machine. Keep the source fallback local.
+                curl_bin = shutil.which("curl") or shutil.which("curl.exe")
+                if not curl_bin:
+                    continue
+                proc = subprocess.run(
+                    [curl_bin, "-sS", "--max-time", "15", "-A", "Mozilla/5.0", candidate],
+                    capture_output=True,
+                    timeout=20,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    try:
+                        data = json.loads(proc.stdout.decode("utf-8", errors="replace")).get("data")
+                    except json.JSONDecodeError:
+                        data = None
+            if data and data.get("klines"):
+                break
         if not data or "klines" not in data:
             return None
         lines = data["klines"]
@@ -74,19 +99,30 @@ def fetch_flow_east(stock_code: str) -> pd.DataFrame | None:
 def main():
     p = argparse.ArgumentParser(description="直接调东财 API 同步资金流数据")
     p.add_argument("--limit", type=int, default=0, help="最多处理几只股票（0=全部）")
+    p.add_argument("--offset", type=int, default=0, help="股票池偏移量，用于并行分片补数")
     p.add_argument("--date", type=str, default="", help="只保留指定日期的数据（YYYY-MM-DD）")
     p.add_argument("--sleep", type=float, default=0.3, help="每只股票间隔秒数")
     p.add_argument("--skip-truncate", action="store_true", help="不清空表，增量写入")
+    p.add_argument("--codes", type=str, default="", help="逗号分隔的股票代码，仅修复指定代码")
     args = p.parse_args()
 
     eng = _engine()
 
     # 获取股票列表
-    with eng.connect() as conn:
-        codes = [row[0] for row in conn.execute(
-            text("SELECT stock_code FROM si_all_code WHERE stock_code REGEXP '^(0|6)' ORDER BY stock_code")
-        ).fetchall()]
+    if args.codes.strip():
+        codes = sorted({
+            code.strip().zfill(6)
+            for code in args.codes.split(",")
+            if code.strip()
+        })
+    else:
+        with eng.connect() as conn:
+            codes = [row[0] for row in conn.execute(
+                text("SELECT stock_code FROM si_all_code WHERE stock_code REGEXP '^(0|3|6)' ORDER BY stock_code")
+            ).fetchall()]
 
+    if args.offset > 0:
+        codes = codes[args.offset:]
     if args.limit > 0:
         codes = codes[:args.limit]
 
@@ -101,6 +137,57 @@ def main():
     total_rows = 0
     success = 0
     fail = 0
+    pending: list[dict] = []
+
+    def flush_pending() -> None:
+        if not pending:
+            return
+        frame = pd.DataFrame(pending)
+        if args.skip_truncate:
+            # Fetch first, then replace only successfully fetched rows in one
+            # transaction. A network failure can no longer delete good data.
+            frame_codes = sorted(frame["stock_code"].astype(str).str.zfill(6).unique().tolist())
+            with eng.begin() as conn:
+                if args.date:
+                    delete_stmt = text("""
+                        DELETE FROM sm_stock_capital_flow_daily
+                        WHERE trade_date = :trade_date AND stock_code IN :codes
+                    """).bindparams(bindparam("codes", expanding=True))
+                    conn.execute(
+                        delete_stmt,
+                        {"trade_date": args.date[:10], "codes": frame_codes},
+                    )
+                else:
+                    delete_stmt = text("""
+                        DELETE FROM sm_stock_capital_flow_daily
+                        WHERE stock_code = :stock_code AND trade_date IN :dates
+                    """).bindparams(bindparam("dates", expanding=True))
+                    for stock_code, group in frame.groupby("stock_code"):
+                        dates = sorted(group["trade_date"].astype(str).str[:10].unique().tolist())
+                        conn.execute(
+                            delete_stmt,
+                            {"stock_code": str(stock_code).zfill(6), "dates": dates},
+                        )
+                write_frame(
+                    frame,
+                    "sm_stock_capital_flow_daily",
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    chunksize=500,
+                    method="multi",
+                )
+        else:
+            write_frame(
+                frame,
+                "sm_stock_capital_flow_daily",
+                eng,
+                if_exists="append",
+                index=False,
+                chunksize=500,
+                method="multi",
+            )
+        pending.clear()
 
     for i, code in enumerate(codes):
         code = str(code).strip().zfill(6)
@@ -112,19 +199,22 @@ def main():
                 df = df[df["trade_date"].astype(str).str[:10] == args.date[:10]]
 
             if not df.empty:
-                df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
+                df["etl_sync_at"] = datetime.now().replace(microsecond=0)
+                pending.extend(df.to_dict(orient="records"))
                 total_rows += len(df)
                 success += 1
         else:
             fail += 1
 
         if (i + 1) % 100 == 0:
+            flush_pending()
             print(f"  进度: {i+1}/{len(codes)} | 成功: {success} | 失败: {fail} | 写入: {total_rows} 行")
 
         time.sleep(args.sleep)
 
     print(f"\n完成！共 {success} 只成功，{fail} 只失败，写入 {total_rows} 行")
     print(f"最新日期: {args.date or '全部'}")
+    flush_pending()
 
 
 if __name__ == "__main__":

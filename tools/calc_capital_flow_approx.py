@@ -15,26 +15,23 @@
 环境变量：MYSQL_URL
 """
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
-import os
 import sys
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.common.batch_db import read_frame, write_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
-
-
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def main():
@@ -51,7 +48,7 @@ def main():
 
     # 获取最近N天的K线数据
     print(f"获取最近 {args.days} 天的K线数据...")
-    df = pd.read_sql(text(f"""
+    df = read_frame(text(f"""
         SELECT stock_code, trade_date, open, close, high, low, volume, amount, change_pct
         FROM sm_stock_kline
         WHERE k_type = 1 AND trade_date >= DATE_SUB(:d, INTERVAL {args.days + 5} DAY)
@@ -106,7 +103,7 @@ def main():
     with eng.begin() as conn:
         conn.execute(text("DELETE FROM sm_stock_capital_flow_daily"))
 
-    result_df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=1000)
+    write_frame(result_df, "sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=1000)
 
     # 验证
     with eng.connect() as conn:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 个股资金流向全量爬取脚本
@@ -46,14 +47,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from server.common.batch_db import write_frame
 
 # ═══════════════════════════════════════════
 # 配置
@@ -75,6 +76,7 @@ MAX_RETRIES = 2
 RETRY_BASE_DELAY = 3.0
 CONSECUTIVE_FAIL_THRESHOLD = 10
 COOLDOWN_WAIT = 180
+HTTP_REQUEST_TIMEOUT_SECONDS = 20
 
 UNIT_MULTIPLIERS = {"亿": 1e8, "万": 1e4}
 
@@ -82,10 +84,6 @@ UNIT_MULTIPLIERS = {"亿": 1e8, "万": 1e4}
 # ═══════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-
 
 def _read_stock_codes(engine) -> list[str]:
     """从 si_all_code 读取所有股票代码"""
@@ -134,15 +132,16 @@ def _create_httpx_client():
     """创建 httpx 客户端，绕过系统代理"""
     import httpx
     proxy = os.environ.get("FLOW_PROXY", "")
-    kwargs = {
-        "verify": False,
-        "follow_redirects": True,
-        "timeout": 20,
-        "http2": False,
-    }
+    kwargs = {}
     if proxy:
         kwargs["proxy"] = proxy
-    return httpx.Client(**kwargs)
+    return httpx.Client(
+        verify=False,
+        follow_redirects=True,
+        timeout=HTTP_REQUEST_TIMEOUT_SECONDS,
+        http2=False,
+        **kwargs,
+    )
 
 
 def _fetch_push2his_httpx(stock_code: str) -> list[dict] | None:
@@ -171,7 +170,7 @@ def _fetch_push2his_httpx(stock_code: str) -> list[dict] | None:
     }
 
     with _create_httpx_client() as client:
-        resp = client.get(url, params=params, headers=headers)
+        resp = client.get(url, params=params, headers=headers, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
         resp.raise_for_status()
         j = resp.json()
 
@@ -214,7 +213,12 @@ def _fetch_push2his_curl(stock_code: str) -> list[dict] | None:
          url],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    stdout, _ = proc.communicate()
+    try:
+        stdout, _ = proc.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None
     if proc.returncode != 0 or not stdout:
         return None
 
@@ -382,7 +386,7 @@ def _fetch_batch_today(page: int = 1, page_size: int = 5000) -> list[dict] | Non
     }
 
     with _create_httpx_client() as client:
-        resp = client.get(url, params=params, headers=headers)
+        resp = client.get(url, params=params, headers=headers, timeout=HTTP_REQUEST_TIMEOUT_SECONDS)
         resp.raise_for_status()
         j = resp.json()
 
@@ -603,7 +607,8 @@ def _save_to_db(engine, rows: list[dict], mode: str = "full", target_date: str =
     total_written = 0
     for start in range(0, len(df), chunk_size):
         chunk = df.iloc[start:start + chunk_size]
-        chunk.to_sql(
+        write_frame(
+            chunk,
             "sm_stock_capital_flow_daily",
             engine,
             if_exists="append",
@@ -642,7 +647,7 @@ def main():
                         help="只显示计划，不实际执行")
     args = parser.parse_args()
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
 
     if args.today_only:
         crawl_today_batch(engine)

@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+LEGACY_DEPLOY_OVERRIDE="I_ACKNOWLEDGE_LEGACY_DEPLOY_BYPASSES_RELEASE_GATES"
+if [ "${PROBIGA_ALLOW_LEGACY_DEPLOY:-}" != "${LEGACY_DEPLOY_OVERRIDE}" ]; then
+    echo "Legacy deploy blocked. Set PROBIGA_ALLOW_LEGACY_DEPLOY=${LEGACY_DEPLOY_OVERRIDE} to override." >&2
+    exit 64
+fi
+
 echo "======================================"
 echo "  ProBigA 一键部署脚本"
 echo "  适用: Ubuntu 22.04 / CentOS 7+"
@@ -88,11 +94,32 @@ fi
 # ---------- 6. 配置 Nginx 反向代理 ----------
 echo "[6/8] 配置 Nginx..."
 cat > /etc/nginx/conf.d/probiga.conf << 'NGINXEOF'
+limit_req_zone $binary_remote_addr zone=probiga_api:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=probiga_admin:10m rate=1r/s;
+
 server {
     listen 80;
     server_name _;
 
     client_max_body_size 10m;
+
+    location ~ ^/(api/deploy|api/scheduler|api/datasource|api/commentary|api/jq/minute|api/notify|deploy) {
+        limit_req zone=probiga_admin burst=20 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/ {
+        limit_req zone=probiga_api burst=60 nodelay;
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -126,6 +153,7 @@ User=root
 WorkingDirectory=/opt/ProBigA
 Environment=PYTHONPATH=/opt/ProBigA:/opt/ProBigA/adata
 EnvironmentFile=/opt/ProBigA/.env
+Environment=API_EMBEDDED_SCHEDULER_ENABLED=true
 ExecStart=/opt/ProBigA/venv/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=10

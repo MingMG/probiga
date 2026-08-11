@@ -135,3 +135,4 @@ def test_frontend_displays_source_and_never_injects_answer_html():
     assert "DeepSeek 网页" in script
     assert "answer.textContent" in script
     assert "answer.innerHTML" not in script
+

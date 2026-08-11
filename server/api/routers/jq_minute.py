@@ -5,12 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-import numpy as np
-import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.scheduler_tasks import (
+    DEFAULT_SCHEDULER_COLUMNS,
+    ensure_scheduler_columns as ensure_shared_scheduler_columns,
+    update_scheduler_tasks,
+    upsert_scheduler_task as shared_upsert_scheduler_task,
+)
+from server.common.sql_reader import read_sql_rows
 from tools.sync_jq_minute_gml import TABLE_NAME, _run_ddl, is_trading_time, sync_jq_minute_gml
 
 router = APIRouter(tags=["jq-minute"])
@@ -19,31 +24,11 @@ TASK_NAME = "盘中聚宽分钟GML同步"
 TASK_TYPE = "jq_minute_gml"
 SCRIPT_PATH = "tools/sync_jq_minute_gml.py"
 
-SCHEDULER_COLUMNS = {
-    "task_type": "VARCHAR(50) DEFAULT 'python'",
-    "group_name": "VARCHAR(32) DEFAULT 'system'",
-    "script_args": "VARCHAR(500) DEFAULT ''",
-    "date_param": "VARCHAR(100) DEFAULT ''",
-    "interval_minutes": "INT DEFAULT 0",
-    "sort_order": "INT DEFAULT 0",
-    "last_triggered_at": "DATETIME DEFAULT NULL",
-    "last_run_output": "TEXT DEFAULT NULL",
-    "last_run_duration": "INT DEFAULT 0",
-    "etl_sync_at": "DATETIME DEFAULT NULL",
-    "updated_at": "DATETIME DEFAULT NULL",
-}
-NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
+SCHEDULER_COLUMNS = DEFAULT_SCHEDULER_COLUMNS
 
 
 def _read_sql(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    df = pd.read_sql(text(sql), get_engine(), params=params)
-    if df.empty:
-        return []
-    df = df.replace({np.nan: None, pd.NaT: None})
-    for column in df.columns:
-        if str(df[column].dtype).startswith("datetime"):
-            df[column] = df[column].astype(str)
-    return df.to_dict(orient="records")
+    return read_sql_rows(get_engine(), sql, params, context="jq_minute")
 
 
 def _table_exists(table_name: str) -> bool:
@@ -79,16 +64,7 @@ def _table_columns(table_name: str) -> set[str]:
 
 
 def _ensure_scheduler_columns() -> set[str]:
-    columns = _table_columns("st_scheduled_tasks")
-    if not columns:
-        raise RuntimeError("st_scheduled_tasks does not exist")
-
-    with get_engine().begin() as conn:
-        for column, ddl in SCHEDULER_COLUMNS.items():
-            if column not in columns:
-                conn.execute(text(f"ALTER TABLE st_scheduled_tasks ADD COLUMN `{column}` {ddl}"))
-                columns.add(column)
-    return columns
+    return ensure_shared_scheduler_columns(get_engine(), column_definitions=SCHEDULER_COLUMNS)
 
 
 def _scheduler_where(columns: set[str]) -> tuple[str, dict[str, Any]]:
@@ -134,43 +110,14 @@ def _build_script_args(
 
 
 def _upsert_scheduler_task(payload: dict[str, Any]) -> dict[str, Any]:
-    columns = _ensure_scheduler_columns()
-    allowed = {
-        "task_name", "task_type", "group_name", "script_path", "script_args",
-        "cron_time", "interval_minutes", "enabled", "description",
-        "sort_order", "date_param",
-    }
-    compatible = {key: value for key, value in payload.items() if key in allowed and key in columns}
-    if not compatible:
-        raise RuntimeError("no compatible scheduler columns found")
-
-    where_sql, params = _scheduler_where(columns)
-    with get_engine().begin() as conn:
-        task_id = conn.execute(
-            text(f"SELECT id FROM st_scheduled_tasks WHERE {where_sql} LIMIT 1"),
-            params,
-        ).scalar()
-        if task_id:
-            assignments = ", ".join(f"`{key}` = :{key}" for key in compatible if key != "task_name")
-            if "updated_at" in columns:
-                assignments += ", `updated_at` = NOW()"
-            conn.execute(
-                text(f"UPDATE st_scheduled_tasks SET {assignments} WHERE id = :id"),
-                {**compatible, "id": task_id},
-            )
-            action = "updated"
-        else:
-            insert_payload = dict(compatible)
-            for column in NOW_COLUMNS:
-                if column in columns:
-                    insert_payload[column] = None
-            names = ", ".join(f"`{key}`" for key in insert_payload)
-            values = ", ".join("NOW()" if key in NOW_COLUMNS else f":{key}" for key in insert_payload)
-            bind_payload = {key: value for key, value in insert_payload.items() if key not in NOW_COLUMNS}
-            conn.execute(text(f"INSERT INTO st_scheduled_tasks ({names}) VALUES ({values})"), bind_payload)
-            task_id = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
-            action = "inserted"
-    return {"id": int(task_id), "action": action}
+    return shared_upsert_scheduler_task(
+        get_engine(),
+        payload,
+        lookup_where="task_name = :task_name OR script_path = :script_path OR task_type = :task_type",
+        lookup_params={"task_name": TASK_NAME, "task_type": TASK_TYPE, "script_path": SCRIPT_PATH},
+        update_exclude={"task_name"},
+        column_definitions=SCHEDULER_COLUMNS,
+    )
 
 
 def _scheduler_row() -> dict[str, Any] | None:
@@ -340,9 +287,10 @@ def disable_jq_minute_automation():
     if not columns:
         return {"success": False, "error": "st_scheduled_tasks does not exist"}
     where_sql, params = _scheduler_where(columns)
-    with get_engine().begin() as conn:
-        result = conn.execute(
-            text(f"UPDATE st_scheduled_tasks SET enabled = 0 WHERE {where_sql}"),
-            params,
-        )
-    return {"success": True, "disabled": int(result.rowcount or 0), "task_name": TASK_NAME}
+    disabled = update_scheduler_tasks(
+        get_engine(),
+        {"enabled": 0},
+        lookup_where=where_sql,
+        lookup_params=params,
+    )
+    return {"success": True, "disabled": disabled, "task_name": TASK_NAME}

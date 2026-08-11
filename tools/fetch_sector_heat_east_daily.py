@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 同步东方财富行业板块热度到 st_hot_concept_ths_daily。
@@ -26,8 +27,6 @@ ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-
-from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 CACHE_FILE = ROOT / "runtime" / "cache" / "east_sector_heat_cache.json"
 

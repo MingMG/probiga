@@ -130,3 +130,4 @@ def reset_auth_schema_cache(engine: Engine | None = None) -> None:
             _initialized_engines.clear()
         else:
             _initialized_engines.pop(engine, None)
+

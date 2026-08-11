@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import csv
-import io
+import json
 import os
 import subprocess
 import threading
@@ -10,10 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from integrations.qmt import bridge
+from server.common.process_env import build_child_env
 
 
 PROVIDER_ID = "gj_qmt"
 CLIENT_PROCESS_NAME = "XtMiniQmt.exe"
+CLIENT_RUNTIME_PROCESS_NAMES = (CLIENT_PROCESS_NAME, "XtItClient.exe")
 
 _cache_lock = threading.Lock()
 _diagnostics_cache: tuple[float, dict[str, Any]] | None = None
@@ -64,7 +65,7 @@ def _client_file_version(path: Path | None) -> str | None:
     if path is None or os.name != "nt":
         return None
     try:
-        env = os.environ.copy()
+        env = build_child_env(bridge.ROOT)
         env["GJ_QMT_VERSION_PATH"] = str(path)
         proc = subprocess.run(
             [
@@ -90,37 +91,43 @@ def _client_file_version(path: Path | None) -> str | None:
 def _windows_process_rows() -> list[dict[str, str]]:
     if os.name != "nt":
         return []
+    process_names = [Path(name).stem for name in CLIENT_RUNTIME_PROCESS_NAMES]
+    names_literal = ",".join(f"'{name}'" for name in process_names)
+    command = (
+        f"$names=@({names_literal});"
+        "@(Get-Process -Name $names -ErrorAction SilentlyContinue | "
+        "Select-Object @{Name='image_name';Expression={$_.ProcessName+'.exe'}},"
+        "@{Name='pid';Expression={[string]$_.Id}},"
+        "@{Name='memory';Expression={[string]$_.WorkingSet64}}) | "
+        "ConvertTo-Json -Compress"
+    )
     try:
         proc = subprocess.run(
-            [
-                "tasklist.exe",
-                "/FI",
-                f"IMAGENAME eq {CLIENT_PROCESS_NAME}",
-                "/FO",
-                "CSV",
-                "/NH",
-            ],
+            ["powershell.exe", "-NoProfile", "-Command", command],
             text=True,
             encoding="utf-8",
             errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
+            env=build_child_env(bridge.ROOT),
         )
-    except (OSError, subprocess.SubprocessError):
+        payload = json.loads((proc.stdout or "").strip() or "[]")
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
         return []
-    rows: list[dict[str, str]] = []
-    for row in csv.reader(io.StringIO(proc.stdout or "")):
-        if not row or row[0].casefold() != CLIENT_PROCESS_NAME.casefold():
-            continue
-        rows.append(
-            {
-                "image_name": row[0],
-                "pid": row[1] if len(row) > 1 else "",
-                "memory": row[4] if len(row) > 4 else "",
-            }
-        )
-    return rows
+    if isinstance(payload, dict):
+        payload = [payload]
+    return [
+        {
+            "image_name": str(row.get("image_name") or ""),
+            "pid": str(row.get("pid") or ""),
+            "memory": str(row.get("memory") or ""),
+        }
+        for row in payload
+        if isinstance(row, dict)
+        and str(row.get("image_name") or "").casefold()
+        in {name.casefold() for name in CLIENT_RUNTIME_PROCESS_NAMES}
+    ]
 
 
 def client_status() -> dict[str, Any]:

@@ -7,8 +7,8 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path as _Path
+from zoneinfo import ZoneInfo
 
-import pandas as pd
 from sqlalchemy import text
 
 _ROOT = _Path(__file__).resolve().parents[2]
@@ -17,10 +17,14 @@ if str(_ROOT) not in sys.path:
 
 from biz.analysis.sync_analysis_fast import run_batch_for_codes
 from biz.analysis.sync_analysis_result import resolve_trade_date
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, read_frame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def get_engine():
+    return create_batch_engine()
 
 
 def get_portfolio_stocks() -> list[str]:
@@ -30,7 +34,7 @@ def get_portfolio_stocks() -> list[str]:
         WHERE shares > 0 OR is_holding = 1
         ORDER BY sort_order
     """
-    df = pd.read_sql(text(sql), get_engine())
+    df = read_frame(text(sql), get_engine())
     if df.empty:
         return []
     return df["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
@@ -41,16 +45,20 @@ def get_recommended_stocks() -> list[str]:
         SELECT DISTINCT stock_code
         FROM st_recommended_stocks
         WHERE pick_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-          AND (recommend_status IS NULL OR recommend_status = 'ALLOW')
+          AND recommend_status = 'ALLOW'
+          AND chase_risk_status = 'ALLOW'
+          AND ordinary_buy_eligible = 1
     """
-    df = pd.read_sql(text(sql), get_engine())
+    df = read_frame(text(sql), get_engine())
     if df.empty:
         return []
     return df["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
 
 
 def main() -> int:
-    start_time = datetime.now()
+    execution_at = datetime.now(ZoneInfo("Asia/Shanghai")).replace(microsecond=0)
+    execution_time = execution_at.isoformat(sep=" ")
+    start_time = execution_at
     portfolio_codes = get_portfolio_stocks()
     recommended_codes = get_recommended_stocks()
     stock_codes = sorted(set(portfolio_codes + recommended_codes))
@@ -72,9 +80,11 @@ def main() -> int:
         trade_date=trade_date,
         top_n=max(80, len(stock_codes)),
         min_score=62.0,
+        use_intraday_current=True,
+        execution_time=execution_time,
     )
 
-    duration = (datetime.now() - start_time).total_seconds()
+    duration = (datetime.now(ZoneInfo("Asia/Shanghai")) - start_time).total_seconds()
     logger.info(
         "Unified incremental refresh completed: date=%s analysis=%s recommendations=%s market_mood=%.1f cost=%.1fs",
         stats.trade_date,

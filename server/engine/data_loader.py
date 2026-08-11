@@ -7,11 +7,9 @@
 """
 
 import sys
+import logging
 from pathlib import Path as _Path
 from datetime import date, datetime
-
-import pandas as pd
-from sqlalchemy import text
 
 # 添加项目根目录到 path
 _ROOT = _Path(__file__).resolve().parents[2]
@@ -19,20 +17,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from server.api.routers._engine import get_engine
+from server.common.kline_data import get_kline_engine, should_use_kline_engine
+from server.common.sql_reader import read_sql_rows
+
+
+logger = logging.getLogger(__name__)
 
 
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
     """执行SQL查询，返回字典列表"""
-    import numpy as np
     try:
-        df = pd.read_sql(text(sql), get_engine(), params=params)
-        if df.empty:
-            return []
-        df = df.replace({np.nan: None, pd.NA: None, pd.NaT: None})
-        for c in df.columns:
-            if df[c].dtype == "datetime64[ns]":
-                df[c] = df[c].astype(str)
-        return df.to_dict(orient="records")
+        engine = get_kline_engine() if should_use_kline_engine(sql) else get_engine()
+        return read_sql_rows(engine, sql, params, context="data_loader")
     except Exception as e:
         # 表不存在或列不存在时返回空列表，避免阻塞分析
         err_msg = str(e)
@@ -489,7 +485,10 @@ class StockDataLoader:
         # ─── 六、消息面 ───
         notices = _read_sql("""
             SELECT notice_date, title, column_name, detail_url
-            FROM si_notice_eastmoney WHERE stock_code = :c AND notice_date <= :td
+            FROM si_notice_eastmoney
+            WHERE stock_code = :c
+              AND association_validated = 1
+              AND notice_date <= :td
             ORDER BY notice_date DESC LIMIT 10
         """, {"c": code, "td": trade_date})
 
@@ -593,8 +592,8 @@ class StockDataLoader:
                     {"date": str(r["trade_date"]), "up_ratio": round(float(r["up_ratio"] or 0), 3), "avg_chg": round(float(r["avg_chg"] or 0), 2)}
                     for r in reversed(recent_mood)
                 ]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("recent market mood lookup failed: %s", exc)
 
         # ─── 最新新闻时间 ───
         last_news_time = None

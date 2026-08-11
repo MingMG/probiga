@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 获取指定快照日期的东财人气榜TOP100，写入 st_hot_pop_rank_east。
@@ -6,6 +7,7 @@
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,8 +21,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine
-
+from server.common.batch_db import replace_table_rows
 
 def _ensure_snapshot_date_column(engine):
     with engine.connect() as conn:
@@ -39,7 +40,7 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
 
     print(f"开始获取东财人气榜TOP100，快照日期: {snapshot_date}")
 
-    engine = create_batch_engine()
+    engine = create_tool_engine(resolve_tool_mysql_url())
     _ensure_snapshot_date_column(engine)
 
     url = "https://emappdata.eastmoney.com/stockrank/getAllCurrentList"
@@ -60,9 +61,11 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
     }
 
     data = None
+    session = requests.Session()
+    session.trust_env = False
     for attempt in range(1, 4):
         try:
-            r = requests.post(url, json=params, headers=headers, timeout=15)
+            r = session.post(url, json=params, headers=headers, timeout=15)
             r.raise_for_status()
             data = r.json().get("data") or []
             if data:
@@ -75,8 +78,7 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
             _time.sleep(wait)
 
     if not data:
-        print("未获取到东财人气榜数据")
-        return
+        raise RuntimeError("no Eastmoney popularity rows fetched")
 
     rows = []
     for item in data:
@@ -108,25 +110,29 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
     df = pd.DataFrame(rows)
     if not df.empty:
         code_list = df["stock_code"].tolist()
-        in_clause = ",".join([f"'{c}'" for c in code_list])
+        code_params = {f"code_{idx}": code for idx, code in enumerate(code_list)}
+        in_clause = ",".join(f":code_{idx}" for idx in range(len(code_list)))
         try:
             with engine.connect() as conn:
-                result = conn.execute(text(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({in_clause})"))
+                result = conn.execute(
+                    text(f"SELECT stock_code, short_name FROM si_all_code WHERE stock_code IN ({in_clause})"),
+                    code_params,
+                )
                 name_map = {row[0]: row[1] for row in result.fetchall()}
             df["short_name"] = df["stock_code"].map(name_map).fillna("")
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WARN] short_name enrichment failed: {exc}", flush=True)
 
         try:
             with engine.connect() as conn:
                 concept_sql = f"""
-                    SELECT c.stock_code, GROUP_CONCAT(DISTINCT cp.concept_name ORDER BY cp.rank SEPARATOR ';') AS concepts
+                    SELECT c.stock_code, GROUP_CONCAT(DISTINCT cp.concept_name ORDER BY cp.`rank` SEPARATOR ';') AS concepts
                     FROM si_concept_constituent_ths c
                     JOIN st_hot_concept_ths_daily cp ON cp.concept_code = c.query_key AND cp.snapshot_date = :d AND cp.plate_type = 1
                     WHERE c.stock_code IN ({in_clause})
                     GROUP BY c.stock_code
                 """
-                result = conn.execute(text(concept_sql), {"d": snapshot_date,})
+                result = conn.execute(text(concept_sql), {"d": snapshot_date, **code_params})
                 concept_map = {row[0]: row[1] for row in result.fetchall()}
             df["concept_tag"] = df["stock_code"].map(concept_map)
             concept_filled = sum(1 for c in code_list if c in concept_map)
@@ -178,16 +184,19 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
     df = df[["snapshot_date", "rank", "stock_code", "short_name", "rank_change", "his_rank", "price", "price_change", "change_pct", "hot_value", "pop_tag", "concept_tag", "etl_sync_at"]]
     df = df.replace({np.nan: None, pd.NaT: None})
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM st_hot_pop_rank_east WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_pop_rank_east", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    if len(df) < int(os.environ.get("HOT_POP_RANK_MIN_ROWS", "50")):
+        raise RuntimeError(f"Eastmoney popularity returned too few rows: {len(df)}")
+    replace_table_rows(
+        df, "st_hot_pop_rank_east", engine,
+        where_sql="snapshot_date = :d", params={"d": snapshot_date}, chunksize=500,
+    )
 
     print(f"写入完成: st_hot_pop_rank_east, 共 {len(df)} 行, 快照日期: {snapshot_date}")
     top10 = ", ".join([f"{r['rank']}.{r['short_name']}" for _, r in df.head(10).iterrows()])
     print(f"  TOP10: {top10}")
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="获取指定日期的东财人气榜TOP100（写入 st_hot_pop_rank_east）")
     parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
     args = parser.parse_args()
@@ -196,10 +205,15 @@ def main():
         datetime.strptime(args.date, "%Y-%m-%d")
     except ValueError:
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {args.date}")
-        return
+        return 1
 
-    fetch_hot_pop_rank_east(args.date)
+    try:
+        fetch_hot_pop_rank_east(args.date)
+    except Exception as exc:
+        print(f"Eastmoney popularity sync failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

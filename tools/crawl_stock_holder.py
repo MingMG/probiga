@@ -12,7 +12,6 @@
 """
 
 import argparse
-import os
 import random
 import re
 import sys
@@ -24,18 +23,15 @@ import numpy as np
 import pandas as pd
 import requests
 import urllib3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import write_frame
 
 DELAY = 0.8
 JITTER = 0.4
@@ -168,10 +164,14 @@ def save_to_db(engine, rows: list[dict]):
                 {"c": c},
             )
 
-    df.to_sql(
-        "si_stock_holder", engine,
-        if_exists="append", index=False,
-        chunksize=500, method="multi",
+    write_frame(
+        df,
+        "si_stock_holder",
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=500,
+        method="multi",
     )
 
 
@@ -182,7 +182,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     stock_codes = get_stock_codes(engine)
 
     if args.resume:

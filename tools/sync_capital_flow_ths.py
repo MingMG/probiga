@@ -25,7 +25,11 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 from sqlalchemy import text
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, write_frame
+
+
+def get_engine():
+    return create_batch_engine()
 
 
 def _parse_amount(val):
@@ -144,8 +148,15 @@ def main():
     # 写入新数据
     df['data_source'] = 'ths'
     df['etl_sync_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    df.to_sql('sm_stock_capital_flow_daily', engine, if_exists='append', index=False,
-              chunksize=500, method='multi')
+    write_frame(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=500,
+        method="multi",
+    )
 
     print(f"写入完成: {len(df)} 条")
 

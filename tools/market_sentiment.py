@@ -19,6 +19,7 @@
 """
 
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
 import json
@@ -29,14 +30,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.common.batch_db import read_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 INDEX_MAP = {
     "000016": "上证50",
@@ -49,9 +49,12 @@ INDEX_MAP = {
 }
 
 
+def _warn(message: str, exc: Exception) -> None:
+    print(f"[WARN] {message}: {exc}", file=sys.stderr)
+
+
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def _to_date_str(val: any) -> str:
@@ -78,7 +81,7 @@ def _get_trade_dates(engine, end_date: str, lookback_days: int) -> list[str]:
         ORDER BY trade_date DESC
         LIMIT :n
     """)
-    df = pd.read_sql(q, engine, params={"end": end_date, "n": lookback_days + 5})
+    df = read_frame(q, engine, params={"end": end_date, "n": lookback_days + 5})
     if df.empty:
         return []
     dates = sorted({_to_date_str(v) for v in df["trade_date"].values if v is not None})
@@ -105,13 +108,13 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
 
     # 1.1 获取每日概念热度榜
     q = text("""
-        SELECT snapshot_date, plate_type, rank, concept_code, concept_name,
+        SELECT snapshot_date, plate_type, `rank`, concept_code, concept_name,
                change_pct, hot_value, hot_tag
         FROM st_hot_concept_ths_daily
         WHERE snapshot_date >= :d1 AND snapshot_date <= :d2
-        ORDER BY snapshot_date, plate_type, rank
+        ORDER BY snapshot_date, plate_type, `rank`
     """)
-    df = pd.read_sql(q, engine, params={"d1": d1, "d2": d2})
+    df = read_frame(q, engine, params={"d1": d1, "d2": d2})
     if df.empty:
         return {"status": "no_data", "message": "概念热度数据为空"}
 
@@ -369,7 +372,7 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
           AND amount > 0
         ORDER BY trade_date, amount
     """)
-    raw_df = pd.read_sql(raw_q, engine, params={"d1": d1, "d2": d2})
+    raw_df = read_frame(raw_q, engine, params={"d1": d1, "d2": d2})
 
     daily_style = {}
     market_df_rows = []
@@ -474,8 +477,9 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
             WHERE index_code IN :codes AND trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
             ORDER BY index_code, trade_date
         """)
-        idx_df = pd.read_sql(idx_q, engine, params={"codes": tuple(all_idx), "d1": d1, "d2": d2})
-    except Exception:
+        idx_df = read_frame(idx_q, engine, params={"codes": tuple(all_idx), "d1": d1, "d2": d2})
+    except Exception as exc:
+        _warn("failed to read index kline", exc)
         idx_df = pd.DataFrame()
 
     if idx_df.empty:
@@ -485,8 +489,9 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 FROM sm_index_current
                 WHERE index_code IN :codes
             """)
-            idx_df = pd.read_sql(current_q, engine, params={"codes": tuple(all_idx)})
-        except Exception:
+            idx_df = read_frame(current_q, engine, params={"codes": tuple(all_idx)})
+        except Exception as exc:
+            _warn("failed to read current index snapshot", exc)
             idx_df = pd.DataFrame()
 
     if idx_df.empty:
@@ -609,7 +614,7 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
         GROUP BY trade_date
         ORDER BY trade_date
     """)
-    flow_df = pd.read_sql(flow_q, engine, params={"d1": d1, "d2": d2})
+    flow_df = read_frame(flow_q, engine, params={"d1": d1, "d2": d2})
 
     if flow_df.empty:
         return {"status": "no_data", "message": "资金流向数据为空"}
@@ -647,12 +652,12 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
     north_text = ""
     try:
         north_q = text("""
-            SELECT trade_date, net_flow
+            SELECT trade_date, net_tgt AS net_flow
             FROM st_north_flow_daily
             WHERE trade_date >= :d1 AND trade_date <= :d2
             ORDER BY trade_date
         """)
-        north_df = pd.read_sql(north_q, engine, params={"d1": d1, "d2": d2})
+        north_df = read_frame(north_q, engine, params={"d1": d1, "d2": d2})
         north_total = float(north_df["net_flow"].sum()) if not north_df.empty and not north_df["net_flow"].isna().all() else 0
         if north_total > 1e9:
             north_text = "北向资金大幅净流入"
@@ -664,8 +669,8 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
             north_text = "北向资金小幅净流出"
         else:
             north_text = "北向资金持平"
-    except Exception:
-        pass
+    except Exception as exc:
+        _warn("failed to read northbound flow", exc)
 
     return {
         "status": "ok",

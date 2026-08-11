@@ -52,7 +52,11 @@ class StockAnalysisEngineDateTest(unittest.TestCase):
 
         mock_load.assert_called_once_with("000001", "2026-06-10", use_realtime=False)
         mock_evaluate.assert_called_once_with(
-            long_term, short_term, event_risk, analysis_date="2026-06-10"
+            long_term,
+            short_term,
+            event_risk,
+            analysis_date="2026-06-10",
+            actionability=None,
         )
         self.assertEqual(result.analysis_date, "2026-06-10")
 

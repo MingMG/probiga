@@ -66,6 +66,7 @@ def test_screener_status_blocks_stale_base_data(monkeypatch):
     assert result["gate"] == "DATA_STALE"
     assert result["actionable_output_allowed"] is False
 
+
 def test_screener_status_activates_bounded_v456_but_keeps_order_gate_blocked(monkeypatch):
     monkeypatch.setattr(
         screener,
@@ -96,13 +97,13 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     script = (root / "server/static/js/app.js").read_text(encoding="utf-8")
     index = (root / "server/static/index.html").read_text(encoding="utf-8")
 
-    assert "fetch('/api/screener/status')" in script
+    assert "screenerJson('/api/screener/status')" in script
     assert "V3-V6 生产融合选股" in script
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
-    assert "window.exportUnifiedScreener" in script
-    assert "style.css?v=20" in index
-    assert "app.js?v=40" in index
+    assert "row.action || 'WATCH'" in script
+    assert "style.css?v=36" in index
+    assert "app.js?v=85" in index
 
 
 def test_apply_filters_normalizes_rows_and_excludes_st():

@@ -250,6 +250,7 @@ class TradingV2ReadRepository:
             """,
             {"capability_code": capability_code},
         )
+
     def fee_profile_confirmation(
         self,
         fee_profile_version: str,
@@ -278,6 +279,7 @@ class TradingV2ReadRepository:
             """,
             {"fee_profile_version": fee_profile_version},
         )
+
     def latest_snapshot(self) -> dict[str, Any] | None:
         return self._one(
             """
@@ -1008,3 +1010,4 @@ class TradingV2ReadRepository:
             ORDER BY worker_name
             """
         )
+

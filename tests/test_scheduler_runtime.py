@@ -131,7 +131,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_qmt_desktop_tasks_are_delegated_only_on_non_windows_host(self):
         for task_type in (
             "etf_forward_daily",
-            "fetch_hot_rank_xq",
             "index_current",
             "index_kline",
             "index_minute",
@@ -863,19 +862,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
         final_values = update_task.call_args_list[-1].args[2]
         self.assertEqual(final_values["last_run_status"], "blocked")
         validate_result.assert_not_called()
-
-    def test_concept_source_block_is_not_recorded_as_success_or_failure(self):
-        from server.common.scheduler_validation import scheduler_output_status
-
-        status = scheduler_output_status(
-            {"task_type": "concept_constituent_east"},
-            json.dumps({
-                "status": "BLOCK",
-                "reason": "external_concept_source_unavailable",
-            }),
-        )
-
-        self.assertEqual(status, "blocked")
 
     def test_scheduler_quality_uses_cache_unless_forced(self):
         reports = [

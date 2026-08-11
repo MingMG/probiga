@@ -14,27 +14,25 @@ efinance 走的是东财 push2his 接口但有自己的连接池和重试机制�
 环境变量：MYSQL_URL
 """
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
-import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
-
+from server.common.batch_db import write_frame
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def fetch_flow_efinance(stock_code: str) -> pd.DataFrame | None:
@@ -102,7 +100,7 @@ def main():
 
             if not df.empty:
                 df["etl_sync_at"] = now_str
-                df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
+                write_frame(df, "sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
                 total_rows += len(df)
                 success += 1
         else:

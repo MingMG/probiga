@@ -16,6 +16,8 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from server.common.process_env import build_child_env
+
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PYTHON = ROOT / "runtime" / "emquant-py36" / "python.exe"
 WORKER = Path(__file__).with_name("worker.py")
@@ -99,7 +101,7 @@ def _run(payload: dict[str, Any], *, timeout: int | None = None) -> dict[str, An
     if not WORKER.exists():
         raise MyQuantBridgeError(f"MyQuant worker not found: {WORKER}")
 
-    env = os.environ.copy()
+    env = build_child_env(ROOT)
     env["GM_TOKEN"] = token
 
     proc = subprocess.run(

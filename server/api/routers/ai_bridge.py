@@ -135,6 +135,8 @@ def worker_progress(
     if not updated:
         raise HTTPException(status_code=409, detail="Job lease is no longer owned by this worker")
     return {"status": "ok"}
+
+
 @router.post("/worker/{request_id}/complete")
 def worker_complete(
     request_id: str,
@@ -158,3 +160,4 @@ def worker_complete(
     if not updated:
         raise HTTPException(status_code=409, detail="Job lease is no longer owned by this worker")
     return {"status": "ok"}
+

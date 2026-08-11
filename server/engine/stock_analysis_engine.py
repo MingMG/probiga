@@ -70,7 +70,11 @@ class StockAnalysisEngine:
         # 5. 推荐资格判断
         analysis_date = data.get('trade_date')
         recommend_result = self.gate.evaluate(
-            long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
+            long_term_result,
+            short_term_result,
+            event_risk_result,
+            analysis_date=analysis_date,
+            actionability=data.get('actionability'),
         )
 
         # 6. 生成文本结论
@@ -179,7 +183,11 @@ class StockAnalysisEngine:
         # 推荐资格判断
         analysis_date = data.get('trade_date')
         recommend_result = self.gate.evaluate(
-            long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
+            long_term_result,
+            short_term_result,
+            event_risk_result,
+            analysis_date=analysis_date,
+            actionability=data.get('actionability'),
         )
 
         # 生成文本结论

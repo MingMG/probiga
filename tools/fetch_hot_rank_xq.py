@@ -187,12 +187,8 @@ def fetch_hot_rank_xq(snapshot_date: str):
     if len(df) < int(os.environ.get("HOT_RANK_XQ_MIN_ROWS", "50")):
         raise RuntimeError(f"Xueqiu hot rank returned too few rows: {len(df)}")
     replace_table_rows(
-        df,
-        "st_hot_rank_xq",
-        engine,
-        where_sql="snapshot_date = :d",
-        params={"d": snapshot_date},
-        chunksize=500,
+        df, "st_hot_rank_xq", engine,
+        where_sql="snapshot_date = :d", params={"d": snapshot_date}, chunksize=500,
     )
 
     print(f"写入完成: st_hot_rank_xq, 共 {len(df)} 行, 快照日期: {snapshot_date}")

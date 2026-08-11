@@ -31,15 +31,21 @@ class ScoreDetail(BaseModel):
 class EventRisk(BaseModel):
     """事件风险评估"""
 
-    score: float = Field(100, description="风险评分(0-100, 越低越危险)")
-    level: str = Field("LOW", description="风险等级: LOW/MEDIUM/HIGH/CRITICAL")
+    score: float = Field(0, description="风险评分(0-100, 越低越危险)")
+    level: str = Field(
+        "DATA_BLOCKED",
+        description="风险等级: LOW/MEDIUM/HIGH/CRITICAL/DATA_BLOCKED",
+    )
     events: List[dict] = Field(default_factory=list, description="触发事件列表")
 
 
 class RecommendResult(BaseModel):
     """推荐结果"""
 
-    status: str = Field("ALLOW", description="推荐状态: ALLOW/SUSPENDED/BLOCK")
+    status: str = Field(
+        "DATA_BLOCKED",
+        description="推荐状态: ALLOW/SUSPENDED/BLOCK/DATA_BLOCKED",
+    )
     reason: str = Field("", description="状态原因")
 
 
@@ -84,9 +90,9 @@ class StockAnalysisResult(BaseModel):
             "last_news_time": self.last_news_time,
             "long_term_score": self.long_term_score,
             "short_term_score": self.short_term_score,
-            "scores": self.scores.dict(),
-            "event_risk": self.event_risk.dict(),
-            "recommend": self.recommend.dict(),
+            "scores": self.scores.model_dump(),
+            "event_risk": self.event_risk.model_dump(),
+            "recommend": self.recommend.model_dump(),
             "summary": self.summary,
             "recommendation": self.recommendation,
             "strengths": self.strengths,

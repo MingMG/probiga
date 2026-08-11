@@ -89,7 +89,7 @@ if ($AkshareSleep) {
 }
 
 if ($MysqlUrl) {
-    $env:MYSQL_URL = $MysqlUrl
+    Set-Item Env:MYSQL_URL $MysqlUrl
 }
 
 $adjArg = @()

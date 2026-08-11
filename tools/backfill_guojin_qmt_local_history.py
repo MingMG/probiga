@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -24,11 +24,19 @@ from integrations.qmt.local_history import (
     load_trade_dates,
     result_dict,
 )
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
+
+GAP_ORDER_SQL = (
+    "CASE dataset WHEN 'sm_stock_minute.1m' THEN 0 WHEN 'sm_stock_kline.1d' THEN 1 ELSE 2 END, "
+    "gap_start DESC, "
+    "CASE status WHEN 'PENDING' THEN 0 ELSE 1 END, "
+    "COALESCE(next_retry_at, created_at), "
+    "id"
+)
 
 
 def _source_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    return create_batch_engine(future=True)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -61,8 +69,8 @@ def _release_lock(lock_path: Path) -> None:
         pid = int(raw.split()[0])
         if pid == os.getpid():
             lock_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[WARN] failed to release lock {lock_path}: {exc}", file=sys.stderr)
 
 
 def _codes_from_arg(source_engine, raw_codes: str, *, limit: int) -> list[str]:
@@ -105,10 +113,7 @@ def _gap_rows(source_engine, *, limit: int, dataset: str = "") -> list[dict[str,
                   AND status IN ('PENDING', 'RETRYING')
                   AND (next_retry_at IS NULL OR next_retry_at <= NOW() OR status = 'PENDING')
                   {where_dataset}
-                ORDER BY
-                  CASE status WHEN 'PENDING' THEN 0 ELSE 1 END,
-                  COALESCE(next_retry_at, created_at),
-                  id
+                ORDER BY {GAP_ORDER_SQL}
                 LIMIT :limit
                 """
             ),
@@ -187,7 +192,8 @@ def main() -> int:
     parser.add_argument("--end-date", default="", help="YYYY-MM-DD or YYYYMMDD.")
     parser.add_argument("--trade-date", default="", help="One trading date for minute mode.")
     parser.add_argument("--batch-size", type=int, default=80)
-    parser.add_argument("--dividend-type", default="front", choices=["none", "front", "back", "qfq", "hfq"])
+    parser.add_argument("--dividend-type", default="none", choices=["none", "front", "back", "qfq", "hfq"])
+    parser.add_argument("--backend", default="bigqmt", choices=["bigqmt", "legacy", "auto"])
     parser.add_argument("--gap-dataset", default="", choices=["", "sm_stock_kline.1d", "sm_stock_minute.1m"])
     parser.add_argument("--apply", action="store_true", help="Actually write rows and update sys_data_gap. Default is dry-run.")
     parser.add_argument("--json", action="store_true")
@@ -226,6 +232,7 @@ def main() -> int:
             end_date=args.end_date,
             batch_size=max(1, args.batch_size),
             dividend_type=args.dividend_type,
+            backend=args.backend,
             dry_run=dry_run,
         )
         payload = result_dict(result)
@@ -248,6 +255,7 @@ def main() -> int:
             stock_codes=codes,
             trade_dates=trade_dates,
             batch_size=max(1, args.batch_size),
+            backend=args.backend,
             dry_run=dry_run,
         )
         payload = result_dict(result)
@@ -289,6 +297,7 @@ def main() -> int:
                         end_date=end_date,
                         batch_size=max(1, args.batch_size),
                         dividend_type=args.dividend_type,
+                        backend=args.backend,
                         dry_run=dry_run,
                     )
                 elif dataset == "sm_stock_minute.1m":
@@ -298,6 +307,7 @@ def main() -> int:
                         stock_codes=codes,
                         trade_dates=[start_date],
                         batch_size=max(1, min(args.batch_size, 80)),
+                        backend=args.backend,
                         dry_run=dry_run,
                     )
                 else:

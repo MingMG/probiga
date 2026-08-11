@@ -49,7 +49,16 @@ def aggregate_concept_current(members: pd.DataFrame, stock_current: pd.DataFrame
     if merged.empty:
         return pd.DataFrame(columns=["index_code", "trade_time", "trade_date", "open", "price", "high", "low", "volume", "amount", "change", "change_pct", "snapshot_at"])
 
-    pre_close = _safe_numeric(merged.get("pre_close"))
+    if "pre_close" in merged.columns:
+        pre_close = _safe_numeric(merged["pre_close"])
+    else:
+        pre_close = pd.Series(np.nan, index=merged.index, dtype="float64")
+    price = _safe_numeric(merged["price"])
+    if "change" in merged.columns:
+        pre_close = pre_close.fillna(price - _safe_numeric(merged["change"]))
+    if "change_pct" in merged.columns:
+        denominator = (1 + _safe_numeric(merged["change_pct"]) / 100).replace({0: np.nan})
+        pre_close = pre_close.fillna(price / denominator)
     merged["open_pct"] = (_safe_numeric(merged.get("open")) / pre_close.replace({0: np.nan}) - 1) * 100
     merged["high_pct"] = (_safe_numeric(merged.get("high")) / pre_close.replace({0: np.nan}) - 1) * 100
     merged["low_pct"] = (_safe_numeric(merged.get("low")) / pre_close.replace({0: np.nan}) - 1) * 100

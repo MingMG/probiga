@@ -15,6 +15,8 @@ from typing import Literal
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from server.common.process_env import build_child_env
+
 router = APIRouter(tags=["deploy"])
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -22,6 +24,8 @@ RUN_DIR = ROOT / "runtime" / "deploy"
 HISTORY_FILE = RUN_DIR / "history.json"
 MAX_LOG_CHARS = 60000
 MAX_HISTORY = 20
+DEFAULT_GIT_TIMEOUT_SECONDS = 60
+DEFAULT_DEPLOY_COMMAND_TIMEOUT_SECONDS = 30 * 60
 
 _runs: dict[str, dict] = {}
 _lock = threading.Lock()
@@ -37,6 +41,30 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _in_app_deploy_enabled() -> bool:
+    """Production defaults to no deployment mutation from the web process."""
+
+    return os.environ.get("PROBIGA_IN_APP_DEPLOY_ENABLED", "").strip() == "1"
+
+
+def _require_in_app_deploy_enabled() -> None:
+    if not _in_app_deploy_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "In-app deployment is disabled. Use the reviewed CI release "
+                "workflow for a pinned commit."
+            ),
+        )
+
+
+def _int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default)) or default))
+    except ValueError:
+        return default
+
+
 def _run_git(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
     result = subprocess.run(
         ["git", *args],
@@ -45,6 +73,7 @@ def _run_git(args: list[str], *, check: bool = False) -> subprocess.CompletedPro
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=_int_env("PROBIGA_DEPLOY_GIT_TIMEOUT_SECONDS", DEFAULT_GIT_TIMEOUT_SECONDS),
     )
     if check and result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "git command failed").strip())
@@ -110,7 +139,7 @@ def _git_status_payload() -> dict:
 
 def _run_process(run: dict, cmd: list[str], *, env: dict[str, str] | None = None) -> None:
     _append_log(run, f"$ {' '.join(cmd)}\n")
-    child_env = os.environ.copy()
+    child_env = build_child_env(ROOT)
     if env:
         child_env.update(env)
 
@@ -124,10 +153,17 @@ def _run_process(run: dict, cmd: list[str], *, env: dict[str, str] | None = None
         encoding="utf-8",
         errors="replace",
     )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        _append_log(run, line)
-    code = proc.wait()
+    timeout = _int_env("PROBIGA_DEPLOY_COMMAND_TIMEOUT_SECONDS", DEFAULT_DEPLOY_COMMAND_TIMEOUT_SECONDS)
+    try:
+        stdout, _stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        stdout, _stderr = proc.communicate()
+        partial = exc.output or ""
+        _append_log(run, str(partial) + (stdout or ""))
+        raise RuntimeError(f"Command timed out after {timeout}s: {' '.join(cmd)}") from exc
+    _append_log(run, stdout or "")
+    code = proc.returncode
     if code != 0:
         raise RuntimeError(f"Command exited with code {code}: {' '.join(cmd)}")
 
@@ -138,6 +174,10 @@ def _deploy_worker(run_id: str, request: DeployRunRequest) -> None:
         run["status"] = "running"
 
     try:
+        if request.action != "push":
+            raise RuntimeError(
+                "In-app commit and direct-host deployment actions are forbidden."
+            )
         status = _git_status_payload()
         with _lock:
             run["branch"] = status["branch"]
@@ -148,36 +188,15 @@ def _deploy_worker(run_id: str, request: DeployRunRequest) -> None:
 
         if status["branch"] != "main":
             raise RuntimeError("Only the main branch can be deployed from this console.")
-
-        if request.action == "commit_push":
-            message = request.commit_message.strip()
-            if not message:
-                raise RuntimeError("Commit message is required for commit and deploy.")
-            if request.add_all:
-                _run_process(run, ["git", "add", "-A"])
-            staged = _run_git(["diff", "--cached", "--name-only"], check=True).stdout.strip()
-            if not staged:
-                raise RuntimeError("No staged changes to commit.")
-            _run_process(run, ["git", "commit", "-m", message])
-            status = _git_status_payload()
-            with _lock:
-                run["commit"] = status["commit"]
-
-        if request.action in {"push", "commit_push"}:
-            _run_process(run, ["git", "push", "origin", "HEAD:main"])
-            _append_log(run, "\nGitHub Actions will run .github/workflows/deploy.yml after this push.\n")
-
-        if request.action == "local":
-            if status["dirty"]:
-                raise RuntimeError("Working tree has uncommitted changes. Commit first or use commit and deploy.")
-            deploy_script = ROOT / "deploy" / "deploy.ps1"
-            if not deploy_script.exists():
-                raise RuntimeError(f"Deploy script not found: {deploy_script}")
-            _run_process(
-                run,
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(deploy_script)],
-                env={"PROBIGA_NONINTERACTIVE": "1"},
+        if status["dirty"]:
+            raise RuntimeError(
+                "Refusing to push from a dirty working tree; CI must receive a reviewed commit."
             )
+        _run_process(run, ["git", "push", "origin", "HEAD:main"])
+        _append_log(
+            run,
+            "\nGitHub Actions will validate and deploy the pushed commit.\n",
+        )
 
         with _lock:
             run["status"] = "success"
@@ -197,20 +216,25 @@ def _deploy_worker(run_id: str, request: DeployRunRequest) -> None:
 
 @router.get("/deploy/status")
 def deploy_status():
+    _require_in_app_deploy_enabled()
     return {
         "repo": _git_status_payload(),
         "runs": list(_runs.values())[-5:][::-1],
         "history": _read_history(),
         "actions": {
-            "push": "Push current main branch and trigger GitHub Actions deployment.",
-            "commit_push": "Commit selected changes, push main, then trigger GitHub Actions deployment.",
-            "local": "Run deploy/deploy.ps1 locally.",
+            "push": "Push the current clean main commit and trigger the CI deployment.",
         },
     }
 
 
 @router.post("/deploy/run")
 def deploy_run(request: DeployRunRequest):
+    _require_in_app_deploy_enabled()
+    if request.action != "push":
+        raise HTTPException(
+            status_code=403,
+            detail="In-app commit and direct-host deployment actions are forbidden.",
+        )
     running = [r for r in _runs.values() if r.get("status") == "running"]
     if running:
         raise HTTPException(status_code=409, detail=f"Deploy task already running: {running[-1]['id']}")
@@ -235,8 +259,8 @@ def deploy_run(request: DeployRunRequest):
 
 @router.get("/deploy/runs/{run_id}")
 def deploy_run_detail(run_id: str):
+    _require_in_app_deploy_enabled()
     run = _runs.get(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Deploy run not found")
     return run
-

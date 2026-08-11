@@ -28,10 +28,11 @@
   python tools/screen_stocks.py --date 2024-07-12 --mode trend --top 20 --with-context --fetch-notices 3
 
 环境变量：MYSQL_URL（默认与 sync_sentiment 一致）。
-K 线筛选默认 k_type=1、adjust_type=1，与 adata 日 K 常见配置一致；若你同步时改过 SM_STOCK_K_* 请传 --k-type / --adjust-type。
+K 线筛选默认 k_type=1、adjust_type=0，与当前主库日 K 配置一致；若你同步时改过 SM_STOCK_K_* 请传 --k-type / --adjust-type。
 创业板 20cm 连板请把 --limit-pct 调到约 19.5；ST 股约 4.8~5。本工具仅为规则筛选，不构成投资建议。
 """
 from __future__ import annotations
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 import argparse
 import os
@@ -41,13 +42,12 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.common.batch_db import read_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
 
 MODES = {
     "lhb": "龙虎榜日表 st_a_list_daily：指定交易日上榜股",
@@ -65,8 +65,7 @@ MODES = {
 
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine(resolve_tool_mysql_url())
 
 
 def run_lhb(engine, trade_date: str, top: int) -> pd.DataFrame:
@@ -81,7 +80,7 @@ def run_lhb(engine, trade_date: str, top: int) -> pd.DataFrame:
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"d": trade_date, "lim": top})
+    return read_frame(q, engine, params={"d": trade_date, "lim": top})
 
 
 def run_flow(engine, trade_date: str, top: int, min_main: float) -> pd.DataFrame:
@@ -95,7 +94,7 @@ def run_flow(engine, trade_date: str, top: int, min_main: float) -> pd.DataFrame
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"d": trade_date, "m": min_main, "lim": top})
+    return read_frame(q, engine, params={"d": trade_date, "m": min_main, "lim": top})
 
 
 def run_k_day(
@@ -122,7 +121,7 @@ def run_k_day(
         LIMIT :lim
         """
     )
-    return pd.read_sql(
+    return read_frame(
         q,
         engine,
         params={
@@ -147,45 +146,45 @@ def run_concept(engine, concept_code: str, top: int) -> pd.DataFrame:
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"cc": concept_code, "lim": top})
+    return read_frame(q, engine, params={"cc": concept_code, "lim": top})
 
 
 def run_hot_ths_daily(engine, snapshot_date: str, top: int) -> pd.DataFrame:
     q = text(
         """
-        SELECT snapshot_date, plate_type, rank, concept_code, concept_name, change_pct, hot_value, hot_tag
+        SELECT snapshot_date, plate_type, `rank`, concept_code, concept_name, change_pct, hot_value, hot_tag
         FROM st_hot_concept_ths_daily
         WHERE snapshot_date = :d AND plate_type = 1
-        ORDER BY rank
+        ORDER BY `rank`
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"d": snapshot_date, "lim": top})
+    return read_frame(q, engine, params={"d": snapshot_date, "lim": top})
 
 
 def run_hot_ths_rt(engine, top: int) -> pd.DataFrame:
     q = text(
         """
-        SELECT plate_type, rank, concept_code, concept_name, change_pct, hot_value, hot_tag, etl_sync_at
+        SELECT plate_type, `rank`, concept_code, concept_name, change_pct, hot_value, hot_tag, etl_sync_at
         FROM st_hot_concept_ths_rt
         WHERE plate_type = 1
-        ORDER BY rank
+        ORDER BY `rank`
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"lim": top})
+    return read_frame(q, engine, params={"lim": top})
 
 
 def run_hot_rank_ths(engine, top: int) -> pd.DataFrame:
     q = text(
         """
-        SELECT rank, stock_code, short_name, change_pct, hot_value, pop_tag, concept_tag
+        SELECT `rank`, stock_code, short_name, change_pct, hot_value, pop_tag, concept_tag
         FROM st_hot_rank_ths
-        ORDER BY rank
+        ORDER BY `rank`
         LIMIT :lim
         """
     )
-    return pd.read_sql(q, engine, params={"lim": top})
+    return read_frame(q, engine, params={"lim": top})
 
 
 def run_low_start(
@@ -239,7 +238,7 @@ def run_low_start(
         LIMIT :lim
         """
     )
-    return pd.read_sql(
+    return read_frame(
         q,
         engine,
         params={
@@ -307,7 +306,7 @@ def run_trend(
         LIMIT :lim
         """
     )
-    return pd.read_sql(
+    return read_frame(
         q,
         engine,
         params={"d": trade_date, "kt": k_type, "at": adjust_type, "cmin": min_chg, "lim": top},
@@ -391,7 +390,7 @@ def run_trend_strong(
         LIMIT 800
         """
     )
-    df = pd.read_sql(q, engine, params={"d": trade_date, "kt": k_type, "at": adjust_type})
+    df = read_frame(q, engine, params={"d": trade_date, "kt": k_type, "at": adjust_type})
     if df.empty:
         return df
 
@@ -407,7 +406,7 @@ def run_trend_strong(
           AND trade_date <= :d AND trade_date > DATE_SUB(:d, INTERVAL 80 DAY)
         ORDER BY stock_code, trade_date DESC
     """)
-    hist = pd.read_sql(hist_sql, engine, params={"d": trade_date, "kt": k_type, "at": adjust_type})
+    hist = read_frame(hist_sql, engine, params={"d": trade_date, "kt": k_type, "at": adjust_type})
     if hist.empty:
         return df
 
@@ -540,7 +539,7 @@ def run_ladder(
         LIMIT :lim
         """
     )
-    return pd.read_sql(
+    return read_frame(
         q,
         engine,
         params={
@@ -573,7 +572,7 @@ def _read_flow_for_codes(engine, trade_date: str, codes: list[str]) -> pd.DataFr
         f"max_net_inflow AS ctx_max_net_inflow FROM sm_stock_capital_flow_daily "
         f"WHERE trade_date = :d AND stock_code IN ({ph})"
     )
-    return pd.read_sql(q, engine, params=p)
+    return read_frame(q, engine, params=p)
 
 
 def _read_lhb_for_codes(engine, trade_date: str, codes: list[str]) -> pd.DataFrame:
@@ -585,7 +584,7 @@ def _read_lhb_for_codes(engine, trade_date: str, codes: list[str]) -> pd.DataFra
         f"SELECT stock_code, reason AS ctx_lhb_reason, a_net_amount AS ctx_lhb_net_amount "
         f"FROM st_a_list_daily WHERE trade_date = :d AND stock_code IN ({ph})"
     )
-    return pd.read_sql(q, engine, params=p)
+    return read_frame(q, engine, params=p)
 
 
 def _read_mine_for_codes(engine, codes: list[str]) -> pd.DataFrame:
@@ -596,7 +595,7 @@ def _read_mine_for_codes(engine, codes: list[str]) -> pd.DataFrame:
         f"SELECT stock_code, MAX(score) AS ctx_mine_max_score "
         f"FROM st_mine_clearance_tdx WHERE stock_code IN ({ph}) GROUP BY stock_code"
     )
-    return pd.read_sql(q, engine, params=p)
+    return read_frame(q, engine, params=p)
 
 
 def _read_notice_summary_for_codes(engine, context_date: str, codes: list[str]) -> pd.DataFrame:
@@ -611,7 +610,7 @@ def _read_notice_summary_for_codes(engine, context_date: str, codes: list[str]) 
         f"AND notice_date >= DATE_SUB(:d, INTERVAL 30 DAY) AND notice_date <= :d GROUP BY stock_code"
     )
     try:
-        return pd.read_sql(q, engine, params=p)
+        return read_frame(q, engine, params=p)
     except Exception:
         return pd.DataFrame()
 
@@ -698,7 +697,7 @@ def main() -> int:
     p.add_argument("--max-change", type=float, default=1e9, help="[k_day] 涨跌幅%% 上限")
     p.add_argument("--min-turnover", type=float, default=0.0, help="[k_day] 换手率%% 下限")
     p.add_argument("--k-type", type=int, default=1, help="[k_day] sm_stock_kline.k_type")
-    p.add_argument("--adjust-type", type=int, default=1, help="[k_day] sm_stock_kline.adjust_type")
+    p.add_argument("--adjust-type", type=int, default=0, help="[k_day] sm_stock_kline.adjust_type")
     p.add_argument("--concept-code", type=str, default="", help="[concept] 东财概念代码，如 BK0473")
     p.add_argument("--csv", type=str, default="", help="若指定路径则写入 CSV")
     p.add_argument(

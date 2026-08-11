@@ -25,6 +25,7 @@ from sqlalchemy import text
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt import bridge
 from server.common.config import get_market_radar_runtime_config, get_wecom_webhook
+from server.common.kline_data import get_kline_engine
 
 logger = logging.getLogger("market_radar")
 
@@ -291,6 +292,105 @@ class MarketRadarEngine:
             return
         codes = set(self._universe)
         sectors: dict[str, dict[str, Any]] = {}
+
+        # Prefer the validated QMT point-in-time catalogue.  These codes are
+        # shared with Trading V2 so an intraday radar observation can confirm
+        # or veto the exact theme that created a conditional paper order.
+        try:
+            qmt_engine = get_kline_engine()
+            with qmt_engine.connect() as connection:
+                industry_date = connection.execute(
+                    text(
+                        """
+                        SELECT MAX(snapshot_date)
+                        FROM qmt_industry_member_snapshot
+                        WHERE quality_status = 'QMT_VALIDATED'
+                        """
+                    )
+                ).scalar()
+                concept_date = connection.execute(
+                    text(
+                        """
+                        SELECT MAX(snapshot_date)
+                        FROM qmt_concept_member_snapshot
+                        WHERE quality_status = 'QMT_VALIDATED'
+                        """
+                    )
+                ).scalar()
+                industry_rows = (
+                    connection.execute(
+                        text(
+                            """
+                            SELECT industry_code AS sector_key,
+                                   industry_name AS sector_name,
+                                   stock_code, short_name
+                            FROM qmt_industry_member_snapshot
+                            WHERE snapshot_date = :snapshot_date
+                              AND quality_status = 'QMT_VALIDATED'
+                            """
+                        ),
+                        {"snapshot_date": industry_date},
+                    ).mappings().all()
+                    if industry_date
+                    else []
+                )
+                concept_rows = (
+                    connection.execute(
+                        text(
+                            """
+                            SELECT concept_code AS sector_key,
+                                   concept_name AS sector_name,
+                                   stock_code, short_name
+                            FROM qmt_concept_member_snapshot
+                            WHERE snapshot_date = :snapshot_date
+                              AND quality_status = 'QMT_VALIDATED'
+                            """
+                        ),
+                        {"snapshot_date": concept_date},
+                    ).mappings().all()
+                    if concept_date
+                    else []
+                )
+            for sector_type, prefix, rows in (
+                ("industry", "INDUSTRY", industry_rows),
+                ("concept", "CONCEPT", concept_rows),
+            ):
+                for row in rows:
+                    code = _text(row.get("stock_code")).zfill(6)
+                    raw_sector_code = _text(row.get("sector_key"))
+                    name = _text(row.get("sector_name")) or raw_sector_code
+                    if code not in codes or not raw_sector_code:
+                        continue
+                    sector_code = f"{prefix}:{raw_sector_code}"
+                    item = sectors.setdefault(
+                        sector_code,
+                        {
+                            "sector_code": sector_code,
+                            "sector_name": name,
+                            "sector_type": sector_type,
+                            "members": set(),
+                        },
+                    )
+                    item["members"].add(code)
+                    if row.get("short_name") and not self._names.get(code):
+                        self._names[code] = _text(row.get("short_name"))
+        except Exception as exc:
+            logger.warning("load validated QMT radar memberships failed: %s", exc)
+
+        minimum = int(self.config.get("min_sector_members") or 5)
+        if sectors:
+            self._sectors = {
+                key: value
+                for key, value in sectors.items()
+                if len(value["members"]) >= minimum
+            }
+            self._metadata_loaded_at = time.time()
+            logger.info(
+                "market radar QMT metadata loaded sectors=%s stocks=%s",
+                len(self._sectors),
+                len(codes),
+            )
+            return
 
         try:
             industry_rows = _read_rows(

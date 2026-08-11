@@ -1,0 +1,175 @@
+{
+  "schema_version": "probiga.trading-v4-research.v1",
+  "campaign_id": "trading_v4_oos_research_20260801",
+  "created_on": "2026-08-01",
+  "purpose": "Develop a genuinely profitable paper candidate without weakening production gates.",
+  "execution_boundary": {
+    "research_only": true,
+    "paper_orders_only": true,
+    "real_order_submission": false,
+    "model_registration_requires_all_gates": true
+  },
+  "candidate_control": {
+    "prior_recorded_candidate_searches": 49,
+    "maximum_candidate_count": 8,
+    "maximum_familywise_candidate_count": 57,
+    "candidate_specs_must_be_frozen_before_new_backtests": true,
+    "post_result_formula_edits_create_a_new_campaign": true,
+    "multiple_testing_control": "MONTH_AND_STOCK_BLOCK_BOOTSTRAP_MAX_T",
+    "fallback_bonferroni_one_sided_alpha": 0.0008771929824561404,
+    "candidates": [
+      {
+        "id": "health_pullback_blended_v1",
+        "family": "regime_gated_trend_pullback",
+        "eligibility": "market_health>=0.60 AND prior_market_health>=0.60 AND limit_down_breadth_pct<1.0 AND market_daily_return_pct>-2.5 AND close_above_ma20=1 AND ma20_above_ma60=1 AND return_60d_pct IN [8,45] AND return_20d_pct IN [0,18] AND distance_ma20_pct IN [-1,6] AND amount_ratio_5_20 IN [0.7,1.5] AND change_pct IN [-2,4] AND atr_14d_pct IN [1,5]",
+        "score": "0.75*quality_pullback_score+0.25*market_health",
+        "quality_pullback_score": "0.30*band(relative_strength_20d_pct,3,18,12)+0.20*band(distance_ma20_pct,0,4,4)+0.15*band(return_5d_pct,-2,6,6)+0.15*band(amount_ratio_5_20,0.8,1.4,0.7)+0.10*(1-scale(atr_14d_pct,1,5))+0.10*band(change_pct,-1,3,4)",
+        "exit_policy": "PRODUCTION_DYNAMIC_TREND_NEXT_OPEN"
+      },
+      {
+        "id": "rs_hpb_v1",
+        "family": "health_gated_strict_trend_pullback",
+        "eligibility": "health_pullback_blended_v1 eligibility AND return_5d_pct IN [-3,10] AND relative_strength_20d_pct IN [-2,25] AND quality_pullback_score>=0.60",
+        "score": "quality_pullback_score",
+        "exit_policy": "PRODUCTION_DYNAMIC_TREND_NEXT_OPEN"
+      },
+      {
+        "id": "rs_hpb_no_health_v1",
+        "family": "health_gate_ablation",
+        "eligibility": "same stock and liquidity eligibility as rs_hpb_v1 but without market-health, limit-down-breadth and market-daily-return gates",
+        "score": "quality_pullback_score",
+        "exit_policy": "PRODUCTION_DYNAMIC_TREND_NEXT_OPEN"
+      },
+      {
+        "id": "production_trend_health_gate_v1",
+        "family": "production_score_ablation",
+        "eligibility": "production right-side eligibility AND market_health>=0.60 AND prior_market_health>=0.60 AND limit_down_breadth_pct<1.0 AND market_daily_return_pct>-2.5",
+        "score": "production_right_side_score",
+        "exit_policy": "PRODUCTION_DYNAMIC_TREND_NEXT_OPEN"
+      },
+      {
+        "id": "nvcr_price_reversal_v1",
+        "family": "confirmed_failed_breakdown_reversal",
+        "eligibility": "return_20d_pct IN [-35,-10] AND drawdown_20d_pct IN [-45,-12] AND distance_ma20_pct IN [-22,-4] AND atr_14d_pct IN [2,8] AND market_return_20d_pct>=-12 AND breadth_ma20_change_5d_pct>=3 AND limit_down_breadth_pct<=1.5 AND raw_low<=prior_10d_low*1.01 AND close_location_value>=0.65 AND change_pct IN [0.5,7] AND latest_relative_to_market_pct>=1 AND rebound_from_low_pct>=2 AND amount_ratio_1_20 IN [1,3]",
+        "score": "0.28*scale(-drawdown_20d_pct,12,45)+0.27*band(close_location_value,0.65,1.0,0.20)+0.15*scale(rebound_from_low_pct,2,8)+0.15*scale(breadth_ma20_change_5d_pct,3,15)+0.10*band(amount_ratio_1_20,1,2,1)+0.05*(1-scale(atr_14d_pct,2,8))",
+        "entry_policy": "NEXT_TRADABLE_OPEN_CANCEL_IF_GAP_ABOVE_SIGNAL_CLOSE_GT_0.5PCT",
+        "exit_policy": "REVERSAL_MAX5_NEXT_OPEN_WITH_6PCT_OR_SIGNAL_LOW_MINUS_0.25ATR_STOP_MA10_PROFIT_OR_2R"
+      },
+      {
+        "id": "qfbr_quality_reversal_v1",
+        "family": "quality_gated_failed_breakdown_reversal",
+        "eligibility": "nvcr_price_reversal_v1 AND point_in_time_quality_percentile>=0.65 AND point_in_time_cashflow_percentile>=0.60 AND asset_liab_ratio<=70 AND net_profit_yoy_gr>-30",
+        "score": "0.22*quality_percentile+0.16*cashflow_percentile+0.10*valuation_percentile+0.18*scale(-drawdown_20d_pct,12,45)+0.22*reversal_confirmation_score+0.12*market_repair_score",
+        "finance_rank_universe": "all signal-date liquid non-ST stocks with valid point-in-time finance",
+        "entry_policy": "NEXT_TRADABLE_OPEN_CANCEL_IF_GAP_ABOVE_SIGNAL_CLOSE_GT_0.5PCT",
+        "exit_policy": "REVERSAL_MAX5_NEXT_OPEN_WITH_6PCT_OR_SIGNAL_LOW_MINUS_0.25ATR_STOP_MA10_PROFIT_OR_2R"
+      },
+      {
+        "id": "dual_regime_health_reversal_v1",
+        "family": "regime_adaptive_ensemble",
+        "eligibility": "rs_hpb_v1 when market_health>=0.60; qfbr_quality_reversal_v1 when market_health<0.55; no new entry in transition zone [0.55,0.60)",
+        "score": "component candidate score",
+        "exit_policy": "component-specific frozen exit policy"
+      }
+    ]
+  },
+  "data_protocol": {
+    "available_start": "2020-01-02",
+    "available_end": "2026-07-31",
+    "point_in_time_only": true,
+    "minimum_price_cny": 2.0,
+    "minimum_average_amount_20d_cny": 50000000.0,
+    "top_per_day": 10,
+    "candidate_pool_must_be_signal_eligible_before_top_n": true,
+    "same_stock_episode_deduplication": true,
+    "same_stock_cooldown_trading_days_after_exit": 5,
+    "entry_timing": "NEXT_TRADABLE_OPEN",
+    "exit_timing": "NEXT_TRADABLE_OPEN_AFTER_RULE_TRIGGER",
+    "right_censored_candidates_remain_in_portfolio": true,
+    "delisted_st_and_nontradable_rows_excluded_at_signal_time": true,
+    "kline_source_table": "sm_stock_kline",
+    "kline_type": 1,
+    "price_adjustment_method": "RECONSTRUCT_FORWARD_ADJUSTMENT_FROM_POINT_IN_TIME_CHANGE_PCT",
+    "finance_source_table": "si_stock_finance",
+    "finance_visibility_rule": "notice_date <= signal_date AND report_date <= signal_date AND notice_date >= report_date",
+    "market_percentile_rule": "current observation ranked only against the preceding 252 complete trading-day observations; current day is excluded from the reference window",
+    "source_feature_exit_cost_portfolio_and_limit_rules_are_contract_hashed": true
+  },
+  "outer_folds": [
+    {
+      "name": "oos_2022",
+      "training_start": "2020-01-02",
+      "training_end": "2021-11-26",
+      "validation_start": "2022-01-01",
+      "validation_end": "2022-12-31"
+    },
+    {
+      "name": "oos_2023",
+      "training_start": "2020-01-02",
+      "training_end": "2022-11-26",
+      "validation_start": "2023-01-01",
+      "validation_end": "2023-12-31"
+    },
+    {
+      "name": "oos_2024",
+      "training_start": "2021-01-01",
+      "training_end": "2023-11-26",
+      "validation_start": "2024-01-01",
+      "validation_end": "2024-12-31"
+    },
+    {
+      "name": "oos_2025_h1",
+      "training_start": "2022-01-01",
+      "training_end": "2024-11-26",
+      "validation_start": "2025-01-01",
+      "validation_end": "2025-06-30"
+    },
+    {
+      "name": "oos_2025h2_2026h1",
+      "training_start": "2022-07-01",
+      "training_end": "2025-05-27",
+      "validation_start": "2025-07-01",
+      "validation_end": "2026-07-30"
+    }
+  ],
+  "purge_and_embargo": {
+    "signal_embargo_calendar_days": 35,
+    "training_labels_must_exit_before_training_end": true,
+    "unmatured_labels_never_enter_training_or_metrics": true
+  },
+  "profit_gate": {
+    "minimum_oos_samples": 80,
+    "minimum_expected_return_net_pct": 0.0,
+    "minimum_profit_factor": 1.3,
+    "minimum_payoff_ratio": 1.0,
+    "minimum_portfolio_trades": 80,
+    "minimum_portfolio_net_expectancy_pct": 0.0,
+    "minimum_portfolio_profit_factor": 1.3,
+    "minimum_portfolio_payoff_ratio": 1.0,
+    "maximum_drawdown_pct": 12.0,
+    "minimum_positive_outer_folds": 4,
+    "minimum_outer_fold_profit_factor": 0.9
+  },
+  "stress_tests": {
+    "cost_multipliers": [1.0, 1.5, 2.0],
+    "parameter_perturbation_pct": 10.0,
+    "minimum_positive_perturbation_ratio": 0.7,
+    "minimum_bootstrap_iterations": 2000,
+    "bootstrap_confidence": 0.95,
+    "bootstrap_blocks": ["calendar_month", "stock_code", "industry", "market_regime"],
+    "execution_delay_sessions": [0, 1],
+    "remove_best_trade_counts": [0, 5],
+    "top_n_sensitivity": [5, 10, 20],
+    "capital_sensitivity_cny": [200000, 500000, 1000000],
+    "limit_suspension_and_unfilled_order_replay": true,
+    "benchmark_excess_return_required": true
+  },
+  "evidence_status": {
+    "historical_oos_can_grant": "PAPER_CANDIDATE",
+    "historical_oos_cannot_grant": "REAL_TRADING",
+    "prospective_paper_start": "2026-08-03",
+    "minimum_prospective_trading_days": 120,
+    "minimum_prospective_mature_portfolio_trades": 80,
+    "note": "All pre-2026-08 history has been inspected during prior research; only future paper outcomes are pristine evidence."
+  }
+}

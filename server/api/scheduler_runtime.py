@@ -156,8 +156,7 @@ WINDOWS_QMT_BRIDGE_TASK_TYPES = {
     "etf_forward_daily",
     # Xueqiu serves JSON from the operator's Windows egress but returns an
     # HTML WAF page from the production Linux egress.  Keep this source on the
-    # same Windows-owned scheduler lane so the shared task row cannot be
-    # claimed by the incapable host.
+    # Windows-owned scheduler lane.
     "fetch_hot_rank_xq",
     "index_constituent",
     "index_current",

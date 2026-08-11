@@ -25,11 +25,6 @@ from server.common.minute_data import dispose_minute_engine
 logger = logging.getLogger(__name__)
 
 
-def _desktop_runtimes_allowed() -> bool:
-    """Return whether this host may start Windows/QMT desktop runtimes."""
-    return os.name == "nt"
-
-
 def dispose_shared_engines() -> None:
     for label, dispose in (
         ("api", dispose_api_engine),
@@ -48,10 +43,10 @@ async def lifespan(_: FastAPI):
     api_lifespan = get_api_lifespan_config()
     qmt_live_runtime_started = False
     market_radar_runtime_started = False
-    if _desktop_runtimes_allowed() and api_lifespan["qmt_live_runtime_enabled"]:
+    if os.name == "nt" and api_lifespan["qmt_live_runtime_enabled"]:
         start_qmt_live_runtime()
         qmt_live_runtime_started = True
-    if _desktop_runtimes_allowed() and start_market_radar_runtime() is not None:
+    if os.name == "nt" and start_market_radar_runtime() is not None:
         market_radar_runtime_started = True
     try:
         yield
@@ -254,3 +249,4 @@ def trading_v3_page():
 
 if static_dir.is_dir():
     app.mount("/static", StaticFiles(directory=str(static_dir), html=False), name="static")
+

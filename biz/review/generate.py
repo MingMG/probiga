@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, read_frame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("review")
@@ -61,6 +61,10 @@ def get_engine():
     return create_batch_engine()
 
 
+def _read_frame(sql, engine, params: dict | None = None) -> pd.DataFrame:
+    return read_frame(sql, engine, params=params)
+
+
 def run_ddl(engine):
     if DDL_PATH.is_file():
         sql = DDL_PATH.read_text(encoding="utf-8")
@@ -78,6 +82,37 @@ def run_ddl(engine):
 # 1. 市场总览
 # ═══════════════════════════════════════════
 
+DAILY_REVIEW_EXTRA_COLUMNS = {
+    "sentiment_cycle": "VARCHAR(16) DEFAULT NULL COMMENT '情绪周期'",
+    "sentiment_cycle_desc": "VARCHAR(256) DEFAULT NULL COMMENT '情绪周期说明'",
+    "limit_up_count": "INT DEFAULT NULL COMMENT '涨停家数'",
+    "limit_down_count": "INT DEFAULT NULL COMMENT '跌停家数'",
+    "touch_limit_up": "INT DEFAULT NULL COMMENT '触及涨停家数'",
+    "broken_board_count": "INT DEFAULT NULL COMMENT '炸板家数'",
+    "seal_rate": "DECIMAL(5,2) DEFAULT NULL COMMENT '封板率'",
+    "broken_rate": "DECIMAL(5,2) DEFAULT NULL COMMENT '炸板率'",
+    "max_boards": "INT DEFAULT NULL COMMENT '最高连板'",
+    "highest_board_stocks": "TEXT DEFAULT NULL COMMENT '空间板个股'",
+    "market_emotion_json": "TEXT DEFAULT NULL COMMENT '市场情绪结构'",
+}
+
+
+def ensure_daily_review_columns(engine) -> None:
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(text("SHOW COLUMNS FROM st_daily_review")).fetchall()
+            existing = {str(row[0]) for row in rows}
+            for column, ddl in DAILY_REVIEW_EXTRA_COLUMNS.items():
+                if column not in existing:
+                    try:
+                        conn.execute(text(f"ALTER TABLE st_daily_review ADD COLUMN `{column}` {ddl}"))
+                        existing.add(column)
+                    except Exception as exc:
+                        log.warning("ensure st_daily_review column %s skipped: %s", column, exc)
+    except Exception as exc:
+        log.debug("ensure st_daily_review extra columns skipped: %s", exc)
+
+
 def calc_market_overview(engine, date_str: str) -> dict:
     """计算市场热度、成交额、指数表现"""
 
@@ -86,14 +121,14 @@ def calc_market_overview(engine, date_str: str) -> dict:
     SELECT COALESCE(SUM(amount), 0) AS amt FROM sm_stock_kline
     WHERE trade_date = :d AND k_type = 1
     """
-    rows = pd.read_sql(text(amount_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(amount_sql), engine, params={"d": date_str}).to_dict(orient="records")
     total_amt = float(rows[0]["amt"]) if rows else 0
 
     # 前一日成交额
     prev_date = _prev_trade_date(engine, date_str)
     prev_amt = 0
     if prev_date:
-        rows = pd.read_sql(text(amount_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+        rows = _read_frame(text(amount_sql), engine, params={"d": prev_date}).to_dict(orient="records")
         prev_amt = float(rows[0]["amt"]) if rows else 0
 
     amt_change = "平量"
@@ -112,7 +147,7 @@ def calc_market_overview(engine, date_str: str) -> dict:
       COUNT(*) AS total
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     """
-    rows = pd.read_sql(text(up_down_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(up_down_sql), engine, params={"d": date_str}).to_dict(orient="records")
     up_cnt = rows[0]["up_count"] or 0
     down_cnt = rows[0]["down_count"] or 0
     total_cnt = rows[0]["total"] or 1
@@ -124,7 +159,7 @@ def calc_market_overview(engine, date_str: str) -> dict:
     # 热度假设：对比前一日
     heat_change = "flat"
     if prev_date:
-        rows2 = pd.read_sql(text(up_down_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+        rows2 = _read_frame(text(up_down_sql), engine, params={"d": prev_date}).to_dict(orient="records")
         prev_up = rows2[0]["up_count"] or 0
         prev_total = rows2[0]["total"] or 1
         prev_heat = (prev_up / prev_total) * 100
@@ -141,7 +176,7 @@ def calc_market_overview(engine, date_str: str) -> dict:
     SELECT '000852' AS index_code, AVG(close) AS avg_close, AVG(change_pct) AS avg_chg
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     """
-    idx_rows = pd.read_sql(text(idx_kline_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    idx_rows = _read_frame(text(idx_kline_sql), engine, params={"d": date_str}).to_dict(orient="records")
     idx_map = {"000852": {"name": "中证1000", "price": None, "change_pct": None}}
     if idx_rows:
         r = idx_rows[0]
@@ -155,14 +190,14 @@ def calc_market_overview(engine, date_str: str) -> dict:
     WHERE index_code IN ('000001','399001','399006','000688','000852')
     """
     try:
-        idx_rows2 = pd.read_sql(text(idx_sql), engine).to_dict(orient="records")
+        idx_rows2 = _read_frame(text(idx_sql), engine).to_dict(orient="records")
         for r in idx_rows2:
             code = r["index_code"]
             if r.get("price") is not None:
                 idx_map[code] = {"name": idx_name.get(code, code),
                                   "price": r["price"], "change_pct": r["change_pct"]}
     except Exception:
-        pass
+        log.debug("Failed to enrich market index snapshot.", exc_info=True)
 
     # 万得全A 用两市涨跌比替代
     wind_a_name = "万得全A"
@@ -188,7 +223,7 @@ def calc_market_overview(engine, date_str: str) -> dict:
 
 
 def _prev_trade_date(engine, date_str: str) -> str | None:
-    rows = pd.read_sql(text(
+    rows = _read_frame(text(
         "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE trade_date < :d AND k_type=1"
     ), engine, params={"d": date_str}).to_dict(orient="records")
     return rows[0]["d"] if rows and rows[0].get("d") else None
@@ -196,7 +231,7 @@ def _prev_trade_date(engine, date_str: str) -> str | None:
 
 def _recent_trade_dates(engine, date_str: str, n: int = 5) -> list[str]:
     """获取最近n个交易日（含date_str）"""
-    rows = pd.read_sql(text(
+    rows = _read_frame(text(
         "SELECT DISTINCT trade_date FROM sm_stock_kline WHERE trade_date <= :d AND k_type=1 "
         "ORDER BY trade_date DESC LIMIT :n"
     ), engine, params={"d": date_str, "n": n}).to_dict(orient="records")
@@ -207,24 +242,74 @@ def _recent_trade_dates(engine, date_str: str, n: int = 5) -> list[str]:
 # 2. 板块热度分析
 # ═══════════════════════════════════════════
 
+def classify_sentiment_cycle(
+    *,
+    limit_up_count: int,
+    broken_rate: float,
+    up_count: int,
+    down_count: int,
+    limit_down_count: int = 0,
+) -> dict:
+    """Quantify stock.txt market emotion stages from limit-up, broken-board and money-effect data."""
+    limit_up_count = int(limit_up_count or 0)
+    limit_down_count = int(limit_down_count or 0)
+    broken_rate = float(broken_rate or 0.0)
+    up_count = int(up_count or 0)
+    down_count = int(down_count or 0)
+    money_effect_ratio = round(up_count / max(down_count, 1), 2)
+    money_effect_ok = money_effect_ratio >= 1.5
+
+    if limit_up_count < 10 or broken_rate > 50 or limit_down_count >= 10:
+        phase = "退潮期"
+        advice = "空仓或显著降仓，只保留强逻辑低位观察"
+        desc = "涨停不足、炸板率过高或跌停扩散，短线胜率显著下降"
+    elif 35 <= broken_rate <= 45 or limit_down_count >= 5:
+        phase = "分化期"
+        advice = "仅保留主线龙头，回避后排和高位加速"
+        desc = "炸板率进入分化区间，资金开始淘汰弱分支"
+    elif limit_up_count >= 30 and broken_rate < 25 and money_effect_ok:
+        phase = "主升期"
+        advice = "聚焦主线龙头和前排换手确认"
+        desc = "涨停扩张、炸板率低且赚钱效应达标"
+    elif limit_up_count >= 18 and broken_rate < 30 and money_effect_ok:
+        phase = "复苏期"
+        advice = "小仓位试错，优先低位首板和主线确认"
+        desc = "涨停开始恢复，炸板率可控，赚钱效应转正"
+    else:
+        phase = "混沌期"
+        advice = "等待主线确认，降低模式外交易"
+        desc = "涨停、炸板率和赚钱效应尚未形成清晰共振"
+
+    return {
+        "phase": phase,
+        "desc": desc,
+        "position_advice": advice,
+        "money_effect_ratio": money_effect_ratio,
+        "money_effect_ok": money_effect_ok,
+        "limit_up_count": limit_up_count,
+        "broken_rate": round(broken_rate, 2),
+        "limit_down_count": limit_down_count,
+    }
+
+
 def calc_sector_analysis(engine, date_str: str) -> dict:
     """计算板块热度和成交量变化"""
 
     # 从概念数据取板块热度
     concept_sql = """
     SELECT concept_name, change_pct, hot_value FROM st_hot_concept_ths_daily
-    WHERE snapshot_date = :d ORDER BY plate_type, rank LIMIT 30
+    WHERE snapshot_date = :d ORDER BY plate_type, `rank` LIMIT 30
     """
-    rows = pd.read_sql(text(concept_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(concept_sql), engine, params={"d": date_str}).to_dict(orient="records")
 
     # 前一日
     prev_date = _prev_trade_date(engine, date_str)
     prev_rows = []
     if prev_date:
         try:
-            prev_rows = pd.read_sql(text(concept_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+            prev_rows = _read_frame(text(concept_sql), engine, params={"d": prev_date}).to_dict(orient="records")
         except Exception:
-            pass
+            log.debug("Failed to read previous concept rows.", exc_info=True)
 
     prev_map = {r["concept_name"]: r for r in prev_rows}
 
@@ -281,7 +366,7 @@ def calc_index_analysis(engine, date_str: str) -> list[dict]:
            AS ma20
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     """
-    rows = pd.read_sql(text(sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(sql), engine, params={"d": date_str}).to_dict(orient="records")
     if not rows:
         return []
 
@@ -330,7 +415,7 @@ def calc_market_temperature(engine, date_str: str) -> dict:
       SUM(CASE WHEN change_pct <= -9.9 THEN 1 ELSE 0 END) AS limit_down
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     """
-    rows = pd.read_sql(text(stats_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(stats_sql), engine, params={"d": date_str}).to_dict(orient="records")
     r = rows[0] if rows else {}
     up = int(r.get("up_count") or 0)
     down = int(r.get("down_count") or 0)
@@ -379,7 +464,7 @@ def calc_market_temperature(engine, date_str: str) -> dict:
     if len(recent_dates) >= 2:
         recent_up_ratios = []
         for rd in recent_dates:
-            rr = pd.read_sql(text(stats_sql), engine, params={"d": rd}).to_dict(orient="records")
+            rr = _read_frame(text(stats_sql), engine, params={"d": rd}).to_dict(orient="records")
             if rr:
                 ru = int(rr[0].get("up_count") or 0)
                 rt = int(rr[0].get("total") or 1)
@@ -428,13 +513,15 @@ def calc_market_temperature(engine, date_str: str) -> dict:
     WHERE t.trade_date = :d AND t.k_type = 1
     """
     try:
-        seal_rows = pd.read_sql(text(seal_sql2), engine, params={"d": date_str}).to_dict(orient="records")
+        seal_rows = _read_frame(text(seal_sql2), engine, params={"d": date_str}).to_dict(orient="records")
         seal_limit = int(seal_rows[0].get("limit_up") or 0) if seal_rows else 0
         seal_broken = int(seal_rows[0].get("broken") or 0) if seal_rows else 0
         seal_total = seal_limit + seal_broken
         seal_rate = (seal_limit / seal_total * 100) if seal_total > 0 else 50
+        broken_rate = (seal_broken / seal_total * 100) if seal_total > 0 else 50
     except Exception:
         seal_rate = 50
+        broken_rate = 50
 
     # 判断情绪周期
     if limit_up < 30 and up_ratio < 0.30:
@@ -456,7 +543,7 @@ def calc_market_temperature(engine, date_str: str) -> dict:
         cycle_desc = "涨停家数高位，封板率极高，注意高位风险"
     elif prev_date:
         # 对比前日涨停数
-        prev_rows = pd.read_sql(text(stats_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+        prev_rows = _read_frame(text(stats_sql), engine, params={"d": prev_date}).to_dict(orient="records")
         prev_limit_up = int(prev_rows[0].get("limit_up") or 0) if prev_rows else 0
         if prev_limit_up > 0 and limit_up < prev_limit_up * 0.7:
             cycle = "退潮"
@@ -471,6 +558,16 @@ def calc_market_temperature(engine, date_str: str) -> dict:
         cycle = "发酵"
         cycle_desc = "涨停家数和封板率处于中等水平，关注主线确认"
 
+    emotion = classify_sentiment_cycle(
+        limit_up_count=limit_up,
+        broken_rate=broken_rate,
+        up_count=up,
+        down_count=down,
+        limit_down_count=limit_down,
+    )
+    cycle = emotion["phase"]
+    cycle_desc = f"{emotion['desc']}；{emotion['position_advice']}"
+
     return {
         "score": round(score, 2),
         "level": level,
@@ -482,6 +579,8 @@ def calc_market_temperature(engine, date_str: str) -> dict:
         "limit_up": limit_up,
         "limit_down": limit_down,
         "up_ratio": round(up_ratio * 100, 2),
+        "broken_rate": round(broken_rate, 2),
+        "money_effect_ratio": emotion["money_effect_ratio"],
     }
 
 
@@ -502,11 +601,11 @@ def calc_index_detail_pro(engine, date_str: str) -> list[dict]:
             WHERE index_code = :code AND k_type = 1 AND trade_date <= :d
             ORDER BY trade_date DESC LIMIT 25
             """
-            rows = pd.read_sql(text(kline_sql), engine, params={"code": code, "d": date_str}).to_dict(orient="records")
+            rows = _read_frame(text(kline_sql), engine, params={"code": code, "d": date_str}).to_dict(orient="records")
             if not rows:
                 # fallback: sm_index_current
                 cur_sql = "SELECT price AS close, change_pct FROM sm_index_current WHERE index_code = :code"
-                cur_rows = pd.read_sql(text(cur_sql), engine, params={"code": code}).to_dict(orient="records")
+                cur_rows = _read_frame(text(cur_sql), engine, params={"code": code}).to_dict(orient="records")
                 if cur_rows:
                     price = float(cur_rows[0].get("close") or 0)
                     chg = float(cur_rows[0].get("change_pct") or 0)
@@ -546,20 +645,20 @@ def calc_index_detail_pro(engine, date_str: str) -> list[dict]:
 def calc_volume_structure(engine, date_str: str) -> dict:
     """量能结构：今日成交额、昨日、5日均额"""
     amount_sql = "SELECT COALESCE(SUM(amount), 0) AS amt FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1"
-    today_rows = pd.read_sql(text(amount_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    today_rows = _read_frame(text(amount_sql), engine, params={"d": date_str}).to_dict(orient="records")
     today_amt = float(today_rows[0]["amt"]) if today_rows else 0
 
     prev_date = _prev_trade_date(engine, date_str)
     prev_amt = 0
     if prev_date:
-        prev_rows = pd.read_sql(text(amount_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+        prev_rows = _read_frame(text(amount_sql), engine, params={"d": prev_date}).to_dict(orient="records")
         prev_amt = float(prev_rows[0]["amt"]) if prev_rows else 0
 
     # 5日均额
     recent_dates = _recent_trade_dates(engine, date_str, 5)
     amt_list = []
     for rd in recent_dates:
-        rr = pd.read_sql(text(amount_sql), engine, params={"d": rd}).to_dict(orient="records")
+        rr = _read_frame(text(amount_sql), engine, params={"d": rd}).to_dict(orient="records")
         if rr:
             amt_list.append(float(rr[0]["amt"]))
     avg5 = sum(amt_list) / len(amt_list) if amt_list else 0
@@ -598,7 +697,7 @@ def calc_market_breadth(engine, date_str: str) -> dict:
       SUM(CASE WHEN change_pct <= -5 THEN 1 ELSE 0 END) AS down5
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     """
-    rows = pd.read_sql(text(sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rows = _read_frame(text(sql), engine, params={"d": date_str}).to_dict(orient="records")
     r = rows[0] if rows else {}
     total = int(r.get("total") or 1)
     up = int(r.get("up_count") or 0)
@@ -641,7 +740,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     AND change_pct >= 9.9 ORDER BY change_pct DESC
     """
-    zt_rows = pd.read_sql(text(limit_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    zt_rows = _read_frame(text(limit_sql), engine, params={"d": date_str}).to_dict(orient="records")
     limit_up_count = len(zt_rows)
 
     dt_sql = """
@@ -650,7 +749,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
     FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
     AND change_pct <= -9.9 ORDER BY change_pct ASC
     """
-    dt_rows = pd.read_sql(text(dt_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    dt_rows = _read_frame(text(dt_sql), engine, params={"d": date_str}).to_dict(orient="records")
     limit_down_count = len(dt_rows)
 
     # 炸板：今日最高价接近涨停但收盘未封住
@@ -663,7 +762,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
       AND t.high >= p.close * 1.095 AND t.change_pct < 9.9
     """
     try:
-        broken_rows = pd.read_sql(text(broken_sql), engine, params={"d": date_str}).to_dict(orient="records")
+        broken_rows = _read_frame(text(broken_sql), engine, params={"d": date_str}).to_dict(orient="records")
         broken_count = int(broken_rows[0]["cnt"]) if broken_rows else 0
     except Exception:
         broken_count = 0
@@ -691,7 +790,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
         ORDER BY stock_code, trade_date DESC
         """
         try:
-            hist = pd.read_sql(text(hist_sql), engine).to_dict(orient="records")
+            hist = _read_frame(text(hist_sql), engine).to_dict(orient="records")
         except Exception:
             hist = []
 
@@ -731,7 +830,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
         WHERE t.trade_date = :d AND t.k_type = 1 AND t.change_pct >= 9.9
         """
         try:
-            prev_zt = pd.read_sql(text(prev_zt_sql), engine, params={"d": prev_date}).to_dict(orient="records")
+            prev_zt = _read_frame(text(prev_zt_sql), engine, params={"d": prev_date}).to_dict(orient="records")
             if prev_zt:
                 prev_codes = [str(r["stock_code"]) for r in prev_zt]
                 ph2 = ",".join([f"'{c}'" for c in prev_codes])
@@ -739,12 +838,12 @@ def calc_board_structure(engine, date_str: str) -> dict:
                 SELECT change_pct FROM sm_stock_kline
                 WHERE stock_code IN ({ph2}) AND trade_date = :d AND k_type = 1
                 """
-                today_chgs = pd.read_sql(text(today_chg_sql), engine, params={"d": date_str}).to_dict(orient="records")
+                today_chgs = _read_frame(text(today_chg_sql), engine, params={"d": date_str}).to_dict(orient="records")
                 if today_chgs:
                     chg_vals = [float(r["change_pct"] or 0) for r in today_chgs]
                     prev_zt_avg = round(sum(chg_vals) / len(chg_vals), 2)
         except Exception:
-            pass
+            log.debug("Failed to calculate previous limit-up average change.", exc_info=True)
 
     return {
         "limit_up_count": limit_up_count,
@@ -770,7 +869,7 @@ def calc_sector_detail(engine, date_str: str) -> dict:
     SELECT concept_name, change_pct, hot_value FROM st_hot_concept_ths_daily
     WHERE snapshot_date = :d ORDER BY change_pct DESC LIMIT 8
     """
-    rank_rows = pd.read_sql(text(rank_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    rank_rows = _read_frame(text(rank_sql), engine, params={"d": date_str}).to_dict(orient="records")
     sector_rank_top = [{"name": r["concept_name"], "change_pct": round(float(r.get("change_pct") or 0), 2)}
                        for r in rank_rows]
 
@@ -779,7 +878,7 @@ def calc_sector_detail(engine, date_str: str) -> dict:
     SELECT concept_name, change_pct FROM st_hot_concept_ths_daily
     WHERE snapshot_date = :d ORDER BY change_pct ASC LIMIT 5
     """
-    weak_rows = pd.read_sql(text(weak_sql), engine, params={"d": date_str}).to_dict(orient="records")
+    weak_rows = _read_frame(text(weak_sql), engine, params={"d": date_str}).to_dict(orient="records")
     # 需要获取下跌家数 — 从概念板块内的个股统计
     sector_weak = []
     for r in weak_rows:
@@ -798,7 +897,7 @@ def calc_sector_detail(engine, date_str: str) -> dict:
           AND snapshot_at = (SELECT MAX(snapshot_at) FROM sm_concept_capital_flow_east WHERE days_type = 1)
         ORDER BY main_net_inflow DESC LIMIT 8
         """
-        flow_rows = pd.read_sql(text(flow_sql), engine).to_dict(orient="records")
+        flow_rows = _read_frame(text(flow_sql), engine).to_dict(orient="records")
         fund_flow_top = [{"name": r["index_name"],
                           "main_net_inflow": round(float(r.get("main_net_inflow") or 0) / 1e8, 2),
                           "change_pct": round(float(r.get("change_pct") or 0), 2)}
@@ -819,15 +918,93 @@ def calc_sector_detail(engine, date_str: str) -> dict:
     }
 
 
+def _sector_name_match(left: str, right: str) -> bool:
+    left = str(left or "").strip()
+    right = str(right or "").strip()
+    return bool(left and right and (left == right or left in right or right in left))
+
+
+def _main_line_purity(main_name: str, main_chg: float, sector_data: dict, board_data: dict) -> dict:
+    rank_top = sector_data.get("sector_rank_top", []) or []
+    fund_top = sector_data.get("sector_fund_flow_top", []) or []
+    weak_top = sector_data.get("sector_weak_top", []) or []
+    limit_up = int(board_data.get("limit_up_count", 0) or 0)
+
+    rank_pos = next((idx + 1 for idx, item in enumerate(rank_top[:8]) if _sector_name_match(main_name, item.get("name", ""))), None)
+    fund_hit = next((idx + 1 for idx, item in enumerate(fund_top[:8]) if _sector_name_match(main_name, item.get("name", ""))), None)
+    weak_hit = any(_sector_name_match(main_name, item.get("name", "")) for item in weak_top[:5])
+
+    score = 20.0
+    reasons = []
+    if rank_pos:
+        score += max(0.0, 35.0 - (rank_pos - 1) * 5.0)
+        reasons.append(f"涨幅排名第{rank_pos}")
+    if fund_hit:
+        score += max(0.0, 30.0 - (fund_hit - 1) * 4.0)
+        reasons.append(f"资金流入排名第{fund_hit}")
+    else:
+        reasons.append("资金流入未形成明显共振")
+    if main_chg >= 3:
+        score += 10.0
+        reasons.append(f"板块涨幅{main_chg:+.2f}%")
+    elif main_chg >= 1:
+        score += 6.0
+        reasons.append(f"板块涨幅{main_chg:+.2f}%")
+    if limit_up >= 60:
+        score += 15.0
+        reasons.append("涨停家数高，情绪扩散强")
+    elif limit_up >= 40:
+        score += 10.0
+        reasons.append("涨停家数中等偏强")
+    elif limit_up >= 25:
+        score += 6.0
+        reasons.append("涨停家数具备一定扩散")
+    if weak_hit:
+        score -= 22.0
+        reasons.append("同时出现在走弱方向，纯正性扣分")
+
+    score = max(0.0, min(100.0, round(score, 1)))
+    if score >= 75:
+        level = "高"
+    elif score >= 55:
+        level = "中"
+    else:
+        level = "低"
+    return {
+        "score": score,
+        "level": level,
+        "reasons": reasons[:4] or ["板块数据不足，主线仅作观察"],
+    }
+
+
 def _determine_main_line(temp_data: dict, sector_data: dict, board_data: dict) -> dict:
     """判断主线及状态"""
     rank_top = sector_data.get("sector_rank_top", [])
     fund_top = sector_data.get("sector_fund_flow_top", [])
     limit_up = board_data.get("limit_up_count", 0)
 
-    # 主线 = 涨幅最高 + 资金流入靠前的板块
-    main_name = rank_top[0]["name"] if rank_top else "暂无明确主线"
-    main_chg = rank_top[0]["change_pct"] if rank_top else 0
+    # 主线优先选择涨幅和资金共振的方向，避免单看涨幅第一。
+    candidates = []
+    for idx, item in enumerate(rank_top[:5]):
+        name = str(item.get("name") or "")
+        chg = float(item.get("change_pct") or 0)
+        fund_pos = next((fidx + 1 for fidx, fund in enumerate(fund_top[:8]) if _sector_name_match(name, fund.get("name", ""))), None)
+        fund_score = max(0.0, 28.0 - (fund_pos - 1) * 4.0) if fund_pos else 0.0
+        candidates.append({
+            "name": name,
+            "change_pct": chg,
+            "score": max(0.0, 40.0 - idx * 5.0) + max(chg, 0.0) * 5.0 + fund_score,
+        })
+    if not candidates and fund_top:
+        candidates.append({
+            "name": str(fund_top[0].get("name") or "暂无明确主线"),
+            "change_pct": float(fund_top[0].get("change_pct") or 0),
+            "score": 45.0,
+        })
+    selected = max(candidates, key=lambda item: item["score"]) if candidates else {"name": "暂无明确主线", "change_pct": 0}
+    main_name = selected["name"]
+    main_chg = float(selected.get("change_pct") or 0)
+    purity = _main_line_purity(main_name, main_chg, sector_data, board_data)
 
     # 判断主线状态
     if limit_up >= 60 and main_chg >= 3:
@@ -854,7 +1031,10 @@ def _determine_main_line(temp_data: dict, sector_data: dict, board_data: dict) -
         "name": main_name,
         "status": status,
         "style": style,
-        "desc": f"今日主线为 {main_name}，状态\"{status}\"",
+        "purity_score": purity["score"],
+        "purity_level": purity["level"],
+        "purity_reasons": purity["reasons"],
+        "desc": f"今日主线为 {main_name}，状态\"{status}\"，主线纯正性{purity['score']:.1f}分/{purity['level']}",
     }
 
 
@@ -964,6 +1144,7 @@ def generate_pro_review(engine, date_str: str) -> str:
     # 4. 主线与板块判断
     lines.append("4. 主线与板块判断")
     lines.append(f"- 今日主线为 {main_line['name']}，状态\"{main_line['status']}\"。")
+    lines.append(f"- 主线纯正性：{main_line['purity_score']:.1f}分/{main_line['purity_level']}，依据：{'、'.join(main_line['purity_reasons'])}。")
     if sector.get("sector_rank_top"):
         top5 = sector["sector_rank_top"][:5]
         items = [f"{s['name']}（涨幅{s['change_pct']:+.2f}%）" for s in top5]
@@ -1169,14 +1350,44 @@ def generate_summary(overview: dict, sector: dict, idx_analysis: list) -> str:
 
 def generate_review(engine, date_str: str) -> dict:
     run_ddl(engine)
+    ensure_daily_review_columns(engine)
 
     overview = calc_market_overview(engine, date_str)
     sector = calc_sector_analysis(engine, date_str)
     idx_analysis = calc_index_analysis(engine, date_str)
+    temp = calc_market_temperature(engine, date_str)
+    board = calc_board_structure(engine, date_str)
+    emotion = classify_sentiment_cycle(
+        limit_up_count=board.get("limit_up_count", 0),
+        broken_rate=board.get("broken_rate", temp.get("broken_rate", 0)),
+        up_count=temp.get("up_count", 0),
+        down_count=temp.get("down_count", 0),
+        limit_down_count=board.get("limit_down_count", temp.get("limit_down", 0)),
+    )
+    overview["market_heat_note"] = (
+        f"{overview.get('market_heat_note') or ''}；情绪{emotion['phase']}，"
+        f"涨停{board.get('limit_up_count', 0)}家，炸板率{board.get('broken_rate', 0)}%，"
+        f"最高{board.get('max_boards', 0)}板"
+    )
     summary = generate_summary(overview, sector, idx_analysis)
+    summary = (
+        f"{summary}\n情绪周期：{emotion['phase']}，{emotion['desc']}；"
+        f"{emotion['position_advice']}。"
+    )
 
     record = {
         **overview,
+        "sentiment_cycle": emotion["phase"],
+        "sentiment_cycle_desc": f"{emotion['desc']}；{emotion['position_advice']}",
+        "limit_up_count": board.get("limit_up_count"),
+        "limit_down_count": board.get("limit_down_count"),
+        "touch_limit_up": board.get("touch_limit_up"),
+        "broken_board_count": board.get("broken_board_count"),
+        "seal_rate": board.get("seal_rate"),
+        "broken_rate": board.get("broken_rate"),
+        "max_boards": board.get("max_boards"),
+        "highest_board_stocks": json.dumps(board.get("highest_board_stocks", []), ensure_ascii=False),
+        "market_emotion_json": json.dumps(emotion, ensure_ascii=False),
         "hot_sectors": json.dumps(sector["hot_sectors"], ensure_ascii=False),
         "cold_sectors": json.dumps(sector["cold_sectors"], ensure_ascii=False),
         "volume_up_sectors": json.dumps(sector["volume_up_sectors"], ensure_ascii=False),
@@ -1202,7 +1413,7 @@ def generate_review(engine, date_str: str) -> dict:
 
     # 生成专业复盘
     try:
-        generate_pro_review(engine, date_str)
+        record["_pro_review_text"] = generate_pro_review(engine, date_str)
     except Exception as e:
         log.error("专业复盘生成失败: %s", e)
 

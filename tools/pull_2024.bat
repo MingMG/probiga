@@ -5,13 +5,16 @@ echo  ProBigA 历史数据拉取（2024-01-01 起）
 echo  请确认 SSH 隧道已打开！
 echo ============================================
 echo.
-set MYSQL_URL=mysql+pymysql://root:ProBigA%%4070966@127.0.0.1:3307/probiga?charset=utf8mb4
+if not defined MYSQL_URL (
+  echo MYSQL_URL is not set. Point it at your local tunnel before running this script.
+  exit /b 1
+)
 set SM_MAX_STOCKS=200
 set SM_HTTP_RETRIES=3
 set SM_REQUEST_SLEEP=0.5
 set SE_SKIP_GLOBAL_TRUNCATE=1
 
-cd /d "E:\My Code\ProBigA"
+cd /d "%~dp0.."
 
 echo [1/6] 基础数据...
 python tools\run_single_table.py si_all_index_code

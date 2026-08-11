@@ -1,8 +1,9 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-set PORT=8010
-if not defined MYSQL_URL set "MYSQL_URL=mysql+pymysql://root:ProBigA%%4070966@localhost:3306/probiga?charset=utf8mb4"
+set PORT=8000
+if not defined MYSQL_URL echo MYSQL_URL is not set in this shell; server.common.config will load .env if present.
+if not defined API_EMBEDDED_SCHEDULER_ENABLED set "API_EMBEDDED_SCHEDULER_ENABLED=true"
 echo ============================================
 echo   ProBigA 看板启动中...
 echo ============================================

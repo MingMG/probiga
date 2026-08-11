@@ -184,9 +184,6 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             min_rows=3000,
             date_col="snapshot_at",
             distinct_col="stock_code",
-            # Suspended/delisted symbols are not present in the live quote
-            # universe.  Production currently has 5,280 valid A-share quotes;
-            # 5,000 still enforces broad-market coverage without a false fail.
             min_distinct=5000,
         ),
     ),
@@ -316,9 +313,7 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
     "intraday_minute_flow": (
         TableRequirement(
             "sm_stock_capital_flow_min",
-            # The first 09:40 run has only a few bars per stock. Distinct
-            # stock coverage is the useful early-session completeness gate.
-            min_rows=5000,
+            min_rows=100000,
             date_col="trade_time",
             distinct_col="stock_code",
             min_distinct=5000,
@@ -481,14 +476,8 @@ def _validate_requirement(
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
-    # The information_schema query does not contain the target table in its
-    # FROM clause, so route explicitly before inspecting external tables.
-    metadata_engine = routed_read_engine(
-        f"SELECT * FROM {quote_identifier(table_name)}",
-        engine,
-    )
     rows = _read_all(
-        metadata_engine,
+        engine,
         """
         SELECT COLUMN_NAME
         FROM information_schema.COLUMNS

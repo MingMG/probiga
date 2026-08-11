@@ -22,18 +22,15 @@ import numpy as np
 import pandas as pd
 import requests
 import urllib3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import replace_table_rows, write_frame
 
 BATCH_API = "https://push2delay.eastmoney.com/api/qt/clist/get"
 PAGE_SIZE = 100
@@ -125,18 +122,17 @@ def fetch_all(session: requests.Session) -> pd.DataFrame:
 
 
 def save_to_db(engine, df: pd.DataFrame):
-    if df.empty:
-        return
+    min_rows = int(os.environ.get("CONCEPT_EAST_MIN_ROWS", "100"))
+    if df.empty or len(df) < min_rows:
+        raise RuntimeError(f"concept east current returned too few rows: {len(df)} < {min_rows}")
     df = df.replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["index_code"], keep="last")
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_concept_east_current"))
-
-    df.to_sql(
-        "sm_concept_east_current", engine,
-        if_exists="append", index=False,
-        chunksize=500, method="multi",
+    replace_table_rows(
+        df,
+        "sm_concept_east_current",
+        engine,
+        chunksize=500,
     )
 
 
@@ -146,15 +142,18 @@ def main():
     parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     session = make_session()
 
     print(f"Fetching concept east current...", flush=True)
     df = fetch_all(session)
 
     if df.empty:
-        print("No data fetched!")
-        return
+        raise RuntimeError("concept east current returned no rows")
+
+    min_rows = int(os.environ.get("CONCEPT_EAST_MIN_ROWS", "100"))
+    if len(df) < min_rows:
+        raise RuntimeError(f"concept east current returned too few rows: {len(df)} < {min_rows}")
 
     print(f"Got {len(df)} concepts", flush=True)
 

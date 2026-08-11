@@ -23,13 +23,13 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine, write_frame
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -38,7 +38,7 @@ HEADERS = {
 
 
 def _engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    return create_batch_engine()
 
 
 def fetch_all_today() -> pd.DataFrame:
@@ -154,7 +154,7 @@ def main():
     # 写入当日数据
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df_today["etl_sync_at"] = now_str
-    df_today.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=2000)
+    write_frame(df_today, "sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=2000)
     print(f"已写入 {len(df_today)} 条当日数据")
 
     # 第二步：获取历史数据（可选）
@@ -173,7 +173,7 @@ def main():
                     conn.execute(text(
                         "DELETE FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date != :d"
                     ), {"c": code, "d": trade_date})
-                hist.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
+                write_frame(hist, "sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
                 total_hist += len(hist)
             if (i + 1) % 100 == 0:
                 print(f"  进度: {i+1}/{len(codes)} | 写入: {total_hist} 条历史")

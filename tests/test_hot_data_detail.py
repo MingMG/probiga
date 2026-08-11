@@ -593,6 +593,38 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertIn("0 AS `ordinary_buy_eligible`", sql)
         self.assertEqual(params["d"], "2026-07-08")
 
+    def test_recommended_stocks_default_keeps_latest_zero_pick_analysis_date(self):
+        def latest_date(table, column="trade_date"):
+            values = {
+                ("stock_analysis_result", "analysis_date"): "2026-08-10",
+                ("st_recommended_stocks", "pick_date"): "2026-08-03",
+            }
+            return values.get((table, column), "")
+
+        with patch(
+            "server.api.routers.hot_data._table_columns",
+            return_value={"stock_code", "pick_date", "ai_score"},
+        ), patch(
+            "server.api.routers.hot_data._read_sql",
+            return_value=[],
+        ) as read_sql_mock, patch(
+            "server.api.routers.hot_data._latest_date",
+            side_effect=latest_date,
+        ), patch(
+            "server.api.routers.hot_data._recommended_data_freshness",
+            return_value={"status": "current_empty"},
+        ), patch(
+            "server.api.routers.hot_data._recommendation_theme_coverage",
+            return_value={},
+        ):
+            out = hot_data._recommended_stocks_v2("", "", "")
+
+        self.assertEqual(out["date"], "2026-08-10")
+        self.assertEqual(out["total"], 0)
+        self.assertEqual(read_sql_mock.call_count, 1)
+        _sql, params = read_sql_mock.call_args.args
+        self.assertEqual(params["d"], "2026-08-10")
+
     def test_recommended_data_freshness_flags_fallback_and_stale_sources(self):
         latest = {
             ("sm_stock_kline", "trade_date"): "2026-06-27",
@@ -1035,7 +1067,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["000001"]["flow_attitude"], "")
         self.assertEqual(out["000001"]["flow_attitude_basis"], "")
 
-    def test_portfolio_min_flow_summary_labels_fresh_flow_while_baseline_builds(self):
+    def test_portfolio_min_flow_summary_exposes_fresh_current_flow_before_five_minute_baseline(self):
         trade_date = datetime.now().strftime("%Y-%m-%d")
         rows = [{
             "stock_code": "000001",
@@ -1806,9 +1838,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(concept["change_pct"], 3.5)
 
     def test_recommended_progress_uses_long_ttl(self):
-        with patch("server.api.routers.hot_data._recommended_run_history_expire_stale"), \
-             patch("server.api.routers.hot_data._recommended_history_progress", return_value=None), \
-             patch("server.api.routers.hot_data._cache_get", return_value={"status": "done"}) as cache_get_mock, \
+        with patch("server.api.routers.hot_data._cache_get", return_value={"status": "done"}) as cache_get_mock, \
              patch("server.api.routers.hot_data._job_is_running", return_value=False):
             out = hot_data.recommended_stocks_progress()
 

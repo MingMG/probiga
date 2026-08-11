@@ -20,14 +20,14 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 from tools.jq_config import get_jq_client, jq_auth, jq_normalize_code
 
 
@@ -130,7 +130,8 @@ def _is_trade_day(engine: Engine, day: date | None = None) -> bool:
                 {"d": day.isoformat()},
             ).scalar()
         return bool(count)
-    except Exception:
+    except Exception as exc:
+        logger.warning("failed to read trade calendar, falling back to weekday: %s", exc)
         return day.weekday() < 5
 
 
@@ -155,7 +156,8 @@ def _stock_code_to_jq(stock_code: str, *, include_bj: bool = False) -> str:
     if include_bj:
         try:
             return jq_normalize_code(code)
-        except Exception:
+        except Exception as exc:
+            logger.debug("failed to normalize BJ stock code %s: %s", code, exc)
             return ""
     return ""
 
@@ -266,8 +268,8 @@ def _clean_float(value: Any) -> float | None:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("pd.isna failed for %r: %s", value, exc)
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -466,7 +468,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     try:
         result = sync_jq_minute_gml(
             engine,

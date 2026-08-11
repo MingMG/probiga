@@ -24,7 +24,11 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 from sqlalchemy import text
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, read_frame, write_frame
+
+
+def get_engine():
+    return create_batch_engine()
 
 
 def fetch_flow(stock_code: str) -> pd.DataFrame | None:
@@ -115,7 +119,7 @@ def main():
         if len(batch_data) >= args.batch_size or (i + 1) == total_stocks:
             if batch_data:
                 combined = pd.concat(batch_data, ignore_index=True)
-                combined.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
+                write_frame(combined, "sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
                 total_rows += len(combined)
                 batch_data = []
 
@@ -137,11 +141,11 @@ def main():
 
         # 按日期统计
         if args.date:
-            df_stat = pd.read_sql(text(
+            df_stat = read_frame(text(
                 "SELECT trade_date, COUNT(*) as cnt FROM sm_stock_capital_flow_daily WHERE trade_date = :d GROUP BY trade_date"
             ), conn, params={"d": args.date[:10]})
         else:
-            df_stat = pd.read_sql(text(
+            df_stat = read_frame(text(
                 "SELECT trade_date, COUNT(*) as cnt FROM sm_stock_capital_flow_daily GROUP BY trade_date ORDER BY trade_date DESC LIMIT 5"
             ), conn)
         print()

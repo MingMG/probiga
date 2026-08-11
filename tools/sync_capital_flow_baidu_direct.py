@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 """
 直接使用百度API同步资金流向（绕过adata封装）
 """
 import sys
-import os
 import json
+import logging
 import time
 from datetime import datetime, date
 from pathlib import Path
 
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-MYSQL_URL = os.environ.get("MYSQL_URL", "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4")
+from server.common.batch_db import write_frame
 
 HEADERS = {
     'Host': 'finance.pae.baidu.com',
@@ -28,6 +29,7 @@ HEADERS = {
 
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+logger = logging.getLogger(__name__)
 
 
 def parse_amount(val):
@@ -42,7 +44,8 @@ def parse_amount(val):
             return float(val.replace('万', '').replace('+', '')) * 1e4
         else:
             return float(val.replace('+', ''))
-    except:
+    except (TypeError, ValueError) as exc:
+        logger.debug("Failed to parse Baidu amount %r: %s", val, exc)
         return 0.0
 
 
@@ -77,6 +80,7 @@ def fetch_baidu_flow(stock_code, target_date):
                 }
         return None
     except Exception as e:
+        logger.debug("Baidu flow fetch failed for %s on %s: %s", stock_code, target_date, e)
         return None
 
 
@@ -124,7 +128,7 @@ def sync_date(engine, target_date):
         df = pd.DataFrame(rows)
         df["data_source"] = "baidu"
         df["etl_sync_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi", chunksize=1000)
+        write_frame(df, "sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi", chunksize=1000)
         print(f"写入 {len(df)} 条数据")
     else:
         print("无数据可写入")
@@ -133,7 +137,7 @@ def sync_date(engine, target_date):
 def main():
     sys.stdout.reconfigure(line_buffering=True)
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
 
     # 要同步的日期列表
     dates_to_sync = ["2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30", "2026-06-02"]

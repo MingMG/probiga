@@ -21,6 +21,7 @@ class RecommendationGate:
     STATUS_ALLOW = "ALLOW"
     STATUS_SUSPENDED = "SUSPENDED"
     STATUS_BLOCK = "BLOCK"
+    STATUS_DATA_BLOCKED = "DATA_BLOCKED"
 
     def evaluate(
         self,
@@ -28,6 +29,7 @@ class RecommendationGate:
         short_term: dict,
         event_risk: dict,
         analysis_date: str | None = None,
+        actionability: dict | None = None,
     ) -> dict:
         """
         综合评估推荐资格
@@ -56,8 +58,19 @@ class RecommendationGate:
         risks.extend(event_risk.get('risks', []))
 
         # 1. 检查事件风险（最高优先级）
-        event_level = event_risk.get('event_risk_level', 'LOW')
+        event_level = str(
+            event_risk.get('event_risk_level') or self.STATUS_DATA_BLOCKED
+        ).upper()
         triggered_events = event_risk.get('triggered_events', [])
+
+        if event_level not in {'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'}:
+            return {
+                'status': self.STATUS_DATA_BLOCKED,
+                'reason': '事件风险数据缺失或不可验证，禁止形成可执行推荐',
+                'events': triggered_events,
+                'strengths': strengths,
+                'risks': risks,
+            }
 
         if event_level == 'CRITICAL':
             return {
@@ -72,6 +85,33 @@ class RecommendationGate:
             return {
                 'status': self.STATUS_SUSPENDED,
                 'reason': '存在高风险事件，暂停推荐等待市场重新定价',
+                'events': triggered_events,
+                'strengths': strengths,
+                'risks': risks,
+            }
+
+        actionability = actionability or {}
+        pit_status = str(
+            actionability.get('pit_status') or self.STATUS_DATA_BLOCKED
+        ).upper()
+        chase_status = str(
+            actionability.get('chase_risk_status') or self.STATUS_DATA_BLOCKED
+        ).upper()
+        ordinary_buy_eligible = (
+            actionability.get('ordinary_buy_eligible') is True
+        )
+        if pit_status != 'PASS':
+            return {
+                'status': self.STATUS_DATA_BLOCKED,
+                'reason': '缺少经过时间截面验证的完整因子证据，禁止形成可执行推荐',
+                'events': triggered_events,
+                'strengths': strengths,
+                'risks': risks,
+            }
+        if chase_status != self.STATUS_ALLOW or not ordinary_buy_eligible:
+            return {
+                'status': self.STATUS_BLOCK,
+                'reason': f'追高与成交能力硬门未通过：{chase_status}',
                 'events': triggered_events,
                 'strengths': strengths,
                 'risks': risks,
@@ -179,18 +219,22 @@ class RecommendationGate:
             trend = "长短均衡"
 
         # 推荐状态
-        status = recommend.get('status', 'ALLOW')
+        status = str(
+            recommend.get('status') or self.STATUS_DATA_BLOCKED
+        ).upper()
         if status == 'BLOCK':
             action = "不建议介入"
         elif status == 'SUSPENDED':
             action = "建议观望"
-        else:
+        elif status == self.STATUS_ALLOW:
             if st_score >= 75:
                 action = "可关注"
             elif st_score >= 60:
                 action = "谨慎关注"
             else:
                 action = "暂不推荐"
+        else:
+            action = "数据不足，建议观望"
 
         return f"{trend}，{action}"
 
@@ -204,12 +248,15 @@ class RecommendationGate:
         Returns:
             操作建议文本
         """
-        status = recommend.get('status', 'ALLOW')
+        status = str(
+            recommend.get('status') or self.STATUS_DATA_BLOCKED
+        ).upper()
         reason = recommend.get('reason', '')
 
         if status == 'BLOCK':
             return f"禁止推荐：{reason}"
         elif status == 'SUSPENDED':
             return f"暂停推荐：{reason}"
-        else:
+        elif status == self.STATUS_ALLOW:
             return reason or "可正常关注"
+        return f"数据阻断：{reason or '缺少形成推荐所需的完整证据'}"

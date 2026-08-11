@@ -43,6 +43,8 @@ def portfolio_calc_next_position(
         return {"status": "error", "error": "交易类型无效"}
     if px <= 0 or qty <= 0:
         return {"status": "error", "error": "请输入有效价格和股数"}
+    if qty % 100 != 0:
+        return {"status": "error", "error": "A股交易股数必须为100股整数倍"}
     if t == "sell" and old_sh <= 0:
         return {"status": "error", "error": "当前无持仓，不能卖出"}
     trade_shares = min(qty, old_sh) if t == "sell" else qty

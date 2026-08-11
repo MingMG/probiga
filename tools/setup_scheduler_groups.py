@@ -1,133 +1,143 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
+"""Initialize scheduler task groups and a small set of supplemental tasks."""
+
 import sys
-from datetime import datetime
+from pathlib import Path
 
-from sqlalchemy import create_engine, text
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from sqlalchemy import text
+
+from env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.scheduler_tasks import ensure_scheduler_columns, table_columns, upsert_scheduler_task
 
 GROUP_RULES = [
     ("复盘数据", ["热股榜", "人气榜", "热股", "融合", "强势股", "fetch_hot_rank", "fetch_hot_pop", "merge_hot_rank"]),
     ("概念行业", ["概念", "行业", "concept", "industry"]),
     ("资金流向", ["资金", "capital", "flow"]),
-    ("龙虎榜",   ["龙虎榜", "a_list", "alist"]),
+    ("龙虎榜", ["龙虎榜", "a_list", "alist"]),
     ("系统管理", ["同步", "sync", "system", "backup"]),
 ]
 
-def ensure_group_column(engine):
-    with engine.begin() as conn:
-        try:
-            conn.execute(text("ALTER TABLE `st_scheduled_tasks` ADD COLUMN `group_name` VARCHAR(32) DEFAULT '其他' COMMENT '分组名称' AFTER `task_name`"))
-            print("  [OK] 添加 group_name 列")
-        except Exception as e:
-            if "Duplicate column" in str(e):
-                print("  [SKIP] group_name 列已存在")
-            else:
-                raise
 
-def get_all_tasks(engine):
+def ensure_group_column(engine) -> None:
+    before = table_columns(engine)
+    ensure_scheduler_columns(engine)
+    if "group_name" in before:
+        print("  [SKIP] group_name 列已存在")
+    else:
+        print("  [OK] 添加 group_name 列")
+
+
+def get_all_tasks(engine) -> list[dict[str, object]]:
     with engine.connect() as conn:
-        result = conn.execute(text("SELECT id, task_name, script_path FROM st_scheduled_tasks ORDER BY sort_order"))
-        return [dict(row._mapping) for row in result]
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, task_name, script_path
+                FROM st_scheduled_tasks
+                ORDER BY sort_order
+                """
+            )
+        ).fetchall()
+    return [dict(row._mapping) for row in rows]
 
-def classify_task(task_name, script_path):
-    combined = (task_name or "") + " " + (script_path or "")
+
+def classify_task(task_name: str | None, script_path: str | None) -> str:
+    combined = f"{task_name or ''} {script_path or ''}"
     for group_name, keywords in GROUP_RULES:
-        for kw in keywords:
-            if kw in combined:
-                return group_name
+        if any(keyword in combined for keyword in keywords):
+            return group_name
     return "其他"
 
-def assign_groups(engine):
-    tasks = get_all_tasks(engine)
-    for t in tasks:
-        group = classify_task(t["task_name"], t.get("script_path", ""))
-        with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE st_scheduled_tasks SET group_name = :g WHERE id = :id"),
-                {"g": group, "id": t["id"]}
-            )
-        print(f"  [{group}] {t['task_name']}")
 
-def get_max_sort(engine):
+def assign_groups(engine) -> None:
+    for task in get_all_tasks(engine):
+        group = classify_task(task.get("task_name"), task.get("script_path"))
+        upsert_scheduler_task(
+            engine,
+            {"group_name": group},
+            lookup_where="id = :id",
+            lookup_params={"id": task["id"]},
+            allowed_columns={"group_name"},
+        )
+        print(f"  [{group}] {task['task_name']}")
+
+
+def get_max_sort(engine) -> int:
     with engine.connect() as conn:
-        r = conn.execute(text("SELECT COALESCE(MAX(sort_order), 0) FROM st_scheduled_tasks"))
-        return r.scalar()
+        value = conn.execute(text("SELECT COALESCE(MAX(sort_order), 0) FROM st_scheduled_tasks")).scalar()
+    return int(value or 0)
 
-def insert_xq_task(engine):
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT COUNT(*) FROM st_scheduled_tasks WHERE script_path LIKE :p"),
-            {"p": "%fetch_hot_rank_xq%"}
-        ).scalar()
-    if exists:
-        print("  [SKIP] 雪球热股任务已存在")
-        return
 
-    max_sort = get_max_sort(engine)
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO st_scheduled_tasks
-            (task_name, group_name, script_path, script_args, cron_time, enabled, sort_order, date_param, created_at, updated_at)
-            VALUES (:name, :grp, :script, :args, :cron, :enabled, :sort, :dp, NOW(), NOW())
-        """), {
-            "name": "雪球热股榜TOP100",
-            "grp": "复盘数据",
-            "script": "tools/fetch_hot_rank_xq.py",
-            "args": "",
-            "cron": "17:10",
-            "enabled": 1,
-            "sort": max_sort + 1,
-            "dp": "",
-        })
-    print("  [OK] 插入雪球热股榜定时任务")
+def upsert_xq_task(engine) -> None:
+    payload = {
+        "task_name": "雪球热股榜TOP100",
+        "task_type": "hot_rank_xq",
+        "group_name": "复盘数据",
+        "script_path": "tools/fetch_hot_rank_xq.py",
+        "script_args": "",
+        "cron_time": "17:10",
+        "enabled": 1,
+        "sort_order": get_max_sort(engine) + 1,
+        "date_param": "",
+    }
+    result = upsert_scheduler_task(
+        engine,
+        payload,
+        lookup_where="script_path LIKE :script_path",
+        lookup_params={"script_path": "%fetch_hot_rank_xq%"},
+        update_exclude={"script_path", "sort_order"},
+    )
+    print(f"  [OK] 雪球热股榜任务已{result['action']}: id={result['id']}")
 
-def insert_concept_task(engine):
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT COUNT(*) FROM st_scheduled_tasks WHERE script_path LIKE :p"),
-            {"p": "%sync_concept_ths%"}
-        ).scalar()
-    if exists:
-        print("  [SKIP] 概念成分股任务已存在")
-        return
 
-    max_sort = get_max_sort(engine)
-    with engine.begin() as conn:
-        conn.execute(text("""
-            INSERT INTO st_scheduled_tasks
-            (task_name, group_name, script_path, script_args, cron_time, enabled, sort_order, date_param, created_at, updated_at)
-            VALUES (:name, :grp, :script, :args, :cron, :enabled, :sort, :dp, NOW(), NOW())
-        """), {
-            "name": "同花顺概念成分股同步",
-            "grp": "概念行业",
-            "script": "tools/sync_concept_ths.py",
-            "args": "",
-            "cron": "06:00",
-            "enabled": 1,
-            "sort": max_sort + 1,
-            "dp": "",
-        })
-    print("  [OK] 插入同花顺概念成分股同步任务（每天06:00）")
+def upsert_concept_task(engine) -> None:
+    payload = {
+        "task_name": "同花顺概念成分股同步",
+        "task_type": "concept_constituent_ths",
+        "group_name": "概念行业",
+        "script_path": "tools/sync_concept_ths.py",
+        "script_args": "",
+        "cron_time": "06:00",
+        "enabled": 1,
+        "sort_order": get_max_sort(engine) + 1,
+        "date_param": "",
+    }
+    result = upsert_scheduler_task(
+        engine,
+        payload,
+        lookup_where="script_path LIKE :script_path",
+        lookup_params={"script_path": "%sync_concept_ths%"},
+        update_exclude={"script_path", "sort_order"},
+    )
+    print(f"  [OK] 同花顺概念成分股同步任务已{result['action']}: id={result['id']}")
 
-print("=" * 60)
-print("  调度任务分组 + 新任务初始化")
-print("=" * 60)
 
-print("\n[1/4] 添加 group_name 列...")
-ensure_group_column(engine)
+def main() -> None:
+    engine = create_tool_engine(resolve_tool_mysql_url())
 
-print("\n[2/4] 插入雪球热股任务...")
-insert_xq_task(engine)
+    print("=" * 60)
+    print("  调度任务分组 + 新任务初始化")
+    print("=" * 60)
 
-print("\n[3/4] 插入概念成分股同步任务...")
-insert_concept_task(engine)
+    print("\n[1/4] 检查 group_name 列...")
+    ensure_group_column(engine)
 
-print("\n[4/4] 自动分组...")
-assign_groups(engine)
+    print("\n[2/4] 写入雪球热股任务...")
+    upsert_xq_task(engine)
 
-print("\nDone!")
+    print("\n[3/4] 写入概念成分股同步任务...")
+    upsert_concept_task(engine)
+
+    print("\n[4/4] 自动分组...")
+    assign_groups(engine)
+
+    print("\nDone!")
+
+
+if __name__ == "__main__":
+    main()

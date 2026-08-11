@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
 慢速补同步个股资金流向，只用东财 push2his 数据源。
@@ -7,7 +8,6 @@
 
 import http.client
 import json
-import os
 import random
 import ssl
 import sys
@@ -17,14 +17,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+from server.common.batch_db import read_frame, write_frame
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
-
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 # ── 慢速参数（东财限流极严，必须非常慢）──
 REQUEST_DELAY = 3.0       # 基础间隔 3 秒
@@ -43,10 +42,6 @@ _HEADERS = {
     "Accept": "*/*",
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
-
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
 
 
 def _read_stock_codes(engine):
@@ -69,7 +64,12 @@ def _fetch_push2his(stock_code: str, target_date: str) -> dict | None:
         ["curl", "-s", "--max-time", "15", "-H", "User-Agent: Mozilla/5.0", url],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
-    stdout, _ = proc.communicate()
+    try:
+        stdout, _ = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        proc.communicate()
+        raise TimeoutError("curl 请求超时") from exc
     if proc.returncode != 0 or not stdout:
         raise ConnectionError("curl 请求失败")
     data = json.loads(stdout.decode("utf-8"))
@@ -195,8 +195,15 @@ def _backfill_one_day(engine, target_date: str, stock_codes: list[str]):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d"), {"d": target_date})
 
-    df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False,
-              chunksize=500, method="multi")
+    write_frame(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=500,
+        method="multi",
+    )
 
     elapsed = time.time() - t_start
     print(f"  ✅ {target_date} 写入 {len(df)} 条  成功={success}  失败={failed}  无数据={no_data}  耗时 {elapsed:.0f}s ({elapsed/60:.1f}min)")
@@ -210,17 +217,17 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只列出待补日期，不实际执行")
     args = parser.parse_args()
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(resolve_tool_mysql_url())
     stock_codes = _read_stock_codes(engine)
 
     # 找出需要补的日期
-    kline = pd.read_sql(text(f"""
+    kline = read_frame(text(f"""
         SELECT trade_date FROM sm_stock_kline
         WHERE k_type = 1 AND trade_date >= '{args.start}' AND trade_date <= '{args.end}'
         GROUP BY trade_date ORDER BY trade_date
     """), engine)
 
-    flow = pd.read_sql(text(f"""
+    flow = read_frame(text(f"""
         SELECT trade_date, COUNT(DISTINCT stock_code) as cnt
         FROM sm_stock_capital_flow_daily
         WHERE trade_date >= '{args.start}' AND trade_date <= '{args.end}'

@@ -259,6 +259,8 @@ def readiness():
         },
         status="ok" if paper_ready else "blocked",
     )
+
+
 @router.get("/overview")
 def overview(compact: bool = Query(default=False)):
     data = _repo().overview()
@@ -451,3 +453,4 @@ def run_manual_action(
         },
         status=str(result["status"]),
     )
+

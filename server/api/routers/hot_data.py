@@ -8730,14 +8730,21 @@ def _recommended_stocks_v2(
         if requested_trade_date:
             trade_date = requested_trade_date
         else:
-            trade_date = _latest_date("st_recommended_stocks", "pick_date")
+            # Anchor the default response to the latest completed analysis,
+            # even when the safety gates legitimately produced zero picks.
+            # Falling back silently to an older non-empty recommendation day
+            # makes stale candidates look current.
+            trade_date = (
+                _latest_date("stock_analysis_result", "analysis_date")
+                or _latest_date("st_recommended_stocks", "pick_date")
+            )
         rows = _query_for_date(trade_date) if trade_date else []
         if not rows and requested_trade_date and allow_previous_snapshot:
             fallback = _latest_date_not_after("st_recommended_stocks", requested_trade_date, "pick_date")
             if fallback and fallback != trade_date:
                 trade_date = fallback
                 rows = _query_for_date(trade_date)
-        if not rows and not requested_trade_date:
+        if not rows and not requested_trade_date and allow_previous_snapshot:
             fallback = _latest_date("st_recommended_stocks", "pick_date")
             if fallback and fallback != trade_date:
                 trade_date = fallback

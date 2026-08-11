@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+import os
 from collections.abc import Iterable
 
 import pandas as pd
 
-from integrations.qmt import bridge
+from integrations.qmt import bridge, to_qmt_symbol
 
 INDUSTRY_PREFIXES: dict[str, str] = {
     "1000SW1": "申万一级",
@@ -111,12 +112,22 @@ def _fetch_memberships(sector_names: Iterable[str]) -> pd.DataFrame:
     names = _dedupe_strings(sector_names)
     if not names:
         return pd.DataFrame(columns=["sector_name", "stock_code", "qmt_code"])
-    df = bridge.sector_members_many(names, timeout=900)
-    if df is None or df.empty:
+    batch_size = max(5, int(os.environ.get("QMT_SECTOR_MEMBER_BATCH_SIZE", "40") or 40))
+    parts: list[pd.DataFrame] = []
+    for offset in range(0, len(names), batch_size):
+        batch = names[offset : offset + batch_size]
+        frame = bridge.sector_members_many(batch, timeout=180)
+        if frame is not None and not frame.empty:
+            parts.append(frame)
+    if not parts:
         return pd.DataFrame(columns=["sector_name", "stock_code", "qmt_code"])
+    df = pd.concat(parts, ignore_index=True)
     out = df[["sector_name", "stock_code", "qmt_code"]].copy()
     out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
     out["qmt_code"] = out["qmt_code"].astype(str).str.upper()
+    # QMT concept sectors can contain indices, bonds, or other instruments.
+    # Keep only symbols that round-trip through the canonical A-share mapper.
+    out = out[out["qmt_code"].eq(out["stock_code"].map(to_qmt_symbol))]
     return out.drop_duplicates(subset=["sector_name", "stock_code"], keep="first").reset_index(drop=True)
 
 

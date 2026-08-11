@@ -15,6 +15,7 @@ from integrations.qmt.pending_write import replay_pending_writes, result_dict as
 
 
 CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
+MAIN_A_SHARE_CODE_PATTERN = "^(0|3|6)"
 
 
 @dataclass(frozen=True)
@@ -139,11 +140,11 @@ def _expected_stock_counts(engine: Engine, dates: Sequence[date]) -> dict[date, 
                         """
                         SELECT COUNT(*)
                         FROM si_all_code
-                        WHERE stock_code REGEXP '^(0|3|4|6|8|9)'
+                        WHERE stock_code REGEXP :stock_pattern
                           AND (list_date IS NULL OR list_date <= :trade_date)
                         """
                     ),
-                    {"trade_date": trade_date},
+                    {"trade_date": trade_date, "stock_pattern": MAIN_A_SHARE_CODE_PATTERN},
                 ).scalar()
                 or 0
             )
@@ -226,7 +227,13 @@ def build_coverage_results(engine: Engine, *, scan_days: int) -> list[CoverageRe
                     missing_count=missing_count,
                     coverage_ratio=round(ratio, 8),
                     status=_coverage_status(ratio, warn_threshold=warn, pass_threshold=passed),
-                    details={"warn_threshold": warn, "pass_threshold": passed, "history_backfill": "deferred_queue"},
+                    details={
+                        "warn_threshold": warn,
+                        "pass_threshold": passed,
+                        "history_backfill": "deferred_queue",
+                        "stock_universe": "main_a_share",
+                        "stock_code_pattern": MAIN_A_SHARE_CODE_PATTERN,
+                    },
                 )
             )
     return results

@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import uuid
+import os
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 
 from integrations.qmt.diagnostics import PROVIDER_ID
 
 
 CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
+RETRYABLE_MYSQL_WRITE_ERRORS = {1205, 1213}
 
 
 @dataclass(frozen=True)
@@ -116,7 +120,18 @@ def _ordered_insert_columns(rows: Sequence[Mapping[str, Any]], table_columns: Se
     return [column for column in table_columns if column in present]
 
 
-def safe_upsert_rows(
+def _mysql_error_code(exc: BaseException) -> int | None:
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", None) or getattr(exc, "args", None) or ()
+    if not args:
+        return None
+    try:
+        return int(args[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_upsert_rows_once(
     engine: Engine,
     *,
     table_name: str,
@@ -213,6 +228,41 @@ def safe_upsert_rows(
         update_columns=update_set,
         batch_id=batch_id,
     )
+
+
+def safe_upsert_rows(
+    engine: Engine,
+    *,
+    table_name: str,
+    rows: Iterable[Mapping[str, Any]],
+    key_columns: Sequence[str],
+    batch_id: str | None = None,
+    update_columns: Sequence[str] | None = None,
+    permission_status: str = "SUPPORTED",
+    quality_status: str = "PENDING",
+) -> SafeUpsertResult:
+    """Retry transient MySQL write conflicts around the temp-table upsert."""
+    source_rows = list(rows)
+    attempts = max(1, int(os.environ.get("QMT_SAFE_UPSERT_RETRIES", "3")))
+    base_sleep = max(0.05, float(os.environ.get("QMT_SAFE_UPSERT_RETRY_SLEEP", "0.25")))
+    for attempt in range(attempts):
+        try:
+            return _safe_upsert_rows_once(
+                engine,
+                table_name=table_name,
+                rows=source_rows,
+                key_columns=key_columns,
+                batch_id=batch_id,
+                update_columns=update_columns,
+                permission_status=permission_status,
+                quality_status=quality_status,
+            )
+        except OperationalError as exc:
+            code = _mysql_error_code(exc)
+            if code not in RETRYABLE_MYSQL_WRITE_ERRORS or attempt >= attempts - 1:
+                raise
+            time.sleep(base_sleep * (2**attempt))
+    raise RuntimeError("unreachable safe_upsert retry state")
 
 
 def result_dict(result: SafeUpsertResult) -> dict[str, Any]:

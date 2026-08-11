@@ -7,7 +7,7 @@ from integrations.qmt.aggregate import (
     aggregate_concept_kline,
     aggregate_concept_minute,
 )
-from integrations.qmt.sectors import build_concept_catalog
+from integrations.qmt.sectors import _fetch_memberships, build_concept_catalog
 
 
 def test_build_concept_catalog_prefers_tdgn_variant() -> None:
@@ -15,6 +15,27 @@ def test_build_concept_catalog_prefers_tdgn_variant() -> None:
     codes = df.set_index("name")["concept_code"].to_dict()
     assert codes["5G概念"] == "TDGN5G概念"
     assert codes["机器人"] == "GN机器人"
+
+
+def test_memberships_are_batched_and_non_a_share_symbols_are_filtered(monkeypatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setenv("QMT_SECTOR_MEMBER_BATCH_SIZE", "5")
+
+    def fake_members(sectors, **_kwargs):
+        calls.append(list(sectors))
+        return pd.DataFrame(
+            [
+                {"sector_name": sectors[0], "stock_code": "000001", "qmt_code": "000001.SZ"},
+                {"sector_name": sectors[0], "stock_code": "910001", "qmt_code": "910001.BJ"},
+            ]
+        )
+
+    monkeypatch.setattr("integrations.qmt.sectors.bridge.sector_members_many", fake_members)
+
+    out = _fetch_memberships([f"TGN{i}" for i in range(11)])
+
+    assert [len(batch) for batch in calls] == [5, 5, 1]
+    assert set(out["qmt_code"]) == {"000001.SZ"}
 
 
 def test_aggregate_concept_current() -> None:

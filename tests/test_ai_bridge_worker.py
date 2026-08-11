@@ -106,3 +106,4 @@ def test_deepseek_citation_badges_are_rendered_inline():
     answer = "收盘价上涨-\n3\n。成交活跃-\n1\n-\n3\n。\n\n下一段。"
 
     assert _normalize_deepseek_answer(answer) == "收盘价上涨[3]。成交活跃[1][3]。\n\n下一段。"
+

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from datetime import datetime
@@ -38,6 +39,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("sync_notice_em")
+NOTICE_HTTP_TIMEOUT_SECONDS = 20.0
+NOTICE_MIN_COVERAGE = float(os.environ.get("NOTICE_MIN_COVERAGE", "0.90"))
+NOTICE_MIN_ROW_COVERAGE = float(os.environ.get("NOTICE_MIN_ROW_COVERAGE", "0.50"))
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -50,9 +54,11 @@ DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_notice_eastmoney.sql
 UPSERT_SQL = text(
     """
     INSERT INTO si_notice_eastmoney (
-        stock_code, art_code, notice_date, title, column_name, display_time, detail_url, etl_sync_at
+        stock_code, art_code, notice_date, title, column_name, display_time,
+        detail_url, association_validated, etl_sync_at
     ) VALUES (
-        :stock_code, :art_code, :notice_date, :title, :column_name, :display_time, :detail_url, :etl_sync_at
+        :stock_code, :art_code, :notice_date, :title, :column_name, :display_time,
+        :detail_url, :association_validated, :etl_sync_at
     )
     ON DUPLICATE KEY UPDATE
         notice_date = VALUES(notice_date),
@@ -60,6 +66,7 @@ UPSERT_SQL = text(
         column_name = VALUES(column_name),
         display_time = VALUES(display_time),
         detail_url = VALUES(detail_url),
+        association_validated = VALUES(association_validated),
         etl_sync_at = VALUES(etl_sync_at)
     """
 )
@@ -97,6 +104,116 @@ def run_ddl(engine: Engine) -> None:
                 logger.warning("DDL 执行提示：%s", e)
 
 
+    ensure_notice_validation_schema(engine)
+
+
+def ensure_notice_validation_schema(engine: Engine) -> None:
+    """Add the non-destructive stock-association trust marker."""
+    with engine.begin() as conn:
+        columns = {
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'si_notice_eastmoney'
+                    """
+                )
+            ).fetchall()
+        }
+        if "association_validated" not in columns:
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE si_notice_eastmoney
+                    ADD COLUMN association_validated TINYINT(1) NOT NULL DEFAULT 0
+                    COMMENT '1=source payload explicitly contains this stock code'
+                    AFTER detail_url
+                    """
+                )
+            )
+        indexes = {
+            str(row[0])
+            for row in conn.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'si_notice_eastmoney'
+                    """
+                )
+            ).fetchall()
+        }
+        if "idx_notice_validated_stock_date" not in indexes:
+            conn.execute(
+                text(
+                    """
+                    CREATE INDEX idx_notice_validated_stock_date
+                    ON si_notice_eastmoney
+                       (association_validated, stock_code, notice_date)
+                    """
+                )
+            )
+        conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS si_notice_sync_run (
+                    id BIGINT NOT NULL AUTO_INCREMENT,
+                    stock_code VARCHAR(16) NOT NULL,
+                    started_at DATETIME NOT NULL,
+                    completed_at DATETIME NOT NULL,
+                    status VARCHAR(16) NOT NULL,
+                    fetched_rows INT NOT NULL DEFAULT 0,
+                    validated_rows INT NOT NULL DEFAULT 0,
+                    error_text VARCHAR(1000) NULL,
+                    PRIMARY KEY (id),
+                    KEY idx_notice_sync_code_time
+                        (stock_code, completed_at, status),
+                    KEY idx_notice_sync_time (completed_at, status)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+        )
+
+
+def record_sync_run(
+    engine: Engine,
+    *,
+    stock_code: str,
+    started_at: datetime,
+    completed_at: datetime,
+    status: str,
+    fetched_rows: int,
+    validated_rows: int,
+    error_text: str = "",
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO si_notice_sync_run
+                    (stock_code, started_at, completed_at, status,
+                     fetched_rows, validated_rows, error_text)
+                VALUES
+                    (:stock_code, :started_at, :completed_at, :status,
+                     :fetched_rows, :validated_rows, :error_text)
+                """
+            ),
+            {
+                "stock_code": str(stock_code).strip().zfill(6),
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "status": str(status or "FAILED")[:16],
+                "fetched_rows": max(0, int(fetched_rows)),
+                "validated_rows": max(0, int(validated_rows)),
+                "error_text": str(error_text or "")[:1000] or None,
+            },
+        )
+
+
 def _detail_url(stock_code: str, art_code: str) -> str:
     c = str(stock_code).strip().zfill(6)
     return f"https://data.eastmoney.com/notices/detail/{c}/{art_code}.html"
@@ -115,16 +232,47 @@ def _parse_notice_date(raw: Any) -> datetime | None:
 
 
 def _notice_date_from_item(item: dict[str, Any]) -> datetime | None:
+    today = datetime.now().date()
     for key in ("display_time", "notice_date", "eiTime", "art_date"):
         parsed = _parse_notice_date(item.get(key))
-        if parsed:
+        if parsed and parsed.date() <= today:
             return parsed
     return None
 
 
-def _parse_item(stock_code: str, item: dict[str, Any], etl: datetime) -> dict[str, Any]:
+def _item_stock_codes(item: dict[str, Any]) -> set[str]:
+    codes: set[str] = set()
+    raw_codes = item.get("codes") or []
+    if not isinstance(raw_codes, list):
+        return codes
+    for raw in raw_codes:
+        if isinstance(raw, dict):
+            value = (
+                raw.get("stock_code")
+                or raw.get("code")
+                or raw.get("security_code")
+                or ""
+            )
+        else:
+            value = raw
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if len(digits) >= 6:
+            codes.add(digits[-6:])
+    return codes
+
+
+def _parse_item(
+    stock_code: str,
+    item: dict[str, Any],
+    etl: datetime,
+) -> dict[str, Any] | None:
+    requested_code = str(stock_code).strip().zfill(6)
+    if requested_code not in _item_stock_codes(item):
+        return None
     art = (item.get("art_code") or "").strip()
     title = (item.get("title") or item.get("title_ch") or "").strip()[:1024]
+    if not art or not title:
+        return None
     cols = item.get("columns") or []
     col_name = ""
     if isinstance(cols, list) and cols and isinstance(cols[0], dict):
@@ -132,13 +280,14 @@ def _parse_item(stock_code: str, item: dict[str, Any], etl: datetime) -> dict[st
     disp = str(item.get("display_time") or "")[:64]
     nd = _notice_date_from_item(item)
     return {
-        "stock_code": str(stock_code).strip().zfill(6),
+        "stock_code": requested_code,
         "art_code": art,
         "notice_date": nd.date() if nd else None,
         "title": title or None,
         "column_name": col_name or None,
         "display_time": disp or None,
         "detail_url": _detail_url(stock_code, art) if art else None,
+        "association_validated": 1,
         "etl_sync_at": etl,
     }
 
@@ -155,12 +304,14 @@ def fetch_pages(
     for page in range(1, max_pages + 1):
         url = (
             "https://np-anotice-stock.eastmoney.com/api/security/ann?sr=-1"
-            f"&page_size={page_size}&page_index={page}&client_source=web&stock_list={code}"
+            f"&page_size={page_size}&page_index={page}"
+            f"&ann_type=A&client_source=web&stock_list={code}"
+            "&f_node=0&s_node=0"
         )
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                r = client.get(url, timeout=20.0)
+                r = client.get(url, timeout=NOTICE_HTTP_TIMEOUT_SECONDS)
                 r.raise_for_status()
                 break
             except httpx.HTTPError as e:
@@ -197,9 +348,21 @@ def upsert_rows(engine: Engine, rows: list[dict[str, Any]]) -> int:
 
 
 def read_codes_from_db(engine: Engine, offset: int, limit: int) -> list[str]:
-    q = text("SELECT stock_code FROM si_all_code ORDER BY stock_code LIMIT :lim OFFSET :off")
+    sql = """
+        SELECT stock_code
+        FROM si_all_code
+        WHERE stock_code REGEXP '^(0|3|6)'
+        ORDER BY stock_code
+    """
+    params = {"off": max(0, int(offset))}
+    if int(limit) > 0:
+        sql += " LIMIT :lim OFFSET :off"
+        params["lim"] = int(limit)
+    else:
+        # MySQL's maximum unsigned BIGINT limit means "all remaining rows".
+        sql += " LIMIT 18446744073709551615 OFFSET :off"
     with engine.connect() as c:
-        rows = c.execute(q, {"lim": limit, "off": offset}).fetchall()
+        rows = c.execute(text(sql), params).fetchall()
     return [str(r[0]).strip().zfill(6) for r in rows]
 
 
@@ -213,6 +376,18 @@ def main() -> int:
     p.add_argument("--max-pages", type=int, default=3, help="每只股票最多翻页数，默认 3")
     p.add_argument("--sleep", type=float, default=0.3, help="股票间隔秒数")
     p.add_argument("--skip-ddl", action="store_true", help="不执行建表 SQL")
+    p.add_argument(
+        "--min-coverage",
+        type=float,
+        default=NOTICE_MIN_COVERAGE,
+        help="Minimum successful stock-request coverage; default 90%%.",
+    )
+    p.add_argument(
+        "--min-row-coverage",
+        type=float,
+        default=NOTICE_MIN_ROW_COVERAGE,
+        help="Minimum stock coverage with at least one parsed notice; default 50%%.",
+    )
     args = p.parse_args()
 
     stock = args.stock.strip()
@@ -229,12 +404,21 @@ def main() -> int:
     if stock:
         codes = [stock.zfill(6)]
     else:
-        codes = read_codes_from_db(engine, max(0, args.offset), max(1, args.limit))
+        codes = read_codes_from_db(engine, max(0, args.offset), args.limit)
 
     etl = datetime.now().replace(microsecond=0)
     total_items = 0
-    with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA-notice-sync"}, trust_env=False) as client:
+    succeeded = 0
+    failed = 0
+    empty = 0
+    nonempty = 0
+    with httpx.Client(
+        headers={"User-Agent": "Mozilla/5.0 ProBigA-notice-sync"},
+        timeout=NOTICE_HTTP_TIMEOUT_SECONDS,
+        trust_env=False,
+    ) as client:
         for i, code in enumerate(codes):
+            started_at = datetime.now().replace(microsecond=0)
             try:
                 raw = fetch_pages(
                     client,
@@ -242,15 +426,77 @@ def main() -> int:
                     page_size=max(5, min(50, int(args.page_size))),
                     max_pages=max(1, int(args.max_pages)),
                 )
-                rows = [_parse_item(code, it, etl) for it in raw if isinstance(it, dict)]
+                rows = [
+                    row
+                    for it in raw
+                    if isinstance(it, dict)
+                    for row in [_parse_item(code, it, etl)]
+                    if row is not None
+                ]
                 n = upsert_rows(engine, rows)
+                record_sync_run(
+                    engine,
+                    stock_code=code,
+                    started_at=started_at,
+                    completed_at=datetime.now().replace(microsecond=0),
+                    status="SUCCESS",
+                    fetched_rows=len(raw),
+                    validated_rows=n,
+                )
                 total_items += n
+                succeeded += 1
+                if not rows:
+                    empty += 1
+                else:
+                    nonempty += 1
                 logger.info("%s/%s %s：本批解析 %s 条，写入/更新 %s 行", i + 1, len(codes), code, len(rows), n)
             except Exception as e:  # noqa: BLE001
+                try:
+                    record_sync_run(
+                        engine,
+                        stock_code=code,
+                        started_at=started_at,
+                        completed_at=datetime.now().replace(microsecond=0),
+                        status="FAILED",
+                        fetched_rows=0,
+                        validated_rows=0,
+                        error_text=str(e),
+                    )
+                except Exception as ledger_exc:  # noqa: BLE001
+                    logger.warning(
+                        "%s notice sync ledger write failed: %s",
+                        code,
+                        ledger_exc,
+                    )
                 logger.warning("%s 失败：%s", code, e)
             if i + 1 < len(codes):
                 time.sleep(max(0.0, float(args.sleep)))
     logger.info("完成：共处理 %s 只股票，累计写入/更新约 %s 行公告记录。", len(codes), total_items)
+    failed = max(0, len(codes) - succeeded)
+    coverage = succeeded / max(len(codes), 1)
+    row_coverage = nonempty / max(len(codes), 1)
+    logger.info(
+        "Notice sync completed: stocks=%s succeeded=%s failed=%s empty=%s nonempty=%s rows=%s coverage=%.1f%% row_coverage=%.1f%%",
+        len(codes), succeeded, failed, empty, nonempty, total_items, coverage * 100, row_coverage * 100,
+    )
+    if not codes:
+        logger.error("No stock codes were read; refusing to report notice sync success")
+        return 2
+    if coverage < max(0.0, min(1.0, float(args.min_coverage))):
+        logger.error(
+            "Notice sync failed: successful stock-request coverage %.1f%% < %.1f%%",
+            coverage * 100,
+            float(args.min_coverage) * 100,
+        )
+        return 3
+    min_row_coverage = max(0.0, min(1.0, float(args.min_row_coverage)))
+    if row_coverage < min_row_coverage:
+        logger.error(
+            "Notice sync failed: non-empty stock coverage %.1f%% < %.1f%%",
+            row_coverage * 100,
+            min_row_coverage * 100,
+        )
+        return 3
     return 0
 
 

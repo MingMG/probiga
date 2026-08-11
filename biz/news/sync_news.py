@@ -22,6 +22,7 @@ from server.common.config import get_wecom_webhook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+NEWS_REQUEST_TIMEOUT_SECONDS = 15.0
 
 IMPORTANT_KEYWORDS = [
     "央行", "降息", "加息", "降准", "LPR", "MLF", "逆回购", "公开市场",
@@ -129,17 +130,39 @@ def _categorize_news(items: list) -> dict:
 
 def fetch_cls(client, pages=2):
     items = []
-    last_time = 0
+    # The former nodeapi endpoint now returns 404.  The public telegraph page
+    # uses /api/cache with a descending ctime cursor, which keeps pagination
+    # stable and avoids silently losing the CLS source.
+    last_time = int(time.time())
+    seen: set[tuple] = set()
     for _ in range(pages):
-        url = "https://www.cls.cn/nodeapi/updateTelegraphList?app=CailianpressWeb&os=web&sv=8.4.6&rn=50"
-        if last_time:
-            url += f"&last_time={last_time}"
-        r = client.get(url)
+        r = client.get(
+            "https://www.cls.cn/api/cache",
+            # The cache endpoint currently exposes at most 20 entries.  Asking
+            # for all 20 (or the former value 50) drains that cache in one call
+            # and makes ``pages > 1`` ineffective.  Ten rows keeps the public
+            # cursor usable for a stable second page.
+            params={"rn": 10, "lastTime": last_time, "name": "telegraph"},
+            timeout=NEWS_REQUEST_TIMEOUT_SECONDS,
+        )
         r.raise_for_status()
-        roll_data = (r.json().get("data") or {}).get("roll_data") or []
+        payload = r.json()
+        if payload.get("errno") not in (None, 0, "0"):
+            raise RuntimeError(f"CLS telegraph API error: {payload.get('errno')}")
+        roll_data = (payload.get("data") or {}).get("roll_data") or []
         if not roll_data:
             break
         for it in roll_data:
+            source_id = str(it.get("id") or "")
+            item_time = it.get("ctime") or it.get("modified_time") or 0
+            dedupe_key = (
+                ("id", source_id)
+                if source_id
+                else ("fallback", str(item_time), it.get("title") or "", it.get("content") or it.get("brief") or "")
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
             stocks = it.get("stock_list") or []
             stock_info = [{"name": s.get("stock_name", ""), "code": s.get("stock_code", "")} for s in stocks[:10] if s.get("stock_name")]
             content = it.get("content") or it.get("brief") or ""
@@ -155,7 +178,7 @@ def fetch_cls(client, pages=2):
                     time_str = str(ts)
             subjects = it.get("subjects") or []
             items.append({
-                "source": "cls", "source_id": str(it.get("id") or ""),
+                "source": "cls", "source_id": source_id,
                 "title": it.get("title") or "", "content": content_clean[:800],
                 "time": time_str, "publish_time": dt_obj,
                 "level": it.get("level") or "C",
@@ -164,9 +187,19 @@ def fetch_cls(client, pages=2):
                 "is_top": bool(it.get("is_top")), "jpush": bool(it.get("jpush")),
                 "bold": bool(it.get("bold")), "author": it.get("author") or "",
             })
-        last_time = roll_data[-1].get("ctime") or 0
-        if not last_time:
+        page_times = []
+        for row in roll_data:
+            try:
+                page_times.append(int(row.get("ctime") or row.get("modified_time") or 0))
+            except (TypeError, ValueError):
+                continue
+        page_times = [value for value in page_times if value > 0]
+        if not page_times:
             break
+        next_last_time = min(page_times) - 1
+        if next_last_time >= last_time:
+            break
+        last_time = next_last_time
     return items
 
 
@@ -174,7 +207,7 @@ def fetch_eastmoney(client, pages=1):
     items = []
     for page in range(1, pages + 1):
         url = f"https://np-listapi.eastmoney.com/comm/web/getFastNewsList?client=web&biz=web_724&fastColumn=102&sortEnd=&pageSize=20&page={page}&req_trace=1"
-        r = client.get(url)
+        r = client.get(url, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         fl = (r.json().get("data") or {}).get("fastNewsList") or []
         if not fl:
@@ -185,8 +218,8 @@ def fetch_eastmoney(client, pages=1):
             if ts_str:
                 try:
                     dt_obj = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
+                except ValueError:
+                    dt_obj = None
             stock_raw = it.get("stockList") or []
             stock_info = []
             for s in stock_raw:
@@ -208,7 +241,7 @@ def fetch_sina(client, pages=1):
     items = []
     for page in range(1, pages + 1):
         url = f"https://zhibo.sina.com.cn/api/zhibo/feed?page={page}&page_size=20&zhibo_id=152&tag_id=0&type=0"
-        r = client.get(url)
+        r = client.get(url, timeout=NEWS_REQUEST_TIMEOUT_SECONDS)
         r.raise_for_status()
         feed = (r.json().get("result") or {}).get("data") or {}
         lst = (feed.get("feed") or {}).get("list") or []
@@ -220,8 +253,8 @@ def fetch_sina(client, pages=1):
             if ts_str:
                 try:
                     dt_obj = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
+                except ValueError:
+                    dt_obj = None
             tag_list = it.get("tag") or []
             subjects = [{"name": t.get("name", "")} for t in tag_list if t.get("name")]
             stock_info = []
@@ -232,8 +265,8 @@ def fetch_sina(client, pages=1):
                     for s in (ext.get("stocks") or []):
                         if isinstance(s, dict) and s.get("symbol"):
                             stock_info.append({"name": s.get("key", ""), "code": s.get("symbol", "")})
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    log.debug("Failed to parse sina stock extension.", exc_info=True)
             items.append({
                 "source": "sina", "source_id": str(it.get("id") or ""),
                 "title": "", "content": it.get("rich_text") or "",
@@ -248,8 +281,8 @@ def fetch_sina(client, pages=1):
 def save_to_db(engine, items):
     etl = datetime.now().replace(microsecond=0)
     upsert = text(
-        "INSERT INTO st_news_flash (source, source_id, title, content, publish_time, level, stocks, subjects, reading_num, is_top, jpush, extra, pushed, etl_sync_at) "
-        "VALUES (:source, :source_id, :title, :content, :publish_time, :level, :stocks, :subjects, :reading_num, :is_top, :jpush, :extra, 0, :etl_sync_at) "
+        "INSERT INTO st_news_flash (source, source_id, title, content, publish_time, first_seen_at, level, stocks, subjects, reading_num, is_top, jpush, extra, pushed, etl_sync_at) "
+        "VALUES (:source, :source_id, :title, :content, :publish_time, :etl_sync_at, :level, :stocks, :subjects, :reading_num, :is_top, :jpush, :extra, 0, :etl_sync_at) "
         "ON DUPLICATE KEY UPDATE title=VALUES(title), content=VALUES(content), level=VALUES(level), reading_num=VALUES(reading_num), etl_sync_at=VALUES(etl_sync_at)"
     )
     saved = 0
@@ -269,7 +302,7 @@ def save_to_db(engine, items):
                 })
                 saved += 1
             except Exception:
-                pass
+                log.debug("Skipped one news row during upsert.", exc_info=True)
     return saved
 
 
@@ -282,7 +315,7 @@ def push_to_wecom(content_md, webhook_url=None):
     payload = {"msgtype": "markdown", "markdown": {"content": content_md}}
     try:
         with httpx.Client(timeout=10) as client:
-            r = client.post(webhook_url, json=payload)
+            r = client.post(webhook_url, json=payload, timeout=10)
             resp = r.json()
             if resp.get("errcode") == 0:
                 return True

@@ -290,7 +290,11 @@ def akshare_daily_to_sm_kline(
     elif "prevclose" in work.columns:
         source_pre_close = pd.to_numeric(work["prevclose"], errors="coerce")
     else:
-        source_pre_close = pd.Series([None] * len(work), index=work.index)
+        source_pre_close = pd.Series(
+            float("nan"),
+            index=work.index,
+            dtype="float64",
+        )
     has_source_change = "change" in work.columns
     has_source_change_pct = "change_pct" in work.columns
     work["prev_close_calc"] = source_pre_close.fillna(work["close"].shift(1))

@@ -5,14 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.qmt.gap_repair import plan_gap_repairs, result_dict
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 def main() -> int:
@@ -22,7 +20,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     plan = plan_gap_repairs(engine, limit=args.limit, apply=args.apply)
     payload = result_dict(plan)
     if args.json:

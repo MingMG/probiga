@@ -191,6 +191,8 @@ def update_progress(
             )
         )
     return bool(result.rowcount)
+
+
 def complete_job(
     engine: Engine,
     *,
@@ -230,3 +232,4 @@ def complete_job(
             )
         )
     return bool(result.rowcount)
+

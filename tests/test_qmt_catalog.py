@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from integrations.qmt.catalog import CORE_PROBE_TO_REGISTRY_KEYS, PROVIDER_ID, _dedupe_capability_rows, api_definitions
+from tools import setup_guojin_qmt_catalog
 
 
 def test_catalog_definitions_have_unique_capability_keys():
@@ -44,3 +47,24 @@ def test_dedupe_capability_rows_keeps_supported_result():
 
     assert len(deduped) == 1
     assert deduped[0]["capability_status"] == "SUPPORTED"
+
+
+def test_setup_catalog_main_uses_batch_engine():
+    engine = object()
+
+    with patch("tools.setup_guojin_qmt_catalog.create_batch_engine", return_value=engine) as create_batch_engine, \
+         patch("tools.setup_guojin_qmt_catalog.ensure_catalog_tables") as ensure_catalog_tables, \
+         patch("tools.setup_guojin_qmt_catalog.seed_registry", return_value=10) as seed_registry, \
+         patch("tools.setup_guojin_qmt_catalog.capabilities", return_value={"status": "ok"}) as capabilities, \
+         patch("tools.setup_guojin_qmt_catalog.core_probe", return_value={"status": "ok"}) as core_probe, \
+         patch("tools.setup_guojin_qmt_catalog.save_capabilities", return_value=8) as save_capabilities, \
+         patch("tools.setup_guojin_qmt_catalog.complete_capability_ledger", return_value=2) as complete_ledger:
+        assert setup_guojin_qmt_catalog.main() == 0
+
+    create_batch_engine.assert_called_once_with(future=True)
+    ensure_catalog_tables.assert_called_once_with(engine)
+    seed_registry.assert_called_once_with(engine)
+    capabilities.assert_called_once_with(timeout=30, force=True)
+    core_probe.assert_called_once_with(timeout=45, force=True)
+    save_capabilities.assert_called_once_with(engine, {"status": "ok"}, {"status": "ok"})
+    complete_ledger.assert_called_once_with(engine)

@@ -9,26 +9,23 @@
   python tools/add_sm_stock_kline_short_name.py
 
 连接串与 sync_stock_market 一致，默认::
-  MYSQL_URL=mysql+pymysql://root:123456@127.0.0.1:3306/probiga?charset=utf8mb4
+  Set MYSQL_URL to your target MySQL connection string before running.
 """
 from __future__ import annotations
 
-import os
 import sys
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 
 def main() -> None:
     try:
-        from sqlalchemy import create_engine, text
+        from sqlalchemy import text
     except ImportError as e:
         print("请先安装: pip install sqlalchemy pymysql", file=sys.stderr)
         raise SystemExit(1) from e
 
-    url = os.environ.get(
-        "MYSQL_URL",
-        "mysql+pymysql://root:123456@127.0.0.1:3306/probiga?charset=utf8mb4",
-    )
-    engine = create_engine(url, pool_pre_ping=True)
+    url = resolve_tool_mysql_url()
+    engine = create_tool_engine(url)
 
     def col_exists(conn) -> bool:
         r = conn.execute(

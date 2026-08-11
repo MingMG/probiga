@@ -1,0 +1,8 @@
+tests/test_hot_data_detail.py
+tests/test_sync_analysis_fast.py
+tests/test_trading_v4_chase_risk.py
+tests/test_trading_v4_factor_store.py
+tests/test_trading_v4_pit_contracts.py
+tests/test_trading_v4_pit_sources.py
+tests/test_trading_v4_stage3_migration.py
+tests/test_unified_analysis_jobs.py

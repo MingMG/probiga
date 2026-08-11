@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 from integrations.qmt.business_schema import (
     QMT_BUSINESS_COLUMNS,
     migrate_qmt_business_tables,
     missing_qmt_columns,
     qmt_business_tables,
 )
+from tools import setup_guojin_qmt_business_schema
 
 
 class _ScalarResult:
@@ -107,3 +111,27 @@ def test_migration_rejects_unsafe_table_name():
 
     assert results[0].status == "ERROR"
     assert "Unsafe SQL identifier" in (results[0].error or "")
+
+
+def test_setup_business_schema_main_uses_batch_engine_for_dry_run():
+    engine = object()
+    result = SimpleNamespace(status="DRY_RUN")
+
+    with patch.object(
+        setup_guojin_qmt_business_schema.sys,
+        "argv",
+        ["setup_guojin_qmt_business_schema.py", "--tables", "sm_stock_current"],
+    ), patch(
+        "tools.setup_guojin_qmt_business_schema.create_batch_engine",
+        return_value=engine,
+    ) as create_batch_engine, patch(
+        "tools.setup_guojin_qmt_business_schema.migrate_qmt_business_tables",
+        return_value=[result],
+    ) as migrate_qmt_business_tables, patch(
+        "tools.setup_guojin_qmt_business_schema.result_dicts",
+        return_value=[{"status": "DRY_RUN"}],
+    ):
+        assert setup_guojin_qmt_business_schema.main() == 0
+
+    create_batch_engine.assert_called_once_with(future=True)
+    migrate_qmt_business_tables.assert_called_once_with(engine, tables=["sm_stock_current"], dry_run=True)

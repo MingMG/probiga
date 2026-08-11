@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Configurable stock-minute data source.
+"""Configurable stock-minute and persisted capital-flow data source.
 
 The production database can stay small while historical 1-minute bars live in a
 separate MySQL instance, for example a workstation reached through VPN or an SSH
@@ -30,7 +30,7 @@ _TABLE_REF_RE = re.compile(r"\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_]+)`?", re.IGNORECA
 
 
 def get_minute_engine() -> Engine:
-    """Return the engine used for stock-minute reads."""
+    """Return the engine used for minute/flow market-data reads and writes."""
     global _MINUTE_ENGINE
     if _MINUTE_ENGINE is None:
         with _MINUTE_ENGINE_LOCK:

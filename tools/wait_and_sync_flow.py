@@ -3,7 +3,14 @@
 import subprocess
 import sys
 import time
+from pathlib import Path
 import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from server.common.process_env import build_child_env, child_process_timeout
 
 MAX_WAIT = 3600
 CHECK_INTERVAL = 60
@@ -32,12 +39,12 @@ def main():
         print("等待超时，东财API仍未恢复", flush=True)
         return 1
     
-    import pymysql
-    conn = pymysql.connect(host='localhost', user='root', password='ProBigA@70966', database='probiga', charset='utf8mb4')
-    cur = conn.cursor()
-    cur.execute('SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily')
-    latest = cur.fetchone()[0]
-    conn.close()
+    from sqlalchemy import text
+    from server.common.batch_db import create_batch_engine
+
+    engine = create_batch_engine()
+    with engine.connect() as conn:
+        latest = conn.execute(text('SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily')).scalar()
     
     import datetime
     today = datetime.date.today()
@@ -62,8 +69,7 @@ def main():
             'SM_HTTP_RETRIES': '8',
             'SM_HTTP_BACKOFF': '5',
         }
-        import os
-        e = os.environ.copy()
+        e = build_child_env(ROOT)
         e.update(env)
         
         cmd = [
@@ -73,7 +79,12 @@ def main():
             '--limit', '-1',
         ]
         
-        rc = subprocess.call(cmd, cwd='/opt/ProBigA', env=e)
+        timeout = child_process_timeout(2 * 60 * 60, env_name="PROBIGA_WAIT_SYNC_FLOW_STEP_TIMEOUT")
+        try:
+            rc = subprocess.run(cmd, cwd=ROOT, env=e, timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            print(f"  {date} TIMEOUT after {timeout}s", flush=True)
+            rc = 124
         if rc != 0:
             print(f"  {date} 失败 (rc={rc})", flush=True)
             time.sleep(30)

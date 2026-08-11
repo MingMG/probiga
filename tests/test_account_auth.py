@@ -9,25 +9,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from server.api import admin_auth
 from server.api.routers import auth as auth_router
 from server.auth.schema import auth_session, auth_user, reset_auth_schema_cache
 from server.auth.service import registration_window_open
 from server.common.config import get_settings
-
-
-@pytest.fixture(autouse=True)
-def _isolate_auth_environment(monkeypatch):
-    # Settings intentionally load /opt/ProBigA/.env in production. Override
-    # those values so unit tests are deterministic on the production host.
-    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
-    monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "")
-    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
-    get_settings.cache_clear()
-    yield
-    get_settings.cache_clear()
 
 
 def _build_client(monkeypatch, tmp_path) -> tuple[TestClient, object]:
@@ -139,7 +125,7 @@ def test_first_account_registration_login_refresh_and_logout(monkeypatch, tmp_pa
 def test_disabled_development_auth_status_does_not_require_login(monkeypatch, tmp_path):
     client, engine = _build_client(monkeypatch, tmp_path)
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "false")
-    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
     get_settings.cache_clear()
     try:
         status = client.get("/api/auth/status")
@@ -188,7 +174,7 @@ def test_production_first_admin_registration_requires_explicit_deadline(
     tmp_path,
 ):
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
-    monkeypatch.setenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", "")
+    monkeypatch.delenv("PROBIGA_AUTH_REGISTRATION_DEADLINE", raising=False)
     client, engine = _build_client(monkeypatch, tmp_path)
     try:
         status = client.get("/api/auth/status")
@@ -249,3 +235,4 @@ def test_registration_window_deadline_fails_closed():
     assert registration_window_open(future) is True
     assert registration_window_open(past) is False
     assert registration_window_open("not-a-date") is False
+

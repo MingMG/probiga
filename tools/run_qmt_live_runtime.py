@@ -26,7 +26,7 @@ def main() -> int:
     qmt_thread = start_qmt_live_runtime()
     radar_thread = start_market_radar_runtime()
     if qmt_thread is None and radar_thread is None:
-        print("QMT live runtime and market radar are disabled by configuration.")
+        print("Live quote runtime and market radar are disabled by configuration.")
         return 1
 
     stop_requested = False

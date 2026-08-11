@@ -117,16 +117,11 @@ def import_gm_minute(
     dry_run: bool = False,
 ) -> None:
     import fastavro
-    import pymysql
 
     data_path = str(Path(data_path).resolve())
     if not Path(data_path).exists():
         logger.error("文件不存在：%s", data_path)
         sys.exit(1)
-
-    # 解析 MySQL 连接参数
-    from sqlalchemy import make_url
-    url = make_url(_mysql_url())
 
     # 1. 扫描容器偏移量
     logger.info("扫描 Avro 容器索引：%s", data_path)
@@ -145,22 +140,17 @@ def import_gm_minute(
                     block = next(reader)
                     total_records += sum(1 for _ in block)
                 except Exception:
-                    pass
+                    logger.debug("[dry-run] failed to read one avro block.", exc_info=True)
                 if (i + 1) % 10000 == 0:
                     logger.info("[dry-run] %d/%d 容器, %d 行", i + 1, len(offsets), total_records)
         logger.info("[dry-run] 完成！%d 容器, %d 行, 耗时 %.1fs", len(offsets), total_records, time.time() - t0)
         return
 
     # 2. 连接 MySQL
-    conn = pymysql.connect(
-        host=url.host or "127.0.0.1",
-        port=url.port or 3306,
-        user=url.username or "root",
-        password=url.password or "",
-        database=url.database or "probiga",
-        charset="utf8mb4",
-        local_infile=True,
-    )
+    from server.common.batch_db import create_batch_engine
+
+    engine = create_batch_engine(_mysql_url(), connect_args={"local_infile": True})
+    conn = engine.raw_connection()
     cur = conn.cursor()
 
     # DDL
@@ -257,6 +247,7 @@ def import_gm_minute(
 
     cur.close()
     conn.close()
+    engine.dispose()
 
 
 # ---------------------------------------------------------------------------

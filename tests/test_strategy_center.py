@@ -335,3 +335,4 @@ def test_persisted_compact_snapshot_rebuilds_candidates_without_heavy_json(monke
 
 def test_market_states_are_the_four_user_facing_states():
     assert set(MARKET_STATES) == {"trend_bullish", "high_range", "risk_declining", "extreme_event"}
+

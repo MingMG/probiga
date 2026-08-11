@@ -16,15 +16,18 @@ SSH_PORT=${SSH_PORT:-22}
 # ---------- 1. 本地导出数据库 ----------
 echo ""
 echo "[1/4] 本地导出数据库..."
-$env:MYSQL_PWD="123456"
+if (-not $env:MYSQL_PWD) {
+    Write-Host "请先通过 MYSQL_PWD 设置本地 MySQL 导出密码。" -ForegroundColor Red
+    exit 1
+}
 mysqldump -h localhost -P 3306 -u root --databases probiga --skip-lock-tables --single-transaction --quick -r probiga_dump.sql 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "mysqldump 可能不在 PATH，尝试用 python 导出..." -ForegroundColor Yellow
     python -c "
 import subprocess, os
-url = os.environ.get('MYSQL_URL', 'mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4')
+url = os.environ.get('MYSQL_URL', '')
 print(f'请手动执行: mysqldump -h localhost -P 3306 -u root -p probiga > probiga_dump.sql')
-print(f'然后输入密码: 123456')
+print('然后输入你的本地 MySQL 密码')
 "
     exit 1
 }

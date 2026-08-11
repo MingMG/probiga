@@ -89,7 +89,11 @@ class EngineDateConsistencyTest(unittest.TestCase):
             analysis_date="2026-05-30",
         )
 
-        self.assertEqual(result["status"], "SUSPENDED")
+        # Date selection is still anchored to analysis_date, but an otherwise
+        # incomplete recommendation can no longer become actionable.  The
+        # four-part execution contract fails closed before a legacy status is
+        # exposed as a trading recommendation.
+        self.assertEqual(result["status"], "DATA_BLOCKED")
 
 
 if __name__ == "__main__":

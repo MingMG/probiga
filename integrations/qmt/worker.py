@@ -79,7 +79,7 @@ def _json_value(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
+    except (TypeError, ValueError):
         pass
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
@@ -93,13 +93,15 @@ def _json_value(value: Any) -> Any:
         try:
             return _json_value(value.item())
         except Exception:
-            pass
+            return str(value)
     if isinstance(value, list):
         return [_json_value(item) for item in value]
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]
     if isinstance(value, dict):
         return {str(k): _json_value(v) for k, v in value.items()}
+    # QMT returns five-level arrays as numpy arrays in some xtquant builds.
+    # Convert array-like values before the persistent gateway serializes them.
     tolist = getattr(value, "tolist", None)
     if callable(tolist):
         try:
@@ -138,7 +140,7 @@ def _subscribe(codes: list[str], period: str) -> None:
         try:
             xtdata.subscribe_quote(code, period=period, count=-1)
         except Exception:
-            pass
+            continue
 
 
 def _download_history(codes: list[str], *, period: str, start_date: str = "", end_date: str = "") -> None:
@@ -164,7 +166,7 @@ def _download_history(codes: list[str], *, period: str, start_date: str = "", en
             for code in codes:
                 single(code, period, start_time, end_time)
     except Exception:
-        pass
+        traceback.print_exc(file=sys.stderr)
 
     wait_seconds = float(os.environ.get("QMT_HISTORY_WAIT_SECONDS", "0.8") or "0.8")
     if wait_seconds > 0:
@@ -226,7 +228,10 @@ def _transform_kline(data: Any, *, start_date: str, end_date: str) -> list[dict[
                     "close": row.get("close"),
                     "high": row.get("high"),
                     "low": row.get("low"),
-                    "volume": row.get("volume"),
+                    # QMT daily volume is reported in lots while the canonical
+                    # K-line table stores shares, matching the external source
+                    # and the summed canonical minute series.
+                    "volume": (_safe_float(row.get("volume")) * 100) if _safe_float(row.get("volume")) is not None else None,
                     "amount": row.get("amount"),
                     "change": change,
                     "change_pct": change_pct,
@@ -242,6 +247,12 @@ def _transform_minute(data: Any, *, trade_date: str) -> list[dict[str, Any]]:
     if not isinstance(data, dict):
         return rows
 
+    normalized_trade_date = _normalize_qmt_date(trade_date, include_time=False)
+    if len(normalized_trade_date) == 8:
+        normalized_trade_date = datetime.strptime(normalized_trade_date, "%Y%m%d").strftime("%Y-%m-%d")
+    else:
+        normalized_trade_date = str(trade_date or "")[:10]
+
     for qmt_code, frame in data.items():
         if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
             continue
@@ -249,9 +260,28 @@ def _transform_minute(data: Any, *, trade_date: str) -> list[dict[str, Any]]:
         df = frame.copy()
         df.index = pd.to_datetime(df.index, errors="coerce")
         df = df[df.index.notna()].sort_index()
-        df = df[df.index.strftime("%Y-%m-%d") == trade_date]
+        df = df[df.index.strftime("%Y-%m-%d") == normalized_trade_date]
         if df.empty:
             continue
+
+        # QMT exposes the opening auction as a separate 09:30 bar while the
+        # canonical ProBigA minute series follows the common 240-bar convention
+        # (09:31..15:00).  Merge the auction into 09:31 so volume/amount match
+        # the existing business table exactly instead of silently dropping it.
+        auction_rows = df[df.index.strftime("%H:%M:%S") == "09:30:00"]
+        if not auction_rows.empty:
+            auction_idx = auction_rows.index[0]
+            minute_931 = auction_idx.replace(hour=9, minute=31, second=0, microsecond=0)
+            if minute_931 in df.index:
+                for field in ("volume", "amount"):
+                    auction_value = _safe_float(df.at[auction_idx, field]) or 0.0
+                    next_value = _safe_float(df.at[minute_931, field]) or 0.0
+                    df.at[minute_931, field] = auction_value + next_value
+                if "preClose" in df.columns:
+                    df.at[minute_931, "preClose"] = df.at[auction_idx, "preClose"]
+                df = df.drop(index=auction_idx)
+            else:
+                df = df.rename(index={auction_idx: minute_931}).sort_index()
 
         close_series = pd.to_numeric(df.get("close"), errors="coerce")
         prev_close_series = pd.to_numeric(df.get("preClose"), errors="coerce")
@@ -267,12 +297,14 @@ def _transform_minute(data: Any, *, trade_date: str) -> list[dict[str, Any]]:
                     "qmt_code": qmt_code,
                     "stock_code": stock_code,
                     "trade_time": idx.strftime("%Y-%m-%d %H:%M:%S"),
-                    "trade_date": trade_date,
+                    "trade_date": normalized_trade_date,
                     "price": row.get("close"),
                     "avg_price": avg_price,
                     "change": change_series.loc[idx],
                     "change_pct": change_pct_series.loc[idx],
-                    "volume": row.get("volume"),
+                    # QMT stock minute volume is in lots; canonical K-line and
+                    # minute tables store shares (realtime snapshots keep lots).
+                    "volume": volume * 100 if volume is not None else None,
                     "amount": row.get("amount"),
                     "pre_close": prev_close_series.loc[idx],
                 }
@@ -323,13 +355,15 @@ def _transform_current(tick: Any) -> list[dict[str, Any]]:
                 "amount": info.get("amount"),
                 "snapshot_at": snapshot_at,
                 "pre_close": last_close,
+                # Standard QMT full-tick fields.  These are the ordinary
+                # five-level quote cache, not VIP/L2 order-flow data.
                 "timetag": timetag,
                 "last_close": last_close,
                 "ask_price": info.get("askPrice") if info.get("askPrice") is not None else info.get("ask_price"),
                 "ask_vol": info.get("askVol") if info.get("askVol") is not None else info.get("ask_vol"),
                 "bid_price": info.get("bidPrice") if info.get("bidPrice") is not None else info.get("bid_price"),
                 "bid_vol": info.get("bidVol") if info.get("bidVol") is not None else info.get("bid_vol"),
-                "stock_status": info.get("stockStatus") if info.get("stockStatus") is not None else info.get("stock_status"),
+                "stock_status": info.get("stockStatus") or info.get("stock_status"),
                 "last_settlement_price": info.get("lastSettlementPrice"),
                 "settlement_price": info.get("settlementPrice"),
             }
@@ -436,7 +470,9 @@ def _kline(payload: dict[str, Any]) -> dict[str, Any]:
             field_list=[],
             stock_list=batch,
             period="1d",
-            count=0,
+            start_time=_normalize_qmt_date(start_date, include_time=False),
+            end_time=_normalize_qmt_date(end_date, include_time=False),
+            count=-1,
             dividend_type=dividend_type,
             fill_data=False,
         )
@@ -457,13 +493,17 @@ def _minute(payload: dict[str, Any]) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     for batch in _chunked(stock_codes, batch_size):
-        _subscribe(batch, "1m")
-        _download_history(batch, period="1m", start_date=start_date, end_date=end_date)
+        if os.environ.get("QMT_MINUTE_SUBSCRIBE", "0") == "1":
+            _subscribe(batch, "1m")
+        if payload.get("download_history") is not False:
+            _download_history(batch, period="1m", start_date=start_date, end_date=end_date)
         data = xtdata.get_market_data_ex(
             field_list=[],
             stock_list=batch,
             period="1m",
-            count=count,
+            start_time=_normalize_qmt_date(start_date, include_time=True),
+            end_time=_normalize_qmt_date(end_date, include_time=True, end_of_day=True),
+            count=count if count > 0 else -1,
             dividend_type="none",
             fill_data=True,
         )
@@ -478,7 +518,12 @@ def _current(payload: dict[str, Any]) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     for batch in _chunked(stock_codes, batch_size):
-        _subscribe(batch, "1m")
+        # get_full_tick reads the terminal's shared full-quote cache directly.
+        # Subscribing every symbol one by one made a full-market read take more
+        # than three minutes and could monopolize the persistent gateway.  QMT
+        # does not require those subscriptions for this snapshot API.
+        if os.environ.get("QMT_CURRENT_SUBSCRIBE", "0") == "1":
+            _subscribe(batch, "1m")
         rows.extend(_transform_current(xtdata.get_full_tick(batch)))
         time.sleep(float(os.environ.get("QMT_BATCH_SLEEP_SECONDS", "0.08") or "0.08"))
     return {"rows": _records(rows), "errors": {}}
@@ -519,7 +564,9 @@ def _flow_daily(payload: dict[str, Any]) -> dict[str, Any]:
             field_list=[],
             stock_list=batch,
             period="transactioncount1d",
-            count=0,
+            start_time=_normalize_qmt_date(start_date, include_time=False),
+            end_time=_normalize_qmt_date(end_date, include_time=False),
+            count=-1,
             dividend_type="none",
             fill_data=False,
         )
@@ -542,7 +589,9 @@ def _flow_min(payload: dict[str, Any]) -> dict[str, Any]:
             field_list=[],
             stock_list=batch,
             period="transactioncount1m",
-            count=0,
+            start_time=_normalize_qmt_date(start_date, include_time=True),
+            end_time=_normalize_qmt_date(end_date, include_time=True, end_of_day=True),
+            count=-1,
             dividend_type="none",
             fill_data=True,
         )
@@ -719,14 +768,14 @@ def _connect() -> int | None:
         try:
             xtdata.enable_hello = False
         except Exception:
-            pass
+            traceback.print_exc(file=sys.stderr)
     raw_port = str(os.environ.get("QMT_PORT", "") or "").strip()
     port_candidates: list[int] = []
     if raw_port:
         try:
             port_candidates.append(int(raw_port))
-        except Exception:
-            pass
+        except ValueError:
+            raw_port = ""
     for fallback_port in (58610, 58670, 58671, 58672, 58673, 58680):
         if fallback_port not in port_candidates:
             port_candidates.append(fallback_port)

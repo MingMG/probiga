@@ -5,14 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.qmt.reconciliation import result_dict, run_nightly_reconciliation
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 def main() -> int:
@@ -21,7 +19,7 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     args = parser.parse_args()
 
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     result = run_nightly_reconciliation(engine, scan_days=max(1, args.scan_days))
     payload = result_dict(result)
     if args.json:

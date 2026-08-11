@@ -176,6 +176,28 @@ def _mark_error(engine: Engine, run_uid: str, message: str, error: str) -> None:
         })
 
 
+def _mark_queued_waiting(engine: Engine, reason: str) -> None:
+    message = f"AI recommendation worker waiting for system resources: {reason}"
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE st_recommended_run_history
+            SET progress_percent = 5,
+                done_count = 0,
+                message = :message,
+                error = ''
+            WHERE run_uid = (
+                SELECT run_uid FROM (
+                    SELECT run_uid
+                    FROM st_recommended_run_history
+                    WHERE status = 'queued'
+                    ORDER BY started_at ASC, id ASC
+                    LIMIT 1
+                ) queued_job
+            )
+              AND status = 'queued'
+        """), {"message": message[:500]})
+
+
 def _available_memory_mb() -> int:
     try:
         values: dict[str, int] = {}
@@ -318,6 +340,21 @@ def _safe_to_run(*, allow_intraday: bool, max_load: float, min_memory_mb: int) -
     return True, "ok"
 
 
+def _job_uses_intraday_current(job: dict[str, Any], *, refresh_realtime: bool) -> bool:
+    if not refresh_realtime:
+        return False
+    trade_date = str(job.get("trade_date") or "")[:10]
+    raw_execution_time = str(job.get("execution_time") or "")[:19]
+    try:
+        execution_dt = datetime.fromisoformat(raw_execution_time.replace("T", " "))
+    except Exception:
+        execution_dt = datetime.now()
+    if not trade_date or trade_date != execution_dt.date().isoformat():
+        return False
+    hhmm = execution_dt.hour * 100 + execution_dt.minute
+    return 925 <= hhmm <= 1505
+
+
 def _run_claimed_job(
     engine: Engine,
     job: dict[str, Any],
@@ -346,11 +383,14 @@ def _run_claimed_job(
         run_uid,
         "--json",
         "--auto-repair-missing-kline",
+        "--auto-repair-missing-data",
     ]
     if bool(job.get("strict_prev_trade_day")):
         cmd.append("--strict-prev-trade-day")
     if refresh_realtime:
         cmd.append("--refresh-realtime")
+    if _job_uses_intraday_current(job, refresh_realtime=bool(refresh_realtime)):
+        cmd.append("--use-intraday-current")
 
     env = build_child_env(ROOT, engine=engine)
     env.update({
@@ -360,6 +400,7 @@ def _run_claimed_job(
         "NUMEXPR_NUM_THREADS": "1",
         "PROBIGA_KLINE_FEATURE_SQL_MODE": os.environ.get("PROBIGA_KLINE_FEATURE_SQL_MODE", "pandas"),
         "PROBIGA_KLINE_FEATURE_BATCH_SIZE": os.environ.get("PROBIGA_KLINE_FEATURE_BATCH_SIZE", "80"),
+        "PROBIGA_INTRADAY_KLINE_FEATURE_BATCH_SIZE": os.environ.get("PROBIGA_INTRADAY_KLINE_FEATURE_BATCH_SIZE", "600"),
         "PROBIGA_KLINE_FEATURE_STREAM_BATCHES": os.environ.get("PROBIGA_KLINE_FEATURE_STREAM_BATCHES", "1"),
         "PROBIGA_BATCH_DB_READ_RETRIES": os.environ.get("PROBIGA_BATCH_DB_READ_RETRIES", "12"),
     })
@@ -390,8 +431,8 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Run even when worker env flag is disabled.")
     parser.add_argument("--allow-intraday", action="store_true", help="Allow running during 09:00-15:30.")
     parser.add_argument("--refresh-realtime", action="store_true", help="Refresh realtime data before analysis.")
-    parser.add_argument("--max-load", type=float, default=float(os.environ.get("PROBIGA_AI_WORKER_MAX_LOAD", "1.20")))
-    parser.add_argument("--min-memory-mb", type=int, default=int(os.environ.get("PROBIGA_AI_WORKER_MIN_MEMORY_MB", "1200")))
+    parser.add_argument("--max-load", type=float, default=float(os.environ.get("PROBIGA_AI_WORKER_MAX_LOAD", "8.00")))
+    parser.add_argument("--min-memory-mb", type=int, default=int(os.environ.get("PROBIGA_AI_WORKER_MIN_MEMORY_MB", "700")))
     parser.add_argument("--timeout-seconds", type=int, default=int(os.environ.get("PROBIGA_AI_WORKER_TIMEOUT_SECONDS", "7200")))
     parser.add_argument("--child-rss-limit-mb", type=int, default=int(os.environ.get("PROBIGA_AI_WORKER_CHILD_RSS_LIMIT_MB", "1800")))
     args = parser.parse_args()
@@ -401,18 +442,19 @@ def main() -> int:
         logger.info("AI recommendation worker disabled; set PROBIGA_AI_RECOMMEND_WORKER_ENABLED=1 or pass --force.")
         return 0
 
+    engine = create_batch_engine()
+    _ensure_history_table(engine)
+    _expire_stale(engine)
     ok, reason = _safe_to_run(
         allow_intraday=bool(args.allow_intraday),
         max_load=float(args.max_load),
         min_memory_mb=int(args.min_memory_mb),
     )
     if not ok:
+        _mark_queued_waiting(engine, reason)
         logger.info("AI recommendation worker guard skipped run: %s", reason)
         return 0
 
-    engine = create_batch_engine()
-    _ensure_history_table(engine)
-    _expire_stale(engine)
     job = _claim_next(engine)
     if not job:
         logger.info("No queued AI recommendation job.")

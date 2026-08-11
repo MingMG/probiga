@@ -47,6 +47,8 @@ _SOURCE_ALIASES: dict[str, str] = {
     "east": "akshare",
     "em": "akshare",
     "eastmoney": "akshare",
+    "qmt_big": "bigqmt",
+    "big_qmt": "bigqmt",
     "ohlc": "myquant",      # minute_data.py 把 ohlc 当 myquant
     "gml": "joinquant",
     "jq": "joinquant",
@@ -85,6 +87,18 @@ def _resolve_source_name(data_type: str) -> str:
         if raw:
             canonical = _SOURCE_ALIASES.get(raw, raw)
             return canonical
+
+    # API and standalone processes load project .env through pydantic settings,
+    # which intentionally does not mutate os.environ.  Read the corresponding
+    # typed setting so datasource selection is consistent in both launch modes.
+    try:
+        from server.common.config import get_settings
+
+        raw = str(getattr(get_settings(), f"data_source_{data_type}", "") or "").strip().lower()
+        if raw:
+            return _SOURCE_ALIASES.get(raw, raw)
+    except Exception:
+        logger.debug("failed to resolve configured datasource for %s", data_type, exc_info=True)
 
     return _DEFAULT_SOURCES.get(data_type, "adata")
 
@@ -152,6 +166,11 @@ def _load_backends() -> None:
         import integrations.qmt.backend  # noqa: F401
     except Exception as exc:
         logger.debug("QMT 后端未加载: %s", exc)
+
+    try:
+        import integrations.bigqmt.backend  # noqa: F401
+    except Exception as exc:
+        logger.debug("Big QMT backend was not loaded: %s", exc)
 
     try:
         import integrations.akshare.backend  # noqa: F401

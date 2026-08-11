@@ -1,31 +1,301 @@
 # -*- coding: utf-8 -*-
 """数据源管理 API"""
+import copy
+import logging
+import threading
+import time
 from datetime import datetime, timedelta
 
-import numpy as np
-import pandas as pd
 from fastapi import APIRouter, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.batch_db import quote_identifier
+from server.common.scheduler_runner import run_scheduler_task_sync
+from server.common.scheduler_tasks import update_scheduler_task
+from server.common.sql_reader import read_sql_rows
 
 router = APIRouter(tags=["datasource"])
-
+logger = logging.getLogger(__name__)
+_REQUIRED_HEALTH_CACHE_TTL_SECONDS = 120
+_required_health_cache_lock = threading.Lock()
+_required_health_cache: tuple[float, list[dict]] | None = None
 
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
-    df = pd.read_sql(text(sql), get_engine(), params=params)
-    if df.empty:
-        return []
-    df = df.replace({np.nan: None, pd.NaT: None})
-    for c in df.columns:
-        if df[c].dtype == "datetime64[ns]":
-            df[c] = df[c].astype(str)
-    return df.to_dict(orient="records")
+    return read_sql_rows(get_engine(), sql, params, context="datasource")
 
 
-def _execute_sql(sql: str, params: dict = None):
-    with get_engine().begin() as conn:
-        conn.execute(text(sql), params or {})
+REQUIRED_TASK_HEALTH = [
+    {
+        "key": "hot_rank_sina",
+        "label": "新浪热股",
+        "task_type": "hot_rank_sina",
+        "task_types": ["hot_rank_sina"],
+        "table": "st_hot_rank_sina",
+        "date_col": "snapshot_date",
+        "min_rows": 1,
+        "max_stale_days": 4,
+        "require_latest_trade_date": True,
+        "target_ready_time": "17:16",
+    },
+    {
+        "key": "capital_flow",
+        "label": "个股资金流向(全量)",
+        "task_type": "capital_flow",
+        "task_types": ["capital_flow", "capital_flow_batch_fast"],
+        "table": "sm_stock_capital_flow_daily",
+        "date_col": "trade_date",
+        "min_rows": 100,
+        "max_stale_days": 4,
+        "require_latest_trade_date": True,
+        "target_ready_time": "15:20",
+    },
+    {
+        "key": "concept_flow",
+        "label": "概念资金流向",
+        "task_type": "concept_flow",
+        "task_types": ["concept_flow"],
+        "table": "sm_concept_capital_flow_east",
+        "date_col": "snapshot_at",
+        "min_rows": 1,
+        "max_stale_days": 4,
+        "require_latest_trade_date": True,
+        "target_ready_time": "19:30",
+    },
+]
+
+
+def _parse_dt(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text_value[:len(fmt)], fmt)
+        except Exception:
+            continue
+    try:
+        return datetime.fromisoformat(text_value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _time_reached(now: datetime, hhmm: str) -> bool:
+    try:
+        hour, minute = str(hhmm or "00:00").split(":", 1)
+        return now.hour * 60 + now.minute >= int(hour) * 60 + int(minute)
+    except Exception:
+        return True
+
+
+def _latest_required_trade_date(now: datetime, *, ready_time: str = "00:00") -> datetime.date:
+    today = now.date().isoformat()
+    comparator = "<=" if _time_reached(now, ready_time) else "<"
+    try:
+        rows = _read_sql(
+            f"""
+            SELECT MAX(trade_date) AS latest_trade_date
+            FROM si_trade_calendar
+            WHERE trade_status = 1 AND trade_date {comparator} :today
+            """,
+            {"today": today},
+        )
+        value = rows[0].get("latest_trade_date") if rows else None
+        parsed = _parse_dt(value)
+        if parsed:
+            return parsed.date()
+    except Exception:
+        logger.debug("Failed to resolve latest required trade date", exc_info=True)
+    return now.date()
+
+
+def _task_types_for_config(cfg: dict) -> list[str]:
+    raw = cfg.get("task_types") or [cfg.get("task_type")]
+    out = []
+    for item in raw:
+        value = str(item or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _select_required_task(candidates: list[dict], primary_task_type: str) -> dict | None:
+    if not candidates:
+        return None
+
+    def score(row: dict) -> tuple:
+        status = str(row.get("last_run_status") or "").lower()
+        run_at = _parse_dt(row.get("last_run_at")) or datetime.min
+        return (
+            1 if int(row.get("enabled") or 0) == 1 else 0,
+            2 if status in ("success", "running") else 1 if status not in ("failed", "timeout", "stopped") else 0,
+            run_at,
+            1 if str(row.get("task_type") or "") == primary_task_type else 0,
+        )
+
+    return max(candidates, key=score)
+
+
+def _table_freshness(table: str, date_col: str) -> dict:
+    exists = _read_sql(
+        """
+        SELECT COUNT(*) AS cnt
+        FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table
+        """,
+        {"table": table},
+    )
+    if not exists or int(exists[0].get("cnt") or 0) <= 0:
+        return {"table_exists": False, "max_data_time": None, "row_count_latest": 0}
+
+    quoted_table = quote_identifier(table)
+    quoted_date_col = quote_identifier(date_col)
+    latest = _read_sql(f"SELECT MAX({quoted_date_col}) AS max_data_time FROM {quoted_table}")
+    max_data_time = latest[0].get("max_data_time") if latest else None
+    if not max_data_time:
+        return {"table_exists": True, "max_data_time": None, "row_count_latest": 0}
+
+    count_rows = _read_sql(
+        f"SELECT COUNT(*) AS cnt FROM {quoted_table} WHERE {quoted_date_col} = :max_data_time",
+        {"max_data_time": max_data_time},
+    )
+    return {
+        "table_exists": True,
+        "max_data_time": str(max_data_time),
+        "row_count_latest": int(count_rows[0].get("cnt") or 0) if count_rows else 0,
+    }
+
+
+def _required_task_health(now: datetime | None = None) -> list[dict]:
+    now = now or datetime.now()
+    all_task_types = []
+    for cfg in REQUIRED_TASK_HEALTH:
+        for task_type in _task_types_for_config(cfg):
+            if task_type not in all_task_types:
+                all_task_types.append(task_type)
+    placeholders = ", ".join(f":task_type_{idx}" for idx, _ in enumerate(all_task_types))
+    params = {f"task_type_{idx}": task_type for idx, task_type in enumerate(all_task_types)}
+    task_rows = _read_sql(
+        f"""
+        SELECT id, task_name, task_type, script_path, script_args, enabled,
+               last_run_status, last_run_at, last_run_duration, last_run_output
+        FROM st_scheduled_tasks
+        WHERE task_type IN ({placeholders})
+        ORDER BY id
+        """,
+        params,
+    )
+    tasks_by_type: dict[str, list[dict]] = {}
+    for row in task_rows:
+        task_type = row.get("task_type") or ""
+        if task_type:
+            tasks_by_type.setdefault(task_type, []).append(row)
+
+    results = []
+    for cfg in REQUIRED_TASK_HEALTH:
+        latest_trade_date = _latest_required_trade_date(
+            now,
+            ready_time=str(cfg.get("target_ready_time") or "00:00"),
+        )
+        task_types = _task_types_for_config(cfg)
+        candidates = [row for task_type in task_types for row in tasks_by_type.get(task_type, [])]
+        task = _select_required_task(candidates, cfg["task_type"])
+        item = {
+            "key": cfg["key"],
+            "label": cfg["label"],
+            "task_type": cfg["task_type"],
+            "candidate_task_types": task_types,
+            "table": cfg["table"],
+            "date_col": cfg["date_col"],
+            "min_rows": cfg["min_rows"],
+            "target_trade_date": latest_trade_date.isoformat(),
+            "configured": bool(task),
+            "status": "ok",
+            "message": "正常",
+        }
+
+        if task:
+            item.update({
+                "task_id": task.get("id"),
+                "task_name": task.get("task_name"),
+                "enabled": int(task.get("enabled") or 0),
+                "last_run_status": task.get("last_run_status") or "",
+                "last_run_at": task.get("last_run_at") or "",
+                "last_run_duration": task.get("last_run_duration"),
+                "selected_task_type": task.get("task_type") or "",
+                "script_path": task.get("script_path") or "",
+                "script_args": task.get("script_args") or "",
+                "last_run_output_tail": (task.get("last_run_output") or "")[-500:],
+            })
+        else:
+            item.update({"status": "missing_task", "message": "调度任务未配置"})
+            results.append(item)
+            continue
+
+        try:
+            item.update(_table_freshness(cfg["table"], cfg["date_col"]))
+        except Exception as exc:
+            item.update({
+                "table_exists": None,
+                "max_data_time": None,
+                "row_count_latest": 0,
+                "status": "table_error",
+                "message": f"数据表检查失败: {exc}",
+            })
+            results.append(item)
+            continue
+
+        last_status = str(item.get("last_run_status") or "").lower()
+        max_dt = _parse_dt(item.get("max_data_time"))
+        row_count = int(item.get("row_count_latest") or 0)
+        enabled = int(item.get("enabled") or 0) == 1
+
+        if not enabled:
+            item.update({"status": "disabled", "message": "任务已停用"})
+        elif last_status == "running":
+            item.update({"status": "running", "message": "任务正在运行"})
+        elif last_status == "failed":
+            item.update({"status": "failed", "message": "最近一次执行失败"})
+        elif not item.get("last_run_at") and not last_status:
+            item.update({"status": "never_run", "message": "任务尚未执行"})
+        elif item.get("table_exists") is False:
+            item.update({"status": "missing_table", "message": "目标表不存在"})
+        elif not max_dt:
+            item.update({"status": "empty", "message": "目标表暂无数据"})
+        elif row_count < int(cfg["min_rows"]):
+            item.update({"status": "too_few_rows", "message": f"最新批次只有 {row_count} 条"})
+        elif cfg.get("require_latest_trade_date") and max_dt.date() < latest_trade_date:
+            item.update({
+                "status": "stale_target_date",
+                "message": f"目标交易日 {latest_trade_date.isoformat()} 数据未补齐",
+            })
+        elif (now - max_dt).days > int(cfg.get("max_stale_days") or 4):
+            item.update({"status": "stale", "message": "目标表数据过旧"})
+        else:
+            item.update({"status": "ok", "message": "正常"})
+
+        results.append(item)
+
+    return results
+
+
+def _required_task_health_cached(force: bool = False) -> tuple[list[dict], bool, int]:
+    global _required_health_cache
+    now = time.monotonic()
+    if not force:
+        with _required_health_cache_lock:
+            cached = _required_health_cache
+        if cached and now - cached[0] < _REQUIRED_HEALTH_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1]), True, int(now - cached[0])
+
+    health = _required_task_health()
+    with _required_health_cache_lock:
+        _required_health_cache = (time.monotonic(), copy.deepcopy(health))
+    return health, False, 0
 
 
 # 数据源分组配置
@@ -193,6 +463,7 @@ def get_stats():
     """)
 
     stats = rows[0] if rows else {}
+    required_health, _, _ = _required_task_health_cached()
     return {
         "total": int(stats.get("total") or 0),
         "success": int(stats.get("success") or 0),
@@ -201,6 +472,21 @@ def get_stats():
         "pending": int(stats.get("pending") or 0),
         "enabled": int(stats.get("enabled") or 0),
         "disabled": int(stats.get("disabled") or 0),
+        "required_health": required_health,
+    }
+
+
+@router.get("/datasource/required-health")
+def get_required_health(force: bool = False):
+    """获取关键数据任务健康状态"""
+    health, cached, cache_age_seconds = _required_task_health_cached(force=force)
+    bad = [item for item in health if item.get("status") not in ("ok", "running")]
+    return {
+        "data": health,
+        "ok": len(bad) == 0,
+        "bad_count": len(bad),
+        "cached": cached,
+        "cache_age_seconds": cache_age_seconds,
     }
 
 
@@ -219,7 +505,7 @@ def get_history(task_id: int, limit: int = Query(default=10)):
         if rows:
             return {"data": rows}
     except Exception:
-        pass
+        logger.debug("Failed to read scheduler run history; falling back to task row.", exc_info=True)
 
     # 如果没有历史表，从主表读取最近一次运行信息
     row = _read_sql("""
@@ -256,62 +542,13 @@ def get_log(task_id: int):
 @router.post("/datasource/{task_id}/run")
 def run_task(task_id: int):
     """手动执行数据源"""
-    import subprocess
-    import sys
     from pathlib import Path
 
     row = _read_sql("SELECT * FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
         return {"error": "任务不存在"}
-    task = row[0]
-
-    _execute_sql(
-        "UPDATE st_scheduled_tasks SET last_run_status = 'running', last_run_at = NOW(), last_triggered_at = NOW() WHERE id = :id",
-        {"id": task_id},
-    )
-
     root = Path(__file__).resolve().parents[3]
-    script = root / task["script_path"]
-
-    script_args_raw = (task["script_args"] or "").strip()
-    date_param = (task["date_param"] or "").strip()
-
-    if script_args_raw:
-        args = script_args_raw.split()
-        if date_param:
-            args.append(date_param)
-    elif date_param:
-        args = date_param.split()
-    else:
-        args = [datetime.now().strftime("%Y-%m-%d")]
-
-    if "run_single_table" in (task["script_path"] or "") and len(args) == 1:
-        args.append(datetime.now().strftime("%Y-%m-%d"))
-
-    cmd = [sys.executable, str(script)] + args
-
-    import os
-    child_env = os.environ.copy()
-    child_env["MYSQL_URL"] = get_engine().url.render_as_string(hide_password=False)
-    child_env.setdefault("PYTHONPATH", str(root))
-
-    try:
-        start = datetime.now()
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=None, cwd=str(root), env=child_env)
-        duration = int((datetime.now() - start).total_seconds())
-        status = "success" if r.returncode == 0 else "failed"
-        output = (r.stdout or "")[-2000:] + (r.stderr or "")[-2000:]
-    except Exception as e:
-        status = "failed"
-        duration = 0
-        output = str(e)
-
-    _execute_sql(
-        "UPDATE st_scheduled_tasks SET last_run_status = :s, last_run_output = :o, last_run_duration = :d, updated_at = NOW() WHERE id = :id",
-        {"s": status, "o": output, "d": duration, "id": task_id}
-    )
-
-    return {"id": task_id, "status": status, "duration": duration, "output": output}
+    return run_scheduler_task_sync(row[0], root=root, engine=get_engine())
 
 
 @router.post("/datasource/{task_id}/toggle")
@@ -321,5 +558,5 @@ def toggle_task(task_id: int):
     if not row:
         return {"error": "任务不存在"}
     new_enabled = 0 if row[0]["enabled"] == 1 else 1
-    _execute_sql("UPDATE st_scheduled_tasks SET enabled = :e, updated_at = NOW() WHERE id = :id", {"e": new_enabled, "id": task_id})
+    update_scheduler_task(get_engine(), task_id, {"enabled": new_enabled})
     return {"id": task_id, "enabled": new_enabled}

@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Iterable
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 import pandas as pd
+
+from server.common.process_env import build_child_env
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PYTHON = ROOT / "runtime" / "qmt-py313" / "Scripts" / "python.exe"
@@ -26,7 +29,18 @@ def python_path() -> Path:
 
 
 def is_configured() -> bool:
-    return python_path().exists() and WORKER.exists()
+    if not WORKER.exists():
+        return False
+    gateway_enabled = os.environ.get("QMT_GATEWAY_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    # The production host consumes the Windows QMT runtime through a reverse
+    # SSH tunnel.  It deliberately has no local QMT Python installation, so a
+    # configured gateway is sufficient; the local runtime is only the fallback.
+    return gateway_enabled or python_path().exists()
 
 
 def _decode_output(text: str) -> dict[str, Any]:
@@ -41,6 +55,28 @@ def gateway_url() -> str:
     return (os.environ.get("QMT_GATEWAY_URL") or DEFAULT_GATEWAY_URL).rstrip("/")
 
 
+def _transient_gateway_error(detail: str) -> bool:
+    text = str(detail or "").strip().lower()
+    return any(
+        token in text
+        for token in (
+            "unicodedecodeerror",
+            "timed out",
+            "timeout",
+            "temporarily",
+            "connection reset",
+            "remote end closed",
+            "broken pipe",
+            "isneterror",
+            "10053",
+            "10054",
+            "10060",
+            "10061",
+            "强迫关闭",
+        )
+    )
+
+
 def _run_gateway(payload: dict[str, Any], *, timeout: int) -> dict[str, Any] | None:
     if os.environ.get("QMT_GATEWAY_ENABLED", "1").strip().lower() in {"0", "false", "no", "off"}:
         return None
@@ -50,32 +86,84 @@ def _run_gateway(payload: dict[str, Any], *, timeout: int) -> dict[str, Any] | N
     if token:
         headers["X-QMT-Token"] = token
     req = urllib_request.Request(f"{gateway_url()}/call", data=body, headers=headers, method="POST")
-    gateway_timeout = min(float(timeout), float(os.environ.get("QMT_GATEWAY_REQUEST_TIMEOUT", "30") or 30))
-    try:
-        with urllib_request.urlopen(req, timeout=max(0.5, gateway_timeout)) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except (urllib_error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
-        if os.environ.get("QMT_GATEWAY_REQUIRED", "0") == "1":
-            raise QmtBridgeError("Guojin QMT persistent gateway is unavailable")
+    # ``timeout`` is the total request budget.  Previously every retry got a
+    # fresh full timeout, so a live quote with timeout=8 could block for about
+    # 24 seconds before the caller saw an error.
+    total_timeout = max(0.5, float(timeout))
+    deadline = time.monotonic() + total_timeout
+    gateway_timeout = min(total_timeout, float(os.environ.get("QMT_GATEWAY_REQUEST_TIMEOUT", "30") or 30))
+    attempts = max(1, int(os.environ.get("QMT_GATEWAY_ATTEMPTS", "3") or 3))
+    retry_delay = max(0.0, float(os.environ.get("QMT_GATEWAY_RETRY_DELAY", "0.25") or 0.25))
+    last_error: BaseException | None = None
+    last_detail = "Guojin QMT gateway call failed"
+    for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with urllib_request.urlopen(req, timeout=max(0.5, min(gateway_timeout, remaining))) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (urllib_error.URLError, TimeoutError, ConnectionError, UnicodeError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                delay = min(retry_delay * (attempt + 1), max(0.0, deadline - time.monotonic()))
+                if delay:
+                    time.sleep(delay)
+                continue
+            if os.environ.get("QMT_GATEWAY_REQUIRED", "0") == "1":
+                raise QmtBridgeError("Guojin QMT persistent gateway is unavailable") from exc
+            return None
+        if result.get("ok"):
+            return result
+        detail = str(result.get("error") or "Guojin QMT gateway call failed")
+        last_detail = detail
+        if attempt + 1 < attempts and _transient_gateway_error(detail):
+            delay = min(retry_delay * (attempt + 1), max(0.0, deadline - time.monotonic()))
+            if delay:
+                time.sleep(delay)
+            continue
+        raise QmtBridgeError(detail)
+    if os.environ.get("QMT_GATEWAY_REQUIRED", "0") == "1":
+        if last_error is not None:
+            raise QmtBridgeError("Guojin QMT persistent gateway is unavailable") from last_error
+        raise QmtBridgeError(last_detail)
+    if last_error is not None:
         return None
-    if not result.get("ok"):
-        raise QmtBridgeError(str(result.get("error") or "Guojin QMT gateway call failed"))
-    return result
+    raise QmtBridgeError("Guojin QMT persistent gateway is unavailable")
 
 
 def _run(payload: dict[str, Any], *, timeout: int | None = None) -> dict[str, Any]:
-    python = python_path()
-    if not python.exists():
-        raise QmtBridgeError(f"QMT Python runtime not found: {python}")
     if not WORKER.exists():
         raise QmtBridgeError(f"QMT worker not found: {WORKER}")
 
     effective_timeout = timeout or int(os.environ.get("QMT_TIMEOUT", "180"))
+    gateway_enabled = os.environ.get("QMT_GATEWAY_ENABLED", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    started_at = time.monotonic()
     gateway_result = _run_gateway(payload, timeout=effective_timeout)
     if gateway_result is not None:
         return gateway_result
 
-    env = os.environ.copy()
+    # The gateway and local-runtime fallback share one budget.  Otherwise a
+    # failed gateway can consume the full timeout and the local fallback can
+    # consume it again, which is especially painful for live polling.
+    remaining_timeout = float(effective_timeout)
+    if gateway_enabled:
+        remaining_timeout = float(effective_timeout) - (time.monotonic() - started_at)
+        if remaining_timeout <= 0:
+            raise QmtBridgeError(f"QMT request timed out after {effective_timeout}s")
+
+    python = python_path()
+    if not python.exists():
+        raise QmtBridgeError(
+            f"Guojin QMT gateway is unavailable and local QMT Python runtime was not found: {python}"
+        )
+
+    env = build_child_env(ROOT)
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("QMT_ENABLE_HELLO", "0")
 
@@ -89,7 +177,7 @@ def _run(payload: dict[str, Any], *, timeout: int | None = None) -> dict[str, An
             capture_output=True,
             cwd=str(ROOT),
             env=env,
-            timeout=effective_timeout,
+            timeout=max(0.5, remaining_timeout),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -111,6 +199,18 @@ def _as_codes(items: Iterable[str] | str) -> list[str]:
     if isinstance(items, str):
         return [items]
     return [str(item).strip() for item in items if str(item).strip()]
+
+
+def _as_qmt_stock_codes(items: Iterable[str] | str) -> list[str]:
+    """Accept canonical six-digit stock codes at the public bridge boundary."""
+    from integrations.qmt.backend import to_qmt_symbol
+
+    result: list[str] = []
+    for item in _as_codes(items):
+        symbol = to_qmt_symbol(item)
+        if symbol:
+            result.append(symbol)
+    return result
 
 
 def ping(*, timeout: int | None = None) -> dict[str, Any]:
@@ -146,7 +246,7 @@ def kline(
     result = _run(
         {
             "action": "kline",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "start_date": start_date,
             "end_date": end_date,
             "dividend_type": dividend_type,
@@ -164,17 +264,19 @@ def minute(
     start_date: str | None = None,
     end_date: str | None = None,
     count: int = 0,
+    download_history: bool | None = None,
     batch_size: int | None = None,
     timeout: int | None = None,
 ) -> pd.DataFrame:
     result = _run(
         {
             "action": "minute",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "trade_date": trade_date,
             "start_date": start_date or trade_date,
             "end_date": end_date or trade_date,
             "count": count,
+            "download_history": download_history,
             "batch_size": batch_size,
         },
         timeout=timeout,
@@ -191,7 +293,7 @@ def current(
     result = _run(
         {
             "action": "current",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "batch_size": batch_size,
         },
         timeout=timeout,
@@ -209,7 +311,7 @@ def tick(
     result = _run(
         {
             "action": "tick",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "count": count,
             "batch_size": batch_size,
         },
@@ -229,7 +331,7 @@ def flow_daily(
     result = _run(
         {
             "action": "flow_daily",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "start_date": start_date,
             "end_date": end_date,
             "batch_size": batch_size,
@@ -251,7 +353,7 @@ def flow_min(
     result = _run(
         {
             "action": "flow_min",
-            "stock_codes": _as_codes(stock_codes),
+            "stock_codes": _as_qmt_stock_codes(stock_codes),
             "trade_date": trade_date,
             "start_date": start_date or trade_date,
             "end_date": end_date or trade_date,

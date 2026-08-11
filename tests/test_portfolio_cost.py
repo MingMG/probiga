@@ -16,10 +16,15 @@ class PortfolioCostTest(unittest.TestCase):
         self.assertEqual(result["trade_shares"], 100)
 
     def test_sell_decreases_shares(self):
-        result = portfolio_calc_next_position("sell", 10, 100, 12, 50)
+        result = portfolio_calc_next_position("sell", 10, 200, 12, 100)
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["trade_shares"], 50)
-        self.assertEqual(result["new_shares"], 50)
+        self.assertEqual(result["trade_shares"], 100)
+        self.assertEqual(result["new_shares"], 100)
+
+    def test_rejects_non_lot_trade_quantity(self):
+        result = portfolio_calc_next_position("buy", 0, 0, 12, 50)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("100股整数倍", result["error"])
 
     def test_sell_more_than_holding_caps_at_holding(self):
         result = portfolio_calc_next_position("sell", 10, 100, 12, 200)

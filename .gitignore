@@ -32,9 +32,8 @@ logs/
 output/
 outputs/
 .codex_backups/
-# Multi-gigabyte research feature caches stay local. Release manifests retain
-# the small, immutable evidence outputs; production never loads these caches.
-artifacts/trading_v4/research_features_*.pkl
+.runtime/
+.codex_*
 stock.txt
 *.zip
 *.tar
@@ -55,6 +54,21 @@ _archive/
 server*.log
 data/**
 !data/.gitkeep
+
+# Local migration rehearsals and generated acceptance evidence
+data_manifest_rehearsal_*.json
+D_MySQL84_rehearsal_*.ini
+artifacts/acceptance/
+artifacts/acceptance_*.json
+artifacts/*backtest*/
+artifacts/etf_forward/
+artifacts/trading_v3/
+artifacts/qmt_*.png
+/My CodeProBigAartifactsqmt_strategy_pasted.png
+
+# Large/raw documentation inputs stay local; authored Markdown/DOCX is tracked.
+docs/*.png
+docs/*.pdf
 
 # adata (external library, tracked separately)
 adata/

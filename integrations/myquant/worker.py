@@ -23,7 +23,7 @@ def _json_value(value):
     try:
         if pd.isna(value):
             return None
-    except Exception:
+    except (TypeError, ValueError):
         pass
     if isinstance(value, (pd.Timestamp, _dt.datetime, _dt.date)):
         return value.isoformat()
@@ -35,7 +35,7 @@ def _json_value(value):
         try:
             return _json_value(value.item())
         except Exception:
-            pass
+            return str(value)
     return value
 
 

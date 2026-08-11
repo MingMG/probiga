@@ -1,0 +1,127 @@
+{
+  "schema_version": "probiga.trading-v4-bounded-research.v1",
+  "campaign_id": "trading_v4_bounded_horizon_research_20260801",
+  "created_on": "2026-08-01",
+  "parent_campaigns": [
+    "trading_v4_oos_research_20260801",
+    "trading_v4_nested_ml_research_20260801"
+  ],
+  "diagnostic_basis": "The dynamic trend-exit parent universe was negative in nested OOF; this campaign freezes new bounded-risk trade definitions before evaluation.",
+  "execution_boundary": {
+    "research_only": true,
+    "paper_orders_only": true,
+    "real_order_submission": false,
+    "historical_success_ceiling": "PAPER_CANDIDATE"
+  },
+  "candidate_control": {
+    "prior_recorded_candidate_searches": 59,
+    "maximum_new_candidate_count": 6,
+    "maximum_familywise_candidate_count": 65,
+    "candidate_specs_must_be_frozen_before_backtest": true,
+    "post_result_edits_create_a_new_campaign": true,
+    "multiple_testing_control": "CALENDAR_MONTH_JOINT_BLOCK_BOOTSTRAP_MAX_T",
+    "fallback_bonferroni_one_sided_alpha": 0.0007692307692307692,
+    "candidates": [
+      {
+        "id": "bounded_low_vol_pullback_10_v1",
+        "eligibility": "strict Q pullback, Q>=0.60, market_return_60d_pct>=0, market_aligned_breadth_pct>=45",
+        "score": "Q",
+        "stop_pct": 4.5,
+        "take_profit_pct": 9.0,
+        "maximum_holding_sessions": 10,
+        "maximum_entry_gap_pct": 1.0
+      },
+      {
+        "id": "bounded_breakout_7_v1",
+        "eligibility": "close>MA20>MA60, return20 [4,20], return60 [8,40], breakout proximity>=0.985, amount ratio5/20 [1.05,1.8], change [0.5,5], ATR [1,4], market return20>=0",
+        "score": "0.30*scale(breakout_proximity,0.985,1)+0.25*band(relative_strength20,4,18,10)+0.15*band(amount_ratio5_20,1.05,1.5,0.5)+0.15*band(change,0.5,3.5,2)+0.15*(1-scale(ATR,1,4))",
+        "stop_pct": 4.5,
+        "take_profit_pct": 9.0,
+        "maximum_holding_sessions": 7,
+        "maximum_entry_gap_pct": 1.0
+      },
+      {
+        "id": "bounded_reacceleration_10_v1",
+        "eligibility": "close>MA20>MA60, return5 [-2,6], return20 [2,15], return60 [8,40], MA20 slope [0.2,2.5], distanceMA20 [0,4], amount ratio5/20 [0.8,1.5], ATR [1,4.5], market return60>=0",
+        "score": "0.25*band(relative_strength20,3,18,12)+0.20*band(return5,-1,5,5)+0.20*band(distanceMA20,0,3,3)+0.15*band(MA20slope,0.2,2,1.5)+0.10*band(amount_ratio5_20,0.8,1.4,0.6)+0.10*(1-scale(ATR,1,4.5))",
+        "stop_pct": 5.0,
+        "take_profit_pct": 10.0,
+        "maximum_holding_sessions": 10,
+        "maximum_entry_gap_pct": 1.0
+      },
+      {
+        "id": "bounded_nvcr_3_v1",
+        "eligibility": "frozen nvcr_price_reversal_v1",
+        "score": "frozen NVCR score",
+        "stop_pct": 4.5,
+        "take_profit_pct": 7.0,
+        "maximum_holding_sessions": 3,
+        "maximum_entry_gap_pct": 0.5
+      },
+      {
+        "id": "bounded_qfbr_5_v1",
+        "eligibility": "frozen qfbr_quality_reversal_v1",
+        "score": "frozen QFBR score",
+        "stop_pct": 6.0,
+        "take_profit_pct": 10.0,
+        "maximum_holding_sessions": 5,
+        "maximum_entry_gap_pct": 0.5
+      },
+      {
+        "id": "bounded_quality_momentum_20_v1",
+        "eligibility": "point-in-time quality percentile>=0.70, cashflow percentile>=0.60, asset liabilities<=65, profit YoY>0, close>MA20>MA60, return60 [5,35], return20 [0,15], distanceMA20 [-1,5], ATR [1,4], market return60>=0",
+        "score": "0.30*quality+0.15*cashflow+0.15*valuation+0.20*band(relative_strength20,3,18,12)+0.20*(1-scale(ATR,1,4))",
+        "stop_pct": 6.0,
+        "take_profit_pct": 12.0,
+        "maximum_holding_sessions": 20,
+        "maximum_entry_gap_pct": 1.0
+      }
+    ]
+  },
+  "execution_protocol": {
+    "signal_time": "T_CLOSE",
+    "entry": "NEXT_TRADABLE_OPEN",
+    "exit_decision": "STOP_TOUCH_THEN_TARGET_TOUCH_THEN_TIME_LIMIT",
+    "exit_fill": "NEXT_TRADABLE_OPEN_AFTER_DECISION",
+    "one_price_limit_orders_are_unfilled_and_deferred": true,
+    "same_stock_cooldown_trading_days_after_exit": 5,
+    "top_per_day": 10,
+    "right_censored_candidates_remain_in_portfolio": true,
+    "cost_model": "trading_v3 production account costs"
+  },
+  "outer_folds": [
+    {"name": "oos_2022", "training_start": "2020-01-02", "training_end": "2021-11-26", "validation_start": "2022-01-01", "validation_end": "2022-12-31"},
+    {"name": "oos_2023", "training_start": "2020-01-02", "training_end": "2022-11-26", "validation_start": "2023-01-01", "validation_end": "2023-12-31"},
+    {"name": "oos_2024", "training_start": "2021-01-01", "training_end": "2023-11-26", "validation_start": "2024-01-01", "validation_end": "2024-12-31"},
+    {"name": "oos_2025_h1", "training_start": "2022-01-01", "training_end": "2024-11-26", "validation_start": "2025-01-01", "validation_end": "2025-06-30"},
+    {"name": "oos_2025h2_2026h1", "training_start": "2022-07-01", "training_end": "2025-05-27", "validation_start": "2025-07-01", "validation_end": "2026-07-30"}
+  ],
+  "profit_gate": {
+    "minimum_oos_samples": 80,
+    "minimum_expected_return_net_pct": 0.0,
+    "minimum_profit_factor": 1.3,
+    "minimum_payoff_ratio": 1.0,
+    "minimum_portfolio_trades": 80,
+    "minimum_portfolio_net_expectancy_pct": 0.0,
+    "minimum_portfolio_profit_factor": 1.3,
+    "minimum_portfolio_payoff_ratio": 1.0,
+    "maximum_drawdown_pct": 12.0,
+    "minimum_positive_outer_folds": 4,
+    "minimum_outer_fold_profit_factor": 0.9
+  },
+  "stress_tests": {
+    "minimum_bootstrap_iterations": 2000,
+    "cost_multipliers": [1.0, 1.5, 2.0],
+    "execution_delay_sessions": [0, 1],
+    "remove_best_trade_counts": [0, 5],
+    "parameter_perturbation_pct": 10.0,
+    "top_n_sensitivity": [5, 10, 20],
+    "capital_sensitivity_cny": [200000, 500000, 1000000]
+  },
+  "evidence_status": {
+    "all_history_through_2026_07_31_is_contaminated_by_prior_inspection": true,
+    "prospective_paper_start": "2026-08-03",
+    "minimum_prospective_trading_days": 120,
+    "minimum_prospective_mature_portfolio_trades": 80
+  }
+}

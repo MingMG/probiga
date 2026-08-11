@@ -289,6 +289,8 @@ def _refresh_full_snapshot(C):
                         quotes[code] = _json_safe(raw_tick)
         except Exception:
             errors.append(traceback.format_exc()[-500:])
+        finally:
+            _write_heartbeat("busy")
     _atomic_write("full_quotes.json", _snapshot_payload("full", quotes))
     _last_full_refresh = now
     if errors:
@@ -452,23 +454,30 @@ def _market_rows(C, params, period):
     symbols = _normalize_codes(params.get("stock_codes"))
     start_time = _date_digits(params.get("start_date"))[:14]
     end_time = _date_digits(params.get("end_date"))[:14]
-    if params.get("download_history"):
-        _download_history(symbols, period, start_time, end_time)
+    batch_size = max(1, int(params.get("batch_size") or 200))
     count = int(params.get("count", -1) or 0) if period == "1m" else -1
     raw_reader = getattr(C, "get_market_data_ex_ori", None)
-    if callable(raw_reader):
-        data = raw_reader(
-            [], symbols, period=period, start_time=start_time, end_time=end_time,
-            count=count, dividend_type=str(params.get("dividend_type") or "none"),
-            fill_data=True, subscribe=False
-        )
-    else:
-        data = C.get_market_data_ex(
-            [], symbols, period=period, start_time=start_time, end_time=end_time,
-            count=count, dividend_type=str(params.get("dividend_type") or "none"),
-            fill_data=True, subscribe=False
-        )
-    return _bar_rows(data, period)
+    rows = []
+    for offset in range(0, len(symbols), batch_size):
+        batch = symbols[offset:offset + batch_size]
+        if params.get("download_history"):
+            _download_history(batch, period, start_time, end_time)
+            _write_heartbeat("busy")
+        if callable(raw_reader):
+            data = raw_reader(
+                [], batch, period=period, start_time=start_time, end_time=end_time,
+                count=count, dividend_type=str(params.get("dividend_type") or "none"),
+                fill_data=True, subscribe=False
+            )
+        else:
+            data = C.get_market_data_ex(
+                [], batch, period=period, start_time=start_time, end_time=end_time,
+                count=count, dividend_type=str(params.get("dividend_type") or "none"),
+                fill_data=True, subscribe=False
+            )
+        rows.extend(_bar_rows(data, period))
+        _write_heartbeat("busy")
+    return rows
 
 
 def _current_rows(C, params):
@@ -477,31 +486,34 @@ def _current_rows(C, params):
     rows = []
     snapshot_at = _now_text()
     for offset in range(0, len(symbols), batch_size):
-        data = C.get_full_tick(symbols[offset:offset + batch_size])
-        if not isinstance(data, dict):
-            continue
-        for raw_symbol, tick in data.items():
-            symbol = _valid_symbol(raw_symbol)
-            if not symbol or not isinstance(tick, dict):
+        try:
+            data = C.get_full_tick(symbols[offset:offset + batch_size])
+            if not isinstance(data, dict):
                 continue
-            price = _float(tick.get("lastPrice", tick.get("close")))
-            pre_close = _float(tick.get("lastClose", tick.get("preClose")))
-            if price <= 0:
-                price = pre_close
-            change = price - pre_close if pre_close > 0 else 0.0
-            rows.append({
-                "qmt_code": symbol,
-                "stock_code": symbol.split(".", 1)[0],
-                "snapshot_at": _time_text(tick.get("time") or tick.get("stime"), "tick") or snapshot_at,
-                "open": _float(tick.get("open")),
-                "price": price,
-                "high": _float(tick.get("high")),
-                "low": _float(tick.get("low")),
-                "volume": max(0.0, _float(tick.get("volume", tick.get("pvolume")))),
-                "amount": max(0.0, _float(tick.get("amount"))),
-                "change": change,
-                "change_pct": change / pre_close * 100.0 if pre_close > 0 else 0.0,
-            })
+            for raw_symbol, tick in data.items():
+                symbol = _valid_symbol(raw_symbol)
+                if not symbol or not isinstance(tick, dict):
+                    continue
+                price = _float(tick.get("lastPrice", tick.get("close")))
+                pre_close = _float(tick.get("lastClose", tick.get("preClose")))
+                if price <= 0:
+                    price = pre_close
+                change = price - pre_close if pre_close > 0 else 0.0
+                rows.append({
+                    "qmt_code": symbol,
+                    "stock_code": symbol.split(".", 1)[0],
+                    "snapshot_at": _time_text(tick.get("time") or tick.get("stime"), "tick") or snapshot_at,
+                    "open": _float(tick.get("open")),
+                    "price": price,
+                    "high": _float(tick.get("high")),
+                    "low": _float(tick.get("low")),
+                    "volume": max(0.0, _float(tick.get("volume", tick.get("pvolume")))),
+                    "amount": max(0.0, _float(tick.get("amount"))),
+                    "change": change,
+                    "change_pct": change / pre_close * 100.0 if pre_close > 0 else 0.0,
+                })
+        finally:
+            _write_heartbeat("busy")
     return rows
 
 

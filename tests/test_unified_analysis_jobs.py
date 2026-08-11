@@ -43,6 +43,31 @@ class UnifiedAnalysisJobsTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(mock_run_codes.call_args.kwargs["stock_codes"], ["000001", "000002"])
+        self.assertTrue(mock_run_codes.call_args.kwargs["use_intraday_current"])
+        self.assertRegex(
+            mock_run_codes.call_args.kwargs["execution_time"],
+            r"\+08:00$",
+        )
+
+    def test_incremental_recommendation_scope_requires_explicit_buy_gates(self):
+        captured = {}
+
+        def fake_read(statement, _engine):
+            captured["sql"] = str(statement)
+            from pandas import DataFrame
+            return DataFrame({"stock_code": []})
+
+        with patch(
+            "biz.analysis.sync_analysis_incremental.get_engine", return_value=object()
+        ), patch(
+            "biz.analysis.sync_analysis_incremental.read_frame", side_effect=fake_read
+        ):
+            self.assertEqual(sync_analysis_incremental.get_recommended_stocks(), [])
+
+        self.assertIn("recommend_status = 'ALLOW'", captured["sql"])
+        self.assertIn("chase_risk_status = 'ALLOW'", captured["sql"])
+        self.assertIn("ordinary_buy_eligible = 1", captured["sql"])
+        self.assertNotIn("recommend_status IS NULL", captured["sql"])
 
     def test_prepare_signals_can_ensure_recommendations_first(self):
         with patch("biz.analysis.sync_sim_trade._is_trade_date", return_value=True), \

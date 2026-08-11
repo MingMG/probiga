@@ -1,25 +1,54 @@
 import paramiko
-import os
-
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('47.113.123.190', username='root', password='ProBigA@2026', look_for_keys=False, allow_agent=False)
-sftp = ssh.open_sftp()
-
-sftp.put(os.path.abspath('e:/My Code/ProBigA/tools/_sync_plates_for_fused.py'), '/opt/ProBigA/tools/_sync_plates_for_fused.py')
-print('OK: _sync_plates_for_fused.py uploaded')
-sftp.close()
-
-print('--- 运行板块数据同步 ---')
-stdin, stdout, stderr = ssh.exec_command(
-    'cd /opt/ProBigA && export MYSQL_URL="mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4" && /opt/ProBigA/venv/bin/python tools/_sync_plates_for_fused.py',
-    timeout=600
+from remote_support import (
+    production_ssh_client,
+    production_ssh_connect_kwargs,
+    remote_root,
 )
-out = stdout.read().decode()
-err = stderr.read().decode()
-print(out)
-if err:
-    print('STDERR:', err[:1000])
+import os
+from pathlib import Path
 
-ssh.close()
-print('Done!')
+
+ROOT = Path(__file__).resolve().parents[1]
+LEGACY_DEPLOY_OVERRIDE_ENV = "PROBIGA_ALLOW_LEGACY_DEPLOY"
+LEGACY_DEPLOY_OVERRIDE_SENTINEL = (
+    "I_ACKNOWLEDGE_LEGACY_DEPLOY_BYPASSES_RELEASE_GATES"
+)
+
+
+def _require_legacy_deploy_override() -> None:
+    if os.environ.get(LEGACY_DEPLOY_OVERRIDE_ENV) != LEGACY_DEPLOY_OVERRIDE_SENTINEL:
+        raise SystemExit(
+            "Legacy deploy blocked. Set "
+            f"{LEGACY_DEPLOY_OVERRIDE_ENV}={LEGACY_DEPLOY_OVERRIDE_SENTINEL} "
+            "to override."
+        )
+
+
+def main() -> None:
+    _require_legacy_deploy_override()
+    ssh = production_ssh_client(paramiko)
+    ssh.connect(**production_ssh_connect_kwargs())
+    sftp = ssh.open_sftp()
+    remote = remote_root()
+
+    sftp.put(os.fspath(ROOT / "tools" / "_sync_plates_for_fused.py"), f"{remote}/tools/_sync_plates_for_fused.py")
+    print('OK: _sync_plates_for_fused.py uploaded')
+    sftp.close()
+
+    print('--- 运行板块数据同步 ---')
+    stdin, stdout, stderr = ssh.exec_command(
+        f'cd {remote} && {remote}/venv/bin/python tools/_sync_plates_for_fused.py',
+        timeout=600
+    )
+    out = stdout.read().decode()
+    err = stderr.read().decode()
+    print(out)
+    if err:
+        print('STDERR:', err[:1000])
+
+    ssh.close()
+    print('Done!')
+
+
+if __name__ == "__main__":
+    main()

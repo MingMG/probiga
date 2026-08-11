@@ -16,19 +16,23 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from biz.analysis.sync_analysis_fast import run_batch_for_codes
-from server.api.routers._engine import get_engine
+from server.common.batch_db import create_batch_engine, read_frame
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
+def get_engine():
+    return create_batch_engine()
+
+
 def get_allowed_recommendations() -> tuple[str, list[str]]:
     engine = get_engine()
-    latest_rows = pd.read_sql(text("SELECT MAX(analysis_date) AS d FROM stock_analysis_result"), engine)
+    latest_rows = read_frame(text("SELECT MAX(analysis_date) AS d FROM stock_analysis_result"), engine)
     if latest_rows.empty or not latest_rows.iloc[0]["d"]:
         return "", []
     analysis_date = str(latest_rows.iloc[0]["d"])[:10]
-    df = pd.read_sql(
+    df = read_frame(
         text("""
             SELECT stock_code
             FROM stock_analysis_result
@@ -36,6 +40,7 @@ def get_allowed_recommendations() -> tuple[str, list[str]]:
               AND recommend_status = 'ALLOW'
             ORDER BY short_term_score DESC
         """),
+        engine,
         engine,
         params={"analysis_date": analysis_date},
     )

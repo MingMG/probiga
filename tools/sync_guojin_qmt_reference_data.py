@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -20,17 +20,10 @@ from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.info import CORE_INDEXES, to_qmt_index_symbol
 from integrations.qmt.safe_upsert import safe_upsert_rows
 from integrations.qmt.sectors import fetch_sector_datasets
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine, quote_identifier, write_frame
 
 
 PROVIDER_ID = "gj_qmt"
-
-
-def _quote(identifier: str) -> str:
-    value = str(identifier or "").strip()
-    if not value.replace("_", "").isalnum():
-        raise ValueError(f"unsafe identifier: {identifier!r}")
-    return f"`{value}`"
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
@@ -44,7 +37,7 @@ def _ensure_column(engine: Engine, table_name: str, column_name: str, ddl: str) 
     if column_name in _table_columns(engine, table_name):
         return
     with engine.begin() as conn:
-        conn.execute(text(f"ALTER TABLE {_quote(table_name)} ADD COLUMN {_quote(column_name)} {ddl}"))
+        conn.execute(text(f"ALTER TABLE {quote_identifier(table_name)} ADD COLUMN {quote_identifier(column_name)} {ddl}"))
 
 
 def ensure_reference_tables(engine: Engine) -> None:
@@ -135,7 +128,7 @@ def ensure_reference_tables(engine: Engine) -> None:
         ("qmt_index_weight", "stock_code", "VARCHAR(64) NOT NULL"),
     ]:
         with engine.begin() as conn:
-            conn.execute(text(f"ALTER TABLE {_quote(table_name)} MODIFY COLUMN {_quote(column_name)} {ddl}"))
+            conn.execute(text(f"ALTER TABLE {quote_identifier(table_name)} MODIFY COLUMN {quote_identifier(column_name)} {ddl}"))
 
     if _table_columns(engine, "si_index_constituent"):
         _ensure_column(engine, "si_index_constituent", "index_qmt_code", "VARCHAR(32) NULL")
@@ -318,8 +311,11 @@ def _append_replace_source(engine: Engine, table_name: str, df: pd.DataFrame, *,
     if df.empty or not _table_columns(engine, table_name):
         return 0
     with engine.begin() as conn:
-        conn.execute(text(f"DELETE FROM {_quote(table_name)} WHERE {_quote(source_column)} = :source"), {"source": source_value})
-    df.to_sql(table_name, engine, if_exists="append", index=False, chunksize=2000, method="multi")
+        conn.execute(
+            text(f"DELETE FROM {quote_identifier(table_name)} WHERE {quote_identifier(source_column)} = :source"),
+            {"source": source_value},
+        )
+    write_frame(df, table_name, engine, if_exists="append", index=False, chunksize=2000, method="multi")
     return int(len(df))
 
 
@@ -329,9 +325,9 @@ def _delete_qmt_batch_rows(engine: Engine, table_name: str) -> None:
     with engine.begin() as conn:
         columns = _table_columns(engine, table_name)
         if "data_source" in columns:
-            conn.execute(text(f"DELETE FROM {_quote(table_name)} WHERE data_source = :source"), {"source": PROVIDER_ID})
+            conn.execute(text(f"DELETE FROM {quote_identifier(table_name)} WHERE data_source = :source"), {"source": PROVIDER_ID})
         elif "source" in columns:
-            conn.execute(text(f"DELETE FROM {_quote(table_name)} WHERE source = 'qmt'"))
+            conn.execute(text(f"DELETE FROM {quote_identifier(table_name)} WHERE source = 'qmt'"))
 
 
 def sync_reference_data(
@@ -344,7 +340,7 @@ def sync_reference_data(
     skip_calendar: bool = True,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     ensure_reference_tables(engine)
     batch_id = f"qmt_reference_{datetime.now().strftime('%Y%m%d%H%M%S')}"
 
@@ -495,7 +491,15 @@ def sync_reference_data(
             )
         index_business["short_name"] = index_business["stock_code"].map(detail_names).fillna("")
         _delete_qmt_batch_rows(engine, "si_index_constituent")
-        index_business.to_sql("si_index_constituent", engine, if_exists="append", index=False, chunksize=2000, method="multi")
+        write_frame(
+            index_business,
+            "si_index_constituent",
+            engine,
+            if_exists="append",
+            index=False,
+            chunksize=2000,
+            method="multi",
+        )
         results["tables"]["si_index_constituent"] = {
             "status": "REPLACED_QMT_ROWS",
             "accepted_rows": int(len(index_business)),

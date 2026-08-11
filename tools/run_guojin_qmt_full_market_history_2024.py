@@ -4,12 +4,14 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -25,11 +27,12 @@ from integrations.qmt.local_history import (
     load_stock_codes,
     load_trade_dates,
 )
-from server.common.config import get_mysql_url
+from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
+from server.common.batch_db import create_batch_engine, quote_identifier
 
 
 def _source_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    return create_batch_engine(future=True)
 
 
 def _pid_alive(pid: int) -> bool:
@@ -62,8 +65,8 @@ def _release_lock(lock_path: Path) -> None:
         pid = int(raw.split()[0])
         if pid == os.getpid():
             lock_path.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[WARN] failed to release lock {lock_path}: {exc}", file=sys.stderr)
 
 
 def _latest_trade_date(source_engine) -> str:
@@ -87,9 +90,27 @@ def _latest_trade_date(source_engine) -> str:
 
 
 def _local_count(local_engine, *, table: str, trade_date: str) -> int:
+    if table == LOCAL_KLINE_TABLE:
+        predicate = (
+            "trade_date = :d AND provider = :provider "
+            "AND period = '1d' AND adjust_type = 0"
+        )
+    elif table == LOCAL_MINUTE_TABLE:
+        predicate = (
+            "trade_date = :d AND provider = :provider "
+            "AND period = '1m'"
+        )
+    else:
+        raise ValueError(f"unsupported local history table: {table}")
     with local_engine.begin() as conn:
         return int(
-            conn.execute(text(f"SELECT COUNT(*) FROM `{table}` WHERE trade_date = :d"), {"d": trade_date}).scalar()
+            conn.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {quote_identifier(table)} "
+                    f"WHERE {predicate}"
+                ),
+                {"d": trade_date, "provider": BIGQMT_PROVIDER_ID},
+            ).scalar()
             or 0
         )
 
@@ -132,13 +153,24 @@ def run_full_history(
     resume: bool,
     log_path: Path,
     stop_at: datetime_time | None = None,
+    reverse: bool = False,
+    date_workers: int = 1,
 ) -> dict[str, Any]:
     source_engine = _source_engine()
     local_engine = get_local_history_engine()
     ensure_local_history_tables(local_engine)
     codes = load_stock_codes(source_engine)
     trade_dates = load_trade_dates(source_engine, start_date=start_date, end_date=end_date)
+    if reverse:
+        trade_dates = list(reversed(trade_dates))
     stock_count = len(codes)
+    worker_count = max(1, int(date_workers or 1))
+    log_lock = threading.Lock()
+
+    def log_event(payload: dict[str, Any]) -> None:
+        with log_lock:
+            _log(log_path, payload)
+
     summary = {
         "status": "started",
         "start_date": start_date,
@@ -148,23 +180,23 @@ def run_full_history(
         "modes": sorted(modes),
         "local_database": str(local_engine.url.database or ""),
         "stop_at": stop_at.isoformat(timespec="minutes") if stop_at else "",
+        "reverse": reverse,
+        "date_workers": worker_count,
     }
-    _log(log_path, {"event": "start", **summary})
+    log_event({"event": "start", **summary})
 
-    daily_done = 0
-    minute_done = 0
-    errors = 0
-    stopped_by_window = False
-    for trade_date in trade_dates:
+    def process_trade_date(trade_date: str) -> dict[str, Any]:
+        daily_done = 0
+        minute_done = 0
+        errors = 0
         if _stop_time_reached(stop_at):
-            stopped_by_window = True
-            _log(log_path, {"event": "stop_window_reached", "trade_date": trade_date})
-            break
+            log_event({"event": "stop_window_reached", "trade_date": trade_date})
+            return {"trade_date": trade_date, "daily_done": 0, "minute_done": 0, "errors": 0, "stopped": True}
         if "daily" in modes:
             expected_daily = max(1, int(stock_count * 0.80))
             current_daily = _local_count(local_engine, table=LOCAL_KLINE_TABLE, trade_date=trade_date)
             if resume and current_daily >= expected_daily:
-                _log(log_path, {"event": "skip_daily", "trade_date": trade_date, "rows": current_daily})
+                log_event({"event": "skip_daily", "trade_date": trade_date, "rows": current_daily})
             else:
                 try:
                     result = backfill_daily_kline_local(
@@ -174,31 +206,37 @@ def run_full_history(
                         start_date=trade_date,
                         end_date=trade_date,
                         batch_size=daily_batch_size,
+                        dividend_type="none",
+                        backend="bigqmt",
                         dry_run=False,
                     )
                     daily_done += 1
-                    _log(
-                        log_path,
+                    log_event(
                         {
                             "event": "daily_done",
                             "trade_date": trade_date,
                             "fetched_rows": result.fetched_rows,
                             "written_rows": result.written_rows,
                             "batch_count": result.batch_count,
-                        },
+                        }
                     )
                 except Exception as exc:
                     errors += 1
-                    _log(log_path, {"event": "daily_error", "trade_date": trade_date, "error": str(exc)})
+                    log_event({"event": "daily_error", "trade_date": trade_date, "error": str(exc)})
         if _stop_time_reached(stop_at):
-            stopped_by_window = True
-            _log(log_path, {"event": "stop_window_reached", "trade_date": trade_date, "after": "daily"})
-            break
+            log_event({"event": "stop_window_reached", "trade_date": trade_date, "after": "daily"})
+            return {
+                "trade_date": trade_date,
+                "daily_done": daily_done,
+                "minute_done": minute_done,
+                "errors": errors,
+                "stopped": True,
+            }
         if "minute" in modes:
             expected_minute = max(1, int(_expected_minute_rows(stock_count) * 0.80))
             current_minute = _local_count(local_engine, table=LOCAL_MINUTE_TABLE, trade_date=trade_date)
             if resume and current_minute >= expected_minute:
-                _log(log_path, {"event": "skip_minute", "trade_date": trade_date, "rows": current_minute})
+                log_event({"event": "skip_minute", "trade_date": trade_date, "rows": current_minute})
             else:
                 try:
                     result = backfill_minute_local(
@@ -207,24 +245,68 @@ def run_full_history(
                         stock_codes=codes,
                         trade_dates=[trade_date],
                         batch_size=minute_batch_size,
+                        backend="bigqmt",
                         dry_run=False,
                     )
                     minute_done += 1
-                    _log(
-                        log_path,
+                    log_event(
                         {
                             "event": "minute_done",
                             "trade_date": trade_date,
                             "fetched_rows": result.fetched_rows,
                             "written_rows": result.written_rows,
                             "batch_count": result.batch_count,
-                        },
+                        }
                     )
                 except Exception as exc:
                     errors += 1
-                    _log(log_path, {"event": "minute_error", "trade_date": trade_date, "error": str(exc)})
+                    log_event({"event": "minute_error", "trade_date": trade_date, "error": str(exc)})
         if sleep_seconds > 0:
             time.sleep(sleep_seconds)
+        return {
+            "trade_date": trade_date,
+            "daily_done": daily_done,
+            "minute_done": minute_done,
+            "errors": errors,
+            "stopped": False,
+        }
+
+    daily_done = 0
+    minute_done = 0
+    errors = 0
+    stopped_by_window = False
+
+    if worker_count <= 1:
+        for trade_date in trade_dates:
+            result = process_trade_date(trade_date)
+            daily_done += int(result.get("daily_done") or 0)
+            minute_done += int(result.get("minute_done") or 0)
+            errors += int(result.get("errors") or 0)
+            if result.get("stopped"):
+                stopped_by_window = True
+                break
+    else:
+        log_event({"event": "parallel_start", "date_workers": worker_count, "trade_days": len(trade_dates)})
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+            for trade_date in trade_dates:
+                if _stop_time_reached(stop_at):
+                    stopped_by_window = True
+                    log_event({"event": "stop_window_reached", "trade_date": trade_date, "before_submit": True})
+                    break
+                futures[executor.submit(process_trade_date, trade_date)] = trade_date
+            for future in as_completed(futures):
+                trade_date = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    errors += 1
+                    log_event({"event": "trade_date_error", "trade_date": trade_date, "error": str(exc)})
+                    continue
+                daily_done += int(result.get("daily_done") or 0)
+                minute_done += int(result.get("minute_done") or 0)
+                errors += int(result.get("errors") or 0)
+                stopped_by_window = stopped_by_window or bool(result.get("stopped"))
 
     final = {
         "status": "stopped_window" if stopped_by_window else "finished",
@@ -234,9 +316,10 @@ def run_full_history(
         "trade_days": len(trade_dates),
         "stock_count": stock_count,
         "stop_at": stop_at.isoformat(timespec="minutes") if stop_at else "",
+        "date_workers": worker_count,
         "finished_at": datetime.now().isoformat(timespec="seconds"),
     }
-    _log(log_path, {"event": "finish", **final})
+    log_event({"event": "finish", **final})
     return final
 
 
@@ -251,6 +334,8 @@ def main() -> int:
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--stop-at", default="", help="Stop naturally once local time reaches HH:MM, e.g. 07:00.")
     parser.add_argument("--log-path", default="")
+    parser.add_argument("--reverse", action="store_true", help="Process trade dates from end-date backwards.")
+    parser.add_argument("--date-workers", type=int, default=1, help="Trade-date level parallel workers. Start with 2 for QMT.")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -281,6 +366,8 @@ def main() -> int:
                 resume=not args.no_resume,
                 log_path=log_path,
                 stop_at=stop_at,
+                reverse=args.reverse,
+                date_workers=max(1, args.date_workers),
             )
         finally:
             _release_lock(lock_path)

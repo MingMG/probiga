@@ -113,6 +113,20 @@ class EnginePoolConfigTest(unittest.TestCase):
         self.assertTrue(fake_engine.disposed)
         self.assertIsNone(minute_data._MINUTE_ENGINE)
 
+    def test_capital_flow_router_only_routes_pure_flow_queries(self):
+        self.assertTrue(minute_data.should_use_capital_flow_engine(
+            "SELECT * FROM sm_stock_capital_flow_daily WHERE trade_date = :d"
+        ))
+        self.assertTrue(minute_data.should_use_capital_flow_engine(
+            "SELECT * FROM sm_stock_capital_flow_min WHERE stock_code = :c"
+        ))
+        self.assertFalse(minute_data.should_use_capital_flow_engine(
+            "SELECT f.* FROM sm_stock_capital_flow_daily f JOIN si_all_code c ON c.stock_code = f.stock_code"
+        ))
+        self.assertFalse(minute_data.should_use_capital_flow_engine(
+            "SELECT * FROM st_user_portfolio"
+        ))
+
     def test_kline_engine_uses_configured_pool_settings(self):
         fake_engine = object()
         with patch("server.common.kline_data.get_kline_mysql_url", return_value="mysql://kline"), \
@@ -170,21 +184,6 @@ class EnginePoolConfigTest(unittest.TestCase):
         ))
         self.assertFalse(kline_data.should_use_kline_engine(
             "SELECT * FROM st_recommended_stocks"
-        ))
-
-    def test_capital_flow_router_only_routes_pure_flow_queries(self):
-        self.assertTrue(minute_data.should_use_capital_flow_engine(
-            "SELECT main_net_inflow FROM sm_stock_capital_flow_daily WHERE stock_code = :c"
-        ))
-        self.assertTrue(minute_data.should_use_capital_flow_engine(
-            "SELECT main_net_inflow FROM sm_stock_capital_flow_min WHERE stock_code = :c"
-        ))
-        self.assertFalse(minute_data.should_use_capital_flow_engine(
-            "SELECT p.stock_code, f.main_net_inflow FROM st_user_portfolio p "
-            "JOIN sm_stock_capital_flow_daily f ON f.stock_code = p.stock_code"
-        ))
-        self.assertFalse(minute_data.should_use_capital_flow_engine(
-            "SELECT * FROM st_user_portfolio"
         ))
 
 

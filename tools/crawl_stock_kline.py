@@ -14,7 +14,6 @@
 """
 
 import argparse
-import os
 import random
 import sys
 import time
@@ -26,7 +25,7 @@ import pandas as pd
 import requests
 import urllib3
 from requests.adapters import HTTPAdapter
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -34,10 +33,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from server.common.batch_db import create_batch_engine, write_frame
+from server.common.config import get_kline_mysql_url
+from env_config import create_tool_engine, resolve_tool_mysql_url
 
 PROXY_IP = "61.129.129.48"
 TARGET_HOST = "push2his.eastmoney.com"
@@ -171,10 +169,31 @@ def save_to_db(engine, rows: list[dict]):
                 {"c": c, "d": tuple(dates)},
             )
 
-    out.to_sql(
-        "sm_stock_kline", engine, if_exists="append",
-        index=False, chunksize=500, method="multi",
+    write_frame(
+        out,
+        "sm_stock_kline",
+        engine,
+        if_exists="append",
+        index=False,
+        chunksize=500,
+        method="multi",
     )
+
+
+def get_kline_mirror_engine(primary_url: str):
+    try:
+        kline_url = get_kline_mysql_url().strip()
+    except Exception:
+        return None
+    if not kline_url or kline_url == primary_url.strip():
+        return None
+    return create_batch_engine(kline_url)
+
+
+def save_to_db_with_mirror(engine, mirror_engine, rows: list[dict]):
+    save_to_db(engine, rows)
+    if mirror_engine is not None:
+        save_to_db(mirror_engine, rows)
 
 
 def find_missing_dates(engine, lookback_days: int = 10) -> tuple[str, str] | None:
@@ -226,7 +245,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    mysql_url = resolve_tool_mysql_url()
+    engine = create_tool_engine(mysql_url)
     stock_codes = get_stock_codes(engine)
 
     # 自动检测缺失日期
@@ -283,7 +303,8 @@ def main():
         return
 
     session = make_session()
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine(mysql_url)
+    mirror_engine = get_kline_mirror_engine(mysql_url)
 
     buffer = []
     ok = fail = 0
@@ -335,12 +356,12 @@ def main():
 
         if len(buffer) >= 2000:
             print(f"  Writing {len(buffer)} rows...", flush=True)
-            save_to_db(engine, buffer)
+            save_to_db_with_mirror(engine, mirror_engine, buffer)
             buffer.clear()
 
     if buffer:
         print(f"  Writing {len(buffer)} rows...", flush=True)
-        save_to_db(engine, buffer)
+        save_to_db_with_mirror(engine, mirror_engine, buffer)
 
     elapsed = time.time() - t0
     print(f"\nDone! OK={ok} Fail={fail} Time={elapsed/60:.1f}min", flush=True)

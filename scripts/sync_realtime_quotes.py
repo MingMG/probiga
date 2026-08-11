@@ -14,18 +14,16 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 from tools.crawl_realtime_batch import is_trading_time, refresh_snapshot
 
 
 def sync_realtime(*, min_coverage: float = 0.70, skip_closed: bool = True) -> dict:
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(future=True)
     if skip_closed and not is_trading_time(engine):
         return {
             "status": "skipped",

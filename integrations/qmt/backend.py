@@ -13,17 +13,35 @@ def to_qmt_symbol(code: str) -> str | None:
     text = str(code or "").strip()
     if not text:
         return None
-    if "." in text:
-        return text.upper()
-    digits = "".join(ch for ch in text if ch.isdigit())
+    raw_code, separator, raw_exchange = text.partition(".")
+    digits = "".join(ch for ch in raw_code if ch.isdigit())
     if len(digits) != 6:
         return None
+    explicit_exchange = raw_exchange.strip().upper() if separator else ""
+    if explicit_exchange and explicit_exchange not in {"SH", "SZ", "BJ"}:
+        return None
     if digits.startswith("6"):
-        return f"{digits}.SH"
+        default_exchange = "SH"
+        return f"{digits}.{explicit_exchange or default_exchange}"
+    # Exchange-traded funds use 5xxxxx in Shanghai and 1xxxxx in Shenzhen.
+    # Keep these mappings at the common QMT boundary so both standard QMT and
+    # legacy MiniQMT history calls can consume ETF symbols.
+    if digits.startswith("5"):
+        return f"{digits}.{explicit_exchange or 'SH'}"
+    if digits.startswith("1"):
+        return f"{digits}.{explicit_exchange or 'SZ'}"
     if digits.startswith(("0", "3")):
-        return f"{digits}.SZ"
-    if digits.startswith(("4", "8")):
-        return f"{digits}.BJ"
+        default_exchange = "SZ"
+        return f"{digits}.{explicit_exchange or default_exchange}"
+    # Beijing Stock Exchange migrated newly listed equities to the 920xxx
+    # range. Keep the legacy 4/8 prefixes, except 810xxx private-placement
+    # convertible bonds and 899xxx BSE indexes. QMT can expose both instrument
+    # classes inside provider-maintained A-share sectors.
+    # 900xxx is Shanghai B-share and must not be mislabeled as Beijing.
+    if digits.startswith(("810", "899")):
+        return None
+    if digits.startswith(("4", "8", "92")):
+        return f"{digits}.{explicit_exchange or 'BJ'}"
     return None
 
 
@@ -48,7 +66,8 @@ def is_configured() -> bool:
             return False
         bridge.ping(timeout=int(os.environ.get("QMT_PING_TIMEOUT", "20")))
         return True
-    except Exception:
+    except Exception as exc:
+        logger.debug("QMT backend configuration probe failed: %s", exc)
         return False
 
 
@@ -228,6 +247,7 @@ class QmtBackend:
             start_date=start_date,
             end_date=end_date,
             count=count,
+            download_history=kwargs.get("download_history"),
             batch_size=batch_size,
             timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
         )
@@ -291,10 +311,16 @@ class QmtBackend:
 
         short_name_map = kwargs.get("short_name_map", {})
         batch_size = self._batch_size("QMT_CURRENT_BATCH_SIZE", 500)
+        # Current quotes are a live-poll operation.  Do not inherit the long
+        # historical-data timeout (QMT_TIMEOUT, often 600s) when the terminal
+        # or gateway is unavailable.
+        timeout = kwargs.get("timeout")
+        if timeout is None:
+            timeout = int(os.environ.get("QMT_CURRENT_TIMEOUT", "15"))
         df = bridge.current(
             qmt_codes,
             batch_size=batch_size,
-            timeout=int(os.environ.get("QMT_TIMEOUT", "120")),
+            timeout=max(1, int(timeout)),
         )
         if df is None or df.empty:
             return pd.DataFrame()

@@ -24,7 +24,7 @@ def send_markdown(webhook_url: str, content: str, timeout: float = 15.0) -> dict
     payload = {"msgtype": "markdown", "markdown": {"content": content}}
     try:
         with httpx.Client(timeout=timeout) as client:
-            res = client.post(webhook_url, json=payload)
+            res = client.post(webhook_url, json=payload, timeout=timeout)
             res.raise_for_status()
             data = res.json()
     except httpx.HTTPError as e:

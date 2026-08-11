@@ -430,7 +430,7 @@ def step_a_list_daily(engine: Engine, sentiment: Any) -> pd.DataFrame:
     if "trade_date" in df.columns and "stock_code" in df.columns:
         df = df.drop_duplicates(subset=["trade_date", "stock_code"], keep="last")
     df = _coerce_a_list_daily_columns(df)
-    _replace_a_list_dates(engine, "st_a_list_daily", df)
+    replace_table_rows(_with_etl(df), "st_a_list_daily", engine)
     _sleep()
     return df
 
@@ -441,60 +441,8 @@ def _finalize_a_list_info_df(df: pd.DataFrame) -> pd.DataFrame:
         df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
     for c in ("a_net_amount", "a_buy_amount", "a_sell_amount", "a_buy_amount_rate", "a_sell_amount_rate"):
         if c in df.columns:
-            # The target schema stores DECIMAL(..., 6).  Round before duplicate
-            # detection so rows that differ only beyond database precision do
-            # not become physical duplicates after INSERT.
-            df[c] = pd.to_numeric(df[c], errors="coerce").round(6)
-    # The Eastmoney BUY and SELL reports overlap: a seat that appears on both
-    # lists is returned twice with identical combined buy/sell amounts.  Keep
-    # one physical row so downstream SUM(a_net_amount) does not double count
-    # the same seat.
-    business_columns = [
-        column
-        for column in (
-            "trade_date", "stock_code", "operate_code", "operate_name",
-            "a_net_amount", "a_buy_amount", "a_sell_amount",
-            "a_buy_amount_rate", "a_sell_amount_rate", "reason",
-        )
-        if column in df.columns
-    ]
-    if business_columns:
-        df = df.drop_duplicates(subset=business_columns, keep="first")
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
-
-
-def _replace_a_list_dates(
-    engine: Engine,
-    table_name: str,
-    df: pd.DataFrame,
-) -> None:
-    """Atomically replace only the fetched dragon-tiger trade dates.
-
-    Daily scheduler runs and partial historical retries must never erase older
-    successful dates. A failed/empty provider date is intentionally excluded
-    from the replacement predicate so the last good snapshot is retained.
-    """
-    if df is None or df.empty or "trade_date" not in df.columns:
-        raise ValueError(f"{table_name} replacement requires trade_date rows")
-    trade_dates = sorted({
-        str(value)[:10]
-        for value in df["trade_date"].dropna().tolist()
-        if str(value).strip()
-    })
-    if not trade_dates:
-        raise ValueError(f"{table_name} replacement has no valid trade dates")
-    params = {
-        f"trade_date_{index}": value
-        for index, value in enumerate(trade_dates)
-    }
-    placeholders = ", ".join(f":{key}" for key in params)
-    replace_table_rows(
-        _with_etl(df),
-        table_name,
-        engine,
-        where_sql=f"trade_date IN ({placeholders})",
-        params=params,
-    )
 
 
 def step_a_list_info_batch_from_db(engine: Engine, sentiment: Any, start_s: str, end_s: str) -> None:
@@ -564,7 +512,7 @@ def step_a_list_info_batch_from_db(engine: Engine, sentiment: Any, start_s: str,
         raise RuntimeError("no a-list info rows fetched")
     df = pd.concat(all_rows, ignore_index=True)
     df = _finalize_a_list_info_df(df)
-    _replace_a_list_dates(engine, "st_a_list_info", df)
+    replace_table_rows(_with_etl(df), "st_a_list_info", engine)
 
 
 def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> None:
@@ -610,7 +558,7 @@ def step_a_list_info(engine: Engine, sentiment: Any, daily_df: pd.DataFrame) -> 
         raise RuntimeError("no a-list info rows fetched")
     df = pd.concat(rows, ignore_index=True)
     df = _finalize_a_list_info_df(df)
-    _replace_a_list_dates(engine, "st_a_list_info", df)
+    replace_table_rows(_with_etl(df), "st_a_list_info", engine)
 
 
 def step_mine(engine: Engine, sentiment: Any) -> None:

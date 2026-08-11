@@ -486,7 +486,7 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
     "si_stock_concept_east": ("py_si_stock_rel", None),
     "si_stock_plate_east": ("py_si_stock_rel", None),
     "sm_concept_capital_flow_east": ("subprocess_sm", ["concept_flow_east"]),
-    "sm_concept_east_current": ("subprocess_script", ["tools/crawl_concept_east_current.py"]),
+    "sm_concept_east_current": ("subprocess_concept_current", None),
     "sm_concept_east_kline": ("subprocess_sm", ["concept_east_kline"]),
     "sm_concept_east_minute": ("subprocess_minute", ["concept"]),
     "sm_concept_ths_current": ("subprocess_sm", ["concept_ths_current"]),
@@ -575,6 +575,36 @@ def _run_one_table(key: str, date_str: str = "") -> int:
     if kind == "subprocess_minute":
         assert payload
         return _sub_run_minute(payload[0], date_str)
+    if kind == "subprocess_concept_current":
+        # Keep the current snapshot on the same universe/provenance as the
+        # concept reference table.  The legacy Eastmoney crawler only covers
+        # BK-style concepts and would replace a full BigQMT catalog with a
+        # partial snapshot at the scheduled 15:45 run.
+        reference_source = _first_env(
+            os.environ,
+            "DATA_SOURCE_CONCEPT_LIST",
+            "SI_CONCEPT_SOURCE",
+            default="east",
+        ).lower()
+        if reference_source in {"bigqmt", "big_qmt", "qmt_big"}:
+            current_source = "bigqmt"
+        elif reference_source == "qmt":
+            current_source = "qmt"
+        else:
+            current_source = _first_env(
+                os.environ,
+                "DATA_SOURCE_CONCEPT_CURRENT",
+                "SM_CONCEPT_CURRENT_SOURCE",
+                default="east",
+            ).lower()
+        with temporary_env(
+            {
+                "DATA_SOURCE_CONCEPT_CURRENT": current_source,
+                "SM_CONCEPT_CURRENT_SOURCE": current_source,
+            },
+            overwrite=True,
+        ):
+            return _sub_run_stock_market("concept_east_current")
     if kind == "subprocess_se":
         assert payload
         return _sub_run_sentiment(",".join(payload), date_str)

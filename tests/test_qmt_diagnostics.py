@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from integrations.qmt import bridge
 from integrations.qmt import diagnostics as qmt_diagnostics
+from tools import archive_guojin_qmt_probe
 
 
 def test_iter_client_candidates_prefers_guojin_environment(monkeypatch, tmp_path: Path):
@@ -37,6 +39,24 @@ def test_client_status_reports_installed_and_running(monkeypatch, tmp_path: Path
     assert result["provider"] == "gj_qmt"
     assert result["installed"] is True
     assert result["running"] is True
+
+
+def test_windows_process_rows_accepts_new_qmt_runtime_name(monkeypatch):
+    monkeypatch.setattr(qmt_diagnostics.os, "name", "nt")
+    monkeypatch.setattr(
+        qmt_diagnostics.subprocess,
+        "run",
+        lambda args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            '[{"image_name":"XtItClient.exe","pid":"42","memory":"123456"}]',
+            "",
+        ),
+    )
+
+    assert qmt_diagnostics._windows_process_rows() == [
+        {"image_name": "XtItClient.exe", "pid": "42", "memory": "123456"}
+    ]
 
 
 def test_bridge_status_normalizes_timeout(monkeypatch, tmp_path: Path):
@@ -99,3 +119,29 @@ def test_refresh_reference_data_uses_worker_action(monkeypatch):
 
     assert result["action"] == "refresh_reference_data"
     assert result["operations"] == ["download_sector_data"]
+
+
+def test_archive_probe_main_uses_batch_engine():
+    engine = object()
+    diag = {
+        "status": "ok",
+        "client": {"client_version": "1.0"},
+        "sdk": {"sdk_module": "xtquant"},
+    }
+
+    with patch("tools.archive_guojin_qmt_probe.create_batch_engine", return_value=engine) as create_batch_engine, \
+         patch("tools.archive_guojin_qmt_probe.ensure_audit_tables") as ensure_audit_tables, \
+         patch("tools.archive_guojin_qmt_probe.diagnostics", return_value=diag) as diagnostics, \
+         patch("tools.archive_guojin_qmt_probe.capabilities", return_value={"status": "cap"}) as capabilities, \
+         patch("tools.archive_guojin_qmt_probe.core_probe", return_value={"status": "core"}) as core_probe, \
+         patch("tools.archive_guojin_qmt_probe.archive_payload", return_value=object()) as archive_payload, \
+         patch("tools.archive_guojin_qmt_probe.result_dict", side_effect=[{"a": 1}, {"b": 2}]):
+        assert archive_guojin_qmt_probe.main() == 0
+
+    create_batch_engine.assert_called_once_with(future=True)
+    ensure_audit_tables.assert_called_once_with(engine)
+    diagnostics.assert_called_once_with(force=True)
+    capabilities.assert_called_once_with(force=True)
+    core_probe.assert_called_once_with(force=True)
+    assert archive_payload.call_count == 2
+    assert all(call.args[0] is engine for call in archive_payload.call_args_list)

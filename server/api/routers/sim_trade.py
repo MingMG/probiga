@@ -10,20 +10,29 @@ import logging
 import re
 from datetime import date, datetime, timedelta
 
-import pandas as pd
 from fastapi import APIRouter, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.kline_data import get_kline_engine, should_use_kline_engine
+from server.common.sql_reader import read_sql_rows
+from server.api.scheduler_runtime import read_scheduler_heartbeat, scheduler_runtime_info
 from server.common.minute_data import get_latest_stock_minute_price, minute_source_info
 from server.engine.sim_trade_engine import (
     SimTradeEngine,
     STRATEGY_CONFIG,
+    SIM_RISK_CONFIG,
+    EXCLUDED_RECOMMEND_PREFIXES,
+    MIN_EXECUTABLE_RISK_REWARD,
+    SNAPSHOT_FALLBACK_MAX_AGE_MINUTES,
     build_buy_decision,
+    build_sell_decision,
     fetch_recommended_candidates,
     _get_current_price,
     _ensure_tables,
     _is_trading_time,
+    _intraday_action_window,
+    _is_near_limit_down,
 )
 
 logger = logging.getLogger(__name__)
@@ -33,16 +42,38 @@ router = APIRouter()
 SIM_INITIAL_CAPITAL = 1_000_000.0
 
 
+def _runtime_config_snapshot() -> dict:
+    window = _intraday_action_window()
+    return {
+        "status": "ok",
+        "strategy_config": {
+            key: dict(value)
+            for key, value in STRATEGY_CONFIG.items()
+        },
+        "risk_config": {
+            key: (dict(value) if isinstance(value, dict) else value)
+            for key, value in SIM_RISK_CONFIG.items()
+        },
+        "global_rules": {
+            "excluded_recommend_prefixes": list(EXCLUDED_RECOMMEND_PREFIXES),
+            "min_executable_risk_reward": MIN_EXECUTABLE_RISK_REWARD,
+            "snapshot_fallback_max_age_minutes": SNAPSHOT_FALLBACK_MAX_AGE_MINUTES,
+            "buy_trigger_mode": "continuous_market",
+            "buy_trigger_label": "交易时段持续根据实时盘面判断",
+            "holding_count_limit_enabled": False,
+            "same_strategy_duplicate_block": True,
+        },
+        "intraday_windows": {
+            "entry_windows": window.get("entry_windows") or [],
+            "exit_windows": window.get("exit_windows") or [],
+            "t_windows": window.get("t_windows") or [],
+        },
+    }
+
+
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
-    import numpy as np
-    df = pd.read_sql(text(sql), get_engine(), params=params)
-    if df.empty:
-        return []
-    df = df.replace({np.nan: None, pd.NA: None, pd.NaT: None})
-    for c in df.columns:
-        if df[c].dtype == "datetime64[ns]":
-            df[c] = df[c].astype(str)
-    return df.to_dict(orient="records")
+    engine = get_kline_engine() if should_use_kline_engine(sql) else get_engine()
+    return read_sql_rows(engine, sql, params, context="sim_trade_api")
 
 
 def _exec_sql(sql: str, params: dict = None):
@@ -68,6 +99,90 @@ def _safe_int(v, default=0) -> int:
 def _normalize_trade_mode(trade_mode: str) -> str:
     trade_mode = (trade_mode or "live").strip().lower()
     return trade_mode if trade_mode in ("live", "backtest", "forward") else "live"
+
+
+def _position_exit_decision(
+    engine: SimTradeEngine,
+    row: dict,
+    current_price: float,
+    price_info: dict | None = None,
+) -> dict:
+    strategy_type = str(row.get("strategy_type") or "")
+    cfg = STRATEGY_CONFIG.get(strategy_type) or {}
+    buy_price = _safe_float(row.get("buy_price"))
+    max_rate = None
+    if cfg.get("trailing_activate") is not None and row.get("id") and buy_price > 0:
+        max_rate = engine._get_max_profit_rate(
+            _safe_int(row.get("id")),
+            str(row.get("stock_code") or ""),
+            buy_price,
+        )
+    return build_sell_decision(
+        strategy_type,
+        buy_price,
+        current_price,
+        row.get("buy_date"),
+        max_profit_rate=max_rate,
+        near_limit_down=bool(price_info and _is_near_limit_down(price_info)),
+    )
+
+
+def _sim_trade_task_status(row: dict | None) -> dict:
+    if not row:
+        return {
+            "exists": False,
+            "enabled": False,
+            "status": "missing",
+            "status_label": "任务缺失",
+        }
+    enabled = int(row.get("enabled") or 0) == 1
+    last_status = str(row.get("last_run_status") or "").lower()
+    if not enabled:
+        status, label = "disabled", "已停用"
+    elif last_status in {"failed", "timeout", "stopped"}:
+        status, label = "error", "最近失败"
+    elif last_status == "running":
+        status, label = "running", "运行中"
+    elif last_status == "success":
+        status, label = "ok", "正常"
+    else:
+        status, label = "idle", "待运行"
+    return {
+        "exists": True,
+        "enabled": enabled,
+        "status": status,
+        "status_label": label,
+        "task_name": row.get("task_name") or "",
+        "task_type": row.get("task_type") or "",
+        "cron_time": row.get("cron_time") or "",
+        "interval_minutes": _safe_int(row.get("interval_minutes")),
+        "last_run_status": row.get("last_run_status") or "",
+        "last_run_at": str(row.get("last_run_at") or "")[:19],
+        "last_triggered_at": str(row.get("last_triggered_at") or "")[:19],
+        "last_run_output_tail": str(row.get("last_run_output") or "")[-300:],
+    }
+
+
+def _scheduler_online_status() -> dict:
+    info = scheduler_runtime_info()
+    heartbeat = read_scheduler_heartbeat()
+    poll_seconds = int(info.get("scheduler_poll_seconds") or 60)
+    heartbeat_age = None
+    if heartbeat and heartbeat.get("heartbeat_age_seconds") is not None:
+        try:
+            heartbeat_age = int(heartbeat["heartbeat_age_seconds"])
+        except Exception:
+            heartbeat_age = None
+    standalone_online = bool(heartbeat and heartbeat_age is not None and heartbeat_age <= max(180, poll_seconds * 3))
+    embedded_running = bool(info.get("embedded_scheduler_running"))
+    return {
+        "embedded_enabled": bool(info.get("embedded_scheduler_enabled")),
+        "embedded_running": embedded_running,
+        "standalone_online": standalone_online,
+        "api_restart_safe": bool((not bool(info.get("embedded_scheduler_enabled"))) and standalone_online),
+        "heartbeat_age_seconds": heartbeat_age,
+        "poll_seconds": poll_seconds,
+    }
 
 
 def _extract_signal_date_from_reason(reason: str) -> str:
@@ -149,6 +264,11 @@ def _candidate_action_rows(signal_date: str, limit: int = 80) -> list[dict]:
             "entry_score": round(_safe_float(rec.get("entry_score")), 2),
             "final_trade_score": round(_safe_float(rec.get("final_trade_score")), 2),
             "expected_return_pct": round(_safe_float(rec.get("expected_return_pct")), 2),
+            "risk_reward_ratio": round(_safe_float(rec.get("risk_reward_ratio")), 2),
+            "sector_gate_status": rec.get("sector_gate_status") or "WATCH",
+            "sector_gate_reason": rec.get("sector_gate_reason") or "",
+            "evidence_chain_json": rec.get("evidence_chain_json") or "[]",
+            "failure_tags_json": rec.get("failure_tags_json") or "[]",
             "main_wave_score": round(_safe_float(rec.get("main_wave_score")), 2),
             "trend_hold_score": round(_safe_float(rec.get("trend_hold_score")), 2),
             "signal_status": signal_status or "-",
@@ -170,8 +290,55 @@ def _candidate_action_rows(signal_date: str, limit: int = 80) -> list[dict]:
     return rows
 
 
+def _recommendation_window_returns(signal_date: str, candidate_rows: list[dict]) -> dict:
+    codes = sorted({str(r.get("stock_code") or "").zfill(6) for r in candidate_rows if r.get("stock_code")})
+    if not signal_date or not codes:
+        return {"windows": {}, "sample_count": 0}
+    placeholders = ", ".join(f":c{i}" for i in range(len(codes)))
+    params = {"signal_date": signal_date, **{f"c{i}": code for i, code in enumerate(codes)}}
+    rows = _read_sql(f"""
+        SELECT stock_code, trade_date, close
+        FROM sm_stock_kline
+        WHERE k_type = 1
+          AND adjust_type = 0
+          AND stock_code IN ({placeholders})
+          AND trade_date >= :signal_date
+          AND trade_date <= DATE_ADD(:signal_date, INTERVAL 30 DAY)
+        ORDER BY stock_code, trade_date
+    """, params)
+    if not rows:
+        return {"windows": {}, "sample_count": 0}
+
+    by_code: dict[str, list[dict]] = {}
+    for row in rows:
+        code = str(row.get("stock_code") or "").zfill(6)
+        by_code.setdefault(code, []).append(row)
+
+    windows = {1: [], 3: [], 5: [], 10: []}
+    for code, items in by_code.items():
+        ordered = sorted(items, key=lambda x: str(x.get("trade_date") or ""))
+        base = _safe_float(ordered[0].get("close")) if ordered else 0.0
+        if base <= 0:
+            continue
+        for window in windows:
+            if len(ordered) > window:
+                close = _safe_float(ordered[window].get("close"))
+                if close > 0:
+                    windows[window].append((close / base - 1.0) * 100.0)
+
+    summary = {}
+    for window, values in windows.items():
+        summary[f"{window}d"] = {
+            "avg_return_pct": round(sum(values) / len(values), 2) if values else None,
+            "win_rate": round(sum(1 for v in values if v > 0) / len(values) * 100, 1) if values else None,
+            "sample_count": len(values),
+        }
+    return {"windows": summary, "sample_count": len(by_code)}
+
+
 def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dict:
     candidate_rows = _candidate_action_rows(signal_date, limit=500)
+    window_returns = _recommendation_window_returns(signal_date, candidate_rows)
     positions = _read_sql("""
         SELECT stock_code, short_name, strategy_type, status, buy_date, buy_reason,
                sell_date, profit, profit_rate
@@ -253,6 +420,7 @@ def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dic
         "sell_alert_rows": sell_alert_rows[:3],
         "by_strategy": sorted(by_strategy.values(), key=lambda x: (-x["bought_count"], x["strategy_type"])),
         "bought_pairs": [{"stock_code": code, "strategy_type": stype} for code, stype in sorted(bought_pairs)],
+        "window_returns": window_returns,
     }
 
 
@@ -631,6 +799,12 @@ def _sim_backtest_report(strategy_types: str = "", initial_capital: float = SIM_
     }
 
 
+@router.get("/sim-trade/runtime-config")
+def sim_trade_runtime_config():
+    """Return the effective simulated-trading rule snapshot."""
+    return _runtime_config_snapshot()
+
+
 @router.get("/sim-trade/dashboard")
 def sim_trade_dashboard(trade_mode: str = Query(default="live")):
     """模拟交易总览数据"""
@@ -729,6 +903,12 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
                 pnl = (cur_price - bp) * bs if bp > 0 else 0
                 pnl_rate = ((cur_price - bp) / bp * 100) if bp > 0 else 0
                 holding_amount += cur_price * bs
+                exit_decision = _position_exit_decision(
+                    engine,
+                    {**h, "strategy_type": stype},
+                    cur_price,
+                    lp,
+                )
 
                 holding_details.append({
                     "id": h.get("id"),
@@ -743,6 +923,16 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
                     "holding_days": (date.today() - datetime.strptime(bd_str, "%Y-%m-%d").date()).days
                         if bd_str else 0,
                     "ai_score": _safe_float(h.get("ai_score")),
+                    "exit_action": exit_decision.get("action"),
+                    "exit_reason": exit_decision.get("reason"),
+                    "exit_reason_detail": exit_decision.get("reason_detail"),
+                    "exit_thresholds": {
+                        "take_profit_pct": exit_decision.get("take_profit_pct"),
+                        "stop_loss_pct": exit_decision.get("stop_loss_pct"),
+                        "max_holding_days": exit_decision.get("max_holding_days"),
+                        "trailing_activate_pct": exit_decision.get("trailing_activate_pct"),
+                        "trailing_drawdown_pct": exit_decision.get("trailing_drawdown_pct"),
+                    },
                 })
 
             result["strategies"][stype] = {
@@ -802,6 +992,84 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
         return {"error": str(e)}
 
 
+@router.get("/sim-trade/automation-status")
+def sim_trade_automation_status():
+    """Return whether paper-trading automation is wired and visible."""
+    try:
+        _ensure_tables()
+        today = date.today().isoformat()
+        engine = SimTradeEngine()
+        task_rows = _read_sql(
+            """
+            SELECT task_name, task_type, script_path, script_args, cron_time, interval_minutes,
+                   enabled, last_run_status, last_run_at, last_triggered_at, last_run_output
+            FROM st_scheduled_tasks
+            WHERE task_type IN ('sim_trade', 'sim_trade_signal_prepare')
+               OR script_path = 'biz/analysis/sync_sim_trade.py'
+            ORDER BY task_type, id
+            """,
+            {},
+        )
+        task_by_type = {}
+        for row in task_rows:
+            task_type = str(row.get("task_type") or "")
+            if task_type and task_type not in task_by_type:
+                task_by_type[task_type] = row
+
+        scheduler = _scheduler_online_status()
+        tick_task = _sim_trade_task_status(task_by_type.get("sim_trade"))
+        prepare_task = _sim_trade_task_status(task_by_type.get("sim_trade_signal_prepare"))
+        intraday_window = _intraday_action_window()
+        signal_counts = engine.signal_pool_counts(today)
+        order_counts = engine.order_counts(today)
+        latest_events = _read_sql(
+            """
+            SELECT e.event_time, e.event_type, e.stock_code,
+                   COALESCE(NULLIF(s.short_name, ''), e.stock_code) AS short_name,
+                   e.strategy_type, e.message
+            FROM st_sim_event e
+            LEFT JOIN si_all_code s ON BINARY e.stock_code = BINARY s.stock_code
+            WHERE BINARY COALESCE(e.trade_mode, 'live') = BINARY 'live'
+            ORDER BY e.event_time DESC, e.id DESC
+            LIMIT 5
+            """,
+            {},
+        )
+        sim_auto_ready = bool(
+            tick_task.get("enabled")
+            and prepare_task.get("enabled")
+            and (scheduler.get("standalone_online") or scheduler.get("embedded_running"))
+        )
+        return {
+            "date": today,
+            "sim_auto_ready": sim_auto_ready,
+            "sim_auto_status": "ready" if sim_auto_ready else "not_ready",
+            "sim_auto_label": "模拟自动交易已就绪" if sim_auto_ready else "模拟自动交易未就绪",
+            "real_trading_enabled": False,
+            "real_trading_label": "真实自动买卖未启用",
+            "real_trading_reason": "当前系统只做模拟交易和风控提示，真实账户下单需要单独的券商权限、人工确认和风控闸门。",
+            "intraday_window": intraday_window,
+            "scheduler": scheduler,
+            "tasks": {
+                "signal_prepare": prepare_task,
+                "intraday_tick": tick_task,
+            },
+            "signal_counts": signal_counts,
+            "order_counts": order_counts,
+            "latest_events": latest_events,
+        }
+    except Exception as e:
+        logger.error("模拟交易自动化状态查询失败: %s", e, exc_info=True)
+        return {
+            "sim_auto_ready": False,
+            "sim_auto_status": "error",
+            "sim_auto_label": "模拟自动交易状态异常",
+            "real_trading_enabled": False,
+            "real_trading_label": "真实自动买卖未启用",
+            "error": str(e),
+        }
+
+
 # ═══════════════════════════════════════════
 # AI推荐模拟池
 # ═══════════════════════════════════════════
@@ -816,6 +1084,7 @@ def sim_trade_candidates(
     try:
         _ensure_tables()
         trade_mode = _normalize_trade_mode(trade_mode)
+        engine = SimTradeEngine()
 
         if not signal_date:
             latest = _read_sql("SELECT MAX(pick_date) AS d FROM st_recommended_stocks", {})
@@ -884,6 +1153,11 @@ def sim_trade_candidates(
                 "entry_score": round(_safe_float(rec.get("entry_score")), 2),
                 "final_trade_score": round(_safe_float(rec.get("final_trade_score")), 2),
                 "expected_return_pct": round(_safe_float(rec.get("expected_return_pct")), 2),
+                "risk_reward_ratio": round(_safe_float(rec.get("risk_reward_ratio")), 2),
+                "sector_gate_status": rec.get("sector_gate_status") or "WATCH",
+                "sector_gate_reason": rec.get("sector_gate_reason") or "",
+                "evidence_chain_json": rec.get("evidence_chain_json") or "[]",
+                "failure_tags_json": rec.get("failure_tags_json") or "[]",
                 "main_wave_score": round(_safe_float(rec.get("main_wave_score")), 2),
                 "trend_hold_score": round(_safe_float(rec.get("trend_hold_score")), 2),
                 "signal_status": signal_status or "-",
@@ -976,6 +1250,7 @@ def sim_trade_positions(
     try:
         _ensure_tables()
         trade_mode = _normalize_trade_mode(trade_mode)
+        engine = SimTradeEngine()
         where = "WHERE status = 'holding'"
         params = {"mode": trade_mode}
         where += " AND COALESCE(trade_mode, 'live') = :mode"
@@ -1029,6 +1304,17 @@ def sim_trade_positions(
             r["cur_price"] = round(cp, 2)
             r["pnl"] = round((cp - bp) * _safe_int(r["buy_shares"]), 2)
             r["pnl_rate"] = round(((cp - bp) / bp * 100), 2) if bp > 0 else 0
+            exit_decision = _position_exit_decision(engine, r, cp, lp)
+            r["exit_action"] = exit_decision.get("action")
+            r["exit_reason"] = exit_decision.get("reason")
+            r["exit_reason_detail"] = exit_decision.get("reason_detail")
+            r["exit_thresholds"] = {
+                "take_profit_pct": exit_decision.get("take_profit_pct"),
+                "stop_loss_pct": exit_decision.get("stop_loss_pct"),
+                "max_holding_days": exit_decision.get("max_holding_days"),
+                "trailing_activate_pct": exit_decision.get("trailing_activate_pct"),
+                "trailing_drawdown_pct": exit_decision.get("trailing_drawdown_pct"),
+            }
 
             bd = r.get("buy_date")
             if isinstance(bd, str):
@@ -1330,7 +1616,7 @@ def sim_trade_events(
                 try:
                     row["payload"] = json.loads(payload)
                 except Exception:
-                    pass
+                    logger.debug("Failed to decode simulated trade event payload.", exc_info=True)
         return {"status": "ok", "mode": trade_mode, "data": rows}
     except Exception as e:
         logger.error("模拟交易事件查询失败: %s", e, exc_info=True)
