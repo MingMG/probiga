@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 SLEEP_SEC = float(os.environ.get("SI_REQUEST_SLEEP", "0.3"))
 MAX_CONCEPTS = int(os.environ.get("THS_CONCEPT_MAX_CONCEPTS", "0"))
 FRESH_HOURS = int(os.environ.get("THS_CONCEPT_FRESH_HOURS", "72"))
+MIN_CONSTITUENT_ROWS = int(os.environ.get("THS_CONCEPT_MIN_CONSTITUENT_ROWS", "50000"))
 
 
 def _now():
@@ -60,6 +61,11 @@ def replace_table_transactionally(engine, df, table):
         raise ValueError(f"unsupported concept table: {table}")
     if df is None or df.empty:
         raise ValueError(f"refuse to replace {table} with an empty dataset")
+    if table == "si_concept_constituent_ths" and len(df) < MIN_CONSTITUENT_ROWS:
+        raise ValueError(
+            f"refuse to replace {table} with only {len(df)} rows; "
+            f"expected at least {MIN_CONSTITUENT_ROWS}"
+        )
     cleaned = _clean_object_df(df.copy())
     with engine.begin() as conn:
         conn.execute(text(f"DELETE FROM `{table}`"))

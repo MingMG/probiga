@@ -56,3 +56,21 @@ def test_concept_refresh_refuses_to_replace_with_empty_dataset():
             pd.DataFrame(),
             "si_concept_constituent_ths",
         )
+
+
+def test_concept_refresh_refuses_partial_constituent_snapshot_before_delete():
+    module = _load_module()
+    test_engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with test_engine.begin() as conn:
+        conn.execute(text("CREATE TABLE si_concept_constituent_ths (stock_code TEXT)"))
+        conn.execute(text("INSERT INTO si_concept_constituent_ths (stock_code) VALUES ('old')"))
+
+    with pytest.raises(ValueError, match="expected at least 50000"):
+        module.replace_table_transactionally(
+            test_engine,
+            pd.DataFrame([{"stock_code": "new"}]),
+            "si_concept_constituent_ths",
+        )
+
+    with test_engine.connect() as conn:
+        assert conn.execute(text("SELECT stock_code FROM si_concept_constituent_ths")).scalar() == "old"
