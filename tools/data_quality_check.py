@@ -17,14 +17,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 @dataclass(frozen=True)
@@ -695,7 +695,7 @@ def main() -> int:
     parser.add_argument("--readiness", action="store_true", help="输出盘中实时交易就绪状态")
     args = parser.parse_args()
 
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    engine = create_batch_engine()
     if args.readiness:
         readiness = intraday_readiness(engine, args.date.strip() or None)
         if args.json:

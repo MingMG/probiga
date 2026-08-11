@@ -96,20 +96,38 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
     }
 
 
-def _should_delegate_to_windows_qmt_bridge(
-    row: dict,
-    *,
-    platform_name: str | None = None,
-) -> bool:
-    current_platform = platform_name or os.name
-    if current_platform == "nt":
-        return False
+def _is_windows_qmt_bridge_task(row: dict) -> bool:
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
     return (
         task_type in WINDOWS_QMT_BRIDGE_TASK_TYPES
         or script_path in WINDOWS_QMT_BRIDGE_SCRIPT_PATHS
     )
+
+
+def _should_delegate_to_windows_qmt_bridge(
+    row: dict,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    current_platform = platform_name or os.name
+    return current_platform != "nt" and _is_windows_qmt_bridge_task(row)
+
+
+def _should_skip_task_for_host(
+    row: dict,
+    *,
+    platform_name: str | None = None,
+) -> bool:
+    """Enforce one scheduler owner for every task row.
+
+    Windows owns only QMT/desktop-market jobs.  Linux owns every other job.
+    This prevents the two production daemons from racing on the shared task
+    table while keeping all rows enabled and auditable.
+    """
+    current_platform = platform_name or os.name
+    is_windows_owned = _is_windows_qmt_bridge_task(row)
+    return (not is_windows_owned) if current_platform == "nt" else is_windows_owned
 
 
 def _should_skip_outside_intraday_window(row: dict, now: datetime) -> bool:
@@ -337,7 +355,7 @@ def _check_and_run_tasks() -> None:
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
 
-                if _should_delegate_to_windows_qmt_bridge(row):
+                if _should_skip_task_for_host(row):
                     continue
                 if _should_skip_outside_intraday_window(row, now):
                     continue

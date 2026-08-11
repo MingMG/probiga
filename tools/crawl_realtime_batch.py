@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 import requests
 import urllib3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -34,14 +34,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 from biz.stock_market.realtime_quotes import _ensure_rt_snapshot_table
-
-def _load_mysql_url() -> str:
-    return get_mysql_url(required=True)
-
-
-MYSQL_URL = _load_mysql_url()
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -404,7 +398,7 @@ def main():
     parser.add_argument("--trade-date", default="")
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_batch_engine()
     if args.skip_closed and not is_trading_time(engine):
         result = {
             "status": "skipped",

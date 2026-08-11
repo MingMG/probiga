@@ -4,7 +4,6 @@
 push2.eastmoney.com 被服务器 IP 封了，改用 datacenter-web API。
 """
 
-import os
 import sys
 import time
 from datetime import datetime
@@ -13,14 +12,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 API_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 REPORT_NAME = "RPT_CONCEPT_FUNDFLOW"
 
@@ -47,8 +45,7 @@ _FIELD_MAP = {
 }
 
 
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+from server.common.batch_db import create_batch_engine
 
 
 def _fetch_page(date_str: str, page: int, page_size: int = 500) -> dict | None:
@@ -137,7 +134,7 @@ def _lookup_stock_codes(engine, names: list[str]) -> dict[str, str]:
 
 
 def fetch_concept_flow():
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
 
     print("开始获取概念资金流向 (datacenter-web)")
 

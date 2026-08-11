@@ -123,6 +123,23 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
+    def test_each_scheduler_host_runs_only_its_owned_tasks(self):
+        qmt_task = {"task_type": "stock_kline"}
+        linux_task = {"task_type": "analysis_fast"}
+
+        self.assertTrue(
+            scheduler_runtime._should_skip_task_for_host(qmt_task, platform_name="posix")
+        )
+        self.assertFalse(
+            scheduler_runtime._should_skip_task_for_host(linux_task, platform_name="posix")
+        )
+        self.assertFalse(
+            scheduler_runtime._should_skip_task_for_host(qmt_task, platform_name="nt")
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_task_for_host(linux_task, platform_name="nt")
+        )
+
     def test_intraday_interval_tasks_do_not_run_before_market_window(self):
         row = {"task_type": "intraday_minute_flow"}
 

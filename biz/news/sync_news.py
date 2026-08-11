@@ -11,13 +11,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url, get_wecom_webhook
+from server.common.batch_db import create_batch_engine
+from server.common.config import get_wecom_webhook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -55,8 +56,7 @@ SRC_COLORS = {"cls": "warning", "eastmoney": "info", "sina": "comment"}
 
 
 def get_engine():
-    url = get_mysql_url(required=True)
-    return create_engine(url, pool_pre_ping=True, pool_size=2, max_overflow=2)
+    return create_batch_engine(pool_size=2, max_overflow=2)
 
 
 def _calc_importance(it: dict) -> int:

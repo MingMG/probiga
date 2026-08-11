@@ -21,13 +21,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("review")
@@ -58,7 +58,7 @@ SECTOR_NAMES = {
 
 
 def get_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    return create_batch_engine()
 
 
 def run_ddl(engine):

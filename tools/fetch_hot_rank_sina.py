@@ -3,25 +3,20 @@
 """获取新浪热股榜（按关注热度），写入 st_hot_rank_sina。"""
 
 import argparse
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+from server.common.batch_db import create_batch_engine
 
 
 def _run_ddl(engine):
@@ -47,7 +42,7 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
 
     print(f"开始获取新浪热股榜，快照日期: {snapshot_date}，top={top}")
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
     _run_ddl(engine)
 
     url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"

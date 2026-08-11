@@ -14,7 +14,7 @@ import sys
 from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from pathlib import Path
 
@@ -22,11 +22,11 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 def get_engine():
-    return create_engine(get_mysql_url(required=True), pool_size=5, max_overflow=10)
+    return create_batch_engine(pool_size=5, max_overflow=10)
 
 
 # ── 核心逻辑 ────────────────────────────────────────────────

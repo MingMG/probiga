@@ -24,14 +24,14 @@ from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 logger = logging.getLogger(__name__)
 
@@ -2622,7 +2622,7 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    engine = create_batch_engine()
     stats = run_batch(
         engine=engine,
         trade_date=args.date.strip() or None,

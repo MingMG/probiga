@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 logging.basicConfig(
@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_notice_eastmoney.sql"
 
@@ -63,10 +63,6 @@ UPSERT_SQL = text(
         etl_sync_at = VALUES(etl_sync_at)
     """
 )
-
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
 
 
 def run_ddl(engine: Engine) -> None:
@@ -225,7 +221,7 @@ def main() -> int:
         print("\n请指定 --stock 或 --from-si-all-code", file=sys.stderr)
         return 2
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
     if not args.skip_ddl:
         run_ddl(engine)
 

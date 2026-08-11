@@ -19,14 +19,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests as http
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 _SESSION = http.Session()
 _SESSION.trust_env = False
@@ -35,10 +35,6 @@ _SESSION.headers.update({
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9",
 })
-
-
-def _mysql_url() -> str:
-    return get_mysql_url(required=True)
 
 
 def _ensure_snapshot_date_column(engine):
@@ -113,7 +109,7 @@ def _fetch_hot_rank_xq() -> pd.DataFrame | None:
 def fetch_hot_rank_xq(snapshot_date: str):
     print(f"开始获取雪球热股TOP100，快照日期: {snapshot_date}")
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
 
     with engine.connect() as conn:
         exists = conn.execute(

@@ -6,25 +6,20 @@
 """
 
 import argparse
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-
-
-def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+from server.common.batch_db import create_batch_engine
 
 
 def _ensure_snapshot_date_column(engine):
@@ -44,7 +39,7 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
 
     print(f"开始获取东财人气榜TOP100，快照日期: {snapshot_date}")
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_batch_engine()
     _ensure_snapshot_date_column(engine)
 
     url = "https://emappdata.eastmoney.com/stockrank/getAllCurrentList"
