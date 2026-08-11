@@ -15,11 +15,11 @@
   "source_hashes_are_authoritative": true,
   "source_coverage_required": true,
   "source_tree_hash_algorithm": "sha256(sorted(path + NUL + file_sha256 + LF))",
-  "source_tree_sha256": "69b5aa52b313b5fd1a54b81e7457e81220e04f1852792c08367b2aeb56558911",
+  "source_tree_sha256": "5d084e2289743dd6b542a643ace7ca3bdb5ccdad0d5f9ace25c747639e352200",
   "source_files": {
     "server/trading_v6/__init__.py": "2ec8879208b5e6b822895fc0040d748b98931ef779946df62048e9613de583d2",
     "server/trading_v6/evidence.py": "ecfb982793827f91afb095edafc9ad46494200077ca0f81e8f17f7223ef52785",
-    "server/trading_v6/models.py": "91aa8a4ee9f5642520ecce697f872f2430ae1c0841e331bb2d94bdff235dcf86",
+    "server/trading_v6/models.py": "1a3517048282ac78f738b305468b87b270b47e313fb2ba5a5cc69f70a3d17bcb",
     "server/trading_v6/pit_finance.py": "891a99202f6d92a2ebae35a8c0ec5360e357686484d5f0aa7ab2843cd215ad1e",
     "tools/trading_v6/__init__.py": "e66606ca5a4b169092925a20c2bb5610b2fef70b43a7776b32de709dcc9c01f8",
     "tools/trading_v6/audit_release.py": "eb9bf95305d2f7bb4fabc83f3c78b88a79ac2ba8783f9b841a958eb95c63ed90",

@@ -82,9 +82,10 @@ _PREDICTION_ATTESTATIONS: weakref.WeakKeyDictionary[_PredictionToken, str] = (
 )
 
 
-@dataclass(frozen=True, slots=True, weakref_slot=True, eq=False)
 class _PredictionBatchToken:
-    pass
+    """Identity-only weak-reference token compatible with Python 3.10+."""
+
+    __slots__ = ("__weakref__",)
 
 
 _PREDICTION_BATCH_ATTESTATIONS: weakref.WeakKeyDictionary[
