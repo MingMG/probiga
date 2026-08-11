@@ -23,12 +23,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from biz.analysis.sync_analysis_fast import latest_trade_date, previous_trade_date, run_batch
+from biz.market_context.external_market import fetch_external_market_snapshot, store_external_market_snapshot
 from server.api.routers.hot_data import (
     _recommended_run_history_finish,
     _recommended_run_history_start,
     _recommended_run_history_update,
 )
 from server.common.batch_db import create_batch_engine
+from tools.repair_recommendation_data import repair_target_data
 
 
 def _wait_for_db(engine, *, attempts: int = 12) -> None:
@@ -59,6 +61,56 @@ def _wait_for_db(engine, *, attempts: int = 12) -> None:
     raise RuntimeError(f"MySQL not ready before AI recommendation: {last_error}")
 
 
+def _fetch_external_market_snapshot_with_retries(
+    *,
+    attempts: int = 3,
+    retry_delay_seconds: float = 5.0,
+) -> dict:
+    """Prefer a complete external snapshot without blocking the daily run forever."""
+    attempts = max(1, int(attempts))
+    best_snapshot: dict | None = None
+    best_available = -1
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            snapshot = fetch_external_market_snapshot()
+            available = int(snapshot.get("available_count") or 0)
+            expected = int(snapshot.get("expected_count") or 0)
+            if best_snapshot is None or available > best_available:
+                best_snapshot = snapshot
+                best_available = available
+            if expected > 0 and available >= expected:
+                return snapshot
+            logging.warning(
+                "External market snapshot incomplete attempt=%s/%s available=%s expected=%s",
+                attempt,
+                attempts,
+                available,
+                expected,
+            )
+        except Exception as exc:
+            last_error = exc
+            logging.warning(
+                "External market snapshot fetch failed attempt=%s/%s: %s",
+                attempt,
+                attempts,
+                exc,
+            )
+        if attempt < attempts:
+            time.sleep(max(0.0, float(retry_delay_seconds)))
+
+    if best_snapshot is None:
+        raise RuntimeError(f"External market snapshot unavailable after {attempts} attempts: {last_error}")
+    best_snapshot = dict(best_snapshot)
+    warnings = list(best_snapshot.get("source_warnings") or [])
+    warnings.append(
+        "external snapshot remained incomplete after retries: "
+        f"{best_available}/{int(best_snapshot.get('expected_count') or 0)}"
+    )
+    best_snapshot["source_warnings"] = warnings
+    return best_snapshot
+
+
 def _resolve_target_trade_date(engine, *, strict_prev_trade_day: bool, execution_time: str, trade_date: str) -> str:
     if trade_date:
         return str(trade_date)[:10]
@@ -78,6 +130,9 @@ def main() -> int:
     parser.add_argument("--execution-time", default="")
     parser.add_argument("--min-kline-coverage", type=float, default=0.80)
     parser.add_argument("--auto-repair-missing-kline", action="store_true")
+    parser.add_argument("--auto-repair-missing-data", action="store_true", help="Repair K-line, historical capital flow and snapshot coverage before screening")
+    parser.add_argument("--use-intraday-current", action="store_true", help="Use current intraday quote snapshots as target-day K-line inputs")
+    parser.add_argument("--external-market", action="store_true", help="Capture global market data before recommendations")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -87,6 +142,11 @@ def main() -> int:
     os.environ.setdefault("PROBIGA_KLINE_FEATURE_BATCH_SIZE", "200")
     execution_time = args.execution_time.strip() or datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
     engine = create_batch_engine()
+    try:
+        wait_attempts = int(os.environ.get("PROBIGA_AI_RECOMMEND_DB_WAIT_ATTEMPTS", "12"))
+    except (TypeError, ValueError):
+        wait_attempts = 12
+    _wait_for_db(engine, attempts=wait_attempts)
     target_trade_date = _resolve_target_trade_date(
         engine,
         strict_prev_trade_day=bool(args.strict_prev_trade_day),
@@ -104,6 +164,76 @@ def main() -> int:
     )
 
     try:
+        repair_report = None
+        external_report = None
+        batch_execution_time = execution_time
+        if args.external_market:
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 3,
+                "done_count": 0,
+                "message": "正在抓取美股、日韩、港股、期货、外汇和美债外围数据...",
+                "error": "",
+            })
+            try:
+                external_attempts = int(os.environ.get("PROBIGA_EXTERNAL_MARKET_FETCH_ATTEMPTS", "3"))
+            except (TypeError, ValueError):
+                external_attempts = 3
+            try:
+                external_retry_delay = float(os.environ.get("PROBIGA_EXTERNAL_MARKET_RETRY_DELAY_SECONDS", "5"))
+            except (TypeError, ValueError):
+                external_retry_delay = 5.0
+            snapshot = _fetch_external_market_snapshot_with_retries(
+                attempts=external_attempts,
+                retry_delay_seconds=external_retry_delay,
+            )
+            try:
+                external_report = store_external_market_snapshot(engine, snapshot)
+            except Exception as exc:
+                logging.warning("External market snapshot storage failed; continuing base recommendation: %s", exc)
+                external_report = {
+                    "external_market_status": snapshot.get("external_market_status") or "UNKNOWN",
+                    "external_market_score": snapshot.get("external_market_score"),
+                    "external_market_data_quality": "NOT_STORED",
+                    "available_count": int(snapshot.get("available_count") or 0),
+                    "expected_count": int(snapshot.get("expected_count") or 0),
+                    "source_warnings": [f"storage failed: {exc}"],
+                }
+            # Use a completion-side cutoff so the snapshot captured during this
+            # run is always eligible for the model context.
+            batch_execution_time = datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 7,
+                "done_count": 0,
+                "message": "外围数据已落库，正在执行 AI 推荐筛选..." if external_report.get("external_market_data_quality") != "NOT_STORED" else "外围数据抓取完成但未落库，继续执行基础 AI 推荐...",
+                "error": "",
+            })
+        if args.auto_repair_missing_data:
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 4,
+                "done_count": 0,
+                "message": "正在检查并补齐推荐所需的交易日数据覆盖...",
+                "error": "",
+            })
+
+            def _repair_progress(stage: str, _payload: dict) -> None:
+                _recommended_run_history_update(run_uid, status="running", payload={
+                    "progress_percent": 5,
+                    "done_count": 0,
+                    "message": f"正在补齐推荐数据：{stage}",
+                    "error": "",
+                })
+
+            repair_report = repair_target_data(
+                target_trade_date,
+                min_kline_coverage=float(args.min_kline_coverage),
+                callback=_repair_progress,
+            )
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 8,
+                "done_count": 0,
+                "message": "推荐所需数据已补齐，准备运行策略筛选...",
+                "error": "",
+            })
         if args.refresh_realtime:
             _recommended_run_history_update(run_uid, status="running", payload={
                 "progress_percent": 8,
@@ -120,6 +250,8 @@ def main() -> int:
                 "0.70",
                 "--archive-snapshot",
                 "--skip-closed",
+                "--trade-date",
+                target_trade_date,
                 "--json",
             ]
             completed = subprocess.run(
@@ -140,12 +272,6 @@ def main() -> int:
                 "message": "实时数据已刷新，正在准备 AI 推荐筛选...",
                 "error": "",
             })
-        try:
-            wait_attempts = int(os.environ.get("PROBIGA_AI_RECOMMEND_DB_WAIT_ATTEMPTS", "12"))
-        except (TypeError, ValueError):
-            wait_attempts = 12
-        _wait_for_db(engine, attempts=wait_attempts)
-
         def _progress_callback(event: dict) -> None:
             try:
                 stage = str(event.get("stage") or "")
@@ -155,7 +281,7 @@ def main() -> int:
                 _recommended_run_history_update(run_uid, status="running", payload={
                     "progress_percent": max(1, min(99, percent)),
                     "done_count": int(event.get("done") or 0),
-                    "total": int(event.get("analysis_count") or 0) or None,
+                    "total": int(event.get("analysis_count") or event.get("total") or 0) or None,
                     "passed": int(event.get("recommendation_count") or 0),
                     "flow_date": event.get("flow_date") or "",
                     "hot_date": event.get("hot_date") or "",
@@ -172,9 +298,10 @@ def main() -> int:
             top_n=int(args.top_n),
             min_score=float(args.min_score),
             strict_prev_trade_day=bool(args.strict_prev_trade_day),
-            execution_time=execution_time,
+            execution_time=batch_execution_time,
             min_kline_coverage=float(args.min_kline_coverage),
             auto_repair_missing_kline=bool(args.auto_repair_missing_kline),
+            use_intraday_current=bool(args.use_intraday_current),
             progress_callback=_progress_callback,
         )
         payload = {
@@ -182,9 +309,11 @@ def main() -> int:
             "analysis_count": stats.analysis_count,
             "recommendation_count": stats.recommendation_count,
             "market_mood_score": stats.market_mood_score,
+            "external_market": external_report,
             "flow_date": stats.flow_date,
             "hot_date": stats.hot_date,
             "run_uid": run_uid,
+            "repair": repair_report,
         }
         _recommended_run_history_finish(run_uid, status="done", payload={
             "trade_date": stats.trade_date,
