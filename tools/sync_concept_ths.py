@@ -48,15 +48,30 @@ def df_to_table(engine, df, table):
     logger.info("表 %s：写入 %s 行。", table, len(df))
 
 
-def truncate_only(engine, *table_names):
-    if not table_names:
-        return
+_REPLACEABLE_TABLES = {
+    "si_concept_code_ths",
+    "si_concept_constituent_ths",
+}
+
+
+def replace_table_transactionally(engine, df, table):
+    """Replace one concept table without exposing an empty partial refresh."""
+    if table not in _REPLACEABLE_TABLES:
+        raise ValueError(f"unsupported concept table: {table}")
+    if df is None or df.empty:
+        raise ValueError(f"refuse to replace {table} with an empty dataset")
+    cleaned = _clean_object_df(df.copy())
     with engine.begin() as conn:
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
-        for t in table_names:
-            conn.execute(text(f"TRUNCATE TABLE `{t}`"))
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
-    logger.info("已 TRUNCATE 表：%s", ", ".join(table_names))
+        conn.execute(text(f"DELETE FROM `{table}`"))
+        cleaned.to_sql(
+            table,
+            conn,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
+    logger.info("表 %s：原子替换 %s 行。", table, len(cleaned))
 
 
 def retry_remote(fn, *args, max_retries=3, **kwargs):
@@ -112,7 +127,6 @@ def _is_bad_ths_result(res):
 
 def sync_concept_code_ths(engine, info):
     logger.info("===== 同步同花顺概念列表 (si_concept_code_ths) =====")
-    truncate_only(engine, "si_concept_code_ths")
     ts = _now()
     df = retry_remote(info.all_concept_code_ths)
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
@@ -120,7 +134,7 @@ def sync_concept_code_ths(engine, info):
         return pd.DataFrame()
     df = _clean_object_df(df)
     df["etl_sync_at"] = ts
-    df_to_table(engine, df, "si_concept_code_ths")
+    replace_table_transactionally(engine, df, "si_concept_code_ths")
     logger.info("概念列表: %d 条", len(df))
     _sleep()
     return df
@@ -128,7 +142,6 @@ def sync_concept_code_ths(engine, info):
 
 def sync_concept_constituent_ths(engine, info, df_ths):
     logger.info("===== 同步同花顺概念成分股 (si_concept_constituent_ths) =====")
-    truncate_only(engine, "si_concept_constituent_ths")
     ts = _now()
     if df_ths is None or df_ths.empty:
         logger.error("概念列表为空，无法同步成分股！")
@@ -169,7 +182,11 @@ def sync_concept_constituent_ths(engine, info, df_ths):
 
     if parts:
         out = pd.concat(parts, ignore_index=True)
-        df_to_table(engine, out, "si_concept_constituent_ths")
+        replace_table_transactionally(
+            engine,
+            out,
+            "si_concept_constituent_ths",
+        )
         logger.info("成分股总计: %d 条", len(out))
     else:
         logger.error("未获取到任何成分股数据！")
