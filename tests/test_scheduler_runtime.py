@@ -420,7 +420,11 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime.update_scheduler_task = lambda *args: updates.append(args)
         remaining_ids = None
         try:
-            cleaned = scheduler_runtime._cleanup_stale_running_tasks(FakeEngine())
+            with patch(
+                "server.api.scheduler_runtime._should_skip_task_for_host",
+                return_value=False,
+            ):
+                cleaned = scheduler_runtime._cleanup_stale_running_tasks(FakeEngine())
             remaining_ids = set(scheduler_runtime._running_task_ids)
         finally:
             scheduler_runtime.update_scheduler_task = original_update
