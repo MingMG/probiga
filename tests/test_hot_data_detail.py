@@ -1806,7 +1806,9 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(concept["change_pct"], 3.5)
 
     def test_recommended_progress_uses_long_ttl(self):
-        with patch("server.api.routers.hot_data._cache_get", return_value={"status": "done"}) as cache_get_mock, \
+        with patch("server.api.routers.hot_data._recommended_run_history_expire_stale"), \
+             patch("server.api.routers.hot_data._recommended_history_progress", return_value=None), \
+             patch("server.api.routers.hot_data._cache_get", return_value={"status": "done"}) as cache_get_mock, \
              patch("server.api.routers.hot_data._job_is_running", return_value=False):
             out = hot_data.recommended_stocks_progress()
 
