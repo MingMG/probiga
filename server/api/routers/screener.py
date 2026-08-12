@@ -900,6 +900,39 @@ _INTRADAY_NAME_THEME_MARKERS = (
 )
 
 
+def _intraday_quota_shortlist(
+    rows: list[dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep a bounded main board while reserving space for small live themes."""
+    capacity = max(1, int(limit))
+    theme_groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("intraday_theme_source") != "name_keyword":
+            continue
+        theme_groups.setdefault(str(row.get("primary_concept") or ""), []).append(row)
+    mandatory: list[dict[str, Any]] = []
+    for theme_name in sorted(theme_groups):
+        mandatory.extend(theme_groups[theme_name][:4])
+    mandatory = mandatory[:capacity]
+    mandatory_codes = {
+        str(row.get("stock_code") or "") for row in mandatory
+    }
+    base_capacity = capacity - len(mandatory)
+    base = [
+        row for row in rows
+        if str(row.get("stock_code") or "") not in mandatory_codes
+    ][:base_capacity]
+    selected = [*base, *mandatory]
+    selected.sort(
+        key=lambda row: (
+            int(row.get("intraday_discovery_rank") or 10**9),
+            str(row.get("stock_code") or ""),
+        )
+    )
+    return selected
+
+
 def _run_intraday_sector(
     request: ScreenerRunRequest,
     target_date: str,
@@ -1124,7 +1157,7 @@ def _run_intraday_sector(
     # This endpoint is a live discovery list.  V4/V5/V6 still annotate every
     # row with gates and buy readiness, but cannot hide an already discovered
     # sector leader merely because its previous-close evidence ranks lower.
-    shortlist = raw[: request.top]
+    shortlist = _intraday_quota_shortlist(raw, request.top)
     enriched = _enrich_selector_evidence(shortlist, target_date)
     enriched = _attach_correlation_clusters(enriched, target_date)
     normalized, stats = _apply_filters(

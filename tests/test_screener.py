@@ -217,6 +217,39 @@ def test_intraday_sector_recovers_renamed_industry_from_live_names(monkeypatch):
     assert all(row["actionable"] is False for row in result["data"])
 
 
+def test_intraday_shortlist_reserves_slots_for_small_live_name_theme():
+    rows = [
+        {
+            "stock_code": f"60{index:04d}",
+            "intraday_discovery_rank": index + 1,
+            "intraday_theme_source": "concept",
+            "primary_concept": "大主题",
+        }
+        for index in range(110)
+    ]
+    rows.extend(
+        [
+            {
+                "stock_code": "603399",
+                "intraday_discovery_rank": 111,
+                "intraday_theme_source": "name_keyword",
+                "primary_concept": "锂产业链",
+            },
+            {
+                "stock_code": "002240",
+                "intraday_discovery_rank": 112,
+                "intraday_theme_source": "name_keyword",
+                "primary_concept": "锂产业链",
+            },
+        ]
+    )
+
+    shortlisted = screener._intraday_quota_shortlist(rows, 100)
+
+    assert len(shortlisted) == 100
+    assert {row["stock_code"] for row in shortlisted}.issuperset({"603399", "002240"})
+
+
 def test_apply_filters_rejects_non_stock_and_future_listing_codes():
     request = screener.ScreenerRunRequest(top=10)
     rows, _stats = screener._apply_filters(
