@@ -2,7 +2,9 @@
 import unittest
 
 from biz.analysis.sync_analysis_fast import (
+    _load_sector_industry_memberships,
     add_strategy_signals,
+    build_recommendation_rows,
     build_strategy_trade_plan,
     choose_recommend_status,
     clamp_score,
@@ -15,6 +17,34 @@ from unittest.mock import patch
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_sector_membership_prefers_complete_immutable_snapshot(self):
+        run = pd.DataFrame([
+            {
+                "snapshot_date": "2026-08-11",
+                "source": "QMT_LOCAL",
+                "industry_relation_count": 2,
+            }
+        ])
+        evidence = pd.DataFrame([{"relation_count": 2}])
+        memberships = pd.DataFrame([
+            {"stock_code": "000001", "industry_name": "Bank"},
+            {"stock_code": "000002", "industry_name": "AI"},
+        ])
+
+        with patch(
+            "biz.analysis.sync_analysis_fast._table_exists", return_value=True
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=[run, evidence, memberships],
+        ):
+            result = _load_sector_industry_memberships(object(), "2026-08-11")
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            result.set_index("stock_code").loc["000002", "industry_name"],
+            "AI",
+        )
+
     def test_clamp_score_handles_invalid_values(self):
         self.assertEqual(clamp_score(120), 100.0)
         self.assertEqual(clamp_score(-5), 0.0)
@@ -92,6 +122,58 @@ class SyncAnalysisFastTest(unittest.TestCase):
         )
         self.assertEqual(status, "SUSPENDED")
         self.assertTrue(reason)
+
+    def test_recommendation_rows_keep_soft_risk_in_observation_ledger(self):
+        row = {
+            "stock_code": "600001",
+            "short_name": "candidate",
+            "ai_score": 78,
+            "long_term_score": 72,
+            "short_term_score": 76,
+            "quality_score": 79,
+            "final_trade_score": 77,
+            "entry_score": 68,
+            "capital_score": 70,
+            "main_wave_score": 65,
+            "main_wave_signal": "WATCH",
+            "signal_status": "WATCH",
+            "recommend_status": "SUSPENDED",
+            "recommend_reason": "keep observing",
+            "event_risk_level": "LOW",
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([row]), "2026-08-11", top_n=80, min_score=62
+        )
+
+        self.assertEqual([item["stock_code"] for item in rows], ["600001"])
+        self.assertEqual(rows[0]["recommend_status"], "SUSPENDED")
+        self.assertEqual(rows[0]["signal_status"], "WATCH")
+
+    def test_recommendation_rows_exclude_exit_signal(self):
+        row = {
+            "stock_code": "600001",
+            "short_name": "candidate",
+            "ai_score": 90,
+            "long_term_score": 85,
+            "short_term_score": 88,
+            "quality_score": 92,
+            "final_trade_score": 91,
+            "entry_score": 86,
+            "capital_score": 84,
+            "main_wave_score": 82,
+            "main_wave_signal": "SELL_ALERT",
+            "signal_status": "WATCH",
+            "recommend_status": "SUSPENDED",
+            "recommend_reason": "exit",
+            "event_risk_level": "LOW",
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([row]), "2026-08-11", top_n=80, min_score=62
+        )
+
+        self.assertEqual(rows, [])
 
     def test_primary_strategy_prefers_highest_qualified_score(self):
         strategy = select_primary_strategy({

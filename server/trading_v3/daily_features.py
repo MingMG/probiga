@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -26,6 +27,8 @@ from .theme_features import (
     calculate_theme_statistics,
     diversified_universe_codes,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_pct(current: float, base: float) -> float:
@@ -345,6 +348,89 @@ def _load_industries(
 ) -> dict[str, tuple[str, str]]:
     if not codes:
         return {}
+    as_of_exclusive = (
+        datetime.combine(as_of + timedelta(days=1), datetime.min.time())
+        if as_of is not None
+        else None
+    )
+    # The current SW table is refreshed in place, so its ETL timestamp can be
+    # newer than the membership itself.  Historical decisions must prefer the
+    # immutable, validated QMT close snapshot.
+    if as_of is not None:
+        try:
+            with engine.connect() as connection:
+                run = connection.execute(
+                    text(
+                        """
+                        SELECT snapshot_date, source, industry_relation_count
+                        FROM qmt_membership_snapshot_run
+                        WHERE snapshot_date <= :as_of
+                          AND quality_status = 'QMT_VALIDATED'
+                          AND captured_at < :as_of_exclusive
+                        ORDER BY snapshot_date DESC, captured_at DESC, source
+                        LIMIT 1
+                        """
+                    ),
+                    {"as_of": as_of, "as_of_exclusive": as_of_exclusive},
+                ).mappings().first()
+                if run:
+                    actual = int(
+                        connection.execute(
+                            text(
+                                """
+                                SELECT COUNT(*)
+                                FROM qmt_industry_member_snapshot
+                                WHERE snapshot_date = :snapshot_date
+                                  AND source = :source
+                                  AND quality_status = 'QMT_VALIDATED'
+                                  AND captured_at < :as_of_exclusive
+                                """
+                            ),
+                            {
+                                "snapshot_date": run["snapshot_date"],
+                                "source": run["source"],
+                                "as_of_exclusive": as_of_exclusive,
+                            },
+                        ).scalar()
+                        or 0
+                    )
+                    expected = int(run.get("industry_relation_count") or 0)
+                    if expected > 0 and actual == expected:
+                        snapshot_statement = text(
+                            """
+                            SELECT stock_code, industry_code, industry_name
+                            FROM qmt_industry_member_snapshot
+                            WHERE snapshot_date = :snapshot_date
+                              AND source = :source
+                              AND stock_code IN :codes
+                              AND quality_status = 'QMT_VALIDATED'
+                              AND captured_at < :as_of_exclusive
+                              AND industry_type IN
+                                  ('L1', '一级行业', '申万一级', 'SW2021')
+                            ORDER BY stock_code, industry_code
+                            """
+                        ).bindparams(bindparam("codes", expanding=True))
+                        result: dict[str, tuple[str, str]] = {}
+                        for row in connection.execute(
+                            snapshot_statement,
+                            {
+                                "snapshot_date": run["snapshot_date"],
+                                "source": run["source"],
+                                "codes": codes,
+                                "as_of_exclusive": as_of_exclusive,
+                            },
+                        ).mappings():
+                            code = str(row["stock_code"])[:6]
+                            result.setdefault(
+                                code,
+                                (
+                                    str(row.get("industry_code") or ""),
+                                    str(row.get("industry_name") or ""),
+                                ),
+                            )
+                        return result
+        except Exception as exc:
+            logger.debug("Immutable industry snapshot lookup skipped: %s", exc)
     statement = text(
         """
         SELECT stock_code, sw_code, industry_name
@@ -364,14 +450,7 @@ def _load_industries(
             statement,
             {
                 "codes": codes,
-                "as_of_exclusive": (
-                    datetime.combine(
-                        as_of + timedelta(days=1),
-                        datetime.min.time(),
-                    )
-                    if as_of is not None
-                    else None
-                ),
+                "as_of_exclusive": as_of_exclusive,
             },
         ).mappings():
             code = str(row["stock_code"])[:6]

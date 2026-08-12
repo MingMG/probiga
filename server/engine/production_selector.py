@@ -27,7 +27,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 SELECTOR_MODE = "V3_V4_V5_V6_GATED_MULTI_HORIZON_ENSEMBLE"
 CONTRACT_VERSION = "production-selector.v2"
-POLICY_VERSION = "2026-08-10.p0-p3"
+POLICY_VERSION = "2026-08-12.p0-p5"
 ADVISORY_WEIGHTS = {"V4": 0.12, "V5": 0.10, "V6": 0.08}
 HORIZON_WEIGHTS = {"T+1": 0.35, "T+5": 0.35, "T+20": 0.30}
 FEATURE_OWNERS = {
@@ -559,6 +559,14 @@ def score_production_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
     ensemble = round(max(0.0, min(100.0, ensemble)), 2)
 
     gate = versions["V4"]["details"]["hard_gate"]
+    recommend_status = str(item.get("recommend_status") or "SUSPENDED").upper()
+    signal_status = str(item.get("signal_status") or "WATCH").upper()
+    new_buy_ready = (
+        recommend_status == "ALLOW"
+        and signal_status in {"CONFIRM", "BUY_READY"}
+        and _explicit_true(item.get("ordinary_buy_eligible"))
+        and gate["status"] == "PASS"
+    )
     evidence_fields = 1 + sum(
         versions[version]["evidence_count"] for version in ("V4", "V5", "V6")
     )
@@ -572,6 +580,7 @@ def score_production_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
         and evidence_completeness >= 0.80
         and execution["status"] == "PASS"
         and ensemble >= 70
+        and new_buy_ready
     ):
         grade = "A"
     else:
@@ -593,6 +602,15 @@ def score_production_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
             "execution_diagnostics": execution,
             "candidate_grade": grade,
             "candidate_pool": grade,
+            "decision_readiness": {
+                "new_buy_ready": new_buy_ready,
+                "recommend_status": recommend_status,
+                "signal_status": signal_status,
+                "ordinary_buy_eligible": _explicit_true(
+                    item.get("ordinary_buy_eligible")
+                ),
+                "v4_gate_status": gate["status"],
+            },
             "evidence_completeness": round(evidence_completeness, 4),
             "risk_gate": gate,
             "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
@@ -672,13 +690,28 @@ def rank_production_candidates(rows: Iterable[Mapping[str, Any]]) -> list[dict[s
 def selector_run_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     grades = {grade: 0 for grade in ("A", "B", "C", "REJECT")}
     version_active = {version: 0 for version in ("V4", "V5", "V6")}
+    version_evidence_covered = {version: 0 for version in ("V4", "V5", "V6")}
+    version_fallback = {version: 0 for version in ("V4", "V5", "V6")}
     reject_reasons: dict[str, int] = {}
     for row in rows:
         grade = str(row.get("candidate_grade") or "C")
         grades[grade] = grades.get(grade, 0) + 1
         for version in version_active:
-            if version in (row.get("active_versions") or []):
+            status = str(
+                ((row.get("selector_versions") or {}).get(version) or {}).get(
+                    "status"
+                )
+                or "FALLBACK_TO_V3"
+            ).upper()
+            if status == "ACTIVE_BOUNDED":
                 version_active[version] += 1
+                version_evidence_covered[version] += 1
+            elif version == "V4" and status == "HARD_REJECT":
+                # A hard rejection proves that V4 evaluated its gate evidence;
+                # it is evidence coverage, but not ranking activation.
+                version_evidence_covered[version] += 1
+            else:
+                version_fallback[version] += 1
         for reason in row.get("risk_gate", {}).get("reject_reasons") or []:
             reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
     count = len(rows)
@@ -689,6 +722,14 @@ def selector_run_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "version_activation_rate": {
             version: round(value / count, 4) if count else 0.0
             for version, value in version_active.items()
+        },
+        "version_evidence_coverage_rate": {
+            version: round(value / count, 4) if count else 0.0
+            for version, value in version_evidence_covered.items()
+        },
+        "version_fallback_rate": {
+            version: round(value / count, 4) if count else 0.0
+            for version, value in version_fallback.items()
         },
         "hard_reject_reasons": reject_reasons,
         "model_fingerprint": MODEL_FINGERPRINT,

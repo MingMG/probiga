@@ -1212,8 +1212,99 @@ def load_failure_features(engine: Engine, trade_date: str) -> pd.DataFrame:
     return out
 
 
-def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFrame:
+def _load_sector_industry_memberships(engine: Engine, trade_date: str) -> pd.DataFrame:
+    """Prefer a validated immutable QMT L1-industry snapshot."""
+    cutoff = datetime.combine(
+        date.fromisoformat(str(trade_date)[:10]) + timedelta(days=1),
+        datetime.min.time(),
+    )
+    if (
+        _table_exists(engine, "qmt_membership_snapshot_run")
+        and _table_exists(engine, "qmt_industry_member_snapshot")
+    ):
+        try:
+            run = pd.read_sql(
+                text(
+                    """
+                    SELECT snapshot_date, source, industry_relation_count
+                    FROM qmt_membership_snapshot_run
+                    WHERE snapshot_date <= :trade_date
+                      AND quality_status = 'QMT_VALIDATED'
+                      AND captured_at < :cutoff
+                    ORDER BY snapshot_date DESC, captured_at DESC, source
+                    LIMIT 1
+                    """
+                ),
+                engine,
+                params={"trade_date": trade_date, "cutoff": cutoff},
+            )
+            if not run.empty:
+                snapshot_date = run.iloc[0]["snapshot_date"]
+                source = str(run.iloc[0]["source"] or "")
+                expected = int(run.iloc[0]["industry_relation_count"] or 0)
+                evidence = pd.read_sql(
+                    text(
+                        """
+                        SELECT COUNT(*) AS relation_count
+                        FROM qmt_industry_member_snapshot
+                        WHERE snapshot_date = :snapshot_date
+                          AND source = :source
+                          AND quality_status = 'QMT_VALIDATED'
+                          AND captured_at < :cutoff
+                        """
+                    ),
+                    engine,
+                    params={
+                        "snapshot_date": snapshot_date,
+                        "source": source,
+                        "cutoff": cutoff,
+                    },
+                )
+                actual = int(evidence.iloc[0]["relation_count"] or 0)
+                if expected > 0 and actual == expected:
+                    rows = pd.read_sql(
+                        text(
+                            """
+                            SELECT stock_code, industry_name
+                            FROM qmt_industry_member_snapshot
+                            WHERE snapshot_date = :snapshot_date
+                              AND source = :source
+                              AND quality_status = 'QMT_VALIDATED'
+                              AND captured_at < :cutoff
+                              AND industry_type IN
+                                  ('L1', '一级行业', '申万一级', 'SW2021')
+                            """
+                        ),
+                        engine,
+                        params={
+                            "snapshot_date": snapshot_date,
+                            "source": source,
+                            "cutoff": cutoff,
+                        },
+                    )
+                    if not rows.empty:
+                        return rows.drop_duplicates("stock_code", keep="first")
+        except Exception as exc:
+            logger.debug("Immutable industry snapshot lookup skipped: %s", exc)
+
     if not _table_exists(engine, "si_industry_sw"):
+        return pd.DataFrame({"stock_code": []})
+    return pd.read_sql(
+        text(
+            """
+            SELECT stock_code, industry_name
+            FROM si_industry_sw
+            WHERE industry_type IN ('L1', '一级行业', '申万一级', 'SW2021')
+              AND industry_name IS NOT NULL
+            """
+        ),
+        engine,
+    ).drop_duplicates("stock_code", keep="first")
+
+
+def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFrame:
+    memberships = _load_sector_industry_memberships(engine, trade_date)
+    if memberships.empty:
         return pd.DataFrame({"stock_code": []})
     dates = _recent_dates(engine, "sm_stock_kline", "trade_date", trade_date, 3)
     if not dates:
@@ -1256,12 +1347,7 @@ def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFra
         index=sector.index,
     )
     sector["sector_rotation_score"] = (base + early_rotation - overheated).clip(30, 100)
-    codes = pd.read_sql(text("""
-        SELECT stock_code, industry_name
-        FROM si_industry_sw
-        WHERE industry_type = '申万一级'
-          AND industry_name IS NOT NULL
-    """), engine)
+    codes = memberships.copy()
     if codes.empty:
         return pd.DataFrame({"stock_code": []})
     codes["stock_code"] = codes["stock_code"].astype(str).str.strip().str.zfill(6)
@@ -2082,41 +2168,48 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
 
 
 def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min_score: float) -> list[dict[str, Any]]:
+    stock_code_series = df["stock_code"].astype(str).str.strip().str.zfill(6)
     main_wave_signal_series = (
         df["main_wave_signal"].fillna("").astype(str)
         if "main_wave_signal" in df.columns
         else pd.Series("", index=df.index)
     )
+    recommend_status_series = (
+        df["recommend_status"].fillna("BLOCK").astype(str).str.upper()
+    )
+    event_risk_series = (
+        df["event_risk_level"].fillna("DATA_BLOCKED").astype(str).str.upper()
+    )
+    signal_status_series = (
+        df["signal_status"].fillna("BLOCK").astype(str).str.upper()
+    )
+    # The recommendation table is also the ranked observation ledger.  Keep
+    # soft-risk SUSPENDED/WATCH rows visible for later V4/V5/V6 evaluation,
+    # while hard blocks and exit signals remain excluded.  Execution remains
+    # fail-closed in the selector and execution router.
+    ranked_observation_candidate = (
+        recommend_status_series.isin({"ALLOW", "SUSPENDED"})
+        & (_numeric_col(df, "quality_score", 0.0) >= float(min_score))
+    )
     main_wave_candidate = (
         (_numeric_col(df, "main_wave_score", 0.0) >= float(STRATEGY_PROFILES["main_wave"]["min_score"]))
-        & (df["recommend_status"] != "BLOCK")
-        & (df["event_risk_level"] != "CRITICAL")
-    )
-    main_wave_exit_candidate = (
-        main_wave_signal_series.isin(["REDUCE", "SELL_ALERT"])
-        & (df["event_risk_level"] != "CRITICAL")
+        & recommend_status_series.isin({"ALLOW", "SUSPENDED"})
+        & (event_risk_series != "CRITICAL")
     )
     eligible = df[
         (
-            ((df["recommend_status"] == "ALLOW") & (df["quality_score"] >= float(min_score)))
+            ranked_observation_candidate
             | main_wave_candidate
-            | main_wave_exit_candidate
         )
-        & (df["signal_status"] != "BLOCK")
-        & (df["stock_code"].astype(str).str.match(r"^(0|3|6)"))
+        & (recommend_status_series != "BLOCK")
+        & (signal_status_series != "BLOCK")
+        & (~main_wave_signal_series.isin(["REDUCE", "SELL_ALERT"]))
+        & (event_risk_series != "CRITICAL")
+        & (stock_code_series.str.match(r"^(0|3|6)"))
     ].copy()
-    exit_priority = pd.Series(0.0, index=eligible.index)
-    eligible_signal = (
-        eligible["main_wave_signal"].fillna("").astype(str)
-        if "main_wave_signal" in eligible.columns
-        else pd.Series("", index=eligible.index)
-    )
-    exit_priority = exit_priority.mask(eligible_signal == "REDUCE", 92.0)
-    exit_priority = exit_priority.mask(eligible_signal == "SELL_ALERT", 100.0)
     eligible["ranking_score"] = pd.concat([
         _numeric_col(eligible, "final_trade_score", 0.0),
         _numeric_col(eligible, "main_wave_score", 0.0),
-        exit_priority,
     ], axis=1).max(axis=1)
     eligible = eligible.sort_values(
         ["ranking_score", "final_trade_score", "main_wave_score", "entry_score", "quality_score", "capital_score"],
@@ -2146,7 +2239,7 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "reason": reason[:500],
             "sources": sources[:100],
             "pick_date": trade_date,
-            "recommend_status": row.get("recommend_status") or "ALLOW",
+            "recommend_status": row.get("recommend_status") or "BLOCK",
             "recommend_reason": str(row.get("recommend_reason") or "")[:500],
             "event_risk_level": row.get("event_risk_level") or "LOW",
             "sentiment_score": round(float(row.get("sentiment_score") or 0), 1),
