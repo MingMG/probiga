@@ -87,10 +87,10 @@
         </div>
         <article class="panel">
           <div class="panel-head"><div><p>THEME OPPORTUNITY AUDIT</p><h3>主题机会覆盖与高分漏选预警</h3></div><span class="badge" id="themeAuditStatus">等待审计</span></div>
-          <p class="note">每次决策先扫描完整股票池和全部策略预测，再单独审计纸面候选；AI应用、机器人目前是跨策略主题雷达，不冒充已经训练并通过 OOS 的独立模型。高分方向全部落选、候选没有拒绝原因或目标主题过度集中都会主动提示，且不绕过样本外和风控门槛。</p>
+          <p class="note">研究方向不设固定白名单：每次决策扫描完整股票池和全部策略预测，按当期全市场主题信号动态聚类、排序，再单独审计纸面候选。高分方向全部落选、候选没有拒绝原因或目标主题过度集中都会主动提示，且不绕过样本外和风控门槛。</p>
           <div id="themeAuditFacts" class="facts"></div>
           <div class="two">
-            <div class="table-wrap"><table><thead><tr><th>研究方向</th><th>覆盖股票</th><th>策略预测</th><th>纸面候选</th><th>入选</th><th>全量最高信号</th><th>状态 / 原因</th></tr></thead><tbody id="researchGroupRows"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>动态研究方向</th><th>覆盖股票</th><th>策略预测</th><th>纸面候选</th><th>入选</th><th>全量最高信号</th><th>状态 / 原因</th></tr></thead><tbody id="researchGroupRows"></tbody></table></div>
             <div class="table-wrap"><table><thead><tr><th>纸面候选主题</th><th>候选数</th><th>入选数</th><th>最高分候选</th></tr></thead><tbody id="opportunityThemeRows"></tbody></table></div>
           </div>
         </article>
@@ -285,6 +285,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v3.js?v=16"></script>
+  <script src="/static/js/trading-v3.js?v=17"></script>
 </body>
 </html>

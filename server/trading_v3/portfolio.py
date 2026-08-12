@@ -100,35 +100,16 @@ def _paper_opportunity_audit(
     max_unselected_rows = int(
         research.get("maximum_audit_unselected_rows", 20)
     )
-    configured_groups = tuple(
-        str(group)
-        for group in (research.get("groups") or {})
-        if str(group)
-    )
-    configured_sleeves = {
-        str(strategy_key)
-        for strategy_key in (config.get("sleeves") or {})
-        if str(strategy_key)
-    }
     target_codes = {str(item.stock_code) for item in targets}
     rejection_by_code = {
         str(item.get("stock_code")): item for item in rejected
     }
-    candidate_group_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    radar_group_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     theme_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     candidate_rows: list[dict[str, Any]] = []
     selected_theme_sets: list[set[str]] = []
 
     forecast_rows = []
     for forecast in forecasts:
-        groups = {
-            str(item)
-            for item in (
-                forecast.features.get("paper_research_groups") or ()
-            )
-            if str(item)
-        }
         row = {
             "stock_code": str(forecast.stock_code),
             "short_name": forecast.stock_name,
@@ -151,11 +132,15 @@ def _paper_opportunity_audit(
                 )
                 if str(value)
             } | ({str(forecast.theme_code)} if forecast.theme_code else set())),
-            "research_groups": sorted(groups),
+            "research_groups": sorted({
+                str(item)
+                for item in (
+                    forecast.features.get("paper_research_groups") or ()
+                )
+                if str(item)
+            }),
         }
         forecast_rows.append(row)
-        for group in groups:
-            radar_group_rows[group].append(row)
 
     for candidate_order, (score, code, primary, _support) in enumerate(
         candidates,
@@ -177,13 +162,6 @@ def _paper_opportunity_audit(
         }
         if primary.theme_code:
             themes.add(str(primary.theme_code))
-        groups = {
-            str(item)
-            for item in (
-                primary.features.get("paper_research_groups") or ()
-            )
-            if str(item)
-        }
         row = {
             "candidate_order": candidate_order,
             "stock_code": code,
@@ -192,7 +170,13 @@ def _paper_opportunity_audit(
             "score": round(float(score), 8),
             "theme_code": primary.theme_code,
             "theme_names": sorted(themes),
-            "research_groups": sorted(groups),
+            "research_groups": sorted({
+                str(item)
+                for item in (
+                    primary.features.get("paper_research_groups") or ()
+                )
+                if str(item)
+            }),
             "selected": selected,
             "reason_code": rejection.get("reason_code"),
             "reason": rejection.get("reason"),
@@ -200,8 +184,6 @@ def _paper_opportunity_audit(
         candidate_rows.append(row)
         if selected:
             selected_theme_sets.append(themes)
-        for group in groups:
-            candidate_group_rows[group].append(row)
         for theme in themes:
             theme_rows[theme].append(row)
 
@@ -218,101 +200,6 @@ def _paper_opportunity_audit(
     )
     if missing_theme_count:
         warnings.append("CANDIDATE_THEME_MISSING")
-
-    research_group_audit = []
-    for group in sorted(
-        set(configured_groups)
-        | set(candidate_group_rows)
-        | set(radar_group_rows)
-    ):
-        rows = sorted(
-            candidate_group_rows.get(group, []),
-            key=lambda item: (-float(item["score"]), item["stock_code"]),
-        )
-        radar_rows = radar_group_rows.get(group, [])
-        universe_codes = {
-            str(item["stock_code"]) for item in radar_rows
-        }
-        status_counts: dict[str, int] = defaultdict(int)
-        sleeve_counts: dict[str, int] = defaultdict(int)
-        for item in radar_rows:
-            status_counts[str(item["status"])] += 1
-            sleeve_counts[str(item["strategy_key"])] += 1
-        scored_radar = [
-            item for item in radar_rows if item["score"] is not None
-        ]
-        evaluated_radar = [
-            item
-            for item in scored_radar
-            if item["status"] != "INSUFFICIENT_DATA"
-        ]
-        top_signal = min(
-            evaluated_radar,
-            key=lambda item: (
-                -float(item["score"]),
-                item["stock_code"],
-                item["strategy_key"],
-            ),
-            default=None,
-        )
-        selected_count = sum(bool(item["selected"]) for item in rows)
-        top = rows[0] if rows else None
-        high_score_unselected = bool(
-            selected_count == 0
-            and (
-                (
-                    top is not None
-                    and float(top["score"]) >= alert_score
-                )
-                or (
-                    top_signal is not None
-                    and float(top_signal["score"]) >= alert_score
-                )
-            )
-        )
-        observed_forecasts = {
-            (str(item["stock_code"]), str(item["strategy_key"]))
-            for item in radar_rows
-        }
-        expected_forecast_count = (
-            len(universe_codes) * len(configured_sleeves)
-        )
-        missing_forecast_count = max(
-            0,
-            expected_forecast_count - len(observed_forecasts),
-        )
-        if group in configured_groups and not universe_codes:
-            warnings.append(f"RESEARCH_GROUP_UNIVERSE_EMPTY:{group}")
-        if missing_forecast_count:
-            warnings.append(
-                f"RESEARCH_GROUP_FORECAST_COVERAGE_INCOMPLETE:{group}"
-            )
-        if high_score_unselected:
-            warnings.append(f"HIGH_SCORE_RESEARCH_GROUP_UNSELECTED:{group}")
-        research_group_audit.append({
-            "group": group,
-            "universe_stock_count": len(universe_codes),
-            "forecast_count": len(radar_rows),
-            "expected_forecast_count": expected_forecast_count,
-            "missing_forecast_count": missing_forecast_count,
-            "candidate_count": len(rows),
-            "selected_count": selected_count,
-            "top_signal": top_signal,
-            "top_candidate": top,
-            "status_counts": dict(sorted(status_counts.items())),
-            "sleeve_counts": dict(sorted(sleeve_counts.items())),
-            "status": (
-                "COVERED"
-                if selected_count
-                else "HIGH_SCORE_UNSELECTED"
-                if high_score_unselected
-                else "BELOW_ALERT"
-                if rows
-                else "UNIVERSE_EMPTY"
-                if not universe_codes
-                else "NO_CANDIDATE"
-            ),
-        })
 
     common_selected_themes: set[str] = set()
     if len(selected_theme_sets) >= 2:
@@ -386,6 +273,11 @@ def _paper_opportunity_audit(
             ),
         )
         stock_codes = {str(item["stock_code"]) for item in rows}
+        status_counts: dict[str, int] = defaultdict(int)
+        sleeve_counts: dict[str, int] = defaultdict(int)
+        for item in rows:
+            status_counts[str(item["status"])] += 1
+            sleeve_counts[str(item["strategy_key"])] += 1
         candidate_rows_by_code = {
             str(row["stock_code"]): row
             for theme in theme_aliases
@@ -430,6 +322,8 @@ def _paper_opportunity_audit(
             "top_candidate": (
                 ordered_candidates[0] if ordered_candidates else None
             ),
+            "status_counts": dict(sorted(status_counts.items())),
+            "sleeve_counts": dict(sorted(sleeve_counts.items())),
         })
     dynamic_theme_radar.sort(
         key=lambda item: (
@@ -438,6 +332,39 @@ def _paper_opportunity_audit(
             item["theme"],
         )
     )
+    research_group_audit = []
+    for item in dynamic_theme_radar[:max(0, max_theme_rows)]:
+        selected_count = int(item["selected_count"])
+        candidate_count = int(item["candidate_count"])
+        high_score_unselected = bool(
+            selected_count == 0
+            and float(item["top_signal"]["score"]) >= alert_score
+        )
+        research_group_audit.append({
+            "group": str(item["theme"]),
+            "source": "DYNAMIC_ALL_MARKET_THEME",
+            "theme_aliases": list(item["theme_aliases"]),
+            "component_cluster_key": item["component_cluster_key"],
+            "universe_stock_count": int(item["universe_stock_count"]),
+            "forecast_count": int(item["forecast_count"]),
+            "expected_forecast_count": None,
+            "missing_forecast_count": 0,
+            "candidate_count": candidate_count,
+            "selected_count": selected_count,
+            "top_signal": item["top_signal"],
+            "top_candidate": item["top_candidate"],
+            "status_counts": dict(item["status_counts"]),
+            "sleeve_counts": dict(item["sleeve_counts"]),
+            "status": (
+                "COVERED"
+                if selected_count
+                else "HIGH_SCORE_UNSELECTED"
+                if high_score_unselected
+                else "BELOW_ALERT"
+                if candidate_count
+                else "NO_CANDIDATE"
+            ),
+        })
     high_score_dynamic_theme_unselected_details = []
     for item in dynamic_theme_radar:
         if (
@@ -518,7 +445,8 @@ def _paper_opportunity_audit(
 
     return {
         "scope": "ALL_DECISION_FORECASTS",
-        "research_group_kind": "THEME_TAGGED_CROSS_SLEEVE_RADAR",
+        "research_group_kind": "DYNAMIC_ALL_MARKET_THEME_RADAR",
+        "research_group_mode": "DYNAMIC_EACH_DECISION",
         "status": "ATTENTION" if warnings else "PASS",
         "universe_stock_count": len({
             str(row["stock_code"]) for row in forecast_rows

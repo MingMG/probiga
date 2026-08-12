@@ -116,7 +116,7 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
     assert "trading-v3.css?v=6" in page
-    assert "trading-v3.js?v=16" in page
+    assert "trading-v3.js?v=17" in page
     assert "postJson('/api/screener/run'" in script
     assert "preset:'intraday_sector'" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
