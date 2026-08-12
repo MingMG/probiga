@@ -182,8 +182,37 @@ def test_intraday_sector_surfaces_linked_live_leaders(monkeypatch):
 
     assert result["freshness"] == "live"
     assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
-    assert all(row["concept_name"] == "锂电池" for row in result["data"])
+    assert all(row["concept_name"] == "锂产业链" for row in result["data"])
     assert result["actionable_output_allowed"] is False
+
+
+def test_intraday_sector_recovers_renamed_industry_from_live_names(monkeypatch):
+    def fake_rows(_sql, _params=None, context=""):
+        if context == "screener_intraday_live_quotes":
+            return [
+                {"stock_code": "603399", "short_name": "\u6c38\u6749\u9502\u4e1a", "price": 16.8, "change_pct": 7.1, "snapshot_at": "2026-08-12 11:00:00"},
+                {"stock_code": "002240", "short_name": "\u76db\u65b0\u9502\u80fd", "price": 33.5, "change_pct": 4.9, "snapshot_at": "2026-08-12 11:00:00"},
+            ]
+        if context == "screener_intraday_theme_strength":
+            return []
+        if context == "screener_intraday_theme_members":
+            raise AssertionError("synthetic name theme does not need a DB member query")
+        raise AssertionError(context)
+
+    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
+    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
+    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: rows)
+    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
+
+    result = screener._run_preset(
+        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
+        "2026-08-11",
+    )
+
+    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
+    assert all(row["concept_name"] == "\u9502\u4ea7\u4e1a\u94fe" for row in result["data"])
+    assert all(row["intraday_theme_source"] == "name_keyword" for row in result["data"])
+    assert all(row["actionable"] is False for row in result["data"])
 
 
 def test_apply_filters_rejects_non_stock_and_future_listing_codes():

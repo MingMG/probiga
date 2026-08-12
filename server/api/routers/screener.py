@@ -893,6 +893,12 @@ _GENERIC_CONCEPT_MARKERS = (
     "标准普尔", "基金重仓", "社保重仓", "QFII", "预盈预增",
 )
 
+_INTRADAY_NAME_THEME_MARKERS = (
+    "\u9502", "\u7a00\u571f", "\u9ec4\u91d1", "\u94dc", "\u94dd",
+    "\u82af\u7247", "\u534a\u5bfc\u4f53", "\u5149\u4f0f", "\u98ce\u7535",
+    "\u50a8\u80fd", "\u673a\u5668\u4eba",
+)
+
 
 def _run_intraday_sector(
     request: ScreenerRunRequest,
@@ -973,6 +979,47 @@ def _run_intraday_sector(
         {"active_change": max(2.0, min_change), "minimum_active": minimum_active},
         context="screener_intraday_theme_strength",
     )
+    name_theme_members: list[dict[str, Any]] = []
+    active_change = max(2.0, min_change)
+    for marker in _INTRADAY_NAME_THEME_MARKERS:
+        marker_members = [
+            row for row in live_rows
+            if marker in str(row.get("short_name") or "")
+        ]
+        active_members = sum(
+            (_number(row.get("change_pct"), 0.0) or 0.0) >= active_change
+            for row in marker_members
+        )
+        if active_members < minimum_active:
+            continue
+        changes = [
+            _number(row.get("change_pct"), 0.0) or 0.0
+            for row in marker_members
+        ]
+        average_change = sum(changes) / max(1, len(changes))
+        leader_change = max(changes, default=0.0)
+        if average_change < 0.8 or leader_change < 4.0:
+            continue
+        theme_code = f"NAME:{marker}"
+        theme_rows.append({
+            "concept_code": theme_code,
+            "concept_name": f"{marker}\u4ea7\u4e1a\u94fe",
+            "theme_source": "name_keyword",
+            "total_members": len(marker_members),
+            "active_members": active_members,
+            "positive_members": sum(change > 0 for change in changes),
+            "average_change_pct": average_change,
+            "leader_change_pct": leader_change,
+        })
+        name_theme_members.extend(
+            {
+                "stock_code": row.get("stock_code"),
+                "concept_code": theme_code,
+                "name": f"{marker}\u4ea7\u4e1a\u94fe",
+                "theme_source": "name_keyword",
+            }
+            for row in marker_members
+        )
     theme_rows = [
         row for row in theme_rows
         if not any(marker.lower() in str(row.get("concept_name") or "").lower() for marker in _GENERIC_CONCEPT_MARKERS)
@@ -990,14 +1037,20 @@ def _run_intraday_sector(
             average * 5.0 + leader * 2.0 + min(active, 12.0) * 1.5 + min(positive / total, 1.0) * 12.0,
             2,
         )
+        if row.get("theme_source") == "name_keyword":
+            row["theme_strength"] = round(row["theme_strength"] + 15.0, 2)
         theme_by_code[str(row.get("concept_code") or "")] = row
 
-    if not theme_by_code:
+    database_theme_codes = [
+        concept_code for concept_code in theme_by_code
+        if not concept_code.startswith("NAME:")
+    ]
+    if not database_theme_codes:
         member_rows: list[dict[str, Any]] = []
     else:
         params: dict[str, Any] = {}
         placeholders: list[str] = []
-        for index, concept_code in enumerate(theme_by_code):
+        for index, concept_code in enumerate(database_theme_codes):
             key = f"theme_{index}"
             params[key] = concept_code
             placeholders.append(f":{key}")
@@ -1020,6 +1073,7 @@ def _run_intraday_sector(
             params,
             context="screener_intraday_theme_members",
         )
+    member_rows.extend(name_theme_members)
 
     themes_for_stock: dict[str, list[dict[str, Any]]] = {}
     for member in member_rows:
