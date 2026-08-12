@@ -141,11 +141,33 @@ jobs:
           tests/test_deploy_console.py
           tests/test_scheduler_runtime.py
 
+  deployment-disabled:
+    name: Production deployment disabled
+    needs: trading-v4-ci-gate
+    if: >-
+      ${{ github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          vars.PRODUCTION_DEPLOY_ENABLED != 'true' &&
+          needs.trading-v4-ci-gate.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explain why production was not changed
+        run: |
+          echo "::notice title=Production deployment disabled::CI passed, but this revision was not deployed. Complete the non-root ECS migration and set the repository variable PRODUCTION_DEPLOY_ENABLED=true to enable deployment."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ### Production deployment disabled
+
+          CI passed, but this revision was **not deployed**. Complete the non-root ECS
+          migration and set the repository variable `PRODUCTION_DEPLOY_ENABLED=true`
+          before enabling automatic production deployment.
+          EOF
+
   deploy:
     needs: trading-v4-ci-gate
     if: >-
       ${{ github.event_name == 'push' &&
           github.ref == 'refs/heads/main' &&
+          vars.PRODUCTION_DEPLOY_ENABLED == 'true' &&
           needs.trading-v4-ci-gate.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -159,7 +181,7 @@ jobs:
       - name: Validate production SSH identity
         shell: bash
         env:
-          SERVER_HOST: 47.113.123.190
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}

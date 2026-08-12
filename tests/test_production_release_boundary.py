@@ -134,6 +134,12 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "appleboy/ssh-action@v1.0.3" not in workflow
     assert "SERVER_HOST_FINGERPRINT must be an exact SHA256 fingerprint" in workflow
     assert "^SHA256:[A-Za-z0-9+/]{43}$" in workflow
+    assert "vars.PRODUCTION_DEPLOY_ENABLED == 'true'" in workflow_source
+    assert "vars.PRODUCTION_DEPLOY_ENABLED != 'true'" in workflow_source
+    assert "Production deployment disabled" in workflow_source
+    assert "this revision was **not deployed**" in workflow_source
+    assert "SERVER_HOST: ${{ secrets.SERVER_HOST }}" in workflow_source
+    assert "SERVER_HOST: 47.113.123.190" not in workflow_source
     assert 'test "$SERVER_USER" != root' in workflow
     assert 'test "$SERVICE_USER" != root' in workflow
     assert "probiga-production-deploy" in workflow
