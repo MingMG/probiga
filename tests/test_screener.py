@@ -183,6 +183,7 @@ def test_intraday_sector_surfaces_linked_live_leaders(monkeypatch):
     assert result["freshness"] == "live"
     assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
     assert all(row["concept_name"] == "锂产业链" for row in result["data"])
+    assert [row["rank"] for row in result["data"]] == [1, 2]
     assert result["actionable_output_allowed"] is False
 
 
@@ -212,6 +213,7 @@ def test_intraday_sector_recovers_renamed_industry_from_live_names(monkeypatch):
     assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
     assert all(row["concept_name"] == "\u9502\u4ea7\u4e1a\u94fe" for row in result["data"])
     assert all(row["intraday_theme_source"] == "name_keyword" for row in result["data"])
+    assert [row["intraday_discovery_rank"] for row in result["data"]] == [1, 2]
     assert all(row["actionable"] is False for row in result["data"])
 
 

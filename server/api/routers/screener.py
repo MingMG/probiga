@@ -1086,7 +1086,11 @@ def _run_intraday_sector(
         code = str(quote.get("stock_code") or "").zfill(6)
         themes = sorted(
             themes_for_stock.get(code) or [],
-            key=lambda item: (-float(item.get("theme_strength") or 0), str(item.get("concept_code") or "")),
+            key=lambda item: (
+                0 if item.get("theme_source") == "name_keyword" else 1,
+                -float(item.get("theme_strength") or 0),
+                str(item.get("concept_code") or ""),
+            ),
         )
         if not themes:
             continue
@@ -1115,7 +1119,12 @@ def _run_intraday_sector(
             ],
         })
     raw.sort(key=lambda row: (-float(row.get("score") or 0), str(row.get("stock_code") or "")))
-    shortlist = raw[: max(300, request.top * 4)]
+    for discovery_rank, row in enumerate(raw, 1):
+        row["intraday_discovery_rank"] = discovery_rank
+    # This endpoint is a live discovery list.  V4/V5/V6 still annotate every
+    # row with gates and buy readiness, but cannot hide an already discovered
+    # sector leader merely because its previous-close evidence ranks lower.
+    shortlist = raw[: request.top]
     enriched = _enrich_selector_evidence(shortlist, target_date)
     enriched = _attach_correlation_clusters(enriched, target_date)
     normalized, stats = _apply_filters(
@@ -1123,6 +1132,16 @@ def _run_intraday_sector(
         request,
         listed_codes=_listed_codes(target_date),
     )
+    normalized.sort(
+        key=lambda row: (
+            int(row.get("intraday_discovery_rank") or 10**9),
+            str(row.get("stock_code") or ""),
+        )
+    )
+    for rank, row in enumerate(normalized, 1):
+        row["selector_rank"] = row.get("rank")
+        row["rank"] = rank
+        row["intraday_rank"] = rank
     return {
         "status": "ok",
         "preset": preset,
