@@ -463,7 +463,7 @@ def paper_ledger(
         result["market_value"] = round(current_price * quantity, 2) if current_price > 0 else None
         result["unrealized_pnl"] = round((current_price - cost_price) * quantity, 2) if current_price > 0 and cost_price > 0 else None
         result["unrealized_pnl_pct"] = round((current_price / cost_price - 1.0) * 100.0, 2) if current_price > 0 and cost_price > 0 else None
-        if not result.get("short_name") and quote.get("short_name"):
+        if quote.get("short_name"):
             result["short_name"] = quote.get("short_name")
         return result
 

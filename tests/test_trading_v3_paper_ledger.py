@@ -91,6 +91,7 @@ def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
     assert result["data"]["positions"][0]["stock_code"] == "688059"
     assert result["data"]["positions"][0]["ledger_source"] == "LEGACY_EVENT_SIM"
     assert result["data"]["positions"][0]["current_price"] == 99.8
+    assert result["data"]["positions"][0]["short_name"] == "华锐精密"
     assert result["data"]["positions"][0]["market_value"] == 99_800.0
     assert result["data"]["positions"][0]["unrealized_pnl"] == 4_270.0
     assert result["data"]["positions"][0]["unrealized_pnl_pct"] == 4.47
