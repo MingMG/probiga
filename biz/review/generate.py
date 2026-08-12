@@ -1200,27 +1200,35 @@ def generate_review(engine, date_str: str) -> dict:
 
     log.info("复盘数据已写入: %s (%s 字节summary)", date_str, len(summary))
 
-    # 生成专业复盘
-    try:
-        generate_pro_review(engine, date_str)
-    except Exception as e:
-        log.error("专业复盘生成失败: %s", e)
+    # 旧版入口也必须失败可见，不能把专业复盘异常吞掉后继续报成功。
+    record["_pro_review_text"] = generate_pro_review(engine, date_str)
 
     return record
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="生成三段式盘后量化复盘")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("date", nargs="?", help="日期 YYYY-MM-DD")
     g.add_argument("--today", action="store_true")
     p.add_argument("--force", action="store_true", help="强制覆盖")
+    p.add_argument("--legacy", action="store_true", help="显式运行旧版复盘生成器")
     args, unknown = p.parse_known_args()
 
     engine = get_engine()
     date_str = datetime.now().strftime("%Y-%m-%d") if args.today else args.date
-    generate_review(engine, date_str)
-    return 0
+    if args.legacy:
+        generate_review(engine, date_str)
+        return 0
+
+    from biz.review.quant_digest import PUBLISH_READY, generate_quant_digest
+
+    result = generate_quant_digest(engine, date_str, persist=True)
+    output = result.get("compact_review") or json.dumps(
+        result.get("quality_json") or {}, ensure_ascii=False, indent=2
+    )
+    print(output)
+    return 0 if result.get("publish_status") == PUBLISH_READY else 2
 
 
 if __name__ == "__main__":

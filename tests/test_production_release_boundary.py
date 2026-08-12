@@ -216,6 +216,14 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "--task-type analysis_premarket_external" in deploy_script
     assert 'find "$tree_root"' in workflow
     assert "-writable -print -quit" in workflow
+    validate_boundary = workflow.index("tools/validate_production_release_boundary.py")
+    validate_scheduler_manifest = workflow.index("tools/ensure_quality_gate.py")
+    restart_service = workflow.index("sudo systemctl restart probiga", validate_scheduler_manifest)
+    assert validate_boundary < validate_scheduler_manifest < restart_service
+    assert 'sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1' in workflow
+    assert "tools/ensure_quality_gate.py --validate-review-delivery" in workflow
+    assert "--apply-review-delivery-with-snapshot" not in workflow
+    assert "--restore-review-delivery" not in workflow
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:

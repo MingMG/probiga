@@ -483,6 +483,12 @@ fi
 "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/validate_production_release_boundary.py \
   --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
+# The Windows QMT bridge only runs registered task types. Refuse activation
+# unless the four delivery tasks were provisioned explicitly and match this
+# release; production deployment itself remains read-only with respect to DB.
+sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1 \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+  tools/ensure_quality_gate.py --validate-review-delivery
 rm -f "$RESOLVED_LOCK"
 sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \

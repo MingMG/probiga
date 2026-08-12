@@ -14,13 +14,12 @@ import argparse
 import json
 import logging
 import math
-import os
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import httpx
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -35,6 +34,7 @@ log = logging.getLogger("evening")
 from server.common.batch_db import create_batch_engine, read_records
 from server.common.config import get_settings, get_wecom_webhook
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
+from integrations.wecom.delivery import deliver_markdown
 try:
     from biz.research_radar.radar import build_research_radar, format_radar_markdown
 except Exception:
@@ -320,72 +320,31 @@ def build_report(data: dict, date_str: str, ai_analysis: str = "") -> str:
     return "\n".join(lines)
 
 
-def push_to_wecom(content: str) -> bool:
-    """推送到早报机器人"""
-    MAX_BYTES = 4000
-    content_bytes = content.encode("utf-8")
-    webhook_url = get_wecom_webhook("briefing", required=False)
-    if not webhook_url:
-        log.warning("WECOM briefing webhook is not configured; skip push.")
-        return True
+def push_to_wecom(content: str, engine=None) -> bool:
+    """可靠投递晚报；任何缺配置或部分失败都会抛错。"""
 
-    if len(content_bytes) <= MAX_BYTES:
-        payload = {"msgtype": "markdown", "markdown": {"content": content}}
-        try:
-            r = httpx.post(webhook_url, json=payload, timeout=15)
-            resp = r.json()
-            if resp.get("errcode") == 0:
-                log.info("推送成功 (%d 字节)", len(content_bytes))
-                return True
-            log.warning("推送失败: %s", resp)
-            return False
-        except Exception as e:
-            log.error("推送异常: %s", e)
-            return False
-
-    # 超长分段
-    paragraphs = content.split("\n\n")
-    parts, cur = [], ""
-    for para in paragraphs:
-        candidate = (cur + "\n\n" + para).strip() if cur else para
-        if len(candidate.encode("utf-8")) > MAX_BYTES:
-            if cur:
-                parts.append(cur)
-                cur = para
-            else:
-                for line in para.split("\n"):
-                    if cur and len((cur + "\n" + line).encode("utf-8")) > MAX_BYTES:
-                        parts.append(cur)
-                        cur = line
-                    else:
-                        cur = (cur + "\n" + line).strip()
-                cur = ""
-        else:
-            cur = candidate
-    if cur:
-        parts.append(cur)
-
-    n = len(parts)
-    ok = 0
-    for i, part in enumerate(parts):
-        header = f"## 📊 晚报 ({i+1}/{n})\n\n"
-        payload = {"msgtype": "markdown", "markdown": {"content": header + part}}
-        try:
-            r = httpx.post(webhook_url, json=payload, timeout=15)
-            if r.json().get("errcode") == 0:
-                ok += 1
-                log.info("  第 %d/%d 段 ✓", i + 1, n)
-            else:
-                log.warning("  第 %d/%d 段失败: %s", i + 1, n, r.text[:100])
-        except Exception as e:
-            log.error("  第 %d/%d 段异常: %s", i + 1, n, e)
-        if i < n - 1:
-            time.sleep(2)
-    return ok == n
+    result = deliver_markdown(
+        get_wecom_webhook("briefing", required=False),
+        content,
+        engine=engine or get_engine(),
+        delivery_kind="evening_review",
+        webhook_kind="briefing",
+        title="## 📊 盘后复盘",
+    )
+    log.info(
+        "企微推送完成: delivery_id=%s, %d/%d 段",
+        result.delivery_id,
+        result.delivered_count,
+        result.segment_count,
+    )
+    return result.success
 
 
 def _query(engine, sql: str, params: dict = None):
-    return read_records(sql, engine, params=params)
+    # SQLAlchemy 2.x does not accept a plain SQL string through every
+    # execution path. Bind explicitly so named parameters such as ``:d`` are
+    # preserved when pandas and SQLAlchemy versions differ.
+    return read_records(text(sql), engine, params=params)
 
 
 def _find_latest_trade_date(engine) -> str:
@@ -582,24 +541,8 @@ def main():
         date_str = _find_latest_trade_date(engine)
         log.info("使用最新交易日: %s", date_str)
 
-    report = ""
-
-    if not args.legacy:
-        # ── 优先使用专业复盘 ──
-        log.info("生成专业复盘...")
-        try:
-            from biz.review.generate import generate_review
-            review_record = generate_review(engine, date_str)
-            pro_text = str(review_record.get("_pro_review_text") or "")
-            if not pro_text:
-                raise RuntimeError("专业复盘文本为空")
-            log.info("专业复盘生成完成 (%d 字)", len(pro_text))
-            report = pro_review_to_wecom(pro_text, date_str)
-        except Exception as e:
-            log.error("专业复盘生成失败: %s，回退到AI分析模式", e)
-
-    if not report:
-        # ── 回退：旧版AI分析模式 ──
+    if args.legacy:
+        # 旧版只保留为显式诊断入口，不再作为质量门禁失败时的发布回退。
         log.info("采集盘面数据...")
         data = collect_market_data(engine, date_str)
 
@@ -610,17 +553,30 @@ def main():
 
         log.info("生成晚报报告...")
         report = build_report(data, date_str, ai_analysis)
+        report = append_decision_radar(report, engine, date_str)
+        report = append_research_radar(report, engine, date_str)
+    else:
+        from biz.review.quant_digest import PUBLISH_READY, generate_quant_digest
 
-    report = append_decision_radar(report, engine, date_str)
-    report = append_research_radar(report, engine, date_str)
+        log.info("生成三段式盘后量化复盘...")
+        digest = generate_quant_digest(engine, date_str, persist=not args.test)
+        if digest.get("publish_status") != PUBLISH_READY:
+            quality = digest.get("quality_json") or {}
+            reasons = quality.get("errors") or ["未知质量门禁错误"]
+            raise RuntimeError("量化复盘未通过发布门禁: " + "；".join(map(str, reasons)))
+        report = str(digest.get("compact_review") or "").strip()
+        if not report:
+            raise RuntimeError("量化复盘通过门禁但正文为空")
+        log.info("三段式量化复盘生成完成 (%d 字)", len(report))
 
     if args.test:
         _safe_print(report)
-        return
+        return 0
 
     log.info("推送到企微...")
-    push_to_wecom(report)
+    push_to_wecom(report, engine=engine)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

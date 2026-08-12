@@ -16,10 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -38,6 +36,7 @@ log = logging.getLogger("briefing")
 from server.common.batch_db import create_batch_engine, read_records
 from server.common.config import get_settings, get_wecom_webhook
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
+from integrations.wecom.delivery import deliver_markdown
 try:
     from biz.research_radar.radar import build_research_radar, format_radar_markdown
 except Exception:
@@ -361,90 +360,24 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 # 4. 推送
 # ═══════════════════════════════════════════
 
-def push_to_wecom(content: str) -> bool:
-    """推送到企业微信：超长自动分段 + 文件兜底"""
-    MAX = 4000
-    webhook_url = get_wecom_webhook("briefing", required=False)
-    if not webhook_url:
-        log.warning("WECOM briefing webhook is not configured; skip push.")
-        return True
+def push_to_wecom(content: str, engine=None) -> bool:
+    """可靠投递早报；任何缺配置或部分失败都会抛错。"""
 
-    # 按段落边界分块（优先在空行处断开）
-    paragraphs = content.split("\n\n")
-    parts, cur = [], ""
-    for para in paragraphs:
-        candidate = (cur + "\n\n" + para).strip() if cur else para
-        if len(candidate.encode("utf-8")) > MAX:
-            if cur:
-                parts.append(cur)
-                cur = para
-            else:
-                # 单个段落也太长，按行分割
-                for line in para.split("\n"):
-                    if cur and len((cur + "\n" + line).encode("utf-8")) > MAX:
-                        parts.append(cur)
-                        cur = line
-                    else:
-                        cur = (cur + "\n" + line).strip()
-                cur = ""
-        else:
-            cur = candidate
-    if cur:
-        parts.append(cur)
-
-    n = len(parts)
-    log.info("共 %d 段待推送", n)
-
-    ok = 0
-    for i, part in enumerate(parts):
-        header = f"## 📰 A股早报 ({i + 1}/{n})\n\n" if n > 1 else "## 📰 A股早报\n\n"
-        payload = {"msgtype": "markdown", "markdown": {"content": header + part}}
-
-        try:
-            r = httpx.post(webhook_url, json=payload, timeout=15)
-            resp = r.json()
-            if resp.get("errcode") == 0:
-                ok += 1
-                log.info("  第 %d/%d 段 ✓ (%d 字节)", i + 1, n, len(part.encode("utf-8")))
-            else:
-                log.warning("  第 %d/%d 段 失败: %s", i + 1, n, r.text[:100])
-        except Exception as e:
-            log.error("  第 %d/%d 段 异常: %s", i + 1, n, e)
-
-        if i < n - 1:
-            time.sleep(2)
-
-    if ok == n:
-        log.info("推送完成: %d/%d 段全部成功", ok, n)
-        return True
-
-    # 如果有失败的段，尝试用文件方式补推
-    if ok < n:
-        log.warning("有 %d 段失败，尝试文件方式...", n - ok)
-        try:
-            # 写临时文件
-            file_path = f"/tmp/early_briefing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-
-            # 企微文件上传
-            upload_url = webhook_url.replace("/send?", "/upload_media?")
-            if "type=file" not in upload_url:
-                upload_url += "&type=file"
-            with open(file_path, "rb") as f:
-                r = httpx.post(upload_url, files={"media": (os.path.basename(file_path), f, "text/markdown")}, timeout=30)
-            upload_resp = r.json()
-            if upload_resp.get("errcode") == 0:
-                media_id = upload_resp.get("media_id")
-                file_payload = {"msgtype": "file", "file": {"media_id": media_id}}
-                r2 = httpx.post(webhook_url, json=file_payload, timeout=15)
-                log.info("文件方式推送: %s", r2.text[:100])
-            else:
-                log.error("文件上传失败: %s", upload_resp)
-        except Exception as e:
-            log.error("文件推送异常: %s", e)
-
-    return ok == n
+    result = deliver_markdown(
+        get_wecom_webhook("briefing", required=False),
+        content,
+        engine=engine or get_engine(),
+        delivery_kind="early_briefing",
+        webhook_kind="briefing",
+        title="## 📰 A股早报",
+    )
+    log.info(
+        "企微推送完成: delivery_id=%s, %d/%d 段",
+        result.delivery_id,
+        result.delivered_count,
+        result.segment_count,
+    )
+    return result.success
 
 
 def append_research_radar(content: str, market_data: dict) -> str:
@@ -530,7 +463,7 @@ def main():
         return 0
 
     log.info("4/4 推送到企业微信...")
-    push_to_wecom(briefing)
+    push_to_wecom(briefing, engine=engine)
     log.info("完成")
     return 0
 

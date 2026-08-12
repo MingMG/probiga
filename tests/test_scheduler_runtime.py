@@ -19,10 +19,14 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._task_semaphore = None
         scheduler_runtime._fast_lane_semaphore = None
         scheduler_runtime._alert_lane_semaphore = None
+        scheduler_runtime._delivery_lane_semaphore = None
         scheduler_runtime._running_procs.clear()
         scheduler_runtime._running_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
+        scheduler_runtime._delivery_lane_running_task_ids.clear()
+        scheduler_runtime._task_history_ready_engines.clear()
+        scheduler_runtime._history_cleanup_next_at = 0.0
         scheduler_router._quality_cache.clear()
 
     def test_start_embedded_scheduler_skips_when_disabled(self):
@@ -91,6 +95,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     "embedded_scheduler_running": True,
                     "scheduler_max_concurrent_tasks": 2,
                     "scheduler_alert_lane_tasks": 1,
+                    "scheduler_delivery_lane_tasks": 1,
                     "scheduler_poll_seconds": 45,
                     "api_mysql_pool_size": 3,
                     "api_mysql_max_overflow": 1,
@@ -152,6 +157,50 @@ class SchedulerRuntimeTest(unittest.TestCase):
             self.assertTrue(
                 scheduler_runtime._should_skip_non_trading_day(row, MagicMock())
             )
+
+    def test_user_deliverables_use_dedicated_delivery_lane(self):
+        for task_type in ("news_daily", "daily_review", "evening_review"):
+            with self.subTest(task_type=task_type):
+                row = {"task_type": task_type}
+                self.assertTrue(scheduler_runtime._uses_delivery_lane(row))
+                self.assertFalse(scheduler_runtime._uses_fast_lane(row))
+        self.assertFalse(
+            scheduler_runtime._uses_delivery_lane({"task_type": "stock_minute"})
+        )
+
+    def test_delivery_lane_semaphore_is_independent_from_general_and_fast_lanes(self):
+        delivery = scheduler_runtime._task_lane_semaphore({"task_type": "news_daily"})
+        general = scheduler_runtime._task_lane_semaphore({"task_type": "stock_minute"})
+        fast = scheduler_runtime._task_lane_semaphore({"task_type": "sim_trade"})
+
+        self.assertIs(delivery, scheduler_runtime._get_delivery_lane_semaphore())
+        self.assertIsNot(delivery, general)
+        self.assertIsNot(delivery, fast)
+
+    def test_delivery_lane_still_has_capacity_when_general_worker_is_full(self):
+        scheduler_runtime._running_task_ids.add(501)
+
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "stock_minute"},
+                max_general_tasks=1,
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "news_daily"},
+                max_general_tasks=1,
+            )
+        )
+
+        scheduler_runtime._running_task_ids.add(502)
+        scheduler_runtime._delivery_lane_running_task_ids.add(502)
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "evening_review"},
+                max_general_tasks=1,
+            )
+        )
 
     def test_intraday_capital_flow_fast_is_latency_sensitive_and_windows_owned(self):
         row = {"task_type": "intraday_capital_flow_fast"}
@@ -261,6 +310,70 @@ class SchedulerRuntimeTest(unittest.TestCase):
         }
         with patch("server.api.scheduler_runtime._is_trade_day", return_value=False):
             self.assertFalse(scheduler_runtime._should_skip_non_trading_day(row, MagicMock()))
+
+    def test_daily_user_deliverables_skip_on_non_trading_day(self):
+        with patch("server.api.scheduler_runtime._is_trade_day", return_value=False):
+            for task_type in ("news_daily", "daily_review", "evening_review"):
+                with self.subTest(task_type=task_type):
+                    self.assertTrue(
+                        scheduler_runtime._should_skip_non_trading_day(
+                            {"task_type": task_type, "script_path": "", "script_args": ""},
+                            MagicMock(),
+                        )
+                    )
+
+    def test_missing_trade_calendar_row_keeps_user_deliverable_due(self):
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value.execute.return_value.scalar.return_value = None
+        row = {"task_type": "news_daily", "script_path": "", "script_args": ""}
+
+        self.assertIsNone(
+            scheduler_runtime._is_trade_day(engine, datetime(2026, 8, 12).date())
+        )
+        self.assertIsNone(
+            scheduler_runtime._should_skip_non_trading_day(
+                row,
+                engine,
+                datetime(2026, 8, 12, 8, 30),
+            )
+        )
+
+    def test_trade_calendar_failure_keeps_user_deliverable_due(self):
+        engine = MagicMock()
+        engine.connect.side_effect = RuntimeError("calendar unavailable")
+        row = {"task_type": "daily_review", "script_path": "", "script_args": ""}
+
+        self.assertIsNone(
+            scheduler_runtime._should_skip_non_trading_day(
+                row,
+                engine,
+                datetime(2026, 8, 12, 18, 0),
+            )
+        )
+
+    def test_explicit_closed_calendar_row_skips_user_deliverable(self):
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value.execute.return_value.scalar.return_value = 0
+
+        self.assertTrue(
+            scheduler_runtime._should_skip_non_trading_day(
+                {"task_type": "evening_review", "script_path": "", "script_args": ""},
+                engine,
+                datetime(2026, 8, 15, 20, 0),
+            )
+        )
+
+    def test_unknown_trade_calendar_status_keeps_user_deliverable_due(self):
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value.execute.return_value.scalar.return_value = 2
+
+        self.assertIsNone(
+            scheduler_runtime._should_skip_non_trading_day(
+                {"task_type": "news_daily", "script_path": "", "script_args": ""},
+                engine,
+                datetime(2026, 8, 12, 8, 30),
+            )
+        )
 
     def test_counterfactual_drain_runs_on_non_trading_day(self):
         row = {
@@ -707,17 +820,83 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
-    def test_overdue_cron_skips_old_regular_task_after_restart(self):
+    def test_overdue_cron_allows_daily_review_for_rest_of_same_day(self):
         now = datetime(2026, 7, 8, 23, 59, 0)
         startup = now - timedelta(seconds=30)
         row = {"task_type": "daily_review", "last_triggered_at": "2026-07-07 18:00:00"}
 
-        self.assertFalse(
+        self.assertTrue(
             scheduler_runtime._overdue_cron_allowed(
                 row,
                 now=now,
                 cron_time="18:00",
                 startup_time=startup,
+            )
+        )
+
+    def test_user_deliverables_catch_up_after_busy_slot_same_day(self):
+        now = datetime(2026, 8, 12, 23, 59, 0)
+
+        for task_type, cron_time in (
+            ("daily_review", "18:00"),
+            ("evening_review", "20:00"),
+        ):
+            with self.subTest(task_type=task_type):
+                self.assertTrue(
+                    scheduler_runtime._critical_cron_catchup_allowed(
+                        {
+                            "task_type": task_type,
+                            "last_triggered_at": "2026-08-11 20:00:00",
+                            "last_run_status": "success",
+                        },
+                        now=now,
+                        cron_time=cron_time,
+                    )
+                )
+
+    def test_early_briefing_catches_up_only_during_the_morning(self):
+        row = {
+            "task_type": "news_daily",
+            "last_triggered_at": "2026-08-11 08:30:00",
+            "last_run_status": "success",
+        }
+
+        self.assertTrue(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=datetime(2026, 8, 12, 11, 59, 0),
+                cron_time="08:30",
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=datetime(2026, 8, 12, 12, 1, 0),
+                cron_time="08:30",
+            )
+        )
+
+    def test_user_deliverable_failed_run_retries_after_completion_backoff(self):
+        row = {
+            "task_type": "news_daily",
+            "last_triggered_at": "2026-08-12 08:30:00",
+            "last_run_at": "2026-08-12 08:30:00",
+            "last_run_duration": 17 * 60,
+            "last_run_status": "failed",
+        }
+
+        self.assertFalse(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=datetime(2026, 8, 12, 9, 1, 0),
+                cron_time="08:30",
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=datetime(2026, 8, 12, 9, 2, 0),
+                cron_time="08:30",
             )
         )
 
@@ -843,6 +1022,355 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(values["last_run_status"], "failed")
         self.assertEqual(values["last_run_duration"], 0)
         self.assertIn("missing.py", values["last_run_output"])
+
+    def test_run_task_finishes_history_when_script_policy_rejects(self):
+        engine = MagicMock()
+        row = {
+            "id": 70,
+            "task_name": "unsafe",
+            "task_type": "daily_review",
+            "script_path": "../outside.py",
+        }
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="run-70",
+        ), patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            side_effect=scheduler_runtime.SchedulerScriptPolicyError("outside root"),
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        final_values = update_task.call_args.args[2]
+        self.assertEqual(final_values["last_run_status"], "failed")
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "failed")
+        self.assertEqual(history_finish.call_args.kwargs["exit_code"], 126)
+        self.assertIn("SCHEDULER_SCRIPT_BLOCKED", history_finish.call_args.kwargs["output"])
+
+    def test_history_output_redacts_secrets_before_truncating(self):
+        output = (
+            "prefix "
+            + "x" * 5100
+            + " password=hunter2 token:abc123 "
+            + "Authorization: Bearer secret-token "
+            + "mysql://alice:dbpass@db.example/probiga "
+            + "https://example.test/?api_key=query-secret"
+        )
+
+        redacted = scheduler_runtime._redact_history_output(output)
+
+        self.assertLessEqual(len(redacted), scheduler_runtime._HISTORY_OUTPUT_LIMIT)
+        for secret in ("hunter2", "abc123", "secret-token", "dbpass", "query-secret"):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_history_start_records_metadata_without_task_arguments(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__.return_value = conn
+        engine.begin.return_value = ctx
+        row = {
+            "id": 74,
+            "task_name": "early briefing",
+            "task_type": "news_daily",
+            "script_args": "--token should-not-be-stored",
+            "_trigger_source": "scheduled",
+        }
+
+        with patch("server.api.scheduler_runtime._ensure_task_history_table"):
+            run_uid = scheduler_runtime._task_history_start(
+                engine,
+                row,
+                run_uid="fixed-run-74",
+            )
+
+        self.assertEqual(run_uid, "fixed-run-74")
+        params = conn.execute.call_args.args[1]
+        self.assertEqual(params["task_id"], 74)
+        self.assertEqual(params["task_type"], "news_daily")
+        self.assertEqual(params["trigger_source"], "scheduled")
+        self.assertNotIn("script_args", params)
+        self.assertNotIn("should-not-be-stored", str(params))
+
+    def test_legacy_history_upgrade_adds_required_indexes(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        engine.begin.return_value.__enter__.return_value = conn
+        columns_result = MagicMock()
+        columns_result.fetchall.return_value = [
+            (name,)
+            for name in (
+                "id",
+                "run_uid",
+                "task_id",
+                "task_name",
+                "task_type",
+                "run_at",
+                "finished_at",
+                "status",
+                "duration",
+                "exit_code",
+                "output",
+                "host_name",
+                "scheduler_instance_id",
+                "trigger_source",
+            )
+        ]
+        index_result = MagicMock()
+        index_result.mappings.return_value.all.return_value = [
+            {"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}
+        ]
+        conn.execute.side_effect = [MagicMock(), columns_result, index_result, MagicMock(), MagicMock()]
+
+        scheduler_runtime._ensure_task_history_table(engine)
+
+        statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+        self.assertTrue(any("ADD UNIQUE INDEX" in sql and "`run_uid`" in sql for sql in statements))
+        self.assertTrue(
+            any("ADD INDEX" in sql and "`task_id`, `run_at`" in sql for sql in statements)
+        )
+
+    def test_history_upgrade_does_not_duplicate_equivalent_indexes(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        engine.begin.return_value.__enter__.return_value = conn
+        columns_result = MagicMock()
+        columns_result.fetchall.return_value = [
+            (name,)
+            for name in (
+                "id",
+                "run_uid",
+                "task_id",
+                "task_name",
+                "task_type",
+                "run_at",
+                "finished_at",
+                "status",
+                "duration",
+                "exit_code",
+                "output",
+                "host_name",
+                "scheduler_instance_id",
+                "trigger_source",
+            )
+        ]
+        index_result = MagicMock()
+        index_result.mappings.return_value.all.return_value = [
+            {"Key_name": "run_uid_custom", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "run_uid"},
+            {"Key_name": "task_run_custom", "Non_unique": 1, "Seq_in_index": 1, "Column_name": "task_id"},
+            {"Key_name": "task_run_custom", "Non_unique": 1, "Seq_in_index": 2, "Column_name": "run_at"},
+        ]
+        conn.execute.side_effect = [MagicMock(), columns_result, index_result]
+
+        scheduler_runtime._ensure_task_history_table(engine)
+
+        statements = [str(call.args[0]) for call in conn.execute.call_args_list]
+        self.assertFalse(any("ADD UNIQUE INDEX" in sql for sql in statements))
+        self.assertFalse(any("ADD INDEX" in sql for sql in statements))
+
+    def test_history_retention_cleanup_is_bounded_and_throttled(self):
+        engine = MagicMock()
+        read_conn = MagicMock()
+        table_result = MagicMock()
+        table_result.fetchall.return_value = [
+            ("st_scheduled_task_history",),
+            ("sys_wecom_delivery_receipt",),
+        ]
+        read_conn.execute.return_value = table_result
+        engine.connect.return_value.__enter__.return_value = read_conn
+        delete_conn = MagicMock()
+        delete_conn.execute.side_effect = [
+            MagicMock(rowcount=12),
+            MagicMock(rowcount=7),
+        ]
+        engine.begin.return_value.__enter__.return_value = delete_conn
+
+        first = scheduler_runtime._maybe_cleanup_history(engine, monotonic_now=100.0)
+        second = scheduler_runtime._maybe_cleanup_history(engine, monotonic_now=101.0)
+
+        self.assertEqual(
+            first,
+            {"st_scheduled_task_history": 12, "sys_wecom_delivery_receipt": 7},
+        )
+        self.assertEqual(second, {})
+        self.assertEqual(delete_conn.execute.call_count, 2)
+        for call in delete_conn.execute.call_args_list:
+            sql = str(call.args[0])
+            self.assertIn(f"INTERVAL {scheduler_runtime.HISTORY_RETENTION_DAYS} DAY", sql)
+            self.assertIn(f"LIMIT {scheduler_runtime.HISTORY_CLEANUP_BATCH_SIZE}", sql)
+
+    def test_history_cleanup_failure_is_throttled(self):
+        engine = MagicMock()
+        engine.connect.side_effect = RuntimeError("database unavailable")
+
+        self.assertEqual(
+            scheduler_runtime._maybe_cleanup_history(engine, monotonic_now=200.0),
+            {},
+        )
+        self.assertEqual(
+            scheduler_runtime._maybe_cleanup_history(engine, monotonic_now=201.0),
+            {},
+        )
+        self.assertEqual(engine.connect.call_count, 1)
+
+    def test_history_finish_persists_redacted_terminal_summary(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__.return_value = conn
+        engine.begin.return_value = ctx
+
+        scheduler_runtime._task_history_finish(
+            engine,
+            "fixed-run-75",
+            status="failed",
+            duration=22,
+            exit_code=1,
+            output="request failed token=private-token",
+        )
+
+        params = conn.execute.call_args.args[1]
+        self.assertEqual(params["run_uid"], "fixed-run-75")
+        self.assertEqual(params["status"], "failed")
+        self.assertEqual(params["duration"], 22)
+        self.assertEqual(params["exit_code"], 1)
+        self.assertNotIn("private-token", params["output"])
+        self.assertIn("[REDACTED]", params["output"])
+
+    def test_run_task_finishes_history_on_success(self):
+        engine = MagicMock()
+        row = {
+            "id": 71,
+            "task_name": "early briefing",
+            "task_type": "news_daily",
+            "script_path": "biz/early_briefing/generate.py",
+            "script_args": "",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+        fake_proc = MagicMock()
+        fake_proc.communicate.return_value = ("sent", "")
+        fake_proc.returncode = 0
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="run-71",
+        ) as history_start, patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/generate.py"),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env",
+            return_value={},
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args",
+            return_value=[],
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+            return_value=fake_proc,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ):
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        history_start.assert_called_once_with(engine, row, run_uid=None)
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.args[:2], (engine, "run-71"))
+        self.assertEqual(history_finish.call_args.kwargs["status"], "success")
+        self.assertEqual(history_finish.call_args.kwargs["exit_code"], 0)
+        self.assertIn("sent", history_finish.call_args.kwargs["output"])
+
+    def test_run_task_finishes_history_before_timeout_return(self):
+        engine = MagicMock()
+        row = {
+            "id": 72,
+            "task_name": "evening briefing",
+            "task_type": "evening_review",
+            "script_path": "biz/evening_review/generate.py",
+            "script_args": "",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+        fake_proc = MagicMock()
+        fake_proc.communicate.side_effect = [
+            scheduler_runtime.subprocess.TimeoutExpired("cmd", 60),
+            ("partial", "timed out"),
+        ]
+        fake_proc.returncode = -9
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="run-72",
+        ), patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/generate.py"),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env",
+            return_value={},
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args",
+            return_value=[],
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+            return_value=fake_proc,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ):
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "timeout")
+        self.assertEqual(history_finish.call_args.kwargs["exit_code"], -9)
+        self.assertIn("partial", history_finish.call_args.kwargs["output"])
+
+    def test_run_task_finishes_history_when_setup_raises(self):
+        engine = MagicMock()
+        row = {
+            "id": 73,
+            "task_name": "daily review",
+            "task_type": "daily_review",
+            "script_path": "biz/review/generate.py",
+            "script_args": "",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="run-73",
+        ), patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            side_effect=RuntimeError("resolver unavailable"),
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        final_values = update_task.call_args.args[2]
+        self.assertEqual(final_values["last_run_status"], "failed")
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "failed")
+        self.assertIsNone(history_finish.call_args.kwargs["exit_code"])
+        self.assertIn("resolver unavailable", history_finish.call_args.kwargs["output"])
 
     def test_run_task_marks_success_failed_when_data_validation_fails(self):
         engine = MagicMock()

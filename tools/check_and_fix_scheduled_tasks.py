@@ -35,7 +35,10 @@ REQUIRED_TASKS = [
     ('龙虎榜明细', 'alist_info', 'tools/run_single_table.py', 'st_a_list_info', '17:45', 21),
     ('个股资金流向(全量)', 'capital_flow', 'tools/run_single_table.py', 'sm_stock_capital_flow_daily', '17:30', 30),
     ('概念资金流向', 'concept_flow', 'tools/run_single_table.py', 'sm_concept_capital_flow_east', '19:30', 54),
-    ('A股晚报推送', 'evening_review', 'biz/evening_review/generate.py', '', '20:00', 90),
+    ('A股早报推送', 'news_daily', 'biz/early_briefing/generate.py', '', '08:30', 87),
+    ('QMT行业成员快照', 'qmt_membership_snapshot', 'tools/sync_bigqmt_reference.py', '--apply --force-reference-refresh --json', '15:12', 88),
+    ('盘后量化复盘', 'daily_review', 'biz/review/generate.py', '', '18:00', 90),
+    ('A股晚报推送', 'evening_review', 'biz/evening_review/generate.py', '', '20:00', 91),
 ]
 
 # Optional tasks are canonical definitions for audit/repair tooling, but are not
@@ -82,9 +85,9 @@ def main():
             for task_name, task_type, script_path, script_args, cron_time, sort_order in missing_tasks:
                 conn.execute(text("""
                     INSERT INTO st_scheduled_tasks
-                        (task_name, task_type, script_path, script_args, cron_time, date_param, date_param_desc, sort_order, etl_sync_at)
+                        (task_name, task_type, script_path, script_args, cron_time, enabled, date_param, date_param_desc, sort_order, etl_sync_at)
                     VALUES
-                        (:name, :type, :path, :args, :cron, '', '空=当天, 或 YYYY-MM-DD', :order, NOW())
+                        (:name, :type, :path, :args, :cron, 1, '', '空=当天, 或 YYYY-MM-DD', :order, NOW())
                 """), {
                     "name": task_name,
                     "type": task_type,

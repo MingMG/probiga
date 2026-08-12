@@ -569,8 +569,43 @@
 
     function card(lbl, val, cls) { return '<div class="stat-card"><div class="label">' + lbl + '</div><div class="value ' + (cls || '') + '">' + val + '</div></div>'; }
     function jsonF(v, def) { if (!v) return def; if (typeof v === 'object') return v; try { return JSON.parse(v); } catch(e) { return def; } }
-    window.genReviewBtn = function(d) { fetch('/api/hot-data/daily-review/generate?review_date=' + d, {method:'POST'}).then(function(r){return r.json()}).then(function(res){alert('生成' + (res.status === 'success' ? '成功' : '失败') + '!');}); };
-    window.exportReview = function(d) { fetch('/api/hot-data/daily-review/print?review_date='+d).then(function(r){return r.blob()}).then(function(b){var a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download='review_'+d+'.html'; a.click(); URL.revokeObjectURL(a.href);}); };
+    window.genReviewBtn = function(d) {
+        fetch('/api/hot-data/daily-review/generate?review_date=' + encodeURIComponent(d), {method:'POST'})
+            .then(function(r){return r.json();})
+            .then(function(res){
+                if (res.status !== 'success') {
+                    alert('生成失败：' + (res.output || res.status || '未知错误'));
+                    return;
+                }
+                alert('生成成功');
+                var container = document.getElementById('tab-review');
+                if (container && LOADERS && LOADERS.review) LOADERS.review(d, container);
+            })
+            .catch(function(err){ alert('生成失败：' + (err.message || err)); });
+    };
+    window.exportReview = function(d) {
+        fetch('/api/hot-data/daily-review/export?review_date=' + encodeURIComponent(d))
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+                if (res.error || !res.text) {
+                    var quality = jsonF(res.quality, {});
+                    var errors = Array.isArray(quality.errors) ? quality.errors : [];
+                    var detail = errors.length ? '\n- ' + errors.join('\n- ') : '';
+                    alert((res.error || '暂无可导出的复盘') + detail);
+                    return;
+                }
+                var blob = new Blob(['\ufeff' + String(res.text)], {type:'text/markdown;charset=utf-8'});
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = 'review_' + (res.date || d) + '.md';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+            })
+            .catch(function(err) { alert('导出失败：' + (err.message || err)); });
+    };
     window.switchReviewTab = function(tab) {
         var basicEl = document.getElementById('review-basic');
         var proEl = document.getElementById('review-pro');
@@ -4266,13 +4301,77 @@
             });
         },
         review: function (d, c) {
-            // 先加载基础复盘，同时加载专业复盘
+            // 量化三段式为默认视图；目标日完全无量化记录时保留旧版历史视图。
             Promise.all([
                 apiGet('/daily-review?review_date=' + d),
-                apiGet('/daily-review/pro?review_date=' + d)
+                apiGet('/daily-review/pro?review_date=' + d),
+                apiGet('/daily-review/quant?review_date=' + d)
             ]).then(function(results) {
                 var res = results[0];
                 var proRes = results[1];
+                var quantRes = results[2] || {};
+                var quantData = quantRes.data && quantRes.data.length ? quantRes.data[0] : null;
+
+                if (quantRes.error && !quantRes.unavailable) {
+                    c.innerHTML = '<div style="padding:18px 20px;background:#2b1115;border:1px solid #7f1d1d;border-radius:8px;color:#fecaca"><div style="font-weight:700;margin-bottom:8px">量化复盘读取失败</div><div style="font-size:13px">' + escHtml(quantRes.error) + '</div></div>';
+                    return;
+                }
+
+                if (quantData) {
+                    syncDateFromResponse(quantRes);
+                    var reviewDate = quantRes.date || quantData.review_date || d;
+                    var publishStatus = String(quantData.publish_status || '').toLowerCase();
+                    var quality = jsonF(quantData.quality_json, {});
+                    var coverage = quality.coverage || {};
+                    var gates = Array.isArray(quality.gates) ? quality.gates : [];
+                    var errors = Array.isArray(quality.errors) ? quality.errors.slice() : [];
+                    if (!errors.length && publishStatus !== 'ready') {
+                        gates.forEach(function(gate) {
+                            if (String(gate.status || '').toLowerCase() === 'blocked') {
+                                errors.push(gate.message || (gate.name + ' 未通过'));
+                            }
+                        });
+                    }
+                    var targetCoverage = Number(coverage.target);
+                    var coverageText = Number.isFinite(targetCoverage) ? (targetCoverage * 100).toFixed(1) + '%' : '-';
+                    var qualityStatus = String(quality.status || (publishStatus === 'ready' ? 'pass' : 'blocked')).toLowerCase();
+                    var gateLabel = publishStatus === 'ready'
+                        ? (qualityStatus === 'warn' ? '通过（有警告）' : '通过')
+                        : '未通过';
+                    var gateColor = publishStatus === 'ready' ? (qualityStatus === 'warn' ? '#f59e0b' : '#22c55e') : '#ef4444';
+                    var cutoff = quantData.data_cutoff_at ? String(quantData.data_cutoff_at).replace('T', ' ').replace(/\.\d+$/, '') : '-';
+                    var html = '<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px">';
+                    html += '<span style="font-size:16px;font-weight:700;color:#e0e0e0">盘后量化复盘 | ' + escHtml(reviewDate) + '</span>';
+                    html += '<div><button onclick="exportReview(\'' + escAttr(reviewDate) + '\')" style="padding:6px 14px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:12px">导出 Markdown</button></div></div>';
+                    if (quantRes.fallback) {
+                        html += '<div style="margin-bottom:12px;padding:9px 12px;border:1px solid #854d0e;background:#422006;color:#fde68a;border-radius:6px;font-size:12px">请求日 ' + escHtml(quantRes.requested_date || d) + ' 暂无量化复盘，当前显示最近可发布日 ' + escHtml(reviewDate) + '。</div>';
+                    }
+                    html += '<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;font-size:12px">';
+                    html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">数据截止：' + escHtml(cutoff) + '</span>';
+                    html += '<span style="padding:5px 9px;border-radius:12px;background:#172554;color:#bfdbfe">目标覆盖：' + escHtml(coverageText) + '</span>';
+                    html += '<span style="padding:5px 9px;border-radius:12px;background:#111827;color:' + gateColor + ';border:1px solid ' + gateColor + '">质量门禁：' + escHtml(gateLabel) + '</span>';
+                    html += '</div>';
+
+                    if (publishStatus === 'ready') {
+                        html += '<div style="background:#111827;border-radius:8px;padding:22px 24px;font-size:14px;line-height:1.75;color:#cbd5e1;font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">';
+                        html += _renderProReview(quantData.compact_review || '');
+                        html += '</div>';
+                    } else {
+                        html += '<div style="background:#2b1115;border:1px solid #7f1d1d;border-radius:8px;padding:18px 20px;color:#fecaca">';
+                        html += '<div style="font-size:15px;font-weight:700;margin-bottom:10px">本日复盘未发布：质量门禁未通过</div>';
+                        if (errors.length) {
+                            html += '<ul style="margin:0;padding-left:20px;line-height:1.8">';
+                            errors.forEach(function(message) { html += '<li>' + escHtml(message) + '</li>'; });
+                            html += '</ul>';
+                        } else {
+                            html += '<div>未记录具体门禁原因，请重新生成并检查数据完整性。</div>';
+                        }
+                        html += '<button onclick="genReviewBtn(\'' + escAttr(reviewDate) + '\')" style="margin-top:14px;padding:7px 16px;border:none;border-radius:6px;background:#b91c1c;color:#fff;cursor:pointer">重新生成</button></div>';
+                    }
+                    c.innerHTML = html;
+                    return;
+                }
+
                 syncDateFromResponse(res);
                 if (!res.data || !res.data.length) {
                     c.innerHTML = '<div class="loading" style="padding:20px"><p>当前日期暂无复盘数据</p><button onclick="genReviewBtn(\'' + d + '\')" style="margin-top:10px;padding:8px 20px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:14px">🔄 生成复盘数据</button></div>';

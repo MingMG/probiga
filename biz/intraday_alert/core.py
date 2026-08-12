@@ -23,7 +23,7 @@ import httpx
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Connection, Engine
 
-from integrations.wecom.webhook import send_markdown
+from integrations.wecom.delivery import deliver_markdown
 from server.common.config import get_wecom_webhook
 from server.common.mysql_lock import mysql_named_lock
 
@@ -48,18 +48,6 @@ NORMAL_DAILY_CAP = 7
 HARD_DAILY_CAP = 12
 ACTIVE_STATES = frozenset({"SUSPECTED", "ENHANCED", "CONFIRMED"})
 EMIT_STATES = frozenset({"ENHANCED", "CONFIRMED", "INVALIDATED"})
-
-
-def deliver_markdown(webhook_url: str, content: str, **_metadata: Any) -> dict:
-    """Send one alert through the production WeCom adapter.
-
-    The alert outbox below owns idempotency, retry state, and audit metadata, so
-    the shared webhook client only needs to perform the final HTTP delivery.
-    Extra keyword arguments are accepted to keep injected delivery adapters and
-    tests compatible without coupling this feature to an older receipt module.
-    """
-
-    return send_markdown(webhook_url, content)
 STATE_RANK = {"SUSPECTED": 1, "ENHANCED": 2, "CONFIRMED": 3}
 
 

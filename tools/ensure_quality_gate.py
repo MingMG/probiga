@@ -11,16 +11,17 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.batch_db import create_batch_engine
+from server.common.config import get_mysql_url
+from server.common.engine_factory import create_pooled_engine
 
 
 SCHEDULER_COLUMNS = {
@@ -36,13 +37,46 @@ SCHEDULER_COLUMNS = {
     "last_run_duration": "INT DEFAULT 0",
     "etl_sync_at": "DATETIME DEFAULT NULL",
     "updated_at": "DATETIME DEFAULT NULL",
+    "description": "VARCHAR(500) DEFAULT ''",
 }
+REVIEW_DELIVERY_TASK_TYPES = frozenset(
+    {
+        "qmt_membership_snapshot",
+        "news_daily",
+        "daily_review",
+        "evening_review",
+    }
+)
 
 NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
 INTRADAY_ALERT_TASK_TYPES = frozenset({"intraday_market_alert"})
 OPT_IN_TASK_TYPES = INTRADAY_ALERT_TASK_TYPES
-
-
+TASK_PAYLOAD_COLUMNS = frozenset(
+    {
+        "task_name",
+        "task_type",
+        "group_name",
+        "script_path",
+        "script_args",
+        "cron_time",
+        "interval_minutes",
+        "enabled",
+        "description",
+        "sort_order",
+        "date_param",
+    }
+)
+REVIEW_DELIVERY_RUNTIME_COLUMNS = frozenset(
+    {
+        "task_type",
+        "script_path",
+        "script_args",
+        "cron_time",
+        "interval_minutes",
+        "enabled",
+        "date_param",
+    }
+)
 TASKS = [
     {
         "task_name": "Guojin QMT API catalog capability refresh",
@@ -347,18 +381,78 @@ TASKS = [
         "date_param": "",
         "description": "Linux-owned event-driven market, sector, key-stock, style rotation, and broad-index flow alert evaluator.",
     },
+    {
+        "task_name": "QMT industry membership snapshot",
+        "task_type": "qmt_membership_snapshot",
+        "group_name": "Guojin QMT",
+        "script_path": "tools/sync_bigqmt_reference.py",
+        "script_args": "--apply --force-reference-refresh --json",
+        "cron_time": "15:12",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 94,
+        "date_param": "",
+        "description": "Windows QMT bridge-owned daily reference and immutable industry membership snapshot required by the quantitative review gate.",
+    },
+    {
+        "task_name": "A股早报推送",
+        "task_type": "news_daily",
+        "group_name": "资讯公告",
+        "script_path": "biz/early_briefing/generate.py",
+        "script_args": "",
+        "cron_time": "08:30",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 93,
+        "date_param": "",
+        "description": "工作日生成并严格投递早报；缺配置或企微未确认成功时任务失败并在当天补跑。",
+    },
+    {
+        "task_name": "盘后量化复盘",
+        "task_type": "daily_review",
+        "group_name": "系统管理",
+        "script_path": "biz/review/generate.py",
+        "script_args": "",
+        "cron_time": "18:00",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 96,
+        "date_param": "",
+        "description": "生成三段式量化复盘并写库；数据未通过门禁时失败并在当天持续补跑。",
+    },
+    {
+        "task_name": "A股晚报推送",
+        "task_type": "evening_review",
+        "group_name": "资讯公告",
+        "script_path": "biz/evening_review/generate.py",
+        "script_args": "",
+        "cron_time": "20:00",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 97,
+        "date_param": "",
+        "description": "投递已通过质量门禁的三段式量化复盘；数据未就绪或企微未确认时失败并在当天补跑。",
+    },
 ]
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
-    with engine.connect() as conn:
-        rows = conn.execute(text("""
-            SELECT COLUMN_NAME
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME = :table_name
-        """), {"table_name": table_name}).fetchall()
-    return {str(row[0]) for row in rows}
+    try:
+        return {
+            str(column["name"])
+            for column in inspect(engine).get_columns(table_name)
+        }
+    except Exception:
+        # Some MySQL accounts intentionally cannot use SHOW FULL COLUMNS even
+        # though information_schema metadata is available to them.
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = :table_name
+            """), {"table_name": table_name}).fetchall()
+        return {str(row[0]) for row in rows}
 
 
 def ensure_scheduler_columns(engine: Engine) -> None:
@@ -373,12 +467,11 @@ def ensure_scheduler_columns(engine: Engine) -> None:
 
 
 def _task_payload(task: dict[str, Any], columns: set[str]) -> dict[str, Any]:
-    allowed = {
-        "task_name", "task_type", "group_name", "script_path", "script_args",
-        "cron_time", "interval_minutes", "enabled", "description",
-        "sort_order", "date_param",
+    return {
+        key: value
+        for key, value in task.items()
+        if key in TASK_PAYLOAD_COLUMNS and key in columns
     }
-    return {k: v for k, v in task.items() if k in allowed and k in columns}
 
 
 def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
@@ -420,10 +513,66 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         return "inserted"
 
 
+def validate_review_delivery(engine: Engine) -> dict[str, str]:
+    """Fail closed unless all four production task rows match this release."""
+
+    columns = _table_columns(engine, "st_scheduled_tasks")
+    required_columns = REVIEW_DELIVERY_RUNTIME_COLUMNS | {"id"}
+    missing_columns = required_columns - columns
+    if missing_columns:
+        missing = ", ".join(sorted(missing_columns))
+        raise RuntimeError(f"scheduler validation is missing columns: {missing}")
+
+    expected = {
+        str(task["task_type"]): {
+            key: task[key] for key in REVIEW_DELIVERY_RUNTIME_COLUMNS
+        }
+        for task in TASKS
+        if task["task_type"] in REVIEW_DELIVERY_TASK_TYPES
+    }
+    statement = text(
+        "SELECT id, task_type, script_path, script_args, cron_time, "
+        "interval_minutes, enabled, date_param "
+        "FROM st_scheduled_tasks WHERE task_type IN :task_types ORDER BY task_type"
+    ).bindparams(bindparam("task_types", expanding=True))
+    with engine.connect() as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                statement,
+                {"task_types": sorted(REVIEW_DELIVERY_TASK_TYPES)},
+            ).mappings()
+        ]
+    actual: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        task_type = str(row["task_type"])
+        if task_type in actual:
+            raise RuntimeError(f"duplicate scheduler task type: {task_type}")
+        actual[task_type] = row
+
+    missing_tasks = REVIEW_DELIVERY_TASK_TYPES - set(actual)
+    if missing_tasks:
+        raise RuntimeError(
+            "missing review delivery scheduler tasks: "
+            + ", ".join(sorted(missing_tasks))
+        )
+    for task_type, expected_payload in expected.items():
+        row = actual[task_type]
+        drift = {
+            key: (row.get(key), expected_value)
+            for key, expected_value in expected_payload.items()
+            if row.get(key) != expected_value
+        }
+        if drift:
+            fields = ", ".join(sorted(drift))
+            raise RuntimeError(f"scheduler task {task_type} drifted fields: {fields}")
+    return {task_type: "validated" for task_type in sorted(expected)}
+
+
 def run(
     engine: Engine,
     *,
-    task_types: set[str] | frozenset[str] | None = None,
+    task_types: Iterable[str] | None = None,
     intraday_alert_mode: str = "shadow",
 ) -> dict[str, str]:
     requested = (
@@ -434,11 +583,12 @@ def run(
     known = {str(task["task_type"]) for task in TASKS}
     unknown = requested - known
     if unknown:
-        raise ValueError("unknown scheduled task types: " + ", ".join(sorted(unknown)))
+        raise ValueError(f"unknown scheduled task types: {', '.join(sorted(unknown))}")
+
     ensure_scheduler_columns(engine)
     result: dict[str, str] = {}
     for task in TASKS:
-        if str(task.get("task_type") or "") not in requested:
+        if task["task_type"] not in requested:
             continue
         candidate = dict(task)
         if candidate["task_type"] == "intraday_market_alert":
@@ -448,7 +598,7 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Upsert reviewed scheduler task definitions")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--task-type",
         action="append",
@@ -461,15 +611,28 @@ def main(argv: list[str] | None = None) -> int:
         default="shadow",
         help="Runtime mode used when intraday_market_alert is explicitly selected",
     )
-    args = parser.parse_args(argv)
-    engine = create_batch_engine()
-    result = run(
-        engine,
-        task_types=set(args.task_type) or None,
-        intraday_alert_mode=args.intraday_alert_mode,
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument(
+        "--review-delivery-only",
+        action="store_true",
+        help="upsert only the QMT snapshot, early briefing, review, and delivery tasks",
     )
-    if args.task_type and not result:
-        raise RuntimeError("no scheduled task matched --task-type")
+    scope.add_argument("--validate-review-delivery", action="store_true")
+    args = parser.parse_args(argv)
+    engine = create_pooled_engine(get_mysql_url(required=True), pool_pre_ping=True)
+    if args.validate_review_delivery:
+        result = validate_review_delivery(engine)
+    else:
+        selected_types: Iterable[str] | None = set(args.task_type) or None
+        if args.review_delivery_only:
+            selected_types = REVIEW_DELIVERY_TASK_TYPES
+        result = run(
+            engine,
+            task_types=selected_types,
+            intraday_alert_mode=args.intraday_alert_mode,
+        )
+        if args.task_type and not result:
+            raise RuntimeError("no scheduled task matched --task-type")
     for task_name, action in result.items():
         print(f"{action}: {task_name}")
     return 0

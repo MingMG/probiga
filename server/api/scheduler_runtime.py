@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
-from datetime import date, datetime
+import uuid
+from datetime import date, datetime, timedelta
 from socket import gethostname
 from pathlib import Path
 
@@ -44,6 +46,25 @@ CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRON_CATCHUP_WINDOW_
 CRITICAL_CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRITICAL_CRON_CATCHUP_WINDOW_SECONDS", "10800"))
 CRON_RETRY_INTERVAL_MINUTES = max(1, int(os.environ.get("SCHEDULER_CRON_RETRY_INTERVAL_MINUTES", "15")))
 STALE_RUNNING_GRACE_MINUTES = int(os.environ.get("SCHEDULER_STALE_RUNNING_GRACE_MINUTES", "5"))
+HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SCHEDULER_HISTORY_RETENTION_DAYS", "90")))
+HISTORY_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_BATCH_SIZE", "1000")))
+HISTORY_CLEANUP_MAX_BATCHES = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_MAX_BATCHES", "4")))
+HISTORY_CLEANUP_INTERVAL_SECONDS = max(
+    300,
+    int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_INTERVAL_SECONDS", "3600")),
+)
+# Briefings and reviews are user-facing daily deliverables.  Once their cron
+# time has passed, keep post-market reports eligible for the rest of that
+# calendar day; keep an early briefing eligible only through the morning so a
+# scheduler recovery never emits a stale “morning” message at night.
+# The date check in ``_critical_cron_catchup_allowed`` prevents cross-day
+# replay; failed runs continue to use the normal retry backoff above.
+USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS = int(
+    os.environ.get("SCHEDULER_USER_DELIVERY_CATCHUP_WINDOW_SECONDS", "86400")
+)
+EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
+    os.environ.get("SCHEDULER_EARLY_BRIEFING_CATCHUP_WINDOW_SECONDS", "12600")
+)
 # A daily recommendation is a user-facing deliverable.  It must not be lost
 # merely because a long post-market sync occupies the scheduler at its exact
 # cron minute; allow it to be claimed later on the same day.
@@ -52,6 +73,9 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
+        "news_daily",
+        "daily_review",
+        "evening_review",
         "trading_v2_premarket_decision",
         "trading_v2_close_decision",
         "trading_v2_reconciliation",
@@ -71,6 +95,9 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     }
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
+    "news_daily": EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS,
+    "daily_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
+    "evening_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
     "trading_v2_premarket_decision": 6 * 60 * 60,
     "trading_v2_close_decision": 4 * 60 * 60,
     "trading_v2_reconciliation": 4 * 60 * 60,
@@ -109,6 +136,8 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "concept_ths_current",
     "concept_ths_kline",
     "concept_ths_minute",
+    "daily_review",
+    "evening_review",
     "etf_forward_daily",
     "index_current",
     "index_kline",
@@ -121,6 +150,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "intraday_minute_kline",
     "capital_flow_batch_fast",
     "market_overview_daily",
+    "news_daily",
     "qmt_intraday_realtime",
     "quality_check_post",
     "quality_check_pre",
@@ -185,6 +215,7 @@ _running_procs: dict[int, subprocess.Popen] = {}
 _running_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
+_delivery_lane_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
 _running_skip_logged_at: dict[int, datetime] = {}
 _intraday_skip_logged_for: set[tuple[int, str]] = set()
@@ -193,10 +224,23 @@ _delegated_skip_logged_for: set[tuple[int, str]] = set()
 _task_semaphore: threading.Semaphore | None = None
 _fast_lane_semaphore: threading.Semaphore | None = None
 _alert_lane_semaphore: threading.Semaphore | None = None
+_delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
 _scheduler_started_at = datetime.now()
 _scheduler_instance_id = f"{gethostname()}-{os.getpid()}"
+_task_history_schema_lock = threading.Lock()
+_task_history_ready_engines: set[int] = set()
+_history_cleanup_lock = threading.Lock()
+_history_cleanup_next_at = 0.0
+_HISTORY_OUTPUT_LIMIT = 5000
+_HISTORY_SECRET_PATTERNS = (
+    (re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+\-/=]+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([\"']?\b(?:authorization|password|passwd|pwd|token|api[_-]?key|api[_-]?secret|access[_-]?token|secret)\b[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;&}]+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|secret|password)=)([^&#\s]+)"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)([^\s/@]+)(@)"), r"\1[REDACTED]\3"),
+    (re.compile(r"(?i)(\b(?:sk-|ghp_|github_pat_|xox[baprs]-))([A-Za-z0-9_-]{12,})"), r"\1[REDACTED]"),
+)
 
 
 LONG_RUNNING_TASK_TYPES = {
@@ -253,6 +297,15 @@ FAST_LANE_TASK_TYPES = {
 # or trading tick cannot delay a user-visible notification.  Single-flight
 # execution also prevents two observations from sending duplicate alerts.
 ALERT_LANE_TASK_TYPES = {"intraday_market_alert"}
+# User-visible briefings and reviews get one independent worker slot.  This is
+# deliberately separate from both the general sync pool and the latency lane:
+# a long market-data job must not consume the only opportunity to deliver a
+# report, while report generation must not delay intraday safety checks.
+USER_DELIVERY_LANE_TASK_TYPES = {
+    "news_daily",
+    "daily_review",
+    "evening_review",
+}
 INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_capital_flow_fast",
     "intraday_minute_flow",
@@ -276,21 +329,40 @@ INTRADAY_WINDOW_PATH_PARTS = {
 }
 
 
-def _is_trade_day(engine, day: date | None = None) -> bool:
+def _is_trade_day(engine, day: date | None = None) -> bool | None:
+    """Return the explicit calendar state, or ``None`` when it is unknown.
+
+    Missing calendar rows are not equivalent to an exchange holiday: the
+    calendar sync may be incomplete or between truncate and refill.  Callers
+    must only skip work for an explicit ``trade_status = 0`` row.
+    """
     day = day or datetime.now().date()
     try:
         with engine.connect() as conn:
-            count = conn.execute(
+            trade_status = conn.execute(
                 text(
-                    "SELECT COUNT(*) FROM si_trade_calendar "
-                    "WHERE trade_date = :trade_date AND trade_status = 1"
+                    "SELECT trade_status FROM si_trade_calendar "
+                    "WHERE trade_date = :trade_date LIMIT 1"
                 ),
                 {"trade_date": day.isoformat()},
             ).scalar()
-        return bool(count)
+        if trade_status is None:
+            logger.warning("trade calendar has no row for %s; keep scheduled tasks due", day)
+            return None
+        status_value = int(trade_status)
+        if status_value == 1:
+            return True
+        if status_value == 0:
+            return False
+        logger.warning(
+            "trade calendar has unexpected status %r for %s; keep scheduled tasks due",
+            trade_status,
+            day,
+        )
+        return None
     except Exception as exc:
-        logger.warning("trade calendar lookup failed, fallback to weekday: %s", exc)
-        return day.weekday() < 5
+        logger.warning("trade calendar lookup failed; keep scheduled tasks due: %s", exc)
+        return None
 
 
 def _coerce_datetime(value) -> datetime | None:
@@ -349,7 +421,7 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
         status = str(row.get("last_run_status") or "").strip().lower()
         if status not in {"failed", "timeout", "stopped"}:
             return False
-        retry_at = _coerce_datetime(row.get("last_run_at")) or last_triggered
+        retry_at = _cron_retry_reference(row, fallback=last_triggered)
         if (
             now - retry_at
         ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
@@ -360,6 +432,16 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     current_min = now.hour * 60 + now.minute
     missed_seconds = (current_min - cron_min) * 60
     return 0 < missed_seconds <= catchup_window
+
+
+def _cron_retry_reference(row: dict, *, fallback: datetime) -> datetime:
+    """Approximate completion time from persisted start plus duration."""
+    started_at = _coerce_datetime(row.get("last_run_at")) or fallback
+    try:
+        duration_seconds = max(0, int(row.get("last_run_duration") or 0))
+    except (TypeError, ValueError):
+        duration_seconds = 0
+    return started_at + timedelta(seconds=duration_seconds)
 
 
 def _overdue_cron_allowed(
@@ -403,7 +485,7 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     status = str(row.get("last_run_status") or "").strip().lower()
     if status not in {"failed", "timeout", "stopped"}:
         return False
-    retry_at = _coerce_datetime(row.get("last_run_at")) or last_triggered
+    retry_at = _cron_retry_reference(row, fallback=last_triggered)
     return (now - retry_at).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
 
 
@@ -572,10 +654,18 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     "last_run_duration": max(0, age_minutes * 60),
                 },
             )
+            _task_history_mark_interrupted(
+                engine,
+                data,
+                status="failed",
+                duration=max(0, age_minutes * 60),
+                output="scheduler service restarted; prior task run was interrupted",
+            )
             with _running_lock:
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
+                _delivery_lane_running_task_ids.discard(task_id)
             cleaned += 1
             continue
         if age_minutes < timeout_minutes + STALE_RUNNING_GRACE_MINUTES:
@@ -602,35 +692,57 @@ def _cleanup_stale_running_tasks(engine) -> int:
                 "last_run_duration": age_minutes * 60,
             },
         )
+        _task_history_mark_interrupted(
+            engine,
+            data,
+            status="timeout",
+            duration=age_minutes * 60,
+            output=f"stale task exceeded {timeout_minutes} minute timeout",
+        )
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
         cleaned += 1
     return cleaned
 
 
-def _should_skip_non_trading_day(row: dict, engine, now: datetime | None = None) -> bool:
-    now = now or datetime.now()
-    if _is_trade_day(engine, now.date()):
-        return False
+def _should_skip_non_trading_day(
+    row: dict,
+    engine,
+    now: datetime | None = None,
+) -> bool | None:
+    """Return True to skip, False to run, or None to defer for calendar data.
 
+    Deferring leaves the cron task unclaimed, so the next scheduler poll can
+    retry after a calendar truncate/refill or transient lookup failure.  This
+    avoids both a false-success skip and an early briefing built from stale
+    market data.
+    """
+    now = now or datetime.now()
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     script_args = str(row.get("script_args") or "").strip()
 
-    if task_type in NON_TRADING_DAY_SKIP_TYPES:
-        return True
-    if script_path in NON_TRADING_DAY_SKIP_PATHS and (
-        script_args.startswith("sm_")
-        or script_args.startswith("st_a_list")
-        or "stock_" in script_args
-        or "index_" in script_args
-        or "concept_" in script_args
-        or "quality" in task_type
-    ):
-        return True
-    return False
+    market_day_sensitive = task_type in NON_TRADING_DAY_SKIP_TYPES or (
+        script_path in NON_TRADING_DAY_SKIP_PATHS
+        and (
+            script_args.startswith("sm_")
+            or script_args.startswith("st_a_list")
+            or "stock_" in script_args
+            or "index_" in script_args
+            or "concept_" in script_args
+            or "quality" in task_type
+        )
+    )
+    if not market_day_sensitive:
+        return False
+
+    trade_day = _is_trade_day(engine, now.date())
+    if trade_day is None:
+        return None
+    return not trade_day
 
 
 def _mark_non_trading_day_skip(row: dict, engine, now: datetime) -> None:
@@ -677,6 +789,10 @@ def _uses_alert_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in ALERT_LANE_TASK_TYPES
 
 
+def _uses_delivery_lane(row: dict) -> bool:
+    return str(row.get("task_type") or "").strip() in USER_DELIVERY_LANE_TASK_TYPES
+
+
 def _get_fast_lane_semaphore() -> threading.Semaphore:
     global _fast_lane_semaphore
     if _fast_lane_semaphore is None:
@@ -691,13 +807,38 @@ def _get_alert_lane_semaphore() -> threading.Semaphore:
     return _alert_lane_semaphore
 
 
+def _get_delivery_lane_semaphore() -> threading.Semaphore:
+    global _delivery_lane_semaphore
+    if _delivery_lane_semaphore is None:
+        _delivery_lane_semaphore = threading.Semaphore(1)
+    return _delivery_lane_semaphore
+
+
 def _task_lane_semaphore(row: dict) -> threading.Semaphore:
     if _uses_alert_lane(row):
         return _get_alert_lane_semaphore()
+    if _uses_delivery_lane(row):
+        return _get_delivery_lane_semaphore()
     if _uses_fast_lane(row):
         return _get_fast_lane_semaphore()
     return _get_task_semaphore()
 
+
+def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
+    """Return lane capacity while ``_running_lock`` is held by the caller."""
+    if _uses_alert_lane(row):
+        return len(_alert_lane_running_task_ids) < 1
+    if _uses_delivery_lane(row):
+        return len(_delivery_lane_running_task_ids) < 1
+    if _uses_fast_lane(row):
+        return len(_fast_lane_running_task_ids) < 1
+    general_running = len(
+        _running_task_ids
+        - _fast_lane_running_task_ids
+        - _delivery_lane_running_task_ids
+        - _alert_lane_running_task_ids
+    )
+    return general_running < max(1, int(max_general_tasks))
 
 def scheduler_runtime_info() -> dict[str, int | bool]:
     scheduler = get_scheduler_runtime_config()
@@ -707,6 +848,7 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
         "embedded_scheduler_running": bool(_scheduler_thread and _scheduler_thread.is_alive()),
         "scheduler_max_concurrent_tasks": int(scheduler["max_concurrent_tasks"]),
         "scheduler_alert_lane_tasks": 1,
+        "scheduler_delivery_lane_tasks": 1,
         "scheduler_poll_seconds": int(scheduler["poll_seconds"]),
         "api_mysql_pool_size": int(api_pool["pool_size"]),
         "api_mysql_max_overflow": int(api_pool["max_overflow"]),
@@ -817,7 +959,311 @@ def read_scheduler_heartbeat() -> dict[str, object] | None:
         return None
 
 
+def _ensure_task_history_table(engine) -> None:
+    """Create the scheduler audit table while retaining datasource API fields."""
+    engine_key = id(engine)
+    with _task_history_schema_lock:
+        if engine_key in _task_history_ready_engines:
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS st_scheduled_task_history ("
+                    "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
+                    "run_uid VARCHAR(64) NOT NULL, task_id INT NOT NULL, "
+                    "task_name VARCHAR(255) NULL, task_type VARCHAR(64) NULL, "
+                    "run_at DATETIME NOT NULL, finished_at DATETIME NULL, "
+                    "status VARCHAR(32) NOT NULL, duration INT NOT NULL DEFAULT 0, "
+                    "exit_code INT NULL, output TEXT NULL, host_name VARCHAR(128) NULL, "
+                    "scheduler_instance_id VARCHAR(128) NULL, "
+                    "trigger_source VARCHAR(32) NOT NULL DEFAULT 'scheduled', "
+                    "UNIQUE KEY uk_scheduled_task_history_run_uid (run_uid), "
+                    "KEY idx_scheduled_task_history_task_run (task_id, run_at)"
+                    ")"
+                )
+            )
+            columns = {
+                str(row[0])
+                for row in conn.execute(
+                    text("SHOW COLUMNS FROM st_scheduled_task_history")
+                ).fetchall()
+            }
+            # Older installations may already have only the six legacy
+            # columns read by the datasource API.  Extend that table in place
+            # without changing or deleting prior audit rows.
+            extra_columns = {
+                "run_uid": "VARCHAR(64) NULL",
+                "task_name": "VARCHAR(255) NULL",
+                "task_type": "VARCHAR(64) NULL",
+                "finished_at": "DATETIME NULL",
+                "exit_code": "INT NULL",
+                "host_name": "VARCHAR(128) NULL",
+                "scheduler_instance_id": "VARCHAR(128) NULL",
+                "trigger_source": "VARCHAR(32) NULL DEFAULT 'scheduled'",
+            }
+            for column, ddl in extra_columns.items():
+                if column not in columns:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE st_scheduled_task_history "
+                            f"ADD COLUMN `{column}` {ddl}"
+                        )
+                    )
+            index_rows = conn.execute(
+                text("SHOW INDEX FROM st_scheduled_task_history")
+            ).mappings().all()
+            indexes: dict[str, dict[str, object]] = {}
+            for row in index_rows:
+                name = str(row.get("Key_name") or row.get("key_name") or "")
+                if not name:
+                    continue
+                entry = indexes.setdefault(
+                    name,
+                    {"unique": int(row.get("Non_unique") or row.get("non_unique") or 0) == 0, "columns": []},
+                )
+                entry["columns"].append(
+                    (
+                        int(row.get("Seq_in_index") or row.get("seq_in_index") or 0),
+                        str(row.get("Column_name") or row.get("column_name") or ""),
+                    )
+                )
+
+            index_shapes = {
+                (
+                    bool(entry["unique"]),
+                    tuple(column for _seq, column in sorted(entry["columns"])),
+                )
+                for entry in indexes.values()
+            }
+            used_names = set(indexes)
+
+            def _available_index_name(preferred: str) -> str:
+                if preferred not in used_names:
+                    used_names.add(preferred)
+                    return preferred
+                suffix = 2
+                while f"{preferred}_{suffix}" in used_names:
+                    suffix += 1
+                name = f"{preferred}_{suffix}"
+                used_names.add(name)
+                return name
+
+            if (True, ("run_uid",)) not in index_shapes:
+                index_name = _available_index_name("uk_scheduled_task_history_run_uid")
+                conn.execute(
+                    text(
+                        "ALTER TABLE st_scheduled_task_history "
+                        f"ADD UNIQUE INDEX `{index_name}` (`run_uid`)"
+                    )
+                )
+            if (False, ("task_id", "run_at")) not in index_shapes and (
+                True,
+                ("task_id", "run_at"),
+            ) not in index_shapes:
+                index_name = _available_index_name("idx_scheduled_task_history_task_run")
+                conn.execute(
+                    text(
+                        "ALTER TABLE st_scheduled_task_history "
+                        f"ADD INDEX `{index_name}` (`task_id`, `run_at`)"
+                    )
+                )
+        _task_history_ready_engines.add(engine_key)
+
+
+def _maybe_cleanup_history(engine, *, monotonic_now: float | None = None) -> dict[str, int]:
+    """Delete a bounded batch of old audit rows at a low fixed frequency."""
+    global _history_cleanup_next_at
+    current = time.monotonic() if monotonic_now is None else float(monotonic_now)
+    with _history_cleanup_lock:
+        if current < _history_cleanup_next_at:
+            return {}
+        # Advance before I/O so a missing table or transient database failure
+        # cannot turn the scheduler's minute poll into a cleanup hot loop.
+        _history_cleanup_next_at = current + HISTORY_CLEANUP_INTERVAL_SECONDS
+
+    deleted: dict[str, int] = {}
+    table_dates = {
+        "st_scheduled_task_history": "run_at",
+        "sys_wecom_delivery_receipt": "started_at",
+    }
+    try:
+        with engine.connect() as conn:
+            existing = {
+                str(row[0])
+                for row in conn.execute(
+                    text(
+                        "SELECT TABLE_NAME FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA = DATABASE() "
+                        "AND TABLE_NAME IN ('st_scheduled_task_history', 'sys_wecom_delivery_receipt')"
+                    )
+                ).fetchall()
+            }
+        for table_name, date_column in table_dates.items():
+            if table_name not in existing:
+                continue
+            table_deleted = 0
+            for _batch in range(HISTORY_CLEANUP_MAX_BATCHES):
+                with engine.begin() as conn:
+                    result = conn.execute(
+                        text(
+                            f"DELETE FROM `{table_name}` "
+                            f"WHERE `{date_column}` < NOW() - INTERVAL {HISTORY_RETENTION_DAYS} DAY "
+                            f"LIMIT {HISTORY_CLEANUP_BATCH_SIZE}"
+                        )
+                    )
+                batch_deleted = int(getattr(result, "rowcount", 0) or 0)
+                table_deleted += batch_deleted
+                if batch_deleted < HISTORY_CLEANUP_BATCH_SIZE:
+                    break
+            deleted[table_name] = table_deleted
+    except Exception as exc:
+        logger.warning("history retention cleanup failed: %s", exc)
+    return deleted
+
+
+def _redact_history_output(value: object) -> str:
+    output = str(value or "")
+    for pattern, replacement in _HISTORY_SECRET_PATTERNS:
+        output = pattern.sub(replacement, output)
+    return output[-_HISTORY_OUTPUT_LIMIT:]
+
+
+def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str | None:
+    """Append one claimed run. History failure must not prevent delivery."""
+    task_id = int(row["id"])
+    run_uid = str(run_uid or uuid.uuid4().hex)[:64]
+    try:
+        _ensure_task_history_table(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO st_scheduled_task_history "
+                    "(run_uid, task_id, task_name, task_type, run_at, status, "
+                    "host_name, scheduler_instance_id, trigger_source) "
+                    "VALUES (:run_uid, :task_id, :task_name, :task_type, NOW(), "
+                    "'running', :host_name, :instance_id, :trigger_source)"
+                ),
+                {
+                    "run_uid": run_uid,
+                    "task_id": task_id,
+                    "task_name": str(row.get("task_name") or "")[:255],
+                    "task_type": str(row.get("task_type") or "")[:64],
+                    "host_name": gethostname()[:128],
+                    "instance_id": _scheduler_instance_id[:128],
+                    "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
+                },
+            )
+        return run_uid
+    except Exception as exc:
+        logger.warning("Failed to append scheduler history start for task %s: %s", task_id, exc)
+        return None
+
+
+def _task_history_finish(
+    engine,
+    run_uid: str | None,
+    *,
+    status: str,
+    duration: int,
+    exit_code: int | None,
+    output: object,
+) -> None:
+    if not run_uid:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
+                    "status=:status, duration=:duration, exit_code=:exit_code, "
+                    "output=:output WHERE run_uid=:run_uid"
+                ),
+                {
+                    "run_uid": run_uid,
+                    "status": str(status or "failed")[:32],
+                    "duration": max(0, int(duration or 0)),
+                    "exit_code": exit_code,
+                    "output": _redact_history_output(output),
+                },
+            )
+    except Exception as exc:
+        logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
+
+
+def _task_history_mark_interrupted(
+    engine,
+    row: dict,
+    *,
+    status: str,
+    duration: int,
+    output: str,
+) -> None:
+    """Finish the newest orphaned running audit row for a stale task."""
+    try:
+        _ensure_task_history_table(engine)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
+                    "status=:status, duration=:duration, output=:output "
+                    "WHERE task_id=:task_id AND status='running' "
+                    "ORDER BY run_at DESC LIMIT 1"
+                ),
+                {
+                    "task_id": int(row["id"]),
+                    "status": str(status)[:32],
+                    "duration": max(0, int(duration or 0)),
+                    "output": _redact_history_output(output),
+                },
+            )
+    except Exception as exc:
+        logger.warning("Failed to close stale scheduler history for task %s: %s", row.get("id"), exc)
+
+
 def _run_task(row: dict, root: Path, engine) -> None:
+    """Execute one task and leave a terminal audit row on every code path."""
+    requested_run_uid = str(row.get("_history_run_uid") or "") or None
+    history_run_uid = requested_run_uid if row.get("_history_started") else _task_history_start(
+        engine,
+        row,
+        run_uid=requested_run_uid,
+    )
+    started_at = datetime.now()
+    try:
+        _run_task_impl(row, root, engine, history_run_uid=history_run_uid)
+    except Exception as exc:
+        duration = max(0, int((datetime.now() - started_at).total_seconds()))
+        output = f"scheduler task execution failed: {exc}"
+        try:
+            update_scheduler_task(
+                engine,
+                int(row["id"]),
+                {
+                    "last_run_status": "failed",
+                    "last_run_output": output,
+                    "last_run_duration": duration,
+                },
+            )
+        except Exception as update_exc:
+            logger.warning("Failed to persist task %s failure: %s", row.get("id"), update_exc)
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=duration,
+            exit_code=None,
+            output=output,
+        )
+        logger.exception("Scheduler task %s failed before completion", row.get("task_name"))
+
+
+def _run_task_impl(
+    row: dict,
+    root: Path,
+    engine,
+    *,
+    history_run_uid: str | None,
+) -> None:
     """执行单个定时任务"""
     task_id = row["id"]
     task_name = row["task_name"]
@@ -837,6 +1283,14 @@ def _run_task(row: dict, root: Path, engine) -> None:
                 "last_run_duration": 0,
             },
         )
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=0,
+            exit_code=126,
+            output=f"SCHEDULER_SCRIPT_BLOCKED: {exc}",
+        )
         return
     if not script.exists():
         logger.warning("脚本不存在: %s", script)
@@ -848,6 +1302,14 @@ def _run_task(row: dict, root: Path, engine) -> None:
                 "last_run_output": f"脚本不存在: {script}",
                 "last_run_duration": 0,
             },
+        )
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=0,
+            exit_code=127,
+            output=f"script not found: {script}",
         )
         return
 
@@ -906,6 +1368,14 @@ def _run_task(row: dict, root: Path, engine) -> None:
                 },
             )
             logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
+            _task_history_finish(
+                engine,
+                history_run_uid,
+                status=status,
+                duration=duration,
+                exit_code=getattr(proc, "returncode", None),
+                output=output,
+            )
             return
         _running_procs.pop(task_id, None)
 
@@ -939,6 +1409,14 @@ def _run_task(row: dict, root: Path, engine) -> None:
             "last_run_duration": duration,
         },
     )
+    _task_history_finish(
+        engine,
+        history_run_uid,
+        status=status,
+        duration=duration,
+        exit_code=getattr(locals().get("proc"), "returncode", None),
+        output=output,
+    )
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
 
@@ -953,6 +1431,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
+                _delivery_lane_running_task_ids.discard(task_id)
                 _running_skip_logged_at.pop(task_id, None)
 
 
@@ -995,6 +1474,8 @@ def launch_scheduler_task(
             _fast_lane_running_task_ids.add(task_id)
         if _uses_alert_lane(row):
             _alert_lane_running_task_ids.add(task_id)
+        if _uses_delivery_lane(row):
+            _delivery_lane_running_task_ids.add(task_id)
 
     try:
         claimed = _claim_task_run(row, engine)
@@ -1003,12 +1484,14 @@ def launch_scheduler_task(
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
         raise
     if not claimed:
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
         return {
             "accepted": False,
             "status": "already_running",
@@ -1016,9 +1499,18 @@ def launch_scheduler_task(
             "task_name": task_name,
         }
 
+    manual_row = dict(row)
+    manual_row["_trigger_source"] = "manual"
+    manual_history_uid = _task_history_start(
+        engine,
+        manual_row,
+        run_uid=uuid.uuid4().hex,
+    )
+    manual_row["_history_run_uid"] = manual_history_uid
+    manual_row["_history_started"] = bool(manual_history_uid)
     worker = threading.Thread(
         target=_run_task_async,
-        args=(dict(row), root, engine),
+        args=(manual_row, root, engine),
         daemon=True,
         name=f"scheduler-manual-task-{task_id}",
     )
@@ -1029,6 +1521,7 @@ def launch_scheduler_task(
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
             task_id,
@@ -1037,6 +1530,14 @@ def launch_scheduler_task(
                 "last_run_output": "manual task thread failed to start",
                 "last_run_duration": 0,
             },
+        )
+        _task_history_finish(
+            engine,
+            manual_row.get("_history_run_uid"),
+            status="failed",
+            duration=0,
+            exit_code=None,
+            output="manual task thread failed to start",
         )
         raise
     return {
@@ -1079,10 +1580,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             except Exception as exc:
                 logger.warning("僵尸检测异常: %s", exc)
 
+            _maybe_cleanup_history(engine)
+
             with engine.connect() as conn:
                 result = conn.execute(
                     text("SELECT id, task_name, task_type, script_path, script_args, cron_time, interval_minutes, "
-                         "enabled, date_param, last_run_at, last_triggered_at, last_run_status "
+                         "enabled, date_param, last_run_at, last_triggered_at, last_run_status, last_run_duration "
                          "FROM st_scheduled_tasks WHERE enabled = 1 ORDER BY sort_order")
                 )
                 rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
@@ -1163,7 +1666,15 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 time_str,
                             )
 
-                if _should_skip_non_trading_day(row, engine, now):
+                non_trading_day_action = _should_skip_non_trading_day(row, engine, now)
+                if non_trading_day_action is None:
+                    logger.warning(
+                        "Defer scheduled market task until trade calendar is available: %s (type=%s)",
+                        task_name,
+                        row.get("task_type"),
+                    )
+                    continue
+                if non_trading_day_action:
                     logger.info(
                         "Skip scheduled market task on non-trading day: %s (type=%s)",
                         task_name,
@@ -1197,23 +1708,35 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         else:
                             logger.debug("任务 %s 仍在运行，跳过本次触发", task_name)
                         continue
+                    uses_delivery_lane = _uses_delivery_lane(row)
                     uses_fast_lane = _uses_fast_lane(row)
                     uses_alert_lane = _uses_alert_lane(row)
-                    general_running_count = len(
-                        _running_task_ids
-                        - _fast_lane_running_task_ids
-                        - _alert_lane_running_task_ids
-                    )
-                    if uses_alert_lane and len(_alert_lane_running_task_ids) >= 1:
+                    if uses_alert_lane and not _scheduler_lane_has_capacity(
+                        row,
+                        max_general_tasks=max_pending_tasks,
+                    ):
                         logger.debug("Scheduler alert lane full; defer task %s", task_name)
                         continue
-                    if uses_fast_lane and len(_fast_lane_running_task_ids) >= 1:
+                    if uses_delivery_lane and not _scheduler_lane_has_capacity(
+                        row,
+                        max_general_tasks=max_pending_tasks,
+                    ):
+                        logger.debug("Scheduler delivery lane full; defer task %s", task_name)
+                        continue
+                    if uses_fast_lane and not _scheduler_lane_has_capacity(
+                        row,
+                        max_general_tasks=max_pending_tasks,
+                    ):
                         logger.debug("Scheduler fast lane full; defer task %s", task_name)
                         continue
                     if (
-                        not uses_fast_lane
-                        and not uses_alert_lane
-                        and general_running_count >= max_pending_tasks
+                        not uses_alert_lane
+                        and not uses_delivery_lane
+                        and not uses_fast_lane
+                        and not _scheduler_lane_has_capacity(
+                            row,
+                            max_general_tasks=max_pending_tasks,
+                        )
                     ):
                         logger.debug(
                             "Scheduler capacity full (%s); defer task %s",
@@ -1226,6 +1749,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _fast_lane_running_task_ids.add(int(task_id))
                     if uses_alert_lane:
                         _alert_lane_running_task_ids.add(int(task_id))
+                    if uses_delivery_lane:
+                        _delivery_lane_running_task_ids.add(int(task_id))
 
                 try:
                     claimed = _claim_task_run(row, engine)
@@ -1235,6 +1760,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
+                        _delivery_lane_running_task_ids.discard(int(task_id))
                     continue
                 if not claimed:
                     logger.warning("任务 %s 已被其他调度实例抢占，跳过本次触发", task_name)
@@ -1242,15 +1768,50 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
+                        _delivery_lane_running_task_ids.discard(int(task_id))
                     continue
 
                 logger.info("执行定时任务: %s (cron=%s, now=%s)", task_name, cron_time, time_str)
-                threading.Thread(
+                history_uid = _task_history_start(
+                    engine,
+                    row,
+                    run_uid=uuid.uuid4().hex,
+                )
+                row["_history_run_uid"] = history_uid
+                row["_history_started"] = bool(history_uid)
+                worker = threading.Thread(
                     target=_run_task_async,
                     args=(row, root, engine),
                     daemon=True,
                     name=f"scheduler-task-{task_id}",
-                ).start()
+                )
+                try:
+                    worker.start()
+                except Exception as exc:
+                    with _running_lock:
+                        _running_task_ids.discard(int(task_id))
+                        _fast_lane_running_task_ids.discard(int(task_id))
+                        _alert_lane_running_task_ids.discard(int(task_id))
+                        _delivery_lane_running_task_ids.discard(int(task_id))
+                    output = f"scheduled task thread failed to start: {exc}"
+                    update_scheduler_task(
+                        engine,
+                        int(task_id),
+                        {
+                            "last_run_status": "failed",
+                            "last_run_output": output,
+                            "last_run_duration": 0,
+                        },
+                    )
+                    _task_history_finish(
+                        engine,
+                        history_uid,
+                        status="failed",
+                        duration=0,
+                        exit_code=None,
+                        output=output,
+                    )
+                    logger.exception("Failed to start scheduler task thread for %s", task_name)
 
         except Exception as exc:
             logger.error("调度线程异常: %s", exc)

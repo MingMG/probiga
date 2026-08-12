@@ -4131,6 +4131,95 @@ def daily_review(review_date: str = Query(default_factory=lambda: date.today().i
         return {"date": review_date, "data": [], "total": 0, "error": str(e)}
 
 
+def _review_date_text(value: object, default: str) -> str:
+    """Return a stable YYYY-MM-DD response value for DATE-like database values."""
+    if value is None:
+        return default
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return str(isoformat())[:10]
+        except (TypeError, ValueError):
+            pass
+    return str(value)[:10] or default
+
+
+def _is_missing_review_table_error(exc: BaseException) -> bool:
+    """Distinguish an undeployed digest table from operational DB failures."""
+    original = getattr(exc, "orig", None)
+    args = getattr(original or exc, "args", ())
+    if args and args[0] == 1146:  # MySQL ER_NO_SUCH_TABLE
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in ("doesn't exist", "does not exist", "no such table", "undefined table")
+    ) and "st_quant_review_digest" in message
+
+
+def _quant_review_lookup(review_date: str, adjust_type: int = 0):
+    """Atomically resolve an exact digest or the latest earlier ready digest.
+
+    An exact blocked row is intentionally returned as-is.  This keeps a failed
+    target-date quality gate from being hidden by older prose.
+    """
+    rows = _read_sql(
+        """
+        SELECT *
+        FROM st_quant_review_digest
+        WHERE adjust_type = :adjust_type
+          AND (
+              review_date = :d
+              OR (review_date < :d AND publish_status = 'ready')
+          )
+        ORDER BY (review_date = :d) DESC, review_date DESC
+        LIMIT 1
+        """,
+        {"d": review_date, "adjust_type": adjust_type},
+    )
+    if not rows:
+        return None, False
+    row = rows[0]
+    resolved_date = _review_date_text(row.get("review_date"), review_date)
+    return row, resolved_date != review_date
+
+
+@router.get("/hot-data/daily-review/quant")
+def quant_daily_review(
+    review_date: str = Query(default_factory=lambda: date.today().isoformat()),
+    adjust_type: int = Query(default=0),
+):
+    """Quality-gated compact quantitative review, with explicit fallback state."""
+    try:
+        row, fallback = _quant_review_lookup(review_date, adjust_type)
+        if row is None:
+            return {
+                "date": review_date,
+                "requested_date": review_date,
+                "fallback": False,
+                "data": [],
+                "total": 0,
+            }
+        resolved_date = _review_date_text(row.get("review_date"), review_date)
+        return {
+            "date": resolved_date,
+            "requested_date": review_date,
+            "fallback": bool(fallback),
+            "data": [row],
+            "total": 1,
+        }
+    except Exception as e:
+        return {
+            "date": review_date,
+            "requested_date": review_date,
+            "fallback": False,
+            "data": [],
+            "total": 0,
+            "unavailable": _is_missing_review_table_error(e),
+            "error": str(e),
+        }
+
+
 @router.get("/hot-data/research-radar")
 def research_radar(trade_date: str = Query(default=None)):
     """研报/博主/财报趋势雷达，用于网站、早报和晚报统一展示。"""
@@ -4177,11 +4266,25 @@ def premarket_theme_forecast(session_date: str = Query(default=None)):
 @router.get("/hot-data/daily-review-dates")
 def daily_review_dates():
     """复盘数据可用日期列表"""
-    try:
-        rows = _read_sql("SELECT DISTINCT review_date AS d FROM st_daily_review ORDER BY review_date DESC")
-        return {"dates": [r["d"] for r in rows]}
-    except Exception as e:
-        return {"dates": [], "error": str(e)}
+    dates: set[str] = set()
+    errors: list[str] = []
+    for table_name in ("st_quant_review_digest", "st_daily_review"):
+        try:
+            rows = _read_sql(
+                f"SELECT DISTINCT review_date AS d FROM {table_name} ORDER BY review_date DESC"
+            )
+            dates.update(
+                _review_date_text(row.get("d"), "")
+                for row in rows
+                if row.get("d") is not None
+            )
+        except Exception as exc:
+            errors.append(f"{table_name}: {exc}")
+
+    result = {"dates": sorted((item for item in dates if item), reverse=True)}
+    if errors:
+        result["warnings"] = errors
+    return result
 
 
 @router.post("/hot-data/daily-review/generate")
@@ -4392,9 +4495,54 @@ th{{color:#888;font-weight:500;font-size:12px}}
 
 @router.get("/hot-data/daily-review/export")
 def export_daily_review(review_date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """导出复盘数据为文本（优先返回专业复盘）"""
+    """导出复盘文本，量化门禁结果优先且 blocked 时禁止旧版回退。"""
     try:
-        # 优先查询专业复盘
+        try:
+            quant_row, quant_fallback = _quant_review_lookup(review_date, 0)
+        except Exception as exc:
+            # A deployment without the new table can still export historical
+            # legacy reviews. Operational failures must not silently substitute
+            # stale legacy prose for the quality-gated result.
+            if _is_missing_review_table_error(exc):
+                logger.debug("quant review export table unavailable: %s", exc)
+                quant_row, quant_fallback = None, False
+            else:
+                return {
+                    "date": review_date,
+                    "publish_status": "error",
+                    "error": f"量化复盘查询失败: {exc}",
+                }
+
+        if quant_row is not None:
+            resolved_date = _review_date_text(quant_row.get("review_date"), review_date)
+            status = str(quant_row.get("publish_status") or "").lower()
+            quality = quant_row.get("quality_json")
+            if isinstance(quality, str):
+                try:
+                    quality = json.loads(quality)
+                except (TypeError, json.JSONDecodeError):
+                    quality = {"errors": [quality] if quality else []}
+            if not isinstance(quality, dict):
+                quality = {}
+            if status != "ready":
+                return {
+                    "date": resolved_date,
+                    "requested_date": review_date,
+                    "fallback": False,
+                    "publish_status": status or "blocked",
+                    "error": "量化复盘未通过质量门禁",
+                    "quality": quality,
+                }
+            return {
+                "date": resolved_date,
+                "requested_date": review_date,
+                "fallback": bool(quant_fallback),
+                "publish_status": "ready",
+                "text": str(quant_row.get("compact_review") or ""),
+            }
+
+        # The target date has no quant digest (and no earlier ready digest), so
+        # preserve access to historical professional/basic review exports.
         pro_rows = _read_sql("SELECT pro_review FROM st_daily_review_pro WHERE review_date = :d", {"d": review_date})
         if pro_rows and pro_rows[0].get("pro_review"):
             return {"date": review_date, "text": pro_rows[0]["pro_review"]}

@@ -117,6 +117,12 @@ jobs:
           tests/test_scheduler_runtime.py
           tests/test_intraday_alert_rules.py
           tests/test_intraday_alert_core.py
+          tests/test_quant_digest.py
+          tests/test_daily_review_quant_api.py
+          tests/test_evening_review_generate.py
+          tests/test_early_briefing_generate.py
+          tests/test_wecom_delivery.py
+          tests/test_quality_gate.py
 
       - name: Validate independent V4 V5 V6 releases
         shell: bash
