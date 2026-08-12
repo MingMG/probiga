@@ -217,6 +217,62 @@ def test_intraday_sector_recovers_renamed_industry_from_live_names(monkeypatch):
     assert all(row["actionable"] is False for row in result["data"])
 
 
+def test_intraday_sector_exposes_latest_close_as_read_only_review(monkeypatch):
+    def fake_rows(_sql, _params=None, context=""):
+        if context == "screener_intraday_live_quotes":
+            return []
+        if context == "screener_intraday_latest_snapshot":
+            return [{"snapshot_at": "2026-08-12 15:00:00"}]
+        if context == "screener_intraday_review_quotes":
+            assert _params["quote_date"] == "2026-08-12"
+            return [
+                {"stock_code": "603399", "short_name": "永杉锂业", "price": 17.29, "change_pct": 9.99, "snapshot_at": "2026-08-12 15:00:00"},
+                {"stock_code": "002240", "short_name": "盛新锂能", "price": 33.72, "change_pct": 5.61, "snapshot_at": "2026-08-12 15:00:00"},
+            ]
+        if context == "screener_intraday_theme_strength":
+            assert "DATE(c.snapshot_at) = :quote_date" in _sql
+            return []
+        if context == "screener_intraday_theme_members":
+            raise AssertionError("synthetic name theme does not need a DB member query")
+        raise AssertionError(context)
+
+    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
+    monkeypatch.setattr(screener, "_intraday_market_day_active", lambda: False)
+    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
+    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: rows)
+    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
+
+    result = screener._run_preset(
+        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
+        "2026-08-11",
+    )
+
+    assert result["freshness"] == "historical_close"
+    assert result["review_only"] is True
+    assert result["data_date"] == "2026-08-12"
+    assert result["actionable_output_allowed"] is False
+    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
+
+
+def test_intraday_sector_does_not_fallback_to_old_snapshot_during_session(monkeypatch):
+    def fake_rows(_sql, _params=None, context=""):
+        if context == "screener_intraday_live_quotes":
+            return []
+        raise AssertionError(f"must not read historical close during session: {context}")
+
+    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
+    monkeypatch.setattr(screener, "_intraday_market_day_active", lambda: True)
+
+    result = screener._run_preset(
+        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
+        "2026-08-11",
+    )
+
+    assert result["freshness"] == "unavailable"
+    assert result["data"] == []
+    assert result["actionable_output_allowed"] is False
+
+
 def test_intraday_shortlist_reserves_slots_for_small_live_name_theme():
     rows = [
         {

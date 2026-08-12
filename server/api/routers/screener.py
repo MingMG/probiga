@@ -933,12 +933,26 @@ def _intraday_quota_shortlist(
     return selected
 
 
+def _intraday_market_day_active(now: datetime | None = None) -> bool:
+    current = now or datetime.now()
+    current_time = current.time()
+    return (
+        current.weekday() < 5
+        and time(9, 20) <= current_time <= time(15, 10)
+    )
+
+
 def _run_intraday_sector(
     request: ScreenerRunRequest,
     target_date: str,
     preset: dict[str, Any],
 ) -> dict[str, Any]:
-    """Rank fresh, concept-linked intraday leaders without granting order authority."""
+    """Rank concept-linked leaders without ever granting order authority.
+
+    During the session only a fresh ten-minute quote window is accepted.  Once
+    the session has ended, the latest complete market snapshot is exposed as a
+    clearly-labelled, read-only review instead of returning an empty page.
+    """
     filters = request.filters or {}
     min_change = float(filters.get("min_change", 1.0))
     minimum_active = max(2, int(filters.get("minimum_active_members", 2)))
@@ -959,6 +973,46 @@ def _run_intraday_sector(
         {"target_date": target_date, "min_change": min_change},
         context="screener_intraday_live_quotes",
     )
+    freshness = "live"
+    quote_date = date.today().isoformat()
+    quote_filter_sql = "c.snapshot_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)"
+    quote_filter_params: dict[str, Any] = {}
+    if not live_rows and not _intraday_market_day_active():
+        latest_rows = _engine_rows(
+            """
+            SELECT MAX(snapshot_at) AS snapshot_at
+            FROM sm_stock_current
+            WHERE price > 0
+            """,
+            context="screener_intraday_latest_snapshot",
+        )
+        latest_snapshot = str((latest_rows[0] if latest_rows else {}).get("snapshot_at") or "")
+        quote_date = latest_snapshot[:10]
+        if quote_date:
+            freshness = "historical_close"
+            quote_filter_sql = "DATE(c.snapshot_at) = :quote_date"
+            quote_filter_params = {"quote_date": quote_date}
+            live_rows = _engine_rows(
+                """
+                SELECT c.stock_code, c.short_name, c.price, c.change_pct,
+                       c.volume, c.amount, c.snapshot_at,
+                       k.close, k.high, k.low, k.turnover_ratio
+                FROM sm_stock_current c
+                LEFT JOIN sm_stock_kline k
+                  ON k.stock_code = c.stock_code
+                 AND k.k_type = 1 AND k.adjust_type = 0
+                 AND k.trade_date = :target_date
+                WHERE DATE(c.snapshot_at) = :quote_date
+                  AND c.price > 0 AND c.change_pct >= :min_change
+                  AND c.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
+                """,
+                {
+                    "target_date": target_date,
+                    "quote_date": quote_date,
+                    "min_change": min_change,
+                },
+                context="screener_intraday_review_quotes",
+            )
     observed_at = max(
         (str(row.get("snapshot_at") or "") for row in live_rows),
         default="",
@@ -968,7 +1022,7 @@ def _run_intraday_sector(
             "status": "degraded",
             "preset": preset,
             "requested_date": _clean_date(request.as_of_date) or date.today().isoformat(),
-            "data_date": date.today().isoformat(),
+            "data_date": quote_date or date.today().isoformat(),
             "freshness": "unavailable",
             "source": "sm_stock_current+si_stock_concept_east",
             "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
@@ -977,11 +1031,11 @@ def _run_intraday_sector(
             "stats": {"input_count": 0, "result_count": 0, "selector_summary": selector_run_summary([])},
             "data": [],
             "total": 0,
-            "error": "没有十分钟内的新鲜全市场行情；禁止用旧快照冒充盘中主线。",
+            "error": "没有可用的全市场行情快照；盘中机会暂时无法生成。",
         }
 
     theme_rows = _engine_rows(
-        """
+        f"""
         SELECT m.theme_code AS concept_code, MAX(m.theme_name) AS concept_name,
                MAX(m.theme_source) AS theme_source,
                COUNT(DISTINCT m.stock_code) AS total_members,
@@ -1000,7 +1054,7 @@ def _run_intraday_sector(
             WHERE industry_name IS NOT NULL AND industry_name <> ''
         ) m
         JOIN sm_stock_current c ON c.stock_code = m.stock_code
-        WHERE c.snapshot_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+        WHERE {quote_filter_sql}
           AND c.price > 0
         GROUP BY m.theme_code
         HAVING active_members >= :minimum_active
@@ -1009,7 +1063,11 @@ def _run_intraday_sector(
         ORDER BY average_change_pct DESC, active_members DESC, leader_change_pct DESC
         LIMIT 500
         """,
-        {"active_change": max(2.0, min_change), "minimum_active": minimum_active},
+        {
+            "active_change": max(2.0, min_change),
+            "minimum_active": minimum_active,
+            **quote_filter_params,
+        },
         context="screener_intraday_theme_strength",
     )
     name_theme_members: list[dict[str, Any]] = []
@@ -1179,10 +1237,11 @@ def _run_intraday_sector(
         "status": "ok",
         "preset": preset,
         "requested_date": _clean_date(request.as_of_date) or date.today().isoformat(),
-        "data_date": date.today().isoformat(),
+        "data_date": quote_date,
         "evidence_date": target_date,
         "observed_at": observed_at,
-        "freshness": "live",
+        "freshness": freshness,
+        "review_only": freshness != "live",
         "source": "sm_stock_current+si_stock_concept_east+previous_close_evidence",
         "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
         "actionable_output_allowed": False,

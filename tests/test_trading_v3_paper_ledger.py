@@ -18,6 +18,19 @@ class _Rows:
 class _Connection:
     def execute(self, statement, params):
         sql = str(statement)
+        if "FROM sm_stock_current c" in sql:
+            assert params == {"quote_code_0": "688059"}
+            return _Rows(
+                [
+                    {
+                        "stock_code": "688059",
+                        "short_name": "华锐精密",
+                        "price": 99.80,
+                        "snapshot_at": "2026-08-12 15:00:00",
+                        "data_source": "GJ_BIG_QMT_INNER",
+                    }
+                ]
+            )
         if "FROM st_sim_position" in sql:
             return _Rows(
                 [
@@ -77,4 +90,9 @@ def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
     assert result["data"]["summary"]["legacy_position_count"] == 1
     assert result["data"]["positions"][0]["stock_code"] == "688059"
     assert result["data"]["positions"][0]["ledger_source"] == "LEGACY_EVENT_SIM"
+    assert result["data"]["positions"][0]["current_price"] == 99.8
+    assert result["data"]["positions"][0]["market_value"] == 99_800.0
+    assert result["data"]["positions"][0]["unrealized_pnl"] == 4_270.0
+    assert result["data"]["positions"][0]["unrealized_pnl_pct"] == 4.47
+    assert result["data"]["summary"]["total_unrealized_pnl"] == 4_270.0
     assert result["data"]["real_trading_enabled"] is False

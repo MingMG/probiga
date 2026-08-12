@@ -414,11 +414,64 @@ def paper_ledger(
             {"limit": int(limit)},
         ).mappings().all()]
 
+        position_codes = sorted({
+            str(row.get("stock_code") or "").zfill(6)
+            for row in [*v2_positions, *legacy_positions]
+            if row.get("stock_code")
+        })
+        latest_quotes: dict[str, dict[str, Any]] = {}
+        if position_codes:
+            quote_params: dict[str, Any] = {}
+            quote_placeholders: list[str] = []
+            for index, stock_code in enumerate(position_codes):
+                key = f"quote_code_{index}"
+                quote_params[key] = stock_code
+                quote_placeholders.append(f":{key}")
+            quote_rows = connection.execute(
+                text(
+                    f"""
+                    SELECT c.stock_code, c.short_name, c.price,
+                           c.snapshot_at, c.data_source
+                    FROM sm_stock_current c
+                    JOIN (
+                        SELECT stock_code, MAX(snapshot_at) AS snapshot_at
+                        FROM sm_stock_current
+                        WHERE stock_code IN ({','.join(quote_placeholders)})
+                        GROUP BY stock_code
+                    ) latest
+                      ON latest.stock_code = c.stock_code
+                     AND latest.snapshot_at = c.snapshot_at
+                    """
+                ),
+                quote_params,
+            ).mappings().all()
+            latest_quotes = {
+                str(row.get("stock_code") or "").zfill(6): dict(row)
+                for row in quote_rows
+            }
+
+    def enrich_position(row: dict[str, Any]) -> dict[str, Any]:
+        result = dict(row)
+        stock_code = str(result.get("stock_code") or "").zfill(6)
+        quote = latest_quotes.get(stock_code) or {}
+        quantity = int(result.get("remaining_quantity") or result.get("quantity") or 0)
+        cost_price = float(result.get("cost_price") or result.get("average_cost") or 0)
+        current_price = float(quote.get("price") or 0)
+        result["current_price"] = round(current_price, 4) if current_price > 0 else None
+        result["quote_at"] = quote.get("snapshot_at")
+        result["quote_source"] = quote.get("data_source")
+        result["market_value"] = round(current_price * quantity, 2) if current_price > 0 else None
+        result["unrealized_pnl"] = round((current_price - cost_price) * quantity, 2) if current_price > 0 and cost_price > 0 else None
+        result["unrealized_pnl_pct"] = round((current_price / cost_price - 1.0) * 100.0, 2) if current_price > 0 and cost_price > 0 else None
+        if not result.get("short_name") and quote.get("short_name"):
+            result["short_name"] = quote.get("short_name")
+        return result
+
     positions = []
     for row in v2_positions:
-        positions.append({**row, "ledger_source": "V2_CANONICAL"})
+        positions.append(enrich_position({**row, "ledger_source": "V2_CANONICAL"}))
     for row in legacy_positions:
-        positions.append({
+        positions.append(enrich_position({
             **row,
             "ledger_source": "LEGACY_EVENT_SIM",
             "position_state": "HOLDING",
@@ -427,7 +480,7 @@ def paper_ledger(
             "sellable_quantity": 0 if str(row.get("buy_date") or "")[:10] == date.today().isoformat() else int(row.get("buy_shares") or 0),
             "cost_price": row.get("buy_price"),
             "last_reason": row.get("buy_reason") or "事件驱动模拟成交",
-        })
+        }))
 
     orders = []
     for row in v2_orders:
@@ -449,6 +502,8 @@ def paper_ledger(
         for row in legacy_positions
     )
     v2_cash = float(account.get("cash_balance") or initial_cash)
+    total_market_value = round(sum(float(row.get("market_value") or 0) for row in positions), 2)
+    total_unrealized_pnl = round(sum(float(row.get("unrealized_pnl") or 0) for row in positions), 2)
     return _envelope({
         "account_id": account_id,
         "account": account,
@@ -463,6 +518,8 @@ def paper_ledger(
             "legacy_order_count": len(legacy_orders),
             "cash_balance": v2_cash,
             "legacy_cost_market_value": round(legacy_market_value, 2),
+            "current_market_value": total_market_value,
+            "total_unrealized_pnl": total_unrealized_pnl,
         },
         "ledger_sources": ["V2_CANONICAL", "LEGACY_EVENT_SIM"],
         "real_trading_enabled": False,
