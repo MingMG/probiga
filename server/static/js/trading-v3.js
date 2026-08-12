@@ -146,6 +146,7 @@
     if(!run.run_uid){el('heroTitle').textContent='V3 尚未产生首个决策';el('heroReason').textContent='完成样本外验收后才会启用模拟组合。';el('hero').classList.add('blocked')}
     else if(ready&&formalTargets.length){el('heroTitle').textContent='发现扣费后正期望目标，进入模拟组合';el('heroReason').textContent=discoveryTargets.length?'正式目标通过全部闸门；同时有左侧实验小仓收集前向证据。':'目标已经通过样本外、成本、仓位、主题和开放风险约束。';el('hero').classList.remove('blocked')}
     else if(ready&&discoveryTargets.length){el('heroTitle').textContent='左侧实验触发，进入模拟盘小仓试错';el('heroReason').textContent='这不是“已证明能赚钱”的推荐；系统会动态止损，并把成功与失败都写入下一版校准样本。';el('hero').classList.remove('blocked')}
+    else if(positionCount){el('heroTitle').textContent='本次没有新增目标，继续管理现有 '+String(positionCount)+' 只持仓';el('heroReason').textContent='现有持仓和盈亏继续按模拟账本管理；本次 V3 决策没有新增可执行买入目标。';el('hero').classList.add('blocked')}
     else{el('heroTitle').textContent='当前没有值得出手的组合，保持现金';el('heroReason').textContent=ready?'没有股票同时通过净期望和组合约束，空仓不是故障。':'新公式尚未形成排序可信的正期望模型，旧目标已隔离，自动模拟买入暂停。';el('hero').classList.add('blocked')}
   }
   function renderOverview(){
@@ -153,7 +154,7 @@
     var discoveryTargets=targets.filter(isDiscoveryTarget),uncalibratedOnly=targets.length>0&&discoveryTargets.length===targets.length;
     el('decisionStatus').textContent=portfolio.status||'尚无组合';el('decisionStatus').className='badge '+(targets.length?'safe':'warning');
     el('decisionFacts').innerHTML=[
-      fact('决策日期',run.trade_date||'—'),fact('市场状态',run.dominant_regime||regime.dominant_state||'—'),fact('目标风险资产',pct(Number(portfolio.target_risk_asset_weight||0)*100,1)),fact('目标现金',money(portfolio.target_cash)),fact('组合预期收益',uncalibratedOnly?'未校准（仅模拟试错）':pct(portfolio.expected_portfolio_return_pct)),fact('最坏开放风险',money(portfolio.worst_case_loss_cny))
+      fact('决策日期',run.trade_date||'—'),fact('市场状态',run.dominant_regime||regime.dominant_state||'—'),fact('目标风险资产',pct(Number(portfolio.target_risk_asset_weight||0)*100,1)),fact('V3 本次决策预算现金',money(portfolio.target_cash)),fact('组合预期收益',uncalibratedOnly?'未校准（仅模拟试错）':pct(portfolio.expected_portfolio_return_pct)),fact('最坏开放风险',money(portfolio.worst_case_loss_cny))
     ].join('');
     var counts={};state.forecasts.forEach(function(x){counts[x.strategy_key]=(counts[x.strategy_key]||0)+(x.forecast_status==='VALIDATED_POSITIVE'?1:0)});
     el('sleeveCards').innerHTML=Object.keys(strategyNames).map(function(k){var calibrated=(state.readiness.active_calibrated_sleeves||[]).indexOf(k)>=0;return '<div class="card"><strong>'+esc(strategy(k))+'</strong><span>'+esc(calibrated?'已有样本外校准':k==='oversold_reversal'?'独立模拟试错并积累前向样本':'未校准时只观察，不借用别的策略结论')+'</span><em>'+String(counts[k]||0)+' 个通过</em></div>'}).join('');

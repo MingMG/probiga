@@ -116,7 +116,7 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
     assert "trading-v3.css?v=6" in page
-    assert "trading-v3.js?v=18" in page
+    assert "trading-v3.js?v=19" in page
     assert 'id="equitySource"' in page
     assert 'id="cashSource"' in page
     assert 'id="unrealizedPnl"' in page
@@ -136,6 +136,8 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "ledgerSummary.display_cash_balance" in script
     assert "String(positionCount)+' 只'" in script
     assert "本次决策目标 '+String(targets.length)+' 只" in script
+    assert "本次没有新增目标，继续管理现有" in script
+    assert "V3 本次决策预算现金" in script
     assert "String(actionableTargets.length)+' / '" not in script
     assert "diversifyDynamic(dynamic,20)" in script
     assert "window.openKlineModal" in app
