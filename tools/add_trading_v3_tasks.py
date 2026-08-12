@@ -24,11 +24,11 @@ TASKS = (
             "--mode close --universe-limit 1200 "
             "--per-sleeve-limit 300"
         ),
-        "cron_time": "16:05",
+        "cron_time": "22:05",
         "interval_minutes": 0,
         "date_param": "",
         "date_param_desc": "",
-        "description": "完整日线与资金数据落库后生成V3模拟组合和内部模拟订单，并推送早报机器人",
+        "description": "收盘后等待日线、题材、资金、公告与QMT成员快照落库，再生成V3/V4/V5/V6模拟组合并推送早报机器人",
         "sort_order": 130,
         "enabled": 1,
     },

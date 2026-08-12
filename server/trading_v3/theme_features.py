@@ -95,10 +95,24 @@ THEME_CLUSTER_TAXONOMY = {
     "BATTERY": {
         "canonical_label": "电池",
         "keywords": ("电池", "锂电", "固态电池", "钠离子电池"),
+        "name_markers": ("电池",),
+    },
+    "LITHIUM": {
+        "canonical_label": "锂产业链",
+        "keywords": (
+            "锂产业链",
+            "锂电原料",
+            "锂矿",
+            "锂资源",
+            "锂盐",
+            "碳酸锂",
+        ),
+        "name_markers": ("锂",),
     },
     "PHOTOVOLTAIC": {
         "canonical_label": "光伏",
         "keywords": ("光伏", "太阳能", "HJT", "TOPCON"),
+        "name_markers": ("光伏",),
     },
     "ENERGY_STORAGE": {
         "canonical_label": "储能",
@@ -151,6 +165,7 @@ THEME_CLUSTER_TAXONOMY = {
     "PRECIOUS_METAL": {
         "canonical_label": "贵金属",
         "keywords": ("黄金", "白银", "贵金属"),
+        "name_markers": ("黄金",),
     },
 }
 
@@ -232,6 +247,35 @@ def cluster_theme_labels(labels: Iterable[Any]) -> list[dict[str, Any]]:
         }
         for cluster_key, item in sorted(clustered.items())
     ]
+
+
+def infer_name_theme_memberships(
+    stock_names: Mapping[Any, Any],
+) -> dict[str, list[Membership]]:
+    """Infer narrow business themes from immutable security short names.
+
+    This is a fallback for providers whose concept snapshot omits a company's
+    most obvious business identity.  Only explicit ``name_markers`` from the
+    shared taxonomy are eligible; broad taxonomy keywords are deliberately
+    not scanned, which prevents generic words from inventing memberships.
+    """
+
+    inferred: dict[str, list[Membership]] = defaultdict(list)
+    for raw_code, raw_name in stock_names.items():
+        code = str(raw_code or "")[:6]
+        name = str(raw_name or "").strip()
+        if not code or not name:
+            continue
+        for cluster_key, settings in THEME_CLUSTER_TAXONOMY.items():
+            markers = tuple(settings.get("name_markers") or ())
+            if not markers or not any(str(marker) in name for marker in markers):
+                continue
+            inferred[code].append((
+                f"NAME_CLUSTER:{cluster_key}",
+                str(settings.get("canonical_label") or cluster_key),
+                "name_keyword",
+            ))
+    return dict(inferred)
 
 
 def cluster_themes_by_component_overlap(
@@ -979,7 +1023,13 @@ def diversified_universe_codes(
     *,
     limit: int,
 ) -> list[str]:
-    """Reserve room for trend, ignition, theme and oversold reversal setups."""
+    """Reserve room for trend, ignition, theme and oversold reversal setups.
+
+    The theme reserve is intentionally applied before the shared blend.  A
+    newly strengthening board therefore reaches V3/V4/V5/V6 evaluation even
+    when its leaders are not yet top-market momentum names.  This changes
+    observation coverage only; it does not bypass any risk or entry gate.
+    """
 
     if not base:
         return []
@@ -995,19 +1045,22 @@ def diversified_universe_codes(
         )
         distance = float(item.get("distance_ma20_pct") or 0.0)
         ignition = (
-            0.28
+            0.24
             * _scaled(float(item.get("amount_ratio_5_20") or 0.0), 0.9, 2.8)
-            + 0.22
-            * _scaled(float(item.get("latest_change_pct") or 0.0), -1.0, 7.0)
-            + 0.20
-            * float(item.get("theme_opportunity_score") or 0.0)
             + 0.18
+            * _scaled(float(item.get("latest_change_pct") or 0.0), -1.0, 7.0)
+            + 0.18
+            * float(item.get("theme_opportunity_score") or 0.0)
+            + 0.16
             * float(item.get("stock_leadership_score") or 0.0)
-            + 0.12 * (1.0 - _scaled(abs(distance - 3.0), 0.0, 12.0))
+            + 0.16
+            * float(item.get("news_theme_context_score") or 0.0)
+            + 0.08 * (1.0 - _scaled(abs(distance - 3.0), 0.0, 12.0))
         )
         theme_leader = (
-            0.58 * float(item.get("theme_opportunity_score") or 0.0)
-            + 0.42 * float(item.get("stock_leadership_score") or 0.0)
+            0.50 * float(item.get("theme_opportunity_score") or 0.0)
+            + 0.32 * float(item.get("stock_leadership_score") or 0.0)
+            + 0.18 * float(item.get("news_theme_context_score") or 0.0)
         )
         ret20 = float(item.get("return_20d_pct") or 0.0)
         drawdown = float(item.get("drawdown_20d_pct") or 0.0)
@@ -1070,15 +1123,162 @@ def diversified_universe_codes(
         ascending=[False, False],
     )
     requested = max(1, int(limit))
+    theme_reserve_quota = min(requested, max(12, int(requested * 0.20)))
+    per_theme_limit = 3
+    theme_groups: dict[
+        str,
+        list[tuple[str, float, float, float]],
+    ] = defaultdict(list)
+    semantic_groups: dict[
+        str,
+        dict[str, tuple[str, float, float, float]],
+    ] = defaultdict(dict)
+    name_theme_groups: dict[
+        str,
+        dict[str, tuple[str, float, float, float]],
+    ] = defaultdict(dict)
+    for code, item in base.items():
+        context_score = float(item.get("news_theme_context_score") or 0.0)
+        for candidate in item.get("theme_signal_candidates") or ():
+            theme_code = str(candidate.get("theme_code") or "").strip()
+            board_score = float(
+                candidate.get("theme_composite_score")
+                or candidate.get("theme_opportunity_score")
+                or 0.0
+            )
+            stock_score = float(candidate.get("stock_leadership_score") or 0.0)
+            novelty_score = float(
+                candidate.get("theme_news_novelty_score") or 0.0
+            )
+            trigger_score = max(
+                board_score,
+                context_score,
+                novelty_score,
+            )
+            if not theme_code or trigger_score < 0.35:
+                continue
+            theme_groups[theme_code].append((
+                str(code),
+                stock_score,
+                float(ranked.at[code, "ignition"]),
+                trigger_score,
+            ))
+            if str(candidate.get("theme_source") or "") == "name_keyword":
+                name_theme_groups[theme_code][str(code)] = (
+                    str(code),
+                    stock_score,
+                    float(ranked.at[code, "ignition"]),
+                    trigger_score,
+                )
+            for cluster_key in candidate.get("theme_cluster_keys") or ():
+                normalized_cluster = str(cluster_key or "").strip()
+                if normalized_cluster in THEME_CLUSTER_TAXONOMY:
+                    row = (
+                        str(code),
+                        stock_score,
+                        float(ranked.at[code, "ignition"]),
+                        trigger_score,
+                    )
+                    previous = semantic_groups[normalized_cluster].get(
+                        str(code)
+                    )
+                    if previous is None or row[3:] > previous[3:]:
+                        semantic_groups[normalized_cluster][str(code)] = row
+    ordered_themes = sorted(
+        theme_groups,
+        key=lambda theme_code: (
+            -max(row[3] for row in theme_groups[theme_code]),
+            theme_code,
+        ),
+    )
+    theme_codes: list[str] = []
+    for theme_code in sorted(name_theme_groups):
+        leaders = sorted(
+            name_theme_groups[theme_code].values(),
+            key=lambda row: (-row[1], -row[3], -row[2], row[0]),
+        )[:3]
+        for code, _stock_score, _ignition, _trigger_score in leaders:
+            if code not in theme_codes:
+                theme_codes.append(code)
+            if len(theme_codes) >= theme_reserve_quota:
+                break
+        if len(theme_codes) >= theme_reserve_quota:
+            break
+    semantic_quota = theme_reserve_quota
+    semantic_leaders = {
+        cluster_key: sorted(
+            rows,
+            key=lambda row: (-row[3], -row[1], -row[2], row[0]),
+        )
+        for cluster_key, by_code in semantic_groups.items()
+        for rows in (list(by_code.values()),)
+    }
+    cluster_opportunities = sorted(
+        (
+            semantic_leaders[cluster_key][0][3],
+            cluster_key,
+        )
+        for cluster_key in semantic_leaders
+    )
+    opportunity_values = pd.Series(
+        [row[0] for row in cluster_opportunities],
+        dtype=float,
+    )
+    opportunity_percentiles = opportunity_values.rank(
+        method="average",
+        pct=True,
+    ).tolist()
+    ordered_clusters = [
+        cluster_key
+        for percentile, (_opportunity, cluster_key) in sorted(
+            zip(opportunity_percentiles, cluster_opportunities),
+            key=lambda row: (
+                -row[0],
+                row[1][1],
+            ),
+        )
+        if percentile >= 0.50
+    ]
+    # Keep three independently ranked leaders when available.  One stock alone
+    # cannot demonstrate board breadth, while three still leave the majority of
+    # the universe to the normal multi-sleeve blend.
+    for cluster_key in ordered_clusters:
+        for leader in semantic_leaders[cluster_key][:3]:
+            code = leader[0]
+            if code not in theme_codes:
+                theme_codes.append(code)
+            if len(theme_codes) >= semantic_quota:
+                break
+        if len(theme_codes) >= semantic_quota:
+            break
+    for theme_code in ordered_themes:
+        leaders = sorted(
+            theme_groups[theme_code],
+            key=lambda row: (-row[3], -row[1], -row[2], row[0]),
+        )[:per_theme_limit]
+        for code, _stock_score, _ignition, _trigger_score in leaders:
+            if code not in theme_codes:
+                theme_codes.append(code)
+            if len(theme_codes) >= theme_reserve_quota:
+                break
+        if len(theme_codes) >= theme_reserve_quota:
+            break
     # A broad sell-off can put hundreds of liquid stocks into a bottoming
     # process at once.  Reserve half of the retail universe for this distinct
     # shape; the remaining half still comes from the multi-sleeve blend.
-    reversal_quota = min(requested, max(50, int(requested * 0.50)))
+    reversal_quota = min(
+        max(0, requested - len(theme_codes)),
+        max(50, int(requested * 0.50)),
+    )
     reversal_codes = ranked.sort_values(
         ["reversal_pct", "reversal", "blend"],
         ascending=[False, False, False],
     ).head(reversal_quota).index.tolist()
-    result = [str(code) for code in reversal_codes]
+    result = list(theme_codes)
+    for code in reversal_codes:
+        normalized = str(code)
+        if normalized not in result:
+            result.append(normalized)
     for code in blended.index.tolist():
         normalized = str(code)
         if normalized not in result:

@@ -30,6 +30,7 @@ def test_v3_daily_tasks_use_bounded_production_universe() -> None:
             f"--per-sleeve-limit {DEFAULT_PER_SLEEVE_LIMIT}"
             in task["script_args"]
         )
+    assert daily_tasks["trading_v3_close_decision"]["cron_time"] == "22:05"
 
 
 def test_daily_bar_loader_streams_rows_into_frame() -> None:

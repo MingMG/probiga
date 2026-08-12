@@ -26,6 +26,7 @@ from .theme_features import (
     build_theme_alias_index,
     calculate_theme_statistics,
     diversified_universe_codes,
+    infer_name_theme_memberships,
 )
 
 logger = logging.getLogger(__name__)
@@ -981,6 +982,21 @@ def load_daily_feature_universe(
         codes=codes,
         industries=industries,
     )
+    latest_names = {
+        str(row.stock_code)[:6]: str(row.short_name or "")
+        for row in (
+            frame.sort_values("trade_date")
+            .groupby("stock_code", sort=False, observed=True)
+            .tail(1)
+            .itertuples(index=False)
+        )
+    }
+    for code, inferred in infer_name_theme_memberships(latest_names).items():
+        existing = theme_memberships.setdefault(code, [])
+        existing_keys = {(item[0], item[2]) for item in existing}
+        for membership in inferred:
+            if (membership[0], membership[2]) not in existing_keys:
+                existing.append(membership)
     market = _market_features(frame, dates, industries)
     market.update(
         _qmt_attestation_evidence(
@@ -1189,6 +1205,11 @@ def load_daily_feature_universe(
         memberships=theme_memberships,
         statistics=theme_statistics,
     )
+    for item in base.values():
+        item["news_theme_context_score"] = theme_context_score(
+            _theme_context_label(item),
+            dict(market.get("context_theme_scores") or {}),
+        )
 
     finance = _load_finance(
         primary_engine,
@@ -1291,10 +1312,6 @@ def load_daily_feature_universe(
     selected = []
     for code in ranked_codes:
         item = base[code]
-        item["news_theme_context_score"] = theme_context_score(
-            _theme_context_label(item),
-            dict(market.get("context_theme_scores") or {}),
-        )
         item["market_news_risk_score"] = float(
             market.get("news_risk_score") or 0.0
         )
