@@ -402,7 +402,7 @@ def paper_ledger(
                 """
                 SELECT id, stock_code, short_name, strategy_type, side,
                        requested_shares, filled_shares, remaining_shares,
-                       limit_price, filled_price, status, reason,
+                       limit_price, target_price, filled_price, status, reason,
                        reject_reason, last_match_reason, order_date,
                        order_time, filled_at, created_at
                 FROM st_sim_order
@@ -412,6 +412,30 @@ def paper_ledger(
                 """
             ),
             {"limit": int(limit)},
+        ).mappings().all()]
+        legacy_profit_rows = [dict(row) for row in connection.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(profit), 0) AS realized_profit
+                FROM st_sim_position
+                WHERE COALESCE(trade_mode, 'live') = 'live'
+                  AND status = 'sold'
+                """
+            ),
+            {},
+        ).mappings().all()]
+        legacy_capital_rows = [dict(row) for row in connection.execute(
+            text(
+                """
+                SELECT initial_capital
+                FROM st_sim_risk_budget
+                WHERE COALESCE(trade_mode, 'live') = 'live'
+                  AND initial_capital > 0
+                ORDER BY budget_date DESC, updated_at DESC
+                LIMIT 1
+                """
+            ),
+            {},
         ).mappings().all()]
 
         position_codes = sorted({
@@ -568,13 +592,87 @@ def paper_ledger(
             "expires_at": row.get("filled_at") or "",
         })
     initial_cash = float(account.get("initial_cash") or 0)
+    latest_equity = account.get("latest_equity") or {}
     legacy_market_value = sum(
         float(row.get("buy_price") or 0) * int(row.get("buy_shares") or 0)
         for row in legacy_positions
     )
-    v2_cash = float(account.get("cash_balance") or initial_cash)
+    legacy_current_market_value = sum(
+        float(
+            (latest_quotes.get(str(row.get("stock_code") or "").zfill(6)) or {}).get("price")
+            or row.get("buy_price")
+            or 0
+        ) * int(row.get("buy_shares") or 0)
+        for row in legacy_positions
+    )
+    legacy_initial_cash = float(
+        (legacy_capital_rows[0] if legacy_capital_rows else {}).get("initial_capital")
+        or 1_000_000
+    )
+    legacy_realized_pnl = float(
+        (legacy_profit_rows[0] if legacy_profit_rows else {}).get("realized_profit")
+        or 0
+    )
+
+    def pending_buy_amount(row: dict[str, Any]) -> float:
+        if str(row.get("status") or "").upper() not in {"PENDING", "PARTIAL"}:
+            return 0.0
+        if str(row.get("side") or "").upper() != "BUY":
+            return 0.0
+        remaining = int(row.get("remaining_shares") or 0)
+        if remaining <= 0:
+            remaining = max(
+                0,
+                int(row.get("requested_shares") or 0)
+                - int(row.get("filled_shares") or 0),
+            )
+        price = float(row.get("limit_price") or row.get("target_price") or 0)
+        return remaining * price
+
+    legacy_pending_buy_amount = sum(
+        pending_buy_amount(row) for row in legacy_orders
+    )
+    legacy_unrealized_pnl = legacy_current_market_value - legacy_market_value
+    legacy_cash_balance = (
+        legacy_initial_cash
+        + legacy_realized_pnl
+        - legacy_market_value
+        - legacy_pending_buy_amount
+    )
+    legacy_total_equity = (
+        legacy_initial_cash + legacy_realized_pnl + legacy_unrealized_pnl
+    )
+    account_cash = account.get("cash_balance")
+    v2_cash = float(account_cash if account_cash is not None else initial_cash)
+    equity_cash = latest_equity.get("cash_balance")
+    canonical_cash = float(equity_cash if equity_cash is not None else v2_cash)
+    equity_market_value = latest_equity.get("market_value")
+    canonical_market_value = float(
+        equity_market_value if equity_market_value is not None else 0
+    )
+    equity_total = latest_equity.get("total_equity")
+    canonical_total_equity = float(
+        equity_total
+        if equity_total is not None
+        else canonical_cash + canonical_market_value
+    )
     total_market_value = round(sum(float(row.get("market_value") or 0) for row in positions), 2)
     total_unrealized_pnl = round(sum(float(row.get("unrealized_pnl") or 0) for row in positions), 2)
+    legacy_account_present = bool(
+        legacy_capital_rows or legacy_positions or legacy_orders
+    )
+    if legacy_account_present and v2_positions:
+        display_account_scope = "MERGED_LEDGER"
+        display_cash_balance = canonical_cash + legacy_cash_balance
+        display_total_equity = canonical_total_equity + legacy_total_equity
+    elif legacy_account_present:
+        display_account_scope = "LEGACY_EVENT_SIM_ACTIVE"
+        display_cash_balance = legacy_cash_balance
+        display_total_equity = legacy_total_equity
+    else:
+        display_account_scope = "V2_CANONICAL"
+        display_cash_balance = canonical_cash
+        display_total_equity = canonical_total_equity
     return _envelope({
         "account_id": account_id,
         "account": account,
@@ -589,9 +687,25 @@ def paper_ledger(
             "v2_order_count": len(v2_orders),
             "legacy_order_count": len(legacy_orders),
             "cash_balance": v2_cash,
+            "canonical_initial_cash": initial_cash,
+            "canonical_cash_balance": round(canonical_cash, 2),
+            "canonical_market_value": round(canonical_market_value, 2),
+            "canonical_total_equity": round(canonical_total_equity, 2),
+            "canonical_equity_trade_date": latest_equity.get("trade_date"),
+            "canonical_account_name": account.get("account_name") or "V2 主模拟账户",
+            "canonical_account_scope": "V2_CANONICAL_ONLY",
+            "legacy_initial_cash": round(legacy_initial_cash, 2),
+            "legacy_realized_pnl": round(legacy_realized_pnl, 2),
+            "legacy_pending_buy_amount": round(legacy_pending_buy_amount, 2),
+            "legacy_cash_balance": round(legacy_cash_balance, 2),
+            "legacy_market_value": round(legacy_current_market_value, 2),
+            "legacy_total_equity": round(legacy_total_equity, 2),
             "legacy_cost_market_value": round(legacy_market_value, 2),
             "current_market_value": total_market_value,
             "total_unrealized_pnl": total_unrealized_pnl,
+            "display_account_scope": display_account_scope,
+            "display_cash_balance": round(display_cash_balance, 2),
+            "display_total_equity": round(display_total_equity, 2),
         },
         "ledger_sources": ["V2_CANONICAL", "LEGACY_EVENT_SIM"],
         "real_trading_enabled": False,

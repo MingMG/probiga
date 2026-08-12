@@ -68,10 +68,10 @@
       </section>
 
       <section class="metrics">
-        <article><span>账户权益</span><strong id="equity">—</strong><small>万一佣金，最低 5 元</small></article>
-        <article><span>可用现金</span><strong id="cash">—</strong><small>空仓也是主动决策</small></article>
-        <article><span>通过样本外闸门</span><strong id="validated">—</strong><small id="sleeves">策略独立记账</small></article>
-        <article><span>目标持仓</span><strong id="targetCount">—</strong><small id="targetPolicy">读取当前生产仓位规则</small></article>
+        <article><span>当前模拟账户总权益</span><strong id="equity">—</strong><small id="equitySource">读取当前持仓所属账本</small></article>
+        <article><span>当前可用现金</span><strong id="cash">—</strong><small id="cashSource">读取当前持仓所属账本</small></article>
+        <article><span>当前浮动盈亏</span><strong id="unrealizedPnl">—</strong><small id="marketValue">读取最新持仓市值</small></article>
+        <article><span>当前持仓</span><strong id="positionCount">—</strong><small id="targetPolicy">同时显示本次决策目标</small></article>
       </section>
 
       <section class="view active" id="view-overview">
@@ -285,6 +285,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v3.js?v=17"></script>
+  <script src="/static/js/trading-v3.js?v=18"></script>
 </body>
 </html>

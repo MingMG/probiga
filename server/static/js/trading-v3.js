@@ -14,6 +14,7 @@
   function pct(v,d){var n=Number(v);return Number.isFinite(n)?n.toFixed(d==null?2:d)+'%':'—'}
   function ratio(v){var n=Number(v);return Number.isFinite(n)?n.toFixed(2):'—'}
   function money(v){if(v==null||v==='')return '—';var n=Number(v);return Number.isFinite(n)?'¥'+n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}
+  function firstNumber(values){for(var i=0;i<values.length;i+=1){if(values[i]!=null&&values[i]!==''&&Number.isFinite(Number(values[i])))return Number(values[i])}return null}
   function unwrap(v){return v&&v.data}
   function fetchJson(path){return fetch(path,{headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
   function postJson(path,body){var options={method:'POST',headers:{Accept:'application/json'}};if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}return fetch(path,options).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
@@ -120,21 +121,28 @@
     el('actionStatus').textContent=brief(daily,'日级')+'；'+brief(live,'盘中');
   }
   function renderChrome(){
-    var run=state.overview.run||{},portfolio=run.portfolio||{},regime=run.regime||{},account=state.account||{},equity=account.latest_equity||{};
-    var ready=state.readiness.paper_ready,targets=portfolio.targets||state.targets||[],actionableTargets=ready?targets.filter(isExecutableTarget):[];
+    var run=state.overview.run||{},portfolio=run.portfolio||{},regime=run.regime||{},account=state.account||{},equity=account.latest_equity||{},ledgerSummary=(state.paperLedger||{}).summary||{};
+    var ready=state.readiness.paper_ready,targets=portfolio.targets||state.targets||[],actionableTargets=targets.filter(isExecutableTarget);
     var discoveryTargets=actionableTargets.filter(isDiscoveryTarget);
     var formalTargets=actionableTargets.filter(function(x){return discoveryTargets.indexOf(x)<0});
+    var displayEquity=firstNumber([ledgerSummary.display_total_equity,ledgerSummary.canonical_total_equity,equity.total_equity,account.cash_balance]);
+    var displayCash=firstNumber([ledgerSummary.display_cash_balance,ledgerSummary.canonical_cash_balance,equity.cash_balance,account.cash_balance]);
+    var displayPnl=firstNumber([ledgerSummary.total_unrealized_pnl])||0;
+    var accountScope=String(ledgerSummary.display_account_scope||'V2_CANONICAL');
+    var scopeText=accountScope==='LEGACY_EVENT_SIM_ACTIVE'?'当前持仓来自事件模拟账本；空仓 V2 账本未重复叠加':accountScope==='MERGED_LEDGER'?'V2 与事件模拟账本均有持仓，按独立账户合计':'当前持仓来自 V2 主模拟账本';
+    var positionCount=Number(ledgerSummary.position_count||0),positionLots=Number(ledgerSummary.position_lot_count||0);
     el('regime').textContent=run.dominant_regime||regime.dominant_state||'尚无决策';
     el('riskCap').textContent='风险仓位上限 '+pct(Number(run.risk_asset_cap||regime.risk_asset_cap||0)*100,1);
-    el('equity').textContent=money(equity.total_equity||account.cash_balance);
-    el('cash').textContent=money(account.cash_balance);
-    el('validated').textContent=String(run.validated_count==null?'0':run.validated_count);
-    el('sleeves').textContent=(state.readiness.active_calibrated_sleeves||[]).map(strategy).join(' / ')||'暂无策略通过样本外闸门';
-    var opportunityAudit=(run.portfolio||{}).opportunity_audit||{},limits=state.readiness.portfolio_limits||{};
-    var targetCap=formalTargets.length?Number(limits.maximum_positions||limits.maximum_live_positions||0):Number(limits.maximum_paper_discovery_positions||opportunityAudit.maximum_paper_positions||0);
-    if(!targetCap)targetCap=Number(limits.maximum_live_positions||12);
-    el('targetCount').textContent=String(actionableTargets.length)+' / '+String(targetCap);
-    el('targetPolicy').textContent='正式组合最多 '+String(limits.maximum_positions||limits.maximum_live_positions||'—')+' 只；模拟试错最多 '+String(limits.maximum_paper_discovery_positions||'—')+' 只；加仓最多 '+String(limits.maximum_add_count==null?'—':limits.maximum_add_count)+' 次';
+    el('equity').textContent=money(displayEquity);
+    el('cash').textContent=money(displayCash);
+    el('equitySource').textContent=scopeText;
+    el('cashSource').textContent='待买资金 '+money(ledgerSummary.legacy_pending_buy_amount||0)+'；已实现盈亏 '+money(ledgerSummary.legacy_realized_pnl||0);
+    el('unrealizedPnl').textContent=(displayPnl>0?'+':'')+money(displayPnl);
+    el('unrealizedPnl').className=pnlClass(displayPnl);
+    el('marketValue').textContent='最新持仓市值 '+money(ledgerSummary.current_market_value||0);
+    var limits=state.readiness.portfolio_limits||{};
+    el('positionCount').textContent=String(positionCount)+' 只'+(positionLots!==positionCount?' / '+String(positionLots)+' 笔':'');
+    el('targetPolicy').textContent='本次决策目标 '+String(targets.length)+' 只；其中可执行 '+String(actionableTargets.length)+' 只；正式上限 '+String(limits.maximum_positions||limits.maximum_live_positions||'—')+' 只';
     if(!run.run_uid){el('heroTitle').textContent='V3 尚未产生首个决策';el('heroReason').textContent='完成样本外验收后才会启用模拟组合。';el('hero').classList.add('blocked')}
     else if(ready&&formalTargets.length){el('heroTitle').textContent='发现扣费后正期望目标，进入模拟组合';el('heroReason').textContent=discoveryTargets.length?'正式目标通过全部闸门；同时有左侧实验小仓收集前向证据。':'目标已经通过样本外、成本、仓位、主题和开放风险约束。';el('hero').classList.remove('blocked')}
     else if(ready&&discoveryTargets.length){el('heroTitle').textContent='左侧实验触发，进入模拟盘小仓试错';el('heroReason').textContent='这不是“已证明能赚钱”的推荐；系统会动态止损，并把成功与失败都写入下一版校准样本。';el('hero').classList.remove('blocked')}
