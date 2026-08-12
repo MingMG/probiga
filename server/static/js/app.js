@@ -3753,12 +3753,16 @@
         setStatus((frame.title || '交易模块') + '已加载');
     };
     window.addEventListener('message', function(event) {
-        if (!event.data || ['probiga-trading-v2-resize', 'probiga-trading-v3-resize'].indexOf(event.data.type) < 0) return;
+        if (!event.data || ['probiga-trading-v2-resize', 'probiga-trading-v3-resize', 'probiga-open-kline'].indexOf(event.data.type) < 0) return;
         var matchedFrame = null;
         document.querySelectorAll('.trade-full-frame').forEach(function(frame) {
             if (event.source === frame.contentWindow) matchedFrame = frame;
         });
         if (!matchedFrame || (event.origin !== window.location.origin && event.origin !== 'null')) return;
+        if (event.data.type === 'probiga-open-kline') {
+            window.openKlineModal(String(event.data.stock_code || ''), String(event.data.short_name || ''));
+            return;
+        }
         window.resizeTradingModuleFrame(matchedFrame, event.data.height);
     });
     window.openTradingModule = function(tabId) {

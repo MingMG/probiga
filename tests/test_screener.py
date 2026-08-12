@@ -104,7 +104,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "四版本实际运行：V3 为基础排序" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
     assert "style.css?v=36" in index
-    assert "app.js?v=86" in index
+    assert "app.js?v=87" in index
 
 
 def test_trading_v3_candidate_page_uses_unified_production_selector():
@@ -115,12 +115,14 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
 
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
-    assert "trading-v3.js?v=14" in page
+    assert "trading-v3.js?v=15" in page
     assert "postJson('/api/screener/run'" in script
     assert "preset:'intraday_sector'" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
     assert "自动下单','固定关闭" in script
+    assert "probiga-open-kline" in script
+    assert "window.openKlineModal" in app
     assert "V3-V6 生产融合" in app
     assert "V3.6 生产真值" not in app
 
