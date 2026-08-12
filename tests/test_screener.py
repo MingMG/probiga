@@ -115,13 +115,17 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
 
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
-    assert "trading-v3.js?v=15" in page
+    assert "trading-v3.css?v=6" in page
+    assert "trading-v3.js?v=16" in page
     assert "postJson('/api/screener/run'" in script
     assert "preset:'intraday_sector'" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
     assert "自动下单','固定关闭" in script
     assert "probiga-open-kline" in script
+    assert "pnl-gain" in script
+    assert "pnl-loss" in script
+    assert "position_lot_count" in script
     assert "window.openKlineModal" in app
     assert "V3-V6 生产融合" in app
     assert "V3.6 生产真值" not in app

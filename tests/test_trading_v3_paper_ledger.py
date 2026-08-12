@@ -96,4 +96,46 @@ def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
     assert result["data"]["positions"][0]["unrealized_pnl"] == 4_270.0
     assert result["data"]["positions"][0]["unrealized_pnl_pct"] == 4.47
     assert result["data"]["summary"]["total_unrealized_pnl"] == 4_270.0
+    assert result["data"]["summary"]["position_lot_count"] == 1
+    assert result["data"]["positions"][0]["position_lot_count"] == 1
     assert result["data"]["real_trading_enabled"] is False
+
+
+def test_paper_ledger_merges_same_stock_with_weighted_cost(monkeypatch):
+    monkeypatch.setattr(trading_v3, "get_engine", lambda: _Engine())
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "account", lambda self, account_id: {})
+    monkeypatch.setattr(
+        v2_repository.TradingV2ReadRepository,
+        "positions",
+        lambda self, account_id: [
+            {
+                "stock_code": "688059",
+                "short_name": "华锐精密",
+                "position_state": "HOLDING",
+                "quantity": 400,
+                "remaining_quantity": 400,
+                "sellable_quantity": 400,
+                "cost_price": 100.0,
+            }
+        ],
+    )
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "orders", lambda self, account_id, limit: [])
+
+    result = trading_v3.paper_ledger(account_id="paper-main-v2", limit=20)
+    data = result["data"]
+    assert data["summary"]["position_count"] == 1
+    assert data["summary"]["position_lot_count"] == 2
+    assert len(data["positions"]) == 1
+    position = data["positions"][0]
+    assert position["stock_code"] == "688059"
+    assert position["quantity"] == 1400
+    assert position["sellable_quantity"] == 400
+    assert position["cost_price"] == 96.8071
+    assert position["current_price"] == 99.8
+    assert position["market_value"] == 139_720.0
+    assert position["unrealized_pnl"] == 4_190.0
+    assert position["unrealized_pnl_pct"] == 3.09
+    assert position["position_lot_count"] == 2
+    assert position["ledger_source"] == "MERGED_LEDGER"
+    assert position["ledger_sources"] == ["V2_CANONICAL", "LEGACY_EVENT_SIM"]
+    assert data["merge_policy"] == "READ_ONLY_GROUP_BY_STOCK_CODE_WEIGHTED_COST"

@@ -467,11 +467,11 @@ def paper_ledger(
             result["short_name"] = quote.get("short_name")
         return result
 
-    positions = []
+    position_lots = []
     for row in v2_positions:
-        positions.append(enrich_position({**row, "ledger_source": "V2_CANONICAL"}))
+        position_lots.append(enrich_position({**row, "ledger_source": "V2_CANONICAL"}))
     for row in legacy_positions:
-        positions.append(enrich_position({
+        position_lots.append(enrich_position({
             **row,
             "ledger_source": "LEGACY_EVENT_SIM",
             "position_state": "HOLDING",
@@ -481,6 +481,77 @@ def paper_ledger(
             "cost_price": row.get("buy_price"),
             "last_reason": row.get("buy_reason") or "事件驱动模拟成交",
         }))
+
+    def merge_position_lots(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge display positions by security without changing the fill ledger."""
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            stock_code = str(row.get("stock_code") or "").zfill(6)
+            grouped.setdefault(stock_code, []).append(row)
+
+        merged: list[dict[str, Any]] = []
+        for stock_code, lots in grouped.items():
+            result = dict(lots[0])
+            quantities = [
+                int(lot.get("remaining_quantity") or lot.get("quantity") or 0)
+                for lot in lots
+            ]
+            quantity = sum(quantities)
+            cost_amount = sum(
+                float(lot.get("cost_price") or lot.get("average_cost") or 0) * lot_quantity
+                for lot, lot_quantity in zip(lots, quantities)
+            )
+            cost_price = cost_amount / quantity if quantity > 0 and cost_amount > 0 else 0.0
+            current_prices = [
+                float(lot.get("current_price") or 0)
+                for lot in lots
+                if float(lot.get("current_price") or 0) > 0
+            ]
+            current_price = current_prices[0] if current_prices else 0.0
+            ledger_sources = list(dict.fromkeys(
+                str(lot.get("ledger_source") or "") for lot in lots if lot.get("ledger_source")
+            ))
+            reasons = list(dict.fromkeys(
+                str(lot.get("invalidation_condition") or lot.get("last_reason") or "")
+                for lot in lots
+                if lot.get("invalidation_condition") or lot.get("last_reason")
+            ))
+            stops = [
+                float(lot.get("protective_stop") or 0)
+                for lot in lots
+                if float(lot.get("protective_stop") or 0) > 0
+            ]
+            quote_lot = max(lots, key=lambda lot: str(lot.get("quote_at") or ""))
+
+            result.update({
+                "stock_code": stock_code,
+                "short_name": quote_lot.get("short_name") or result.get("short_name"),
+                "position_state": result.get("position_state") or result.get("state") or "HOLDING",
+                "quantity": quantity,
+                "remaining_quantity": quantity,
+                "sellable_quantity": sum(int(lot.get("sellable_quantity") or 0) for lot in lots),
+                "cost_price": round(cost_price, 4) if cost_price > 0 else None,
+                "average_cost": round(cost_price, 4) if cost_price > 0 else None,
+                "current_price": round(current_price, 4) if current_price > 0 else None,
+                "market_value": round(current_price * quantity, 2) if current_price > 0 else None,
+                "unrealized_pnl": round(current_price * quantity - cost_amount, 2)
+                if current_price > 0 and cost_amount > 0 else None,
+                "unrealized_pnl_pct": round((current_price * quantity / cost_amount - 1.0) * 100.0, 2)
+                if current_price > 0 and cost_amount > 0 else None,
+                "protective_stop": round(max(stops), 4) if stops else None,
+                "add_count": sum(int(lot.get("add_count") or 0) for lot in lots) + max(0, len(lots) - 1),
+                "quote_at": quote_lot.get("quote_at"),
+                "quote_source": quote_lot.get("quote_source"),
+                "ledger_source": ledger_sources[0] if len(ledger_sources) == 1 else "MERGED_LEDGER",
+                "ledger_sources": ledger_sources,
+                "position_lot_count": len(lots),
+                "holding_notes": reasons,
+                "last_reason": "；".join(reasons),
+            })
+            merged.append(result)
+        return merged
+
+    positions = merge_position_lots(position_lots)
 
     orders = []
     for row in v2_orders:
@@ -511,6 +582,7 @@ def paper_ledger(
         "orders": orders,
         "summary": {
             "position_count": len(positions),
+            "position_lot_count": len(position_lots),
             "order_count": len(orders),
             "v2_position_count": len(v2_positions),
             "legacy_position_count": len(legacy_positions),
@@ -523,7 +595,7 @@ def paper_ledger(
         },
         "ledger_sources": ["V2_CANONICAL", "LEGACY_EVENT_SIM"],
         "real_trading_enabled": False,
-        "merge_policy": "READ_ONLY_NO_FILL_COPY",
+        "merge_policy": "READ_ONLY_GROUP_BY_STOCK_CODE_WEIGHTED_COST",
     })
 
 
