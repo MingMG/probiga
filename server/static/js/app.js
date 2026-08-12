@@ -3779,7 +3779,7 @@
         var view = item.tradingView;
         var modulePage = item.modulePage === 'v2' ? 'v2' : 'v3';
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
-        var moduleLabel = modulePage === 'v3' ? 'V3.6 生产真值' : '共享生产证据';
+        var moduleLabel = modulePage === 'v3' ? 'V3-V6 生产融合' : '共享生产证据';
         container.innerHTML = '<div class="trade-module-page">' +
             '<section class="trade-module-head"><span>策略与模拟 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
             '<p>本页使用当前生产决策、模拟账本与验收证据，不再读取旧版选股结论。</p></section>' +

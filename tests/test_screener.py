@@ -103,8 +103,24 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "window.exportUnifiedScreener" in script
     assert "四版本实际运行：V3 为基础排序" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
-    assert "style.css?v=20" in index
-    assert "app.js?v=41" in index
+    assert "style.css?v=36" in index
+    assert "app.js?v=86" in index
+
+
+def test_trading_v3_candidate_page_uses_unified_production_selector():
+    root = Path(__file__).resolve().parents[1]
+    page = (root / "server/static/trading-v3.html").read_text(encoding="utf-8")
+    script = (root / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
+    app = (root / "server/static/js/app.js").read_text(encoding="utf-8")
+
+    assert "V3/V4/V5/V6 生产融合候选" in page
+    assert 'id="unifiedCandidateRows"' in page
+    assert "trading-v3.js?v=13" in page
+    assert "postJson('/api/screener/run'" in script
+    assert "version_evidence_coverage_rate" in script
+    assert "自动下单','固定关闭" in script
+    assert "V3-V6 生产融合" in app
+    assert "V3.6 生产真值" not in app
 
 
 def test_apply_filters_normalizes_rows_and_excludes_st():

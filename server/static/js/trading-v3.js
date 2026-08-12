@@ -1,6 +1,6 @@
 (function(){
   'use strict';
-  var state={readiness:{},overview:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},candidatePage:1,actionMessage:''};
+  var state={readiness:{},overview:{},forecasts:[],unifiedRun:{},oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},candidatePage:1,actionMessage:''};
   var titles={overview:'执行总览',hypotheses:'交易假设',candidates:'候选与拒绝',intraday:'盘中机会',portfolio:'目标组合',positions:'当前持仓',orders:'模拟订单',validation:'回测验收',missed:'漏抓复盘',evidence:'数据与系统'};
   var strategyNames={theme_diffusion:'板块扩散预热',low_base_ignition:'板块点火预判',right_side_trend:'右侧趋势启动',event_drift:'事件后漂移',quality_momentum:'质量与动量',oversold_reversal:'超跌抄底实验',intraday_surprise:'盘中超预期',weak_market_structural_mainline:'弱市结构性主线',ai_application_research:'AI应用纸面研究',robotics_research:'机器人纸面研究',paper_discovery:'模拟试错'};
   var statusNames={VALIDATED_POSITIVE:'扣费后正期望，允许进入组合',PAPER_DISCOVERY_CANDIDATE:'触发小仓模拟试错',LEFT_SIDE_PREPARE:'已进入抄底准备区，暂不买',RESEARCH_ONLY_UNCALIBRATED:'没有样本外校准，只记录不交易',RESEARCH_ONLY_MODEL_VERSION_MISMATCH:'旧公式校准已隔离，仅允许模拟盘重新验证',RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED:'高分组反而亏损，排序失真，禁止自动买入',RESEARCH_ONLY_PROFIT_GATE_FAILED:'样本外收益闸门失败，只研究',INSUFFICIENT_DATA:'所需事实不完整，不计算',SETUP_NOT_READY:'板块、趋势和入场位置尚未同时确认',WEAK_MARKET_THEME_WATCH:'弱市结构性机会，进入观察池但暂不自动买入',MARKET_REGIME_BLOCKED:'大盘偏弱且细分板块扩散或个股领导力不足',NO_ACTIVE_OOS_CALIBRATION:'没有策略通过样本外校准',NO_COMPATIBLE_OOS_CALIBRATION:'当前没有与冻结公式匹配且排序可信的正期望模型',V3_SCHEMA_INCOMPLETE:'V3独立账本尚未完成迁移',PAPER_ACTIVE:'模拟盘已启用',PAPER_TRIAL:'模拟观察',PAPER_DISCOVERY_READY:'模拟盘小仓试错已就绪',READY_WITH_PAPER_DISCOVERY:'正式组合与模拟试错并行',RESEARCH:'研究验证中，不会发出交易指令',QUEUED:'等待模拟撮合',FILLED:'已成交',CANCELLED:'已取消',RISK_APPROVED:'风控通过',V3_PAPER_DISCOVERY:'模拟盘小仓前向验证',V3_VALIDATED_POSITIVE:'正期望组合模拟委托',V3_PROFIT_GATE_MIGRATION:'V3正期望闸门启用，旧买单已撤销',EXIT_PENDING_T1:'趋势已失效，T+1 后立即卖出'};
@@ -16,7 +16,7 @@
   function money(v){var n=Number(v);return Number.isFinite(n)?'¥'+n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}
   function unwrap(v){return v&&v.data}
   function fetchJson(path){return fetch(path,{headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
-  function postJson(path){return fetch(path,{method:'POST',headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
+  function postJson(path,body){var options={method:'POST',headers:{Accept:'application/json'}};if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}return fetch(path,options).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
   function api3(path){return fetchJson('/api/v3'+path)}
   function api2(path){return fetchJson('/api/v2'+path)}
   function security(code,name){code=String(code||'').split('.')[0];name=String(name||code||'—');var href='/?tab=stock-list&stock_code='+encodeURIComponent(code);return '<span class="security"><a class="name" href="'+href+'">'+esc(name)+'</a><a class="code" href="'+href+'">'+esc(code)+'</a></span>'}
@@ -76,7 +76,11 @@
     function add(key,promise,fallback){requests.push([key,promise,fallback])}
     if(view==='overview'){add('forecasts',api3('/forecasts/latest?limit=200'),[]);add('oversold',api3('/forecasts/latest?strategy_key=oversold_reversal&limit=200'),[]);add('targets',api3('/portfolio/latest'),[])}
     if(view==='hypotheses')add('hypotheses',api3('/hypotheses/latest?limit=300'),[]);
-    if(view==='candidates'){add('forecasts',api3('/forecasts/latest?limit=200'),[]);add('runs',api3('/decision-runs?limit=100'),[])}
+    if(view==='candidates'){
+      add('forecasts',api3('/forecasts/latest?limit=200'),[]);
+      add('runs',api3('/decision-runs?limit=100'),[]);
+      add('unifiedRun',postJson('/api/screener/run',{preset:'capital_support',as_of_date:'',universe:'market',top:100,filters:{exclude_st:true}}).then(function(payload){return {data:payload}}),{status:'error',error:'生产统一候选接口读取失败',data:[],stats:{}})
+    }
     if(view==='intraday')add('intraday',api2('/accounts/paper-main-v2/intraday?limit=200'),{});
     if(view==='portfolio')add('targets',api3('/portfolio/latest'),[]);
     if(view==='positions'){add('positions',api2('/accounts/paper-main-v2/positions'),[]);add('targets',api3('/portfolio/latest'),[])}
@@ -190,7 +194,35 @@
     if(q)params.push('q='+encodeURIComponent(q));
     api3('/hypotheses/latest?'+params.join('&')).then(function(v){state.hypotheses=unwrap(v)||[];renderHypotheses()})
   }
+  function renderUnifiedCandidates(){
+    var run=state.unifiedRun||{},rows=Array.isArray(run.data)?run.data:[],summary=((run.stats||{}).selector_summary)||{},coverage=summary.version_evidence_coverage_rate||{},activation=summary.version_activation_rate||{},grades=summary.grades||{};
+    var statusNode=el('unifiedCandidateStatus');
+    if(run.status==='error'){
+      statusNode.textContent='生产候选读取失败';statusNode.className='badge danger';
+      el('unifiedCandidateSummary').innerHTML=fact('接口状态',run.error||'生产统一候选接口读取失败')+fact('执行边界','没有可靠数据时不显示候选，也不会自动下单');
+      el('unifiedCandidateCards').innerHTML='<p class="empty">生产统一排序器暂时不可用，请查看“数据与系统”中的接口状态。</p>';
+      el('unifiedCandidateRows').innerHTML=empty(12,'生产统一候选读取失败');
+      return
+    }
+    statusNode.textContent=rows.length?'已加载 '+rows.length+' 只':'当前无生产候选';statusNode.className='badge '+(rows.length?'safe':'warning');
+    function rateText(bucket,version){return pct(Number(bucket[version]||0)*100,1)}
+    el('unifiedCandidateSummary').innerHTML=[
+      fact('数据日期',run.data_date||'—'),fact('数据新鲜度',run.freshness||'—'),fact('候选等级','A '+(grades.A||0)+' / B '+(grades.B||0)+' / C '+(grades.C||0)+' / 拒绝 '+(grades.REJECT||0)),
+      fact('V4 证据 / 激活',rateText(coverage,'V4')+' / '+rateText(activation,'V4')),fact('V5 证据 / 激活',rateText(coverage,'V5')+' / '+rateText(activation,'V5')),fact('V6 证据 / 激活',rateText(coverage,'V6')+' / '+rateText(activation,'V6')),
+      fact('组合可纳入',String(summary.portfolio_eligible_count||0)+' 只'),fact('自动下单','固定关闭')
+    ].join('');
+    function versionCell(row,version){var item=((row.selector_versions||{})[version])||{},label=item.status||'无证据';return '<strong>'+num(item.score,1)+'</strong><span>'+esc(label)+'</span>'}
+    function horizonText(row){var scores=((row.multi_horizon||{}).scores)||{};return ['T+1','T+5','T+20'].map(function(key){return key+' '+num(scores[key],1)}).join(' / ')}
+    function reasonLabel(value){var labels={industry_concentration:'行业集中度限制',theme_concentration:'主题集中度限制',correlation_concentration:'相关性集中度限制',correlation_evidence_missing:'60日相关性证据不足',capacity_blocked:'容量不足',hard_gate_reject:'V4硬门禁拒绝'};return labels[value]||value}
+    function reasonText(row){var reasons=[];((row.risk_gate||{}).reject_reasons||[]).concat(row.portfolio_reject_reasons||[]).forEach(function(value){value=reasonLabel(String(value||''));if(value&&reasons.indexOf(value)<0)reasons.push(value)});if(!reasons.length)(row.matched_conditions||[]).slice(0,3).forEach(function(value){if(value)reasons.push(String(value))});return reasons.join('；')||'V3-V6 证据完整，等待人工复核'}
+    function readinessText(row){var ready=row.decision_readiness||{};return ready.new_buy_ready===true?'新买闸门通过':ready.recommend_status==='SUSPENDED'?'推荐暂停':'仅观察'}
+    function portfolioText(row){return row.portfolio_eligible===true?'可纳入 #'+String(row.portfolio_rank||'—'):'未纳入组合'}
+    function card(row){var versions=row.selector_versions||{},ready=row.decision_readiness||{};return '<article class="candidate-card"><div class="candidate-card-head"><span class="candidate-rank">#'+esc(row.rank||'—')+'</span>'+security(row.stock_code,row.stock_name||row.short_name)+'<span class="badge '+(row.candidate_grade==='A'?'safe':row.candidate_grade==='B'?'warning':'')+'">'+esc(row.candidate_grade||'—')+' · '+num(row.ensemble_score||row.score,1)+'</span></div><div class="candidate-card-route"><strong>V3 '+num(((versions.V3||{}).score),1)+' / V4 '+num(((versions.V4||{}).score),1)+' / V5 '+num(((versions.V5||{}).score),1)+' / V6 '+num(((versions.V6||{}).score),1)+'</strong><span>'+esc(horizonText(row))+'</span></div><div class="candidate-card-metrics"><div><span>执行门</span><strong>'+esc((row.execution_diagnostics||{}).status||'—')+'</strong></div><div><span>新买资格</span><strong class="'+(ready.new_buy_ready===true?'safe-text':'warning-text')+'">'+esc(readinessText(row))+'</strong></div><div><span>组合结论</span><strong>'+esc(portfolioText(row))+'</strong></div><div><span>证据完整度</span><strong>'+pct(Number(row.evidence_completeness||0)*100,1)+'</strong></div></div><p class="candidate-card-reason"><b>判断依据：</b>'+esc(reasonText(row))+'</p></article>'}
+    el('unifiedCandidateCards').innerHTML=rows.length?rows.slice(0,12).map(card).join(''):'<p class="empty">当前没有股票通过生产统一排序器。</p>';
+    el('unifiedCandidateRows').innerHTML=rows.length?rows.map(function(row){var execution=row.execution_diagnostics||{};return '<tr><td>'+esc(row.rank||'—')+'</td><td>'+security(row.stock_code,row.stock_name||row.short_name)+'</td><td><strong>'+esc(row.candidate_grade||'—')+' / '+num(row.ensemble_score||row.score,1)+'</strong></td><td>'+versionCell(row,'V3')+'</td><td>'+versionCell(row,'V4')+'</td><td>'+versionCell(row,'V5')+'</td><td>'+versionCell(row,'V6')+'</td><td>'+esc(horizonText(row))+'</td><td>'+esc(execution.status||'—')+(Number.isFinite(Number(execution.estimated_round_trip_cost_bps))?' · '+num(execution.estimated_round_trip_cost_bps,1)+'bps':'')+'</td><td>'+esc(readinessText(row))+'</td><td>'+esc(portfolioText(row))+'</td><td class="reason">'+esc(reasonText(row))+'</td></tr>'}).join(''):empty(12,'当前没有生产统一候选');
+  }
   function renderCandidates(){
+    renderUnifiedCandidates();
     var strategies=Object.keys(strategyNames);if(el('strategyFilter').options.length===1){strategies.forEach(function(k){el('strategyFilter').insertAdjacentHTML('beforeend','<option value="'+k+'">'+esc(strategy(k))+'</option>')})}
     if(!el('candidateDate').value){var defaultDate=(state.overview.run||{}).trade_date||(state.runs[0]||{}).trade_date||'';if(defaultDate)el('candidateDate').value=String(defaultDate).slice(0,10)}
     var sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim().toLowerCase();
@@ -243,7 +275,10 @@
   window.addEventListener('message',function(event){if(event.source!==window.parent||!event.data||event.data.type!=='probiga-trading-v3-view')return;var expectedOrigin='*';try{expectedOrigin=new URL(document.referrer).origin}catch(ignore){}if(expectedOrigin!=='*'&&expectedOrigin!=='null'&&event.origin!==expectedOrigin)return;activateView(String(event.data.view||'overview'));notifyParentResize()});
   if(window.ResizeObserver)new ResizeObserver(notifyParentResize).observe(document.documentElement);
   var candidateTimer=null;
-  function reloadCandidates(){state.candidatePage=1;var day=el('candidateDate').value,sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim(),params=['limit='+(q?1000:200)];if(day)params.push('trade_date='+encodeURIComponent(day));if(sf)params.push('strategy_key='+encodeURIComponent(sf));if(st)params.push('status='+encodeURIComponent(st));if(q)params.push('q='+encodeURIComponent(q));api3('/forecasts/latest?'+params.join('&')).then(function(v){state.forecasts=unwrap(v)||[];renderCandidates();notifyParentResize()})}
+  function reloadCandidates(){state.candidatePage=1;var day=el('candidateDate').value,sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim(),params=['limit='+(q?1000:200)];if(day)params.push('trade_date='+encodeURIComponent(day));if(sf)params.push('strategy_key='+encodeURIComponent(sf));if(st)params.push('status='+encodeURIComponent(st));if(q)params.push('q='+encodeURIComponent(q));Promise.all([
+    api3('/forecasts/latest?'+params.join('&')).then(function(v){state.forecasts=unwrap(v)||[]}).catch(function(){state.forecasts=[]}),
+    postJson('/api/screener/run',{preset:'capital_support',as_of_date:day,universe:'market',top:100,filters:{exclude_st:true}}).then(function(v){state.unifiedRun=v}).catch(function(err){state.unifiedRun={status:'error',error:err.message,data:[],stats:{}}})
+  ]).then(function(){renderCandidates();notifyParentResize()})}
   function pollAction(actionKey,taskType,button,remaining){
     setTimeout(function(){
       fetchJson('/api/scheduler/tasks').then(function(payload){
