@@ -84,6 +84,45 @@ def _paper_probe_quantity(
     return 0, "PAPER_DISCOVERY_LOT_NOT_ECONOMIC"
 
 
+def _diversified_dynamic_theme_rows(
+    rows: Iterable[dict[str, Any]],
+    *,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Prefer different leading stocks before repeating one stock's tags.
+
+    A strong stock can belong to dozens of provider concepts.  Ranking only
+    by its maximum signal would therefore turn a dynamic research table into
+    twenty aliases for the same security.  The first pass keeps the best
+    ranked theme for each distinct leading stock; a second pass fills any
+    remaining capacity so small universes are still fully represented.
+    """
+
+    maximum = max(0, int(limit))
+    if maximum == 0:
+        return [], 0
+    ordered = list(rows)
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    leader_codes: set[str] = set()
+    for item in ordered:
+        leader = str((item.get("top_signal") or {}).get("stock_code") or "")
+        if leader and leader in leader_codes:
+            deferred.append(item)
+            continue
+        selected.append(item)
+        if leader:
+            leader_codes.add(leader)
+        if len(selected) >= maximum:
+            return selected, len(deferred)
+    omitted_duplicates = len(deferred)
+    for item in deferred:
+        if len(selected) >= maximum:
+            break
+        selected.append(item)
+    return selected, omitted_duplicates
+
+
 def _paper_opportunity_audit(
     candidates: list[tuple[float, str, AlphaForecast, list[AlphaForecast]]],
     *,
@@ -332,8 +371,14 @@ def _paper_opportunity_audit(
             item["theme"],
         )
     )
+    dynamic_research_rows, duplicate_leader_theme_count = (
+        _diversified_dynamic_theme_rows(
+            dynamic_theme_radar,
+            limit=max_theme_rows,
+        )
+    )
     research_group_audit = []
-    for item in dynamic_theme_radar[:max(0, max_theme_rows)]:
+    for item in dynamic_research_rows:
         selected_count = int(item["selected_count"])
         candidate_count = int(item["candidate_count"])
         high_score_unselected = bool(
@@ -447,6 +492,10 @@ def _paper_opportunity_audit(
         "scope": "ALL_DECISION_FORECASTS",
         "research_group_kind": "DYNAMIC_ALL_MARKET_THEME_RADAR",
         "research_group_mode": "DYNAMIC_EACH_DECISION",
+        "research_group_selection_rule": (
+            "TOP_SIGNAL_DESC_THEN_DISTINCT_LEADER_STOCK"
+        ),
+        "duplicate_leader_theme_count": duplicate_leader_theme_count,
         "status": "ATTENTION" if warnings else "PASS",
         "universe_stock_count": len({
             str(row["stock_code"]) for row in forecast_rows

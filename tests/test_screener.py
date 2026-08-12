@@ -126,6 +126,7 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "pnl-gain" in script
     assert "pnl-loss" in script
     assert "position_lot_count" in script
+    assert "diversifyDynamic(dynamic,20)" in script
     assert "window.openKlineModal" in app
     assert "V3-V6 生产融合" in app
     assert "V3.6 生产真值" not in app
