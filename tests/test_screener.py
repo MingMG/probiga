@@ -151,6 +151,11 @@ def test_apply_filters_normalizes_rows_and_excludes_st():
 
 def test_intraday_sector_surfaces_linked_live_leaders(monkeypatch):
     def fake_rows(_sql, _params=None, context=""):
+        if context in {
+            "screener_intraday_theme_strength",
+            "screener_intraday_theme_members",
+        }:
+            assert "si_industry_sw" in _sql
         if context == "screener_intraday_live_quotes":
             return [
                 {"stock_code": "603399", "short_name": "永杉锂业", "price": 17.29, "change_pct": 9.99, "amount": 900_000_000, "snapshot_at": "2026-08-12 10:20:00"},

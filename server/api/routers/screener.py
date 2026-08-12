@@ -943,22 +943,32 @@ def _run_intraday_sector(
 
     theme_rows = _engine_rows(
         """
-        SELECT m.concept_code, MAX(m.name) AS concept_name,
+        SELECT m.theme_code AS concept_code, MAX(m.theme_name) AS concept_name,
+               MAX(m.theme_source) AS theme_source,
                COUNT(DISTINCT m.stock_code) AS total_members,
                COUNT(DISTINCT CASE WHEN c.change_pct >= :active_change THEN m.stock_code END) AS active_members,
                SUM(CASE WHEN c.change_pct > 0 THEN 1 ELSE 0 END) AS positive_members,
                AVG(c.change_pct) AS average_change_pct,
                MAX(c.change_pct) AS leader_change_pct
-        FROM si_stock_concept_east m
+        FROM (
+            SELECT stock_code, CONCAT('CONCEPT:', concept_code) AS theme_code,
+                   name AS theme_name, 'concept' AS theme_source
+            FROM si_stock_concept_east
+            UNION
+            SELECT stock_code, CONCAT('INDUSTRY:', sw_code) AS theme_code,
+                   industry_name AS theme_name, 'industry' AS theme_source
+            FROM si_industry_sw
+            WHERE industry_name IS NOT NULL AND industry_name <> ''
+        ) m
         JOIN sm_stock_current c ON c.stock_code = m.stock_code
         WHERE c.snapshot_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
           AND c.price > 0
-        GROUP BY m.concept_code
+        GROUP BY m.theme_code
         HAVING active_members >= :minimum_active
            AND leader_change_pct >= 4.0
            AND average_change_pct >= 0.8
         ORDER BY average_change_pct DESC, active_members DESC, leader_change_pct DESC
-        LIMIT 120
+        LIMIT 500
         """,
         {"active_change": max(2.0, min_change), "minimum_active": minimum_active},
         context="screener_intraday_theme_strength",
@@ -993,9 +1003,19 @@ def _run_intraday_sector(
             placeholders.append(f":{key}")
         member_rows = _engine_rows(
             f"""
-            SELECT stock_code, concept_code, name
-            FROM si_stock_concept_east
-            WHERE concept_code IN ({','.join(placeholders)})
+            SELECT stock_code, theme_code AS concept_code, theme_name AS name,
+                   theme_source
+            FROM (
+                SELECT stock_code, CONCAT('CONCEPT:', concept_code) AS theme_code,
+                       name AS theme_name, 'concept' AS theme_source
+                FROM si_stock_concept_east
+                UNION
+                SELECT stock_code, CONCAT('INDUSTRY:', sw_code) AS theme_code,
+                       industry_name AS theme_name, 'industry' AS theme_source
+                FROM si_industry_sw
+                WHERE industry_name IS NOT NULL AND industry_name <> ''
+            ) membership
+            WHERE theme_code IN ({','.join(placeholders)})
             """,
             params,
             context="screener_intraday_theme_members",
@@ -1030,6 +1050,7 @@ def _run_intraday_sector(
             "concept_name": best.get("concept_name") or best.get("concept_code"),
             "theme_name": best.get("concept_name") or best.get("concept_code"),
             "intraday_theme_strength": best.get("theme_strength"),
+            "intraday_theme_source": best.get("theme_source") or "concept",
             "intraday_theme_active_members": int(best.get("active_members") or 0),
             "intraday_theme_positive_breadth": best.get("positive_breadth"),
             "intraday_theme_names": [str(item.get("concept_name") or item.get("concept_code")) for item in themes[:5]],
