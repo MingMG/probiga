@@ -16,6 +16,10 @@ from server.trading_v3.decision_worker import run_daily_decision_v3
 from tools.env_config import create_tool_engine, load_project_env
 
 
+DEFAULT_UNIVERSE_LIMIT = 1200
+DEFAULT_PER_SLEEVE_LIMIT = 300
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--as-of", default="")
@@ -24,8 +28,16 @@ def main() -> int:
         choices=("close", "premarket", "manual"),
         default="close",
     )
-    parser.add_argument("--universe-limit", type=int, default=5000)
-    parser.add_argument("--per-sleeve-limit", type=int, default=5000)
+    parser.add_argument(
+        "--universe-limit",
+        type=int,
+        default=DEFAULT_UNIVERSE_LIMIT,
+    )
+    parser.add_argument(
+        "--per-sleeve-limit",
+        type=int,
+        default=DEFAULT_PER_SLEEVE_LIMIT,
+    )
     args = parser.parse_args()
     load_project_env()
     primary = create_tool_engine()

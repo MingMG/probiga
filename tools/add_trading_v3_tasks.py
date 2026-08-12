@@ -20,7 +20,10 @@ TASKS = (
         "task_type": "trading_v3_close_decision",
         "group_name": "strategy_v3",
         "script_path": "tools/run_trading_v3_decision.py",
-        "script_args": "--mode close",
+        "script_args": (
+            "--mode close --universe-limit 1200 "
+            "--per-sleeve-limit 300"
+        ),
         "cron_time": "16:05",
         "interval_minutes": 0,
         "date_param": "",
@@ -34,7 +37,10 @@ TASKS = (
         "task_type": "trading_v3_premarket_review",
         "group_name": "strategy_v3",
         "script_path": "tools/run_trading_v3_decision.py",
-        "script_args": "--mode premarket",
+        "script_args": (
+            "--mode premarket --universe-limit 1200 "
+            "--per-sleeve-limit 300"
+        ),
         "cron_time": "09:15",
         "interval_minutes": 0,
         "date_param": "",

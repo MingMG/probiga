@@ -264,12 +264,31 @@ def _load_bars(
         ORDER BY stock_code, trade_date
         """
     ).bindparams(bindparam("dates", expanding=True))
+    # Do not materialize the result as ``list[RowMapping]``.  A normal
+    # production universe is roughly 350k bars here; keeping every SQLAlchemy
+    # mapping alive while pandas makes a second copy can push the scheduler
+    # above its memory high-water mark.  Build bounded tuple-backed chunks and
+    # release each database batch before doing feature work.
+    chunks: list[pd.DataFrame] = []
     with engine.connect() as connection:
-        rows = connection.execute(
+        result = connection.execute(
             statement,
             {"dates": dates, "latest_date": dates[-1]},
-        ).mappings().all()
-    frame = pd.DataFrame(rows)
+        )
+        columns = list(result.keys())
+        while True:
+            rows = result.fetchmany(10_000)
+            if not rows:
+                break
+            chunks.append(
+                pd.DataFrame.from_records(rows, columns=columns)
+            )
+    frame = (
+        pd.concat(chunks, ignore_index=True)
+        if chunks
+        else pd.DataFrame(columns=columns)
+    )
+    chunks.clear()
     if frame.empty:
         return frame
     numeric = (
