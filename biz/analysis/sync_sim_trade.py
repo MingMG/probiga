@@ -146,43 +146,6 @@ def prepare_signals(
 
 
 def run_sim_trade_scan():
-    """
-    执行一次事件驱动模拟交易 tick。
-    卖出是风控检查；买入只执行信号池里的 NEW 信号，不重新选股。
-    """
-    logger.info("=" * 50)
-    logger.info("模拟交易事件tick开始 %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    engine = SimTradeEngine()
-    result = engine.run_event_tick(auto_prepare=True, strict=True)
-    live_sold = len(result.get("sell_signals") or [])
-    forward_sold = len(result.get("forward_sell_signals") or [])
-    buy_order_count = len(result.get("buy_orders") or [])
-    matched = result.get("match_results") or []
-    buy_filled = len([r for r in matched if r.get("side") == "BUY" and r.get("status") == "filled"])
-    sell_filled = len([r for r in matched if r.get("side") == "SELL" and r.get("status") == "filled"])
-    logger.info(
-        "模拟交易事件tick完成: 实时卖出%d笔, 验证卖出%d笔, 买入%d笔, 过期%d, signal_counts=%s",
-        live_sold,
-        forward_sold,
-        buy_order_count,
-        buy_filled,
-        sell_filled,
-        result.get("expired_count", 0),
-        result.get("signal_counts"),
-        result.get("order_counts"),
-    )
-    logger.info("=" * 50)
-
-    return {
-        "sell_count": live_sold + forward_sold,
-        "live_sell_count": live_sold,
-        "forward_sell_count": forward_sold,
-        "buy_count": total_bought,
-        "details": result,
-    }
-
-
-def run_sim_trade_scan():
     """Run one three-stage simulated trading tick."""
     logger.info("=" * 50)
     logger.info("sim trade event tick start %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -206,6 +169,11 @@ def run_sim_trade_scan():
         result.get("order_counts"),
     )
     logger.info("=" * 50)
+    try:
+        from biz.analysis.trading_wecom import notify_sim_trade_result
+        notification = notify_sim_trade_result(result)
+    except Exception as exc:
+        notification = {"status": "error", "error": str(exc)[:300]}
     return {
         "sell_count": live_sold + forward_sold,
         "live_sell_count": live_sold,
@@ -214,6 +182,7 @@ def run_sim_trade_scan():
         "buy_order_count": buy_order_count,
         "buy_fill_count": buy_filled,
         "sell_fill_count": sell_filled,
+        "notification": notification,
         "details": result,
     }
 

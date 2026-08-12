@@ -34,6 +34,14 @@ router = APIRouter()
 
 PRESETS: tuple[dict[str, Any], ...] = (
     {
+        "key": "intraday_sector",
+        "name": "盘中主线",
+        "mode": "intraday_sector",
+        "category": "盘中",
+        "description": "使用新鲜全市场行情识别同一概念内的联动上涨，避免用昨日日线替代今天盘中主线。",
+        "defaults": {"min_change": 1.0, "minimum_active_members": 2},
+    },
+    {
         "key": "trend_breakout",
         "name": "趋势突破",
         "mode": "trend_strong",
@@ -813,6 +821,8 @@ def _run_preset(request: ScreenerRunRequest, target_date: str) -> dict[str, Any]
     preset = PRESET_MAP.get(request.preset)
     if not preset:
         raise HTTPException(status_code=400, detail=f"未知选股预设: {request.preset}")
+    if preset["mode"] == "intraday_sector":
+        return _run_intraday_sector(request, target_date, preset)
     from server.api.routers.hot_data import screen_stocks as legacy_screen_stocks
 
     defaults = dict(preset.get("defaults") or {})
@@ -875,6 +885,190 @@ def _run_preset(request: ScreenerRunRequest, target_date: str) -> dict[str, Any]
         "data": normalized,
         "total": len(normalized),
         "error": result.get("error", ""),
+    }
+
+
+_GENERIC_CONCEPT_MARKERS = (
+    "融资融券", "沪股通", "深股通", "转融券", "MSCI", "富时罗素",
+    "标准普尔", "基金重仓", "社保重仓", "QFII", "预盈预增",
+)
+
+
+def _run_intraday_sector(
+    request: ScreenerRunRequest,
+    target_date: str,
+    preset: dict[str, Any],
+) -> dict[str, Any]:
+    """Rank fresh, concept-linked intraday leaders without granting order authority."""
+    filters = request.filters or {}
+    min_change = float(filters.get("min_change", 1.0))
+    minimum_active = max(2, int(filters.get("minimum_active_members", 2)))
+    live_rows = _engine_rows(
+        """
+        SELECT c.stock_code, c.short_name, c.price, c.change_pct,
+               c.volume, c.amount, c.snapshot_at,
+               k.close, k.high, k.low, k.turnover_ratio
+        FROM sm_stock_current c
+        LEFT JOIN sm_stock_kline k
+          ON k.stock_code = c.stock_code
+         AND k.k_type = 1 AND k.adjust_type = 0
+         AND k.trade_date = :target_date
+        WHERE c.snapshot_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+          AND c.price > 0 AND c.change_pct >= :min_change
+          AND c.stock_code REGEXP '^(00|30|60|68|92)[0-9]{4}$'
+        """,
+        {"target_date": target_date, "min_change": min_change},
+        context="screener_intraday_live_quotes",
+    )
+    observed_at = max(
+        (str(row.get("snapshot_at") or "") for row in live_rows),
+        default="",
+    )
+    if not live_rows:
+        return {
+            "status": "degraded",
+            "preset": preset,
+            "requested_date": _clean_date(request.as_of_date) or date.today().isoformat(),
+            "data_date": date.today().isoformat(),
+            "freshness": "unavailable",
+            "source": "sm_stock_current+si_stock_concept_east",
+            "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
+            "actionable_output_allowed": False,
+            "selector": selector_contract(),
+            "stats": {"input_count": 0, "result_count": 0, "selector_summary": selector_run_summary([])},
+            "data": [],
+            "total": 0,
+            "error": "没有十分钟内的新鲜全市场行情；禁止用旧快照冒充盘中主线。",
+        }
+
+    theme_rows = _engine_rows(
+        """
+        SELECT m.concept_code, MAX(m.name) AS concept_name,
+               COUNT(DISTINCT m.stock_code) AS total_members,
+               COUNT(DISTINCT CASE WHEN c.change_pct >= :active_change THEN m.stock_code END) AS active_members,
+               SUM(CASE WHEN c.change_pct > 0 THEN 1 ELSE 0 END) AS positive_members,
+               AVG(c.change_pct) AS average_change_pct,
+               MAX(c.change_pct) AS leader_change_pct
+        FROM si_stock_concept_east m
+        JOIN sm_stock_current c ON c.stock_code = m.stock_code
+        WHERE c.snapshot_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+          AND c.price > 0
+        GROUP BY m.concept_code
+        HAVING active_members >= :minimum_active
+           AND leader_change_pct >= 4.0
+           AND average_change_pct >= 0.8
+        ORDER BY average_change_pct DESC, active_members DESC, leader_change_pct DESC
+        LIMIT 120
+        """,
+        {"active_change": max(2.0, min_change), "minimum_active": minimum_active},
+        context="screener_intraday_theme_strength",
+    )
+    theme_rows = [
+        row for row in theme_rows
+        if not any(marker.lower() in str(row.get("concept_name") or "").lower() for marker in _GENERIC_CONCEPT_MARKERS)
+    ]
+    theme_by_code: dict[str, dict[str, Any]] = {}
+    for row in theme_rows:
+        total = max(1.0, _number(row.get("total_members"), 1.0) or 1.0)
+        active = _number(row.get("active_members"), 0.0) or 0.0
+        positive = _number(row.get("positive_members"), 0.0) or 0.0
+        average = _number(row.get("average_change_pct"), 0.0) or 0.0
+        leader = _number(row.get("leader_change_pct"), 0.0) or 0.0
+        row = dict(row)
+        row["positive_breadth"] = positive / total
+        row["theme_strength"] = round(
+            average * 5.0 + leader * 2.0 + min(active, 12.0) * 1.5 + min(positive / total, 1.0) * 12.0,
+            2,
+        )
+        theme_by_code[str(row.get("concept_code") or "")] = row
+
+    if not theme_by_code:
+        member_rows: list[dict[str, Any]] = []
+    else:
+        params: dict[str, Any] = {}
+        placeholders: list[str] = []
+        for index, concept_code in enumerate(theme_by_code):
+            key = f"theme_{index}"
+            params[key] = concept_code
+            placeholders.append(f":{key}")
+        member_rows = _engine_rows(
+            f"""
+            SELECT stock_code, concept_code, name
+            FROM si_stock_concept_east
+            WHERE concept_code IN ({','.join(placeholders)})
+            """,
+            params,
+            context="screener_intraday_theme_members",
+        )
+
+    themes_for_stock: dict[str, list[dict[str, Any]]] = {}
+    for member in member_rows:
+        theme = theme_by_code.get(str(member.get("concept_code") or ""))
+        if theme:
+            themes_for_stock.setdefault(str(member.get("stock_code") or "").zfill(6), []).append(theme)
+
+    raw: list[dict[str, Any]] = []
+    for quote in live_rows:
+        code = str(quote.get("stock_code") or "").zfill(6)
+        themes = sorted(
+            themes_for_stock.get(code) or [],
+            key=lambda item: (-float(item.get("theme_strength") or 0), str(item.get("concept_code") or "")),
+        )
+        if not themes:
+            continue
+        best = themes[0]
+        change = _number(quote.get("change_pct"), 0.0) or 0.0
+        base_score = max(0.0, min(100.0, 42.0 + change * 3.0 + float(best.get("theme_strength") or 0) * 0.35))
+        raw.append({
+            **quote,
+            "stock_code": code,
+            "score": round(base_score, 2),
+            "final_trade_score": round(base_score, 2),
+            "data_date": target_date,
+            "intraday_observed_at": observed_at,
+            "primary_concept": best.get("concept_name") or best.get("concept_code"),
+            "concept_name": best.get("concept_name") or best.get("concept_code"),
+            "theme_name": best.get("concept_name") or best.get("concept_code"),
+            "intraday_theme_strength": best.get("theme_strength"),
+            "intraday_theme_active_members": int(best.get("active_members") or 0),
+            "intraday_theme_positive_breadth": best.get("positive_breadth"),
+            "intraday_theme_names": [str(item.get("concept_name") or item.get("concept_code")) for item in themes[:5]],
+            "matched_conditions": [
+                f"盘中涨幅{change:.2f}%",
+                f"{best.get('concept_name') or best.get('concept_code')}联动{int(best.get('active_members') or 0)}只",
+                f"板块均涨{float(best.get('average_change_pct') or 0):.2f}%",
+            ],
+        })
+    raw.sort(key=lambda row: (-float(row.get("score") or 0), str(row.get("stock_code") or "")))
+    shortlist = raw[: max(300, request.top * 4)]
+    enriched = _enrich_selector_evidence(shortlist, target_date)
+    enriched = _attach_correlation_clusters(enriched, target_date)
+    normalized, stats = _apply_filters(
+        enriched,
+        request,
+        listed_codes=_listed_codes(target_date),
+    )
+    return {
+        "status": "ok",
+        "preset": preset,
+        "requested_date": _clean_date(request.as_of_date) or date.today().isoformat(),
+        "data_date": date.today().isoformat(),
+        "evidence_date": target_date,
+        "observed_at": observed_at,
+        "freshness": "live",
+        "source": "sm_stock_current+si_stock_concept_east+previous_close_evidence",
+        "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
+        "actionable_output_allowed": False,
+        "selector": selector_contract(),
+        "stats": {
+            **stats,
+            "live_quote_count": len(live_rows),
+            "strong_theme_count": len(theme_by_code),
+            "selector_summary": selector_run_summary(normalized),
+        },
+        "data": normalized,
+        "total": len(normalized),
+        "error": "",
     }
 
 

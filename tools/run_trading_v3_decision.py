@@ -47,6 +47,8 @@ def main() -> int:
             ),
             kline_engine=kline,
         )
+        from biz.analysis.trading_wecom import notify_v3_decision_result
+        result["notification"] = notify_v3_decision_result(result)
     finally:
         primary.dispose()
         kline.dispose()

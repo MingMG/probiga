@@ -362,6 +362,114 @@ def latest_portfolio():
     )
 
 
+@router.get("/paper-ledger")
+def paper_ledger(
+    account_id: str = Query(default="paper-main-v2", min_length=3, max_length=64),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    """Return the two internal paper ledgers as one honest read model.
+
+    The legacy event simulator is still the active scheduled executor while
+    V2/V3 owns the new immutable plan/order ledger.  This endpoint merges only
+    their display projections; it never copies, invents or executes a fill.
+    """
+    engine = get_engine()
+    if engine is None:
+        raise HTTPException(status_code=503, detail="paper ledger database unavailable")
+    from server.trading_v2.repository import TradingV2Repository
+
+    v2 = TradingV2Repository(engine)
+    account = v2.account(account_id) or {}
+    v2_positions = v2.positions(account_id)
+    v2_orders = v2.orders(account_id, limit)
+    with engine.connect() as connection:
+        legacy_positions = [dict(row) for row in connection.execute(
+            text(
+                """
+                SELECT id, stock_code, short_name, strategy_type, buy_price,
+                       buy_shares, buy_date, buy_time, buy_reason, status
+                FROM st_sim_position
+                WHERE COALESCE(trade_mode, 'live') = 'live'
+                  AND status = 'holding'
+                ORDER BY buy_date DESC, buy_time DESC, id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": int(limit)},
+        ).mappings().all()]
+        legacy_orders = [dict(row) for row in connection.execute(
+            text(
+                """
+                SELECT id, stock_code, short_name, strategy_type, side,
+                       requested_shares, filled_shares, remaining_shares,
+                       limit_price, filled_price, status, reason,
+                       reject_reason, last_match_reason, order_date,
+                       order_time, filled_at, created_at
+                FROM st_sim_order
+                WHERE COALESCE(trade_mode, 'live') = 'live'
+                ORDER BY COALESCE(filled_at, created_at) DESC, id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": int(limit)},
+        ).mappings().all()]
+
+    positions = []
+    for row in v2_positions:
+        positions.append({**row, "ledger_source": "V2_CANONICAL"})
+    for row in legacy_positions:
+        positions.append({
+            **row,
+            "ledger_source": "LEGACY_EVENT_SIM",
+            "position_state": "HOLDING",
+            "quantity": int(row.get("buy_shares") or 0),
+            "remaining_quantity": int(row.get("buy_shares") or 0),
+            "sellable_quantity": 0 if str(row.get("buy_date") or "")[:10] == date.today().isoformat() else int(row.get("buy_shares") or 0),
+            "cost_price": row.get("buy_price"),
+            "last_reason": row.get("buy_reason") or "事件驱动模拟成交",
+        })
+
+    orders = []
+    for row in v2_orders:
+        orders.append({**row, "ledger_source": "V2_CANONICAL"})
+    for row in legacy_orders:
+        orders.append({
+            **row,
+            "ledger_source": "LEGACY_EVENT_SIM",
+            "order_id": f"legacy-{row.get('id')}",
+            "quantity": int(row.get("requested_shares") or 0),
+            "filled_quantity": int(row.get("filled_shares") or 0),
+            "waiting_reason": row.get("last_match_reason") or row.get("reject_reason") or row.get("reason") or "",
+            "earliest_at": f"{row.get('order_date') or ''} {row.get('order_time') or ''}".strip(),
+            "expires_at": row.get("filled_at") or "",
+        })
+    initial_cash = float(account.get("initial_cash") or 0)
+    legacy_market_value = sum(
+        float(row.get("buy_price") or 0) * int(row.get("buy_shares") or 0)
+        for row in legacy_positions
+    )
+    v2_cash = float(account.get("cash_balance") or initial_cash)
+    return _envelope({
+        "account_id": account_id,
+        "account": account,
+        "positions": positions,
+        "orders": orders,
+        "summary": {
+            "position_count": len(positions),
+            "order_count": len(orders),
+            "v2_position_count": len(v2_positions),
+            "legacy_position_count": len(legacy_positions),
+            "v2_order_count": len(v2_orders),
+            "legacy_order_count": len(legacy_orders),
+            "cash_balance": v2_cash,
+            "legacy_cost_market_value": round(legacy_market_value, 2),
+        },
+        "ledger_sources": ["V2_CANONICAL", "LEGACY_EVENT_SIM"],
+        "real_trading_enabled": False,
+        "merge_policy": "READ_ONLY_NO_FILL_COPY",
+    })
+
+
 @router.get("/validation/latest")
 def latest_validation():
     result = _repo().latest_validation()

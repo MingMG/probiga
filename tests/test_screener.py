@@ -115,8 +115,10 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
 
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
-    assert "trading-v3.js?v=13" in page
+    assert "trading-v3.js?v=14" in page
     assert "postJson('/api/screener/run'" in script
+    assert "preset:'intraday_sector'" in script
+    assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
     assert "自动下单','固定关闭" in script
     assert "V3-V6 生产融合" in app
@@ -145,6 +147,38 @@ def test_apply_filters_normalizes_rows_and_excludes_st():
     assert rows[0]["selector_mode"] == "V3_V4_V5_V6_GATED_MULTI_HORIZON_ENSEMBLE"
     assert rows[0]["action"] == "WATCH"
     assert rows[0]["actionable"] is False
+
+
+def test_intraday_sector_surfaces_linked_live_leaders(monkeypatch):
+    def fake_rows(_sql, _params=None, context=""):
+        if context == "screener_intraday_live_quotes":
+            return [
+                {"stock_code": "603399", "short_name": "永杉锂业", "price": 17.29, "change_pct": 9.99, "amount": 900_000_000, "snapshot_at": "2026-08-12 10:20:00"},
+                {"stock_code": "002240", "short_name": "盛新锂能", "price": 33.72, "change_pct": 5.61, "amount": 800_000_000, "snapshot_at": "2026-08-12 10:20:00"},
+            ]
+        if context == "screener_intraday_theme_strength":
+            return [{"concept_code": "BK_LI", "concept_name": "锂电池", "total_members": 20, "active_members": 4, "positive_members": 14, "average_change_pct": 2.4, "leader_change_pct": 9.99}]
+        if context == "screener_intraday_theme_members":
+            return [
+                {"stock_code": "603399", "concept_code": "BK_LI", "name": "锂电池"},
+                {"stock_code": "002240", "concept_code": "BK_LI", "name": "锂电池"},
+            ]
+        raise AssertionError(context)
+
+    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
+    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
+    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: [{**row, "correlation_cluster_status": "VERIFIED_60D", "correlation_cluster": row["stock_code"]} for row in rows])
+    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
+
+    result = screener._run_preset(
+        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
+        "2026-08-11",
+    )
+
+    assert result["freshness"] == "live"
+    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
+    assert all(row["concept_name"] == "锂电池" for row in result["data"])
+    assert result["actionable_output_allowed"] is False
 
 
 def test_apply_filters_rejects_non_stock_and_future_listing_codes():
