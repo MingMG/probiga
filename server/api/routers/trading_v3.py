@@ -376,9 +376,9 @@ def paper_ledger(
     engine = get_engine()
     if engine is None:
         raise HTTPException(status_code=503, detail="paper ledger database unavailable")
-    from server.trading_v2.repository import TradingV2Repository
+    from server.trading_v2.repository import TradingV2ReadRepository
 
-    v2 = TradingV2Repository(engine)
+    v2 = TradingV2ReadRepository(engine)
     account = v2.account(account_id) or {}
     v2_positions = v2.positions(account_id)
     v2_orders = v2.orders(account_id, limit)
