@@ -5612,7 +5612,13 @@
             var blocked = data.status !== 'ok';
             var color = blocked ? '#b91c1c' : '#166534';
             var summary = ((data.stats || {}).selector_summary || {}), grades = summary.grades || {};
+            var versionCoverage = summary.version_evidence_coverage_rate || {};
+            var versionActivation = summary.version_activation_rate || {};
+            var versionCoverageText = ['V4', 'V5', 'V6'].map(function (version) {
+                return version + ' 证据覆盖 ' + fmt((versionCoverage[version] || 0) * 100, 0) + '% / 排名激活 ' + fmt((versionActivation[version] || 0) * 100, 0) + '%';
+            }).join(' · ');
             var html = '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px"><span style="font-weight:800;color:#111827">' + escHtml((data.preset || {}).name || presetKey) + '</span><span style="color:' + color + ';font-weight:800">' + (blocked ? 'DATA BLOCKED' : 'PRODUCTION RANKING') + '</span><span style="font-size:12px;color:#64748b">数据日期 ' + escHtml(data.data_date || '-') + ' · ' + rows.length + ' 只 · A/B/C/拒绝 ' + (grades.A || 0) + '/' + (grades.B || 0) + '/' + (grades.C || 0) + '/' + (grades.REJECT || 0) + ' · 模型 ' + escHtml(String(window._unifiedScreenerFingerprint).slice(0, 12) || '-') + ' · 不允许自动下单</span></div>';
+            html += '<div style="margin-bottom:10px;padding:9px 12px;border:1px solid #86efac;background:#f0fdf4;border-radius:8px;color:#166534;font-size:12px">四版本实际运行：V3 为基础排序；' + escHtml(versionCoverageText) + '。V4 硬拒绝会计入证据覆盖，但不会计入排名激活。</div>';
             if (data.error) html += '<div style="color:#b91c1c;font-size:12px;margin-bottom:8px">' + escHtml(data.error) + '</div>';
             if (!rows.length) { result.innerHTML = html + '<div class="loading">当前条件没有候选；请先检查数据日期，再调整参数。</div>'; return; }
             result.innerHTML = html;

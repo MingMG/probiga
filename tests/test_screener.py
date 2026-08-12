@@ -101,8 +101,10 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
     assert "window.exportUnifiedScreener" in script
+    assert "四版本实际运行：V3 为基础排序" in script
+    assert "V4 硬拒绝会计入证据覆盖" in script
     assert "style.css?v=20" in index
-    assert "app.js?v=40" in index
+    assert "app.js?v=41" in index
 
 
 def test_apply_filters_normalizes_rows_and_excludes_st():

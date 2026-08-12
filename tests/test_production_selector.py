@@ -5,6 +5,7 @@ from server.engine.production_selector import (
     rank_production_candidates,
     score_production_candidate,
     selector_contract,
+    selector_run_summary,
 )
 
 
@@ -128,6 +129,42 @@ def test_v4_hard_reject_cannot_be_overridden_by_high_other_scores():
     assert result["risk_gate"]["hard_veto"] is True
     assert result["candidate_grade"] == "REJECT"
     assert result["order_authority"] is False
+
+
+def test_suspended_observation_cannot_be_presented_as_grade_a():
+    row = _full_row(base=86)
+    row.update({"recommend_status": "SUSPENDED", "signal_status": "WATCH"})
+
+    result = score_production_candidate(row)
+
+    assert result["candidate_grade"] == "B"
+    assert result["decision_readiness"]["new_buy_ready"] is False
+    assert result["decision_readiness"]["recommend_status"] == "SUSPENDED"
+
+
+def test_grade_a_requires_explicit_buy_readiness():
+    row = _full_row(base=86)
+    row.update({"recommend_status": "ALLOW", "signal_status": "BUY_READY"})
+
+    result = score_production_candidate(row)
+
+    assert result["candidate_grade"] == "A"
+    assert result["decision_readiness"]["new_buy_ready"] is True
+
+
+def test_summary_separates_v4_gate_coverage_from_ranking_activation():
+    active = score_production_candidate(
+        {**_full_row("600001", 86), "recommend_status": "ALLOW", "signal_status": "BUY_READY"}
+    )
+    rejected = score_production_candidate(
+        {**_full_row("600002", 86), "event_risk_level": "CRITICAL"}
+    )
+
+    summary = selector_run_summary([active, rejected])
+
+    assert summary["version_evidence_coverage_rate"]["V4"] == 1.0
+    assert summary["version_activation_rate"]["V4"] == 0.5
+    assert summary["version_fallback_rate"]["V4"] == 0.0
 
 
 def test_v5_uses_global_regime_instead_of_stock_sentiment():
