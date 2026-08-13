@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.api.routers.screener import ScreenerRunRequest, screener_run
+from biz.analysis.trading_wecom import notify_screener_failure
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,16 +26,35 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    result = screener_run(
-        ScreenerRunRequest(
-            preset=args.preset,
-            as_of_date=args.as_of_date,
-            universe="market",
-            top=args.top,
-            filters={"exclude_st": True},
-            notify=True,
+    try:
+        result = screener_run(
+            ScreenerRunRequest(
+                preset=args.preset,
+                as_of_date=args.as_of_date,
+                universe="market",
+                top=args.top,
+                filters={"exclude_st": True},
+                notify=True,
+            )
         )
-    )
+    except Exception as exc:
+        notification = notify_screener_failure(
+            preset=args.preset,
+            reason=str(exc),
+            stage="生成或落库",
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "preset": args.preset,
+                    "error": str(exc)[:500],
+                    "notification": notification,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 5
     output = {
         "status": result.get("status"),
         "preset": result.get("preset"),
@@ -56,6 +76,12 @@ def main() -> int:
         "notification": result.get("notification"),
         "error": result.get("error"),
     }
+    if not result.get("data"):
+        output["notification"] = notify_screener_failure(
+            preset=args.preset,
+            reason=str(result.get("error") or "本次筛选没有生成任何候选"),
+            stage="结果校验",
+        )
     print(json.dumps(output, ensure_ascii=False, default=str))
     if not (result.get("run") or {}).get("persisted"):
         return 2

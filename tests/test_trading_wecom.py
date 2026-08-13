@@ -1,6 +1,30 @@
 from biz.analysis import trading_wecom
 
 
+def test_notify_screener_failure_uses_briefing_channel(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        trading_wecom,
+        "get_wecom_webhook",
+        lambda kind, **_kwargs: "https://example.invalid" if kind == "briefing" else "",
+    )
+    monkeypatch.setattr(
+        trading_wecom,
+        "send_markdown",
+        lambda _url, content: sent.append(content) or {"errcode": 0, "errmsg": "ok"},
+    )
+
+    result = trading_wecom.notify_screener_failure(
+        preset="capital_support",
+        reason="database unavailable",
+        stage="生成或落库",
+    )
+
+    assert result["status"] == "sent"
+    assert "09:08" in sent[0]
+    assert "database unavailable" in sent[0]
+
+
 def test_sim_trade_notification_only_sends_new_fills(monkeypatch):
     sent = []
     monkeypatch.setattr(trading_wecom, "get_wecom_webhook", lambda *_args, **_kwargs: "https://example.invalid")

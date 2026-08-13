@@ -117,3 +117,30 @@ def notify_screener_result(result: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("screener WeCom notification failed: %s", exc)
         return {"status": "error", "error": str(exc)[:300]}
+
+
+def notify_screener_failure(
+    *,
+    preset: str,
+    reason: str,
+    stage: str = "generate",
+) -> dict[str, Any]:
+    """Tell the briefing channel when a promised ranking was not delivered."""
+    webhook = get_wecom_webhook("briefing", required=False)
+    if not webhook:
+        return {"status": "skipped", "reason": "webhook_not_configured"}
+    title = "09:08 盘前榜" if preset == "capital_support" else "09:32 开盘融合榜"
+    content = "\n".join(
+        [
+            f"### ProBigA {title}生成失败",
+            f"> 失败阶段：{stage}",
+            f"> 原因：{str(reason or '未知错误')[:500]}",
+            "> 系统会保留日志并按调度规则重试；本次没有可供使用的新榜单。",
+        ]
+    )
+    try:
+        response = send_markdown(webhook, content)
+        return {"status": "sent", "response": response}
+    except Exception as exc:
+        logger.warning("screener failure notification failed: %s", exc)
+        return {"status": "error", "error": str(exc)[:300]}
