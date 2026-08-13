@@ -66,6 +66,8 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "capital_flow",
         "capital_flow_batch_fast",
         "market_overview_daily",
+        "screener_premarket_delivery",
+        "screener_intraday_delivery",
     }
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
@@ -137,6 +139,8 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "trading_v2_paper_tick",
     "trading_v3_close_decision",
     "trading_v3_premarket_review",
+    "screener_premarket_delivery",
+    "screener_intraday_delivery",
 }
 NON_TRADING_DAY_SKIP_PATHS = {
     "biz/analysis/sync_analysis_fast.py",
@@ -216,6 +220,8 @@ LONG_RUNNING_PATH_PARTS = {
     "tools/run_single_table.py",
 }
 FAST_RUNNING_TASK_TYPES = {
+    "screener_premarket_delivery",
+    "screener_intraday_delivery",
     "hot_rank_sina",
     "hot_rank_ths",
     "hot_pop_east",

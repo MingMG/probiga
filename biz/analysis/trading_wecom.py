@@ -69,3 +69,51 @@ def notify_v3_decision_result(result: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("V3 decision WeCom notification failed: %s", exc)
         return {"status": "error", "error": str(exc)[:300]}
+
+
+def notify_screener_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Deliver a persisted top-five ranking to the briefing robot."""
+    rows = result.get("data") or []
+    if not rows:
+        return {"status": "skipped", "reason": "no_screener_result"}
+    run = result.get("run") or {}
+    if not run.get("persisted"):
+        return {"status": "error", "error": "候选榜未落库，禁止发送无追溯结果"}
+    webhook = get_wecom_webhook("briefing", required=False)
+    if not webhook:
+        return {"status": "skipped", "reason": "webhook_not_configured"}
+    freshness = {
+        "live": "实时盘中快照",
+        "historical_close": "收盘复盘快照",
+        "exact": "指定交易日数据",
+        "fallback": "最近可用交易日数据",
+    }.get(str(result.get("freshness") or ""), str(result.get("freshness") or "未知"))
+    preset = str(result.get("preset") or "")
+    title = "盘前生产候选榜" if preset == "capital_support" else "开盘生产融合候选榜" if preset == "intraday_sector" else "生产融合候选榜"
+    lines = [
+        f"### ProBigA {title}",
+        f"> 数据日期：{result.get('data_date') or '—'}；证据时间：{result.get('observed_at') or run.get('generated_at') or '—'}",
+        f"> 数据状态：{freshness}；策略：{preset or '—'}",
+    ]
+    for index, row in enumerate(rows[:5], 1):
+        code = str(row.get("stock_code") or "")[:6]
+        name = str(row.get("stock_name") or row.get("short_name") or code or "未知证券")
+        score = row.get("ensemble_score", row.get("score"))
+        change = row.get("change_pct")
+        score_text = "—" if score is None else f"{float(score):.2f}"
+        change_text = "—" if change is None else f"{float(change):+.2f}%"
+        lines.append(f"> {index}. **{name}（{code}）** · 综合分 {score_text} · 涨幅 {change_text}")
+    lines.extend(
+        [
+            f"> 批次：`{run.get('run_uid') or '—'}`（已固定落库，可按日期追溯）",
+            "> **仅用于研究与模拟，真实下单保持关闭。**",
+        ]
+    )
+    try:
+        response = send_markdown(webhook, "\n".join(lines))
+        if int((response or {}).get("errcode") or 0) != 0:
+            return {"status": "error", "error": str(response)[:300], "response": response}
+        return {"status": "sent", "result_count": len(rows), "response": response}
+    except Exception as exc:
+        logger.warning("screener WeCom notification failed: %s", exc)
+        return {"status": "error", "error": str(exc)[:300]}

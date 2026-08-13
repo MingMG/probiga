@@ -115,13 +115,18 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
 
     assert "V3/V4/V5/V6 生产融合候选" in page
     assert 'id="unifiedCandidateRows"' in page
+    assert 'id="unifiedPresetFilter"' in page
+    assert 'id="unifiedCandidateDate"' in page
+    assert 'id="unifiedCandidateSearch"' in page
     assert "trading-v3.css?v=6" in page
-    assert "trading-v3.js?v=19" in page
+    assert "trading-v3.js?v=20" in page
     assert 'id="equitySource"' in page
     assert 'id="cashSource"' in page
     assert 'id="unrealizedPnl"' in page
     assert 'id="positionCount"' in page
     assert "postJson('/api/screener/run'" in script
+    assert "'/api/screener/history?data_date='" in script
+    assert "绝不用今天数据重算过去" in page
     assert "preset:'intraday_sector'" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
@@ -143,6 +148,97 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "window.openKlineModal" in app
     assert "V3-V6 生产融合" in app
     assert "V3.6 生产真值" not in app
+
+
+def test_screener_run_persists_before_optional_delivery(monkeypatch):
+    result = {
+        "status": "ok",
+        "preset": "intraday_sector",
+        "requested_date": "2026-08-13",
+        "data_date": "2026-08-13",
+        "observed_at": "2026-08-13 09:32:33",
+        "freshness": "live",
+        "source": "test",
+        "stats": {},
+        "data": [{"rank": 1, "stock_code": "300333", "short_name": "兆日科技", "score": 100}],
+    }
+    monkeypatch.setattr(screener, "_latest_date", lambda *_args, **_kwargs: "2026-08-12")
+    monkeypatch.setattr(screener, "_run_preset", lambda *_args, **_kwargs: dict(result))
+    monkeypatch.setattr(screener, "_runtime_status", lambda: {"status": "ok"})
+    monkeypatch.setattr(
+        screener,
+        "_persist_screener_run",
+        lambda _request, _result: {
+            "run_uid": "a" * 32,
+            "run_key": "b" * 64,
+            "generated_at": "2026-08-13 09:32:34",
+            "persisted": True,
+            "is_new": True,
+            "push_status": "PENDING",
+        },
+    )
+    updated = {}
+    monkeypatch.setattr(screener, "_update_screener_push", lambda uid, notice: updated.update(uid=uid, notice=notice))
+    from biz.analysis import trading_wecom
+
+    monkeypatch.setattr(trading_wecom, "notify_screener_result", lambda payload: {"status": "sent", "count": len(payload["data"])})
+
+    payload = screener.screener_run(screener.ScreenerRunRequest(preset="intraday_sector", notify=True))
+
+    assert payload["run"]["persisted"] is True
+    assert payload["run"]["run_uid"] == "a" * 32
+    assert payload["notification"]["status"] == "sent"
+    assert updated["uid"] == "a" * 32
+
+
+def test_screener_history_reads_immutable_payload_and_stock_filter(monkeypatch):
+    monkeypatch.setattr(screener, "_ensure_tables", lambda: None)
+
+    def fake_rows(_sql, params=None, context=""):
+        if context == "screener_history_runs":
+            assert params["data_date"] == "2026-08-13"
+            return [{
+                "run_uid": "a" * 32,
+                "preset": "intraday_sector",
+                "requested_date": "2026-08-13",
+                "session_date": "2026-08-13",
+                "data_date": "2026-08-13",
+                "evidence_date": "2026-08-12",
+                "observed_at": "2026-08-13 09:32:33",
+                "generated_at": "2026-08-13 09:32:34",
+                "freshness": "live",
+                "status": "ok",
+                "source": "snapshot",
+                "result_count": 5,
+                "summary_json": "{}",
+                "selector_json": "{}",
+                "push_status": "SENT",
+                "pushed_at": "2026-08-13 09:32:35",
+            }]
+        if context == "screener_history_results":
+            assert params["keyword"] == "300333"
+            return [{
+                "rank_no": 1,
+                "selector_rank": 1,
+                "stock_code": "300333",
+                "stock_name": "兆日科技",
+                "payload_json": '{"score":100,"change_pct":19.95}',
+            }]
+        raise AssertionError(context)
+
+    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
+    payload = screener.screener_history(data_date="2026-08-13", q="300333")
+
+    assert payload["run"]["persisted"] is True
+    assert payload["session_date"] == "2026-08-13"
+    assert payload["data"][0] == {
+        "score": 100,
+        "change_pct": 19.95,
+        "rank": 1,
+        "selector_rank": 1,
+        "stock_code": "300333",
+        "stock_name": "兆日科技",
+    }
 
 
 def test_apply_filters_normalizes_rows_and_excludes_st():

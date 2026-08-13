@@ -145,7 +145,13 @@
             <div><p>V3-V6 PRODUCTION SELECTOR</p><h3>V3/V4/V5/V6 生产融合候选</h3></div>
             <span class="badge" id="unifiedCandidateStatus">读取生产候选中</span>
           </div>
-          <p class="note">这里读取当前生产统一排序器：V3 负责基础分，V4 负责硬门禁与可执行性，V5 负责市场状态适配，V6 负责 PIT 财务质量。结果仅用于生产选股建议，自动下单固定关闭。</p>
+          <p class="note">这里读取当前生产统一排序器：V3 负责基础分，V4 负责硬门禁与可执行性，V5 负责市场状态适配，V6 负责 PIT 财务质量。每次结果先固定落库再展示；下方“历史日期、代码/中文/主题”同时筛选本榜，历史日期只读当时批次，绝不用今天数据重算过去。</p>
+          <div class="filters unified-candidate-filters">
+            <label>榜单类型<select id="unifiedPresetFilter"><option value="intraday_sector">09:32 开盘融合榜</option><option value="capital_support">09:08 盘前榜</option></select></label>
+            <label>历史日期<input type="date" id="unifiedCandidateDate"></label>
+            <label>代码/中文/主题<input id="unifiedCandidateSearch" placeholder="输入代码、中文名或主题"></label>
+            <button type="button" id="unifiedCurrent">查看当前榜</button>
+          </div>
           <div id="unifiedCandidateSummary" class="facts"></div>
           <div id="unifiedCandidateCards" class="candidate-list" aria-live="polite"></div>
           <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>等级 / 总分</th><th>V3</th><th>V4</th><th>V5</th><th>V6</th><th>T+1 / T+5 / T+20</th><th>执行门</th><th>新买资格</th><th>组合结论</th><th>依据</th></tr></thead><tbody id="unifiedCandidateRows"></tbody></table></div>
@@ -285,6 +291,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v3.js?v=19"></script>
+  <script src="/static/js/trading-v3.js?v=20"></script>
 </body>
 </html>

@@ -9,9 +9,11 @@ candidate pool.  It deliberately never places orders.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import math
 import re
+import uuid
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
@@ -206,6 +208,7 @@ class ScreenerRunRequest(BaseModel):
     concept_code: str = ""
     top: int = Field(default=50, ge=1, le=200)
     filters: dict[str, Any] = Field(default_factory=dict)
+    notify: bool = False
 
 
 class SavedScreenRequest(BaseModel):
@@ -365,6 +368,60 @@ def _ensure_tables() -> None:
                 UNIQUE KEY uq_st_screener_candidate (stock_code, source, as_of_date)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS st_screener_run_history (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                run_uid CHAR(32) NOT NULL,
+                run_key CHAR(64) NOT NULL,
+                preset VARCHAR(64) NOT NULL,
+                requested_date DATE NULL,
+                session_date DATE NULL,
+                data_date DATE NULL,
+                evidence_date DATE NULL,
+                observed_at DATETIME NULL,
+                generated_at DATETIME NOT NULL,
+                freshness VARCHAR(32) NOT NULL DEFAULT '',
+                status VARCHAR(32) NOT NULL DEFAULT '',
+                source VARCHAR(255) NOT NULL DEFAULT '',
+                universe VARCHAR(32) NOT NULL DEFAULT 'market',
+                concept_code VARCHAR(32) NOT NULL DEFAULT '',
+                result_count INT NOT NULL DEFAULT 0,
+                request_json LONGTEXT NOT NULL,
+                summary_json LONGTEXT NULL,
+                selector_json LONGTEXT NULL,
+                push_status VARCHAR(32) NOT NULL DEFAULT 'NOT_REQUESTED',
+                push_error VARCHAR(500) NULL,
+                pushed_at DATETIME NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_st_screener_run_uid (run_uid),
+                UNIQUE KEY uq_st_screener_run_key (run_key),
+                KEY idx_st_screener_run_date (session_date, preset, generated_at),
+                KEY idx_st_screener_data_date (data_date, preset)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS st_screener_run_result (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                run_uid CHAR(32) NOT NULL,
+                rank_no INT NOT NULL,
+                selector_rank INT NULL,
+                stock_code VARCHAR(12) NOT NULL,
+                stock_name VARCHAR(120) NOT NULL DEFAULT '',
+                score DECIMAL(12,4) NULL,
+                ensemble_score DECIMAL(12,4) NULL,
+                candidate_grade VARCHAR(20) NOT NULL DEFAULT '',
+                action_status VARCHAR(40) NOT NULL DEFAULT '',
+                primary_concept VARCHAR(120) NOT NULL DEFAULT '',
+                change_pct DECIMAL(12,4) NULL,
+                price DECIMAL(18,4) NULL,
+                payload_json LONGTEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_st_screener_result_rank (run_uid, rank_no),
+                UNIQUE KEY uq_st_screener_result_stock (run_uid, stock_code),
+                KEY idx_st_screener_result_lookup (stock_code, run_uid)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """))
 
 
 def _number(value: Any, default: float | None = None) -> float | None:
@@ -372,6 +429,150 @@ def _number(value: Any, default: float | None = None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _request_payload(request: ScreenerRunRequest) -> dict[str, Any]:
+    payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    payload.pop("notify", None)
+    return payload
+
+
+def _screener_run_key(request: ScreenerRunRequest, result: dict[str, Any]) -> str:
+    rows = result.get("data") or []
+    signature = {
+        "request": _request_payload(request),
+        "data_date": result.get("data_date"),
+        "evidence_date": result.get("evidence_date"),
+        "observed_at": result.get("observed_at"),
+        "freshness": result.get("freshness"),
+        "selector": (result.get("selector") or {}).get("model_fingerprint"),
+        "results": [
+            [
+                row.get("rank"),
+                row.get("stock_code"),
+                row.get("ensemble_score", row.get("score")),
+            ]
+            for row in rows
+        ],
+    }
+    raw = json.dumps(signature, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _persist_screener_run(request: ScreenerRunRequest, result: dict[str, Any]) -> dict[str, Any]:
+    """Persist the immutable ranking before it is returned to a page or notifier."""
+    _ensure_tables()
+    run_key = _screener_run_key(request, result)
+    generated_at = datetime.now().replace(microsecond=0)
+    run_uid = uuid.uuid4().hex
+    rows = result.get("data") or []
+    request_json = json.dumps(_request_payload(request), ensure_ascii=False, default=str, separators=(",", ":"))
+    summary_json = json.dumps(result.get("stats") or {}, ensure_ascii=False, default=str, separators=(",", ":"))
+    selector_json = json.dumps(result.get("selector") or {}, ensure_ascii=False, default=str, separators=(",", ":"))
+    observed_date = _clean_date(str(result.get("observed_at") or "")[:10])
+    session_date = observed_date or (_clean_date(result.get("requested_date")) if request.as_of_date else "") or generated_at.date().isoformat()
+    with get_engine().begin() as conn:
+        existing = conn.execute(
+            text("SELECT run_uid, generated_at, push_status FROM st_screener_run_history WHERE run_key = :run_key LIMIT 1"),
+            {"run_key": run_key},
+        ).mappings().first()
+        if existing:
+            return {
+                "run_uid": str(existing["run_uid"]),
+                "run_key": run_key,
+                "generated_at": str(existing["generated_at"]),
+                "persisted": True,
+                "is_new": False,
+                "push_status": str(existing.get("push_status") or ""),
+            }
+        conn.execute(
+            text("""
+                INSERT INTO st_screener_run_history
+                  (run_uid, run_key, preset, requested_date, session_date, data_date, evidence_date,
+                   observed_at, generated_at, freshness, status, source, universe,
+                   concept_code, result_count, request_json, summary_json, selector_json, push_status)
+                VALUES
+                  (:run_uid, :run_key, :preset, :requested_date, :session_date, :data_date, :evidence_date,
+                   :observed_at, :generated_at, :freshness, :status, :source, :universe,
+                   :concept_code, :result_count, :request_json, :summary_json, :selector_json, :push_status)
+            """),
+            {
+                "run_uid": run_uid,
+                "run_key": run_key,
+                "preset": request.preset,
+                "requested_date": _clean_date(result.get("requested_date")) or None,
+                "session_date": session_date,
+                "data_date": _clean_date(result.get("data_date")) or None,
+                "evidence_date": _clean_date(result.get("evidence_date")) or None,
+                "observed_at": str(result.get("observed_at") or "").replace("T", " ")[:19] or None,
+                "generated_at": generated_at,
+                "freshness": str(result.get("freshness") or "")[:32],
+                "status": str(result.get("status") or "")[:32],
+                "source": str(result.get("source") or "")[:255],
+                "universe": request.universe,
+                "concept_code": request.concept_code,
+                "result_count": len(rows),
+                "request_json": request_json,
+                "summary_json": summary_json,
+                "selector_json": selector_json,
+                "push_status": "PENDING" if request.notify else "NOT_REQUESTED",
+            },
+        )
+        for index, row in enumerate(rows, 1):
+            stock_code = str(row.get("stock_code") or "").strip().split(".")[0].zfill(6)
+            if not stock_code:
+                continue
+            conn.execute(
+                text("""
+                    INSERT INTO st_screener_run_result
+                      (run_uid, rank_no, selector_rank, stock_code, stock_name, score,
+                       ensemble_score, candidate_grade, action_status, primary_concept,
+                       change_pct, price, payload_json)
+                    VALUES
+                      (:run_uid, :rank_no, :selector_rank, :stock_code, :stock_name, :score,
+                       :ensemble_score, :candidate_grade, :action_status, :primary_concept,
+                       :change_pct, :price, :payload_json)
+                """),
+                {
+                    "run_uid": run_uid,
+                    "rank_no": int(row.get("rank") or index),
+                    "selector_rank": int(row.get("selector_rank") or 0) or None,
+                    "stock_code": stock_code,
+                    "stock_name": str(row.get("stock_name") or row.get("short_name") or "")[:120],
+                    "score": _number(row.get("score")),
+                    "ensemble_score": _number(row.get("ensemble_score")),
+                    "candidate_grade": str(row.get("candidate_grade") or "")[:20],
+                    "action_status": str((row.get("decision_readiness") or {}).get("recommend_status") or row.get("signal_status") or "")[:40],
+                    "primary_concept": str(row.get("primary_concept") or row.get("concept_name") or "")[:120],
+                    "change_pct": _number(row.get("change_pct")),
+                    "price": _number(row.get("price", row.get("close"))),
+                    "payload_json": json.dumps(row, ensure_ascii=False, default=str, separators=(",", ":")),
+                },
+            )
+    return {
+        "run_uid": run_uid,
+        "run_key": run_key,
+        "generated_at": generated_at.isoformat(sep=" "),
+        "persisted": True,
+        "is_new": True,
+        "push_status": "PENDING" if request.notify else "NOT_REQUESTED",
+    }
+
+
+def _update_screener_push(run_uid: str, notification: dict[str, Any]) -> None:
+    status = str(notification.get("status") or "error").upper()[:32]
+    error = str(notification.get("error") or notification.get("reason") or "")[:500] or None
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE st_screener_run_history
+                SET push_status = :status,
+                    push_error = :error,
+                    pushed_at = CASE WHEN :status = 'SENT' THEN CURRENT_TIMESTAMP ELSE pushed_at END
+                WHERE run_uid = :run_uid
+            """),
+            {"status": status, "error": error, "run_uid": run_uid},
+        )
 
 
 def _codes_for_universe(universe: str, concept_code: str = "") -> set[str] | None:
@@ -1305,13 +1506,33 @@ def screener_run(request: ScreenerRunRequest):
     result["data_gate"] = _runtime_status()
     result["versions"] = list(VERSION_MATRIX)
     result["selector"] = selector_contract()
-    result["run"] = {
+    run_meta = {
         "run_type": "sync",
         "run_id": f"screen-{target}-{request.preset}",
-        "generated_at": date.today().isoformat(),
+        "generated_at": datetime.now().replace(microsecond=0).isoformat(sep=" "),
         "model_fingerprint": result["selector"]["model_fingerprint"],
         "rollback_target": result["selector"]["rollback"]["target"],
     }
+    try:
+        persisted = _persist_screener_run(request, result)
+        run_meta.update(persisted)
+    except Exception as exc:  # A database ledger failure must be visible without hiding the ranking.
+        logger.exception("Unable to persist screener run: %s", exc)
+        run_meta.update({"persisted": False, "is_new": False, "persistence_error": str(exc)[:300]})
+    result["run"] = run_meta
+    if request.notify:
+        if not run_meta.get("persisted"):
+            result["notification"] = {"status": "error", "error": "候选榜未落库，禁止发送无追溯结果"}
+        elif not run_meta.get("is_new") and str(run_meta.get("push_status") or "").upper() == "SENT":
+            result["notification"] = {"status": "skipped", "reason": "same_snapshot_already_sent"}
+        else:
+            from biz.analysis.trading_wecom import notify_screener_result
+
+            result["notification"] = notify_screener_result(result)
+            try:
+                _update_screener_push(str(run_meta.get("run_uid") or ""), result["notification"])
+            except Exception as exc:  # The result remains queryable even if push status bookkeeping fails.
+                logger.warning("Unable to update screener push status: %s", exc)
     logger.info(
         "production_screener_run %s",
         json.dumps(
@@ -1329,6 +1550,106 @@ def screener_run(request: ScreenerRunRequest):
         ),
     )
     return result
+
+
+@router.get("/screener/history")
+def screener_history(
+    data_date: str = Query(default=""),
+    preset: str = Query(default="intraday_sector"),
+    q: str = Query(default="", max_length=120),
+    run_uid: str = Query(default="", max_length=32),
+    limit: int = Query(default=200, ge=1, le=500),
+):
+    """Read a persisted ranking; historical dates are never recomputed with today's data."""
+    try:
+        _ensure_tables()
+        target = _clean_date(data_date)
+        params: dict[str, Any] = {"preset": preset, "data_date": target or None, "run_uid": run_uid}
+        runs = _engine_rows(
+            """
+            SELECT run_uid, preset, requested_date, session_date, data_date, evidence_date, observed_at,
+                   generated_at, freshness, status, source, result_count, summary_json,
+                   selector_json, push_status, pushed_at
+            FROM st_screener_run_history
+            WHERE (:preset = '' OR preset = :preset)
+              AND (:data_date IS NULL OR session_date = :data_date)
+              AND (:run_uid = '' OR run_uid = :run_uid)
+            ORDER BY COALESCE(observed_at, generated_at) DESC, id DESC
+            LIMIT 50
+            """,
+            params,
+            context="screener_history_runs",
+        )
+        if not runs:
+            return {"status": "not_found", "data": [], "total": 0, "available_runs": []}
+        selected = runs[0]
+        selected_uid = str(selected.get("run_uid") or "")
+        keyword = str(q or "").strip()
+        result_rows = _engine_rows(
+            """
+            SELECT rank_no, selector_rank, stock_code, stock_name, payload_json
+            FROM st_screener_run_result
+            WHERE run_uid = :run_uid
+              AND (:keyword = '' OR stock_code LIKE :pattern OR stock_name LIKE :pattern)
+            ORDER BY rank_no ASC
+            LIMIT :limit
+            """,
+            {"run_uid": selected_uid, "keyword": keyword, "pattern": f"%{keyword}%", "limit": limit},
+            context="screener_history_results",
+        )
+        data: list[dict[str, Any]] = []
+        for row in result_rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            payload.setdefault("rank", row.get("rank_no"))
+            payload.setdefault("selector_rank", row.get("selector_rank"))
+            payload.setdefault("stock_code", row.get("stock_code"))
+            payload.setdefault("stock_name", row.get("stock_name"))
+            data.append(payload)
+        try:
+            stats = json.loads(selected.get("summary_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stats = {}
+        try:
+            selector = json.loads(selected.get("selector_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            selector = {}
+        available = [
+            {
+                "run_uid": row.get("run_uid"),
+                "data_date": row.get("data_date"),
+                "session_date": row.get("session_date"),
+                "observed_at": row.get("observed_at"),
+                "generated_at": row.get("generated_at"),
+                "freshness": row.get("freshness"),
+                "result_count": row.get("result_count"),
+                "push_status": row.get("push_status"),
+            }
+            for row in runs
+        ]
+        return {
+            "status": selected.get("status") or "ok",
+            "preset": selected.get("preset"),
+            "requested_date": selected.get("requested_date"),
+            "session_date": selected.get("session_date"),
+            "data_date": selected.get("data_date"),
+            "evidence_date": selected.get("evidence_date"),
+            "observed_at": selected.get("observed_at"),
+            "generated_at": selected.get("generated_at"),
+            "freshness": selected.get("freshness"),
+            "source": selected.get("source"),
+            "stats": stats,
+            "selector": selector,
+            "run": {"run_uid": selected_uid, "persisted": True, "push_status": selected.get("push_status"), "pushed_at": selected.get("pushed_at")},
+            "data": data,
+            "total": len(data),
+            "available_runs": available,
+        }
+    except Exception as exc:
+        logger.exception("Unable to read screener history: %s", exc)
+        return {"status": "error", "data": [], "total": 0, "error": str(exc)[:300], "available_runs": []}
 
 
 @router.get("/screener/saved")
