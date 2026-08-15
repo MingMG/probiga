@@ -376,6 +376,14 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             where_sql="recommend_status IS NOT NULL AND TRIM(recommend_status) <> ''",
             freshness_col="updated_at",
         ),
+        TableRequirement(
+            "st_premarket_theme_forecast_run",
+            min_rows=1,
+            date_col="session_date",
+            target="run_date",
+            where_sql="stage = 'PREMARKET_0908' AND status = 'COMPLETED' AND delivery_status = 'SUCCESS'",
+            freshness_col="updated_at",
+        ),
     ),
 }
 

@@ -499,10 +499,14 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
 fi
 assert_scheduler_triggers_quiescent
 test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+sudo -u "$SERVICE_USER" env \
+  "PYTHONPATH=$ADATA_SOURCE:/opt/ProBigA" \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+  tools/ensure_quality_gate.py \
+  --task-type analysis_premarket_external
 ACTIVE_REQUIREMENTS_SHA256="$EXPECTED_REQUIREMENTS_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
 ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
 write_receipt "DEPLOYED" "$EXPECTED_SHA"
 trap - ERR TERM INT
 rm -f "$PREVIOUS_DROPIN"
-

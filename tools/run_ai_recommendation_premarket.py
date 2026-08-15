@@ -14,7 +14,8 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, time as datetime_time
 from pathlib import Path
 
 from sqlalchemy import text
@@ -25,12 +26,19 @@ if str(ROOT) not in sys.path:
 
 from biz.analysis.sync_analysis_fast import latest_trade_date, previous_trade_date, run_batch
 from biz.market_context.external_market import fetch_external_market_snapshot, store_external_market_snapshot
+from biz.premarket.theme_forecast import (
+    format_forecast_markdown,
+    mark_forecast_delivery,
+    run_premarket_theme_forecast,
+)
+from integrations.wecom.webhook import send_markdown
 from server.api.routers.hot_data import (
     _recommended_run_history_finish,
     _recommended_run_history_start,
     _recommended_run_history_update,
 )
 from server.common.batch_db import create_batch_engine
+from server.common.config import get_wecom_webhook
 from tools.repair_recommendation_data import repair_target_data
 
 
@@ -120,6 +128,98 @@ def _resolve_target_trade_date(engine, *, strict_prev_trade_day: bool, execution
     return latest_trade_date(engine)
 
 
+def _premarket_theme_cutoff(execution_time: str) -> datetime:
+    execution_dt = datetime.fromisoformat(str(execution_time).replace("Z", "+00:00"))
+    if execution_dt.tzinfo is not None:
+        execution_dt = execution_dt.replace(tzinfo=None)
+    now = datetime.now().replace(microsecond=0)
+    hard_cutoff = datetime.combine(execution_dt.date(), datetime_time(9, 7, 59))
+    if now.date() == execution_dt.date():
+        return min(now, hard_cutoff)
+    return min(execution_dt.replace(microsecond=0), hard_cutoff)
+
+
+def _split_theme_markdown(content: str, max_bytes: int = 3800) -> list[str]:
+    """Split Markdown on line boundaries while keeping every UTF-8 character."""
+    if not content:
+        raise ValueError("09:08盘前主线预判内容为空")
+    chunks: list[str] = []
+    current = ""
+    for line in content.splitlines(keepends=True):
+        if len(line.encode("utf-8")) > max_bytes:
+            if current:
+                chunks.append(current)
+                current = ""
+            remaining = line
+            while remaining:
+                end = min(len(remaining), max_bytes)
+                while end > 0 and len(remaining[:end].encode("utf-8")) > max_bytes:
+                    end -= 1
+                if end <= 0:
+                    raise ValueError("企业微信消息中存在无法分段的字符")
+                chunks.append(remaining[:end])
+                remaining = remaining[end:]
+            continue
+        candidate = current + line
+        if current and len(candidate.encode("utf-8")) > max_bytes:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _send_theme_forecast_markdown(webhook_url: str, content: str) -> dict:
+    if not str(webhook_url or "").strip():
+        raise RuntimeError("未配置企业微信早报机器人 webhook")
+    segments = _split_theme_markdown(content)
+    delivery_id = str(uuid.uuid4())
+    for index, segment in enumerate(segments, start=1):
+        prefix = f"## 🧭 09:08盘前主线预判 ({index}/{len(segments)})\n\n" if len(segments) > 1 else ""
+        response = send_markdown(webhook_url, prefix + segment)
+        if not isinstance(response, dict) or response.get("errcode") not in (None, 0):
+            raise RuntimeError(f"企业微信第{index}/{len(segments)}段未返回成功回执")
+        if index < len(segments):
+            time.sleep(2)
+    return {"success": True, "delivery_id": delivery_id, "segments": len(segments)}
+
+
+def _deliver_theme_forecast(engine, forecast: dict) -> dict:
+    run_uid = str(forecast.get("run_uid") or "")
+    if str(forecast.get("delivery_status") or "").upper() == "SUCCESS":
+        return {
+            "success": True,
+            "delivery_id": str(forecast.get("delivery_id") or ""),
+            "skipped": True,
+        }
+    try:
+        result = _send_theme_forecast_markdown(
+            get_wecom_webhook("briefing", required=False),
+            format_forecast_markdown(forecast),
+        )
+        if not result.get("success"):
+            raise RuntimeError("09:08盘前主线预判未获得企业微信成功回执")
+        if run_uid:
+            mark_forecast_delivery(
+                engine,
+                run_uid,
+                status="SUCCESS",
+                delivery_id=str(result.get("delivery_id") or ""),
+            )
+        return {
+            "success": True,
+            "delivery_id": str(result.get("delivery_id") or ""),
+            "segments": int(result.get("segments") or 0),
+            "skipped": False,
+        }
+    except Exception as exc:
+        if run_uid:
+            mark_forecast_delivery(engine, run_uid, status="FAILED", error=str(exc))
+        raise
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Premarket AI recommendation batch with run history")
     parser.add_argument("--date", default="", help="Analysis trade date; default latest/previous trading day")
@@ -134,6 +234,10 @@ def main() -> int:
     parser.add_argument("--auto-repair-missing-data", action="store_true", help="Repair K-line, historical capital flow and snapshot coverage before screening")
     parser.add_argument("--use-intraday-current", action="store_true", help="Use current intraday quote snapshots as target-day K-line inputs")
     parser.add_argument("--external-market", action="store_true", help="Capture global market data before recommendations")
+    parser.add_argument("--theme-forecast", action="store_true", help="Build and freeze the theme-first 09:08 forecast")
+    parser.add_argument("--push-theme-forecast", action="store_true", help="Push the frozen 09:08 forecast to the briefing WeCom bot")
+    parser.add_argument("--theme-top-n", type=int, default=12)
+    parser.add_argument("--theme-stocks-per-theme", type=int, default=5)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -167,6 +271,9 @@ def main() -> int:
     try:
         repair_report = None
         external_report = None
+        external_snapshot = None
+        theme_forecast_report = None
+        theme_delivery_report = None
         batch_execution_time = execution_time
         if args.external_market:
             _recommended_run_history_update(run_uid, status="running", payload={
@@ -187,6 +294,7 @@ def main() -> int:
                 attempts=external_attempts,
                 retry_delay_seconds=external_retry_delay,
             )
+            external_snapshot = snapshot
             try:
                 external_report = store_external_market_snapshot(engine, snapshot)
             except Exception as exc:
@@ -206,6 +314,51 @@ def main() -> int:
                 "progress_percent": 7,
                 "done_count": 0,
                 "message": "外围数据已落库，正在执行 AI 推荐筛选..." if external_report.get("external_market_data_quality") != "NOT_STORED" else "外围数据抓取完成但未落库，继续执行基础 AI 推荐...",
+                "error": "",
+            })
+        if args.theme_forecast:
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 10,
+                "done_count": 0,
+                "message": "正在按外盘、隔夜催化和上一完整交易日数据生成09:08主线预判...",
+                "error": "",
+            })
+            theme_cutoff = _premarket_theme_cutoff(execution_time)
+            snapshot_for_theme = external_snapshot
+            snapshot_time = None
+            if snapshot_for_theme is not None:
+                captured_value = snapshot_for_theme.get("captured_at")
+                if isinstance(captured_value, datetime):
+                    snapshot_time = captured_value.replace(tzinfo=None) if captured_value.tzinfo else captured_value
+                elif captured_value:
+                    try:
+                        snapshot_time = datetime.fromisoformat(str(captured_value).replace("Z", "+00:00")).replace(tzinfo=None)
+                    except ValueError:
+                        snapshot_time = None
+            if snapshot_time is not None and snapshot_time > theme_cutoff:
+                snapshot_for_theme = None
+            theme_forecast_report = run_premarket_theme_forecast(
+                engine,
+                session_date=theme_cutoff.date().isoformat(),
+                source_trade_date=target_trade_date,
+                cutoff_at=theme_cutoff,
+                external_snapshot=snapshot_for_theme,
+                theme_limit=max(1, int(args.theme_top_n)),
+                stocks_per_theme=max(1, int(args.theme_stocks_per_theme)),
+                persist=True,
+            )
+            if args.push_theme_forecast:
+                _recommended_run_history_update(run_uid, status="running", payload={
+                    "progress_percent": 14,
+                    "done_count": 0,
+                    "message": "09:08主线预判已冻结，正在推送到企业微信早报机器人...",
+                    "error": "",
+                })
+                theme_delivery_report = _deliver_theme_forecast(engine, theme_forecast_report)
+            _recommended_run_history_update(run_uid, status="running", payload={
+                "progress_percent": 16,
+                "done_count": len(theme_forecast_report.get("stock_candidates") or []),
+                "message": "09:08主线预判已落库并冻结，继续执行基础AI推荐。",
                 "error": "",
             })
         if args.auto_repair_missing_data:
@@ -319,6 +472,15 @@ def main() -> int:
             "recommendation_count": stats.recommendation_count,
             "market_mood_score": stats.market_mood_score,
             "external_market": external_report,
+            "premarket_theme_forecast": {
+                "run_uid": (theme_forecast_report or {}).get("run_uid"),
+                "session_date": (theme_forecast_report or {}).get("session_date"),
+                "summary": (theme_forecast_report or {}).get("summary"),
+                "data_quality": (theme_forecast_report or {}).get("data_quality"),
+                "theme_count": len((theme_forecast_report or {}).get("themes") or []),
+                "candidate_count": len((theme_forecast_report or {}).get("stock_candidates") or []),
+                "delivery": theme_delivery_report,
+            } if theme_forecast_report is not None else None,
             "flow_date": stats.flow_date,
             "hot_date": stats.hot_date,
             "run_uid": run_uid,

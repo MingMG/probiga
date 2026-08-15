@@ -6544,12 +6544,48 @@
 
     function loadCandidateCenterPage(d, container) {
         container.innerHTML = '<div class="loading">加载候选中心...</div>';
-        screenerJson('/api/screener/candidate-center?trade_date=' + encodeURIComponent(d || '') + '&limit=120').then(function (data) {
+        Promise.all([
+            screenerJson('/api/screener/candidate-center?trade_date=' + encodeURIComponent(d || '') + '&limit=120'),
+            fetchJsonWithTimeout('/premarket-theme-forecast?session_date=' + encodeURIComponent(d || ''), 10000).catch(function (e) {
+                return { themes: [], stock_candidates: [], total: 0, error: e.message || String(e) };
+            })
+        ]).then(function (result) {
+            var data = result[0] || {};
+            var premarket = result[1] || {};
             _screenerState.center = data;
+            _screenerState.premarketTheme = premarket;
             var summary = data.summary || {}, jq = ((data.sources || {}).jq || {});
             var h = '<div class="screen-page candidate-center"><section class="screen-intro"><div><div class="screen-eyebrow">CANDIDATE CENTER / V3-V6 生产融合排序</div><h2 class="screen-title">候选中心</h2><p class="screen-subtitle">V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据和 T+1/T+5/T+20 多周期结果均可见；成本、容量与组合集中度不通过时会明确受限。</p></div><div class="screen-intro-count"><strong>' + (summary.candidate_count || 0) + '</strong><span>当前候选</span></div></section>';
             h += '<div class="stats-bar">' + card('A 级', (summary.grades || {}).A || 0, 'red') + card('B 级', (summary.grades || {}).B || 0, 'orange') + card('组合可用', summary.portfolio_eligible_count || 0, 'blue') + card('实际数据日', data.data_date || '-', 'green') + '</div>';
             if (jq.stale) h += '<div class="sc-freshness warn">聚宽策略最新数据为 ' + escHtml(jq.latest_date || '-') + '，早于当前候选日期；已保留在外部策略状态中，不参与主候选排序。</div>';
+            h += '<section class="sc-panel premarket-theme-panel"><div class="sc-panel-title"><strong>09:08 盘前主线预判</strong><span>' + escHtml((premarket.session_date || d || '-') + ' · A股数据截止 ' + (premarket.source_trade_date || '-') + ' · ' + (premarket.data_quality || '暂无')) + '</span></div>';
+            if (premarket.fallback) h += '<div class="sc-freshness warn">所选日期没有09:08冻结结果，下面展示最近一次 ' + escHtml(premarket.session_date || '-') + ' 的结果，不代表所选日期。</div>';
+            if (premarket.error) h += '<div class="sc-freshness error">09:08结果读取失败：' + escHtml(premarket.error) + '</div>';
+            var premarketThemes = Array.isArray(premarket.themes) ? premarket.themes : [];
+            if (!premarketThemes.length) {
+                h += '<div class="sc-empty-cell premarket-theme-empty">该日期尚无已冻结的09:08主线预判。每个交易日会在09:08前自动落库并推送企业微信。</div>';
+            } else {
+                h += '<div class="premarket-theme-meta"><span>截止时间 ' + escHtml(premarket.cutoff_at || '-') + '</span><span>模型 ' + escHtml(premarket.model_version || '-') + '</span><span>企微 ' + escHtml(premarket.delivery_status === 'SUCCESS' ? '已送达' : (premarket.delivery_status || '待送达')) + '</span><span>结果已冻结，盘中不会覆盖</span></div>';
+                h += '<div class="premarket-theme-grid">';
+                premarketThemes.slice(0, 12).forEach(function (theme) {
+                    var themeStocks = Array.isArray(theme.stock_candidates) ? theme.stock_candidates : [];
+                    h += '<article class="premarket-theme-card"><div class="premarket-theme-head"><span class="premarket-theme-rank">' + escHtml(theme.rank || '-') + '</span><div><strong>' + escHtml(theme.theme_name || '-') + '</strong><small>' + escHtml(theme.status || '观察') + ' · 成分 ' + escHtml(theme.member_count || 0) + '</small></div><b>' + fmt(theme.score, 1) + '</b></div>';
+                    h += '<div class="premarket-theme-scores"><span>外盘 ' + fmt(theme.external_score, 1) + '</span><span>资金广度 ' + fmt(theme.flow_breadth_score, 1) + '</span><span>技术 ' + fmt(theme.technical_score, 1) + '</span><span>催化 ' + fmt(theme.catalyst_score, 1) + '</span><span>拥挤扣分 ' + fmt(theme.crowding_penalty, 1) + '</span></div>';
+                    h += '<div class="premarket-theme-labels">' + escHtml((theme.concept_names || []).slice(0, 6).join(' · ') || '动态主题') + '</div>';
+                    h += '<div class="premarket-theme-evidence"><b>入选依据</b><span>' + escHtml((theme.evidence || []).slice(0, 4).join('；') || '等待更多盘前证据') + '</span></div>';
+                    if (themeStocks.length) {
+                        h += '<div class="premarket-theme-stocks">' + themeStocks.slice(0, 5).map(function (stock) {
+                            var code = String(stock.stock_code || '').padStart(6, '0');
+                            return '<span>' + nameLink(code, stock.stock_name || code) + '<em>' + fmt(stock.score, 1) + ' · ' + escHtml(stock.signal_status || '观察') + '</em></span>';
+                        }).join('') + '</div>';
+                    } else {
+                        h += '<div class="premarket-theme-labels">暂无成分股通过盘前排序，保留主题观察。</div>';
+                    }
+                    h += '</article>';
+                });
+                h += '</div>';
+            }
+            h += '<div class="sc-table-note">这里回答“开盘前优先看什么板块、哪些票”；下方 V3-V6 表回答“个股证据和交易门禁是否允许”。两层必须同时看。</div></section>';
             h += '<section class="sc-panel"><div class="sc-panel-title"><strong>策略分布</strong><span>' + escHtml(Object.keys(summary.strategy_counts || {}).map(function (key) { return key + ' ' + summary.strategy_counts[key]; }).join(' · ') || '暂无策略标签') + '</span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>综合分</th><th>信号</th><th>策略</th><th>入场/止损/目标</th><th>证据</th><th>动作</th></tr></thead><tbody>';
             var rows = data.candidates || [];
             if (!rows.length) h += '<tr><td colspan="8" class="sc-empty-cell">当前日期没有推荐候选，可以回到选股工作台运行规则筛选。</td></tr>';

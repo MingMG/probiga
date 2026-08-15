@@ -4150,6 +4150,30 @@ def research_radar(trade_date: str = Query(default=None)):
         }
 
 
+@router.get("/hot-data/premarket-theme-forecast")
+def premarket_theme_forecast(session_date: str = Query(default=None)):
+    """读取已冻结的09:08盘前主题预判，不混用盘中或收盘后结论。"""
+    try:
+        from biz.premarket.theme_forecast import load_premarket_theme_forecast
+
+        return load_premarket_theme_forecast(
+            get_engine(),
+            session_date,
+            allow_fallback=True,
+        )
+    except Exception as e:
+        return {
+            "requested_date": session_date or date.today().isoformat(),
+            "session_date": session_date or date.today().isoformat(),
+            "stage": "PREMARKET_0908",
+            "fallback": False,
+            "themes": [],
+            "stock_candidates": [],
+            "total": 0,
+            "error": str(e),
+        }
+
+
 @router.get("/hot-data/daily-review-dates")
 def daily_review_dates():
     """复盘数据可用日期列表"""

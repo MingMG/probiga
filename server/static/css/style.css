@@ -4621,3 +4621,109 @@ tr:hover { background: #f8f9fb; }
   .trade-panel-head { align-items: flex-start; flex-direction: column; gap: 5px; }
   .trade-account-grid { grid-template-columns: 1fr; }
 }
+.premarket-theme-panel {
+  border-color: #c7d8ee;
+  background: linear-gradient(180deg, #f7fbff 0%, #ffffff 100%);
+}
+.premarket-theme-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.premarket-theme-meta span {
+  padding: 5px 9px;
+  border: 1px solid #dbe7f5;
+  border-radius: 999px;
+  background: #fff;
+  color: #52657d;
+  font-size: 11px;
+}
+.premarket-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.premarket-theme-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #e0eaf5;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 4px 14px rgba(41, 72, 110, .05);
+}
+.premarket-theme-head {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.premarket-theme-rank {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  color: #fff;
+  background: #2563eb;
+  font-weight: 800;
+}
+.premarket-theme-head strong { display: block; color: #172b4d; font-size: 13px; }
+.premarket-theme-head small { display: block; margin-top: 2px; color: #7b8da5; font-size: 11px; }
+.premarket-theme-head b { color: #d7432f; font-size: 18px; }
+.premarket-theme-scores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+}
+.premarket-theme-scores span {
+  padding: 3px 6px;
+  border-radius: 5px;
+  background: #edf4fc;
+  color: #48627f;
+  font-size: 10px;
+}
+.premarket-theme-labels {
+  margin-top: 8px;
+  color: #718096;
+  font-size: 11px;
+  line-height: 1.55;
+}
+.premarket-theme-evidence {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px;
+  margin-top: 7px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  background: #fff8e8;
+  color: #6f5a2d;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.premarket-theme-evidence b { color: #a66b00; white-space: nowrap; }
+.premarket-theme-stocks {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 10px;
+  margin-top: 9px;
+}
+.premarket-theme-stocks > span {
+  min-width: 0;
+  padding-top: 5px;
+  border-top: 1px dashed #e3ebf4;
+  font-size: 11px;
+}
+.premarket-theme-stocks em {
+  display: block;
+  margin-top: 2px;
+  color: #7b8da5;
+  font-size: 10px;
+  font-style: normal;
+}
+.premarket-theme-empty { padding: 22px 10px; }
+@media (max-width: 980px) {
+  .premarket-theme-grid { grid-template-columns: 1fr; }
+}

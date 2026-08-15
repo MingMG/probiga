@@ -757,7 +757,7 @@ def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, A
         "snapshot_id": str(uuid.uuid4()),
         "context_date": context_date.isoformat(),
         "captured_at": captured_at,
-        "source": "akshare_eastmoney",
+        "source": "akshare_eastmoney+yahoo_finance" if yahoo_items else "akshare_eastmoney",
         "items": items,
         "external_market_score": score,
         "external_market_status": status,
@@ -902,13 +902,14 @@ def load_latest_external_market_context(
         score, status, reason = _score_snapshot(items)
         available_count = sum(item.get("availability") == "available" for item in items)
         quality = _snapshot_quality(items)
+        item_sources = sorted({str(item.get("source") or "").strip() for item in items if item.get("source")})
         return {
             "external_market_status": status,
             "external_market_score": score if score is not None else 50.0,
             "external_market_reason": reason,
             "external_market_data_quality": quality,
             "external_market_captured_at": str(rows.iloc[0].get("captured_at") or "")[:19],
-            "external_market_source": "akshare_eastmoney",
+            "external_market_source": "+".join(item_sources) or "unknown",
             "external_market_items_json": json.dumps(items, ensure_ascii=False, default=str),
         }
     except Exception as exc:  # data enrichment must never block the base recommendation

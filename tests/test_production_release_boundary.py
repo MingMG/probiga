@@ -212,6 +212,8 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "reused release virtual environment" in workflow
     assert "new release virtual environment" in workflow
     assert "previous release virtual environment" in workflow
+    assert "tools/ensure_quality_gate.py" in deploy_script
+    assert "--task-type analysis_premarket_external" in deploy_script
     assert 'find "$tree_root"' in workflow
     assert "-writable -print -quit" in workflow
 

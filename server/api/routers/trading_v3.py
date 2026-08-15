@@ -501,7 +501,9 @@ def paper_ledger(
             "position_state": "HOLDING",
             "quantity": int(row.get("buy_shares") or 0),
             "remaining_quantity": int(row.get("buy_shares") or 0),
-            "sellable_quantity": 0 if str(row.get("buy_date") or "")[:10] == date.today().isoformat() else int(row.get("buy_shares") or 0),
+            # Legacy event-sim lots are display-only evidence.  They are not
+            # canonical V2 inventory and must never inflate executable shares.
+            "sellable_quantity": 0,
             "cost_price": row.get("buy_price"),
             "last_reason": row.get("buy_reason") or "事件驱动模拟成交",
         }))

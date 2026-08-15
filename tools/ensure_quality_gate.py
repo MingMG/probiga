@@ -8,18 +8,19 @@ dashboard or paper-trading workflows trust it.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.config import get_mysql_url
+from server.common.batch_db import create_batch_engine
 
 
 SCHEDULER_COLUMNS = {
@@ -293,6 +294,19 @@ TASKS = [
         "description": "每天08:30按执行日上一交易日严格生成AI推荐；上一交易日K线不足时先用国金QMT补目标日，仍不足则失败，不回退更早日期。",
     },
     {
+        "task_name": "AI推荐09:08盘前主线预判",
+        "task_type": "analysis_premarket_external",
+        "group_name": "AI推荐",
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+        "script_args": "--strict-prev-trade-day --external-market --theme-forecast --push-theme-forecast --theme-top-n 12 --theme-stocks-per-theme 5 --top-n 80 --min-score 62 --min-kline-coverage 0.80 --json",
+        "cron_time": "09:07",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 92,
+        "date_param": "",
+        "description": "09:07启动，在09:08档结合美股、日韩、港股、产业ETF与龙头、期货商品、汇率、美债、隔夜催化和上一完整交易日A股数据，生成并冻结主线与动态成分股候选，推送企业微信早报机器人。",
+    },
+    {
         "task_name": "盘后数据质量体检",
         "task_type": "quality_check_post",
         "group_name": "系统管理",
@@ -301,7 +315,7 @@ TASKS = [
         "cron_time": "19:30",
         "interval_minutes": 0,
         "enabled": 1,
-        "sort_order": 92,
+        "sort_order": 93,
         "date_param": "",
         "description": "盘后只读体检；确认采集、分析、推荐和调度链路是否跟上最新交易日。",
     },
@@ -378,17 +392,29 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         return "inserted"
 
 
-def run(engine: Engine) -> dict[str, str]:
+def run(engine: Engine, *, task_types: set[str] | None = None) -> dict[str, str]:
     ensure_scheduler_columns(engine)
     result: dict[str, str] = {}
     for task in TASKS:
+        if task_types and str(task.get("task_type") or "") not in task_types:
+            continue
         result[task["task_name"]] = upsert_task(engine, task)
     return result
 
 
 def main() -> int:
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True)
-    result = run(engine)
+    parser = argparse.ArgumentParser(description="Upsert reviewed scheduler task definitions")
+    parser.add_argument(
+        "--task-type",
+        action="append",
+        default=[],
+        help="Only upsert this task type; may be repeated",
+    )
+    args = parser.parse_args()
+    engine = create_batch_engine()
+    result = run(engine, task_types=set(args.task_type) or None)
+    if args.task_type and not result:
+        raise RuntimeError("no scheduled task matched --task-type")
     for task_name, action in result.items():
         print(f"{action}: {task_name}")
     return 0
