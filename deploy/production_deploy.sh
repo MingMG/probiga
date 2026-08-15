@@ -168,6 +168,40 @@ assert_service_cannot_write_release_paths() {
     return 2
   fi
 }
+seal_release_checkout() {
+  declare -A tracked_directories=()
+  local directory
+  local entry
+  local git_mode
+  local tracked_path
+  while IFS= read -r -d '' entry; do
+    git_mode="${entry%% *}"
+    tracked_path="${entry#*$'\t'}"
+    if [ -L "$tracked_path" ]; then
+      chown -h root:root -- "$tracked_path"
+    else
+      chown root:root -- "$tracked_path"
+      if [ "$git_mode" = 100755 ]; then
+        chmod 0555 -- "$tracked_path"
+      else
+        chmod 0444 -- "$tracked_path"
+      fi
+    fi
+    directory="$(dirname "$tracked_path")"
+    while [ "$directory" != . ]; do
+      tracked_directories["$directory"]=1
+      directory="$(dirname "$directory")"
+    done
+  done < <(git ls-files --stage -z)
+  for directory in "${!tracked_directories[@]}"; do
+    chown root:root -- "$directory"
+    chmod 0555 -- "$directory"
+  done
+  find .git -type f -exec chown root:root -- {} + \
+    -exec chmod 0444 -- {} +
+  find .git -type d -exec chown root:root -- {} + \
+    -exec chmod 0555 -- {} +
+}
 assert_scheduler_triggers_quiescent
 write_dropin() {
   local revision="$1"
@@ -183,6 +217,7 @@ write_dropin() {
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
+    'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
@@ -449,6 +484,7 @@ git cat-file -e "${EXPECTED_SHA}^{commit}"
 git checkout --detach --force "$EXPECTED_SHA"
 find server biz integrations tools scripts strategies versions \
   -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+seal_release_checkout
 assert_service_cannot_write_release_paths
 test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
 if [ -n "$PREVIOUS_ADATA_TREE_SHA256" ]; then
