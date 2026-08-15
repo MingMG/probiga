@@ -253,6 +253,14 @@ def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
     assert "*.sh text eol=lf" in attributes
 
 
+def test_production_dependency_lock_respects_server_mirror_ceiling() -> None:
+    requirements = (ROOT / "requirements-platform.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "charset-normalizer==3.5.0" in requirements
+
+
 def test_sector_heat_runtime_cache_is_outside_tracked_data() -> None:
     from tools import fetch_sector_heat_east_daily
 
