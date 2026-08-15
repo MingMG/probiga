@@ -166,6 +166,9 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert ".probiga_deploy_lock" in workflow
     assert "resolved_requirements_sha256" in workflow
     assert ".release_venvs" in workflow
+    assert 'chown root:root "$RELEASE_VENV_ROOT"' in deploy_script
+    assert 'chmod 0555 "$RELEASE_VENV_ROOT"' in deploy_script
+    assert 'sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"' in deploy_script
     assert "command_timeout: 25m" in workflow
     assert "probiga.deploy-receipt.v3" in workflow
     assert '"expected_requirements_sha256":"%s"' in workflow

@@ -580,7 +580,10 @@ trap 'rollback $?' ERR
 trap 'rollback 143' TERM
 trap 'rollback 130' INT
 mkdir -p "$RELEASE_VENV_ROOT"
+chown root:root "$RELEASE_VENV_ROOT"
+chmod 0555 "$RELEASE_VENV_ROOT"
 sudo -u "$SERVICE_USER" test ! -w "$RELEASE_VENV_ROOT"
+sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
   ! systemctl is-active --quiet probiga-scheduler
