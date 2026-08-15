@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-from biz.market_context.external_market import _index_items, _parse_eastmoney_vix_payload, _score_snapshot
+from datetime import datetime
+
+from biz.market_context.external_market import (
+    EXTERNAL_MARKET_SYMBOLS,
+    _YAHOO_FALLBACK_MAP,
+    _index_items,
+    _parse_eastmoney_vix_payload,
+    _parse_yahoo_chart_payload,
+    _score_snapshot,
+)
 
 
 def _item(symbol: str, change_pct: float) -> dict:
@@ -72,3 +81,87 @@ def test_high_vix_adds_external_risk_pressure() -> None:
     score, status, _ = _score_snapshot(items)
     assert score is not None and score <= 47.0
     assert status == "RISK"
+
+
+def test_yahoo_fallback_uses_live_quote_before_cutoff() -> None:
+    item = _parse_yahoo_chart_payload(
+        "kospi",
+        "韩国KOSPI",
+        "^KS11",
+        {
+            "chart": {
+                "result": [{
+                    "meta": {
+                        "regularMarketPrice": 2810.0,
+                        "chartPreviousClose": 2782.0,
+                        "regularMarketTime": 1786671000,
+                        "exchangeTimezoneName": "Asia/Seoul",
+                    },
+                    "timestamp": [1786498200, 1786584600],
+                    "indicators": {"quote": [{"close": [2750.0, 2782.0]}]},
+                }]
+            }
+        },
+        captured_at=datetime.fromtimestamp(1786671060),
+    )
+    assert item is not None
+    assert item["price"] == 2810.0
+    assert round(item["change_pct"], 2) == 1.01
+    assert item["source"] == "yahoo.finance.chart"
+
+
+def test_yahoo_fallback_rejects_future_live_quote_during_replay() -> None:
+    item = _parse_yahoo_chart_payload(
+        "nasdaq",
+        "美股纳斯达克",
+        "^IXIC",
+        {
+            "chart": {
+                "result": [{
+                    "meta": {
+                        "regularMarketPrice": 30000.0,
+                        "chartPreviousClose": 29000.0,
+                        "regularMarketTime": 1787000000,
+                    },
+                    "timestamp": [1786400000, 1786486400, 1786572800],
+                    "indicators": {"quote": [{"close": [27000.0, 27200.0, 27500.0]}]},
+                }]
+            }
+        },
+        captured_at=datetime.fromtimestamp(1786500000),
+    )
+    assert item is None
+
+
+def test_external_snapshot_includes_theme_specific_us_korea_japan_proxies() -> None:
+    expected = {
+        "us_lithium", "us_semiconductor", "us_ai", "us_robotics",
+        "kr_battery", "kr_semiconductor", "jp_battery", "jp_semiconductor",
+        "jp_robotics", "jp_auto", "taiwan_semiconductor",
+    }
+    assert expected <= {symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS}
+    assert expected <= set(_YAHOO_FALLBACK_MAP)
+
+
+def test_yahoo_tnx_is_normalized_to_percentage_points() -> None:
+    item = _parse_yahoo_chart_payload(
+        "us10y",
+        "美国10年期国债收益率",
+        "^TNX",
+        {
+            "chart": {
+                "result": [{
+                    "meta": {
+                        "regularMarketPrice": 46.43,
+                        "regularMarketTime": 1786671000,
+                    },
+                    "timestamp": [1786498200, 1786584600],
+                    "indicators": {"quote": [{"close": [46.20, 46.41]}]},
+                }]
+            }
+        },
+        captured_at=datetime.fromtimestamp(1786671060),
+    )
+    assert item is not None
+    assert item["price"] == 4.643
+    assert item["previous_close"] == 4.62

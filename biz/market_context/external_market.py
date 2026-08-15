@@ -12,8 +12,11 @@ import json
 import logging
 import math
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from sqlalchemy import text
@@ -45,6 +48,26 @@ EXTERNAL_MARKET_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("usdhkd", "美元兑港币"),
     ("us10y", "美国10年期国债收益率"),
     ("vix", "VIX恐慌指数"),
+    ("us_lithium", "美股锂电ETF"),
+    ("us_semiconductor", "美股半导体ETF"),
+    ("us_ai", "美股人工智能ETF"),
+    ("us_robotics", "美股机器人ETF"),
+    ("us_clean_energy", "美股清洁能源ETF"),
+    ("us_biotech", "美股生物科技ETF"),
+    ("us_auto", "美股汽车ETF"),
+    ("us_defense", "美股国防航空ETF"),
+    ("us_software", "美股软件ETF"),
+    ("us_cybersecurity", "美股网络安全ETF"),
+    ("us_consumer", "美股可选消费ETF"),
+    ("us_financial", "美股金融ETF"),
+    ("us_agriculture", "美股农业商品ETF"),
+    ("kr_semiconductor", "韩国三星电子"),
+    ("kr_battery", "韩国LG新能源"),
+    ("jp_semiconductor", "日本东京电子"),
+    ("jp_robotics", "日本发那科"),
+    ("jp_auto", "日本丰田汽车"),
+    ("jp_battery", "日本松下控股"),
+    ("taiwan_semiconductor", "中国台湾台积电"),
 )
 
 _INDEX_MAP = {
@@ -78,6 +101,54 @@ _FOREX_MAP = {
     "USDJPY": "usdjpy",
     "USDKRW": "usdkrw",
     "USDHKD": "usdhkd",
+}
+
+# AkShare's Eastmoney global-index/FX frames occasionally return an empty
+# frame while futures remain healthy.  Yahoo's chart endpoint is used only as
+# a per-symbol fallback for the missing fields.  The timestamp is validated
+# against the requested capture time, so a replay cannot consume a quote that
+# was published after its point-in-time cutoff.
+_YAHOO_FALLBACK_MAP = {
+    "sp500_futures": "ES=F",
+    "nasdaq_futures": "NQ=F",
+    "dow_futures": "YM=F",
+    "crude_oil": "CL=F",
+    "gold": "GC=F",
+    "silver": "SI=F",
+    "copper": "HG=F",
+    "nasdaq": "^IXIC",
+    "sp500": "^GSPC",
+    "dow": "^DJI",
+    "nikkei": "^N225",
+    "kospi": "^KS11",
+    "hang_seng": "^HSI",
+    "taiwan": "^TWII",
+    "vix": "^VIX",
+    "usdcnh": "CNH=X",
+    "usdjpy": "JPY=X",
+    "usdkrw": "KRW=X",
+    "usdhkd": "HKD=X",
+    "us10y": "^TNX",
+    "us_lithium": "LIT",
+    "us_semiconductor": "SOXX",
+    "us_ai": "AIQ",
+    "us_robotics": "BOTZ",
+    "us_clean_energy": "ICLN",
+    "us_biotech": "XBI",
+    "us_auto": "CARZ",
+    "us_defense": "ITA",
+    "us_software": "IGV",
+    "us_cybersecurity": "CIBR",
+    "us_consumer": "XLY",
+    "us_financial": "XLF",
+    "us_agriculture": "DBA",
+    "kr_semiconductor": "005930.KS",
+    "kr_battery": "373220.KS",
+    "jp_semiconductor": "8035.T",
+    "jp_robotics": "6954.T",
+    "jp_auto": "7203.T",
+    "jp_battery": "6752.T",
+    "taiwan_semiconductor": "2330.TW",
 }
 
 
@@ -267,6 +338,163 @@ def _fetch_eastmoney_vix_item() -> dict[str, Any] | None:
     except Exception as exc:  # pragma: no cover - network failures vary by run
         logger.warning("Eastmoney VIX fallback failed: %s", exc)
         return None
+
+
+def _parse_yahoo_chart_payload(
+    symbol: str,
+    display_name: str,
+    raw_code: str,
+    payload: dict[str, Any],
+    *,
+    captured_at: datetime,
+) -> dict[str, Any] | None:
+    """Parse one Yahoo chart response without crossing ``captured_at``."""
+    chart = payload.get("chart") if isinstance(payload, dict) else None
+    results = chart.get("result") if isinstance(chart, dict) else None
+    result = results[0] if isinstance(results, list) and results else None
+    if not isinstance(result, dict):
+        return None
+    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    cutoff_ts = captured_at.timestamp()
+    market_ts = _number(meta.get("regularMarketTime"))
+    price = None
+    previous = None
+    selected_ts = None
+    timestamps = result.get("timestamp") if isinstance(result.get("timestamp"), list) else []
+    indicators = result.get("indicators") if isinstance(result.get("indicators"), dict) else {}
+    quotes = indicators.get("quote") if isinstance(indicators.get("quote"), list) else []
+    closes = quotes[0].get("close") if quotes and isinstance(quotes[0], dict) else []
+    safe_points: list[tuple[float, float]] = []
+    for timestamp, close in zip(timestamps, closes or []):
+        ts = _number(timestamp)
+        value = _number(close)
+        if ts is not None and value is not None and ts <= cutoff_ts:
+            safe_points.append((ts, value))
+    # A small clock-skew allowance is acceptable for a live request, but a
+    # historical replay must never read today's regularMarketPrice.
+    if market_ts is not None and market_ts <= cutoff_ts + 300:
+        price = _number(meta.get("regularMarketPrice"))
+        # ``chartPreviousClose`` is the close at the beginning of the selected
+        # range, not necessarily yesterday's close.  The penultimate daily
+        # point is the correct comparison for a live/current-session quote.
+        if safe_points:
+            latest_bar = safe_points[-1][1]
+            same_as_live = price is not None and abs(latest_bar - price) <= max(0.0001, abs(price) * 0.0005)
+            if same_as_live and len(safe_points) >= 2:
+                previous = safe_points[-2][1]
+            elif not same_as_live:
+                previous = latest_bar
+        if previous is None:
+            previous = _number(meta.get("previousClose"))
+        selected_ts = market_ts
+    elif market_ts is not None:
+        # The response has already advanced beyond the requested replay
+        # cutoff.  Daily bars are mutable until the session closes, so using
+        # them here would silently introduce future information.
+        return None
+    elif safe_points:
+        selected_ts, price = safe_points[-1]
+        if len(safe_points) >= 2:
+            previous = safe_points[-2][1]
+    if price is None:
+        return None
+    # Yahoo quotes ``^TNX`` in tenths of a percentage point (for example
+    # 42.1 means a 4.21% Treasury yield).  Normalize it to the same unit as
+    # the AkShare bond source before the macro risk rules consume the value.
+    if symbol == "us10y" and abs(float(price)) >= 20.0:
+        price = float(price) / 10.0
+        if previous is not None:
+            previous = float(previous) / 10.0
+    change_pct = None
+    if previous not in (None, 0.0):
+        change_pct = (float(price) - float(previous)) / abs(float(previous)) * 100.0
+    market_time = None
+    if selected_ts is not None:
+        try:
+            market_time = datetime.fromtimestamp(float(selected_ts)).isoformat(sep=" ")
+        except (OverflowError, OSError, ValueError):
+            market_time = None
+    return {
+        "symbol": symbol,
+        "display_name": display_name,
+        "price": price,
+        "change_pct": change_pct,
+        "previous_close": previous,
+        "market_time": market_time,
+        "availability": "available",
+        "source": "yahoo.finance.chart",
+        "raw_code": raw_code,
+        "payload": {
+            "currency": meta.get("currency"),
+            "exchangeName": meta.get("exchangeName"),
+            "exchangeTimezoneName": meta.get("exchangeTimezoneName"),
+            "regularMarketTime": meta.get("regularMarketTime"),
+        },
+    }
+
+
+def _fetch_yahoo_fallback_item(
+    symbol: str,
+    display_name: str,
+    raw_code: str,
+    *,
+    captured_at: datetime,
+) -> dict[str, Any] | None:
+    try:
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{quote(raw_code, safe='')}?interval=1d&range=10d"
+        )
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0 ProBigA external-market"})
+        with urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        return _parse_yahoo_chart_payload(
+            symbol,
+            display_name,
+            raw_code,
+            payload,
+            captured_at=captured_at,
+        )
+    except Exception as exc:  # pragma: no cover - network failures vary by run
+        logger.warning("Yahoo external fallback %s failed: %s", raw_code, exc)
+        return None
+
+
+def _load_yahoo_fallback_items(
+    symbols: Iterable[str],
+    *,
+    captured_at: datetime,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Fetch missing spot/FX symbols concurrently within the 09:08 budget."""
+    display_names = dict(EXTERNAL_MARKET_SYMBOLS)
+    requested = [symbol for symbol in dict.fromkeys(symbols) if symbol in _YAHOO_FALLBACK_MAP]
+    if not requested:
+        return {}, []
+    items: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(requested))) as executor:
+        futures = {
+            executor.submit(
+                _fetch_yahoo_fallback_item,
+                symbol,
+                display_names.get(symbol, symbol),
+                _YAHOO_FALLBACK_MAP[symbol],
+                captured_at=captured_at,
+            ): symbol
+            for symbol in requested
+        }
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                item = future.result()
+            except Exception as exc:  # defensive: worker should already absorb failures
+                errors.append(f"yahoo {symbol}: {exc}")
+                continue
+            if item is None:
+                errors.append(f"yahoo {symbol}: no point-in-time quote")
+            else:
+                items[symbol] = item
+    return items, errors
 
 
 def _index_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -502,6 +730,23 @@ def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, A
         else:
             item = _item(symbol, display_name, None, source="akshare.index_global_spot_em", raw_code=symbol.upper())
         items.append(item)
+
+    missing_fallback_symbols = [
+        str(item.get("symbol") or "")
+        for item in items
+        if item.get("availability") != "available"
+        and str(item.get("symbol") or "") in _YAHOO_FALLBACK_MAP
+    ]
+    yahoo_items, yahoo_errors = _load_yahoo_fallback_items(
+        missing_fallback_symbols,
+        captured_at=captured_at,
+    )
+    if yahoo_items:
+        items = [
+            yahoo_items.get(str(item.get("symbol") or ""), item)
+            for item in items
+        ]
+    errors.extend(yahoo_errors)
 
     score, status, reason = _score_snapshot(items)
     available_count = sum(item.get("availability") == "available" for item in items)
