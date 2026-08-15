@@ -57,6 +57,11 @@ SERVICE_USER="$(systemctl show -p User --value probiga)"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
 sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
+REPOSITORY_ROOT=/opt/ProBigA
+if ! sudo git config --system --get-all safe.directory \
+  | grep -Fxq "$REPOSITORY_ROOT"; then
+  sudo git config --system --add safe.directory "$REPOSITORY_ROOT"
+fi
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 assert_service_cannot_write_tree() {
   local tree_root="$1"
@@ -131,6 +136,7 @@ write_dropin() {
   local adata_source="$4"
   printf '%s\n' \
     '[Service]' \
+    'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
     "ExecStart=$RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=true' \

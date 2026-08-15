@@ -142,6 +142,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "SERVER_HOST: 47.113.123.190" not in workflow_source
     assert 'test "$SERVER_USER" != root' in workflow
     assert 'test "$SERVICE_USER" != root' in workflow
+    assert 'WorkingDirectory=/opt/ProBigA' in deploy_script
+    assert 'git config --system --add safe.directory "$REPOSITORY_ROOT"' in deploy_script
     assert "probiga-production-deploy" in workflow
     assert ".probiga_deploy_lock" in workflow
     assert "resolved_requirements_sha256" in workflow
