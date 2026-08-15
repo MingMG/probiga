@@ -699,12 +699,17 @@ def health_qmt_capabilities(force: bool = False):
     from integrations.qmt.diagnostics import capabilities
 
     runtime = _get_qmt_live_runtime_config()
-    if not force and not bool(runtime.get("enabled")) and not bridge.is_configured():
+    # The production API runs on Linux while the licensed QMT SDK and client
+    # run on the Windows collector.  Enabling the server-side freshness loop
+    # must not make this endpoint probe a non-existent local Windows runtime.
+    # ``force=true`` remains available for hosts that intentionally configure
+    # a local SDK probe.
+    if not force and not bridge.is_configured():
         return {
             "ok": False,
             "provider": "gj_qmt",
-            "status": "disabled",
-            "reason": "国金QMT实时运行时未启用，且本服务器未配置国金QMT SDK运行环境",
+            "status": "external_windows_collector",
+            "reason": "生产服务器通过 Windows QMT 采集器接收数据，本机不直接加载 QMT SDK",
             "qmt_live_runtime": runtime,
             "rows": [],
         }
