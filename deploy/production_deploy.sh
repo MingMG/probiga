@@ -68,6 +68,40 @@ if [ -d "$LEGACY_ADATA_REPOSITORY/.git" ] && \
     | grep -Fxq "$LEGACY_ADATA_REPOSITORY"; then
   sudo git config --system --add safe.directory "$LEGACY_ADATA_REPOSITORY"
 fi
+LEGACY_STATE_DIR="$RECEIPT_DIR/legacy-state-$RECEIPT_ID"
+preserve_tracked_worktree_state() {
+  local repository="$1"
+  local label="$2"
+  local status_file
+  local patch_file
+  local manifest_file
+  local tracked_status
+  tracked_status="$(git -C "$repository" status \
+    --porcelain --untracked-files=no)"
+  if [ -z "$tracked_status" ]; then
+    return 0
+  fi
+  sudo mkdir -p "$LEGACY_STATE_DIR"
+  sudo chown root:root "$LEGACY_STATE_DIR"
+  sudo chmod 0700 "$LEGACY_STATE_DIR"
+  status_file="$LEGACY_STATE_DIR/$label.status"
+  patch_file="$LEGACY_STATE_DIR/$label.patch"
+  manifest_file="$LEGACY_STATE_DIR/$label.sha256"
+  printf '%s\n' "$tracked_status" | sudo tee "$status_file" >/dev/null
+  git -C "$repository" diff --binary --full-index HEAD -- \
+    | sudo tee "$patch_file" >/dev/null
+  (
+    cd "$LEGACY_STATE_DIR"
+    sha256sum "$label.status" "$label.patch"
+  ) | sudo tee "$manifest_file" >/dev/null
+  sudo chown root:root "$status_file" "$patch_file" "$manifest_file"
+  sudo chmod 0600 "$status_file" "$patch_file" "$manifest_file"
+  echo "Preserved tracked legacy $label changes in $LEGACY_STATE_DIR" >&2
+}
+preserve_tracked_worktree_state "$REPOSITORY_ROOT" repository
+if [ -d "$LEGACY_ADATA_REPOSITORY/.git" ]; then
+  preserve_tracked_worktree_state "$LEGACY_ADATA_REPOSITORY" adata
+fi
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 assert_service_cannot_write_tree() {
   local tree_root="$1"
@@ -218,7 +252,6 @@ if [ -n "$PREVIOUS_ADATA_SHA$PREVIOUS_ADATA_TREE_SHA256$PREVIOUS_ADATA_SOURCE" ]
     "$(dirname "$(dirname "$(dirname "$PREVIOUS_ADATA_SOURCE")")")"
 else
   test -d /opt/ProBigA/adata/.git
-  test -z "$(git -C /opt/ProBigA/adata status --porcelain --untracked-files=all)"
   PREVIOUS_ADATA_SHA="$(git -C /opt/ProBigA/adata rev-parse HEAD)"
   [[ "$PREVIOUS_ADATA_SHA" =~ ^[0-9a-f]{40}$ ]]
   PREVIOUS_ADATA_TREE_SHA256=""
@@ -399,7 +432,7 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
 fi
 sudo systemctl stop probiga
 git cat-file -e "${EXPECTED_SHA}^{commit}"
-git checkout --detach "$EXPECTED_SHA"
+git checkout --detach --force "$EXPECTED_SHA"
 find server biz integrations tools scripts strategies versions \
   -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 assert_service_cannot_write_release_paths

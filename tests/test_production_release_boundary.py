@@ -145,6 +145,10 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'WorkingDirectory=/opt/ProBigA' in deploy_script
     assert 'git config --system --add safe.directory "$REPOSITORY_ROOT"' in deploy_script
     assert 'git config --system --add safe.directory "$LEGACY_ADATA_REPOSITORY"' in deploy_script
+    assert 'LEGACY_STATE_DIR="$RECEIPT_DIR/legacy-state-$RECEIPT_ID"' in deploy_script
+    assert "preserve_tracked_worktree_state" in deploy_script
+    assert 'git checkout --detach --force "$EXPECTED_SHA"' in deploy_script
+    assert "git clean" not in deploy_script
     assert "probiga-production-deploy" in workflow
     assert ".probiga_deploy_lock" in workflow
     assert "resolved_requirements_sha256" in workflow
