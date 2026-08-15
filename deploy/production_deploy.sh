@@ -102,6 +102,91 @@ preserve_tracked_worktree_state "$REPOSITORY_ROOT" repository
 if [ -d "$LEGACY_ADATA_REPOSITORY/.git" ]; then
   preserve_tracked_worktree_state "$LEGACY_ADATA_REPOSITORY" adata
 fi
+quarantine_untracked_executable_code() {
+  declare -A unsafe_paths=()
+  local candidate
+  local code_root
+  local manifest_file
+  local relative_path
+  local source_path
+  local target_path
+  local target_parent
+  local digest
+  local metadata
+
+  collect_untracked_candidate() {
+    candidate="$1"
+    relative_path="${candidate#./}"
+    case "$relative_path" in
+      ''|.|/*|..|../*|*/..|*/../*)
+        echo "unsafe quarantine path: $relative_path" >&2
+        return 2
+        ;;
+    esac
+    if git ls-files --error-unmatch -- "$relative_path" >/dev/null 2>&1; then
+      return 0
+    fi
+    unsafe_paths["$relative_path"]=1
+  }
+
+  while IFS= read -r -d '' candidate; do
+    collect_untracked_candidate "$candidate"
+  done < <(find . -maxdepth 1 \( -type f -o -type l \) \
+    \( -name '*.py' -o -name '*.pyw' -o -name '*.pyc' \
+    -o -name '*.pyo' -o -name '*.pyd' -o -name '*.so' \) -print0)
+
+  for code_root in server biz integrations tools scripts strategies versions; do
+    if [ ! -d "$code_root" ]; then
+      continue
+    fi
+    while IFS= read -r -d '' candidate; do
+      collect_untracked_candidate "$candidate"
+    done < <(find "$code_root" \( -type f -o -type l \) \
+      \( -name '*.py' -o -name '*.pyw' -o -name '*.pyc' \
+      -o -name '*.pyo' -o -name '*.pyd' -o -name '*.so' \) -print0)
+  done
+
+  while IFS= read -r -d '' candidate; do
+    collect_untracked_candidate "$candidate"
+  done < <(find . -mindepth 2 -maxdepth 2 \( -type f -o -type l \) \
+    \( -name '__init__.py' -o -name '__init__*.pyc' \
+    -o -name '__init__*.pyd' -o -name '__init__*.so' \) -print0)
+
+  if [ "${#unsafe_paths[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  mkdir -p "$LEGACY_STATE_DIR/untracked-code"
+  chown root:root "$LEGACY_STATE_DIR" "$LEGACY_STATE_DIR/untracked-code"
+  chmod 0700 "$LEGACY_STATE_DIR" "$LEGACY_STATE_DIR/untracked-code"
+  manifest_file="$LEGACY_STATE_DIR/untracked-code.manifest"
+  : > "$manifest_file"
+  chmod 0600 "$manifest_file"
+  for relative_path in "${!unsafe_paths[@]}"; do
+    source_path="$REPOSITORY_ROOT/$relative_path"
+    target_path="$LEGACY_STATE_DIR/untracked-code/$relative_path"
+    target_parent="$(dirname "$target_path")"
+    mkdir -p "$target_parent"
+    chmod 0700 "$target_parent"
+    if [ -L "$source_path" ]; then
+      digest="$(readlink -- "$source_path" | sha256sum | cut -d' ' -f1)"
+    else
+      digest="$(sha256sum -- "$source_path" | cut -d' ' -f1)"
+    fi
+    metadata="$(stat -c '%F|%a|%U:%G|%s|%y' -- "$source_path")"
+    printf 'path=%q\tsha256=%s\tstat=%q\n' \
+      "$relative_path" "$digest" "$metadata" >> "$manifest_file"
+    mv -- "$source_path" "$target_path"
+    chown -h root:root -- "$target_path"
+    if [ ! -L "$target_path" ]; then
+      chmod 0600 -- "$target_path"
+    fi
+    echo "Quarantined unsafe untracked code: $relative_path" >&2
+  done
+  chown -R root:root "$LEGACY_STATE_DIR/untracked-code"
+  chmod 0600 "$manifest_file"
+}
+quarantine_untracked_executable_code
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 assert_service_cannot_write_tree() {
   local tree_root="$1"
