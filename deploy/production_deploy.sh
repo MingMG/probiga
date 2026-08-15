@@ -508,6 +508,16 @@ rollback() {
       rollback_failure "checkout previous Git revision"
       restoration_ready=0
     fi
+    if [ "$restoration_ready" -eq 1 ] && \
+      ! seal_release_checkout; then
+      rollback_failure "reseal previous Git checkout"
+      restoration_ready=0
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
+      ! assert_service_cannot_write_release_paths; then
+      rollback_failure "verify previous Git checkout is immutable"
+      restoration_ready=0
+    fi
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_DROPIN_PRESENT" -eq 1 ]; then
         if ! sudo cp "$PREVIOUS_DROPIN" \
@@ -707,17 +717,22 @@ else
   rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
   ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
 fi
-PYTHONDONTWRITEBYTECODE=1 \
+GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/validate_production_release_boundary.py \
   --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
 # The Windows QMT bridge only runs registered task types. Refuse activation
 # unless the four delivery tasks were provisioned explicitly and match this
 # release; production deployment itself remains read-only with respect to DB.
-sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1 \
+sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
+  PYTHONDONTWRITEBYTECODE=1 \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/ensure_quality_gate.py --validate-review-delivery
 rm -f "$RESOLVED_LOCK"
+# Root-owned validation can refresh Git metadata with a restrictive umask.
+# Seal again immediately before the service-account identity proof and start.
+seal_release_checkout
+assert_service_cannot_write_release_paths
 release_identity_check 1
 sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \

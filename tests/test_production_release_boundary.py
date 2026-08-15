@@ -267,7 +267,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     )
     assert validate_boundary - validate_boundary_env < 160
     assert validate_boundary < validate_scheduler_manifest < restart_service
-    assert 'sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1' in workflow
+    assert 'sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0' in workflow
     assert "tools/ensure_quality_gate.py --validate-review-delivery" in workflow
     assert "--apply-review-delivery-with-snapshot" not in workflow
     assert "--restore-review-delivery" not in workflow
@@ -294,6 +294,11 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "release_identity_check 1" in deploy_script
     assert "release_identity_check 0 >&2 || true" in deploy_script
     assert "PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN" in deploy_script
+    final_seal = deploy_script.rindex("\nseal_release_checkout\n")
+    final_identity_check = deploy_script.index("\nrelease_identity_check 1\n")
+    assert final_seal < final_identity_check
+    assert "reseal previous Git checkout" in deploy_script
+    assert "GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1" in deploy_script
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
