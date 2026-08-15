@@ -115,6 +115,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "index_minute",
     "intraday_quality_check",
     "intraday_realtime",
+    "intraday_market_alert",
     "intraday_minute_flow",
     "intraday_capital_flow_fast",
     "intraday_minute_kline",
@@ -183,6 +184,7 @@ WINDOWS_QMT_BRIDGE_SCRIPT_PATHS = {
 _running_procs: dict[int, subprocess.Popen] = {}
 _running_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
+_alert_lane_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
 _running_skip_logged_at: dict[int, datetime] = {}
 _intraday_skip_logged_for: set[tuple[int, str]] = set()
@@ -190,6 +192,7 @@ _overdue_skip_logged_for: set[tuple[int, str]] = set()
 _delegated_skip_logged_for: set[tuple[int, str]] = set()
 _task_semaphore: threading.Semaphore | None = None
 _fast_lane_semaphore: threading.Semaphore | None = None
+_alert_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
 _scheduler_started_at = datetime.now()
@@ -246,12 +249,17 @@ FAST_LANE_TASK_TYPES = {
     "trading_v2_intraday_activation",
     "trading_v2_paper_tick",
 }
+# Event-driven intraday alerts get their own single-worker lane so a bulk sync
+# or trading tick cannot delay a user-visible notification.  Single-flight
+# execution also prevents two observations from sending duplicate alerts.
+ALERT_LANE_TASK_TYPES = {"intraday_market_alert"}
 INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_capital_flow_fast",
     "intraday_minute_flow",
     "intraday_minute_kline",
     "intraday_quality_check",
     "intraday_realtime",
+    "intraday_market_alert",
     "qmt_intraday_realtime",
     "public_quote_failover",
     "sim_trade",
@@ -264,6 +272,7 @@ INTRADAY_WINDOW_PATH_PARTS = {
     "tools/crawl_realtime_batch.py",
     "tools/sync_market_realtime.py",
     "tools/sync_qmt_realtime.py",
+    "tools/run_intraday_market_alert.py",
 }
 
 
@@ -416,6 +425,10 @@ def _should_skip_outside_intraday_window(row: dict, now: datetime) -> bool:
     if not is_intraday:
         return False
     start, end = _intraday_window_minutes()
+    if task_type in ALERT_LANE_TASK_TYPES:
+        configured_start = _parse_hhmm(str(row.get("cron_time") or ""))
+        if configured_start is not None:
+            start = max(start, configured_start)
     current = now.hour * 60 + now.minute
     return current < start or current > end
 
@@ -562,6 +575,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
             with _running_lock:
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
+                _alert_lane_running_task_ids.discard(task_id)
             cleaned += 1
             continue
         if age_minutes < timeout_minutes + STALE_RUNNING_GRACE_MINUTES:
@@ -591,6 +605,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
         cleaned += 1
     return cleaned
 
@@ -658,11 +673,30 @@ def _uses_fast_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in FAST_LANE_TASK_TYPES
 
 
+def _uses_alert_lane(row: dict) -> bool:
+    return str(row.get("task_type") or "").strip() in ALERT_LANE_TASK_TYPES
+
+
 def _get_fast_lane_semaphore() -> threading.Semaphore:
     global _fast_lane_semaphore
     if _fast_lane_semaphore is None:
         _fast_lane_semaphore = threading.Semaphore(1)
     return _fast_lane_semaphore
+
+
+def _get_alert_lane_semaphore() -> threading.Semaphore:
+    global _alert_lane_semaphore
+    if _alert_lane_semaphore is None:
+        _alert_lane_semaphore = threading.Semaphore(1)
+    return _alert_lane_semaphore
+
+
+def _task_lane_semaphore(row: dict) -> threading.Semaphore:
+    if _uses_alert_lane(row):
+        return _get_alert_lane_semaphore()
+    if _uses_fast_lane(row):
+        return _get_fast_lane_semaphore()
+    return _get_task_semaphore()
 
 
 def scheduler_runtime_info() -> dict[str, int | bool]:
@@ -672,6 +706,7 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
         "embedded_scheduler_enabled": bool(scheduler["embedded_enabled"]),
         "embedded_scheduler_running": bool(_scheduler_thread and _scheduler_thread.is_alive()),
         "scheduler_max_concurrent_tasks": int(scheduler["max_concurrent_tasks"]),
+        "scheduler_alert_lane_tasks": 1,
         "scheduler_poll_seconds": int(scheduler["poll_seconds"]),
         "api_mysql_pool_size": int(api_pool["pool_size"]),
         "api_mysql_max_overflow": int(api_pool["max_overflow"]),
@@ -908,7 +943,7 @@ def _run_task(row: dict, root: Path, engine) -> None:
 
 
 def _run_task_async(row: dict, root: Path, engine) -> None:
-    semaphore = _get_fast_lane_semaphore() if _uses_fast_lane(row) else _get_task_semaphore()
+    semaphore = _task_lane_semaphore(row)
     with semaphore:
         try:
             _run_task(row, root, engine)
@@ -917,6 +952,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 task_id = int(row["id"])
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
+                _alert_lane_running_task_ids.discard(task_id)
                 _running_skip_logged_at.pop(task_id, None)
 
 
@@ -957,6 +993,8 @@ def launch_scheduler_task(
         _running_task_ids.add(task_id)
         if _uses_fast_lane(row):
             _fast_lane_running_task_ids.add(task_id)
+        if _uses_alert_lane(row):
+            _alert_lane_running_task_ids.add(task_id)
 
     try:
         claimed = _claim_task_run(row, engine)
@@ -964,11 +1002,13 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
         raise
     if not claimed:
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
         return {
             "accepted": False,
             "status": "already_running",
@@ -988,6 +1028,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
             task_id,
@@ -1157,11 +1198,23 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                             logger.debug("任务 %s 仍在运行，跳过本次触发", task_name)
                         continue
                     uses_fast_lane = _uses_fast_lane(row)
-                    general_running_count = len(_running_task_ids - _fast_lane_running_task_ids)
+                    uses_alert_lane = _uses_alert_lane(row)
+                    general_running_count = len(
+                        _running_task_ids
+                        - _fast_lane_running_task_ids
+                        - _alert_lane_running_task_ids
+                    )
+                    if uses_alert_lane and len(_alert_lane_running_task_ids) >= 1:
+                        logger.debug("Scheduler alert lane full; defer task %s", task_name)
+                        continue
                     if uses_fast_lane and len(_fast_lane_running_task_ids) >= 1:
                         logger.debug("Scheduler fast lane full; defer task %s", task_name)
                         continue
-                    if not uses_fast_lane and general_running_count >= max_pending_tasks:
+                    if (
+                        not uses_fast_lane
+                        and not uses_alert_lane
+                        and general_running_count >= max_pending_tasks
+                    ):
                         logger.debug(
                             "Scheduler capacity full (%s); defer task %s",
                             max_pending_tasks,
@@ -1171,6 +1224,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     _running_task_ids.add(int(task_id))
                     if uses_fast_lane:
                         _fast_lane_running_task_ids.add(int(task_id))
+                    if uses_alert_lane:
+                        _alert_lane_running_task_ids.add(int(task_id))
 
                 try:
                     claimed = _claim_task_run(row, engine)
@@ -1179,12 +1234,14 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _alert_lane_running_task_ids.discard(int(task_id))
                     continue
                 if not claimed:
                     logger.warning("任务 %s 已被其他调度实例抢占，跳过本次触发", task_name)
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _alert_lane_running_task_ids.discard(int(task_id))
                     continue
 
                 logger.info("执行定时任务: %s (cron=%s, now=%s)", task_name, cron_time, time_str)

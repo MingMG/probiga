@@ -38,6 +38,13 @@ REQUIRED_TASKS = [
     ('A股晚报推送', 'evening_review', 'biz/evening_review/generate.py', '', '20:00', 90),
 ]
 
+# Optional tasks are canonical definitions for audit/repair tooling, but are not
+# installed by this legacy default repair command.  Intraday alerts require an
+# explicit mode choice via ``ensure_quality_gate.py --intraday-alert-only``.
+OPTIONAL_TASKS = [
+    ('盘中关键事件播报', 'intraday_market_alert', 'tools/run_intraday_market_alert.py', '--mode shadow --json', '09:25', 95, 1),
+]
+
 
 def main():
     mysql_url = os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL

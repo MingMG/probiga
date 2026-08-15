@@ -45,6 +45,40 @@ class ConfigTest(unittest.TestCase):
             get_settings.cache_clear()
             self.assertEqual(get_wecom_webhook("news"), "https://news")
 
+    def test_wecom_intraday_prefers_dedicated_then_briefing_then_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "WECOM_WEBHOOK_URL": "https://default",
+                "WECOM_BRIEFING_WEBHOOK_URL": "https://briefing",
+                "WECOM_INTRADAY_WEBHOOK_URL": "https://intraday",
+            },
+        ):
+            get_settings.cache_clear()
+            self.assertEqual(get_wecom_webhook("intraday"), "https://intraday")
+
+        with patch.dict(
+            os.environ,
+            {
+                "WECOM_WEBHOOK_URL": "https://default",
+                "WECOM_BRIEFING_WEBHOOK_URL": "https://briefing",
+                "WECOM_INTRADAY_WEBHOOK_URL": "",
+            },
+        ):
+            get_settings.cache_clear()
+            self.assertEqual(get_wecom_webhook("intraday"), "https://briefing")
+
+        with patch.dict(
+            os.environ,
+            {
+                "WECOM_WEBHOOK_URL": "https://default",
+                "WECOM_BRIEFING_WEBHOOK_URL": "",
+                "WECOM_INTRADAY_WEBHOOK_URL": "",
+            },
+        ):
+            get_settings.cache_clear()
+            self.assertEqual(get_wecom_webhook("intraday"), "https://default")
+
     def test_api_mysql_pool_config_uses_small_machine_defaults(self):
         with patch("server.common.config.get_settings", return_value=SimpleNamespace(
             api_mysql_pool_size=0,

@@ -39,6 +39,8 @@ SCHEDULER_COLUMNS = {
 }
 
 NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
+INTRADAY_ALERT_TASK_TYPES = frozenset({"intraday_market_alert"})
+OPT_IN_TASK_TYPES = INTRADAY_ALERT_TASK_TYPES
 
 
 TASKS = [
@@ -332,6 +334,19 @@ TASKS = [
         "date_param": "",
         "description": "盘后只读体检；确认采集、分析、推荐和调度链路是否跟上最新交易日。",
     },
+    {
+        "task_name": "Intraday key market event alerts",
+        "task_type": "intraday_market_alert",
+        "group_name": "Intraday alerts",
+        "script_path": "tools/run_intraday_market_alert.py",
+        "script_args": "--mode shadow --json",
+        "cron_time": "09:25",
+        "interval_minutes": 1,
+        "enabled": 1,
+        "sort_order": 95,
+        "date_param": "",
+        "description": "Linux-owned event-driven market, sector, key-stock, style rotation, and broad-index flow alert evaluator.",
+    },
 ]
 
 
@@ -405,17 +420,34 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         return "inserted"
 
 
-def run(engine: Engine, *, task_types: set[str] | None = None) -> dict[str, str]:
+def run(
+    engine: Engine,
+    *,
+    task_types: set[str] | frozenset[str] | None = None,
+    intraday_alert_mode: str = "shadow",
+) -> dict[str, str]:
+    requested = (
+        {str(task["task_type"]) for task in TASKS} - OPT_IN_TASK_TYPES
+        if task_types is None
+        else {str(item) for item in task_types}
+    )
+    known = {str(task["task_type"]) for task in TASKS}
+    unknown = requested - known
+    if unknown:
+        raise ValueError("unknown scheduled task types: " + ", ".join(sorted(unknown)))
     ensure_scheduler_columns(engine)
     result: dict[str, str] = {}
     for task in TASKS:
-        if task_types and str(task.get("task_type") or "") not in task_types:
+        if str(task.get("task_type") or "") not in requested:
             continue
-        result[task["task_name"]] = upsert_task(engine, task)
+        candidate = dict(task)
+        if candidate["task_type"] == "intraday_market_alert":
+            candidate["script_args"] = f"--mode {intraday_alert_mode} --json"
+        result[candidate["task_name"]] = upsert_task(engine, candidate)
     return result
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Upsert reviewed scheduler task definitions")
     parser.add_argument(
         "--task-type",
@@ -423,9 +455,19 @@ def main() -> int:
         default=[],
         help="Only upsert this task type; may be repeated",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--intraday-alert-mode",
+        choices=("shadow", "live"),
+        default="shadow",
+        help="Runtime mode used when intraday_market_alert is explicitly selected",
+    )
+    args = parser.parse_args(argv)
     engine = create_batch_engine()
-    result = run(engine, task_types=set(args.task_type) or None)
+    result = run(
+        engine,
+        task_types=set(args.task_type) or None,
+        intraday_alert_mode=args.intraday_alert_mode,
+    )
     if args.task_type and not result:
         raise RuntimeError("no scheduled task matched --task-type")
     for task_name, action in result.items():

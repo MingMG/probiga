@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     wecom_webhook_url: str | None = None
     wecom_news_webhook_url: str | None = None
     wecom_briefing_webhook_url: str | None = None
+    wecom_intraday_webhook_url: str | None = None
     deepseek_api_key: str | None = None
     deepseek_model: str = "deepseek-chat"
 
@@ -347,12 +348,19 @@ def get_wecom_webhook(kind: str = "default", required: bool = False) -> str:
       - default: WECOM_WEBHOOK_URL
       - news: WECOM_NEWS_WEBHOOK_URL, fallback to default
       - briefing: WECOM_BRIEFING_WEBHOOK_URL, fallback to default
+      - intraday: WECOM_INTRADAY_WEBHOOK_URL, fallback to briefing/default
     """
     settings = get_settings()
     if kind == "news":
         url = settings.wecom_news_webhook_url or settings.wecom_webhook_url
     elif kind == "briefing":
         url = settings.wecom_briefing_webhook_url or settings.wecom_webhook_url
+    elif kind == "intraday":
+        url = (
+            settings.wecom_intraday_webhook_url
+            or settings.wecom_briefing_webhook_url
+            or settings.wecom_webhook_url
+        )
     else:
         url = settings.wecom_webhook_url
     url = (url or "").strip()

@@ -8,6 +8,7 @@ from typing import Any
 NO_DEFAULT_DATE_TASK_TYPES = {
     "early_briefing",
     "evening_review",
+    "intraday_market_alert",
     "market_overview_daily",
     "news_daily",
     "public_quote_failover",
@@ -23,6 +24,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
 NO_DEFAULT_DATE_PATHS = {
     "biz/early_briefing/generate.py",
     "biz/evening_review/generate.py",
+    "tools/run_intraday_market_alert.py",
     "biz/stock_market/sync_stock_snapshot.py",
     "tools/refresh_market_overview_daily.py",
 }

@@ -18,9 +18,11 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._scheduler_stop_event = None
         scheduler_runtime._task_semaphore = None
         scheduler_runtime._fast_lane_semaphore = None
+        scheduler_runtime._alert_lane_semaphore = None
         scheduler_runtime._running_procs.clear()
         scheduler_runtime._running_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
+        scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_router._quality_cache.clear()
 
     def test_start_embedded_scheduler_skips_when_disabled(self):
@@ -88,6 +90,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     "embedded_scheduler_enabled": True,
                     "embedded_scheduler_running": True,
                     "scheduler_max_concurrent_tasks": 2,
+                    "scheduler_alert_lane_tasks": 1,
                     "scheduler_poll_seconds": 45,
                     "api_mysql_pool_size": 3,
                     "api_mysql_max_overflow": 1,
@@ -98,6 +101,57 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_sim_trade_uses_dedicated_fast_lane(self):
         self.assertTrue(scheduler_runtime._uses_fast_lane({"task_type": "sim_trade"}))
         self.assertFalse(scheduler_runtime._uses_fast_lane({"task_type": "stock_minute"}))
+
+    def test_intraday_alert_uses_independent_single_worker_lane(self):
+        alert = {"task_type": "intraday_market_alert"}
+        general = {"task_type": "stock_minute"}
+        fast = {"task_type": "sim_trade"}
+
+        self.assertTrue(scheduler_runtime._uses_alert_lane(alert))
+        self.assertFalse(scheduler_runtime._uses_fast_lane(alert))
+        semaphore = scheduler_runtime._task_lane_semaphore(alert)
+        self.assertIs(semaphore, scheduler_runtime._get_alert_lane_semaphore())
+        self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(general))
+        self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(fast))
+
+        scheduler_runtime._running_task_ids.add(604)
+        scheduler_runtime._alert_lane_running_task_ids.add(604)
+        self.assertEqual(len(scheduler_runtime._alert_lane_running_task_ids), 1)
+
+    def test_intraday_alert_is_linux_owned_and_market_hours_only(self):
+        row = {
+            "task_type": "intraday_market_alert",
+            "script_path": "tools/run_intraday_market_alert.py",
+            "cron_time": "09:25",
+        }
+        self.assertFalse(
+            scheduler_runtime._should_skip_task_for_host(row, platform_name="posix")
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_task_for_host(row, platform_name="nt")
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_outside_intraday_window(
+                row,
+                datetime(2026, 8, 12, 9, 24),
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._should_skip_outside_intraday_window(
+                row,
+                datetime(2026, 8, 12, 9, 25),
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_outside_intraday_window(
+                row,
+                datetime(2026, 8, 12, 15, 11),
+            )
+        )
+        with patch("server.api.scheduler_runtime._is_trade_day", return_value=False):
+            self.assertTrue(
+                scheduler_runtime._should_skip_non_trading_day(row, MagicMock())
+            )
 
     def test_intraday_capital_flow_fast_is_latency_sensitive_and_windows_owned(self):
         row = {"task_type": "intraday_capital_flow_fast"}
@@ -251,6 +305,21 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(
             scheduler_runtime._build_task_args(overview, "tools/refresh_market_overview_daily.py", today),
             [],
+        )
+
+    def test_intraday_alert_keeps_explicit_mode_without_default_date_arg(self):
+        row = {
+            "task_type": "intraday_market_alert",
+            "script_args": "--mode shadow --json",
+            "date_param": "",
+        }
+        self.assertEqual(
+            scheduler_runtime._build_task_args(
+                row,
+                "tools/run_intraday_market_alert.py",
+                "2026-08-12",
+            ),
+            ["--mode", "shadow", "--json"],
         )
 
     def test_regular_tasks_receive_default_date_arg(self):
