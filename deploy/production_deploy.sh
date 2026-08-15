@@ -333,6 +333,21 @@ write_dropin() {
     "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
     | sudo tee /etc/systemd/system/probiga.service.d/scheduler.conf >/dev/null
 }
+release_identity_check() {
+  local require_clean="$1"
+  sudo -u "$SERVICE_USER" env \
+    GIT_OPTIONAL_LOCKS=0 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
+    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+    PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
+    PYTHONPATH="$ADATA_SOURCE:/opt/ProBigA" \
+    PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN="$require_clean" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -c \
+    'import json, os; from server.api.routers.health import _deployed_git_revision; info = _deployed_git_revision(); print(json.dumps(info, ensure_ascii=True, sort_keys=True)); raise SystemExit(2 if os.environ["PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN"] == "1" and (info.get("matches_expected") is not True or info.get("code_worktree_clean") is not True) else 0)'
+}
 BOOTSTRAP_PYTHON=/usr/bin/python3.14
 test -x "$BOOTSTRAP_PYTHON"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
@@ -703,6 +718,7 @@ sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1 \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/ensure_quality_gate.py --validate-review-delivery
 rm -f "$RESOLVED_LOCK"
+release_identity_check 1
 sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
   "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
@@ -728,6 +744,7 @@ if ! curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
   --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
   cat "$HEALTH_RESPONSE" >&2
+  release_identity_check 0 >&2 || true
   rm -f "$HEALTH_RESPONSE"
   false
 fi

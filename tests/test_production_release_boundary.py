@@ -291,6 +291,9 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert '"/proc/$SERVICE_MAIN_PID/environ"' in deploy_script
     assert "curl --fail-with-body" in deploy_script
     assert 'cat "$HEALTH_RESPONSE" >&2' in deploy_script
+    assert "release_identity_check 1" in deploy_script
+    assert "release_identity_check 0 >&2 || true" in deploy_script
+    assert "PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN" in deploy_script
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
