@@ -167,7 +167,7 @@ quarantine_unsafe_untracked_release_files() {
   while IFS= read -r -d '' candidate; do
     collect_untracked_candidate "$candidate"
   done < <(find . -mindepth 2 -maxdepth 2 \( -type f -o -type l \) \
-    \( -name '__init__.py' -o -name '__init__*.pyc' \
+    \( -name '__init__.py' -o -name '*.pyc' -o -name '*.pyo' \
     -o -name '__init__*.pyd' -o -name '__init__*.so' \) -print0)
 
   if [ "${#unsafe_paths[@]}" -eq 0 ]; then

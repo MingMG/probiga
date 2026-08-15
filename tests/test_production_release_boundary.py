@@ -156,6 +156,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "server biz integrations tools scripts strategies versions" in deploy_script
     assert "git ls-files --others --exclude-standard -z" in deploy_script
     assert "artifacts/trading_v4 artifacts/trading_v5 artifacts/trading_v6" in deploy_script
+    assert "-mindepth 2 -maxdepth 2" in deploy_script
+    assert "-name '*.pyc' -o -name '*.pyo'" in deploy_script
     assert "seal_release_checkout" in deploy_script
     assert "git ls-files --stage -z" in deploy_script
     assert 'git checkout --detach --force "$EXPECTED_SHA"' in deploy_script
