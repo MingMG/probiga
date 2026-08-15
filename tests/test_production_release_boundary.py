@@ -241,9 +241,17 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert '! -type l -perm /0222 -print -quit' in workflow
     assert "-perm /0222 -print -quit" in workflow
     assert "-writable -print -quit 2>/dev/null || true" in workflow
-    validate_boundary = workflow.index("tools/validate_production_release_boundary.py")
-    validate_scheduler_manifest = workflow.index("tools/ensure_quality_gate.py")
-    restart_service = workflow.index("sudo systemctl restart probiga", validate_scheduler_manifest)
+    validate_boundary = deploy_script.index(
+        "tools/validate_production_release_boundary.py"
+    )
+    validate_boundary_env = deploy_script.rindex(
+        "PYTHONDONTWRITEBYTECODE=1", 0, validate_boundary
+    )
+    validate_scheduler_manifest = deploy_script.index("tools/ensure_quality_gate.py")
+    restart_service = deploy_script.index(
+        "sudo systemctl restart probiga", validate_scheduler_manifest
+    )
+    assert validate_boundary - validate_boundary_env < 160
     assert validate_boundary < validate_scheduler_manifest < restart_service
     assert 'sudo -u "$SERVICE_USER" env PYTHONDONTWRITEBYTECODE=1' in workflow
     assert "tools/ensure_quality_gate.py --validate-review-delivery" in workflow

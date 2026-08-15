@@ -682,7 +682,8 @@ else
   rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
   ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
 fi
-"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+PYTHONDONTWRITEBYTECODE=1 \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/validate_production_release_boundary.py \
   --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
 # The Windows QMT bridge only runs registered task types. Refuse activation
