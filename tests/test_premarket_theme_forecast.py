@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime
 
 import pytest
 
 from biz.premarket.theme_forecast import (
     PREMARKET_STAGE,
+    _flow_dataset_quality,
     _flow_history_by_code,
+    _neutralize_flow_profiles,
+    _stock_candidate_score,
+    _stock_flow_factor_details,
     _stock_flow_factor_score,
+    build_auction_confirmation_from_records,
     build_theme_forecast_from_records,
     classify_catalyst,
     family_for_label,
@@ -252,6 +258,107 @@ def test_flow_history_rejects_future_sessions_and_keeps_latest_five():
     assert [row["trade_date"] for row in history] == [
         "2026-08-12", "2026-08-11", "2026-08-10", "2026-08-09", "2026-08-08",
     ]
+
+
+def test_flow_profile_normalizes_every_day_by_that_days_turnover():
+    history = [
+        {
+            "trade_date": f"2026-08-{day:02d}",
+            "main_net_inflow": turnover * 0.05,
+            "max_net_inflow": turnover * 0.03,
+            "lg_net_inflow": turnover * 0.02,
+            "turnover_amount": turnover,
+        }
+        for day, turnover in zip((12, 11, 10, 9, 8), (100, 200, 300, 400, 500))
+    ]
+    profile = _stock_flow_factor_details(history, {})
+
+    assert profile["quality_status"] == "PASS"
+    assert profile["normalized_days"] == 5
+    assert profile["five_day_rate"] == 5.0
+
+
+def test_flow_profiles_are_neutralized_within_industry_and_cap_peers():
+    profiles = {
+        f"30000{index}": {"raw_score": score, "score": score, "quality_status": "PASS"}
+        for index, score in enumerate((30, 40, 50, 60, 70), start=1)
+    }
+    klines = {
+        code: {"industry_name": "测试行业", "market_cap": (index + 1) * 1_000_000}
+        for index, code in enumerate(profiles)
+    }
+    result = _neutralize_flow_profiles(profiles, klines)
+
+    ordered = sorted(result, key=lambda code: result[code]["raw_score"])
+    assert result[ordered[0]]["industry_percentile"] == 0.0
+    assert result[ordered[-1]]["industry_percentile"] == 100.0
+    assert result[ordered[-1]]["score"] > result[ordered[0]]["score"]
+
+
+def test_flow_quality_gate_blocks_missing_coverage_and_passes_complete_data():
+    klines = {f"30000{index}": {} for index in range(1, 6)}
+    profiles = {
+        code: {"score": 60, "normalized_days": 5}
+        for code in klines
+    }
+    rows = [
+        {"stock_code": code, "trade_date": "2026-08-12", "main_net_inflow": 1, "turnover_amount": 100}
+        for code in klines
+    ]
+
+    assert _flow_dataset_quality(profiles, klines, rows)["status"] == "PASS"
+    assert _flow_dataset_quality({}, klines, [])["status"] == "BLOCK"
+
+
+def test_candidate_does_not_double_count_legacy_capital_score_when_flow_exists():
+    profile = {
+        "score": 72.0,
+        "raw_score": 72.0,
+        "quality_status": "PASS",
+        "latest_direction": 0.5,
+        "history_days": 5,
+        "normalized_days": 5,
+        "positive_days": 4,
+    }
+    common = dict(
+        code="300999", theme_score=75, theme_match_count=2, theme_v3_score=70,
+        alpha={"v3_alpha_score": 72}, recommendation={},
+        kline={"change_pct": 1.0}, flow={}, flow_profile=profile,
+        theme_flow_score=70, flow_dataset_status="PASS",
+    )
+    low = _stock_candidate_score(analysis={"capital_score": 0}, **common)
+    high = _stock_candidate_score(analysis={"capital_score": 100}, **common)
+
+    assert low[0] == high[0]
+
+
+def test_0920_confirmation_is_independent_and_rejects_future_quotes():
+    forecast = {
+        "session_date": "2026-08-13",
+        "stage": "PREMARKET_0908",
+        "model_version": "frozen",
+        "run_uid": "run-0908",
+        "stock_candidates": [{
+            "global_rank": 1,
+            "stock_code": "300999",
+            "stock_name": "测试电池",
+            "score": 78.0,
+        }],
+    }
+    frozen = deepcopy(forecast)
+    result = build_auction_confirmation_from_records(
+        forecast,
+        [
+            {"stock_code": "300999", "price": 20, "change_pct": 2.5, "snapshot_at": "2026-08-13 09:19:59"},
+            {"stock_code": "300999", "price": 22, "change_pct": 9.8, "snapshot_at": "2026-08-13 09:21:00"},
+        ],
+        cutoff_at="2026-08-13 09:20:59",
+    )
+
+    assert forecast == frozen
+    assert result["source_run_uid"] == "run-0908"
+    assert result["confirmations"][0]["confirmation_status"] == "CONFIRMED"
+    assert result["confirmations"][0]["quote_change_pct"] == 2.5
 
 
 def test_forecast_is_theme_first_dynamic_and_uses_database_memberships():

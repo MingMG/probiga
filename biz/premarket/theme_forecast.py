@@ -40,7 +40,7 @@ from server.common.sql_reader import read_sql_rows
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "PREMARKET_THEME_V1.2_FLOW"
+MODEL_VERSION = "PREMARKET_THEME_V1.3_FLOW_CALIBRATED"
 PREMARKET_STAGE = "PREMARKET_0908"
 DEFAULT_THEME_LIMIT = 12
 DEFAULT_STOCKS_PER_THEME = 5
@@ -552,6 +552,243 @@ def _flow_direction(value: Any, turnover_amount: Any = None) -> tuple[float | No
     return 0.0, None
 
 
+def _flow_resonance_score(main_direction: float | None, theme_flow_score: float | None) -> float | None:
+    if theme_flow_score is None or main_direction is None:
+        return None
+    theme_direction = max(-1.0, min(1.0, (float(theme_flow_score) - 50.0) / 35.0))
+    aligned = main_direction * theme_direction
+    return _clamp(
+        50.0
+        + 22.0 * main_direction
+        + 18.0 * theme_direction
+        + 12.0 * max(0.0, aligned)
+        - 12.0 * max(0.0, -aligned)
+    )
+
+
+def _stock_flow_factor_details(
+    flow_history: Sequence[Mapping[str, Any]],
+    kline: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one de-duplicated, turnover-normalized five-session flow profile."""
+
+    history = [dict(row) for row in flow_history[:5]]
+    if not history:
+        return {"score": None, "quality_status": "BLOCK", "history_days": 0}
+    recency_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
+    main_parts: list[tuple[float, float]] = []
+    order_parts: list[tuple[float, float]] = []
+    main_rate_parts: list[tuple[float, float]] = []
+    positive_days = 0
+    normalized_days = 0
+    latest_direction: float | None = None
+    latest_rate: float | None = None
+
+    for index, row in enumerate(history):
+        turnover = _number(row.get("turnover_amount"))
+        if (turnover is None or turnover <= 0) and index == 0:
+            turnover = _number(kline.get("amount"))
+        main_direction, main_rate = _flow_direction(row.get("main_net_inflow"), turnover)
+        if index == 0:
+            latest_direction = main_direction
+            latest_rate = main_rate
+        if main_direction is not None:
+            main_parts.append((main_direction, recency_weights[index]))
+            positive_days += int((_number(row.get("main_net_inflow"), 0.0) or 0.0) > 0)
+            if main_rate is not None:
+                main_rate_parts.append((main_rate, recency_weights[index]))
+                normalized_days += 1
+
+        max_direction, _ = _flow_direction(row.get("max_net_inflow"), turnover)
+        large_direction, _ = _flow_direction(row.get("lg_net_inflow"), turnover)
+        day_order = [value for value in (max_direction, large_direction) if value is not None]
+        if day_order:
+            order_parts.append((_safe_mean(day_order, default=0.0), recency_weights[index]))
+
+    if latest_direction is None and not main_parts:
+        return {"score": None, "quality_status": "BLOCK", "history_days": len(history)}
+    intensity_score = _clamp(50.0 + 45.0 * (latest_direction or 0.0))
+    continuity_direction = _weighted_average(main_parts, default=0.0)
+    continuity_score = _clamp(50.0 + 40.0 * continuity_direction)
+    order_score = (
+        _clamp(50.0 + 35.0 * _weighted_average(order_parts, default=0.0))
+        if order_parts else None
+    )
+    base_score = _weighted_average(
+        ((intensity_score, 0.20), (continuity_score, 0.50), (order_score, 0.30)),
+        default=50.0,
+    )
+    quality_status = "PASS" if normalized_days >= 3 and len(main_parts) >= 3 else (
+        "WATCH" if latest_direction is not None else "BLOCK"
+    )
+    return {
+        "score": round(_clamp(base_score), 1),
+        "raw_score": round(_clamp(base_score), 1),
+        "intensity_score": round(intensity_score, 1),
+        "continuity_score": round(continuity_score, 1),
+        "order_score": round(order_score, 1) if order_score is not None else None,
+        "latest_direction": latest_direction,
+        "latest_rate": round(latest_rate, 4) if latest_rate is not None else None,
+        "five_day_rate": round(
+            _weighted_average(main_rate_parts, default=0.0), 4
+        ) if main_rate_parts else None,
+        "history_days": len(main_parts),
+        "normalized_days": normalized_days,
+        "positive_days": positive_days,
+        "quality_status": quality_status,
+    }
+
+
+def _percentile_scores(values: Mapping[str, float]) -> dict[str, float]:
+    """Return mid-rank percentile scores while keeping ties identical."""
+
+    if not values:
+        return {}
+    ordered = sorted((float(value), code) for code, value in values.items())
+    if len(ordered) == 1:
+        return {ordered[0][1]: 50.0}
+    result: dict[str, float] = {}
+    index = 0
+    while index < len(ordered):
+        end = index + 1
+        while end < len(ordered) and ordered[end][0] == ordered[index][0]:
+            end += 1
+        mid_rank = (index + end - 1) / 2.0
+        score = 100.0 * mid_rank / (len(ordered) - 1)
+        for position in range(index, end):
+            result[ordered[position][1]] = round(score, 1)
+        index = end
+    return result
+
+
+def _neutralize_flow_profiles(
+    profiles: Mapping[str, Mapping[str, Any]],
+    kline_by_code: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Neutralize individual flow strength within industry and market-cap peers."""
+
+    output = {code: dict(profile) for code, profile in profiles.items()}
+    industries: dict[str, dict[str, float]] = defaultdict(dict)
+    caps: list[tuple[float, str]] = []
+    for code, profile in output.items():
+        raw_score = _number(profile.get("raw_score"))
+        if raw_score is None:
+            continue
+        kline = kline_by_code.get(code, {})
+        industry = str(kline.get("industry_name") or "").strip()
+        if industry:
+            industries[industry][code] = raw_score
+        market_cap = _number(kline.get("market_cap"))
+        if market_cap is not None and market_cap > 0:
+            caps.append((market_cap, code))
+
+    industry_percentiles: dict[str, float] = {}
+    for members in industries.values():
+        if len(members) >= 5:
+            industry_percentiles.update(_percentile_scores(members))
+
+    cap_buckets: dict[int, dict[str, float]] = defaultdict(dict)
+    for rank, (_market_cap, code) in enumerate(sorted(caps)):
+        bucket = min(4, int(rank * 5 / max(1, len(caps))))
+        raw_score = _number(output[code].get("raw_score"))
+        if raw_score is not None:
+            cap_buckets[bucket][code] = raw_score
+    cap_percentiles: dict[str, float] = {}
+    for members in cap_buckets.values():
+        if len(members) >= 5:
+            cap_percentiles.update(_percentile_scores(members))
+
+    for code, profile in output.items():
+        raw_score = _number(profile.get("raw_score"))
+        if raw_score is None:
+            continue
+        industry_score = industry_percentiles.get(code)
+        cap_score = cap_percentiles.get(code)
+        neutralized = _weighted_average(
+            ((raw_score, 0.60), (industry_score, 0.25), (cap_score, 0.15)),
+            default=raw_score,
+        )
+        profile["industry_percentile"] = industry_score
+        profile["market_cap_percentile"] = cap_score
+        profile["score"] = round(_clamp(neutralized), 1)
+    return output
+
+
+def _flow_profile_evidence(profile: Mapping[str, Any], resonance_score: float | None) -> list[str]:
+    score = _number(profile.get("score"))
+    evidence = [f"统一资金因子{score:.1f}"] if score is not None else []
+    latest_rate = _number(profile.get("latest_rate"))
+    if latest_rate is not None:
+        evidence.append(f"主力净流入强度{latest_rate:+.2f}%")
+    elif _number(profile.get("latest_direction")) is not None:
+        evidence.append("主力净流入方向为正" if float(profile["latest_direction"]) > 0 else "主力净流入方向为负")
+    history_days = int(profile.get("history_days") or 0)
+    if history_days:
+        evidence.append(f"近{history_days}日净流入{int(profile.get('positive_days') or 0)}日")
+    if _number(profile.get("order_score")) is not None:
+        evidence.append(f"近5日大单结构{float(profile['order_score']):.1f}")
+        if float(profile["order_score"]) >= 55.0:
+            evidence.append("大单与超大单方向一致")
+    if _number(profile.get("industry_percentile")) is not None:
+        evidence.append(f"行业资金分位{float(profile['industry_percentile']):.1f}")
+    if _number(profile.get("market_cap_percentile")) is not None:
+        evidence.append(f"同市值资金分位{float(profile['market_cap_percentile']):.1f}")
+    if resonance_score is not None:
+        evidence.append(f"板块个股资金共振{resonance_score:.1f}")
+    return evidence
+
+
+def _flow_dataset_quality(
+    profiles: Mapping[str, Mapping[str, Any]],
+    kline_by_code: Mapping[str, Mapping[str, Any]],
+    flow_rows: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Audit coverage, duplicate rows and impossible flow/turnover ratios."""
+
+    expected = len(kline_by_code)
+    covered = sum(_number(profile.get("score")) is not None for profile in profiles.values())
+    normalized = sum(int(profile.get("normalized_days") or 0) >= 3 for profile in profiles.values())
+    seen: set[tuple[str, str]] = set()
+    duplicates = 0
+    invalid = 0
+    comparable = 0
+    for row in flow_rows:
+        code = str(row.get("stock_code") or "").zfill(6)
+        trade_date = _date_text(row.get("trade_date")) if row.get("trade_date") else ""
+        key = (code, trade_date)
+        if trade_date and key in seen:
+            duplicates += 1
+        elif trade_date:
+            seen.add(key)
+        turnover = _number(row.get("turnover_amount"))
+        main_flow = _number(row.get("main_net_inflow"))
+        if turnover is not None and turnover > 0 and main_flow is not None:
+            comparable += 1
+            invalid += int(abs(main_flow / turnover) > 1.0)
+
+    coverage = covered / expected if expected else 0.0
+    normalized_coverage = normalized / expected if expected else 0.0
+    invalid_ratio = invalid / comparable if comparable else 0.0
+    if expected and coverage >= 0.80 and normalized_coverage >= 0.65 and not duplicates and invalid_ratio <= 0.01:
+        status = "PASS"
+    elif covered and coverage >= 0.25 and invalid_ratio <= 0.05:
+        status = "WATCH"
+    else:
+        status = "BLOCK"
+    return {
+        "status": status,
+        "expected_stocks": expected,
+        "covered_stocks": covered,
+        "coverage_ratio": round(coverage, 4),
+        "normalized_stocks": normalized,
+        "normalized_coverage_ratio": round(normalized_coverage, 4),
+        "duplicate_rows": duplicates,
+        "invalid_ratio_rows": invalid,
+        "comparable_rows": comparable,
+        "invalid_ratio": round(invalid_ratio, 4),
+    }
+
+
 def _stock_flow_factor_score(
     flow_history: Sequence[Mapping[str, Any]],
     kline: Mapping[str, Any],
@@ -565,79 +802,18 @@ def _stock_flow_factor_score(
     and persistence.  This avoids a structural large-cap bias.
     """
 
-    history = [dict(row) for row in flow_history[:5]]
-    if not history:
+    profile = _stock_flow_factor_details(flow_history, kline)
+    base_score = _number(profile.get("score"))
+    if base_score is None:
         return None, []
-    latest = history[0]
-    turnover = kline.get("amount")
-    main_direction, main_rate = _flow_direction(latest.get("main_net_inflow"), turnover)
-
-    valid_main = [
-        _number(row.get("main_net_inflow"))
-        for row in history
-        if _number(row.get("main_net_inflow")) is not None
-    ]
-    if main_direction is None and not valid_main:
-        return None, []
-
-    intensity_score = _clamp(50.0 + 45.0 * (main_direction or 0.0))
-    recency_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
-    signed_parts: list[tuple[float, float]] = []
-    positive_days = 0
-    for index, row in enumerate(history):
-        value = _number(row.get("main_net_inflow"))
-        if value is None:
-            continue
-        direction = 1.0 if value > 0 else (-1.0 if value < 0 else 0.0)
-        positive_days += int(direction > 0)
-        signed_parts.append((direction, recency_weights[index]))
-    continuity_direction = _weighted_average(signed_parts, default=0.0)
-    continuity_score = _clamp(50.0 + 40.0 * continuity_direction)
-
-    max_direction, _max_rate = _flow_direction(latest.get("max_net_inflow"), turnover)
-    large_direction, _large_rate = _flow_direction(latest.get("lg_net_inflow"), turnover)
-    order_directions = [value for value in (max_direction, large_direction) if value is not None]
-    order_score = (
-        _clamp(50.0 + 35.0 * _safe_mean(order_directions, default=0.0))
-        if order_directions else None
+    resonance_score = _flow_resonance_score(
+        _number(profile.get("latest_direction")),
+        theme_flow_score,
     )
-
-    resonance_score: float | None = None
-    if theme_flow_score is not None and main_direction is not None:
-        theme_direction = max(-1.0, min(1.0, (float(theme_flow_score) - 50.0) / 35.0))
-        aligned = main_direction * theme_direction
-        resonance_score = _clamp(
-            50.0
-            + 22.0 * main_direction
-            + 18.0 * theme_direction
-            + 12.0 * max(0.0, aligned)
-            - 12.0 * max(0.0, -aligned)
-        )
-
-    score = _weighted_average(
-        (
-            (intensity_score, 0.35),
-            (continuity_score, 0.30),
-            (order_score, 0.20),
-            (resonance_score, 0.15),
-        ),
-        default=50.0,
-    )
-    evidence = [f"资金因子{score:.1f}"]
-    if main_rate is not None:
-        evidence.append(f"主力净流入强度{main_rate:+.2f}%")
-    elif main_direction is not None:
-        evidence.append("主力净流入方向为正" if main_direction > 0 else "主力净流入方向为负")
-    if signed_parts:
-        evidence.append(f"近{len(signed_parts)}日净流入{positive_days}日")
-    if order_score is not None:
-        if max_direction is not None and large_direction is not None and max_direction * large_direction > 0:
-            evidence.append("大单与超大单方向一致")
-        else:
-            evidence.append(f"大单结构{order_score:.1f}")
-    if resonance_score is not None:
-        evidence.append(f"板块个股资金共振{resonance_score:.1f}")
-    return round(_clamp(score), 1), evidence
+    score = _weighted_average(((base_score, 0.85), (resonance_score, 0.15)), default=base_score)
+    rendered = dict(profile)
+    rendered["score"] = round(_clamp(score), 1)
+    return rendered["score"], _flow_profile_evidence(rendered, resonance_score)
 
 
 def _latest_by_code(rows: Sequence[Mapping[str, Any]], code_field: str = "stock_code") -> dict[str, dict[str, Any]]:
@@ -661,6 +837,8 @@ def _stock_candidate_score(
     flow: Mapping[str, Any],
     flow_history: Sequence[Mapping[str, Any]] = (),
     theme_flow_score: float | None = None,
+    flow_profile: Mapping[str, Any] | None = None,
+    flow_dataset_status: str = "WATCH",
 ) -> tuple[float, float, str, list[str]]:
     short_score = _number(analysis.get("short_term_score"), 50.0) or 50.0
     technical = _number(analysis.get("technical_score"), _number(recommendation.get("technical"), 50.0)) or 50.0
@@ -672,26 +850,27 @@ def _stock_candidate_score(
     change = _number(kline.get("change_pct"), 0.0) or 0.0
     setup_score = 68.0 if -2.5 <= change <= 3.5 else (55.0 if -5.0 <= change < -2.5 else 42.0)
     effective_history = list(flow_history) or ([dict(flow)] if flow else [])
-    flow_factor, flow_evidence = _stock_flow_factor_score(
-        effective_history,
-        kline,
-        theme_flow_score=theme_flow_score,
+    profile = dict(flow_profile or _stock_flow_factor_details(effective_history, kline))
+    base_flow_factor = _number(profile.get("score"))
+    resonance = _flow_resonance_score(_number(profile.get("latest_direction")), theme_flow_score)
+    flow_factor = (
+        _weighted_average(((base_flow_factor, 0.85), (resonance, 0.15)), default=base_flow_factor or 50.0)
+        if base_flow_factor is not None else None
     )
-    capital = (
-        _weighted_average(((base_capital, 0.40), (flow_factor, 0.60)), default=base_capital)
-        if flow_factor is not None else base_capital
-    )
+    flow_evidence = _flow_profile_evidence({**profile, "score": flow_factor}, resonance) if flow_factor is not None else []
+    unified_flow = flow_factor if flow_factor is not None else base_capital
+    flow_fallback = flow_factor is None
     theme_match_score = _clamp(52.0 + min(5, max(1, int(theme_match_count))) * 8.0)
     raw = (
-        theme_score * 0.18
+        theme_score * 0.20
         + theme_match_score * 0.08
         + v3_alpha * 0.12
         + v3_theme * 0.14
-        + short_score * 0.12
-        + technical * 0.10
-        + capital * 0.10
-        + event_score * 0.04
-        + final_trade * 0.08
+        + short_score * 0.11
+        + technical * 0.11
+        + unified_flow * 0.12
+        + event_score * 0.05
+        + final_trade * 0.03
         + setup_score * 0.04
     )
     penalty = max(0.0, (change - 5.0) * 2.0)
@@ -711,15 +890,28 @@ def _stock_candidate_score(
     risk_level = str(analysis.get("event_risk_level") or recommendation.get("event_risk_level") or "LOW").upper()
     if risk_level in {"HIGH", "CRITICAL"}:
         penalty += 18.0
+    profile_quality = str(profile.get("quality_status") or "BLOCK").upper()
+    dataset_quality = str(flow_dataset_status or "BLOCK").upper()
+    if profile_quality == "WATCH":
+        penalty += 2.0
+    elif profile_quality == "BLOCK":
+        penalty += 5.0
+    if dataset_quality == "BLOCK":
+        penalty += 8.0
     score = _clamp(raw - penalty)
     status = "盘前候选" if score >= 68.0 else ("重点观察" if score >= 60.0 else "暂缓")
+    if dataset_quality == "BLOCK":
+        status = "数据不足"
     evidence = [
         f"主题{theme_score:.1f}", f"主题命中{theme_match_count}项",
         f"V3个股{v3_alpha:.1f}", f"V3主题个股{v3_theme:.1f}",
         f"短线{short_score:.1f}", f"技术{technical:.1f}",
-        f"资金{capital:.1f}", f"昨涨跌{change:+.2f}%",
+        f"统一资金{unified_flow:.1f}", f"昨涨跌{change:+.2f}%",
     ]
     evidence.extend(flow_evidence)
+    if flow_fallback:
+        evidence.append("资金流水不足，暂用历史资金评分且降级")
+    evidence.append(f"资金数据质量{profile_quality}/{dataset_quality}")
     if penalty > 0:
         evidence.append(f"门禁/风险扣分{penalty:.1f}")
     if theme_match_count <= 1 and v3_theme < 60.0:
@@ -824,6 +1016,12 @@ def build_theme_forecast_from_records(
         for code, history in stock_flow_history_by_code.items()
         if history
     }
+    raw_flow_profiles = {
+        code: _stock_flow_factor_details(stock_flow_history_by_code.get(code, ()), kline)
+        for code, kline in kline_by_code.items()
+    }
+    stock_flow_profiles = _neutralize_flow_profiles(raw_flow_profiles, kline_by_code)
+    flow_quality = _flow_dataset_quality(stock_flow_profiles, kline_by_code, stock_flow_rows)
     external_score = _number((external_summary or {}).get("external_market_score"))
     if external_score is None:
         external_score, _status, _reason = _score_snapshot([dict(item) for item in external_items])
@@ -939,16 +1137,21 @@ def build_theme_forecast_from_records(
             100.0 * sum(persistent_flow_flags) / len(persistent_flow_flags)
             if persistent_flow_flags else None
         )
-        member_flow_scores = []
-        for code in member_codes:
-            flow_factor, _flow_evidence = _stock_flow_factor_score(
-                stock_flow_history_by_code.get(code, ()),
-                kline_by_code.get(code, {}),
-                theme_flow_score=None,
-            )
-            if flow_factor is not None:
-                member_flow_scores.append(flow_factor)
+        member_flow_profiles = [
+            stock_flow_profiles[code]
+            for code in member_codes
+            if code in stock_flow_profiles and _number(stock_flow_profiles[code].get("score")) is not None
+        ]
+        member_flow_scores = [float(profile["score"]) for profile in member_flow_profiles]
         member_flow_strength = _safe_mean(member_flow_scores) if member_flow_scores else None
+        member_flow_quality = (
+            "PASS"
+            if member_flow_profiles and sum(
+                str(profile.get("quality_status") or "BLOCK").upper() == "PASS"
+                for profile in member_flow_profiles
+            ) / len(member_flow_profiles) >= 0.65
+            else ("WATCH" if member_flow_profiles else "BLOCK")
+        )
         domestic_flow = _weighted_average(
             (
                 (hot_score, 0.22),
@@ -1051,6 +1254,14 @@ def build_theme_forecast_from_records(
             "flow_positive_ratio": round(positive_flow, 1) if positive_flow is not None else None,
             "flow_persistence_ratio": round(persistent_flow, 1) if persistent_flow is not None else None,
             "member_flow_strength_score": round(member_flow_strength, 1) if member_flow_strength is not None else None,
+            "flow_quality_status": member_flow_quality,
+            "flow_metrics": {
+                "covered_members": len(member_flow_profiles),
+                "member_count": len(member_codes),
+                "positive_ratio": round(positive_flow, 1) if positive_flow is not None else None,
+                "persistence_ratio": round(persistent_flow, 1) if persistent_flow is not None else None,
+                "strength_score": round(member_flow_strength, 1) if member_flow_strength is not None else None,
+            },
             "external_score": round(external, 1),
             "technical_score": round(technical_readiness, 1),
             "commodity_score": round(commodity, 1),
@@ -1081,7 +1292,16 @@ def build_theme_forecast_from_records(
                 strategy_stock_scores.get(code), alpha,
                 analysis, recommendation, kline, flow,
                 stock_flow_history_by_code.get(code, ()), domestic_flow,
+                stock_flow_profiles.get(code), str(flow_quality.get("status") or "BLOCK"),
             )
+            flow_profile = dict(stock_flow_profiles.get(code) or {})
+            resonance = _flow_resonance_score(
+                _number(flow_profile.get("latest_direction")), domestic_flow
+            )
+            factor_score = _weighted_average(
+                ((_number(flow_profile.get("score")), 0.85), (resonance, 0.15)),
+                default=_number(flow_profile.get("score"), 0.0) or 0.0,
+            ) if _number(flow_profile.get("score")) is not None else None
             candidates.append({
                 "stock_code": code,
                 "stock_name": name,
@@ -1091,6 +1311,9 @@ def build_theme_forecast_from_records(
                 "previous_change_pct": round(_number(kline.get("change_pct"), 0.0) or 0.0, 2),
                 "reason": "；".join(stock_evidence),
                 "evidence": stock_evidence,
+                "flow_factor_score": round(factor_score, 1) if factor_score is not None else None,
+                "flow_quality_status": str(flow_profile.get("quality_status") or "BLOCK"),
+                "flow_metrics": flow_profile,
             })
         candidates.sort(key=lambda item: (-float(item["score"]), float(item["penalty_score"]), item["stock_code"]))
         for rank, candidate in enumerate(candidates[: max(1, int(stocks_per_theme))], start=1):
@@ -1172,6 +1395,10 @@ def build_theme_forecast_from_records(
         if quality_parts["external_core"] >= 3 and quality_ok >= 5
         else ("WATCH" if quality_ok >= 2 else "LOW")
     )
+    if str(flow_quality.get("status") or "BLOCK") == "BLOCK":
+        data_quality = "LOW"
+    elif str(flow_quality.get("status") or "WATCH") == "WATCH" and data_quality == "PASS":
+        data_quality = "WATCH"
     top_name = visible_themes[0]["theme_name"] if visible_themes else "暂无"
     return {
         "run_uid": str(uuid.uuid4()),
@@ -1182,7 +1409,8 @@ def build_theme_forecast_from_records(
         "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
         "generated_at": datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S"),
         "data_quality": data_quality,
-        "quality_counts": quality_parts,
+        "quality_counts": {**quality_parts, "flow_quality": flow_quality},
+        "flow_quality": flow_quality,
         "summary": f"09:08盘前主线首位：{top_name}；共{len(visible_themes)}个主题、{len(all_candidates)}只候选。",
         "themes": visible_themes,
         "stock_candidates": all_candidates,
@@ -1294,15 +1522,35 @@ def _load_forecast_inputs(
         WHERE pick_date = :source_date
     """, {"source_date": source_trade_date}, "premarket.recommendations")
     kline_rows = _safe_rows(engine, """
-        SELECT stock_code, short_name, close, change_pct, turnover_ratio, amount
-        FROM sm_stock_kline
-        WHERE trade_date = :source_date AND k_type = 1 AND adjust_type = 0
+        SELECT k.stock_code, k.short_name, k.close, k.change_pct,
+               k.turnover_ratio, k.amount,
+               k.close * shares.total_shares AS market_cap,
+               industry.industry_name
+        FROM sm_stock_kline k
+        LEFT JOIN (
+            SELECT stock_code, MAX(total_shares) AS total_shares
+            FROM si_stock_shares GROUP BY stock_code
+        ) shares ON shares.stock_code = k.stock_code
+        LEFT JOIN (
+            SELECT stock_code, MAX(industry_name) AS industry_name
+            FROM si_industry_sw
+            WHERE industry_type = '申万一级'
+            GROUP BY stock_code
+        ) industry ON industry.stock_code = k.stock_code
+        WHERE k.trade_date = :source_date AND k.k_type = 1 AND k.adjust_type = 0
     """, {"source_date": source_trade_date}, "premarket.kline")
     stock_flow_rows = _safe_rows(engine, """
-        SELECT stock_code, trade_date, main_net_inflow, max_net_inflow, lg_net_inflow
-        FROM sm_stock_capital_flow_daily
-        WHERE trade_date BETWEEN :history_start AND :source_date
-        ORDER BY stock_code ASC, trade_date DESC
+        SELECT flow.stock_code, flow.trade_date, flow.main_net_inflow,
+               flow.max_net_inflow, flow.lg_net_inflow,
+               kline.amount AS turnover_amount
+        FROM sm_stock_capital_flow_daily flow
+        LEFT JOIN sm_stock_kline kline
+          ON kline.stock_code = flow.stock_code
+         AND kline.trade_date = flow.trade_date
+         AND kline.k_type = 1
+         AND kline.adjust_type = 0
+        WHERE flow.trade_date BETWEEN :history_start AND :source_date
+        ORDER BY flow.stock_code ASC, flow.trade_date DESC
     """, {
         "history_start": history_start,
         "source_date": source_trade_date,
@@ -1376,6 +1624,11 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_forecast_item (
     member_count INT NOT NULL DEFAULT 0,
     catalyst_score DECIMAL(8,2) NOT NULL,
     flow_breadth_score DECIMAL(8,2) NOT NULL,
+    flow_positive_ratio DECIMAL(8,2) NULL,
+    flow_persistence_ratio DECIMAL(8,2) NULL,
+    member_flow_strength_score DECIMAL(8,2) NULL,
+    flow_quality_status VARCHAR(16) NOT NULL DEFAULT 'UNKNOWN',
+    flow_metrics_json LONGTEXT NULL,
     external_score DECIMAL(8,2) NOT NULL,
     technical_score DECIMAL(8,2) NOT NULL,
     commodity_score DECIMAL(8,2) NOT NULL,
@@ -1406,6 +1659,9 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_stock_candidate (
     signal_status VARCHAR(32) NOT NULL,
     penalty_score DECIMAL(8,2) NOT NULL,
     previous_change_pct DECIMAL(10,4) NULL,
+    flow_factor_score DECIMAL(8,2) NULL,
+    flow_quality_status VARCHAR(16) NOT NULL DEFAULT 'UNKNOWN',
+    flow_metrics_json LONGTEXT NULL,
     reason VARCHAR(1000) NULL,
     evidence_json LONGTEXT NULL,
     created_at DATETIME NOT NULL,
@@ -1417,11 +1673,58 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_stock_candidate (
 """
 
 
+_FORECAST_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
+    "st_premarket_theme_forecast_item": {
+        "flow_positive_ratio": "DECIMAL(8,2) NULL",
+        "flow_persistence_ratio": "DECIMAL(8,2) NULL",
+        "member_flow_strength_score": "DECIMAL(8,2) NULL",
+        "flow_quality_status": "VARCHAR(16) NOT NULL DEFAULT 'UNKNOWN'",
+        "flow_metrics_json": "LONGTEXT NULL",
+    },
+    "st_premarket_theme_stock_candidate": {
+        "flow_factor_score": "DECIMAL(8,2) NULL",
+        "flow_quality_status": "VARCHAR(16) NOT NULL DEFAULT 'UNKNOWN'",
+        "flow_metrics_json": "LONGTEXT NULL",
+    },
+}
+
+
+def _ensure_forecast_columns(connection: Any) -> None:
+    """Apply additive MySQL migrations without touching frozen forecast rows."""
+
+    try:
+        rows = connection.execute(text("""
+            SELECT TABLE_NAME, COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME IN (
+                  'st_premarket_theme_forecast_item',
+                  'st_premarket_theme_stock_candidate'
+              )
+        """)).mappings().all()
+    except Exception as exc:
+        logger.warning("Premarket forecast column audit skipped: %s", exc)
+        return
+    existing = {
+        (str(row.get("TABLE_NAME") or row.get("table_name") or ""),
+         str(row.get("COLUMN_NAME") or row.get("column_name") or ""))
+        for row in rows
+    }
+    for table_name, columns in _FORECAST_COLUMN_MIGRATIONS.items():
+        for column_name, definition in columns.items():
+            if (table_name, column_name) in existing:
+                continue
+            connection.execute(text(
+                f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {definition}"
+            ))
+
+
 def ensure_premarket_theme_tables(engine: Engine) -> None:
     with engine.begin() as connection:
         connection.execute(text(_RUN_TABLE_DDL))
         connection.execute(text(_ITEM_TABLE_DDL))
         connection.execute(text(_STOCK_TABLE_DDL))
+        _ensure_forecast_columns(connection)
 
 
 def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]) -> dict[str, Any]:
@@ -1479,11 +1782,15 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
                 INSERT INTO st_premarket_theme_forecast_item
                     (run_uid, rank_no, theme_key, family_key, theme_name, total_score,
                      status, data_quality, member_count, catalyst_score, flow_breadth_score,
+                     flow_positive_ratio, flow_persistence_ratio, member_flow_strength_score,
+                     flow_quality_status, flow_metrics_json,
                      external_score, technical_score, commodity_score, market_style_score,
                      continuity_score, crowding_penalty, concept_names_json, evidence_json, created_at)
                 VALUES
                     (:run_uid, :rank_no, :theme_key, :family_key, :theme_name, :total_score,
                      :status, :data_quality, :member_count, :catalyst_score, :flow_breadth_score,
+                     :flow_positive_ratio, :flow_persistence_ratio, :member_flow_strength_score,
+                     :flow_quality_status, :flow_metrics_json,
                      :external_score, :technical_score, :commodity_score, :market_style_score,
                      :continuity_score, :crowding_penalty, :concept_names_json, :evidence_json, :created_at)
             """), [{
@@ -1498,6 +1805,11 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
                 "member_count": int(theme.get("member_count") or 0),
                 "catalyst_score": _number(theme.get("catalyst_score"), 0.0),
                 "flow_breadth_score": _number(theme.get("flow_breadth_score"), 0.0),
+                "flow_positive_ratio": _number(theme.get("flow_positive_ratio")),
+                "flow_persistence_ratio": _number(theme.get("flow_persistence_ratio")),
+                "member_flow_strength_score": _number(theme.get("member_flow_strength_score")),
+                "flow_quality_status": str(theme.get("flow_quality_status") or "UNKNOWN")[:16],
+                "flow_metrics_json": json.dumps(theme.get("flow_metrics") or {}, ensure_ascii=False, default=str),
                 "external_score": _number(theme.get("external_score"), 0.0),
                 "technical_score": _number(theme.get("technical_score"), 0.0),
                 "commodity_score": _number(theme.get("commodity_score"), 0.0),
@@ -1513,11 +1825,13 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
                 INSERT INTO st_premarket_theme_stock_candidate
                     (run_uid, global_rank, theme_rank, stock_rank, theme_key, theme_name,
                      stock_code, stock_name, candidate_score, signal_status, penalty_score,
-                     previous_change_pct, reason, evidence_json, created_at)
+                     previous_change_pct, flow_factor_score, flow_quality_status,
+                     flow_metrics_json, reason, evidence_json, created_at)
                 VALUES
                     (:run_uid, :global_rank, :theme_rank, :stock_rank, :theme_key, :theme_name,
                      :stock_code, :stock_name, :candidate_score, :signal_status, :penalty_score,
-                     :previous_change_pct, :reason, :evidence_json, :created_at)
+                     :previous_change_pct, :flow_factor_score, :flow_quality_status,
+                     :flow_metrics_json, :reason, :evidence_json, :created_at)
             """), [{
                 "run_uid": run_uid,
                 "global_rank": int(item.get("global_rank") or 0),
@@ -1531,6 +1845,9 @@ def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]
                 "signal_status": str(item.get("signal_status") or "观察")[:32],
                 "penalty_score": _number(item.get("penalty_score"), 0.0),
                 "previous_change_pct": _number(item.get("previous_change_pct")),
+                "flow_factor_score": _number(item.get("flow_factor_score")),
+                "flow_quality_status": str(item.get("flow_quality_status") or "UNKNOWN")[:16],
+                "flow_metrics_json": json.dumps(item.get("flow_metrics") or {}, ensure_ascii=False, default=str),
                 "reason": str(item.get("reason") or "")[:1000],
                 "evidence_json": json.dumps(item.get("evidence") or [], ensure_ascii=False, default=str),
                 "created_at": now,
@@ -1602,6 +1919,10 @@ def load_premarket_theme_forecast(
             }
         run = run_rows[0]
         run_uid = str(run.get("run_uid") or "")
+        try:
+            quality_counts = json.loads(str(run.get("quality_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            quality_counts = {}
         theme_rows = _safe_rows(engine, """
             SELECT * FROM st_premarket_theme_forecast_item
             WHERE run_uid = :run_uid ORDER BY rank_no ASC
@@ -1620,6 +1941,10 @@ def load_premarket_theme_forecast(
                 evidence = json.loads(str(row.get("evidence_json") or "[]"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 evidence = []
+            try:
+                flow_metrics = json.loads(str(row.get("flow_metrics_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                flow_metrics = {}
             themes.append({
                 "rank": int(row.get("rank_no") or 0),
                 "theme_key": row.get("theme_key"),
@@ -1631,6 +1956,11 @@ def load_premarket_theme_forecast(
                 "member_count": int(row.get("member_count") or 0),
                 "catalyst_score": _number(row.get("catalyst_score"), 0.0),
                 "flow_breadth_score": _number(row.get("flow_breadth_score"), 0.0),
+                "flow_positive_ratio": _number(row.get("flow_positive_ratio")),
+                "flow_persistence_ratio": _number(row.get("flow_persistence_ratio")),
+                "member_flow_strength_score": _number(row.get("member_flow_strength_score")),
+                "flow_quality_status": row.get("flow_quality_status") or "UNKNOWN",
+                "flow_metrics": flow_metrics,
                 "external_score": _number(row.get("external_score"), 0.0),
                 "technical_score": _number(row.get("technical_score"), 0.0),
                 "commodity_score": _number(row.get("commodity_score"), 0.0),
@@ -1648,6 +1978,10 @@ def load_premarket_theme_forecast(
                 evidence = json.loads(str(row.get("evidence_json") or "[]"))
             except (TypeError, ValueError, json.JSONDecodeError):
                 evidence = []
+            try:
+                flow_metrics = json.loads(str(row.get("flow_metrics_json") or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                flow_metrics = {}
             item = {
                 "global_rank": int(row.get("global_rank") or 0),
                 "theme_rank": int(row.get("theme_rank") or 0),
@@ -1660,6 +1994,9 @@ def load_premarket_theme_forecast(
                 "signal_status": row.get("signal_status"),
                 "penalty_score": _number(row.get("penalty_score"), 0.0),
                 "previous_change_pct": _number(row.get("previous_change_pct"), 0.0),
+                "flow_factor_score": _number(row.get("flow_factor_score")),
+                "flow_quality_status": row.get("flow_quality_status") or "UNKNOWN",
+                "flow_metrics": flow_metrics,
                 "reason": row.get("reason") or "",
                 "evidence": evidence,
             }
@@ -1675,6 +2012,8 @@ def load_premarket_theme_forecast(
             "stage": run.get("stage"),
             "model_version": run.get("model_version"),
             "data_quality": run.get("data_quality"),
+            "quality_counts": quality_counts,
+            "flow_quality": quality_counts.get("flow_quality") or {},
             "summary": run.get("summary") or "",
             "delivery_status": run.get("delivery_status"),
             "delivery_id": run.get("delivery_id") or "",
@@ -1791,3 +2130,242 @@ def run_premarket_theme_forecast(
             return frozen
         forecast["run_uid"] = str(persistence.get("run_uid") or forecast["run_uid"])
     return forecast
+
+
+_AUCTION_CONFIRMATION_DDL = """
+CREATE TABLE IF NOT EXISTS st_premarket_theme_stock_confirmation (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    confirmation_uid VARCHAR(64) NOT NULL,
+    session_date DATE NOT NULL,
+    source_run_uid VARCHAR(64) NOT NULL,
+    cutoff_at DATETIME NOT NULL,
+    model_version VARCHAR(64) NOT NULL,
+    original_rank INT NOT NULL,
+    stock_code VARCHAR(16) NOT NULL,
+    stock_name VARCHAR(128) NOT NULL,
+    original_score DECIMAL(8,2) NOT NULL,
+    quote_price DECIMAL(18,4) NULL,
+    quote_change_pct DECIMAL(10,4) NULL,
+    quote_snapshot_at DATETIME NULL,
+    confirmation_status VARCHAR(32) NOT NULL,
+    reason VARCHAR(512) NOT NULL,
+    metrics_json LONGTEXT NULL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_premarket_theme_confirmation (source_run_uid, stock_code),
+    KEY idx_premarket_theme_confirmation_date (session_date, original_rank)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+
+def build_auction_confirmation_from_records(
+    forecast: Mapping[str, Any],
+    quote_rows: Sequence[Mapping[str, Any]],
+    *,
+    cutoff_at: datetime | str,
+) -> dict[str, Any]:
+    """Build an independent 09:20 audit layer without mutating 09:08 output."""
+
+    cutoff = _parse_datetime(cutoff_at)
+    if cutoff is None:
+        raise ValueError("cutoff_at is invalid")
+    session_date = str(forecast.get("session_date") or "")[:10]
+    if not session_date or cutoff.date().isoformat() != session_date:
+        raise ValueError("confirmation cutoff and frozen session_date must match")
+
+    latest_quotes: dict[str, tuple[datetime, dict[str, Any]]] = {}
+    for row in quote_rows:
+        code = str(row.get("stock_code") or "").zfill(6)
+        snapshot = _parse_datetime(row.get("snapshot_at") or row.get("received_at"))
+        if not re.fullmatch(r"[036]\d{5}", code) or snapshot is None:
+            continue
+        if snapshot.date().isoformat() != session_date or snapshot > cutoff:
+            continue
+        existing = latest_quotes.get(code)
+        if existing is None or snapshot > existing[0]:
+            latest_quotes[code] = (snapshot, dict(row))
+
+    confirmations: list[dict[str, Any]] = []
+    for candidate in list(forecast.get("stock_candidates") or []):
+        code = str(candidate.get("stock_code") or "").zfill(6)
+        quoted = latest_quotes.get(code)
+        price: float | None = None
+        change_pct: float | None = None
+        snapshot: datetime | None = None
+        if quoted is None:
+            status, reason = "DATA_BLOCKED", "09:20前没有当日有效行情，不得把缺数据当确认"
+        else:
+            snapshot, quote = quoted
+            price = _number(quote.get("price") or quote.get("latest_price"))
+            change_pct = _number(quote.get("change_pct"))
+            permission = str(quote.get("permission_status") or "AVAILABLE").upper()
+            quality = str(quote.get("quality_status") or "PASS").upper()
+            age_seconds = max(0.0, (cutoff - snapshot).total_seconds())
+            if price is None or price <= 0 or change_pct is None:
+                status, reason = "DATA_BLOCKED", "行情价格或涨跌幅缺失"
+            elif age_seconds > 600 or permission not in {"AVAILABLE", "OK", "PASS", "SUPPORTED"} or quality in {"FAIL", "BLOCK"}:
+                status, reason = "DATA_BLOCKED", "行情过期或行情质量门禁未通过"
+            elif change_pct >= 9.5:
+                status, reason = "REJECT_LIMIT", "已接近涨停，禁止追入"
+            elif change_pct >= 5.0:
+                status, reason = "REJECT_CHASE", "竞价涨幅过高，等待开盘后重新确认"
+            elif change_pct <= -4.0:
+                status, reason = "REJECT_WEAK", "竞价显著走弱，盘前候选被否决"
+            elif -1.5 <= change_pct <= 4.0:
+                status, reason = "CONFIRMED", "竞价价格可执行且未触发追高/走弱门禁"
+            else:
+                status, reason = "WATCH", "竞价处于边界区，仅保留观察"
+        confirmations.append({
+            "original_rank": int(candidate.get("global_rank") or candidate.get("rank") or 0),
+            "stock_code": code,
+            "stock_name": str(candidate.get("stock_name") or ""),
+            "original_score": round(_number(candidate.get("score"), 0.0) or 0.0, 1),
+            "quote_price": round(price, 4) if price is not None else None,
+            "quote_change_pct": round(change_pct, 4) if change_pct is not None else None,
+            "quote_snapshot_at": snapshot.strftime("%Y-%m-%d %H:%M:%S") if snapshot else None,
+            "confirmation_status": status,
+            "reason": reason,
+            "metrics": {
+                "source_stage": forecast.get("stage"),
+                "source_model_version": forecast.get("model_version"),
+                "flow_factor_score": candidate.get("flow_factor_score"),
+                "flow_quality_status": candidate.get("flow_quality_status"),
+            },
+        })
+    return {
+        "confirmation_uid": str(uuid.uuid4()),
+        "session_date": session_date,
+        "source_run_uid": str(forecast.get("run_uid") or ""),
+        "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
+        "model_version": f"{MODEL_VERSION}_AUCTION_0920",
+        "confirmations": confirmations,
+        "counts": dict((status, sum(item["confirmation_status"] == status for item in confirmations)) for status in (
+            "CONFIRMED", "WATCH", "REJECT_CHASE", "REJECT_LIMIT", "REJECT_WEAK", "DATA_BLOCKED"
+        )),
+    }
+
+
+def persist_auction_confirmation(engine: Engine, confirmation: Mapping[str, Any]) -> dict[str, Any]:
+    """Freeze the first 09:20 confirmation; never update 09:08 or an earlier confirmation."""
+
+    rows = list(confirmation.get("confirmations") or [])
+    source_run_uid = str(confirmation.get("source_run_uid") or "")
+    if not source_run_uid:
+        raise ValueError("source_run_uid is required")
+    with engine.begin() as connection:
+        connection.execute(text(_AUCTION_CONFIRMATION_DDL))
+        existing = connection.execute(text("""
+            SELECT confirmation_uid, COUNT(*) AS row_count
+            FROM st_premarket_theme_stock_confirmation
+            WHERE source_run_uid = :source_run_uid
+            GROUP BY confirmation_uid
+            LIMIT 1
+        """), {"source_run_uid": source_run_uid}).mappings().first()
+        if existing:
+            return {
+                "created": False,
+                "confirmation_uid": str(existing.get("confirmation_uid") or ""),
+                "row_count": int(existing.get("row_count") or 0),
+            }
+        if rows:
+            now = datetime.now().replace(microsecond=0)
+            connection.execute(text("""
+                INSERT INTO st_premarket_theme_stock_confirmation
+                    (confirmation_uid, session_date, source_run_uid, cutoff_at, model_version,
+                     original_rank, stock_code, stock_name, original_score,
+                     quote_price, quote_change_pct, quote_snapshot_at,
+                     confirmation_status, reason, metrics_json, created_at)
+                VALUES
+                    (:confirmation_uid, :session_date, :source_run_uid, :cutoff_at, :model_version,
+                     :original_rank, :stock_code, :stock_name, :original_score,
+                     :quote_price, :quote_change_pct, :quote_snapshot_at,
+                     :confirmation_status, :reason, :metrics_json, :created_at)
+            """), [{
+                "confirmation_uid": str(confirmation.get("confirmation_uid") or ""),
+                "session_date": str(confirmation.get("session_date") or "")[:10],
+                "source_run_uid": source_run_uid,
+                "cutoff_at": _parse_datetime(confirmation.get("cutoff_at")),
+                "model_version": str(confirmation.get("model_version") or "")[:64],
+                "original_rank": int(item.get("original_rank") or 0),
+                "stock_code": str(item.get("stock_code") or "")[:16],
+                "stock_name": str(item.get("stock_name") or "")[:128],
+                "original_score": _number(item.get("original_score"), 0.0),
+                "quote_price": _number(item.get("quote_price")),
+                "quote_change_pct": _number(item.get("quote_change_pct")),
+                "quote_snapshot_at": _parse_datetime(item.get("quote_snapshot_at")),
+                "confirmation_status": str(item.get("confirmation_status") or "DATA_BLOCKED")[:32],
+                "reason": str(item.get("reason") or "")[:512],
+                "metrics_json": json.dumps(item.get("metrics") or {}, ensure_ascii=False, default=str),
+                "created_at": now,
+            } for item in rows])
+    return {
+        "created": True,
+        "confirmation_uid": str(confirmation.get("confirmation_uid") or ""),
+        "row_count": len(rows),
+    }
+
+
+def run_auction_confirmation(
+    engine: Engine,
+    *,
+    session_date: str,
+    cutoff_at: datetime | str,
+    persist: bool = True,
+) -> dict[str, Any]:
+    forecast = load_premarket_theme_forecast(
+        engine, str(session_date)[:10], allow_fallback=False
+    )
+    if not forecast.get("run_uid"):
+        raise RuntimeError("当天09:08冻结预判不存在，不能凭空生成09:20确认")
+    codes = sorted({
+        str(item.get("stock_code") or "").zfill(6)
+        for item in forecast.get("stock_candidates") or []
+        if re.fullmatch(r"[036]\d{5}", str(item.get("stock_code") or "").zfill(6))
+    })
+    params: dict[str, Any] = {"cutoff_at": _parse_datetime(cutoff_at)}
+    placeholders = []
+    for index, code in enumerate(codes):
+        key = f"code_{index}"
+        params[key] = code
+        placeholders.append(f":{key}")
+    quote_rows = _safe_rows(engine, f"""
+        SELECT stock_code, short_name, price, change_pct, snapshot_at, received_at,
+               permission_status, quality_status, data_source
+        FROM sm_stock_current
+        WHERE snapshot_at <= :cutoff_at
+          AND stock_code IN ({', '.join(placeholders) if placeholders else "''"})
+        ORDER BY stock_code ASC, snapshot_at DESC
+    """, params, "premarket.auction_confirmation")
+    result = build_auction_confirmation_from_records(
+        forecast, quote_rows, cutoff_at=cutoff_at
+    )
+    if persist:
+        result["persistence"] = persist_auction_confirmation(engine, result)
+    return result
+
+
+def format_auction_confirmation_markdown(result: Mapping[str, Any]) -> str:
+    lines = [
+        f"## ⏱️ 09:20竞价确认｜{result.get('session_date')}",
+        "> 这是对09:08冻结候选的独立确认，不会改写原始排名。",
+        "",
+    ]
+    labels = {
+        "CONFIRMED": "确认",
+        "WATCH": "观察",
+        "REJECT_CHASE": "拒绝追高",
+        "REJECT_LIMIT": "拒绝涨停追入",
+        "REJECT_WEAK": "否决走弱",
+        "DATA_BLOCKED": "数据不足",
+    }
+    for item in list(result.get("confirmations") or [])[:12]:
+        change = _number(item.get("quote_change_pct"))
+        change_text = f"{change:+.2f}%" if change is not None else "无有效行情"
+        status = str(item.get("confirmation_status") or "DATA_BLOCKED")
+        lines.append(
+            f"- {int(item.get('original_rank') or 0)}. {item.get('stock_name')}({item.get('stock_code')}) "
+            f"{change_text}｜**{labels.get(status, status)}**｜{item.get('reason')}"
+        )
+    if not result.get("confirmations"):
+        lines.append("- 09:08没有冻结候选，本档没有可确认标的。")
+    return "\n".join(lines)
