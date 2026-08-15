@@ -287,6 +287,10 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         "grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true'"
         in deploy_script
     )
+    assert "grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=true'" in deploy_script
+    assert '"/proc/$SERVICE_MAIN_PID/environ"' in deploy_script
+    assert "curl --fail-with-body" in deploy_script
+    assert 'cat "$HEALTH_RESPONSE" >&2' in deploy_script
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:

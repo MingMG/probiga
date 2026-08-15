@@ -712,9 +712,27 @@ systemctl show probiga --property=ExecStart --value \
 systemctl show probiga --property=ExecStart --value \
   | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
 sudo systemctl restart probiga
-curl --fail --silent --show-error --retry 15 --retry-all-errors \
-  --retry-delay 2 --retry-connrefused \
-  http://127.0.0.1/api/health >/dev/null
+SERVICE_MAIN_PID="$(systemctl show probiga --property=MainPID --value)"
+case "$SERVICE_MAIN_PID" in
+  ''|0|*[!0-9]*)
+    echo "probiga did not expose a valid main PID after restart" >&2
+    false
+    ;;
+esac
+grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+HEALTH_RESPONSE="$(mktemp)"
+if ! curl --fail-with-body --silent --show-error --retry 15 \
+  --retry-all-errors --retry-delay 2 --retry-connrefused \
+  --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
+  cat "$HEALTH_RESPONSE" >&2
+  rm -f "$HEALTH_RESPONSE"
+  false
+fi
+cat "$HEALTH_RESPONSE"
+rm -f "$HEALTH_RESPONSE"
 sudo systemctl is-active --quiet probiga
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   ! systemctl is-active --quiet probiga-scheduler
