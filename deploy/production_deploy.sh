@@ -62,6 +62,12 @@ if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
   sudo git config --system --add safe.directory "$REPOSITORY_ROOT"
 fi
+LEGACY_ADATA_REPOSITORY=/opt/ProBigA/adata
+if [ -d "$LEGACY_ADATA_REPOSITORY/.git" ] && \
+  ! sudo git config --system --get-all safe.directory \
+    | grep -Fxq "$LEGACY_ADATA_REPOSITORY"; then
+  sudo git config --system --add safe.directory "$LEGACY_ADATA_REPOSITORY"
+fi
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 assert_service_cannot_write_tree() {
   local tree_root="$1"
