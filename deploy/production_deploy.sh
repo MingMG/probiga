@@ -102,7 +102,7 @@ preserve_tracked_worktree_state "$REPOSITORY_ROOT" repository
 if [ -d "$LEGACY_ADATA_REPOSITORY/.git" ]; then
   preserve_tracked_worktree_state "$LEGACY_ADATA_REPOSITORY" adata
 fi
-quarantine_untracked_executable_code() {
+quarantine_unsafe_untracked_release_files() {
   declare -A unsafe_paths=()
   local candidate
   local code_root
@@ -129,6 +129,24 @@ quarantine_untracked_executable_code() {
     unsafe_paths["$relative_path"]=1
   }
 
+  # Production code/config/evidence roots must contain exactly the Git release.
+  # Preserve every non-ignored legacy file from those roots outside the
+  # checkout, including harmless-looking .bak files which still make the
+  # release identity unverifiable.
+  while IFS= read -r -d '' candidate; do
+    collect_untracked_candidate "$candidate"
+  done < <(git ls-files --others --exclude-standard -z -- \
+    server biz integrations tools scripts strategies versions \
+    artifacts/trading_v4 artifacts/trading_v5 artifacts/trading_v6 \
+    .github deploy requirements-platform.txt .gitattributes .gitignore \
+    sitecustomize.py usercustomize.py \
+    ':(top,glob)*.py' ':(top,glob)*.pyw' ':(top,glob)*.pyd' \
+    ':(top,glob)*.so' ':(top,glob)*/__init__.py' \
+    ':(top,glob)*/__init__*.pyc' ':(top,glob)*/__init__*.pyd' \
+    ':(top,glob)*/__init__*.so')
+
+  # Git ignores bytecode and some local helpers, but Python can still import
+  # them. Include those executable shadows even though status omits them.
   while IFS= read -r -d '' candidate; do
     collect_untracked_candidate "$candidate"
   done < <(find . -maxdepth 1 \( -type f -o -type l \) \
@@ -156,15 +174,17 @@ quarantine_untracked_executable_code() {
     return 0
   fi
 
-  mkdir -p "$LEGACY_STATE_DIR/untracked-code"
-  chown root:root "$LEGACY_STATE_DIR" "$LEGACY_STATE_DIR/untracked-code"
-  chmod 0700 "$LEGACY_STATE_DIR" "$LEGACY_STATE_DIR/untracked-code"
-  manifest_file="$LEGACY_STATE_DIR/untracked-code.manifest"
+  mkdir -p "$LEGACY_STATE_DIR/untracked-release-files"
+  chown root:root "$LEGACY_STATE_DIR" \
+    "$LEGACY_STATE_DIR/untracked-release-files"
+  chmod 0700 "$LEGACY_STATE_DIR" \
+    "$LEGACY_STATE_DIR/untracked-release-files"
+  manifest_file="$LEGACY_STATE_DIR/untracked-release-files.manifest"
   : > "$manifest_file"
   chmod 0600 "$manifest_file"
   for relative_path in "${!unsafe_paths[@]}"; do
     source_path="$REPOSITORY_ROOT/$relative_path"
-    target_path="$LEGACY_STATE_DIR/untracked-code/$relative_path"
+    target_path="$LEGACY_STATE_DIR/untracked-release-files/$relative_path"
     target_parent="$(dirname "$target_path")"
     mkdir -p "$target_parent"
     chmod 0700 "$target_parent"
@@ -181,12 +201,12 @@ quarantine_untracked_executable_code() {
     if [ ! -L "$target_path" ]; then
       chmod 0600 -- "$target_path"
     fi
-    echo "Quarantined unsafe untracked code: $relative_path" >&2
+    echo "Quarantined unsafe untracked release file: $relative_path" >&2
   done
-  chown -R root:root "$LEGACY_STATE_DIR/untracked-code"
+  chown -R root:root "$LEGACY_STATE_DIR/untracked-release-files"
   chmod 0600 "$manifest_file"
 }
-quarantine_untracked_executable_code
+quarantine_unsafe_untracked_release_files
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 assert_service_cannot_write_tree() {
   local tree_root="$1"

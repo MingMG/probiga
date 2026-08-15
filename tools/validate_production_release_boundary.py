@@ -578,17 +578,22 @@ def _git_delivery_status(releases: Sequence[Any], expected_sha: str | None) -> d
                 "head": head,
                 "reason": f"release files are not Git-tracked: {missing[:8]}",
             }
-        if _git(
+        protected_status = _git(
             "status",
             "--porcelain",
             "--untracked-files=all",
             "--",
             *PROTECTED_RELEASE_PATHS,
-        ):
+        )
+        if protected_status:
+            changed_paths = protected_status.splitlines()[:8]
             return {
                 "ready": False,
                 "head": head,
-                "reason": "protected release files differ from Git HEAD",
+                "reason": (
+                    "protected release files differ from Git HEAD: "
+                    f"{changed_paths}"
+                ),
             }
         untracked_code = _git(
             "ls-files",

@@ -148,12 +148,14 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'git config --system --add safe.directory "$LEGACY_ADATA_REPOSITORY"' in deploy_script
     assert 'LEGACY_STATE_DIR="$RECEIPT_DIR/legacy-state-$RECEIPT_ID"' in deploy_script
     assert "preserve_tracked_worktree_state" in deploy_script
-    assert "quarantine_untracked_executable_code" in deploy_script
-    assert 'LEGACY_STATE_DIR/untracked-code.manifest' in deploy_script
-    assert 'LEGACY_STATE_DIR/untracked-code/$relative_path' in deploy_script
+    assert "quarantine_unsafe_untracked_release_files" in deploy_script
+    assert 'LEGACY_STATE_DIR/untracked-release-files.manifest' in deploy_script
+    assert 'LEGACY_STATE_DIR/untracked-release-files/$relative_path' in deploy_script
     assert "sha256sum -- \"$source_path\"" in deploy_script
     assert "mv -- \"$source_path\" \"$target_path\"" in deploy_script
     assert "server biz integrations tools scripts strategies versions" in deploy_script
+    assert "git ls-files --others --exclude-standard -z" in deploy_script
+    assert "artifacts/trading_v4 artifacts/trading_v5 artifacts/trading_v6" in deploy_script
     assert "seal_release_checkout" in deploy_script
     assert "git ls-files --stage -z" in deploy_script
     assert 'git checkout --detach --force "$EXPECTED_SHA"' in deploy_script
