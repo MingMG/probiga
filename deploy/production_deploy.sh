@@ -272,12 +272,26 @@ ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 mkdir -p "$(dirname "$ADATA_GIT_CACHE")"
 if [ ! -d "$ADATA_GIT_CACHE" ]; then
   ADATA_CACHE_BUILD="$(mktemp -d /opt/ProBigA/.release_sources/adata-git.XXXXXX)"
-  git clone --mirror "$ADATA_REPOSITORY_URL" "$ADATA_CACHE_BUILD/repository.git"
+  if git -C "$LEGACY_ADATA_REPOSITORY" cat-file -e \
+    "${EXPECTED_ADATA_SHA}^{commit}"; then
+    git clone --mirror "$LEGACY_ADATA_REPOSITORY" \
+      "$ADATA_CACHE_BUILD/repository.git"
+    git --git-dir="$ADATA_CACHE_BUILD/repository.git" remote set-url origin \
+      "$ADATA_REPOSITORY_URL"
+  else
+    git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --mirror \
+      "$ADATA_REPOSITORY_URL" "$ADATA_CACHE_BUILD/repository.git"
+  fi
   mv "$ADATA_CACHE_BUILD/repository.git" "$ADATA_GIT_CACHE"
   rmdir "$ADATA_CACHE_BUILD"
 fi
 test "$(git --git-dir="$ADATA_GIT_CACHE" remote get-url origin)" = "$ADATA_REPOSITORY_URL"
-git --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin "$EXPECTED_ADATA_SHA"
+if ! git --git-dir="$ADATA_GIT_CACHE" cat-file -e \
+  "${EXPECTED_ADATA_SHA}^{commit}"; then
+  git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 \
+    --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin \
+    "$EXPECTED_ADATA_SHA"
+fi
 test "$(git --git-dir="$ADATA_GIT_CACHE" rev-parse "${EXPECTED_ADATA_SHA}^{commit}")" = \
   "$EXPECTED_ADATA_SHA"
 rollback() {

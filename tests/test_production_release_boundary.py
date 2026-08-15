@@ -192,6 +192,8 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
         in workflow
     )
     assert "https://github.com/1nchaos/adata.git" in workflow
+    assert 'git clone --mirror "$LEGACY_ADATA_REPOSITORY"' in workflow
+    assert "http.lowSpeedTime=30" in workflow
     assert "EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "server.common.adata_release seal" in workflow
     assert "pip wheel --no-deps" in workflow
