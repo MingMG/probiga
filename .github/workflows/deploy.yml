@@ -245,9 +245,11 @@ jobs:
             [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
             git fetch --no-tags origin main
             git cat-file -e "${EXPECTED_SHA}^{commit}"
-            DEPLOY_BOOTSTRAP="$(mktemp /tmp/probiga-deploy.XXXXXX)"
-            cleanup_bootstrap() { rm -f "$DEPLOY_BOOTSTRAP"; }
-            trap cleanup_bootstrap EXIT
-            git show "${EXPECTED_SHA}:deploy/production_deploy.sh" > "$DEPLOY_BOOTSTRAP"
-            chmod 0700 "$DEPLOY_BOOTSTRAP"
-            bash "$DEPLOY_BOOTSTRAP"
+            # The root-owned broker executes deploy/production_deploy.sh from
+            # the requested, independently verified main revision.
+            printf '%s\n' "$RESOLVED_REQUIREMENTS_B64" | \
+              sudo -n /usr/local/sbin/probiga-production-deploy \
+                "$EXPECTED_SHA" \
+                "$EXPECTED_REQUIREMENTS_SHA256" \
+                "$EXPECTED_ADATA_SHA" \
+                "$EXPECTED_ADATA_TREE_SHA256"
