@@ -676,7 +676,10 @@ else
   printf '%s\n' "$EXPECTED_ADATA_TREE_SHA256" \
     > "$EXPECTED_BUILD/.adata.tree.sha256"
   verify_venv_dependency_lock "$EXPECTED_BUILD"
-  chmod -R a-w "$EXPECTED_BUILD"
+  chmod -R a+rX,a-w "$EXPECTED_BUILD"
+  sudo -u "$SERVICE_USER" test -x "$EXPECTED_BUILD/bin/python"
+  sudo -u "$SERVICE_USER" "$EXPECTED_BUILD/bin/python" -I -c \
+    'import sys; assert sys.version_info[:2] == (3, 14)'
   assert_service_cannot_write_tree "$EXPECTED_BUILD" \
     "new release virtual environment"
   rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"

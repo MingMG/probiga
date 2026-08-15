@@ -234,6 +234,8 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "scripts strategies versions" in workflow
     assert "reused release virtual environment" in workflow
     assert "new release virtual environment" in workflow
+    assert 'chmod -R a+rX,a-w "$EXPECTED_BUILD"' in deploy_script
+    assert 'sudo -u "$SERVICE_USER" test -x "$EXPECTED_BUILD/bin/python"' in deploy_script
     assert "previous release virtual environment" in workflow
     assert "tools/ensure_quality_gate.py" in deploy_script
     assert "--task-type analysis_premarket_external" in deploy_script
