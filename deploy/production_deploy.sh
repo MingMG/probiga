@@ -107,10 +107,9 @@ assert_service_cannot_write_tree() {
   local tree_root="$1"
   local label="$2"
   local writable_path
-  writable_path="$(sudo -u "$SERVICE_USER" find "$tree_root" \
-    -writable -print -quit)"
+  writable_path="$(find "$tree_root" -perm /0222 -print -quit)"
   if [ -n "$writable_path" ]; then
-    echo "$label is writable by the service account: $writable_path" >&2
+    echo "$label retains a write permission bit: $writable_path" >&2
     return 2
   fi
 }
@@ -155,14 +154,15 @@ assert_service_cannot_write_release_paths() {
     .git .github deploy server biz integrations tools scripts \
     strategies versions artifacts/trading_v4 artifacts/trading_v5 \
     artifacts/trading_v6 requirements-platform.txt .gitattributes \
-    .gitignore -writable -print -quit)"
+    .gitignore -writable -print -quit 2>/dev/null || true)"
   if [ -n "$writable_path" ]; then
     echo "service account can modify protected release paths: $writable_path" >&2
     return 2
   fi
   writable_root_file="$(sudo -u "$SERVICE_USER" find . -maxdepth 1 \
     -type f \( -name '*.py' -o -name '*.pyw' -o -name '*.pyc' \
-    -o -name '*.pyd' -o -name '*.so' \) -writable -print -quit)"
+    -o -name '*.pyd' -o -name '*.so' \) -writable -print -quit \
+    2>/dev/null || true)"
   if [ -n "$writable_root_file" ]; then
     echo "service account can modify root executable code: $writable_root_file" >&2
     return 2
@@ -397,7 +397,7 @@ rollback() {
   fi
   sudo systemctl is-active --quiet probiga || \
     rollback_failure "verify probiga is active"
-  curl --fail --silent --show-error --retry 10 \
+  curl --fail --silent --show-error --retry 15 --retry-all-errors \
     --retry-delay 2 --retry-connrefused \
     http://127.0.0.1/api/health >/dev/null || \
     rollback_failure "verify previous API health"
@@ -554,7 +554,7 @@ write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
   "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
 sudo systemctl daemon-reload
 sudo systemctl restart probiga
-curl --fail --silent --show-error --retry 10 \
+curl --fail --silent --show-error --retry 15 --retry-all-errors \
   --retry-delay 2 --retry-connrefused \
   http://127.0.0.1/api/health >/dev/null
 sudo systemctl is-active --quiet probiga

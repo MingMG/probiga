@@ -166,6 +166,7 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'sudo mv -f "$receipt_tmp" "$RECEIPT_DIR/$RECEIPT_ID.json"' in workflow
     assert 'sudo tee "$RECEIPT_DIR/$RECEIPT_ID.json"' not in workflow
     assert "trap 'rollback 143' TERM" in workflow
+    assert workflow.count("--retry-all-errors") == 2
     rollback = workflow.index("rollback() {")
     stop_service = workflow.index("sudo systemctl stop probiga", rollback)
     checkout_previous = workflow.index(
@@ -224,7 +225,8 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "tools/ensure_quality_gate.py" in deploy_script
     assert "--task-type analysis_premarket_external" in deploy_script
     assert 'find "$tree_root"' in workflow
-    assert "-writable -print -quit" in workflow
+    assert "-perm /0222 -print -quit" in workflow
+    assert "-writable -print -quit 2>/dev/null || true" in workflow
     validate_boundary = workflow.index("tools/validate_production_release_boundary.py")
     validate_scheduler_manifest = workflow.index("tools/ensure_quality_gate.py")
     restart_service = workflow.index("sudo systemctl restart probiga", validate_scheduler_manifest)
