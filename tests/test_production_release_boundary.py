@@ -273,6 +273,22 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "--restore-review-delivery" not in workflow
 
 
+def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
+    deploy_script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true "
+        in deploy_script
+    )
+    assert "systemctl show probiga --property=ExecStart --value" in deploy_script
+    assert (
+        "grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true'"
+        in deploy_script
+    )
+
+
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
     assert "artifacts/trading_v5/regime_expert_capacity_oos_20260802.json -text" in attributes

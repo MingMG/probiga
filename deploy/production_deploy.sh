@@ -319,7 +319,7 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=$RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=true' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
@@ -349,7 +349,7 @@ dropin_environment_value() {
   sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN" | tail -n 1
 }
 PREVIOUS_RELEASE_REVISION="$(sed -n \
-  "s|^ExecStart=$RELEASE_VENV_ROOT/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
+  "s|^ExecStart=.*$RELEASE_VENV_ROOT/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
   "$PREVIOUS_DROPIN" | tail -n 1)"
 PREVIOUS_REQUIREMENTS_SHA256=""
 if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
@@ -707,6 +707,10 @@ sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
   "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
 sudo systemctl daemon-reload
+systemctl show probiga --property=ExecStart --value \
+  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' >/dev/null
+systemctl show probiga --property=ExecStart --value \
+  | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
 sudo systemctl restart probiga
 curl --fail --silent --show-error --retry 15 --retry-all-errors \
   --retry-delay 2 --retry-connrefused \
