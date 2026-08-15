@@ -630,14 +630,18 @@ if [ ! -d "$ADATA_SOURCE" ]; then
   SEALED_TREE_SHA="$(printf '%s' "$SEAL_JSON" | $BOOTSTRAP_PYTHON -I -c \
     'import json,sys; print(json.load(sys.stdin)["tree_sha256"])')"
   test "$SEALED_TREE_SHA" = "$EXPECTED_ADATA_TREE_SHA256"
-  chmod -R a-w "$ADATA_SOURCE_BUILD"
+  chmod -R a+rX,a-w "$ADATA_SOURCE_BUILD"
   sudo mv "$ADATA_SOURCE_BUILD" "$ADATA_SOURCE"
-  sudo chown -R root:root "$ADATA_SOURCE"
 fi
+sudo chown -R root:root "$ADATA_SOURCE"
+sudo chmod -R a+rX,a-w "$ADATA_SOURCE"
 sudo -u "$SERVICE_USER" test ! -w "$ADATA_RUNTIME_ROOT"
 sudo -u "$SERVICE_USER" test ! -w "$(dirname "$ADATA_RUNTIME_ROOT")"
 sudo -u "$SERVICE_USER" test ! -w "$(dirname "$(dirname "$ADATA_RUNTIME_ROOT")")"
 sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE"
+sudo -u "$SERVICE_USER" test -x "$ADATA_SOURCE"
+sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.gitsha"
+sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.tree.sha256"
 $BOOTSTRAP_PYTHON -I server/common/adata_release.py verify \
   --source "$ADATA_SOURCE" --git-sha "$EXPECTED_ADATA_SHA" \
   --tree-sha256 "$EXPECTED_ADATA_TREE_SHA256"
