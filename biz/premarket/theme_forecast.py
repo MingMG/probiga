@@ -40,7 +40,7 @@ from server.common.sql_reader import read_sql_rows
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "PREMARKET_THEME_V1.1"
+MODEL_VERSION = "PREMARKET_THEME_V1.2_FLOW"
 PREMARKET_STAGE = "PREMARKET_0908"
 DEFAULT_THEME_LIMIT = 12
 DEFAULT_STOCKS_PER_THEME = 5
@@ -505,6 +505,141 @@ def _flow_row_score(row: Mapping[str, Any]) -> float:
     return _clamp(50.0 + change * 2.0)
 
 
+def _flow_history_by_code(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    source_trade_date: str,
+    limit: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return point-in-time stock-flow histories, newest session first."""
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    source_date = str(source_trade_date or "")[:10]
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        if not re.fullmatch(r"[036]\d{5}", code):
+            continue
+        trade_date = _date_text(row.get("trade_date")) if row.get("trade_date") else ""
+        if trade_date and source_date and trade_date > source_date:
+            continue
+        grouped[code].append(dict(row))
+    for code, history in grouped.items():
+        history.sort(
+            key=lambda row: (
+                bool(row.get("trade_date")),
+                _date_text(row.get("trade_date")) if row.get("trade_date") else "",
+            ),
+            reverse=True,
+        )
+        grouped[code] = history[: max(1, int(limit))]
+    return dict(grouped)
+
+
+def _flow_direction(value: Any, turnover_amount: Any = None) -> tuple[float | None, float | None]:
+    """Map a cash flow to [-1, 1], normalized by turnover when available."""
+
+    cash_flow = _number(value)
+    if cash_flow is None:
+        return None, None
+    turnover = _number(turnover_amount)
+    if turnover is not None and turnover > 0:
+        rate = cash_flow / turnover * 100.0
+        return math.tanh(rate / 4.0), rate
+    if cash_flow > 0:
+        return 0.35, None
+    if cash_flow < 0:
+        return -0.35, None
+    return 0.0, None
+
+
+def _stock_flow_factor_score(
+    flow_history: Sequence[Mapping[str, Any]],
+    kline: Mapping[str, Any],
+    *,
+    theme_flow_score: float | None,
+) -> tuple[float | None, list[str]]:
+    """Score intensity, persistence, order structure and theme resonance.
+
+    Absolute cash amounts are never compared directly across stocks.  The latest
+    flow is divided by daily turnover, while history is used only for direction
+    and persistence.  This avoids a structural large-cap bias.
+    """
+
+    history = [dict(row) for row in flow_history[:5]]
+    if not history:
+        return None, []
+    latest = history[0]
+    turnover = kline.get("amount")
+    main_direction, main_rate = _flow_direction(latest.get("main_net_inflow"), turnover)
+
+    valid_main = [
+        _number(row.get("main_net_inflow"))
+        for row in history
+        if _number(row.get("main_net_inflow")) is not None
+    ]
+    if main_direction is None and not valid_main:
+        return None, []
+
+    intensity_score = _clamp(50.0 + 45.0 * (main_direction or 0.0))
+    recency_weights = (5.0, 4.0, 3.0, 2.0, 1.0)
+    signed_parts: list[tuple[float, float]] = []
+    positive_days = 0
+    for index, row in enumerate(history):
+        value = _number(row.get("main_net_inflow"))
+        if value is None:
+            continue
+        direction = 1.0 if value > 0 else (-1.0 if value < 0 else 0.0)
+        positive_days += int(direction > 0)
+        signed_parts.append((direction, recency_weights[index]))
+    continuity_direction = _weighted_average(signed_parts, default=0.0)
+    continuity_score = _clamp(50.0 + 40.0 * continuity_direction)
+
+    max_direction, _max_rate = _flow_direction(latest.get("max_net_inflow"), turnover)
+    large_direction, _large_rate = _flow_direction(latest.get("lg_net_inflow"), turnover)
+    order_directions = [value for value in (max_direction, large_direction) if value is not None]
+    order_score = (
+        _clamp(50.0 + 35.0 * _safe_mean(order_directions, default=0.0))
+        if order_directions else None
+    )
+
+    resonance_score: float | None = None
+    if theme_flow_score is not None and main_direction is not None:
+        theme_direction = max(-1.0, min(1.0, (float(theme_flow_score) - 50.0) / 35.0))
+        aligned = main_direction * theme_direction
+        resonance_score = _clamp(
+            50.0
+            + 22.0 * main_direction
+            + 18.0 * theme_direction
+            + 12.0 * max(0.0, aligned)
+            - 12.0 * max(0.0, -aligned)
+        )
+
+    score = _weighted_average(
+        (
+            (intensity_score, 0.35),
+            (continuity_score, 0.30),
+            (order_score, 0.20),
+            (resonance_score, 0.15),
+        ),
+        default=50.0,
+    )
+    evidence = [f"资金因子{score:.1f}"]
+    if main_rate is not None:
+        evidence.append(f"主力净流入强度{main_rate:+.2f}%")
+    elif main_direction is not None:
+        evidence.append("主力净流入方向为正" if main_direction > 0 else "主力净流入方向为负")
+    if signed_parts:
+        evidence.append(f"近{len(signed_parts)}日净流入{positive_days}日")
+    if order_score is not None:
+        if max_direction is not None and large_direction is not None and max_direction * large_direction > 0:
+            evidence.append("大单与超大单方向一致")
+        else:
+            evidence.append(f"大单结构{order_score:.1f}")
+    if resonance_score is not None:
+        evidence.append(f"板块个股资金共振{resonance_score:.1f}")
+    return round(_clamp(score), 1), evidence
+
+
 def _latest_by_code(rows: Sequence[Mapping[str, Any]], code_field: str = "stock_code") -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -524,19 +659,28 @@ def _stock_candidate_score(
     recommendation: Mapping[str, Any],
     kline: Mapping[str, Any],
     flow: Mapping[str, Any],
+    flow_history: Sequence[Mapping[str, Any]] = (),
+    theme_flow_score: float | None = None,
 ) -> tuple[float, float, str, list[str]]:
     short_score = _number(analysis.get("short_term_score"), 50.0) or 50.0
     technical = _number(analysis.get("technical_score"), _number(recommendation.get("technical"), 50.0)) or 50.0
-    capital = _number(analysis.get("capital_score"), _number(recommendation.get("capital_score"), 50.0)) or 50.0
+    base_capital = _number(analysis.get("capital_score"), _number(recommendation.get("capital_score"), 50.0)) or 50.0
     event_score = _number(analysis.get("event_score"), _number(recommendation.get("event_score"), 50.0)) or 50.0
     final_trade = _number(recommendation.get("final_trade_score"), _number(recommendation.get("ai_score"), 50.0)) or 50.0
     v3_alpha = _number(alpha.get("v3_alpha_score"), 50.0) or 50.0
     v3_theme = _number(theme_v3_score, 45.0) or 45.0
     change = _number(kline.get("change_pct"), 0.0) or 0.0
-    stock_flow = _number(flow.get("main_net_inflow"))
     setup_score = 68.0 if -2.5 <= change <= 3.5 else (55.0 if -5.0 <= change < -2.5 else 42.0)
-    if stock_flow is not None:
-        capital = _clamp(capital + (5.0 if stock_flow > 0 else -4.0))
+    effective_history = list(flow_history) or ([dict(flow)] if flow else [])
+    flow_factor, flow_evidence = _stock_flow_factor_score(
+        effective_history,
+        kline,
+        theme_flow_score=theme_flow_score,
+    )
+    capital = (
+        _weighted_average(((base_capital, 0.40), (flow_factor, 0.60)), default=base_capital)
+        if flow_factor is not None else base_capital
+    )
     theme_match_score = _clamp(52.0 + min(5, max(1, int(theme_match_count))) * 8.0)
     raw = (
         theme_score * 0.18
@@ -575,6 +719,7 @@ def _stock_candidate_score(
         f"短线{short_score:.1f}", f"技术{technical:.1f}",
         f"资金{capital:.1f}", f"昨涨跌{change:+.2f}%",
     ]
+    evidence.extend(flow_evidence)
     if penalty > 0:
         evidence.append(f"门禁/风险扣分{penalty:.1f}")
     if theme_match_count <= 1 and v3_theme < 60.0:
@@ -669,7 +814,16 @@ def build_theme_forecast_from_records(
     recommendation_by_code = _latest_by_code(recommendation_rows)
     alpha_by_code = _latest_by_code(alpha_rows)
     kline_by_code = _latest_by_code(kline_rows)
-    stock_flow_by_code = _latest_by_code(stock_flow_rows)
+    stock_flow_history_by_code = _flow_history_by_code(
+        stock_flow_rows,
+        source_trade_date=source_trade_date,
+        limit=5,
+    )
+    stock_flow_by_code = {
+        code: history[0]
+        for code, history in stock_flow_history_by_code.items()
+        if history
+    }
     external_score = _number((external_summary or {}).get("external_market_score"))
     if external_score is None:
         external_score, _status, _reason = _score_snapshot([dict(item) for item in external_items])
@@ -769,9 +923,42 @@ def build_theme_forecast_from_records(
             100.0 * sum((_number(row.get("main_net_inflow"), 0.0) or 0.0) > 0 for row in member_flows) / len(member_flows)
             if member_flows else None
         )
+        persistent_flow_flags = []
+        for code in member_codes:
+            valid_values = [
+                value
+                for row in stock_flow_history_by_code.get(code, [])
+                if (value := _number(row.get("main_net_inflow"))) is not None
+            ]
+            if len(valid_values) >= 3:
+                persistent_flow_flags.append(
+                    valid_values[0] > 0
+                    and sum(value > 0 for value in valid_values) / len(valid_values) >= 0.60
+                )
+        persistent_flow = (
+            100.0 * sum(persistent_flow_flags) / len(persistent_flow_flags)
+            if persistent_flow_flags else None
+        )
+        member_flow_scores = []
+        for code in member_codes:
+            flow_factor, _flow_evidence = _stock_flow_factor_score(
+                stock_flow_history_by_code.get(code, ()),
+                kline_by_code.get(code, {}),
+                theme_flow_score=None,
+            )
+            if flow_factor is not None:
+                member_flow_scores.append(flow_factor)
+        member_flow_strength = _safe_mean(member_flow_scores) if member_flow_scores else None
         domestic_flow = _weighted_average(
-            ((hot_score, 0.30), (flow_score, 0.25), (market_score, 0.10),
-             (positive_breadth, 0.18), (positive_flow, 0.17)),
+            (
+                (hot_score, 0.22),
+                (flow_score, 0.22),
+                (market_score, 0.08),
+                (positive_breadth, 0.15),
+                (positive_flow, 0.15),
+                (persistent_flow, 0.10),
+                (member_flow_strength, 0.08),
+            ),
             default=42.0,
         )
         avg_technical = _safe_mean((row.get("technical_score") for row in member_analysis), default=50.0)
@@ -843,6 +1030,10 @@ def build_theme_forecast_from_records(
             evidence.append(f"成分股上涨占比{positive_breadth:.1f}%")
         if positive_flow is not None:
             evidence.append(f"成分股主力净流入占比{positive_flow:.1f}%")
+        if persistent_flow is not None:
+            evidence.append(f"成分股近5日持续净流入占比{persistent_flow:.1f}%")
+        if member_flow_strength is not None:
+            evidence.append(f"成分股资金强度{member_flow_strength:.1f}")
         if theme["strategy_rows"]:
             evidence.append(f"V3主题信号{strategy_theme_score:.1f}")
 
@@ -857,6 +1048,9 @@ def build_theme_forecast_from_records(
             "member_count": len(member_codes),
             "catalyst_score": round(catalyst, 1),
             "flow_breadth_score": round(domestic_flow, 1),
+            "flow_positive_ratio": round(positive_flow, 1) if positive_flow is not None else None,
+            "flow_persistence_ratio": round(persistent_flow, 1) if persistent_flow is not None else None,
+            "member_flow_strength_score": round(member_flow_strength, 1) if member_flow_strength is not None else None,
             "external_score": round(external, 1),
             "technical_score": round(technical_readiness, 1),
             "commodity_score": round(commodity, 1),
@@ -885,7 +1079,8 @@ def build_theme_forecast_from_records(
             candidate_score, penalty, signal_status, stock_evidence = _stock_candidate_score(
                 code, total_score, member_match_counts.get(code, 1),
                 strategy_stock_scores.get(code), alpha,
-                analysis, recommendation, kline, flow
+                analysis, recommendation, kline, flow,
+                stock_flow_history_by_code.get(code, ()), domestic_flow,
             )
             candidates.append({
                 "stock_code": code,
@@ -961,6 +1156,7 @@ def build_theme_forecast_from_records(
         "theme_signals": len(theme_signal_rows),
         "v3_alpha": len(alpha_rows),
         "kline": len(kline_rows),
+        "stock_flow": len(stock_flow_by_code),
         "external": sum(str(item.get("availability") or "available") == "available" for item in external_items),
         "external_core": sum(
             str(item.get("availability") or "available") == "available"
@@ -1103,10 +1299,14 @@ def _load_forecast_inputs(
         WHERE trade_date = :source_date AND k_type = 1 AND adjust_type = 0
     """, {"source_date": source_trade_date}, "premarket.kline")
     stock_flow_rows = _safe_rows(engine, """
-        SELECT stock_code, main_net_inflow, max_net_inflow, lg_net_inflow
+        SELECT stock_code, trade_date, main_net_inflow, max_net_inflow, lg_net_inflow
         FROM sm_stock_capital_flow_daily
-        WHERE trade_date = :source_date
-    """, {"source_date": source_trade_date}, "premarket.stock_flow")
+        WHERE trade_date BETWEEN :history_start AND :source_date
+        ORDER BY stock_code ASC, trade_date DESC
+    """, {
+        "history_start": history_start,
+        "source_date": source_trade_date,
+    }, "premarket.stock_flow")
 
     if external_snapshot is not None:
         external_items = [dict(item) for item in external_snapshot.get("items") or []]

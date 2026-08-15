@@ -6,6 +6,8 @@ import pytest
 
 from biz.premarket.theme_forecast import (
     PREMARKET_STAGE,
+    _flow_history_by_code,
+    _stock_flow_factor_score,
     build_theme_forecast_from_records,
     classify_catalyst,
     family_for_label,
@@ -167,6 +169,89 @@ def test_overseas_sector_proxies_drive_theme_specific_resonance():
     assert supportive > adverse
     assert any("韩国" in item for item in evidence)
     assert any("日本" in item for item in evidence)
+
+
+def test_stock_flow_factor_rewards_normalized_persistent_confirmed_inflow():
+    strong_history = [
+        {
+            "trade_date": f"2026-08-{day:02d}",
+            "main_net_inflow": 5_000_000,
+            "max_net_inflow": 3_000_000,
+            "lg_net_inflow": 2_000_000,
+        }
+        for day in (12, 11, 10, 9, 8)
+    ]
+    weak_history = [
+        {
+            "trade_date": f"2026-08-{day:02d}",
+            "main_net_inflow": value,
+            "max_net_inflow": -3_000_000,
+            "lg_net_inflow": -2_000_000,
+        }
+        for day, value in zip((12, 11, 10, 9, 8), (5_000_000, -4_000_000, -3_000_000, -2_000_000, -1_000_000))
+    ]
+
+    strong_score, evidence = _stock_flow_factor_score(
+        strong_history,
+        {"amount": 100_000_000},
+        theme_flow_score=72.0,
+    )
+    weak_score, _ = _stock_flow_factor_score(
+        weak_history,
+        {"amount": 100_000_000},
+        theme_flow_score=72.0,
+    )
+
+    assert strong_score is not None and weak_score is not None
+    assert strong_score > weak_score + 15
+    assert any("主力净流入强度+5.00%" in item for item in evidence)
+    assert any("近5日净流入5日" in item for item in evidence)
+    assert any("大单与超大单方向一致" in item for item in evidence)
+    assert any("板块个股资金共振" in item for item in evidence)
+
+
+def test_stock_flow_factor_uses_turnover_rate_instead_of_absolute_amount():
+    small_cap_history = [{
+        "trade_date": "2026-08-12",
+        "main_net_inflow": 5_000_000,
+        "max_net_inflow": 3_000_000,
+        "lg_net_inflow": 2_000_000,
+    }]
+    large_cap_history = [{
+        "trade_date": "2026-08-12",
+        "main_net_inflow": 50_000_000,
+        "max_net_inflow": 30_000_000,
+        "lg_net_inflow": 20_000_000,
+    }]
+
+    small_score, _ = _stock_flow_factor_score(
+        small_cap_history,
+        {"amount": 100_000_000},
+        theme_flow_score=65.0,
+    )
+    large_score, _ = _stock_flow_factor_score(
+        large_cap_history,
+        {"amount": 1_000_000_000},
+        theme_flow_score=65.0,
+    )
+
+    assert small_score == large_score
+
+
+def test_flow_history_rejects_future_sessions_and_keeps_latest_five():
+    rows = [
+        {"stock_code": "300999", "trade_date": f"2026-08-{day:02d}", "main_net_inflow": day}
+        for day in range(7, 14)
+    ]
+    history = _flow_history_by_code(
+        rows,
+        source_trade_date="2026-08-12",
+        limit=5,
+    )["300999"]
+
+    assert [row["trade_date"] for row in history] == [
+        "2026-08-12", "2026-08-11", "2026-08-10", "2026-08-09", "2026-08-08",
+    ]
 
 
 def test_forecast_is_theme_first_dynamic_and_uses_database_memberships():
