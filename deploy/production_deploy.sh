@@ -192,7 +192,9 @@ assert_service_cannot_write_tree() {
   local tree_root="$1"
   local label="$2"
   local writable_path
-  writable_path="$(find "$tree_root" -perm /0222 -print -quit)"
+  # POSIX symlinks commonly report mode 0777; their effective writability is
+  # governed by the resolved target, which is scanned separately by find.
+  writable_path="$(find "$tree_root" ! -type l -perm /0222 -print -quit)"
   if [ -n "$writable_path" ]; then
     echo "$label retains a write permission bit: $writable_path" >&2
     return 2

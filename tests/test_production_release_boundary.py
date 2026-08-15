@@ -234,6 +234,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "tools/ensure_quality_gate.py" in deploy_script
     assert "--task-type analysis_premarket_external" in deploy_script
     assert 'find "$tree_root"' in workflow
+    assert '! -type l -perm /0222 -print -quit' in workflow
     assert "-perm /0222 -print -quit" in workflow
     assert "-writable -print -quit 2>/dev/null || true" in workflow
     validate_boundary = workflow.index("tools/validate_production_release_boundary.py")
