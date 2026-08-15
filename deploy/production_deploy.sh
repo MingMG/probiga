@@ -392,7 +392,7 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl disable probiga-scheduler
 fi
 sudo systemctl stop probiga
-git fetch --no-tags origin "$EXPECTED_SHA"
+git cat-file -e "${EXPECTED_SHA}^{commit}"
 git checkout --detach "$EXPECTED_SHA"
 find server biz integrations tools scripts strategies versions \
   -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete

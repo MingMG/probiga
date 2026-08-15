@@ -243,10 +243,8 @@ jobs:
             set -Eeuo pipefail
             cd /opt/ProBigA
             [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-            git fetch --no-tags origin main
-            git cat-file -e "${EXPECTED_SHA}^{commit}"
             # The root-owned broker executes deploy/production_deploy.sh from
-            # the requested, independently verified main revision.
+            # the requested, independently fetched and verified main revision.
             printf '%s\n' "$RESOLVED_REQUIREMENTS_B64" | \
               sudo -n /usr/local/sbin/probiga-production-deploy \
                 "$EXPECTED_SHA" \

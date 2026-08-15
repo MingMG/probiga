@@ -5,8 +5,11 @@ set -Eeuo pipefail
 umask 077
 
 readonly REPOSITORY=/opt/ProBigA
-readonly TRUSTED_REMOTE=https://github.com/MingMG/probiga.git
+readonly TRUSTED_REMOTE=git@github.com:MingMG/probiga.git
 readonly DEPLOY_USER=probiga-deploy
+readonly GITHUB_SSH_KEY=/etc/probiga/github-readonly-ed25519
+readonly GITHUB_KNOWN_HOSTS=/etc/probiga/github_known_hosts
+readonly REMOTE_GIT_SSH="ssh -i $GITHUB_SSH_KEY -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$GITHUB_KNOWN_HOSTS"
 
 fail() {
   echo "production deploy broker: $*" >&2
@@ -39,11 +42,16 @@ test "${#RESOLVED_REQUIREMENTS_B64}" -le 2097152 || \
   fail "resolved requirements payload is not canonical base64"
 
 test -d "$REPOSITORY/.git" || fail "production repository is missing"
-REMOTE_SHA="$(git ls-remote "$TRUSTED_REMOTE" refs/heads/main | awk 'NR == 1 {print $1}')"
+test -r "$GITHUB_SSH_KEY" || fail "GitHub read-only deploy key is missing"
+test -r "$GITHUB_KNOWN_HOSTS" || fail "GitHub known-hosts file is missing"
+REMOTE_SHA="$(GIT_SSH_COMMAND="$REMOTE_GIT_SSH" \
+  git ls-remote "$TRUSTED_REMOTE" refs/heads/main | awk 'NR == 1 {print $1}')"
 test "$REMOTE_SHA" = "$EXPECTED_SHA" || \
   fail "requested revision is not the current trusted main revision"
 
 GIT=(git -c safe.directory="$REPOSITORY" -C "$REPOSITORY")
+GIT_SSH_COMMAND="$REMOTE_GIT_SSH" \
+  "${GIT[@]}" fetch --no-tags "$TRUSTED_REMOTE" refs/heads/main
 "${GIT[@]}" cat-file -e "${EXPECTED_SHA}^{commit}" || \
   fail "requested revision is absent from the production repository"
 

@@ -20,7 +20,11 @@ def test_broker_restricts_caller_remote_and_revision() -> None:
 
     assert "SUDO_USER" in broker
     assert "probiga-deploy" in broker
-    assert "https://github.com/MingMG/probiga.git" in broker
+    assert "git@github.com:MingMG/probiga.git" in broker
+    assert "/etc/probiga/github-readonly-ed25519" in broker
+    assert "/etc/probiga/github_known_hosts" in broker
+    assert 'GIT_SSH_COMMAND="$REMOTE_GIT_SSH"' in broker
+    assert 'fetch --no-tags "$TRUSTED_REMOTE" refs/heads/main' in broker
     assert "refs/heads/main" in broker
     assert "requested revision is not the current trusted main revision" in broker
     assert "safe.directory" in broker
