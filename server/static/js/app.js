@@ -24,8 +24,12 @@
     var MARKET_CLOCK = null;
     var MARKET_CLOCK_REFRESHED_AT = 0;
     function setActiveTab(tabId) {
+        var previousTab = ACTIVE_TAB;
         ACTIVE_TAB = String(tabId || '');
         window._activeTab = ACTIVE_TAB;
+        if (previousTab === 'broad-etf-flow' && ACTIVE_TAB !== 'broad-etf-flow' && typeof window.stopBroadEtfFlow === 'function') {
+            window.stopBroadEtfFlow();
+        }
         if (document.body) document.body.classList.toggle('ai-workspace-active', ACTIVE_TAB === 'ai-stock' || ACTIVE_TAB === 'ai-general');
     }
     function activeTabId() {
@@ -4092,6 +4096,10 @@
             };
             state['_handler_capital'](prepared.activeId);
         },
+        /* ── 宽基 ETF 资金监测 ── */
+        'broad-etf-flow': function (d, c) {
+            return loadBroadEtfFlowPage(d, c);
+        },
         /* ── 主力行为 ── */
         mainforce: function (d, c) {
             loadMainforcePage(d, c);
@@ -5126,6 +5134,7 @@
         ]},
         {group:'资金流向', items:[
             {id:'capital',icon:'💰',label:'个股资金净流入'},
+            {id:'broad-etf-flow',icon:'🏛',label:'宽基资金监测'},
             {id:'capital-rt',icon:'⏱',label:'实时资金'},
             {id:'mainforce',icon:'🔍',label:'主力行为分析'}
         ]},
@@ -5171,6 +5180,7 @@
         ]},
         {group:'资金流向', items:[
             {id:'capital',icon:'💰',label:'个股资金'},
+            {id:'broad-etf-flow',icon:'🏛',label:'宽基资金'},
             {id:'mainforce',icon:'🔍',label:'主力行为'}
         ]},
         {group:'研究工具', items:[
@@ -5237,6 +5247,7 @@
         PAGE_TITLES['research-radar'] = '🧭 研报趋势雷达';
         PAGE_TITLES['market-radar'] = '📡 异动雷达';
         PAGE_TITLES['hunter'] = '🏹 狩猎场';
+        PAGE_TITLES['broad-etf-flow'] = '🏛 宽基资金监测';
         PAGE_TITLES['ai-stock'] = '📈 股票问答';
         PAGE_TITLES['ai-general'] = '💬 通用问答';
         TRADING_MODULE_NAV_ITEMS.forEach(function(item) {
@@ -6554,11 +6565,15 @@
             var premarket = result[1] || {};
             _screenerState.center = data;
             _screenerState.premarketTheme = premarket;
+            var centerFilter = _screenerState.centerFilter || {};
+            var filterDate = String(centerFilter.tradeDate || data.data_date || d || '').trim();
+            var filterStock = String(centerFilter.stock || '').trim();
+            _screenerState.centerFilter = { tradeDate: filterDate, stock: filterStock };
             var summary = data.summary || {}, jq = ((data.sources || {}).jq || {});
-            var h = '<div class="screen-page candidate-center"><section class="screen-intro"><div><div class="screen-eyebrow">CANDIDATE CENTER / V3-V6 生产融合排序</div><h2 class="screen-title">候选中心</h2><p class="screen-subtitle">V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据和 T+1/T+5/T+20 多周期结果均可见；成本、容量与组合集中度不通过时会明确受限。</p></div><div class="screen-intro-count"><strong>' + (summary.candidate_count || 0) + '</strong><span>当前候选</span></div></section>';
+            var h = '<div class="screen-page candidate-center"><section class="screen-intro"><div><div class="screen-eyebrow">CANDIDATE CENTER / V3-V6 生产融合排序</div><h2 class="screen-title">候选中心</h2><p class="screen-subtitle">V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据和 T+1/T+5/T+20 多周期结果均可见；成本、容量与组合集中度不通过时会明确受限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + (summary.candidate_count || 0) + '</strong><span>当前显示</span></div></section>';
             h += '<div class="stats-bar">' + card('A 级', (summary.grades || {}).A || 0, 'red') + card('B 级', (summary.grades || {}).B || 0, 'orange') + card('组合可用', summary.portfolio_eligible_count || 0, 'blue') + card('实际数据日', data.data_date || '-', 'green') + '</div>';
             if (jq.stale) h += '<div class="sc-freshness warn">聚宽策略最新数据为 ' + escHtml(jq.latest_date || '-') + '，早于当前候选日期；已保留在外部策略状态中，不参与主候选排序。</div>';
-            h += '<section class="sc-panel premarket-theme-panel"><div class="sc-panel-title"><strong>09:08 盘前主线预判</strong><span>' + escHtml((premarket.session_date || d || '-') + ' · A股数据截止 ' + (premarket.source_trade_date || '-') + ' · ' + (premarket.data_quality || '暂无')) + '</span></div>';
+            h += '<section class="sc-panel premarket-theme-panel"><div class="sc-panel-title"><strong>09:08 盘前主线预判</strong><span>' + escHtml((premarket.session_date || filterDate || '-') + ' · A股数据截止 ' + (premarket.source_trade_date || '-') + ' · ' + (premarket.data_quality || '暂无')) + '</span></div>';
             if (premarket.fallback) h += '<div class="sc-freshness warn">所选日期没有09:08冻结结果，下面展示最近一次 ' + escHtml(premarket.session_date || '-') + ' 的结果，不代表所选日期。</div>';
             if (premarket.error) h += '<div class="sc-freshness error">09:08结果读取失败：' + escHtml(premarket.error) + '</div>';
             var premarketThemes = Array.isArray(premarket.themes) ? premarket.themes : [];
@@ -6586,16 +6601,55 @@
                 h += '</div>';
             }
             h += '<div class="sc-table-note">这里回答“开盘前优先看什么板块、哪些票”；下方 V3-V6 表回答“个股证据和交易门禁是否允许”。两层必须同时看。</div></section>';
-            h += '<section class="sc-panel"><div class="sc-panel-title"><strong>策略分布</strong><span>' + escHtml(Object.keys(summary.strategy_counts || {}).map(function (key) { return key + ' ' + summary.strategy_counts[key]; }).join(' · ') || '暂无策略标签') + '</span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>综合分</th><th>信号</th><th>策略</th><th>入场/止损/目标</th><th>证据</th><th>动作</th></tr></thead><tbody>';
             var rows = data.candidates || [];
+            h += '<section class="sc-panel"><div class="candidate-center-filterbar" aria-label="候选与拒绝筛选"><label><span>结果日期</span><input id="candidateCenterDateFilter" type="date" value="' + escAttr(filterDate) + '"></label><label class="candidate-center-stock-filter"><span>个股</span><input id="candidateCenterStockFilter" type="search" value="' + escAttr(filterStock) + '" placeholder="输入股票代码或名称" autocomplete="off"></label><button id="candidateCenterQueryButton" class="sc-primary" type="button">查询</button><button id="candidateCenterResetButton" class="sc-secondary" type="button">清空</button><span id="candidateCenterFilterCount" class="candidate-center-filter-count">共 ' + rows.length + ' 只</span></div><div class="sc-panel-title"><strong>策略分布</strong><span>' + escHtml(Object.keys(summary.strategy_counts || {}).map(function (key) { return key + ' ' + summary.strategy_counts[key]; }).join(' · ') || '暂无策略标签') + '</span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>综合分</th><th>信号</th><th>策略</th><th>入场/止损/目标</th><th>证据</th><th>动作</th></tr></thead><tbody>';
             if (!rows.length) h += '<tr><td colspan="8" class="sc-empty-cell">当前日期没有推荐候选，可以回到选股工作台运行规则筛选。</td></tr>';
             rows.forEach(function (r, i) {
                 var code = String(r.stock_code || '').padStart(6, '0');
                 var plan = (r.entry_price_low != null && r.entry_price_high != null ? fmtPrice(r.entry_price_low) + '-' + fmtPrice(r.entry_price_high) : '-') + ' / ' + fmtPrice(r.stop_loss_price) + ' / ' + fmtPrice(r.take_profit_1);
-                h += '<tr><td>' + (r.rank || i + 1) + '</td><td><strong>' + nameLink(code, r.stock_name || code) + '</strong><small>' + escHtml(code) + '</small></td><td><b class="sc-score">' + fmt(r.score, 1) + ' · ' + escHtml(r.candidate_grade || 'C') + '</b><small>' + escHtml(screenerVersionScores(r)) + '</small><small>' + escHtml(screenerHorizonScores(r)) + '</small></td><td><span class="sc-status-pill">' + escHtml(r.action || '-') + '</span><small>' + escHtml(screenerExecutionText(r)) + '</small></td><td>' + escHtml(r.primary_strategy || r.strategy_profile || '综合') + '</td><td>' + escHtml(plan) + '</td><td title="' + escAttr(r.signal_reason || r.recommend_reason || '') + '">' + escHtml(localizeMachineText(r.signal_reason || r.recommend_reason || '-').slice(0, 100)) + '</td><td><button class="sc-mini-btn" onclick="window.saveCandidateCenterRow(\'' + escAttr(code) + '\')">候选池</button><button class="sc-mini-btn" onclick="pfAddWithCode(\'' + escAttr(code) + '\')">自选</button></td></tr>';
+                h += '<tr data-candidate-center-row="1" data-candidate-center-search="' + escAttr((code + ' ' + (r.stock_name || '')).toLowerCase()) + '"><td>' + (r.rank || i + 1) + '</td><td><strong>' + nameLink(code, r.stock_name || code) + '</strong><small>' + escHtml(code) + '</small></td><td><b class="sc-score">' + fmt(r.score, 1) + ' · ' + escHtml(r.candidate_grade || 'C') + '</b><small>' + escHtml(screenerVersionScores(r)) + '</small><small>' + escHtml(screenerHorizonScores(r)) + '</small></td><td><span class="sc-status-pill">' + escHtml(r.action || '-') + '</span><small>' + escHtml(screenerExecutionText(r)) + '</small></td><td>' + escHtml(r.primary_strategy || r.strategy_profile || '综合') + '</td><td>' + escHtml(plan) + '</td><td title="' + escAttr(r.signal_reason || r.recommend_reason || '') + '">' + escHtml(localizeMachineText(r.signal_reason || r.recommend_reason || '-').slice(0, 100)) + '</td><td><button class="sc-mini-btn" onclick="window.saveCandidateCenterRow(\'' + escAttr(code) + '\')">候选池</button><button class="sc-mini-btn" onclick="pfAddWithCode(\'' + escAttr(code) + '\')">自选</button></td></tr>';
             });
+            if (rows.length) h += '<tr id="candidateCenterNoMatch" style="display:none"><td colspan="8" class="sc-empty-cell">没有匹配该股票代码或名称的记录。</td></tr>';
             h += '</tbody></table></div><div class="sc-table-note">AI 推荐来源：' + escHtml(((data.sources || {}).ai_recommendation || {}).date || data.data_date || '-') + '；V3-V6 融合分已用于生产候选排序，但不自动下单。</div></section></div>';
             container.innerHTML = h;
+            var dateInput = container.querySelector('#candidateCenterDateFilter');
+            var stockInput = container.querySelector('#candidateCenterStockFilter');
+            var queryButton = container.querySelector('#candidateCenterQueryButton');
+            var resetButton = container.querySelector('#candidateCenterResetButton');
+            function applyStockFilter() {
+                var keyword = String((stockInput || {}).value || '').trim().toLowerCase();
+                _screenerState.centerFilter = { tradeDate: String((dateInput || {}).value || filterDate), stock: keyword };
+                var visible = 0;
+                Array.prototype.forEach.call(container.querySelectorAll('[data-candidate-center-row]'), function (row) {
+                    var matched = !keyword || String(row.getAttribute('data-candidate-center-search') || '').indexOf(keyword) >= 0;
+                    row.style.display = matched ? '' : 'none';
+                    if (matched) visible += 1;
+                });
+                var count = container.querySelector('#candidateCenterFilterCount');
+                var introCount = container.querySelector('#candidateCenterVisibleCount');
+                var noMatch = container.querySelector('#candidateCenterNoMatch');
+                if (count) count.textContent = keyword ? ('显示 ' + visible + ' / ' + rows.length + ' 只') : ('共 ' + rows.length + ' 只');
+                if (introCount) introCount.textContent = visible;
+                if (noMatch) noMatch.style.display = visible ? 'none' : '';
+            }
+            function queryCandidateCenter() {
+                var nextDate = String((dateInput || {}).value || '').trim();
+                _screenerState.centerFilter = { tradeDate: nextDate, stock: String((stockInput || {}).value || '').trim() };
+                loadCandidateCenterPage(nextDate, container);
+            }
+            if (stockInput) {
+                stockInput.addEventListener('input', applyStockFilter);
+                stockInput.addEventListener('keydown', function (event) { if (event.key === 'Enter') applyStockFilter(); });
+            }
+            if (dateInput) dateInput.addEventListener('keydown', function (event) { if (event.key === 'Enter') queryCandidateCenter(); });
+            if (queryButton) queryButton.addEventListener('click', queryCandidateCenter);
+            if (resetButton) resetButton.addEventListener('click', function () {
+                _screenerState.centerFilter = { tradeDate: data.data_date || filterDate, stock: '' };
+                if (stockInput) stockInput.value = '';
+                if (dateInput) dateInput.value = data.data_date || filterDate;
+                applyStockFilter();
+            });
+            applyStockFilter();
         }).catch(function (e) { container.innerHTML = '<div class="loading" style="color:#e74c3c">候选中心加载失败：' + escHtml(e.message || e) + '</div>'; });
     }
 
@@ -6930,6 +6984,302 @@
     };
     window.hideDetail = window.closeAlistModal;
 
+    /* ===== 宽基 ETF 资金监测 ===== */
+    var _broadEtfFlowChart = null;
+    var _broadEtfFlowRequestId = 0;
+
+    function destroyBroadEtfFlowChart() {
+        if (_broadEtfFlowChart) {
+            try { _broadEtfFlowChart.destroy(); } catch (e) {}
+            _broadEtfFlowChart = null;
+        }
+        if (typeof Chart !== 'undefined' && typeof Chart.getChart === 'function') {
+            var canvas = el('broadEtfFlowChart');
+            var existing = canvas ? Chart.getChart(canvas) : null;
+            if (existing) {
+                try { existing.destroy(); } catch (e) {}
+            }
+        }
+    }
+
+    window.stopBroadEtfFlow = function () {
+        _broadEtfFlowRequestId += 1;
+        destroyBroadEtfFlowChart();
+    };
+
+    function broadEtfFinite(value) {
+        if (value == null || value === '') return null;
+        var number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    }
+
+    function broadEtfSignedMoney(value) {
+        var number = broadEtfFinite(value);
+        if (number == null) return '-';
+        return (number > 0 ? '+' : '') + fmtMoney(number);
+    }
+
+    function broadEtfSignedNumber(value, suffix, digits) {
+        var number = broadEtfFinite(value);
+        if (number == null) return '-';
+        return (number > 0 ? '+' : '') + number.toFixed(digits == null ? 2 : digits) + (suffix || '');
+    }
+
+    function broadEtfShareNumber(value) {
+        var number = broadEtfFinite(value);
+        if (number == null) return '-';
+        var sign = number > 0 ? '+' : (number < 0 ? '-' : '');
+        var absolute = Math.abs(number);
+        if (absolute >= 100000000) return sign + (absolute / 100000000).toFixed(2) + ' 亿份';
+        if (absolute >= 10000) return sign + (absolute / 10000).toFixed(1) + ' 万份';
+        return sign + absolute.toFixed(0) + ' 份';
+    }
+
+    function broadEtfTone(value, fallbackText) {
+        var tone = String(value || '').toLowerCase();
+        var text = String(fallbackText || '');
+        if (['positive', 'inflow', 'entry', 'bullish', 'red'].indexOf(tone) >= 0 || /入场|流入|增持|积极/.test(text)) return 'positive';
+        if (['negative', 'outflow', 'exit', 'bearish', 'green'].indexOf(tone) >= 0 || /减持|流出|赎回|谨慎|出货/.test(text)) return 'negative';
+        if (['unknown', 'insufficient', 'missing'].indexOf(tone) >= 0 || /不足|缺失|未知/.test(text)) return 'unknown';
+        return 'neutral';
+    }
+
+    function broadEtfAmountTone(value) {
+        var number = broadEtfFinite(value);
+        return number == null ? 'unknown' : (number > 0 ? 'positive' : (number < 0 ? 'negative' : 'neutral'));
+    }
+
+    function broadEtfAxisMoney(value) {
+        var number = Number(value || 0);
+        var abs = Math.abs(number);
+        if (abs >= 1e8) return (number / 1e8).toFixed(abs >= 1e10 ? 0 : 1) + '亿';
+        if (abs >= 1e4) return (number / 1e4).toFixed(0) + '万';
+        return String(Math.round(number));
+    }
+
+    function broadEtfKpi(label, value, hint) {
+        var tone = broadEtfAmountTone(value);
+        return '<article class="bef-kpi bef-tone-' + tone + '">' +
+            '<span>' + escHtml(label) + '</span>' +
+            '<strong>' + escHtml(broadEtfSignedMoney(value)) + '</strong>' +
+            '<small>' + escHtml(hint || '宽基 ETF 净申购估算') + '</small>' +
+            '</article>';
+    }
+
+    function broadEtfEmptyRow(colspan, text) {
+        return '<tr><td class="bef-empty-cell" colspan="' + colspan + '">' + escHtml(text || '暂无数据') + '</td></tr>';
+    }
+
+    function broadEtfEvidenceTone(item) {
+        var text = String((item || {}).kind || '') + ' ' + String((item || {}).title || '') + ' ' + String((item || {}).detail || '');
+        if (/反证|风险|减持|流出|赎回|不足|缺失/.test(text)) return 'risk';
+        if (/支持|入场|流入|申购|增加/.test(text)) return 'support';
+        return 'neutral';
+    }
+
+    function broadEtfQualityTone(status) {
+        var value = String(status || '').toLowerCase();
+        if (/pass|ok|good|complete|valid/.test(value)) return 'good';
+        if (/warn|partial|degraded|stale/.test(value)) return 'warn';
+        if (/fail|error|missing|invalid/.test(value)) return 'bad';
+        return 'neutral';
+    }
+
+    function broadEtfSafeUrl(value) {
+        try {
+            var url = new URL(String(value || ''), window.location.origin);
+            return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function renderBroadEtfFlowPage(container, data) {
+        data = data || {};
+        var summary = data.summary || {};
+        var history = Array.isArray(data.history) ? data.history.slice() : [];
+        var benchmarks = Array.isArray(data.benchmarks) ? data.benchmarks : [];
+        var etfs = Array.isArray(data.etfs) ? data.etfs : [];
+        var evidence = Array.isArray(data.evidence) ? data.evidence : [];
+        var caveats = Array.isArray(data.caveats) ? data.caveats : [];
+        var sources = Array.isArray(data.sources) ? data.sources : [];
+        var coverage = data.coverage || {};
+        var signal = summary.signal || '数据不足';
+        var signalTone = broadEtfTone(summary.signal_tone, signal);
+        var coveragePct = broadEtfFinite(summary.coverage_pct);
+        var positiveCount = broadEtfFinite(summary.positive_count);
+        var totalCount = broadEtfFinite(summary.total_count);
+        var confidence = broadEtfFinite(summary.confidence);
+        var confidenceText = confidence == null ? '-' : confidence.toFixed(0) + '%';
+        if (summary.confidence_label) confidenceText += ' · ' + summary.confidence_label;
+        history.sort(function (a, b) { return String(a.trade_date || '').localeCompare(String(b.trade_date || '')); });
+
+        var h = '<div class="bef-page">';
+        h += '<section class="bef-hero">';
+        h += '<div class="bef-hero-copy"><span class="bef-eyebrow">BROAD-BASED ETF FLOW PROXY</span><h2>宽基 ETF 资金监测</h2>';
+        h += '<p>用公开份额变化估算宽基 ETF 净申购，辅助观察大资金方向；这是代理信号，不能识别最终持有人。</p></div>';
+        h += '<div class="bef-signal bef-tone-' + signalTone + '"><small>国家队动向代理</small><strong>' + escHtml(signal) + '</strong><span>置信度 ' + escHtml(confidenceText) + '</span></div>';
+        h += '</section>';
+
+        h += '<div class="bef-meta" aria-label="数据口径状态">';
+        h += '<span>请求日 <strong>' + escHtml(data.requested_date || '-') + '</strong></span>';
+        h += '<span>交易日 <strong>' + escHtml(data.trade_date || '-') + '</strong></span>';
+        h += '<span>数据截至 <strong>' + escHtml(data.data_as_of || '-') + '</strong></span>';
+        h += '<span>覆盖 <strong>' + (coveragePct == null ? '-' : coveragePct.toFixed(0) + '%') + '</strong></span>';
+        h += '</div>';
+
+        h += '<section class="bef-kpis" aria-label="宽基资金关键指标">';
+        h += broadEtfKpi('今日净申购估算', summary.net_1d, '份额变化 × 前一交易日收盘价');
+        h += broadEtfKpi('近 3 日累计', summary.net_3d, '连续性观察');
+        h += broadEtfKpi('近 5 日累计', summary.net_5d, '短周期方向');
+        h += broadEtfKpi('近 20 日累计', summary.net_20d, '中周期方向');
+        h += '<article class="bef-kpi bef-coverage"><span>净申购 ETF 数</span><strong>' + (positiveCount == null ? '-' : positiveCount.toFixed(0)) + '<em> / ' + (totalCount == null ? '-' : totalCount.toFixed(0)) + '</em></strong><small>当日估算净申购为正</small></article>';
+        h += '</section>';
+
+        h += '<section class="bef-overview-grid">';
+        h += '<article class="bef-panel bef-chart-panel"><div class="bef-panel-head"><div><span>日度趋势</span><h3>净申购估算与区间累计</h3></div><p>最近 ' + escHtml(data.window_days || 20) + ' 个交易日 · 金额单位随刻度显示</p></div>';
+        h += history.length ? '<div class="bef-chart-wrap"><canvas id="broadEtfFlowChart" role="img" aria-label="宽基 ETF 日度净申购柱状图与累计金额折线图"></canvas></div>' : '<div class="bef-empty">暂无趋势数据</div>';
+        h += '</article>';
+        h += '<aside class="bef-panel bef-evidence-panel"><div class="bef-panel-head"><div><span>判断依据</span><h3>证据与反证</h3></div></div><div class="bef-evidence-list">';
+        if (!evidence.length) {
+            h += '<div class="bef-empty">暂无可用证据</div>';
+        } else {
+            evidence.forEach(function (item) {
+                var tone = broadEtfEvidenceTone(item);
+                h += '<article class="bef-evidence bef-evidence-' + tone + '"><span>' + escHtml(item.kind || '观察') + '</span><strong>' + escHtml(item.title || '-') + '</strong><p>' + escHtml(item.detail || '-') + '</p></article>';
+            });
+        }
+        h += '</div></aside></section>';
+
+        h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>基准拆解</span><h3>各宽基贡献汇总</h3></div><p>正数为净申购，负数为净赎回</p></div><div class="bef-table-wrap"><table class="bef-table bef-benchmark-table"><thead><tr><th>跟踪基准</th><th>今日估算</th><th>近3日</th><th>近5日</th><th>近20日</th><th>份额变化</th><th>净申购数</th></tr></thead><tbody>';
+        if (!benchmarks.length) h += broadEtfEmptyRow(7, '暂无基准汇总数据');
+        benchmarks.forEach(function (row) {
+            h += '<tr><td><strong>' + escHtml(row.benchmark || '-') + '</strong></td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_1d) + '">' + escHtml(broadEtfSignedMoney(row.net_1d)) + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_3d) + '">' + escHtml(broadEtfSignedMoney(row.net_3d)) + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_5d) + '">' + escHtml(broadEtfSignedMoney(row.net_5d)) + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_20d) + '">' + escHtml(broadEtfSignedMoney(row.net_20d)) + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.share_change) + '">' + escHtml(broadEtfShareNumber(row.share_change)) + '</td>' +
+                '<td>' + escHtml(row.positive_count == null ? '-' : row.positive_count) + ' / ' + escHtml(row.total_count == null ? '-' : row.total_count) + '</td></tr>';
+        });
+        h += '</tbody></table></div></section>';
+
+        h += '<section class="bef-panel"><div class="bef-panel-head"><div><span>ETF 明细</span><h3>当日份额与资金变化</h3></div><p>共 ' + etfs.length + ' 只</p></div><div class="bef-table-wrap"><table class="bef-table bef-detail-table"><thead><tr><th>日期</th><th>代码 / 名称</th><th>跟踪基准</th><th>净申购估算</th><th>份额变化</th><th>份额变化率</th><th>总份额</th><th>价格 / 涨跌</th><th>成交额</th><th>来源</th><th>质量</th></tr></thead><tbody>';
+        if (!etfs.length) h += broadEtfEmptyRow(11, '暂无 ETF 明细数据');
+        etfs.forEach(function (row) {
+            var quality = row.quality_status || '-';
+            h += '<tr><td>' + escHtml(row.trade_date || data.trade_date || '-') + '</td>' +
+                '<td><strong class="bef-code">' + escHtml(row.etf_code || '-') + '</strong><small>' + escHtml(row.short_name || '-') + (row.exchange ? ' · ' + escHtml(row.exchange) : '') + '</small></td>' +
+                '<td>' + escHtml(row.benchmark || '-') + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.net_amount) + '"><strong>' + escHtml(broadEtfSignedMoney(row.net_amount)) + '</strong></td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.share_change) + '">' + escHtml(broadEtfShareNumber(row.share_change)) + '</td>' +
+                '<td class="bef-number bef-tone-' + broadEtfAmountTone(row.share_change_pct) + '">' + escHtml(broadEtfSignedNumber(row.share_change_pct, '%', 2)) + '</td>' +
+                '<td class="bef-number">' + escHtml(broadEtfShareNumber(row.fund_share).replace(/^\+/, '')) + '</td>' +
+                '<td class="bef-number">' + escHtml(fmt(row.price, 3)) + '<small class="bef-tone-' + broadEtfAmountTone(row.change_pct) + '">' + escHtml(pct(row.change_pct)) + '</small></td>' +
+                '<td class="bef-number">' + escHtml(fmtMoney(row.amount)) + '</td>' +
+                '<td>' + escHtml(row.source || '-') + '</td>' +
+                '<td><span class="bef-quality bef-quality-' + broadEtfQualityTone(quality) + '">' + escHtml(quality) + '</span></td></tr>';
+        });
+        h += '</tbody></table></div></section>';
+
+        h += '<details class="bef-method"><summary>口径说明、覆盖范围与数据源</summary><div class="bef-method-body">';
+        h += '<section><h3>估算口径</h3><p><strong>日度净申购估算 = 基金份额日变化 × 前一交易日收盘价。</strong>该指标反映 ETF 一级市场份额变化对应的近似资金量，不等于二级市场成交净流入，也不能确认申购或赎回方身份。</p></section>';
+        h += '<section><h3>覆盖情况</h3><p>预期 ' + escHtml(coverage.expected == null ? '-' : coverage.expected) + ' 只，可用 ' + escHtml(coverage.available == null ? '-' : coverage.available) + ' 只。';
+        if (Array.isArray(coverage.missing) && coverage.missing.length) h += ' 缺失：' + coverage.missing.map(function (item) { return escHtml(typeof item === 'object' ? ((item.etf_code || '') + (item.short_name ? ' ' + item.short_name : '')) : item); }).join('、') + '。';
+        h += '</p></section>';
+        h += '<section><h3>注意事项</h3><ul><li>“国家队动向”仅为宽基 ETF 资金的代理观察，不构成账户身份识别或投资建议。</li>';
+        caveats.forEach(function (item) { h += '<li>' + escHtml(item) + '</li>'; });
+        h += '</ul></section>';
+        if (sources.length) {
+            h += '<section><h3>数据源</h3><ul>';
+            sources.forEach(function (source) {
+                var url = broadEtfSafeUrl(source.url);
+                var name = escHtml(source.name || source.url || '数据源');
+                h += '<li>' + (url ? '<a href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">' + name + '</a>' : name) + (source.note ? '：' + escHtml(source.note) : '') + '</li>';
+            });
+            h += '</ul></section>';
+        }
+        h += '</div></details></div>';
+        container.innerHTML = h;
+        initBroadEtfFlowChart(history);
+    }
+
+    function initBroadEtfFlowChart(history) {
+        destroyBroadEtfFlowChart();
+        var canvas = el('broadEtfFlowChart');
+        if (!canvas || typeof Chart === 'undefined' || !history.length) return;
+        var netValues = history.map(function (row) { return broadEtfFinite(row.net_amount); });
+        var cumulativeValues = history.map(function (row) { return broadEtfFinite(row.cumulative_amount); });
+        _broadEtfFlowChart = new Chart(canvas.getContext('2d'), {
+            type: 'bar',
+            data: {
+                labels: history.map(function (row) { return String(row.trade_date || '').slice(5); }),
+                datasets: [{
+                    type: 'bar',
+                    label: '日度净申购估算',
+                    data: netValues,
+                    backgroundColor: netValues.map(function (value) { return value >= 0 ? 'rgba(220, 38, 38, .72)' : 'rgba(22, 163, 74, .72)'; }),
+                    borderColor: netValues.map(function (value) { return value >= 0 ? '#dc2626' : '#16a34a'; }),
+                    borderWidth: 1,
+                    borderRadius: 3,
+                    maxBarThickness: 26,
+                    yAxisID: 'y'
+                }, {
+                    type: 'line',
+                    label: '区间累计',
+                    data: cumulativeValues,
+                    borderColor: '#2563eb',
+                    backgroundColor: '#2563eb',
+                    borderWidth: 2,
+                    pointRadius: history.length > 30 ? 0 : 2,
+                    pointHoverRadius: 4,
+                    tension: .28,
+                    spanGaps: true,
+                    yAxisID: 'y1'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: { position: 'top', align: 'end', labels: { color: '#64748b', boxWidth: 11, usePointStyle: true, font: { size: 11 } } },
+                    tooltip: { callbacks: { label: function (context) { return context.dataset.label + '：' + broadEtfSignedMoney(context.raw); } } }
+                },
+                scales: {
+                    x: { grid: { display: false }, ticks: { color: '#8290a3', maxRotation: 0, autoSkip: true, maxTicksLimit: 10, font: { size: 10 } } },
+                    y: { position: 'left', grid: { color: 'rgba(148, 163, 184, .16)' }, ticks: { color: '#8290a3', callback: broadEtfAxisMoney, font: { size: 10 } } },
+                    y1: { position: 'right', grid: { drawOnChartArea: false }, ticks: { color: '#2563eb', callback: broadEtfAxisMoney, font: { size: 10 } } }
+                }
+            }
+        });
+    }
+
+    function loadBroadEtfFlowPage(requestedDate, container) {
+        var keepCurrent = silentRefreshDepth > 0 && hasRenderedContent(container);
+        var requestId = ++_broadEtfFlowRequestId;
+        if (!keepCurrent) {
+            destroyBroadEtfFlowChart();
+            container.innerHTML = '<div class="loading"><span class="spinner"></span> 正在读取宽基 ETF 资金数据...</div>';
+        }
+        return fetchJsonWithTimeout('/broad-etf-flow?trade_date=' + encodeURIComponent(requestedDate || currentDateValue()) + '&days=20', 45000)
+            .then(function (data) {
+                if (requestId !== _broadEtfFlowRequestId || activeTabId() !== 'broad-etf-flow') return { cancelled: true };
+                renderBroadEtfFlowPage(container, data);
+                var degraded = ['degraded', 'insufficient', 'error'].indexOf(String(data.status || '').toLowerCase()) >= 0;
+                setStatus(degraded ? '宽基资金数据覆盖不足' : '宽基资金已更新');
+                return data;
+            })
+            .catch(function (error) {
+                if (requestId !== _broadEtfFlowRequestId) return { cancelled: true };
+                if (!keepCurrent) {
+                    container.innerHTML = '<div class="loading" style="color:#e74c3c">⚠️ 宽基资金加载失败：' + escHtml(error.message || '网络异常') + '</div>';
+                }
+                setStatus(keepCurrent ? '宽基资金刷新失败，已保留现有结果' : '宽基资金加载失败', true);
+                return { loadError: error.message || '网络异常' };
+            });
+    }
     /* ===== 资金净流入 ===== */
     window.loadCap2 = function (silent) {
         var d = el('datePicker').value;

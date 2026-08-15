@@ -1321,6 +1321,312 @@ class TradingV3Repository:
             ),
         )
 
+    def stock_pool(
+        self,
+        *,
+        trade_date: date | None = None,
+    ) -> dict[str, Any]:
+        """Return one read-only, de-duplicated stock-pool snapshot.
+
+        Forecasts are emitted once for each strategy sleeve, while the desk
+        needs to reason about a security only once. This projection keeps the
+        immutable run data intact and only consolidates it for display.
+        """
+        run = self._latest_run(trade_date)
+        if not run:
+            return {
+                "run_uid": None,
+                "trade_date": trade_date.isoformat() if trade_date else None,
+                "generated_at": None,
+                "items": [],
+                "summary": {
+                    "stock_count": 0,
+                    "forecast_count": 0,
+                    "strategy_candidate_count": 0,
+                    "target_count": 0,
+                    "rejected_count": 0,
+                },
+            }
+
+        with self.engine.connect() as connection:
+            forecast_rows = connection.execute(
+                text(
+                    """
+                    SELECT forecast_id, rank_no, stock_code, short_name,
+                           strategy_key, raw_score,
+                           expected_return_net_pct, probability_positive,
+                           confidence, forecast_status, theme_code,
+                           valid_until, reasons_json
+                    FROM st_alpha_forecast_v3
+                    WHERE run_uid = :run_uid
+                    ORDER BY rank_no, stock_code, strategy_key
+                    """
+                ),
+                {"run_uid": run["run_uid"]},
+            ).mappings().all()
+            target_rows = connection.execute(
+                text(
+                    """
+                    SELECT *
+                    FROM st_target_portfolio_v3
+                    WHERE run_uid = :run_uid
+                    ORDER BY rank_no, stock_code
+                    """
+                ),
+                {"run_uid": run["run_uid"]},
+            ).mappings().all()
+
+        def _list_json(value: Any) -> list[Any]:
+            try:
+                parsed = json.loads(str(value or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return []
+            return parsed if isinstance(parsed, list) else []
+
+        pool: dict[str, dict[str, Any]] = {}
+
+        def _item_for(stock_code: Any, stock_name: Any = "") -> dict[str, Any]:
+            code = str(stock_code or "").zfill(6)
+            item = pool.get(code)
+            if item is None:
+                item = {
+                    "stock_code": code,
+                    "stock_name": str(stock_name or code),
+                    "rank_no": None,
+                    "strategy_keys": [],
+                    "theme_codes": [],
+                    "forecast_statuses": [],
+                    "raw_score": None,
+                    "expected_return_net_pct": None,
+                    "probability_positive": None,
+                    "confidence": None,
+                    "valid_until": None,
+                    "reasons": [],
+                    "is_strategy_candidate": False,
+                    "target": None,
+                    "rejection": None,
+                }
+                pool[code] = item
+            elif stock_name and (
+                not item["stock_name"]
+                or item["stock_name"] == item["stock_code"]
+            ):
+                item["stock_name"] = str(stock_name)
+            return item
+
+        candidate_statuses = {
+            "VALIDATED_POSITIVE",
+            "PAPER_DISCOVERY_CANDIDATE",
+            "LEFT_SIDE_PREPARE",
+        }
+        for row in forecast_rows:
+            forecast = dict(row)
+            item = _item_for(
+                forecast.get("stock_code"),
+                forecast.get("short_name"),
+            )
+            rank_no = forecast.get("rank_no")
+            if rank_no is not None and (
+                item["rank_no"] is None
+                or int(rank_no) < int(item["rank_no"])
+            ):
+                item["rank_no"] = int(rank_no)
+            for field in ("strategy_key", "theme_code", "forecast_status"):
+                value = str(forecast.get(field) or "").strip()
+                target_field = {
+                    "strategy_key": "strategy_keys",
+                    "theme_code": "theme_codes",
+                    "forecast_status": "forecast_statuses",
+                }[field]
+                if value and value not in item[target_field]:
+                    item[target_field].append(value)
+            if str(forecast.get("forecast_status") or "") in candidate_statuses:
+                item["is_strategy_candidate"] = True
+            for field in (
+                "raw_score",
+                "expected_return_net_pct",
+                "probability_positive",
+                "confidence",
+            ):
+                value = forecast.get(field)
+                if value is not None and (
+                    item[field] is None or float(value) > float(item[field])
+                ):
+                    item[field] = float(value)
+            valid_until = forecast.get("valid_until")
+            if valid_until is not None:
+                serialized = str(valid_until)
+                if (
+                    item["valid_until"] is None
+                    or serialized > str(item["valid_until"])
+                ):
+                    item["valid_until"] = serialized
+            for reason in _list_json(forecast.get("reasons_json")):
+                text_reason = str(reason).strip()
+                if text_reason and text_reason not in item["reasons"]:
+                    item["reasons"].append(text_reason)
+
+        for row in target_rows:
+            target = dict(row)
+            item = _item_for(
+                target.get("stock_code"),
+                target.get("short_name"),
+            )
+            item["is_strategy_candidate"] = True
+            target_projection = {
+                key: target.get(key)
+                for key in (
+                    "rank_no",
+                    "target_weight",
+                    "target_value",
+                    "target_quantity",
+                    "expected_return_net_pct",
+                    "conservative_return_pct",
+                    "expected_mae_pct",
+                    "theme_code",
+                    "reason",
+                    "status",
+                )
+            }
+            target_projection["strategy_keys"] = _list_json(
+                target.get("strategy_keys_json")
+            )
+            target_projection["theme_codes"] = _list_json(
+                target.get("theme_codes_json")
+            )
+            item["target"] = target_projection
+            for strategy_key in target_projection["strategy_keys"]:
+                value = str(strategy_key).strip()
+                if value and value not in item["strategy_keys"]:
+                    item["strategy_keys"].append(value)
+            for theme_code in target_projection["theme_codes"]:
+                value = str(theme_code).strip()
+                if value and value not in item["theme_codes"]:
+                    item["theme_codes"].append(value)
+            for value in (
+                target_projection.get("theme_code"),
+                target_projection.get("reason"),
+            ):
+                normalized = str(value or "").strip()
+                if normalized and normalized not in item["reasons"]:
+                    item["reasons"].append(normalized)
+
+        for rejection in list((run.get("portfolio") or {}).get("rejected") or []):
+            if not isinstance(rejection, dict):
+                continue
+            code = rejection.get("stock_code")
+            if not code:
+                continue
+            item = _item_for(
+                code,
+                rejection.get("short_name") or rejection.get("stock_name"),
+            )
+            item["rejection"] = {
+                "reason_code": str(rejection.get("reason_code") or ""),
+                "reason": str(rejection.get("reason") or ""),
+            }
+            strategy_key = str(rejection.get("strategy_key") or "").strip()
+            if strategy_key and strategy_key not in item["strategy_keys"]:
+                item["strategy_keys"].append(strategy_key)
+
+        items = list(pool.values())
+        for item in items:
+            item["reasons"] = item["reasons"][:8]
+            item["strategy_keys"].sort()
+            item["theme_codes"].sort()
+            item["forecast_statuses"].sort()
+        items.sort(
+            key=lambda item: (
+                0 if item["target"] else 1,
+                0 if item["is_strategy_candidate"] else 1,
+                0 if item["rejection"] else 1,
+                item["rank_no"] if item["rank_no"] is not None else 999999,
+                item["stock_code"],
+            )
+        )
+        return {
+            "run_uid": run["run_uid"],
+            "trade_date": str(run["trade_date"]),
+            "generated_at": str(
+                run.get("completed_at") or run.get("decision_at") or ""
+            ),
+            "items": items,
+            "summary": {
+                "stock_count": len(items),
+                "forecast_count": len(forecast_rows),
+                "strategy_candidate_count": sum(
+                    1 for item in items if item["is_strategy_candidate"]
+                ),
+                "target_count": sum(
+                    1 for item in items if item["target"]
+                ),
+                "rejected_count": sum(
+                    1 for item in items if item["rejection"]
+                ),
+            },
+        }
+
+    @staticmethod
+    def _hypothesis_row(
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        item = dict(row)
+        item["probability"] = float(
+            item.pop("current_probability") or 0.0
+        )
+        for source, target in (
+            ("supporting_evidence_json", "supporting_evidence"),
+            ("opposing_evidence_json", "opposing_evidence"),
+            ("triggers_json", "triggers"),
+            ("invalidations_json", "invalidations"),
+            ("strategy_keys_json", "strategy_keys"),
+        ):
+            item[target] = json.loads(str(item.pop(source) or "[]"))
+        return item
+
+    @classmethod
+    def _hypothesis_domain(
+        cls,
+        row: dict[str, Any],
+    ) -> TradeHypothesis:
+        item = cls._hypothesis_row(row)
+        return TradeHypothesis(
+            hypothesis_key=str(item["hypothesis_key"]),
+            run_uid=str(item["run_uid"]),
+            trade_date=str(item["trade_date"])[:10],
+            scope_type=str(item["scope_type"]),
+            scope_code=str(item["scope_code"]),
+            scope_name=str(item["scope_name"]),
+            direction=str(item["direction"]),
+            state=str(item["state"]),
+            probability=float(item["probability"]),
+            prior_probability=float(item["prior_probability"]),
+            probability_kind=str(item["probability_kind"]),
+            confidence=float(item["confidence"]),
+            score=float(item["score"]),
+            horizon_minutes=int(item["horizon_minutes"]),
+            alpha_half_life_minutes=int(
+                item["alpha_half_life_minutes"]
+            ),
+            proposed_action=str(item["proposed_action"]),
+            max_position_weight=float(item["max_position_weight"]),
+            theme_code=str(item["theme_code"] or ""),
+            role=str(item["role"]),
+            thesis=str(item["thesis"]),
+            counter_thesis=str(item["counter_thesis"]),
+            supporting_evidence=tuple(
+                item["supporting_evidence"]
+            ),
+            opposing_evidence=tuple(item["opposing_evidence"]),
+            triggers=tuple(item["triggers"]),
+            invalidations=tuple(item["invalidations"]),
+            strategy_keys=tuple(item["strategy_keys"]),
+            feature_time=item["feature_time"],
+            valid_until=item["valid_until"],
+            source_forecast_count=int(
+                item["source_forecast_count"] or 0
+            ),
+        )
     def latest_hypotheses(
         self,
         *,

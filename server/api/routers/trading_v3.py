@@ -296,6 +296,14 @@ def latest_forecasts(
     )
 
 
+@router.get("/stock-pool")
+def stock_pool(
+    trade_date: date | None = Query(default=None),
+):
+    """Read-only, per-stock projection of the latest V3 decision run."""
+    return _envelope(_repo().stock_pool(trade_date=trade_date))
+
+
 @router.get("/hypotheses/latest")
 def latest_hypotheses(
     limit: int = Query(default=300, ge=1, le=1000),

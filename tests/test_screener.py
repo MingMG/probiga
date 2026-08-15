@@ -103,8 +103,12 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "window.exportUnifiedScreener" in script
     assert "四版本实际运行：V3 为基础排序" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
-    assert "style.css?v=36" in index
-    assert "app.js?v=87" in index
+    assert "style.css?v=39" in index
+    assert "app.js?v=90" in index
+    assert 'id="candidateCenterDateFilter"' in script
+    assert 'id="candidateCenterStockFilter"' in script
+    assert "queryButton.addEventListener('click', queryCandidateCenter)" in script
+    assert "stockInput.addEventListener('input', applyStockFilter)" in script
 
 
 def test_trading_v3_candidate_page_uses_unified_production_selector():

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=36">
+    <link rel="stylesheet" href="/static/css/style.css?v=39">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/js/auth.js?v=2"></script>
 </head>
@@ -54,6 +54,7 @@
   <div class="sidebar-group">
     <div class="sidebar-group-title">资金流向</div>
     <button class="sidebar-item" data-tab="capital" onclick="switchTab('capital')">💰 个股资金</button>
+    <button class="sidebar-item" data-tab="broad-etf-flow" onclick="switchTab('broad-etf-flow')">🏛 宽基资金</button>
     <button class="sidebar-item" data-tab="mainforce" onclick="switchTab('mainforce')">🔍 主力行为</button>
   </div>
 
@@ -107,6 +108,7 @@
     <div id="tab-concept" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-alist" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-capital" class="tab-content"><div class="loading">加载中...</div></div>
+    <div id="tab-broad-etf-flow" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-mainforce" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-screen" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-jq-picks" class="tab-content"><div class="loading">加载中...</div></div>
@@ -263,6 +265,7 @@ var PAGE_TITLES = {
   concept:'🏷️ 概念 / 行业',
   alist:'🐲 龙虎榜',
   capital:'💰 个股资金',
+  'broad-etf-flow':'🏛 宽基资金监测',
   mainforce:'🔍 主力行为分析',
   screen:'🎯 选股策略',
   'jq-picks':'🤖 聚宽策略',
@@ -279,6 +282,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 旧模拟交易（归档）'
 };
 </script>
-<script src="/static/js/app.js?v=87"></script>
+<script src="/static/js/app.js?v=90"></script>
 </body>
 </html>

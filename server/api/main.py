@@ -15,7 +15,7 @@ from server.api.admin_auth import validate_admin_request
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
 from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
 from server.api.routers._engine import dispose_engine as dispose_api_engine
-from server.api.routers import ai_bridge, auth, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
+from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_radar
 from server.api.scheduler_runtime import start_embedded_scheduler, stop_embedded_scheduler
 from server.common.config import get_api_lifespan_config, get_api_observability_config
@@ -75,6 +75,7 @@ app.include_router(auth.router, prefix="/api")
 app.include_router(ai_bridge.router, prefix="/api")
 app.include_router(notify.router, prefix="/api")
 app.include_router(hot_data.router, prefix="/api")
+app.include_router(broad_etf_flow.router, prefix="/api")
 app.include_router(jq_minute.router, prefix="/api")
 app.include_router(scheduler.router, prefix="/api")
 app.include_router(sim_trade.router, prefix="/api")
