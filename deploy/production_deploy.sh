@@ -57,6 +57,9 @@ SERVICE_USER="$(systemctl show -p User --value probiga)"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
 sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
+AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
+AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
+AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
 REPOSITORY_ROOT=/opt/ProBigA
 if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
@@ -333,6 +336,44 @@ write_dropin() {
     "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
     | sudo tee /etc/systemd/system/probiga.service.d/scheduler.conf >/dev/null
 }
+write_ai_worker_dropin() {
+  local revision="$1"
+  local adata_sha="$2"
+  local adata_tree_sha="$3"
+  local adata_source="$4"
+  sudo mkdir -p "$(dirname "$AI_WORKER_DROPIN")"
+  printf '%s\n' \
+    '[Service]' \
+    "User=$SERVICE_USER" \
+    "Group=$SERVICE_USER" \
+    'WorkingDirectory=/opt/ProBigA' \
+    'ExecStart=' \
+    "ExecStart=/usr/bin/env GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python tools/run_ai_recommendation_worker.py --once" \
+    'Environment=GIT_OPTIONAL_LOCKS=0' \
+    'Environment=PYTHONDONTWRITEBYTECODE=1' \
+    'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
+    "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
+    "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
+    "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
+    | sudo tee "$AI_WORKER_DROPIN" >/dev/null
+}
+assert_ai_worker_runtime() {
+  local revision="$1"
+  test "$(systemctl show -p User --value "$AI_WORKER_SERVICE")" = \
+    "$SERVICE_USER"
+  test "$(systemctl show -p Group --value "$AI_WORKER_SERVICE")" = \
+    "$SERVICE_USER"
+  test "$(systemctl show -p WorkingDirectory --value "$AI_WORKER_SERVICE")" = \
+    /opt/ProBigA
+  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+    | grep -F -- 'PYTHONDONTWRITEBYTECODE=1' >/dev/null
+  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+    | grep -F -- "$RELEASE_VENV_ROOT/$revision/bin/python" >/dev/null
+  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+    | grep -F -- 'tools/run_ai_recommendation_worker.py --once' >/dev/null
+}
 release_identity_check() {
   local require_clean="$1"
   sudo -u "$SERVICE_USER" env \
@@ -423,6 +464,23 @@ if systemctl list-unit-files probiga-scheduler.service --no-legend \
   systemctl is-active --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ACTIVE=1 || true
   systemctl is-enabled --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ENABLED=1 || true
 fi
+AI_WORKER_UNIT_PRESENT=0
+PREVIOUS_AI_WORKER_TIMER_ACTIVE=0
+PREVIOUS_AI_WORKER_TIMER_ENABLED=0
+AI_WORKER_SERVICE_LOAD="$(systemctl show -p LoadState --value \
+  "$AI_WORKER_SERVICE")"
+AI_WORKER_TIMER_LOAD="$(systemctl show -p LoadState --value \
+  "$AI_WORKER_TIMER")"
+if [ "$AI_WORKER_SERVICE_LOAD" != not-found ] || \
+  [ "$AI_WORKER_TIMER_LOAD" != not-found ]; then
+  test "$AI_WORKER_SERVICE_LOAD" != not-found
+  test "$AI_WORKER_TIMER_LOAD" != not-found
+  AI_WORKER_UNIT_PRESENT=1
+  systemctl is-active --quiet "$AI_WORKER_TIMER" && \
+    PREVIOUS_AI_WORKER_TIMER_ACTIVE=1 || true
+  systemctl is-enabled --quiet "$AI_WORKER_TIMER" && \
+    PREVIOUS_AI_WORKER_TIMER_ENABLED=1 || true
+fi
 ADATA_REPOSITORY_URL=https://github.com/1nchaos/adata.git
 ADATA_GIT_CACHE=/opt/ProBigA/.release_sources/adata.git
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
@@ -469,6 +527,16 @@ rollback() {
     rollback_failed=1
   }
 
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    sudo systemctl stop "$AI_WORKER_TIMER" || \
+      rollback_failure "stop AI recommendation worker timer"
+    sudo systemctl stop "$AI_WORKER_SERVICE" || \
+      rollback_failure "stop AI recommendation worker"
+    if systemctl is-active --quiet "$AI_WORKER_SERVICE"; then
+      rollback_failure "AI recommendation worker remained active before checkout"
+      services_quiescent=0
+    fi
+  fi
   if [ "$services_quiescent" -eq 1 ] && \
     [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
     sudo systemctl stop probiga-scheduler || \
@@ -532,6 +600,20 @@ rollback() {
       fi
     fi
     if [ "$restoration_ready" -eq 1 ] && \
+      [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+      if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
+        if ! write_ai_worker_dropin "$PREVIOUS_RELEASE_REVISION" \
+          "$PREVIOUS_ADATA_SHA" "$PREVIOUS_ADATA_TREE_SHA256" \
+          "$PREVIOUS_ADATA_SOURCE"; then
+          rollback_failure "pin previous AI recommendation worker runtime"
+          restoration_ready=0
+        fi
+      elif ! sudo rm -f "$AI_WORKER_DROPIN"; then
+        rollback_failure "remove AI recommendation worker release drop-in"
+        restoration_ready=0
+      fi
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
       ! sudo systemctl daemon-reload; then
       rollback_failure "systemd daemon-reload"
       restoration_ready=0
@@ -560,6 +642,27 @@ rollback() {
     else
       sudo systemctl stop probiga-scheduler || \
         rollback_failure "keep probiga-scheduler stopped"
+    fi
+  fi
+  if [ "$restoration_ready" -eq 1 ] && \
+    [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
+      sudo systemctl enable "$AI_WORKER_TIMER" || \
+        rollback_failure "enable AI recommendation worker timer"
+    else
+      sudo systemctl disable "$AI_WORKER_TIMER" || \
+        rollback_failure "disable AI recommendation worker timer"
+    fi
+    if [ "$PREVIOUS_AI_WORKER_TIMER_ACTIVE" -eq 1 ]; then
+      sudo systemctl start "$AI_WORKER_TIMER" || \
+        rollback_failure "start AI recommendation worker timer"
+    else
+      sudo systemctl stop "$AI_WORKER_TIMER" || \
+        rollback_failure "keep AI recommendation worker timer stopped"
+    fi
+    if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
+      assert_ai_worker_runtime "$PREVIOUS_RELEASE_REVISION" || \
+        rollback_failure "verify previous AI recommendation worker runtime"
     fi
   fi
   sudo systemctl is-active --quiet probiga || \
@@ -609,6 +712,11 @@ chown root:root "$RELEASE_VENV_ROOT"
 chmod 0555 "$RELEASE_VENV_ROOT"
 sudo -u "$SERVICE_USER" test ! -w "$RELEASE_VENV_ROOT"
 sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl stop "$AI_WORKER_TIMER"
+  sudo systemctl stop "$AI_WORKER_SERVICE"
+  ! systemctl is-active --quiet "$AI_WORKER_SERVICE"
+fi
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
   ! systemctl is-active --quiet probiga-scheduler
@@ -737,11 +845,18 @@ release_identity_check 1
 sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
   "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  write_ai_worker_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
+    "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
+fi
 sudo systemctl daemon-reload
 systemctl show probiga --property=ExecStart --value \
   | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' >/dev/null
 systemctl show probiga --property=ExecStart --value \
   | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  assert_ai_worker_runtime "$EXPECTED_SHA"
+fi
 sudo systemctl restart probiga
 SERVICE_MAIN_PID="$(systemctl show probiga --property=MainPID --value)"
 case "$SERVICE_MAIN_PID" in
@@ -769,6 +884,29 @@ sudo systemctl is-active --quiet probiga
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   ! systemctl is-active --quiet probiga-scheduler
   ! systemctl is-enabled --quiet probiga-scheduler
+fi
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
+    sudo systemctl enable "$AI_WORKER_TIMER"
+  else
+    sudo systemctl disable "$AI_WORKER_TIMER"
+  fi
+  if [ "$PREVIOUS_AI_WORKER_TIMER_ACTIVE" -eq 1 ]; then
+    sudo systemctl start "$AI_WORKER_TIMER"
+  else
+    sudo systemctl stop "$AI_WORKER_TIMER"
+  fi
+  assert_ai_worker_runtime "$EXPECTED_SHA"
+  if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
+    systemctl is-enabled --quiet "$AI_WORKER_TIMER"
+  else
+    ! systemctl is-enabled --quiet "$AI_WORKER_TIMER"
+  fi
+  if [ "$PREVIOUS_AI_WORKER_TIMER_ACTIVE" -eq 1 ]; then
+    systemctl is-active --quiet "$AI_WORKER_TIMER"
+  else
+    ! systemctl is-active --quiet "$AI_WORKER_TIMER"
+  fi
 fi
 assert_scheduler_triggers_quiescent
 test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"

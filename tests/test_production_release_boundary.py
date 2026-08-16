@@ -299,6 +299,35 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert final_seal < final_identity_check
     assert "reseal previous Git checkout" in deploy_script
     assert "GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1" in deploy_script
+    assert "probiga-ai-recommendation-worker.service" in deploy_script
+    assert "probiga-ai-recommendation-worker.timer" in deploy_script
+    assert (
+        "probiga-ai-recommendation-worker.service.d/release-runtime.conf"
+        in deploy_script
+    )
+    assert 'User=$SERVICE_USER' in deploy_script
+    assert 'Group=$SERVICE_USER' in deploy_script
+    assert (
+        "$RELEASE_VENV_ROOT/$revision/bin/python "
+        "tools/run_ai_recommendation_worker.py --once"
+        in deploy_script
+    )
+    assert 'sudo systemctl stop "$AI_WORKER_TIMER"' in deploy_script
+    assert 'sudo systemctl stop "$AI_WORKER_SERVICE"' in deploy_script
+    assert "pin previous AI recommendation worker runtime" in deploy_script
+    assert 'assert_ai_worker_runtime "$EXPECTED_SHA"' in deploy_script
+    worker_stop = deploy_script.index(
+        'sudo systemctl stop "$AI_WORKER_TIMER"',
+        deploy_script.index("trap 'rollback $?'"),
+    )
+    release_checkout = deploy_script.index('git checkout --detach --force "$EXPECTED_SHA"')
+    worker_pin = deploy_script.index('write_ai_worker_dropin "$EXPECTED_SHA"')
+    service_restart = deploy_script.index("sudo systemctl restart probiga")
+    worker_restore = deploy_script.index(
+        'sudo systemctl start "$AI_WORKER_TIMER"',
+        deploy_script.index('write_ai_worker_dropin "$EXPECTED_SHA"'),
+    )
+    assert worker_stop < release_checkout < worker_pin < service_restart < worker_restore
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
