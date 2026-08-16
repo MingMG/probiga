@@ -212,6 +212,193 @@ quarantine_unsafe_untracked_release_files() {
 }
 quarantine_unsafe_untracked_release_files
 RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
+RELEASE_VENV_RETENTION=2
+LEGACY_RELEASE_ROOT=/opt/ProBigA-releases
+LEGACY_RELEASE_RETENTION=0
+
+path_is_runtime_referenced() {
+  local candidate="$1"
+  local proc_dir
+  local resolved
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "$proc_dir" ] || continue
+    if [ -r "$proc_dir/cmdline" ] && \
+      grep -aFq -- "$candidate" "$proc_dir/cmdline"; then
+      return 0
+    fi
+    resolved="$(readlink -f -- "$proc_dir/exe" 2>/dev/null || true)"
+    case "$resolved" in
+      "$candidate"|"$candidate"/*) return 0 ;;
+    esac
+    resolved="$(readlink -f -- "$proc_dir/cwd" 2>/dev/null || true)"
+    case "$resolved" in
+      "$candidate"|"$candidate"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+path_is_opt_link_target() {
+  local candidate="$1"
+  local link
+  local resolved
+  for link in /opt/*; do
+    [ -L "$link" ] || continue
+    resolved="$(readlink -f -- "$link" 2>/dev/null || true)"
+    case "$resolved" in
+      "$candidate"|"$candidate"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+prune_release_venvs() {
+  local protected_sha="$1"
+  local release_root_real
+  local sha
+  local link
+  local target
+  local build_dir
+  local build_real
+  local kept=0
+  local removed_bytes=0
+  local candidate_bytes=0
+  local -a release_shas=()
+  declare -A keep_shas=()
+  declare -A keep_targets=()
+
+  release_root_real="$(readlink -f -- "$RELEASE_VENV_ROOT")"
+  test "$release_root_real" = "$RELEASE_VENV_ROOT"
+  [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]]
+  mapfile -t release_shas < <(
+    find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 -type l \
+      -printf '%T@ %f\n' | LC_ALL=C sort -nr | awk '{print $2}'
+  )
+
+  # The running release is always retained, even if its link timestamp is old.
+  link="$RELEASE_VENV_ROOT/$protected_sha"
+  test -L "$link"
+  target="$(readlink -f -- "$link")"
+  case "$target" in
+    "$RELEASE_VENV_ROOT"/build-*) ;;
+    *) echo "protected release venv escaped its immutable root" >&2; return 2 ;;
+  esac
+  test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT"
+  keep_shas["$protected_sha"]=1
+  keep_targets["$target"]=1
+  kept=1
+
+  # Keep the newest successful releases until the rollback retention is full.
+  for sha in "${release_shas[@]}"; do
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [ -n "${keep_shas[$sha]:-}" ] && continue
+    link="$RELEASE_VENV_ROOT/$sha"
+    target="$(readlink -f -- "$link" 2>/dev/null || true)"
+    case "$target" in
+      "$RELEASE_VENV_ROOT"/build-*) ;;
+      *) continue ;;
+    esac
+    test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT"
+    if [ "$kept" -lt "$RELEASE_VENV_RETENTION" ]; then
+      keep_shas["$sha"]=1
+      keep_targets["$target"]=1
+      kept=$((kept + 1))
+    fi
+  done
+
+  # Remove stale SHA links first. Their build directories are handled below.
+  for sha in "${release_shas[@]}"; do
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [ -n "${keep_shas[$sha]:-}" ] && continue
+    link="$RELEASE_VENV_ROOT/$sha"
+    target="$(readlink -f -- "$link" 2>/dev/null || true)"
+    if path_is_runtime_referenced "$link" || \
+      { [ -n "$target" ] && path_is_runtime_referenced "$target"; }; then
+      echo "Retained runtime-referenced release venv: $sha" >&2
+      [ -n "$target" ] && keep_targets["$target"]=1
+      continue
+    fi
+    rm -f -- "$link"
+    echo "Removed stale release venv link: $sha" >&2
+  done
+
+  # Every removable target must be a direct build-* child of the immutable root.
+  while IFS= read -r -d '' build_dir; do
+    build_real="$(readlink -f -- "$build_dir")"
+    case "$build_real" in
+      "$RELEASE_VENV_ROOT"/build-*) ;;
+      *) echo "refusing unsafe release venv target: $build_real" >&2; return 2 ;;
+    esac
+    test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"
+    [ -n "${keep_targets[$build_real]:-}" ] && continue
+    if path_is_runtime_referenced "$build_real" || \
+      path_is_opt_link_target "$build_real"; then
+      echo "Retained referenced release venv target: $build_real" >&2
+      continue
+    fi
+    candidate_bytes="$(du -sb -- "$build_real" | awk '{print $1}')"
+    rm -rf -- "$build_real"
+    removed_bytes=$((removed_bytes + candidate_bytes))
+    echo "Removed stale release venv target: $build_real ($candidate_bytes bytes)" >&2
+  done < <(find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 \
+    -type d -name 'build-*' -print0)
+  echo "Release venv cleanup reclaimed $removed_bytes bytes" >&2
+}
+
+prune_legacy_release_copies() {
+  local legacy_root_real
+  local entry
+  local entry_real
+  local kept=0
+  local removed_bytes=0
+  local candidate_bytes=0
+  local -a entries=()
+
+  [ -d "$LEGACY_RELEASE_ROOT" ] || return 0
+  legacy_root_real="$(readlink -f -- "$LEGACY_RELEASE_ROOT")"
+  test "$legacy_root_real" = "$LEGACY_RELEASE_ROOT"
+  mapfile -t entries < <(
+    find "$LEGACY_RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d \
+      -printf '%T@ %f\n' | LC_ALL=C sort -nr | awk '{print $2}'
+  )
+  for entry in "${entries[@]}"; do
+    entry_real="$(readlink -f -- "$LEGACY_RELEASE_ROOT/$entry")"
+    test "$(dirname -- "$entry_real")" = "$LEGACY_RELEASE_ROOT"
+    if [ "$kept" -lt "$LEGACY_RELEASE_RETENTION" ]; then
+      kept=$((kept + 1))
+      continue
+    fi
+    if path_is_runtime_referenced "$entry_real" || \
+      path_is_opt_link_target "$entry_real"; then
+      echo "Retained referenced legacy release: $entry_real" >&2
+      continue
+    fi
+    candidate_bytes="$(du -sb -- "$entry_real" | awk '{print $1}')"
+    rm -rf -- "$entry_real"
+    removed_bytes=$((removed_bytes + candidate_bytes))
+    echo "Removed legacy release copy: $entry_real ($candidate_bytes bytes)" >&2
+  done
+  echo "Legacy release cleanup reclaimed $removed_bytes bytes" >&2
+}
+
+prune_release_temp_files() {
+  local temp_file
+  local removed_bytes=0
+  local candidate_bytes=0
+  while IFS= read -r -d '' temp_file; do
+    case "$temp_file" in
+      /tmp/probiga-release-*.tar.gz|/tmp/probiga-*.bundle) ;;
+      *) echo "refusing unsafe release temp path: $temp_file" >&2; return 2 ;;
+    esac
+    candidate_bytes="$(stat -c '%s' -- "$temp_file")"
+    rm -f -- "$temp_file"
+    removed_bytes=$((removed_bytes + candidate_bytes))
+    echo "Removed stale release temp file: $temp_file ($candidate_bytes bytes)" >&2
+  done < <(find /tmp -mindepth 1 -maxdepth 1 -type f \
+    \( -name 'probiga-release-*.tar.gz' -o -name 'probiga-*.bundle' \) \
+    -mtime +0 -print0)
+  echo "Release temp cleanup reclaimed $removed_bytes bytes" >&2
+}
 assert_service_cannot_write_tree() {
   local tree_root="$1"
   local label="$2"
@@ -486,6 +673,15 @@ else
   PREVIOUS_ADATA_TREE_SHA256=""
   PREVIOUS_ADATA_SOURCE=/opt/ProBigA/adata
 fi
+# Code history is authoritative in GitHub. Keep only the active dependency
+# environment and one immediate rollback environment on the ECS host; legacy
+# full code copies are reproducible and are not production data.
+if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
+  prune_release_venvs "$PREVIOUS_RELEASE_REVISION"
+fi
+prune_legacy_release_copies
+prune_release_temp_files
+df -h / >&2
 SCHEDULER_UNIT_PRESENT=0
 PREVIOUS_SCHEDULER_ACTIVE=0
 PREVIOUS_SCHEDULER_ENABLED=0
@@ -961,6 +1157,8 @@ sudo -u "$SERVICE_USER" env \
 ACTIVE_REQUIREMENTS_SHA256="$EXPECTED_REQUIREMENTS_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
 ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
+prune_release_venvs "$EXPECTED_SHA"
+df -h / >&2
 write_receipt "DEPLOYED" "$EXPECTED_SHA"
 trap - ERR TERM INT
 rm -f "$PREVIOUS_DROPIN"

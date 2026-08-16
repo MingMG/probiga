@@ -169,6 +169,16 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'chown root:root "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'chmod 0555 "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"' in deploy_script
+    assert "RELEASE_VENV_RETENTION=2" in deploy_script
+    assert "LEGACY_RELEASE_RETENTION=0" in deploy_script
+    assert 'prune_release_venvs "$PREVIOUS_RELEASE_REVISION"' in deploy_script
+    assert 'prune_release_venvs "$EXPECTED_SHA"' in deploy_script
+    assert "prune_legacy_release_copies" in deploy_script
+    assert "prune_release_temp_files" in deploy_script
+    assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
+    assert 'test "$(dirname -- "$entry_real")" = "$LEGACY_RELEASE_ROOT"' in deploy_script
+    assert 'path_is_runtime_referenced "$build_real"' in deploy_script
+    assert 'path_is_opt_link_target "$entry_real"' in deploy_script
     assert "command_timeout: 25m" in workflow
     assert "probiga.deploy-receipt.v3" in workflow
     assert '"expected_requirements_sha256":"%s"' in workflow
