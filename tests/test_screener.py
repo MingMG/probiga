@@ -104,7 +104,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "四版本实际运行：V3 为基础排序" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
     assert "style.css?v=39" in index
-    assert "app.js?v=90" in index
+    assert "app.js?v=91" in index
     assert 'id="candidateCenterDateFilter"' in script
     assert 'id="candidateCenterStockFilter"' in script
     assert "queryButton.addEventListener('click', queryCandidateCenter)" in script
@@ -116,14 +116,21 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     page = (root / "server/static/trading-v3.html").read_text(encoding="utf-8")
     script = (root / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
     app = (root / "server/static/js/app.js").read_text(encoding="utf-8")
+    index = (root / "server/static/index.html").read_text(encoding="utf-8")
 
-    assert "V3/V4/V5/V6 生产融合候选" in page
-    assert 'id="unifiedCandidateRows"' in page
-    assert 'id="unifiedPresetFilter"' in page
-    assert 'id="unifiedCandidateDate"' in page
-    assert 'id="unifiedCandidateSearch"' in page
-    assert "trading-v3.css?v=6" in page
-    assert "trading-v3.js?v=21" in page
+    assert "盘前与盘中生产融合候选" in page
+    assert 'id="selectorDateFilter"' in page
+    assert 'id="selectorStockFilter"' in page
+    assert 'id="selectorGradeFilter"' in page
+    assert 'id="premarketCandidateRows"' in page
+    assert 'id="intradayCandidateRows"' in page
+    assert 'id="view-intraday"' not in page
+    assert 'data-view="intraday"' not in page
+    assert "trading-v3-intraday" not in app
+    assert "trading-v3-intraday" not in index
+    assert "<span>04</span>目标组合" in index
+    assert "trading-v3.css?v=7" in page
+    assert "trading-v3.js?v=22" in page
     assert 'id="equitySource"' in page
     assert 'id="cashSource"' in page
     assert 'id="unrealizedPnl"' in page
@@ -133,10 +140,13 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "payload.message||payload.detail||payload.error" in script
     assert "'/api/screener/history?data_date='" in script
     assert "绝不用今天数据重算过去" in page
+    assert "loadProductionSelector('capital_support',100)" in script
     assert "loadProductionSelector('intraday_sector',100)" in script
+    assert "selectorRequest('capital_support',day)" in script
+    assert "selectorRequest('intraday_sector',day)" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
-    assert "自动下单','固定关闭" in script
+    assert "自动下单 <strong>固定关闭" in script
     assert "probiga-open-kline" in script
     assert "pnl-gain" in script
     assert "pnl-loss" in script

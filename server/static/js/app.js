@@ -5306,15 +5306,14 @@
         {id:'trading-v3-overview', modulePage:'v3', tradingView:'overview', icon:'01', label:'执行总览'},
         {id:'trading-v3-hypotheses', modulePage:'v3', tradingView:'hypotheses', icon:'02', label:'交易假设'},
         {id:'trading-v3-candidates', modulePage:'v3', tradingView:'candidates', icon:'03', label:'候选与拒绝'},
-        {id:'trading-v3-intraday', modulePage:'v3', tradingView:'intraday', icon:'04', label:'盘中机会'},
-        {id:'trading-v3-portfolio', modulePage:'v3', tradingView:'portfolio', icon:'05', label:'目标组合'},
-        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'06', label:'当前持仓'},
-        {id:'trading-v3-orders', modulePage:'v3', tradingView:'orders', icon:'07', label:'模拟订单'},
-        {id:'trading-v3-validation', modulePage:'v3', tradingView:'validation', icon:'08', label:'回测验收'},
-        {id:'trading-v3-missed', modulePage:'v3', tradingView:'missed', icon:'09', label:'漏抓复盘'},
-        {id:'trading-v3-evidence', modulePage:'v3', tradingView:'evidence', icon:'10', label:'数据与系统'},
-        {id:'trading-shared-etf', modulePage:'v2', tradingView:'etf', icon:'11', label:'ETF 前向'},
-        {id:'trading-shared-operations', modulePage:'v2', tradingView:'operations', icon:'12', label:'运行状态'}
+        {id:'trading-v3-portfolio', modulePage:'v3', tradingView:'portfolio', icon:'04', label:'目标组合'},
+        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'05', label:'当前持仓'},
+        {id:'trading-v3-orders', modulePage:'v3', tradingView:'orders', icon:'06', label:'模拟订单'},
+        {id:'trading-v3-validation', modulePage:'v3', tradingView:'validation', icon:'07', label:'回测验收'},
+        {id:'trading-v3-missed', modulePage:'v3', tradingView:'missed', icon:'08', label:'漏抓复盘'},
+        {id:'trading-v3-evidence', modulePage:'v3', tradingView:'evidence', icon:'09', label:'数据与系统'},
+        {id:'trading-shared-etf', modulePage:'v2', tradingView:'etf', icon:'10', label:'ETF 前向'},
+        {id:'trading-shared-operations', modulePage:'v2', tradingView:'operations', icon:'11', label:'运行状态'}
     ];
     TRADING_MODULE_NAV_ITEMS.forEach(function(item) {
         LOADERS[item.id] = function(d, container) {
