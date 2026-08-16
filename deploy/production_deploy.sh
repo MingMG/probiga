@@ -61,6 +61,7 @@ AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
 REPOSITORY_ROOT=/opt/ProBigA
+STATIC_RELEASE_LINK=/opt/ProBigA-current
 if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
   sudo git config --system --add safe.directory "$REPOSITORY_ROOT"
@@ -374,6 +375,36 @@ assert_ai_worker_runtime() {
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
     | grep -F -- 'tools/run_ai_recommendation_worker.py --once' >/dev/null
 }
+point_static_release_to_checkout() {
+  local link_build
+  link_build="$(sudo mktemp -d /opt/.probiga-static-link.XXXXXX)"
+  sudo ln -s "$REPOSITORY_ROOT" "$link_build/current"
+  sudo mv -Tf "$link_build/current" "$STATIC_RELEASE_LINK"
+  sudo rmdir "$link_build"
+  test -L "$STATIC_RELEASE_LINK"
+  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$REPOSITORY_ROOT"
+}
+assert_nginx_static_matches_checkout() {
+  local asset
+  local response
+  test -L "$STATIC_RELEASE_LINK"
+  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$REPOSITORY_ROOT"
+  for asset in js/app.js css/style.css; do
+    response="$(mktemp)"
+    if ! curl --fail --silent --show-error \
+      -H 'Cache-Control: no-cache' \
+      "http://127.0.0.1/static/$asset" > "$response"; then
+      rm -f "$response"
+      return 1
+    fi
+    if ! cmp --silent "$REPOSITORY_ROOT/server/static/$asset" "$response"; then
+      rm -f "$response"
+      echo "Nginx served stale static asset: $asset" >&2
+      return 1
+    fi
+    rm -f "$response"
+  done
+}
 release_identity_check() {
   local require_clean="$1"
   sudo -u "$SERVICE_USER" env \
@@ -616,6 +647,16 @@ rollback() {
     if [ "$restoration_ready" -eq 1 ] && \
       ! sudo systemctl daemon-reload; then
       rollback_failure "systemd daemon-reload"
+      restoration_ready=0
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
+      ! point_static_release_to_checkout; then
+      rollback_failure "point Nginx static assets at previous checkout"
+      restoration_ready=0
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
+      ! assert_nginx_static_matches_checkout; then
+      rollback_failure "verify previous Nginx static assets"
       restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ]; then
@@ -881,6 +922,8 @@ fi
 cat "$HEALTH_RESPONSE"
 rm -f "$HEALTH_RESPONSE"
 sudo systemctl is-active --quiet probiga
+point_static_release_to_checkout
+assert_nginx_static_matches_checkout
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   ! systemctl is-active --quiet probiga-scheduler
   ! systemctl is-enabled --quiet probiga-scheduler

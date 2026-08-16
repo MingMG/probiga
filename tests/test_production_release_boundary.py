@@ -316,6 +316,12 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert 'sudo systemctl stop "$AI_WORKER_SERVICE"' in deploy_script
     assert "pin previous AI recommendation worker runtime" in deploy_script
     assert 'assert_ai_worker_runtime "$EXPECTED_SHA"' in deploy_script
+    assert "STATIC_RELEASE_LINK=/opt/ProBigA-current" in deploy_script
+    assert 'sudo mv -Tf "$link_build/current" "$STATIC_RELEASE_LINK"' in deploy_script
+    assert 'test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$REPOSITORY_ROOT"' in deploy_script
+    assert 'cmp --silent "$REPOSITORY_ROOT/server/static/$asset" "$response"' in deploy_script
+    assert "point Nginx static assets at previous checkout" in deploy_script
+    assert "verify previous Nginx static assets" in deploy_script
     worker_stop = deploy_script.index(
         'sudo systemctl stop "$AI_WORKER_TIMER"',
         deploy_script.index("trap 'rollback $?'"),
@@ -323,11 +329,22 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     release_checkout = deploy_script.index('git checkout --detach --force "$EXPECTED_SHA"')
     worker_pin = deploy_script.index('write_ai_worker_dropin "$EXPECTED_SHA"')
     service_restart = deploy_script.index("sudo systemctl restart probiga")
+    static_switch = deploy_script.index(
+        "point_static_release_to_checkout",
+        deploy_script.index('cat "$HEALTH_RESPONSE"'),
+    )
     worker_restore = deploy_script.index(
         'sudo systemctl start "$AI_WORKER_TIMER"',
         deploy_script.index('write_ai_worker_dropin "$EXPECTED_SHA"'),
     )
-    assert worker_stop < release_checkout < worker_pin < service_restart < worker_restore
+    assert (
+        worker_stop
+        < release_checkout
+        < worker_pin
+        < service_restart
+        < static_switch
+        < worker_restore
+    )
 
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
