@@ -16,8 +16,13 @@
   function money(v){if(v==null||v==='')return '—';var n=Number(v);return Number.isFinite(n)?'¥'+n.toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}
   function firstNumber(values){for(var i=0;i<values.length;i+=1){if(values[i]!=null&&values[i]!==''&&Number.isFinite(Number(values[i])))return Number(values[i])}return null}
   function unwrap(v){return v&&v.data}
-  function fetchJson(path){return fetch(path,{headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
-  function postJson(path,body){var options={method:'POST',headers:{Accept:'application/json'}};if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}return fetch(path,options).then(function(r){if(!r.ok)throw new Error(r.status+' '+path);return r.json()})}
+  function responseJson(path,r){return r.json().catch(function(){return {}}).then(function(payload){if(r.ok)return payload;var message=payload.message||payload.detail||payload.error||('HTTP '+r.status);var error=new Error(message+'（'+r.status+'）');error.status=r.status;error.path=path;throw error})}
+  function fetchJson(path){return fetch(path,{headers:{Accept:'application/json'}}).then(function(r){return responseJson(path,r)})}
+  function postJson(path,body){var options={method:'POST',headers:{Accept:'application/json'}};if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}return fetch(path,options).then(function(r){return responseJson(path,r)})}
+  function delay(ms){return new Promise(function(resolve){window.setTimeout(resolve,ms)})}
+  function isTransientRequestError(error){var status=Number(error&&error.status||0);return status===0||status===429||status===502||status===503||status===504}
+  function postJsonRetry(path,body,retries){return postJson(path,body).catch(function(error){if(retries>0&&isTransientRequestError(error))return delay(1200).then(function(){return postJsonRetry(path,body,retries-1)});throw error})}
+  function loadProductionSelector(preset,top){return postJsonRetry('/api/screener/run',{preset:preset,as_of_date:'',universe:'market',top:top,filters:{exclude_st:true}},1).then(function(payload){return {data:payload}}).catch(function(error){return {data:{status:'error',error:error&&error.message?error.message:'生产统一候选接口读取失败',data:[],stats:{}}}})}
   function api3(path){return fetchJson('/api/v3'+path)}
   function api2(path){return fetchJson('/api/v2'+path)}
   function security(code,name){code=String(code||'').split('.')[0];name=String(name||code||'—');return '<span class="security"><a class="name" href="#" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(name)+'</a><a class="code" href="#" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(code)+'</a></span>'}
@@ -91,11 +96,11 @@
     if(view==='candidates'){
       add('forecasts',api3('/forecasts/latest?limit=200'),[]);
       add('runs',api3('/decision-runs?limit=100'),[]);
-      add('unifiedRun',postJson('/api/screener/run',{preset:'intraday_sector',as_of_date:'',universe:'market',top:100,filters:{exclude_st:true}}).then(function(payload){return {data:payload}}),{status:'error',error:'生产统一候选接口读取失败',data:[],stats:{}})
+      add('unifiedRun',loadProductionSelector('intraday_sector',100),{status:'error',error:'生产统一候选接口读取失败',data:[],stats:{}})
     }
     if(view==='intraday'){
       add('intraday',api2('/accounts/paper-main-v2/intraday?limit=200'),{});
-      add('intradayRadar',postJson('/api/screener/run',{preset:'intraday_sector',as_of_date:'',universe:'market',top:200,filters:{exclude_st:true}}).then(function(payload){return {data:payload}}),{status:'degraded',freshness:'unavailable',data:[],error:'盘中雷达读取失败'});
+      add('intradayRadar',loadProductionSelector('intraday_sector',200),{status:'degraded',freshness:'unavailable',data:[],error:'盘中雷达读取失败'});
     }
     if(view==='portfolio')add('targets',api3('/portfolio/latest'),[]);
     if(view==='positions')add('targets',api3('/portfolio/latest'),[]);
@@ -306,7 +311,7 @@
   window.addEventListener('message',function(event){if(event.source!==window.parent||!event.data||event.data.type!=='probiga-trading-v3-view')return;var expectedOrigin='*';try{expectedOrigin=new URL(document.referrer).origin}catch(ignore){}if(expectedOrigin!=='*'&&expectedOrigin!=='null'&&event.origin!==expectedOrigin)return;activateView(String(event.data.view||'overview'));notifyParentResize()});
   if(window.ResizeObserver)new ResizeObserver(notifyParentResize).observe(document.documentElement);
   var candidateTimer=null;
-  function reloadCandidates(){state.candidatePage=1;var day=el('candidateDate').value,sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim(),unifiedDay=el('unifiedCandidateDate').value,unifiedQ=el('unifiedCandidateSearch').value.trim(),unifiedPreset=el('unifiedPresetFilter').value,params=['limit='+(q?1000:200)];if(day)params.push('trade_date='+encodeURIComponent(day));if(sf)params.push('strategy_key='+encodeURIComponent(sf));if(st)params.push('status='+encodeURIComponent(st));if(q)params.push('q='+encodeURIComponent(q));var unified=unifiedDay?fetchJson('/api/screener/history?data_date='+encodeURIComponent(unifiedDay)+'&preset='+encodeURIComponent(unifiedPreset)+'&limit=200'+(unifiedQ?'&q='+encodeURIComponent(unifiedQ):'')):postJson('/api/screener/run',{preset:unifiedPreset,as_of_date:'',universe:'market',top:100,filters:{exclude_st:true}});Promise.all([
+  function reloadCandidates(){state.candidatePage=1;var day=el('candidateDate').value,sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim(),unifiedDay=el('unifiedCandidateDate').value,unifiedQ=el('unifiedCandidateSearch').value.trim(),unifiedPreset=el('unifiedPresetFilter').value,params=['limit='+(q?1000:200)];if(day)params.push('trade_date='+encodeURIComponent(day));if(sf)params.push('strategy_key='+encodeURIComponent(sf));if(st)params.push('status='+encodeURIComponent(st));if(q)params.push('q='+encodeURIComponent(q));var unified=unifiedDay?fetchJson('/api/screener/history?data_date='+encodeURIComponent(unifiedDay)+'&preset='+encodeURIComponent(unifiedPreset)+'&limit=200'+(unifiedQ?'&q='+encodeURIComponent(unifiedQ):'')):postJsonRetry('/api/screener/run',{preset:unifiedPreset,as_of_date:'',universe:'market',top:100,filters:{exclude_st:true}},1);Promise.all([
     api3('/forecasts/latest?'+params.join('&')).then(function(v){state.forecasts=unwrap(v)||[]}).catch(function(){state.forecasts=[]}),
     unified.then(function(v){state.unifiedRun=v}).catch(function(err){state.unifiedRun={status:'error',error:err.message,data:[],stats:{}}})
   ]).then(function(){renderCandidates();notifyParentResize()})}

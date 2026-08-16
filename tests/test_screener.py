@@ -123,15 +123,17 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert 'id="unifiedCandidateDate"' in page
     assert 'id="unifiedCandidateSearch"' in page
     assert "trading-v3.css?v=6" in page
-    assert "trading-v3.js?v=20" in page
+    assert "trading-v3.js?v=21" in page
     assert 'id="equitySource"' in page
     assert 'id="cashSource"' in page
     assert 'id="unrealizedPnl"' in page
     assert 'id="positionCount"' in page
-    assert "postJson('/api/screener/run'" in script
+    assert "postJsonRetry('/api/screener/run'" in script
+    assert "status===429||status===502||status===503||status===504" in script
+    assert "payload.message||payload.detail||payload.error" in script
     assert "'/api/screener/history?data_date='" in script
     assert "绝不用今天数据重算过去" in page
-    assert "preset:'intraday_sector'" in script
+    assert "loadProductionSelector('intraday_sector',100)" in script
     assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
     assert "version_evidence_coverage_rate" in script
     assert "自动下单','固定关闭" in script
