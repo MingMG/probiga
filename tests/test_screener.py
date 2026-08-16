@@ -129,8 +129,16 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "trading-v3-intraday" not in app
     assert "trading-v3-intraday" not in index
     assert "<span>04</span>目标组合" in index
-    assert "trading-v3.css?v=7" in page
-    assert "trading-v3.js?v=22" in page
+    assert "trading-v3.css?v=8" in page
+    assert "trading-v3.js?v=23" in page
+    assert "实际选出时间" in script
+    assert "候选归属日" in script
+    assert "行情数据日" in script
+    assert "证据截止日" in script
+    assert "行情快照时间" in script
+    assert "最新生产批次" in script
+    assert "历史落库批次" in script
+    assert "是策略计划档位，不是当前这批票的实际生成时间" in page
     assert 'id="equitySource"' in page
     assert 'id="cashSource"' in page
     assert 'id="unrealizedPnl"' in page
@@ -203,6 +211,7 @@ def test_screener_run_persists_before_optional_delivery(monkeypatch):
 
     assert payload["run"]["persisted"] is True
     assert payload["run"]["run_uid"] == "a" * 32
+    assert payload["view_mode"] == "latest"
     assert payload["notification"]["status"] == "sent"
     assert updated["uid"] == "a" * 32
 
@@ -246,6 +255,7 @@ def test_screener_history_reads_immutable_payload_and_stock_filter(monkeypatch):
     payload = screener.screener_history(data_date="2026-08-13", q="300333")
 
     assert payload["run"]["persisted"] is True
+    assert payload["view_mode"] == "historical"
     assert payload["session_date"] == "2026-08-13"
     assert payload["data"][0] == {
         "score": 100,

@@ -473,13 +473,23 @@ def _persist_screener_run(request: ScreenerRunRequest, result: dict[str, Any]) -
     session_date = observed_date or (_clean_date(result.get("requested_date")) if request.as_of_date else "") or generated_at.date().isoformat()
     with get_engine().begin() as conn:
         existing = conn.execute(
-            text("SELECT run_uid, generated_at, push_status FROM st_screener_run_history WHERE run_key = :run_key LIMIT 1"),
+            text("""
+                SELECT run_uid, session_date, data_date, evidence_date,
+                       observed_at, generated_at, push_status
+                FROM st_screener_run_history
+                WHERE run_key = :run_key
+                LIMIT 1
+            """),
             {"run_key": run_key},
         ).mappings().first()
         if existing:
             return {
                 "run_uid": str(existing["run_uid"]),
                 "run_key": run_key,
+                "session_date": str(existing.get("session_date") or ""),
+                "data_date": str(existing.get("data_date") or ""),
+                "evidence_date": str(existing.get("evidence_date") or ""),
+                "observed_at": str(existing.get("observed_at") or ""),
                 "generated_at": str(existing["generated_at"]),
                 "persisted": True,
                 "is_new": False,
@@ -552,6 +562,10 @@ def _persist_screener_run(request: ScreenerRunRequest, result: dict[str, Any]) -
     return {
         "run_uid": run_uid,
         "run_key": run_key,
+        "session_date": session_date,
+        "data_date": _clean_date(result.get("data_date")),
+        "evidence_date": _clean_date(result.get("evidence_date")),
+        "observed_at": str(result.get("observed_at") or "").replace("T", " ")[:19],
         "generated_at": generated_at.isoformat(sep=" "),
         "persisted": True,
         "is_new": True,
@@ -1506,6 +1520,7 @@ def screener_run(request: ScreenerRunRequest):
     result["data_gate"] = _runtime_status()
     result["versions"] = list(VERSION_MATRIX)
     result["selector"] = selector_contract()
+    result["view_mode"] = "latest"
     run_meta = {
         "run_type": "sync",
         "run_id": f"screen-{target}-{request.preset}",
@@ -1643,6 +1658,7 @@ def screener_history(
             "stats": stats,
             "selector": selector,
             "run": {"run_uid": selected_uid, "persisted": True, "push_status": selected.get("push_status"), "pushed_at": selected.get("pushed_at")},
+            "view_mode": "historical",
             "data": data,
             "total": len(data),
             "available_runs": available,

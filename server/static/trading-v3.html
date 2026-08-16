@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=7">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=8">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -144,7 +144,7 @@
             <div><p>V3-V6 PRODUCTION SELECTOR</p><h3>盘前与盘中生产融合候选</h3></div>
             <span class="badge" id="selectorWorkspaceStatus">读取两档候选中</span>
           </div>
-          <p class="note">同一套筛选条件同时作用于两档生产结果：左侧是 09:08 盘前候选，右侧是 09:32 盘中候选。V3 负责基础分，V4 负责硬门禁与可执行性，V5 负责市场状态适配，V6 负责 PIT 财务质量；历史日期只读当时已落库批次，绝不用今天数据重算过去。</p>
+          <p class="note">同一套筛选条件同时作用于两档生产结果：左侧是 09:08 盘前档，右侧是 09:32 盘中档。09:08 / 09:32 是策略计划档位，不是当前这批票的实际生成时间；每个榜单下方会分别写明“实际选出时间、候选归属日、行情数据日、证据截止日和行情快照时间”。V3 负责基础分，V4 负责硬门禁与可执行性，V5 负责市场状态适配，V6 负责 PIT 财务质量；历史日期只读当时已落库批次，绝不用今天数据重算过去。</p>
           <div class="filters selector-workspace-filters">
             <label>历史日期<input type="date" id="selectorDateFilter"></label>
             <label>代码/中文/主题<input id="selectorStockFilter" placeholder="输入代码、中文名或主题"></label>
@@ -154,7 +154,7 @@
           <div class="candidate-boards">
             <section class="selector-board selector-board-premarket" aria-labelledby="premarketBoardTitle">
               <div class="selector-board-head">
-                <div><span class="selector-time">09:08</span><h4 id="premarketBoardTitle">盘前选股</h4><p>隔夜市场、板块预判与资金承接</p></div>
+                <div><span class="selector-time">盘前档 09:08</span><h4 id="premarketBoardTitle">盘前选股</h4><p>隔夜市场、板块预判与资金承接</p></div>
                 <span class="badge" id="premarketCandidateStatus">读取中</span>
               </div>
               <div id="premarketCandidateSummary" class="selector-board-summary"></div>
@@ -162,7 +162,7 @@
             </section>
             <section class="selector-board selector-board-intraday" aria-labelledby="intradayBoardTitle">
               <div class="selector-board-head">
-                <div><span class="selector-time">09:32</span><h4 id="intradayBoardTitle">盘中选股</h4><p>开盘确认、板块联动与可执行性</p></div>
+                <div><span class="selector-time">盘中档 09:32</span><h4 id="intradayBoardTitle">盘中选股</h4><p>开盘确认、板块联动与可执行性</p></div>
                 <span class="badge" id="intradayCandidateStatus">读取中</span>
               </div>
               <div id="intradayCandidateSummary" class="selector-board-summary"></div>
@@ -253,6 +253,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v3.js?v=22"></script>
+  <script src="/static/js/trading-v3.js?v=23"></script>
 </body>
 </html>
