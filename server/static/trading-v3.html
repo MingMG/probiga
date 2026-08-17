@@ -14,15 +14,21 @@
       <a class="brand" href="/"><span>Pro</span>BigA</a>
       <p class="rail-caption">POSITIVE EXPECTANCY DESK</p>
       <nav>
-        <button class="nav active" data-view="overview"><i>01</i>执行总览</button>
+        <span class="nav-group">今日决策</span>
+        <button class="nav active" data-view="overview"><i>01</i>决策总览</button>
+        <span class="nav-group">机会与拒绝</span>
         <button class="nav" data-view="hypotheses"><i>02</i>交易假设</button>
         <button class="nav" data-view="candidates"><i>03</i>候选与拒绝</button>
-        <button class="nav" data-view="portfolio"><i>04</i>目标组合</button>
-        <button class="nav" data-view="positions"><i>05</i>当前持仓</button>
-        <button class="nav" data-view="orders"><i>06</i>模拟订单</button>
-        <button class="nav" data-view="validation"><i>07</i>回测验收</button>
-        <button class="nav" data-view="missed"><i>08</i>漏抓复盘</button>
-        <button class="nav" data-view="evidence"><i>09</i>数据与系统</button>
+        <button class="nav" data-view="intraday"><i>04</i>盘中只读证据</button>
+        <span class="nav-group">模拟执行</span>
+        <button class="nav" data-view="portfolio"><i>05</i>目标组合</button>
+        <button class="nav" data-view="positions"><i>06</i>持仓与退出</button>
+        <button class="nav" data-view="orders"><i>07</i>模拟订单</button>
+        <span class="nav-group">验证复盘</span>
+        <button class="nav" data-view="validation"><i>08</i>回测验收</button>
+        <button class="nav" data-view="missed"><i>09</i>漏抓复盘</button>
+        <span class="nav-group">系统证据</span>
+        <button class="nav" data-view="evidence"><i>10</i>数据与系统</button>
       </nav>
       <div class="rail-foot">
         <span></span>
@@ -42,14 +48,36 @@
         </div>
       </header>
 
+      <section class="truth-context" id="truthContext" aria-live="polite" aria-busy="true">
+        <div class="truth-context-head">
+          <div><span class="truth-kicker">统一决策上下文</span><strong id="truthState">读取中</strong></div>
+          <p id="truthStateReason">正在核对决策批次、证据时点和执行权限。</p>
+        </div>
+        <dl class="truth-clock">
+          <div><dt>页面请求日</dt><dd id="ctxRequestedDate">—</dd></div>
+          <div><dt>决策会话日</dt><dd id="ctxDecisionSessionDate">—</dd></div>
+          <div><dt>特征数据日</dt><dd id="ctxDataDate">—</dd></div>
+          <div><dt>预期数据日</dt><dd id="ctxExpectedDataDate">—</dd></div>
+          <div><dt>决策批次</dt><dd id="ctxRunUid">—</dd></div>
+          <div><dt>决策时间</dt><dd id="ctxDecisionAt">—</dd></div>
+          <div><dt>证据截至</dt><dd id="ctxEvidenceAsOf">—</dd></div>
+          <div><dt>有效至</dt><dd id="ctxValidUntil">—</dd></div>
+        </dl>
+        <div class="authority-axis" aria-label="交易权限边界">
+          <div id="researchAuthority"><span>研究分析</span><strong>读取中</strong><small>只形成证据和排序</small></div>
+          <div id="paperAuthority"><span>模拟执行</span><strong>读取中</strong><small>必须通过 V2 执行门禁</small></div>
+          <div id="realAuthority"><span>真实交易</span><strong>固定关闭</strong><small>本页面没有真实订单权限</small></div>
+        </div>
+        <div class="truth-error" id="truthError" role="alert" hidden></div>
+      </section>
+
       <section class="action-strip">
         <div>
           <strong>手动执行</strong>
-          <span id="actionStatus">正在读取今日自动执行状态</span>
+          <span id="actionStatus" role="status" aria-live="polite">正在读取今日自动执行状态</span>
         </div>
         <div class="action-buttons">
           <button id="runDaily">手动重跑日级选股</button>
-          <button id="runIntraday">立即刷新盘中候选</button>
         </div>
       </section>
 
@@ -70,7 +98,9 @@
         <article><span>当前模拟账户总权益</span><strong id="equity">—</strong><small id="equitySource">读取当前持仓所属账本</small></article>
         <article><span>当前可用现金</span><strong id="cash">—</strong><small id="cashSource">读取当前持仓所属账本</small></article>
         <article><span>当前浮动盈亏</span><strong id="unrealizedPnl">—</strong><small id="marketValue">读取最新持仓市值</small></article>
-        <article><span>当前持仓</span><strong id="positionCount">—</strong><small id="targetPolicy">同时显示本次决策目标</small></article>
+        <article><span>当前持仓</span><strong id="positionCount">—</strong><small>只统计当前开放持仓</small></article>
+        <article><span>通过样本外闸门</span><strong id="validated">—</strong><small id="sleeves">策略独立记账</small></article>
+        <article><span>研究目标 / 组合上限</span><strong id="targetCount">—</strong><small id="targetPolicy">读取当前生产仓位规则</small></article>
       </section>
 
       <section class="view active" id="view-overview">
@@ -86,10 +116,10 @@
         </div>
         <article class="panel">
           <div class="panel-head"><div><p>THEME OPPORTUNITY AUDIT</p><h3>主题机会覆盖与高分漏选预警</h3></div><span class="badge" id="themeAuditStatus">等待审计</span></div>
-          <p class="note">研究方向不设固定白名单：每次决策扫描完整股票池和全部策略预测，按当期全市场主题信号动态聚类、排序，再单独审计纸面候选。高分方向全部落选、候选没有拒绝原因或目标主题过度集中都会主动提示，且不绕过样本外和风控门槛。</p>
+          <p class="note">每次决策先扫描完整股票池和全部策略预测，再单独审计纸面候选；AI应用、机器人目前是跨策略主题雷达，不冒充已经训练并通过 OOS 的独立模型。高分方向全部落选、候选没有拒绝原因或目标主题过度集中都会主动提示，且不绕过样本外和风控门槛。</p>
           <div id="themeAuditFacts" class="facts"></div>
           <div class="two">
-            <div class="table-wrap"><table><thead><tr><th>动态研究方向</th><th>覆盖股票</th><th>策略预测</th><th>纸面候选</th><th>入选</th><th>全量最高信号</th><th>状态 / 原因</th></tr></thead><tbody id="researchGroupRows"></tbody></table></div>
+            <div class="table-wrap"><table><thead><tr><th>研究方向</th><th>覆盖股票</th><th>策略预测</th><th>纸面候选</th><th>入选</th><th>全量最高信号</th><th>状态 / 原因</th></tr></thead><tbody id="researchGroupRows"></tbody></table></div>
             <div class="table-wrap"><table><thead><tr><th>纸面候选主题</th><th>候选数</th><th>入选数</th><th>最高分候选</th></tr></thead><tbody id="opportunityThemeRows"></tbody></table></div>
           </div>
         </article>
@@ -99,7 +129,7 @@
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题</th><th>阶段</th><th>实验动作</th><th>评分</th><th>保护位</th><th>依据</th></tr></thead><tbody id="oversoldRows"></tbody></table></div>
         </article>
         <article class="panel">
-          <div class="panel-head"><div><p>TARGETS</p><h3>本次可执行目标</h3></div><span class="badge safe">先组合，后下单</span></div>
+          <div class="panel-head"><div><p>TARGETS</p><h3>本次研究目标</h3></div><span class="badge warning">RESEARCH_ONLY 不可直接下单</span></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>目标仓位</th><th>股数</th><th>净期望</th><th>保守收益</th><th>往返成本</th><th>证据</th></tr></thead><tbody id="overviewTargets"></tbody></table></div>
         </article>
       </section>
@@ -140,35 +170,56 @@
 
       <section class="view" id="view-candidates">
         <article class="panel">
+          <div class="panel-head wrap">
+            <div><p>FORECAST LEDGER</p><h3>候选、研究样本与拒绝原因</h3></div>
+            <div class="filters">
+              <label>历史日期<input type="date" id="candidateDate"></label>
+              <label>策略<select id="strategyFilter"><option value="">全部策略</option></select></label>
+              <label>状态<select id="statusFilter"><option value="">全部状态</option><option value="RESEARCH_TARGET">同批次研究目标</option><option value="PORTFOLIO_REJECTED">同批次组合拒绝</option><option value="VALIDATED_POSITIVE">通过研究闸门</option><option value="PAPER_DISCOVERY_CANDIDATE">触发小仓模拟试错</option><option value="LEFT_SIDE_PREPARE">进入左侧准备区</option><option value="RESEARCH_ONLY_UNCALIBRATED">未校准，仅研究</option><option value="RESEARCH_ONLY_MODEL_VERSION_MISMATCH">旧模型已隔离</option><option value="RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED">分数排序失真</option><option value="RESEARCH_ONLY_PROFIT_GATE_FAILED">收益闸门失败</option><option value="WEAK_MARKET_THEME_WATCH">弱市结构性观察</option><option value="SETUP_NOT_READY">形态尚未同时确认</option><option value="MARKET_REGIME_BLOCKED">弱市且板块未确认</option><option value="INSUFFICIENT_DATA">数据不足</option></select></label>
+              <label>代码/中文/主题<input id="candidateSearch" placeholder="输入代码、中文名或主题"></label>
+            </div>
+          </div>
+          <div class="candidate-toolbar">
+            <p class="note">选择历史日期读取当时已落库的不可变决策，不用今天的数据重算过去。</p>
+            <span class="badge" id="candidateSummary">读取候选中</span>
+          </div>
+          <div id="candidateCards" class="candidate-list" aria-live="polite"></div>
+          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
+          <div class="candidate-pager" id="candidatePager"><button type="button" id="candidatePrev">上一页</button><span id="candidatePageStatus">第 1 / 1 页</span><button type="button" id="candidateNext">下一页</button></div>
+        </article>
+      </section>
+
+      <section class="view" id="view-intraday">
+        <div class="two">
+          <article class="panel">
+            <div class="panel-head">
+              <div><p>CURRENT REALTIME STATE</p><h3>当前实时状态与市场确认</h3></div>
+              <span class="badge" id="intradayStatus">等待扫描</span>
+            </div>
+            <div id="intradayFacts" class="facts"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div><p>WHY WATCH ONLY</p><h3>能提醒与能下单是两道门</h3></div>
+              <span class="badge warning">真实交易固定关闭</span>
+            </div>
+            <div id="intradayEvidence" class="facts"></div>
+          </article>
+        </div>
+        <article class="panel">
           <div class="panel-head">
-            <div><p>V3-V6 PRODUCTION SELECTOR</p><h3>盘前与盘中生产融合候选</h3></div>
-            <span class="badge" id="selectorWorkspaceStatus">读取两档候选中</span>
+            <div><p>LATEST HISTORICAL SNAPSHOT</p><h3>最新历史快照</h3></div>
+            <span class="badge">只读复盘，绝不冒充实时</span>
           </div>
-          <p class="note">同一套筛选条件同时作用于两档生产结果：左侧是 09:08 盘前档，右侧是 09:32 盘中档。09:08 / 09:32 是策略计划档位，不是当前这批票的实际生成时间；每个榜单下方会分别写明“实际选出时间、候选归属日、行情数据日、证据截止日和行情快照时间”。V3 负责基础分，V4 负责硬门禁与可执行性，V5 负责市场状态适配，V6 负责 PIT 财务质量；历史日期只读当时已落库批次，绝不用今天数据重算过去。</p>
-          <div class="filters selector-workspace-filters">
-            <label>历史日期<input type="date" id="selectorDateFilter"></label>
-            <label>代码/中文/主题<input id="selectorStockFilter" placeholder="输入代码、中文名或主题"></label>
-            <label>结果状态<select id="selectorGradeFilter"><option value="">全部候选与拒绝</option><option value="A">A级候选</option><option value="B">B级候选</option><option value="C">C级观察</option><option value="REJECT">已拒绝</option></select></label>
-            <button type="button" id="selectorCurrent">查看当前双榜</button>
+          <div id="intradayHistoricalFacts" class="facts"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head wrap">
+            <div><p>INTRADAY OPPORTUNITY RADAR</p><h3>水下修复、突然放量、极速上攻与龙二替补</h3></div>
+            <span class="badge" id="intradayCount">0 条</span>
           </div>
-          <div class="candidate-boards">
-            <section class="selector-board selector-board-premarket" aria-labelledby="premarketBoardTitle">
-              <div class="selector-board-head">
-                <div><span class="selector-time">盘前档 09:08</span><h4 id="premarketBoardTitle">盘前选股</h4><p>隔夜市场、板块预判与资金承接</p></div>
-                <span class="badge" id="premarketCandidateStatus">读取中</span>
-              </div>
-              <div id="premarketCandidateSummary" class="selector-board-summary"></div>
-              <div id="premarketCandidateRows" class="selector-board-list" aria-live="polite"></div>
-            </section>
-            <section class="selector-board selector-board-intraday" aria-labelledby="intradayBoardTitle">
-              <div class="selector-board-head">
-                <div><span class="selector-time">盘中档 09:32</span><h4 id="intradayBoardTitle">盘中选股</h4><p>开盘确认、板块联动与可执行性</p></div>
-                <span class="badge" id="intradayCandidateStatus">读取中</span>
-              </div>
-              <div id="intradayCandidateSummary" class="selector-board-summary"></div>
-              <div id="intradayCandidateRows" class="selector-board-list" aria-live="polite"></div>
-            </section>
-          </div>
+          <p class="note">观察信号会完整展示；只有实时数据、板块确认、盈亏比和模拟风控全部通过，才允许进入 ProBigA 模拟订单。</p>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题</th><th>角色</th><th>动作</th><th>现价</th><th>当前涨幅</th><th>相对强度</th><th>量能比</th><th>板块红盘</th><th>评分</th><th>盈亏比</th><th>判断原因</th><th>观察时间</th></tr></thead><tbody id="intradayRows"></tbody></table></div>
         </article>
       </section>
 
@@ -181,15 +232,27 @@
 
       <section class="view" id="view-positions">
         <article class="panel">
-          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge safe">不按固定天数死拿</span></div>
+          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge warning">当前 V2 快照 · 不随历史决策日回放</span></div>
           <div id="positionSummary" class="facts"></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>持仓状态</th><th>持仓数量</th><th>可卖数量</th><th>成本价</th><th>最新价</th><th>持仓市值</th><th>浮动盈亏</th><th>盈亏率</th><th>买入时间</th><th>卖出时间</th><th>卖出价格</th><th>保护位</th><th>加仓次数</th><th>行情时间</th><th>持仓说明</th></tr></thead><tbody id="positionRows"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>EXIT LIFECYCLE</p><h3>完整退出链</h3></div><span class="badge warning" id="exitLineageStatus">等待同批次血缘</span></div>
+          <div class="facts exit-lineage-facts" id="exitLineageFacts"></div>
+          <ol class="workflow-line" id="exitWorkflow">
+            <li><strong>持仓建立</strong><span>fill_id → lot_id</span></li>
+            <li><strong>T+1 可卖检查</strong><span>不可卖时进入待退出</span></li>
+            <li><strong>失效 / 止损 / 止盈</strong><span>记录触发证据</span></li>
+            <li><strong>退出委托</strong><span>exit_order_id</span></li>
+            <li><strong>退出成交</strong><span>费用与已实现盈亏</span></li>
+            <li><strong>归因复盘</strong><span>回写决策学习账本</span></li>
+          </ol>
         </article>
       </section>
 
       <section class="view" id="view-orders">
         <article class="panel">
-          <div class="panel-head"><div><p>PAPER OMS</p><h3>ProBigA 模拟订单</h3></div><span class="badge danger">真实交易固定为 0</span></div>
+          <div class="panel-head"><div><p>PAPER OMS</p><h3>本决策批次模拟订单</h3></div><span class="badge danger">真实交易固定为 0</span></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>方向</th><th>数量</th><th>限价</th><th>状态</th><th>等待原因</th><th>有效时间</th></tr></thead><tbody id="orderRows"></tbody></table></div>
         </article>
       </section>
@@ -216,6 +279,25 @@
           <div class="panel-head"><div><p>WALK-FORWARD ACCEPTANCE</p><h3>是否允许进入模拟盘</h3></div><span class="badge" id="validationStatus">暂无结果</span></div>
           <div id="validationEvidence" class="facts"></div>
         </article>
+        <div class="two research-two">
+          <article class="panel">
+            <div class="panel-head"><div><p>IMMUTABLE BATCH DIFF</p><h3>当前批次 vs 前一批次</h3></div><span class="badge" id="batchDiffStatus">等待批次</span></div>
+            <div id="batchDiffFacts" class="facts"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><p>ADVISORY PORTFOLIO INTELLIGENCE</p><h3>替代与组合优化（只读）</h3></div><span class="badge warning" id="advisoryStatus">读取持久化快照</span></div>
+            <div id="advisoryFacts" class="facts"></div>
+          </article>
+        </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>INDEPENDENT MULTI-HORIZON CONTRACTS</p><h3>T+1 / T+5 / T+20 独立模型</h3></div><span class="badge" id="horizonValidationStatus">读取治理配置</span></div>
+          <div class="horizon-contracts" id="horizonContracts">
+            <div data-horizon="T+1"><span>T+1</span><strong>等待模型</strong><small>order=false</small></div>
+            <div data-horizon="T+5"><span>T+5</span><strong>等待模型</strong><small>order=false</small></div>
+            <div data-horizon="T+20"><span>T+20</span><strong>等待模型</strong><small>order=false</small></div>
+          </div>
+          <div id="horizonFacts" class="facts research-facts"></div>
+        </article>
       </section>
 
       <section class="view" id="view-missed">
@@ -239,6 +321,16 @@
           </div>
           <div id="learningFacts" class="facts"></div>
         </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>FOUR-QUADRANT COUNTERFACTUAL</p><h3>选对 / 选错 / 漏抓 / 正确拒绝</h3></div><span class="badge" id="counterfactualStatus">COLLECTING</span></div>
+          <div class="quadrant-grid">
+            <div><span>选中且上涨</span><strong id="quadrantSelectedWin">0</strong><small>SELECTED_WIN</small></div>
+            <div><span>选中但下跌</span><strong id="quadrantSelectedLoss">0</strong><small>SELECTED_LOSS</small></div>
+            <div><span>拒绝但上涨</span><strong id="quadrantRejectedWin">0</strong><small>REJECTED_WIN</small></div>
+            <div><span>正确拒绝</span><strong id="quadrantRejectedCorrect">0</strong><small>REJECTED_CORRECT</small></div>
+          </div>
+          <div id="counterfactualFacts" class="facts research-facts"></div>
+        </article>
       </section>
 
       <section class="view" id="view-evidence">
@@ -246,6 +338,26 @@
           <article class="panel"><div class="panel-head"><div><p>READINESS</p><h3>系统能力门禁</h3></div><span class="badge" id="readinessStatus">—</span></div><div id="blocks" class="facts"></div></article>
           <article class="panel"><div class="panel-head"><div><p>PROVENANCE</p><h3>本次决策证据</h3></div></div><div id="provenance" class="facts"></div></article>
         </div>
+        <article class="panel">
+          <div class="panel-head"><div><p>DECISION LINEAGE</p><h3>决策血缘</h3></div><span class="badge" id="lineageStatus">等待统一批次</span></div>
+          <ol class="workflow-line lineage" id="lineageWorkflow">
+            <li><strong>数据快照</strong><span id="lineageEvidence">evidence_as_of —</span></li>
+            <li><strong>研究排序</strong><span>V3 + 受限顾问，不拥有订单权限</span></li>
+            <li><strong>组合目标</strong><span id="lineageRun">run_uid —</span></li>
+            <li><strong>执行复验</strong><span>V2 账户 / 现金 / T+1 / 行情</span></li>
+            <li><strong>Intent / Order / Fill</strong><span>按业务 ID 串联</span></li>
+            <li><strong>Lot / Exit / P&amp;L</strong><span>完整退出与归因</span></li>
+          </ol>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><div><p>SHADOW RELEASE &amp; CONTINUOUS CALIBRATION</p><h3>Shadow 发布与持续校准门禁</h3></div><span class="badge warning" id="shadowStage">读取中</span></div>
+          <div class="shadow-governance">
+            <div><span>治理配置边界</span><strong id="shadowReleaseMode">SHADOW_RESEARCH_ONLY</strong><small>不是服务端持久化运行态</small></div>
+            <div><span>校准 Gate</span><strong id="shadowGateStatus">FAIL_CLOSED</strong><small>按 T+1 / T+5 / T+20 独立阈值</small></div>
+            <div><span>订单权限</span><strong id="shadowOrderAuthority">false</strong><small>真实交易固定关闭</small></div>
+          </div>
+          <div id="shadowFacts" class="facts research-facts"></div>
+        </article>
         <article class="panel">
           <div class="panel-head"><div><p>SCHEMA</p><h3>V3 业务账本</h3></div><span class="badge safe">技术明细默认收起</span></div>
           <details><summary>查看数据库表状态</summary><div id="schema" class="schema"></div></details>
@@ -263,6 +375,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=24"></script>
+  <script src="/static/js/trading-v3.js?v=25"></script>
 </body>
 </html>

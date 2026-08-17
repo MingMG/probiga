@@ -13,6 +13,7 @@ from server.common.kline_data import get_kline_engine
 
 from .config import load_v3_config
 from .daily_features import load_daily_feature_universe
+from .decision_truth import load_decision_snapshot
 from .engine import TradingV3Engine
 from .hypotheses import (
     build_market_hypothesis,
@@ -25,6 +26,7 @@ from .paper_execution import (
 from .position_sync import sync_position_states
 from .regime import classify_regime_probabilities
 from .repository import TradingV3Repository
+from .shadow_intelligence_repository import ShadowIntelligenceRepository
 
 
 _CALIBRATABLE_FORECAST_STATUSES = frozenset({
@@ -65,29 +67,48 @@ def _calibrated_universe(
 
 def _account_equity(engine: Engine) -> float:
     with engine.connect() as connection:
-        equity = connection.execute(
+        row = connection.execute(
             text(
                 """
-                SELECT total_equity
-                FROM st_equity_daily_v2
-                WHERE account_id = 'paper-main-v2'
-                ORDER BY trade_date DESC
+                SELECT a.status AS account_status,
+                       e.total_equity, e.trade_date,
+                       r.status AS reconciliation_status
+                FROM st_trade_account_v2 a
+                JOIN st_equity_daily_v2 e
+                  ON e.account_id = a.account_id
+                LEFT JOIN st_reconciliation_v2 r
+                  ON r.account_id = e.account_id
+                 AND r.trade_date = e.trade_date
+                 AND r.version = (
+                     SELECT MAX(r2.version)
+                     FROM st_reconciliation_v2 r2
+                     WHERE r2.account_id = e.account_id
+                       AND r2.trade_date = e.trade_date
+                 )
+                WHERE a.account_id = 'paper-main-v2'
+                ORDER BY e.trade_date DESC
                 LIMIT 1
                 """
             )
-        ).scalar()
-        if equity is None:
-            equity = connection.execute(
-                text(
-                    """
-                    SELECT cash_balance
-                    FROM st_trade_account_v2
-                    WHERE account_id = 'paper-main-v2'
-                    LIMIT 1
-                    """
-                )
-            ).scalar()
-    return float(equity or 200_000.0)
+        ).mappings().first()
+    if not row:
+        raise RuntimeError(
+            "ACCOUNT_SNAPSHOT_MISSING: 禁止使用默认 20 万元替代"
+        )
+    if str(row.get("account_status") or "") != "ACTIVE":
+        raise RuntimeError(
+            "ACCOUNT_NOT_ACTIVE: 模拟账户未处于 ACTIVE"
+        )
+    if str(row.get("reconciliation_status") or "") != "PASS":
+        raise RuntimeError(
+            "RECONCILIATION_BLOCKED: 最新权益没有 PASS 对账"
+        )
+    equity = float(row.get("total_equity") or 0)
+    if equity <= 0:
+        raise RuntimeError(
+            "EQUITY_NOT_POSITIVE: 权益为零或无效"
+        )
+    return equity
 
 
 def _current_portfolio_state(
@@ -245,6 +266,27 @@ def _open_position_codes(engine: Engine) -> tuple[str, ...]:
     return tuple(str(code).zfill(6) for code in rows if code)
 
 
+def _decision_truth_status(
+    result: dict[str, Any],
+    *,
+    execution_enabled: bool,
+) -> tuple[str, str]:
+    portfolio = dict(result.get("portfolio") or {})
+    regime = dict(result.get("regime") or {})
+    data_blocked = (
+        str(regime.get("quality_status") or "") != "PASS"
+        or str(portfolio.get("status") or "").upper()
+        == "DATA_BLOCKED"
+    )
+    if data_blocked:
+        return "BLOCKED", "DATA_BLOCKED"
+    if not execution_enabled:
+        return "COMPLETED", "REPLAY_ONLY"
+    if portfolio.get("targets"):
+        return "COMPLETED", "PAPER_ACTIONABLE"
+    return "COMPLETED", "NO_ACTION"
+
+
 def run_daily_decision_v3(
     primary_engine: Engine,
     *,
@@ -254,6 +296,7 @@ def run_daily_decision_v3(
     universe_limit: int = 5000,
     per_sleeve_limit: int = 5000,
     kline_engine: Engine | None = None,
+    execution_enabled: bool = True,
 ) -> dict[str, Any]:
     config = load_v3_config()
     repository = TradingV3Repository(primary_engine)
@@ -262,7 +305,7 @@ def run_daily_decision_v3(
         "cancelled_execution_plans": [],
         "cancelled_partial_orders": [],
     }
-    if mode == "premarket":
+    if execution_enabled and mode == "premarket":
         premarket_freeze = freeze_pending_v3_buys(
             primary_engine,
             now=decision_at,
@@ -296,6 +339,16 @@ def run_daily_decision_v3(
         primary_engine,
         market_engine,
         **load_kwargs,
+    )
+    snapshot = load_decision_snapshot(
+        primary_engine,
+        requested_as_of=as_of,
+        trade_date=dataset["trade_date"],
+        decision_at=decision_at,
+        feature_time=dataset["feature_time"],
+        data_snapshot_hash=dataset["data_snapshot_hash"],
+        data_source=dataset["source"],
+        stocks=dataset["stocks"],
     )
     calibrations = repository.active_calibrations()
     version_token = str(
@@ -358,12 +411,8 @@ def run_daily_decision_v3(
         item["stock_code"]: float(item["price"])
         for item in dataset["stocks"]
     }
-    equity = _account_equity(primary_engine)
-    current_portfolio = _current_portfolio_state(
-        primary_engine,
-        equity=equity,
-        stocks=dataset["stocks"],
-    )
+    equity = float(snapshot["equity"])
+    current_portfolio = dict(snapshot["portfolio_state"])
     learning_reader = getattr(
         repository,
         "strategy_learning_summary",
@@ -403,6 +452,34 @@ def run_daily_decision_v3(
         opportunity_audit_forecasts=all_forecasts,
         decision_at=decision_at,
     )
+    try:
+        shadow_audit = ShadowIntelligenceRepository(
+            primary_engine
+        ).release_audit()
+    except Exception as exc:
+        shadow_audit = {
+            "schema_version": "probiga.trading-v3.shadow-release-audit.v1",
+            "status": "UNAVAILABLE",
+            "blockers": [f"SHADOW_AUDIT_UNAVAILABLE:{type(exc).__name__}"],
+            "releases": [],
+            "automatic_promotion_allowed": False,
+            "order_authority": False,
+        }
+    portfolio = dict(result["portfolio"])
+    opportunity_audit = dict(portfolio.get("opportunity_audit") or {})
+    opportunity_audit["shadow_intelligence"] = {
+        **shadow_audit,
+        "strategy_version": str(config["strategy_version"]),
+        "binding_scope": "READ_ONLY_AUDIT",
+        "affects_order_decision": False,
+        "order_authority": False,
+    }
+    portfolio["opportunity_audit"] = opportunity_audit
+    result = {**result, "portfolio": portfolio}
+    run_status, actionable_status = _decision_truth_status(
+        result,
+        execution_enabled=execution_enabled,
+    )
     run_uid = uuid.uuid4().hex
     regime = classify_regime_probabilities(
         dataset["market_features"]
@@ -428,6 +505,7 @@ def run_daily_decision_v3(
     saved = repository.save_decision(
         run_uid=run_uid,
         trade_date=dataset["trade_date"],
+        requested_as_of=as_of,
         decision_at=decision_at,
         mode=mode,
         model_version=config["strategy_version"],
@@ -438,24 +516,76 @@ def run_daily_decision_v3(
         theme_signals=all_theme_signals,
         data_snapshot_hash=dataset["data_snapshot_hash"],
         hypotheses=hypotheses,
+        run_status=run_status,
+        actionable_status=actionable_status,
+        snapshot_manifest=snapshot["manifest"],
+        defer_completion=True,
     )
-    position_sync = sync_position_states(
-        primary_engine,
-        trade_date=dataset["trade_date"],
-        equity=equity,
-        stocks=dataset["stocks"],
-        forecasts=all_forecasts,
-        targets=result["portfolio"]["targets"],
-        hypotheses=hypotheses,
-        decision_quality_status=regime.quality_status,
-    )
-    execution = materialize_internal_paper_orders(
-        primary_engine,
-        run_uid=run_uid,
-    )
+    if execution_enabled:
+        try:
+            position_sync = sync_position_states(
+                primary_engine,
+                trade_date=dataset["trade_date"],
+                equity=equity,
+                stocks=dataset["stocks"],
+                forecasts=all_forecasts,
+                targets=result["portfolio"]["targets"],
+                hypotheses=hypotheses,
+                decision_quality_status=regime.quality_status,
+            )
+        except Exception as exc:
+            repository.mark_run_failed(
+                run_uid,
+                stage="POSITION_SYNC",
+                error=exc,
+            )
+            raise RuntimeError(
+                f"V3_POSITION_SYNC_FAILED: {exc}"
+            ) from exc
+    else:
+        # Historical/replay decisions may persist their own immutable research
+        # batch, but must never rewrite today's position state projection.
+        position_sync = {
+            "status": "replay_only",
+            "updated_count": 0,
+        }
+    if execution_enabled:
+        try:
+            execution = materialize_internal_paper_orders(
+                primary_engine,
+                run_uid=run_uid,
+            )
+        except Exception as exc:
+            repository.mark_run_failed(
+                run_uid,
+                stage="ORDER_MATERIALIZATION",
+                error=exc,
+            )
+            raise RuntimeError(
+                f"V3_ORDER_MATERIALIZATION_FAILED: {exc}"
+            ) from exc
+    else:
+        execution = {
+            "status": "replay_only",
+            "paper_order_count": 0,
+            "created": [],
+            "skipped": [],
+        }
+    try:
+        repository.finalize_run(run_uid, status=run_status)
+    except Exception as exc:
+        repository.mark_run_failed(
+            run_uid,
+            stage="RUN_FINALIZATION",
+            error=exc,
+        )
+        raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
     return {
-        "status": "ok",
+        "status": "blocked" if run_status == "BLOCKED" else "ok",
         **saved,
+        "run_status": run_status,
+        "actionable_status": actionable_status,
+        "snapshot_manifest_hash": snapshot["manifest"]["manifest_hash"],
         "trade_date": dataset["trade_date"].isoformat(),
         "decision_at": decision_at.isoformat(sep=" "),
         "mode": mode,

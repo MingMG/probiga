@@ -162,3 +162,63 @@ def create_pooled_engine(
     engine = create_engine(url, **engine_kwargs)
     event.listen(engine, "connect", _verify_runtime_mysql_tls)
     return engine
+
+
+def create_isolated_mysql_acceptance_engine(
+    url: str,
+    *,
+    ssl_ca: str,
+    **kwargs: Any,
+) -> Engine:
+    """Create the TLS-only engine used by isolated MySQL acceptance runs.
+
+    Acceptance instances use a short-lived, explicitly supplied CA instead
+    of the production runtime CA. Engine construction still stays in this
+    central factory, and callers cannot weaken certificate verification or
+    replace the DBAPI connection path.
+    """
+
+    parsed_url = make_url(url)
+    if parsed_url.get_backend_name() != "mysql":
+        raise RuntimeError("isolated MySQL acceptance requires a MySQL URL")
+    if parsed_url.drivername != "mysql+pymysql":
+        raise RuntimeError(
+            "isolated MySQL acceptance requires an explicit mysql+pymysql URL"
+        )
+    query_overrides = _tls_override_keys(parsed_url.query)
+    if query_overrides:
+        raise RuntimeError(
+            "MySQL TLS parameters must not be embedded in the database URL: "
+            + ", ".join(sorted(query_overrides))
+        )
+    forbidden = frozenset(kwargs) & {"connect_args", "creator", "module"}
+    if forbidden:
+        raise RuntimeError(
+            "isolated MySQL acceptance forbids engine policy overrides: "
+            + ", ".join(sorted(forbidden))
+        )
+
+    ca_path = Path(str(ssl_ca or "")).expanduser()
+    if not ca_path.is_absolute():
+        raise RuntimeError("isolated MySQL acceptance CA must be absolute")
+    try:
+        resolved_ca = ca_path.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "isolated MySQL acceptance CA does not exist"
+        ) from exc
+    if not resolved_ca.is_file():
+        raise RuntimeError(
+            "isolated MySQL acceptance CA must identify a regular file"
+        )
+
+    engine = create_engine(
+        url,
+        connect_args={
+            "ssl_ca": str(resolved_ca),
+            "ssl_verify_cert": True,
+        },
+        **kwargs,
+    )
+    event.listen(engine, "connect", _verify_runtime_mysql_tls)
+    return engine

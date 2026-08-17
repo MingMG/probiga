@@ -18,6 +18,22 @@ from server.integrations.v3_execution_projection_outbox.schema import (
     V3_PROJECTION_OUTBOX_DDL,
     validate_v3_projection_outbox_schema,
 )
+from server.trading_v3.horizon_candidate_ledger_schema import (
+    HORIZON_CANDIDATE_LEDGER_DDL,
+    HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
+    validate_horizon_candidate_ledger_schema,
+    validate_horizon_candidate_ledger_server,
+)
+from server.trading_v3.horizon_protocol_v2_schema import (
+    HORIZON_PROTOCOL_V2_DDL,
+    HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
+    validate_horizon_protocol_v2_schema,
+)
+from server.trading_v3.shadow_intelligence_schema import (
+    SHADOW_INTELLIGENCE_DDL,
+    SHADOW_INTELLIGENCE_MIGRATION_VERSION,
+    validate_shadow_intelligence_schema,
+)
 
 
 MIGRATION_TABLE_DDL = """
@@ -85,6 +101,75 @@ class V3MigrationAcceptanceFaultHook:
             committed_statement_count=committed_statement_count,
         )
 
+    @classmethod
+    def after_shadow_fk_ddl_commit(
+        cls,
+        constraint_name: str,
+    ) -> "V3MigrationAcceptanceFaultHook":
+        expected = str(constraint_name or "").strip().casefold()
+        supported = {
+            "fk_v3_calibration_gate_learning_run",
+            "fk_v3_shadow_release_gate",
+        }
+        if expected not in supported:
+            raise ValueError(
+                "shadow acceptance fault must target a recoverable ALTER FK"
+            )
+        matches = [
+            index
+            for index, statement in enumerate(
+                SHADOW_INTELLIGENCE_DDL,
+                start=1,
+            )
+            if f"add constraint {expected}" in _normalized_sql(statement)
+        ]
+        if len(matches) != 1 or matches[0] >= len(SHADOW_INTELLIGENCE_DDL):
+            raise RuntimeError(
+                "shadow acceptance FK statement inventory is invalid"
+            )
+        return cls(
+            version=SHADOW_INTELLIGENCE_MIGRATION_VERSION,
+            committed_statement_count=matches[0],
+        )
+
+    @classmethod
+    def after_horizon_protocol_v2_ddl_commit(
+        cls,
+        committed_statement_count: int,
+    ) -> "V3MigrationAcceptanceFaultHook":
+        supported_counts = {1, 2, 4, 6, 8}
+        if (
+            type(committed_statement_count) is not int
+            or committed_statement_count not in supported_counts
+        ):
+            raise ValueError(
+                "horizon protocol V2 acceptance fault must target a "
+                "recoverable committed DDL boundary"
+            )
+        return cls(
+            version=HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
+            committed_statement_count=committed_statement_count,
+        )
+
+    @classmethod
+    def after_horizon_candidate_ledger_ddl_commit(
+        cls,
+        committed_statement_count: int,
+    ) -> "V3MigrationAcceptanceFaultHook":
+        supported_counts = {1, 3, 5, 7}
+        if (
+            type(committed_statement_count) is not int
+            or committed_statement_count not in supported_counts
+        ):
+            raise ValueError(
+                "horizon candidate-ledger acceptance fault must target a "
+                "recoverable committed DDL boundary"
+            )
+        return cls(
+            version=HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
+            committed_statement_count=committed_statement_count,
+        )
+
     def raise_if_matches(self, *, version: str, statement_count: int) -> None:
         if self.triggered:
             raise RuntimeError("a V3 acceptance fault hook cannot be reused")
@@ -94,20 +179,46 @@ class V3MigrationAcceptanceFaultHook:
         ):
             self.triggered = True
             raise V3MigrationAcceptanceFault(
-                "intentional V3 outbox migration fault after committed DDL: "
+                "intentional V3 migration fault after committed DDL: "
                 f"{version} statement={statement_count}"
             )
 
     def validate(self) -> None:
-        if self.version != V3_PROJECTION_OUTBOX_MIGRATION_VERSION:
-            raise ValueError(
-                "V3 acceptance faults may target only the outbox migration"
+        if self.version == V3_PROJECTION_OUTBOX_MIGRATION_VERSION:
+            valid_count = (
+                type(self.committed_statement_count) is int
+                and 1 <= self.committed_statement_count
+                < len(V3_PROJECTION_OUTBOX_DDL)
             )
-        if type(self.committed_statement_count) is not int or not (
-            1 <= self.committed_statement_count < len(V3_PROJECTION_OUTBOX_DDL)
-        ):
+        elif self.version == SHADOW_INTELLIGENCE_MIGRATION_VERSION:
+            valid_count = self.committed_statement_count in {
+                cls.committed_statement_count
+                for cls in (
+                    self.after_shadow_fk_ddl_commit(
+                        "fk_v3_calibration_gate_learning_run"
+                    ),
+                    self.after_shadow_fk_ddl_commit(
+                        "fk_v3_shadow_release_gate"
+                    ),
+                )
+            }
+        elif self.version == HORIZON_PROTOCOL_V2_MIGRATION_VERSION:
+            valid_count = (
+                type(self.committed_statement_count) is int
+                and self.committed_statement_count in {1, 2, 4, 6, 8}
+            )
+        elif self.version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
+            valid_count = (
+                type(self.committed_statement_count) is int
+                and self.committed_statement_count in {1, 3, 5, 7}
+            )
+        else:
             raise ValueError(
-                "outbox acceptance fault must leave the migration incomplete"
+                "V3 acceptance fault target migration is unsupported"
+            )
+        if not valid_count:
+            raise ValueError(
+                "V3 acceptance fault must leave a supported migration incomplete"
             )
         if type(self.triggered) is not bool or self.triggered:
             raise ValueError("V3 acceptance fault hook must be fresh")
@@ -1376,8 +1487,20 @@ MIGRATIONS = (
 # independently repeatable after MySQL's implicit DDL commit.
 MIGRATIONS = MIGRATIONS + (
     {
+        "version": SHADOW_INTELLIGENCE_MIGRATION_VERSION,
+        "statements": tuple(SHADOW_INTELLIGENCE_DDL),
+    },
+    {
         "version": V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
         "statements": tuple(V3_PROJECTION_OUTBOX_DDL),
+    },
+    {
+        "version": HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
+        "statements": tuple(HORIZON_PROTOCOL_V2_DDL),
+    },
+    {
+        "version": HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
+        "statements": tuple(HORIZON_CANDIDATE_LEDGER_DDL),
     },
 )
 
@@ -1645,6 +1768,14 @@ _CREATE_INDEX_RE = re.compile(
     r"`?([a-z0-9_]+)`?\s*\(([^)]+)\)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+_ALTER_ADD_FOREIGN_KEY_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+`?([a-z0-9_]+)`?\s+"
+    r"ADD\s+CONSTRAINT\s+`?([a-z0-9_]+)`?\s+"
+    r"FOREIGN\s+KEY\s*\(\s*`?([a-z0-9_]+)`?\s*\)\s+"
+    r"REFERENCES\s+`?([a-z0-9_]+)`?\s*"
+    r"\(\s*`?([a-z0-9_]+)`?\s*\)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _normalized_sql(value: object) -> str:
@@ -1700,6 +1831,55 @@ def _ddl_statement_already_applied(
         if not exact:
             raise RuntimeError(
                 f"V3 migration recovery found a drifted trigger: {trigger_name}"
+            )
+        return True
+
+    add_foreign_key = _ALTER_ADD_FOREIGN_KEY_RE.match(statement)
+    if add_foreign_key is not None:
+        (
+            table_name,
+            constraint_name,
+            column_name,
+            referenced_table,
+            referenced_column,
+        ) = add_foreign_key.groups()
+        rows = tuple(connection.execute(
+            text(
+                "SELECT k.TABLE_NAME, k.COLUMN_NAME, "
+                "k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, "
+                "r.UPDATE_RULE, r.DELETE_RULE "
+                "FROM information_schema.KEY_COLUMN_USAGE k "
+                "JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+                "ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
+                "AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+                "AND r.TABLE_NAME = k.TABLE_NAME "
+                "WHERE k.CONSTRAINT_SCHEMA = DATABASE() "
+                "AND k.CONSTRAINT_NAME = :constraint_name "
+                "ORDER BY k.ORDINAL_POSITION"
+            ),
+            {"constraint_name": constraint_name},
+        ).mappings())
+        if not rows:
+            return False
+        exact = (
+            len(rows) == 1
+            and str(rows[0]["TABLE_NAME"]).casefold()
+                == table_name.casefold()
+            and str(rows[0]["COLUMN_NAME"]).casefold()
+                == column_name.casefold()
+            and str(rows[0]["REFERENCED_TABLE_NAME"]).casefold()
+                == referenced_table.casefold()
+            and str(rows[0]["REFERENCED_COLUMN_NAME"]).casefold()
+                == referenced_column.casefold()
+            and str(rows[0]["UPDATE_RULE"]).upper()
+                in {"RESTRICT", "NO ACTION"}
+            and str(rows[0]["DELETE_RULE"]).upper()
+                in {"RESTRICT", "NO ACTION"}
+        )
+        if not exact:
+            raise RuntimeError(
+                "V3 migration recovery found a drifted foreign key: "
+                f"{constraint_name}"
             )
         return True
 
@@ -1813,8 +1993,14 @@ def _validate_applied_migration(
     *,
     version: str,
 ) -> None:
+    if version == SHADOW_INTELLIGENCE_MIGRATION_VERSION:
+        validate_shadow_intelligence_schema(connection)
     if version == V3_PROJECTION_OUTBOX_MIGRATION_VERSION:
         validate_v3_projection_outbox_schema(connection)
+    if version == HORIZON_PROTOCOL_V2_MIGRATION_VERSION:
+        validate_horizon_protocol_v2_schema(connection)
+    if version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
+        validate_horizon_candidate_ledger_schema(connection)
 
 
 def _run_v3_migrations_unlocked(
@@ -1876,6 +2062,8 @@ def _run_v3_migrations_unlocked(
             statements = tuple(migration["statements"])
             checksum = _checksum(statements)
             statement_count = len(statements)
+            if version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
+                validate_horizon_candidate_ledger_server(connection)
             applied = _applied_record(connection, version)
             if applied is not None:
                 if (
@@ -2018,5 +2206,8 @@ __all__ = [
     "V3MigrationAcceptanceFault",
     "V3MigrationAcceptanceFaultHook",
     "V3_PROJECTION_OUTBOX_MIGRATION_VERSION",
+    "HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION",
+    "HORIZON_PROTOCOL_V2_MIGRATION_VERSION",
+    "SHADOW_INTELLIGENCE_MIGRATION_VERSION",
     "run_v3_migrations",
 ]

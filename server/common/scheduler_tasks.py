@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -196,6 +197,60 @@ def update_scheduler_tasks(
             {**update_payload, **dict(lookup_params)},
         )
     return int(getattr(result, "rowcount", 0) or 0)
+
+
+def set_scheduler_tasks_enabled_atomically(
+    engine: Engine,
+    task_types: Sequence[str],
+    *,
+    enabled: bool,
+    expected_row_count: int | None = None,
+    table_name: str = SCHEDULED_TASK_TABLE,
+) -> int:
+    """Set an exact task set's enabled bit in one fail-closed transaction.
+
+    When ``expected_row_count`` is supplied, the cardinality check happens
+    before the transaction context exits.  A missing or duplicate task row
+    therefore raises and rolls the whole update back.
+    """
+
+    normalized = tuple(str(item).strip() for item in task_types)
+    if not normalized or any(not item for item in normalized):
+        raise ValueError("task_types must contain non-empty values")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("task_types must be unique")
+    if type(enabled) is not bool:
+        raise TypeError("enabled must be a strict boolean")
+    if expected_row_count is not None and (
+        type(expected_row_count) is not int or expected_row_count < 0
+    ):
+        raise ValueError("expected_row_count must be a non-negative integer")
+
+    quoted_table = quote_identifier(table_name)
+    quoted_enabled = quote_identifier("enabled")
+    quoted_task_type = quote_identifier("task_type")
+    bind_names = tuple(f"task_type_{index}" for index in range(len(normalized)))
+    placeholders = ", ".join(f":{name}" for name in bind_names)
+    params = {
+        "enabled": 1 if enabled else 0,
+        **dict(zip(bind_names, normalized, strict=True)),
+    }
+    statement = text(
+        f"UPDATE {quoted_table} SET {quoted_enabled} = :enabled "
+        f"WHERE {quoted_task_type} IN ({placeholders})"
+    )
+    with engine.begin() as connection:
+        result = connection.execute(statement, params)
+        changed = int(getattr(result, "rowcount", 0) or 0)
+        if (
+            expected_row_count is not None
+            and changed != expected_row_count
+        ):
+            raise RuntimeError(
+                "scheduler task enablement cardinality mismatch: "
+                f"expected={expected_row_count}, changed={changed}"
+            )
+    return changed
 
 
 def update_scheduler_task(

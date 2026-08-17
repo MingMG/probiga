@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +23,11 @@ from server.trading_v2.oms import order_idempotency_key
 from server.trading_v2.position_monitor import _persist_exit_chain
 
 from .config import load_v3_config
+from .decision_truth import (
+    canonical_hash,
+    canonical_target_ledger,
+    decision_result_hash,
+)
 
 
 ACTIVE_ORDER_STATES = (
@@ -285,8 +290,355 @@ def _next_trade_date(connection, source_date: date) -> date:
         {"source_date": source_date},
     ).scalar()
     if value is None:
-        return source_date + timedelta(days=1)
+        raise RuntimeError("V3_NEXT_TRADE_SESSION_UNAVAILABLE")
     return value if isinstance(value, date) else date.fromisoformat(str(value))
+
+
+def _verify_persisted_decision_truth(
+    connection,
+    *,
+    account: dict[str, Any],
+    run: dict[str, Any],
+    targets: list[dict[str, Any]],
+    account_id: str,
+    now: datetime,
+) -> tuple[dict[str, Any], float, bool, str]:
+    """Revalidate the immutable decision snapshot before creating BUYs."""
+
+    if str(account.get("status") or "") != "ACTIVE":
+        raise RuntimeError("V3_ACCOUNT_NOT_ACTIVE")
+    if int(account.get("real_trading_enabled") or 0) != 0:
+        raise RuntimeError("V3_REAL_TRADING_SWITCH_ENABLED")
+    if float(account.get("cash_balance") or 0) < 0:
+        raise RuntimeError("V3_ACCOUNT_CASH_INVALID")
+    integrity_reason = ""
+
+    def block(reason: str) -> None:
+        nonlocal integrity_reason
+        if not integrity_reason:
+            integrity_reason = reason
+
+    try:
+        portfolio = json.loads(str(run.get("portfolio_json") or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        portfolio = {}
+        block("V3_PORTFOLIO_MANIFEST_INVALID")
+    manifest = dict(portfolio.get("decision_snapshot") or {})
+    decision_truth = dict(portfolio.get("decision_truth") or {})
+    if bool(manifest) != bool(decision_truth):
+        block("V3_DECISION_TRUTH_ENVELOPE_INCOMPLETE")
+    if manifest and decision_truth:
+        stored_hash = str(manifest.pop("manifest_hash", ""))
+        if not stored_hash or canonical_hash(manifest) != stored_hash:
+            block("V3_DECISION_SNAPSHOT_HASH_MISMATCH")
+        manifest["manifest_hash"] = stored_hash
+        if str(manifest.get("trade_date") or "") != str(run["trade_date"]):
+            block("V3_DECISION_SNAPSHOT_DATE_MISMATCH")
+        if (
+            str((manifest.get("account") or {}).get("account_id") or "")
+            != account_id
+        ):
+            block("V3_DECISION_SNAPSHOT_ACCOUNT_MISMATCH")
+        if str(
+            (manifest.get("reconciliation") or {}).get("status") or ""
+        ) != "PASS":
+            block("V3_DECISION_SNAPSHOT_RECONCILIATION_BLOCKED")
+        if str(decision_truth.get("schema_version") or "") != (
+            "probiga.trading-v3.decision-truth.v1"
+        ):
+            block("V3_DECISION_TRUTH_SCHEMA_INVALID")
+        if decision_truth.get("order_authority") is not False:
+            block("V3_DECISION_TRUTH_ORDER_AUTHORITY_INVALID")
+        if decision_truth.get("real_order_allowed") is not False:
+            block("V3_DECISION_TRUTH_REAL_ORDER_INVALID")
+        if str(decision_truth.get("execution_authority") or "") != (
+            "V2_CANONICAL_LEDGER"
+        ):
+            block("V3_DECISION_TRUTH_EXECUTION_AUTHORITY_INVALID")
+        lifecycle = str(run.get("lifecycle_status") or "").upper()
+        paper_lifecycle = lifecycle in {"PAPER_TRIAL", "PAPER_ACTIVE"}
+        expected_scope = (
+            "INTERNAL_PAPER_TRIAL" if paper_lifecycle else "RESEARCH_ONLY"
+        )
+        if str(decision_truth.get("decision_scope") or "") != expected_scope:
+            block("V3_DECISION_TRUTH_SCOPE_MISMATCH")
+        if (
+            not paper_lifecycle
+            and str(decision_truth.get("paper_order_authority") or "")
+            != "NONE"
+        ):
+            block("V3_RESEARCH_RUN_CLAIMS_PAPER_AUTHORITY")
+        truth_run_status = str(
+            decision_truth.get("run_status") or ""
+        ).upper()
+        if truth_run_status not in {"COMPLETED", "BLOCKED"}:
+            block("V3_DECISION_TRUTH_RUN_STATUS_INVALID")
+        if str(run.get("status") or "").upper() not in {
+            "PROCESSING",
+            truth_run_status,
+        }:
+            block("V3_DECISION_TRUTH_RUN_STATUS_MISMATCH")
+    source_date = run["trade_date"]
+    equity = connection.execute(
+        text(
+            """
+            SELECT total_equity, cash_balance, trade_date, created_at
+            FROM st_equity_daily_v2
+            WHERE account_id = :account_id
+              AND trade_date = :trade_date
+              AND created_at <= :now
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "account_id": account_id,
+            "trade_date": source_date,
+            "now": now,
+        },
+    ).mappings().first()
+    reconciliation = connection.execute(
+        text(
+            """
+            SELECT status, reconciliation_hash, trade_date, version,
+                   created_at
+            FROM st_reconciliation_v2
+            WHERE account_id = :account_id
+              AND trade_date = :trade_date
+              AND created_at <= :now
+            ORDER BY version DESC, created_at DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "account_id": account_id,
+            "trade_date": source_date,
+            "now": now,
+        },
+    ).mappings().first()
+    account_equity = float((equity or {}).get("total_equity") or 0)
+    if account_equity <= 0:
+        block("V3_EQUITY_SNAPSHOT_MISSING_OR_ZERO")
+    if not reconciliation or str(reconciliation.get("status") or "") != "PASS":
+        block("V3_RECONCILIATION_NOT_PASS")
+    try:
+        account_updated_at = datetime.fromisoformat(
+            str(account.get("updated_at") or "")
+        )
+        reconciliation_created_at = datetime.fromisoformat(
+            str((reconciliation or {}).get("created_at") or "")
+        )
+    except ValueError:
+        block("V3_ACCOUNT_RECONCILIATION_CLOCK_MISSING")
+        account_updated_at = now
+        reconciliation_created_at = datetime.min
+    if account_updated_at > reconciliation_created_at:
+        block("V3_ACCOUNT_CHANGED_AFTER_RECONCILIATION")
+    if manifest and decision_truth:
+        frozen_equity = float(
+            (manifest.get("equity") or {}).get("total_equity") or 0
+        )
+        if frozen_equity <= 0:
+            block("V3_FROZEN_EQUITY_INVALID")
+        if abs(frozen_equity - account_equity) > 0.01:
+            block("V3_EQUITY_CHANGED_AFTER_DECISION")
+        frozen_reconciliation = str(
+            (manifest.get("reconciliation") or {}).get(
+                "reconciliation_hash"
+            )
+            or ""
+        )
+        if frozen_reconciliation != str(
+            (reconciliation or {}).get("reconciliation_hash") or ""
+        ):
+            block("V3_RECONCILIATION_CHANGED_AFTER_DECISION")
+
+    decision_integrity = dict(portfolio.get("decision_integrity") or {})
+    if str(decision_integrity.get("schema_version") or "") != (
+        "probiga.trading-v3.decision-integrity.v1"
+    ):
+        block("V3_DECISION_INTEGRITY_ENVELOPE_MISSING")
+    else:
+        try:
+            source_trade_date = (
+                source_date
+                if isinstance(source_date, date)
+                else date.fromisoformat(str(source_date))
+            )
+            if any(
+                str(row.get("run_uid") or run.get("run_uid") or "")
+                != str(run.get("run_uid") or "")
+                or str(row.get("trade_date") or source_trade_date)
+                != str(source_trade_date)
+                for row in targets
+            ):
+                raise ValueError("target run/date binding mismatch")
+            target_ledger = canonical_target_ledger(
+                targets,
+                run_uid=str(run.get("run_uid") or ""),
+                trade_date=source_trade_date,
+                persisted=True,
+            )
+            if (
+                canonical_hash(target_ledger)
+                != str(decision_integrity.get("target_ledger_hash") or "")
+            ):
+                raise ValueError("target ledger hash mismatch")
+            if len(targets) != int(
+                decision_integrity.get("target_count") or 0
+            ):
+                raise ValueError("target count mismatch")
+            persisted_counts = connection.execute(
+                text(
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM st_alpha_forecast_v3
+                         WHERE run_uid = :run_uid) AS forecast_count,
+                        (SELECT COUNT(*) FROM st_theme_signal_v3
+                         WHERE run_uid = :run_uid) AS theme_signal_count,
+                        (SELECT COUNT(*) FROM st_trade_hypothesis_v3
+                         WHERE run_uid = :run_uid) AS hypothesis_count
+                    """
+                ),
+                {"run_uid": str(run.get("run_uid") or "")},
+            ).mappings().first()
+            if not persisted_counts:
+                raise ValueError("decision ledger counts unavailable")
+            expected_forecast_count = int(
+                decision_integrity.get("forecast_count") or 0
+            )
+            expected_theme_count = int(
+                decision_integrity.get("persisted_theme_signal_count") or 0
+            )
+            expected_hypothesis_count = int(
+                decision_integrity.get("hypothesis_count") or 0
+            )
+            if int(persisted_counts.get("forecast_count") or 0) != (
+                expected_forecast_count
+            ):
+                raise ValueError("forecast ledger count mismatch")
+            if int(persisted_counts.get("theme_signal_count") or 0) != (
+                expected_theme_count
+            ):
+                raise ValueError("theme ledger count mismatch")
+            if int(persisted_counts.get("hypothesis_count") or 0) != (
+                expected_hypothesis_count
+            ):
+                raise ValueError("hypothesis ledger count mismatch")
+            if int(run.get("forecast_count") or 0) != expected_forecast_count:
+                raise ValueError("run forecast count mismatch")
+            if int(run.get("target_count") or 0) != len(targets):
+                raise ValueError("run target count mismatch")
+            regime = json.loads(str(run.get("regime_json") or "{}"))
+            recomputed_result_hash = decision_result_hash(
+                regime=regime,
+                portfolio=portfolio,
+                forecast_count=expected_forecast_count,
+                theme_signal_count=int(
+                    decision_integrity.get("raw_theme_signal_count") or 0
+                ),
+                hypothesis_count=expected_hypothesis_count,
+            )
+            if recomputed_result_hash != str(run.get("result_hash") or ""):
+                raise ValueError("decision result hash mismatch")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            block("V3_DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED")
+
+    truth_verified = bool(
+        manifest
+        and decision_truth
+        and not integrity_reason
+    )
+    return portfolio, account_equity, truth_verified, integrity_reason
+
+
+def _evaluate_cumulative_buy_risk(
+    *,
+    requested_quantity: int,
+    worst_price: float,
+    initial_stop: float,
+    current_code_value: float,
+    current_total_value: float,
+    current_theme_value: float,
+    current_open_risk_cny: float,
+    available_cash_cny: float,
+    current_turnover_cny: float,
+    equity_cny: float,
+    creates_new_position: bool,
+    live_position_count: int,
+    maximum_live_positions: int,
+    maximum_single_weight: float,
+    maximum_total_weight: float,
+    maximum_theme_weight: float,
+    maximum_open_risk_weight: float,
+    maximum_daily_turnover_weight: float,
+    commission_rate: float = 0.0,
+    minimum_commission_cny: float = 0.0,
+    transfer_fee_rate: float = 0.0,
+) -> dict[str, Any]:
+    notional = max(0, requested_quantity) * max(0.0, worst_price)
+    estimated_buy_fee = (
+        max(minimum_commission_cny, notional * commission_rate)
+        + notional * transfer_fee_rate
+        if notional > 0
+        else 0.0
+    )
+    cash_reservation = notional + estimated_buy_fee
+    trade_risk = max(0, requested_quantity) * max(
+        0.0,
+        worst_price - initial_stop,
+    )
+    post_cash = available_cash_cny - cash_reservation
+    post_single_weight = (current_code_value + notional) / equity_cny
+    post_total_weight = (current_total_value + notional) / equity_cny
+    post_theme_weight = (current_theme_value + notional) / equity_cny
+    post_open_risk_cny = current_open_risk_cny + trade_risk
+    post_turnover_weight = (current_turnover_cny + notional) / equity_cny
+    checks = {
+        "CASH_AVAILABLE": post_cash >= -0.01,
+        "SINGLE_POSITION_CAP": (
+            post_single_weight <= maximum_single_weight + 1e-9
+        ),
+        "TOTAL_RISK_ASSET_CAP": (
+            post_total_weight <= maximum_total_weight + 1e-9
+        ),
+        "THEME_EXPOSURE_CAP": (
+            post_theme_weight <= maximum_theme_weight + 1e-9
+        ),
+        "OPEN_RISK_CAP": (
+            post_open_risk_cny / equity_cny
+            <= maximum_open_risk_weight + 1e-9
+        ),
+        "DAILY_TURNOVER_CAP": (
+            post_turnover_weight
+            <= maximum_daily_turnover_weight + 1e-9
+        ),
+        "LIVE_POSITION_CAP": (
+            not creates_new_position
+            or live_position_count < maximum_live_positions
+        ),
+        "REAL_TRADING_DISABLED": True,
+    }
+    first_failure = next(
+        (key for key, passed in checks.items() if not passed),
+        None,
+    )
+    return {
+        "decision_status": "REJECTED" if first_failure else "APPROVED",
+        "approved_quantity": 0 if first_failure else requested_quantity,
+        "trade_risk": trade_risk,
+        "post_cash": post_cash,
+        "post_single_weight": post_single_weight,
+        "post_total_weight": post_total_weight,
+        "post_theme_weight": post_theme_weight,
+        "post_open_risk_cny": post_open_risk_cny,
+        "post_turnover_weight": post_turnover_weight,
+        "checks": checks,
+        "first_failure": first_failure,
+        "reserved_notional": notional,
+        "cash_reservation": cash_reservation,
+        "estimated_buy_fee": estimated_buy_fee,
+    }
 
 
 def materialize_internal_paper_orders(
@@ -328,8 +680,6 @@ def materialize_internal_paper_orders(
         ).mappings().first()
         if not account:
             raise RuntimeError("ProBigA 模拟账户不存在")
-        if int(account.get("real_trading_enabled") or 0) != 0:
-            raise RuntimeError("V3 只允许内部模拟盘，真实交易开关必须为 0")
         run = connection.execute(
             text(
                 """
@@ -341,25 +691,81 @@ def materialize_internal_paper_orders(
             ),
             {"run_uid": run_uid},
         ).mappings().first()
-        if not run or run["status"] != "COMPLETED":
+        if not run or str(run["status"]) not in {
+            "PROCESSING",
+            "COMPLETED",
+            "BLOCKED",
+        }:
             raise RuntimeError("V3 决策批次不存在或尚未完成")
-        targets = connection.execute(
-            text(
-                """
-                SELECT t.*,
-                       (
-                           SELECT MIN(f.initial_stop_pct)
-                           FROM st_alpha_forecast_v3 f
-                           WHERE f.run_uid = t.run_uid
-                             AND f.stock_code = t.stock_code
-                       ) AS initial_stop_pct
-                FROM st_target_portfolio_v3 t
-                WHERE t.run_uid = :run_uid
-                ORDER BY t.rank_no
-                """
-            ),
-            {"run_uid": run_uid},
-        ).mappings().all()
+        target_lock_clause = (
+            ""
+            if str(
+                getattr(getattr(connection, "dialect", None), "name", "")
+            ).casefold()
+            == "sqlite"
+            else " FOR UPDATE"
+        )
+        targets = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    f"""
+                    SELECT t.*,
+                           (
+                               SELECT MIN(f.initial_stop_pct)
+                               FROM st_alpha_forecast_v3 f
+                               WHERE f.run_uid = t.run_uid
+                                 AND f.stock_code = t.stock_code
+                           ) AS initial_stop_pct
+                    FROM st_target_portfolio_v3 t
+                    WHERE t.run_uid = :run_uid
+                    ORDER BY t.rank_no
+                    {target_lock_clause}
+                    """
+                ),
+                {"run_uid": run_uid},
+            ).mappings().all()
+        ]
+        (
+            portfolio_payload,
+            account_equity,
+            decision_truth_verified,
+            decision_integrity_reason,
+        ) = _verify_persisted_decision_truth(
+            connection,
+            account=dict(account),
+            run=dict(run),
+            targets=targets,
+            account_id=account_id,
+            now=now,
+        )
+        decision_truth = dict(
+            portfolio_payload.get("decision_truth") or {}
+        )
+        buy_materialization_allowed = bool(
+            decision_truth_verified
+            and str(decision_truth.get("run_status") or "")
+            == "COMPLETED"
+            and str(decision_truth.get("actionable_status") or "")
+            == "PAPER_ACTIONABLE"
+            and str(decision_truth.get("paper_order_authority") or "")
+            == "V2_GATED"
+            and str(run.get("lifecycle_status") or "").upper()
+            in {"PAPER_TRIAL", "PAPER_ACTIVE"}
+            and str(decision_truth.get("decision_scope") or "")
+            == "INTERNAL_PAPER_TRIAL"
+        )
+        valuation_prices = {
+            str(code): float(value or 0)
+            for code, value in dict(
+                (
+                    portfolio_payload.get("decision_snapshot")
+                    or {}
+                ).get("valuation_prices")
+                or {}
+            ).items()
+            if str(code) and float(value or 0) > 0
+        }
         superseded = _cancel_superseded_v3_buys(
             connection,
             account_id=account_id,
@@ -403,8 +809,139 @@ def materialize_internal_paper_orders(
                 {"account_id": account_id},
             ).all()
         }
+        existing_positions = connection.execute(
+            text(
+                """
+                SELECT stock_code, theme_code, remaining_quantity,
+                       cost_price, protective_stop
+                FROM st_position_lot_v2
+                WHERE account_id = :account_id
+                  AND remaining_quantity > 0
+                ORDER BY stock_code, lot_id
+                """
+            ),
+            {"account_id": account_id},
+        ).mappings().all()
+        active_buy_orders = connection.execute(
+            text(
+                """
+                SELECT o.stock_code, o.quantity, o.filled_quantity,
+                       o.limit_price, i.worst_price, i.protective_stop,
+                       i.theme_code
+                FROM st_order_v2 o
+                JOIN st_trade_intent_v2 i ON i.intent_id = o.intent_id
+                WHERE o.account_id = :account_id
+                  AND o.side = 'BUY'
+                  AND o.status IN (
+                      'CREATED', 'RISK_APPROVED', 'QUEUED',
+                      'PARTIALLY_FILLED'
+                  )
+                ORDER BY o.stock_code, o.order_id
+                """
+            ),
+            {"account_id": account_id},
+        ).mappings().all()
+        account_policy = dict(config.get("account") or {})
+        commission_rate = float(
+            account_policy.get("commission_rate", 0.0)
+        )
+        minimum_commission_cny = float(
+            account_policy.get("minimum_commission_cny", 0.0)
+        )
+        transfer_fee_rate = float(
+            account_policy.get("transfer_fee_rate", 0.0)
+        )
+        code_values: dict[str, float] = {}
+        theme_values: dict[str, float] = {}
+        cumulative_total_value = 0.0
+        cumulative_open_risk_cny = 0.0
+        cumulative_turnover_cny = 0.0
+        reserved_cash_cny = 0.0
+        valuation_unverified_codes: list[str] = []
+        for raw in existing_positions:
+            row = dict(raw)
+            code = str(row.get("stock_code") or "")
+            theme = str(row.get("theme_code") or "")
+            quantity = int(row.get("remaining_quantity") or 0)
+            price = float(valuation_prices.get(code) or 0)
+            if quantity > 0 and price <= 0:
+                valuation_unverified_codes.append(code)
+                continue
+            value = max(0, quantity) * max(0.0, price)
+            code_values[code] = code_values.get(code, 0.0) + value
+            if theme:
+                theme_values[theme] = theme_values.get(theme, 0.0) + value
+            cumulative_total_value += value
+            stop = float(row.get("protective_stop") or 0)
+            cumulative_open_risk_cny += max(0, quantity) * (
+                max(0.0, price - stop) if stop > 0 else price * 0.08
+            )
+        for raw in active_buy_orders:
+            row = dict(raw)
+            remaining = max(
+                0,
+                int(row.get("quantity") or 0)
+                - int(row.get("filled_quantity") or 0),
+            )
+            price = max(
+                float(row.get("worst_price") or 0),
+                float(row.get("limit_price") or 0),
+            )
+            value = remaining * price
+            code = str(row.get("stock_code") or "")
+            theme = str(row.get("theme_code") or "")
+            code_values[code] = code_values.get(code, 0.0) + value
+            if theme:
+                theme_values[theme] = theme_values.get(theme, 0.0) + value
+            cumulative_total_value += value
+            cumulative_turnover_cny += value
+            reserved_cash_cny += value + (
+                max(minimum_commission_cny, value * commission_rate)
+                + value * transfer_fee_rate
+                if value > 0
+                else 0.0
+            )
+            stop = float(row.get("protective_stop") or 0)
+            cumulative_open_risk_cny += remaining * (
+                max(0.0, price - stop) if stop > 0 else price * 0.08
+            )
+        if valuation_unverified_codes:
+            buy_materialization_allowed = False
+        available_cash_cny = float(account["cash_balance"]) - reserved_cash_cny
+        portfolio_policy = dict(config.get("portfolio") or {})
+        maximum_single_weight = float(
+            portfolio_policy.get("maximum_single_position_weight", 0.12)
+        )
+        maximum_total_weight = float(run.get("risk_asset_cap") or 0)
+        maximum_theme_weight = float(
+            portfolio_policy.get("maximum_theme_weight", 0.25)
+        )
+        maximum_open_risk_weight = float(
+            portfolio_policy.get("maximum_open_risk", 0.02)
+        )
+        maximum_daily_turnover_weight = float(
+            portfolio_policy.get("maximum_daily_turnover", 0.30)
+        )
         source_date = run["trade_date"]
         execution_date = _next_trade_date(connection, source_date)
+        same_day_filled_turnover_cny = float(
+            connection.execute(
+                text(
+                    """
+                    SELECT COALESCE(SUM(ABS(gross_amount)), 0)
+                    FROM st_fill_v2
+                    WHERE account_id = :account_id
+                      AND DATE(filled_at) = :execution_date
+                    """
+                ),
+                {
+                    "account_id": account_id,
+                    "execution_date": execution_date,
+                },
+            ).scalar()
+            or 0
+        )
+        cumulative_turnover_cny += same_day_filled_turnover_cny
         earliest_at = datetime.combine(execution_date, time(9, 30))
         expires_at = datetime.combine(execution_date, time(14, 45))
         exit_states = connection.execute(
@@ -545,21 +1082,36 @@ def materialize_internal_paper_orders(
                 })
         for target in targets:
             code = str(target["stock_code"])
+            if not buy_materialization_allowed:
+                if decision_integrity_reason:
+                    blocked_reason = (
+                        "DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED"
+                    )
+                elif not decision_truth_verified:
+                    blocked_reason = "DECISION_TRUTH_UNVERIFIED"
+                elif valuation_unverified_codes:
+                    blocked_reason = "POSITION_VALUATION_UNVERIFIED"
+                elif (
+                    str(run["status"]) == "BLOCKED"
+                    or str(decision_truth.get("run_status") or "")
+                    == "BLOCKED"
+                ):
+                    blocked_reason = "DECISION_RUN_BLOCKED"
+                else:
+                    blocked_reason = "DECISION_NOT_PAPER_ACTIONABLE"
+                skipped.append({
+                    "stock_code": code,
+                    "side": "BUY",
+                    "status": "BLOCKED",
+                    "reason": blocked_reason,
+                    "integrity_detail": decision_integrity_reason,
+                })
+                continue
             if code in exit_codes:
                 skipped.append({
                     "stock_code": code,
                     "side": "BUY",
                     "reason": "V3_EXIT_HAS_PRIORITY",
-                })
-                continue
-            if (
-                code not in live_position_codes
-                and len(live_position_codes) >= maximum_live_positions
-            ):
-                skipped.append({
-                    "stock_code": code,
-                    "side": "BUY",
-                    "reason": "ACTUAL_PAPER_POSITION_CONFIGURED_CAP",
                 })
                 continue
             paper_discovery = str(
@@ -910,10 +1462,60 @@ def materialize_internal_paper_orders(
                     "created_at": now,
                 },
             )
+            theme_code = str(target.get("theme_code") or "")
+            target_theme_cap = maximum_theme_weight
+            if paper_discovery:
+                target_theme_cap = min(
+                    target_theme_cap,
+                    float(
+                        config.get("paper_discovery", {}).get(
+                            "maximum_theme_weight",
+                            target_theme_cap,
+                        )
+                    ),
+                )
+            risk = _evaluate_cumulative_buy_risk(
+                requested_quantity=delta,
+                worst_price=worst_price,
+                initial_stop=initial_stop,
+                current_code_value=code_values.get(code, 0.0),
+                current_total_value=cumulative_total_value,
+                current_theme_value=theme_values.get(theme_code, 0.0),
+                current_open_risk_cny=cumulative_open_risk_cny,
+                available_cash_cny=available_cash_cny,
+                current_turnover_cny=cumulative_turnover_cny,
+                equity_cny=account_equity,
+                creates_new_position=code not in live_position_codes,
+                live_position_count=len(live_position_codes),
+                maximum_live_positions=maximum_live_positions,
+                maximum_single_weight=maximum_single_weight,
+                maximum_total_weight=maximum_total_weight,
+                maximum_theme_weight=target_theme_cap,
+                maximum_open_risk_weight=maximum_open_risk_weight,
+                maximum_daily_turnover_weight=(
+                    maximum_daily_turnover_weight
+                ),
+                commission_rate=commission_rate,
+                minimum_commission_cny=minimum_commission_cny,
+                transfer_fee_rate=transfer_fee_rate,
+            )
             risk_payload = {
-                "approved_quantity": delta,
-                "target_weight": float(target["target_weight"]),
-                "expected_mae_pct": float(target["expected_mae_pct"]),
+                "run_uid": run_uid,
+                "intent_id": intent_id,
+                "requested_quantity": delta,
+                "approved_quantity": risk["approved_quantity"],
+                "decision_status": risk["decision_status"],
+                "trade_risk": risk["trade_risk"],
+                "post_single_weight": risk["post_single_weight"],
+                "post_total_weight": risk["post_total_weight"],
+                "post_theme_weight": risk["post_theme_weight"],
+                "post_open_risk_cny": risk["post_open_risk_cny"],
+                "post_cash": risk["post_cash"],
+                "post_turnover_weight": risk["post_turnover_weight"],
+                "cash_reservation": risk["cash_reservation"],
+                "estimated_buy_fee": risk["estimated_buy_fee"],
+                "checks": risk["checks"],
+                "first_failure": risk["first_failure"],
             }
             connection.execute(
                 text(
@@ -926,51 +1528,58 @@ def materialize_internal_paper_orders(
                         checks_json, first_failure, decision_hash,
                         created_at
                     ) VALUES (
-                        :intent_id, 'APPROVED', :requested_quantity,
+                        :intent_id, :decision_status, :requested_quantity,
                         :approved_quantity, :trade_risk,
                         :post_single_weight, :post_total_weight,
                         :post_theme_weight, :post_open_risk, :post_cash,
-                        :checks_json, NULL, :decision_hash, :created_at
+                        :checks_json, :first_failure,
+                        :decision_hash, :created_at
                     )
                     """
                 ),
                 {
                     "intent_id": intent_id,
+                    "decision_status": risk["decision_status"],
                     "requested_quantity": delta,
-                    "approved_quantity": delta,
-                    "trade_risk": abs(
-                        delta * reference_price * stop_pct / 100.0
-                    ),
-                    "post_single_weight": target["target_weight"],
-                    "post_total_weight": float(
-                        json.loads(str(run["portfolio_json"])).get(
-                            "target_risk_asset_weight",
-                            0,
-                        )
-                    ),
-                    "post_theme_weight": target["target_weight"],
-                    "post_open_risk": float(
-                        json.loads(str(run["portfolio_json"])).get(
-                            "worst_case_loss_cny",
-                            0,
-                        )
-                    ),
-                    "post_cash": float(account["cash_balance"])
-                    - delta * reference_price,
+                    "approved_quantity": risk["approved_quantity"],
+                    "trade_risk": risk["trade_risk"],
+                    "post_single_weight": risk["post_single_weight"],
+                    "post_total_weight": risk["post_total_weight"],
+                    "post_theme_weight": risk["post_theme_weight"],
+                    "post_open_risk": risk["post_open_risk_cny"],
+                    "post_cash": risk["post_cash"],
                     "checks_json": json.dumps(
-                        {
-                            "V3_OOS_PROFIT_GATE": not paper_discovery,
-                            "V3_PAPER_DISCOVERY_ONLY": paper_discovery,
-                            "V3_COST_BUFFER": not paper_discovery,
-                            "V3_PORTFOLIO_RISK": True,
-                            "REAL_TRADING_DISABLED": True,
-                        },
+                        risk["checks"],
                         sort_keys=True,
                     ),
+                    "first_failure": risk["first_failure"],
                     "decision_hash": _hash(risk_payload),
                     "created_at": now,
                 },
             )
+            if risk["decision_status"] != "APPROVED":
+                skipped.append({
+                    "stock_code": code,
+                    "side": "BUY",
+                    "status": "RISK_REJECTED",
+                    "reason": risk["first_failure"],
+                })
+                continue
+            reserved_notional = float(risk["reserved_notional"])
+            code_values[code] = (
+                code_values.get(code, 0.0) + reserved_notional
+            )
+            if theme_code:
+                theme_values[theme_code] = (
+                    theme_values.get(theme_code, 0.0)
+                    + reserved_notional
+                )
+            cumulative_total_value += reserved_notional
+            cumulative_open_risk_cny = float(
+                risk["post_open_risk_cny"]
+            )
+            cumulative_turnover_cny += reserved_notional
+            available_cash_cny = float(risk["post_cash"])
             order_id = uuid.uuid4().hex
             order_key = order_idempotency_key(
                 account_id=account_id,
@@ -1070,6 +1679,8 @@ def materialize_internal_paper_orders(
         "created": created,
         "skipped": skipped,
         **superseded,
+        "decision_integrity_verified": decision_truth_verified,
+        "decision_integrity_reason": decision_integrity_reason,
         "real_order_count": 0,
         "paper_order_count": len(created),
     }

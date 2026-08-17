@@ -19,6 +19,8 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "trading_v2_paper_tick",
     "trading_v2_reconciliation",
     "trading_v2_strategy_health",
+    "trading_v3_counterfactual_audit",
+    "trading_v3_continuous_calibration",
 }
 
 NO_DEFAULT_DATE_PATHS = {

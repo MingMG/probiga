@@ -670,7 +670,7 @@ def _consume_sell_lots(
     trade_date: date,
     quantity: int,
     now: datetime,
-) -> None:
+) -> list[dict[str, Any]]:
     rows = connection.execute(
         text(
             """
@@ -691,9 +691,11 @@ def _consume_sell_lots(
         },
     ).mappings().all()
     remaining = quantity
+    allocations: list[dict[str, Any]] = []
     for row in rows:
-        consumed = min(remaining, int(row["remaining_quantity"]))
-        next_quantity = int(row["remaining_quantity"]) - consumed
+        remaining_before = int(row["remaining_quantity"])
+        consumed = min(remaining, remaining_before)
+        next_quantity = remaining_before - consumed
         connection.execute(
             text(
                 """
@@ -715,9 +717,18 @@ def _consume_sell_lots(
                 "lot_id": row["lot_id"],
             },
         )
+        allocations.append(
+            {
+                "lot_id": str(row["lot_id"]),
+                "stock_code": stock_code,
+                "consumed_quantity": consumed,
+                "remaining_before": remaining_before,
+                "remaining_after": next_quantity,
+            }
+        )
         remaining -= consumed
         if remaining == 0:
-            return
+            return allocations
     raise RuntimeError("sell lot consumption invariant failed")
 
 
@@ -1453,6 +1464,7 @@ def _execute_one(
             {"cash": next_cash, "now": now, "account_id": account_id},
         )
 
+        lot_close_allocations: list[dict[str, Any]] = []
         if side == OrderSide.BUY:
             settlement_date = _settlement_date(
                 connection,
@@ -1508,7 +1520,7 @@ def _execute_one(
                 },
             )
         else:
-            _consume_sell_lots(
+            lot_close_allocations = _consume_sell_lots(
                 connection,
                 account_id=account_id,
                 stock_code=str(order["stock_code"]),
@@ -1554,6 +1566,7 @@ def _execute_one(
             "balance_after": str(next_cash),
             "execution_price_source": execution_price_source,
             "match_explanation": match.explanation,
+            "lot_close_allocations": lot_close_allocations,
             "real_order_count": 0,
         }
         _record_event(

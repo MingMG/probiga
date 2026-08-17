@@ -56,6 +56,13 @@ server*.log
 data/**
 !data/.gitkeep
 
+# One-off local production diagnostics/evidence. These stay outside every
+# Git-anchored release and must never be force-added.
+/artifacts/production_selector_readiness_20260811.stdout.json
+/tools/_diagnose_lithium_and_sim_production.py
+/tools/_finish_qmt_attestation_20260811.py
+/tools/_notify_wecom_briefing_production.py
+
 # adata (external library, tracked separately)
 adata/
 .release_venvs/

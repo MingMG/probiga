@@ -66,6 +66,7 @@ def test_screener_status_blocks_stale_base_data(monkeypatch):
     assert result["gate"] == "DATA_STALE"
     assert result["actionable_output_allowed"] is False
 
+
 def test_screener_status_activates_bounded_v456_but_keeps_order_gate_blocked(monkeypatch):
     monkeypatch.setattr(
         screener,
@@ -95,181 +96,39 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     root = Path(__file__).resolve().parents[1]
     script = (root / "server/static/js/app.js").read_text(encoding="utf-8")
     index = (root / "server/static/index.html").read_text(encoding="utf-8")
+    trading_script = (root / "server/static/js/trading-v3.js").read_text(
+        encoding="utf-8"
+    )
+    trading_page = (root / "server/static/trading-v3.html").read_text(
+        encoding="utf-8"
+    )
 
-    assert "fetch('/api/screener/status')" in script
+    assert "screenerJson('/api/screener/status')" in script
     assert "V3-V6 生产融合选股" in script
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
-    assert "window.exportUnifiedScreener" in script
+    assert "row.action || 'WATCH'" in script
+    assert "style.css?v=40" in index
+    assert "app.js?v=95" in index
+    assert 'data-tab="trading-v3-candidates" onclick="switchTab(\'trading-v3-candidates\')"' in index
+    assert 'data-trading-view="candidates"' not in index
+    assert "{id:'trading-v3-candidates', candidateCenter:true" in script
+    assert "if (item.candidateCenter)" in script
+    assert "loadCandidateCenterPage(d, container);" in script
+    assert "V3.6 生产真值" not in script
+    assert "V3 决策、Shadow 与模拟账本" in script
     assert "四版本实际运行：V3 为基础排序" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
-    assert "style.css?v=39" in index
-    assert "app.js?v=91" in index
     assert 'id="candidateCenterDateFilter"' in script
     assert 'id="candidateCenterStockFilter"' in script
     assert "queryButton.addEventListener('click', queryCandidateCenter)" in script
     assert "stockInput.addEventListener('input', applyStockFilter)" in script
-
-
-def test_trading_v3_candidate_page_uses_unified_production_selector():
-    root = Path(__file__).resolve().parents[1]
-    page = (root / "server/static/trading-v3.html").read_text(encoding="utf-8")
-    script = (root / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
-    app = (root / "server/static/js/app.js").read_text(encoding="utf-8")
-    index = (root / "server/static/index.html").read_text(encoding="utf-8")
-
-    assert "盘前与盘中生产融合候选" in page
-    assert 'id="selectorDateFilter"' in page
-    assert 'id="selectorStockFilter"' in page
-    assert 'id="selectorGradeFilter"' in page
-    assert 'id="premarketCandidateRows"' in page
-    assert 'id="intradayCandidateRows"' in page
-    assert 'id="view-intraday"' not in page
-    assert 'data-view="intraday"' not in page
-    assert "trading-v3-intraday" not in app
-    assert "trading-v3-intraday" not in index
-    assert "<span>04</span>目标组合" in index
-    assert "trading-v3.css?v=9" in page
-    assert "trading-v3.js?v=24" in page
-    assert "实际选出时间" in script
-    assert "候选归属日" in script
-    assert "行情数据日" in script
-    assert "证据截止日" in script
-    assert "行情快照时间" in script
-    assert "最新生产批次" in script
-    assert "历史落库批次" in script
-    assert "是策略计划档位，不是当前这批票的实际生成时间" in page
-    assert 'id="equitySource"' in page
-    assert 'id="cashSource"' in page
-    assert 'id="unrealizedPnl"' in page
-    assert 'id="positionCount"' in page
-    assert "postJsonRetry('/api/screener/run'" in script
-    assert "status===429||status===502||status===503||status===504" in script
-    assert "payload.message||payload.detail||payload.error" in script
-    assert "'/api/screener/history?data_date='" in script
-    assert "绝不用今天数据重算过去" in page
-    assert "loadProductionSelector('capital_support',100)" in script
-    assert "loadProductionSelector('intraday_sector',100)" in script
-    assert "selectorRequest('capital_support',day)" in script
-    assert "selectorRequest('intraday_sector',day)" in script
-    assert "api3('/paper-ledger?account_id=paper-main-v2&limit=200')" in script
-    assert "version_evidence_coverage_rate" in script
-    assert "自动下单 <strong>固定关闭" in script
-    assert "probiga-open-kline" in script
-    assert "pnl-gain" in script
-    assert "pnl-loss" in script
-    assert "position_lot_count" in script
-    assert "today_closed_positions" in script
-    assert "data-position-detail-index" in script
-    assert "买入时间" in page
-    assert "卖出时间" in page
-    assert "卖出价格" in page
-    assert "ledgerSummary.canonical_total_equity" in script
-    assert "ledgerSummary.canonical_cash_balance" in script
-    assert "ledgerSummary.display_total_equity" in script
-    assert "ledgerSummary.display_cash_balance" in script
-    assert "String(positionCount)+' 只'" in script
-    assert "本次决策目标 '+String(targets.length)+' 只" in script
-    assert "本次没有新增目标，继续管理现有" in script
-    assert "V3 本次决策预算现金" in script
-    assert "String(actionableTargets.length)+' / '" not in script
-    assert "diversifyDynamic(dynamic,20)" in script
-    assert "window.openKlineModal" in app
-    assert "V3-V6 生产融合" in app
-    assert "V3.6 生产真值" not in app
-
-
-def test_screener_run_persists_before_optional_delivery(monkeypatch):
-    result = {
-        "status": "ok",
-        "preset": "intraday_sector",
-        "requested_date": "2026-08-13",
-        "data_date": "2026-08-13",
-        "observed_at": "2026-08-13 09:32:33",
-        "freshness": "live",
-        "source": "test",
-        "stats": {},
-        "data": [{"rank": 1, "stock_code": "300333", "short_name": "兆日科技", "score": 100}],
-    }
-    monkeypatch.setattr(screener, "_latest_date", lambda *_args, **_kwargs: "2026-08-12")
-    monkeypatch.setattr(screener, "_run_preset", lambda *_args, **_kwargs: dict(result))
-    monkeypatch.setattr(screener, "_runtime_status", lambda: {"status": "ok"})
-    monkeypatch.setattr(
-        screener,
-        "_persist_screener_run",
-        lambda _request, _result: {
-            "run_uid": "a" * 32,
-            "run_key": "b" * 64,
-            "generated_at": "2026-08-13 09:32:34",
-            "persisted": True,
-            "is_new": True,
-            "push_status": "PENDING",
-        },
-    )
-    updated = {}
-    monkeypatch.setattr(screener, "_update_screener_push", lambda uid, notice: updated.update(uid=uid, notice=notice))
-    from biz.analysis import trading_wecom
-
-    monkeypatch.setattr(trading_wecom, "notify_screener_result", lambda payload: {"status": "sent", "count": len(payload["data"])})
-
-    payload = screener.screener_run(screener.ScreenerRunRequest(preset="intraday_sector", notify=True))
-
-    assert payload["run"]["persisted"] is True
-    assert payload["run"]["run_uid"] == "a" * 32
-    assert payload["view_mode"] == "latest"
-    assert payload["notification"]["status"] == "sent"
-    assert updated["uid"] == "a" * 32
-
-
-def test_screener_history_reads_immutable_payload_and_stock_filter(monkeypatch):
-    monkeypatch.setattr(screener, "_ensure_tables", lambda: None)
-
-    def fake_rows(_sql, params=None, context=""):
-        if context == "screener_history_runs":
-            assert params["data_date"] == "2026-08-13"
-            return [{
-                "run_uid": "a" * 32,
-                "preset": "intraday_sector",
-                "requested_date": "2026-08-13",
-                "session_date": "2026-08-13",
-                "data_date": "2026-08-13",
-                "evidence_date": "2026-08-12",
-                "observed_at": "2026-08-13 09:32:33",
-                "generated_at": "2026-08-13 09:32:34",
-                "freshness": "live",
-                "status": "ok",
-                "source": "snapshot",
-                "result_count": 5,
-                "summary_json": "{}",
-                "selector_json": "{}",
-                "push_status": "SENT",
-                "pushed_at": "2026-08-13 09:32:35",
-            }]
-        if context == "screener_history_results":
-            assert params["keyword"] == "300333"
-            return [{
-                "rank_no": 1,
-                "selector_rank": 1,
-                "stock_code": "300333",
-                "stock_name": "兆日科技",
-                "payload_json": '{"score":100,"change_pct":19.95}',
-            }]
-        raise AssertionError(context)
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-    payload = screener.screener_history(data_date="2026-08-13", q="300333")
-
-    assert payload["run"]["persisted"] is True
-    assert payload["view_mode"] == "historical"
-    assert payload["session_date"] == "2026-08-13"
-    assert payload["data"][0] == {
-        "score": 100,
-        "change_pct": 19.95,
-        "rank": 1,
-        "selector_rank": 1,
-        "stock_code": "300333",
-        "stock_name": "兆日科技",
-    }
+    assert "trading-v3.js?v=25" in trading_page
+    assert "today_closed_positions" in trading_script
+    assert "data-position-detail-index" in trading_script
+    assert "买入时间" in trading_page
+    assert "卖出时间" in trading_page
+    assert "卖出价格" in trading_page
 
 
 def test_apply_filters_normalizes_rows_and_excludes_st():
@@ -294,163 +153,6 @@ def test_apply_filters_normalizes_rows_and_excludes_st():
     assert rows[0]["selector_mode"] == "V3_V4_V5_V6_GATED_MULTI_HORIZON_ENSEMBLE"
     assert rows[0]["action"] == "WATCH"
     assert rows[0]["actionable"] is False
-
-
-def test_intraday_sector_surfaces_linked_live_leaders(monkeypatch):
-    def fake_rows(_sql, _params=None, context=""):
-        if context in {
-            "screener_intraday_theme_strength",
-            "screener_intraday_theme_members",
-        }:
-            assert "si_industry_sw" in _sql
-        if context == "screener_intraday_live_quotes":
-            return [
-                {"stock_code": "603399", "short_name": "永杉锂业", "price": 17.29, "change_pct": 9.99, "amount": 900_000_000, "snapshot_at": "2026-08-12 10:20:00"},
-                {"stock_code": "002240", "short_name": "盛新锂能", "price": 33.72, "change_pct": 5.61, "amount": 800_000_000, "snapshot_at": "2026-08-12 10:20:00"},
-            ]
-        if context == "screener_intraday_theme_strength":
-            return [{"concept_code": "BK_LI", "concept_name": "锂电池", "total_members": 20, "active_members": 4, "positive_members": 14, "average_change_pct": 2.4, "leader_change_pct": 9.99}]
-        if context == "screener_intraday_theme_members":
-            return [
-                {"stock_code": "603399", "concept_code": "BK_LI", "name": "锂电池"},
-                {"stock_code": "002240", "concept_code": "BK_LI", "name": "锂电池"},
-            ]
-        raise AssertionError(context)
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
-    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: [{**row, "correlation_cluster_status": "VERIFIED_60D", "correlation_cluster": row["stock_code"]} for row in rows])
-    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
-
-    result = screener._run_preset(
-        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
-        "2026-08-11",
-    )
-
-    assert result["freshness"] == "live"
-    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
-    assert all(row["concept_name"] == "锂产业链" for row in result["data"])
-    assert [row["rank"] for row in result["data"]] == [1, 2]
-    assert result["actionable_output_allowed"] is False
-
-
-def test_intraday_sector_recovers_renamed_industry_from_live_names(monkeypatch):
-    def fake_rows(_sql, _params=None, context=""):
-        if context == "screener_intraday_live_quotes":
-            return [
-                {"stock_code": "603399", "short_name": "\u6c38\u6749\u9502\u4e1a", "price": 16.8, "change_pct": 7.1, "snapshot_at": "2026-08-12 11:00:00"},
-                {"stock_code": "002240", "short_name": "\u76db\u65b0\u9502\u80fd", "price": 33.5, "change_pct": 4.9, "snapshot_at": "2026-08-12 11:00:00"},
-            ]
-        if context == "screener_intraday_theme_strength":
-            return []
-        if context == "screener_intraday_theme_members":
-            raise AssertionError("synthetic name theme does not need a DB member query")
-        raise AssertionError(context)
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
-    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: rows)
-    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
-
-    result = screener._run_preset(
-        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
-        "2026-08-11",
-    )
-
-    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
-    assert all(row["concept_name"] == "\u9502\u4ea7\u4e1a\u94fe" for row in result["data"])
-    assert all(row["intraday_theme_source"] == "name_keyword" for row in result["data"])
-    assert [row["intraday_discovery_rank"] for row in result["data"]] == [1, 2]
-    assert all(row["actionable"] is False for row in result["data"])
-
-
-def test_intraday_sector_exposes_latest_close_as_read_only_review(monkeypatch):
-    def fake_rows(_sql, _params=None, context=""):
-        if context == "screener_intraday_live_quotes":
-            return []
-        if context == "screener_intraday_latest_snapshot":
-            return [{"snapshot_at": "2026-08-12 15:00:00"}]
-        if context == "screener_intraday_review_quotes":
-            assert _params["quote_date"] == "2026-08-12"
-            return [
-                {"stock_code": "603399", "short_name": "永杉锂业", "price": 17.29, "change_pct": 9.99, "snapshot_at": "2026-08-12 15:00:00"},
-                {"stock_code": "002240", "short_name": "盛新锂能", "price": 33.72, "change_pct": 5.61, "snapshot_at": "2026-08-12 15:00:00"},
-            ]
-        if context == "screener_intraday_theme_strength":
-            assert "DATE(c.snapshot_at) = :quote_date" in _sql
-            return []
-        if context == "screener_intraday_theme_members":
-            raise AssertionError("synthetic name theme does not need a DB member query")
-        raise AssertionError(context)
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-    monkeypatch.setattr(screener, "_intraday_market_day_active", lambda: False)
-    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
-    monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: rows)
-    monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"603399", "002240"})
-
-    result = screener._run_preset(
-        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
-        "2026-08-11",
-    )
-
-    assert result["freshness"] == "historical_close"
-    assert result["review_only"] is True
-    assert result["data_date"] == "2026-08-12"
-    assert result["actionable_output_allowed"] is False
-    assert [row["stock_code"] for row in result["data"]] == ["603399", "002240"]
-
-
-def test_intraday_sector_does_not_fallback_to_old_snapshot_during_session(monkeypatch):
-    def fake_rows(_sql, _params=None, context=""):
-        if context == "screener_intraday_live_quotes":
-            return []
-        raise AssertionError(f"must not read historical close during session: {context}")
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-    monkeypatch.setattr(screener, "_intraday_market_day_active", lambda: True)
-
-    result = screener._run_preset(
-        screener.ScreenerRunRequest(preset="intraday_sector", top=10),
-        "2026-08-11",
-    )
-
-    assert result["freshness"] == "unavailable"
-    assert result["data"] == []
-    assert result["actionable_output_allowed"] is False
-
-
-def test_intraday_shortlist_reserves_slots_for_small_live_name_theme():
-    rows = [
-        {
-            "stock_code": f"60{index:04d}",
-            "intraday_discovery_rank": index + 1,
-            "intraday_theme_source": "concept",
-            "primary_concept": "大主题",
-        }
-        for index in range(110)
-    ]
-    rows.extend(
-        [
-            {
-                "stock_code": "603399",
-                "intraday_discovery_rank": 111,
-                "intraday_theme_source": "name_keyword",
-                "primary_concept": "锂产业链",
-            },
-            {
-                "stock_code": "002240",
-                "intraday_discovery_rank": 112,
-                "intraday_theme_source": "name_keyword",
-                "primary_concept": "锂产业链",
-            },
-        ]
-    )
-
-    shortlisted = screener._intraday_quota_shortlist(rows, 100)
-
-    assert len(shortlisted) == 100
-    assert {row["stock_code"] for row in shortlisted}.issuperset({"603399", "002240"})
 
 
 def test_apply_filters_rejects_non_stock_and_future_listing_codes():

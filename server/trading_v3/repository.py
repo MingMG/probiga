@@ -13,10 +13,16 @@ from typing import Any, Iterable
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from .calibration import CalibrationTable
 from .config import config_hash as current_config_hash
 from .config import load_v3_config
+from .decision_truth import (
+    canonical_hash,
+    canonical_target_ledger,
+    decision_result_hash,
+)
 from .domain import AlphaForecast, HypothesisEvidence, TradeHypothesis
 from .right_side_policy import right_side_model_contract_hash
 from .shadow_portfolio import build_shadow_portfolio_rows
@@ -41,6 +47,12 @@ V3_TABLES = (
     "st_validation_result_v3",
     "st_trade_hypothesis_v3",
     "st_hypothesis_evidence_v3",
+    "st_horizon_model_artifact_v3",
+    "st_horizon_forecast_contract_v3",
+    "st_horizon_outcome_v3",
+    "st_shadow_release_v3",
+    "st_calibration_gate_v3",
+    "st_counterfactual_learning_run_v3",
 )
 
 
@@ -564,6 +576,7 @@ class TradingV3Repository:
         *,
         run_uid: str,
         trade_date: date,
+        requested_as_of: date,
         decision_at: datetime,
         mode: str,
         model_version: str,
@@ -574,21 +587,81 @@ class TradingV3Repository:
         data_snapshot_hash: str,
         theme_signals: Iterable[dict[str, Any]] = (),
         hypotheses: Iterable[TradeHypothesis] = (),
+        run_status: str = "COMPLETED",
+        actionable_status: str | None = None,
+        snapshot_manifest: dict[str, Any] | None = None,
+        defer_completion: bool = False,
     ) -> dict[str, Any]:
+        if isinstance(requested_as_of, datetime) or not isinstance(
+            requested_as_of, date
+        ):
+            raise ValueError("requested_as_of must be a date")
+        if snapshot_manifest is not None:
+            manifest_requested = str(
+                snapshot_manifest.get("requested_as_of") or ""
+            ).strip()
+            if (
+                manifest_requested
+                and manifest_requested != requested_as_of.isoformat()
+            ):
+                raise ValueError(
+                    "requested_as_of does not match the frozen snapshot manifest"
+                )
+        normalized_run_status = str(run_status or "").upper()
+        if normalized_run_status not in {"COMPLETED", "BLOCKED"}:
+            raise ValueError(
+                "decision run_status must be COMPLETED or BLOCKED"
+            )
         forecast_rows = list(forecasts)
         raw_theme_signal_rows = list(theme_signals)
         hypothesis_rows = list(hypotheses)
+        portfolio = dict(portfolio)
         targets = list(portfolio.get("targets") or [])
-        result_payload = {
-            "regime": regime,
-            "portfolio": portfolio,
-            "forecast_count": len(forecast_rows),
-            "theme_signal_count": len(raw_theme_signal_rows),
-            "hypothesis_count": len(hypothesis_rows),
+        normalized_actionable_status = str(
+            actionable_status
+            or (
+                "DATA_BLOCKED"
+                if str(portfolio.get("status") or "") == "DATA_BLOCKED"
+                else "PAPER_ACTIONABLE"
+                if targets
+                else "NO_ACTION"
+            )
+        ).upper()
+        normalized_lifecycle = str(lifecycle_status or "").upper()
+        paper_lifecycle = normalized_lifecycle in {
+            "PAPER_TRIAL",
+            "PAPER_ACTIVE",
         }
-        result_hash = hashlib.sha256(
-            _json(result_payload).encode("utf-8")
-        ).hexdigest()
+        snapshot_verified_at_save = bool(
+            isinstance(snapshot_manifest, dict)
+            and str(snapshot_manifest.get("manifest_hash") or "")
+        )
+        portfolio["decision_truth"] = {
+            "schema_version": "probiga.trading-v3.decision-truth.v1",
+            "run_status": normalized_run_status,
+            "actionable_status": normalized_actionable_status,
+            "decision_scope": (
+                "INTERNAL_PAPER_TRIAL"
+                if paper_lifecycle
+                else "RESEARCH_ONLY"
+            ),
+            "paper_order_authority": (
+                "V2_GATED"
+                if paper_lifecycle
+                and snapshot_verified_at_save
+                and normalized_run_status == "COMPLETED"
+                and normalized_actionable_status == "PAPER_ACTIONABLE"
+                else "NONE"
+            ),
+            "execution_authority": "V2_CANONICAL_LEDGER",
+            "order_authority": False,
+            "real_order_allowed": False,
+        }
+        if snapshot_manifest is not None:
+            portfolio["decision_snapshot"] = dict(snapshot_manifest)
+        persisted_run_status = (
+            "PROCESSING" if defer_completion else normalized_run_status
+        )
         decision_config_hash = current_config_hash()
         code_commit_sha, _code_version_source = code_version()
         calibration_set_hash = hashlib.sha256(
@@ -720,6 +793,30 @@ class TradingV3Repository:
                 "primary_forecast_id": primary_forecast_id,
                 "attribution_snapshot_hash": ownership_hash,
             }
+        target_ledger = canonical_target_ledger(
+            targets,
+            run_uid=run_uid,
+            trade_date=trade_date,
+            ownership_by_code=target_ownership,
+        )
+        portfolio["decision_integrity"] = {
+            "schema_version": (
+                "probiga.trading-v3.decision-integrity.v1"
+            ),
+            "forecast_count": len(forecast_rows),
+            "raw_theme_signal_count": len(raw_theme_signal_rows),
+            "persisted_theme_signal_count": len(theme_signal_rows),
+            "hypothesis_count": len(hypothesis_rows),
+            "target_count": len(targets),
+            "target_ledger_hash": canonical_hash(target_ledger),
+        }
+        result_hash = decision_result_hash(
+            regime=regime,
+            portfolio=portfolio,
+            forecast_count=len(forecast_rows),
+            theme_signal_count=len(raw_theme_signal_rows),
+            hypothesis_count=len(hypothesis_rows),
+        )
         shadow_rows = build_shadow_portfolio_rows(
             ranked,
             run_uid=run_uid,
@@ -747,7 +844,8 @@ class TradingV3Repository:
                 text(
                     """
                     INSERT INTO st_decision_run_v3 (
-                        run_uid, trade_date, decision_at, mode,
+                        run_uid, trade_date, requested_as_of,
+                        decision_at, mode,
                         model_version, config_hash, code_commit_sha,
                         calibration_set_hash, lifecycle_status, status,
                         dominant_regime, risk_asset_cap, regime_json,
@@ -755,9 +853,10 @@ class TradingV3Repository:
                         target_count, data_snapshot_hash, result_hash,
                         created_at, completed_at
                     ) VALUES (
-                        :run_uid, :trade_date, :decision_at, :mode,
+                        :run_uid, :trade_date, :requested_as_of,
+                        :decision_at, :mode,
                         :model_version, :config_hash, :code_commit_sha,
-                        :calibration_set_hash, :lifecycle_status, 'COMPLETED',
+                        :calibration_set_hash, :lifecycle_status, :status,
                         :dominant_regime, :risk_asset_cap, :regime_json,
                         :portfolio_json, :forecast_count, :validated_count,
                         :target_count, :data_snapshot_hash, :result_hash,
@@ -768,6 +867,7 @@ class TradingV3Repository:
                 {
                     "run_uid": run_uid,
                     "trade_date": trade_date,
+                    "requested_as_of": requested_as_of,
                     "decision_at": decision_at,
                     "mode": mode,
                     "model_version": model_version,
@@ -775,6 +875,7 @@ class TradingV3Repository:
                     "code_commit_sha": code_commit_sha,
                     "calibration_set_hash": calibration_set_hash,
                     "lifecycle_status": lifecycle_status,
+                    "status": persisted_run_status,
                     "dominant_regime": str(
                         regime.get("dominant_state") or "DATA_BLOCKED"
                     ),
@@ -792,7 +893,7 @@ class TradingV3Repository:
                     "data_snapshot_hash": data_snapshot_hash,
                     "result_hash": result_hash,
                     "created_at": now,
-                    "completed_at": now,
+                    "completed_at": None if defer_completion else now,
                 },
             )
             forecast_insert = text(
@@ -1123,6 +1224,12 @@ class TradingV3Repository:
         _save_progress("committed", save_started_at)
         return {
             "run_uid": run_uid,
+            "run_status": normalized_run_status,
+            "persisted_run_status": persisted_run_status,
+            "actionable_status": normalized_actionable_status,
+            "snapshot_manifest_hash": str(
+                (snapshot_manifest or {}).get("manifest_hash") or ""
+            ),
             "result_hash": result_hash,
             "forecast_count": len(ranked),
             "theme_signal_count": len(theme_signal_rows),
@@ -1144,6 +1251,60 @@ class TradingV3Repository:
             "hypothesis_count": len(hypothesis_rows),
         }
 
+    def mark_run_failed(
+        self,
+        run_uid: str,
+        *,
+        stage: str,
+        error: BaseException | str,
+    ) -> None:
+        """Make a committed decision visibly non-successful after a saga step."""
+
+        message = f"{str(stage or 'DOWNSTREAM').upper()}: {error}"[:4000]
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE st_decision_run_v3
+                    SET status = 'FAILED',
+                        error_message = :error_message,
+                        completed_at = :completed_at
+                    WHERE run_uid = :run_uid
+                      AND status IN (
+                          'PROCESSING', 'COMPLETED', 'BLOCKED'
+                      )
+                    """
+                ),
+                {
+                    "run_uid": run_uid,
+                    "error_message": message,
+                    "completed_at": datetime.now().replace(microsecond=0),
+                },
+            )
+
+    def finalize_run(self, run_uid: str, *, status: str) -> None:
+        normalized = str(status or "").upper()
+        if normalized not in {"COMPLETED", "BLOCKED"}:
+            raise ValueError("final run status must be COMPLETED or BLOCKED")
+        with self.engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    UPDATE st_decision_run_v3
+                    SET status = :status,
+                        error_message = NULL,
+                        completed_at = :completed_at
+                    WHERE run_uid = :run_uid
+                      AND status = 'PROCESSING'
+                    """
+                ),
+                {
+                    "run_uid": run_uid,
+                    "status": normalized,
+                    "completed_at": datetime.now().replace(microsecond=0),
+                },
+            )
+
     def _latest_run(
         self,
         trade_date: date | None = None,
@@ -1151,7 +1312,24 @@ class TradingV3Repository:
         where = ""
         params: dict[str, Any] = {}
         if trade_date is not None:
-            where = "WHERE trade_date = :trade_date"
+            dialect_name = str(
+                getattr(getattr(self.engine, "dialect", None), "name", "")
+            ).casefold()
+            if dialect_name == "sqlite":
+                requested_expression = (
+                    "COALESCE(requested_as_of, "
+                    "json_extract(portfolio_json, "
+                    "'$.decision_snapshot.requested_as_of'), "
+                    "date(decision_at))"
+                )
+            else:
+                requested_expression = (
+                    "COALESCE(requested_as_of, "
+                    "STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT("
+                    "portfolio_json, '$.decision_snapshot.requested_as_of'"
+                    ")), '%Y-%m-%d'), DATE(decision_at))"
+                )
+            where = f"WHERE {requested_expression} = :trade_date"
             params["trade_date"] = trade_date
         with self.engine.connect() as connection:
             row = connection.execute(
@@ -1169,6 +1347,23 @@ class TradingV3Repository:
         if not row:
             return None
         result = dict(row)
+        if result.get("requested_as_of") is None:
+            snapshot = {}
+            try:
+                snapshot = json.loads(
+                    str(result.get("portfolio_json") or "{}")
+                ).get("decision_snapshot") or {}
+            except (TypeError, ValueError):
+                snapshot = {}
+            decision_value = result["decision_at"]
+            decision_date = (
+                decision_value.date()
+                if isinstance(decision_value, datetime)
+                else date.fromisoformat(str(decision_value)[:10])
+            )
+            result["requested_as_of"] = snapshot.get(
+                "requested_as_of"
+            ) or decision_date
         for key in ("regime_json", "portfolio_json"):
             result[key.removesuffix("_json")] = json.loads(
                 str(result.pop(key))
@@ -1688,7 +1883,102 @@ class TradingV3Repository:
         trade_date: date | None = None,
     ) -> dict[str, Any] | None:
         """Return the current immutable decision-run metadata."""
-        return self._latest_run(trade_date)
+        run = self._latest_run(trade_date)
+        if not run:
+            return None
+        run["decision_integrity_verified"] = False
+        run["decision_integrity_reason"] = (
+            "DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED"
+        )
+        try:
+            portfolio = dict(run.get("portfolio") or {})
+            integrity = dict(portfolio.get("decision_integrity") or {})
+            if str(integrity.get("schema_version") or "") != (
+                "probiga.trading-v3.decision-integrity.v1"
+            ):
+                return run
+            run_uid = str(run.get("run_uid") or "")
+            source_date = run.get("trade_date")
+            source_date = (
+                source_date
+                if isinstance(source_date, date)
+                else date.fromisoformat(str(source_date))
+            )
+            with self.engine.connect() as connection:
+                targets = [
+                    dict(row)
+                    for row in connection.execute(
+                        text(
+                            """
+                            SELECT *
+                            FROM st_target_portfolio_v3
+                            WHERE run_uid = :run_uid
+                            ORDER BY rank_no, stock_code
+                            """
+                        ),
+                        {"run_uid": run_uid},
+                    ).mappings().all()
+                ]
+                counts = connection.execute(
+                    text(
+                        """
+                        SELECT
+                            (SELECT COUNT(*) FROM st_alpha_forecast_v3
+                             WHERE run_uid = :run_uid) AS forecast_count,
+                            (SELECT COUNT(*) FROM st_theme_signal_v3
+                             WHERE run_uid = :run_uid) AS theme_signal_count,
+                            (SELECT COUNT(*) FROM st_trade_hypothesis_v3
+                             WHERE run_uid = :run_uid) AS hypothesis_count
+                        """
+                    ),
+                    {"run_uid": run_uid},
+                ).mappings().first()
+            ledger = canonical_target_ledger(
+                targets,
+                run_uid=run_uid,
+                trade_date=source_date,
+                persisted=True,
+            )
+            forecast_count = int(integrity.get("forecast_count") or 0)
+            hypothesis_count = int(integrity.get("hypothesis_count") or 0)
+            checks = (
+                canonical_hash(ledger)
+                == str(integrity.get("target_ledger_hash") or ""),
+                len(targets) == int(integrity.get("target_count") or 0),
+                len(targets) == int(run.get("target_count") or 0),
+                bool(counts),
+                int((counts or {}).get("forecast_count") or 0)
+                == forecast_count,
+                int((counts or {}).get("theme_signal_count") or 0)
+                == int(
+                    integrity.get("persisted_theme_signal_count") or 0
+                ),
+                int((counts or {}).get("hypothesis_count") or 0)
+                == hypothesis_count,
+                int(run.get("forecast_count") or 0) == forecast_count,
+                decision_result_hash(
+                    regime=dict(run.get("regime") or {}),
+                    portfolio=portfolio,
+                    forecast_count=forecast_count,
+                    theme_signal_count=int(
+                        integrity.get("raw_theme_signal_count") or 0
+                    ),
+                    hypothesis_count=hypothesis_count,
+                )
+                == str(run.get("result_hash") or ""),
+            )
+            if all(checks):
+                run["decision_integrity_verified"] = True
+                run["decision_integrity_reason"] = ""
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            SQLAlchemyError,
+        ):
+            pass
+        return run
 
     def ensure_intraday_hypothesis(
         self,
@@ -2000,19 +2290,37 @@ class TradingV3Repository:
             rows = connection.execute(
                 text(
                     """
-                    SELECT run_uid, trade_date, decision_at, mode,
+                    SELECT run_uid, requested_as_of, trade_date,
+                           decision_at, mode,
                            model_version, lifecycle_status, status,
                            dominant_regime, risk_asset_cap,
                            forecast_count, validated_count, target_count,
                            data_snapshot_hash, result_hash
                     FROM st_decision_run_v3
-                    ORDER BY decision_at DESC, created_at DESC
+                    ORDER BY COALESCE(
+                                 requested_as_of, DATE(decision_at)
+                             ) DESC,
+                             decision_at DESC, run_uid DESC
                     LIMIT :limit
                     """
                 ),
                 {"limit": max(1, min(500, int(limit)))},
             ).mappings().all()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["data_date"] = item.get("trade_date")
+            decision_at = item.get("decision_at")
+            item["decision_session_date"] = (
+                item.get("requested_as_of")
+                or (
+                    decision_at.date()
+                    if isinstance(decision_at, datetime)
+                    else str(decision_at or "")[:10] or None
+                )
+            )
+            result.append(item)
+        return result
 
     def latest_targets(self) -> list[dict[str, Any]]:
         run = self._latest_run()

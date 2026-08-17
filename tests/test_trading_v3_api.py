@@ -1,6 +1,7 @@
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
-from server.api.routers import trading_v3
+from server.api.routers import trading_v2, trading_v3
 
 
 class FakeCalibration:
@@ -36,6 +37,34 @@ class FakeRepository:
             "account_update": True,
             "execution_plan_insert": True,
             "execution_plan_update": True,
+        }
+
+    def latest_run_metadata(self):
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return {
+            "run_uid": "run-ready",
+            "requested_as_of": today,
+            "trade_date": today,
+            "decision_at": datetime.combine(today, datetime.min.time()),
+            "status": "COMPLETED",
+            "lifecycle_status": "PAPER_TRIAL",
+            "target_count": 1,
+            "decision_integrity_verified": True,
+            "decision_integrity_reason": "",
+            "portfolio": {
+                "decision_snapshot": {"manifest_hash": "a" * 64},
+                "decision_truth": {
+                    "schema_version": (
+                        "probiga.trading-v3.decision-truth.v1"
+                    ),
+                    "run_status": "COMPLETED",
+                    "actionable_status": "PAPER_ACTIONABLE",
+                    "paper_order_authority": "V2_GATED",
+                    "execution_authority": "V2_CANONICAL_LEDGER",
+                    "order_authority": False,
+                    "real_order_allowed": False,
+                },
+            },
         }
 
     def overview(self):
@@ -117,7 +146,10 @@ class FakeRepository:
 def test_v3_readiness_reports_calibrated_sleeves(monkeypatch):
     monkeypatch.setattr(trading_v3, "_repo", lambda: FakeRepository())
     result = trading_v3.readiness()
-    assert result["data"]["paper_ready"] is True
+    assert result["data"]["structural_ready"] is True
+    assert result["data"]["decision_ready"] is True
+    assert result["data"]["execution_ready"] is None
+    assert result["data"]["paper_ready"] is False
     assert result["data"]["active_calibrated_sleeves"] == [
         "right_side_trend"
     ]
@@ -137,6 +169,68 @@ def test_v3_readiness_reports_calibrated_sleeves(monkeypatch):
         "maximum_live_positions",
     }
     assert result["real_trading_enabled"] is False
+
+
+def test_v3_readiness_blocks_unverified_decision_truth(monkeypatch):
+    class Repository(FakeRepository):
+        engine = object()
+
+        def latest_run_metadata(self):
+            today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+            return {
+                "run_uid": "run-without-decision-truth",
+                "requested_as_of": today,
+                "trade_date": today,
+                "decision_at": datetime.combine(
+                    today,
+                    datetime.min.time(),
+                ),
+                "status": "COMPLETED",
+                "lifecycle_status": "PAPER_TRIAL",
+                "target_count": 1,
+                "portfolio": {},
+            }
+
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+    monkeypatch.setattr(
+        trading_v2,
+        "readiness",
+        lambda: {
+            "data": {
+                "ready_for_new_positions": True,
+                "blocks": [],
+            }
+        },
+    )
+
+    result = trading_v3.readiness()
+
+    assert result["data"]["data_ready"] is False
+    assert result["data"]["decision_ready"] is False
+    assert result["data"]["execution_ready"] is True
+    assert result["data"]["paper_authority_ready"] is False
+    assert result["data"]["paper_ready"] is False
+    assert result["status"] == "blocked"
+    assert "LATEST_DECISION_UNAVAILABLE" in result["data"]["blocks"]
+
+
+def test_v3_readiness_fails_closed_without_current_context_reader(
+    monkeypatch,
+):
+    class Repository(FakeRepository):
+        latest_run_metadata = None
+
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+
+    result = trading_v3.readiness()
+
+    assert result["data"]["data_ready"] is False
+    assert result["data"]["decision_ready"] is False
+    assert result["data"]["paper_authority_ready"] is False
+    assert result["data"]["paper_ready"] is False
+    assert "DECISION_CONTEXT_READER_UNAVAILABLE" in result["data"][
+        "blocks"
+    ]
 
 
 def test_v3_compact_overview_omits_heavy_audit_and_caps_rejections(

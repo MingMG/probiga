@@ -38,6 +38,63 @@ def _safe_pct(current: float, base: float) -> float:
     return (current / base - 1.0) * 100.0
 
 
+def _history_session_evidence(
+    observed_dates: Iterable[Any],
+    exchange_dates: Iterable[Any],
+) -> dict[str, Any]:
+    """Bind one stock's available history to the exchange-calendar tail."""
+
+    observed = tuple(
+        pd.Timestamp(item).date().isoformat() for item in observed_dates
+    )
+    calendar = tuple(
+        pd.Timestamp(item).date().isoformat() for item in exchange_dates
+    )
+    expected = (
+        calendar[-len(observed):]
+        if observed and len(observed) <= len(calendar)
+        else ()
+    )
+
+    def digest(values: tuple[str, ...]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                list(values),
+                ensure_ascii=False,
+                sort_keys=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    return {
+        "observed_history_sessions": len(observed),
+        "history_sessions_consecutive": bool(
+            observed and observed == expected
+        ),
+        "history_window_start": observed[0] if observed else None,
+        "history_window_end": observed[-1] if observed else None,
+        "history_session_dates_hash": digest(observed),
+        "expected_history_session_dates_hash": digest(expected),
+    }
+
+
+def _rolling_close_drawdown_pct(
+    close: pd.Series,
+    *,
+    window: int,
+) -> float:
+    """Match the horizon trainer's close-to-rolling-close-maximum formula."""
+
+    if window < 1 or len(close) < window:
+        raise ValueError("drawdown window is unavailable")
+    values = pd.to_numeric(close.iloc[-window:], errors="coerce")
+    latest = float(values.iloc[-1])
+    maximum = float(values.max())
+    if not math.isfinite(latest) or not math.isfinite(maximum) or maximum <= 0:
+        raise ValueError("drawdown close history is invalid")
+    return _safe_pct(latest, maximum)
+
+
 def _snapshot_feature_value(value: Any) -> Any:
     if isinstance(value, bool):
         return value
@@ -314,6 +371,7 @@ def _load_bars(
     frame["stock_code"] = frame["stock_code"].astype(str).str[:6]
     for column in ("open", "close", "high", "low"):
         frame["raw_" + column] = frame[column]
+    frame["raw_pre_close"] = frame["pre_close"]
     daily_return = frame["change_pct"] / 100.0
     fallback = frame["close"] / frame["pre_close"] - 1.0
     daily_return = daily_return.where(
@@ -351,8 +409,6 @@ def _load_bars(
             "pre_close",
             "_growth",
             "_adj_close",
-            "raw_open",
-            "raw_high",
         ],
         inplace=True,
         errors="ignore",
@@ -1024,6 +1080,7 @@ def load_daily_feature_universe(
         sort=False,
         observed=True,
     ):
+        group = group.sort_values("trade_date", kind="mergesort")
         if len(group) < 65:
             continue
         code = str(raw_code)
@@ -1049,14 +1106,32 @@ def load_daily_feature_universe(
         ma20_prior = float(close.iloc[-25:-5].mean())
         ma5 = float(close.iloc[-5:].mean())
         ma60 = float(close.iloc[-60:].mean())
+        ma60_prior = (
+            float(close.iloc[-70:-10].mean())
+            if len(close) >= 70
+            else None
+        )
         latest_close = float(close.iloc[-1])
         latest_low = float(low.iloc[-1])
+        latest_row = group.iloc[-1]
+        raw_open = float(latest_row["raw_open"])
+        raw_close = float(latest_row["raw_close"])
+        raw_high = float(latest_row["raw_high"])
+        raw_low = float(latest_row["raw_low"])
+        raw_pre_close = float(latest_row["raw_pre_close"])
         ret5 = _safe_pct(float(close.iloc[-1]), float(close.iloc[-6]))
         ret2 = _safe_pct(float(close.iloc[-1]), float(close.iloc[-3]))
         ret20 = _safe_pct(float(close.iloc[-1]), float(close.iloc[-21]))
         ret60 = _safe_pct(float(close.iloc[-1]), float(close.iloc[-61]))
         average_amount_20d = float(amount.iloc[-20:].mean())
         latest_amount = float(group.iloc[-1]["amount"] or 0)
+        daily_returns = pd.to_numeric(
+            group["change_pct"], errors="coerce"
+        ).astype(float)
+        history_evidence = _history_session_evidence(
+            group["trade_date"].tolist(),
+            dates,
+        )
         true_ranges = pd.concat(
             [
                 high - low,
@@ -1088,11 +1163,18 @@ def load_daily_feature_universe(
             "latest_tradable": float(amount.iloc[-1] > 0),
             "theme_code": industry_code,
             "theme_name": industry_name,
+            **history_evidence,
             "return_2d_pct": ret2,
+            "return_1d_pct": float(latest_row["change_pct"] or 0),
             "return_5d_pct": ret5,
             "return_20d_pct": ret20,
             "return_60d_pct": ret60,
             "ma20_slope_5d_pct": _safe_pct(ma20, ma20_prior),
+            "ma60_slope_10d_pct": (
+                _safe_pct(ma60, ma60_prior)
+                if ma60_prior is not None and ma60_prior > 0
+                else None
+            ),
             "breakout_20d_proximity": min(
                 1.0,
                 float(close.iloc[-1]) / max(float(high.iloc[-20:].max()), 1e-9),
@@ -1100,6 +1182,10 @@ def load_daily_feature_universe(
             "amount_ratio_5_20": (
                 float(amount.iloc[-5:].mean())
                 / max(float(amount.iloc[-20:].mean()), 1.0)
+            ),
+            "amount_ratio_20_60": (
+                float(amount.iloc[-20:].mean())
+                / max(float(amount.iloc[-60:].mean()), 1.0)
             ),
             "relative_strength_20d_pct": (
                 ret20 - market["market_return_20d_pct"]
@@ -1112,14 +1198,51 @@ def load_daily_feature_universe(
                 float(group.iloc[-1]["change_pct"] or 0)
                 - market["market_latest_change_pct"]
             ),
+            "relative_return_1d_pct": (
+                float(latest_row["change_pct"] or 0)
+                - market["market_latest_change_pct"]
+            ),
+            "relative_return_20d_pct": (
+                ret20 - market["market_return_20d_pct"]
+            ),
             "distance_ma20_pct": _safe_pct(
                 latest_close,
                 ma20,
             ),
             "distance_ma5_pct": _safe_pct(latest_close, ma5),
-            "drawdown_20d_pct": _safe_pct(
-                latest_close,
-                float(high.iloc[-20:].max()),
+            "drawdown_20d_pct": _rolling_close_drawdown_pct(
+                close,
+                window=20,
+            ),
+            "drawdown_60d_pct": _rolling_close_drawdown_pct(
+                close,
+                window=60,
+            ),
+            "overnight_gap_pct": (
+                _safe_pct(raw_open, raw_pre_close)
+                if raw_pre_close > 0
+                else None
+            ),
+            "intraday_return_pct": (
+                _safe_pct(raw_close, raw_open)
+                if raw_open > 0
+                else None
+            ),
+            "range_1d_pct": (
+                (raw_high - raw_low) / raw_pre_close * 100.0
+                if raw_pre_close > 0
+                else None
+            ),
+            "close_location_value": (
+                (raw_close - raw_low) / (raw_high - raw_low)
+                if raw_high > raw_low
+                else 0.5
+            ),
+            "volatility_5d_pct": float(
+                daily_returns.iloc[-5:].std(ddof=0)
+            ),
+            "volatility_20d_pct": float(
+                daily_returns.iloc[-20:].std(ddof=0)
             ),
             "rebound_from_low_pct": _safe_pct(
                 latest_close,

@@ -80,6 +80,7 @@ function Get-ServiceProcesses {
                 $_.ExecutablePath -like "*runtime\qmt-py313\Scripts\python.exe"
             ) -or
             $_.CommandLine -like "*run_qmt_live_runtime.py*" -or
+            $_.CommandLine -like "*run_scheduler_daemon.py*" -or
             $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
         )
     }
@@ -92,6 +93,8 @@ function Stop-DuplicateProcesses {
             "qmt_gateway"
         } elseif ($proc.CommandLine -like "*run_qmt_live_runtime.py*") {
             "qmt_live"
+        } elseif ($proc.CommandLine -like "*run_scheduler_daemon.py*") {
+            "scheduler"
         } else {
             "tunnel"
         }
@@ -157,6 +160,13 @@ Ensure-Process `
     -StdErrPath (Join-Path $DataDir "qmt_gateway.err.log")
 
 Start-Sleep -Seconds 2
+
+Ensure-Process `
+    -PythonExe $python `
+    -ScriptName "run_scheduler_daemon.py" `
+    -ArgLine "tools/run_scheduler_daemon.py" `
+    -StdOutPath (Join-Path $DataDir "scheduler_daemon.out.log") `
+    -StdErrPath (Join-Path $DataDir "scheduler_daemon.err.log")
 
 Ensure-Process `
     -PythonExe $python `

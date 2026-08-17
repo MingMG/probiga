@@ -85,6 +85,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "trading_v3_close_decision",
         "trading_v3_premarket_review",
         "trading_v3_counterfactual_audit",
+        "trading_v3_continuous_calibration",
         "qmt_membership_snapshot",
         "concept_constituent_east",
         "capital_flow",
@@ -107,6 +108,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v3_close_decision": 8 * 60 * 60,
     "trading_v3_premarket_review": 3 * 60 * 60,
     "trading_v3_counterfactual_audit": 8 * 60 * 60,
+    "trading_v3_continuous_calibration": 8 * 60 * 60,
     "qmt_membership_snapshot": 8 * 60 * 60,
     "concept_constituent_east": 8 * 60 * 60,
     # These tables feed the watchlist's current-session market and funds
@@ -260,6 +262,7 @@ LONG_RUNNING_TASK_TYPES = {
     "stock_kline",
     "stock_minute",
     "stock_minute_flow",
+    "trading_v3_continuous_calibration",
 }
 LONG_RUNNING_PATH_PARTS = {
     "biz/analysis/sync_analysis_fast.py",
@@ -1506,6 +1509,29 @@ def launch_scheduler_task(
         manual_row,
         run_uid=uuid.uuid4().hex,
     )
+    if not manual_history_uid:
+        with _running_lock:
+            _running_task_ids.discard(task_id)
+            _fast_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
+        update_scheduler_task(
+            engine,
+            task_id,
+            {
+                "last_run_status": "failed",
+                "last_run_output": (
+                    "manual launch rejected: scheduler audit row unavailable"
+                ),
+                "last_run_duration": 0,
+            },
+        )
+        return {
+            "accepted": False,
+            "status": "audit_unavailable",
+            "task_id": task_id,
+            "task_name": task_name,
+            "job_id": "",
+        }
     manual_row["_history_run_uid"] = manual_history_uid
     manual_row["_history_started"] = bool(manual_history_uid)
     worker = threading.Thread(
@@ -1545,6 +1571,7 @@ def launch_scheduler_task(
         "status": "running",
         "task_id": task_id,
         "task_name": task_name,
+        "job_id": str(manual_history_uid or ""),
     }
 
 

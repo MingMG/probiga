@@ -116,6 +116,14 @@ MUTABLE_RUNTIME_ROOTS = (
     "tmp",
 )
 MUTABLE_RUNTIME_TRACKED_ALLOWLIST = frozenset({"data/.gitkeep"})
+LOCAL_ONLY_RELEASE_PATHS = frozenset(
+    {
+        "artifacts/production_selector_readiness_20260811.stdout.json",
+        "tools/_diagnose_lithium_and_sim_production.py",
+        "tools/_finish_qmt_attestation_20260811.py",
+        "tools/_notify_wecom_briefing_production.py",
+    }
+)
 
 
 def validate_production_boundary(
@@ -124,6 +132,7 @@ def validate_production_boundary(
     expected_git_sha: str | None = None,
 ) -> dict[str, Any]:
     _validate_mutable_runtime_roots_untracked()
+    _validate_local_only_release_paths_untracked()
     releases = (
         validate_v4_release(),
         validate_v5_release(),
@@ -560,6 +569,37 @@ def _validate_mutable_runtime_roots_untracked() -> tuple[str, ...]:
     return tuple(sorted(tracked - deleted))
 
 
+def _validate_local_only_release_paths_untracked() -> tuple[str, ...]:
+    """Reject workstation diagnostics/evidence from a Git-anchored release."""
+
+    tracked = tuple(
+        sorted(
+            path
+            for path in _git(
+                "ls-files",
+                "-z",
+                "--",
+                *sorted(LOCAL_ONLY_RELEASE_PATHS),
+            ).split("\0")
+            if path
+        )
+    )
+    if tracked:
+        raise ProductionBoundaryError(
+            "local-only diagnostics/evidence entered the production release: "
+            f"{list(tracked)}"
+        )
+    return tracked
+
+
+def _local_only_release_paths_present() -> tuple[str, ...]:
+    return tuple(
+        path
+        for path in sorted(LOCAL_ONLY_RELEASE_PATHS)
+        if (ROOT / path).exists()
+    )
+
+
 def _git_delivery_status(releases: Sequence[Any], expected_sha: str | None) -> dict[str, Any]:
     try:
         head = _git("rev-parse", "HEAD")
@@ -568,6 +608,16 @@ def _git_delivery_status(releases: Sequence[Any], expected_sha: str | None) -> d
                 "ready": False,
                 "head": head,
                 "reason": "checked-out HEAD differs from the workflow commit",
+            }
+        local_only_present = _local_only_release_paths_present()
+        if local_only_present:
+            return {
+                "ready": False,
+                "head": head,
+                "reason": (
+                    "local-only diagnostics/evidence exist in the release tree: "
+                    f"{list(local_only_present)}"
+                ),
             }
         required = _required_release_files(releases)
         tracked = set(_git("ls-files", "--", *sorted(required)).splitlines())

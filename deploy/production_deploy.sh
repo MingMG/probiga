@@ -60,6 +60,7 @@ sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
 AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
+SCHEDULER_DROPIN=/etc/systemd/system/probiga-scheduler.service.d/release.conf
 REPOSITORY_ROOT=/opt/ProBigA
 STATIC_RELEASE_LINK=/opt/ProBigA-current
 if ! sudo git config --system --get-all safe.directory \
@@ -510,19 +511,45 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
-    'Environment=API_EMBEDDED_SCHEDULER_ENABLED=true' \
+    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
+    'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_BUILD_COMMIT_SHA=$revision" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
     "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
     "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
     "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
     | sudo tee /etc/systemd/system/probiga.service.d/scheduler.conf >/dev/null
+}
+write_scheduler_dropin() {
+  local revision="$1"
+  local adata_sha="$2"
+  local adata_tree_sha="$3"
+  local adata_source="$4"
+  sudo mkdir -p "$(dirname "$SCHEDULER_DROPIN")"
+  printf '%s\n' \
+    '[Service]' \
+    "User=$SERVICE_USER" \
+    "Group=$SERVICE_USER" \
+    'WorkingDirectory=/opt/ProBigA' \
+    'ExecStart=' \
+    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python tools/run_scheduler_daemon.py" \
+    'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
+    'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    'Environment=GIT_OPTIONAL_LOCKS=0' \
+    'Environment=PYTHONDONTWRITEBYTECODE=1' \
+    "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_BUILD_COMMIT_SHA=$revision" \
+    "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
+    "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
+    "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
+    "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
+    | sudo tee "$SCHEDULER_DROPIN" >/dev/null
 }
 write_ai_worker_dropin() {
   local revision="$1"
@@ -618,6 +645,12 @@ if sudo test -f /etc/systemd/system/probiga.service.d/scheduler.conf; then
   sudo cat /etc/systemd/system/probiga.service.d/scheduler.conf > "$PREVIOUS_DROPIN"
   PREVIOUS_DROPIN_PRESENT=1
 fi
+PREVIOUS_SCHEDULER_DROPIN="$(mktemp)"
+PREVIOUS_SCHEDULER_DROPIN_PRESENT=0
+if sudo test -f "$SCHEDULER_DROPIN"; then
+  sudo cat "$SCHEDULER_DROPIN" > "$PREVIOUS_SCHEDULER_DROPIN"
+  PREVIOUS_SCHEDULER_DROPIN_PRESENT=1
+fi
 dropin_environment_value() {
   local name="$1"
   sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN" | tail -n 1
@@ -691,6 +724,7 @@ if systemctl list-unit-files probiga-scheduler.service --no-legend \
   systemctl is-active --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ACTIVE=1 || true
   systemctl is-enabled --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ENABLED=1 || true
 fi
+test "$SCHEDULER_UNIT_PRESENT" -eq 1
 AI_WORKER_UNIT_PRESENT=0
 PREVIOUS_AI_WORKER_TIMER_ACTIVE=0
 PREVIOUS_AI_WORKER_TIMER_ENABLED=0
@@ -823,6 +857,17 @@ rollback() {
       elif ! sudo rm -f \
         /etc/systemd/system/probiga.service.d/scheduler.conf; then
         rollback_failure "remove release probiga drop-in"
+        restoration_ready=0
+      fi
+    fi
+    if [ "$restoration_ready" -eq 1 ]; then
+      if [ "$PREVIOUS_SCHEDULER_DROPIN_PRESENT" -eq 1 ]; then
+        if ! sudo cp "$PREVIOUS_SCHEDULER_DROPIN" "$SCHEDULER_DROPIN"; then
+          rollback_failure "restore previous scheduler drop-in"
+          restoration_ready=0
+        fi
+      elif ! sudo rm -f "$SCHEDULER_DROPIN"; then
+        rollback_failure "remove release scheduler drop-in"
         restoration_ready=0
       fi
     fi
@@ -1025,6 +1070,8 @@ if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
   sudo -u "$SERVICE_USER" test ! -w "$EXPECTED_VENV_TARGET"
   test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.requirements.sha256")" = \
     "$EXPECTED_REQUIREMENTS_SHA256"
+  test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.probiga.gitsha")" = \
+    "$EXPECTED_SHA"
   test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.gitsha")" = \
     "$EXPECTED_ADATA_SHA"
   test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.tree.sha256")" = \
@@ -1049,6 +1096,7 @@ else
     "${ADATA_WHEELS[0]}" --quiet
   printf '%s\n' "$EXPECTED_REQUIREMENTS_SHA256" \
     > "$EXPECTED_BUILD/.requirements.sha256"
+  printf '%s\n' "$EXPECTED_SHA" > "$EXPECTED_BUILD/.probiga.gitsha"
   printf '%s\n' "$EXPECTED_ADATA_SHA" > "$EXPECTED_BUILD/.adata.gitsha"
   printf '%s\n' "$EXPECTED_ADATA_TREE_SHA256" \
     > "$EXPECTED_BUILD/.adata.tree.sha256"
@@ -1073,6 +1121,14 @@ sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
   PYTHONDONTWRITEBYTECODE=1 \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
   tools/ensure_quality_gate.py --validate-review-delivery
+# Persist the Layer-4 writer fence while both scheduler implementations are
+# stopped. Activation is a separate, schema-gated maintenance operation.
+sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
+  PYTHONDONTWRITEBYTECODE=1 \
+  PROBIGA_DEPLOYMENT_MODE=production \
+  PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+  tools/add_trading_v3_tasks.py --writer-fence
 rm -f "$RESOLVED_LOCK"
 # Root-owned validation can refresh Git metadata with a restrictive umask.
 # Seal again immediately before the service-account identity proof and start.
@@ -1082,19 +1138,27 @@ release_identity_check 1
 sudo mkdir -p /etc/systemd/system/probiga.service.d
 write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
   "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
+write_scheduler_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
+  "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   write_ai_worker_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
     "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
 fi
 sudo systemctl daemon-reload
 systemctl show probiga --property=ExecStart --value \
-  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' >/dev/null
+  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' >/dev/null
 systemctl show probiga --property=ExecStart --value \
+  | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
+systemctl show probiga-scheduler --property=ExecStart --value \
+  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' >/dev/null
+systemctl show probiga-scheduler --property=ExecStart --value \
   | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   assert_ai_worker_runtime "$EXPECTED_SHA"
 fi
 sudo systemctl restart probiga
+sudo systemctl enable probiga-scheduler
+sudo systemctl restart probiga-scheduler
 SERVICE_MAIN_PID="$(systemctl show probiga --property=MainPID --value)"
 case "$SERVICE_MAIN_PID" in
   ''|0|*[!0-9]*)
@@ -1102,10 +1166,21 @@ case "$SERVICE_MAIN_PID" in
     false
     ;;
 esac
-grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' \
+grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+SCHEDULER_MAIN_PID="$(systemctl show probiga-scheduler --property=MainPID --value)"
+case "$SCHEDULER_MAIN_PID" in
+  ''|0|*[!0-9]*)
+    echo "probiga-scheduler did not expose a valid main PID after restart" >&2
+    false
+    ;;
+esac
+grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
@@ -1120,10 +1195,8 @@ rm -f "$HEALTH_RESPONSE"
 sudo systemctl is-active --quiet probiga
 point_static_release_to_checkout
 assert_nginx_static_matches_checkout
-if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
-  ! systemctl is-active --quiet probiga-scheduler
-  ! systemctl is-enabled --quiet probiga-scheduler
-fi
+systemctl is-active --quiet probiga-scheduler
+systemctl is-enabled --quiet probiga-scheduler
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
     sudo systemctl enable "$AI_WORKER_TIMER"
@@ -1161,4 +1234,4 @@ prune_release_venvs "$EXPECTED_SHA"
 df -h / >&2
 write_receipt "DEPLOYED" "$EXPECTED_SHA"
 trap - ERR TERM INT
-rm -f "$PREVIOUS_DROPIN"
+rm -f "$PREVIOUS_DROPIN" "$PREVIOUS_SCHEDULER_DROPIN"

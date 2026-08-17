@@ -1,6 +1,6 @@
 {
   "schema_version": "probiga.trading-v3.v1",
-  "strategy_version": "trading_v3.6.0-paper",
+  "strategy_version": "trading_v3.11.0-paper",
   "calibration_version_token": "v3.3.0",
   "calibration_version_tokens": {
     "right_side_trend": "v3.4.1",
@@ -12,7 +12,7 @@
     "oversold_reversal": "v3.3.0",
     "weak_market_structural_mainline": "v3.6.0"
   },
-  "frozen_at": "2026-08-02T15:00:00+08:00",
+  "frozen_at": "2026-08-17T00:00:00+08:00",
   "lifecycle_status": "PAPER_TRIAL",
   "automatic_real_order_submission": false,
   "production_routes": {
@@ -152,6 +152,279 @@
     "unresolved_rows_are_deferred": true,
     "recall_rebuilt_from_complete_ledger": true,
     "can_activate_model": false
+  },
+  "decision_intelligence": {
+    "protocol_version": "DECISION_INTELLIGENCE_V1",
+    "lifecycle": "SHADOW_RESEARCH_ONLY",
+    "batch_diff_enabled": true,
+    "replacement_analysis_enabled": true,
+    "portfolio_optimizer_enabled": true,
+    "portfolio_optimizer": {
+      "maximum_participation_rate": 0.05,
+      "capacity_sessions": 2,
+      "maximum_cluster_weight": 0.35,
+      "minimum_edge_to_cost_multiple": 3.0,
+      "board_lot": 100
+    },
+    "minimum_replacement_net_edge_pct": 0.5,
+    "execution_revalidation_required": true,
+    "order_allowed": false,
+    "can_activate_model": false
+  },
+  "multi_horizon_forecasts": {
+    "protocol_version": "INDEPENDENT_T1_T5_T20_LEDGER_BOUND_CONTRACT_V3",
+    "model_protocol": "POINT_IN_TIME_INDEPENDENT_NUMPY_REGRESSION_V2",
+    "lifecycle": "SHADOW_RESEARCH_ONLY",
+    "required_horizons": [
+      1,
+      5,
+      20
+    ],
+    "same_close_entry_allowed": false,
+    "t0_exit_allowed": false,
+    "mature_outcomes_required": true,
+    "cost_inclusive_calibration_required": true,
+    "scorer_algorithm_version": "BOUNDED_LINEAR_PROXY_V1",
+    "models": {
+      "T+1": {
+        "model_key": "trading_v3_t1_independent_proxy_v1",
+        "model_version": "1.0-shadow-proxy",
+        "prediction_kind": "PROXY_SCORE",
+        "source_strategy_keys": [
+          "intraday_surprise"
+        ],
+        "cost_assumption_pct": 0.2,
+        "cost_model_version": "ROUNDTRIP_COST_ASSUMPTION_V1",
+        "feature_protocol": {
+          "protocol_version": "T1_INTRADAY_MICROSTRUCTURE_PROXY_V1",
+          "intercept": 0.0,
+          "inputs": {
+            "intraday_amount_surprise_z": {"weight": 0.28, "lower": 0.0, "upper": 5.0},
+            "price_vs_vwap_pct": {"weight": 0.18, "lower": -1.0, "upper": 3.0},
+            "interval_return_pct": {"weight": 0.16, "lower": -1.0, "upper": 4.0},
+            "sector_breadth_pct": {"weight": 0.14, "lower": 30.0, "upper": 90.0},
+            "fill_probability": {"weight": 0.18, "lower": 0.0, "upper": 1.0},
+            "spread_bps": {"weight": 0.06, "lower": 10.0, "upper": 80.0, "invert": true}
+          }
+        },
+        "lifecycle": "SHADOW_RESEARCH_ONLY",
+        "order_allowed": false
+      },
+      "T+5": {
+        "model_key": "trading_v3_t5_independent_proxy_v1",
+        "model_version": "1.0-shadow-proxy",
+        "prediction_kind": "PROXY_SCORE",
+        "source_strategy_keys": [
+          "theme_diffusion",
+          "low_base_ignition",
+          "oversold_reversal",
+          "weak_market_structural_mainline"
+        ],
+        "cost_assumption_pct": 0.2,
+        "cost_model_version": "ROUNDTRIP_COST_ASSUMPTION_V1",
+        "feature_protocol": {
+          "protocol_version": "T5_SWING_BREADTH_REVERSAL_PROXY_V1",
+          "intercept": 0.0,
+          "inputs": {
+            "return_5d_pct": {"weight": 0.22, "lower": -12.0, "upper": 15.0},
+            "latest_change_pct": {"weight": 0.16, "lower": -5.0, "upper": 6.5},
+            "amount_ratio_5_20": {"weight": 0.18, "lower": 0.5, "upper": 2.5},
+            "sector_relative_return_pct": {"weight": 0.18, "lower": -3.0, "upper": 6.0},
+            "sector_breadth_pct": {"weight": 0.16, "lower": 30.0, "upper": 85.0},
+            "distance_ma20_pct": {"weight": 0.10, "lower": -20.0, "upper": 10.0}
+          }
+        },
+        "lifecycle": "SHADOW_RESEARCH_ONLY",
+        "order_allowed": false
+      },
+      "T+20": {
+        "model_key": "trading_v3_t20_independent_proxy_v1",
+        "model_version": "1.0-shadow-proxy",
+        "prediction_kind": "PROXY_SCORE",
+        "source_strategy_keys": [
+          "quality_momentum"
+        ],
+        "cost_assumption_pct": 0.2,
+        "cost_model_version": "ROUNDTRIP_COST_ASSUMPTION_V1",
+        "feature_protocol": {
+          "protocol_version": "T20_QUALITY_MOMENTUM_PROXY_V1",
+          "intercept": 0.0,
+          "inputs": {
+            "quality_percentile": {"weight": 0.24, "lower": 0.0, "upper": 1.0},
+            "growth_percentile": {"weight": 0.18, "lower": 0.0, "upper": 1.0},
+            "cashflow_quality_percentile": {"weight": 0.18, "lower": 0.0, "upper": 1.0},
+            "valuation_percentile": {"weight": 0.12, "lower": 0.0, "upper": 1.0},
+            "momentum_60d_percentile": {"weight": 0.20, "lower": 0.0, "upper": 1.0},
+            "volatility_20d_percentile": {"weight": 0.08, "lower": 0.0, "upper": 1.0, "invert": true}
+          }
+        },
+        "lifecycle": "SHADOW_RESEARCH_ONLY",
+        "order_allowed": false
+      }
+    },
+    "runtime_model_selection": {
+      "policy": "CURRENT_DB_OOS_VERIFIED_ELSE_FROZEN_PROXY",
+      "artifact_registry": "st_horizon_model_artifact_v3",
+      "artifact_must_match_current_config_and_code": true,
+      "current_protocol": {
+        "artifact_schema": "probiga.trading-v3.independent-horizon-model-artifact.v3",
+        "suite_schema": "probiga.trading-v3.independent-horizon-model-suite.v3",
+        "model_protocol": "POINT_IN_TIME_INDEPENDENT_NUMPY_REGRESSION_V2",
+        "selection_protocol": "FULL_UNIVERSE_TOP12_RESEARCH_DIAGNOSTIC_V2",
+        "selection_policy_hash": "824721cb771a3d73b4dcad9f7ff69acd300f74f291f2e87c81ad793a74b2d941",
+        "candidate_ledger_schema": "probiga.trading-v3.prequential-candidate-evaluation-ledger.v1",
+      "candidate_ledger_binding_protocol": "FULL_PREQUENTIAL_OOS_CANDIDATE_LEDGER_CONTENT_ADDRESS_V1",
+      "candidate_ledger_registration_required": true,
+      "training_window_protocol": "FROZEN_CONFIG_SIGNAL_START_INCLUSIVE_V1",
+      "history_start": "2023-01-01",
+      "artifact_status_required": "OOS_VERIFIED",
+        "contract_eligibility_scope": "SHADOW_CONTRACT_ONLY",
+        "deployment_gate": false,
+        "paper_eligible": false,
+        "order_allowed": false
+      },
+      "historical_v1": {
+        "artifact_schema": "probiga.trading-v3.independent-horizon-model-artifact.v1",
+        "suite_schema": "probiga.trading-v3.independent-horizon-model-suite.v1",
+        "mode": "AUDIT_ONLY",
+        "runtime_selectable": false,
+        "contract_eligible": false,
+        "deployment_gate": false,
+        "paper_eligible": false,
+        "order_allowed": false
+      },
+      "historical_v2": {
+        "artifact_schema": "probiga.trading-v3.independent-horizon-model-artifact.v2",
+        "suite_schema": "probiga.trading-v3.independent-horizon-model-suite.v2",
+        "mode": "AUDIT_ONLY",
+        "missing_candidate_ledger": true,
+        "runtime_selectable": false,
+        "contract_eligible": false,
+        "deployment_gate": false,
+        "paper_eligible": false,
+        "order_allowed": false
+      },
+      "fallback_prediction_kind": "PROXY_SCORE",
+      "fallback_proxy_models_enabled": true,
+      "fallback_can_activate_model": false,
+      "order_allowed": false
+    },
+    "trainable_models": {
+      "T+1": {
+        "model_key": "trading_v3_t1_micro_reversion_ridge_v2",
+        "model_version": "2.0.0-oos-shadow",
+        "algorithm": "RIDGE_RETURN_V2",
+        "features": [
+          "return_1d_pct",
+          "overnight_gap_pct",
+          "intraday_return_pct",
+          "amount_ratio_1_20",
+          "range_1d_pct",
+          "close_location_value",
+          "volatility_5d_pct",
+          "relative_return_1d_pct"
+        ],
+        "source_strategy_keys": ["intraday_surprise"],
+        "order_allowed": false
+      },
+      "T+5": {
+        "model_key": "trading_v3_t5_swing_huber_ridge_v2",
+        "model_version": "2.0.0-oos-shadow",
+        "algorithm": "HUBER_RIDGE_RETURN_V2",
+        "features": [
+          "return_5d_pct",
+          "return_20d_pct",
+          "distance_ma5_pct",
+          "distance_ma20_pct",
+          "amount_ratio_5_20",
+          "volatility_20d_pct",
+          "drawdown_20d_pct",
+          "relative_return_20d_pct"
+        ],
+        "source_strategy_keys": [
+          "theme_diffusion",
+          "low_base_ignition",
+          "oversold_reversal",
+          "weak_market_structural_mainline"
+        ],
+        "order_allowed": false
+      },
+      "T+20": {
+        "model_key": "trading_v3_t20_trend_recency_ridge_v2",
+        "model_version": "2.0.0-oos-shadow",
+        "algorithm": "RECENCY_WEIGHTED_RIDGE_RETURN_V2",
+        "features": [
+          "return_20d_pct",
+          "return_60d_pct",
+          "ma20_slope_5d_pct",
+          "ma60_slope_10d_pct",
+          "volatility_20d_pct",
+          "drawdown_60d_pct",
+          "amount_ratio_20_60",
+          "relative_return_20d_pct"
+        ],
+        "source_strategy_keys": ["quality_momentum"],
+        "order_allowed": false
+      }
+    },
+    "training_policy": {
+      "protocol_version": "POINT_IN_TIME_MATURITY_PURGED_PREQUENTIAL_OOS_V3",
+      "training_window_protocol": "FROZEN_CONFIG_SIGNAL_START_INCLUSIVE_V1",
+      "history_start": "2023-01-01",
+      "minimum_train_sessions": {"1": 120, "5": 160, "20": 240},
+      "minimum_oos_sessions": {"1": 40, "5": 50, "20": 80},
+      "minimum_maturity_coverage": 0.98,
+      "artifact_core_hash_excludes_generated_at": true,
+      "external_execution_attestation_required": true,
+      "automatic_retraining_enabled": true
+    },
+    "order_allowed": false,
+    "can_activate_model": false
+  },
+  "shadow_release": {
+    "protocol_version": "SHADOW_RELEASE_STATE_MACHINE_V1",
+    "initial_stage": "DRAFT",
+    "paper_eligible_requires_manual_review": true,
+    "paper_eligible_requires_external_execution_grant": true,
+    "automatic_promotion_allowed": false,
+    "order_authority_managed_externally": true,
+    "order_allowed": false,
+    "real_order_allowed": false
+  },
+  "continuous_calibration": {
+    "protocol_version": "CONTINUOUS_CALIBRATION_FAIL_CLOSED_V1",
+    "minimum_mature_samples": {
+      "1": 160,
+      "5": 120,
+      "20": 80
+    },
+    "minimum_oos_samples": {
+      "1": 100,
+      "5": 100,
+      "20": 80
+    },
+    "minimum_train_sessions": {
+      "1": 120,
+      "5": 160,
+      "20": 240
+    },
+    "minimum_oos_sessions": {
+      "1": 40,
+      "5": 50,
+      "20": 80
+    },
+    "minimum_walk_forward_folds": 3,
+    "minimum_direction_rank_correlation": 0.05,
+    "maximum_calibration_mae": 0.15,
+    "maximum_brier_score": 0.24,
+    "maximum_population_stability_index": 0.2,
+    "minimum_net_expectancy_after_cost_pct": 0.0,
+    "minimum_profit_factor": 1.3,
+    "minimum_cost_coverage_ratio": 1.0,
+    "maximum_evidence_age_days": 30,
+    "failed_gate_stage": "BLOCKED",
+    "automatic_promotion_allowed": false,
+    "order_allowed": false
   },
   "theme_research": {
     "minimum_alert_score": 0.82,

@@ -123,7 +123,10 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    workflow = workflow_source + "\n" + deploy_script
+    root_broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
 
     assert len(workflow_source) < 21_000
     assert "deploy/production_deploy.sh" in workflow_source
@@ -191,6 +194,9 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'sudo chmod 0600 "$receipt_tmp"' in workflow
     assert 'sudo mv -f "$receipt_tmp" "$RECEIPT_DIR/$RECEIPT_ID.json"' in workflow
     assert 'sudo tee "$RECEIPT_DIR/$RECEIPT_ID.json"' not in workflow
+    assert 'fetch --no-tags "$TRUSTED_REMOTE" refs/heads/main' in root_broker
+    assert 'REMOTE_SHA="$(GIT_SSH_COMMAND="$REMOTE_GIT_SSH"' in root_broker
+    assert 'git checkout --detach --force "$EXPECTED_SHA"' in deploy_script
     assert "trap 'rollback 143' TERM" in workflow
     assert workflow.count("--retry-all-errors") == 2
     rollback = workflow.index("rollback() {")
@@ -289,16 +295,21 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     )
 
     assert (
-        "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true "
+        "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
         in deploy_script
     )
     assert "systemctl show probiga --property=ExecStart --value" in deploy_script
     assert (
-        "grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true'"
+        "systemctl show probiga-scheduler --property=ExecStart --value"
         in deploy_script
     )
-    assert "grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=true'" in deploy_script
+    assert (
+        "grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false'"
+        in deploy_script
+    )
+    assert "grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false'" in deploy_script
     assert '"/proc/$SERVICE_MAIN_PID/environ"' in deploy_script
+    assert '"/proc/$SCHEDULER_MAIN_PID/environ"' in deploy_script
     assert "curl --fail-with-body" in deploy_script
     assert 'cat "$HEALTH_RESPONSE" >&2' in deploy_script
     assert "release_identity_check 1" in deploy_script
@@ -416,6 +427,62 @@ def test_mutable_runtime_roots_allow_only_git_reported_deletions(
     )
 
 
+def test_local_only_diagnostics_are_exactly_ignored_and_release_denied() -> None:
+    expected = {
+        "artifacts/production_selector_readiness_20260811.stdout.json",
+        "tools/_diagnose_lithium_and_sim_production.py",
+        "tools/_finish_qmt_attestation_20260811.py",
+        "tools/_notify_wecom_briefing_production.py",
+    }
+    ignored = {
+        line.strip().removeprefix("/")
+        for line in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("/")
+    }
+
+    assert boundary.LOCAL_ONLY_RELEASE_PATHS == expected
+    assert expected <= ignored
+
+
+def test_local_only_diagnostic_becoming_tracked_blocks_release(monkeypatch) -> None:
+    tracked = "tools/_diagnose_lithium_and_sim_production.py"
+
+    def fake_git(*args):
+        assert args[:2] == ("ls-files", "-z")
+        assert set(args[3:]) == boundary.LOCAL_ONLY_RELEASE_PATHS
+        return tracked + "\0"
+
+    monkeypatch.setattr(boundary, "_git", fake_git)
+
+    with pytest.raises(
+        boundary.ProductionBoundaryError,
+        match="local-only diagnostics/evidence entered",
+    ):
+        boundary._validate_local_only_release_paths_untracked()
+
+
+def test_git_delivery_rejects_ignored_local_only_file(tmp_path, monkeypatch) -> None:
+    local_script = tmp_path / "tools/_diagnose_lithium_and_sim_production.py"
+    local_script.parent.mkdir()
+    local_script.write_text("print('local only')\n", encoding="utf-8")
+    monkeypatch.setattr(boundary, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        boundary,
+        "_git",
+        lambda *args: "a" * 40
+        if args[:2] == ("rev-parse", "HEAD")
+        else pytest.fail(f"unexpected Git call after local-only detection: {args}"),
+    )
+
+    result = boundary._git_delivery_status(
+        (SimpleNamespace(document={}),),
+        None,
+    )
+
+    assert result["ready"] is False
+    assert "local-only diagnostics/evidence exist" in result["reason"]
+
+
 def test_git_delivery_protects_scripts_and_configs_but_excludes_runtime_data(
     monkeypatch,
 ) -> None:
@@ -424,6 +491,7 @@ def test_git_delivery_protects_scripts_and_configs_but_excludes_runtime_data(
     assert "data" not in boundary.PROTECTED_RELEASE_PATHS
     monkeypatch.setattr(boundary, "_required_release_files", lambda _items: {"x"})
     monkeypatch.setattr(boundary, "_untracked_root_shadow_files", lambda: [])
+    monkeypatch.setattr(boundary, "_local_only_release_paths_present", lambda: ())
 
     def fake_git(*args):
         if args[:2] == ("rev-parse", "HEAD"):
@@ -446,6 +514,7 @@ def test_git_delivery_protects_scripts_and_configs_but_excludes_runtime_data(
 
 def test_git_delivery_rejects_ignored_root_import_shadow(monkeypatch) -> None:
     monkeypatch.setattr(boundary, "_required_release_files", lambda _items: {"x"})
+    monkeypatch.setattr(boundary, "_local_only_release_paths_present", lambda: ())
     monkeypatch.setattr(
         boundary,
         "_untracked_root_shadow_files",

@@ -11,6 +11,10 @@ from sqlalchemy.engine import make_url
 
 from server.api.admin_auth import admin_auth_status
 from server.api.scheduler_runtime import scheduler_runtime_info
+from server.common.scheduler_authority import (
+    PRODUCTION_SCHEDULER_SERVICE,
+    scheduler_authority_contract,
+)
 from server.api.routers._engine import get_engine
 from server.common.batch_db import quote_identifier
 from server.common.adata_release import (
@@ -110,10 +114,10 @@ def _untracked_root_shadow_files() -> tuple[str, ...]:
 
 
 def _standalone_scheduler_status() -> dict[str, str | bool | None]:
-    """Prove that the legacy standalone scheduler is inactive and not enabled."""
+    """Prove that the production standalone scheduler is active and enabled."""
     try:
         active_result = subprocess.run(
-            ["systemctl", "is-active", "probiga-scheduler.service"],
+            ["systemctl", "is-active", PRODUCTION_SCHEDULER_SERVICE],
             check=False,
             capture_output=True,
             text=True,
@@ -122,7 +126,7 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
             timeout=5,
         )
         enabled_result = subprocess.run(
-            ["systemctl", "is-enabled", "probiga-scheduler.service"],
+            ["systemctl", "is-enabled", PRODUCTION_SCHEDULER_SERVICE],
             check=False,
             capture_output=True,
             text=True,
@@ -138,7 +142,7 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
                     "show",
                     "--property=LoadState",
                     "--value",
-                    "probiga-scheduler.service",
+                    PRODUCTION_SCHEDULER_SERVICE,
                 ],
                 check=False,
                 capture_output=True,
@@ -169,27 +173,25 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         if not enablement_state:
             enablement_state = "not-found"
             enablement_returncode = 1
-    active_states = {"active", "activating", "reloading", "deactivating"}
-    inactive_states = {"inactive", "failed", "unknown"}
-    if state in active_states:
+    non_active_states = {
+        "activating",
+        "reloading",
+        "deactivating",
+        "inactive",
+        "failed",
+        "unknown",
+    }
+    if state == "active" and active_returncode == 0:
         active: bool | None = True
         active_verified = True
-    elif state in inactive_states and active_returncode in {3, 4}:
+    elif state in non_active_states and active_returncode in {0, 3, 4}:
         active = False
         active_verified = True
     else:
         active = None
         active_verified = False
 
-    safe_enablement_states = {
-        "disabled",
-        "masked",
-        "masked-runtime",
-        "static",
-        "not-found",
-    }
-    unsafe_enablement_states = {
-        "enabled",
+    non_persistent_enablement_states = {
         "enabled-runtime",
         "linked",
         "linked-runtime",
@@ -197,15 +199,20 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         "indirect",
         "generated",
         "transient",
+        "disabled",
+        "masked",
+        "masked-runtime",
+        "static",
+        "not-found",
     }
-    if (
-        enablement_state in safe_enablement_states
+    if enablement_state == "enabled" and enablement_returncode == 0:
+        enabled = True
+        enablement_verified = True
+    elif (
+        enablement_state in non_persistent_enablement_states
         and enablement_returncode in {0, 1, 3, 4}
     ):
-        enabled: bool | None = False
-        enablement_verified = True
-    elif enablement_state in unsafe_enablement_states:
-        enabled = True
+        enabled = False
         enablement_verified = True
     else:
         enabled = None
@@ -217,8 +224,10 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         error = f"systemctl_is_active_exit_{active_returncode}"
     elif not enablement_verified:
         error = f"systemctl_is_enabled_exit_{enablement_returncode}"
-    elif enabled:
-        error = "standalone_scheduler_enabled"
+    elif active is not True:
+        error = "standalone_scheduler_inactive"
+    elif enabled is not True:
+        error = "standalone_scheduler_disabled"
     return {
         "verified": verified,
         "active": active,
@@ -503,6 +512,7 @@ def health():
     adata_revision = _deployed_adata_revision()
     auth = admin_auth_status()
     production_mode = revision["deployment_mode"] == "production"
+    scheduler_authority = scheduler_authority_contract()
     scheduler = scheduler_runtime_info()
     standalone_scheduler = (
         _standalone_scheduler_status()
@@ -545,21 +555,21 @@ def health():
             detail="production administrative authentication is not ready",
         )
     if production_mode and (
-        scheduler.get("embedded_scheduler_enabled") is not True
-        or scheduler.get("embedded_scheduler_running") is not True
+        scheduler.get("embedded_scheduler_enabled") is not False
+        or scheduler.get("embedded_scheduler_running") is not False
     ):
         raise HTTPException(
             status_code=503,
-            detail="production embedded scheduler is not enabled and running",
+            detail="production embedded scheduler is not disabled and inactive",
         )
     if production_mode and (
         standalone_scheduler.get("verified") is not True
-        or standalone_scheduler.get("active") is not False
-        or standalone_scheduler.get("enabled") is not False
+        or standalone_scheduler.get("active") is not True
+        or standalone_scheduler.get("enabled") is not True
     ):
         raise HTTPException(
             status_code=503,
-            detail="standalone scheduler inactivity and disablement could not be proven",
+            detail="standalone scheduler activity and enablement could not be proven",
         )
     return {
         "status": "ok",
@@ -567,6 +577,7 @@ def health():
         "adata_release_revision": adata_revision,
         "admin_auth_ready": bool(auth.get("ready")),
         "scheduler_runtime": scheduler,
+        "scheduler_authority": scheduler_authority,
         "standalone_scheduler": standalone_scheduler,
         "in_app_deploy_enabled": (
             os.environ.get("PROBIGA_IN_APP_DEPLOY_ENABLED", "").strip() == "1"
@@ -579,6 +590,7 @@ def health_runtime():
     return {
         "status": "ok",
         **scheduler_runtime_info(),
+        "scheduler_authority": scheduler_authority_contract(),
         "mysql_target": _format_mysql_target(),
         "current_mysql_target": _format_mysql_target(get_current_mysql_url()),
         "minute_mysql_pool": get_minute_mysql_pool_config(),

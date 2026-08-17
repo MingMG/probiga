@@ -20,9 +20,9 @@ import re
 import ssl
 from typing import Any
 
-from sqlalchemy import event
 from sqlalchemy.engine import Engine, make_url
 
+from server.common.engine_factory import create_isolated_mysql_acceptance_engine
 from tools.env_config import create_tool_engine
 
 
@@ -100,26 +100,6 @@ def resolve_mysql_acceptance_tls_config(
     return require_mysql_acceptance_ssl_ca(source.get(normalized, ""))
 
 
-def _require_negotiated_tls(dbapi_connection: object, _record: object) -> None:
-    """Reject a DBAPI checkout when the server negotiated no TLS cipher."""
-
-    cursor = dbapi_connection.cursor()  # type: ignore[attr-defined]
-    try:
-        cursor.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
-        row = cursor.fetchone()
-    finally:
-        cursor.close()
-    cipher = row[1] if isinstance(row, (tuple, list)) and len(row) >= 2 else None
-    if not isinstance(cipher, (str, bytes)) or not cipher:
-        try:
-            dbapi_connection.close()  # type: ignore[attr-defined]
-        finally:
-            raise RuntimeError(
-                "MySQL acceptance TLS was configured but no TLS cipher was "
-                "negotiated"
-            )
-
-
 def create_mysql_acceptance_engine(
     url: str,
     *,
@@ -134,7 +114,9 @@ def create_mysql_acceptance_engine(
     negotiated cipher.  There is no retry without TLS.
     """
 
-    forbidden = frozenset(engine_options) & {"connect_args", "creator"}
+    forbidden = frozenset(engine_options) & {
+        "connect_args", "creator", "module"
+    }
     if forbidden:
         raise TypeError(
             "MySQL acceptance engine options may not override "
@@ -152,16 +134,11 @@ def create_mysql_acceptance_engine(
         raise ValueError(
             "MySQL acceptance TLS requires an explicit mysql+pymysql URL"
         )
-    engine = create_tool_engine(
+    return create_isolated_mysql_acceptance_engine(
         url,
-        connect_args={
-            "ssl_ca": verified.ssl_ca,
-            "ssl_verify_cert": True,
-        },
+        ssl_ca=verified.ssl_ca,
         **engine_options,
     )
-    event.listen(engine, "connect", _require_negotiated_tls)
-    return engine
 
 
 __all__ = [

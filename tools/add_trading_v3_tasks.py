@@ -2,15 +2,21 @@
 """Install the production V3 decision, review and counterfactual tasks."""
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.scheduler_tasks import upsert_scheduler_task
+from server.common.scheduler_authority import LAYER4_WRITER_TASK_TYPES
+from server.common.scheduler_tasks import (
+    set_scheduler_tasks_enabled_atomically,
+    upsert_scheduler_task,
+)
 from tools.env_config import create_tool_engine, load_project_env
 
 
@@ -50,41 +56,192 @@ TASKS = (
         "enabled": 1,
     },
     {
-        "task_name": "V3漏抓反事实复盘",
+        "task_name": "V3 拒绝样本与漏抓审计",
         "task_type": "trading_v3_counterfactual_audit",
         "group_name": "strategy_v3",
         "script_path": "tools/run_trading_v3_counterfactual.py",
-        "script_args": "",
+        "script_args": "--limit 10000 --max-batches 10",
         "cron_time": "16:30",
         "interval_minutes": 0,
         "date_param": "",
         "date_param_desc": "",
-        "description": "记录漏抓与误触发结果，作为后续校准证据，不产生订单",
-        "sort_order": 132,
+        "description": (
+            "先维护旧拒绝样本诊断，再按冻结 T+1/T+5/T+20 合同生成"
+            "独立 outcome ledger、反事实学习与持续校准门禁；全程 Shadow、"
+            "失败即任务失败且绝不授予订单权限"
+        ),
+        "sort_order": 212,
+        "enabled": 1,
+    },
+    {
+        "task_name": "V3 多周期持续校准与 Shadow 发布",
+        "task_type": "trading_v3_continuous_calibration",
+        "group_name": "strategy_v3",
+        "script_path": "tools/run_trading_v3_continuous_calibration.py",
+        "script_args": (
+            "--lock-timeout-seconds 0 "
+            "--training-timeout-seconds 19800"
+        ),
+        "cron_time": "17:10",
+        "interval_minutes": 0,
+        "date_param": "",
+        "date_param_desc": "",
+        "description": (
+            "发现/深验 T+1/T+5/T+20 JSON 模型；缺失或过期时用全 A 股"
+            "点时数据触发真实训练，按新增 forward outcome 做受控刷新，写入"
+            "不可变证据并执行 Shadow 注册、持续门禁与自动降级；无外部签名"
+            "和 EXECUTABLE_VERIFIED 证据时保持 COLLECTING 且绝不授予订单权限"
+        ),
+        "sort_order": 213,
         "enabled": 1,
     },
 )
 
 
-def main() -> int:
+def deployment_tasks(*, activate_layer4: bool) -> tuple[dict, ...]:
+    """Return task definitions with the durable Layer-4 writer fence applied."""
+
+    result = []
+    for definition in TASKS:
+        task = dict(definition)
+        if task["task_type"] in LAYER4_WRITER_TASK_TYPES:
+            task["enabled"] = 1 if activate_layer4 else 0
+        result.append(task)
+    return tuple(result)
+
+
+def layer4_activation_preconditions(engine) -> dict:
+    """Deep-check all three migrations before any Layer-4 writer is enabled."""
+
+    # Lazy import avoids a module cycle: readiness reads TASKS to derive the
+    # canonical post-activation task definitions.
+    from tools.trading_v3_fourth_layer_readiness import (
+        collect_migration_readiness,
+    )
+
+    return collect_migration_readiness(engine)
+
+
+def activate_layer4_writers_atomically(engine) -> int:
+    """Lift the two-row writer fence in one transaction or not at all."""
+
+    task_types = tuple(LAYER4_WRITER_TASK_TYPES)
+    if len(task_types) != 2:
+        raise RuntimeError("Layer-4 writer contract must contain exactly two tasks")
+    return set_scheduler_tasks_enabled_atomically(
+        engine,
+        task_types,
+        enabled=True,
+        expected_row_count=len(task_types),
+    )
+
+
+def enforce_layer4_writer_fence_atomically(engine) -> int:
+    """Disable every matching writer row, including accidental duplicates."""
+
+    return set_scheduler_tasks_enabled_atomically(
+        engine,
+        tuple(LAYER4_WRITER_TASK_TYPES),
+        enabled=False,
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Deploy Trading V3 scheduler tasks with Layer-4 writers fenced "
+            "unless an explicitly verified activation is requested."
+        )
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--writer-fence",
+        action="store_true",
+        help=(
+            "persist counterfactual/continuous tasks as disabled (default)"
+        ),
+    )
+    mode.add_argument(
+        "--activate-layer4",
+        action="store_true",
+        help=(
+            "enable Layer-4 writers only after all migration ledgers, "
+            "progress rows and schemas verify"
+        ),
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    activate_layer4 = bool(args.activate_layer4)
     load_project_env()
     engine = create_tool_engine()
     results = []
+    fenced_row_count = 0
+    preconditions: dict = {
+        "checked": False,
+        "ready": None,
+        "reason_codes": [],
+    }
     try:
-        for task in TASKS:
-            results.append({
-                **upsert_scheduler_task(
-                    engine,
-                    task,
-                    lookup_where="task_type = :task_type",
-                    lookup_params={"task_type": task["task_type"]},
-                    update_exclude={"task_type"},
-                ),
-                "task_type": task["task_type"],
-            })
+        # Fence every matching row before validation or definition upserts.
+        # This also neutralizes duplicate legacy rows and makes an accidental
+        # early activation request fail safe instead of leaving old writers on.
+        fenced_row_count = enforce_layer4_writer_fence_atomically(engine)
+        if activate_layer4:
+            preconditions = {
+                **layer4_activation_preconditions(engine),
+                "checked": True,
+            }
+            if preconditions.get("ready") is not True:
+                print(json.dumps(
+                    {
+                        "status": "blocked",
+                        "mode": "activate-layer4",
+                        "writer_fence_active": True,
+                        "fenced_row_count": fenced_row_count,
+                        "layer4_writers_enabled": False,
+                        "migration_readiness": preconditions,
+                        "tasks": [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ))
+                return 2
+        # Always stage exact definitions behind the durable fence first.  The
+        # explicit activation path lifts both rows atomically only after every
+        # upsert succeeds, so a crash cannot leave one writer live by itself.
+        for task in deployment_tasks(activate_layer4=False):
+            result = upsert_scheduler_task(
+                engine,
+                task,
+                lookup_where="task_type = :task_type",
+                lookup_params={"task_type": task["task_type"]},
+                update_exclude={"task_type"},
+            )
+            results.append({**result, "task_type": task["task_type"]})
+        if activate_layer4:
+            activate_layer4_writers_atomically(engine)
     finally:
         engine.dispose()
-    print(json.dumps({"status": "ok", "tasks": results}, ensure_ascii=False, indent=2))
+    print(json.dumps(
+        {
+            "status": "ok",
+            "mode": (
+                "activate-layer4" if activate_layer4 else "writer-fence"
+            ),
+            "writer_fence_active": not activate_layer4,
+            "fenced_row_count": fenced_row_count,
+            "layer4_writers_enabled": activate_layer4,
+            "migration_readiness": preconditions,
+            "tasks": results,
+        },
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    ))
     return 0
 
 

@@ -391,6 +391,14 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     MagicMock(),
                 )
             )
+        self.assertEqual(
+            scheduler_runtime._build_task_args(
+                row,
+                row["script_path"],
+                "2026-08-16",
+            ),
+            ["--limit", "10000", "--max-batches", "10"],
+        )
 
     def test_briefing_tasks_do_not_receive_default_date_arg(self):
         today = "2026-07-01"
