@@ -129,8 +129,8 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "trading-v3-intraday" not in app
     assert "trading-v3-intraday" not in index
     assert "<span>04</span>目标组合" in index
-    assert "trading-v3.css?v=8" in page
-    assert "trading-v3.js?v=23" in page
+    assert "trading-v3.css?v=9" in page
+    assert "trading-v3.js?v=24" in page
     assert "实际选出时间" in script
     assert "候选归属日" in script
     assert "行情数据日" in script
@@ -159,6 +159,11 @@ def test_trading_v3_candidate_page_uses_unified_production_selector():
     assert "pnl-gain" in script
     assert "pnl-loss" in script
     assert "position_lot_count" in script
+    assert "today_closed_positions" in script
+    assert "data-position-detail-index" in script
+    assert "买入时间" in page
+    assert "卖出时间" in page
+    assert "卖出价格" in page
     assert "ledgerSummary.canonical_total_equity" in script
     assert "ledgerSummary.canonical_cash_balance" in script
     assert "ledgerSummary.display_total_equity" in script

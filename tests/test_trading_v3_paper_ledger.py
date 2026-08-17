@@ -122,6 +122,8 @@ def test_paper_ledger_uses_real_v2_read_repository(monkeypatch):
     assert result["data"]["summary"]["display_cash_balance"] == 904_470.0
     assert result["data"]["summary"]["display_total_equity"] == 1_004_270.0
     assert result["data"]["positions"][0]["position_lot_count"] == 1
+    assert result["data"]["positions"][0]["buy_at"] == "2026-08-12 09:31:00"
+    assert result["data"]["positions"][0]["lot_details"][0]["quantity"] == 1000
     assert result["data"]["real_trading_enabled"] is False
 
 
@@ -163,6 +165,103 @@ def test_paper_ledger_merges_same_stock_with_weighted_cost(monkeypatch):
     assert position["ledger_source"] == "MERGED_LEDGER"
     assert position["ledger_sources"] == ["V2_CANONICAL", "LEGACY_EVENT_SIM"]
     assert data["merge_policy"] == "READ_ONLY_GROUP_BY_STOCK_CODE_WEIGHTED_COST"
+
+
+def test_paper_ledger_keeps_today_closed_position_for_same_day_review(monkeypatch):
+    today = trading_v3.date.today().isoformat()
+
+    class _SoldTodayConnection(_Connection):
+        def execute(self, statement, params):
+            sql = str(statement)
+            if "SUM(profit) AS realized_profit" in sql:
+                return _Rows([{"realized_profit": 125.5}])
+            if "FROM st_sim_position" in sql and "status = 'holding'" in sql:
+                return _Rows([])
+            if "FROM st_sim_position" in sql and "status = 'sold'" in sql:
+                return _Rows(
+                    [
+                        {
+                            "id": 8,
+                            "stock_code": "600030",
+                            "short_name": "中信证券",
+                            "strategy_type": "live_event",
+                            "buy_price": 28.71,
+                            "buy_shares": 500,
+                            "buy_date": today,
+                            "buy_time": "09:36:10",
+                            "buy_reason": "盘中确认后成交",
+                            "status": "sold",
+                            "sell_price": 29.18,
+                            "sell_date": today,
+                            "sell_time": "14:42:05",
+                            "sell_reason": "达到动态退出条件",
+                            "profit": 125.5,
+                            "profit_rate": 1.64,
+                        }
+                    ]
+                )
+            if "FROM st_sim_risk_budget" in sql:
+                return _Rows([{"initial_capital": 1_000_000}])
+            return _Rows([])
+
+    class _SoldTodayEngine:
+        def connect(self):
+            return _SoldTodayConnection()
+
+    monkeypatch.setattr(trading_v3, "get_engine", lambda: _SoldTodayEngine())
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "account", lambda self, account_id: {})
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "positions", lambda self, account_id: [])
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "orders", lambda self, account_id, limit: [])
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "fills", lambda self, account_id, limit: [])
+
+    data = trading_v3.paper_ledger(account_id="paper-main-v2", limit=20)["data"]
+
+    assert data["positions"] == []
+    assert data["summary"]["position_count"] == 0
+    assert data["summary"]["today_sold_count"] == 1
+    assert data["summary"]["today_closed_position_count"] == 1
+    closed = data["today_closed_positions"][0]
+    assert closed["stock_code"] == "600030"
+    assert closed["position_state"] == "SOLD_TODAY"
+    assert closed["buy_at"] == f"{today} 09:36:10"
+    assert closed["sell_at"] == f"{today} 14:42:05"
+    assert closed["sell_price"] == 29.18
+    assert closed["sold_quantity_today"] == 500
+    assert closed["realized_pnl"] == 125.5
+
+
+def test_paper_ledger_excludes_closed_position_after_sale_day(monkeypatch):
+    class _OldSoldConnection(_Connection):
+        def execute(self, statement, params):
+            sql = str(statement)
+            if "FROM st_sim_position" in sql and "status = 'holding'" in sql:
+                return _Rows([])
+            if "FROM st_sim_position" in sql and "status = 'sold'" in sql:
+                return _Rows(
+                    [
+                        {
+                            "stock_code": "600030",
+                            "status": "sold",
+                            "sell_date": "2026-08-01",
+                            "sell_time": "14:42:05",
+                        }
+                    ]
+                )
+            return super().execute(statement, params)
+
+    class _OldSoldEngine:
+        def connect(self):
+            return _OldSoldConnection()
+
+    monkeypatch.setattr(trading_v3, "get_engine", lambda: _OldSoldEngine())
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "account", lambda self, account_id: {})
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "positions", lambda self, account_id: [])
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "orders", lambda self, account_id, limit: [])
+    monkeypatch.setattr(v2_repository.TradingV2ReadRepository, "fills", lambda self, account_id, limit: [])
+
+    data = trading_v3.paper_ledger(account_id="paper-main-v2", limit=20)["data"]
+    assert data["today_closed_positions"] == []
+    assert data["summary"]["today_sold_count"] == 0
 
 
 def test_paper_ledger_counts_pending_buy_when_remaining_quantity_is_zero(monkeypatch):

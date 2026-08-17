@@ -390,6 +390,7 @@ def paper_ledger(
     account = v2.account(account_id) or {}
     v2_positions = v2.positions(account_id)
     v2_orders = v2.orders(account_id, limit)
+    v2_fills = v2.fills(account_id, max(int(limit), 500))
     with engine.connect() as connection:
         legacy_positions = [dict(row) for row in connection.execute(
             text(
@@ -405,6 +406,31 @@ def paper_ledger(
             ),
             {"limit": int(limit)},
         ).mappings().all()]
+        legacy_today_sold = [dict(row) for row in connection.execute(
+            text(
+                """
+                SELECT id, stock_code, short_name, strategy_type, buy_price,
+                       buy_shares, buy_date, buy_time, buy_reason, status,
+                       sell_price, sell_date, sell_time, sell_reason,
+                       profit, profit_rate
+                FROM st_sim_position
+                WHERE COALESCE(trade_mode, 'live') = 'live'
+                  AND status = 'sold'
+                  AND sell_date = CURDATE()
+                ORDER BY sell_time DESC, id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": int(limit)},
+        ).mappings().all()]
+        # Test doubles and old compatibility views can return broader rows than
+        # the SQL predicate.  Keep the read model strict: only today's closed
+        # positions may appear beside open holdings.
+        legacy_today_sold = [
+            row for row in legacy_today_sold
+            if str(row.get("status") or "").lower() == "sold"
+            and str(row.get("sell_date") or "")[:10] == date.today().isoformat()
+        ]
         legacy_orders = [dict(row) for row in connection.execute(
             text(
                 """
@@ -499,9 +525,44 @@ def paper_ledger(
             result["short_name"] = quote.get("short_name")
         return result
 
+    def display_datetime(date_value: Any, time_value: Any = None) -> str | None:
+        if date_value in (None, ""):
+            return None
+        date_text = str(date_value).strip()
+        if "T" in date_text or " " in date_text:
+            return date_text.replace("T", " ")
+        time_text = str(time_value or "").strip()
+        return f"{date_text} {time_text}".strip()
+
+    def date_token(value: Any) -> str:
+        if value in (None, ""):
+            return ""
+        return str(value).strip().replace("T", " ")[:10]
+
+    fill_by_id = {
+        str(row.get("fill_id") or ""): row
+        for row in v2_fills
+        if row.get("fill_id")
+    }
+    v2_buy_times: dict[str, list[str]] = {}
+    for fill in v2_fills:
+        if str(fill.get("side") or "").upper() != "BUY":
+            continue
+        code = str(fill.get("stock_code") or "").zfill(6)
+        filled_at = display_datetime(fill.get("filled_at"))
+        if code and filled_at:
+            v2_buy_times.setdefault(code, []).append(filled_at)
+
     position_lots = []
     for row in v2_positions:
-        position_lots.append(enrich_position({**row, "ledger_source": "V2_CANONICAL"}))
+        opened_fill = fill_by_id.get(str(row.get("opened_fill_id") or "")) or {}
+        position_lots.append(enrich_position({
+            **row,
+            "ledger_source": "V2_CANONICAL",
+            "buy_at": display_datetime(
+                opened_fill.get("filled_at") or row.get("opened_trade_date")
+            ),
+        }))
     for row in legacy_positions:
         position_lots.append(enrich_position({
             **row,
@@ -513,6 +574,7 @@ def paper_ledger(
             # canonical V2 inventory and must never inflate executable shares.
             "sellable_quantity": 0,
             "cost_price": row.get("buy_price"),
+            "buy_at": display_datetime(row.get("buy_date"), row.get("buy_time")),
             "last_reason": row.get("buy_reason") or "事件驱动模拟成交",
         }))
 
@@ -556,6 +618,20 @@ def paper_ledger(
                 if float(lot.get("protective_stop") or 0) > 0
             ]
             quote_lot = max(lots, key=lambda lot: str(lot.get("quote_at") or ""))
+            buy_times = sorted(
+                str(lot.get("buy_at")) for lot in lots if lot.get("buy_at")
+            )
+            lot_details = [
+                {
+                    "ledger_source": lot.get("ledger_source"),
+                    "quantity": lot_quantity,
+                    "cost_price": lot.get("cost_price") or lot.get("average_cost"),
+                    "buy_at": lot.get("buy_at"),
+                    "protective_stop": lot.get("protective_stop"),
+                    "note": lot.get("invalidation_condition") or lot.get("last_reason") or "",
+                }
+                for lot, lot_quantity in zip(lots, quantities)
+            ]
 
             result.update({
                 "stock_code": stock_code,
@@ -581,11 +657,153 @@ def paper_ledger(
                 "position_lot_count": len(lots),
                 "holding_notes": reasons,
                 "last_reason": "；".join(reasons),
+                "buy_at": buy_times[0] if buy_times else None,
+                "sell_at": None,
+                "sell_price": None,
+                "sold_quantity_today": 0,
+                "lot_details": lot_details,
             })
             merged.append(result)
         return merged
 
     positions = merge_position_lots(position_lots)
+
+    sale_events: list[dict[str, Any]] = []
+    for row in legacy_today_sold:
+        sale_events.append({
+            "stock_code": str(row.get("stock_code") or "").zfill(6),
+            "short_name": row.get("short_name"),
+            "ledger_source": "LEGACY_EVENT_SIM",
+            "sold_quantity": int(row.get("buy_shares") or 0),
+            "cost_price": row.get("buy_price"),
+            "buy_at": display_datetime(row.get("buy_date"), row.get("buy_time")),
+            "sell_at": display_datetime(row.get("sell_date"), row.get("sell_time")),
+            "sell_price": row.get("sell_price"),
+            "realized_pnl": row.get("profit"),
+            "realized_pnl_pct": row.get("profit_rate"),
+            "note": row.get("sell_reason") or row.get("buy_reason") or "今日已卖出",
+        })
+    today_text = date.today().isoformat()
+    for row in v2_fills:
+        if (
+            str(row.get("side") or "").upper() != "SELL"
+            or date_token(row.get("filled_at")) != today_text
+        ):
+            continue
+        stock_code = str(row.get("stock_code") or "").zfill(6)
+        buy_times = sorted(v2_buy_times.get(stock_code) or [])
+        sale_events.append({
+            "stock_code": stock_code,
+            "short_name": row.get("short_name"),
+            "ledger_source": "V2_CANONICAL",
+            "sold_quantity": int(row.get("quantity") or 0),
+            "cost_price": None,
+            "buy_at": buy_times[0] if buy_times else None,
+            "sell_at": display_datetime(row.get("filled_at")),
+            "sell_price": row.get("price"),
+            "realized_pnl": None,
+            "realized_pnl_pct": None,
+            "note": "V2/V3 模拟账本今日卖出成交",
+        })
+
+    def merge_sale_events(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            stock_code = str(row.get("stock_code") or "").zfill(6)
+            if stock_code:
+                grouped.setdefault(stock_code, []).append(row)
+        merged: dict[str, dict[str, Any]] = {}
+        for stock_code, events in grouped.items():
+            quantities = [int(event.get("sold_quantity") or 0) for event in events]
+            sold_quantity = sum(quantities)
+            sell_amount = sum(
+                float(event.get("sell_price") or 0) * quantity
+                for event, quantity in zip(events, quantities)
+            )
+            cost_amount = sum(
+                float(event.get("cost_price") or 0) * quantity
+                for event, quantity in zip(events, quantities)
+            )
+            cost_quantity = sum(
+                quantity
+                for event, quantity in zip(events, quantities)
+                if float(event.get("cost_price") or 0) > 0
+            )
+            sell_times = sorted(
+                str(event.get("sell_at")) for event in events if event.get("sell_at")
+            )
+            buy_times = sorted(
+                str(event.get("buy_at")) for event in events if event.get("buy_at")
+            )
+            notes = list(dict.fromkeys(
+                str(event.get("note") or "") for event in events if event.get("note")
+            ))
+            sources = list(dict.fromkeys(
+                str(event.get("ledger_source") or "")
+                for event in events if event.get("ledger_source")
+            ))
+            realized_values = [
+                float(event.get("realized_pnl") or 0)
+                for event in events if event.get("realized_pnl") is not None
+            ]
+            merged[stock_code] = {
+                "stock_code": stock_code,
+                "short_name": next(
+                    (event.get("short_name") for event in events if event.get("short_name")),
+                    None,
+                ),
+                "position_state": "SOLD_TODAY",
+                "quantity": 0,
+                "remaining_quantity": 0,
+                "sellable_quantity": 0,
+                "sold_quantity_today": sold_quantity,
+                "cost_price": round(cost_amount / cost_quantity, 4)
+                if cost_quantity > 0 and cost_amount > 0 else None,
+                "buy_at": buy_times[0] if buy_times else None,
+                "sell_at": sell_times[-1] if sell_times else None,
+                "sell_price": round(sell_amount / sold_quantity, 4)
+                if sold_quantity > 0 and sell_amount > 0 else None,
+                "realized_pnl": round(sum(realized_values), 2) if realized_values else None,
+                "holding_notes": notes,
+                "last_reason": "；".join(notes) or "今日已卖出",
+                "ledger_source": sources[0] if len(sources) == 1 else "MERGED_LEDGER",
+                "ledger_sources": sources,
+                "position_lot_count": len(events),
+                "lot_details": [
+                    {
+                        "ledger_source": event.get("ledger_source"),
+                        "quantity": event.get("sold_quantity"),
+                        "cost_price": event.get("cost_price"),
+                        "buy_at": event.get("buy_at"),
+                        "sell_at": event.get("sell_at"),
+                        "sell_price": event.get("sell_price"),
+                        "realized_pnl": event.get("realized_pnl"),
+                        "note": event.get("note"),
+                    }
+                    for event in events
+                ],
+            }
+        return merged
+
+    sales_by_code = merge_sale_events(sale_events)
+    open_codes = {str(row.get("stock_code") or "").zfill(6) for row in positions}
+    for position in positions:
+        sale = sales_by_code.get(str(position.get("stock_code") or "").zfill(6))
+        if not sale:
+            continue
+        position.update({
+            "sell_at": sale.get("sell_at"),
+            "sell_price": sale.get("sell_price"),
+            "sold_quantity_today": sale.get("sold_quantity_today") or 0,
+            "lot_details": [
+                *(position.get("lot_details") or []),
+                *(sale.get("lot_details") or []),
+            ],
+        })
+    today_closed_positions = [
+        sale for stock_code, sale in sales_by_code.items()
+        if stock_code not in open_codes
+    ]
 
     orders = []
     for row in v2_orders:
@@ -687,6 +905,7 @@ def paper_ledger(
         "account_id": account_id,
         "account": account,
         "positions": positions,
+        "today_closed_positions": today_closed_positions,
         "orders": orders,
         "summary": {
             "position_count": len(positions),
@@ -694,6 +913,8 @@ def paper_ledger(
             "order_count": len(orders),
             "v2_position_count": len(v2_positions),
             "legacy_position_count": len(legacy_positions),
+            "today_sold_count": len(sales_by_code),
+            "today_closed_position_count": len(today_closed_positions),
             "v2_order_count": len(v2_orders),
             "legacy_order_count": len(legacy_orders),
             "cash_balance": v2_cash,

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=8">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=9">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -183,7 +183,7 @@
         <article class="panel">
           <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge safe">不按固定天数死拿</span></div>
           <div id="positionSummary" class="facts"></div>
-          <div class="table-wrap"><table><thead><tr><th>证券</th><th>持仓状态</th><th>持仓数量</th><th>可卖数量</th><th>成本价</th><th>最新价</th><th>持仓市值</th><th>浮动盈亏</th><th>盈亏率</th><th>保护位</th><th>加仓次数</th><th>行情时间</th><th>持仓说明</th></tr></thead><tbody id="positionRows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>持仓状态</th><th>持仓数量</th><th>可卖数量</th><th>成本价</th><th>最新价</th><th>持仓市值</th><th>浮动盈亏</th><th>盈亏率</th><th>买入时间</th><th>卖出时间</th><th>卖出价格</th><th>保护位</th><th>加仓次数</th><th>行情时间</th><th>持仓说明</th></tr></thead><tbody id="positionRows"></tbody></table></div>
         </article>
       </section>
 
@@ -253,6 +253,16 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v3.js?v=23"></script>
+  <div id="positionDetailModal" class="position-detail-modal" hidden>
+    <div class="position-detail-backdrop" data-close-position-detail></div>
+    <section class="position-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="positionDetailTitle">
+      <header>
+        <div><p>POSITION EVIDENCE</p><h3 id="positionDetailTitle">持仓详情</h3></div>
+        <button type="button" class="position-detail-close" data-close-position-detail aria-label="关闭">×</button>
+      </header>
+      <div id="positionDetailBody" class="position-detail-body"></div>
+    </section>
+  </div>
+  <script src="/static/js/trading-v3.js?v=24"></script>
 </body>
 </html>
