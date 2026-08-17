@@ -725,6 +725,7 @@ if systemctl list-unit-files probiga-scheduler.service --no-legend \
   systemctl is-enabled --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ENABLED=1 || true
 fi
 test "$SCHEDULER_UNIT_PRESENT" -eq 1
+EXTERNAL_WRITER_BLOCKED=0
 AI_WORKER_UNIT_PRESENT=0
 PREVIOUS_AI_WORKER_TIMER_ACTIVE=0
 PREVIOUS_AI_WORKER_TIMER_ENABLED=0
@@ -900,7 +901,11 @@ rollback() {
       rollback_failure "verify previous Nginx static assets"
       restoration_ready=0
     fi
-    if [ "$restoration_ready" -eq 1 ]; then
+    if [ "$restoration_ready" -eq 1 ] && \
+      [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ]; then
+      sudo systemctl stop probiga || \
+        rollback_failure "keep probiga stopped after external writer block"
+    elif [ "$restoration_ready" -eq 1 ]; then
       sudo systemctl start probiga || rollback_failure "start probiga"
     else
       rollback_failure "probiga restart skipped after unsafe restore state"
@@ -911,19 +916,26 @@ rollback() {
   fi
   if [ "$restoration_ready" -eq 1 ] && \
     [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
-    if [ "$PREVIOUS_SCHEDULER_ENABLED" -eq 1 ]; then
-      sudo systemctl enable probiga-scheduler || \
-        rollback_failure "enable probiga-scheduler"
-    else
+    if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ]; then
       sudo systemctl disable probiga-scheduler || \
-        rollback_failure "disable probiga-scheduler"
-    fi
-    if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
-      sudo systemctl start probiga-scheduler || \
-        rollback_failure "start probiga-scheduler"
-    else
+        rollback_failure "disable scheduler after external writer block"
       sudo systemctl stop probiga-scheduler || \
-        rollback_failure "keep probiga-scheduler stopped"
+        rollback_failure "keep scheduler stopped after external writer block"
+    else
+      if [ "$PREVIOUS_SCHEDULER_ENABLED" -eq 1 ]; then
+        sudo systemctl enable probiga-scheduler || \
+          rollback_failure "enable probiga-scheduler"
+      else
+        sudo systemctl disable probiga-scheduler || \
+          rollback_failure "disable probiga-scheduler"
+      fi
+      if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+        sudo systemctl start probiga-scheduler || \
+          rollback_failure "start probiga-scheduler"
+      else
+        sudo systemctl stop probiga-scheduler || \
+          rollback_failure "keep probiga-scheduler stopped"
+      fi
     fi
   fi
   if [ "$restoration_ready" -eq 1 ] && \
@@ -947,17 +959,32 @@ rollback() {
         rollback_failure "verify previous AI recommendation worker runtime"
     fi
   fi
-  sudo systemctl is-active --quiet probiga || \
-    rollback_failure "verify probiga is active"
-  curl --fail --silent --show-error --retry 15 --retry-all-errors \
-    --retry-delay 2 --retry-connrefused \
-    http://127.0.0.1/api/health >/dev/null || \
-    rollback_failure "verify previous API health"
+  if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ]; then
+    if systemctl is-active --quiet probiga; then
+      rollback_failure "probiga restarted after external writer block"
+    fi
+    if systemctl is-active --quiet probiga-scheduler; then
+      rollback_failure \
+        "probiga-scheduler restarted after external writer block"
+    fi
+    if systemctl is-enabled --quiet probiga-scheduler; then
+      rollback_failure \
+        "probiga-scheduler remained enabled after external writer block"
+    fi
+  else
+    sudo systemctl is-active --quiet probiga || \
+      rollback_failure "verify probiga is active"
+    curl --fail --silent --show-error --retry 15 --retry-all-errors \
+      --retry-delay 2 --retry-connrefused \
+      http://127.0.0.1/api/health >/dev/null || \
+      rollback_failure "verify previous API health"
+  fi
   current_sha="$(git rev-parse HEAD 2>/dev/null)"
   if [ "$current_sha" != "$PREVIOUS_SHA" ]; then
     rollback_failure "verify previous Git revision"
   fi
-  if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ] && \
+    [ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ]; then
     systemctl is-active --quiet probiga-scheduler && \
       observed_scheduler_active=1
     systemctl is-enabled --quiet probiga-scheduler && \
@@ -978,6 +1005,11 @@ rollback() {
     ACTIVE_ADATA_TREE_SHA256=""
     echo "Rollback verification failed" >&2
     write_receipt "ROLLBACK_FAILED" "$current_sha" || true
+  elif [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ]; then
+    ACTIVE_REQUIREMENTS_SHA256="$PREVIOUS_REQUIREMENTS_SHA256"
+    ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
+    ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
+    write_receipt "BLOCKED_EXTERNAL_WRITER" "$PREVIOUS_SHA" || true
   else
     ACTIVE_REQUIREMENTS_SHA256="$PREVIOUS_REQUIREMENTS_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
@@ -1123,12 +1155,22 @@ sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
   tools/ensure_quality_gate.py --validate-review-delivery
 # Persist the Layer-4 writer fence while both scheduler implementations are
 # stopped. Activation is a separate, schema-gated maintenance operation.
+WRITER_FENCE_STATUS=0
 sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
   PYTHONDONTWRITEBYTECODE=1 \
   PROBIGA_DEPLOYMENT_MODE=production \
   PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
-  tools/add_trading_v3_tasks.py --writer-fence
+  tools/add_trading_v3_tasks.py --writer-fence \
+    --require-no-live-scheduler-writers \
+    --writer-drain-timeout-seconds 150 \
+    --writer-drain-poll-seconds 5 || WRITER_FENCE_STATUS=$?
+if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
+  if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then
+    EXTERNAL_WRITER_BLOCKED=1
+  fi
+  false
+fi
 rm -f "$RESOLVED_LOCK"
 # Root-owned validation can refresh Git metadata with a restrictive umask.
 # Seal again immediately before the service-account identity proof and start.

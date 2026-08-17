@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 from server.common.batch_db import quote_identifier
 
 SCHEDULED_TASK_TABLE = "st_scheduled_tasks"
+SCHEDULER_RUNTIME_TABLE = "st_scheduler_runtime"
 
 DEFAULT_SCHEDULER_COLUMNS: dict[str, str] = {
     "task_type": "VARCHAR(50) DEFAULT 'python'",
@@ -42,6 +43,70 @@ TASK_PAYLOAD_COLUMNS = {
     "date_param",
     "date_param_desc",
 }
+
+
+def evaluate_fresh_scheduler_writers(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    freshness_multiplier: int = 2,
+) -> tuple[dict[str, Any], ...]:
+    """Return every scheduler heartbeat that still represents a live writer.
+
+    Deployment uses this after the remote API and scheduler have both stopped.
+    At that point every still-fresh row belongs to a writer that is outside the
+    release transaction, so proceeding would recreate a cross-host double
+    writer.  Invalid heartbeat contracts fail closed instead of being treated
+    as stale.
+    """
+
+    if type(freshness_multiplier) is not int or freshness_multiplier < 1:
+        raise ValueError("freshness_multiplier must be a positive integer")
+    fresh: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        age = row.get("heartbeat_age_seconds")
+        poll_seconds = row.get("poll_seconds")
+        if type(age) is not int or type(poll_seconds) is not int:
+            raise RuntimeError(
+                "scheduler heartbeat age and poll interval must be integers"
+            )
+        if poll_seconds < 1:
+            raise RuntimeError(
+                "scheduler heartbeat poll interval must be positive"
+            )
+        # A future-dated heartbeat is intentionally considered fresh.  Clock
+        # skew must never let a live writer evade the deployment fence.
+        if age <= freshness_multiplier * poll_seconds:
+            fresh.append(row)
+    return tuple(fresh)
+
+
+def read_fresh_scheduler_writers(
+    engine: Engine,
+    *,
+    freshness_multiplier: int = 2,
+    table_name: str = SCHEDULER_RUNTIME_TABLE,
+) -> tuple[dict[str, Any], ...]:
+    """Read and evaluate the shared scheduler-writer heartbeat ledger."""
+
+    quoted_table = quote_identifier(table_name)
+    with engine.connect() as connection:
+        rows = tuple(
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT instance_id, mode, host_name, pid, started_at, "
+                    "heartbeat_at, TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
+                    "AS heartbeat_age_seconds, poll_seconds, "
+                    "max_concurrent_tasks "
+                    f"FROM {quoted_table} ORDER BY heartbeat_at DESC"
+                )
+            ).mappings().all()
+        )
+    return evaluate_fresh_scheduler_writers(
+        rows,
+        freshness_multiplier=freshness_multiplier,
+    )
 
 
 def table_columns(engine: Engine, table_name: str = SCHEDULED_TASK_TABLE) -> set[str]:

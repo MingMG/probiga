@@ -11,6 +11,7 @@ from server.common.scheduler_authority import (
     PRODUCTION_SCHEDULER_MODE,
     PRODUCTION_SCHEDULER_SERVICE,
 )
+from server.common.scheduler_tasks import evaluate_fresh_scheduler_writers
 from tools import add_trading_v3_tasks as task_deployment
 from tools import trading_v3_fourth_layer_readiness as readiness
 
@@ -92,6 +93,74 @@ def test_deploy_workflow_fences_layer4_before_starting_standalone() -> None:
     assert "systemctl is-enabled --quiet probiga-scheduler" in workflow[restart:]
 
 
+def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None:
+    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    runtime = workflow.index("trap 'rollback $?' ERR")
+    stop_scheduler = workflow.index(
+        "sudo systemctl stop probiga-scheduler",
+        runtime,
+    )
+    stop_api = workflow.index(
+        "\n            sudo systemctl stop probiga\n",
+        stop_scheduler,
+    )
+    guard = workflow.index(
+        "--require-no-live-scheduler-writers",
+        stop_api,
+    )
+    start_api = workflow.index("sudo systemctl restart probiga", guard)
+    start_scheduler = workflow.index(
+        "sudo systemctl restart probiga-scheduler",
+        start_api,
+    )
+    deployed = workflow.index('write_receipt "DEPLOYED"', start_scheduler)
+
+    assert stop_scheduler < stop_api < guard < start_api < start_scheduler < deployed
+    assert "--writer-drain-timeout-seconds 150" in workflow
+    assert 'if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then' in workflow
+    assert "EXTERNAL_WRITER_BLOCKED=1" in workflow
+    assert 'write_receipt "BLOCKED_EXTERNAL_WRITER"' in workflow
+    assert "keep probiga stopped after external writer block" in workflow
+    assert "keep scheduler stopped after external writer block" in workflow
+    assert "probiga-scheduler restarted after external writer block" in workflow
+
+
+def test_fresh_scheduler_writer_evaluation_is_exact_and_fail_closed() -> None:
+    fresh = {
+        "instance_id": "local-1",
+        "mode": "standalone",
+        "heartbeat_age_seconds": 120,
+        "poll_seconds": 60,
+    }
+    future = {
+        "instance_id": "future-clock",
+        "mode": "embedded",
+        "heartbeat_age_seconds": -5,
+        "poll_seconds": 60,
+    }
+    stale = {
+        "instance_id": "stale-1",
+        "mode": "standalone",
+        "heartbeat_age_seconds": 121,
+        "poll_seconds": 60,
+    }
+
+    assert evaluate_fresh_scheduler_writers([fresh, future, stale]) == (
+        fresh,
+        future,
+    )
+    with pytest.raises(RuntimeError, match="poll interval must be positive"):
+        evaluate_fresh_scheduler_writers([
+            {**fresh, "poll_seconds": 0},
+        ])
+    with pytest.raises(RuntimeError, match="must be integers"):
+        evaluate_fresh_scheduler_writers([
+            {**fresh, "heartbeat_age_seconds": None},
+        ])
+
+
 def test_default_task_deployment_persists_layer4_writer_fence(
     monkeypatch,
     capsys,
@@ -127,6 +196,55 @@ def test_default_task_deployment_persists_layer4_writer_fence(
         for task in observed
         if task["task_type"] not in LAYER4_WRITER_TASK_TYPES
     )
+
+
+def test_writer_quiescence_block_keeps_fence_and_skips_task_upserts(
+    monkeypatch,
+    capsys,
+) -> None:
+    engine = _Engine()
+    observed: list[dict] = []
+    live_writer = {
+        "instance_id": "external-7",
+        "mode": "standalone",
+        "host_name": "other-host",
+        "heartbeat_age_seconds": 3,
+        "poll_seconds": 60,
+    }
+    monkeypatch.setattr(task_deployment, "load_project_env", lambda: None)
+    monkeypatch.setattr(task_deployment, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        task_deployment,
+        "enforce_layer4_writer_fence_atomically",
+        lambda _engine: 2,
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "wait_for_scheduler_writer_quiescence",
+        lambda _engine, **_kwargs: (live_writer,),
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "upsert_scheduler_task",
+        lambda _engine, task, **_kwargs: observed.append(dict(task)),
+    )
+
+    assert task_deployment.main([
+        "--writer-fence",
+        "--require-no-live-scheduler-writers",
+        "--writer-drain-timeout-seconds",
+        "0",
+    ]) == task_deployment.WRITER_QUIESCENCE_BLOCK_EXIT_CODE
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert payload["writer_fence_active"] is True
+    assert payload["writer_quiescence"]["ready"] is False
+    assert payload["writer_quiescence"]["reason_codes"] == [
+        "SCHEDULER_LIVE_WRITERS_REMAIN"
+    ]
+    assert payload["writer_quiescence"]["live_writers"] == [live_writer]
+    assert observed == []
+    assert engine.disposed is True
 
 
 def test_explicit_layer4_activation_fails_before_any_write_when_schema_blocks(
