@@ -94,7 +94,7 @@ def test_deploy_workflow_fences_layer4_before_starting_standalone() -> None:
 
 
 def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None:
-    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+    workflow = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
     runtime = workflow.index("trap 'rollback $?' ERR")
@@ -103,7 +103,7 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
         runtime,
     )
     stop_api = workflow.index(
-        "\n            sudo systemctl stop probiga\n",
+        "\nsudo systemctl stop probiga\n",
         stop_scheduler,
     )
     guard = workflow.index(

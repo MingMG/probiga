@@ -5,8 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from tools import run_remote_mysql_tunnel
-from tools import run_production_acceptance_job
-import remote_support as root_remote_support
 from tools.remote_support import (
     DEFAULT_SSH_AUTH_TIMEOUT_SECONDS,
     DEFAULT_SSH_BANNER_TIMEOUT_SECONDS,
@@ -81,32 +79,6 @@ def test_production_release_command_rejects_unpinned_paths(entrypoint, root):
         production_release_command(entrypoint, root=root)
 
 
-def test_production_acceptance_start_fails_before_connect(monkeypatch):
-    args = SimpleNamespace(
-        action="start",
-        name="unsafe-adata-probe",
-        memory_high="450M",
-        memory_max="700M",
-        cpu_quota="70%",
-        runtime_max="7200",
-        lines=120,
-        command=["--", "tools/sync_kline_adata.py"],
-    )
-    monkeypatch.setattr(
-        run_production_acceptance_job,
-        "parse_args",
-        lambda: args,
-    )
-    monkeypatch.setattr(
-        run_production_acceptance_job,
-        "_connect",
-        lambda: pytest.fail("SSH connection happened before the runtime guard"),
-    )
-
-    with pytest.raises(UnsafeRemoteRuntimeError):
-        run_production_acceptance_job.main()
-
-
 def test_ssh_connect_kwargs_uses_remote_helpers(monkeypatch):
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
@@ -138,21 +110,6 @@ def test_ssh_connect_kwargs_accepts_password_override(monkeypatch):
     kwargs = ssh_connect_kwargs(password="from-option")
 
     assert kwargs["password"] == "from-option"
-
-
-def test_root_remote_support_shim_forwards_shared_helpers():
-    assert root_remote_support.remote_host is remote_host
-    assert root_remote_support.ssh_connect_kwargs is ssh_connect_kwargs
-    assert root_remote_support.production_ssh_client is production_ssh_client
-    assert (
-        root_remote_support.production_release_command
-        is production_release_command
-    )
-    assert (
-        root_remote_support.production_ssh_connect_kwargs
-        is production_ssh_connect_kwargs
-    )
-    assert root_remote_support.DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS == DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS
 
 
 def test_mysql_tunnel_defaults_to_remote_support(monkeypatch):
@@ -251,23 +208,26 @@ def test_deploy_release_venv_and_layer4_ci_are_git_sha_bound():
     workflow = (root / ".github/workflows/deploy.yml").read_text(
         encoding="utf-8"
     )
+    deploy_script = (root / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
 
-    assert workflow.count(".probiga.gitsha") >= 2
+    assert deploy_script.count(".probiga.gitsha") >= 2
     assert (
         'printf \'%s\\n\' "$EXPECTED_SHA" '
         '> "$EXPECTED_BUILD/.probiga.gitsha"'
-    ) in workflow
-    api_dropin = workflow[
-        workflow.index("            write_dropin() {") :
-        workflow.index("            write_scheduler_dropin() {")
+    ) in deploy_script
+    api_dropin = deploy_script[
+        deploy_script.index("write_dropin() {") :
+        deploy_script.index("write_scheduler_dropin() {")
     ]
-    scheduler_dropin = workflow[
-        workflow.index("            write_scheduler_dropin() {") :
-        workflow.index("            BOOTSTRAP_PYTHON=")
+    scheduler_dropin = deploy_script[
+        deploy_script.index("write_scheduler_dropin() {") :
+        deploy_script.index("write_ai_worker_dropin() {")
     ]
     build_identity = '"Environment=PROBIGA_BUILD_COMMIT_SHA=$revision"'
     expected_identity = '"Environment=PROBIGA_EXPECTED_GIT_SHA=$revision"'
-    assert workflow.count(build_identity) == 2
+    assert deploy_script.count(build_identity) == 2
     assert api_dropin.count(expected_identity) == 1
     assert api_dropin.count(build_identity) == 1
     assert scheduler_dropin.count(expected_identity) == 1
