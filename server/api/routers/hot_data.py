@@ -67,6 +67,9 @@ PORTFOLIO_LIVE_FRESH_SECONDS = 90
 PORTFOLIO_LIVE_STALE_SECONDS = 300
 PORTFOLIO_FLOW_FRESH_SECONDS = 180
 NEWS_REQUEST_TIMEOUT_SECONDS = 10.0
+PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
+PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS = 3
+PORTFOLIO_FORCE_REQUEST_TTL_SECONDS = 120
 
 LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 雪球热股 / 新浪热股 / 同花顺热股"
 
@@ -84,6 +87,9 @@ _job_running: dict[str, bool] = {
     "market_refresh": False,
 }
 _portfolio_qmt_refresh_lock = _threading.Lock()
+_portfolio_snapshot_build_lock = _threading.Lock()
+_portfolio_snapshot_generation = 0
+_portfolio_completed_force_requests: OrderedDict[str, tuple[int, float]] = OrderedDict()
 _portfolio_qmt_refresh_thread: _threading.Thread | None = None
 _portfolio_qmt_refresh_state: dict[str, object] = {
     "state": "idle",
@@ -164,6 +170,75 @@ def _cache_set(key: str, value):
         _cache_store[key] = (_cache_now(), value)
         _cache_store.move_to_end(key)
         _cache_trim_locked()
+
+
+def _cache_peek(key: str):
+    """Return ``(created_at, value)`` without expiring a stale entry."""
+    with _cache_lock:
+        entry = _cache_store.get(key)
+        if not entry:
+            return None
+        _cache_store.move_to_end(key)
+        return entry
+
+
+def _portfolio_snapshot_cache_publish(
+    value: dict,
+    *,
+    generation: int,
+    force_request_id: str = "",
+) -> bool:
+    """Publish only if no portfolio mutation invalidated this build."""
+    with _cache_lock:
+        if generation != _portfolio_snapshot_generation:
+            return False
+        _cache_store["portfolio_snapshot"] = (_cache_now(), value)
+        _cache_store.move_to_end("portfolio_snapshot")
+        if force_request_id:
+            _portfolio_completed_force_requests[force_request_id] = (
+                generation,
+                _cache_now(),
+            )
+            _portfolio_completed_force_requests.move_to_end(force_request_id)
+            while len(_portfolio_completed_force_requests) > 128:
+                _portfolio_completed_force_requests.popitem(last=False)
+        _cache_trim_locked()
+        return True
+
+
+def _portfolio_snapshot_entry_is_fresh(entry, ttl_seconds: int) -> bool:
+    if entry is None:
+        return False
+    effective_ttl = _cache_ttl_seconds(ttl_seconds)
+    value = entry[1]
+    if isinstance(value, dict) and "error" in value:
+        effective_ttl = min(effective_ttl, PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS)
+    return effective_ttl > 0 and (_cache_now() - entry[0]) < effective_ttl
+
+
+def _portfolio_completed_force_result(force_request_id: str):
+    """Return the result of a recently completed idempotent force request."""
+    if not force_request_id:
+        return None
+    with _cache_lock:
+        completed = _portfolio_completed_force_requests.get(force_request_id)
+        entry = _cache_store.get("portfolio_snapshot")
+        if completed is None or entry is None:
+            return None
+        generation, completed_at = completed
+        age_seconds = _cache_now() - completed_at
+        value = entry[1]
+        if (
+            generation != _portfolio_snapshot_generation
+            or age_seconds >= PORTFOLIO_FORCE_REQUEST_TTL_SECONDS
+            or not isinstance(value, dict)
+            or "error" in value
+        ):
+            _portfolio_completed_force_requests.pop(force_request_id, None)
+            return None
+        _portfolio_completed_force_requests.move_to_end(force_request_id)
+        _cache_store.move_to_end("portfolio_snapshot")
+        return value
 
 
 def _cache_drop(key: str):
@@ -5721,7 +5796,7 @@ def _portfolio_snapshot_ttl_seconds(live_mode: bool) -> int:
         # snapshot on every request overloads both MySQL and the QMT bridge.
         # Keep the API responsive while still allowing sub-second UI polling
         # to observe the latest persisted snapshot.
-        return _trading_live_ttl_seconds(60, intraday_seconds=1)
+        return _trading_live_ttl_seconds(60, intraday_seconds=3)
     return 30 if _is_monitor_trading_time() else 120
 
 
@@ -6070,26 +6145,162 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     }
 
 
-def _get_portfolio_snapshot(live_mode: bool, *, force_live: bool = False) -> dict:
+def _get_portfolio_snapshot(
+    live_mode: bool,
+    *,
+    force_live: bool = False,
+    force_request_id: str = "",
+) -> dict:
     ttl_seconds = _portfolio_snapshot_ttl_seconds(live_mode)
-    cached = None if force_live else _cache_get("portfolio_snapshot", ttl_seconds=ttl_seconds)
-    if cached is not None:
+    cache_key = "portfolio_snapshot"
+    force_request_id = str(force_request_id or "").strip()[:128] if force_live else ""
+    completed_force = _portfolio_completed_force_result(force_request_id)
+    if completed_force is not None:
         if live_mode:
-            return {**cached, "live": True}
-        return cached
+            return {
+                **completed_force,
+                "live": True,
+                "force": True,
+                "force_reused": True,
+            }
+        return completed_force
+    entry = _cache_peek(cache_key)
+    stale = entry[1] if entry is not None else None
+    if not force_live and _portfolio_snapshot_entry_is_fresh(entry, ttl_seconds):
+        if live_mode:
+            return {**entry[1], "live": True}
+        return entry[1]
+
+    # The live page can poll frequently and multiple browser sessions may do so
+    # together.  Exactly one request may run the multi-query builder.  Other
+    # stale normal reads return immediately.  A cold or forced read may wait a
+    # tightly bounded interval so the usual ~100 ms build can finish, but a
+    # wedged builder cannot exhaust the FastAPI threadpool.
+    if stale is not None and not force_live:
+        acquired = _portfolio_snapshot_build_lock.acquire(blocking=False)
+    else:
+        acquired = _portfolio_snapshot_build_lock.acquire(
+            timeout=PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS,
+        )
+    if not acquired:
+        if stale is not None and not force_live and "error" not in stale:
+            return {
+                **stale,
+                **({"live": True} if live_mode else {}),
+                "snapshot_stale": True,
+                "snapshot_refreshing": True,
+            }
+        return {
+            "data": stale.get("data", []) if isinstance(stale, dict) else [],
+            "total": stale.get("total", 0) if isinstance(stale, dict) else 0,
+            "summary": stale.get("summary", {}) if isinstance(stale, dict) else {},
+            "live": bool(live_mode),
+            "error": "portfolio snapshot refresh is already in progress",
+            "retryable": True,
+            "snapshot_stale": stale is not None,
+            "snapshot_refreshing": True,
+            "force": force_live,
+        }
     try:
-        result = _build_portfolio_snapshot(force_live=force_live)
-        if "error" not in result:
-            _cache_set("portfolio_snapshot", result)
-        if live_mode:
-            return {**result, "live": True, "force": force_live}
-        return result
-    except Exception as exc:
-        return {"data": [], "total": 0, "error": str(exc)[:200]}
+        # A same-id force request may have finished while this retry waited for
+        # the build lock.  Recheck after acquiring it so the waiter cannot turn
+        # a just-completed idempotent refresh into a second full rebuild.
+        if force_live and force_request_id:
+            completed_force = _portfolio_completed_force_result(force_request_id)
+            if completed_force is not None:
+                if live_mode:
+                    return {
+                        **completed_force,
+                        "live": True,
+                        "force": True,
+                        "force_reused": True,
+                    }
+                return completed_force
+        # Recheck after winning the lock because another request may have
+        # published between our first cache read and this nonblocking acquire.
+        if not force_live:
+            refreshed_entry = _cache_peek(cache_key)
+            if _portfolio_snapshot_entry_is_fresh(refreshed_entry, ttl_seconds):
+                if live_mode:
+                    return {**refreshed_entry[1], "live": True}
+                return refreshed_entry[1]
+        with _cache_lock:
+            build_generation = _portfolio_snapshot_generation
+        try:
+            result = _build_portfolio_snapshot(force_live=force_live)
+            if "error" in result:
+                result = {**result, "retryable": True}
+            if not _portfolio_snapshot_cache_publish(
+                result,
+                generation=build_generation,
+                force_request_id=(
+                    force_request_id
+                    if force_live and "error" not in result
+                    else ""
+                ),
+            ):
+                return {
+                    "data": [],
+                    "total": 0,
+                    "summary": {},
+                    "live": bool(live_mode),
+                    "error": "portfolio snapshot was invalidated during refresh",
+                    "retryable": True,
+                    "snapshot_superseded": True,
+                    "force": force_live,
+                }
+            if live_mode:
+                return {**result, "live": True, "force": force_live}
+            return result
+        except Exception as exc:
+            with _cache_lock:
+                generation_is_current = build_generation == _portfolio_snapshot_generation
+            if stale is not None and generation_is_current and "error" not in stale:
+                fallback = {
+                    **stale,
+                    "snapshot_stale": True,
+                    "snapshot_error": str(exc)[:200],
+                    "retryable": True,
+                }
+                _portfolio_snapshot_cache_publish(
+                    fallback,
+                    generation=build_generation,
+                )
+                response = {
+                    **fallback,
+                    **({"live": True} if live_mode else {}),
+                    "force": force_live,
+                }
+                if force_live:
+                    response["error"] = (
+                        "portfolio snapshot refresh failed: " + str(exc)[:160]
+                    )
+                return response
+            failure = {
+                "data": [],
+                "total": 0,
+                "summary": {},
+                "error": str(exc)[:200],
+                "retryable": True,
+            }
+            if generation_is_current:
+                _portfolio_snapshot_cache_publish(
+                    failure,
+                    generation=build_generation,
+                )
+            else:
+                failure["snapshot_superseded"] = True
+            return failure
+    finally:
+        _portfolio_snapshot_build_lock.release()
 
 
 def _invalidate_portfolio_snapshot_cache() -> None:
-    _cache_drop("portfolio_snapshot")
+    global _portfolio_snapshot_generation
+    with _cache_lock:
+        _portfolio_snapshot_generation += 1
+        _cache_store.pop("portfolio_snapshot", None)
+        _portfolio_completed_force_requests.clear()
 
 
 def _invalidate_market_runtime_caches() -> None:
@@ -6597,9 +6808,15 @@ def _queue_portfolio_qmt_refresh(codes: list[str]) -> dict[str, object]:
 
 
 @router.get("/portfolio/live")
-def portfolio_live(force: bool = False):
+def portfolio_live(force: bool = False, refresh_id: str = ""):
     """自选股实时行情：拉取最新价 + 返回自选股数据（含当日盈亏/持仓盈亏），一次搞定"""
     if force:
+        if refresh_id:
+            return _get_portfolio_snapshot(
+                live_mode=True,
+                force_live=True,
+                force_request_id=refresh_id,
+            )
         return _get_portfolio_snapshot(live_mode=True, force_live=True)
     return _get_portfolio_snapshot(live_mode=True)
 

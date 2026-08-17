@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 import os
+import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
     def _clear_hot_data_cache(self):
         with hot_data._cache_lock:
             hot_data._cache_store.clear()
+            hot_data._portfolio_completed_force_requests.clear()
+            hot_data._portfolio_snapshot_generation = 0
         with hot_data._fallback_lock:
             hot_data._fallback_events.clear()
 
@@ -951,6 +954,15 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertTrue(out["live"])
         self.assertEqual(out["total"], 1)
 
+        with patch("server.api.routers.hot_data._get_portfolio_snapshot", return_value={**snapshot, "live": True}) as snapshot_mock:
+            hot_data.portfolio_live(force=True, refresh_id="browser-refresh-1")
+
+        snapshot_mock.assert_called_once_with(
+            live_mode=True,
+            force_live=True,
+            force_request_id="browser-refresh-1",
+        )
+
     def test_live_quotes_from_current_table_can_return_stale_rows(self):
         snapshot_at = (_FakeIntradayDatetime.now() - timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S")
         with patch("server.api.routers.hot_data.datetime", _FakeIntradayDatetime), patch("server.api.routers.hot_data._read_sql", return_value=[{
@@ -1279,7 +1291,236 @@ class HotDataDetailHelperTest(unittest.TestCase):
 
     def test_portfolio_live_snapshot_has_positive_intraday_ttl(self):
         with patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=True):
-            self.assertEqual(hot_data._portfolio_snapshot_ttl_seconds(True), 1)
+            self.assertEqual(hot_data._portfolio_snapshot_ttl_seconds(True), 3)
+
+    def test_portfolio_snapshot_returns_stale_value_while_builder_is_busy(self):
+        self._clear_hot_data_cache()
+        stale = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        try:
+            with hot_data._cache_lock:
+                hot_data._cache_store["portfolio_snapshot"] = (0.0, stale)
+            hot_data._portfolio_snapshot_build_lock.acquire()
+            try:
+                with patch("server.api.routers.hot_data._cache_now", return_value=10.0), \
+                     patch("server.api.routers.hot_data._portfolio_snapshot_ttl_seconds", return_value=3), \
+                     patch("server.api.routers.hot_data._build_portfolio_snapshot") as build_mock:
+                    out = hot_data._get_portfolio_snapshot(live_mode=True)
+            finally:
+                hot_data._portfolio_snapshot_build_lock.release()
+
+            build_mock.assert_not_called()
+            self.assertEqual(out["total"], 1)
+            self.assertTrue(out["snapshot_stale"])
+            self.assertTrue(out["snapshot_refreshing"])
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_forced_portfolio_snapshot_reports_retryable_contention(self):
+        self._clear_hot_data_cache()
+        stale = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        try:
+            with hot_data._cache_lock:
+                hot_data._cache_store["portfolio_snapshot"] = (0.0, stale)
+            hot_data._portfolio_snapshot_build_lock.acquire()
+            try:
+                with patch("server.api.routers.hot_data._cache_now", return_value=10.0), \
+                     patch("server.api.routers.hot_data._build_portfolio_snapshot") as build_mock:
+                    out = hot_data._get_portfolio_snapshot(live_mode=True, force_live=True)
+            finally:
+                hot_data._portfolio_snapshot_build_lock.release()
+
+            build_mock.assert_not_called()
+            self.assertTrue(out["retryable"])
+            self.assertTrue(out["force"])
+            self.assertIn("already in progress", out["error"])
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_completed_force_request_is_reused_by_browser_retry(self):
+        self._clear_hot_data_cache()
+        result = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        try:
+            with patch(
+                "server.api.routers.hot_data._build_portfolio_snapshot",
+                return_value=result,
+            ) as build_mock:
+                first = hot_data._get_portfolio_snapshot(
+                    live_mode=True,
+                    force_live=True,
+                    force_request_id="same-browser-refresh",
+                )
+                second = hot_data._get_portfolio_snapshot(
+                    live_mode=True,
+                    force_live=True,
+                    force_request_id="same-browser-refresh",
+                )
+
+            build_mock.assert_called_once_with(force_live=True)
+            self.assertEqual(first["total"], 1)
+            self.assertEqual(second["total"], 1)
+            self.assertTrue(second["force_reused"])
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_force_waiter_rechecks_same_request_after_winning_build_lock(self):
+        self._clear_hot_data_cache()
+        result = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        first_check_done = threading.Event()
+        outputs = []
+        errors = []
+        original_completed = hot_data._portfolio_completed_force_result
+        lock_held = False
+
+        def observed_completed(force_request_id):
+            completed = original_completed(force_request_id)
+            first_check_done.set()
+            return completed
+
+        def run_waiter():
+            try:
+                outputs.append(hot_data._get_portfolio_snapshot(
+                    live_mode=True,
+                    force_live=True,
+                    force_request_id="force-finishes-during-wait",
+                ))
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        try:
+            hot_data._portfolio_snapshot_build_lock.acquire()
+            lock_held = True
+            with patch(
+                "server.api.routers.hot_data._portfolio_completed_force_result",
+                side_effect=observed_completed,
+            ), patch(
+                "server.api.routers.hot_data._build_portfolio_snapshot",
+            ) as build_mock:
+                waiter = threading.Thread(target=run_waiter)
+                waiter.start()
+                self.assertTrue(first_check_done.wait(timeout=1.0))
+                self.assertTrue(hot_data._portfolio_snapshot_cache_publish(
+                    result,
+                    generation=hot_data._portfolio_snapshot_generation,
+                    force_request_id="force-finishes-during-wait",
+                ))
+                hot_data._portfolio_snapshot_build_lock.release()
+                lock_held = False
+                waiter.join(timeout=2.0)
+
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(errors, [])
+            build_mock.assert_not_called()
+            self.assertTrue(outputs[0]["force_reused"])
+        finally:
+            if lock_held:
+                hot_data._portfolio_snapshot_build_lock.release()
+            self._clear_hot_data_cache()
+
+    def test_force_build_error_with_stale_data_remains_retryable(self):
+        self._clear_hot_data_cache()
+        stale = {"data": [{"stock_code": "OLD"}], "total": 1, "summary": {}}
+        fresh = {"data": [{"stock_code": "NEW"}], "total": 1, "summary": {}}
+        try:
+            with hot_data._cache_lock:
+                hot_data._cache_store["portfolio_snapshot"] = (0.0, stale)
+            with patch(
+                "server.api.routers.hot_data._build_portfolio_snapshot",
+                side_effect=[RuntimeError("temporary database outage"), fresh],
+            ) as build_mock:
+                failed = hot_data._get_portfolio_snapshot(
+                    live_mode=True,
+                    force_live=True,
+                    force_request_id="retry-after-error",
+                )
+                recovered = hot_data._get_portfolio_snapshot(
+                    live_mode=True,
+                    force_live=True,
+                    force_request_id="retry-after-error",
+                )
+
+            self.assertIn("temporary database outage", failed["error"])
+            self.assertEqual(failed["data"][0]["stock_code"], "OLD")
+            self.assertEqual(recovered["data"][0]["stock_code"], "NEW")
+            self.assertEqual(build_mock.call_count, 2)
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_cached_snapshot_error_has_short_negative_ttl(self):
+        self._clear_hot_data_cache()
+        failure = {"data": [], "total": 0, "error": "database unavailable"}
+        fresh = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        try:
+            with hot_data._cache_lock:
+                hot_data._cache_store["portfolio_snapshot"] = (0.0, failure)
+            with patch("server.api.routers.hot_data._cache_now", return_value=10.0), \
+                 patch("server.api.routers.hot_data._portfolio_snapshot_ttl_seconds", return_value=60), \
+                 patch(
+                     "server.api.routers.hot_data._build_portfolio_snapshot",
+                     return_value=fresh,
+                 ) as build_mock:
+                out = hot_data._get_portfolio_snapshot(live_mode=False)
+
+            build_mock.assert_called_once_with(force_live=False)
+            self.assertEqual(out["total"], 1)
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_portfolio_mutation_prevents_inflight_snapshot_from_repopulating_cache(self):
+        self._clear_hot_data_cache()
+
+        def build_then_mutate(*, force_live=False):
+            hot_data._invalidate_portfolio_snapshot_cache()
+            return {"data": [{"stock_code": "OLD"}], "total": 1, "summary": {}}
+
+        try:
+            with patch(
+                "server.api.routers.hot_data._build_portfolio_snapshot",
+                side_effect=build_then_mutate,
+            ):
+                out = hot_data._get_portfolio_snapshot(live_mode=True)
+
+            self.assertTrue(out["retryable"])
+            self.assertTrue(out["snapshot_superseded"])
+            with hot_data._cache_lock:
+                self.assertNotIn("portfolio_snapshot", hot_data._cache_store)
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_cold_portfolio_contention_has_a_bounded_wait(self):
+        self._clear_hot_data_cache()
+        try:
+            hot_data._portfolio_snapshot_build_lock.acquire()
+            try:
+                with patch("server.api.routers.hot_data._build_portfolio_snapshot") as build_mock:
+                    out = hot_data._get_portfolio_snapshot(live_mode=True)
+            finally:
+                hot_data._portfolio_snapshot_build_lock.release()
+
+            build_mock.assert_not_called()
+            self.assertTrue(out["retryable"])
+            self.assertIn("already in progress", out["error"])
+        finally:
+            self._clear_hot_data_cache()
+
+    def test_portfolio_snapshot_keeps_last_good_value_on_build_error(self):
+        self._clear_hot_data_cache()
+        stale = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {}}
+        try:
+            with hot_data._cache_lock:
+                hot_data._cache_store["portfolio_snapshot"] = (0.0, stale)
+            with patch("server.api.routers.hot_data._cache_now", return_value=10.0), \
+                 patch("server.api.routers.hot_data._portfolio_snapshot_ttl_seconds", return_value=3), \
+                 patch(
+                     "server.api.routers.hot_data._build_portfolio_snapshot",
+                     side_effect=RuntimeError("temporary database outage"),
+                 ):
+                out = hot_data._get_portfolio_snapshot(live_mode=True)
+
+            self.assertEqual(out["total"], 1)
+            self.assertTrue(out["snapshot_stale"])
+            self.assertIn("temporary database outage", out["snapshot_error"])
+        finally:
+            self._clear_hot_data_cache()
 
     def test_stock_detail_uses_short_intraday_cache(self):
         cached = {"stock_code": "000001", "cached": True}
