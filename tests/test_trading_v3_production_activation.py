@@ -36,12 +36,11 @@ def test_workstation_verifier_executes_only_the_active_release_command(
             events.append(("close",))
 
     monkeypatch.setattr(production_verifier, "load_project_env", lambda: None)
-    monkeypatch.setattr(production_verifier, "remote_root", lambda: "/opt/ProBigA")
     monkeypatch.setattr(
         production_verifier,
         "production_release_command",
-        lambda entrypoint, arguments, root: (
-            events.append(("build", entrypoint, arguments, root))
+        lambda entrypoint, arguments: (
+            events.append(("build", entrypoint, arguments))
             or "PINNED_RELEASE_COMMAND"
         ),
     )
@@ -63,7 +62,6 @@ def test_workstation_verifier_executes_only_the_active_release_command(
             "build",
             "tools/verify_trading_v3_production.py",
             ("--local-runtime",),
-            "/opt/ProBigA",
         ),
         ("connect", {"username": "deploy", "timeout": 30}),
         ("exec", "PINNED_RELEASE_COMMAND", 240),

@@ -50,6 +50,19 @@ def test_scheduler_authority_is_one_shared_standalone_contract() -> None:
     }
 
 
+def test_local_live_qmt_launcher_never_owns_shared_database_scheduler() -> None:
+    source = (ROOT / "tools" / "start_local_live_services.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "run_scheduler_daemon.py" not in source
+    assert "scheduler_daemon.out.log" not in source
+    assert "scheduler_daemon.err.log" not in source
+    assert "run_guojin_qmt_gateway.py" in source
+    assert "run_qmt_live_runtime.py" in source
+    assert "run_remote_mysql_tunnel.py" in source
+
+
 def test_readiness_exposes_the_durable_layer4_writer_fence() -> None:
     tasks = []
     for definition in task_deployment.deployment_tasks(

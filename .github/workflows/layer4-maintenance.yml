@@ -78,7 +78,6 @@ jobs:
     environment: production
     env:
       PROBIGA_DEPLOYMENT_MODE: production
-      PROBIGA_REMOTE_ROOT: /opt/ProBigA
       PROBIGA_EXPECTED_GIT_SHA: ${{ inputs.expected_sha }}
       PROBIGA_MAINTENANCE_PHASE: ${{ inputs.phase }}
       PROBIGA_MAINTENANCE_ALLOW_RESUME: ${{ inputs.allow_forward_recovery }}
@@ -105,7 +104,6 @@ jobs:
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           PROBIGA_DEPLOYMENT_MODE: production
-          PROBIGA_REMOTE_ROOT: /opt/ProBigA
           PROBIGA_EXPECTED_GIT_SHA: ${{ inputs.expected_sha }}
           PROBIGA_MAINTENANCE_PHASE: ${{ inputs.phase }}
           PROBIGA_MAINTENANCE_ALLOW_RESUME: ${{ inputs.allow_forward_recovery }}
@@ -120,7 +118,6 @@ jobs:
           command_timeout: 60m
           envs: >-
             PROBIGA_DEPLOYMENT_MODE,
-            PROBIGA_REMOTE_ROOT,
             PROBIGA_EXPECTED_GIT_SHA,
             PROBIGA_MAINTENANCE_PHASE,
             PROBIGA_MAINTENANCE_ALLOW_RESUME,
@@ -129,6 +126,19 @@ jobs:
             PROBIGA_MAINTENANCE_ACTOR
           script: |
             set -Eeuo pipefail
-            cd /opt/ProBigA
-            test "$(git rev-parse HEAD)" = "$PROBIGA_EXPECTED_GIT_SHA"
-            exec /bin/bash deploy/layer4_maintenance.sh
+            active_code="/opt/ProBigA-releases/$PROBIGA_EXPECTED_GIT_SHA"
+            test ! -L "$active_code"
+            test -d "$active_code"
+            test -L /opt/ProBigA-current
+            test "$(readlink -f /opt/ProBigA-current)" = "$active_code"
+            test "$(git -C "$active_code" rev-parse HEAD)" = \
+              "$PROBIGA_EXPECTED_GIT_SHA"
+            exec sudo -n /usr/bin/env -- \
+              PROBIGA_DEPLOYMENT_MODE="$PROBIGA_DEPLOYMENT_MODE" \
+              PROBIGA_EXPECTED_GIT_SHA="$PROBIGA_EXPECTED_GIT_SHA" \
+              PROBIGA_MAINTENANCE_PHASE="$PROBIGA_MAINTENANCE_PHASE" \
+              PROBIGA_MAINTENANCE_ALLOW_RESUME="$PROBIGA_MAINTENANCE_ALLOW_RESUME" \
+              PROBIGA_MAINTENANCE_ACK="$PROBIGA_MAINTENANCE_ACK" \
+              PROBIGA_MAINTENANCE_RUN_ID="$PROBIGA_MAINTENANCE_RUN_ID" \
+              PROBIGA_MAINTENANCE_ACTOR="$PROBIGA_MAINTENANCE_ACTOR" \
+              /bin/bash "$active_code/deploy/layer4_maintenance.sh"

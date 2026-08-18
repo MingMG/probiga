@@ -48,17 +48,25 @@ def test_production_release_command_uses_active_pins_and_sealed_adata():
     command = production_release_command(
         "tools/verify_trading_v3_production.py",
         ("--local-runtime",),
-        root="/opt/ProBigA",
+        root="/opt/ProBigA-current",
     )
 
     assert "http://127.0.0.1/api/health" in command
-    assert 'RELEASE_VENV_ROOT="$ROOT/.release_venvs"' in command
+    assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in command
+    assert "CURRENT_RELEASE_LINK=/opt/ProBigA-current" in command
+    assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in command
+    assert 'ACTIVE_CODE="$CODE_RELEASE_ROOT/$EXPECTED_SHA"' in command
+    assert (
+        'test "$(readlink -f "$CURRENT_RELEASE_LINK")" = "$ACTIVE_CODE"'
+        in command
+    )
     assert ".probiga.gitsha" in command
     assert 'PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA"' in command
+    assert 'PROBIGA_CODE_ROOT="$ACTIVE_CODE"' in command
     assert "systemctl show -p MainPID --value probiga" in command
     assert "/var/lib/probiga/release-sources/adata" in command
-    assert 'PYTHONPATH="$ADATA_SOURCE:$ROOT"' in command
-    assert '"$RELEASE_VENV/bin/python"' in command
+    assert 'PYTHONPATH="$ADATA_SOURCE:$ACTIVE_CODE"' in command
+    assert '"$RELEASE_VENV/bin/python" -P' in command
     assert "/opt/ProBigA/venv/bin/python" not in command
     assert "/opt/ProBigA/adata" not in command
 
@@ -66,12 +74,16 @@ def test_production_release_command_uses_active_pins_and_sealed_adata():
 @pytest.mark.parametrize(
     ("entrypoint", "root"),
     (
-        ("../tools/verify.py", "/opt/ProBigA"),
-        ("/tmp/verify.py", "/opt/ProBigA"),
-        ("tools/verify.sh", "/opt/ProBigA"),
-        ("tools/migrate_production.py", "/opt/ProBigA"),
+        ("../tools/verify.py", "/opt/ProBigA-current"),
+        ("/tmp/verify.py", "/opt/ProBigA-current"),
+        ("tools/verify.sh", "/opt/ProBigA-current"),
+        ("tools/migrate_production.py", "/opt/ProBigA-current"),
         ("tools/verify.py", "relative/root"),
-        ("tools/verify_trading_v3_production.py", "/opt/ProBigA/../other"),
+        ("tools/verify_trading_v3_production.py", "/opt/ProBigA"),
+        (
+            "tools/verify_trading_v3_production.py",
+            "/opt/ProBigA-current/../other",
+        ),
     ),
 )
 def test_production_release_command_rejects_unpinned_paths(entrypoint, root):

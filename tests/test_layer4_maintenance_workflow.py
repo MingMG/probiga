@@ -20,6 +20,14 @@ def test_layer4_workflow_is_manual_protected_and_sha_pinned() -> None:
     assert "environment: production" in workflow
     assert "SERVER_HOST_FINGERPRINT" in workflow
     assert 'test "$SERVER_USER" != root' in workflow
+    assert 'active_code="/opt/ProBigA-releases/$PROBIGA_EXPECTED_GIT_SHA"' in workflow
+    assert "test -L /opt/ProBigA-current" in workflow
+    assert (
+        'test "$(readlink -f /opt/ProBigA-current)" = "$active_code"'
+        in workflow
+    )
+    assert "exec sudo -n /usr/bin/env --" in workflow
+    assert "cd /opt/ProBigA" not in workflow
 
 
 def test_layer4_workflow_has_separate_migrate_recovery_activation_acks() -> None:
@@ -80,6 +88,28 @@ def test_remote_maintenance_has_dba_backup_receipt_and_recovery_contracts() -> N
     assert "model_gate_modified\": False" in script
     assert "order_authority\": False" in script
     assert "down migration" in script
+
+
+def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
+    script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in script
+    assert "CURRENT_RELEASE_LINK=/opt/ProBigA-current" in script
+    assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in script
+    assert "DEPLOY_LOCK_ROOT=/run/probiga" in script
+    assert (
+        'DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"'
+        in script
+    )
+    assert "exec 9>\"$DEPLOY_LOCK_FILE\"" in script
+    assert "flock -n 9" in script
+    assert "root:root:600" in script
+    assert ".probiga_deploy_lock" not in script
+    assert 'PROBIGA_CODE_ROOT="$ROOT"' in script
+    assert 'PYTHONPATH="$ADATA_SOURCE:$ROOT"' in script
+    assert '"$RELEASE_VENV/bin/python" -P "$ROOT/$entrypoint"' in script
+    assert '"$ROOT/.release_venvs' not in script
 
 
 def test_remote_maintenance_never_lifts_model_or_order_gates() -> None:

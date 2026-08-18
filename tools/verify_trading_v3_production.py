@@ -29,11 +29,13 @@ from server.trading_v3.counterfactual_worker import (
 from server.trading_v3.repository import TradingV3Repository
 from tools.env_config import create_tool_engine, load_project_env
 from tools.remote_support import (
+    PRODUCTION_CODE_RELEASE_ROOT,
+    PRODUCTION_CURRENT_RELEASE_LINK,
     production_ssh_client,
     production_ssh_connect_kwargs,
     PRODUCTION_ADATA_RELEASE_ROOT,
+    PRODUCTION_RELEASE_VENV_ROOT,
     production_release_command,
-    remote_root,
 )
 from tools.trading_v3_fourth_layer_readiness import (
     collect_fourth_layer_readiness,
@@ -150,10 +152,13 @@ def _real_trading_guard_rows_valid(rows: Any) -> bool:
 
 
 def _is_production_runtime() -> bool:
-    raw = str(ROOT).replace("\\", "/").rstrip("/")
-    resolved = str(ROOT.resolve()).replace("\\", "/").rstrip("/")
-    production_root = remote_root()
-    return raw == production_root or resolved == production_root
+    configured = os.environ.get("PROBIGA_CODE_ROOT", "").strip()
+    if not configured:
+        return False
+    try:
+        return ROOT.resolve(strict=True) == Path(configured).resolve(strict=True)
+    except (OSError, ValueError):
+        return False
 
 
 def _local_production_runtime_identity() -> tuple[bool, str]:
@@ -164,6 +169,7 @@ def _local_production_runtime_identity() -> tuple[bool, str]:
     if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip() != "production":
         return False, "PROBIGA_DEPLOYMENT_MODE is not production"
     expected_sha = os.environ.get("PROBIGA_EXPECTED_GIT_SHA", "").strip()
+    build_sha = os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip()
     adata_sha = os.environ.get("PROBIGA_EXPECTED_ADATA_SHA", "").strip()
     adata_tree_sha = os.environ.get(
         "PROBIGA_EXPECTED_ADATA_TREE_SHA256", ""
@@ -171,10 +177,31 @@ def _local_production_runtime_identity() -> tuple[bool, str]:
     adata_source_value = os.environ.get("PROBIGA_ADATA_SOURCE_DIR", "").strip()
     if re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None:
         return False, "production Git SHA pin is absent or invalid"
+    if build_sha != expected_sha:
+        return False, "production build SHA differs from its Git SHA pin"
     if re.fullmatch(r"[0-9a-f]{40}", adata_sha) is None:
         return False, "production adata Git SHA pin is absent or invalid"
     if re.fullmatch(r"[0-9a-f]{64}", adata_tree_sha) is None:
         return False, "production adata tree SHA pin is absent or invalid"
+    expected_code_root = Path(PRODUCTION_CODE_RELEASE_ROOT) / expected_sha
+    configured_code_root = os.environ.get("PROBIGA_CODE_ROOT", "").strip()
+    if configured_code_root != str(expected_code_root):
+        return False, "production code root is not the SHA-addressed release"
+    try:
+        canonical_code_root = expected_code_root.resolve(strict=True)
+        if expected_code_root.is_symlink() or canonical_code_root != expected_code_root:
+            return False, "production code release is not a canonical directory"
+        if ROOT.resolve(strict=True) != canonical_code_root:
+            return False, "verifier code is not the active SHA-addressed release"
+        current_link = Path(PRODUCTION_CURRENT_RELEASE_LINK)
+        if (
+            not current_link.is_symlink()
+            or current_link.resolve(strict=True) != canonical_code_root
+        ):
+            return False, "production current link does not select this release"
+    except (OSError, ValueError) as exc:
+        return False, f"active production code identity cannot be proven: {exc}"
+
     try:
         actual_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -191,12 +218,14 @@ def _local_production_runtime_identity() -> tuple[bool, str]:
     if actual_sha != expected_sha:
         return False, "production checkout does not match its Git SHA pin"
 
-    venv_link = ROOT / ".release_venvs" / expected_sha
+    venv_link = Path(PRODUCTION_RELEASE_VENV_ROOT) / expected_sha
     try:
         if not venv_link.is_symlink():
             return False, "production release venv is not a SHA-addressed symlink"
         venv_target = venv_link.resolve(strict=True)
-        release_venv_root = (ROOT / ".release_venvs").resolve(strict=True)
+        release_venv_root = Path(PRODUCTION_RELEASE_VENV_ROOT).resolve(
+            strict=True
+        )
         venv_target.relative_to(release_venv_root)
         if not venv_target.name.startswith(f"build-{expected_sha}-"):
             return False, "production release venv target is not bound to Git SHA"
@@ -263,11 +292,9 @@ def _run_on_production_host() -> int:
     """
 
     load_project_env()
-    root = remote_root()
     command = production_release_command(
         "tools/verify_trading_v3_production.py",
         ("--local-runtime",),
-        root=root,
     )
     import paramiko
 

@@ -16,6 +16,9 @@ DEFAULT_SSH_AUTH_TIMEOUT_SECONDS = 30
 DEFAULT_SSH_BANNER_TIMEOUT_SECONDS = 30
 PRODUCTION_ADATA_RELEASE_ROOT = "/var/lib/probiga/release-sources/adata"
 PRODUCTION_BOOTSTRAP_PYTHON = "/usr/bin/python3.14"
+PRODUCTION_CODE_RELEASE_ROOT = "/opt/ProBigA-releases"
+PRODUCTION_CURRENT_RELEASE_LINK = "/opt/ProBigA-current"
+PRODUCTION_RELEASE_VENV_ROOT = "/var/lib/probiga/release-venvs"
 PRODUCTION_READ_ONLY_ENTRYPOINTS = frozenset({
     "tools/verify_trading_v3_production.py",
 })
@@ -190,19 +193,24 @@ def production_release_command(
     the service is running another.
     """
 
-    release_root = (root or remote_root()).rstrip("/")
-    release_root_path = PurePosixPath(release_root)
+    current_release_link = (
+        root or PRODUCTION_CURRENT_RELEASE_LINK
+    ).rstrip("/")
+    release_root_path = PurePosixPath(current_release_link)
     if (
-        not release_root.startswith("/")
-        or release_root in {"", "/"}
-        or release_root_path.as_posix() != release_root
+        not current_release_link.startswith("/")
+        or current_release_link in {"", "/"}
+        or release_root_path.as_posix() != current_release_link
         or ".." in release_root_path.parts
         or any(
-            character in release_root for character in ("\x00", "\r", "\n")
+            character in current_release_link
+            for character in ("\x00", "\r", "\n")
         )
+        or current_release_link != PRODUCTION_CURRENT_RELEASE_LINK
     ):
         raise UnsafeRemoteRuntimeError(
-            "production release root must be a single absolute POSIX path"
+            "production current-release link must be the authoritative "
+            f"{PRODUCTION_CURRENT_RELEASE_LINK} path"
         )
     relative = PurePosixPath(str(entrypoint))
     relative_text = relative.as_posix()
@@ -222,11 +230,13 @@ def production_release_command(
             "production release arguments must not contain NUL bytes"
         )
 
-    quoted_root = shlex.quote(release_root)
+    quoted_current_link = shlex.quote(current_release_link)
     quoted_entrypoint = shlex.quote(relative_text)
     quoted_arguments = " ".join(shlex.quote(value) for value in normalized_arguments)
     invocation = " ".join(
-        value for value in ('"$ROOT/$ENTRYPOINT"', quoted_arguments) if value
+        value
+        for value in ('"$ACTIVE_CODE/$ENTRYPOINT"', quoted_arguments)
+        if value
     )
     identity_parser = r'''import json, os, re
 payload = json.loads(os.environ["HEALTH_JSON"])
@@ -260,11 +270,12 @@ for value in values:
     print(value)
 '''
     script = f"""set -Eeuo pipefail
-ROOT={quoted_root}
+CURRENT_RELEASE_LINK={quoted_current_link}
+CODE_RELEASE_ROOT={shlex.quote(PRODUCTION_CODE_RELEASE_ROOT)}
 ENTRYPOINT={quoted_entrypoint}
 BOOTSTRAP_PYTHON={shlex.quote(PRODUCTION_BOOTSTRAP_PYTHON)}
 ADATA_RUNTIME_ROOT={shlex.quote(PRODUCTION_ADATA_RELEASE_ROOT)}
-RELEASE_VENV_ROOT="$ROOT/.release_venvs"
+RELEASE_VENV_ROOT={shlex.quote(PRODUCTION_RELEASE_VENV_ROOT)}
 test -x "$BOOTSTRAP_PYTHON"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 test ! -w "$BOOTSTRAP_PYTHON"
@@ -282,9 +293,17 @@ ADATA_SOURCE="${{RELEASE_IDENTITY[3]}}"
 [[ "$EXPECTED_ADATA_SHA" =~ ^[0-9a-f]{{40}}$ ]]
 [[ "$EXPECTED_ADATA_TREE_SHA256" =~ ^[0-9a-f]{{64}}$ ]]
 test "$ADATA_SOURCE" = "$ADATA_RUNTIME_ROOT/$EXPECTED_ADATA_SHA-$EXPECTED_ADATA_TREE_SHA256"
-test "$ADATA_SOURCE" != "$ROOT/adata"
-test "$(git -C "$ROOT" rev-parse HEAD)" = "$EXPECTED_SHA"
-test -f "$ROOT/$ENTRYPOINT"
+ACTIVE_CODE="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
+test ! -L "$CODE_RELEASE_ROOT"
+test "$(readlink -f "$CODE_RELEASE_ROOT")" = "$CODE_RELEASE_ROOT"
+test ! -L "$ACTIVE_CODE"
+test -d "$ACTIVE_CODE"
+test "$(readlink -f "$ACTIVE_CODE")" = "$ACTIVE_CODE"
+test -L "$CURRENT_RELEASE_LINK"
+test "$(readlink -f "$CURRENT_RELEASE_LINK")" = "$ACTIVE_CODE"
+test "$ADATA_SOURCE" != "$ACTIVE_CODE/adata"
+test "$(git -C "$ACTIVE_CODE" rev-parse HEAD)" = "$EXPECTED_SHA"
+test -f "$ACTIVE_CODE/$ENTRYPOINT"
 RELEASE_VENV="$RELEASE_VENV_ROOT/$EXPECTED_SHA"
 test -L "$RELEASE_VENV"
 RELEASE_VENV_TARGET="$(readlink -f "$RELEASE_VENV")"
@@ -300,21 +319,22 @@ MAIN_PID="$(systemctl show -p MainPID --value probiga)"
 [[ "$MAIN_PID" =~ ^[1-9][0-9]*$ ]]
 ACTIVE_ARGV0="$(tr '\0' '\n' < "/proc/$MAIN_PID/cmdline" | sed -n '1p')"
 test "$ACTIVE_ARGV0" = "$RELEASE_VENV/bin/python"
-"$BOOTSTRAP_PYTHON" -I "$ROOT/server/common/adata_release.py" verify \
+"$BOOTSTRAP_PYTHON" -I "$ACTIVE_CODE/server/common/adata_release.py" verify \
   --source "$ADATA_SOURCE" --git-sha "$EXPECTED_ADATA_SHA" \
   --tree-sha256 "$EXPECTED_ADATA_TREE_SHA256" >/dev/null
-cd "$ROOT"
+cd "$ACTIVE_CODE"
 exec env -i \
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-  LANG=C.UTF-8 PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 \
+  LANG=C.UTF-8 PYTHONUTF8=1 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
   PROBIGA_DEPLOYMENT_MODE=production \
-  PROBIGA_REMOTE_ROOT="$ROOT" \
+  PROBIGA_REMOTE_ROOT="$CURRENT_RELEASE_LINK" \
+  PROBIGA_CODE_ROOT="$ACTIVE_CODE" \
   PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
   PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
   PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
   PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
   PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
-  PYTHONPATH="$ADATA_SOURCE:$ROOT" \
-  "$RELEASE_VENV/bin/python" {invocation}
+  PYTHONPATH="$ADATA_SOURCE:$ACTIVE_CODE" \
+  "$RELEASE_VENV/bin/python" -P {invocation}
 """
     return "/bin/bash -ceu " + shlex.quote(script)

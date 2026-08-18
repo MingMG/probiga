@@ -147,6 +147,8 @@ jobs:
           python -m pytest -q
           tests/test_production_release_boundary.py
           tests/test_deploy_console.py
+          tests/test_hot_data_detail.py
+          tests/test_portfolio_watch_modal_ui.py
           tests/test_scheduler_runtime.py
 
       - name: Run Trading V3 Layer 4 release regressions

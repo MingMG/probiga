@@ -7,7 +7,6 @@
 set -Eeuo pipefail
 umask 077
 
-ROOT="${PROBIGA_REMOTE_ROOT:-/opt/ProBigA}"
 EXPECTED_SHA="${PROBIGA_EXPECTED_GIT_SHA:-}"
 PHASE="${PROBIGA_MAINTENANCE_PHASE:-}"
 ACK="${PROBIGA_MAINTENANCE_ACK:-}"
@@ -19,7 +18,12 @@ MYSQL_BIN=/usr/bin/mysql
 MYSQLDUMP_BIN=/usr/bin/mysqldump
 RECEIPT_ROOT=/var/lib/probiga/maintenance-receipts
 BACKUP_ROOT=/var/backups/probiga/layer4
-REMOTE_LOCK_DIR="$ROOT/.probiga_deploy_lock"
+CODE_RELEASE_ROOT=/opt/ProBigA-releases
+CURRENT_RELEASE_LINK=/opt/ProBigA-current
+RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
+DEPLOY_LOCK_ROOT=/run/probiga
+DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
+ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 
 die() {
   echo "Layer-4 maintenance blocked: $1" >&2
@@ -49,20 +53,39 @@ case "$PHASE" in
     ;;
   *) die "phase must be migrate or activate" ;;
 esac
-test "$ROOT" = /opt/ProBigA || die "production root must be /opt/ProBigA"
 test "${PROBIGA_DEPLOYMENT_MODE:-}" = production || \
   die "production deployment mode is required"
+test "${EUID:-$(id -u)}" -eq 0 || \
+  die "Layer-4 maintenance must run through the root maintenance broker"
 test -x "$BOOTSTRAP_PYTHON" || die "pinned bootstrap Python is missing"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root || \
   die "bootstrap Python is not root-owned"
 
-cd "$ROOT"
-if ! mkdir "$REMOTE_LOCK_DIR"; then
+test ! -L "$DEPLOY_LOCK_ROOT" || die "deploy lock root must not be a symlink"
+install -d -o root -g root -m 0700 "$DEPLOY_LOCK_ROOT"
+test "$(readlink -f "$DEPLOY_LOCK_ROOT")" = "$DEPLOY_LOCK_ROOT" || \
+  die "deploy lock root is not canonical"
+test ! -L "$DEPLOY_LOCK_FILE" || die "deploy lock file must not be a symlink"
+touch "$DEPLOY_LOCK_FILE"
+chown root:root "$DEPLOY_LOCK_FILE"
+chmod 0600 "$DEPLOY_LOCK_FILE"
+test "$(stat -c '%U:%G:%a' "$DEPLOY_LOCK_FILE")" = root:root:600 || \
+  die "deploy lock file ownership or mode is unsafe"
+exec 9>"$DEPLOY_LOCK_FILE"
+if ! flock -n 9; then
   die "another deploy or maintenance run holds the remote lock"
 fi
-release_remote_lock() {
-  rmdir "$REMOTE_LOCK_DIR" 2>/dev/null || true
-}
+test ! -L "$CODE_RELEASE_ROOT" || die "code release root must not be a symlink"
+test "$(readlink -f "$CODE_RELEASE_ROOT")" = "$CODE_RELEASE_ROOT" || \
+  die "code release root is not canonical"
+test ! -L "$ROOT" && test -d "$ROOT" || \
+  die "expected immutable code release is missing or linked"
+test "$(readlink -f "$ROOT")" = "$ROOT" || \
+  die "expected immutable code release is not canonical"
+test -L "$CURRENT_RELEASE_LINK" || die "current release link is missing"
+test "$(readlink -f "$CURRENT_RELEASE_LINK")" = "$ROOT" || \
+  die "current release does not select the expected SHA"
+cd "$ROOT"
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="layer4-${PHASE}-${EXPECTED_SHA}-${RUN_ID}"
@@ -82,7 +105,6 @@ FAILURE_DETAIL=""
 
 cleanup_run_dir() {
   rm -rf -- "$RUN_DIR"
-  release_remote_lock
 }
 trap cleanup_run_dir EXIT
 
@@ -174,12 +196,13 @@ test "${#RELEASE_IDENTITY[@]}" -eq 3 || die "active release identity failed"
 ADATA_SHA="${RELEASE_IDENTITY[0]}"
 ADATA_TREE_SHA256="${RELEASE_IDENTITY[1]}"
 ADATA_SOURCE="${RELEASE_IDENTITY[2]}"
-test "$(git rev-parse HEAD)" = "$EXPECTED_SHA" || die "checkout SHA differs"
-RELEASE_VENV="$ROOT/.release_venvs/$EXPECTED_SHA"
+test "$(git -C "$ROOT" rev-parse HEAD)" = "$EXPECTED_SHA" || \
+  die "active code release SHA differs"
+RELEASE_VENV="$RELEASE_VENV_ROOT/$EXPECTED_SHA"
 test -L "$RELEASE_VENV" || die "release venv is not SHA-addressed"
 RELEASE_VENV_TARGET="$(readlink -f "$RELEASE_VENV")"
 case "$RELEASE_VENV_TARGET" in
-  "$ROOT/.release_venvs/build-$EXPECTED_SHA-"*) ;;
+  "$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-"*) ;;
   *) die "release venv escaped its immutable root" ;;
 esac
 test "$(cat "$RELEASE_VENV/.probiga.gitsha")" = "$EXPECTED_SHA" || \
@@ -197,22 +220,37 @@ for unit in probiga probiga-scheduler; do
   active_argv0="$(tr '\0' '\n' < "/proc/$main_pid/cmdline" | sed -n '1p')"
   test "$active_argv0" = "$RELEASE_VENV/bin/python" || \
     die "$unit is not running the pinned release interpreter"
+  grep -zFx -- "PROBIGA_CODE_ROOT=$ROOT" \
+    "/proc/$main_pid/environ" >/dev/null || \
+    die "$unit is not bound to the active code release"
+  grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$ROOT" \
+    "/proc/$main_pid/environ" >/dev/null || \
+    die "$unit PYTHONPATH is not sealed adata plus active code"
 done
 
 run_release_python() {
+  local entrypoint="$1"
   local service_home
+  shift
+  case "$entrypoint" in
+    tools/*.py) ;;
+    *) die "maintenance entrypoint escaped the active release" ;;
+  esac
+  test -f "$ROOT/$entrypoint" || die "maintenance entrypoint is missing"
   service_home="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
   sudo -u "$SERVICE_USER" env -i \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME="$service_home" LANG=C.UTF-8 PYTHONUTF8=1 \
-    PYTHONDONTWRITEBYTECODE=1 PROBIGA_DEPLOYMENT_MODE=production \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_CODE_ROOT="$ROOT" \
     PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
     PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
     PROBIGA_EXPECTED_ADATA_SHA="$ADATA_SHA" \
     PROBIGA_EXPECTED_ADATA_TREE_SHA256="$ADATA_TREE_SHA256" \
     PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
     PYTHONPATH="$ADATA_SOURCE:$ROOT" \
-    "$RELEASE_VENV/bin/python" "$@"
+    "$RELEASE_VENV/bin/python" -P "$ROOT/$entrypoint" "$@"
 }
 
 release_maintenance_lock() {
