@@ -1070,16 +1070,21 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     )
     assert "CUTOVER_STEP=verify_installed_runtime_units" in deploy_script
     assert (
-        "LEGACY_SCHEDULER_DROPIN=/etc/systemd/system/"
-        "probiga-scheduler.service.d/release.conf"
+        "/etc/systemd/system/probiga-scheduler.service.d/release.conf"
         in deploy_script
     )
-    assert 'sudo rm -f "$LEGACY_SCHEDULER_DROPIN"' in deploy_script
+    assert "release-path.conf" in deploy_script
+    assert "release-revision.conf" in deploy_script
+    assert "zz-probiga-env.conf" in deploy_script
+    assert "SCHEDULER_LIMITS_DROPIN=" in deploy_script
+    assert 'sudo rm -f "$legacy_scheduler_dropin"' in deploy_script
     assert "CUTOVER_STEP=verify_no_scheduler_dropins" in deploy_script
     assert "scheduler_identity unexpected_dropins=%q" in deploy_script
+    assert "scheduler_identity unsafe_limits_dropin=%q" in deploy_script
     assert (
-        '"$PREVIOUS_LEGACY_SCHEDULER_DROPIN" '
-        '"$LEGACY_SCHEDULER_DROPIN"'
+        '"$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR/'
+        '$(basename "$legacy_scheduler_dropin")" '
+        '"$legacy_scheduler_dropin"'
         in normalized
     )
     assert (
