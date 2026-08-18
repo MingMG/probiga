@@ -802,6 +802,7 @@ ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
 ADATA_WHEEL_DIR=""
 EXPECTED_BUILD=""
+EXPECTED_VENV_TARGET=""
 RESOLVED_LOCK=""
 HEALTH_RESPONSE=""
 PREPARED_MAIN_DROPIN=""
@@ -1289,6 +1290,7 @@ prepare_release_venv() {
     assert_service_cannot_write_tree "$EXPECTED_BUILD" \
       "new release virtual environment"
     ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+    EXPECTED_VENV_TARGET="$EXPECTED_BUILD"
     NEW_VENV_LINK=1
   fi
   chmod 0555 "$RELEASE_VENV_ROOT"
@@ -1810,8 +1812,15 @@ grep -zFx -- 'PYTHONSAFEPATH=1' \
 # interpreter and script directly here; /proc environ can omit PYTHONPATH after
 # interpreter startup on this production image even though the unit is exact.
 mapfile -d '' -t SCHEDULER_CMDLINE < "/proc/$SCHEDULER_MAIN_PID/cmdline"
-test "${SCHEDULER_CMDLINE[0]}" = \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+case "${SCHEDULER_CMDLINE[0]}" in
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"|\
+  "$EXPECTED_VENV_TARGET/bin/python") ;;
+  *)
+    printf 'scheduler_identity unexpected_argv0=%q\n' \
+      "${SCHEDULER_CMDLINE[0]}" >&2
+    false
+    ;;
+esac
 test "${SCHEDULER_CMDLINE[1]}" = -P
 test "${SCHEDULER_CMDLINE[2]}" = \
   "$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"
