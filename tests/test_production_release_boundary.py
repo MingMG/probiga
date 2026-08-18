@@ -578,7 +578,7 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     assert re.search(
         r'sudo install\s+-o root -g root -m 0644\s+'
         r'"\$PREVIOUS_DROPIN"\s+'
-        r'/etc/systemd/system/probiga\.service\.d/scheduler\.conf',
+        r'"\$MAIN_RELEASE_DROPIN"',
         normalized_rollback,
     )
     assert re.search(
@@ -1057,7 +1057,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     )
     assert (
         'cmp --silent "$PREPARED_MAIN_DROPIN" '
-        "/etc/systemd/system/probiga.service.d/scheduler.conf"
+        '"$MAIN_RELEASE_DROPIN"'
         in normalized
     )
     assert (
@@ -1069,6 +1069,14 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         in normalized
     )
     assert "CUTOVER_STEP=verify_installed_runtime_units" in deploy_script
+    assert "MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf" in deploy_script
+    assert "LEGACY_MAIN_OVERRIDE_DROPINS=(" in deploy_script
+    assert "MAIN_LIMITS_DROPIN=" in deploy_script
+    assert 'sudo rm -f "$legacy_main_dropin"' in deploy_script
+    assert "main_identity missing_release_dropin=%q" in deploy_script
+    assert "main_identity unexpected_dropin=%q" in deploy_script
+    assert "main_identity unexpected_argv0=%q" in deploy_script
+    assert 'test "${MAIN_CMDLINE[4]}" = server.api.main:app' in deploy_script
     assert (
         "/etc/systemd/system/probiga-scheduler.service.d/release.conf"
         in deploy_script

@@ -107,6 +107,14 @@ AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
 SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service
+MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf
+LEGACY_MAIN_OVERRIDE_DROPINS=(
+  /etc/systemd/system/probiga.service.d/release.conf
+  /etc/systemd/system/probiga.service.d/release-path.conf
+  /etc/systemd/system/probiga.service.d/release-revision.conf
+  /etc/systemd/system/probiga.service.d/zz-probiga-env.conf
+)
+MAIN_LIMITS_DROPIN=/etc/systemd/system/probiga.service.d/limits.conf
 LEGACY_SCHEDULER_OVERRIDE_DROPINS=(
   /etc/systemd/system/probiga-scheduler.service.d/release.conf
   /etc/systemd/system/probiga-scheduler.service.d/release-path.conf
@@ -816,6 +824,8 @@ PREPARED_MAIN_DROPIN=""
 PREPARED_SCHEDULER_DROPIN=""
 PREPARED_AI_WORKER_DROPIN=""
 PREVIOUS_DROPIN=""
+PREVIOUS_LEGACY_MAIN_DROPIN_DIR=""
+declare -a PREVIOUS_LEGACY_MAIN_DROPINS=()
 PREVIOUS_SCHEDULER_DROPIN=""
 PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR=""
 declare -a PREVIOUS_LEGACY_SCHEDULER_DROPINS=()
@@ -823,6 +833,8 @@ PREVIOUS_AI_WORKER_DROPIN=""
 PREVIOUS_LOCK_SNAPSHOT=""
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
+  [ -z "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR" ] || \
+    rm -rf -- "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR"
   [ -z "$PREVIOUS_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREVIOUS_SCHEDULER_DROPIN"
   [ -z "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR" ] || \
@@ -838,10 +850,18 @@ cleanup_prepare_artifacts() {
 }
 PREVIOUS_DROPIN="$(mktemp)"
 PREVIOUS_DROPIN_PRESENT=0
-if sudo test -f /etc/systemd/system/probiga.service.d/scheduler.conf; then
-  sudo cat /etc/systemd/system/probiga.service.d/scheduler.conf > "$PREVIOUS_DROPIN"
+if sudo test -f "$MAIN_RELEASE_DROPIN"; then
+  sudo cat "$MAIN_RELEASE_DROPIN" > "$PREVIOUS_DROPIN"
   PREVIOUS_DROPIN_PRESENT=1
 fi
+PREVIOUS_LEGACY_MAIN_DROPIN_DIR="$(mktemp -d)"
+for legacy_main_dropin in "${LEGACY_MAIN_OVERRIDE_DROPINS[@]}"; do
+  if sudo test -f "$legacy_main_dropin"; then
+    sudo cat "$legacy_main_dropin" > \
+      "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR/$(basename "$legacy_main_dropin")"
+    PREVIOUS_LEGACY_MAIN_DROPINS+=("$legacy_main_dropin")
+  fi
+done
 PREVIOUS_SCHEDULER_DROPIN="$(mktemp)"
 PREVIOUS_SCHEDULER_DROPIN_PRESENT=0
 if sudo test -f "$SCHEDULER_UNIT"; then
@@ -1121,6 +1141,8 @@ cleanup_prepare_artifacts() {
   fi
   rm -f -- "$PREVIOUS_DROPIN" "$PREVIOUS_SCHEDULER_DROPIN" \
     "$PREVIOUS_AI_WORKER_DROPIN"
+  [ -z "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR" ] || \
+    rm -rf -- "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR"
   [ -z "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR" ] || \
     rm -rf -- "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR"
   [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
@@ -1412,9 +1434,12 @@ prepare_release() {
 install_prepared_dropins() {
   test -s "$PREPARED_MAIN_DROPIN"
   sudo install -d -o root -g root -m 0755 \
-    /etc/systemd/system/probiga.service.d
+    "$(dirname "$MAIN_RELEASE_DROPIN")"
+  for legacy_main_dropin in "${LEGACY_MAIN_OVERRIDE_DROPINS[@]}"; do
+    sudo rm -f "$legacy_main_dropin"
+  done
   sudo install -o root -g root -m 0644 "$PREPARED_MAIN_DROPIN" \
-    /etc/systemd/system/probiga.service.d/scheduler.conf
+    "$MAIN_RELEASE_DROPIN"
   test -s "$PREPARED_SCHEDULER_DROPIN"
   sudo install -d -o root -g root -m 0755 \
     "$(dirname "$SCHEDULER_UNIT")"
@@ -1530,15 +1555,25 @@ rollback() {
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_DROPIN_PRESENT" -eq 1 ]; then
         if ! sudo install -o root -g root -m 0644 "$PREVIOUS_DROPIN" \
-          /etc/systemd/system/probiga.service.d/scheduler.conf; then
+          "$MAIN_RELEASE_DROPIN"; then
           rollback_failure "restore previous probiga drop-in"
           restoration_ready=0
         fi
-      elif ! sudo rm -f \
-        /etc/systemd/system/probiga.service.d/scheduler.conf; then
+      elif ! sudo rm -f "$MAIN_RELEASE_DROPIN"; then
         rollback_failure "remove release probiga drop-in"
         restoration_ready=0
       fi
+    fi
+    if [ "$restoration_ready" -eq 1 ]; then
+      for legacy_main_dropin in "${PREVIOUS_LEGACY_MAIN_DROPINS[@]}"; do
+        if ! sudo install -o root -g root -m 0644 \
+          "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR/$(basename "$legacy_main_dropin")" \
+          "$legacy_main_dropin"; then
+          rollback_failure "restore previous legacy probiga drop-in"
+          restoration_ready=0
+          break
+        fi
+      done
     fi
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_SCHEDULER_DROPIN_PRESENT" -eq 1 ]; then
@@ -1785,7 +1820,7 @@ CUTOVER_STEP=verify_installed_runtime_units
 # not the installed unit source of truth. Compare the exact files here; the
 # post-start /proc checks below independently prove the effective processes.
 cmp --silent "$PREPARED_MAIN_DROPIN" \
-  /etc/systemd/system/probiga.service.d/scheduler.conf
+  "$MAIN_RELEASE_DROPIN"
 cmp --silent "$PREPARED_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   cmp --silent "$PREPARED_AI_WORKER_DROPIN" "$AI_WORKER_DROPIN"
@@ -1793,6 +1828,26 @@ fi
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 CUTOVER_STEP=verify_no_scheduler_dropins
+MAIN_DROPIN_PATHS="$(systemctl show "$MAIN_SERVICE" \
+  --property=DropInPaths --value)"
+case " $MAIN_DROPIN_PATHS " in
+  *" $MAIN_RELEASE_DROPIN "*) ;;
+  *)
+    printf 'main_identity missing_release_dropin=%q\n' \
+      "$MAIN_DROPIN_PATHS" >&2
+    false
+    ;;
+esac
+for main_dropin_path in $MAIN_DROPIN_PATHS; do
+  case "$main_dropin_path" in
+    "$MAIN_RELEASE_DROPIN"|"$MAIN_LIMITS_DROPIN") ;;
+    *)
+      printf 'main_identity unexpected_dropin=%q\n' \
+        "$main_dropin_path" >&2
+      false
+      ;;
+  esac
+done
 SCHEDULER_DROPIN_PATHS="$(systemctl show probiga-scheduler \
   --property=DropInPaths --value)"
 EXPECTED_SCHEDULER_DROPIN_PATHS=""
@@ -1829,10 +1884,30 @@ grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$EXPECTED_ADATA_SHA" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- \
+  "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$EXPECTED_ADATA_TREE_SHA256" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$ADATA_SOURCE" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- 'PYTHONSAFEPATH=1' \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+mapfile -d '' -t MAIN_CMDLINE < "/proc/$SERVICE_MAIN_PID/cmdline"
+case "${MAIN_CMDLINE[0]}" in
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"|\
+  "$EXPECTED_VENV_TARGET/bin/python") ;;
+  *)
+    printf 'main_identity unexpected_argv0=%q\n' "${MAIN_CMDLINE[0]}" >&2
+    false
+    ;;
+esac
+test "${MAIN_CMDLINE[1]}" = -P
+test "${MAIN_CMDLINE[2]}" = -m
+test "${MAIN_CMDLINE[3]}" = uvicorn
+test "${MAIN_CMDLINE[4]}" = server.api.main:app
 CUTOVER_STEP=verify_scheduler_process
 SCHEDULER_MAIN_PID="$(systemctl show probiga-scheduler --property=MainPID --value)"
 case "$SCHEDULER_MAIN_PID" in
