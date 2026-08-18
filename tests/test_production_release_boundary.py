@@ -1137,6 +1137,7 @@ def test_production_dependency_lock_respects_server_mirror_ceiling() -> None:
     )
 
     assert "charset-normalizer==3.5.0" in requirements
+    assert "idna==3.18" in requirements
 
 
 def test_sector_heat_runtime_cache_is_outside_tracked_data() -> None:
