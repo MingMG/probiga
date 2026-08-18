@@ -858,18 +858,31 @@ runtime_environment_value() {
     | sed -n "s|^$name=||p" \
     | tail -n 1
 }
-PREVIOUS_RELEASE_REVISION=""
+PREVIOUS_RELEASE_REVISION="$(runtime_environment_value PROBIGA_EXPECTED_GIT_SHA)"
+if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
+  [[ "$PREVIOUS_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+fi
 PREVIOUS_VENV=""
-for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
-  candidate_revision="$(sed -n \
-    "s|^ExecStart=.*$candidate_root/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
-    "$PREVIOUS_DROPIN" | tail -n 1)"
-  if [ -n "$candidate_revision" ]; then
-    test -z "$PREVIOUS_RELEASE_REVISION"
-    PREVIOUS_RELEASE_REVISION="$candidate_revision"
-    PREVIOUS_VENV="$candidate_root/$candidate_revision"
-  fi
-done
+if [ -z "$PREVIOUS_RELEASE_REVISION" ]; then
+  for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
+    candidate_revision="$(sed -n \
+      "s|^ExecStart=.*$candidate_root/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
+      "$PREVIOUS_DROPIN" | tail -n 1)"
+    if [ -n "$candidate_revision" ]; then
+      test -z "$PREVIOUS_RELEASE_REVISION"
+      PREVIOUS_RELEASE_REVISION="$candidate_revision"
+      PREVIOUS_VENV="$candidate_root/$candidate_revision"
+    fi
+  done
+else
+  for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
+    if [ -L "$candidate_root/$PREVIOUS_RELEASE_REVISION" ]; then
+      PREVIOUS_VENV="$candidate_root/$PREVIOUS_RELEASE_REVISION"
+      break
+    fi
+  done
+  test -n "$PREVIOUS_VENV"
+fi
 PREVIOUS_REQUIREMENTS_SHA256=""
 if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
   PREVIOUS_SHA="$PREVIOUS_RELEASE_REVISION"
