@@ -107,6 +107,7 @@ AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
 SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service
+LEGACY_SCHEDULER_DROPIN=/etc/systemd/system/probiga-scheduler.service.d/release.conf
 STATIC_RELEASE_LINK=/opt/ProBigA-current
 if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
@@ -797,6 +798,7 @@ PREPARED_CODE_ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 CODE_VALIDATION_ROOT=""
 NEW_CODE_RELEASE=0
 SCHEDULER_UNIT_TOUCHED=0
+LEGACY_SCHEDULER_DROPIN_TOUCHED=0
 ADATA_CACHE_BUILD=""
 ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
@@ -810,12 +812,15 @@ PREPARED_SCHEDULER_DROPIN=""
 PREPARED_AI_WORKER_DROPIN=""
 PREVIOUS_DROPIN=""
 PREVIOUS_SCHEDULER_DROPIN=""
+PREVIOUS_LEGACY_SCHEDULER_DROPIN=""
 PREVIOUS_AI_WORKER_DROPIN=""
 PREVIOUS_LOCK_SNAPSHOT=""
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
   [ -z "$PREVIOUS_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREVIOUS_SCHEDULER_DROPIN"
+  [ -z "$PREVIOUS_LEGACY_SCHEDULER_DROPIN" ] || \
+    rm -f -- "$PREVIOUS_LEGACY_SCHEDULER_DROPIN"
   [ -z "$PREVIOUS_AI_WORKER_DROPIN" ] || \
     rm -f -- "$PREVIOUS_AI_WORKER_DROPIN"
   [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
@@ -836,6 +841,13 @@ PREVIOUS_SCHEDULER_DROPIN_PRESENT=0
 if sudo test -f "$SCHEDULER_UNIT"; then
   sudo cat "$SCHEDULER_UNIT" > "$PREVIOUS_SCHEDULER_DROPIN"
   PREVIOUS_SCHEDULER_DROPIN_PRESENT=1
+fi
+PREVIOUS_LEGACY_SCHEDULER_DROPIN="$(mktemp)"
+PREVIOUS_LEGACY_SCHEDULER_DROPIN_PRESENT=0
+if sudo test -f "$LEGACY_SCHEDULER_DROPIN"; then
+  sudo cat "$LEGACY_SCHEDULER_DROPIN" > \
+    "$PREVIOUS_LEGACY_SCHEDULER_DROPIN"
+  PREVIOUS_LEGACY_SCHEDULER_DROPIN_PRESENT=1
 fi
 PREVIOUS_AI_WORKER_DROPIN="$(mktemp)"
 PREVIOUS_AI_WORKER_DROPIN_PRESENT=0
@@ -1101,7 +1113,7 @@ cleanup_prepare_artifacts() {
     esac
   fi
   rm -f -- "$PREVIOUS_DROPIN" "$PREVIOUS_SCHEDULER_DROPIN" \
-    "$PREVIOUS_AI_WORKER_DROPIN"
+    "$PREVIOUS_LEGACY_SCHEDULER_DROPIN" "$PREVIOUS_AI_WORKER_DROPIN"
   [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
@@ -1400,6 +1412,10 @@ install_prepared_dropins() {
   SCHEDULER_UNIT_TOUCHED=1
   sudo install -o root -g root -m 0644 "$PREPARED_SCHEDULER_DROPIN" \
     "$SCHEDULER_UNIT"
+  if sudo test -f "$LEGACY_SCHEDULER_DROPIN"; then
+    LEGACY_SCHEDULER_DROPIN_TOUCHED=1
+    sudo rm -f "$LEGACY_SCHEDULER_DROPIN"
+  fi
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     test -s "$PREPARED_AI_WORKER_DROPIN"
     sudo install -d -o root -g root -m 0755 \
@@ -1534,6 +1550,19 @@ rollback() {
           restoration_ready=0
         fi
       fi
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
+      [ "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_PRESENT" -eq 1 ]; then
+      if ! sudo install -o root -g root -m 0644 \
+        "$PREVIOUS_LEGACY_SCHEDULER_DROPIN" "$LEGACY_SCHEDULER_DROPIN"; then
+        rollback_failure "restore previous legacy scheduler drop-in"
+        restoration_ready=0
+      fi
+    elif [ "$restoration_ready" -eq 1 ] && \
+      [ "$LEGACY_SCHEDULER_DROPIN_TOUCHED" -eq 1 ] && \
+      ! sudo rm -f "$LEGACY_SCHEDULER_DROPIN"; then
+      rollback_failure "remove release legacy scheduler drop-in"
+      restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ] && \
       [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
@@ -1756,6 +1785,14 @@ if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
 fi
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
+CUTOVER_STEP=verify_no_scheduler_dropins
+SCHEDULER_DROPIN_PATHS="$(systemctl show probiga-scheduler \
+  --property=DropInPaths --value)"
+if [ -n "$SCHEDULER_DROPIN_PATHS" ]; then
+  printf 'scheduler_identity unexpected_dropins=%q\n' \
+    "$SCHEDULER_DROPIN_PATHS" >&2
+  false
+fi
 CUTOVER_STEP=start_api
 sudo systemctl start "$MAIN_SERVICE"
 CUTOVER_STEP=enable_scheduler
