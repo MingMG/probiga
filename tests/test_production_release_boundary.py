@@ -966,6 +966,16 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "WorkingDirectory=/opt/ProBigA" in main_dropin
     assert "WorkingDirectory=/opt/ProBigA" in scheduler_dropin
     assert "WorkingDirectory=/opt/ProBigA" in worker_dropin
+    assert "[Unit]" in scheduler_dropin
+    assert "Description=ProBigA standalone scheduler" in scheduler_dropin
+    assert "Restart=on-failure" in scheduler_dropin
+    assert "[Install]" in scheduler_dropin
+    assert "WantedBy=multi-user.target" in scheduler_dropin
+    assert (
+        "SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service"
+        in deploy_script
+    )
+    assert 'test "$SCHEDULER_UNIT_PRESENT" -eq 1' not in deploy_script
     assert (
         "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
         in main_dropin

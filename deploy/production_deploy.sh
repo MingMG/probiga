@@ -49,6 +49,7 @@ trap release_lock EXIT
 [[ "$EXPECTED_ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
 LEGACY_LIVE_SHA="$(git rev-parse HEAD)"
 PREVIOUS_SHA="$LEGACY_LIVE_SHA"
+DEPLOY_MAIN_BASHPID="$BASHPID"
 DEPLOY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="${EXPECTED_SHA}-$(date -u +%Y%m%dT%H%M%SZ)"
 RECEIPT_DIR=/var/lib/probiga/deploy-receipts
@@ -82,6 +83,18 @@ write_receipt() {
     return 1
   fi
 }
+precutover_failure() {
+  local failed_status="$1"
+  local failed_line="$2"
+  if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
+    return "$failed_status"
+  fi
+  trap - ERR
+  echo "Production deploy preparation failed at line $failed_line (status $failed_status)" >&2
+  write_receipt "PREPARE_FAILED" "$PREVIOUS_SHA" || true
+  exit "$failed_status"
+}
+trap 'precutover_failure "$?" "${BASH_LINENO[0]:-$LINENO}"' ERR
 MAIN_SERVICE=probiga
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
@@ -90,7 +103,7 @@ sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
 AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
-SCHEDULER_DROPIN=/etc/systemd/system/probiga-scheduler.service.d/release.conf
+SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service
 STATIC_RELEASE_LINK=/opt/ProBigA-current
 if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
@@ -634,12 +647,19 @@ write_scheduler_dropin() {
   local adata_source="$5"
   local output_file="$6"
   printf '%s\n' \
+    '[Unit]' \
+    'Description=ProBigA standalone scheduler' \
+    'Wants=network-online.target' \
+    'After=network-online.target' \
+    '' \
     '[Service]' \
+    'Type=simple' \
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
-    'ExecStart=' \
     "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    'Restart=on-failure' \
+    'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
@@ -652,6 +672,9 @@ write_scheduler_dropin() {
     "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
     "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
     "Environment=PYTHONPATH=$adata_source:$code_root" \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' \
     > "$output_file"
 }
 write_ai_worker_dropin() {
@@ -761,7 +784,6 @@ test -x "$BOOTSTRAP_PYTHON"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 sudo -u "$SERVICE_USER" test ! -w "$BOOTSTRAP_PYTHON"
 test "$($BOOTSTRAP_PYTHON -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.14"
-DEPLOY_MAIN_BASHPID="$BASHPID"
 CUTOVER_STARTED=0
 API_STOPPED=0
 DEPLOY_SUCCEEDED=0
@@ -805,8 +827,8 @@ if sudo test -f /etc/systemd/system/probiga.service.d/scheduler.conf; then
 fi
 PREVIOUS_SCHEDULER_DROPIN="$(mktemp)"
 PREVIOUS_SCHEDULER_DROPIN_PRESENT=0
-if sudo test -f "$SCHEDULER_DROPIN"; then
-  sudo cat "$SCHEDULER_DROPIN" > "$PREVIOUS_SCHEDULER_DROPIN"
+if sudo test -f "$SCHEDULER_UNIT"; then
+  sudo cat "$SCHEDULER_UNIT" > "$PREVIOUS_SCHEDULER_DROPIN"
   PREVIOUS_SCHEDULER_DROPIN_PRESENT=1
 fi
 PREVIOUS_AI_WORKER_DROPIN="$(mktemp)"
@@ -907,7 +929,6 @@ if systemctl list-unit-files probiga-scheduler.service --no-legend \
   systemctl is-active --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ACTIVE=1 || true
   systemctl is-enabled --quiet probiga-scheduler && PREVIOUS_SCHEDULER_ENABLED=1 || true
 fi
-test "$SCHEDULER_UNIT_PRESENT" -eq 1
 EXTERNAL_WRITER_BLOCKED=0
 AI_WORKER_UNIT_PRESENT=0
 PREVIOUS_AI_WORKER_TIMER_ACTIVE=0
@@ -1283,9 +1304,9 @@ install_prepared_dropins() {
     /etc/systemd/system/probiga.service.d/scheduler.conf
   test -s "$PREPARED_SCHEDULER_DROPIN"
   sudo install -d -o root -g root -m 0755 \
-    "$(dirname "$SCHEDULER_DROPIN")"
+    "$(dirname "$SCHEDULER_UNIT")"
   sudo install -o root -g root -m 0644 "$PREPARED_SCHEDULER_DROPIN" \
-    "$SCHEDULER_DROPIN"
+    "$SCHEDULER_UNIT"
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     test -s "$PREPARED_AI_WORKER_DROPIN"
     sudo install -d -o root -g root -m 0755 \
@@ -1396,11 +1417,11 @@ rollback() {
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_SCHEDULER_DROPIN_PRESENT" -eq 1 ]; then
         if ! sudo install -o root -g root -m 0644 \
-          "$PREVIOUS_SCHEDULER_DROPIN" "$SCHEDULER_DROPIN"; then
+          "$PREVIOUS_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"; then
           rollback_failure "restore previous scheduler drop-in"
           restoration_ready=0
         fi
-      elif ! sudo rm -f "$SCHEDULER_DROPIN"; then
+      elif ! sudo rm -f "$SCHEDULER_UNIT"; then
         rollback_failure "remove release scheduler drop-in"
         restoration_ready=0
       fi
