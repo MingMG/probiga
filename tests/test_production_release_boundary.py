@@ -1074,6 +1074,26 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         in deploy_script
     )
     assert "grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false'" in deploy_script
+    assert (
+        '"PROBIGA_ADATA_SOURCE_DIR=$ADATA_SOURCE" '
+        '"/proc/$SCHEDULER_MAIN_PID/environ"'
+        in normalized
+    )
+    assert (
+        'mapfile -d \'\' -t SCHEDULER_CMDLINE '
+        '< "/proc/$SCHEDULER_MAIN_PID/cmdline"'
+        in normalized
+    )
+    assert (
+        'test "${SCHEDULER_CMDLINE[0]}" = '
+        '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"'
+        in normalized
+    )
+    assert (
+        'test "${SCHEDULER_CMDLINE[2]}" = '
+        '"$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"'
+        in normalized
+    )
     assert '"/proc/$SERVICE_MAIN_PID/environ"' in deploy_script
     assert '"/proc/$SCHEDULER_MAIN_PID/environ"' in deploy_script
     assert "curl --fail-with-body" in deploy_script
