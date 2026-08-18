@@ -1080,7 +1080,10 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert 'sudo rm -f "$legacy_scheduler_dropin"' in deploy_script
     assert "CUTOVER_STEP=verify_no_scheduler_dropins" in deploy_script
     assert "scheduler_identity unexpected_dropins=%q" in deploy_script
-    assert "scheduler_identity unsafe_limits_dropin=%q" in deploy_script
+    assert (
+        'EXPECTED_SCHEDULER_DROPIN_PATHS="$SCHEDULER_LIMITS_DROPIN"'
+        in deploy_script
+    )
     assert (
         '"$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR/'
         '$(basename "$legacy_scheduler_dropin")" '

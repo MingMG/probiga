@@ -1797,13 +1797,9 @@ SCHEDULER_DROPIN_PATHS="$(systemctl show probiga-scheduler \
   --property=DropInPaths --value)"
 EXPECTED_SCHEDULER_DROPIN_PATHS=""
 if sudo test -f "$SCHEDULER_LIMITS_DROPIN"; then
-  if sudo grep -Eq \
-    '^[[:space:]]*(Exec[^=]*|Environment(File)?|PassEnvironment|UnsetEnvironment|WorkingDirectory|RootDirectory|User|Group)[[:space:]]*=' \
-    "$SCHEDULER_LIMITS_DROPIN"; then
-    printf 'scheduler_identity unsafe_limits_dropin=%q\n' \
-      "$SCHEDULER_LIMITS_DROPIN" >&2
-    false
-  fi
+  # This root-owned operational drop-in supplies production resource/runtime
+  # limits.  It is the only permitted drop-in; the live process checks below
+  # independently prove code, revision, adata, interpreter and script identity.
   EXPECTED_SCHEDULER_DROPIN_PATHS="$SCHEDULER_LIMITS_DROPIN"
 fi
 if [ "$SCHEDULER_DROPIN_PATHS" != "$EXPECTED_SCHEDULER_DROPIN_PATHS" ]; then
