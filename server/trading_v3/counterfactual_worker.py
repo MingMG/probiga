@@ -9,6 +9,8 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from server.common.trading_v3_maintenance import trading_v3_writer
+
 from .audit import build_counterfactual_records, opportunity_recall
 from .backtest import _build_features, _dynamic_signal_outcome
 from .config import load_v3_config
@@ -517,6 +519,7 @@ def counterfactual_queue_stats(
     }
 
 
+@trading_v3_writer
 def drain_counterfactual_backlog(
     primary_engine: Engine,
     kline_engine: Engine,

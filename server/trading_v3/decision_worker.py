@@ -10,6 +10,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from server.common.kline_data import get_kline_engine
+from server.common.trading_v3_maintenance import trading_v3_writer
 
 from .config import load_v3_config
 from .daily_features import load_daily_feature_universe
@@ -287,6 +288,7 @@ def _decision_truth_status(
     return "COMPLETED", "NO_ACTION"
 
 
+@trading_v3_writer
 def run_daily_decision_v3(
     primary_engine: Engine,
     *,

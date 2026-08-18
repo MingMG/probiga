@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from server.common.trading_v3_maintenance import trading_v3_writer
+
 from .continuous_calibration import (
     HorizonModelLifecycleAdapter,
     ImmutableEvidenceStore,
@@ -1839,6 +1841,7 @@ def _run_shadow_intelligence_cycle_unlocked(
     }
 
 
+@trading_v3_writer
 def run_shadow_intelligence_cycle(
     primary_engine: Engine,
     calendar_engine: Engine,
@@ -1893,6 +1896,7 @@ def run_shadow_intelligence_cycle(
             raise
 
 
+@trading_v3_writer
 def run_continuous_model_lifecycle_cycle(
     primary_engine: Engine,
     calendar_engine: Engine,

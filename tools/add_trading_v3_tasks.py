@@ -191,6 +191,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     mode.add_argument(
+        "--fence-only",
+        action="store_true",
+        help=(
+            "only atomically disable existing Layer-4 writer rows; do not "
+            "upsert task definitions, add scheduler columns, or activate"
+        ),
+    )
+    mode.add_argument(
         "--activate-layer4",
         action="store_true",
         help=(
@@ -224,6 +232,15 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     activate_layer4 = bool(args.activate_layer4)
+    fence_only = bool(args.fence_only)
+    if fence_only and (
+        args.require_no_live_scheduler_writers
+        or args.writer_drain_timeout_seconds != 0.0
+        or args.writer_drain_poll_seconds != 5.0
+    ):
+        _parser().error(
+            "--fence-only cannot be combined with writer-drain options"
+        )
     load_project_env()
     engine = create_tool_engine()
     results = []
@@ -243,6 +260,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         # This also neutralizes duplicate legacy rows and makes an accidental
         # early activation request fail safe instead of leaving old writers on.
         fenced_row_count = enforce_layer4_writer_fence_atomically(engine)
+        if fence_only:
+            print(json.dumps(
+                {
+                    "status": "ok",
+                    "mode": "fence-only",
+                    "writer_fence_active": True,
+                    "fenced_row_count": fenced_row_count,
+                    "layer4_writers_enabled": False,
+                    "writer_quiescence": writer_quiescence,
+                    "migration_readiness": preconditions,
+                    "tasks": [],
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ))
+            return 0
         if args.require_no_live_scheduler_writers:
             try:
                 live_writers = wait_for_scheduler_writer_quiescence(
