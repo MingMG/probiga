@@ -642,7 +642,7 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
@@ -1911,6 +1911,8 @@ test "${MAIN_CMDLINE[1]}" = -P
 test "${MAIN_CMDLINE[2]}" = -m
 test "${MAIN_CMDLINE[3]}" = uvicorn
 test "${MAIN_CMDLINE[4]}" = server.api.main:app
+test "${MAIN_CMDLINE[5]}" = --app-dir
+test "${MAIN_CMDLINE[6]}" = "$PREPARED_CODE_ROOT"
 CUTOVER_STEP=verify_scheduler_process
 SCHEDULER_MAIN_PID="$(systemctl show probiga-scheduler --property=MainPID --value)"
 case "$SCHEDULER_MAIN_PID" in

@@ -1019,6 +1019,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "PYTHONPATH=$adata_source:$code_root" in main_dropin
     assert "PYTHONSAFEPATH=1" in main_dropin
     assert "$RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn" in main_dropin
+    assert "server.api.main:app --app-dir $code_root" in main_dropin
     assert "PROBIGA_CODE_ROOT=$code_root" in scheduler_dropin
     assert "PROBIGA_BUILD_COMMIT_SHA=$revision" in scheduler_dropin
     assert "PYTHONPATH=$adata_source:$code_root" in scheduler_dropin
@@ -1079,6 +1080,8 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "main_identity unexpected_dropin=%q" in deploy_script
     assert "main_identity unexpected_argv0=%q" in deploy_script
     assert 'test "${MAIN_CMDLINE[4]}" = server.api.main:app' in deploy_script
+    assert 'test "${MAIN_CMDLINE[5]}" = --app-dir' in deploy_script
+    assert 'test "${MAIN_CMDLINE[6]}" = "$PREPARED_CODE_ROOT"' in deploy_script
     assert (
         "/etc/systemd/system/probiga-scheduler.service.d/release.conf"
         in deploy_script
