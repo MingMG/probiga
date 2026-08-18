@@ -89,7 +89,10 @@
                 try {
                     if (controller) controller.abort();
                 } catch (e) {}
-                reject(new Error('Timed out after ' + waitMs + 'ms'));
+                var timeoutError = new Error('Timed out after ' + waitMs + 'ms');
+                timeoutError.isTimeout = true;
+                timeoutError.httpStatus = 0;
+                reject(timeoutError);
             }, waitMs);
 
             fetch(url, fetchOptions)
@@ -101,12 +104,17 @@
                                 data = JSON.parse(text);
                             } catch (e) {
                                 var preview = text.replace(/\s+/g, ' ').trim().slice(0, 200);
-                                throw new Error(preview || ('HTTP ' + r.status));
+                                var parseError = new Error(preview || ('HTTP ' + r.status));
+                                parseError.httpStatus = r.status;
+                                parseError.invalidJson = true;
+                                throw parseError;
                             }
                         }
                         if (!r.ok) {
                             var msg = (data && (data.message || data.error || data.detail)) || ('HTTP ' + r.status);
-                            throw new Error(msg);
+                            var httpError = new Error(msg);
+                            httpError.httpStatus = r.status;
+                            throw httpError;
                         }
                         return data == null ? {} : data;
                     });
@@ -174,7 +182,7 @@
     }
     function refreshLoadTab(tabId, options) {
         options = options || {};
-        if (tabId === 'portfolio' && options.force == null) options.force = true;
+        if (tabId === 'portfolio' && options.force == null) options.force = false;
         options.silent = true;
         return loadTab(tabId, options);
     }
@@ -668,7 +676,9 @@
 
     /* ===== 自选股 ===== */
     function pfReloadAfterMutation() {
-        return refreshLoadTab('portfolio', { force: true });
+        // Every mutation invalidates the server snapshot cache, so forcing a
+        // second uncached rebuild only adds avoidable database load.
+        return refreshLoadTab('portfolio', { force: false });
     }
     window.pfAdd = function() {
         var code = el('pfCode').value.trim();
@@ -761,8 +771,16 @@
             var waitForRefresh = ['queued', 'running'].indexOf(res.state) >= 0;
             var refreshDeadline = Date.now() + 20000;
             function fetchFreshPortfolio(prefix, state) {
-                var url = '/api/portfolio/live?force=true&_=' + Date.now();
-                return fetchRawJsonWithTimeout(url, 12000, {cache:'no-store'}).then(function(liveRes){
+                var fetchLive = typeof window.pfFetchPortfolioWithRetry === 'function'
+                    ? window.pfFetchPortfolioWithRetry(true)
+                    : fetchRawJsonWithTimeout(
+                        '/api/portfolio/live?force=true&refresh_id=' +
+                            encodeURIComponent('pf-sync-' + Date.now().toString(36)) +
+                            '&_=' + Date.now(),
+                        12000,
+                        {cache:'no-store'}
+                    );
+                return fetchLive.then(function(liveRes){
                     if (liveRes && liveRes.error) throw new Error(liveRes.error);
                     return {liveRes: liveRes, prefix: prefix, refreshState: state || {}};
                 });
@@ -797,9 +815,10 @@
                     window.pfRenderPortfolio(liveRes, prefix);
                     return;
                 }
-                return refreshLoadTab('portfolio', { force: true });
+                return refreshLoadTab('portfolio', { force: false });
             });
         }).catch(function(e){
+            if (e && e.cancelled) return;
             if (status) status.textContent = '刷新失败';
             alert('行情刷新失败: ' + (e.message || '网络请求异常'));
         }).finally(function(){
@@ -4453,6 +4472,8 @@
         },
         portfolio: function (d, c, options) {
             options = options || {};
+            window._pfLoadToken = (Number(window._pfLoadToken) || 0) + 1;
+            var portfolioLoadToken = window._pfLoadToken;
             if (options.force) {
                 window._pfManualRefreshToken = (Number(window._pfManualRefreshToken) || 0) + 1;
             }
@@ -4526,11 +4547,14 @@
             }
             function pfLiveIntervalMs() {
                 var saved = 0;
-                try { saved = Number(localStorage.getItem('probiga_pf_live_ms') || 1000); } catch (e) { saved = 1000; }
+                try { saved = Number(localStorage.getItem('probiga_pf_live_ms') || 3000); } catch (e) { saved = 3000; }
                 return saved === 3000 ? 3000 : 1000;
             }
-            function pfLiveUrl(force) {
-                return '/api/portfolio/live' + (force ? '?force=true&_=' + Date.now() : '');
+            function pfLiveUrl(force, refreshId) {
+                if (!force) return '/api/portfolio/live';
+                var url = '/api/portfolio/live?force=true';
+                if (refreshId) url += '&refresh_id=' + encodeURIComponent(refreshId);
+                return url + '&_=' + Date.now();
             }
             function pfIsActiveTab() {
                 return activeTabId() === 'portfolio';
@@ -4612,6 +4636,103 @@
                 status.textContent = text;
                 status.style.color = isError ? '#dc2626' : '#9ca3af';
             }
+            function pfIsTransientRequestError(error) {
+                if (error && error.cancelled) return false;
+                var status = Number(error && error.httpStatus);
+                if (error && error.invalidJson && (!status || status === 200)) return true;
+                return !status || status === 408 || status === 425 || status === 429 || status >= 500;
+            }
+            function pfCancelledLoadError() {
+                var error = new Error('Portfolio load superseded');
+                error.cancelled = true;
+                return error;
+            }
+            function pfWaitForRetry(waitMs) {
+                return new Promise(function(resolve, reject) {
+                    if (waitMs <= 0) {
+                        resolve();
+                        return;
+                    }
+                    var settled = false;
+                    var timer = setTimeout(function() {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(cancelPoll);
+                        resolve();
+                    }, waitMs);
+                    var cancelPoll = null;
+                    function pollForCancellation() {
+                        if (portfolioLoadToken === window._pfLoadToken && activeTabId() === 'portfolio') {
+                            cancelPoll = setTimeout(pollForCancellation, 250);
+                            return;
+                        }
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
+                        clearTimeout(cancelPoll);
+                        reject(pfCancelledLoadError());
+                    }
+                    cancelPoll = setTimeout(pollForCancellation, 250);
+                });
+            }
+            function pfFetchPortfolioWithRetry(force) {
+                // Covers a normal deployment/tunnel reconnection window while
+                // keeping authentication and other 4xx failures fail-fast.
+                var retryDelays = [0, 1000, 2000, 4000, 8000, 15000, 15000, 15000, 10000];
+                var retryDeadline = Date.now() + 75000;
+                var forceRefreshId = '';
+                if (force) {
+                    window._pfForceRefreshSequence = (Number(window._pfForceRefreshSequence) || 0) + 1;
+                    forceRefreshId = 'pf-' + Date.now().toString(36) + '-' + window._pfForceRefreshSequence.toString(36);
+                }
+                function attempt(index, lastError) {
+                    if (portfolioLoadToken !== window._pfLoadToken || activeTabId() !== 'portfolio') {
+                        return Promise.reject(pfCancelledLoadError());
+                    }
+                    var waitMs = retryDelays[index];
+                    if (Date.now() + waitMs >= retryDeadline) {
+                        return Promise.reject(lastError || new Error('自选股重连超时'));
+                    }
+                    if (index > 0) {
+                        var reconnectText = '服务短暂切换，正在自动重连（' + (index + 1) + '/' + retryDelays.length + '）';
+                        var status = document.getElementById('pfLiveStatus');
+                        if (status) pfSetLiveStatusText(reconnectText, false);
+                        else if (!document.getElementById('pfTable')) {
+                            c.innerHTML = '<div class="loading">' + escHtml(reconnectText) + '</div>';
+                        }
+                    }
+                    return pfWaitForRetry(waitMs).then(function() {
+                        if (portfolioLoadToken !== window._pfLoadToken || activeTabId() !== 'portfolio') {
+                            throw pfCancelledLoadError();
+                        }
+                        var remainingMs = retryDeadline - Date.now();
+                        if (remainingMs <= 0) throw (lastError || new Error('自选股重连超时'));
+                        return fetchRawJsonWithTimeout(
+                            pfLiveUrl(!!force, forceRefreshId),
+                            Math.min(12000, remainingMs),
+                            {cache:'no-store'}
+                        );
+                    }).then(function(payload) {
+                        if (!payload || payload.error || !Array.isArray(payload.data)) {
+                            var payloadError = new Error(
+                                (payload && payload.error) || '自选股响应无效'
+                            );
+                            payloadError.httpStatus = payload && payload.retryable === false ? 400 : 503;
+                            throw payloadError;
+                        }
+                        return payload;
+                    }).catch(function(error) {
+                        if (
+                            index + 1 >= retryDelays.length ||
+                            Date.now() >= retryDeadline ||
+                            !pfIsTransientRequestError(error)
+                        ) throw error;
+                        return attempt(index + 1, error);
+                    });
+                }
+                return attempt(0, null);
+            }
+            window.pfFetchPortfolioWithRetry = pfFetchPortfolioWithRetry;
             function pfApplyLivePayload(res, prefix) {
                 if (!res || res.error || !Array.isArray(res.data)) {
                     throw new Error((res && res.error) || '自选股行情响应无效');
@@ -4929,14 +5050,23 @@
                 window._pfRefreshMarketBar();
             }
             window.pfRenderPortfolio = renderPortfolio;
-            var portfolioLoadPromise = fetchRawJsonWithTimeout(
-                pfLiveUrl(!!options.force),
-                12000,
-                {cache:'no-store'}
-            ).then(renderPortfolio).catch(function(e) {
-                c.innerHTML = '<div class="loading" style="color:#e74c3c">自选股加载失败: ' + escHtml(e.message || '网络异常') + '</div>';
-                return {loadError: e.message || '网络异常'};
-            });
+            var portfolioLoadPromise = pfFetchPortfolioWithRetry(!!options.force)
+                .then(function(res) {
+                    if (portfolioLoadToken !== window._pfLoadToken || activeTabId() !== 'portfolio') {
+                        return {cancelled: true};
+                    }
+                    return renderPortfolio(res);
+                })
+                .catch(function(e) {
+                    if (e && e.cancelled) return {cancelled: true};
+                    var message = e.message || '网络异常';
+                    if (document.getElementById('pfTable')) {
+                        pfSetLiveStatusText('服务暂不可用，已保留上次数据', true);
+                        return {loadError: message, retained: true};
+                    }
+                    c.innerHTML = '<div class="loading" style="color:#e74c3c">自选股加载失败: ' + escHtml(message) + ' <button onclick="loadPortfolio()" style="margin-left:8px">重试</button></div>';
+                    return {loadError: message};
+                });
 
             // Poll quickly only while this visible tab is in a live trading session.
             // Hidden, inactive and closed-market pages keep a low-cost wake-up timer
@@ -7837,9 +7967,13 @@
         var loadResult = null;
         try {
             if (loader) {
-                if (keepCurrent) {
+                if (keepCurrent && tabId !== 'portfolio') {
                     loadResult = runWithSilentRefresh(function () { return loader(d, c, options); });
                 } else {
+                    // Portfolio may retry across a brief deploy/tunnel outage.
+                    // Its own target guard preserves the current table; keeping
+                    // the global silent-refresh depth open for that whole retry
+                    // window would suppress loading placeholders on other tabs.
                     loadResult = loader(d, c, options);
                 }
             } else {

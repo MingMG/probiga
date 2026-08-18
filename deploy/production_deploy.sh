@@ -1,15 +1,43 @@
 #!/usr/bin/env bash
 # Production deployment logic invoked by the pinned GitHub SSH action.
 # Inputs are passed explicitly through the action env allowlist.
+# ERR inheritance catches failures inside preparation helpers. rollback()
+# fences child shells by BASHPID so a subshell cannot perform system rollback.
 set -Eeuo pipefail
-cd /opt/ProBigA
-DEPLOY_LOCK_DIR=/opt/ProBigA/.probiga_deploy_lock
-if ! mkdir "$DEPLOY_LOCK_DIR"; then
+umask 022
+REPOSITORY_ROOT=/opt/ProBigA
+CODE_GIT_CACHE=/var/lib/probiga/release-sources/probiga.git
+CODE_RELEASE_ROOT=/opt/ProBigA-releases
+RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
+LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
+DEPLOY_LOCK_ROOT=/run/probiga
+DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
+REQUIRED_DEPLOY_PROTOCOL=probiga-production-deploy-v2
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "production deploy engine must run through the root broker" >&2
+  exit 2
+fi
+if [ "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" != "$REQUIRED_DEPLOY_PROTOCOL" ]; then
+  echo "production deploy broker protocol mismatch; install the new root broker out of band" >&2
+  exit 2
+fi
+cd "$REPOSITORY_ROOT"
+test ! -L "$DEPLOY_LOCK_ROOT"
+install -d -o root -g root -m 0700 "$DEPLOY_LOCK_ROOT"
+test "$(readlink -f "$DEPLOY_LOCK_ROOT")" = "$DEPLOY_LOCK_ROOT"
+test ! -L "$DEPLOY_LOCK_FILE"
+touch "$DEPLOY_LOCK_FILE"
+chown root:root "$DEPLOY_LOCK_FILE"
+chmod 0600 "$DEPLOY_LOCK_FILE"
+exec 9>"$DEPLOY_LOCK_FILE"
+if ! flock -n 9; then
   echo "Another production deployment holds the remote lock" >&2
   exit 2
 fi
 release_lock() {
-  rmdir "$DEPLOY_LOCK_DIR" 2>/dev/null || true
+  if declare -F cleanup_prepare_artifacts >/dev/null 2>&1; then
+    cleanup_prepare_artifacts || true
+  fi
 }
 trap release_lock EXIT
 : "${EXPECTED_SHA:?EXPECTED_SHA is required}"
@@ -19,7 +47,8 @@ trap release_lock EXIT
 : "${EXPECTED_ADATA_TREE_SHA256:?EXPECTED_ADATA_TREE_SHA256 is required}"
 [[ "$EXPECTED_ADATA_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$EXPECTED_ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-PREVIOUS_SHA="$(git rev-parse HEAD)"
+LEGACY_LIVE_SHA="$(git rev-parse HEAD)"
+PREVIOUS_SHA="$LEGACY_LIVE_SHA"
 DEPLOY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="${EXPECTED_SHA}-$(date -u +%Y%m%dT%H%M%SZ)"
 RECEIPT_DIR=/var/lib/probiga/deploy-receipts
@@ -53,14 +82,14 @@ write_receipt() {
     return 1
   fi
 }
-SERVICE_USER="$(systemctl show -p User --value probiga)"
+MAIN_SERVICE=probiga
+SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
 sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
 AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
 AI_WORKER_TIMER=probiga-ai-recommendation-worker.timer
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
-REPOSITORY_ROOT=/opt/ProBigA
 STATIC_RELEASE_LINK=/opt/ProBigA-current
 if ! sudo git config --system --get-all safe.directory \
   | grep -Fxq "$REPOSITORY_ROOT"; then
@@ -210,11 +239,8 @@ quarantine_unsafe_untracked_release_files() {
   chown -R root:root "$LEGACY_STATE_DIR/untracked-release-files"
   chmod 0600 "$manifest_file"
 }
-quarantine_unsafe_untracked_release_files
-RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 RELEASE_VENV_RETENTION=2
-LEGACY_RELEASE_ROOT=/opt/ProBigA-releases
-LEGACY_RELEASE_RETENTION=0
+CODE_RELEASE_RETENTION=2
 
 path_is_runtime_referenced() {
   local candidate="$1"
@@ -224,6 +250,10 @@ path_is_runtime_referenced() {
     [ -d "$proc_dir" ] || continue
     if [ -r "$proc_dir/cmdline" ] && \
       grep -aFq -- "$candidate" "$proc_dir/cmdline"; then
+      return 0
+    fi
+    if [ -r "$proc_dir/environ" ] && \
+      grep -aFq -- "$candidate" "$proc_dir/environ"; then
       return 0
     fi
     resolved="$(readlink -f -- "$proc_dir/exe" 2>/dev/null || true)"
@@ -254,12 +284,14 @@ path_is_opt_link_target() {
 
 prune_release_venvs() {
   local protected_sha="$1"
+  local rollback_sha="${2:-}"
   local release_root_real
   local sha
   local link
   local target
   local build_dir
   local build_real
+  local release_scan
   local kept=0
   local removed_bytes=0
   local candidate_bytes=0
@@ -267,26 +299,45 @@ prune_release_venvs() {
   declare -A keep_shas=()
   declare -A keep_targets=()
 
-  release_root_real="$(readlink -f -- "$RELEASE_VENV_ROOT")"
-  test "$release_root_real" = "$RELEASE_VENV_ROOT"
-  [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]]
+  release_root_real="$(readlink -f -- "$RELEASE_VENV_ROOT")" || return 2
+  test "$release_root_real" = "$RELEASE_VENV_ROOT" || return 2
+  [[ "$protected_sha" =~ ^[0-9a-f]{40}$ ]] || return 2
+  release_scan="$(find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 \
+    -type l -printf '%T@ %f\n')" || return 2
   mapfile -t release_shas < <(
-    find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 -type l \
-      -printf '%T@ %f\n' | LC_ALL=C sort -nr | awk '{print $2}'
+    printf '%s\n' "$release_scan" | LC_ALL=C sort -nr | awk 'NF {print $2}'
   )
 
   # The running release is always retained, even if its link timestamp is old.
   link="$RELEASE_VENV_ROOT/$protected_sha"
-  test -L "$link"
-  target="$(readlink -f -- "$link")"
+  test -L "$link" || return 2
+  target="$(readlink -f -- "$link")" || return 2
   case "$target" in
     "$RELEASE_VENV_ROOT"/build-*) ;;
     *) echo "protected release venv escaped its immutable root" >&2; return 2 ;;
   esac
-  test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT"
+  test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT" || return 2
   keep_shas["$protected_sha"]=1
   keep_targets["$target"]=1
   kept=1
+
+  # Preserve the exact previous immutable venv when it already lives in the
+  # external release root. Legacy /opt venvs are outside this cleanup scope.
+  if [ -n "$rollback_sha" ] && [ "$rollback_sha" != "$protected_sha" ]; then
+    [[ "$rollback_sha" =~ ^[0-9a-f]{40}$ ]] || return 2
+  fi
+  if [ -n "$rollback_sha" ] && [ "$rollback_sha" != "$protected_sha" ] && \
+    [ -L "$RELEASE_VENV_ROOT/$rollback_sha" ]; then
+    target="$(readlink -f -- "$RELEASE_VENV_ROOT/$rollback_sha")" || return 2
+    case "$target" in
+      "$RELEASE_VENV_ROOT"/build-*) ;;
+      *) echo "rollback release venv escaped its immutable root" >&2; return 2 ;;
+    esac
+    test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT" || return 2
+    keep_shas["$rollback_sha"]=1
+    keep_targets["$target"]=1
+    kept=$((kept + 1))
+  fi
 
   # Keep the newest successful releases until the rollback retention is full.
   for sha in "${release_shas[@]}"; do
@@ -298,7 +349,7 @@ prune_release_venvs() {
       "$RELEASE_VENV_ROOT"/build-*) ;;
       *) continue ;;
     esac
-    test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT"
+    test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT" || return 2
     if [ "$kept" -lt "$RELEASE_VENV_RETENTION" ]; then
       keep_shas["$sha"]=1
       keep_targets["$target"]=1
@@ -318,26 +369,26 @@ prune_release_venvs() {
       [ -n "$target" ] && keep_targets["$target"]=1
       continue
     fi
-    rm -f -- "$link"
+    rm -f -- "$link" || return 2
     echo "Removed stale release venv link: $sha" >&2
   done
 
   # Every removable target must be a direct build-* child of the immutable root.
   while IFS= read -r -d '' build_dir; do
-    build_real="$(readlink -f -- "$build_dir")"
+    build_real="$(readlink -f -- "$build_dir")" || return 2
     case "$build_real" in
       "$RELEASE_VENV_ROOT"/build-*) ;;
       *) echo "refusing unsafe release venv target: $build_real" >&2; return 2 ;;
     esac
-    test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"
+    test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT" || return 2
     [ -n "${keep_targets[$build_real]:-}" ] && continue
     if path_is_runtime_referenced "$build_real" || \
       path_is_opt_link_target "$build_real"; then
       echo "Retained referenced release venv target: $build_real" >&2
       continue
     fi
-    candidate_bytes="$(du -sb -- "$build_real" | awk '{print $1}')"
-    rm -rf -- "$build_real"
+    candidate_bytes="$(du -sb -- "$build_real" | awk '{print $1}')" || return 2
+    rm -rf -- "$build_real" || return 2
     removed_bytes=$((removed_bytes + candidate_bytes))
     echo "Removed stale release venv target: $build_real ($candidate_bytes bytes)" >&2
   done < <(find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 \
@@ -345,40 +396,67 @@ prune_release_venvs() {
   echo "Release venv cleanup reclaimed $removed_bytes bytes" >&2
 }
 
-prune_legacy_release_copies() {
-  local legacy_root_real
+prune_code_releases() {
+  local active_root="$1"
+  local rollback_root="$2"
   local entry
   local entry_real
-  local kept=0
+  local entry_name
   local removed_bytes=0
   local candidate_bytes=0
-  local -a entries=()
+  local release_root_real
+  local active_name
+  local rollback_name
+  local unsafe_link
 
-  [ -d "$LEGACY_RELEASE_ROOT" ] || return 0
-  legacy_root_real="$(readlink -f -- "$LEGACY_RELEASE_ROOT")"
-  test "$legacy_root_real" = "$LEGACY_RELEASE_ROOT"
-  mapfile -t entries < <(
-    find "$LEGACY_RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d \
-      -printf '%T@ %f\n' | LC_ALL=C sort -nr | awk '{print $2}'
-  )
-  for entry in "${entries[@]}"; do
-    entry_real="$(readlink -f -- "$LEGACY_RELEASE_ROOT/$entry")"
-    test "$(dirname -- "$entry_real")" = "$LEGACY_RELEASE_ROOT"
-    if [ "$kept" -lt "$LEGACY_RELEASE_RETENTION" ]; then
-      kept=$((kept + 1))
+  test ! -L "$CODE_RELEASE_ROOT" || return 2
+  release_root_real="$(readlink -f -- "$CODE_RELEASE_ROOT")" || return 2
+  test "$release_root_real" = "$CODE_RELEASE_ROOT" || return 2
+  active_name="${active_root#"$CODE_RELEASE_ROOT"/}"
+  [[ "$active_name" =~ ^[0-9a-f]{40}$ ]] || return 2
+  test "$active_root" = "$CODE_RELEASE_ROOT/$active_name" || return 2
+  if [ "$rollback_root" != "$REPOSITORY_ROOT" ]; then
+    rollback_name="${rollback_root#"$CODE_RELEASE_ROOT"/}"
+    [[ "$rollback_name" =~ ^[0-9a-f]{40}$ ]] || return 2
+    test "$rollback_root" = "$CODE_RELEASE_ROOT/$rollback_name" || return 2
+  fi
+  unsafe_link="$(find "$CODE_RELEASE_ROOT" -mindepth 1 -maxdepth 1 \
+    -type l -print -quit)" || return 2
+  if [ -n "$unsafe_link" ]; then
+    echo "refusing symlink inside immutable code release root" >&2
+    return 2
+  fi
+  while IFS= read -r -d '' entry; do
+    entry_name="$(basename -- "$entry")"
+    if [[ ! "$entry_name" =~ ^[0-9a-f]{40}$ ]] && \
+      [[ ! "$entry_name" =~ ^\.build-[0-9a-f]{40}-[0-9]+$ ]]; then
       continue
     fi
+    entry_real="$(readlink -f -- "$entry")" || return 2
+    test "$(dirname -- "$entry_real")" = "$CODE_RELEASE_ROOT" || return 2
+    case "$entry_real" in
+      "$active_root"|"$rollback_root") continue ;;
+    esac
     if path_is_runtime_referenced "$entry_real" || \
       path_is_opt_link_target "$entry_real"; then
-      echo "Retained referenced legacy release: $entry_real" >&2
+      echo "Retained referenced immutable code release: $entry_real" >&2
       continue
     fi
-    candidate_bytes="$(du -sb -- "$entry_real" | awk '{print $1}')"
-    rm -rf -- "$entry_real"
+    candidate_bytes="$(du -sb -- "$entry_real" | awk '{print $1}')" || return 2
+    chmod -R u+rwX "$entry_real" 2>/dev/null || true
+    if [ -f "$entry_real/.git" ]; then
+      git --git-dir="$CODE_GIT_CACHE" worktree remove --force "$entry_real" || \
+        return 2
+    fi
+    if [ -e "$entry_real" ]; then
+      rm -rf -- "$entry_real" || return 2
+    fi
     removed_bytes=$((removed_bytes + candidate_bytes))
-    echo "Removed legacy release copy: $entry_real ($candidate_bytes bytes)" >&2
-  done
-  echo "Legacy release cleanup reclaimed $removed_bytes bytes" >&2
+    echo "Removed stale immutable code release: $entry_real ($candidate_bytes bytes)" >&2
+  done < <(find "$CODE_RELEASE_ROOT" -mindepth 1 -maxdepth 1 \
+    -type d -print0)
+  git --git-dir="$CODE_GIT_CACHE" worktree prune || return 2
+  echo "Code release cleanup reclaimed $removed_bytes bytes" >&2
 }
 
 prune_release_temp_files() {
@@ -390,8 +468,8 @@ prune_release_temp_files() {
       /tmp/probiga-release-*.tar.gz|/tmp/probiga-*.bundle) ;;
       *) echo "refusing unsafe release temp path: $temp_file" >&2; return 2 ;;
     esac
-    candidate_bytes="$(stat -c '%s' -- "$temp_file")"
-    rm -f -- "$temp_file"
+    candidate_bytes="$(stat -c '%s' -- "$temp_file")" || return 2
+    rm -f -- "$temp_file" || return 2
     removed_bytes=$((removed_bytes + candidate_bytes))
     echo "Removed stale release temp file: $temp_file ($candidate_bytes bytes)" >&2
   done < <(find /tmp -mindepth 1 -maxdepth 1 -type f \
@@ -446,18 +524,26 @@ assert_scheduler_triggers_quiescent() {
   done
 }
 assert_service_cannot_write_release_paths() {
+  local checkout_root="${1:-$REPOSITORY_ROOT}"
   local writable_path
   local writable_root_file
   writable_path="$(sudo -u "$SERVICE_USER" find \
-    .git .github deploy server biz integrations tools scripts \
-    strategies versions artifacts/trading_v4 artifacts/trading_v5 \
-    artifacts/trading_v6 requirements-platform.txt .gitattributes \
-    .gitignore -writable -print -quit 2>/dev/null || true)"
+    "$checkout_root/.git" "$checkout_root/.github" \
+    "$checkout_root/deploy" "$checkout_root/server" \
+    "$checkout_root/biz" "$checkout_root/integrations" \
+    "$checkout_root/tools" "$checkout_root/scripts" \
+    "$checkout_root/strategies" "$checkout_root/versions" \
+    "$checkout_root/artifacts/trading_v4" \
+    "$checkout_root/artifacts/trading_v5" \
+    "$checkout_root/artifacts/trading_v6" \
+    "$checkout_root/requirements-platform.txt" \
+    "$checkout_root/.gitattributes" "$checkout_root/.gitignore" \
+    -writable -print -quit 2>/dev/null || true)"
   if [ -n "$writable_path" ]; then
     echo "service account can modify protected release paths: $writable_path" >&2
     return 2
   fi
-  writable_root_file="$(sudo -u "$SERVICE_USER" find . -maxdepth 1 \
+  writable_root_file="$(sudo -u "$SERVICE_USER" find "$checkout_root" -maxdepth 1 \
     -type f \( -name '*.py' -o -name '*.pyw' -o -name '*.pyc' \
     -o -name '*.pyd' -o -name '*.so' \) -writable -print -quit \
     2>/dev/null || true)"
@@ -467,11 +553,14 @@ assert_service_cannot_write_release_paths() {
   fi
 }
 seal_release_checkout() {
+  local checkout_root="${1:-$REPOSITORY_ROOT}"
   declare -A tracked_directories=()
   local directory
   local entry
   local git_mode
   local tracked_path
+  (
+  cd "$checkout_root"
   while IFS= read -r -d '' entry; do
     git_mode="${entry%% *}"
     tracked_path="${entry#*$'\t'}"
@@ -495,60 +584,76 @@ seal_release_checkout() {
     chown root:root -- "$directory"
     chmod 0555 -- "$directory"
   done
-  find .git -type f -exec chown root:root -- {} + \
-    -exec chmod 0444 -- {} +
-  find .git -type d -exec chown root:root -- {} + \
-    -exec chmod 0555 -- {} +
+  if [ -d .git ]; then
+    find .git -type f -exec chown root:root -- {} + \
+      -exec chmod 0444 -- {} +
+    find .git -type d -exec chown root:root -- {} + \
+      -exec chmod 0555 -- {} +
+  else
+    test -f .git
+    chown root:root .git
+    chmod 0444 .git
+  fi
+  )
 }
 assert_scheduler_triggers_quiescent
 write_dropin() {
   local revision="$1"
-  local adata_sha="$2"
-  local adata_tree_sha="$3"
-  local adata_source="$4"
+  local code_root="$2"
+  local adata_sha="$3"
+  local adata_tree_sha="$4"
+  local adata_source="$5"
+  local output_file="$6"
   printf '%s\n' \
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=true PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=true' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
+    'Environment=PYTHONSAFEPATH=1' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
     "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
     "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
-    "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
-    | sudo tee /etc/systemd/system/probiga.service.d/scheduler.conf >/dev/null
+    "Environment=PYTHONPATH=$adata_source:$code_root" \
+    > "$output_file"
 }
 write_ai_worker_dropin() {
   local revision="$1"
-  local adata_sha="$2"
-  local adata_tree_sha="$3"
-  local adata_source="$4"
-  sudo mkdir -p "$(dirname "$AI_WORKER_DROPIN")"
+  local code_root="$2"
+  local adata_sha="$3"
+  local adata_tree_sha="$4"
+  local adata_source="$5"
+  local output_file="$6"
   printf '%s\n' \
     '[Service]' \
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:/opt/ProBigA $RELEASE_VENV_ROOT/$revision/bin/python tools/run_ai_recommendation_worker.py --once" \
+    "ExecStart=/usr/bin/env GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_ai_recommendation_worker.py --once" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
+    'Environment=PYTHONSAFEPATH=1' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
     "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
     "Environment=PROBIGA_ADATA_SOURCE_DIR=$adata_source" \
-    "Environment=PYTHONPATH=$adata_source:/opt/ProBigA" \
-    | sudo tee "$AI_WORKER_DROPIN" >/dev/null
+    "Environment=PYTHONPATH=$adata_source:$code_root" \
+    > "$output_file"
 }
 assert_ai_worker_runtime() {
   local revision="$1"
+  local venv_path="${2:-$RELEASE_VENV_ROOT/$revision}"
+  local code_root="${3:-$CODE_RELEASE_ROOT/$revision}"
   test "$(systemctl show -p User --value "$AI_WORKER_SERVICE")" = \
     "$SERVICE_USER"
   test "$(systemctl show -p Group --value "$AI_WORKER_SERVICE")" = \
@@ -558,24 +663,30 @@ assert_ai_worker_runtime() {
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
     | grep -F -- 'PYTHONDONTWRITEBYTECODE=1' >/dev/null
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
-    | grep -F -- "$RELEASE_VENV_ROOT/$revision/bin/python" >/dev/null
+    | grep -F -- 'PYTHONSAFEPATH=1' >/dev/null
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
-    | grep -F -- 'tools/run_ai_recommendation_worker.py --once' >/dev/null
+    | grep -F -- "$venv_path/bin/python" >/dev/null
+  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+    | grep -F -- ' -P ' >/dev/null
+  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+    | grep -F -- "$code_root/tools/run_ai_recommendation_worker.py --once" >/dev/null
 }
 point_static_release_to_checkout() {
+  local checkout_root="${1:-$REPOSITORY_ROOT}"
   local link_build
   link_build="$(sudo mktemp -d /opt/.probiga-static-link.XXXXXX)"
-  sudo ln -s "$REPOSITORY_ROOT" "$link_build/current"
+  sudo ln -s "$checkout_root" "$link_build/current"
   sudo mv -Tf "$link_build/current" "$STATIC_RELEASE_LINK"
   sudo rmdir "$link_build"
   test -L "$STATIC_RELEASE_LINK"
-  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$REPOSITORY_ROOT"
+  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$checkout_root"
 }
 assert_nginx_static_matches_checkout() {
+  local checkout_root="${1:-$REPOSITORY_ROOT}"
   local asset
   local response
   test -L "$STATIC_RELEASE_LINK"
-  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$REPOSITORY_ROOT"
+  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$checkout_root"
   for asset in js/app.js css/style.css; do
     response="$(mktemp)"
     if ! curl --fail --silent --show-error \
@@ -584,7 +695,7 @@ assert_nginx_static_matches_checkout() {
       rm -f "$response"
       return 1
     fi
-    if ! cmp --silent "$REPOSITORY_ROOT/server/static/$asset" "$response"; then
+    if ! cmp --silent "$checkout_root/server/static/$asset" "$response"; then
       rm -f "$response"
       echo "Nginx served stale static asset: $asset" >&2
       return 1
@@ -594,47 +705,100 @@ assert_nginx_static_matches_checkout() {
 }
 release_identity_check() {
   local require_clean="$1"
+  local checkout_root="${2:-$REPOSITORY_ROOT}"
+  (
+  cd "$checkout_root"
   sudo -u "$SERVICE_USER" env \
     GIT_OPTIONAL_LOCKS=0 \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0="$checkout_root" \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
     PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
     PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
     PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
-    PYTHONPATH="$ADATA_SOURCE:/opt/ProBigA" \
+    PYTHONPATH="$ADATA_SOURCE:$checkout_root" \
     PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN="$require_clean" \
-    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -c \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -c \
     'import json, os; from server.api.routers.health import _deployed_git_revision; info = _deployed_git_revision(); print(json.dumps(info, ensure_ascii=True, sort_keys=True)); raise SystemExit(2 if os.environ["PROBIGA_RELEASE_IDENTITY_REQUIRE_CLEAN"] == "1" and (info.get("matches_expected") is not True or info.get("code_worktree_clean") is not True) else 0)'
+  )
 }
 BOOTSTRAP_PYTHON=/usr/bin/python3.14
 test -x "$BOOTSTRAP_PYTHON"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 sudo -u "$SERVICE_USER" test ! -w "$BOOTSTRAP_PYTHON"
 test "$($BOOTSTRAP_PYTHON -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.14"
+DEPLOY_MAIN_BASHPID="$BASHPID"
+CUTOVER_STARTED=0
+API_STOPPED=0
+DEPLOY_SUCCEEDED=0
+NEW_VENV_LINK=0
+STAGING_WORKTREE=""
+PREPARED_CODE_ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
+CODE_VALIDATION_ROOT=""
+NEW_CODE_RELEASE=0
+ADATA_CACHE_BUILD=""
+ADATA_SOURCE_BUILD=""
+ADATA_BUILD_SOURCE=""
+ADATA_WHEEL_DIR=""
+EXPECTED_BUILD=""
+RESOLVED_LOCK=""
+HEALTH_RESPONSE=""
+PREPARED_MAIN_DROPIN=""
+PREPARED_AI_WORKER_DROPIN=""
+PREVIOUS_DROPIN=""
+PREVIOUS_AI_WORKER_DROPIN=""
+PREVIOUS_LOCK_SNAPSHOT=""
+cleanup_prepare_artifacts() {
+  [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
+  [ -z "$PREVIOUS_AI_WORKER_DROPIN" ] || \
+    rm -f -- "$PREVIOUS_AI_WORKER_DROPIN"
+  [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
+  [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
+  [ -z "$PREPARED_AI_WORKER_DROPIN" ] || \
+    rm -f -- "$PREPARED_AI_WORKER_DROPIN"
+}
 PREVIOUS_DROPIN="$(mktemp)"
 PREVIOUS_DROPIN_PRESENT=0
 if sudo test -f /etc/systemd/system/probiga.service.d/scheduler.conf; then
   sudo cat /etc/systemd/system/probiga.service.d/scheduler.conf > "$PREVIOUS_DROPIN"
   PREVIOUS_DROPIN_PRESENT=1
 fi
+PREVIOUS_AI_WORKER_DROPIN="$(mktemp)"
+PREVIOUS_AI_WORKER_DROPIN_PRESENT=0
+if sudo test -f "$AI_WORKER_DROPIN"; then
+  sudo cat "$AI_WORKER_DROPIN" > "$PREVIOUS_AI_WORKER_DROPIN"
+  PREVIOUS_AI_WORKER_DROPIN_PRESENT=1
+fi
 dropin_environment_value() {
   local name="$1"
   sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN" | tail -n 1
 }
-PREVIOUS_RELEASE_REVISION="$(sed -n \
-  "s|^ExecStart=.*$RELEASE_VENV_ROOT/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
-  "$PREVIOUS_DROPIN" | tail -n 1)"
+PREVIOUS_RELEASE_REVISION=""
+PREVIOUS_VENV=""
+for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
+  candidate_revision="$(sed -n \
+    "s|^ExecStart=.*$candidate_root/\([0-9a-f]\{40\}\)/bin/python .*|\1|p" \
+    "$PREVIOUS_DROPIN" | tail -n 1)"
+  if [ -n "$candidate_revision" ]; then
+    test -z "$PREVIOUS_RELEASE_REVISION"
+    PREVIOUS_RELEASE_REVISION="$candidate_revision"
+    PREVIOUS_VENV="$candidate_root/$candidate_revision"
+  fi
+done
 PREVIOUS_REQUIREMENTS_SHA256=""
 if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
-  test "$PREVIOUS_RELEASE_REVISION" = "$PREVIOUS_SHA"
-  PREVIOUS_VENV="$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
+  PREVIOUS_SHA="$PREVIOUS_RELEASE_REVISION"
   test -L "$PREVIOUS_VENV"
   PREVIOUS_VENV_TARGET="$(readlink -f "$PREVIOUS_VENV")"
   case "$PREVIOUS_VENV_TARGET" in
-    "$RELEASE_VENV_ROOT"/build-*) ;;
+    "$RELEASE_VENV_ROOT"/build-*|"$LEGACY_RELEASE_VENV_ROOT"/build-*) ;;
     *) echo "previous release venv escaped its immutable root" >&2; exit 2 ;;
   esac
+  test "$(dirname "$PREVIOUS_VENV_TARGET")" = "$(dirname "$PREVIOUS_VENV")"
   test -x "$PREVIOUS_VENV/bin/python"
   PREVIOUS_REQUIREMENTS_SHA256="$(cat \
     "$PREVIOUS_VENV/.requirements.sha256")"
@@ -650,6 +814,25 @@ if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
   assert_service_cannot_write_tree "$PREVIOUS_VENV_TARGET" \
     "previous release virtual environment"
 fi
+PREVIOUS_CODE_ROOT="$(dropin_environment_value PROBIGA_CODE_ROOT)"
+if [ -z "$PREVIOUS_CODE_ROOT" ]; then
+  PREVIOUS_CODE_ROOT="$REPOSITORY_ROOT"
+fi
+case "$PREVIOUS_CODE_ROOT" in
+  "$REPOSITORY_ROOT")
+    test "$PREVIOUS_SHA" = "$LEGACY_LIVE_SHA"
+    ;;
+  "$CODE_RELEASE_ROOT/$PREVIOUS_SHA")
+    test ! -L "$PREVIOUS_CODE_ROOT"
+    test -d "$PREVIOUS_CODE_ROOT"
+    test "$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD)" = "$PREVIOUS_SHA"
+    assert_service_cannot_write_release_paths "$PREVIOUS_CODE_ROOT"
+    ;;
+  *)
+    echo "previous code root escaped immutable release storage" >&2
+    exit 2
+    ;;
+esac
 PREVIOUS_ADATA_SHA="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
 PREVIOUS_ADATA_TREE_SHA256="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
 PREVIOUS_ADATA_SOURCE="$(dropin_environment_value PROBIGA_ADATA_SOURCE_DIR)"
@@ -673,15 +856,6 @@ else
   PREVIOUS_ADATA_TREE_SHA256=""
   PREVIOUS_ADATA_SOURCE=/opt/ProBigA/adata
 fi
-# Code history is authoritative in GitHub. Keep only the active dependency
-# environment and one immediate rollback environment on the ECS host; legacy
-# full code copies are reproducible and are not production data.
-if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
-  prune_release_venvs "$PREVIOUS_RELEASE_REVISION"
-fi
-prune_legacy_release_copies
-prune_release_temp_files
-df -h / >&2
 SCHEDULER_UNIT_PRESENT=0
 PREVIOUS_SCHEDULER_ACTIVE=0
 PREVIOUS_SCHEDULER_ENABLED=0
@@ -708,36 +882,349 @@ if [ "$AI_WORKER_SERVICE_LOAD" != not-found ] || \
   systemctl is-enabled --quiet "$AI_WORKER_TIMER" && \
     PREVIOUS_AI_WORKER_TIMER_ENABLED=1 || true
 fi
+CODE_REPOSITORY_URL=git@github.com:MingMG/probiga.git
 ADATA_REPOSITORY_URL=https://github.com/1nchaos/adata.git
-ADATA_GIT_CACHE=/opt/ProBigA/.release_sources/adata.git
+ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git
+LEGACY_ADATA_GIT_CACHE=/opt/ProBigA/.release_sources/adata.git
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
-mkdir -p "$(dirname "$ADATA_GIT_CACHE")"
-if [ ! -d "$ADATA_GIT_CACHE" ]; then
-  ADATA_CACHE_BUILD="$(mktemp -d /opt/ProBigA/.release_sources/adata-git.XXXXXX)"
-  if git -C "$LEGACY_ADATA_REPOSITORY" cat-file -e \
-    "${EXPECTED_ADATA_SHA}^{commit}"; then
-    git clone --mirror "$LEGACY_ADATA_REPOSITORY" \
-      "$ADATA_CACHE_BUILD/repository.git"
+cleanup_staging_worktree() {
+  if [ -n "$STAGING_WORKTREE" ]; then
+    case "$STAGING_WORKTREE" in
+      "$CODE_RELEASE_ROOT"/.build-"$EXPECTED_SHA"-*) ;;
+      *) echo "refusing unsafe staging cleanup: $STAGING_WORKTREE" >&2; return 2 ;;
+    esac
+    test "$(dirname -- "$STAGING_WORKTREE")" = "$CODE_RELEASE_ROOT" || \
+      return 2
+    chmod -R u+rwX "$STAGING_WORKTREE" 2>/dev/null || true
+    git --git-dir="$CODE_GIT_CACHE" worktree remove --force \
+      "$STAGING_WORKTREE" 2>/dev/null || true
+    rm -rf -- "$STAGING_WORKTREE" || return 2
+    STAGING_WORKTREE=""
+  fi
+}
+cleanup_prepare_artifacts() {
+  local build_target=""
+  local venv_in_use=0
+  cleanup_staging_worktree || true
+  [ -z "$RESOLVED_LOCK" ] || rm -f -- "$RESOLVED_LOCK"
+  [ -z "$HEALTH_RESPONSE" ] || rm -f -- "$HEALTH_RESPONSE"
+  if [ -n "$ADATA_SOURCE_BUILD" ]; then
+    case "$ADATA_SOURCE_BUILD" in
+      "$ADATA_RUNTIME_ROOT"/.build-*) rm -rf -- "$ADATA_SOURCE_BUILD" ;;
+    esac
+  fi
+  for temp_dir in "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"; do
+    case "$temp_dir" in
+      /tmp/tmp.*) rm -rf -- "$temp_dir" ;;
+    esac
+  done
+  if [ -n "$ADATA_CACHE_BUILD" ]; then
+    case "$ADATA_CACHE_BUILD" in
+      /var/lib/probiga/release-sources/adata-git.*) \
+        rm -rf -- "$ADATA_CACHE_BUILD" ;;
+    esac
+  fi
+  if [ "$DEPLOY_SUCCEEDED" -ne 1 ] && [ -n "$EXPECTED_BUILD" ]; then
+    if path_is_runtime_referenced "$RELEASE_VENV_ROOT/$EXPECTED_SHA" || \
+      path_is_runtime_referenced "$EXPECTED_BUILD"; then
+      venv_in_use=1
+      echo "Retained runtime-referenced prepared venv after failure" >&2
+    fi
+    if [ "$NEW_VENV_LINK" -eq 1 ] && \
+      [ "$venv_in_use" -eq 0 ] && [ -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
+      build_target="$(readlink -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA")"
+      if [ "$build_target" = "$EXPECTED_BUILD" ]; then
+        rm -f -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+      fi
+    fi
+    case "$EXPECTED_BUILD:$venv_in_use" in
+      "$RELEASE_VENV_ROOT"/build-*:0)
+        chmod -R u+rwX "$EXPECTED_BUILD" 2>/dev/null || true
+        rm -rf -- "$EXPECTED_BUILD"
+        ;;
+    esac
+  fi
+  rm -f -- "$PREVIOUS_DROPIN" "$PREVIOUS_AI_WORKER_DROPIN"
+  [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
+  [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
+  [ -z "$PREPARED_AI_WORKER_DROPIN" ] || \
+    rm -f -- "$PREPARED_AI_WORKER_DROPIN"
+}
+verify_venv_dependency_lock() {
+  local venv_path="$1"
+  local observed_lock
+  local observed_sha
+  observed_lock="$(mktemp)"
+  if ! "$venv_path/bin/python" -m pip freeze --all --exclude-editable \
+    | awk 'tolower($0) !~ /^adata([[:space:]]|==|@)/' \
+    | LC_ALL=C sort > "$observed_lock"; then
+    rm -f "$observed_lock"
+    return 2
+  fi
+  observed_sha="$(sha256sum "$observed_lock" | cut -d' ' -f1)"
+  rm -f "$observed_lock"
+  test "$observed_sha" = "$EXPECTED_REQUIREMENTS_SHA256"
+}
+prepare_code_staging() {
+  local cache_parent
+  cache_parent="$(dirname "$CODE_GIT_CACHE")"
+  test ! -L "$cache_parent"
+  test ! -L "$CODE_RELEASE_ROOT"
+  install -d -o root -g root -m 0755 "$cache_parent" "$CODE_RELEASE_ROOT"
+  test "$(readlink -f "$cache_parent")" = "$cache_parent"
+  test "$(readlink -f "$CODE_RELEASE_ROOT")" = "$CODE_RELEASE_ROOT"
+  sudo -u "$SERVICE_USER" test ! -w "$CODE_RELEASE_ROOT"
+  test ! -L "$CODE_GIT_CACHE"
+  test -d "$CODE_GIT_CACHE"
+  test "$(git --git-dir="$CODE_GIT_CACHE" rev-parse --is-bare-repository)" = true
+  test "$(git --git-dir="$CODE_GIT_CACHE" remote get-url origin)" = \
+    "$CODE_REPOSITORY_URL"
+  git --git-dir="$CODE_GIT_CACHE" cat-file -e "${EXPECTED_SHA}^{commit}"
+  test "$(git --git-dir="$CODE_GIT_CACHE" rev-parse "$EXPECTED_SHA^{commit}")" = \
+    "$EXPECTED_SHA"
+  chown -R root:root "$CODE_GIT_CACHE"
+  chmod -R u+rwX,go+rX,go-w "$CODE_GIT_CACHE"
+  test ! -L "$PREPARED_CODE_ROOT"
+  if [ -d "$PREPARED_CODE_ROOT" ]; then
+    test -f "$PREPARED_CODE_ROOT/.git"
+    CODE_VALIDATION_ROOT="$PREPARED_CODE_ROOT"
+  else
+    STAGING_WORKTREE="$CODE_RELEASE_ROOT/.build-$EXPECTED_SHA-$RANDOM"
+    git --git-dir="$CODE_GIT_CACHE" worktree add --detach \
+      "$STAGING_WORKTREE" "$EXPECTED_SHA"
+    CODE_VALIDATION_ROOT="$STAGING_WORKTREE"
+  fi
+  test "$(git -C "$CODE_VALIDATION_ROOT" rev-parse HEAD)" = "$EXPECTED_SHA"
+  assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
+}
+prepare_adata_release() {
+  local adata_seed=""
+  local seal_json
+  local sealed_tree_sha
+  test ! -L "$(dirname "$ADATA_GIT_CACHE")"
+  test ! -L "$ADATA_RUNTIME_ROOT"
+  install -d -o root -g root -m 0755 "$(dirname "$ADATA_GIT_CACHE")"
+  test ! -L "$ADATA_GIT_CACHE"
+  if [ ! -d "$ADATA_GIT_CACHE" ]; then
+    ADATA_CACHE_BUILD="$(mktemp -d \
+      "$(dirname "$ADATA_GIT_CACHE")/adata-git.XXXXXX")"
+    if [ -d "$LEGACY_ADATA_GIT_CACHE" ] && \
+      git --git-dir="$LEGACY_ADATA_GIT_CACHE" cat-file -e \
+        "${EXPECTED_ADATA_SHA}^{commit}"; then
+      adata_seed="$LEGACY_ADATA_GIT_CACHE"
+    elif [ -d "$LEGACY_ADATA_REPOSITORY/.git" ] && \
+      git -C "$LEGACY_ADATA_REPOSITORY" cat-file -e \
+        "${EXPECTED_ADATA_SHA}^{commit}"; then
+      adata_seed="$LEGACY_ADATA_REPOSITORY"
+    fi
+    if [ -n "$adata_seed" ]; then
+      git clone --mirror --no-hardlinks "$adata_seed" \
+        "$ADATA_CACHE_BUILD/repository.git"
+    else
+      git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --mirror \
+        "$ADATA_REPOSITORY_URL" "$ADATA_CACHE_BUILD/repository.git"
+    fi
     git --git-dir="$ADATA_CACHE_BUILD/repository.git" remote set-url origin \
       "$ADATA_REPOSITORY_URL"
-  else
-    git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 clone --mirror \
-      "$ADATA_REPOSITORY_URL" "$ADATA_CACHE_BUILD/repository.git"
+    mv "$ADATA_CACHE_BUILD/repository.git" "$ADATA_GIT_CACHE"
+    rmdir "$ADATA_CACHE_BUILD"
+    ADATA_CACHE_BUILD=""
   fi
-  mv "$ADATA_CACHE_BUILD/repository.git" "$ADATA_GIT_CACHE"
-  rmdir "$ADATA_CACHE_BUILD"
-fi
-test "$(git --git-dir="$ADATA_GIT_CACHE" remote get-url origin)" = "$ADATA_REPOSITORY_URL"
-if ! git --git-dir="$ADATA_GIT_CACHE" cat-file -e \
-  "${EXPECTED_ADATA_SHA}^{commit}"; then
-  git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 \
-    --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin \
-    "$EXPECTED_ADATA_SHA"
-fi
-test "$(git --git-dir="$ADATA_GIT_CACHE" rev-parse "${EXPECTED_ADATA_SHA}^{commit}")" = \
-  "$EXPECTED_ADATA_SHA"
+  test "$(git --git-dir="$ADATA_GIT_CACHE" rev-parse --is-bare-repository)" = true
+  test "$(git --git-dir="$ADATA_GIT_CACHE" remote get-url origin)" = \
+    "$ADATA_REPOSITORY_URL"
+  if ! git --git-dir="$ADATA_GIT_CACHE" cat-file -e \
+    "${EXPECTED_ADATA_SHA}^{commit}"; then
+    git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 \
+      --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin \
+      "$EXPECTED_ADATA_SHA"
+  fi
+  test "$(git --git-dir="$ADATA_GIT_CACHE" rev-parse \
+    "${EXPECTED_ADATA_SHA}^{commit}")" = "$EXPECTED_ADATA_SHA"
+  install -d -o root -g root -m 0755 "$ADATA_RUNTIME_ROOT"
+  test "$(readlink -f "$ADATA_RUNTIME_ROOT")" = "$ADATA_RUNTIME_ROOT"
+  ADATA_SOURCE="$ADATA_RUNTIME_ROOT/$EXPECTED_ADATA_SHA-$EXPECTED_ADATA_TREE_SHA256"
+  test ! -L "$ADATA_SOURCE"
+  if [ ! -d "$ADATA_SOURCE" ]; then
+    ADATA_SOURCE_BUILD="$(mktemp -d \
+      "$ADATA_RUNTIME_ROOT/.build-$EXPECTED_ADATA_SHA.XXXXXX")"
+    git --git-dir="$ADATA_GIT_CACHE" archive "$EXPECTED_ADATA_SHA" \
+      | tar -xf - -C "$ADATA_SOURCE_BUILD"
+    seal_json="$("$BOOTSTRAP_PYTHON" -I \
+      "$CODE_VALIDATION_ROOT/server/common/adata_release.py" seal \
+      --source "$ADATA_SOURCE_BUILD" --git-sha "$EXPECTED_ADATA_SHA")"
+    sealed_tree_sha="$(printf '%s' "$seal_json" | "$BOOTSTRAP_PYTHON" -I -c \
+      'import json,sys; print(json.load(sys.stdin)["tree_sha256"])')"
+    test "$sealed_tree_sha" = "$EXPECTED_ADATA_TREE_SHA256"
+    chown -R root:root "$ADATA_SOURCE_BUILD"
+    chmod -R a+rX,a-w "$ADATA_SOURCE_BUILD"
+    mv "$ADATA_SOURCE_BUILD" "$ADATA_SOURCE"
+    ADATA_SOURCE_BUILD=""
+  fi
+  chown -R root:root "$ADATA_SOURCE"
+  chmod -R a+rX,a-w "$ADATA_SOURCE"
+  sudo -u "$SERVICE_USER" test ! -w "$ADATA_RUNTIME_ROOT"
+  sudo -u "$SERVICE_USER" test ! -w "$(dirname "$ADATA_RUNTIME_ROOT")"
+  sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE"
+  sudo -u "$SERVICE_USER" test -x "$ADATA_SOURCE"
+  sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.gitsha"
+  sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.tree.sha256"
+  "$BOOTSTRAP_PYTHON" -I "$CODE_VALIDATION_ROOT/server/common/adata_release.py" verify \
+    --source "$ADATA_SOURCE" --git-sha "$EXPECTED_ADATA_SHA" \
+    --tree-sha256 "$EXPECTED_ADATA_TREE_SHA256"
+}
+prepare_release_venv() {
+  local -a adata_wheels=()
+  test ! -L "$RELEASE_VENV_ROOT"
+  install -d -o root -g root -m 0755 "$RELEASE_VENV_ROOT"
+  test "$(readlink -f "$RELEASE_VENV_ROOT")" = "$RELEASE_VENV_ROOT"
+  RESOLVED_LOCK="$(mktemp)"
+  printf '%s' "$RESOLVED_REQUIREMENTS_B64" | base64 -d > "$RESOLVED_LOCK"
+  test "$(sha256sum "$RESOLVED_LOCK" | cut -d' ' -f1)" = \
+    "$EXPECTED_REQUIREMENTS_SHA256"
+  if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
+    test -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+    EXPECTED_VENV_TARGET="$(readlink -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA")"
+    case "$EXPECTED_VENV_TARGET" in
+      "$RELEASE_VENV_ROOT"/build-*) ;;
+      *) echo "release venv target escaped its immutable root" >&2; return 2 ;;
+    esac
+    test "$(dirname "$EXPECTED_VENV_TARGET")" = "$RELEASE_VENV_ROOT"
+    test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.requirements.sha256")" = \
+      "$EXPECTED_REQUIREMENTS_SHA256"
+    test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.gitsha")" = \
+      "$EXPECTED_ADATA_SHA"
+    test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.tree.sha256")" = \
+      "$EXPECTED_ADATA_TREE_SHA256"
+    verify_venv_dependency_lock "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+    assert_service_cannot_write_tree "$EXPECTED_VENV_TARGET" \
+      "reused release virtual environment"
+  else
+    EXPECTED_BUILD="$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-$RANDOM"
+    "$BOOTSTRAP_PYTHON" -I -m venv "$EXPECTED_BUILD"
+    "$EXPECTED_BUILD/bin/python" -m pip install -r "$RESOLVED_LOCK" --quiet
+    ADATA_BUILD_SOURCE="$(mktemp -d)"
+    ADATA_WHEEL_DIR="$(mktemp -d)"
+    git --git-dir="$ADATA_GIT_CACHE" archive "$EXPECTED_ADATA_SHA" \
+      | tar -xf - -C "$ADATA_BUILD_SOURCE"
+    "$EXPECTED_BUILD/bin/python" -m pip wheel --no-deps \
+      --wheel-dir "$ADATA_WHEEL_DIR" "$ADATA_BUILD_SOURCE" --quiet
+    mapfile -t adata_wheels < <(find "$ADATA_WHEEL_DIR" -maxdepth 1 \
+      -type f -name '*.whl' -print)
+    test "${#adata_wheels[@]}" -eq 1
+    "$EXPECTED_BUILD/bin/python" -m pip install --no-deps \
+      "${adata_wheels[0]}" --quiet
+    printf '%s\n' "$EXPECTED_REQUIREMENTS_SHA256" \
+      > "$EXPECTED_BUILD/.requirements.sha256"
+    printf '%s\n' "$EXPECTED_ADATA_SHA" > "$EXPECTED_BUILD/.adata.gitsha"
+    printf '%s\n' "$EXPECTED_ADATA_TREE_SHA256" \
+      > "$EXPECTED_BUILD/.adata.tree.sha256"
+    verify_venv_dependency_lock "$EXPECTED_BUILD"
+    chown -R root:root "$EXPECTED_BUILD"
+    chmod -R a+rX,a-w "$EXPECTED_BUILD"
+    sudo -u "$SERVICE_USER" test -x "$EXPECTED_BUILD/bin/python"
+    sudo -u "$SERVICE_USER" "$EXPECTED_BUILD/bin/python" -I -c \
+      'import sys; assert sys.version_info[:2] == (3, 14)'
+    assert_service_cannot_write_tree "$EXPECTED_BUILD" \
+      "new release virtual environment"
+    ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+    NEW_VENV_LINK=1
+  fi
+  chmod 0555 "$RELEASE_VENV_ROOT"
+  sudo -u "$SERVICE_USER" test ! -w "$RELEASE_VENV_ROOT"
+  sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"
+  rm -f "$RESOLVED_LOCK"
+  RESOLVED_LOCK=""
+  rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
+  ADATA_BUILD_SOURCE=""
+  ADATA_WHEEL_DIR=""
+}
+prepare_release() {
+  prepare_code_staging
+  if [ -n "$PREVIOUS_ADATA_TREE_SHA256" ]; then
+    "$BOOTSTRAP_PYTHON" -I \
+      "$CODE_VALIDATION_ROOT/server/common/adata_release.py" verify \
+      --source "$PREVIOUS_ADATA_SOURCE" --git-sha "$PREVIOUS_ADATA_SHA" \
+      --tree-sha256 "$PREVIOUS_ADATA_TREE_SHA256"
+  fi
+  prepare_adata_release
+  prepare_release_venv
+  assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
+  (
+    cd "$CODE_VALIDATION_ROOT"
+    GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+      tools/validate_production_release_boundary.py \
+      --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
+    sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
+      GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+      GIT_CONFIG_VALUE_0="$CODE_VALIDATION_ROOT" \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+      tools/ensure_quality_gate.py --validate-review-delivery
+  )
+  release_identity_check 1 "$CODE_VALIDATION_ROOT"
+  if [ -n "$STAGING_WORKTREE" ]; then
+    seal_release_checkout "$STAGING_WORKTREE"
+    assert_service_cannot_write_release_paths "$STAGING_WORKTREE"
+    git --git-dir="$CODE_GIT_CACHE" worktree move \
+      "$STAGING_WORKTREE" "$PREPARED_CODE_ROOT"
+    STAGING_WORKTREE=""
+    CODE_VALIDATION_ROOT="$PREPARED_CODE_ROOT"
+    NEW_CODE_RELEASE=1
+  fi
+  if [ "$NEW_CODE_RELEASE" -eq 1 ]; then
+    seal_release_checkout "$PREPARED_CODE_ROOT"
+  fi
+  assert_service_cannot_write_release_paths "$PREPARED_CODE_ROOT"
+  test "$(git -C "$PREPARED_CODE_ROOT" rev-parse HEAD)" = "$EXPECTED_SHA"
+  release_identity_check 1 "$PREPARED_CODE_ROOT"
+  PREPARED_MAIN_DROPIN="$(mktemp)"
+  write_dropin "$EXPECTED_SHA" "$PREPARED_CODE_ROOT" \
+    "$EXPECTED_ADATA_SHA" "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE" \
+    "$PREPARED_MAIN_DROPIN"
+  chmod 0600 "$PREPARED_MAIN_DROPIN"
+  grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+    "$PREPARED_MAIN_DROPIN" >/dev/null
+  grep -Fx "Environment=PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+    "$PREPARED_MAIN_DROPIN" >/dev/null
+  grep -F -- 'PYTHONSAFEPATH=1' "$PREPARED_MAIN_DROPIN" >/dev/null
+  grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python -P " \
+    "$PREPARED_MAIN_DROPIN" >/dev/null
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    PREPARED_AI_WORKER_DROPIN="$(mktemp)"
+    write_ai_worker_dropin "$EXPECTED_SHA" "$PREPARED_CODE_ROOT" \
+      "$EXPECTED_ADATA_SHA" "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE" \
+      "$PREPARED_AI_WORKER_DROPIN"
+    chmod 0600 "$PREPARED_AI_WORKER_DROPIN"
+    grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+      "$PREPARED_AI_WORKER_DROPIN" >/dev/null
+    grep -F -- "$PREPARED_CODE_ROOT/tools/run_ai_recommendation_worker.py" \
+      "$PREPARED_AI_WORKER_DROPIN" >/dev/null
+    grep -F -- 'PYTHONSAFEPATH=1' "$PREPARED_AI_WORKER_DROPIN" >/dev/null
+  fi
+}
+install_prepared_dropins() {
+  test -s "$PREPARED_MAIN_DROPIN"
+  sudo install -d -o root -g root -m 0755 \
+    /etc/systemd/system/probiga.service.d
+  sudo install -o root -g root -m 0644 "$PREPARED_MAIN_DROPIN" \
+    /etc/systemd/system/probiga.service.d/scheduler.conf
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    test -s "$PREPARED_AI_WORKER_DROPIN"
+    sudo install -d -o root -g root -m 0755 \
+      "$(dirname "$AI_WORKER_DROPIN")"
+    sudo install -o root -g root -m 0644 "$PREPARED_AI_WORKER_DROPIN" \
+      "$AI_WORKER_DROPIN"
+  fi
+}
 rollback() {
   local failed_status="${1:-$?}"
+  if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
+    trap - ERR TERM INT
+    exit "$failed_status"
+  fi
   local rollback_failed=0
   local current_sha=""
   local observed_scheduler_active=0
@@ -747,6 +1234,24 @@ rollback() {
   local services_quiescent=1
   trap - ERR TERM INT
   set +e
+  if [ "$CUTOVER_STARTED" -eq 0 ]; then
+    echo "Release preparation failed; the running services were not stopped" >&2
+    current_sha="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD 2>/dev/null)"
+    ACTIVE_REQUIREMENTS_SHA256="$PREVIOUS_REQUIREMENTS_SHA256"
+    ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
+    ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
+    if [ "$current_sha" != "$PREVIOUS_SHA" ] || \
+      ! systemctl is-active --quiet "$MAIN_SERVICE" || \
+      ! curl --fail --silent --show-error --retry 3 --retry-all-errors \
+        --retry-delay 1 --retry-connrefused \
+        http://127.0.0.1/api/health >/dev/null; then
+      echo "Preparation failed and the untouched service could not be verified" >&2
+      write_receipt "PREPARATION_FAILED_UNVERIFIED" "$current_sha" || true
+    else
+      write_receipt "PREPARATION_FAILED" "$PREVIOUS_SHA" || true
+    fi
+    exit "$failed_status"
+  fi
   echo "Deployment failed; rolling back to $PREVIOUS_SHA" >&2
 
   rollback_failure() {
@@ -760,7 +1265,7 @@ rollback() {
     sudo systemctl stop "$AI_WORKER_SERVICE" || \
       rollback_failure "stop AI recommendation worker"
     if systemctl is-active --quiet "$AI_WORKER_SERVICE"; then
-      rollback_failure "AI recommendation worker remained active before checkout"
+      rollback_failure "AI recommendation worker remained active before rollback"
       services_quiescent=0
     fi
   fi
@@ -777,15 +1282,16 @@ rollback() {
         inactive|failed) ;;
         *)
           rollback_failure \
-            "probiga-scheduler remained $service_active_state before checkout"
+            "probiga-scheduler remained $service_active_state before rollback"
           services_quiescent=0
           ;;
       esac
     fi
   fi
-  sudo systemctl stop probiga || rollback_failure "stop probiga"
+  if [ "$API_STOPPED" -eq 1 ]; then
+  sudo systemctl stop "$MAIN_SERVICE" || rollback_failure "stop probiga"
   if ! service_active_state="$(systemctl show -p ActiveState --value \
-    probiga)"; then
+    "$MAIN_SERVICE")"; then
     rollback_failure "inspect probiga stop state"
     services_quiescent=0
   else
@@ -793,29 +1299,15 @@ rollback() {
       inactive|failed) ;;
       *)
         rollback_failure \
-          "probiga remained $service_active_state before checkout"
+          "probiga remained $service_active_state before rollback"
         services_quiescent=0
         ;;
     esac
   fi
   if [ "$services_quiescent" -eq 1 ]; then
-    if ! git checkout --detach "$PREVIOUS_SHA"; then
-      rollback_failure "checkout previous Git revision"
-      restoration_ready=0
-    fi
-    if [ "$restoration_ready" -eq 1 ] && \
-      ! seal_release_checkout; then
-      rollback_failure "reseal previous Git checkout"
-      restoration_ready=0
-    fi
-    if [ "$restoration_ready" -eq 1 ] && \
-      ! assert_service_cannot_write_release_paths; then
-      rollback_failure "verify previous Git checkout is immutable"
-      restoration_ready=0
-    fi
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_DROPIN_PRESENT" -eq 1 ]; then
-        if ! sudo cp "$PREVIOUS_DROPIN" \
+        if ! sudo install -o root -g root -m 0644 "$PREVIOUS_DROPIN" \
           /etc/systemd/system/probiga.service.d/scheduler.conf; then
           rollback_failure "restore previous probiga drop-in"
           restoration_ready=0
@@ -828,11 +1320,10 @@ rollback() {
     fi
     if [ "$restoration_ready" -eq 1 ] && \
       [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
-      if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
-        if ! write_ai_worker_dropin "$PREVIOUS_RELEASE_REVISION" \
-          "$PREVIOUS_ADATA_SHA" "$PREVIOUS_ADATA_TREE_SHA256" \
-          "$PREVIOUS_ADATA_SOURCE"; then
-          rollback_failure "pin previous AI recommendation worker runtime"
+      if [ "$PREVIOUS_AI_WORKER_DROPIN_PRESENT" -eq 1 ]; then
+        if ! sudo install -o root -g root -m 0644 \
+          "$PREVIOUS_AI_WORKER_DROPIN" "$AI_WORKER_DROPIN"; then
+          rollback_failure "restore previous AI recommendation worker drop-in"
           restoration_ready=0
         fi
       elif ! sudo rm -f "$AI_WORKER_DROPIN"; then
@@ -846,23 +1337,26 @@ rollback() {
       restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ] && \
-      ! point_static_release_to_checkout; then
-      rollback_failure "point Nginx static assets at previous checkout"
+      ! point_static_release_to_checkout "$PREVIOUS_CODE_ROOT"; then
+      rollback_failure "point Nginx static assets at previous code release"
       restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ] && \
-      ! assert_nginx_static_matches_checkout; then
+      ! assert_nginx_static_matches_checkout "$PREVIOUS_CODE_ROOT"; then
       rollback_failure "verify previous Nginx static assets"
       restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ]; then
-      sudo systemctl start probiga || rollback_failure "start probiga"
+      sudo systemctl start "$MAIN_SERVICE" || rollback_failure "start probiga"
     else
       rollback_failure "probiga restart skipped after unsafe restore state"
     fi
   else
-    rollback_failure "services were not quiescent; code restoration skipped"
+    rollback_failure "services were not quiescent; runtime restoration skipped"
     restoration_ready=0
+  fi
+  else
+    echo "Cutover aborted before the API stop; leaving its checkout untouched" >&2
   fi
   if [ "$restoration_ready" -eq 1 ] && \
     [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
@@ -897,18 +1391,20 @@ rollback() {
       sudo systemctl stop "$AI_WORKER_TIMER" || \
         rollback_failure "keep AI recommendation worker timer stopped"
     fi
-    if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
-      assert_ai_worker_runtime "$PREVIOUS_RELEASE_REVISION" || \
+    if [ "$PREVIOUS_AI_WORKER_DROPIN_PRESENT" -eq 1 ] && \
+      [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
+      assert_ai_worker_runtime "$PREVIOUS_RELEASE_REVISION" \
+        "$PREVIOUS_VENV" "$PREVIOUS_CODE_ROOT" || \
         rollback_failure "verify previous AI recommendation worker runtime"
     fi
   fi
-  sudo systemctl is-active --quiet probiga || \
+  sudo systemctl is-active --quiet "$MAIN_SERVICE" || \
     rollback_failure "verify probiga is active"
   curl --fail --silent --show-error --retry 15 --retry-all-errors \
     --retry-delay 2 --retry-connrefused \
     http://127.0.0.1/api/health >/dev/null || \
     rollback_failure "verify previous API health"
-  current_sha="$(git rev-parse HEAD 2>/dev/null)"
+  current_sha="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD 2>/dev/null)"
   if [ "$current_sha" != "$PREVIOUS_SHA" ]; then
     rollback_failure "verify previous Git revision"
   fi
@@ -944,11 +1440,13 @@ rollback() {
 trap 'rollback $?' ERR
 trap 'rollback 143' TERM
 trap 'rollback 130' INT
-mkdir -p "$RELEASE_VENV_ROOT"
-chown root:root "$RELEASE_VENV_ROOT"
-chmod 0555 "$RELEASE_VENV_ROOT"
-sudo -u "$SERVICE_USER" test ! -w "$RELEASE_VENV_ROOT"
-sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"
+# PREPARE: all network, dependency, and release validation work happens while
+# the old API remains active. This phase must not mutate the live checkout.
+prepare_release
+
+# CUTOVER: only quiesce writers, install the prevalidated runtime definition,
+# reload systemd, start, and prove health/static. The live checkout is untouched.
+CUTOVER_STARTED=1
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop "$AI_WORKER_TIMER"
   sudo systemctl stop "$AI_WORKER_SERVICE"
@@ -959,143 +1457,12 @@ if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   ! systemctl is-active --quiet probiga-scheduler
   sudo systemctl disable probiga-scheduler
 fi
-sudo systemctl stop probiga
-git cat-file -e "${EXPECTED_SHA}^{commit}"
-git checkout --detach --force "$EXPECTED_SHA"
-find server biz integrations tools scripts strategies versions \
-  -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
-seal_release_checkout
-assert_service_cannot_write_release_paths
-test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-if [ -n "$PREVIOUS_ADATA_TREE_SHA256" ]; then
-  $BOOTSTRAP_PYTHON -I server/common/adata_release.py verify \
-    --source "$PREVIOUS_ADATA_SOURCE" --git-sha "$PREVIOUS_ADATA_SHA" \
-    --tree-sha256 "$PREVIOUS_ADATA_TREE_SHA256"
-fi
-RESOLVED_LOCK="$(mktemp)"
-printf '%s' "$RESOLVED_REQUIREMENTS_B64" | base64 -d > "$RESOLVED_LOCK"
-test "$(sha256sum "$RESOLVED_LOCK" | cut -d' ' -f1)" = \
-  "$EXPECTED_REQUIREMENTS_SHA256"
-verify_venv_dependency_lock() {
-  local venv_path="$1"
-  local observed_lock
-  observed_lock="$(mktemp)"
-  "$venv_path/bin/python" -m pip freeze --all --exclude-editable \
-    | awk 'tolower($0) !~ /^adata([[:space:]]|==|@)/' \
-    | LC_ALL=C sort > "$observed_lock"
-  test "$(sha256sum "$observed_lock" | cut -d' ' -f1)" = \
-    "$EXPECTED_REQUIREMENTS_SHA256"
-  rm -f "$observed_lock"
-}
-sudo mkdir -p "$ADATA_RUNTIME_ROOT"
-sudo chown root:root "$ADATA_RUNTIME_ROOT" "$(dirname "$ADATA_RUNTIME_ROOT")"
-sudo chmod 0755 "$ADATA_RUNTIME_ROOT" "$(dirname "$ADATA_RUNTIME_ROOT")"
-ADATA_SOURCE="$ADATA_RUNTIME_ROOT/$EXPECTED_ADATA_SHA-$EXPECTED_ADATA_TREE_SHA256"
-if [ ! -d "$ADATA_SOURCE" ]; then
-  ADATA_SOURCE_BUILD="$(mktemp -d)"
-  git --git-dir="$ADATA_GIT_CACHE" archive "$EXPECTED_ADATA_SHA" \
-    | tar -xf - -C "$ADATA_SOURCE_BUILD"
-  SEAL_JSON="$($BOOTSTRAP_PYTHON -I server/common/adata_release.py seal \
-    --source "$ADATA_SOURCE_BUILD" --git-sha "$EXPECTED_ADATA_SHA")"
-  SEALED_TREE_SHA="$(printf '%s' "$SEAL_JSON" | $BOOTSTRAP_PYTHON -I -c \
-    'import json,sys; print(json.load(sys.stdin)["tree_sha256"])')"
-  test "$SEALED_TREE_SHA" = "$EXPECTED_ADATA_TREE_SHA256"
-  chmod -R a+rX,a-w "$ADATA_SOURCE_BUILD"
-  sudo mv "$ADATA_SOURCE_BUILD" "$ADATA_SOURCE"
-fi
-sudo chown -R root:root "$ADATA_SOURCE"
-sudo chmod -R a+rX,a-w "$ADATA_SOURCE"
-sudo -u "$SERVICE_USER" test ! -w "$ADATA_RUNTIME_ROOT"
-sudo -u "$SERVICE_USER" test ! -w "$(dirname "$ADATA_RUNTIME_ROOT")"
-sudo -u "$SERVICE_USER" test ! -w "$(dirname "$(dirname "$ADATA_RUNTIME_ROOT")")"
-sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE"
-sudo -u "$SERVICE_USER" test -x "$ADATA_SOURCE"
-sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.gitsha"
-sudo -u "$SERVICE_USER" test -r "$ADATA_SOURCE/.probiga-adata.tree.sha256"
-$BOOTSTRAP_PYTHON -I server/common/adata_release.py verify \
-  --source "$ADATA_SOURCE" --git-sha "$EXPECTED_ADATA_SHA" \
-  --tree-sha256 "$EXPECTED_ADATA_TREE_SHA256"
-if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
-  test -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
-  EXPECTED_VENV_TARGET="$(readlink -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA")"
-  case "$EXPECTED_VENV_TARGET" in
-    "$RELEASE_VENV_ROOT"/build-*) ;;
-    *) echo "release venv target escaped its immutable root" >&2; exit 2 ;;
-  esac
-  sudo -u "$SERVICE_USER" test ! -w "$EXPECTED_VENV_TARGET"
-  test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.requirements.sha256")" = \
-    "$EXPECTED_REQUIREMENTS_SHA256"
-  test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.gitsha")" = \
-    "$EXPECTED_ADATA_SHA"
-  test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.adata.tree.sha256")" = \
-    "$EXPECTED_ADATA_TREE_SHA256"
-  verify_venv_dependency_lock "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
-  assert_service_cannot_write_tree "$EXPECTED_VENV_TARGET" \
-    "reused release virtual environment"
-else
-  EXPECTED_BUILD="$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-$RANDOM"
-  $BOOTSTRAP_PYTHON -I -m venv "$EXPECTED_BUILD"
-  "$EXPECTED_BUILD/bin/python" -m pip install -r "$RESOLVED_LOCK" --quiet
-  ADATA_BUILD_SOURCE="$(mktemp -d)"
-  ADATA_WHEEL_DIR="$(mktemp -d)"
-  git --git-dir="$ADATA_GIT_CACHE" archive "$EXPECTED_ADATA_SHA" \
-    | tar -xf - -C "$ADATA_BUILD_SOURCE"
-  "$EXPECTED_BUILD/bin/python" -m pip wheel --no-deps \
-    --wheel-dir "$ADATA_WHEEL_DIR" "$ADATA_BUILD_SOURCE" --quiet
-  mapfile -t ADATA_WHEELS < <(find "$ADATA_WHEEL_DIR" -maxdepth 1 \
-    -type f -name '*.whl' -print)
-  test "${#ADATA_WHEELS[@]}" -eq 1
-  "$EXPECTED_BUILD/bin/python" -m pip install --no-deps \
-    "${ADATA_WHEELS[0]}" --quiet
-  printf '%s\n' "$EXPECTED_REQUIREMENTS_SHA256" \
-    > "$EXPECTED_BUILD/.requirements.sha256"
-  printf '%s\n' "$EXPECTED_ADATA_SHA" > "$EXPECTED_BUILD/.adata.gitsha"
-  printf '%s\n' "$EXPECTED_ADATA_TREE_SHA256" \
-    > "$EXPECTED_BUILD/.adata.tree.sha256"
-  verify_venv_dependency_lock "$EXPECTED_BUILD"
-  chmod -R a+rX,a-w "$EXPECTED_BUILD"
-  sudo -u "$SERVICE_USER" test -x "$EXPECTED_BUILD/bin/python"
-  sudo -u "$SERVICE_USER" "$EXPECTED_BUILD/bin/python" -I -c \
-    'import sys; assert sys.version_info[:2] == (3, 14)'
-  assert_service_cannot_write_tree "$EXPECTED_BUILD" \
-    "new release virtual environment"
-  rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
-  ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
-fi
-GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
-  tools/validate_production_release_boundary.py \
-  --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
-# The Windows QMT bridge only runs registered task types. Refuse activation
-# unless the four delivery tasks were provisioned explicitly and match this
-# release; production deployment itself remains read-only with respect to DB.
-sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 \
-  PYTHONDONTWRITEBYTECODE=1 \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
-  tools/ensure_quality_gate.py --validate-review-delivery
-rm -f "$RESOLVED_LOCK"
-# Root-owned validation can refresh Git metadata with a restrictive umask.
-# Seal again immediately before the service-account identity proof and start.
-seal_release_checkout
-assert_service_cannot_write_release_paths
-release_identity_check 1
-sudo mkdir -p /etc/systemd/system/probiga.service.d
-write_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
-  "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
-if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
-  write_ai_worker_dropin "$EXPECTED_SHA" "$EXPECTED_ADATA_SHA" \
-    "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE"
-fi
+API_STOPPED=1
+sudo systemctl stop "$MAIN_SERVICE"
+install_prepared_dropins
 sudo systemctl daemon-reload
-systemctl show probiga --property=ExecStart --value \
-  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' >/dev/null
-systemctl show probiga --property=ExecStart --value \
-  | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
-if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
-  assert_ai_worker_runtime "$EXPECTED_SHA"
-fi
-sudo systemctl restart probiga
-SERVICE_MAIN_PID="$(systemctl show probiga --property=MainPID --value)"
+sudo systemctl start "$MAIN_SERVICE"
+SERVICE_MAIN_PID="$(systemctl show "$MAIN_SERVICE" --property=MainPID --value)"
 case "$SERVICE_MAIN_PID" in
   ''|0|*[!0-9]*)
     echo "probiga did not expose a valid main PID after restart" >&2
@@ -1106,20 +1473,26 @@ grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=true' \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- 'PYTHONSAFEPATH=1' \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
   --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
   cat "$HEALTH_RESPONSE" >&2
-  release_identity_check 0 >&2 || true
   rm -f "$HEALTH_RESPONSE"
   false
 fi
 cat "$HEALTH_RESPONSE"
 rm -f "$HEALTH_RESPONSE"
-sudo systemctl is-active --quiet probiga
-point_static_release_to_checkout
-assert_nginx_static_matches_checkout
+HEALTH_RESPONSE=""
+sudo systemctl is-active --quiet "$MAIN_SERVICE"
+point_static_release_to_checkout "$PREPARED_CODE_ROOT"
+assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT"
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   ! systemctl is-active --quiet probiga-scheduler
   ! systemctl is-enabled --quiet probiga-scheduler
@@ -1135,7 +1508,8 @@ if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   else
     sudo systemctl stop "$AI_WORKER_TIMER"
   fi
-  assert_ai_worker_runtime "$EXPECTED_SHA"
+  assert_ai_worker_runtime "$EXPECTED_SHA" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$PREPARED_CODE_ROOT"
   if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
     systemctl is-enabled --quiet "$AI_WORKER_TIMER"
   else
@@ -1148,17 +1522,24 @@ if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   fi
 fi
 assert_scheduler_triggers_quiescent
-test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-sudo -u "$SERVICE_USER" env \
-  "PYTHONPATH=$ADATA_SOURCE:/opt/ProBigA" \
-  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
-  tools/ensure_quality_gate.py \
+sudo -u "$SERVICE_USER" env PYTHONSAFEPATH=1 \
+  "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
   --task-type analysis_premarket_external
 ACTIVE_REQUIREMENTS_SHA256="$EXPECTED_REQUIREMENTS_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
 ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
-prune_release_venvs "$EXPECTED_SHA"
+if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
+  echo "Warning: release venv cleanup failed after activation" >&2
+fi
+if ! prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"; then
+  echo "Warning: immutable code release cleanup failed after activation" >&2
+fi
+if ! prune_release_temp_files; then
+  echo "Warning: release temp cleanup failed after activation" >&2
+fi
 df -h / >&2
 write_receipt "DEPLOYED" "$EXPECTED_SHA"
+DEPLOY_SUCCEEDED=1
 trap - ERR TERM INT
-rm -f "$PREVIOUS_DROPIN"
