@@ -1796,10 +1796,25 @@ grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$EXPECTED_ADATA_SHA" \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- \
+  "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$EXPECTED_ADATA_TREE_SHA256" \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$ADATA_SOURCE" \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- 'PYTHONSAFEPATH=1' \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
-grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
-  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+# The installed unit was already byte-compared with its prepared source, which
+# pins PYTHONPATH twice (Environment and /usr/bin/env).  Verify the live
+# interpreter and script directly here; /proc environ can omit PYTHONPATH after
+# interpreter startup on this production image even though the unit is exact.
+mapfile -d '' -t SCHEDULER_CMDLINE < "/proc/$SCHEDULER_MAIN_PID/cmdline"
+test "${SCHEDULER_CMDLINE[0]}" = \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+test "${SCHEDULER_CMDLINE[1]}" = -P
+test "${SCHEDULER_CMDLINE[2]}" = \
+  "$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"
 CUTOVER_STEP=verify_health
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
