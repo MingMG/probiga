@@ -1072,6 +1072,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf" in deploy_script
     assert "LEGACY_MAIN_OVERRIDE_DROPINS=(" in deploy_script
     assert "MAIN_LIMITS_DROPIN=" in deploy_script
+    assert "MAIN_MARKET_RADAR_DROPIN=" in deploy_script
     assert 'sudo rm -f "$legacy_main_dropin"' in deploy_script
     assert "main_identity missing_release_dropin=%q" in deploy_script
     assert "main_identity unexpected_dropin=%q" in deploy_script
