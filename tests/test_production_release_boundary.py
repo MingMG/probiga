@@ -422,7 +422,13 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     assert 'exit "$failed_status"' in child_guard
     assert "systemctl stop" not in child_guard
 
-    assert normalized.count("trap 'rollback $?' ERR") == 1
+    rollback_err_trap = "trap 'rollback \"$?\" \"$LINENO\"' ERR"
+    assert normalized.count(rollback_err_trap) == 1
+    assert 'local failed_line="${2:-0}"' in deploy_script
+    assert (
+        "deploy_failure phase=cutover cutover_step=%s line=%s status=%s"
+        in deploy_script
+    )
     assert "trap 'rollback 143' TERM" in normalized
     assert "trap 'rollback 130' INT" in normalized
     assert not re.search(
@@ -435,7 +441,7 @@ def test_main_service_downtime_only_activates_prepared_dropins() -> None:
         encoding="utf-8"
     )
     normalized = _normalized_shell(deploy_script)
-    cutover = normalized.index("trap 'rollback $?' ERR")
+    cutover = normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR")
     api_stop = _required_shell_position(
         normalized[cutover:],
         r'sudo systemctl stop (?:"\$MAIN_SERVICE"|probiga)(?:[ \t]|$)',
@@ -561,7 +567,7 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     )
     rollback = deploy_script[
         deploy_script.index("rollback() {"):
-        deploy_script.index("trap 'rollback $?' ERR")
+        deploy_script.index("trap 'rollback \"$?\" \"$LINENO\"' ERR")
     ]
     normalized_rollback = _normalized_shell(rollback)
 
@@ -638,9 +644,11 @@ def test_previous_code_fallback_and_code_retention_keep_two_generations() -> Non
     assert normalized.count(prune_call) == 1
     prune_position = normalized.index(prune_call)
     service_start = _required_shell_position(
-        normalized[normalized.index("trap 'rollback $?' ERR"):],
+        normalized[
+            normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR"):
+        ],
         r'sudo systemctl start (?:"\$MAIN_SERVICE"|probiga)(?:[ \t]|$)',
-    ) + normalized.index("trap 'rollback $?' ERR")
+    ) + normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR")
     static_switch = normalized.index(
         'point_static_release_to_checkout "$PREPARED_CODE_ROOT"',
         service_start,
@@ -902,7 +910,9 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "probiga-scheduler.socket" in workflow
     assert "assert_scheduler_triggers_quiescent" in workflow
     preflight = workflow.index("\nassert_scheduler_triggers_quiescent\n")
-    rollback_trap = workflow.index("trap 'rollback $?' ERR")
+    rollback_trap = workflow.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR"
+    )
     assert preflight < rollback_trap
     assert '"$checkout_root/.git" "$checkout_root/.github"' in workflow
     assert 'find "$checkout_root" -maxdepth 1' in workflow
@@ -1043,10 +1053,24 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     )
     assert (
         "systemctl show probiga-scheduler --property=ExecStart --value"
-        in deploy_script
+        not in deploy_script
     )
     assert (
-        "grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false'"
+        'cmp --silent "$PREPARED_MAIN_DROPIN" '
+        "/etc/systemd/system/probiga.service.d/scheduler.conf"
+        in normalized
+    )
+    assert (
+        'cmp --silent "$PREPARED_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"'
+        in normalized
+    )
+    assert (
+        'cmp --silent "$PREPARED_AI_WORKER_DROPIN" "$AI_WORKER_DROPIN"'
+        in normalized
+    )
+    assert "CUTOVER_STEP=verify_installed_runtime_units" in deploy_script
+    assert (
+        "grep -Fx 'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false'"
         in deploy_script
     )
     assert "grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false'" in deploy_script
@@ -1092,7 +1116,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "verify previous Nginx static assets" in deploy_script
     worker_stop = normalized.index(
         'sudo systemctl stop "$AI_WORKER_TIMER"',
-        normalized.index("trap 'rollback $?'"),
+        normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR"),
     )
     release_publish = normalized.index(
         'git --git-dir="$CODE_GIT_CACHE" worktree move '

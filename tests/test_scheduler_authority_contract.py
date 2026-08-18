@@ -110,25 +110,28 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
     workflow = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    runtime = workflow.index("trap 'rollback $?' ERR")
-    stop_scheduler = workflow.index(
+    normalized = " ".join(
+        line.strip() for line in workflow.splitlines() if line.strip()
+    )
+    runtime = normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR")
+    stop_scheduler = normalized.index(
         "sudo systemctl stop probiga-scheduler",
         runtime,
     )
-    stop_api = workflow.index(
-        "\nsudo systemctl stop probiga\n",
+    stop_api = normalized.index(
+        'sudo systemctl stop "$MAIN_SERVICE"',
         stop_scheduler,
     )
-    guard = workflow.index(
+    guard = normalized.index(
         "--require-no-live-scheduler-writers",
         stop_api,
     )
-    start_api = workflow.index("sudo systemctl restart probiga", guard)
-    start_scheduler = workflow.index(
+    start_api = normalized.index('sudo systemctl start "$MAIN_SERVICE"', guard)
+    start_scheduler = normalized.index(
         "sudo systemctl restart probiga-scheduler",
         start_api,
     )
-    deployed = workflow.index('write_receipt "DEPLOYED"', start_scheduler)
+    deployed = normalized.index('write_receipt "DEPLOYED"', start_scheduler)
 
     assert stop_scheduler < stop_api < guard < start_api < start_scheduler < deployed
     assert "--writer-drain-timeout-seconds 150" in workflow

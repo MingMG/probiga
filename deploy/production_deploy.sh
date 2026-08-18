@@ -788,6 +788,7 @@ test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 sudo -u "$SERVICE_USER" test ! -w "$BOOTSTRAP_PYTHON"
 test "$($BOOTSTRAP_PYTHON -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.14"
 CUTOVER_STARTED=0
+CUTOVER_STEP=preparation
 API_STOPPED=0
 DEPLOY_SUCCEEDED=0
 NEW_VENV_LINK=0
@@ -1407,6 +1408,7 @@ install_prepared_dropins() {
 }
 rollback() {
   local failed_status="${1:-$?}"
+  local failed_line="${2:-0}"
   if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
     trap - ERR TERM INT
     exit "$failed_status"
@@ -1420,6 +1422,13 @@ rollback() {
   local services_quiescent=1
   trap - ERR TERM INT
   set +e
+  if [ "$CUTOVER_STARTED" -eq 1 ]; then
+    printf 'deploy_failure phase=cutover cutover_step=%s line=%s status=%s\n' \
+      "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2
+  else
+    printf 'deploy_failure phase=preparation step=%s line=%s status=%s\n' \
+      "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2
+  fi
   if [ "$CUTOVER_STARTED" -eq 0 ]; then
     echo "Release preparation failed; the running services were not stopped" >&2
     current_sha="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD 2>/dev/null)"
@@ -1682,30 +1691,35 @@ rollback() {
   fi
   exit "$failed_status"
 }
-trap 'rollback $?' ERR
+trap 'rollback "$?" "$LINENO"' ERR
 trap 'rollback 143' TERM
 trap 'rollback 130' INT
 # PREPARE: all network, dependency, and release validation work happens while
 # the old API remains active. This phase must not mutate the live checkout.
+CUTOVER_STEP=prepare_release
 prepare_release
 
 # CUTOVER: only quiesce writers, install the prevalidated runtime definition,
 # reload systemd, start, and prove health/static. The live checkout is untouched.
 CUTOVER_STARTED=1
+CUTOVER_STEP=stop_auxiliary_writers
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop "$AI_WORKER_TIMER"
   sudo systemctl stop "$AI_WORKER_SERVICE"
   ! systemctl is-active --quiet "$AI_WORKER_SERVICE"
 fi
+CUTOVER_STEP=stop_scheduler
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
   ! systemctl is-active --quiet probiga-scheduler
   sudo systemctl disable probiga-scheduler
 fi
+CUTOVER_STEP=stop_api
 API_STOPPED=1
 sudo systemctl stop "$MAIN_SERVICE"
 # Persist the Layer-4 writer fence while both scheduler implementations are
 # stopped. Activation is a separate, schema-gated maintenance operation.
+CUTOVER_STEP=writer_fence
 WRITER_FENCE_STATUS=0
 (
   cd "$PREPARED_CODE_ROOT"
@@ -1726,19 +1740,27 @@ if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
   fi
   false
 fi
+CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
+CUTOVER_STEP=verify_installed_runtime_units
+# ExecStart's `systemctl show` rendering varies across systemd releases and is
+# not the installed unit source of truth. Compare the exact files here; the
+# post-start /proc checks below independently prove the effective processes.
+cmp --silent "$PREPARED_MAIN_DROPIN" \
+  /etc/systemd/system/probiga.service.d/scheduler.conf
+cmp --silent "$PREPARED_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  cmp --silent "$PREPARED_AI_WORKER_DROPIN" "$AI_WORKER_DROPIN"
+fi
+CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
-systemctl show "$MAIN_SERVICE" --property=ExecStart --value \
-  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' >/dev/null
-systemctl show "$MAIN_SERVICE" --property=ExecStart --value \
-  | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
-systemctl show probiga-scheduler --property=ExecStart --value \
-  | grep -F -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' >/dev/null
-systemctl show probiga-scheduler --property=ExecStart --value \
-  | grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" >/dev/null
+CUTOVER_STEP=start_api
 sudo systemctl start "$MAIN_SERVICE"
+CUTOVER_STEP=enable_scheduler
 sudo systemctl enable probiga-scheduler
+CUTOVER_STEP=start_scheduler
 sudo systemctl restart probiga-scheduler
+CUTOVER_STEP=verify_api_process
 SERVICE_MAIN_PID="$(systemctl show "$MAIN_SERVICE" --property=MainPID --value)"
 case "$SERVICE_MAIN_PID" in
   ''|0|*[!0-9]*)
@@ -1758,6 +1780,7 @@ grep -zFx -- 'PYTHONSAFEPATH=1' \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+CUTOVER_STEP=verify_scheduler_process
 SCHEDULER_MAIN_PID="$(systemctl show probiga-scheduler --property=MainPID --value)"
 case "$SCHEDULER_MAIN_PID" in
   ''|0|*[!0-9]*)
@@ -1777,6 +1800,7 @@ grep -zFx -- 'PYTHONSAFEPATH=1' \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+CUTOVER_STEP=verify_health
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
