@@ -1084,11 +1084,13 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         '< "/proc/$SCHEDULER_MAIN_PID/cmdline"'
         in normalized
     )
+    assert 'EXPECTED_VENV_TARGET="$EXPECTED_BUILD"' in deploy_script
     assert (
-        'test "${SCHEDULER_CMDLINE[0]}" = '
-        '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"'
+        '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"| '
+        '"$EXPECTED_VENV_TARGET/bin/python"'
         in normalized
     )
+    assert "scheduler_identity unexpected_argv0=%q" in deploy_script
     assert (
         'test "${SCHEDULER_CMDLINE[2]}" = '
         '"$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"'
