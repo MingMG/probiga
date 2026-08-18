@@ -131,7 +131,8 @@ jobs:
             test -d "$active_code"
             test -L /opt/ProBigA-current
             test "$(readlink -f /opt/ProBigA-current)" = "$active_code"
-            test "$(git -C "$active_code" rev-parse HEAD)" = \
+            test "$(git -c safe.directory="$active_code" \
+              -C "$active_code" rev-parse HEAD)" = \
               "$PROBIGA_EXPECTED_GIT_SHA"
             exec sudo -n /usr/bin/env -- \
               PROBIGA_DEPLOYMENT_MODE="$PROBIGA_DEPLOYMENT_MODE" \

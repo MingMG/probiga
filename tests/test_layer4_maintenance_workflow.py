@@ -26,6 +26,8 @@ def test_layer4_workflow_is_manual_protected_and_sha_pinned() -> None:
         'test "$(readlink -f /opt/ProBigA-current)" = "$active_code"'
         in workflow
     )
+    assert 'git -c safe.directory="$active_code"' in workflow
+    assert '-C "$active_code" rev-parse HEAD' in workflow
     assert "exec sudo -n /usr/bin/env --" in workflow
     assert "cd /opt/ProBigA" not in workflow
 
