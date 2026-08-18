@@ -980,6 +980,12 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "disable first-install scheduler unit" in deploy_script
     assert "first-install scheduler remained active after rollback" in deploy_script
     assert "first-install scheduler remained enabled after rollback" in deploy_script
+    assert 'PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE"' in deploy_script
+    assert 'tr \'\\0\' \'\\n\' < "/proc/$PREVIOUS_MAIN_PID/environ"' in deploy_script
+    assert "runtime_environment_value PROBIGA_CODE_ROOT" in deploy_script
+    assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_SHA" in deploy_script
+    assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256" in deploy_script
+    assert "runtime_environment_value PROBIGA_ADATA_SOURCE_DIR" in deploy_script
     assert (
         "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
         in main_dropin

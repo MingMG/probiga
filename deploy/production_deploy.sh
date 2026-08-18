@@ -845,6 +845,19 @@ dropin_environment_value() {
   local name="$1"
   sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN" | tail -n 1
 }
+PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" --property=MainPID --value)"
+case "$PREVIOUS_MAIN_PID" in
+  ''|0|*[!0-9]*)
+    echo "running probiga service did not expose a valid main PID" >&2
+    exit 2
+    ;;
+esac
+runtime_environment_value() {
+  local name="$1"
+  tr '\0' '\n' < "/proc/$PREVIOUS_MAIN_PID/environ" \
+    | sed -n "s|^$name=||p" \
+    | tail -n 1
+}
 PREVIOUS_RELEASE_REVISION=""
 PREVIOUS_VENV=""
 for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
@@ -884,6 +897,10 @@ if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
 fi
 PREVIOUS_CODE_ROOT="$(dropin_environment_value PROBIGA_CODE_ROOT)"
 if [ -z "$PREVIOUS_CODE_ROOT" ]; then
+  PREVIOUS_CODE_ROOT="$(runtime_environment_value PROBIGA_CODE_ROOT)"
+fi
+if [ -z "$PREVIOUS_CODE_ROOT" ] && \
+  [ "$PREVIOUS_SHA" = "$LEGACY_LIVE_SHA" ]; then
   PREVIOUS_CODE_ROOT="$REPOSITORY_ROOT"
 fi
 case "$PREVIOUS_CODE_ROOT" in
@@ -904,6 +921,15 @@ esac
 PREVIOUS_ADATA_SHA="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
 PREVIOUS_ADATA_TREE_SHA256="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
 PREVIOUS_ADATA_SOURCE="$(dropin_environment_value PROBIGA_ADATA_SOURCE_DIR)"
+if [ -z "$PREVIOUS_ADATA_SHA" ]; then
+  PREVIOUS_ADATA_SHA="$(runtime_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
+fi
+if [ -z "$PREVIOUS_ADATA_TREE_SHA256" ]; then
+  PREVIOUS_ADATA_TREE_SHA256="$(runtime_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
+fi
+if [ -z "$PREVIOUS_ADATA_SOURCE" ]; then
+  PREVIOUS_ADATA_SOURCE="$(runtime_environment_value PROBIGA_ADATA_SOURCE_DIR)"
+fi
 if [ -n "$PREVIOUS_ADATA_SHA$PREVIOUS_ADATA_TREE_SHA256$PREVIOUS_ADATA_SOURCE" ]; then
   [[ "$PREVIOUS_ADATA_SHA" =~ ^[0-9a-f]{40}$ ]]
   [[ "$PREVIOUS_ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
