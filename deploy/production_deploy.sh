@@ -881,6 +881,36 @@ else
       break
     fi
   done
+  if [ -z "$PREVIOUS_VENV" ]; then
+    running_venv=""
+    mapfile -t matching_venvs < <(
+      find "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT" \
+        -mindepth 1 -maxdepth 1 -type d \
+        -name "build-$PREVIOUS_RELEASE_REVISION-*" -print
+    )
+    if [ "${#matching_venvs[@]}" -eq 1 ]; then
+      running_venv="${matching_venvs[0]}"
+    else
+      for candidate_venv in "${matching_venvs[@]}"; do
+        if grep -aFq -- "$candidate_venv" \
+          "/proc/$PREVIOUS_MAIN_PID/maps"; then
+          test -z "$running_venv"
+          running_venv="$candidate_venv"
+        fi
+      done
+    fi
+    test -n "$running_venv"
+    test -x "$running_venv/bin/python"
+    test "$(stat -c '%U' "$running_venv")" = root
+    candidate_root="$(dirname "$running_venv")"
+    recovered_link="$candidate_root/.recover-$PREVIOUS_RELEASE_REVISION-$$"
+    test ! -e "$candidate_root/$PREVIOUS_RELEASE_REVISION"
+    test ! -L "$candidate_root/$PREVIOUS_RELEASE_REVISION"
+    ln -s "$running_venv" "$recovered_link"
+    mv -T "$recovered_link" "$candidate_root/$PREVIOUS_RELEASE_REVISION"
+    PREVIOUS_VENV="$candidate_root/$PREVIOUS_RELEASE_REVISION"
+    echo "Recovered active release venv link for $PREVIOUS_RELEASE_REVISION" >&2
+  fi
   test -n "$PREVIOUS_VENV"
 fi
 PREVIOUS_REQUIREMENTS_SHA256=""

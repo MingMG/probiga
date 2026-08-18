@@ -988,6 +988,9 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         'PROBIGA_EXPECTED_GIT_SHA)"'
         in deploy_script
     )
+    assert '-name "build-$PREVIOUS_RELEASE_REVISION-*" -print' in deploy_script
+    assert '"/proc/$PREVIOUS_MAIN_PID/maps"' in deploy_script
+    assert "Recovered active release venv link" in deploy_script
     assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_SHA" in deploy_script
     assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256" in deploy_script
     assert "runtime_environment_value PROBIGA_ADATA_SOURCE_DIR" in deploy_script
