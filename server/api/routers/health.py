@@ -61,12 +61,21 @@ _BYTECODE_SCAN_ROOTS = (
 )
 
 
+def _release_git_command(*args: str) -> list[str]:
+    """Inspect the root-owned immutable checkout without global Git state."""
+    return [
+        "git",
+        "-c",
+        f"safe.directory={REPOSITORY_ROOT}",
+        *args,
+    ]
+
+
 def _untracked_root_shadow_files() -> tuple[str, ...]:
     """Find root-level import shadows, including files ignored by Git."""
     tracked = set(
         subprocess.run(
-            [
-                "git",
+            _release_git_command(
                 "ls-files",
                 "--",
                 ":(top,glob)*.py",
@@ -78,7 +87,7 @@ def _untracked_root_shadow_files() -> tuple[str, ...]:
                 ":(top,glob)*/__init__*.pyc",
                 ":(top,glob)*/__init__*.pyd",
                 ":(top,glob)*/__init__*.so",
-            ],
+            ),
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
@@ -246,7 +255,7 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
     )
     try:
         actual = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            _release_git_command("rev-parse", "HEAD"),
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
@@ -256,8 +265,7 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
             timeout=5,
         ).stdout.strip()
         tracked_status = subprocess.run(
-            [
-                "git",
+            _release_git_command(
                 "status",
                 "--porcelain",
                 "--untracked-files=all",
@@ -287,7 +295,7 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
                 ":(top,glob)*/__init__*.pyc",
                 ":(top,glob)*/__init__*.pyd",
                 ":(top,glob)*/__init__*.so",
-            ],
+            ),
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
@@ -298,8 +306,7 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
         ).stdout.strip()
         tracked_worktree_clean = tracked_status == ""
         untracked_output = subprocess.run(
-            [
-                "git",
+            _release_git_command(
                 "ls-files",
                 "--others",
                 "--exclude-standard",
@@ -311,7 +318,7 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
                 "integrations",
                 "tools",
                 "scripts",
-            ],
+            ),
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,

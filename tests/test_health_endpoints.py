@@ -3,6 +3,16 @@ from __future__ import annotations
 from server.api.routers import health
 
 
+def test_release_git_inspection_marks_immutable_checkout_safe() -> None:
+    assert health._release_git_command("rev-parse", "HEAD") == [
+        "git",
+        "-c",
+        f"safe.directory={health.REPOSITORY_ROOT}",
+        "rev-parse",
+        "HEAD",
+    ]
+
+
 def test_qmt_capabilities_uses_external_collector_without_local_sdk(monkeypatch):
     from integrations.qmt import bridge
     from integrations.qmt import diagnostics
