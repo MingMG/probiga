@@ -976,6 +976,10 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         in deploy_script
     )
     assert 'test "$SCHEDULER_UNIT_PRESENT" -eq 1' not in deploy_script
+    assert "SCHEDULER_UNIT_TOUCHED=0" in deploy_script
+    assert "disable first-install scheduler unit" in deploy_script
+    assert "first-install scheduler remained active after rollback" in deploy_script
+    assert "first-install scheduler remained enabled after rollback" in deploy_script
     assert (
         "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
         in main_dropin

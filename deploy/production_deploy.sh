@@ -87,14 +87,17 @@ precutover_failure() {
   local failed_status="$1"
   local failed_line="$2"
   if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
-    return "$failed_status"
+    trap - ERR TERM INT
+    exit "$failed_status"
   fi
-  trap - ERR
-  echo "Production deploy preparation failed at line $failed_line (status $failed_status)" >&2
-  write_receipt "PREPARE_FAILED" "$PREVIOUS_SHA" || true
+  trap - ERR TERM INT
+  set +e
+  printf 'deploy_failure phase=preflight line=%s status=%s\n' \
+    "$failed_line" "$failed_status" >&2
+  write_receipt "PREFLIGHT_FAILED" "$PREVIOUS_SHA" || true
   exit "$failed_status"
 }
-trap 'precutover_failure "$?" "${BASH_LINENO[0]:-$LINENO}"' ERR
+trap 'precutover_failure "$?" "$LINENO"' ERR
 MAIN_SERVICE=probiga
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
@@ -792,6 +795,7 @@ STAGING_WORKTREE=""
 PREPARED_CODE_ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 CODE_VALIDATION_ROOT=""
 NEW_CODE_RELEASE=0
+SCHEDULER_UNIT_TOUCHED=0
 ADATA_CACHE_BUILD=""
 ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
@@ -1305,6 +1309,7 @@ install_prepared_dropins() {
   test -s "$PREPARED_SCHEDULER_DROPIN"
   sudo install -d -o root -g root -m 0755 \
     "$(dirname "$SCHEDULER_UNIT")"
+  SCHEDULER_UNIT_TOUCHED=1
   sudo install -o root -g root -m 0644 "$PREPARED_SCHEDULER_DROPIN" \
     "$SCHEDULER_UNIT"
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
@@ -1366,7 +1371,8 @@ rollback() {
     fi
   fi
   if [ "$services_quiescent" -eq 1 ] && \
-    [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+    { [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ] || \
+      [ "$SCHEDULER_UNIT_TOUCHED" -eq 1 ]; }; then
     sudo systemctl stop probiga-scheduler || \
       rollback_failure "stop probiga-scheduler"
     if ! service_active_state="$(systemctl show -p ActiveState --value \
@@ -1421,9 +1427,16 @@ rollback() {
           rollback_failure "restore previous scheduler drop-in"
           restoration_ready=0
         fi
-      elif ! sudo rm -f "$SCHEDULER_UNIT"; then
-        rollback_failure "remove release scheduler drop-in"
-        restoration_ready=0
+      else
+        if [ "$SCHEDULER_UNIT_PRESENT" -eq 0 ] && \
+          ! sudo systemctl disable probiga-scheduler; then
+          rollback_failure "disable first-install scheduler unit"
+          restoration_ready=0
+        fi
+        if ! sudo rm -f "$SCHEDULER_UNIT"; then
+          rollback_failure "remove release scheduler unit"
+          restoration_ready=0
+        fi
       fi
     fi
     if [ "$restoration_ready" -eq 1 ] && \
@@ -1552,6 +1565,14 @@ rollback() {
     fi
     if [ "$observed_scheduler_enabled" -ne "$PREVIOUS_SCHEDULER_ENABLED" ]; then
       rollback_failure "restore probiga-scheduler enabled state"
+    fi
+  elif [ "$SCHEDULER_UNIT_TOUCHED" -eq 1 ] && \
+    [ "$SCHEDULER_UNIT_PRESENT" -eq 0 ]; then
+    if systemctl is-active --quiet probiga-scheduler; then
+      rollback_failure "first-install scheduler remained active after rollback"
+    fi
+    if systemctl is-enabled --quiet probiga-scheduler; then
+      rollback_failure "first-install scheduler remained enabled after rollback"
     fi
   fi
   assert_scheduler_triggers_quiescent || \
