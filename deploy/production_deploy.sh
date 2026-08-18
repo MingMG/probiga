@@ -882,6 +882,22 @@ else
     fi
   done
   if [ -z "$PREVIOUS_VENV" ]; then
+    runtime_python_argv0="$(tr '\0' '\n' \
+      < "/proc/$PREVIOUS_MAIN_PID/cmdline" | head -n 1)"
+    case "$runtime_python_argv0" in
+      "$RELEASE_VENV_ROOT"/[0-9a-f][0-9a-f]*/bin/python|\
+      "$LEGACY_RELEASE_VENV_ROOT"/[0-9a-f][0-9a-f]*/bin/python)
+        runtime_argv0_venv="$(dirname "$(dirname "$runtime_python_argv0")")"
+        runtime_argv0_revision="$(basename "$runtime_argv0_venv")"
+        [[ "$runtime_argv0_revision" =~ ^[0-9a-f]{40}$ ]]
+        if [ -L "$runtime_argv0_venv" ] && \
+          [ -x "$runtime_argv0_venv/bin/python" ]; then
+          PREVIOUS_VENV="$runtime_argv0_venv"
+        fi
+        ;;
+    esac
+  fi
+  if [ -z "$PREVIOUS_VENV" ]; then
     running_venv=""
     mapfile -t matching_venvs < <(
       find "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT" \

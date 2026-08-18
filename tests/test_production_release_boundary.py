@@ -989,6 +989,8 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         in deploy_script
     )
     assert '-name "build-$PREVIOUS_RELEASE_REVISION-*" -print' in deploy_script
+    assert '"/proc/$PREVIOUS_MAIN_PID/cmdline"' in deploy_script
+    assert "runtime_python_argv0" in deploy_script
     assert '"/proc/$PREVIOUS_MAIN_PID/maps"' in deploy_script
     assert "Recovered active release venv link" in deploy_script
     assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_SHA" in deploy_script
