@@ -116,6 +116,7 @@ LEGACY_MAIN_OVERRIDE_DROPINS=(
 )
 MAIN_LIMITS_DROPIN=/etc/systemd/system/probiga.service.d/limits.conf
 MAIN_MARKET_RADAR_DROPIN=/etc/systemd/system/probiga.service.d/market-radar.conf
+MAIN_SERVICE_USER_DROPIN=/etc/systemd/system/probiga.service.d/service-user.conf
 LEGACY_SCHEDULER_OVERRIDE_DROPINS=(
   /etc/systemd/system/probiga-scheduler.service.d/release.conf
   /etc/systemd/system/probiga-scheduler.service.d/release-path.conf
@@ -1841,7 +1842,8 @@ case " $MAIN_DROPIN_PATHS " in
 esac
 for main_dropin_path in $MAIN_DROPIN_PATHS; do
   case "$main_dropin_path" in
-    "$MAIN_RELEASE_DROPIN"|"$MAIN_LIMITS_DROPIN"|"$MAIN_MARKET_RADAR_DROPIN") ;;
+    "$MAIN_RELEASE_DROPIN"|"$MAIN_LIMITS_DROPIN"|\
+    "$MAIN_MARKET_RADAR_DROPIN"|"$MAIN_SERVICE_USER_DROPIN") ;;
     *)
       printf 'main_identity unexpected_dropin=%q\n' \
         "$main_dropin_path" >&2
