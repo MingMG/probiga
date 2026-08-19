@@ -7,6 +7,7 @@ resolved, and research-only Trading V4/V5/V6 code is never schedulable.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 
@@ -79,6 +80,8 @@ def resolve_scheduler_script(
 
 
 def _require_clean_head_file(root: Path, relative_path: str) -> None:
+    git_environment = os.environ.copy()
+    git_environment["GIT_OPTIONAL_LOCKS"] = "0"
     commands = (
         ("ls-files", "--error-unmatch", "--", relative_path),
         ("diff", "--quiet", "HEAD", "--", relative_path),
@@ -87,10 +90,11 @@ def _require_clean_head_file(root: Path, relative_path: str) -> None:
     for command in commands:
         try:
             subprocess.run(
-                ["git", *command],
+                ["git", "-c", f"safe.directory={root}", *command],
                 cwd=root,
                 check=True,
                 capture_output=True,
+                env=git_environment,
                 timeout=10,
             )
         except (OSError, subprocess.SubprocessError) as exc:
