@@ -12,7 +12,7 @@ from datetime import date, datetime
 from typing import Any, Iterable
 
 from sqlalchemy import bindparam, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from .calibration import CalibrationTable
@@ -1305,33 +1305,79 @@ class TradingV3Repository:
                 },
             )
 
+    @staticmethod
+    def _decision_run_has_requested_as_of(
+        connection: Connection,
+        *,
+        dialect_name: str,
+    ) -> bool:
+        """Return whether the optional Layer-4 session-date column exists.
+
+        Production can legitimately remain on the V3 core schema while the
+        forward-only Layer-4 migration waits for its maintenance window. Date
+        filtered read models therefore use the frozen snapshot fallback until
+        that migration has added ``requested_as_of``.
+        """
+
+        if dialect_name == "sqlite":
+            columns = connection.execute(
+                text("PRAGMA table_info(st_decision_run_v3)")
+            ).mappings().all()
+            return any(
+                str(column.get("name") or "") == "requested_as_of"
+                for column in columns
+            )
+        if dialect_name in {"mysql", "mariadb"}:
+            return connection.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'st_decision_run_v3'
+                      AND COLUMN_NAME = 'requested_as_of'
+                    LIMIT 1
+                    """
+                )
+            ).scalar() is not None
+        # V3 runs only on MySQL in production and SQLite in repository tests.
+        # Preserve the prior query for any explicitly supplied test dialect.
+        return True
+
     def _latest_run(
         self,
         trade_date: date | None = None,
     ) -> dict[str, Any] | None:
         where = ""
         params: dict[str, Any] = {}
-        if trade_date is not None:
-            dialect_name = str(
-                getattr(getattr(self.engine, "dialect", None), "name", "")
-            ).casefold()
-            if dialect_name == "sqlite":
-                requested_expression = (
-                    "COALESCE(requested_as_of, "
-                    "json_extract(portfolio_json, "
-                    "'$.decision_snapshot.requested_as_of'), "
-                    "date(decision_at))"
-                )
-            else:
-                requested_expression = (
-                    "COALESCE(requested_as_of, "
-                    "STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT("
-                    "portfolio_json, '$.decision_snapshot.requested_as_of'"
-                    ")), '%Y-%m-%d'), DATE(decision_at))"
-                )
-            where = f"WHERE {requested_expression} = :trade_date"
-            params["trade_date"] = trade_date
+        dialect_name = str(
+            getattr(getattr(self.engine, "dialect", None), "name", "")
+        ).casefold()
         with self.engine.connect() as connection:
+            if trade_date is not None:
+                has_requested_as_of = self._decision_run_has_requested_as_of(
+                    connection,
+                    dialect_name=dialect_name,
+                )
+                requested_column = (
+                    "requested_as_of, " if has_requested_as_of else ""
+                )
+                if dialect_name == "sqlite":
+                    requested_expression = (
+                        f"COALESCE({requested_column}"
+                        "json_extract(portfolio_json, "
+                        "'$.decision_snapshot.requested_as_of'), "
+                        "date(decision_at))"
+                    )
+                else:
+                    requested_expression = (
+                        f"COALESCE({requested_column}"
+                        "STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT("
+                        "portfolio_json, '$.decision_snapshot.requested_as_of'"
+                        ")), '%Y-%m-%d'), DATE(decision_at))"
+                    )
+                where = f"WHERE {requested_expression} = :trade_date"
+                params["trade_date"] = trade_date
             row = connection.execute(
                 text(
                     f"""
