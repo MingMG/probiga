@@ -28,6 +28,7 @@ LEVEL1_SNAPSHOT_MAX_AGE_SECONDS = 15.0
 LEVEL1_EVENT_MAX_AGE_SECONDS = 15.0
 LEVEL1_MAX_INGRESS_SECONDS = 15.0
 LEVEL1_FUTURE_TOLERANCE_SECONDS = 2.0
+MINUTE_SPOOL_BATCH_LIMIT = 50
 
 
 def _codes(values: Iterable[str] | str) -> list[str]:
@@ -320,18 +321,54 @@ def minute(
 ) -> pd.DataFrame:
     start_bound = _minute_bound(start_date or trade_date, end=False)
     end_bound = _minute_bound(end_date or trade_date, end=True)
-    response = _call(
-        "minute",
-        timeout=timeout,
-        stock_codes=_codes(stock_codes),
-        trade_date=str(trade_date or ""),
-        start_date=start_bound,
-        end_date=end_bound,
-        count=max(0, int(count or 0)),
-        download_history=bool(download_history) if download_history is not None else True,
-        batch_size=batch_size,
+    codes = _codes(stock_codes)
+    total_timeout = _timeout(timeout)
+    deadline = time.monotonic() + total_timeout
+    requested_batch_size = int(batch_size or MINUTE_SPOOL_BATCH_LIMIT)
+    effective_batch_size = max(
+        1,
+        min(MINUTE_SPOOL_BATCH_LIMIT, requested_batch_size),
     )
-    return pd.DataFrame(response.get("rows") or [])
+    code_batches = [
+        codes[offset : offset + effective_batch_size]
+        for offset in range(0, len(codes), effective_batch_size)
+    ] or [[]]
+
+    rows: list[dict[str, Any]] = []
+    for code_batch in code_batches:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Big QMT minute timed out after {total_timeout:.1f}s total"
+            )
+        # Keep each spool request bounded so the QMT strategy returns to its
+        # bridge tick between batches.  That gives genuine Level-1 callbacks
+        # and tracked-snapshot flushing a chance to run during a full-market
+        # minute refresh instead of being blocked for the whole universe.
+        response = _call(
+            "minute",
+            timeout=remaining,
+            stock_codes=code_batch,
+            trade_date=str(trade_date or ""),
+            start_date=start_bound,
+            end_date=end_bound,
+            count=max(0, int(count or 0)),
+            download_history=(
+                bool(download_history)
+                if download_history is not None
+                else True
+            ),
+            batch_size=effective_batch_size,
+        )
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Big QMT minute timed out after {total_timeout:.1f}s total"
+            )
+        batch_rows = response.get("rows") or []
+        if not isinstance(batch_rows, list):
+            raise RuntimeError("Big QMT minute response rows must be a list")
+        rows.extend(batch_rows)
+    return pd.DataFrame(rows)
 
 
 def sector_list(*, timeout: int | float | None = None) -> pd.DataFrame:

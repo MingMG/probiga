@@ -18,7 +18,7 @@ def to_qmt_symbol(code: str) -> str | None:
     digits = "".join(ch for ch in text if ch.isdigit())
     if len(digits) != 6:
         return None
-    if digits.startswith("6"):
+    if digits.startswith(("5", "6", "9")):
         return f"{digits}.SH"
     if digits.startswith(("0", "3")):
         return f"{digits}.SZ"

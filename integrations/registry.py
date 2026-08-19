@@ -41,6 +41,7 @@ _DEFAULT_SOURCES: dict[str, str] = {
 
 # 别名 -> 规范名 映射
 _SOURCE_ALIASES: dict[str, str] = {
+    "big_qmt": "bigqmt",
     "gm": "myquant",
     "goldminer": "myquant",
     "emquant": "myquant",

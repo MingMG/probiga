@@ -12,8 +12,10 @@ import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime
@@ -59,6 +61,8 @@ from tools.remote_support import DEFAULT_REMOTE_SSH_HOST
 
 _last_remote_portfolio_codes: list[str] = []
 _trade_day_cache: dict[str, bool] = {}
+_maintenance_process_lock = threading.Lock()
+_maintenance_processes: set[subprocess.Popen] = set()
 MEMBERSHIP_SNAPSHOT_TASK_TYPE = "qmt_membership_snapshot"
 ETF_FORWARD_TASK_TYPE = "etf_forward_daily"
 ETF_FORWARD_RETRY_MINUTES = 10
@@ -135,7 +139,8 @@ def _membership_snapshot_task(engine) -> dict[str, Any] | None:
             text(
                 """
                 SELECT id, task_name, task_type, cron_time, enabled,
-                       last_run_at, last_triggered_at, last_run_status
+                       last_run_at, last_triggered_at, last_run_status,
+                       last_run_duration, last_run_output
                   FROM st_scheduled_tasks
                  WHERE task_type = :task_type
                  LIMIT 1
@@ -152,7 +157,8 @@ def _etf_forward_task(engine) -> dict[str, Any] | None:
             text(
                 """
                 SELECT id, task_name, task_type, cron_time, enabled,
-                       last_run_at, last_triggered_at, last_run_status
+                       last_run_at, last_triggered_at, last_run_status,
+                       last_run_duration, last_run_output
                   FROM st_scheduled_tasks
                  WHERE task_type = :task_type
                  LIMIT 1
@@ -174,6 +180,234 @@ def _coerce_datetime(value: Any) -> datetime | None:
         return None
 
 
+def _process_identity(pid: int) -> tuple[bool, str]:
+    """Return whether a process exists and a PID-reuse-resistant start token."""
+    if int(pid) <= 0:
+        return False, ""
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_process_times = kernel32.GetProcessTimes
+        get_process_times.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        get_process_times.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(0x1000, False, int(pid))
+        if not handle:
+            # ERROR_INVALID_PARAMETER means the PID does not exist.  Access
+            # denied is treated as alive/unknown so recovery stays fail-closed.
+            return ctypes.get_last_error() not in {87, 1168}, ""
+        try:
+            created = wintypes.FILETIME()
+            exited = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not get_process_times(
+                handle,
+                ctypes.byref(created),
+                ctypes.byref(exited),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return True, ""
+            token = (int(created.dwHighDateTime) << 32) | int(
+                created.dwLowDateTime
+            )
+            return True, str(token)
+        finally:
+            close_handle(handle)
+
+    proc_path = Path(f"/proc/{int(pid)}")
+    try:
+        return True, str(proc_path.stat().st_ctime_ns)
+    except FileNotFoundError:
+        return False, ""
+    except OSError:
+        return True, ""
+
+
+def _bridge_task_owner() -> dict[str, Any]:
+    alive, start_token = _process_identity(os.getpid())
+    if not alive:
+        start_token = ""
+    return {
+        "executor": "windows_big_qmt_bridge",
+        "lease_version": 1,
+        "host": socket.gethostname().casefold(),
+        "pid": os.getpid(),
+        "process_start_token": start_token,
+        "claimed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _parse_bridge_task_owner(value: Any) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        lease_version = int(payload.get("lease_version") or 0)
+        owner_pid = int(payload.get("pid") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        payload.get("executor") != "windows_big_qmt_bridge"
+        or lease_version != 1
+        or owner_pid <= 0
+    ):
+        return None
+    return payload
+
+
+def _bridge_task_owner_is_alive(owner: dict[str, Any]) -> bool:
+    owner_host = str(owner.get("host") or "").casefold()
+    if owner_host and owner_host != socket.gethostname().casefold():
+        # A different QMT host cannot be inspected locally.  Never steal its
+        # lease; this remains fail-closed even if the topology changes later.
+        return True
+    alive, actual_start = _process_identity(int(owner.get("pid") or 0))
+    if not alive:
+        return False
+    expected_start = str(owner.get("process_start_token") or "")
+    return not expected_start or not actual_start or expected_start == actual_start
+
+
+def _bridge_task_lease_seconds(
+    task: dict[str, Any],
+    *,
+    task_type: str,
+) -> float:
+    if task_type == ETF_FORWARD_TASK_TYPE:
+        env_name = "BIG_QMT_ETF_FORWARD_LEASE_SECONDS"
+        default_seconds = 1800.0
+        minimum_seconds = 1500.0
+    else:
+        env_name = "BIG_QMT_MEMBERSHIP_LEASE_SECONDS"
+        default_seconds = 14400.0
+        minimum_seconds = 1800.0
+    try:
+        configured = float(os.environ.get(env_name, str(default_seconds)))
+    except (TypeError, ValueError):
+        configured = default_seconds
+    try:
+        previous_duration = max(0.0, float(task.get("last_run_duration") or 0))
+    except (TypeError, ValueError):
+        previous_duration = 0.0
+    return max(minimum_seconds, configured, previous_duration * 2.0)
+
+
+def _recover_abandoned_bridge_task(
+    engine,
+    task: dict[str, Any],
+    *,
+    task_type: str,
+    now: datetime | None = None,
+) -> bool:
+    """CAS-reset a dead owner or an expired legacy maintenance lease."""
+    if str(task.get("last_run_status") or "").lower() != "running":
+        return False
+
+    owner = _parse_bridge_task_owner(task.get("last_run_output"))
+    reason = "owner process exited"
+    if owner is not None:
+        if _bridge_task_owner_is_alive(owner):
+            return False
+    else:
+        reference = _coerce_datetime(task.get("last_run_at")) or _coerce_datetime(
+            task.get("last_triggered_at")
+        )
+        lease_seconds = _bridge_task_lease_seconds(task, task_type=task_type)
+        if reference is not None:
+            age_seconds = max(
+                0.0,
+                ((now or datetime.now()) - reference).total_seconds(),
+            )
+            if age_seconds < lease_seconds:
+                return False
+        reason = "legacy maintenance lease expired"
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE st_scheduled_tasks
+                   SET last_run_status = 'failed',
+                       last_run_output = :output,
+                       last_run_duration = GREATEST(
+                           0,
+                           TIMESTAMPDIFF(
+                               SECOND,
+                               COALESCE(last_run_at, last_triggered_at),
+                               NOW()
+                           )
+                       ),
+                       updated_at = NOW()
+                 WHERE id = :id
+                   AND last_run_status = 'running'
+                   AND last_run_at <=> :last_run_at
+                   AND last_triggered_at <=> :last_triggered_at
+                """
+            ),
+            {
+                "id": int(task["id"]),
+                "last_run_at": task.get("last_run_at"),
+                "last_triggered_at": task.get("last_triggered_at"),
+                "output": (
+                    "executor=windows_big_qmt_bridge\n"
+                    f"recovered_at={datetime.now().isoformat(timespec='seconds')}\n"
+                    f"reason={reason}"
+                ),
+            },
+        )
+    return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+def _claim_bridge_task_run(
+    engine,
+    task: dict[str, Any],
+    *,
+    task_type: str,
+) -> bool:
+    if str(task.get("last_run_status") or "").lower() == "running":
+        if not _recover_abandoned_bridge_task(
+            engine,
+            task,
+            task_type=task_type,
+        ):
+            return False
+    task_id = int(task["id"])
+    if not claim_scheduler_task_run(engine, task_id):
+        return False
+    update_scheduler_task(
+        engine,
+        task_id,
+        {
+            "last_run_output": json.dumps(
+                _bridge_task_owner(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        },
+    )
+    return True
+
+
 def _calendar_trade_day(engine, current: datetime) -> bool:
     with engine.connect() as conn:
         count = conn.execute(
@@ -190,60 +424,75 @@ def _calendar_trade_day(engine, current: datetime) -> bool:
     return bool(int(count or 0))
 
 
+def _terminate_maintenance_process_tree(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _terminate_active_maintenance_processes() -> None:
+    with _maintenance_process_lock:
+        processes = list(_maintenance_processes)
+    for process in processes:
+        _terminate_maintenance_process_tree(process)
+
+
 def _run_etf_forward_command() -> dict[str, Any]:
-    daily = subprocess.run(
+    popen_kwargs: dict[str, Any] = {
+        "cwd": ROOT,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    daily = subprocess.Popen(
         [
             sys.executable,
             str(ROOT / "tools" / "run_etf_forward_daily.py"),
             "--execute",
         ],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=1200,
-        check=False,
+        **popen_kwargs,
     )
-    promotion = None
-    if int(daily.returncode) == 0:
-        promotion = subprocess.run(
-            [
-                sys.executable,
-                str(
-                    ROOT
-                    / "tools"
-                    / "promote_etf_forward_to_production.py"
-                ),
-                "--promote-production",
-            ],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,
-            check=False,
-        )
-    returncode = (
-        int(daily.returncode)
-        if promotion is None
-        else int(promotion.returncode)
-    )
+    with _maintenance_process_lock:
+        _maintenance_processes.add(daily)
+    try:
+        stdout, stderr = daily.communicate(timeout=1200)
+    except subprocess.TimeoutExpired:
+        _terminate_maintenance_process_tree(daily)
+        raise
+    finally:
+        with _maintenance_process_lock:
+            _maintenance_processes.discard(daily)
     return {
-        "returncode": returncode,
-        "daily_stdout_tail": daily.stdout.strip()[-3000:],
-        "daily_stderr_tail": daily.stderr.strip()[-1500:],
-        "promotion_stdout_tail": (
-            promotion.stdout.strip()[-3000:]
-            if promotion is not None
-            else ""
-        ),
-        "promotion_stderr_tail": (
-            promotion.stderr.strip()[-1500:]
-            if promotion is not None
-            else ""
-        ),
+        "returncode": int(daily.returncode),
+        "daily_stdout_tail": stdout.strip()[-3000:],
+        "daily_stderr_tail": stderr.strip()[-1500:],
+        "delivery_mode": "CONFIGURED_DATABASE_DIRECT",
+        "promotion_stdout_tail": "",
+        "promotion_stderr_tail": "",
     }
 
 
@@ -277,8 +526,6 @@ def maybe_run_etf_forward_daily(
     if last_triggered and last_triggered.date() == current.date():
         if last_status == "success":
             return {"status": "current"}
-        if last_status == "running":
-            return {"status": "already_running"}
         if (
             last_status in {"failed", "timeout", "stopped"}
             and last_run
@@ -288,7 +535,11 @@ def maybe_run_etf_forward_daily(
             return {"status": "retry_wait"}
 
     task_id = int(task["id"])
-    if not claim_scheduler_task_run(engine, task_id):
+    if not _claim_bridge_task_run(
+        engine,
+        task,
+        task_type=ETF_FORWARD_TASK_TYPE,
+    ):
         return {"status": "already_running"}
 
     started = time.monotonic()
@@ -430,7 +681,11 @@ def maybe_sync_membership_snapshot(
         }
 
     task_id = int(task["id"])
-    if not claim_scheduler_task_run(engine, task_id):
+    if not _claim_bridge_task_run(
+        engine,
+        task,
+        task_type=MEMBERSHIP_SNAPSHOT_TASK_TYPE,
+    ):
         return {
             "status": "already_running",
             "snapshot_date": snapshot_date.isoformat(),
@@ -1137,6 +1392,86 @@ def sync_big_qmt_realtime(
     return result
 
 
+def _launch_maintenance_job(
+    state: dict[str, Any],
+    *,
+    name: str,
+    runner,
+) -> bool:
+    """Run one slow maintenance job without blocking quote ingestion.
+
+    ETF and membership maintenance can take minutes.  They used to execute in
+    the quote-consumer loop, leaving the sync receipt stale and prompting the
+    supervisor to recycle an otherwise healthy bridge.  Keep a single daemon
+    slot so those heavy jobs remain serialized while quote receipts continue.
+    """
+    existing = state.get("thread")
+    if isinstance(existing, threading.Thread) and existing.is_alive():
+        return False
+
+    results = state.setdefault("results", {})
+    results[name] = {
+        "status": "running",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    def target() -> None:
+        try:
+            result = runner()
+            if not isinstance(result, dict):
+                result = {
+                    "status": "error",
+                    "error": "maintenance runner returned a non-object result",
+                }
+        except Exception as exc:
+            result = {"status": "error", "error": str(exc)}
+        results[name] = result
+        state["active_name"] = None
+        if result.get("status") in {"success", "failed", "error"}:
+            print(
+                json.dumps({name: result}, ensure_ascii=False, default=str),
+                flush=True,
+            )
+
+    thread = threading.Thread(
+        target=target,
+        name=f"big-qmt-{name}",
+        daemon=True,
+    )
+    state["thread"] = thread
+    state["active_name"] = name
+    try:
+        thread.start()
+    except Exception as exc:
+        state["thread"] = None
+        state["active_name"] = None
+        results[name] = {"status": "error", "error": str(exc)}
+        return False
+    return True
+
+
+def _run_maintenance_with_fresh_engine(runner) -> dict[str, Any]:
+    """Give a background maintenance job an isolated SQLAlchemy pool."""
+    maintenance_engine = create_batch_engine(future=True)
+    try:
+        return runner(maintenance_engine)
+    finally:
+        dispose = getattr(maintenance_engine, "dispose", None)
+        if callable(dispose):
+            dispose()
+
+
+def _shutdown_maintenance_job(
+    state: dict[str, Any],
+    *,
+    wait_seconds: float = 15.0,
+) -> None:
+    _terminate_active_maintenance_processes()
+    thread = state.get("thread")
+    if isinstance(thread, threading.Thread) and thread.is_alive():
+        thread.join(max(0.0, float(wait_seconds)))
+
+
 def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> int:
     engine = create_batch_engine(future=True)
     stopped = False
@@ -1154,6 +1489,7 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
     last_membership_result: dict[str, Any] = {}
     last_etf_forward_check = 0.0
     last_etf_forward_result: dict[str, Any] = {}
+    maintenance_state: dict[str, Any] = {"results": {}}
     last_tokens: dict[str, str] = {}
     last_level1_reconnect = 0.0
     while not stopped:
@@ -1219,49 +1555,35 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
                 time.monotonic() - last_etf_forward_check
                 >= etf_check_seconds
             ):
-                try:
-                    last_etf_forward_result = (
-                        maybe_run_etf_forward_daily(engine)
-                    )
-                except Exception as exc:
-                    last_etf_forward_result = {
-                        "status": "error",
-                        "error": str(exc),
-                    }
-                finally:
+                if _launch_maintenance_job(
+                    maintenance_state,
+                    name="etf_forward_daily",
+                    runner=lambda: _run_maintenance_with_fresh_engine(
+                        maybe_run_etf_forward_daily
+                    ),
+                ):
                     last_etf_forward_check = time.monotonic()
-                if last_etf_forward_result.get("status") in {
-                    "success",
-                    "failed",
-                    "error",
-                }:
-                    print(
-                        json.dumps(
-                            {
-                                "etf_forward_daily":
-                                    last_etf_forward_result
-                            },
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                        flush=True,
-                    )
             membership_check_seconds = max(
                 60.0,
                 float(os.environ.get("BIG_QMT_MEMBERSHIP_CHECK_SECONDS", "300")),
             )
             if time.monotonic() - last_membership_check >= membership_check_seconds:
-                last_membership_result = maybe_sync_membership_snapshot(engine)
-                last_membership_check = time.monotonic()
-                if last_membership_result.get("status") in {"success", "error"}:
-                    print(
-                        json.dumps(
-                            {"membership_snapshot": last_membership_result},
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                        flush=True,
-                    )
+                if _launch_maintenance_job(
+                    maintenance_state,
+                    name="membership_snapshot",
+                    runner=lambda: _run_maintenance_with_fresh_engine(
+                        maybe_sync_membership_snapshot
+                    ),
+                ):
+                    last_membership_check = time.monotonic()
+            maintenance_results = maintenance_state.get("results", {})
+            if isinstance(maintenance_results, dict):
+                last_etf_forward_result = dict(
+                    maintenance_results.get("etf_forward_daily") or {}
+                )
+                last_membership_result = dict(
+                    maintenance_results.get("membership_snapshot") or {}
+                )
             if last_membership_result:
                 result["membership_snapshot"] = last_membership_result
             if last_etf_forward_result:
@@ -1280,6 +1602,7 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
             _write_status(qmt_home, error)
             print(json.dumps(error, ensure_ascii=False), file=sys.stderr, flush=True)
         time.sleep(max(0.2, poll_seconds))
+    _shutdown_maintenance_job(maintenance_state)
     return 0
 
 
@@ -1319,11 +1642,14 @@ def main() -> int:
 
     if installed_path:
         print(f"Installed QMT strategy: {installed_path}", flush=True)
-    return run_daemon(
-        qmt_home=qmt_home,
-        poll_seconds=max(0.2, args.poll_seconds),
-        tracked_limit=max(1, min(280, args.tracked_limit)),
-    )
+    try:
+        return run_daemon(
+            qmt_home=qmt_home,
+            poll_seconds=max(0.2, args.poll_seconds),
+            tracked_limit=max(1, min(280, args.tracked_limit)),
+        )
+    finally:
+        _terminate_active_maintenance_processes()
 
 
 if __name__ == "__main__":

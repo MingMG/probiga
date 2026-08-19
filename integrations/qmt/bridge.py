@@ -26,6 +26,9 @@ def python_path() -> Path:
 
 
 def is_configured() -> bool:
+    gateway_enabled = os.environ.get("QMT_GATEWAY_ENABLED", "1").strip().lower()
+    if gateway_enabled not in {"0", "false", "no", "off"}:
+        return True
     return python_path().exists() and WORKER.exists()
 
 
