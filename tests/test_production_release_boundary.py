@@ -455,7 +455,7 @@ def test_production_deploy_can_recover_from_external_writer_block() -> None:
     assert "systemctl is-active --quiet probiga-scheduler" in recovery
     assert "systemctl is-enabled --quiet probiga-scheduler" in recovery
     assert 'sudo systemctl start "$MAIN_SERVICE"' in recovery
-    assert "http://127.0.0.1/api/health" in recovery
+    assert "http://127.0.0.1/api/health/runtime" in recovery
     assert recovery.count(
         'PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE"'
     ) == 1

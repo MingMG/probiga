@@ -916,7 +916,7 @@ case "$PREVIOUS_MAIN_PID" in
     systemctl is-active --quiet "$MAIN_SERVICE"
     curl --fail --silent --show-error --retry 15 --retry-all-errors \
       --retry-delay 2 --retry-connrefused \
-      http://127.0.0.1/api/health >/dev/null
+      http://127.0.0.1/api/health/runtime >/dev/null
     PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" \
       --property=MainPID --value)"
     case "$PREVIOUS_MAIN_PID" in
