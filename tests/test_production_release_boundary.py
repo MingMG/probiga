@@ -436,6 +436,32 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     )
 
 
+def test_production_deploy_can_recover_from_external_writer_block() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    recovery_start = deploy_script.index(
+        'PREVIOUS_MAIN_STATE="$(systemctl show "$MAIN_SERVICE"'
+    )
+    recovery_end = deploy_script.index(
+        "runtime_environment_value() {", recovery_start
+    )
+    recovery = deploy_script[recovery_start:recovery_end]
+
+    assert "inactive|failed" in recovery
+    assert '"$PREVIOUS_DROPIN_PRESENT" -ne 1' in recovery
+    assert "API_EMBEDDED_SCHEDULER_ENABLED=false" in recovery
+    assert "systemctl is-active --quiet probiga-scheduler" in recovery
+    assert "systemctl is-enabled --quiet probiga-scheduler" in recovery
+    assert 'sudo systemctl start "$MAIN_SERVICE"' in recovery
+    assert "http://127.0.0.1/api/health" in recovery
+    assert recovery.count(
+        'PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE"'
+    ) == 1
+    assert "recovered probiga service did not expose a valid main PID" in recovery
+
+
 def test_main_service_downtime_only_activates_prepared_dropins() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"

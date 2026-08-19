@@ -891,8 +891,40 @@ dropin_environment_value() {
 PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" --property=MainPID --value)"
 case "$PREVIOUS_MAIN_PID" in
   ''|0|*[!0-9]*)
-    echo "running probiga service did not expose a valid main PID" >&2
-    exit 2
+    PREVIOUS_MAIN_STATE="$(systemctl show "$MAIN_SERVICE" \
+      --property=ActiveState --value)"
+    case "$PREVIOUS_MAIN_STATE" in
+      inactive|failed) ;;
+      *)
+        echo "probiga service is $PREVIOUS_MAIN_STATE without a valid main PID" >&2
+        exit 2
+        ;;
+    esac
+    if [ "$PREVIOUS_DROPIN_PRESENT" -ne 1 ] || \
+      ! grep -Fq 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
+        "$PREVIOUS_DROPIN"; then
+      echo "stopped probiga service has no safe immutable runtime definition" >&2
+      exit 2
+    fi
+    if systemctl is-active --quiet probiga-scheduler || \
+      systemctl is-enabled --quiet probiga-scheduler; then
+      echo "refusing API recovery while probiga-scheduler is active or enabled" >&2
+      exit 2
+    fi
+    echo "Recovering stopped probiga API before deployment preflight" >&2
+    sudo systemctl start "$MAIN_SERVICE"
+    systemctl is-active --quiet "$MAIN_SERVICE"
+    curl --fail --silent --show-error --retry 15 --retry-all-errors \
+      --retry-delay 2 --retry-connrefused \
+      http://127.0.0.1/api/health >/dev/null
+    PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" \
+      --property=MainPID --value)"
+    case "$PREVIOUS_MAIN_PID" in
+      ''|0|*[!0-9]*)
+        echo "recovered probiga service did not expose a valid main PID" >&2
+        exit 2
+        ;;
+    esac
     ;;
 esac
 runtime_environment_value() {
