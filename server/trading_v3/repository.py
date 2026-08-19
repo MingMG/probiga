@@ -596,9 +596,10 @@ class TradingV3Repository:
             requested_as_of, date
         ):
             raise ValueError("requested_as_of must be a date")
+        decision_snapshot = dict(snapshot_manifest or {})
         if snapshot_manifest is not None:
             manifest_requested = str(
-                snapshot_manifest.get("requested_as_of") or ""
+                decision_snapshot.get("requested_as_of") or ""
             ).strip()
             if (
                 manifest_requested
@@ -607,6 +608,11 @@ class TradingV3Repository:
                 raise ValueError(
                     "requested_as_of does not match the frozen snapshot manifest"
                 )
+        # The requested session date is part of the frozen decision truth even
+        # before the optional Layer-4 column exists.  Persist it in the JSON
+        # envelope so pre-migration writes remain readable by the compatibility
+        # projection and the later forward migration can backfill safely.
+        decision_snapshot["requested_as_of"] = requested_as_of.isoformat()
         normalized_run_status = str(run_status or "").upper()
         if normalized_run_status not in {"COMPLETED", "BLOCKED"}:
             raise ValueError(
@@ -657,8 +663,7 @@ class TradingV3Repository:
             "order_authority": False,
             "real_order_allowed": False,
         }
-        if snapshot_manifest is not None:
-            portfolio["decision_snapshot"] = dict(snapshot_manifest)
+        portfolio["decision_snapshot"] = decision_snapshot
         persisted_run_status = (
             "PROCESSING" if defer_completion else normalized_run_status
         )
@@ -840,11 +845,24 @@ class TradingV3Repository:
             shadow_position_count=len(shadow_rows),
         )
         with self.engine.begin() as connection:
+            dialect_name = str(
+                getattr(getattr(self.engine, "dialect", None), "name", "")
+            ).casefold()
+            has_requested_as_of = self._decision_run_has_requested_as_of(
+                connection,
+                dialect_name=dialect_name,
+            )
+            requested_column = (
+                "requested_as_of, " if has_requested_as_of else ""
+            )
+            requested_value = (
+                ":requested_as_of, " if has_requested_as_of else ""
+            )
             connection.execute(
                 text(
-                    """
+                    f"""
                     INSERT INTO st_decision_run_v3 (
-                        run_uid, trade_date, requested_as_of,
+                        run_uid, trade_date, {requested_column}
                         decision_at, mode,
                         model_version, config_hash, code_commit_sha,
                         calibration_set_hash, lifecycle_status, status,
@@ -853,7 +871,7 @@ class TradingV3Repository:
                         target_count, data_snapshot_hash, result_hash,
                         created_at, completed_at
                     ) VALUES (
-                        :run_uid, :trade_date, :requested_as_of,
+                        :run_uid, :trade_date, {requested_value}
                         :decision_at, :mode,
                         :model_version, :config_hash, :code_commit_sha,
                         :calibration_set_hash, :lifecycle_status, :status,

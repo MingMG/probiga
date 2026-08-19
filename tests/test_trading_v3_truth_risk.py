@@ -666,9 +666,13 @@ def test_materializer_persists_rejected_risk_without_creating_order(
     )
 
 
-def test_repository_persists_run_and_actionable_status_separately():
+@pytest.mark.parametrize("has_requested_as_of", [True, False])
+def test_repository_persists_run_and_actionable_status_separately(
+    has_requested_as_of,
+):
     class Result:
-        pass
+        def scalar(self):
+            return 1 if has_requested_as_of else None
 
     class Connection:
         def __init__(self):
@@ -688,6 +692,8 @@ def test_repository_persists_run_and_actionable_status_separately():
             return False
 
     class Engine:
+        dialect = type("Dialect", (), {"name": "mysql"})()
+
         def begin(self):
             return Context()
 
@@ -710,14 +716,21 @@ def test_repository_persists_run_and_actionable_status_separately():
         defer_completion=True,
     )
 
-    insert = next(
-        params
+    insert_sql, insert = next(
+        (sql, params)
         for sql, params in connection.calls
         if "INSERT INTO st_decision_run_v3" in sql
     )
     portfolio = json.loads(insert["portfolio_json"])
     assert insert["status"] == "PROCESSING"
     assert insert["requested_as_of"] == date(2026, 8, 5)
+    assert ("run_uid, trade_date, requested_as_of," in insert_sql) is (
+        has_requested_as_of
+    )
+    assert (
+        ":run_uid, :trade_date, :requested_as_of," in insert_sql
+    ) is has_requested_as_of
+    assert portfolio["decision_snapshot"]["requested_as_of"] == "2026-08-05"
     assert portfolio["decision_truth"]["run_status"] == "BLOCKED"
     assert portfolio["decision_truth"]["actionable_status"] == "DATA_BLOCKED"
     assert portfolio["decision_truth"]["order_authority"] is False
