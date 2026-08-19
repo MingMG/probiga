@@ -16,6 +16,10 @@ from server.common.scheduler_authority import (
     scheduler_authority_contract,
 )
 from server.api.routers._engine import get_engine
+from server.common.scheduler_script_policy import (
+    SchedulerScriptPolicyError,
+    resolve_scheduler_script,
+)
 from server.common.batch_db import quote_identifier
 from server.common.adata_release import (
     ADATA_GIT_MARKER,
@@ -513,11 +517,52 @@ def _combine_qmt_table_status(*items: dict[str, object]) -> str:
     return "ok"
 
 
+def _primary_database_readiness() -> dict[str, str | bool]:
+    """Prove that the primary database accepts a minimal round trip."""
+
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            ready = conn.execute(text("SELECT 1")).scalar_one() == 1
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "error": type(exc).__name__,
+        }
+    if not ready:
+        return {
+            "status": "error",
+            "ready": False,
+            "error": "unexpected_probe_result",
+        }
+    return {"status": "ok", "ready": True}
+
+
+def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
+    """Exercise the same immutable-script gate used by scheduled tasks."""
+
+    try:
+        resolve_scheduler_script(
+            REPOSITORY_ROOT,
+            "tools/run_scheduler_daemon.py",
+        )
+    except (OSError, SchedulerScriptPolicyError) as exc:
+        return {
+            "status": "error",
+            "ready": False,
+            "error": type(exc).__name__,
+        }
+    return {"status": "ok", "ready": True}
+
+
 @router.get("/health")
 def health():
     revision = _deployed_git_revision()
     adata_revision = _deployed_adata_revision()
     auth = admin_auth_status()
+    database = _primary_database_readiness()
+    scheduler_script_policy = _scheduler_script_policy_readiness()
     production_mode = revision["deployment_mode"] == "production"
     scheduler_authority = scheduler_authority_contract()
     scheduler = scheduler_runtime_info()
@@ -561,6 +606,16 @@ def health():
             status_code=503,
             detail="production administrative authentication is not ready",
         )
+    if production_mode and database.get("ready") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail="primary database readiness check failed",
+        )
+    if production_mode and scheduler_script_policy.get("ready") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail="scheduler script policy readiness check failed",
+        )
     if production_mode and (
         scheduler.get("embedded_scheduler_enabled") is not False
         or scheduler.get("embedded_scheduler_running") is not False
@@ -583,8 +638,10 @@ def health():
         "release_revision": revision,
         "adata_release_revision": adata_revision,
         "admin_auth_ready": bool(auth.get("ready")),
+        "database": database,
         "scheduler_runtime": scheduler,
         "scheduler_authority": scheduler_authority,
+        "scheduler_script_policy": scheduler_script_policy,
         "standalone_scheduler": standalone_scheduler,
         "in_app_deploy_enabled": (
             os.environ.get("PROBIGA_IN_APP_DEPLOY_ENABLED", "").strip() == "1"

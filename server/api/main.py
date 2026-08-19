@@ -8,7 +8,13 @@ import time
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import (
+    DBAPIError,
+    InterfaceError,
+    OperationalError,
+    SQLAlchemyError,
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from starlette.concurrency import run_in_threadpool
 
 from server.api.admin_auth import validate_admin_request
@@ -23,6 +29,76 @@ from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
 
 logger = logging.getLogger(__name__)
+
+_MYSQL_CONNECTION_ERROR_CODES = frozenset(
+    {
+        1040,  # too many connections
+        1042,  # unable to resolve database host
+        1043,  # bad handshake
+        1045,  # access denied
+        1049,  # unknown database
+        1053,  # server shutdown in progress
+        1077,  # server shutdown
+        1129,  # host blocked
+        1130,  # host not allowed
+        1152,
+        1153,
+        1154,
+        1155,
+        1156,
+        1157,
+        1158,
+        1159,
+        1160,
+        1161,
+        1203,  # per-user connection limit
+        1226,  # resource connection limit
+        2002,
+        2003,
+        2006,
+        2012,
+        2013,
+        2026,
+        2055,
+    }
+)
+
+
+def _dbapi_error_code(exc: SQLAlchemyError) -> int | None:
+    original = getattr(exc, "orig", None)
+    arguments = getattr(original, "args", ())
+    if arguments and isinstance(arguments[0], int):
+        return int(arguments[0])
+    return None
+
+
+def _database_error_response(
+    exc: SQLAlchemyError,
+) -> tuple[int, dict[str, object]]:
+    """Return a safe, accurate public response for a SQLAlchemy failure."""
+
+    error_code = _dbapi_error_code(exc)
+    unavailable = isinstance(
+        exc,
+        (InterfaceError, SQLAlchemyTimeoutError),
+    ) or (
+        isinstance(exc, OperationalError)
+        and (
+            error_code is None
+            or error_code in _MYSQL_CONNECTION_ERROR_CODES
+        )
+    ) or (isinstance(exc, DBAPIError) and bool(exc.connection_invalidated))
+    if unavailable:
+        return 503, {
+            "status": "error",
+            "error": "database_unavailable",
+            "message": "数据库连接暂时不可用，请稍后重试。",
+        }
+    return 500, {
+        "status": "error",
+        "error": "database_operation_failed",
+        "message": "数据库操作失败，服务版本或数据结构可能不一致。",
+    }
 
 
 def _desktop_runtimes_allowed() -> bool:
@@ -140,15 +216,18 @@ async def add_timing_headers(request: Request, call_next):
 
 @app.exception_handler(SQLAlchemyError)
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
-    logger.error("Database error while handling %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    logger.error(
+        "Database error while handling %s %s: type=%s code=%s invalidated=%s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        _dbapi_error_code(exc),
+        bool(getattr(exc, "connection_invalidated", False)),
+    )
+    status_code, content = _database_error_response(exc)
     return JSONResponse(
-        status_code=503,
-        content={
-            "status": "error",
-            "error": "database_unavailable",
-            "message": "数据库暂时不可用，请确认 MySQL 已启动后重试。",
-            "detail": str(exc),
-        },
+        status_code=status_code,
+        content=content,
     )
 
 
