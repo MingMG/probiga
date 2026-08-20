@@ -58,6 +58,9 @@ FORWARD_SHADOW_BINDING_PROTOCOL = (
 QMT_OUTCOME_ATTESTATION_PROTOCOL = (
     "probiga.trading-v3.qmt-attested-outcome-bars.v1"
 )
+SOURCE_ATTRIBUTION_POLICY = (
+    "PREDICTION_SCORE_THEN_SELECTED_SOURCE_THEN_RAW_SCORE_V1"
+)
 
 
 class _CandidateFeatureBlocked(HorizonModelError):
@@ -723,6 +726,44 @@ def score_proxy_model(
     }
 
 
+def _candidate_source_order_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Order duplicate stock candidates without arbitrary attribution.
+
+    A horizon model scores stock features, so two source sleeves for the same
+    stock commonly receive the exact same prediction.  In that case the
+    source contract must follow the sleeve selected by the frozen portfolio;
+    otherwise forward outcomes can be attributed to whichever database row
+    happened to be visited first.  Rejected observations fall back to the
+    strongest raw sleeve score and stable identity fields.
+    """
+
+    prediction = row.get("prediction")
+    score_value = (
+        prediction.get("score")
+        if isinstance(prediction, Mapping)
+        else getattr(prediction, "score", None)
+    )
+    try:
+        score = float(score_value)
+        raw_score = float(row.get("raw_score"))
+    except (TypeError, ValueError) as exc:
+        raise HorizonModelError(
+            "candidate source ranking inputs are invalid"
+        ) from exc
+    if not math.isfinite(score) or not math.isfinite(raw_score):
+        raise HorizonModelError(
+            "candidate source ranking inputs are not finite"
+        )
+    selected = str(row.get("selection_status") or "") == "SELECTED"
+    return (
+        -score,
+        -int(selected),
+        -raw_score,
+        str(row.get("strategy_key") or ""),
+        str(row.get("forecast_id") or ""),
+    )
+
+
 def materialize_proxy_horizon_contracts(
     repository: ShadowIntelligenceRepository,
     calendar_engine: Engine,
@@ -927,8 +968,8 @@ def materialize_proxy_horizon_contracts(
                         current = candidates.get(stock_code)
                         if (
                             current is None
-                            or float(prediction.score)
-                            > float(current["prediction"].score)
+                            or _candidate_source_order_key(scored_row)
+                            < _candidate_source_order_key(current)
                         ):
                             candidates[stock_code] = scored_row
                 real_candidates_by_horizon[horizon] = candidates
@@ -979,8 +1020,8 @@ def materialize_proxy_horizon_contracts(
                     current = candidates.get(stock_code)
                     if (
                         current is None
-                        or float(proxy["score"])
-                        > float(current["prediction"]["score"])
+                        or _candidate_source_order_key(scored_row)
+                        < _candidate_source_order_key(current)
                     ):
                         candidates[stock_code] = scored_row
         blocked_research_artifact = (
@@ -1145,6 +1186,7 @@ def materialize_proxy_horizon_contracts(
                 real_candidate_blocks_by_horizon[horizon]
             ),
             "imputed_feature_keys": sorted(imputed_union),
+            "source_attribution_policy": SOURCE_ATTRIBUTION_POLICY,
             "decision_scope": "RESEARCH_ONLY",
             "order_authority": False,
         }
@@ -1165,6 +1207,7 @@ def materialize_proxy_horizon_contracts(
         "runtime_model_selection": runtime_selection,
         "runtime_suite_release_id": runtime_suite_release_id,
         "runtime_suite_authority": runtime_suite_authority,
+        "source_attribution_policy": SOURCE_ATTRIBUTION_POLICY,
         "artifact_registry_status": (
             "UNAVAILABLE"
             if any(
@@ -1962,6 +2005,7 @@ def run_continuous_model_lifecycle_cycle(
 
 
 __all__ = [
+    "SOURCE_ATTRIBUTION_POLICY",
     "evaluate_shadow_releases",
     "materialize_horizon_outcomes",
     "materialize_proxy_horizon_contracts",

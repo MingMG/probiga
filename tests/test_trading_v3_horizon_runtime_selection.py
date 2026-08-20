@@ -14,6 +14,7 @@ from server.api.routers import trading_v3
 from server.trading_v3 import daily_features
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.shadow_intelligence_worker import (
+    SOURCE_ATTRIBUTION_POLICY,
     materialize_proxy_horizon_contracts,
 )
 
@@ -583,6 +584,112 @@ def test_worker_falls_back_all_horizons_when_complete_suite_is_unavailable(
         for item in result["runtime_model_selection"].values()
     )
     assert result["runtime_suite_release_id"] is None
+
+
+@pytest.mark.parametrize("suite_available", [False, True])
+def test_duplicate_stock_source_attribution_prefers_selected_sleeve(
+    monkeypatch,
+    suite_available,
+):
+    """Equal stock predictions bind to the strategy the portfolio selected."""
+
+    import server.trading_v3.shadow_intelligence_worker as worker
+
+    monkeypatch.setattr(
+        worker, "verify_horizon_artifact", lambda value: dict(value)
+    )
+    if suite_available:
+        monkeypatch.setattr(
+            worker,
+            "predict_horizon_artifact",
+            lambda value, features: SimpleNamespace(
+                score=0.73,
+                expected_return_net_pct=1.4,
+                probability_positive=0.73,
+                model_artifact_hash=value["artifact_hash"],
+                feature_protocol_hash=value["feature_protocol_hash"],
+            ),
+        )
+    repository = _RuntimeRepository(
+        config_hash(), suite_available=suite_available
+    )
+    theme = _source_row(
+        "theme_diffusion", 4, source_hash=config_hash()
+    )
+    reversal = _source_row(
+        "oversold_reversal", 5, source_hash=config_hash()
+    )
+    for row in (theme, reversal):
+        row["stock_code"] = "600099"
+    theme["raw_score"] = 0.91
+    reversal["raw_score"] = 0.80
+    reversal["selection_status"] = "SELECTED"
+    reversal["selection_reason_code"] = "TARGET_PORTFOLIO_SELECTED"
+    reversal["selection_snapshot"] = {
+        **reversal["selection_snapshot"],
+        "target_id": "target-600099",
+        "target_strategy_keys": ["oversold_reversal"],
+        "selection_status": "SELECTED",
+        "selection_reason_code": "TARGET_PORTFOLIO_SELECTED",
+    }
+    # Put the rejected, higher raw-score row first to reproduce the old
+    # row-order-dependent attribution.
+    repository.rows.extend((theme, reversal))
+    calendar = _calendar_engine()
+    try:
+        result = materialize_proxy_horizon_contracts(
+            repository,
+            calendar,
+            config=load_v3_config(),
+            evaluated_at=datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        )
+    finally:
+        calendar.dispose()
+
+    contract = next(
+        item
+        for item, _source_id in repository.saved
+        if item.horizon_days == 5 and item.stock_code == "600099"
+    )
+    assert contract.source_strategy_key == "oversold_reversal"
+    assert contract.selection_status == "SELECTED"
+    assert result["source_attribution_policy"] == SOURCE_ATTRIBUTION_POLICY
+    assert result["runtime_model_selection"]["T+5"][
+        "source_attribution_policy"
+    ] == SOURCE_ATTRIBUTION_POLICY
+
+
+def test_duplicate_rejected_sources_prefer_strongest_raw_sleeve():
+    repository = _RuntimeRepository(config_hash(), suite_available=False)
+    lower = _source_row(
+        "theme_diffusion", 4, source_hash=config_hash()
+    )
+    higher = _source_row(
+        "oversold_reversal", 5, source_hash=config_hash()
+    )
+    for row in (lower, higher):
+        row["stock_code"] = "600098"
+    lower["raw_score"] = 0.79
+    higher["raw_score"] = 0.88
+    repository.rows.extend((lower, higher))
+    calendar = _calendar_engine()
+    try:
+        materialize_proxy_horizon_contracts(
+            repository,
+            calendar,
+            config=load_v3_config(),
+            evaluated_at=datetime(2026, 8, 14, 8, 0, tzinfo=UTC),
+        )
+    finally:
+        calendar.dispose()
+
+    contract = next(
+        item
+        for item, _source_id in repository.saved
+        if item.horizon_days == 5 and item.stock_code == "600098"
+    )
+    assert contract.source_strategy_key == "oversold_reversal"
+    assert contract.selection_status == "REJECTED"
 
 
 def test_worker_never_attaches_current_artifact_to_old_config_run(monkeypatch):
