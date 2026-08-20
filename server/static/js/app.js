@@ -2711,7 +2711,7 @@
             html += '<div class="battle-panel battle-panel-wide"><div class="battle-panel-title">推荐股盘中确认</div>';
             html += renderPickRows(topRecConfirm, '暂无推荐股确认数据');
             html += '</div>';
-            html += '<div class="battle-panel"><div class="battle-panel-title">V2 模拟决策</div>';
+            html += '<div class="battle-panel"><div class="battle-panel-title">统一模拟执行决策</div>';
             html += renderCandidateRows(buyCandidates.concat(sellCandidates).concat(waitCandidates).slice(0, 8), '暂无模拟动作');
             html += '<div class="battle-mini-meta"><a href="/?tab=trading">查看策略入选与模拟买入</a></div>';
             html += '</div>';
@@ -3773,6 +3773,7 @@
         var runStatus = String(context.run_status || '').toUpperCase();
         var loading = /^(LOADING|PROCESSING|CREATED|RUNNING|QUEUED|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(decisionStatus) || /^(LOADING|PROCESSING|CREATED|RUNNING|QUEUED|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(dataStatus) || /^(LOADING|PROCESSING|CREATED|RUNNING|QUEUED|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(runStatus);
         if (loading) return 'LOADING';
+        if (context.historical_read_only === true) return 'STALE';
         var validUntil = context.valid_until ? new Date(context.valid_until) : null;
         if (context.context_date_matches === false || (validUntil && Number.isFinite(validUntil.getTime()) && validUntil.getTime() < Date.now())) return 'STALE';
         if (/FAILED|ERROR|UNAVAILABLE/.test(runStatus) || /FAILED|ERROR|UNAVAILABLE|SCHEMA_MISSING/.test(dataStatus) || /FAILED|ERROR|UNAVAILABLE|SCHEMA_MISSING/.test(decisionStatus)) return 'UNAVAILABLE';
@@ -3923,7 +3924,7 @@
         var view = item.tradingView;
         var modulePage = item.modulePage === 'v2' ? 'v2' : 'v3';
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
-        var moduleLabel = modulePage === 'v3' ? 'V3 决策、Shadow 与模拟账本' : '共享生产证据';
+        var moduleLabel = modulePage === 'v3' ? '统一决策、研究验证与模拟账本' : '共享运行证据';
         container.innerHTML = '<div class="trade-module-page">' +
             '<section class="trade-module-head"><span>策略与模拟 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
             '<p>本页使用当前生产决策、模拟账本与验收证据，不再读取旧版选股结论。</p></section>' +
@@ -4013,29 +4014,29 @@
         else if (contextBlocked) conclusion = '决策门禁已阻断，当前不会创建新的模拟买单';
         else if (lineageUnavailable) conclusion = '研究决策可读，但同批次执行血缘不可用，不能判断是否已委托、成交或持仓';
         else if (decisionScope === 'RESEARCH_ONLY' && targets.length) conclusion = '本轮形成 ' + targets.length + ' 只研究目标，但 RESEARCH_ONLY 不拥有订单权限';
-        else if (readiness.execution_ready === false || executionReadiness.ready_for_new_positions === false) conclusion = '研究决策可读，但 V2 执行门禁已阻断，当前不会创建新的模拟买单';
+        else if (readiness.execution_ready === false || executionReadiness.ready_for_new_positions === false) conclusion = '研究决策可读，但统一模拟执行门禁已阻断，当前不会创建新的模拟买单';
         else if (!run.run_uid) conclusion = '还没有最新策略决策，当前不会创建新的模拟买单';
-        else if (truthCode === 'EMPTY' && currentPositionCount) conclusion = '本轮明确无新增研究目标；当前 V2 账户快照仍持有 ' + currentPositionCount + ' 只模拟仓位';
+        else if (truthCode === 'EMPTY' && currentPositionCount) conclusion = '本轮明确无新增研究目标；当前模拟账户快照仍持有 ' + currentPositionCount + ' 只仓位';
         else if (truthCode === 'EMPTY') conclusion = '已验证完整批次且无研究目标，当前保持现金';
         else if (!targets.length) conclusion = '目标账本与服务端决策真值不一致，禁止解释为空仓';
-        else if (!paperExecutable) conclusion = '策略产出 ' + targets.length + ' 只目标，但模拟链路仍需 V2 门禁复验';
+        else if (!paperExecutable) conclusion = '策略产出 ' + targets.length + ' 只目标，但仍需通过统一模拟执行门禁';
         else if (!visibleOrders.length && !visibleFills.length) conclusion = '策略选出 ' + targets.length + ' 只股票，尚未创建模拟买单';
         else if (!visibleFills.length) conclusion = '策略选出 ' + targets.length + ' 只，已有 ' + visibleOrders.length + ' 笔模拟买单等待处理';
         else conclusion = '本轮选出 ' + targets.length + ' 只，已模拟成交 ' + visibleFills.length + ' 笔，当前持有 ' + currentPositionCount + ' 只';
 
         var h = '<div class="trade-desk">';
         if (criticalFailures.length) truthCode = 'UNAVAILABLE';
-        h += '<section class="trade-context-light" data-state="' + truthCode + '"><div><b>' + truthCode + '</b><span>统一决策上下文与权限边界</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(context.data_date || tradeDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || context.data_date || tradeDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || run.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || run.decision_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextLoading ? '等待决策完成' : contextUnavailable ? '不可用' : contextStale ? '历史复核' : contextBlocked ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + (paperExecutable ? '可入队，V2成交前复验' : contextLoading ? '等待批次完成' : contextUnavailable || contextStale || contextBlocked || truthCode === 'EMPTY' ? '不可入队' : decisionScope === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : 'V2门禁阻断') + '</span><span class="real">真实：固定关闭</span></div></section>';
+        h += '<section class="trade-context-light" data-state="' + truthCode + '"><div><b>' + truthCode + '</b><span>统一决策上下文与权限边界</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(context.data_date || tradeDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || context.data_date || tradeDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || run.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || run.decision_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextLoading ? '等待决策完成' : contextUnavailable ? '不可用' : contextStale ? '历史复核' : contextBlocked ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + (paperExecutable ? '可入队，成交前复验' : contextLoading ? '等待批次完成' : contextUnavailable || contextStale || contextBlocked || truthCode === 'EMPTY' ? '不可入队' : decisionScope === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '执行门禁阻断') + '</span><span class="real">真实：固定关闭</span></div></section>';
         h += '<section class="trade-hero ' + (targets.length ? 'has-target' : 'cash') + '">';
         h += '<div><span class="trade-eyebrow">LATEST DECISION · ' + escHtml(tradeDate || '等待首个决策') + '</span><h2>' + escHtml(conclusion) + '</h2>';
         h += '<p>这里只展示实际链路：策略入选不等于已经买入；出现模拟成交或当前持仓，才代表模拟盘真正买过。</p></div>';
         h += '<div class="trade-mode"><i></i><strong>仅模拟交易</strong><span>真实下单固定关闭</span></div></section>';
         if (failures.length) h += '<div class="trade-warning"><strong>部分数据暂时不可用</strong><span>' + escHtml(failures.join('；')) + '</span></div>';
         h += '<section class="trade-kpis">';
-        h += '<button type="button" onclick="openTradingV2Module(\'tomorrow\')" aria-label="打开明日动作页面"><span>研究目标</span><strong>' + (lineageUnavailable ? '—' : targets.length + '<small>只</small>') + '</strong><p>' + (lineageUnavailable ? '同批次血缘不可用' : paperExecutable ? '可进入 V2 复验' : '不可直接下单') + '</p></button>';
+        h += '<button type="button" onclick="openTradingV2Module(\'tomorrow\')" aria-label="打开明日动作页面"><span>研究目标</span><strong>' + (lineageUnavailable ? '—' : targets.length + '<small>只</small>') + '</strong><p>' + (lineageUnavailable ? '同批次血缘不可用' : paperExecutable ? '可进入执行复验' : '不可直接下单') + '</p></button>';
         h += '<button type="button" onclick="openTradingV2Module(\'orders\')" aria-label="打开订单与成交页面"><span>待处理买单</span><strong>' + (lineageUnavailable ? '—' : openBuyCount + '<small>笔</small>') + '</strong><p>' + (lineageUnavailable ? 'UNAVAILABLE' : '尚未完成模拟成交') + '</p></button>';
         h += '<button type="button" onclick="openTradingV2Module(\'orders\')" aria-label="打开订单与成交页面"><span>本轮模拟成交</span><strong>' + (lineageUnavailable ? '—' : visibleFills.length + '<small>笔</small>') + '</strong><p>' + (lineageUnavailable ? 'UNAVAILABLE' : escHtml(tradeDate || '最新决策日')) + '</p></button>';
-        h += '<button type="button" onclick="openTradingV2Module(\'positions\')" aria-label="打开当前持仓页面"><span>当前 V2 快照持仓</span><strong>' + currentPositionCount + '<small>只</small></strong><p>当前账户态，不随历史决策日回放</p></button>';
+        h += '<button type="button" onclick="openTradingV2Module(\'positions\')" aria-label="打开当前持仓页面"><span>当前模拟持仓</span><strong>' + currentPositionCount + '<small>只</small></strong><p>当前账户态，不随历史决策日回放</p></button>';
         h += '<button type="button" onclick="openTradingV2Module(\'trust\')" aria-label="打开系统可信度页面"><span>模拟账户可用现金</span><strong class="money">' + tradingDeskMoney(cash) + '</strong><p>账户权益 ' + tradingDeskMoney(equity) + '</p></button></section>';
 
         h += '<section class="trade-panel trade-primary trade-scroll-target" id="tradePipeline"><div class="trade-panel-head"><div><span>从策略到模拟盘</span><h3>这只股票走到哪一步了</h3></div><p>入选 → 委托 → 成交 → 持仓</p></div><div class="trade-table-wrap"><table class="trade-table"><thead><tr><th>股票</th><th>策略为什么选</th><th>① 策略入选</th><th>② 模拟委托</th><th>③ 模拟成交</th><th>④ 当前持仓</th><th>当前结论</th></tr></thead><tbody>';
@@ -4116,7 +4117,7 @@
         }
         h += '</tbody></table></div></section></div>';
 
-        h += '<section class="trade-panel trade-account trade-scroll-target" id="tradeAccount"><div class="trade-panel-head"><div><span>当前 V2 快照</span><h3>账户资金与当前持仓摘要</h3></div><p>不随历史 trade_date 回放 · ' + escHtml(account.account_name || account.account_id || 'paper-main-v2') + '</p></div>';
+        h += '<section class="trade-panel trade-account trade-scroll-target" id="tradeAccount"><div class="trade-panel-head"><div><span>当前模拟账户快照</span><h3>账户资金与当前持仓摘要</h3></div><p>不随历史 trade_date 回放 · ' + escHtml(account.account_name || account.account_id || '统一模拟账户') + '</p></div>';
         h += '<div class="trade-account-grid"><div><span>可用现金</span><strong>' + tradingDeskMoney(cash) + '</strong></div><div><span>账户总权益</span><strong>' + tradingDeskMoney(equity) + '</strong></div><div><span>当前持仓</span><strong>' + currentPositionCount + ' 只</strong></div></div></section>';
 
         var targetCodes = Object.keys(targetByCode);
@@ -4131,7 +4132,7 @@
                 : tradingDeskEmpty(4, '暂无未入选明细', '同批次数据完整，当前决策没有可展示的拒绝记录。');
         else rejected.forEach(function (row) { h += '<tr><td>' + tradingDeskSecurity(row.stock_code, tradingDeskName(row, '')) + '</td><td>' + escHtml(tradingDeskStrategy(row.strategy_key || row.primary_strategy_key)) + '</td><td>' + escHtml(tradingDeskStatus(row.forecast_status || row.status || 'REJECTED')) + '</td><td><span class="trade-cell-note wide">' + escHtml((row.reasons || []).join('；') || row.reason || tradingDeskStatus(row.reason_code) || '未通过组合约束') + '</span></td></tr>'; });
         h += '</tbody></table></div></details>';
-        h += '<footer class="trade-foot"><span>决策批次 ' + escHtml(run.run_uid || '—') + '</span><span>市场状态 ' + escHtml(TRADING_REGIME_NAMES[run.dominant_regime] || localizeMachineText(run.dominant_regime || '—')) + '</span><span>风险资产上限 ' + tradingDeskPercent(run.risk_asset_cap, 100) + '</span><span>' + (paperExecutable ? '模拟可入队，仍由 V2 成交前复验' : '模拟链路存在阻断或仅研究') + '</span></footer></div>';
+        h += '<footer class="trade-foot"><span>决策批次 ' + escHtml(run.run_uid || '—') + '</span><span>市场状态 ' + escHtml(TRADING_REGIME_NAMES[run.dominant_regime] || localizeMachineText(run.dominant_regime || '—')) + '</span><span>风险资产上限 ' + tradingDeskPercent(run.risk_asset_cap, 100) + '</span><span>' + (paperExecutable ? '模拟可入队，成交前仍会复验' : '模拟链路存在阻断或仅研究') + '</span></footer></div>';
         container.innerHTML = h;
         setStatus('策略与模拟已更新');
     }
@@ -6967,15 +6968,16 @@
         return String(readiness.recommend_status || row.recommend_status || row.signal_status || '').toUpperCase();
     }
 
-    function decisionPayloadIsFresh(payload) {
+    function decisionPayloadIsFresh(payload, expectedDay) {
         var freshness = String(payload && payload.freshness || '').toLowerCase();
         var requested = String(payload && payload.requested_date || '').slice(0, 10);
         var dataDate = String(payload && payload.data_date || '').slice(0, 10);
-        return (freshness === 'exact' || freshness === 'live') && (!requested || !dataDate || requested === dataDate);
+        var expected = String(expectedDay || '').slice(0, 10);
+        return !payload._load_error && (freshness === 'exact' || freshness === 'live') && !!requested && !!dataDate && requested === dataDate && (!expected || requested === expected);
     }
 
-    function qualifiedDecisionRows(payload) {
-        if (!decisionPayloadIsFresh(payload)) return [];
+    function qualifiedDecisionRows(payload, expectedDay) {
+        if (!decisionPayloadIsFresh(payload, expectedDay)) return [];
         return (payload && payload.data || []).filter(function (row) {
             var grade = String(row.candidate_grade || '').toUpperCase();
             var rejects = row.risk_gate && row.risk_gate.reject_reasons || [];
@@ -6989,6 +6991,12 @@
         return '/api/screener/history?data_date=' + encodeURIComponent(day) + '&preset=' + encodeURIComponent(preset) + '&limit=300';
     }
 
+    function decisionRead(url, timeoutMs) {
+        return fetchRawJsonWithTimeout(url, timeoutMs).catch(function(error) {
+            return { data:[], _load_error:String(error && error.message || error || '接口读取失败') };
+        });
+    }
+
     function decisionRowCard(row, index) {
         var code = String(row.stock_code || '').padStart(6, '0');
         var score = row.ensemble_score == null ? row.score : row.ensemble_score;
@@ -6997,15 +7005,15 @@
         return '<article class="decision-stock-card"><span class="decision-stock-rank">' + escHtml(row.rank || index + 1) + '</span><div><strong>' + nameLink(code, row.stock_name || row.short_name || code) + '</strong><small>' + escHtml(code) + ' · ' + escHtml(theme) + '</small><p>' + escHtml(reason) + '</p></div><div class="decision-stock-score"><b>' + escHtml(fmt(score, 2)) + '</b><span>' + escHtml(row.candidate_grade || '-') + '级 · ALLOW</span></div></article>';
     }
 
-    function decisionColumn(title, kicker, payload) {
+    function decisionColumn(title, kicker, payload, expectedDay) {
         payload = payload || {};
-        var rows = qualifiedDecisionRows(payload);
+        var rows = qualifiedDecisionRows(payload, expectedDay);
         var allRows = payload.data || [];
-        var isFresh = decisionPayloadIsFresh(payload);
-        var state = !payload.run ? '暂无批次' : !isFresh ? '数据回退，禁止推荐' : rows.length ? '有合格候选' : '无合格候选';
+        var isFresh = decisionPayloadIsFresh(payload, expectedDay);
+        var state = payload._load_error ? '数据不可用' : !payload.run ? '暂无批次' : !isFresh ? '数据回退，禁止推荐' : rows.length ? '有合格候选' : '无合格候选';
         var tone = rows.length ? 'ready' : isFresh ? 'empty' : 'blocked';
         var meta = '决策日 ' + escHtml(payload.requested_date || '-') + ' · 数据日 ' + escHtml(payload.data_date || '-') + ' · 审计 ' + allRows.length + ' 只';
-        var body = rows.length ? rows.slice(0, 12).map(decisionRowCard).join('') : '<div class="decision-empty"><strong>' + escHtml(state) + '</strong><span>' + (isFresh ? '没有股票同时通过 A/B 评级、组合约束与推荐门禁；保持现金与观察。' : '当前结果只可用于历史审计，不能作为今天的个股推荐。') + '</span></div>';
+        var body = rows.length ? rows.slice(0, 12).map(decisionRowCard).join('') : '<div class="decision-empty"><strong>' + escHtml(state) + '</strong><span>' + (payload._load_error ? '接口读取失败：' + escHtml(payload._load_error) + '；不能解释为没有候选。' : isFresh ? '没有股票同时通过 A/B 评级、组合约束与推荐门禁；保持现金与观察。' : '当前结果只可用于历史审计，不能作为今天的个股推荐。') + '</span></div>';
         return '<section class="decision-column" data-tone="' + tone + '"><header><div><span>' + escHtml(kicker) + '</span><h3>' + escHtml(title) + '</h3><p>' + meta + '</p></div><b>' + escHtml(state) + '</b></header><div class="decision-stock-list">' + body + '</div><footer>批次 ' + escHtml(String((payload.run || {}).run_uid || '-').slice(0, 12)) + ' · ' + escHtml(payload.observed_at || payload.generated_at || '-') + '</footer></section>';
     }
 
@@ -7013,14 +7021,15 @@
         var day = String(d || currentDateValue() || '').slice(0, 10);
         container.innerHTML = '<div class="loading">正在加载盘前与盘中决策...</div>';
         Promise.all([
-            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'capital_support'), 15000),
-            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'intraday_sector'), 15000)
+            decisionRead(decisionHistoryUrl(day, 'capital_support'), 15000),
+            decisionRead(decisionHistoryUrl(day, 'intraday_sector'), 15000)
         ]).then(function (result) {
             var premarket = result[0] || {}, intraday = result[1] || {};
-            var preQualified = qualifiedDecisionRows(premarket).length;
-            var intradayQualified = qualifiedDecisionRows(intraday).length;
-            container.innerHTML = '<div class="decision-page candidate-decision-page"><section class="decision-page-head"><div><span>03 / CANDIDATES & DECISIONS</span><h2>候选与决策</h2><p>盘前看计划，盘中看确认；两列都只展示日期新鲜、评级与门禁全部通过的标的。拒绝项仍保留在“04 候选账本”审计，不再冒充推荐。</p></div><div class="decision-page-count"><strong>' + (preQualified + intradayQualified) + '</strong><span>当前合格记录</span></div></section><div class="decision-dual-grid">' + decisionColumn('盘前计划', '09:08 / PREMARKET', premarket) + decisionColumn('盘中确认', '09:32+ / INTRADAY', intraday) + '</div><section class="decision-page-note"><strong>阅读顺序</strong><span>先看数据日期是否一致，再看是否有合格候选，最后才看分数；没有合格候选本身就是明确决策。</span><button type="button" onclick="switchTab(\'trading-v3-ledger\')">查看全部候选与拒绝账本</button></section></div>';
-            setStatus('盘前与盘中决策已按同一页面日期加载');
+            var preQualified = qualifiedDecisionRows(premarket, day).length;
+            var intradayQualified = qualifiedDecisionRows(intraday, day).length;
+            var anyUnavailable = !!premarket._load_error || !!intraday._load_error;
+            container.innerHTML = '<div class="decision-page candidate-decision-page"><section class="decision-page-head"><div><span>03 / CANDIDATES & DECISIONS</span><h2>候选与决策</h2><p>盘前看计划，盘中看确认；两列都只展示日期新鲜、评级与门禁全部通过的标的。拒绝项仍保留在“04 候选账本”审计，不再冒充推荐。</p></div><div class="decision-page-count"><strong>' + (anyUnavailable ? '—' : preQualified + intradayQualified) + '</strong><span>' + (anyUnavailable ? '部分数据不可用' : '当前合格记录') + '</span></div></section><div class="decision-dual-grid">' + decisionColumn('盘前计划', '09:08 / PREMARKET', premarket, day) + decisionColumn('盘中确认', '09:32+ / INTRADAY', intraday, day) + '</div><section class="decision-page-note"><strong>阅读顺序</strong><span>先看数据日期是否一致，再看是否有合格候选，最后才看分数；没有合格候选本身就是明确决策。</span><button type="button" onclick="switchTab(\'trading-v3-ledger\')">查看全部候选与拒绝账本</button></section></div>';
+            setStatus(anyUnavailable ? '盘前与盘中决策已加载，部分数据不可用' : '盘前与盘中决策已按同一页面日期加载', anyUnavailable);
         }).catch(function (error) {
             container.innerHTML = '<div class="decision-load-error"><strong>候选与决策加载失败</strong><span>' + escHtml(error.message || error) + '</span></div>';
             setStatus('候选与决策加载失败: ' + (error.message || error), true);
@@ -7040,28 +7049,28 @@
     }
 
     function premarketForecastIsFresh(forecast, day) {
-        if (!forecast || forecast.fallback === true) return false;
+        if (!forecast || forecast._load_error || forecast.fallback === true) return false;
         var sessionDate = String(forecast.session_date || forecast.requested_date || '').slice(0, 10);
-        return !sessionDate || sessionDate === String(day || '').slice(0, 10);
+        return !!sessionDate && sessionDate === String(day || '').slice(0, 10);
     }
 
     function loadDecisionCockpitPage(d, container) {
         var day = String(d || currentDateValue() || '').slice(0, 10);
         container.innerHTML = '<div class="loading">正在整理今日大盘预期与操作策略...</div>';
         Promise.all([
-            fetchRawJsonWithTimeout('/api/v3/context?trade_date=' + encodeURIComponent(day), 12000),
-            fetchRawJsonWithTimeout('/api/v3/hypotheses/latest?limit=50&scope_type=MARKET&trade_date=' + encodeURIComponent(day), 12000),
-            fetchRawJsonWithTimeout('/api/hot-data/premarket-theme-forecast?session_date=' + encodeURIComponent(day), 15000),
-            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'capital_support'), 15000),
-            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'intraday_sector'), 15000)
+            decisionRead('/api/v3/context?trade_date=' + encodeURIComponent(day), 12000),
+            decisionRead('/api/v3/hypotheses/latest?limit=50&scope_type=MARKET&trade_date=' + encodeURIComponent(day), 12000),
+            decisionRead('/api/hot-data/premarket-theme-forecast?session_date=' + encodeURIComponent(day), 15000),
+            decisionRead(decisionHistoryUrl(day, 'capital_support'), 15000),
+            decisionRead(decisionHistoryUrl(day, 'intraday_sector'), 15000)
         ]).then(function (result) {
             var contextEnvelope = result[0] || {}, hypothesisEnvelope = result[1] || {};
-            var context = contextEnvelope.data || contextEnvelope;
-            var hypotheses = hypothesisEnvelope.data || hypothesisEnvelope || [];
+            var context = contextEnvelope._load_error ? {} : contextEnvelope.data || contextEnvelope;
+            var hypotheses = hypothesisEnvelope._load_error ? [] : hypothesisEnvelope.data || hypothesisEnvelope || [];
             var market = Array.isArray(hypotheses) ? hypotheses.filter(function (row) { return row.scope_type === 'MARKET'; })[0] || {} : {};
             var forecast = result[2] || {}, premarket = result[3] || {}, intraday = result[4] || {};
             var contextState = tradingDecisionTruth(context);
-            var marketUsable = contextState === 'READY' && market.scope_type === 'MARKET';
+            var marketUsable = !hypothesisEnvelope._load_error && contextState === 'READY' && market.scope_type === 'MARKET';
             var forecastFresh = premarketForecastIsFresh(forecast, day);
             var action = marketUsable ? decisionActionCopy(market.proposed_action) : decisionActionCopy(contextState === 'EMPTY' || contextState === 'BLOCKED' ? 'CASH_FIRST' : '');
             var riskCap = marketUsable && market.max_position_weight != null ? fmt(Number(market.max_position_weight) * 100, 1) + '%' : '—';
@@ -7074,12 +7083,15 @@
                 ? '盘前主线优先观察：' + freshThemes.slice(0, 3).map(function (theme) { return theme.theme_name; }).join('、')
                 : '今天尚未形成可验证的大盘假设，暂不根据旧数据行动。';
             var invalidations = marketUsable && (market.invalidations || []).length ? market.invalidations.join('；') : '盘中宽度、成交、核心板块或风险事件出现反向变化时立即降级。';
-            var preCount = qualifiedDecisionRows(premarket).length, intraCount = qualifiedDecisionRows(intraday).length;
+            var preCount = qualifiedDecisionRows(premarket, day).length, intraCount = qualifiedDecisionRows(intraday, day).length;
+            var loadErrors = result.map(function(item) { return item && item._load_error; }).filter(Boolean);
+            var warning = loadErrors.length ? '<div class="decision-load-error"><strong>部分决策证据不可用</strong><span>' + escHtml(loadErrors.join('；')) + '；缺失项不会被解释为零或空态。</span></div>' : '';
+            var preCountText = premarket._load_error ? '—' : String(preCount), intraCountText = intraday._load_error ? '—' : String(intraCount);
             var themeCards = freshThemes.slice(0, 6).map(function (theme) {
                 return '<article><span>#' + escHtml(theme.rank || '-') + '</span><strong>' + escHtml(theme.theme_name || '-') + '</strong><b>' + escHtml(fmt(theme.score, 1)) + '</b><small>' + escHtml((theme.evidence || []).slice(0, 2).join('；') || theme.status || '等待盘中确认') + '</small></article>';
-            }).join('') || '<div class="decision-empty"><strong>没有可用的盘前主题预判</strong><span>历史回退主题不参与今天的市场预期。</span></div>';
-            container.innerHTML = '<div class="decision-page decision-cockpit"><section class="decision-hero" data-tone="' + action.tone + '"><div><span>01 / TODAY\'S DECISION</span><h2>今日大盘预期</h2><p>' + escHtml(thesis) + '</p></div><div class="decision-hero-action"><small>整体操作</small><strong>' + escHtml(action.label) + '</strong><p>' + escHtml(action.detail) + '</p></div></section><div class="decision-kpis"><article><span>决策状态</span><strong>' + escHtml(decisionTruthLabel(contextState)) + '</strong><small>' + escHtml(context.data_date || '-') + ' 数据</small></article><article><span>风险仓位上限</span><strong>' + escHtml(riskCap) + '</strong><small>不是目标仓位，是不可突破的上限</small></article><article><span>盘前合格候选</span><strong>' + preCount + '</strong><small>' + escHtml(premarket.freshness || '暂无批次') + '</small></article><article><span>盘中合格候选</span><strong>' + intraCount + '</strong><small>' + escHtml(intraday.freshness || '暂无批次') + '</small></article></div><div class="decision-main-grid"><section class="decision-panel"><header><div><span>MARKET PLAYBOOK</span><h3>今天怎么操作</h3></div></header><ol class="decision-playbook"><li><b>1</b><div><strong>开盘前：先确认数据</strong><span>请求日、数据日和证据时点必须匹配；回退数据只复盘，不荐股。</span></div></li><li><b>2</b><div><strong>盘中：只做确认后的候选</strong><span>盘前计划必须经过实时价格、板块宽度和风险门禁确认；无合格候选就不做。</span></div></li><li><b>3</b><div><strong>仓位：服从 ' + escHtml(riskCap) + ' 上限</strong><span>' + escHtml(action.detail) + '</span></div></li><li class="danger"><b>!</b><div><strong>失效条件</strong><span>' + escHtml(invalidations) + '</span></div></li></ol><button class="decision-primary-button" type="button" onclick="switchTab(\'trading-v3-candidates\')">查看盘前 / 盘中候选决策</button></section><section class="decision-panel"><header><div><span>PREMARKET THEMES</span><h3>盘前主线预期</h3></div><b>' + escHtml(forecastFresh ? forecast.data_quality || '当日冻结' : forecast.fallback ? '历史回退（不采用）' : '等待数据') + '</b></header><div class="decision-theme-grid">' + themeCards + '</div><footer>冻结时点 ' + escHtml(forecast.cutoff_at || '-') + ' · A股源数据 ' + escHtml(forecast.source_trade_date || '-') + '</footer></section></div></div>';
-            setStatus('今日大盘预期与操作策略已加载');
+            }).join('') || '<div class="decision-empty"><strong>' + (forecast._load_error ? '盘前主题数据不可用' : '没有可用的盘前主题预判') + '</strong><span>' + (forecast._load_error ? escHtml(forecast._load_error) + '；不能解释为没有主题。' : '历史回退主题不参与今天的市场预期。') + '</span></div>';
+            container.innerHTML = '<div class="decision-page decision-cockpit"><section class="decision-hero" data-tone="' + action.tone + '"><div><span>01 / TODAY\'S DECISION</span><h2>今日大盘预期</h2><p>' + escHtml(thesis) + '</p></div><div class="decision-hero-action"><small>整体操作</small><strong>' + escHtml(action.label) + '</strong><p>' + escHtml(action.detail) + '</p></div></section>' + warning + '<div class="decision-kpis"><article><span>决策状态</span><strong>' + escHtml(decisionTruthLabel(contextState)) + '</strong><small>' + escHtml(context.data_date || '-') + ' 数据</small></article><article><span>风险仓位上限</span><strong>' + escHtml(riskCap) + '</strong><small>不是目标仓位，是不可突破的上限</small></article><article><span>盘前合格候选</span><strong>' + preCountText + '</strong><small>' + escHtml(premarket._load_error ? '数据不可用' : premarket.freshness || '暂无批次') + '</small></article><article><span>盘中合格候选</span><strong>' + intraCountText + '</strong><small>' + escHtml(intraday._load_error ? '数据不可用' : intraday.freshness || '暂无批次') + '</small></article></div><div class="decision-main-grid"><section class="decision-panel"><header><div><span>MARKET PLAYBOOK</span><h3>今天怎么操作</h3></div></header><ol class="decision-playbook"><li><b>1</b><div><strong>开盘前：先确认数据</strong><span>请求日、数据日和证据时点必须匹配；回退数据只复盘，不荐股。</span></div></li><li><b>2</b><div><strong>盘中：只做确认后的候选</strong><span>盘前计划必须经过实时价格、板块宽度和风险门禁确认；无合格候选就不做。</span></div></li><li><b>3</b><div><strong>仓位：服从 ' + escHtml(riskCap) + ' 上限</strong><span>' + escHtml(action.detail) + '</span></div></li><li class="danger"><b>!</b><div><strong>失效条件</strong><span>' + escHtml(invalidations) + '</span></div></li></ol><button class="decision-primary-button" type="button" onclick="switchTab(\'trading-v3-candidates\')">查看盘前 / 盘中候选决策</button></section><section class="decision-panel"><header><div><span>PREMARKET THEMES</span><h3>盘前主线预期</h3></div><b>' + escHtml(forecast._load_error ? '数据不可用' : forecastFresh ? forecast.data_quality || '当日冻结' : forecast.fallback ? '历史回退（不采用）' : '等待当日数据') + '</b></header><div class="decision-theme-grid">' + themeCards + '</div><footer>冻结时点 ' + escHtml(forecast.cutoff_at || '-') + ' · A股源数据 ' + escHtml(forecast.source_trade_date || '-') + '</footer></section></div></div>';
+            setStatus(loadErrors.length ? '今日决策已加载，部分证据不可用' : '今日大盘预期与操作策略已加载', loadErrors.length > 0);
         }).catch(function (error) {
             container.innerHTML = '<div class="decision-load-error"><strong>交易决策总览加载失败</strong><span>' + escHtml(error.message || error) + '</span></div>';
             setStatus('交易决策总览加载失败: ' + (error.message || error), true);
@@ -7129,8 +7141,8 @@
             }
 
             var h = '<div class="screen-page candidate-center unified-stock-pool">';
-            h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / V3 IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + rows.length + '</strong><span>同批次股票</span></div></section>';
-            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '决策会话日与请求上下文不匹配或证据过期，仅供历史复核' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || requestedDate || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || resolvedDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || pool.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || pool.generated_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'STALE' ? '历史复核' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经 V2 复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
+            h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + rows.length + '</strong><span>同批次股票</span></div></section>';
+            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '决策会话日与请求上下文不匹配或证据过期，仅供历史复核' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || requestedDate || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || resolvedDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || pool.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || pool.generated_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'STALE' ? '历史复核' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经统一执行复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
             var metricsReadable = contextState === 'READY' || contextState === 'EMPTY';
             h += '<div class="stats-bar">' + card('同批次股票', metricsReadable ? Number(summary.stock_count || 0) : '—', 'blue') + card('研究候选', metricsReadable ? Number(summary.strategy_candidate_count || 0) : '—', 'orange') + card('研究目标', metricsReadable ? Number(summary.target_count || 0) : '—', 'red') + card('明确拒绝', metricsReadable ? Number(summary.rejected_count || 0) : '—', 'green') + '</div>';
             h += '<section class="sc-panel"><div class="candidate-center-filterbar" aria-label="候选与拒绝筛选"><label><span>决策日期</span><input id="candidateCenterDateFilter" type="date" value="' + escAttr(requestedDate || resolvedDate) + '"></label><label><span>账本状态</span><select id="candidateCenterKindFilter"><option value="">全部状态</option><option value="TARGET">研究目标</option><option value="CANDIDATE">研究候选</option><option value="REJECTED">组合拒绝</option><option value="RESEARCH">研究样本</option></select></label><label class="candidate-center-stock-filter"><span>股票</span><input id="candidateCenterStockFilter" type="search" value="' + escAttr(filterStock) + '" placeholder="代码或名称" autocomplete="off"></label><button id="candidateCenterQueryButton" class="sc-primary" type="button">查询批次</button><span id="candidateCenterFilterCount" class="candidate-center-filter-count"></span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>账本状态</th><th>独立策略</th><th>主题</th><th>研究分 / 净期望</th><th>证据或拒绝原因</th><th>权限</th></tr></thead><tbody id="candidateCenterUnifiedRows"></tbody></table></div><div class="sc-table-note">显示上限 300 条；每一行都属于 run_uid ' + escHtml(pool.run_uid || '-') + '。V4 硬拒绝会计入证据覆盖，但只保留在研究审计层；RESEARCH_ONLY 永远不会显示为“可执行”。</div></section></div>';

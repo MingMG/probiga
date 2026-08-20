@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ProBigA V2 · 交易决策台</title>
+  <title>ProBigA · 模拟执行与运行证据</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v2-embedded');</script>
   <link rel="stylesheet" href="/static/css/trading-v2.css?v=7">
   <script src="/static/js/auth.js?v=2"></script>
@@ -12,8 +12,8 @@
   <div class="shell">
     <aside class="rail">
       <a class="brand" href="/"><span>Pro</span>BigA</a>
-      <p class="rail-caption">V2 PAPER DESK</p>
-      <nav aria-label="V2 页面">
+      <p class="rail-caption">PAPER EXECUTION DESK</p>
+      <nav aria-label="模拟执行与运行证据页面">
         <button class="nav-item active" data-view="trust"><i>01</i>系统可信度</button>
         <button class="nav-item" data-view="tomorrow"><i>02</i>明日动作</button>
         <button class="nav-item" data-view="opportunity"><i>03</i>今日机会</button>
@@ -47,7 +47,7 @@
       <section id="hero" class="hero">
         <div>
           <p class="hero-label">当前执行结论</p>
-          <h2 id="heroDecision">正在读取 V2 真值账本</h2>
+          <h2 id="heroDecision">正在读取统一模拟账本</h2>
           <p id="heroReason">页面不会现场计算，也不会创建订单。</p>
         </div>
         <div class="regime">
@@ -58,7 +58,7 @@
       </section>
 
       <section class="metrics" aria-label="账户摘要">
-        <article><span>账户权益</span><strong id="equityMetric">¥—</strong><small>20 万元 V2 独立账户</small></article>
+        <article><span>账户权益</span><strong id="equityMetric">¥—</strong><small>20 万元独立模拟账户</small></article>
         <article><span>可用现金</span><strong id="cashMetric">¥—</strong><small id="cashMeta">账本读取中</small></article>
         <article><span>当前持仓</span><strong id="positionMetric">— / 12</strong><small>按证券去重；生产总上限 12 只</small></article>
         <article><span>对账状态</span><strong id="reconMetric">—</strong><small>现金容差 ¥0.01，股数容差 0</small></article>
@@ -76,7 +76,7 @@
           </article>
         </div>
         <article class="panel">
-          <div class="panel-head"><div><p>SCHEMA</p><h3>V2 独立账本</h3></div><span class="badge safe">新旧模拟账本已隔离</span></div>
+          <div class="panel-head"><div><p>SCHEMA</p><h3>模拟执行账本（内部 V2 协议）</h3></div><span class="badge safe">新旧模拟账本已隔离</span></div>
           <div id="schemaSummary" class="schema-summary">账本状态读取中</div>
           <details class="technical-details">
             <summary>查看技术表名</summary>
@@ -248,6 +248,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/js/trading-v2.js?v=14"></script>
+  <script src="/static/js/trading-v2.js?v=15"></script>
 </body>
 </html>

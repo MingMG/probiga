@@ -14,11 +14,11 @@
     NO_PAPER_ENABLED_STRATEGY: ['没有启用模拟试运行策略', '至少一套策略必须进入“模拟试运行”或“模拟运行”状态。'],
     MARKET_REGIME_EXTREME: ['当前市场状态为极端风险', '模拟盘已启用，但本期策略纪律要求暂不开新仓。'],
     MARKET_REGIME_DATA_BLOCKED: ['当前市场状态缺少可靠数据', '数据恢复前不创建新仓，已有持仓仍按风控处理。'],
-    'V2_JOB_WORKER_MISSING': ['V2任务执行器未运行', '回测和决策任务不会在接口请求中临时补算。'],
-    'V2_JOB_WORKER_STALE': ['V2任务执行器心跳过期', '执行器恢复并重新验收前禁止新增风险。'],
+    'V2_JOB_WORKER_MISSING': ['模拟任务执行器未运行', '回测和决策任务不会在接口请求中临时补算。'],
+    'V2_JOB_WORKER_STALE': ['模拟任务执行器心跳过期', '执行器恢复并重新验收前禁止新增风险。'],
     DATA_QUALITY_BLOCK: ['数据质量阻断', '影响价格、时序或规则的缺口不能降级为警告。'],
     DATA_SNAPSHOT_MISSING: ['决策快照缺失', '后台执行器尚未生成可还原的输入快照。'],
-    V2_ACCOUNT_MISSING: ['V2 主模拟账户缺失', '独立 20 万元账户尚未初始化。'],
+    V2_ACCOUNT_MISSING: ['主模拟账户缺失', '独立 20 万元账户尚未初始化。'],
     RECONCILIATION_BLOCKED: ['账本对账未通过', '对账恢复前禁止新开仓和加仓。']
   };
   var actionLabels = {
@@ -289,7 +289,7 @@
   }
   function workerText(v) {
     var map = {
-      'trading-v2-job-worker':'V2 回测与决策执行器'
+      'trading-v2-job-worker':'模拟回测与决策执行器'
     };
     return map[String(v || '')] || String(v || '未命名执行器');
   }
@@ -397,7 +397,7 @@
       el('hero').classList.add('blocked');
     } else {
       el('heroDecision').textContent = '模拟盘基础设施尚未就绪';
-      el('heroReason').textContent = blocks.length ? '存在 ' + blocks.length + ' 项硬阻断，系统不会拿高分抵消。' : '尚无完整 V2 快照。';
+      el('heroReason').textContent = blocks.length ? '存在 ' + blocks.length + ' 项硬阻断，系统不会拿高分抵消。' : '尚无完整模拟执行快照。';
       el('hero').classList.add('blocked');
     }
   }
@@ -407,7 +407,7 @@
     el('readinessBadge').textContent = ready.paper_infrastructure_ready ? '模拟盘已启用' : '模拟盘未就绪';
     el('readinessBadge').className = 'badge ' + (ready.paper_infrastructure_ready ? 'safe' : 'danger');
     var blockHtml = blocks.length ? blocks.map(function (code) {
-      var item = labels[code] || [code, '该能力未达到 V2 的确定性门槛。'];
+      var item = labels[code] || [code, '该能力未达到统一模拟执行的确定性门槛。'];
       return '<div class="block-item" title="' + esc(code) + '"><i></i><div><strong>' + esc(item[0]) + '</strong><small>' + esc(item[1]) + '</small></div></div>';
     }).join('') : '<p class="empty safe-text">模拟盘当前没有硬阻断</p>';
     var realBlocks = ready.real_trading_blocks || [];
@@ -432,8 +432,8 @@
     var schema = ready.schema || {};
     var schemaNames = Object.keys(schema);
     var readyCount = schemaNames.filter(function (name) { return schema[name]; }).length;
-    el('schemaSummary').innerHTML = '<strong>V2 独立账本 ' + readyCount + ' / ' +
-      schemaNames.length + ' 正常</strong><span>新交易流程只写 V2 独立表；真实交易写入保持关闭。</span>';
+    el('schemaSummary').innerHTML = '<strong>模拟执行账本 ' + readyCount + ' / ' +
+      schemaNames.length + ' 正常</strong><span>新交易流程只写隔离的模拟表；真实交易写入保持关闭。</span>';
     el('schemaGrid').innerHTML = Object.keys(schema).map(function (name) { return '<div class="schema-item ' + (schema[name] ? 'ok' : 'fail') + '">' + esc(name) + '</div>'; }).join('');
   }
   function renderTomorrow() {
@@ -685,7 +685,7 @@
         '</td><td>' + esc(r.settlement_date) + '</td><td>' + esc(r.cost_price) +
         '</td><td>' + esc(r.protective_stop) + '</td><td>' + esc(r.add_count) +
         ' / 0</td><td class="reason-cell">' + esc(reasonText(r)) + '</td></tr>';
-    }).join('') : rowEmpty(9, '当前没有 V2 持仓批次');
+    }).join('') : rowEmpty(9, '当前没有模拟持仓批次');
   }
   function cards(rows, render, empty) { return rows.length ? rows.map(render).join('') : '<p class="empty">' + esc(empty) + '</p>'; }
   function renderOrders() {
@@ -696,7 +696,7 @@
         '</span></strong><span>' + esc((r.filled_quantity || 0) + '/' +
         (r.quantity || 0) + ' 股 · ' +
         (r.waiting_reason ? reasonText(r) : '当前无需等待')) + '</span></div>';
-    }, '没有 V2 订单');
+    }, '没有模拟订单');
     el('fillList').innerHTML = cards(fills, function (r) {
       return '<div class="stack-card"><strong>' + securityLink(r.stock_code, r.short_name) +
         '<span>' + esc(actionText(r.side) + ' · ' + r.quantity + ' 股') +
@@ -863,7 +863,7 @@
   function renderReview() {
     var recon = unwrap(state.reconciliation) || [], daily = unwrap(state.daily) || [];
     el('reconList').innerHTML = cards(recon, function (r) { return '<div class="stack-card"><strong class="' + (r.status === 'PASS' ? 'safe-text' : 'danger-text') + '">' + esc(r.trade_date + ' · ' + statusText(r.status)) + '</strong><span>' + esc('现金差 ' + r.cash_difference + ' · 权益差 ' + r.equity_difference + ' · 股数差 ' + r.position_difference) + '</span></div>'; }, '尚无日终对账记录');
-    el('dailyList').innerHTML = cards(daily, function (r) { return '<div class="stack-card"><strong>' + esc(r.trade_date + ' · 权益 ' + r.total_equity) + '</strong><span>' + esc('现金 ' + r.cash_balance + ' · 市值 ' + r.market_value + ' · 回撤 ' + r.drawdown) + '</span></div>'; }, '尚无 V2 日终权益');
+    el('dailyList').innerHTML = cards(daily, function (r) { return '<div class="stack-card"><strong>' + esc(r.trade_date + ' · 权益 ' + r.total_equity) + '</strong><span>' + esc('现金 ' + r.cash_balance + ' · 市值 ' + r.market_value + ' · 回撤 ' + r.drawdown) + '</span></div>'; }, '尚无模拟账户日终权益');
   }
   function renderStrategies() {
     var rows = unwrap(state.strategies) || [];
@@ -936,7 +936,7 @@
       render();
       if (state.selectedCandidateRunUid) loadCandidatePool(state.selectedCandidateRunUid);
     }).catch(function (err) {
-      el('heroDecision').textContent = 'V2 只读快照暂时不可用';
+      el('heroDecision').textContent = '模拟执行只读快照暂时不可用';
       el('heroReason').textContent = err.message;
     }).finally(function () { el('refreshButton').disabled = false; notifyParentResize(); });
   }

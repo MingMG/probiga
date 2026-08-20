@@ -39,7 +39,7 @@
     <main>
       <header>
         <div>
-          <p class="eyebrow">TRADING V3 · OUT-OF-SAMPLE FIRST</p>
+          <p class="eyebrow">UNIFIED DECISION · OUT-OF-SAMPLE FIRST</p>
           <h1 id="pageTitle">执行总览</h1>
         </div>
         <div class="actions">
@@ -65,7 +65,7 @@
         </dl>
         <div class="authority-axis" aria-label="交易权限边界">
           <div id="researchAuthority"><span>研究分析</span><strong>读取中</strong><small>只形成证据和排序</small></div>
-          <div id="paperAuthority"><span>模拟执行</span><strong>读取中</strong><small>必须通过 V2 执行门禁</small></div>
+          <div id="paperAuthority"><span>模拟执行</span><strong>读取中</strong><small>必须通过统一执行门禁</small></div>
           <div id="realAuthority"><span>真实交易</span><strong>固定关闭</strong><small>本页面没有真实订单权限</small></div>
         </div>
         <div class="truth-error" id="truthError" role="alert" hidden></div>
@@ -232,7 +232,7 @@
 
       <section class="view" id="view-positions">
         <article class="panel">
-          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge warning">当前 V2 快照 · 不随历史决策日回放</span></div>
+          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge warning">当前模拟账户快照 · 不随历史决策日回放</span></div>
           <div id="positionSummary" class="facts"></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>持仓状态</th><th>持仓数量</th><th>可卖数量</th><th>成本价</th><th>最新价</th><th>持仓市值</th><th>浮动盈亏</th><th>盈亏率</th><th>买入时间</th><th>卖出时间</th><th>卖出价格</th><th>保护位</th><th>加仓次数</th><th>行情时间</th><th>持仓说明</th></tr></thead><tbody id="positionRows"></tbody></table></div>
         </article>
@@ -342,9 +342,9 @@
           <div class="panel-head"><div><p>DECISION LINEAGE</p><h3>决策血缘</h3></div><span class="badge" id="lineageStatus">等待统一批次</span></div>
           <ol class="workflow-line lineage" id="lineageWorkflow">
             <li><strong>数据快照</strong><span id="lineageEvidence">evidence_as_of —</span></li>
-            <li><strong>研究排序</strong><span>V3 + 受限顾问，不拥有订单权限</span></li>
+            <li><strong>研究排序</strong><span>统一决策引擎 + 受限顾问，不拥有订单权限</span></li>
             <li><strong>组合目标</strong><span id="lineageRun">run_uid —</span></li>
-            <li><strong>执行复验</strong><span>V2 账户 / 现金 / T+1 / 行情</span></li>
+            <li><strong>执行复验</strong><span>统一模拟账户 / 现金 / T+1 / 行情</span></li>
             <li><strong>Intent / Order / Fill</strong><span>按业务 ID 串联</span></li>
             <li><strong>Lot / Exit / P&amp;L</strong><span>完整退出与归因</span></li>
           </ol>
@@ -359,7 +359,7 @@
           <div id="shadowFacts" class="facts research-facts"></div>
         </article>
         <article class="panel">
-          <div class="panel-head"><div><p>SCHEMA</p><h3>V3 业务账本</h3></div><span class="badge safe">技术明细默认收起</span></div>
+          <div class="panel-head"><div><p>SCHEMA</p><h3>决策业务账本（内部 V3 协议）</h3></div><span class="badge safe">技术明细默认收起</span></div>
           <details><summary>查看数据库表状态</summary><div id="schema" class="schema"></div></details>
         </article>
       </section>
@@ -375,6 +375,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=25"></script>
+  <script src="/static/js/trading-v3.js?v=26"></script>
 </body>
 </html>

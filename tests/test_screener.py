@@ -102,6 +102,12 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     trading_page = (root / "server/static/trading-v3.html").read_text(
         encoding="utf-8"
     )
+    execution_script = (root / "server/static/js/trading-v2.js").read_text(
+        encoding="utf-8"
+    )
+    execution_page = (root / "server/static/trading-v2.html").read_text(
+        encoding="utf-8"
+    )
 
     assert "screenerJson('/api/screener/status')" in script
     assert "V3-V6 生产融合选股" in script
@@ -109,7 +115,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert "style.css?v=41" in index
-    assert "app.js?v=96" in index
+    assert "app.js?v=97" in index
     assert 'data-tab="trading-v3-candidates" onclick="switchTab(\'trading-v3-candidates\')"' in index
     assert 'data-tab="trading-v3-ledger" onclick="switchTab(\'trading-v3-ledger\')"' in index
     assert 'data-trading-view="candidates"' not in index
@@ -121,7 +127,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "loadCandidateCenterPage(d, container);" in script
     assert "var isTradingItem = !!it.tradingSection;" in script
     assert "V3.6 生产真值" not in script
-    assert "V3 决策、Shadow 与模拟账本" in script
+    assert "统一决策、研究验证与模拟账本" in script
     assert "保留原有完整账本视图" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
     assert 'id="candidateCenterDateFilter"' in script
@@ -133,7 +139,30 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "数据回退，禁止推荐" in script
     assert "premarketForecastIsFresh" in script
     assert "历史回退主题不参与今天的市场预期" in script
-    assert "trading-v3.js?v=25" in trading_page
+    assert "trading-v3.js?v=26" in trading_page
+    assert "V2 执行门禁" not in script
+    assert "当前 V2 快照" not in script
+    assert "UNIFIED DECISION · OUT-OF-SAMPLE FIRST" in trading_page
+    assert "必须通过统一执行门禁" in trading_page
+    assert "当前模拟账户快照" in trading_page
+    assert "function decisionRead(url, timeoutMs)" in script
+    assert "!!requested && !!dataDate" in script
+    assert "context.historical_read_only === true" in script
+    assert "premarketForecastIsFresh" in script
+    assert "return !!sessionDate && sessionDate ===" in script
+    assert "state.loading=true" in trading_script
+    assert "请求超时（" in trading_script
+    assert "ctx.historical_read_only===true" in trading_script
+    assert "requestedFrameDate()" in trading_script
+    assert "if(dateChanged||viewChanged)load()" in trading_script
+    assert "V2 复验阻断" not in trading_script
+    assert "V2 执行门禁" not in trading_script
+    assert "V3 尚未产生首个决策" not in trading_script
+    assert "trading-v2.js?v=15" in execution_page
+    assert "模拟执行账本（内部 V2 协议）" in execution_page
+    assert "正在读取统一模拟账本" in execution_page
+    assert "V2 回测与决策执行器" not in execution_script
+    assert "尚无完整 V2 快照" not in execution_script
     assert "today_closed_positions" in trading_script
     assert "data-position-detail-index" in trading_script
     assert "买入时间" in trading_page
