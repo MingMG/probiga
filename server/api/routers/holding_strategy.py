@@ -138,6 +138,89 @@ def _latest_pit_row(
     return dict(row), ""
 
 
+def _same_session_quote(
+    engine: Engine,
+    *,
+    stock_code: str,
+    trade_date: str,
+    cutoff: datetime,
+    allow_late_arrival: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """Read a validated quote observed and acquired before the PIT cutoff."""
+
+    try:
+        columns = _table_columns(engine, "sm_stock_current")
+        if not {"stock_code", "price"}.issubset(columns):
+            return {}, "sm_stock_current is missing required fields"
+        observed_columns = [
+            column
+            for column in ("source_time", "snapshot_at")
+            if column in columns
+        ]
+        if not observed_columns:
+            return {}, "sm_stock_current has no observation timestamp"
+        observed_at = "COALESCE(" + ", ".join(
+            f"`{column}`" for column in observed_columns
+        ) + ")"
+        cutoff_clause, acquisition_order = _acquisition_clause(columns)
+        if not cutoff_clause:
+            return {}, "sm_stock_current has no acquisition timestamp"
+        selected = [
+            column
+            for column in (
+                "stock_code",
+                "price",
+                "snapshot_at",
+                "source_time",
+                "data_source",
+                "quality_status",
+                "permission_status",
+            )
+            if column in columns
+        ]
+        filters = [
+            "stock_code = :stock_code",
+            "price > 0",
+            f"DATE({observed_at}) = :trade_date",
+            f"{observed_at} <= :knowledge_cutoff",
+        ]
+        if not allow_late_arrival:
+            filters.append(cutoff_clause)
+        if "quality_status" in columns:
+            filters.append(
+                "UPPER(COALESCE(quality_status, 'VALIDATED')) "
+                "NOT IN ('INVALID', 'BLOCKED', 'REJECTED')"
+            )
+        if "permission_status" in columns:
+            filters.append(
+                "UPPER(COALESCE(permission_status, 'SUPPORTED')) "
+                "NOT IN ('UNSUPPORTED', 'BLOCKED', 'REJECTED')"
+            )
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    f"""
+                    SELECT {', '.join(f'`{column}`' for column in selected)},
+                           {observed_at} AS observed_at
+                    FROM sm_stock_current
+                    WHERE {' AND '.join(filters)}
+                    ORDER BY {observed_at} DESC, {acquisition_order} DESC
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "stock_code": stock_code,
+                    "trade_date": trade_date,
+                    "knowledge_cutoff": cutoff,
+                },
+            ).mappings().first()
+    except Exception as error:
+        return {}, str(error)
+    if row is None:
+        return {}, "no cutoff-eligible same-session quote"
+    return dict(row), ""
+
+
 def _daily_price_context(
     engine: Engine,
     *,
@@ -146,6 +229,21 @@ def _daily_price_context(
     cutoff: datetime,
     current_price: float | None,
 ) -> tuple[dict[str, Any], str]:
+    quote, quote_error = _same_session_quote(
+        engine,
+        stock_code=stock_code,
+        trade_date=trade_date,
+        cutoff=cutoff,
+    )
+    late_quote = {}
+    if not quote:
+        late_quote, _ = _same_session_quote(
+            engine,
+            stock_code=stock_code,
+            trade_date=trade_date,
+            cutoff=cutoff,
+            allow_late_arrival=True,
+        )
     try:
         columns = _table_columns(engine, "sm_stock_kline")
         required = {"stock_code", "trade_date", "close"}
@@ -189,17 +287,67 @@ def _daily_price_context(
         close = _number(row.get("close"))
         if key and close is not None and key not in closes_by_date:
             closes_by_date[key] = close
-    ordered = [closes_by_date[key] for key in sorted(closes_by_date)]
+    ordered_dates = sorted(closes_by_date)
+    ordered = [closes_by_date[key] for key in ordered_dates]
     daily_price = ordered[-1] if ordered else None
-    ma20 = sum(ordered[-20:]) / 20.0 if len(ordered) >= 20 else None
-    live_price = _number(current_price)
-    latest = live_price or daily_price
+    daily_trade_date = ordered_dates[-1] if ordered_dates else None
+    provided_price = _number(current_price)
+    persisted_quote_price = _number(quote.get("price"))
+    late_quote_price = _number(late_quote.get("price"))
+    same_session_price = provided_price or persisted_quote_price
+    ma_series = list(ordered)
+    if (
+        same_session_price is not None
+        and daily_trade_date != trade_date
+        and (cutoff.hour, cutoff.minute) >= (15, 0)
+    ):
+        ma_series.append(same_session_price)
+    ma20 = (
+        sum(ma_series[-20:]) / 20.0
+        if len(ma_series) >= 20
+        else None
+    )
+    latest = same_session_price or daily_price
+    price_source = (
+        "portfolio_live_snapshot"
+        if provided_price is not None
+        else "validated_same_session_quote"
+        if persisted_quote_price is not None
+        else "daily_close"
+    )
+    price_trade_date = (
+        trade_date if same_session_price is not None else daily_trade_date
+    )
+    mark_price = same_session_price or late_quote_price or latest
+    mark_source = (
+        price_source
+        if same_session_price is not None
+        else "late_arriving_same_session_quote"
+        if late_quote_price is not None
+        else price_source
+    )
     return {
         "latest_price": round(latest, 6) if latest is not None else None,
-        "price_source": "portfolio_live_snapshot" if live_price is not None else "daily_close",
+        "price_source": price_source,
+        "price_trade_date": price_trade_date,
+        "same_session": bool(price_trade_date == trade_date),
+        "quote_observed_at": quote.get("observed_at"),
+        "quote_data_source": quote.get("data_source"),
+        "quote_quality_status": quote.get("quality_status"),
+        "mark_price": round(mark_price, 6) if mark_price is not None else None,
+        "mark_price_trade_date": trade_date
+        if same_session_price is not None or late_quote_price is not None
+        else price_trade_date,
+        "mark_price_source": mark_source,
+        "late_arriving_quote": bool(
+            late_quote_price is not None and same_session_price is None
+        ),
+        "late_quote_observed_at": late_quote.get("observed_at"),
+        "late_quote_data_source": late_quote.get("data_source"),
         "ma20": round(ma20, 6) if ma20 is not None else None,
         "daily_session_count": len(ordered),
-    }, ""
+        "latest_daily_trade_date": daily_trade_date,
+    }, quote_error if price_trade_date != trade_date else ""
 
 
 def evaluate_watchlist_holding_exit_at_cutoff(
@@ -209,6 +357,7 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     knowledge_cutoff: str | datetime,
     *,
     current_price: float | None = None,
+    cost_price: float | None = None,
 ) -> dict[str, Any]:
     """Evaluate one holding using only records acquired by ``knowledge_cutoff``."""
     code = str(stock_code or "").strip().zfill(6)
@@ -285,6 +434,19 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     trend_reduce = _number(recommendation.get("trend_reduce_price")) or 0.0
     ma20 = _number(price.get("ma20")) or 0.0
     computed_trend_stop = ma20 * 0.97 if ma20 > 0 else 0.0
+    cost_guard = (_number(cost_price) or 0.0) * 0.95
+    recommendation_date = str(recommendation.get("pick_date") or "")[:10]
+    recommendation_age_days = None
+    if _DATE_RE.fullmatch(recommendation_date):
+        recommendation_age_days = (
+            date.fromisoformat(target_date)
+            - date.fromisoformat(recommendation_date)
+        ).days
+    recommendation_stale = bool(
+        recommendation_age_days is not None
+        and recommendation_age_days > 7
+    )
+    same_session_price = price.get("same_session") is True
 
     intent = "HOLD"
     reason = "cutoff-visible analysis and price do not require an exit"
@@ -293,26 +455,52 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         intent, reason, explicit = "SELL", "persisted strategy signal is SELL_ALERT", True
     elif "CRITICAL" in risks:
         intent, reason, explicit = "SELL", "cutoff-visible critical event risk requires exit", True
-    elif latest_price > 0 and stop_loss > 0 and latest_price <= stop_loss:
+    elif same_session_price and latest_price > 0 and cost_guard > 0 and latest_price <= cost_guard:
+        intent, reason, explicit = "SELL", f"最新价 {latest_price:.4f} 跌破持仓成本保护位 {cost_guard:.4f}", True
+    elif same_session_price and latest_price > 0 and stop_loss > 0 and latest_price <= stop_loss:
         intent, reason, explicit = "SELL", f"latest price {latest_price:.4f} breached stop loss {stop_loss:.4f}", True
-    elif latest_price > 0 and trend_stop > 0 and latest_price <= trend_stop:
+    elif same_session_price and latest_price > 0 and trend_stop > 0 and latest_price <= trend_stop:
         intent, reason, explicit = "SELL", f"latest price {latest_price:.4f} breached trend stop {trend_stop:.4f}", True
-    elif latest_price > 0 and computed_trend_stop > 0 and latest_price <= computed_trend_stop:
+    elif same_session_price and latest_price > 0 and computed_trend_stop > 0 and latest_price <= computed_trend_stop:
         intent, reason, explicit = "SELL", f"latest price {latest_price:.4f} invalidated MA20 trend stop {computed_trend_stop:.4f}", True
     elif "REDUCE" in signals:
         intent, reason, explicit = "REDUCE", "persisted strategy signal is REDUCE", True
     elif "HIGH" in risks:
         intent, reason, explicit = "REDUCE", "cutoff-visible high event risk requires reduction", True
-    elif latest_price > 0 and trend_reduce > 0 and latest_price <= trend_reduce:
+    elif same_session_price and latest_price > 0 and trend_reduce > 0 and latest_price <= trend_reduce:
         intent, reason, explicit = "REDUCE", f"latest price {latest_price:.4f} breached reduction line {trend_reduce:.4f}", True
 
     if not explicit:
         if not recommendation:
-            intent, reason = "WAIT_DATA", recommendation_error or "no cutoff-eligible recommendation row"
+            if analysis and same_session_price and cost_guard > 0:
+                intent, reason = (
+                    "HOLD",
+                    "当前没有同日新建议；价格仍在成本/MA20风险保护线上方，"
+                    "继续持有但不加仓",
+                )
+            else:
+                intent, reason = "WAIT_DATA", recommendation_error or "no cutoff-eligible recommendation row"
+        elif recommendation_stale:
+            if analysis and same_session_price and cost_guard > 0:
+                intent, reason = (
+                    "HOLD",
+                    "旧的持有/观察信号已作废；当前价格仍在成本/MA20风险"
+                    "保护线上方，继续持有但不加仓",
+                )
+            else:
+                intent, reason = (
+                    "WAIT_DATA",
+                    "最近持仓建议已经过期；旧的持有/观察信号不能继续授权风险",
+                )
         elif not analysis:
             intent, reason = "WAIT_DATA", analysis_error or "no cutoff-eligible analysis row"
         elif latest_price <= 0:
             intent, reason = "WAIT_DATA", price_error or "no cutoff-eligible holding price"
+        elif not same_session_price:
+            intent, reason = (
+                "WAIT_DATA",
+                "缺少所选交易日行情；不能把前一日收盘价冒充当天价格",
+            )
 
     evidence = {
         "analysis": analysis,
@@ -326,6 +514,13 @@ def evaluate_watchlist_holding_exit_at_cutoff(
             "trend_stop_price": trend_stop or None,
             "trend_reduce_price": trend_reduce or None,
             "computed_ma20_trend_stop": computed_trend_stop or None,
+            "cost_guard_price": cost_guard or None,
+        },
+        "freshness": {
+            "recommendation_date": recommendation_date or None,
+            "recommendation_age_days": recommendation_age_days,
+            "recommendation_stale": recommendation_stale,
+            "same_session_price": same_session_price,
         },
     }
     hash_payload = json.dumps(
@@ -359,13 +554,15 @@ def build_watchlist_holding_strategy(
     evidence = dict(exit_decision.get("evidence") or {})
     recommendation = dict(evidence.get("recommendation") or {})
     thresholds = dict(evidence.get("thresholds") or {})
+    freshness = dict(evidence.get("freshness") or {})
     price_evidence = dict(evidence.get("price") or {})
     intent = str(exit_decision.get("exit_intent") or "WAIT_DATA").upper()
     if intent not in {"SELL", "REDUCE", "HOLD", "WAIT_DATA"}:
         intent = "WAIT_DATA"
 
     latest_price = _number(
-        price_evidence.get("latest_price")
+        price_evidence.get("mark_price")
+        or price_evidence.get("latest_price")
         or portfolio_row.get("cur_price")
         or portfolio_row.get("price")
     )
@@ -375,8 +572,12 @@ def build_watchlist_holding_strategy(
     position_date = str(portfolio_row.get("position_date") or "")[:10]
     trade_date = str(exit_decision.get("trade_date") or "")[:10]
     t1_blocked = bool(position_date and trade_date and position_date == trade_date)
-    entry_range = _range(recommendation.get("entry_price_low"), recommendation.get("entry_price_high"))
-    take_profit_range = _range(
+    recommendation_stale = freshness.get("recommendation_stale") is True
+    entry_range = None if recommendation_stale else _range(
+        recommendation.get("entry_price_low"),
+        recommendation.get("entry_price_high"),
+    )
+    take_profit_range = None if recommendation_stale else _range(
         recommendation.get("take_profit_1") or recommendation.get("trend_reduce_price"),
         recommendation.get("take_profit_2")
         or recommendation.get("resistance_price")
@@ -384,15 +585,20 @@ def build_watchlist_holding_strategy(
         or recommendation.get("trend_reduce_price"),
     )
     protective_values = [
-        _number(thresholds.get("stop_loss_price")),
-        _number(thresholds.get("trend_stop_price")),
+        None if recommendation_stale else _number(thresholds.get("stop_loss_price")),
+        None if recommendation_stale else _number(thresholds.get("trend_stop_price")),
         _number(thresholds.get("computed_ma20_trend_stop")),
     ]
     protective_values = [value for value in protective_values if value is not None]
+    if cost_price is not None:
+        protective_values.append(round(cost_price * 0.95, 4))
     emergency_exit_price = round(max(protective_values), 4) if protective_values else None
     signal_status = str(recommendation.get("signal_status") or "").upper()
     main_wave_signal = str(recommendation.get("main_wave_signal") or "").upper()
     decision_reason = _first_text(
+        exit_decision.get("reason")
+        if intent == "WAIT_DATA" or recommendation_stale
+        else None,
         recommendation.get("signal_reason"),
         recommendation.get("main_wave_reason"),
         exit_decision.get("reason"),
@@ -417,7 +623,12 @@ def build_watchlist_holding_strategy(
     elif intent == "HOLD":
         action, priority, urgency = "继续持有", 2, "NORMAL"
         sell_plan = {"mode": "PLANNED_RANGE" if take_profit_range else "RECALCULATE_AFTER_CLOSE", "range": take_profit_range, "label": "到达计划区间后分批止盈" if take_profit_range else "收盘后重新计算卖出范围"}
-        next_plan = "收盘后按最新趋势、事件与保护位重新生成下一交易日预案。"
+        next_plan = (
+            "下一交易日继续持有，不加仓；跌破 "
+            f"{emergency_exit_price:.4f} 直接退出，收盘后重算。"
+            if emergency_exit_price is not None
+            else "下一交易日继续持有但不加仓；保护位缺失时先恢复数据。"
+        )
     else:
         action, priority, urgency = "冻结加仓，等待数据", 3, "DATA_BLOCKED"
         sell_plan = {"mode": "RISK_ONLY", "range": None, "label": "证据不完整时不生成正常卖出区间；已知硬止损仍优先"}
@@ -436,6 +647,15 @@ def build_watchlist_holding_strategy(
         "position_date": position_date or None,
         "cost_price": round(cost_price, 4) if cost_price is not None else None,
         "latest_price": round(latest_price, 4) if latest_price is not None else None,
+        "decision_price": price_evidence.get("latest_price"),
+        "price_source": price_evidence.get("mark_price_source")
+        or price_evidence.get("price_source"),
+        "price_trade_date": price_evidence.get("mark_price_trade_date")
+        or price_evidence.get("price_trade_date"),
+        "same_session_price": price_evidence.get("same_session") is True,
+        "late_arriving_quote": price_evidence.get("late_arriving_quote") is True,
+        "quote_observed_at": price_evidence.get("quote_observed_at")
+        or price_evidence.get("late_quote_observed_at"),
         "shares": shares,
         "sellable_shares": 0 if t1_blocked else sellable_shares,
         "t1_blocked": t1_blocked,

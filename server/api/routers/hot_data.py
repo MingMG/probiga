@@ -6382,6 +6382,7 @@ def portfolio_add(body: PortfolioAdd):
                 UPDATE st_user_portfolio
                 SET short_name = CASE WHEN short_name = '' THEN :n ELSE short_name END,
                     notes = CASE WHEN :nt <> '' THEN :nt ELSE notes END,
+                    is_holding = CASE WHEN shares > 0 THEN 1 ELSE 0 END,
                     etl_sync_at = NOW()
                 WHERE stock_code = :c
                 """,
@@ -6414,11 +6415,11 @@ def portfolio_add(body: PortfolioAdd):
         )
         _exec_sql("""
             INSERT INTO st_user_portfolio
-                (stock_code, short_name, cost_price, shares, position_source, position_date, add_date, sort_order, notes, etl_sync_at)
+                (stock_code, short_name, cost_price, shares, position_source, position_date, add_date, sort_order, notes, is_holding, etl_sync_at)
             VALUES
-                (:c, :n, :p, :s, :src, :pd, CURDATE(), :so, :nt, NOW())
+                (:c, :n, :p, :s, :src, :pd, CURDATE(), :so, :nt, :ih, NOW())
             ON DUPLICATE KEY UPDATE
-                cost_price=:p, shares=:s, position_source=:src, position_date=:pd, notes=:nt, etl_sync_at=NOW()
+                cost_price=:p, shares=:s, position_source=:src, position_date=:pd, notes=:nt, is_holding=:ih, etl_sync_at=NOW()
         """, {
             "c": code,
             "n": name,
@@ -6428,6 +6429,7 @@ def portfolio_add(body: PortfolioAdd):
             "pd": position_date,
             "so": next_order,
             "nt": body.notes,
+            "ih": 1 if body.shares > 0 else 0,
         })
         _exec_sql("""
             DELETE FROM st_portfolio_trans_log
@@ -6588,11 +6590,12 @@ def portfolio_transact(stock_code: str, body: PortfolioTransact):
             UPDATE st_user_portfolio
             SET cost_price=:p,
                 shares=:s,
+                is_holding=:ih,
                 position_source=:src,
                 position_date=""" + position_date_sql + """,
                 etl_sync_at=NOW()
             WHERE stock_code=:c
-        """, {"c": code, "p": new_cost, "s": new_shares, "src": position_source})
+        """, {"c": code, "p": new_cost, "s": new_shares, "ih": 1 if new_shares > 0 else 0, "src": position_source})
         _exec_sql(
             "UPDATE sm_stock_snapshot SET is_holding = :ih WHERE stock_code = :c",
             {"ih": 1 if new_shares > 0 else 0, "c": code},
@@ -6954,12 +6957,26 @@ def portfolio_holding_strategy(
 
     historical = target_day < date.today()
     cutoff = (
-        f"{target_day.isoformat()}T15:10:00+08:00"
+        f"{target_day.isoformat()}T23:59:59+08:00"
         if historical
         else datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
     )
     snapshot = _get_portfolio_snapshot(live_mode=not historical)
     snapshot_rows = list((snapshot or {}).get("data") or [])
+    decision_run = {}
+    try:
+        from server.trading_v3.repository import TradingV3Repository
+
+        decision_run = (
+            TradingV3Repository(get_engine()).latest_run_metadata(target_day)
+            or {}
+        )
+    except Exception as error:
+        logger.warning(
+            "holding strategy decision context unavailable for %s: %s",
+            target_day,
+            error,
+        )
     holdings = []
     for row in snapshot_rows:
         shares = int(row.get("shares") or 0)
@@ -6969,13 +6986,25 @@ def portfolio_holding_strategy(
         if position_date and position_date > target_day.isoformat():
             continue
         code = str(row.get("stock_code") or "").strip().zfill(6)
+        row = {**row, "is_holding": True}
+        row_quote_date = str(
+            row.get("quote_trade_date")
+            or row.get("snapshot_at")
+            or ""
+        )[:10]
+        cutoff_current_price = (
+            row.get("cur_price")
+            if not historical and row_quote_date == target_day.isoformat()
+            else None
+        )
         try:
             decision = evaluate_watchlist_holding_exit_at_cutoff(
                 get_engine(),
                 code,
                 target_day.isoformat(),
                 cutoff,
-                current_price=None if historical else row.get("cur_price"),
+                current_price=cutoff_current_price,
+                cost_price=row.get("cost_price"),
             )
         except Exception as error:
             logger.warning(
@@ -7020,8 +7049,16 @@ def portfolio_holding_strategy(
         "trade_date": target_day.isoformat(),
         "knowledge_cutoff": cutoff,
         "historical_read_only": historical,
+        "cutoff_mode": "END_OF_DAY_NEXT_SESSION_PLAN"
+        if historical
+        else "LIVE_AS_OF_NOW",
         "position_scope": "WATCHLIST_CURRENT_HOLDINGS",
         "execution_authority": "ADVISORY_ONLY",
+        "decision_run_uid": decision_run.get("run_uid"),
+        "decision_at": decision_run.get("decision_at"),
+        "decision_data_date": decision_run.get("trade_date"),
+        "decision_session_date": decision_run.get("requested_as_of")
+        or target_day.isoformat(),
         "summary": {**summary, "incomplete_position_count": incomplete_positions},
         "data": holdings,
     }

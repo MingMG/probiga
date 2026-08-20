@@ -1,6 +1,8 @@
 from datetime import datetime
 from unittest.mock import patch
 
+from sqlalchemy import create_engine, text
+
 from server.api.routers import holding_strategy
 
 
@@ -61,6 +63,91 @@ def test_yak_technology_august_17_sell_alert_is_an_immediate_exit():
 def test_timezone_cutoff_is_always_interpreted_as_shanghai_time():
     parsed = holding_strategy._cutoff_datetime("2026-08-17T02:00:00+00:00")
     assert parsed == datetime(2026, 8, 17, 10, 0, 0)
+
+
+def test_historical_holding_uses_validated_same_session_quote(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE sm_stock_kline (stock_code TEXT, trade_date TEXT, "
+            "close REAL, k_type INTEGER, adjust_type INTEGER, etl_sync_at TEXT)"
+        ))
+        connection.execute(
+            text("INSERT INTO sm_stock_kline VALUES "
+                 "('002165','2026-08-19',7.41,1,0,'2026-08-20 09:00:00')")
+        )
+
+    monkeypatch.setattr(
+        holding_strategy,
+        "_table_columns",
+        lambda _engine, table: {
+            "stock_code", "trade_date", "close", "k_type",
+            "adjust_type", "etl_sync_at",
+        } if table == "sm_stock_kline" else set(),
+    )
+    monkeypatch.setattr(
+        holding_strategy,
+        "_same_session_quote",
+        lambda *_args, **_kwargs: ({
+            "price": 7.79,
+            "observed_at": "2026-08-20 15:00:00",
+            "data_source": "gj_big_qmt_inner",
+            "quality_status": "VALIDATED",
+        }, ""),
+    )
+
+    price, error = holding_strategy._daily_price_context(
+        engine,
+        stock_code="002165",
+        trade_date="2026-08-20",
+        cutoff=datetime(2026, 8, 20, 15, 10),
+        current_price=None,
+    )
+
+    assert error == ""
+    assert price["latest_price"] == 7.79
+    assert price["price_trade_date"] == "2026-08-20"
+    assert price["latest_daily_trade_date"] == "2026-08-19"
+    assert price["same_session"] is True
+    assert price["price_source"] == "validated_same_session_quote"
+
+
+def test_stale_watch_signal_cannot_authorize_continued_holding(monkeypatch):
+    def latest_row(_engine, **kwargs):
+        if kwargs["table_name"] == "st_recommended_stocks":
+            return {
+                "pick_date": "2026-07-30",
+                "signal_status": "WATCH",
+                "main_wave_signal": "BUY_READY",
+            }, ""
+        return {
+            "analysis_date": "2026-08-20",
+            "event_risk_level": "LOW",
+            "recommend_status": "HOLD",
+        }, ""
+
+    monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest_row)
+    monkeypatch.setattr(
+        holding_strategy,
+        "_daily_price_context",
+        lambda *_args, **_kwargs: ({
+            "latest_price": 6.05,
+            "price_trade_date": "2026-08-20",
+            "same_session": True,
+            "ma20": 5.94,
+        }, ""),
+    )
+
+    decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
+        object(),
+        "601988",
+        "2026-08-20",
+        "2026-08-20T15:10:00+08:00",
+    )
+
+    assert decision["exit_intent"] == "WAIT_DATA"
+    assert decision["evidence"]["freshness"]["recommendation_stale"] is True
+    assert "已经过期" in decision["reason"]
 
 
 def test_same_day_sell_signal_becomes_next_session_t1_exit():

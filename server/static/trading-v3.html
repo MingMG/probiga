@@ -178,16 +178,16 @@
       <section class="view" id="view-candidates">
         <article class="panel">
           <div class="panel-head wrap">
-            <div><p>FORECAST LEDGER</p><h3>候选、研究样本与拒绝原因</h3></div>
+            <div><p>ACTIONABLE STRATEGY POOL</p><h3>可操作候选与等待触发</h3></div>
             <div class="filters">
               <label>历史日期<input type="date" id="candidateDate"></label>
               <label>策略<select id="strategyFilter"><option value="">全部策略</option></select></label>
-              <label>状态<select id="statusFilter"><option value="">全部状态</option><option value="RESEARCH_TARGET">同批次研究目标</option><option value="PORTFOLIO_REJECTED">同批次组合拒绝</option><option value="VALIDATED_POSITIVE">通过研究闸门</option><option value="PAPER_DISCOVERY_CANDIDATE">触发小仓模拟试错</option><option value="LEFT_SIDE_PREPARE">进入左侧准备区</option><option value="RESEARCH_ONLY_UNCALIBRATED">未校准，仅研究</option><option value="RESEARCH_ONLY_MODEL_VERSION_MISMATCH">旧模型已隔离</option><option value="RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED">分数排序失真</option><option value="RESEARCH_ONLY_PROFIT_GATE_FAILED">收益闸门失败</option><option value="WEAK_MARKET_THEME_WATCH">弱市结构性观察</option><option value="SETUP_NOT_READY">形态尚未同时确认</option><option value="MARKET_REGIME_BLOCKED">弱市且板块未确认</option><option value="INSUFFICIENT_DATA">数据不足</option></select></label>
+              <label>状态<select id="statusFilter"><option value="">默认策略池</option><option value="BUY_ZONE">允许买入区间</option><option value="WAIT_TRIGGER">等待触发</option><option value="PAPER_ONLY">仅模拟研究</option><option value="REJECTED">查看组合拒绝</option></select></label>
               <label>代码/中文/主题<input id="candidateSearch" placeholder="输入代码、中文名或主题"></label>
             </div>
           </div>
           <div class="candidate-toolbar">
-            <p class="note">选择历史日期读取当时已落库的不可变决策，不用今天的数据重算过去。</p>
+            <p class="note">这里只展示同一 V3 不可变批次中的可操作候选、等待触发和明确拒绝。买卖范围没有同批次校准证据时直接显示“未生成”，不再拼接旧推荐表。</p>
             <span class="badge" id="candidateSummary">读取候选中</span>
           </div>
           <div id="candidateCards" class="candidate-list" aria-live="polite"></div>

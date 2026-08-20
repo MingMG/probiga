@@ -78,6 +78,180 @@ def _uuid() -> str:
     return uuid.uuid4().hex
 
 
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _stock_pool_action_plan(
+    *,
+    run_uid: str,
+    forecasts: list[dict[str, Any]],
+    target: dict[str, Any] | None,
+    rejection: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build one run-bound advisory plan without borrowing legacy rankings.
+
+    Entry and exit prices are emitted only when the same immutable V3 run has
+    both a calibrated positive forecast and a portfolio target.  Research and
+    paper-discovery rows retain their run-native reference/stop evidence, but
+    deliberately do not receive invented buy or take-profit ranges.
+    """
+
+    statuses = {
+        str(item.get("forecast_status") or "").upper()
+        for item in forecasts
+    }
+    target_reason = str((target or {}).get("reason") or "").upper()
+    paper_only = "PAPER_DISCOVERY" in target_reason
+    calibrated = [
+        item
+        for item in forecasts
+        if str(item.get("forecast_status") or "").upper()
+        == "VALIDATED_POSITIVE"
+        and int(item.get("sample_count") or 0) > 0
+        and _positive_number(item.get("expected_return_net_pct")) is not None
+    ]
+    preferred_strategy = str(
+        (target or {}).get("primary_strategy_key") or ""
+    )
+    ordered = sorted(
+        forecasts,
+        key=lambda item: (
+            0 if item in calibrated else 1,
+            0
+            if preferred_strategy
+            and str(item.get("strategy_key") or "") == preferred_strategy
+            else 1,
+            int(item.get("rank_no") or 999999),
+            -float(item.get("raw_score") or 0.0),
+        ),
+    )
+    primary = ordered[0] if ordered else {}
+    features = primary.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    reference_price = _positive_number(features.get("price"))
+    stop_pct = None
+    try:
+        candidate_stop = float(primary.get("initial_stop_pct"))
+        if math.isfinite(candidate_stop) and candidate_stop < 0:
+            stop_pct = candidate_stop
+    except (TypeError, ValueError):
+        pass
+
+    buy_zone_ready = bool(target and calibrated and not paper_only)
+    if buy_zone_ready:
+        primary = sorted(
+            calibrated,
+            key=lambda item: (
+                0
+                if preferred_strategy
+                and str(item.get("strategy_key") or "")
+                == preferred_strategy
+                else 1,
+                int(item.get("rank_no") or 999999),
+            ),
+        )[0]
+        features = primary.get("features")
+        if not isinstance(features, dict):
+            features = {}
+        reference_price = _positive_number(features.get("price"))
+        try:
+            candidate_stop = float(primary.get("initial_stop_pct"))
+            if math.isfinite(candidate_stop) and candidate_stop < 0:
+                stop_pct = candidate_stop
+        except (TypeError, ValueError):
+            stop_pct = None
+
+    buy_range = None
+    sell_range = None
+    if buy_zone_ready and reference_price is not None:
+        buy_range = {
+            "low": round(reference_price * 0.995, 4),
+            "high": round(reference_price * 1.005, 4),
+        }
+        return_mid = _positive_number(
+            primary.get("return_q50_pct")
+            or primary.get("expected_return_net_pct")
+        )
+        return_high = _positive_number(
+            primary.get("return_q90_pct") or return_mid
+        )
+        if return_mid is not None and return_high is not None:
+            sell_range = {
+                "low": round(reference_price * (1 + return_mid / 100), 4),
+                "high": round(
+                    reference_price * (1 + max(return_mid, return_high) / 100),
+                    4,
+                ),
+            }
+
+    protective_stop = (
+        round(reference_price * (1 + stop_pct / 100), 4)
+        if reference_price is not None and stop_pct is not None
+        else None
+    )
+    if buy_zone_ready:
+        actionability = "BUY_ZONE"
+        label = "同批次已校准目标；进入买入区后再执行"
+    elif target and paper_only:
+        actionability = "PAPER_ONLY"
+        label = "仅模拟研究，不允许真实或建议性买入"
+    elif "LEFT_SIDE_PREPARE" in statuses:
+        actionability = "WAIT_TRIGGER"
+        label = "等待止跌、量能和相对强度同时确认"
+    elif rejection:
+        actionability = "REJECTED"
+        label = "组合约束已拒绝，不买入"
+    else:
+        actionability = "RESEARCH_ONLY"
+        label = "未形成可操作候选"
+
+    return {
+        "source": "V3_IMMUTABLE_RUN",
+        "run_uid": run_uid,
+        "actionability": actionability,
+        "label": label,
+        "reference_price": round(reference_price, 4)
+        if reference_price is not None
+        else None,
+        "buy_range": buy_range,
+        "sell_range": sell_range,
+        "protective_stop": protective_stop,
+        "evidence_as_of": str(primary.get("feature_time") or "") or None,
+        "valid_until": str(primary.get("valid_until") or "") or None,
+        "strategy_key": str(primary.get("strategy_key") or "") or None,
+        "range_status": "READY" if buy_range and sell_range else "NOT_GENERATED",
+        "execution_authority": "ADVISORY_ONLY",
+    }
+
+
+def _table_column_names(
+    connection: Connection,
+    table_name: str,
+) -> set[str]:
+    dialect_name = str(
+        getattr(getattr(connection, "dialect", None), "name", "")
+    ).casefold()
+    if dialect_name == "sqlite":
+        rows = connection.execute(
+            text(f"PRAGMA table_info({table_name})")
+        ).mappings().all()
+        return {str(row.get("name") or "") for row in rows}
+    rows = connection.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name"
+        ),
+        {"table_name": table_name},
+    ).all()
+    return {str(row[0]) for row in rows}
+
+
 def _theme_signal_rank(item: dict[str, Any]) -> tuple[Any, ...]:
     return (
         -int(item.get("selected_as_primary") or 0),
@@ -1608,14 +1782,35 @@ class TradingV3Repository:
             }
 
         with self.engine.connect() as connection:
+            forecast_columns = _table_column_names(
+                connection,
+                "st_alpha_forecast_v3",
+            )
+            optional_forecast_columns = (
+                "sample_count",
+                "profit_factor",
+                "payoff_ratio",
+                "initial_stop_pct",
+                "return_q50_pct",
+                "return_q90_pct",
+                "features_json",
+                "feature_time",
+            )
+            optional_forecast_select = ", ".join(
+                column
+                if column in forecast_columns
+                else f"NULL AS {column}"
+                for column in optional_forecast_columns
+            )
             forecast_rows = connection.execute(
                 text(
-                    """
+                    f"""
                     SELECT forecast_id, rank_no, stock_code, short_name,
                            strategy_key, raw_score,
                            expected_return_net_pct, probability_positive,
                            confidence, forecast_status, theme_code,
-                           valid_until, reasons_json
+                           valid_until, reasons_json,
+                           {optional_forecast_select}
                     FROM st_alpha_forecast_v3
                     WHERE run_uid = :run_uid
                     ORDER BY rank_no, stock_code, strategy_key
@@ -1661,9 +1856,14 @@ class TradingV3Repository:
                     "confidence": None,
                     "valid_until": None,
                     "reasons": [],
+                    "sample_count": 0,
+                    "profit_factor": None,
+                    "payoff_ratio": None,
                     "is_strategy_candidate": False,
                     "target": None,
                     "rejection": None,
+                    "action_plan": None,
+                    "_plan_forecasts": [],
                 }
                 pool[code] = item
             elif stock_name and (
@@ -1680,6 +1880,15 @@ class TradingV3Repository:
         }
         for row in forecast_rows:
             forecast = dict(row)
+            try:
+                features = json.loads(
+                    str(forecast.get("features_json") or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                features = {}
+            forecast["features"] = (
+                features if isinstance(features, dict) else {}
+            )
             item = _item_for(
                 forecast.get("stock_code"),
                 forecast.get("short_name"),
@@ -1706,12 +1915,18 @@ class TradingV3Repository:
                 "expected_return_net_pct",
                 "probability_positive",
                 "confidence",
+                "profit_factor",
+                "payoff_ratio",
             ):
                 value = forecast.get(field)
                 if value is not None and (
                     item[field] is None or float(value) > float(item[field])
                 ):
                     item[field] = float(value)
+            item["sample_count"] = max(
+                int(item.get("sample_count") or 0),
+                int(forecast.get("sample_count") or 0),
+            )
             valid_until = forecast.get("valid_until")
             if valid_until is not None:
                 serialized = str(valid_until)
@@ -1724,6 +1939,7 @@ class TradingV3Repository:
                 text_reason = str(reason).strip()
                 if text_reason and text_reason not in item["reasons"]:
                     item["reasons"].append(text_reason)
+            item["_plan_forecasts"].append(forecast)
 
         for row in target_rows:
             target = dict(row)
@@ -1742,7 +1958,9 @@ class TradingV3Repository:
                     "expected_return_net_pct",
                     "conservative_return_pct",
                     "expected_mae_pct",
+                    "estimated_roundtrip_cost_pct",
                     "theme_code",
+                    "primary_strategy_key",
                     "reason",
                     "status",
                 )
@@ -1790,6 +2008,13 @@ class TradingV3Repository:
 
         items = list(pool.values())
         for item in items:
+            item["action_plan"] = _stock_pool_action_plan(
+                run_uid=str(run["run_uid"]),
+                forecasts=list(item.pop("_plan_forecasts", [])),
+                target=item.get("target"),
+                rejection=item.get("rejection"),
+            )
+            item["actionability"] = item["action_plan"]["actionability"]
             item["reasons"] = item["reasons"][:8]
             item["strategy_keys"].sort()
             item["theme_codes"].sort()
@@ -1800,9 +2025,27 @@ class TradingV3Repository:
                 item["stock_code"],
             )
         )
+        visible_wait_limit = 20
+        visible_wait_count = 0
+        for item in items:
+            if item["actionability"] != "WAIT_TRIGGER":
+                continue
+            visible_wait_count += 1
+            if visible_wait_count <= visible_wait_limit:
+                continue
+            item["actionability"] = "RESEARCH_ONLY"
+            item["action_plan"]["actionability"] = "RESEARCH_ONLY"
+            item["action_plan"]["label"] = (
+                "等待触发优先级未进入前 20，移入研究审计"
+            )
         return {
             "run_uid": run["run_uid"],
             "trade_date": str(run["trade_date"]),
+            "decision_session_date": str(
+                run.get("requested_as_of")
+                or str(run.get("decision_at") or "")[:10]
+            ),
+            "decision_at": str(run.get("decision_at") or ""),
             "generated_at": str(
                 run.get("completed_at") or run.get("decision_at") or ""
             ),
@@ -1819,6 +2062,27 @@ class TradingV3Repository:
                 "rejected_count": sum(
                     1 for item in items if item["rejection"]
                 ),
+                "display_count": sum(
+                    1
+                    for item in items
+                    if item["actionability"] != "RESEARCH_ONLY"
+                ),
+                "buy_zone_count": sum(
+                    1
+                    for item in items
+                    if item["actionability"] == "BUY_ZONE"
+                ),
+                "wait_trigger_count": sum(
+                    1
+                    for item in items
+                    if item["actionability"] == "WAIT_TRIGGER"
+                ),
+                "paper_only_count": sum(
+                    1
+                    for item in items
+                    if item["actionability"] == "PAPER_ONLY"
+                ),
+                "visible_wait_limit": visible_wait_limit,
             },
         }
 

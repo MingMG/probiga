@@ -6,7 +6,10 @@ from datetime import date
 from sqlalchemy import create_engine, text
 
 from server.api.routers import trading_v3
-from server.trading_v3.repository import TradingV3Repository
+from server.trading_v3.repository import (
+    TradingV3Repository,
+    _stock_pool_action_plan,
+)
 
 
 def _pre_layer4_repository() -> TradingV3Repository:
@@ -176,3 +179,60 @@ def test_stock_pool_is_sorted_by_visible_rank_before_ledger_kind():
     assert [row["rank_no"] for row in pool["items"]] == [1, 2]
     assert [row["stock_code"] for row in pool["items"]] == ["000001", "000002"]
     assert pool["items"][1]["target"] is not None
+
+
+def test_stock_pool_paper_target_never_receives_invented_buy_or_sell_ranges():
+    plan = _stock_pool_action_plan(
+        run_uid="immutable-run",
+        forecasts=[{
+            "rank_no": 1,
+            "strategy_key": "quality_momentum",
+            "forecast_status": "PAPER_DISCOVERY_CANDIDATE",
+            "raw_score": 0.86,
+            "sample_count": 0,
+            "initial_stop_pct": -5,
+            "features": {"price": 16.86},
+            "feature_time": "2026-08-19 15:00:00",
+        }],
+        target={
+            "primary_strategy_key": "quality_momentum",
+            "reason": "PAPER_DISCOVERY: uncalibrated forward trial",
+        },
+        rejection=None,
+    )
+
+    assert plan["source"] == "V3_IMMUTABLE_RUN"
+    assert plan["actionability"] == "PAPER_ONLY"
+    assert plan["buy_range"] is None
+    assert plan["sell_range"] is None
+    assert plan["protective_stop"] == 16.017
+    assert plan["range_status"] == "NOT_GENERATED"
+
+
+def test_stock_pool_calibrated_target_uses_only_run_native_price_and_returns():
+    plan = _stock_pool_action_plan(
+        run_uid="immutable-run",
+        forecasts=[{
+            "rank_no": 2,
+            "strategy_key": "right_side_trend",
+            "forecast_status": "VALIDATED_POSITIVE",
+            "expected_return_net_pct": 3.0,
+            "return_q50_pct": 3.0,
+            "return_q90_pct": 6.0,
+            "sample_count": 40,
+            "initial_stop_pct": -4.0,
+            "features": {"price": 100.0},
+            "feature_time": "2026-08-19 15:00:00",
+        }],
+        target={
+            "primary_strategy_key": "right_side_trend",
+            "reason": "validated target",
+        },
+        rejection=None,
+    )
+
+    assert plan["actionability"] == "BUY_ZONE"
+    assert plan["buy_range"] == {"low": 99.5, "high": 100.5}
+    assert plan["sell_range"] == {"low": 103.0, "high": 106.0}
+    assert plan["protective_stop"] == 96.0
+    assert plan["range_status"] == "READY"
