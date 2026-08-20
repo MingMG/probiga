@@ -1,7 +1,8 @@
 (function(){
   'use strict';
   var state={context:{},readiness:{},overview:{},stockPool:{},recommendations:{},watchlistStrategy:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},paperLedger:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},lineage:{},researchGovernance:{},batchDiff:{},decisionIntelligence:{},horizonValidation:{},counterfactualResearch:{},shadowPreview:{},researchErrors:{},candidatePage:1,actionMessage:'',errors:{},staleKeys:{},loadedKeys:{},requestedDate:'',activeView:'overview',filters:{},activeJobId:'',loadSeq:0,loading:true};
-  var titles={overview:'今日决策',hypotheses:'交易假设',candidates:'候选与拒绝',intraday:'盘中只读证据',portfolio:'目标组合',positions:'我的持仓',orders:'模拟订单',validation:'回测验收',missed:'漏抓复盘',evidence:'数据与系统'};
+  var titles={overview:'今日策略',hypotheses:'连续跟踪',candidates:'策略池',intraday:'盘中应急',portfolio:'目标组合',positions:'我的持仓',orders:'模拟订单',validation:'回测验收',missed:'漏抓复盘',evidence:'数据与系统'};
+  var subtitles={overview:'先处理持仓，再看新机会',positions:'自选股里的真实持仓，今天怎么操作',candidates:'看清买入范围、卖出范围和突发退出',intraday:'盘中出现意外，先执行退出红线',hypotheses:'买入以后继续跟，不让建议断档'};
   var strategyNames={theme_diffusion:'板块扩散预热',low_base_ignition:'板块点火预判',right_side_trend:'右侧趋势启动',event_drift:'事件后漂移',quality_momentum:'质量与动量',oversold_reversal:'超跌抄底实验',intraday_surprise:'盘中超预期',weak_market_structural_mainline:'弱市结构性主线',ai_application_research:'AI应用纸面研究',robotics_research:'机器人纸面研究',paper_discovery:'模拟试错'};
   var statusNames={VALIDATED_POSITIVE:'扣费后正期望，允许进入组合',RESEARCH_TARGET:'同批次研究目标，不可直接下单',PORTFOLIO_REJECTED:'同批次组合拒绝',RESEARCH_SAMPLE:'研究样本',PAPER_DISCOVERY_CANDIDATE:'触发小仓模拟试错',LEFT_SIDE_PREPARE:'已进入抄底准备区，暂不买',RESEARCH_ONLY_UNCALIBRATED:'没有样本外校准，只记录不交易',RESEARCH_ONLY_MODEL_VERSION_MISMATCH:'旧公式校准已隔离，仅允许模拟盘重新验证',RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED:'高分组反而亏损，排序失真，禁止自动买入',RESEARCH_ONLY_PROFIT_GATE_FAILED:'样本外收益闸门失败，只研究',INSUFFICIENT_DATA:'所需事实不完整，不计算',SETUP_NOT_READY:'板块、趋势和入场位置尚未同时确认',WEAK_MARKET_THEME_WATCH:'弱市结构性机会，进入观察池但暂不自动买入',MARKET_REGIME_BLOCKED:'大盘偏弱且细分板块扩散或个股领导力不足',NO_ACTIVE_OOS_CALIBRATION:'没有策略通过样本外校准',NO_COMPATIBLE_OOS_CALIBRATION:'当前没有与冻结公式匹配且排序可信的正期望模型',V3_SCHEMA_INCOMPLETE:'决策账本尚未完成迁移',PAPER_ACTIVE:'模拟盘已启用',PAPER_TRIAL:'模拟观察',PAPER_DISCOVERY_READY:'模拟盘小仓试错已就绪',READY_WITH_PAPER_DISCOVERY:'正式组合与模拟试错并行',RESEARCH:'研究验证中，不会发出交易指令',QUEUED:'等待模拟撮合',FILLED:'已成交',CANCELLED:'已取消',RISK_APPROVED:'风控通过',HOLDING:'持仓中',holding:'持仓中',SOLD_TODAY:'今日已卖出',V3_PAPER_DISCOVERY:'模拟盘小仓前向验证',V3_VALIDATED_POSITIVE:'正期望组合模拟委托',V3_PROFIT_GATE_MIGRATION:'正期望闸门启用，旧买单已撤销',EXIT_PENDING_T1:'趋势已失效，T+1 后立即卖出'};
   var reasonNames={MARKET_NOT_CONFIRMED:'实时行情覆盖率或市场确认未通过，只提醒不买入',OUTSIDE_DAILY_ENTRY_WINDOW:'已过日级候选的盘中开仓窗口，只观察',DUPLICATE_ENTRY_SAME_DAY_BLOCKED:'当天已处理过同一证券，不重复开仓',DATA_QUALITY_BLOCK:'实时数据质量未通过',RISK_REJECTED:'模拟风控拒绝',ACTIVATE_PROBE:'盘中超预期，小仓试单',ACTIVATE_SUBSTITUTE:'龙头无法成交，选择同题材替补',ACTIVATE_REVERSAL_PROBE:'水下修复并放量，小仓试单',ACTIVATE_VOLUME_PROBE:'突然爆量上攻，小仓试单',WATCH:'观察，不下单'};
@@ -94,6 +95,7 @@
     document.querySelectorAll('.nav').forEach(function(x){x.classList.toggle('active',x.dataset.view===view)});
     document.querySelectorAll('.view').forEach(function(x){x.classList.toggle('active',x.id==='view-'+view)});
     el('pageTitle').textContent=titles[view];
+    if(el('pageSubtitle'))el('pageSubtitle').textContent=subtitles[view]||'策略详情与只读证据';
     if(options.userInitiated){
       if(!parentMessage('probiga-trading-v3-navigate',{view:view,requested_date:state.requestedDate,filters:state.filters})){
         history.pushState({view:view},'',location.pathname+location.search+'#'+view);
@@ -214,7 +216,7 @@
     if(decision==='EMPTY')return targetCount===0?{code:'EMPTY',reason:'批次与完整性已验证，且目标账本为 0；这是可解释的主动空仓。'}:{code:'UNAVAILABLE',reason:'服务端声明 EMPTY，但目标账本非空；按 fail-closed 处理。'};
     return {code:'UNAVAILABLE',reason:'决策状态未知或上下文不完整；系统按 fail-closed 处理，不能形成交易结论。'};
   }
-  function setAxis(id,kind,label,detail){var node=el(id);node.className=kind;node.querySelector('strong').textContent=label;node.querySelector('small').textContent=detail}
+  function setAxis(id,kind,label,detail){var node=el(id);node.className='strategy-status-card '+kind;node.querySelector('strong').textContent=label;node.querySelector('small').textContent=detail}
   function renderTruthContext(){
     var ctx=state.context||{},run=(state.overview||{}).run||{},truth=truthState(),ready=state.readiness||{};
     var requested=ctx.requested_date||state.requestedDate||'—',sessionDate=ctx.decision_session_date||ctx.requested_date||run.decision_session_date||'—',dataDate=ctx.data_date||run.trade_date||'—',expectedDataDate=ctx.expected_data_date||dataDate;
@@ -290,6 +292,18 @@
     el('targetCount').textContent=String(targets.length)+' / '+String(targetCap);
     el('targetPolicy').textContent='正式组合最多 '+String(limits.maximum_positions||limits.maximum_live_positions||'—')+' 只；模拟试错最多 '+String(limits.maximum_paper_discovery_positions||'—')+' 只；加仓最多 '+String(limits.maximum_add_count==null?'—':limits.maximum_add_count)+' 次';
     var truth=truthState(),holdingSummary=(state.watchlistStrategy||{}).summary||{},holdingRows=(state.watchlistStrategy||{}).rows||[],urgentHolding=holdingRows.find(function(x){return x.exit_intent==='SELL'||x.exit_intent==='REDUCE'});
+    var holdingCount=Number(holdingSummary.holding_count||holdingRows.length||0),sellCount=Number(holdingSummary.sell_count||0),reduceCount=Number(holdingSummary.reduce_count||0),urgentCount=sellCount+reduceCount;
+    var redlineCount=holdingRows.filter(function(x){var emergency=x.emergency_exit||{};return emergency.direct===true||emergency.price!=null||x.exit_intent==='SELL'}).length;
+    el('actualHoldingCount').textContent=String(holdingCount)+' 只';
+    el('urgentActionCount').textContent=String(urgentCount)+' 只';
+    el('urgentActionSummary').textContent=sellCount?'退出 '+String(sellCount)+' · 减仓 '+String(reduceCount):reduceCount?'减仓 '+String(reduceCount):holdingCount?'当前无强制卖出':'尚未登记真实持仓';
+    el('allowedBuyCount').textContent=String(urgentCount||truth.code!=='READY'?0:actionableTargets.length)+' 只';
+    el('intradayRedlineCount').textContent=String(redlineCount)+' 条';
+    if(state.errors.watchlistStrategy){el('todayFirstAction').textContent='冻结新增风险，先恢复持仓数据';el('todayFirstActionReason').textContent='持仓策略读取失败，不能把缺失数据解释为继续持有。'}
+    else if(sellCount){el('todayFirstAction').textContent='先处理 '+String(sellCount)+' 只退出持仓';el('todayFirstActionReason').textContent=urgentHolding?(urgentHolding.short_name||urgentHolding.stock_code)+'：'+(urgentHolding.action||urgentHolding.reason||'立即卖出'):'退出动作优先于所有新增机会。'}
+    else if(reduceCount){el('todayFirstAction').textContent='先处理 '+String(reduceCount)+' 只减仓持仓';el('todayFirstActionReason').textContent=urgentHolding?(urgentHolding.short_name||urgentHolding.stock_code)+'：'+(urgentHolding.action||urgentHolding.reason||'分批减仓'):'先降低已有风险，再看策略池。'}
+    else if(holdingCount){el('todayFirstAction').textContent='开盘前检查 '+String(holdingCount)+' 只持仓红线';el('todayFirstActionReason').textContent='没有触发退出前继续持有；触发卖出范围或突发红线就执行。'}
+    else{el('todayFirstAction').textContent='先确认自选股持仓是否已登记';el('todayFirstActionReason').textContent='成本价、股数和买入日期完整后，系统才会连续给出后续操作。'}
     if(!state.errors.watchlistStrategy&&Number(holdingSummary.sell_count||0)>0){el('heroTitle').textContent='自选股持仓有 '+String(holdingSummary.sell_count)+' 只需要立即退出';el('heroReason').textContent=urgentHolding?(urgentHolding.short_name||urgentHolding.stock_code)+'：'+(urgentHolding.reason||urgentHolding.action):'持仓退出信号优先于新增买入候选；请先处理风险。';el('hero').classList.add('blocked')}
     else if(!state.errors.watchlistStrategy&&Number(holdingSummary.reduce_count||0)>0){el('heroTitle').textContent='自选股持仓有 '+String(holdingSummary.reduce_count)+' 只需要优先减仓';el('heroReason').textContent=urgentHolding?(urgentHolding.short_name||urgentHolding.stock_code)+'：'+(urgentHolding.reason||urgentHolding.action):'先降低现有持仓风险，再评估新的买入机会。';el('hero').classList.add('blocked')}
     else if(truth.code==='UNAVAILABLE'){el('heroTitle').textContent='数据不可用，不能形成交易结论';el('heroReason').textContent=truth.reason;el('hero').classList.add('blocked')}

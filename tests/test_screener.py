@@ -115,12 +115,11 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert "style.css?v=41" in index
-    assert "app.js?v=98" in index
-    assert 'data-tab="trading-v3-candidates" onclick="switchTab(\'trading-v3-candidates\')"' in index
-    assert 'data-tab="trading-v3-ledger" onclick="switchTab(\'trading-v3-ledger\')"' in index
-    assert 'data-trading-view="candidates"' not in index
-    assert "{id:'trading-v3-candidates', candidateDecision:true" in script
-    assert "{id:'trading-v3-ledger', candidateCenter:true" in script
+    assert "app.js?v=99" in index
+    assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
+    assert 'data-tab="trading-v3-ledger"' not in index
+    assert 'data-trading-view="candidates"' in index
+    assert "{id:'trading-v3-candidates', modulePage:'v3', tradingView:'candidates'" in script
     assert "if (item.candidateDecision)" in script
     assert "loadCandidateDecisionPage(d, container);" in script
     assert "if (item.candidateCenter)" in script
@@ -139,14 +138,14 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "数据回退，禁止推荐" in script
     assert "premarketForecastIsFresh" in script
     assert "历史回退主题不参与今天的市场预期" in script
-    assert "trading-v3.js?v=27" in trading_page
+    assert "trading-v3.js?v=28" in trading_page
     assert "自选股里的真实持仓，今天怎么操作" in trading_page
     assert "买入范围" in trading_page
     assert "卖出范围" in trading_page
     assert "/api/portfolio/holding-strategy" in trading_script
     assert "V2 执行门禁" not in script
     assert "当前 V2 快照" not in script
-    assert "UNIFIED DECISION · OUT-OF-SAMPLE FIRST" in trading_page
+    assert "TODAY'S STRATEGY · 统一结论" in trading_page
     assert "必须通过统一执行门禁" in trading_page
     assert "当前模拟账户快照" in trading_page
     assert "function decisionRead(url, timeoutMs)" in script

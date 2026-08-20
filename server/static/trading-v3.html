@@ -5,30 +5,20 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=11">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=12">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
   <div class="shell">
     <aside class="rail">
       <a class="brand" href="/"><span>Pro</span>BigA</a>
-      <p class="rail-caption">POSITIVE EXPECTANCY DESK</p>
+      <p class="rail-caption">交易策略</p>
       <nav>
-        <span class="nav-group">今日决策</span>
-        <button class="nav active" data-view="overview"><i>01</i>决策总览</button>
-        <span class="nav-group">机会与拒绝</span>
-        <button class="nav" data-view="hypotheses"><i>02</i>交易假设</button>
-        <button class="nav" data-view="candidates"><i>03</i>候选与拒绝</button>
-        <button class="nav" data-view="intraday"><i>04</i>盘中只读证据</button>
-        <span class="nav-group">模拟执行</span>
-        <button class="nav" data-view="portfolio"><i>05</i>目标组合</button>
-        <button class="nav" data-view="positions"><i>06</i>我的持仓</button>
-        <button class="nav" data-view="orders"><i>07</i>模拟订单</button>
-        <span class="nav-group">验证复盘</span>
-        <button class="nav" data-view="validation"><i>08</i>回测验收</button>
-        <button class="nav" data-view="missed"><i>09</i>漏抓复盘</button>
-        <span class="nav-group">系统证据</span>
-        <button class="nav" data-view="evidence"><i>10</i>数据与系统</button>
+        <button class="nav active" data-view="overview"><i>01</i>今日策略</button>
+        <button class="nav" data-view="positions"><i>02</i>我的持仓</button>
+        <button class="nav" data-view="candidates"><i>03</i>策略池</button>
+        <button class="nav" data-view="intraday"><i>04</i>盘中应急</button>
+        <button class="nav" data-view="hypotheses"><i>05</i>连续跟踪</button>
       </nav>
       <div class="rail-foot">
         <span></span>
@@ -39,8 +29,8 @@
     <main>
       <header>
         <div>
-          <p class="eyebrow">UNIFIED DECISION · OUT-OF-SAMPLE FIRST</p>
-          <h1 id="pageTitle">执行总览</h1>
+          <p class="eyebrow" id="pageSubtitle">先处理持仓，再看新机会</p>
+          <h1 id="pageTitle">今日策略</h1>
         </div>
         <div class="actions">
           <span id="updatedAt">读取中</span>
@@ -48,60 +38,68 @@
         </div>
       </header>
 
-      <section class="truth-context" id="truthContext" aria-live="polite" aria-busy="true">
+      <section class="truth-context strategy-status" id="truthContext" aria-live="polite" aria-busy="true">
         <div class="truth-context-head">
-          <div><span class="truth-kicker">统一决策上下文</span><strong id="truthState">读取中</strong></div>
+          <div><span class="truth-kicker">今日决策依据</span></div>
           <p id="truthStateReason">正在核对决策批次、证据时点和执行权限。</p>
         </div>
-        <dl class="truth-clock">
-          <div><dt>页面请求日</dt><dd id="ctxRequestedDate">—</dd></div>
-          <div><dt>决策会话日</dt><dd id="ctxDecisionSessionDate">—</dd></div>
-          <div><dt>特征数据日</dt><dd id="ctxDataDate">—</dd></div>
-          <div><dt>预期数据日</dt><dd id="ctxExpectedDataDate">—</dd></div>
-          <div><dt>决策批次</dt><dd id="ctxRunUid">—</dd></div>
-          <div><dt>决策时间</dt><dd id="ctxDecisionAt">—</dd></div>
-          <div><dt>证据截至</dt><dd id="ctxEvidenceAsOf">—</dd></div>
-          <div><dt>有效至</dt><dd id="ctxValidUntil">—</dd></div>
-        </dl>
-        <div class="authority-axis" aria-label="交易权限边界">
-          <div id="researchAuthority"><span>研究分析</span><strong>读取中</strong><small>只形成证据和排序</small></div>
-          <div id="paperAuthority"><span>模拟执行</span><strong>读取中</strong><small>必须通过统一执行门禁</small></div>
-          <div id="realAuthority"><span>真实交易</span><strong>固定关闭</strong><small>本页面没有真实订单权限</small></div>
+        <div class="strategy-status-grid" aria-label="今日策略状态">
+          <div class="strategy-status-card" id="decisionAuthority"><span>决策与数据</span><strong id="truthState">读取中</strong><small>会话 <b id="ctxDecisionSessionDate">—</b> · 特征 <b id="ctxDataDate">—</b> · 证据 <b id="ctxEvidenceAsOf">—</b></small></div>
+          <div class="strategy-status-card" id="researchAuthority"><span>研究</span><strong>读取中</strong><small>只形成证据和排序</small></div>
+          <div class="strategy-status-card" id="paperAuthority"><span>模拟执行</span><strong>读取中</strong><small>必须通过统一执行门禁</small></div>
+          <div class="strategy-status-card" id="realAuthority"><span>真实交易</span><strong>固定关闭</strong><small>本页面不会自动下真实订单</small></div>
         </div>
+        <details class="truth-more">
+          <summary>查看批次、时间和系统证据</summary>
+          <dl class="truth-clock">
+            <div><dt>页面请求日</dt><dd id="ctxRequestedDate">—</dd></div>
+            <div><dt>预期数据日</dt><dd id="ctxExpectedDataDate">—</dd></div>
+            <div><dt>决策批次</dt><dd id="ctxRunUid">—</dd></div>
+            <div><dt>决策时间</dt><dd id="ctxDecisionAt">—</dd></div>
+            <div><dt>有效至</dt><dd id="ctxValidUntil">—</dd></div>
+          </dl>
+        </details>
         <div class="truth-error" id="truthError" role="alert" hidden></div>
       </section>
 
-      <section class="action-strip">
-        <div>
-          <strong>手动执行</strong>
-          <span id="actionStatus" role="status" aria-live="polite">正在读取今日自动执行状态</span>
-        </div>
-        <div class="action-buttons">
-          <button id="runDaily">手动重跑日级选股</button>
-        </div>
-      </section>
+      <details class="system-tools">
+        <summary>系统操作与手动重跑</summary>
+        <section class="action-strip">
+          <div>
+            <strong>手动执行</strong>
+            <span id="actionStatus" role="status" aria-live="polite">正在读取今日自动执行状态</span>
+          </div>
+          <div class="action-buttons">
+            <button id="runDaily">手动重跑日级选股</button>
+          </div>
+        </section>
+      </details>
 
       <section class="hero" id="hero">
-        <div>
-          <p>当前结论</p>
+        <div class="hero-copy">
+          <p>TODAY'S STRATEGY · 统一结论</p>
           <h2 id="heroTitle">正在读取最新决策</h2>
           <span id="heroReason">没有样本外证据的策略不会进入模拟买单。</span>
         </div>
-        <div class="regime">
+        <div class="today-first-action">
+          <small>今天第一动作</small>
+          <strong id="todayFirstAction">等待持仓策略</strong>
+          <span id="todayFirstActionReason">先核对自选股里的真实持仓。</span>
+        </div>
+        <div class="regime" hidden>
           <small>市场状态（概率最高）</small>
           <strong id="regime">—</strong>
           <span id="riskCap">风险仓位上限 —</span>
         </div>
       </section>
 
-      <section class="metrics">
-        <article><span>当前模拟账户总权益</span><strong id="equity">—</strong><small id="equitySource">读取当前持仓所属账本</small></article>
-        <article><span>当前可用现金</span><strong id="cash">—</strong><small id="cashSource">读取当前持仓所属账本</small></article>
-        <article><span>当前浮动盈亏</span><strong id="unrealizedPnl">—</strong><small id="marketValue">读取最新持仓市值</small></article>
-        <article><span>当前持仓</span><strong id="positionCount">—</strong><small>只统计当前开放持仓</small></article>
-        <article><span>通过样本外闸门</span><strong id="validated">—</strong><small id="sleeves">策略独立记账</small></article>
-        <article><span>研究目标 / 组合上限</span><strong id="targetCount">—</strong><small id="targetPolicy">读取当前生产仓位规则</small></article>
+      <section class="metrics strategy-metrics">
+        <article><span>自选股真实持仓</span><strong id="actualHoldingCount">—</strong><small>全部纳入今日策略</small></article>
+        <article><span>今天需动作</span><strong id="urgentActionCount">—</strong><small id="urgentActionSummary">等待持仓判断</small></article>
+        <article><span>允许新买</span><strong id="allowedBuyCount">—</strong><small>持仓风险优先于新机会</small></article>
+        <article><span>盘中退出红线</span><strong id="intradayRedlineCount">—</strong><small>触发即按 T+1 / 可卖数量处理</small></article>
       </section>
+      <div class="legacy-metrics" hidden><span id="equity"></span><span id="equitySource"></span><span id="cash"></span><span id="cashSource"></span><span id="unrealizedPnl"></span><span id="marketValue"></span><span id="positionCount"></span><span id="validated"></span><span id="sleeves"></span><span id="targetCount"></span><span id="targetPolicy"></span></div>
 
       <section class="view active" id="view-overview">
         <article class="panel holding-strategy-panel">
@@ -110,6 +108,8 @@
           <div id="watchlistStrategySummary" class="facts"></div>
           <div class="table-wrap holding-strategy-table"><table><thead><tr><th>持仓</th><th>成本 / 最新</th><th>今日动作</th><th>买入 / 加仓范围</th><th>卖出范围</th><th>盘中突发退出</th><th>下一交易日</th><th>依据时点</th></tr></thead><tbody id="watchlistStrategyRows"></tbody></table></div>
         </article>
+        <details class="research-details">
+          <summary>查看研究依据、实验与目标明细</summary>
         <div class="two">
           <article class="panel">
             <div class="panel-head"><div><p>WHY THIS DECISION</p><h3>为什么买 / 为什么不买</h3></div><span class="badge" id="decisionStatus">读取中</span></div>
@@ -138,6 +138,7 @@
           <div class="panel-head"><div><p>TARGETS</p><h3>本次研究目标</h3></div><span class="badge warning">RESEARCH_ONLY 不可直接下单</span></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>目标仓位</th><th>股数</th><th>净期望</th><th>保守收益</th><th>往返成本</th><th>证据</th></tr></thead><tbody id="overviewTargets"></tbody></table></div>
         </article>
+        </details>
       </section>
 
       <section class="view" id="view-hypotheses">
@@ -387,6 +388,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=27"></script>
+  <script src="/static/js/trading-v3.js?v=28"></script>
 </body>
 </html>

@@ -3885,7 +3885,7 @@
     window.addEventListener('message', function(event) {
         if (event.data && event.data.type === 'probiga-trading-v3-navigate') {
             if (event.origin !== window.location.origin && event.origin !== 'null') return;
-            var viewMap = {overview:'trading-v3-overview',hypotheses:'trading-v3-hypotheses',candidates:'trading-v3-ledger',intraday:'trading-v3-intraday',portfolio:'trading-v3-portfolio',positions:'trading-v3-positions',orders:'trading-v3-orders',validation:'trading-v3-validation',missed:'trading-v3-missed',evidence:'trading-v3-evidence'};
+            var viewMap = {overview:'trading-v3-overview',positions:'trading-v3-positions',candidates:'trading-v3-candidates',intraday:'trading-v3-intraday',hypotheses:'trading-v3-hypotheses',portfolio:'trading-v3-positions',orders:'trading-v3-positions',validation:'trading-v3-hypotheses',missed:'trading-v3-hypotheses',evidence:'trading-v3-overview'};
             if (event.data.requested_date && el('datePicker')) el('datePicker').value = event.data.requested_date;
             window.updateTradingRouteFilters(event.data.filters || {});
             if (viewMap[event.data.view]) window.switchTab(viewMap[event.data.view]);
@@ -3919,12 +3919,12 @@
     };
     window.openTradingV2Module = function(view) {
         var compatibility = {
-            trust:'trading-v3-evidence', tomorrow:'trading-v3-overview',
-            opportunity:'trading-v3-candidates', plan:'trading-v3-portfolio',
-            positions:'trading-v3-positions', orders:'trading-v3-orders',
-            etf:'trading-shared-etf', evidence:'trading-v3-evidence',
-            operations:'trading-shared-operations', review:'trading-v3-validation',
-            lab:'trading-v3-missed'
+            trust:'trading-v3-overview', tomorrow:'trading-v3-overview',
+            opportunity:'trading-v3-candidates', plan:'trading-v3-positions',
+            positions:'trading-v3-positions', orders:'trading-v3-positions',
+            etf:'trading-v3-overview', evidence:'trading-v3-overview',
+            operations:'trading-v3-overview', review:'trading-v3-hypotheses',
+            lab:'trading-v3-candidates'
         };
         window.openTradingModule(compatibility[String(view || '')] || 'trading-v3-overview');
     };
@@ -3934,7 +3934,7 @@
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
         var moduleLabel = modulePage === 'v3' ? '统一决策、研究验证与模拟账本' : '共享运行证据';
         container.innerHTML = '<div class="trade-module-page">' +
-            '<section class="trade-module-head"><span>策略与模拟 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
+            '<section class="trade-module-head"><span>交易策略 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
             '<p>本页使用当前生产决策、模拟账本与验收证据，不再读取旧版选股结论。</p></section>' +
             '<iframe id="' + frameId + '" class="trade-full-frame" title="' + escHtml(item.label) + '" data-module-page="' + modulePage + '" data-pending-view="' + view + '" data-requested-date="' + escAttr(requestedDate || currentDateValue()) + '" onload="tradingDeskFrameLoaded(this)" scrolling="auto"></iframe>' +
             '</div>';
@@ -4142,7 +4142,7 @@
         h += '</tbody></table></div></details>';
         h += '<footer class="trade-foot"><span>决策批次 ' + escHtml(run.run_uid || '—') + '</span><span>市场状态 ' + escHtml(TRADING_REGIME_NAMES[run.dominant_regime] || localizeMachineText(run.dominant_regime || '—')) + '</span><span>风险资产上限 ' + tradingDeskPercent(run.risk_asset_cap, 100) + '</span><span>' + (paperExecutable ? '模拟可入队，成交前仍会复验' : '模拟链路存在阻断或仅研究') + '</span></footer></div>';
         container.innerHTML = h;
-        setStatus('策略与模拟已更新');
+        setStatus('交易策略已更新');
     }
     function loadTradingDesk(container, requestedDate) {
         var paths = {
@@ -5494,7 +5494,7 @@
     /* ===== 布局切换 ===== */
     var LAYOUT_OLD = [
         {group:'交易决策', items:[
-            {id:'trading',icon:'◎',label:'策略与模拟'}
+            {id:'trading',icon:'◎',label:'交易策略'}
         ]},
         {group:'自选管理', items:[
             {id:'portfolio',icon:'📈',label:'自选股'}
@@ -5556,7 +5556,7 @@
     ];
     var LAYOUT_NEW = [
         {group:'交易决策', items:[
-            {id:'trading',icon:'◎',label:'策略与模拟'},
+            {id:'trading',icon:'◎',label:'交易策略'},
             {id:'strategy-backtest',icon:'📊',label:'策略回测'}
         ]},
         {group:'自选管理', items:[
@@ -5602,19 +5602,11 @@
         ]}
     ];
     var TRADING_MODULE_NAV_ITEMS = [
-        {id:'trading-v3-overview', decisionCockpit:true, icon:'01', label:'决策总览', tradingSection:'今日决策'},
-        {id:'trading-v3-hypotheses', modulePage:'v3', tradingView:'hypotheses', icon:'02', label:'交易假设', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-candidates', candidateDecision:true, icon:'03', label:'候选与决策', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-ledger', candidateCenter:true, icon:'04', label:'候选账本', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-intraday', modulePage:'v3', tradingView:'intraday', icon:'05', label:'盘中只读证据', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-portfolio', modulePage:'v3', tradingView:'portfolio', icon:'06', label:'目标组合', tradingSection:'模拟执行'},
-        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'07', label:'持仓与退出', tradingSection:'模拟执行'},
-        {id:'trading-v3-orders', modulePage:'v3', tradingView:'orders', icon:'08', label:'模拟订单', tradingSection:'模拟执行'},
-        {id:'trading-v3-validation', modulePage:'v3', tradingView:'validation', icon:'09', label:'回测验收', tradingSection:'验证复盘'},
-        {id:'trading-v3-missed', modulePage:'v3', tradingView:'missed', icon:'10', label:'漏抓复盘', tradingSection:'验证复盘'},
-        {id:'trading-v3-evidence', modulePage:'v3', tradingView:'evidence', icon:'11', label:'数据与系统', tradingSection:'系统证据'},
-        {id:'trading-shared-etf', modulePage:'v2', tradingView:'etf', icon:'12', label:'ETF 前向', tradingSection:'系统证据'},
-        {id:'trading-shared-operations', modulePage:'v2', tradingView:'operations', icon:'13', label:'运行状态', tradingSection:'系统证据'}
+        {id:'trading-v3-overview', modulePage:'v3', tradingView:'overview', icon:'01', label:'今日策略'},
+        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'02', label:'我的持仓'},
+        {id:'trading-v3-candidates', modulePage:'v3', tradingView:'candidates', icon:'03', label:'策略池'},
+        {id:'trading-v3-intraday', modulePage:'v3', tradingView:'intraday', icon:'04', label:'盘中应急'},
+        {id:'trading-v3-hypotheses', modulePage:'v3', tradingView:'hypotheses', icon:'05', label:'连续跟踪'}
     ];
     TRADING_MODULE_NAV_ITEMS.forEach(function(item) {
         LOADERS[item.id] = function(d, container) {
@@ -5652,7 +5644,7 @@
         if (!exists) layout[groupIndex].items.push(item);
     }
     if (typeof PAGE_TITLES !== 'undefined') {
-        PAGE_TITLES['trading'] = '◎ 策略与模拟';
+        PAGE_TITLES['trading'] = '◎ 交易策略';
         PAGE_TITLES['intraday-battle'] = '⚡ 盘中作战';
         PAGE_TITLES['strategy-backtest'] = '📊 策略回测';
         PAGE_TITLES['research-radar'] = '🧭 研报趋势雷达';
