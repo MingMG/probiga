@@ -108,21 +108,31 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
-    assert "style.css?v=40" in index
-    assert "app.js?v=95" in index
+    assert "style.css?v=41" in index
+    assert "app.js?v=96" in index
     assert 'data-tab="trading-v3-candidates" onclick="switchTab(\'trading-v3-candidates\')"' in index
+    assert 'data-tab="trading-v3-ledger" onclick="switchTab(\'trading-v3-ledger\')"' in index
     assert 'data-trading-view="candidates"' not in index
-    assert "{id:'trading-v3-candidates', candidateCenter:true" in script
+    assert "{id:'trading-v3-candidates', candidateDecision:true" in script
+    assert "{id:'trading-v3-ledger', candidateCenter:true" in script
+    assert "if (item.candidateDecision)" in script
+    assert "loadCandidateDecisionPage(d, container);" in script
     assert "if (item.candidateCenter)" in script
     assert "loadCandidateCenterPage(d, container);" in script
+    assert "var isTradingItem = !!it.tradingSection;" in script
     assert "V3.6 生产真值" not in script
     assert "V3 决策、Shadow 与模拟账本" in script
-    assert "四版本实际运行：V3 为基础排序" in script
+    assert "保留原有完整账本视图" in script
     assert "V4 硬拒绝会计入证据覆盖" in script
     assert 'id="candidateCenterDateFilter"' in script
     assert 'id="candidateCenterStockFilter"' in script
     assert "queryButton.addEventListener('click', queryCandidateCenter)" in script
     assert "stockInput.addEventListener('input', applyStockFilter)" in script
+    assert "今日大盘预期" in script
+    assert "今天怎么操作" in script
+    assert "数据回退，禁止推荐" in script
+    assert "premarketForecastIsFresh" in script
+    assert "历史回退主题不参与今天的市场预期" in script
     assert "trading-v3.js?v=25" in trading_page
     assert "today_closed_positions" in trading_script
     assert "data-position-detail-index" in trading_script

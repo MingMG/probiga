@@ -143,3 +143,36 @@ def test_historical_run_uses_the_layer4_column_when_present():
     assert run is not None
     assert run["run_uid"] == "layer4-run"
     assert str(run["requested_as_of"]) == "2026-08-19"
+
+
+def test_stock_pool_is_sorted_by_visible_rank_before_ledger_kind():
+    repository = _pre_layer4_repository()
+    with repository.engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO st_alpha_forecast_v3 (
+                    forecast_id, run_uid, rank_no, stock_code, short_name,
+                    strategy_key, raw_score, forecast_status, reasons_json
+                ) VALUES
+                    ('f-target', 'pre-layer4-run', 2, '000002', '目标二号',
+                     'right_side_trend', 80, 'VALIDATED_POSITIVE', '[]'),
+                    ('f-watch', 'pre-layer4-run', 1, '000001', '观察一号',
+                     'right_side_trend', 82, 'RESEARCH_SAMPLE', '[]')
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO st_target_portfolio_v3 (run_uid, rank_no, stock_code)
+                VALUES ('pre-layer4-run', 1, '000002')
+                """
+            )
+        )
+
+    pool = repository.stock_pool(trade_date=date(2026, 8, 19))
+
+    assert [row["rank_no"] for row in pool["items"]] == [1, 2]
+    assert [row["stock_code"] for row in pool["items"]] == ["000001", "000002"]
+    assert pool["items"][1]["target"] is not None

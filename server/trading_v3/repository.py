@@ -1796,9 +1796,6 @@ class TradingV3Repository:
             item["forecast_statuses"].sort()
         items.sort(
             key=lambda item: (
-                0 if item["target"] else 1,
-                0 if item["is_strategy_candidate"] else 1,
-                0 if item["rejection"] else 1,
                 item["rank_no"] if item["rank_no"] is not None else 999999,
                 item["stock_code"],
             )

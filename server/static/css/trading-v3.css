@@ -22,3 +22,34 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,su
 .position-note-cell{min-width:250px;max-width:360px;white-space:normal}.position-note-preview{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;line-height:1.55;color:#aab7be}.position-detail-button{margin-top:7px;padding:5px 9px;border:1px solid rgba(114,167,215,.4);border-radius:6px;background:#14232d;color:#9ac4e7;cursor:pointer;font-size:10px}.position-detail-button:hover{border-color:var(--amber);color:var(--amber)}.position-sold-today{background:rgba(232,173,75,.035)}
 .position-detail-modal[hidden]{display:none}.position-detail-modal{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:24px}.position-detail-backdrop{position:absolute;inset:0;background:rgba(2,7,10,.78);backdrop-filter:blur(3px)}.position-detail-dialog{position:relative;width:min(820px,calc(100vw - 36px));max-height:min(760px,calc(100vh - 48px));overflow:auto;border:1px solid #354952;border-radius:11px;background:#111d23;box-shadow:0 28px 90px rgba(0,0,0,.55)}.position-detail-dialog>header{position:sticky;top:0;z-index:1;display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin:0;padding:18px 20px;border-bottom:1px solid #293a43;background:#111d23}.position-detail-dialog header p{margin:0 0 5px;color:#657781;font:10px/1.2 ui-monospace,monospace;letter-spacing:1.8px}.position-detail-dialog header h3{margin:0;font-size:17px}.position-detail-close{width:32px;height:32px;border:1px solid #35454e;border-radius:7px;background:#17252d;color:#dbe3e8;cursor:pointer;font-size:20px;line-height:1}.position-detail-body{display:grid;gap:16px;padding:20px}.position-detail-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.position-detail-grid div,.position-lot-card{padding:11px;border:1px solid #293b45;border-radius:7px;background:#0e181d}.position-detail-grid span,.position-lot-card span{display:block;color:#71838d;font-size:9px}.position-detail-grid strong,.position-lot-card strong{display:block;margin-top:5px;color:#e4ebee;font-size:11px;line-height:1.55}.position-detail-section h4{margin:0 0 8px;color:#dce5e9;font-size:12px}.position-detail-section p{margin:0;padding:12px;border:1px solid #293b45;border-radius:7px;background:#0e181d;color:#aab7be;font-size:11px;line-height:1.7;white-space:pre-wrap}.position-lots{display:grid;gap:8px}.position-lot-card{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.position-lot-card .position-lot-note{grid-column:1/-1}.position-detail-modal-open{overflow:hidden}
 @media(max-width:720px){.position-detail-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.position-lot-card{grid-template-columns:repeat(2,minmax(0,1fr))}.position-detail-modal{padding:10px}.position-detail-dialog{width:calc(100vw - 20px);max-height:calc(100vh - 20px)}}
+
+/* Embedded views inherit the light visual language of the main ProBigA shell. */
+html.v3-embedded{--bg:transparent;--rail:#f8fafc;--panel:#fff;--panel2:#f7f9fc;--line:#dfe7f0;--ink:#172b4d;--muted:#6c7b8f;--amber:#b7791f;--green:#16835b;--red:#c2413b;--blue:#2563eb}
+html.v3-embedded body{color:var(--ink)}
+html.v3-embedded .truth-context{border-color:#d8e3ee;background:rgba(255,255,255,.97);box-shadow:0 8px 24px rgba(15,23,42,.08)}
+html.v3-embedded .truth-context-head p{color:#64748b}
+html.v3-embedded .truth-clock div,html.v3-embedded .authority-axis>div,html.v3-embedded .workflow-line li,html.v3-embedded .horizon-contracts>div,html.v3-embedded .quadrant-grid>div,html.v3-embedded .shadow-governance>div{border-color:#e3eaf1;background:#f8fafc}
+html.v3-embedded .truth-clock dd,html.v3-embedded .horizon-contracts strong,html.v3-embedded .quadrant-grid strong,html.v3-embedded .shadow-governance strong{color:#243b5a}
+html.v3-embedded .action-strip{border-color:#dfe7f0;background:#fff}
+html.v3-embedded .action-buttons button{background:#fff8e8;color:#95610a}
+html.v3-embedded .hero{border-color:#cbddec;background:radial-gradient(circle at 88% 10%,rgba(96,165,250,.16),transparent 31%),linear-gradient(120deg,#f7fbff,#edf6ff);box-shadow:0 10px 28px rgba(37,99,235,.08)}
+html.v3-embedded .hero h2{color:#172b4d}
+html.v3-embedded .hero>div>span,html.v3-embedded .regime small,html.v3-embedded .regime span{color:#68798e}
+html.v3-embedded .regime{border-left-color:#ccdae8}
+html.v3-embedded .metrics article,html.v3-embedded .panel{border-color:#dfe7f0;background:#fff;box-shadow:0 5px 17px rgba(15,23,42,.045)}
+html.v3-embedded .card,html.v3-embedded .candidate-card,html.v3-embedded .hypothesis-summary>div,html.v3-embedded .position-detail-grid div,html.v3-embedded .position-lot-card,html.v3-embedded .position-detail-section p{border-color:#e3eaf1;background:#f8fafc}
+html.v3-embedded .candidate-card{background:linear-gradient(145deg,#fff,#f8fafc)}
+html.v3-embedded .candidate-card-route{border-color:#e5ebf2}
+html.v3-embedded .candidate-card-route strong,html.v3-embedded .candidate-card-metrics strong,html.v3-embedded .position-detail-grid strong,html.v3-embedded .position-lot-card strong{color:#29415e}
+html.v3-embedded .candidate-card-metrics div{background:#eef3f8}
+html.v3-embedded .table-wrap{border-color:#dfe7f0}
+html.v3-embedded th{background:#f1f5f9;color:#65758a}
+html.v3-embedded th,html.v3-embedded td,html.v3-embedded .facts span,html.v3-embedded .facts strong,html.v3-embedded .evidence-timeline li{border-color:#e8edf3}
+html.v3-embedded tbody tr:hover{background:#f7faff}
+html.v3-embedded .security .name{color:#1d3554}
+html.v3-embedded .filters input,html.v3-embedded .filters select{border-color:#cbd5e1;background:#fff;color:#1f334d}
+html.v3-embedded .evidence-button,html.v3-embedded .position-detail-button,html.v3-embedded .candidate-pager button{border-color:#c8d8e8;background:#f4f8fc;color:#285f94}
+html.v3-embedded .position-detail-dialog,html.v3-embedded .position-detail-dialog>header{border-color:#d8e3ee;background:#fff}
+html.v3-embedded .position-detail-backdrop{background:rgba(15,23,42,.55)}
+html.v3-embedded .position-detail-close{border-color:#d7e0ea;background:#f8fafc;color:#334155}
+html.v3-embedded .truth-error{background:#fff3f2;color:#a9322d}

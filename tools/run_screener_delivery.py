@@ -12,7 +12,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.api.routers.screener import ScreenerRunRequest, screener_run
-from biz.analysis.trading_wecom import notify_screener_failure
+from biz.analysis.trading_wecom import (
+    notify_screener_failure,
+    select_screener_delivery_rows,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,6 +58,7 @@ def main() -> int:
             )
         )
         return 5
+    delivery_rows = select_screener_delivery_rows(result)
     output = {
         "status": result.get("status"),
         "preset": result.get("preset"),
@@ -62,16 +66,22 @@ def main() -> int:
         "observed_at": result.get("observed_at"),
         "freshness": result.get("freshness"),
         "result_count": len(result.get("data") or []),
-        "top_five": [
+        "delivered_top_five": [
             {
                 "rank": row.get("rank"),
                 "stock_code": row.get("stock_code"),
                 "stock_name": row.get("stock_name") or row.get("short_name"),
-                "score": row.get("ensemble_score", row.get("score")),
+                "score": (
+                    row.get("ensemble_score")
+                    if row.get("ensemble_score") is not None
+                    else row.get("score")
+                ),
                 "change_pct": row.get("change_pct"),
             }
-            for row in (result.get("data") or [])[:5]
+            for row in delivery_rows[:5]
         ],
+        "screened_count": len(result.get("data") or []),
+        "qualified_count": len(delivery_rows),
         "run": result.get("run"),
         "notification": result.get("notification"),
         "error": result.get("error"),

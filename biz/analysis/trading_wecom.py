@@ -17,6 +17,65 @@ def _money(value: Any) -> str:
         return "—"
 
 
+def _score(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _percent(value: Any) -> str:
+    try:
+        return f"{float(value):+.2f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def select_screener_delivery_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return only fresh, gate-approved names that may be called candidates.
+
+    The screener ledger deliberately persists rejected rows for audit.  Those
+    rows are useful on the page, but must never be promoted as stock picks in
+    WeCom.  A fallback snapshot is likewise historical evidence, not today's
+    candidate list.
+    """
+
+    freshness = str(result.get("freshness") or "").lower()
+    requested_date = str(result.get("requested_date") or "")[:10]
+    data_date = str(result.get("data_date") or "")[:10]
+    if freshness not in {"exact", "live"}:
+        return []
+    if requested_date and data_date and requested_date != data_date:
+        return []
+
+    eligible: list[dict[str, Any]] = []
+    for raw in result.get("data") or []:
+        row = dict(raw)
+        readiness = row.get("decision_readiness") or {}
+        recommend_status = str(
+            readiness.get("recommend_status")
+            or row.get("recommend_status")
+            or row.get("signal_status")
+            or ""
+        ).upper()
+        grade = str(row.get("candidate_grade") or "").upper()
+        hard_rejected = bool((row.get("risk_gate") or {}).get("reject_reasons"))
+        if (
+            grade in {"A", "B"}
+            and row.get("portfolio_eligible") is True
+            and recommend_status == "ALLOW"
+            and not hard_rejected
+        ):
+            eligible.append(row)
+    eligible.sort(
+        key=lambda row: (
+            int(row.get("rank") or 10**9),
+            str(row.get("stock_code") or ""),
+        )
+    )
+    return eligible
+
+
 def notify_sim_trade_result(result: dict[str, Any]) -> dict[str, Any]:
     """Push only newly completed simulated fills; an empty tick stays silent."""
     fills = [
@@ -72,48 +131,89 @@ def notify_v3_decision_result(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def notify_screener_result(result: dict[str, Any]) -> dict[str, Any]:
-    """Deliver a persisted top-five ranking to the briefing robot."""
+    """Deliver a persisted, fresh and gate-approved decision to WeCom."""
     rows = result.get("data") or []
-    if not rows:
-        return {"status": "skipped", "reason": "no_screener_result"}
     run = result.get("run") or {}
     if not run.get("persisted"):
         return {"status": "error", "error": "候选榜未落库，禁止发送无追溯结果"}
     webhook = get_wecom_webhook("briefing", required=False)
     if not webhook:
         return {"status": "skipped", "reason": "webhook_not_configured"}
+    freshness_key = str(result.get("freshness") or "").lower()
     freshness = {
         "live": "实时盘中快照",
         "historical_close": "收盘复盘快照",
         "exact": "指定交易日数据",
         "fallback": "最近可用交易日数据",
-    }.get(str(result.get("freshness") or ""), str(result.get("freshness") or "未知"))
-    preset = str(result.get("preset") or "")
-    title = "盘前生产候选榜" if preset == "capital_support" else "开盘生产融合候选榜" if preset == "intraday_sector" else "生产融合候选榜"
+    }.get(freshness_key, freshness_key or "未知")
+    preset_value = result.get("preset") or ""
+    preset = str(
+        preset_value.get("key")
+        if isinstance(preset_value, dict)
+        else preset_value
+    )
+    title = (
+        "盘前生产决策"
+        if preset == "capital_support"
+        else "开盘生产决策"
+        if preset == "intraday_sector"
+        else "生产筛选决策"
+    )
+    delivery_rows = select_screener_delivery_rows(result)
+    requested_date = str(result.get("requested_date") or "")[:10]
+    data_date = str(result.get("data_date") or "")[:10]
     lines = [
         f"### ProBigA {title}",
-        f"> 数据日期：{result.get('data_date') or '—'}；证据时间：{result.get('observed_at') or run.get('generated_at') or '—'}",
-        f"> 数据状态：{freshness}；策略：{preset or '—'}",
+        f"> 决策日期：{requested_date or '—'}；数据日期：{data_date or '—'}；证据时间：{result.get('observed_at') or run.get('generated_at') or '—'}",
+        f"> 数据状态：{freshness}；全量审计：{len(rows)} 只；合格候选：**{len(delivery_rows)}** 只",
     ]
-    for index, row in enumerate(rows[:5], 1):
-        code = str(row.get("stock_code") or "")[:6]
-        name = str(row.get("stock_name") or row.get("short_name") or code or "未知证券")
-        score = row.get("ensemble_score", row.get("score"))
-        change = row.get("change_pct")
-        score_text = "—" if score is None else f"{float(score):.2f}"
-        change_text = "—" if change is None else f"{float(change):+.2f}%"
-        lines.append(f"> {index}. **{name}（{code}）** · 综合分 {score_text} · 涨幅 {change_text}")
+    if freshness_key == "fallback" or (
+        requested_date and data_date and requested_date != data_date
+    ):
+        lines.append(
+            "> <font color=\"warning\">数据已回退或日期不一致，本次只保留审计记录，不发送个股推荐。</font>"
+        )
+    elif not delivery_rows:
+        lines.append(
+            "> **今日没有同时通过评级、组合约束与推荐门禁的个股；操作以现金、观察和等待确认优先。**"
+        )
+    else:
+        for index, row in enumerate(delivery_rows[:5], 1):
+            code = str(row.get("stock_code") or "")[:6]
+            name = str(row.get("stock_name") or row.get("short_name") or code or "未知证券")
+            score = row.get("ensemble_score")
+            if score is None:
+                score = row.get("score")
+            lines.append(
+                f"> {index}. **{name}（{code}）** · {_score(score)}分 · "
+                f"{_percent(row.get('change_pct'))} · "
+                f"{row.get('candidate_grade')}级 · 门禁ALLOW"
+            )
     lines.extend(
         [
             f"> 批次：`{run.get('run_uid') or '—'}`（已固定落库，可按日期追溯）",
-            "> **仅用于研究与模拟，真实下单保持关闭。**",
+            "> **候选仍只用于研究与模拟；真实下单保持关闭。**",
         ]
     )
     try:
         response = send_markdown(webhook, "\n".join(lines))
         if int((response or {}).get("errcode") or 0) != 0:
             return {"status": "error", "error": str(response)[:300], "response": response}
-        return {"status": "sent", "result_count": len(rows), "response": response}
+        return {
+            "status": "sent",
+            "screened_count": len(rows),
+            "result_count": len(delivery_rows),
+            "delivered_codes": [
+                str(row.get("stock_code") or "")[:6]
+                for row in delivery_rows[:5]
+            ],
+            "delivery_status": (
+                "candidates_delivered"
+                if delivery_rows
+                else "no_qualified_candidate"
+            ),
+            "response": response,
+        }
     except Exception as exc:
         logger.warning("screener WeCom notification failed: %s", exc)
         return {"status": "error", "error": str(exc)[:300]}
