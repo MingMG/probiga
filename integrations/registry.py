@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import os
+from importlib import import_module
 
 from integrations.base import DataSourceBackend
 
@@ -57,6 +58,21 @@ _SOURCE_ALIASES: dict[str, str] = {
 # 后端工厂注册表：canonical_name -> factory callable
 # ---------------------------------------------------------------------------
 _BACKEND_FACTORIES: dict[str, callable] = {}
+
+
+def _ensure_backend_registered(source: str) -> None:
+    """Retry optional backend loading after import cycles have completed."""
+    if source in _BACKEND_FACTORIES:
+        return
+    module_name = {
+        "bigqmt": "integrations.bigqmt.backend",
+    }.get(source)
+    if not module_name:
+        return
+    try:
+        import_module(module_name)
+    except Exception as exc:
+        logger.debug("数据源后端延迟加载失败 %s: %s", source, exc)
 
 
 def register(name: str, factory) -> None:
@@ -100,6 +116,7 @@ def has_support(data_type: str) -> bool:
     source = _resolve_source_name(data_type)
     if source == "adata":
         return False  # adata 走传统路径
+    _ensure_backend_registered(source)
     factory = _BACKEND_FACTORIES.get(source)
     if factory is None:
         return False
@@ -123,6 +140,7 @@ def get_backend(data_type: str) -> DataSourceBackend | None:
     if source == "adata":
         return None
 
+    _ensure_backend_registered(source)
     factory = _BACKEND_FACTORIES.get(source)
     if factory is None:
         available = sorted(_BACKEND_FACTORIES.keys())
@@ -153,6 +171,11 @@ def _load_backends() -> None:
         import integrations.qmt.backend  # noqa: F401
     except Exception as exc:
         logger.debug("QMT 后端未加载: %s", exc)
+
+    try:
+        import integrations.bigqmt.backend  # noqa: F401
+    except Exception as exc:
+        logger.debug("BigQMT 后端未加载: %s", exc)
 
     try:
         import integrations.akshare.backend  # noqa: F401

@@ -13,9 +13,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
+from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
 from integrations.qmt import bridge
 from integrations.qmt.backend import to_qmt_symbol
-from integrations.qmt.diagnostics import PROVIDER_ID
+from integrations.qmt.diagnostics import PROVIDER_ID as LEGACY_PROVIDER_ID
 from server.common.config import get_mysql_url, get_qmt_history_mysql_url
 
 
@@ -108,6 +109,26 @@ def _same_database(url_a: str, url_b: str) -> bool:
         and (b.host or "localhost").lower() in {(a.host or "localhost").lower(), "localhost", "127.0.0.1"}
         and int(a.port or 3306) == int(b.port or 3306)
         and (a.database or "") == (b.database or "")
+        and (a.username or "") == (b.username or "")
+    )
+
+
+def _same_server_and_user(url_a: str, url_b: str) -> bool:
+    if not url_a or not url_b:
+        return False
+    a = make_url(url_a)
+    b = make_url(url_b)
+    localhost_aliases = {"localhost", "127.0.0.1"}
+    host_a = (a.host or "localhost").lower()
+    host_b = (b.host or "localhost").lower()
+    hosts_match = host_a == host_b or {host_a, host_b}.issubset(
+        localhost_aliases
+    )
+    return (
+        (a.drivername or "").split("+", 1)[0]
+        == (b.drivername or "").split("+", 1)[0]
+        and hosts_match
+        and int(a.port or 3306) == int(b.port or 3306)
         and (a.username or "") == (b.username or "")
     )
 
@@ -305,7 +326,14 @@ def _short_name_map(source_engine: Engine, codes: Sequence[str]) -> dict[str, st
     return {str(code).zfill(6): str(name or "") for code, name in rows}
 
 
-def _prepare_kline_rows(frame: pd.DataFrame, *, source_engine: Engine, period: str, batch_id: str) -> list[dict[str, Any]]:
+def _prepare_kline_rows(
+    frame: pd.DataFrame,
+    *,
+    source_engine: Engine,
+    period: str,
+    batch_id: str,
+    provider: str = LEGACY_PROVIDER_ID,
+) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
     rows = frame.to_dict(orient="records")
@@ -314,8 +342,17 @@ def _prepare_kline_rows(frame: pd.DataFrame, *, source_engine: Engine, period: s
     prepared: list[dict[str, Any]] = []
     for raw in rows:
         stock_code = str(raw.get("stock_code") or "").zfill(6)
+        raw_adjust_type = raw.get("adjust_type")
+        try:
+            adjust_type = (
+                0
+                if raw_adjust_type is None or pd.isna(raw_adjust_type)
+                else raw_adjust_type
+            )
+        except (TypeError, ValueError):
+            adjust_type = raw_adjust_type
         row = {
-            "provider": PROVIDER_ID,
+            "provider": raw.get("data_source") or provider,
             "qmt_code": raw.get("qmt_code") or to_qmt_symbol(stock_code) or "",
             "stock_code": stock_code,
             "short_name": raw.get("short_name") or names.get(stock_code, ""),
@@ -323,7 +360,7 @@ def _prepare_kline_rows(frame: pd.DataFrame, *, source_engine: Engine, period: s
             "trade_time": raw.get("trade_time"),
             "trade_date": raw.get("trade_date"),
             "k_type": raw.get("k_type") or 1,
-            "adjust_type": raw.get("adjust_type") or 1,
+            "adjust_type": adjust_type,
             "open": raw.get("open"),
             "close": raw.get("close"),
             "high": raw.get("high"),
@@ -334,11 +371,11 @@ def _prepare_kline_rows(frame: pd.DataFrame, *, source_engine: Engine, period: s
             "change_pct": raw.get("change_pct"),
             "turnover_ratio": raw.get("turnover_ratio"),
             "pre_close": raw.get("pre_close"),
-            "source_time": raw.get("trade_time"),
-            "received_at": received_at,
-            "batch_id": batch_id,
-            "quality_status": "PENDING",
-            "permission_status": "SUPPORTED",
+            "source_time": raw.get("source_time") or raw.get("trade_time"),
+            "received_at": raw.get("received_at") or received_at,
+            "batch_id": raw.get("batch_id") or batch_id,
+            "quality_status": raw.get("quality_status") or "SOURCE_CAPTURED",
+            "permission_status": raw.get("permission_status") or "SUPPORTED",
         }
         row = {key: _clean_value(value) for key, value in row.items()}
         row["data_version"] = _data_version(row)
@@ -356,7 +393,7 @@ def _prepare_minute_rows(frame: pd.DataFrame, *, source_engine: Engine, period: 
     for raw in rows:
         stock_code = str(raw.get("stock_code") or "").zfill(6)
         row = {
-            "provider": PROVIDER_ID,
+            "provider": LEGACY_PROVIDER_ID,
             "qmt_code": raw.get("qmt_code") or to_qmt_symbol(stock_code) or "",
             "stock_code": stock_code,
             "short_name": names.get(stock_code, ""),
@@ -385,18 +422,71 @@ def _prepare_minute_rows(frame: pd.DataFrame, *, source_engine: Engine, period: 
 def _upsert_rows(engine: Engine, *, table_name: str, rows: Sequence[Mapping[str, Any]], key_columns: Sequence[str]) -> int:
     if not rows:
         return 0
+    table_sql = ".".join(
+        f"`{part.replace('`', '``')}`" for part in table_name.split(".")
+    )
     columns = list(rows[0].keys())
     col_sql = ", ".join(f"`{column}`" for column in columns)
     val_sql = ", ".join(f":{column}" for column in columns)
     update_columns = [column for column in columns if column not in set(key_columns) and column not in {"id", "created_at"}]
     update_sql = ", ".join(f"`{column}`=VALUES(`{column}`)" for column in update_columns)
     sql = text(
-        f"INSERT INTO `{table_name}` ({col_sql}) VALUES ({val_sql}) "
+        f"INSERT INTO {table_sql} ({col_sql}) VALUES ({val_sql}) "
         f"ON DUPLICATE KEY UPDATE {update_sql}, updated_at=NOW()"
     )
     with engine.begin() as conn:
         conn.execute(sql, [dict(row) for row in rows])
     return len(rows)
+
+
+def persist_daily_kline_capture(
+    frame: pd.DataFrame,
+    *,
+    source_engine: Engine,
+    local_engine: Engine | None = None,
+    batch_id: str = "",
+    provider: str = BIGQMT_PROVIDER_ID,
+) -> int:
+    """Persist raw BigQMT evidence before publishing canonical daily bars."""
+    target_engine = local_engine or get_local_history_engine()
+    table_name = LOCAL_KLINE_TABLE
+    if local_engine is None and _same_server_and_user(
+        str(target_engine.url),
+        str(source_engine.url),
+    ):
+        # Connecting with the history schema as the default database can be
+        # denied even though the existing production session has explicit
+        # cross-schema grants.  Reuse that authenticated session and qualify
+        # only the destination table.
+        history_database = make_url(str(target_engine.url)).database
+        if not history_database:
+            raise RuntimeError("QMT history database name is required")
+        target_engine = source_engine
+        table_name = f"{history_database}.{LOCAL_KLINE_TABLE}"
+    else:
+        ensure_local_history_tables(target_engine)
+    rows = _prepare_kline_rows(
+        frame,
+        source_engine=source_engine,
+        period="1d",
+        batch_id=(
+            batch_id
+            or f"qmt_capture_{now_china().strftime('%Y%m%d_%H%M%S')}"
+        ),
+        provider=provider,
+    )
+    return _upsert_rows(
+        target_engine,
+        table_name=table_name,
+        rows=rows,
+        key_columns=[
+            "provider",
+            "stock_code",
+            "period",
+            "trade_date",
+            "adjust_type",
+        ],
+    )
 
 
 def _record_run_start(
@@ -425,7 +515,7 @@ def _record_run_start(
             ),
             {
                 "run_id": run_id,
-                "provider": PROVIDER_ID,
+                "provider": LEGACY_PROVIDER_ID,
                 "dataset": dataset,
                 "period": period,
                 "start_date": _normalize_date(start_date),

@@ -701,6 +701,11 @@ def run_dataset(
     env["SM_MAX_STOCKS"] = "0"
     env["SM_MAX_INDEXES"] = "0"
     env["SM_MAX_CONCEPTS"] = "0"
+    if dataset == "daily_kline":
+        # The production schema is migration-owned.  The stock-market DDL is
+        # intentionally not packaged in every runtime checkout, so a daily
+        # repair must not fail before it can refresh the existing table.
+        env["SM_SKIP_DDL"] = "1"
     # This entrypoint is specifically the production QMT-primary route.  Force
     # the loopback gateway so Linux never tries to spawn a Windows QMT worker.
     env["QMT_GATEWAY_ENABLED"] = "1"
@@ -843,7 +848,7 @@ def run_dataset(
     if (
         returncode == 0
         and dataset == "daily_kline"
-        and source_policy == "bigqmt_primary"
+        and bigqmt_enabled
     ):
         target_date = (
             date_str.strip()
@@ -862,8 +867,8 @@ def run_dataset(
             if attestation.get("status") != "COMPLETED":
                 returncode = 3
                 error = (
-                    "BigQMT daily attestation did not complete: "
-                    f"{attestation.get('status')}"
+                    "BigQMT daily attestation did not complete after "
+                    f"{source_policy}: {attestation.get('status')}"
                 )
         except Exception as exc:
             returncode = 3

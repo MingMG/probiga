@@ -207,6 +207,7 @@ def _qmt_attestation_evidence(
                     FROM qmt_kline_attestation_run
                     WHERE start_date <= :trade_date
                       AND end_date >= :trade_date
+                      AND target_rows > 0
                     ORDER BY started_at DESC
                     LIMIT 1
                     """
@@ -223,7 +224,7 @@ def _qmt_attestation_evidence(
         return {
             "qmt_attestation_current": False,
             "qmt_attestation_status": "MISSING",
-            "qmt_attestation_reason": "NO_RUN_COVERS_TRADE_DATE",
+            "qmt_attestation_reason": "NO_NONEMPTY_RUN_COVERS_TRADE_DATE",
         }
     evidence = dict(row)
     target_rows = int(evidence.get("target_rows") or 0)

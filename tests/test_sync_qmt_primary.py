@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from integrations.qmt import bridge
+from integrations.registry import get_backend
 from tools import sync_qmt_primary
 
 
@@ -132,6 +133,15 @@ def test_bigqmt_is_primary_for_index_kline_on_windows_owner():
         run.call_args.kwargs["env"]["QMT_PRIMARY_ALLOW_EXTERNAL_FALLBACK"]
         == "0"
     )
+
+
+def test_bigqmt_backend_is_registered_for_daily_kline(monkeypatch):
+    monkeypatch.setenv("DATA_SOURCE_KLINE", "bigqmt")
+
+    backend = get_backend("kline")
+
+    assert backend is not None
+    assert backend.name == "bigqmt"
 
 
 def test_bigqmt_is_primary_for_concept_reference_on_windows_owner():
@@ -530,9 +540,67 @@ def test_bigqmt_daily_kline_requires_same_day_attestation():
 
     assert result["status"] == "success"
     assert result["attestation"] == attested
+    assert result["source_policy"] == "bigqmt_primary"
     assert attest.call_args.kwargs["start_date"] == "2026-07-27"
     assert attest.call_args.kwargs["end_date"] == "2026-07-27"
     assert attest.call_args.kwargs["apply"] is True
+
+
+def test_enabled_bigqmt_fallback_stays_failed_until_daily_attestation_completes():
+    completed = SimpleNamespace(returncode=0)
+    empty_attestation = {
+        "status": "EMPTY_TARGET",
+        "start_date": "2026-08-19",
+        "end_date": "2026-08-19",
+    }
+    with patch(
+        "tools.sync_qmt_primary.build_child_env",
+        return_value={"BIG_QMT_BRIDGE_ENABLED": "true"},
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_runtime_available",
+        return_value=False,
+    ), patch(
+        "tools.sync_qmt_primary.subprocess.run",
+        return_value=completed,
+    ) as run, patch(
+        "server.common.batch_db.create_batch_engine",
+        return_value=object(),
+    ), patch(
+        "tools.attest_qmt_daily_kline.attest_range",
+        return_value=empty_attestation,
+    ) as attest:
+        result = sync_qmt_primary.run_dataset(
+            "daily_kline",
+            date_str="2026-08-19",
+        )
+
+    assert result["status"] == "failed"
+    assert result["returncode"] == 3
+    assert result["source_policy"] == "external_primary_miniqmt_disabled"
+    assert "EMPTY_TARGET" in result["error"]
+    assert run.call_args.kwargs["env"]["SM_SKIP_DDL"] == "1"
+    attest.assert_called_once()
+
+
+def test_external_only_daily_kline_does_not_require_qmt_attestation():
+    completed = SimpleNamespace(returncode=0)
+    with patch(
+        "tools.sync_qmt_primary.build_child_env",
+        return_value={},
+    ), patch(
+        "tools.sync_qmt_primary.subprocess.run",
+        return_value=completed,
+    ), patch(
+        "tools.attest_qmt_daily_kline.attest_range",
+    ) as attest:
+        result = sync_qmt_primary.run_dataset(
+            "daily_kline",
+            date_str="2026-08-19",
+        )
+
+    assert result["status"] == "success"
+    assert result["attestation"] is None
+    attest.assert_not_called()
 
 
 def test_qmt_index_kline_acceptance_can_request_a_bounded_history_range():
