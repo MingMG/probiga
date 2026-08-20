@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=10">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=11">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -22,7 +22,7 @@
         <button class="nav" data-view="intraday"><i>04</i>盘中只读证据</button>
         <span class="nav-group">模拟执行</span>
         <button class="nav" data-view="portfolio"><i>05</i>目标组合</button>
-        <button class="nav" data-view="positions"><i>06</i>持仓与退出</button>
+        <button class="nav" data-view="positions"><i>06</i>我的持仓</button>
         <button class="nav" data-view="orders"><i>07</i>模拟订单</button>
         <span class="nav-group">验证复盘</span>
         <button class="nav" data-view="validation"><i>08</i>回测验收</button>
@@ -104,6 +104,12 @@
       </section>
 
       <section class="view active" id="view-overview">
+        <article class="panel holding-strategy-panel">
+          <div class="panel-head wrap"><div><p>MY HOLDINGS · TODAY</p><h3>自选股里的真实持仓，今天怎么操作</h3></div><span class="badge" id="watchlistStrategyStatus">读取持仓策略</span></div>
+          <p class="note">只读取“自选股”中已登记成本和股数的持仓。买入后会持续跟踪，不会因为它退出候选池就停止提示；出现硬止损、趋势破坏或明确卖出信号时，直接列为退出。</p>
+          <div id="watchlistStrategySummary" class="facts"></div>
+          <div class="table-wrap holding-strategy-table"><table><thead><tr><th>持仓</th><th>成本 / 最新</th><th>今日动作</th><th>买入 / 加仓范围</th><th>卖出范围</th><th>盘中突发退出</th><th>下一交易日</th><th>依据时点</th></tr></thead><tbody id="watchlistStrategyRows"></tbody></table></div>
+        </article>
         <div class="two">
           <article class="panel">
             <div class="panel-head"><div><p>WHY THIS DECISION</p><h3>为什么买 / 为什么不买</h3></div><span class="badge" id="decisionStatus">读取中</span></div>
@@ -184,7 +190,7 @@
             <span class="badge" id="candidateSummary">读取候选中</span>
           </div>
           <div id="candidateCards" class="candidate-list" aria-live="polite"></div>
-          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
+          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>买入范围</th><th>卖出范围</th><th>突发退出</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
           <div class="candidate-pager" id="candidatePager"><button type="button" id="candidatePrev">上一页</button><span id="candidatePageStatus">第 1 / 1 页</span><button type="button" id="candidateNext">下一页</button></div>
         </article>
       </section>
@@ -231,8 +237,14 @@
       </section>
 
       <section class="view" id="view-positions">
+        <article class="panel holding-strategy-panel">
+          <div class="panel-head wrap"><div><p>WATCHLIST HOLDINGS</p><h3>自选股持仓与连续操作建议</h3></div><span class="badge" id="watchlistPositionStatus">读取持仓策略</span></div>
+          <p class="note">这里是你在“自选股”登记的实际持仓，不是模拟账户。所有动作都是决策提示，不会自动提交真实订单。</p>
+          <div id="watchlistPositionSummary" class="facts"></div>
+          <div class="table-wrap holding-strategy-table"><table><thead><tr><th>持仓</th><th>成本 / 最新</th><th>今日动作</th><th>买入 / 加仓范围</th><th>卖出范围</th><th>盘中突发退出</th><th>下一交易日</th><th>依据时点</th></tr></thead><tbody id="watchlistPositionRows"></tbody></table></div>
+        </article>
         <article class="panel">
-          <div class="panel-head"><div><p>DYNAMIC HOLDING</p><h3>当前持仓与动态状态机</h3></div><span class="badge warning">当前模拟账户快照 · 不随历史决策日回放</span></div>
+          <div class="panel-head"><div><p>PAPER ACCOUNT HOLDING</p><h3>模拟账户持仓（与上方实际持仓分开）</h3></div><span class="badge warning">当前模拟账户快照 · 不随历史决策日回放</span></div>
           <div id="positionSummary" class="facts"></div>
           <div class="table-wrap"><table><thead><tr><th>证券</th><th>持仓状态</th><th>持仓数量</th><th>可卖数量</th><th>成本价</th><th>最新价</th><th>持仓市值</th><th>浮动盈亏</th><th>盈亏率</th><th>买入时间</th><th>卖出时间</th><th>卖出价格</th><th>保护位</th><th>加仓次数</th><th>行情时间</th><th>持仓说明</th></tr></thead><tbody id="positionRows"></tbody></table></div>
         </article>
@@ -375,6 +387,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=26"></script>
+  <script src="/static/js/trading-v3.js?v=27"></script>
 </body>
 </html>

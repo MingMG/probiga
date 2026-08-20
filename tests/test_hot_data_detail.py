@@ -944,6 +944,76 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["status"], "error")
         exec_sql.assert_not_called()
 
+    def test_duplicate_watchlist_add_preserves_recorded_position(self):
+        existing = {
+            "stock_code": "002409",
+            "short_name": "雅克科技",
+            "cost_price": 147,
+            "shares": 100,
+            "position_date": "2026-08-07",
+            "sort_order": 7,
+        }
+        with patch("server.api.routers.hot_data._ensure_portfolio_position_columns"), \
+             patch("server.api.routers.hot_data._ensure_portfolio_trans_log_table"), \
+             patch("server.api.routers.hot_data._read_sql", side_effect=[[existing], [{"short_name": "雅克科技"}]]), \
+             patch("server.api.routers.hot_data._exec_sql") as exec_sql, \
+             patch("server.api.routers.hot_data._invalidate_portfolio_snapshot_cache"):
+            out = hot_data.portfolio_add(hot_data.PortfolioAdd(
+                stock_code="002409",
+                watchlist_only=True,
+            ))
+
+        self.assertEqual(out["status"], "ok")
+        self.assertTrue(out["position_preserved"])
+        self.assertEqual(out["cost_price"], 147)
+        self.assertEqual(out["shares"], 100)
+        self.assertEqual(out["position_date"], "2026-08-07")
+        self.assertFalse(any("INSERT INTO st_user_portfolio" in call.args[0] for call in exec_sql.call_args_list))
+
+    def test_active_holding_cannot_be_removed_without_sell_record(self):
+        with patch("server.api.routers.hot_data._read_sql", return_value=[{"shares": 100}]), \
+             patch("server.api.routers.hot_data._exec_sql") as exec_sql:
+            out = hot_data.portfolio_remove("002409")
+
+        self.assertEqual(out["status"], "error")
+        self.assertIn("请先记录卖出", out["error"])
+        exec_sql.assert_not_called()
+
+    def test_holding_strategy_tracks_watchlist_position_outside_candidate_pool(self):
+        snapshot = {"data": [
+            {
+                "stock_code": "002409",
+                "display_name": "雅克科技",
+                "cost_price": 147,
+                "shares": 100,
+                "position_date": "2026-08-07",
+            },
+            {"stock_code": "000001", "shares": 0},
+        ]}
+        decision = {
+            "stock_code": "002409",
+            "trade_date": "2026-08-17",
+            "knowledge_cutoff": "2026-08-17T15:10:00+08:00",
+            "exit_intent": "SELL",
+            "reason": "persisted strategy signal is SELL_ALERT",
+            "evidence": {
+                "recommendation": {"signal_status": "SELL_ALERT"},
+                "price": {"latest_price": 157.99},
+                "thresholds": {"trend_stop_price": 151},
+            },
+        }
+        with patch("server.api.routers.hot_data._get_portfolio_snapshot", return_value=snapshot), \
+             patch("server.api.routers.hot_data.get_engine", return_value=object()), \
+             patch("server.api.routers.hot_data.evaluate_watchlist_holding_exit_at_cutoff", return_value=decision) as evaluate:
+            out = hot_data.portfolio_holding_strategy("2026-08-17")
+
+        self.assertEqual(out["summary"]["holding_count"], 1)
+        self.assertEqual(out["summary"]["sell_count"], 1)
+        self.assertEqual(out["data"][0]["stock_code"], "002409")
+        self.assertEqual(out["data"][0]["action"], "立即卖出")
+        self.assertEqual(out["execution_authority"], "ADVISORY_ONLY")
+        evaluate.assert_called_once()
+
     def test_portfolio_live_force_rebuilds_shared_snapshot(self):
         snapshot = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {"holding_count": 1}}
 

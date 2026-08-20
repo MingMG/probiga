@@ -6,7 +6,7 @@ import os
 import re
 import time as _time
 from collections import OrderedDict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pandas as pd
@@ -43,7 +43,13 @@ from server.api.routers.portfolio_math import (
     portfolio_calc_next_position,
     portfolio_cost_profit,
     portfolio_recalc_cost_from_history,
+    portfolio_should_preserve_existing_position,
     portfolio_trade_fee,
+)
+from server.api.routers.holding_strategy import (
+    build_watchlist_holding_strategy,
+    evaluate_watchlist_holding_exit_at_cutoff,
+    summarize_watchlist_holding_strategies,
 )
 
 # Chart generation
@@ -4769,6 +4775,8 @@ class PortfolioAdd(BaseModel):
     shares: int = 0
     notes: str = ""
     is_today_buy: bool = False
+    position_date: date | None = None
+    watchlist_only: bool = False
 
 class PortfolioTransact(BaseModel):
     stock_code: str = ""
@@ -4832,12 +4840,26 @@ def _portfolio_ensure_cost_price_precision() -> None:
         _record_fallback('_portfolio_ensure_cost_price_precision:4309', exc)
 
 
-def _portfolio_log_trans(code: str, trans_type: str, price: float, shares: int, source: str = "trade"):
+def _portfolio_log_trans(
+    code: str,
+    trans_type: str,
+    price: float,
+    shares: int,
+    source: str = "trade",
+    trans_date: date | str | None = None,
+):
     _ensure_portfolio_trans_log_table()
     _exec_sql("""
         INSERT INTO st_portfolio_trans_log (stock_code, trans_type, price, shares, source, trans_date, created_at)
-        VALUES (:c, :t, :p, :s, :src, CURDATE(), NOW())
-    """, {"c": code, "t": trans_type, "p": price, "s": shares, "src": source})
+        VALUES (:c, :t, :p, :s, :src, COALESCE(:trans_date, CURDATE()), NOW())
+    """, {
+        "c": code,
+        "t": trans_type,
+        "p": price,
+        "s": shares,
+        "src": source,
+        "trans_date": trans_date,
+    })
 
 
 def _watchlist_write_flow(code: str, short_name: str, trans_type: str, price: float, shares: int):
@@ -6334,33 +6356,94 @@ def portfolio_add(body: PortfolioAdd):
         code = _require_portfolio_stock_code(body.stock_code)
         _ensure_portfolio_position_columns()
         _ensure_portfolio_trans_log_table()
+        existing_rows = _read_sql(
+            "SELECT * FROM st_user_portfolio WHERE stock_code = :c LIMIT 1",
+            {"c": code},
+        )
+        existing = existing_rows[0] if existing_rows else None
         # get name from si_all_code
         names = _read_sql("SELECT short_name FROM si_all_code WHERE stock_code = :c LIMIT 1", {"c": code})
         name = names[0].get("short_name", code) if names else code
-        max_order = _read_sql("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM st_user_portfolio")
-        next_order = int(max_order[0]["next_order"]) if max_order else 0
+        if existing is None:
+            max_order = _read_sql("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order FROM st_user_portfolio")
+            next_order = int(max_order[0]["next_order"]) if max_order else 0
+        else:
+            next_order = int(existing.get("sort_order") or 0)
+
+        preserve_position = portfolio_should_preserve_existing_position(
+            existing,
+            requested_cost=body.cost_price,
+            requested_shares=body.shares,
+            watchlist_only=body.watchlist_only,
+        )
+        if preserve_position:
+            _exec_sql(
+                """
+                UPDATE st_user_portfolio
+                SET short_name = CASE WHEN short_name = '' THEN :n ELSE short_name END,
+                    notes = CASE WHEN :nt <> '' THEN :nt ELSE notes END,
+                    etl_sync_at = NOW()
+                WHERE stock_code = :c
+                """,
+                {"c": code, "n": name, "nt": body.notes},
+            )
+            current_shares = int(existing.get("shares") or 0) if existing else 0
+            _exec_sql(
+                "UPDATE sm_stock_snapshot SET sort_order = :so, is_holding = :ih WHERE stock_code = :c",
+                {"so": next_order, "ih": 1 if current_shares > 0 else 0, "c": code},
+            )
+            _invalidate_portfolio_snapshot_cache()
+            return {
+                "status": "ok",
+                "stock_code": code,
+                "short_name": name,
+                "position_preserved": True,
+                "cost_price": float(existing.get("cost_price") or 0) if existing else 0,
+                "shares": current_shares,
+                "position_date": str(existing.get("position_date") or "")[:10] or None,
+            }
+
+        position_date = (
+            date.today()
+            if body.is_today_buy
+            else body.position_date
+            if body.position_date is not None
+            else date.today()
+            if body.shares > 0
+            else None
+        )
         _exec_sql("""
             INSERT INTO st_user_portfolio
                 (stock_code, short_name, cost_price, shares, position_source, position_date, add_date, sort_order, notes, etl_sync_at)
             VALUES
-                (:c, :n, :p, :s, :src, CURDATE(), CURDATE(), :so, :nt, NOW())
+                (:c, :n, :p, :s, :src, :pd, CURDATE(), :so, :nt, NOW())
             ON DUPLICATE KEY UPDATE
-                cost_price=:p, shares=:s, position_source=:src, position_date=CURDATE(), notes=:nt, etl_sync_at=NOW()
+                cost_price=:p, shares=:s, position_source=:src, position_date=:pd, notes=:nt, etl_sync_at=NOW()
         """, {
             "c": code,
             "n": name,
             "p": body.cost_price,
             "s": body.shares,
             "src": "today_buy" if body.is_today_buy else "manual",
+            "pd": position_date,
             "so": next_order,
             "nt": body.notes,
         })
         _exec_sql("""
             DELETE FROM st_portfolio_trans_log
-            WHERE stock_code = :c AND trans_date = CURDATE() AND source = 'position_add'
-        """, {"c": code})
+            WHERE stock_code = :c
+              AND source = 'position_add'
+              AND trans_date = COALESCE(:pd, CURDATE())
+        """, {"c": code, "pd": position_date})
         if body.is_today_buy and body.shares > 0 and body.cost_price > 0:
-            _portfolio_log_trans(code, "buy", float(body.cost_price), int(body.shares), source="position_add")
+            _portfolio_log_trans(
+                code,
+                "buy",
+                float(body.cost_price),
+                int(body.shares),
+                source="position_add",
+                trans_date=position_date,
+            )
         elif not body.is_today_buy and body.shares > 0 and body.cost_price > 0:
             trade_rows = _read_sql(
                 "SELECT trans_type, price, shares FROM st_portfolio_trans_log "
@@ -6388,13 +6471,28 @@ def portfolio_add(body: PortfolioAdd):
                 DELETE FROM st_portfolio_trans_log
                 WHERE stock_code = :c AND source = 'initial'
             """, {"c": code})
-            _portfolio_log_trans(code, "buy", round(init_cost, 4), init_shares, source="initial")
+            _portfolio_log_trans(
+                code,
+                "buy",
+                round(init_cost, 4),
+                init_shares,
+                source="initial",
+                trans_date=position_date,
+            )
         # 同步更新快照表自选股排序 + 持仓标记
         is_hold = 1 if body.shares > 0 else 0
         _exec_sql("UPDATE sm_stock_snapshot SET sort_order = :so, is_holding = :ih WHERE stock_code = :c",
                   {"so": next_order, "ih": is_hold, "c": code})
         _invalidate_portfolio_snapshot_cache()
-        return {"status": "ok", "stock_code": code, "short_name": name}
+        return {
+            "status": "ok",
+            "stock_code": code,
+            "short_name": name,
+            "position_preserved": False,
+            "cost_price": float(body.cost_price or 0),
+            "shares": int(body.shares or 0),
+            "position_date": position_date.isoformat() if position_date else None,
+        }
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -6404,6 +6502,15 @@ def portfolio_remove(stock_code: str):
     """删除自选股"""
     try:
         code = _require_portfolio_stock_code(stock_code)
+        rows = _read_sql(
+            "SELECT shares FROM st_user_portfolio WHERE stock_code = :c LIMIT 1",
+            {"c": code},
+        )
+        if rows and int(rows[0].get("shares") or 0) > 0:
+            return {
+                "status": "error",
+                "error": "该股票仍有持仓，请先记录卖出；持仓中不能直接移出自选股。",
+            }
         _exec_sql("DELETE FROM st_user_portfolio WHERE stock_code = :c", {"c": code})
         # 同步更新快照表：移除自选股排序和持仓标记
         _exec_sql("UPDATE sm_stock_snapshot SET sort_order = NULL, is_holding = 0 WHERE stock_code = :c", {"c": code})
@@ -6486,6 +6593,10 @@ def portfolio_transact(stock_code: str, body: PortfolioTransact):
                 etl_sync_at=NOW()
             WHERE stock_code=:c
         """, {"c": code, "p": new_cost, "s": new_shares, "src": position_source})
+        _exec_sql(
+            "UPDATE sm_stock_snapshot SET is_holding = :ih WHERE stock_code = :c",
+            {"ih": 1 if new_shares > 0 else 0, "c": code},
+        )
         _invalidate_portfolio_snapshot_cache()
         return {"status": "ok", "cost_price": new_cost, "shares": new_shares}
     except Exception as e:
@@ -6819,6 +6930,101 @@ def portfolio_live(force: bool = False, refresh_id: str = ""):
             )
         return _get_portfolio_snapshot(live_mode=True, force_live=True)
     return _get_portfolio_snapshot(live_mode=True)
+
+
+@router.get("/portfolio/holding-strategy")
+def portfolio_holding_strategy(
+    trade_date: str = Query(default=""),
+):
+    """Return continuous strategy actions for holdings in ``st_user_portfolio``.
+
+    This is advisory-only.  It evaluates every watchlist row with ``shares > 0``
+    even when that security is absent from today's candidate pool.
+    """
+    requested = trade_date.strip() if isinstance(trade_date, str) else ""
+    if requested:
+        try:
+            target_day = date.fromisoformat(requested)
+        except ValueError:
+            return {"status": "error", "error": "trade_date must be YYYY-MM-DD"}
+    else:
+        target_day = date.today()
+    if target_day > date.today():
+        return {"status": "error", "error": "trade_date cannot be in the future"}
+
+    historical = target_day < date.today()
+    cutoff = (
+        f"{target_day.isoformat()}T15:10:00+08:00"
+        if historical
+        else datetime.now(timezone(timedelta(hours=8))).isoformat(timespec="seconds")
+    )
+    snapshot = _get_portfolio_snapshot(live_mode=not historical)
+    snapshot_rows = list((snapshot or {}).get("data") or [])
+    holdings = []
+    for row in snapshot_rows:
+        shares = int(row.get("shares") or 0)
+        if shares <= 0:
+            continue
+        position_date = str(row.get("position_date") or "")[:10]
+        if position_date and position_date > target_day.isoformat():
+            continue
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        try:
+            decision = evaluate_watchlist_holding_exit_at_cutoff(
+                get_engine(),
+                code,
+                target_day.isoformat(),
+                cutoff,
+                current_price=None if historical else row.get("cur_price"),
+            )
+        except Exception as error:
+            logger.warning(
+                "watchlist holding strategy failed for %s at %s: %s",
+                code,
+                cutoff,
+                error,
+            )
+            decision = {
+                "stock_code": code,
+                "trade_date": target_day.isoformat(),
+                "knowledge_cutoff": cutoff,
+                "exit_intent": "WAIT_DATA",
+                "reason": f"holding strategy unavailable: {error}",
+                "evidence": {
+                    "price": {
+                        "latest_price": row.get("cur_price"),
+                        "price_source": row.get("quote_source") or "portfolio_snapshot",
+                    },
+                    "thresholds": {},
+                },
+                "evaluated_at": cutoff,
+                "valid_until": None,
+                "context_hash": None,
+            }
+        holdings.append(build_watchlist_holding_strategy(row, decision))
+
+    holdings.sort(
+        key=lambda item: (
+            int(item.get("action_priority") or 0),
+            str(item.get("stock_code") or ""),
+        )
+    )
+    summary = summarize_watchlist_holding_strategies(holdings)
+    incomplete_positions = sum(
+        1
+        for row in holdings
+        if int(row.get("shares") or 0) > 0 and not row.get("cost_price")
+    )
+    return {
+        "status": "ok",
+        "trade_date": target_day.isoformat(),
+        "knowledge_cutoff": cutoff,
+        "historical_read_only": historical,
+        "position_scope": "WATCHLIST_CURRENT_HOLDINGS",
+        "execution_authority": "ADVISORY_ONLY",
+        "summary": {**summary, "incomplete_position_count": incomplete_positions},
+        "data": holdings,
+    }
 
 
 @router.post("/portfolio/refresh-prices")

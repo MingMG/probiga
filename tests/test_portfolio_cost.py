@@ -4,11 +4,36 @@ from server.api.routers.portfolio_math import (
     portfolio_calc_next_position,
     portfolio_cost_profit,
     portfolio_recalc_cost_from_history,
+    portfolio_should_preserve_existing_position,
     portfolio_trade_fee,
 )
 
 
 class PortfolioCostTest(unittest.TestCase):
+    def test_watchlist_only_add_preserves_existing_holding(self):
+        self.assertTrue(portfolio_should_preserve_existing_position(
+            {"shares": 100, "cost_price": 147},
+            requested_cost=0,
+            requested_shares=0,
+            watchlist_only=True,
+        ))
+
+    def test_zero_value_duplicate_add_cannot_silently_clear_holding(self):
+        self.assertTrue(portfolio_should_preserve_existing_position(
+            {"shares": 100, "cost_price": 147},
+            requested_cost=0,
+            requested_shares=0,
+            watchlist_only=False,
+        ))
+
+    def test_new_watchlist_row_is_not_mistaken_for_existing_position(self):
+        self.assertFalse(portfolio_should_preserve_existing_position(
+            None,
+            requested_cost=0,
+            requested_shares=0,
+            watchlist_only=True,
+        ))
+
     def test_buy_increases_shares(self):
         result = portfolio_calc_next_position("buy", 0, 100, 20, 100)
         self.assertEqual(result["status"], "ok")

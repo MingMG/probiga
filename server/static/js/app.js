@@ -728,12 +728,20 @@
         var price = parseFloat(el('pfPrice').value);
         var shares = parseInt(el('pfShares').value);
         var isTodayBuy = !!(el('pfTodayBuy') && el('pfTodayBuy').checked);
+        var positionDate = el('pfPositionDate') ? el('pfPositionDate').value : '';
         if (!code) { alert('请输入股票代码'); return; }
         return fetchRawJsonWithTimeout('/api/portfolio/add', 10000, {
             method:'POST',
             cache:'no-store',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({stock_code:code, cost_price:price||0, shares:shares||0, is_today_buy:isTodayBuy})
+            body:JSON.stringify({
+                stock_code:code,
+                cost_price:price||0,
+                shares:shares||0,
+                is_today_buy:isTodayBuy,
+                position_date:positionDate||null,
+                watchlist_only:false
+            })
         }).then(function(res){
             if (res.status !== 'ok') throw new Error(res.error || '未知错误');
             alert('添加成功: ' + (res.short_name || code));
@@ -747,7 +755,7 @@
             method:'POST',
             cache:'no-store',
             headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({stock_code:code, cost_price:0, shares:0, is_today_buy:false})
+            body:JSON.stringify({stock_code:code, cost_price:0, shares:0, is_today_buy:false, watchlist_only:true})
         }).then(function(res){
             if (res.status !== 'ok') throw new Error(res.error || '未知错误');
             alert('添加成功: ' + (res.short_name || code));
@@ -5033,6 +5041,7 @@
                     '<div><label style="font-size:11px;color:#888;display:block">股票代码</label><input id="pfCode" placeholder="000001" style="width:100px;padding:6px 10px;border-radius:4px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0"></div>' +
                     '<div><label style="font-size:11px;color:#888;display:block">成本价(元)</label><input id="pfPrice" type="number" step="0.001" placeholder="0" style="width:100px;padding:6px 10px;border-radius:4px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0"></div>' +
                     '<div><label style="font-size:11px;color:#888;display:block">股数</label><input id="pfShares" type="number" placeholder="0" style="width:80px;padding:6px 10px;border-radius:4px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0"></div>' +
+                    '<div><label style="font-size:11px;color:#888;display:block">买入日期</label><input id="pfPositionDate" type="date" style="width:132px;padding:5px 8px;border-radius:4px;border:1px solid #444;background:#2a2a2e;color:#e0e0e0"></div>' +
                     '<label title="勾选后会写入今日买入流水，当日盈亏按 现价-买入价 计算；不勾选则按历史持仓录入" style="display:flex;gap:4px;align-items:center;color:#aaa;font-size:12px;margin-bottom:7px"><input id="pfTodayBuy" type="checkbox">今日买入</label>' +
                     '<button onclick="pfAdd()" style="padding:6px 16px;border:none;border-radius:6px;background:#1a73e8;color:#fff;cursor:pointer;font-size:13px">添加</button>' +
                     '</div></div>' +

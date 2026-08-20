@@ -7,6 +7,31 @@ PORTFOLIO_STAMP_DUTY_RATE = 0.0005
 PORTFOLIO_TRANSFER_FEE_RATE = 0.00001
 
 
+def portfolio_should_preserve_existing_position(
+    existing_row: dict | None,
+    *,
+    requested_cost: float,
+    requested_shares: int,
+    watchlist_only: bool,
+) -> bool:
+    """Never let a watchlist-only add silently erase an open position.
+
+    Clearing an open position must go through a recorded sell transaction.  A
+    duplicate "add to watchlist" request commonly carries zero cost/shares and
+    therefore cannot be interpreted as a sell.
+    """
+    if not existing_row:
+        return False
+    current_shares = max(0, int(existing_row.get("shares") or 0))
+    if watchlist_only:
+        return True
+    return bool(
+        current_shares > 0
+        and float(requested_cost or 0) <= 0
+        and int(requested_shares or 0) <= 0
+    )
+
+
 def portfolio_cost_profit(shares: int, cur_price: float, cost_price: float) -> float | None:
     """持仓盈亏：(现价 - 成本价) × 股数。成本价会随加减仓摊薄。"""
     sh = int(shares or 0)
