@@ -1573,4 +1573,4 @@ def test_horizon_page_uses_server_runtime_evidence_labels():
     assert "HISTORICAL_AUDIT_ONLY" in javascript
     assert "order=UNAVAILABLE" in javascript
     assert "/static/js/trading-v3.js?v=25" in html
-    assert "/static/css/trading-v3.css?v=9" in html
+    assert "/static/css/trading-v3.css?v=10" in html

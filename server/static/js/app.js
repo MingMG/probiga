@@ -3876,7 +3876,7 @@
     window.addEventListener('message', function(event) {
         if (event.data && event.data.type === 'probiga-trading-v3-navigate') {
             if (event.origin !== window.location.origin && event.origin !== 'null') return;
-            var viewMap = {overview:'trading-v3-overview',hypotheses:'trading-v3-hypotheses',candidates:'trading-v3-candidates',intraday:'trading-v3-intraday',portfolio:'trading-v3-portfolio',positions:'trading-v3-positions',orders:'trading-v3-orders',validation:'trading-v3-validation',missed:'trading-v3-missed',evidence:'trading-v3-evidence'};
+            var viewMap = {overview:'trading-v3-overview',hypotheses:'trading-v3-hypotheses',candidates:'trading-v3-ledger',intraday:'trading-v3-intraday',portfolio:'trading-v3-portfolio',positions:'trading-v3-positions',orders:'trading-v3-orders',validation:'trading-v3-validation',missed:'trading-v3-missed',evidence:'trading-v3-evidence'};
             if (event.data.requested_date && el('datePicker')) el('datePicker').value = event.data.requested_date;
             window.updateTradingRouteFilters(event.data.filters || {});
             if (viewMap[event.data.view]) window.switchTab(viewMap[event.data.view]);
@@ -5592,21 +5592,30 @@
         ]}
     ];
     var TRADING_MODULE_NAV_ITEMS = [
-        {id:'trading-v3-overview', modulePage:'v3', tradingView:'overview', icon:'01', label:'决策总览', tradingSection:'今日决策'},
+        {id:'trading-v3-overview', decisionCockpit:true, icon:'01', label:'决策总览', tradingSection:'今日决策'},
         {id:'trading-v3-hypotheses', modulePage:'v3', tradingView:'hypotheses', icon:'02', label:'交易假设', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-candidates', candidateCenter:true, icon:'03', label:'候选与拒绝', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-intraday', modulePage:'v3', tradingView:'intraday', icon:'04', label:'盘中只读证据', tradingSection:'机会与拒绝'},
-        {id:'trading-v3-portfolio', modulePage:'v3', tradingView:'portfolio', icon:'05', label:'目标组合', tradingSection:'模拟执行'},
-        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'06', label:'持仓与退出', tradingSection:'模拟执行'},
-        {id:'trading-v3-orders', modulePage:'v3', tradingView:'orders', icon:'07', label:'模拟订单', tradingSection:'模拟执行'},
-        {id:'trading-v3-validation', modulePage:'v3', tradingView:'validation', icon:'08', label:'回测验收', tradingSection:'验证复盘'},
-        {id:'trading-v3-missed', modulePage:'v3', tradingView:'missed', icon:'09', label:'漏抓复盘', tradingSection:'验证复盘'},
-        {id:'trading-v3-evidence', modulePage:'v3', tradingView:'evidence', icon:'10', label:'数据与系统', tradingSection:'系统证据'},
-        {id:'trading-shared-etf', modulePage:'v2', tradingView:'etf', icon:'11', label:'ETF 前向', tradingSection:'系统证据'},
-        {id:'trading-shared-operations', modulePage:'v2', tradingView:'operations', icon:'12', label:'运行状态', tradingSection:'系统证据'}
+        {id:'trading-v3-candidates', candidateDecision:true, icon:'03', label:'候选与决策', tradingSection:'机会与拒绝'},
+        {id:'trading-v3-ledger', candidateCenter:true, icon:'04', label:'候选账本', tradingSection:'机会与拒绝'},
+        {id:'trading-v3-intraday', modulePage:'v3', tradingView:'intraday', icon:'05', label:'盘中只读证据', tradingSection:'机会与拒绝'},
+        {id:'trading-v3-portfolio', modulePage:'v3', tradingView:'portfolio', icon:'06', label:'目标组合', tradingSection:'模拟执行'},
+        {id:'trading-v3-positions', modulePage:'v3', tradingView:'positions', icon:'07', label:'持仓与退出', tradingSection:'模拟执行'},
+        {id:'trading-v3-orders', modulePage:'v3', tradingView:'orders', icon:'08', label:'模拟订单', tradingSection:'模拟执行'},
+        {id:'trading-v3-validation', modulePage:'v3', tradingView:'validation', icon:'09', label:'回测验收', tradingSection:'验证复盘'},
+        {id:'trading-v3-missed', modulePage:'v3', tradingView:'missed', icon:'10', label:'漏抓复盘', tradingSection:'验证复盘'},
+        {id:'trading-v3-evidence', modulePage:'v3', tradingView:'evidence', icon:'11', label:'数据与系统', tradingSection:'系统证据'},
+        {id:'trading-shared-etf', modulePage:'v2', tradingView:'etf', icon:'12', label:'ETF 前向', tradingSection:'系统证据'},
+        {id:'trading-shared-operations', modulePage:'v2', tradingView:'operations', icon:'13', label:'运行状态', tradingSection:'系统证据'}
     ];
     TRADING_MODULE_NAV_ITEMS.forEach(function(item) {
         LOADERS[item.id] = function(d, container) {
+            if (item.decisionCockpit) {
+                loadDecisionCockpitPage(d, container);
+                return;
+            }
+            if (item.candidateDecision) {
+                loadCandidateDecisionPage(d, container);
+                return;
+            }
             if (item.candidateCenter) {
                 loadCandidateCenterPage(d, container);
                 return;
@@ -5620,7 +5629,7 @@
         var tradingIndex = items.findIndex(function(item) { return item.id === 'trading'; });
         if (tradingIndex < 0 || items.some(function(item) { return !!item.tradingView; })) return;
         var subItems = TRADING_MODULE_NAV_ITEMS.map(function(item) {
-            return { id:item.id, modulePage:item.modulePage, tradingView:item.tradingView, candidateCenter:item.candidateCenter, tradingSection:item.tradingSection, icon:item.icon, label:item.label };
+            return { id:item.id, modulePage:item.modulePage, tradingView:item.tradingView, decisionCockpit:item.decisionCockpit, candidateDecision:item.candidateDecision, candidateCenter:item.candidateCenter, tradingSection:item.tradingSection, icon:item.icon, label:item.label };
         });
         items.splice.apply(items, [tradingIndex + 1, 0].concat(subItems));
     }
@@ -5733,11 +5742,14 @@
                     lastTradingSection = it.tradingSection;
                 }
                 var cls = it.id === activeId ? 'sidebar-item active' : 'sidebar-item';
+                var isTradingItem = !!it.tradingSection;
+                if (isTradingItem) cls += ' sidebar-trading-item';
                 if (it.tradingView) {
-                    cls += ' sidebar-trading-item';
                     h += '<button class="' + cls + '" data-tab="' + it.id + '" data-trading-view="' + it.tradingView + '" data-module-page="' + (it.modulePage || 'v3') + '" onclick="openTradingModule(\'' + it.id + '\')"><span>' + it.icon + '</span>' + it.label + '</button>';
                 } else if (it.href) {
                     h += '<a class="' + cls + '" href="' + it.href + '">' + it.icon + ' ' + it.label + '</a>';
+                } else if (isTradingItem) {
+                    h += '<button class="' + cls + '" data-tab="' + it.id + '" onclick="switchTab(\'' + it.id + '\')"><span>' + it.icon + '</span>' + it.label + '</button>';
                 } else {
                     h += '<button class="' + cls + '" data-tab="' + it.id + '" onclick="switchTab(\'' + it.id + '\')">' + it.icon + ' ' + it.label + '</button>';
                 }
@@ -6950,6 +6962,130 @@
         screenerJson('/api/screener/candidates', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stock_code: code, stock_name: row.stock_name || row.short_name || code, source: 'screener', screen_name: ((_screenerState.definition || {}).preset || ''), score: row.score, as_of_date: row.data_date || (document.getElementById('datePicker') || {}).value || '', reason: row.explanation || '', payload: row }) }).then(function () { alert(code + ' 已加入候选池'); }).catch(function (e) { alert('加入候选池失败：' + (e.message || e)); });
     };
 
+    function decisionRecommendationStatus(row) {
+        var readiness = row && row.decision_readiness || {};
+        return String(readiness.recommend_status || row.recommend_status || row.signal_status || '').toUpperCase();
+    }
+
+    function decisionPayloadIsFresh(payload) {
+        var freshness = String(payload && payload.freshness || '').toLowerCase();
+        var requested = String(payload && payload.requested_date || '').slice(0, 10);
+        var dataDate = String(payload && payload.data_date || '').slice(0, 10);
+        return (freshness === 'exact' || freshness === 'live') && (!requested || !dataDate || requested === dataDate);
+    }
+
+    function qualifiedDecisionRows(payload) {
+        if (!decisionPayloadIsFresh(payload)) return [];
+        return (payload && payload.data || []).filter(function (row) {
+            var grade = String(row.candidate_grade || '').toUpperCase();
+            var rejects = row.risk_gate && row.risk_gate.reject_reasons || [];
+            return (grade === 'A' || grade === 'B') && row.portfolio_eligible === true && decisionRecommendationStatus(row) === 'ALLOW' && !rejects.length;
+        }).sort(function (left, right) {
+            return Number(left.rank || 999999) - Number(right.rank || 999999) || String(left.stock_code || '').localeCompare(String(right.stock_code || ''));
+        });
+    }
+
+    function decisionHistoryUrl(day, preset) {
+        return '/api/screener/history?data_date=' + encodeURIComponent(day) + '&preset=' + encodeURIComponent(preset) + '&limit=300';
+    }
+
+    function decisionRowCard(row, index) {
+        var code = String(row.stock_code || '').padStart(6, '0');
+        var score = row.ensemble_score == null ? row.score : row.ensemble_score;
+        var theme = row.primary_concept || row.theme_name || row.concept_name || '主题待确认';
+        var reason = (row.matched_conditions || []).join('、') || row.explanation || '评级、组合约束与推荐门禁均已通过';
+        return '<article class="decision-stock-card"><span class="decision-stock-rank">' + escHtml(row.rank || index + 1) + '</span><div><strong>' + nameLink(code, row.stock_name || row.short_name || code) + '</strong><small>' + escHtml(code) + ' · ' + escHtml(theme) + '</small><p>' + escHtml(reason) + '</p></div><div class="decision-stock-score"><b>' + escHtml(fmt(score, 2)) + '</b><span>' + escHtml(row.candidate_grade || '-') + '级 · ALLOW</span></div></article>';
+    }
+
+    function decisionColumn(title, kicker, payload) {
+        payload = payload || {};
+        var rows = qualifiedDecisionRows(payload);
+        var allRows = payload.data || [];
+        var isFresh = decisionPayloadIsFresh(payload);
+        var state = !payload.run ? '暂无批次' : !isFresh ? '数据回退，禁止推荐' : rows.length ? '有合格候选' : '无合格候选';
+        var tone = rows.length ? 'ready' : isFresh ? 'empty' : 'blocked';
+        var meta = '决策日 ' + escHtml(payload.requested_date || '-') + ' · 数据日 ' + escHtml(payload.data_date || '-') + ' · 审计 ' + allRows.length + ' 只';
+        var body = rows.length ? rows.slice(0, 12).map(decisionRowCard).join('') : '<div class="decision-empty"><strong>' + escHtml(state) + '</strong><span>' + (isFresh ? '没有股票同时通过 A/B 评级、组合约束与推荐门禁；保持现金与观察。' : '当前结果只可用于历史审计，不能作为今天的个股推荐。') + '</span></div>';
+        return '<section class="decision-column" data-tone="' + tone + '"><header><div><span>' + escHtml(kicker) + '</span><h3>' + escHtml(title) + '</h3><p>' + meta + '</p></div><b>' + escHtml(state) + '</b></header><div class="decision-stock-list">' + body + '</div><footer>批次 ' + escHtml(String((payload.run || {}).run_uid || '-').slice(0, 12)) + ' · ' + escHtml(payload.observed_at || payload.generated_at || '-') + '</footer></section>';
+    }
+
+    function loadCandidateDecisionPage(d, container) {
+        var day = String(d || currentDateValue() || '').slice(0, 10);
+        container.innerHTML = '<div class="loading">正在加载盘前与盘中决策...</div>';
+        Promise.all([
+            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'capital_support'), 15000),
+            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'intraday_sector'), 15000)
+        ]).then(function (result) {
+            var premarket = result[0] || {}, intraday = result[1] || {};
+            var preQualified = qualifiedDecisionRows(premarket).length;
+            var intradayQualified = qualifiedDecisionRows(intraday).length;
+            container.innerHTML = '<div class="decision-page candidate-decision-page"><section class="decision-page-head"><div><span>03 / CANDIDATES & DECISIONS</span><h2>候选与决策</h2><p>盘前看计划，盘中看确认；两列都只展示日期新鲜、评级与门禁全部通过的标的。拒绝项仍保留在“04 候选账本”审计，不再冒充推荐。</p></div><div class="decision-page-count"><strong>' + (preQualified + intradayQualified) + '</strong><span>当前合格记录</span></div></section><div class="decision-dual-grid">' + decisionColumn('盘前计划', '09:08 / PREMARKET', premarket) + decisionColumn('盘中确认', '09:32+ / INTRADAY', intraday) + '</div><section class="decision-page-note"><strong>阅读顺序</strong><span>先看数据日期是否一致，再看是否有合格候选，最后才看分数；没有合格候选本身就是明确决策。</span><button type="button" onclick="switchTab(\'trading-v3-ledger\')">查看全部候选与拒绝账本</button></section></div>';
+            setStatus('盘前与盘中决策已按同一页面日期加载');
+        }).catch(function (error) {
+            container.innerHTML = '<div class="decision-load-error"><strong>候选与决策加载失败</strong><span>' + escHtml(error.message || error) + '</span></div>';
+            setStatus('候选与决策加载失败: ' + (error.message || error), true);
+        });
+    }
+
+    function decisionActionCopy(action) {
+        return {
+            CONTROLLED_RISK_ON: {label:'控制风险参与', detail:'只做已确认主线，分批进场，不追高；总风险仓位不超过系统上限。', tone:'positive'},
+            SELECTIVE_PROBES: {label:'小仓选择性试错', detail:'只在盘中确认后用小仓试单，失败立即停止新增风险。', tone:'cautious'},
+            CASH_FIRST: {label:'现金优先', detail:'不开无依据的新仓，等待市场宽度、成交与核心板块重新确认。', tone:'defensive'}
+        }[String(action || '').toUpperCase()] || {label:'等待有效决策', detail:'数据或决策批次尚未就绪，不根据旧快照行动。', tone:'blocked'};
+    }
+
+    function decisionTruthLabel(state) {
+        return {READY:'可执行研究决策', EMPTY:'无目标，现金优先', BLOCKED:'门禁阻断', STALE:'数据已过期', LOADING:'决策生成中', UNAVAILABLE:'决策不可用'}[state] || state || '决策不可用';
+    }
+
+    function premarketForecastIsFresh(forecast, day) {
+        if (!forecast || forecast.fallback === true) return false;
+        var sessionDate = String(forecast.session_date || forecast.requested_date || '').slice(0, 10);
+        return !sessionDate || sessionDate === String(day || '').slice(0, 10);
+    }
+
+    function loadDecisionCockpitPage(d, container) {
+        var day = String(d || currentDateValue() || '').slice(0, 10);
+        container.innerHTML = '<div class="loading">正在整理今日大盘预期与操作策略...</div>';
+        Promise.all([
+            fetchRawJsonWithTimeout('/api/v3/context?trade_date=' + encodeURIComponent(day), 12000),
+            fetchRawJsonWithTimeout('/api/v3/hypotheses/latest?limit=50&scope_type=MARKET&trade_date=' + encodeURIComponent(day), 12000),
+            fetchRawJsonWithTimeout('/api/hot-data/premarket-theme-forecast?session_date=' + encodeURIComponent(day), 15000),
+            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'capital_support'), 15000),
+            fetchRawJsonWithTimeout(decisionHistoryUrl(day, 'intraday_sector'), 15000)
+        ]).then(function (result) {
+            var contextEnvelope = result[0] || {}, hypothesisEnvelope = result[1] || {};
+            var context = contextEnvelope.data || contextEnvelope;
+            var hypotheses = hypothesisEnvelope.data || hypothesisEnvelope || [];
+            var market = Array.isArray(hypotheses) ? hypotheses.filter(function (row) { return row.scope_type === 'MARKET'; })[0] || {} : {};
+            var forecast = result[2] || {}, premarket = result[3] || {}, intraday = result[4] || {};
+            var contextState = tradingDecisionTruth(context);
+            var marketUsable = contextState === 'READY' && market.scope_type === 'MARKET';
+            var forecastFresh = premarketForecastIsFresh(forecast, day);
+            var action = marketUsable ? decisionActionCopy(market.proposed_action) : decisionActionCopy(contextState === 'EMPTY' || contextState === 'BLOCKED' ? 'CASH_FIRST' : '');
+            var riskCap = marketUsable && market.max_position_weight != null ? fmt(Number(market.max_position_weight) * 100, 1) + '%' : '—';
+            var freshThemes = forecastFresh ? (forecast.themes || []) : [];
+            var thesis = marketUsable && market.thesis
+                ? market.thesis
+                : forecastFresh && forecast.summary
+                ? forecast.summary
+                : freshThemes.length
+                ? '盘前主线优先观察：' + freshThemes.slice(0, 3).map(function (theme) { return theme.theme_name; }).join('、')
+                : '今天尚未形成可验证的大盘假设，暂不根据旧数据行动。';
+            var invalidations = marketUsable && (market.invalidations || []).length ? market.invalidations.join('；') : '盘中宽度、成交、核心板块或风险事件出现反向变化时立即降级。';
+            var preCount = qualifiedDecisionRows(premarket).length, intraCount = qualifiedDecisionRows(intraday).length;
+            var themeCards = freshThemes.slice(0, 6).map(function (theme) {
+                return '<article><span>#' + escHtml(theme.rank || '-') + '</span><strong>' + escHtml(theme.theme_name || '-') + '</strong><b>' + escHtml(fmt(theme.score, 1)) + '</b><small>' + escHtml((theme.evidence || []).slice(0, 2).join('；') || theme.status || '等待盘中确认') + '</small></article>';
+            }).join('') || '<div class="decision-empty"><strong>没有可用的盘前主题预判</strong><span>历史回退主题不参与今天的市场预期。</span></div>';
+            container.innerHTML = '<div class="decision-page decision-cockpit"><section class="decision-hero" data-tone="' + action.tone + '"><div><span>01 / TODAY\'S DECISION</span><h2>今日大盘预期</h2><p>' + escHtml(thesis) + '</p></div><div class="decision-hero-action"><small>整体操作</small><strong>' + escHtml(action.label) + '</strong><p>' + escHtml(action.detail) + '</p></div></section><div class="decision-kpis"><article><span>决策状态</span><strong>' + escHtml(decisionTruthLabel(contextState)) + '</strong><small>' + escHtml(context.data_date || '-') + ' 数据</small></article><article><span>风险仓位上限</span><strong>' + escHtml(riskCap) + '</strong><small>不是目标仓位，是不可突破的上限</small></article><article><span>盘前合格候选</span><strong>' + preCount + '</strong><small>' + escHtml(premarket.freshness || '暂无批次') + '</small></article><article><span>盘中合格候选</span><strong>' + intraCount + '</strong><small>' + escHtml(intraday.freshness || '暂无批次') + '</small></article></div><div class="decision-main-grid"><section class="decision-panel"><header><div><span>MARKET PLAYBOOK</span><h3>今天怎么操作</h3></div></header><ol class="decision-playbook"><li><b>1</b><div><strong>开盘前：先确认数据</strong><span>请求日、数据日和证据时点必须匹配；回退数据只复盘，不荐股。</span></div></li><li><b>2</b><div><strong>盘中：只做确认后的候选</strong><span>盘前计划必须经过实时价格、板块宽度和风险门禁确认；无合格候选就不做。</span></div></li><li><b>3</b><div><strong>仓位：服从 ' + escHtml(riskCap) + ' 上限</strong><span>' + escHtml(action.detail) + '</span></div></li><li class="danger"><b>!</b><div><strong>失效条件</strong><span>' + escHtml(invalidations) + '</span></div></li></ol><button class="decision-primary-button" type="button" onclick="switchTab(\'trading-v3-candidates\')">查看盘前 / 盘中候选决策</button></section><section class="decision-panel"><header><div><span>PREMARKET THEMES</span><h3>盘前主线预期</h3></div><b>' + escHtml(forecastFresh ? forecast.data_quality || '当日冻结' : forecast.fallback ? '历史回退（不采用）' : '等待数据') + '</b></header><div class="decision-theme-grid">' + themeCards + '</div><footer>冻结时点 ' + escHtml(forecast.cutoff_at || '-') + ' · A股源数据 ' + escHtml(forecast.source_trade_date || '-') + '</footer></section></div></div>';
+            setStatus('今日大盘预期与操作策略已加载');
+        }).catch(function (error) {
+            container.innerHTML = '<div class="decision-load-error"><strong>交易决策总览加载失败</strong><span>' + escHtml(error.message || error) + '</span></div>';
+            setStatus('交易决策总览加载失败: ' + (error.message || error), true);
+        });
+    }
+
     function loadCandidateCenterPage(d, container) {
         container.innerHTML = '<div class="loading">正在按统一决策批次加载候选与拒绝...</div>';
         var requestedDate = String(d || '').slice(0, 10);
@@ -6960,7 +7096,12 @@
             var poolEnvelope = unifiedResult[0] || {}, contextEnvelope = unifiedResult[1] || {};
             var pool = poolEnvelope.data || poolEnvelope;
             var context = contextEnvelope.data || contextEnvelope;
-            var rows = Array.isArray(pool.items) ? pool.items : [];
+            var rows = Array.isArray(pool.items) ? pool.items.slice() : [];
+            rows.sort(function (left, right) {
+                var leftRank = Number(left.rank_no == null ? 999999 : left.rank_no);
+                var rightRank = Number(right.rank_no == null ? 999999 : right.rank_no);
+                return leftRank - rightRank || String(left.stock_code || '').localeCompare(String(right.stock_code || ''));
+            });
             var summary = pool.summary || {};
             var resolvedDate = String(context.data_date || pool.trade_date || '').slice(0, 10);
             var batchMismatch = !!(context.run_uid && pool.run_uid && context.run_uid !== pool.run_uid);
@@ -6988,7 +7129,7 @@
             }
 
             var h = '<div class="screen-page candidate-center unified-stock-pool">';
-            h += '<section class="screen-intro"><div><div class="screen-eyebrow">V3 IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">机会与拒绝</h2><p class="screen-subtitle">候选、目标和组合拒绝均来自同一 V3 决策批次；四版本实际运行：V3 为基础排序，V4–V6 仅作为受限研究顾问；研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + rows.length + '</strong><span>同批次股票</span></div></section>';
+            h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / V3 IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + rows.length + '</strong><span>同批次股票</span></div></section>';
             h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '决策会话日与请求上下文不匹配或证据过期，仅供历史复核' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || requestedDate || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || resolvedDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || pool.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || pool.generated_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'STALE' ? '历史复核' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经 V2 复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
             var metricsReadable = contextState === 'READY' || contextState === 'EMPTY';
             h += '<div class="stats-bar">' + card('同批次股票', metricsReadable ? Number(summary.stock_count || 0) : '—', 'blue') + card('研究候选', metricsReadable ? Number(summary.strategy_candidate_count || 0) : '—', 'orange') + card('研究目标', metricsReadable ? Number(summary.target_count || 0) : '—', 'red') + card('明确拒绝', metricsReadable ? Number(summary.rejected_count || 0) : '—', 'green') + '</div>';

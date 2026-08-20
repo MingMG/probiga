@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=40">
+    <link rel="stylesheet" href="/static/css/style.css?v=41">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/js/auth.js?v=2"></script>
 </head>
@@ -17,22 +17,23 @@
     <div class="sidebar-group-title">交易决策</div>
     <button class="sidebar-item active" data-tab="trading" onclick="switchTab('trading')">◎ 策略与模拟</button>
     <div class="sidebar-trading-section">今日决策</div>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-overview" data-trading-view="overview" data-module-page="v3" onclick="openTradingModule('trading-v3-overview')"><span>01</span>决策总览</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-overview" onclick="switchTab('trading-v3-overview')"><span>01</span>决策总览</button>
     <div class="sidebar-trading-section">机会与拒绝</div>
     <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-hypotheses" data-trading-view="hypotheses" data-module-page="v3" onclick="openTradingModule('trading-v3-hypotheses')"><span>02</span>交易假设</button>
-    <button class="sidebar-item" data-tab="trading-v3-candidates" onclick="switchTab('trading-v3-candidates')"><span>03</span>候选与拒绝</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-intraday" data-trading-view="intraday" data-module-page="v3" onclick="openTradingModule('trading-v3-intraday')"><span>04</span>盘中只读证据</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-candidates" onclick="switchTab('trading-v3-candidates')"><span>03</span>候选与决策</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-ledger" onclick="switchTab('trading-v3-ledger')"><span>04</span>候选账本</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-intraday" data-trading-view="intraday" data-module-page="v3" onclick="openTradingModule('trading-v3-intraday')"><span>05</span>盘中只读证据</button>
     <div class="sidebar-trading-section">模拟执行</div>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-portfolio" data-trading-view="portfolio" data-module-page="v3" onclick="openTradingModule('trading-v3-portfolio')"><span>05</span>目标组合</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-positions" data-trading-view="positions" data-module-page="v3" onclick="openTradingModule('trading-v3-positions')"><span>06</span>持仓与退出</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-orders" data-trading-view="orders" data-module-page="v3" onclick="openTradingModule('trading-v3-orders')"><span>07</span>模拟订单</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-portfolio" data-trading-view="portfolio" data-module-page="v3" onclick="openTradingModule('trading-v3-portfolio')"><span>06</span>目标组合</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-positions" data-trading-view="positions" data-module-page="v3" onclick="openTradingModule('trading-v3-positions')"><span>07</span>持仓与退出</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-orders" data-trading-view="orders" data-module-page="v3" onclick="openTradingModule('trading-v3-orders')"><span>08</span>模拟订单</button>
     <div class="sidebar-trading-section">验证复盘</div>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-validation" data-trading-view="validation" data-module-page="v3" onclick="openTradingModule('trading-v3-validation')"><span>08</span>回测验收</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-missed" data-trading-view="missed" data-module-page="v3" onclick="openTradingModule('trading-v3-missed')"><span>09</span>漏抓复盘</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-validation" data-trading-view="validation" data-module-page="v3" onclick="openTradingModule('trading-v3-validation')"><span>09</span>回测验收</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-missed" data-trading-view="missed" data-module-page="v3" onclick="openTradingModule('trading-v3-missed')"><span>10</span>漏抓复盘</button>
     <div class="sidebar-trading-section">系统证据</div>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-evidence" data-trading-view="evidence" data-module-page="v3" onclick="openTradingModule('trading-v3-evidence')"><span>10</span>数据与系统</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-shared-etf" data-trading-view="etf" data-module-page="v2" onclick="openTradingModule('trading-shared-etf')"><span>11</span>ETF 前向</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-shared-operations" data-trading-view="operations" data-module-page="v2" onclick="openTradingModule('trading-shared-operations')"><span>12</span>运行状态</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-evidence" data-trading-view="evidence" data-module-page="v3" onclick="openTradingModule('trading-v3-evidence')"><span>11</span>数据与系统</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-shared-etf" data-trading-view="etf" data-module-page="v2" onclick="openTradingModule('trading-shared-etf')"><span>12</span>ETF 前向</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-shared-operations" data-trading-view="operations" data-module-page="v2" onclick="openTradingModule('trading-shared-operations')"><span>13</span>运行状态</button>
   </div>
 
   <div class="sidebar-group">
@@ -287,6 +288,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 旧模拟交易（归档）'
 };
 </script>
-    <script src="/static/js/app.js?v=95"></script>
+    <script src="/static/js/app.js?v=96"></script>
 </body>
 </html>
