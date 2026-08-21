@@ -16,6 +16,8 @@ from sqlalchemy.engine import Engine
 _STOCK_CODE_RE = re.compile(r"^\d{6}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
+_TRUSTED_RUN_STATUSES = {"COMPLETED"}
+_DEFENSIVE_REGIMES = {"RISK_OFF", "PANIC_RECOVERY"}
 
 
 def _number(value: Any) -> float | None:
@@ -56,6 +58,98 @@ def _cutoff_datetime(value: str | datetime) -> datetime:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(_SHANGHAI_TZ).replace(tzinfo=None)
     return parsed
+
+
+def build_daily_market_holding_context(
+    decision_run: dict[str, Any] | None,
+    trade_date: str,
+) -> dict[str, Any]:
+    """Project one immutable daily decision into a holding risk instruction.
+
+    ``requested_as_of`` binds the run to the session being reviewed, while the
+    run's ``trade_date`` may legitimately be the previous completed session
+    during the pre-market review. Missing, blocked, or cross-session runs fail
+    closed and may never silently authorize a normal HOLD.
+    """
+    target_date = str(trade_date or "")[:10]
+    run = dict(decision_run or {})
+    regime = dict(run.get("regime") or {})
+    run_status = str(run.get("status") or "MISSING").upper()
+    session_date = str(run.get("requested_as_of") or "")[:10]
+    data_date = str(run.get("trade_date") or "")[:10]
+    dominant_state = str(
+        run.get("dominant_regime")
+        or regime.get("dominant_state")
+        or "DATA_BLOCKED"
+    ).upper()
+    quality_status = str(regime.get("quality_status") or "BLOCK").upper()
+    risk_asset_cap = None
+    for value in (run.get("risk_asset_cap"), regime.get("risk_asset_cap")):
+        try:
+            risk_asset_cap = max(0.0, min(1.0, float(value)))
+            break
+        except (TypeError, ValueError):
+            continue
+
+    blockers = []
+    if not run.get("run_uid"):
+        blockers.append("DAILY_DECISION_RUN_MISSING")
+    if run_status not in _TRUSTED_RUN_STATUSES:
+        blockers.append(f"DAILY_DECISION_RUN_{run_status}")
+    if run.get("decision_integrity_verified") is not True:
+        blockers.append("DAILY_DECISION_INTEGRITY_UNVERIFIED")
+    if session_date != target_date:
+        blockers.append("DAILY_DECISION_SESSION_MISMATCH")
+    if not _DATE_RE.fullmatch(data_date) or data_date > target_date:
+        blockers.append("DAILY_DECISION_DATA_DATE_INVALID")
+    if quality_status != "PASS":
+        blockers.append(f"DAILY_REGIME_QUALITY_{quality_status}")
+    if dominant_state == "DATA_BLOCKED":
+        blockers.append("DAILY_MARKET_REGIME_DATA_BLOCKED")
+    if risk_asset_cap is None:
+        blockers.append("DAILY_RISK_ASSET_CAP_MISSING")
+
+    if blockers:
+        market_action = "WAIT_DATA"
+        risk_level = "DATA_BLOCKED"
+        reason = "每日市场决策不可用或不完整，禁止用旧市场结论继续持有或加仓"
+    elif dominant_state == "EXTREME" or risk_asset_cap <= 0.05:
+        market_action = "SELL"
+        risk_level = "EXTREME"
+        reason = (
+            f"每日市场状态为 {dominant_state}，风险资产上限仅 "
+            f"{risk_asset_cap:.0%}，持仓进入退出优先模式"
+        )
+    elif dominant_state in _DEFENSIVE_REGIMES or risk_asset_cap <= 0.30:
+        market_action = "REDUCE"
+        risk_level = "DEFENSIVE"
+        reason = (
+            f"每日市场状态为 {dominant_state}，风险资产上限 "
+            f"{risk_asset_cap:.0%}，现有持仓先降风险、不再死拿"
+        )
+    else:
+        market_action = "HOLD"
+        risk_level = "NORMAL"
+        reason = (
+            f"每日市场状态为 {dominant_state}，风险资产上限 "
+            f"{risk_asset_cap:.0%}；仍须服从个股止损、趋势和事件红线"
+        )
+
+    return {
+        "status": "READY" if not blockers else "BLOCKED",
+        "market_action": market_action,
+        "risk_level": risk_level,
+        "dominant_state": dominant_state,
+        "risk_asset_cap": risk_asset_cap,
+        "quality_status": quality_status,
+        "run_status": run_status,
+        "run_uid": run.get("run_uid"),
+        "session_date": session_date or None,
+        "data_date": data_date or None,
+        "decision_at": run.get("decision_at"),
+        "reason": reason,
+        "blockers": blockers,
+    }
 
 
 def _table_columns(engine: Engine, table_name: str) -> set[str]:
@@ -358,6 +452,7 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     *,
     current_price: float | None = None,
     cost_price: float | None = None,
+    market_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate one holding using only records acquired by ``knowledge_cutoff``."""
     code = str(stock_code or "").strip().zfill(6)
@@ -436,6 +531,9 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     computed_trend_stop = ma20 * 0.97 if ma20 > 0 else 0.0
     cost_guard = (_number(cost_price) or 0.0) * 0.95
     recommendation_date = str(recommendation.get("pick_date") or "")[:10]
+    analysis_date = str(analysis.get("analysis_date") or "")[:10]
+    daily_context = dict(market_context or {})
+    decision_data_date = str(daily_context.get("data_date") or "")[:10]
     recommendation_age_days = None
     if _DATE_RE.fullmatch(recommendation_date):
         recommendation_age_days = (
@@ -443,10 +541,23 @@ def evaluate_watchlist_holding_exit_at_cutoff(
             - date.fromisoformat(recommendation_date)
         ).days
     recommendation_stale = bool(
-        recommendation_age_days is not None
-        and recommendation_age_days > 7
+        recommendation_date
+        and (
+            (decision_data_date and recommendation_date < decision_data_date)
+            or (
+                not decision_data_date
+                and recommendation_age_days is not None
+                and recommendation_age_days > 3
+            )
+        )
+    )
+    analysis_stale = bool(
+        analysis_date
+        and decision_data_date
+        and analysis_date < decision_data_date
     )
     same_session_price = price.get("same_session") is True
+    market_action = str(daily_context.get("market_action") or "").upper()
 
     intent = "HOLD"
     reason = "cutoff-visible analysis and price do not require an exit"
@@ -463,15 +574,33 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         intent, reason, explicit = "SELL", f"latest price {latest_price:.4f} breached trend stop {trend_stop:.4f}", True
     elif same_session_price and latest_price > 0 and computed_trend_stop > 0 and latest_price <= computed_trend_stop:
         intent, reason, explicit = "SELL", f"latest price {latest_price:.4f} invalidated MA20 trend stop {computed_trend_stop:.4f}", True
+    elif market_action == "SELL":
+        intent, reason, explicit = "SELL", str(
+            daily_context.get("reason") or "daily market risk requires exit"
+        ), True
     elif "REDUCE" in signals:
         intent, reason, explicit = "REDUCE", "persisted strategy signal is REDUCE", True
     elif "HIGH" in risks:
         intent, reason, explicit = "REDUCE", "cutoff-visible high event risk requires reduction", True
     elif same_session_price and latest_price > 0 and trend_reduce > 0 and latest_price <= trend_reduce:
         intent, reason, explicit = "REDUCE", f"latest price {latest_price:.4f} breached reduction line {trend_reduce:.4f}", True
+    elif market_action == "REDUCE":
+        intent, reason, explicit = "REDUCE", str(
+            daily_context.get("reason") or "daily market risk requires reduction"
+        ), True
 
     if not explicit:
-        if not recommendation:
+        if market_context is not None and market_action != "HOLD":
+            intent, reason = "WAIT_DATA", str(
+                daily_context.get("reason")
+                or "daily market context cannot authorize continued holding"
+            )
+        elif analysis_stale:
+            intent, reason = (
+                "WAIT_DATA",
+                "个股分析没有更新到最近完整市场数据日，禁止沿用旧分析继续持有",
+            )
+        elif not recommendation:
             if analysis and same_session_price and cost_guard > 0:
                 intent, reason = (
                     "HOLD",
@@ -520,8 +649,12 @@ def evaluate_watchlist_holding_exit_at_cutoff(
             "recommendation_date": recommendation_date or None,
             "recommendation_age_days": recommendation_age_days,
             "recommendation_stale": recommendation_stale,
+            "analysis_date": analysis_date or None,
+            "analysis_stale": analysis_stale,
+            "decision_data_date": decision_data_date or None,
             "same_session_price": same_session_price,
         },
+        "market_context": daily_context or None,
     }
     hash_payload = json.dumps(
         {"stock_code": code, "trade_date": target_date, "intent": intent, "evidence": evidence},
@@ -555,6 +688,7 @@ def build_watchlist_holding_strategy(
     recommendation = dict(evidence.get("recommendation") or {})
     thresholds = dict(evidence.get("thresholds") or {})
     freshness = dict(evidence.get("freshness") or {})
+    market_context = dict(evidence.get("market_context") or {})
     price_evidence = dict(evidence.get("price") or {})
     intent = str(exit_decision.get("exit_intent") or "WAIT_DATA").upper()
     if intent not in {"SELL", "REDUCE", "HOLD", "WAIT_DATA"}:
@@ -682,6 +816,12 @@ def build_watchlist_holding_strategy(
         "evaluated_at": exit_decision.get("evaluated_at"),
         "valid_until": exit_decision.get("valid_until"),
         "context_hash": exit_decision.get("context_hash"),
+        "market_state": market_context.get("dominant_state"),
+        "market_risk_asset_cap": market_context.get("risk_asset_cap"),
+        "market_context_status": market_context.get("status"),
+        "market_context_reason": market_context.get("reason"),
+        "market_decision_run_uid": market_context.get("run_uid"),
+        "market_data_date": market_context.get("data_date"),
         "execution_authority": "ADVISORY_ONLY",
     }
 

@@ -6,6 +6,131 @@ from sqlalchemy import create_engine, text
 from server.api.routers import holding_strategy
 
 
+def _daily_run(
+    *,
+    dominant_state="TREND_UP",
+    risk_asset_cap=0.8,
+    quality_status="PASS",
+    status="COMPLETED",
+):
+    return {
+        "run_uid": "daily-run-20260821",
+        "status": status,
+        "decision_integrity_verified": True,
+        "requested_as_of": "2026-08-21",
+        "trade_date": "2026-08-20",
+        "decision_at": "2026-08-21 09:15:00",
+        "dominant_regime": dominant_state,
+        "regime": {
+            "dominant_state": dominant_state,
+            "risk_asset_cap": risk_asset_cap,
+            "quality_status": quality_status,
+        },
+    }
+
+
+def test_daily_market_context_reduces_risk_off_holdings():
+    context = holding_strategy.build_daily_market_holding_context(
+        _daily_run(dominant_state="RISK_OFF", risk_asset_cap=0.10),
+        "2026-08-21",
+    )
+
+    assert context["status"] == "READY"
+    assert context["market_action"] == "REDUCE"
+    assert context["dominant_state"] == "RISK_OFF"
+    assert context["risk_asset_cap"] == 0.10
+    assert "不再死拿" in context["reason"]
+
+
+def test_missing_daily_market_context_fails_closed():
+    context = holding_strategy.build_daily_market_holding_context(
+        None,
+        "2026-08-21",
+    )
+
+    assert context["status"] == "BLOCKED"
+    assert context["market_action"] == "WAIT_DATA"
+    assert "DAILY_DECISION_RUN_MISSING" in context["blockers"]
+
+
+def test_daily_market_risk_overrides_an_individual_hold(monkeypatch):
+    def latest_row(_engine, **kwargs):
+        if kwargs["table_name"] == "st_recommended_stocks":
+            return {
+                "pick_date": "2026-08-20",
+                "signal_status": "WATCH",
+                "main_wave_signal": "WATCH",
+            }, ""
+        return {
+            "analysis_date": "2026-08-20",
+            "event_risk_level": "LOW",
+            "recommend_status": "HOLD",
+        }, ""
+
+    monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest_row)
+    monkeypatch.setattr(
+        holding_strategy,
+        "_daily_price_context",
+        lambda *_args, **_kwargs: ({
+            "latest_price": 10.5,
+            "price_trade_date": "2026-08-21",
+            "same_session": True,
+            "ma20": 10.0,
+        }, ""),
+    )
+    market_context = holding_strategy.build_daily_market_holding_context(
+        _daily_run(dominant_state="RISK_OFF", risk_asset_cap=0.10),
+        "2026-08-21",
+    )
+
+    decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
+        object(),
+        "000001",
+        "2026-08-21",
+        "2026-08-21T10:00:00+08:00",
+        cost_price=10.0,
+        market_context=market_context,
+    )
+
+    assert decision["exit_intent"] == "REDUCE"
+    assert decision["evidence"]["market_context"]["dominant_state"] == "RISK_OFF"
+    assert "不再死拿" in decision["reason"]
+
+
+def test_hard_stop_remains_authoritative_when_daily_context_is_blocked(monkeypatch):
+    monkeypatch.setattr(
+        holding_strategy,
+        "_latest_pit_row",
+        lambda *_args, **_kwargs: ({}, "missing"),
+    )
+    monkeypatch.setattr(
+        holding_strategy,
+        "_daily_price_context",
+        lambda *_args, **_kwargs: ({
+            "latest_price": 9.4,
+            "price_trade_date": "2026-08-21",
+            "same_session": True,
+            "ma20": 10.0,
+        }, ""),
+    )
+    market_context = holding_strategy.build_daily_market_holding_context(
+        None,
+        "2026-08-21",
+    )
+
+    decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
+        object(),
+        "000001",
+        "2026-08-21",
+        "2026-08-21T10:00:00+08:00",
+        cost_price=10.0,
+        market_context=market_context,
+    )
+
+    assert decision["exit_intent"] == "SELL"
+    assert "成本保护位" in decision["reason"]
+
+
 def test_yak_technology_august_17_sell_alert_is_an_immediate_exit():
     recommendation = {
         "signal_status": "SELL_ALERT",

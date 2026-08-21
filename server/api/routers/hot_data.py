@@ -47,6 +47,7 @@ from server.api.routers.portfolio_math import (
     portfolio_trade_fee,
 )
 from server.api.routers.holding_strategy import (
+    build_daily_market_holding_context,
     build_watchlist_holding_strategy,
     evaluate_watchlist_holding_exit_at_cutoff,
     summarize_watchlist_holding_strategies,
@@ -6977,6 +6978,10 @@ def portfolio_holding_strategy(
             target_day,
             error,
         )
+    market_context = build_daily_market_holding_context(
+        decision_run,
+        target_day.isoformat(),
+    )
     holdings = []
     for row in snapshot_rows:
         shares = int(row.get("shares") or 0)
@@ -7005,6 +7010,7 @@ def portfolio_holding_strategy(
                 cutoff,
                 current_price=cutoff_current_price,
                 cost_price=row.get("cost_price"),
+                market_context=market_context,
             )
         except Exception as error:
             logger.warning(
@@ -7025,6 +7031,7 @@ def portfolio_holding_strategy(
                         "price_source": row.get("quote_source") or "portfolio_snapshot",
                     },
                     "thresholds": {},
+                    "market_context": market_context,
                 },
                 "evaluated_at": cutoff,
                 "valid_until": None,
@@ -7059,6 +7066,7 @@ def portfolio_holding_strategy(
         "decision_data_date": decision_run.get("trade_date"),
         "decision_session_date": decision_run.get("requested_as_of")
         or target_day.isoformat(),
+        "market_context": market_context,
         "summary": {**summary, "incomplete_position_count": incomplete_positions},
         "data": holdings,
     }

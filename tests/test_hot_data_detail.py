@@ -1012,7 +1012,12 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["data"][0]["stock_code"], "002409")
         self.assertEqual(out["data"][0]["action"], "立即卖出")
         self.assertEqual(out["execution_authority"], "ADVISORY_ONLY")
+        self.assertEqual(out["market_context"]["market_action"], "WAIT_DATA")
         evaluate.assert_called_once()
+        self.assertEqual(
+            evaluate.call_args.kwargs["market_context"]["status"],
+            "BLOCKED",
+        )
 
     def test_portfolio_live_force_rebuilds_shared_snapshot(self):
         snapshot = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {"holding_count": 1}}
