@@ -13,6 +13,7 @@ from server.auth.service import (
     AuthError,
     IssuedSession,
     authenticate,
+    create_managed_user,
     registration_state,
     registration_window_open,
     register_first_admin,
@@ -40,6 +41,12 @@ def _authentication_required() -> bool:
 class Credentials(BaseModel):
     username: str
     password: str
+
+
+class ManagedUserCredentials(BaseModel):
+    username: str
+    password: str
+    role: str = "EVIDENCE_REVIEWER"
 
 
 def _client_ip(request: Request) -> str:
@@ -198,6 +205,41 @@ def login(payload: Credentials, request: Request):
         return _error_response(exc)
     response = JSONResponse(_success_payload(issued))
     _set_session_cookie(response, request, issued)
+    return response
+
+
+@router.post("/users")
+def create_user(payload: ManagedUserCredentials, request: Request):
+    actor = getattr(request.state, "auth_user", None)
+    auth_kind = str(getattr(request.state, "auth_kind", "") or "")
+    if auth_kind != "account_session" or actor is None:
+        return _error_response(
+            AuthError(
+                "account_session_required",
+                "创建复核账号只允许已登录的管理员账户；旧管理令牌无此权限。",
+                status_code=403,
+            )
+        )
+    try:
+        user = create_managed_user(
+            get_engine(),
+            actor=actor,
+            username=payload.username,
+            password=payload.password,
+            role=payload.role,
+            client_ip=_client_ip(request),
+        )
+    except AuthError as exc:
+        return _error_response(exc)
+    response = JSONResponse(
+        status_code=201,
+        content={
+            "status": "ok",
+            "user": user.as_dict(),
+            "purpose": "独立策略证据提交或复核；提交人与复核人必须不同",
+        },
+    )
+    response.headers["Cache-Control"] = "no-store"
     return response
 
 

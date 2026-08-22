@@ -114,8 +114,8 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
-    assert "style.css?v=41" in index
-    assert "app.js?v=99" in index
+    assert "style.css?v=44" in index
+    assert "app.js?v=104" in index
     assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
     assert 'data-trading-view="candidates"' in index

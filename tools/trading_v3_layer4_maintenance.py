@@ -364,6 +364,68 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _process_is_alive(process_id: int) -> bool:
+    """Probe a process without ever delivering a signal on Windows.
+
+    POSIX defines ``kill(pid, 0)`` as a permission/existence check.  Python's
+    Windows implementation does not provide that contract for arbitrary
+    numeric signals and may terminate the target process.  The maintenance
+    holder is also exercised by Windows CI, so use a read-only process handle
+    there instead of risking a signal to the parent pytest/shell process.
+    """
+
+    if process_id <= 1:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+
+        handle = open_process(
+            process_query_limited_information,
+            False,
+            process_id,
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            return bool(get_exit_code(handle, ctypes.byref(exit_code))) and (
+                exit_code.value == still_active
+            )
+        finally:
+            close_handle(handle)
+
+    try:
+        os.kill(process_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def hold_maintenance_lock(
     engine: Engine,
     *,
@@ -402,12 +464,8 @@ def hold_maintenance_lock(
         while not release_file.exists():
             if time.monotonic() - started >= max_hold_seconds:
                 raise MaintenanceBlocked("LAYER4_MAINTENANCE_LOCK_MAX_HOLD_EXPIRED")
-            try:
-                os.kill(parent_pid, 0)
-            except OSError as exc:
-                raise MaintenanceBlocked(
-                    "LAYER4_MAINTENANCE_PARENT_EXITED"
-                ) from exc
+            if not _process_is_alive(parent_pid):
+                raise MaintenanceBlocked("LAYER4_MAINTENANCE_PARENT_EXITED")
             time.sleep(0.25)
     return {
         "status": "released",

@@ -27,6 +27,8 @@ def test_prepare_bigqmt_daily_capture_preserves_raw_unadjusted_provenance(
                 "data_source": BIGQMT_PROVIDER_ID,
                 "quality_status": "VERIFIED",
                 "batch_id": "bigqmt-source-batch",
+                "pre_close": 9.9,
+                "pre_close_origin": "NATIVE_QMT",
             }
         ]
     )
@@ -43,6 +45,8 @@ def test_prepare_bigqmt_daily_capture_preserves_raw_unadjusted_provenance(
     assert rows[0]["adjust_type"] == 0
     assert rows[0]["quality_status"] == "VERIFIED"
     assert rows[0]["batch_id"] == "bigqmt-source-batch"
+    assert rows[0]["pre_close"] == 9.9
+    assert rows[0]["pre_close_origin"] == "NATIVE_QMT"
 
 
 def test_persist_bigqmt_daily_capture_uses_local_evidence_table(monkeypatch):

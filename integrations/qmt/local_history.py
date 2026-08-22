@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
@@ -174,6 +174,8 @@ def ensure_local_history_tables(engine: Engine) -> None:
                     change_pct DECIMAL(20,6) NULL,
                     turnover_ratio DECIMAL(20,6) NULL,
                     pre_close DECIMAL(20,6) NULL,
+                    pre_close_origin VARCHAR(32) NOT NULL
+                        DEFAULT 'UNVERIFIED_LEGACY',
                     source_time DATETIME NULL,
                     received_at DATETIME NOT NULL,
                     batch_id VARCHAR(64) NOT NULL,
@@ -223,6 +225,7 @@ def ensure_local_history_tables(engine: Engine) -> None:
                 """
             )
         )
+    with engine.begin() as conn:
         conn.execute(
             text(
                 f"""
@@ -249,6 +252,17 @@ def ensure_local_history_tables(engine: Engine) -> None:
                 """
             )
         )
+    column_names = {
+        str(column.get("name") or "")
+        for column in inspect(engine).get_columns(LOCAL_KLINE_TABLE)
+    }
+    if "pre_close_origin" not in column_names:
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE {LOCAL_KLINE_TABLE} "
+                "ADD COLUMN pre_close_origin VARCHAR(32) NOT NULL "
+                "DEFAULT 'UNVERIFIED_LEGACY' AFTER pre_close"
+            ))
 
 
 def load_stock_codes(source_engine: Engine, *, codes: Sequence[str] | None = None, limit: int = 0) -> list[str]:
@@ -371,6 +385,9 @@ def _prepare_kline_rows(
             "change_pct": raw.get("change_pct"),
             "turnover_ratio": raw.get("turnover_ratio"),
             "pre_close": raw.get("pre_close"),
+            "pre_close_origin": (
+                raw.get("pre_close_origin") or "UNVERIFIED_LEGACY"
+            ),
             "source_time": raw.get("source_time") or raw.get("trade_time"),
             "received_at": raw.get("received_at") or received_at,
             "batch_id": raw.get("batch_id") or batch_id,
@@ -498,6 +515,7 @@ def _record_run_start(
     start_date: str,
     end_date: str,
     requested_codes: int,
+    provider: str,
     extra: Mapping[str, Any],
 ) -> None:
     with engine.begin() as conn:
@@ -515,7 +533,7 @@ def _record_run_start(
             ),
             {
                 "run_id": run_id,
-                "provider": LEGACY_PROVIDER_ID,
+                "provider": provider,
                 "dataset": dataset,
                 "period": period,
                 "start_date": _normalize_date(start_date),
@@ -565,9 +583,12 @@ def backfill_daily_kline_local(
     start_date: str,
     end_date: str,
     batch_size: int = 80,
-    dividend_type: str = "front",
+    dividend_type: str = "none",
+    provider: str = BIGQMT_PROVIDER_ID,
     dry_run: bool = False,
 ) -> LocalBackfillResult:
+    if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
+        raise ValueError("daily QMT history provider is not supported")
     ensure_local_history_tables(local_engine)
     run_id = f"qmt_hist_kline_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     batches: list[LocalBackfillBatchResult] = []
@@ -581,7 +602,13 @@ def backfill_daily_kline_local(
         start_date=start_date,
         end_date=end_date,
         requested_codes=len(stock_codes),
-        extra={"dry_run": dry_run, "dividend_type": dividend_type, "batch_size": batch_size},
+        provider=provider,
+        extra={
+            "dry_run": dry_run,
+            "dividend_type": dividend_type,
+            "batch_size": batch_size,
+            "provider": provider,
+        },
     )
     status = "SUCCESS"
     error_message: str | None = None
@@ -589,15 +616,32 @@ def backfill_daily_kline_local(
         for batch in _chunked(list(stock_codes), batch_size):
             qmt_codes = [to_qmt_symbol(code) for code in batch]
             qmt_codes = [code for code in qmt_codes if code]
-            frame = bridge.kline(
-                qmt_codes,
-                start_date=start_date,
-                end_date=end_date,
-                dividend_type=dividend_type,
-                batch_size=batch_size,
-                timeout=900,
+            if provider == BIGQMT_PROVIDER_ID:
+                from integrations.bigqmt.backend import BigQmtBackend
+
+                frame = BigQmtBackend().fetch_kline(
+                    list(batch),
+                    start_date,
+                    end_date,
+                    dividend_type=dividend_type,
+                    download_history=True,
+                )
+            else:
+                frame = bridge.kline(
+                    qmt_codes,
+                    start_date=start_date,
+                    end_date=end_date,
+                    dividend_type=dividend_type,
+                    batch_size=batch_size,
+                    timeout=900,
+                )
+            rows = _prepare_kline_rows(
+                frame,
+                source_engine=source_engine,
+                period="1d",
+                batch_id=run_id,
+                provider=provider,
             )
-            rows = _prepare_kline_rows(frame, source_engine=source_engine, period="1d", batch_id=run_id)
             fetched_total += len(rows)
             written = 0 if dry_run else _upsert_rows(
                 local_engine,
@@ -670,6 +714,7 @@ def backfill_minute_local(
         start_date=start_date,
         end_date=end_date,
         requested_codes=len(stock_codes),
+        provider=LEGACY_PROVIDER_ID,
         extra={"dry_run": dry_run, "batch_size": batch_size, "trade_dates": list(trade_dates)},
     )
     status = "SUCCESS"

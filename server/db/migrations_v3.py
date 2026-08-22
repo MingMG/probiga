@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS {MIGRATION_PROGRESS_TABLE} (
 V3_PROJECTION_OUTBOX_MIGRATION_VERSION = (
     "20260804_001_v3_execution_projection_outbox"
 )
+FORWARD_STRATEGY_VERSION_MIGRATION_VERSION = (
+    "20260822_001_freeze_forward_strategy_version"
+)
+V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION = (
+    "20260822_002_freeze_v2_fill_cash_ledgers"
+)
+FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION = (
+    "20260822_003_forward_exit_allocation_ledger"
+)
 
 
 @dataclass(frozen=True)
@@ -1505,6 +1514,689 @@ MIGRATIONS = MIGRATIONS + (
 )
 
 
+FORWARD_STRATEGY_VERSION_DDL = (
+    """
+    ALTER TABLE st_forward_trade_evidence_v3
+    ADD COLUMN strategy_version VARCHAR(160) NOT NULL DEFAULT ''
+        AFTER strategy_key
+    """,
+    """
+    CREATE INDEX idx_v3_forward_strategy_version
+    ON st_forward_trade_evidence_v3 (
+        strategy_key, strategy_version, evidence_status, exit_at
+    )
+    """,
+    """
+    UPDATE st_forward_trade_evidence_v3 e
+    JOIN st_alpha_forecast_v3 f
+      ON f.forecast_id = e.source_forecast_id
+     AND f.run_uid = e.source_run_uid
+     AND f.stock_code = e.stock_code
+     AND f.strategy_key = e.strategy_key
+    JOIN st_decision_run_v3 r
+      ON r.run_uid = f.run_uid
+     AND r.status = 'COMPLETED'
+    JOIN st_trade_intent_v2 i
+      ON i.intent_id = e.source_intent_id
+     AND i.decision_run_uid = e.source_run_uid
+     AND i.account_id = e.account_id
+     AND i.stock_code = e.stock_code
+     AND i.action = 'BUY'
+     AND BINARY i.strategy_version = BINARY r.model_version
+     AND i.reason_code IN ('V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE')
+    JOIN st_order_v2 o
+      ON o.order_id = e.entry_order_id
+     AND o.intent_id = e.source_intent_id
+     AND o.account_id = e.account_id
+     AND o.stock_code = e.stock_code
+     AND o.side = 'BUY'
+    JOIN st_fill_v2 x
+      ON x.fill_id = e.entry_fill_id
+     AND x.order_id = e.entry_order_id
+     AND x.account_id = e.account_id
+     AND x.stock_code = e.stock_code
+     AND x.side = 'BUY'
+     AND x.quantity = e.entry_quantity
+     AND x.price = e.entry_price
+     AND x.gross_amount = e.entry_gross_cny
+     AND x.fee_amount = e.entry_fee_cny
+     AND x.filled_at = e.entry_at
+     AND DATE(x.filled_at) = e.entry_trade_date
+    JOIN st_cash_ledger_v2 c
+      ON c.account_id = e.account_id
+     AND c.related_order_id = e.entry_order_id
+     AND c.related_fill_id = e.entry_fill_id
+     AND c.event_type = 'BUY_FILL'
+     AND c.amount = x.net_cash_amount
+     AND c.occurred_at = x.filled_at
+    SET e.strategy_version = CONCAT(r.model_version, ':', e.strategy_key)
+    WHERE e.strategy_version = ''
+      AND e.sample_owner_role = 'PRIMARY'
+      AND e.attribution_status IN (
+          'VERIFIED_SNAPSHOT', 'LEGACY_SINGLE_STRATEGY_RESOLVED'
+      )
+      AND e.attribution_version = 'V3_PRIMARY_FORECAST_SNAPSHOT_V1'
+      AND e.evidence_kind = 'EXECUTED_PAPER'
+      AND e.protocol_version = 'PAPER_EXECUTED_LEDGER_V1'
+      AND e.evidence_id = SHA2(CONCAT(
+          e.entry_fill_id, '|', e.strategy_key, '|PAPER_EXECUTED_LEDGER_V1'
+      ), 256)
+      AND e.ownership_hash = SHA2(CONCAT(
+          e.source_run_uid, '|', e.source_forecast_id, '|',
+          e.stock_code, '|', e.strategy_key
+      ), 256)
+      AND r.model_version <> ''
+      AND e.strategy_key <> ''
+      AND CHAR_LENGTH(CONCAT(r.model_version, ':', e.strategy_key)) <= 160
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.model_version'
+          )),
+          ''
+      ) = BINARY r.model_version
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.primary_strategy_key'
+          )),
+          ''
+      ) = BINARY e.strategy_key
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.primary_forecast_id'
+          )),
+          ''
+      ) = BINARY e.source_forecast_id
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.ownership_hash'
+          )),
+          ''
+      ) = BINARY e.ownership_hash
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.run_uid'
+          )),
+          ''
+      ) = BINARY e.source_run_uid
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.sample_owner_role'
+          )),
+          ''
+      ) = BINARY e.sample_owner_role
+      AND BINARY COALESCE(
+          JSON_UNQUOTE(JSON_EXTRACT(
+              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+              '$.attribution_version'
+          )),
+          ''
+      ) = BINARY e.attribution_version
+      AND (
+          JSON_CONTAINS(
+              COALESCE(
+                  JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.supporting_strategy_keys'
+                  ),
+                  JSON_ARRAY()
+              ),
+              JSON_QUOTE(e.strategy_key)
+          ) = 1
+          OR JSON_CONTAINS(
+              COALESCE(
+                  JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.signal_strategy_keys'
+                  ),
+                  JSON_ARRAY()
+              ),
+              JSON_QUOTE(e.strategy_key)
+          ) = 1
+      )
+      AND (
+          COALESCE(
+              JSON_UNQUOTE(JSON_EXTRACT(
+                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                  '$.primary_strategy_version'
+              )),
+              ''
+          ) = ''
+          OR BINARY COALESCE(
+              JSON_UNQUOTE(JSON_EXTRACT(
+                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                  '$.primary_strategy_version'
+              )),
+              ''
+          ) = BINARY CONCAT(r.model_version, ':', e.strategy_key)
+      )
+    """,
+    "DROP TRIGGER IF EXISTS trg_v3_forward_owner_required_bi",
+    """
+    CREATE TRIGGER trg_v3_forward_owner_required_bi
+    BEFORE INSERT ON st_forward_trade_evidence_v3
+    FOR EACH ROW
+    BEGIN
+        IF NEW.source_run_uid = ''
+           OR NEW.source_forecast_id = ''
+           OR NEW.source_intent_id = ''
+           OR NEW.strategy_key = ''
+           OR NEW.sample_owner_role <> 'PRIMARY'
+           OR NEW.attribution_status = ''
+           OR NEW.attribution_version = ''
+           OR CHAR_LENGTH(NEW.ownership_hash) <> 64
+           OR NEW.evidence_kind <> 'EXECUTED_PAPER' THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'V3 executed forward evidence is incomplete';
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+            FROM st_alpha_forecast_v3 f
+            JOIN st_decision_run_v3 r
+              ON r.run_uid = f.run_uid
+             AND r.status = 'COMPLETED'
+            JOIN st_trade_intent_v2 i
+              ON i.intent_id = NEW.source_intent_id
+             AND i.account_id = NEW.account_id
+             AND i.stock_code = NEW.stock_code
+             AND i.action = 'BUY'
+             AND BINARY i.strategy_version = BINARY r.model_version
+             AND i.reason_code IN (
+                 'V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE'
+             )
+            JOIN st_order_v2 o
+              ON o.order_id = NEW.entry_order_id
+             AND o.intent_id = NEW.source_intent_id
+             AND o.account_id = NEW.account_id
+             AND o.stock_code = NEW.stock_code
+             AND o.side = 'BUY'
+            JOIN st_fill_v2 x
+              ON x.fill_id = NEW.entry_fill_id
+             AND x.order_id = NEW.entry_order_id
+             AND x.account_id = NEW.account_id
+             AND x.stock_code = NEW.stock_code
+             AND x.side = 'BUY'
+             AND x.quantity = NEW.entry_quantity
+             AND x.price = NEW.entry_price
+             AND x.gross_amount = NEW.entry_gross_cny
+             AND x.fee_amount = NEW.entry_fee_cny
+             AND x.filled_at = NEW.entry_at
+             AND DATE(x.filled_at) = NEW.entry_trade_date
+            JOIN st_cash_ledger_v2 c
+              ON c.account_id = NEW.account_id
+             AND c.related_order_id = NEW.entry_order_id
+             AND c.related_fill_id = NEW.entry_fill_id
+             AND c.event_type = 'BUY_FILL'
+             AND c.amount = x.net_cash_amount
+             AND c.occurred_at = x.filled_at
+            WHERE f.forecast_id = NEW.source_forecast_id
+              AND f.run_uid = NEW.source_run_uid
+              AND f.stock_code = NEW.stock_code
+              AND f.strategy_key = NEW.strategy_key
+              AND i.decision_run_uid = NEW.source_run_uid
+              AND i.stock_code = NEW.stock_code
+              AND NEW.protocol_version = 'PAPER_EXECUTED_LEDGER_V1'
+              AND NEW.attribution_status IN (
+                  'VERIFIED_SNAPSHOT',
+                  'LEGACY_VERSION_DERIVED',
+                  'LEGACY_SINGLE_STRATEGY_RESOLVED'
+              )
+              AND NEW.attribution_version =
+                  'V3_PRIMARY_FORECAST_SNAPSHOT_V1'
+              AND r.model_version <> ''
+              AND NEW.evidence_id = SHA2(CONCAT(
+                  NEW.entry_fill_id, '|', NEW.strategy_key,
+                  '|PAPER_EXECUTED_LEDGER_V1'
+              ), 256)
+              AND NEW.ownership_hash = SHA2(CONCAT(
+                  NEW.source_run_uid, '|', NEW.source_forecast_id, '|',
+                  NEW.stock_code, '|', NEW.strategy_key
+              ), 256)
+              AND BINARY COALESCE(
+                  JSON_UNQUOTE(JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.run_uid'
+                  )), ''
+              ) = BINARY NEW.source_run_uid
+              AND BINARY COALESCE(
+                  JSON_UNQUOTE(JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.primary_forecast_id'
+                  )), ''
+              ) = BINARY NEW.source_forecast_id
+              AND BINARY COALESCE(
+                  JSON_UNQUOTE(JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.sample_owner_role'
+                  )), ''
+              ) = BINARY NEW.sample_owner_role
+              AND BINARY COALESCE(
+                  JSON_UNQUOTE(JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.attribution_version'
+                  )), ''
+              ) = BINARY NEW.attribution_version
+              AND BINARY COALESCE(
+                  JSON_UNQUOTE(JSON_EXTRACT(
+                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                      '$.ownership_hash'
+                  )), ''
+              ) = BINARY NEW.ownership_hash
+              AND (
+                  JSON_CONTAINS(
+                      COALESCE(
+                          JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.supporting_strategy_keys'
+                          ), JSON_ARRAY()
+                      ), JSON_QUOTE(NEW.strategy_key)
+                  ) = 1
+                  OR JSON_CONTAINS(
+                      COALESCE(
+                          JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.signal_strategy_keys'
+                          ), JSON_ARRAY()
+                      ), JSON_QUOTE(NEW.strategy_key)
+                  ) = 1
+              )
+              AND (
+                  NEW.strategy_version = ''
+                  OR (
+                      BINARY NEW.strategy_version = BINARY CONCAT(
+                          r.model_version,
+                          ':',
+                          NEW.strategy_key
+                      )
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(
+                                  JSON_VALID(i.evidence_json),
+                                  i.evidence_json,
+                                  '{}'
+                              ),
+                              '$.model_version'
+                          )),
+                          ''
+                      ) = BINARY r.model_version
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(
+                                  JSON_VALID(i.evidence_json),
+                                  i.evidence_json,
+                                  '{}'
+                              ),
+                              '$.primary_strategy_key'
+                          )),
+                          ''
+                      ) = BINARY NEW.strategy_key
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.primary_forecast_id'
+                          )),
+                          ''
+                      ) = BINARY NEW.source_forecast_id
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.ownership_hash'
+                          )),
+                          ''
+                      ) = BINARY NEW.ownership_hash
+                      AND CHAR_LENGTH(NEW.strategy_version) <= 160
+                      AND (
+                          COALESCE(
+                              JSON_UNQUOTE(JSON_EXTRACT(
+                                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                  '$.primary_strategy_version'
+                              )),
+                              ''
+                          ) = ''
+                          OR BINARY COALESCE(
+                              JSON_UNQUOTE(JSON_EXTRACT(
+                                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                  '$.primary_strategy_version'
+                              )),
+                              ''
+                          ) = BINARY NEW.strategy_version
+                      )
+                  )
+              )
+        ) THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'V3 executed evidence version relation invalid';
+        END IF;
+    END
+    """,
+    "DROP TRIGGER IF EXISTS trg_v3_forward_owner_immutable_bu",
+    """
+    CREATE TRIGGER trg_v3_forward_owner_immutable_bu
+    BEFORE UPDATE ON st_forward_trade_evidence_v3
+    FOR EACH ROW
+    BEGIN
+        IF BINARY NEW.evidence_id <> BINARY OLD.evidence_id
+           OR BINARY NEW.account_id <> BINARY OLD.account_id
+           OR NEW.source_run_uid <> OLD.source_run_uid
+           OR NEW.source_forecast_id <> OLD.source_forecast_id
+           OR NEW.source_intent_id <> OLD.source_intent_id
+           OR NEW.stock_code <> OLD.stock_code
+           OR NEW.strategy_key <> OLD.strategy_key
+           OR NEW.sample_owner_role <> OLD.sample_owner_role
+           OR NEW.attribution_status <> OLD.attribution_status
+           OR NEW.attribution_version <> OLD.attribution_version
+           OR BINARY NEW.supporting_strategy_keys_json <>
+              BINARY OLD.supporting_strategy_keys_json
+           OR NEW.ownership_hash <> OLD.ownership_hash
+           OR NEW.evidence_kind <> OLD.evidence_kind
+           OR NEW.protocol_version <> OLD.protocol_version
+           OR NEW.entry_order_id <> OLD.entry_order_id
+           OR NEW.entry_fill_id <> OLD.entry_fill_id
+           OR NEW.entry_trade_date <> OLD.entry_trade_date
+           OR NEW.entry_at <> OLD.entry_at
+           OR NEW.entry_quantity <> OLD.entry_quantity
+           OR NEW.entry_price <> OLD.entry_price
+           OR NEW.entry_gross_cny <> OLD.entry_gross_cny
+           OR NEW.entry_fee_cny <> OLD.entry_fee_cny
+           OR NEW.evidence_kind <> 'EXECUTED_PAPER' THEN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT =
+                'V3 executed evidence ownership is immutable';
+        END IF;
+        IF BINARY NEW.strategy_version <> BINARY OLD.strategy_version THEN
+            IF OLD.strategy_version <> ''
+               OR NEW.strategy_version = ''
+               OR CHAR_LENGTH(NEW.strategy_version) > 160
+               OR NOT EXISTS (
+                    SELECT 1
+                    FROM st_alpha_forecast_v3 f
+                    JOIN st_decision_run_v3 r
+                      ON r.run_uid = f.run_uid
+                     AND r.status = 'COMPLETED'
+                    JOIN st_trade_intent_v2 i
+                      ON i.intent_id = NEW.source_intent_id
+                     AND i.account_id = NEW.account_id
+                     AND i.stock_code = NEW.stock_code
+                     AND i.action = 'BUY'
+                     AND BINARY i.strategy_version = BINARY r.model_version
+                     AND i.reason_code IN (
+                         'V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE'
+                     )
+                    JOIN st_order_v2 o
+                      ON o.order_id = NEW.entry_order_id
+                     AND o.intent_id = NEW.source_intent_id
+                     AND o.account_id = NEW.account_id
+                     AND o.stock_code = NEW.stock_code
+                     AND o.side = 'BUY'
+                    JOIN st_fill_v2 x
+                      ON x.fill_id = NEW.entry_fill_id
+                     AND x.order_id = NEW.entry_order_id
+                     AND x.account_id = NEW.account_id
+                     AND x.stock_code = NEW.stock_code
+                     AND x.side = 'BUY'
+                     AND x.quantity = NEW.entry_quantity
+                     AND x.price = NEW.entry_price
+                     AND x.gross_amount = NEW.entry_gross_cny
+                     AND x.fee_amount = NEW.entry_fee_cny
+                     AND x.filled_at = NEW.entry_at
+                     AND DATE(x.filled_at) = NEW.entry_trade_date
+                    JOIN st_cash_ledger_v2 c
+                      ON c.account_id = NEW.account_id
+                     AND c.related_order_id = NEW.entry_order_id
+                     AND c.related_fill_id = NEW.entry_fill_id
+                     AND c.event_type = 'BUY_FILL'
+                     AND c.amount = x.net_cash_amount
+                     AND c.occurred_at = x.filled_at
+                    WHERE f.forecast_id = NEW.source_forecast_id
+                      AND f.run_uid = NEW.source_run_uid
+                      AND f.stock_code = NEW.stock_code
+                      AND f.strategy_key = NEW.strategy_key
+                      AND i.decision_run_uid = NEW.source_run_uid
+                      AND i.stock_code = NEW.stock_code
+                      AND NEW.protocol_version = 'PAPER_EXECUTED_LEDGER_V1'
+                      AND NEW.attribution_status IN (
+                          'VERIFIED_SNAPSHOT',
+                          'LEGACY_VERSION_DERIVED',
+                          'LEGACY_SINGLE_STRATEGY_RESOLVED'
+                      )
+                      AND NEW.attribution_version =
+                          'V3_PRIMARY_FORECAST_SNAPSHOT_V1'
+                      AND r.model_version <> ''
+                      AND NEW.evidence_id = SHA2(CONCAT(
+                          NEW.entry_fill_id, '|', NEW.strategy_key,
+                          '|PAPER_EXECUTED_LEDGER_V1'
+                      ), 256)
+                      AND NEW.ownership_hash = SHA2(CONCAT(
+                          NEW.source_run_uid, '|', NEW.source_forecast_id,
+                          '|', NEW.stock_code, '|', NEW.strategy_key
+                      ), 256)
+                      AND BINARY NEW.strategy_version = BINARY CONCAT(
+                          r.model_version, ':', NEW.strategy_key
+                      )
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.model_version'
+                          )), ''
+                      ) = BINARY r.model_version
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.primary_strategy_key'
+                          )), ''
+                      ) = BINARY NEW.strategy_key
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.primary_forecast_id'
+                          )), ''
+                      ) = BINARY NEW.source_forecast_id
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.ownership_hash'
+                          )), ''
+                      ) = BINARY NEW.ownership_hash
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.run_uid'
+                          )), ''
+                      ) = BINARY NEW.source_run_uid
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.sample_owner_role'
+                          )), ''
+                      ) = BINARY NEW.sample_owner_role
+                      AND BINARY COALESCE(
+                          JSON_UNQUOTE(JSON_EXTRACT(
+                              IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                              '$.attribution_version'
+                          )), ''
+                      ) = BINARY NEW.attribution_version
+                      AND (
+                          JSON_CONTAINS(
+                              COALESCE(
+                                  JSON_EXTRACT(
+                                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                      '$.supporting_strategy_keys'
+                                  ), JSON_ARRAY()
+                              ), JSON_QUOTE(NEW.strategy_key)
+                          ) = 1
+                          OR JSON_CONTAINS(
+                              COALESCE(
+                                  JSON_EXTRACT(
+                                      IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                      '$.signal_strategy_keys'
+                                  ), JSON_ARRAY()
+                              ), JSON_QUOTE(NEW.strategy_key)
+                          ) = 1
+                      )
+                      AND (
+                          COALESCE(
+                              JSON_UNQUOTE(JSON_EXTRACT(
+                                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                  '$.primary_strategy_version'
+                              )), ''
+                          ) = ''
+                          OR BINARY COALESCE(
+                              JSON_UNQUOTE(JSON_EXTRACT(
+                                  IF(JSON_VALID(i.evidence_json), i.evidence_json, '{}'),
+                                  '$.primary_strategy_version'
+                              )), ''
+                          ) = BINARY NEW.strategy_version
+                      )
+               ) THEN
+                SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT =
+                    'V3 executed evidence version promotion invalid';
+            END IF;
+        END IF;
+    END
+    """,
+)
+
+MIGRATIONS = MIGRATIONS + (
+    {
+        "version": FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
+        "statements": FORWARD_STRATEGY_VERSION_DDL,
+    },
+)
+
+
+V2_RAW_LEDGER_IMMUTABILITY_DDL = (
+    "DROP TRIGGER IF EXISTS trg_fill_v2_immutable_bu",
+    """
+    CREATE TRIGGER trg_fill_v2_immutable_bu
+    BEFORE UPDATE ON st_fill_v2
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'fill ledger is append only';
+    END
+    """,
+    "DROP TRIGGER IF EXISTS trg_fill_v2_immutable_bd",
+    """
+    CREATE TRIGGER trg_fill_v2_immutable_bd
+    BEFORE DELETE ON st_fill_v2
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'fill ledger cannot be deleted';
+    END
+    """,
+    "DROP TRIGGER IF EXISTS trg_cash_ledger_v2_immutable_bu",
+    """
+    CREATE TRIGGER trg_cash_ledger_v2_immutable_bu
+    BEFORE UPDATE ON st_cash_ledger_v2
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'cash ledger is append only';
+    END
+    """,
+    "DROP TRIGGER IF EXISTS trg_cash_ledger_v2_immutable_bd",
+    """
+    CREATE TRIGGER trg_cash_ledger_v2_immutable_bd
+    BEFORE DELETE ON st_cash_ledger_v2
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'cash ledger cannot be deleted';
+    END
+    """,
+)
+
+MIGRATIONS = MIGRATIONS + (
+    {
+        "version": V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
+        "statements": V2_RAW_LEDGER_IMMUTABILITY_DDL,
+    },
+)
+
+
+FORWARD_EXIT_ALLOCATION_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS st_forward_exit_allocation_v3 (
+        allocation_id CHAR(64) NOT NULL,
+        evidence_id CHAR(64) DEFAULT NULL,
+        attribution_status VARCHAR(32) NOT NULL,
+        account_id VARCHAR(64) NOT NULL,
+        stock_code VARCHAR(16) NOT NULL,
+        entry_fill_id VARCHAR(64) NOT NULL,
+        exit_fill_id VARCHAR(64) NOT NULL,
+        exit_order_id VARCHAR(64) NOT NULL,
+        allocation_sequence BIGINT NOT NULL,
+        allocated_quantity BIGINT NOT NULL,
+        allocated_gross_cny DECIMAL(20,6) NOT NULL,
+        allocated_fee_cny DECIMAL(20,6) NOT NULL,
+        exit_filled_at DATETIME NOT NULL,
+        allocation_protocol_version VARCHAR(80) NOT NULL,
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (allocation_id),
+        UNIQUE KEY uk_v3_forward_exit_evidence_fill (
+            evidence_id, exit_fill_id
+        ),
+        UNIQUE KEY uk_v3_forward_exit_fill_sequence (
+            exit_fill_id, allocation_sequence
+        ),
+        UNIQUE KEY uk_v3_forward_exit_fill_entry (
+            exit_fill_id, entry_fill_id
+        ),
+        KEY idx_v3_forward_exit_evidence (
+            evidence_id, exit_filled_at
+        ),
+        KEY idx_v3_forward_exit_entry (entry_fill_id),
+        KEY idx_v3_forward_exit_account (
+            account_id, stock_code, exit_filled_at
+        ),
+        CONSTRAINT fk_v3_forward_exit_allocation_evidence
+            FOREIGN KEY (evidence_id)
+            REFERENCES st_forward_trade_evidence_v3 (evidence_id),
+        CONSTRAINT fk_v3_forward_exit_allocation_fill
+            FOREIGN KEY (exit_fill_id) REFERENCES st_fill_v2 (fill_id),
+        CONSTRAINT fk_v3_forward_exit_allocation_entry_fill
+            FOREIGN KEY (entry_fill_id) REFERENCES st_fill_v2 (fill_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    "DROP TRIGGER IF EXISTS trg_v3_forward_exit_allocation_immutable_bu",
+    """
+    CREATE TRIGGER trg_v3_forward_exit_allocation_immutable_bu
+    BEFORE UPDATE ON st_forward_exit_allocation_v3
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'V3 forward exit allocation is append only';
+    END
+    """,
+    "DROP TRIGGER IF EXISTS trg_v3_forward_exit_allocation_immutable_bd",
+    """
+    CREATE TRIGGER trg_v3_forward_exit_allocation_immutable_bd
+    BEFORE DELETE ON st_forward_exit_allocation_v3
+    FOR EACH ROW
+    BEGIN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'V3 forward exit allocation cannot be deleted';
+    END
+    """,
+)
+
+MIGRATIONS = MIGRATIONS + (
+    {
+        "version": FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+        "statements": FORWARD_EXIT_ALLOCATION_DDL,
+    },
+)
+
+
 def _checksum(statements: tuple[str, ...]) -> str:
     return hashlib.sha256(
         "\n".join(item.strip() for item in statements).encode("utf-8")
@@ -1988,6 +2680,186 @@ def _is_ddl(statement: str) -> bool:
     return bool(re.match(r"^\s*(?:CREATE|ALTER|DROP)\b", statement, re.I))
 
 
+def validate_forward_exit_allocation_schema(
+    connection: Connection,
+) -> None:
+    """Validate the normalized FIFO exit-allocation ledger exactly."""
+
+    table = connection.execute(
+        text(
+            "SELECT ENGINE, TABLE_COLLATION FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA = DATABASE() "
+            "AND TABLE_NAME = 'st_forward_exit_allocation_v3'"
+        )
+    ).mappings().first()
+    if (
+        table is None
+        or str(table["ENGINE"] or "").upper() != "INNODB"
+        or not str(table["TABLE_COLLATION"] or "").casefold().startswith(
+            "utf8mb4_"
+        )
+    ):
+        raise RuntimeError("V3 forward exit-allocation table contract drifted")
+
+    rows = tuple(connection.execute(text(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, "
+        "NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA "
+        "FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'st_forward_exit_allocation_v3' "
+        "ORDER BY ORDINAL_POSITION"
+    )).mappings())
+    expected = (
+        ("allocation_id", "char", 64, None, None),
+        ("evidence_id", "char", 64, None, None),
+        ("attribution_status", "varchar", 32, None, None),
+        ("account_id", "varchar", 64, None, None),
+        ("stock_code", "varchar", 16, None, None),
+        ("entry_fill_id", "varchar", 64, None, None),
+        ("exit_fill_id", "varchar", 64, None, None),
+        ("exit_order_id", "varchar", 64, None, None),
+        ("allocation_sequence", "bigint", None, None, None),
+        ("allocated_quantity", "bigint", None, None, None),
+        ("allocated_gross_cny", "decimal", None, 20, 6),
+        ("allocated_fee_cny", "decimal", None, 20, 6),
+        ("exit_filled_at", "datetime", None, None, None),
+        ("allocation_protocol_version", "varchar", 80, None, None),
+        ("created_at", "datetime", None, None, None),
+    )
+    if len(rows) != len(expected):
+        raise RuntimeError("V3 forward exit-allocation columns drifted")
+    for row, contract in zip(rows, expected):
+        name, data_type, char_length, precision, scale = contract
+        if (
+            str(row["COLUMN_NAME"]).casefold() != name
+            or str(row["DATA_TYPE"]).casefold() != data_type
+            or str(row["IS_NULLABLE"]).upper()
+                != ("YES" if name == "evidence_id" else "NO")
+            or row["COLUMN_DEFAULT"] is not None
+            or str(row["EXTRA"] or "") != ""
+            or (
+                char_length is not None
+                and int(row["CHARACTER_MAXIMUM_LENGTH"] or -1) != char_length
+            )
+            or (
+                precision is not None
+                and int(row["NUMERIC_PRECISION"] or -1) != precision
+            )
+            or (
+                scale is not None
+                and int(row["NUMERIC_SCALE"] or -1) != scale
+            )
+        ):
+            raise RuntimeError(
+                "V3 forward exit-allocation column contract drifted: " + name
+            )
+
+    index_rows = tuple(connection.execute(text(
+        "SELECT INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME, SUB_PART "
+        "FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA = DATABASE() "
+        "AND TABLE_NAME = 'st_forward_exit_allocation_v3' "
+        "ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+    )).mappings())
+    observed_indexes: dict[str, tuple[int, tuple[str, ...]]] = {}
+    for index_name in sorted({str(row["INDEX_NAME"]) for row in index_rows}):
+        members = tuple(
+            row for row in index_rows if str(row["INDEX_NAME"]) == index_name
+        )
+        if (
+            tuple(int(row["SEQ_IN_INDEX"]) for row in members)
+            != tuple(range(1, len(members) + 1))
+            or any(row["SUB_PART"] is not None for row in members)
+            or len({int(row["NON_UNIQUE"]) for row in members}) != 1
+        ):
+            raise RuntimeError(
+                "V3 forward exit-allocation index metadata drifted: "
+                + index_name
+            )
+        observed_indexes[index_name.casefold()] = (
+            int(members[0]["NON_UNIQUE"]),
+            tuple(str(row["COLUMN_NAME"]).casefold() for row in members),
+        )
+    expected_indexes = {
+        "primary": (0, ("allocation_id",)),
+        "uk_v3_forward_exit_evidence_fill": (
+            0, ("evidence_id", "exit_fill_id"),
+        ),
+        "uk_v3_forward_exit_fill_sequence": (
+            0, ("exit_fill_id", "allocation_sequence"),
+        ),
+        "uk_v3_forward_exit_fill_entry": (
+            0, ("exit_fill_id", "entry_fill_id"),
+        ),
+        "idx_v3_forward_exit_evidence": (
+            1, ("evidence_id", "exit_filled_at"),
+        ),
+        "idx_v3_forward_exit_entry": (
+            1, ("entry_fill_id",),
+        ),
+        "idx_v3_forward_exit_account": (
+            1, ("account_id", "stock_code", "exit_filled_at"),
+        ),
+    }
+    if observed_indexes != expected_indexes:
+        raise RuntimeError("V3 forward exit-allocation indexes drifted")
+
+    foreign_keys = tuple(connection.execute(text(
+        "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, "
+        "k.REFERENCED_COLUMN_NAME, r.UPDATE_RULE, r.DELETE_RULE "
+        "FROM information_schema.KEY_COLUMN_USAGE k "
+        "JOIN information_schema.REFERENTIAL_CONSTRAINTS r "
+        "ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA "
+        "AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME "
+        "AND r.TABLE_NAME = k.TABLE_NAME "
+        "WHERE k.CONSTRAINT_SCHEMA = DATABASE() "
+        "AND k.TABLE_NAME = 'st_forward_exit_allocation_v3' "
+        "ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION"
+    )).mappings())
+    observed_foreign_keys = {
+        str(row["CONSTRAINT_NAME"]).casefold(): (
+            str(row["COLUMN_NAME"]).casefold(),
+            str(row["REFERENCED_TABLE_NAME"]).casefold(),
+            str(row["REFERENCED_COLUMN_NAME"]).casefold(),
+            str(row["UPDATE_RULE"]).upper(),
+            str(row["DELETE_RULE"]).upper(),
+        )
+        for row in foreign_keys
+    }
+    expected_foreign_keys = {
+        "fk_v3_forward_exit_allocation_evidence": (
+            "evidence_id", "st_forward_trade_evidence_v3", "evidence_id",
+        ),
+        "fk_v3_forward_exit_allocation_fill": (
+            "exit_fill_id", "st_fill_v2", "fill_id",
+        ),
+        "fk_v3_forward_exit_allocation_entry_fill": (
+            "entry_fill_id", "st_fill_v2", "fill_id",
+        ),
+    }
+    if set(observed_foreign_keys) != set(expected_foreign_keys):
+        raise RuntimeError("V3 forward exit-allocation foreign keys drifted")
+    for name, contract in expected_foreign_keys.items():
+        observed = observed_foreign_keys[name]
+        if (
+            observed[:3] != contract
+            or observed[3] not in {"RESTRICT", "NO ACTION"}
+            or observed[4] not in {"RESTRICT", "NO ACTION"}
+        ):
+            raise RuntimeError(
+                "V3 forward exit-allocation foreign key drifted: " + name
+            )
+
+    for statement in (
+        FORWARD_EXIT_ALLOCATION_DDL[2],
+        FORWARD_EXIT_ALLOCATION_DDL[4],
+    ):
+        if not _ddl_statement_already_applied(connection, statement):
+            raise RuntimeError(
+                "V3 forward exit-allocation append-only guards are incomplete"
+            )
+
+
 def _validate_applied_migration(
     connection: Connection,
     *,
@@ -2001,6 +2873,53 @@ def _validate_applied_migration(
         validate_horizon_protocol_v2_schema(connection)
     if version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
         validate_horizon_candidate_ledger_schema(connection)
+    if version == FORWARD_STRATEGY_VERSION_MIGRATION_VERSION:
+        # Reconcile exact legacy rows on every migration replay. This covers
+        # records written by rollback-compatible old code after the additive
+        # column was installed; the update trigger permits only this one-way,
+        # fully related empty-to-exact promotion.
+        connection.execute(text(FORWARD_STRATEGY_VERSION_DDL[2]))
+        row = connection.execute(
+            text(
+                "SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT "
+                "FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'st_forward_trade_evidence_v3' "
+                "AND COLUMN_NAME = 'strategy_version'"
+            )
+        ).mappings().first()
+        if (
+            row is None
+            or str(row["COLUMN_TYPE"]).casefold() != "varchar(160)"
+            or str(row["IS_NULLABLE"]).upper() != "NO"
+            or row["COLUMN_DEFAULT"] is None
+            or str(row["COLUMN_DEFAULT"]) != ""
+        ):
+            raise RuntimeError(
+                "V3 forward strategy-version column contract drifted"
+            )
+        for statement in (
+            FORWARD_STRATEGY_VERSION_DDL[1],
+            FORWARD_STRATEGY_VERSION_DDL[4],
+            FORWARD_STRATEGY_VERSION_DDL[6],
+        ):
+            if not _ddl_statement_already_applied(connection, statement):
+                raise RuntimeError(
+                    "V3 forward strategy-version schema is incomplete"
+                )
+    if version == V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION:
+        for statement in (
+            V2_RAW_LEDGER_IMMUTABILITY_DDL[1],
+            V2_RAW_LEDGER_IMMUTABILITY_DDL[3],
+            V2_RAW_LEDGER_IMMUTABILITY_DDL[5],
+            V2_RAW_LEDGER_IMMUTABILITY_DDL[7],
+        ):
+            if not _ddl_statement_already_applied(connection, statement):
+                raise RuntimeError(
+                    "V2 fill/cash append-only ledger guards are incomplete"
+                )
+    if version == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION:
+        validate_forward_exit_allocation_schema(connection)
 
 
 def _run_v3_migrations_unlocked(
@@ -2206,8 +3125,15 @@ __all__ = [
     "V3MigrationAcceptanceFault",
     "V3MigrationAcceptanceFaultHook",
     "V3_PROJECTION_OUTBOX_MIGRATION_VERSION",
+    "FORWARD_EXIT_ALLOCATION_DDL",
+    "FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION",
+    "FORWARD_STRATEGY_VERSION_DDL",
+    "FORWARD_STRATEGY_VERSION_MIGRATION_VERSION",
+    "V2_RAW_LEDGER_IMMUTABILITY_DDL",
+    "V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION",
     "HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION",
     "HORIZON_PROTOCOL_V2_MIGRATION_VERSION",
     "SHADOW_INTELLIGENCE_MIGRATION_VERSION",
+    "validate_forward_exit_allocation_schema",
     "run_v3_migrations",
 ]

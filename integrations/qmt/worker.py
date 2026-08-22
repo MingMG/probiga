@@ -202,10 +202,12 @@ def _transform_kline(data: Any, *, start_date: str, end_date: str) -> list[dict[
             continue
 
         stock_code = str(qmt_code).split(".", 1)[0].zfill(6)
-        prev_close_series = pd.to_numeric(df.get("preClose"), errors="coerce")
+        prev_close_series = (
+            pd.to_numeric(df["preClose"], errors="coerce")
+            if "preClose" in df.columns
+            else pd.Series(index=df.index, dtype="float64")
+        )
         close_series = pd.to_numeric(df.get("close"), errors="coerce")
-        fallback_prev = close_series.shift(1)
-        prev_close_series = prev_close_series.fillna(fallback_prev)
         change_series = close_series - prev_close_series
         change_pct_series = change_series / prev_close_series.replace({0: pd.NA}) * 100
 
@@ -232,6 +234,11 @@ def _transform_kline(data: Any, *, start_date: str, end_date: str) -> list[dict[
                     "change_pct": change_pct,
                     "turnover_ratio": row.get("turnover"),
                     "pre_close": prev_close,
+                    "pre_close_origin": (
+                        "NATIVE_QMT"
+                        if pd.notna(prev_close) and float(prev_close) > 0
+                        else "MISSING_NATIVE_QMT"
+                    ),
                 }
             )
     return rows

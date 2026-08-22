@@ -7,6 +7,12 @@ from sqlalchemy import create_engine
 
 import server.db.migrations_v3 as migrations_v3
 from server.db.migrations_v3 import (
+    FORWARD_EXIT_ALLOCATION_DDL,
+    FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+    FORWARD_STRATEGY_VERSION_DDL,
+    FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
+    V2_RAW_LEDGER_IMMUTABILITY_DDL,
+    V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
     MIGRATION_PROGRESS_TABLE_DDL,
     MIGRATION_TABLE_DDL,
     MIGRATIONS,
@@ -24,23 +30,38 @@ from tools import trading_v3_mysql_acceptance as acceptance
 
 def test_frozen_v3_acceptance_contract_matches_source():
     acceptance._assert_frozen_contract()
-    assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 24
+    assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 27
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-1] == (
+        FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+        "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a",
+        5,
+    )
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
+        V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
+        "5e7d735be4d24659786e17091b89df06e3dba713c3646fd00ef817a67bc8eedf",
+        8,
+    )
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
+        FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
+        "08e0e3d6e6bb9b31227f33780eb54bf3afd38d226f456fa41985137614ce7602",
+        7,
+    )
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-4] == (
         HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
         "88cbd1d4bd57fa65164d2d35e07a6344d9a8d8e255d09efb0e79cabfd0d8c522",
         9,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-5] == (
         HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
         "9430f7bf8014d8758339f6754ac51989283c648657b5fdb1db813ab32afce118",
         10,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-6] == (
         V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
         "5f53bf5258705e410b93db2b5034bbf9683ebe03b17f854625f6854fb55f7e78",
         4,
     )
-    assert len(acceptance.FROZEN_V3_TABLES) == 29
+    assert len(acceptance.FROZEN_V3_TABLES) == 30
 
 
 def test_horizon_protocol_v2_migration_is_additive_and_fail_closed():
@@ -92,6 +113,98 @@ def test_horizon_candidate_ledger_migration_is_additive_and_fail_closed():
     assert "artifact_status = 'OOS_VERIFIED'" in contract
     assert "training_receipt_status = 'PROCESS_VERIFIED'" in contract
     assert "order_authority = 0" in contract
+
+
+def test_forward_strategy_version_migration_is_additive_and_fail_closed():
+    migration = next(
+        item for item in MIGRATIONS
+        if item["version"] == FORWARD_STRATEGY_VERSION_MIGRATION_VERSION
+    )
+    statements = tuple(str(item) for item in migration["statements"])
+    assert statements == FORWARD_STRATEGY_VERSION_DDL
+    assert len(statements) == 7
+    assert "ADD COLUMN strategy_version VARCHAR(160) NOT NULL DEFAULT ''" in (
+        statements[0]
+    )
+    assert "AFTER strategy_key" in statements[0]
+    assert "idx_v3_forward_strategy_version" in statements[1]
+    assert (
+        "strategy_key, strategy_version, evidence_status, exit_at"
+        in " ".join(statements[1].split())
+    )
+    backfill = statements[2]
+    assert "UPDATE st_forward_trade_evidence_v3 e" in backfill
+    assert "JOIN st_decision_run_v3 r" in backfill
+    assert "'$.primary_forecast_id'" in backfill
+    assert "'$.ownership_hash'" in backfill
+    assert "SET e.strategy_version = CONCAT(" in backfill
+    insert_trigger = statements[4]
+    # Expand phase stays rollback-compatible: legacy code may omit the new
+    # column, while every non-empty version must satisfy the strict relation.
+    assert "OR NEW.strategy_version = ''" not in insert_trigger.split(
+        "IF NOT EXISTS", 1
+    )[0]
+    assert "NEW.strategy_version = ''" in insert_trigger
+    assert "OR (" in insert_trigger
+    assert "JOIN st_decision_run_v3 r" in insert_trigger
+    assert "JOIN st_trade_intent_v2 i" in insert_trigger
+    assert "i.stock_code = NEW.stock_code" in insert_trigger
+    assert "f.strategy_key = NEW.strategy_key" in insert_trigger
+    assert "CONCAT(" in insert_trigger
+    assert "r.model_version" in insert_trigger
+    assert "'$.model_version'" in insert_trigger
+    assert "'$.primary_strategy_key'" in insert_trigger
+    assert "'$.primary_strategy_version'" in insert_trigger
+    assert "JSON_VALID(i.evidence_json)" in insert_trigger
+    assert "BINARY NEW.strategy_version = BINARY CONCAT(" in insert_trigger
+    assert (
+        "BINARY NEW.strategy_version <> BINARY OLD.strategy_version"
+        in statements[6]
+    )
+    assert "OLD.strategy_version <> ''" in statements[6]
+    assert "V3 executed evidence version promotion invalid" in statements[6]
+
+
+def test_raw_fill_and_cash_ledgers_are_frozen_by_forward_migration():
+    migration = next(
+        item for item in MIGRATIONS
+        if item["version"] == V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION
+    )
+    statements = tuple(str(item) for item in migration["statements"])
+    assert statements == V2_RAW_LEDGER_IMMUTABILITY_DDL
+    assert len(statements) == 8
+    contract = "\n".join(statements)
+    assert contract.upper().count("BEFORE UPDATE ON") == 2
+    assert contract.upper().count("BEFORE DELETE ON") == 2
+    assert "BEFORE UPDATE ON st_fill_v2" in contract
+    assert "BEFORE DELETE ON st_fill_v2" in contract
+    assert "BEFORE UPDATE ON st_cash_ledger_v2" in contract
+    assert "BEFORE DELETE ON st_cash_ledger_v2" in contract
+    assert contract.count("SIGNAL SQLSTATE '45000'") == 4
+
+
+def test_forward_exit_allocation_migration_is_normalized_and_append_only():
+    migration = next(
+        item for item in MIGRATIONS
+        if item["version"] == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION
+    )
+    statements = tuple(str(item) for item in migration["statements"])
+    assert statements == FORWARD_EXIT_ALLOCATION_DDL
+    assert len(statements) == 5
+    table = statements[0]
+    assert "CREATE TABLE IF NOT EXISTS st_forward_exit_allocation_v3" in table
+    assert "UNIQUE KEY uk_v3_forward_exit_evidence_fill" in table
+    assert "UNIQUE KEY uk_v3_forward_exit_fill_sequence" in table
+    assert "UNIQUE KEY uk_v3_forward_exit_fill_entry" in table
+    assert "KEY idx_v3_forward_exit_evidence" in table
+    assert "attribution_status VARCHAR(32) NOT NULL" in table
+    assert "allocation_sequence BIGINT NOT NULL" in table
+    assert "FOREIGN KEY (evidence_id)" in table
+    assert "FOREIGN KEY (exit_fill_id)" in table
+    contract = "\n".join(statements)
+    assert "BEFORE UPDATE ON st_forward_exit_allocation_v3" in contract
+    assert "BEFORE DELETE ON st_forward_exit_allocation_v3" in contract
+    assert contract.count("SIGNAL SQLSTATE '45000'") == 2
 
 
 @pytest.mark.parametrize(
@@ -317,8 +430,8 @@ def test_controlled_prerequisites_are_explicit_and_never_fabricate_ledgers():
 
 
 def test_combined_schema_inventory_is_frozen_and_isolated():
-    assert len(acceptance._expected_final_tables()) == 85
-    assert len(acceptance._final_trigger_contract()) == 83
+    assert len(acceptance._expected_final_tables()) == 86
+    assert len(acceptance._final_trigger_contract()) == 89
     assert "st_execution_projection_outbox_v2" in (
         acceptance._expected_final_tables()
     )
@@ -540,12 +653,21 @@ def test_partial_recovery_statuses_include_later_unattempted_migrations():
     assert expected[outbox_index:] == ("applied",) * (
         len(MIGRATIONS) - outbox_index
     )
-    assert acceptance._expected_recovery_statuses(
-        HORIZON_PROTOCOL_V2_MIGRATION_VERSION
-    ) == (("exists",) * (len(MIGRATIONS) - 2) + ("applied", "applied"))
-    assert acceptance._expected_recovery_statuses(
-        HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION
-    ) == (("exists",) * (len(MIGRATIONS) - 1) + ("applied",))
+    for version in (
+        HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
+        HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
+        FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
+        V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
+        FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+    ):
+        migration_index = next(
+            index for index, item in enumerate(MIGRATIONS)
+            if item["version"] == version
+        )
+        assert acceptance._expected_recovery_statuses(version) == (
+            ("exists",) * migration_index
+            + ("applied",) * (len(MIGRATIONS) - migration_index)
+        )
 
 
 def test_acceptance_tool_never_reads_generic_application_database_url():

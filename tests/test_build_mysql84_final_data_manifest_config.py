@@ -7,6 +7,8 @@ import pytest
 from tools.build_mysql84_final_data_manifest_config import (
     CRC_SAMPLE_MODULUS,
     FULL_HASH_MAX_BYTES,
+    KNOWN_POST_MIGRATION_EXTENDED_COLUMNS,
+    KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES,
     ConfigBuildError,
     _catalog_relationship,
     build_policy,
@@ -15,6 +17,67 @@ from tools.build_mysql84_final_data_manifest_config import (
 
 
 TARGET_UUID = "f40c3202-9260-11f1-86ae-74d4dd7f8500"
+
+
+def test_forward_allocation_migration_is_in_exact_catalogue_allowlist() -> None:
+    assert (
+        "probiga.st_forward_exit_allocation_v3"
+        in KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES
+    )
+    assert KNOWN_POST_MIGRATION_EXTENDED_COLUMNS[
+        "probiga.st_forward_trade_evidence_v3"
+    ] == ("strategy_version",)
+
+    assert (
+        "probiga.st_forward_trade_evidence_v3"
+        not in KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES
+    )
+    assert not (
+        set(KNOWN_POST_MIGRATION_EXTENDED_COLUMNS)
+        & set(KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES)
+    )
+    source = _catalog()
+    for table_ref in KNOWN_POST_MIGRATION_EXTENDED_COLUMNS:
+        source["tables"][table_ref] = {
+            "table_type": "BASE TABLE",
+            "engine": "InnoDB",
+            "columns": [{
+                "name": "source_id",
+                "data_type": "char",
+                "nullable": False,
+            }],
+            "primary_key": ["source_id"],
+        }
+    target = deepcopy(source)
+    for table_ref, columns in KNOWN_POST_MIGRATION_EXTENDED_COLUMNS.items():
+        target["tables"][table_ref]["columns"].extend(
+            {
+                "name": column,
+                "data_type": "varchar",
+                "nullable": False,
+            }
+            for column in columns
+        )
+    for table_ref in KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES:
+        target["tables"][table_ref] = {
+            "table_type": "BASE TABLE",
+            "engine": "InnoDB",
+            "columns": [{
+                "name": "target_id",
+                "data_type": "char",
+                "nullable": False,
+            }],
+            "primary_key": ["target_id"],
+        }
+
+    relationship = _catalog_relationship(source, target)
+
+    assert "probiga.st_forward_exit_allocation_v3" in relationship[
+        "target_only_tables"
+    ]
+    assert relationship["target_extended_columns"][
+        "probiga.st_forward_trade_evidence_v3"
+    ] == ["strategy_version"]
 
 
 def _catalog() -> dict:

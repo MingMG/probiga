@@ -70,11 +70,22 @@ class BigQmtBackend:
         out["short_name"] = out["stock_code"].map(names).fillna("")
         out["k_type"] = 1
         out["adjust_type"] = dividend_type_to_adjust_type(dividend_type)
+        native_pre_close = pd.to_numeric(
+            out.get("pre_close"), errors="coerce"
+        )
+        if "pre_close_origin" not in out.columns:
+            out["pre_close_origin"] = "MISSING_NATIVE_QMT"
+        out["pre_close_origin"] = out["pre_close_origin"].where(
+            out["pre_close_origin"].eq("NATIVE_QMT")
+            & native_pre_close.gt(0),
+            "MISSING_NATIVE_QMT",
+        )
+        out["pre_close"] = native_pre_close.where(native_pre_close.gt(0))
         out = self._with_provenance(out, batch_prefix="bigqmt_kline")
         columns = [
             "stock_code", "short_name", "trade_time", "trade_date", "k_type", "adjust_type",
             "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
-            "turnover_ratio", "pre_close", "qmt_code", "data_source", "source_time",
+            "turnover_ratio", "pre_close", "pre_close_origin", "qmt_code", "data_source", "source_time",
             "received_at", "batch_id", "data_version", "quality_status", "permission_status",
         ]
         return out.reindex(columns=columns)

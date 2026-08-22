@@ -56,9 +56,9 @@ _AUTHORITY_TOKEN_RE = re.compile(
 _DATE_TYPES = frozenset({"date", "datetime", "timestamp"})
 
 # This is the exact forward-only schema delta produced by the reviewed
-# 2026-08-03/04 V2/V3/V4 migrations.  Keeping the list here deliberately makes
-# a later or unrelated target addition fail closed instead of silently turning
-# "target is a superset" into a broad exception.
+# 2026-08-03/04 and 2026-08-22 V2/V3/V4 migrations.  Keeping the list here
+# deliberately makes a later or unrelated target addition fail closed instead
+# of silently turning "target is a superset" into a broad exception.
 KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES = frozenset(
     {
         "probiga.schema_migration_v2_maintenance_fence",
@@ -89,7 +89,7 @@ KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES = frozenset(
         "probiga.st_fill_accounting_outcome_finalization_v2",
         "probiga.st_fill_accounting_outcome_v2",
         "probiga.st_fill_execution_evidence_v2",
-        "probiga.st_forward_trade_evidence_v3",
+        "probiga.st_forward_exit_allocation_v3",
         "probiga.st_horizon_forecast_contract_v3",
         "probiga.st_horizon_model_artifact_v3",
         "probiga.st_horizon_outcome_v3",
@@ -122,6 +122,7 @@ KNOWN_POST_MIGRATION_EXTENDED_COLUMNS = {
         "calibration_set_hash",
     ),
     "probiga.st_news_flash": ("first_seen_at",),
+    "probiga.st_forward_trade_evidence_v3": ("strategy_version",),
     "probiga.st_opportunity_recall_v3": (
         "strategy_key",
         "evidence_kind",

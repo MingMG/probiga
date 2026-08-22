@@ -261,6 +261,7 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
         in _normalized_shell(deploy_script)
     )
     assert "trap 'rollback 143' TERM" in workflow
+    assert "trap 'rollback 129' HUP" in workflow
     assert workflow.count("--retry-all-errors") >= 2
     assert 'if [ "$rollback_failed" -ne 0 ]; then' in workflow
     assert 'write_receipt "ROLLBACK_FAILED"' in workflow
@@ -394,11 +395,30 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     ]
     assert len(prepare_calls) == 1
     prepare_call = prepare_calls[0]
+    schema_prepare = deploy_script.index(
+        "CUTOVER_STEP=prepare_qmt_attestation_schema", prepare_call
+    )
+    schema_prepare_command = deploy_script.index(
+        '"$PREPARED_CODE_ROOT/tools/'
+        'prepare_strategy_governance_qmt_history.py"',
+        schema_prepare,
+    )
+    schema_only = deploy_script.index("--schema-only", schema_prepare_command)
     cutover_fence = deploy_script.index("CUTOVER_STARTED=1", prepare_call)
     first_cutover_stop = _required_shell_position(
         deploy_script[cutover_fence:], r"sudo systemctl stop\b"
     ) + cutover_fence
-    assert prepare_call < cutover_fence < first_cutover_stop
+    assert (
+        prepare_call
+        < schema_prepare
+        < schema_prepare_command
+        < schema_only
+        < cutover_fence
+        < first_cutover_stop
+    )
+    assert "DATABASE_FORWARD_MIGRATION_STARTED=1" in deploy_script[
+        schema_prepare:cutover_fence
+    ]
 
     rollback_start = deploy_script.index("rollback() {")
     rollback_cutover = deploy_script.index(
@@ -414,6 +434,13 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     assert "systemctl stop" not in prepare_failure_path
     assert 'write_receipt "PREPARATION_FAILED"' in prepare_failure_path
     assert 'exit "$failed_status"' in prepare_failure_path
+    assert (
+        "Forward-only QMT schema preparation may remain installed"
+        in prepare_failure_path
+    )
+    assert "systemctl stop" not in deploy_script[
+        schema_prepare:cutover_fence
+    ]
 
     assert 'DEPLOY_MAIN_BASHPID="$BASHPID"' in deploy_script
     child_guard = deploy_script[rollback_start:rollback_cutover]
@@ -431,6 +458,7 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     )
     assert "trap 'rollback 143' TERM" in normalized
     assert "trap 'rollback 130' INT" in normalized
+    assert "trap 'rollback 129' HUP" in normalized
     assert not re.search(
         r"(?m)^trap\s+[^\n]*rollback[^\n]*\sEXIT\s*$", deploy_script
     )
@@ -462,7 +490,7 @@ def test_production_deploy_can_recover_from_external_writer_block() -> None:
     assert "recovered probiga service did not expose a valid main PID" in recovery
 
 
-def test_main_service_downtime_only_activates_prepared_dropins() -> None:
+def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -505,7 +533,26 @@ def test_main_service_downtime_only_activates_prepared_dropins() -> None:
         for line in downtime_closure.splitlines()
         if "python" in line and "grep -F --" not in line
     ]
-    assert python_cutover_commands == [expected_writer_fence_command]
+    assert python_cutover_commands == [
+        expected_writer_fence_command,
+        'if ! run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--disabled --snapshot-file "$GOVERNANCE_TASK_SNAPSHOT"; then',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"',
+        'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py")"; then',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" '
+        '"${GOVERNANCE_HEALTH_ARGS[@]}"',
+    ]
+    assert downtime.index(
+        "prepare_strategy_governance_qmt_history.py"
+    ) < downtime.index("run_strategy_governance_daily.py")
+    assert "DATABASE_FORWARD_MIGRATION_STARTED=1" in downtime_closure
+    assert "Database schema changes are forward-only additive" in deploy_script
 
     fence_command = writer_fence.index(expected_writer_fence_command)
     status_capture = writer_fence.index(
@@ -537,16 +584,49 @@ def test_main_service_downtime_only_activates_prepared_dropins() -> None:
     dropin_position = normalized.index(
         "install_prepared_dropins", fence_position
     )
-    daemon_reload = normalized.index("systemctl daemon-reload", dropin_position)
+    governance_install = normalized.index(
+        "CUTOVER_STEP=install_strategy_governance", dropin_position
+    )
+    governance_run = normalized.index(
+        "CUTOVER_STEP=run_strategy_governance", governance_install
+    )
+    governance_enable = normalized.index(
+        "CUTOVER_STEP=enable_strategy_governance_task", governance_run
+    )
+    governance_prestart_check = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_before_start",
+        governance_enable,
+    )
+    daemon_reload = normalized.index(
+        "systemctl daemon-reload", governance_prestart_check
+    )
     assert (
         cutover
         < scheduler_stop
         < api_stop
         < fence_position
         < dropin_position
+        < governance_install
+        < governance_run
+        < governance_enable
+        < governance_prestart_check
         < daemon_reload
         < service_start
     )
+    governance_activation = normalized[
+        governance_install:governance_prestart_check
+    ]
+    assert (
+        'case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in'
+        in governance_activation
+    )
+    assert "0:ok)" in governance_activation
+    assert "2:blocked)" in governance_activation
+    assert 'blocked_keys={"status","reason","target_trade_date",' in governance_activation
+    assert '"input_trade_date","automatic_real_order_submission"}' in governance_activation
+    assert "GOVERNANCE_INPUT_NOT_READY=1" in governance_activation
+    assert "GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)" in normalized
+    assert '--expected-build-sha "$EXPECTED_SHA"' in normalized
 
     assert 'install_prepared_dropins' in downtime
     assert "systemctl daemon-reload" in downtime
@@ -570,8 +650,12 @@ def test_main_service_downtime_only_activates_prepared_dropins() -> None:
     static_switch = normalized.index(
         'point_static_release_to_checkout "$PREPARED_CODE_ROOT"', health
     )
+    governance_poststart_check = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_after_start", static_switch
+    )
     premarket_probe = normalized.index(
-        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"', static_switch
+        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"',
+        governance_poststart_check,
     )
     premarket_task = normalized.index(
         "--task-type analysis_premarket_external", premarket_probe
@@ -583,8 +667,44 @@ def test_main_service_downtime_only_activates_prepared_dropins() -> None:
     deployed_receipt = normalized.index(
         'write_receipt "DEPLOYED" "$EXPECTED_SHA"', code_cleanup
     )
-    assert service_start < health < static_switch < premarket_probe
+    assert (
+        service_start
+        < health
+        < static_switch
+        < governance_poststart_check
+        < premarket_probe
+    )
     assert premarket_probe < premarket_task < code_cleanup < deployed_receipt
+
+
+def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    writer_fence = normalized.index("CUTOVER_STEP=writer_fence")
+    history_gate = normalized.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history",
+        writer_fence,
+    )
+    governance_run = normalized.index(
+        "CUTOVER_STEP=run_strategy_governance", history_gate
+    )
+    api_start = normalized.index("CUTOVER_STEP=start_api", governance_run)
+    gate_body = normalized[history_gate:governance_run]
+
+    assert writer_fence < history_gate < governance_run < api_start
+    assert gate_body.count(
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/'
+        'prepare_strategy_governance_qmt_history.py"'
+    ) == 1
+    assert "--schema-only" not in gate_body
+    assert "if run_prepared_python_tool" not in gate_body
+    assert "|| true" not in gate_body
+    assert "GOVERNANCE_INPUT_NOT_READY" not in gate_body
+    assert "--allow-input-not-ready" not in gate_body
+    assert "set -Eeuo pipefail" in normalized
 
 
 def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None:
@@ -623,6 +743,12 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     )
     assert "restore previous probiga drop-in" in rollback
     assert "restore previous AI recommendation worker drop-in" in rollback
+    assert "restore previous strategy governance task" in rollback
+    assert (
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--restore-snapshot "$GOVERNANCE_TASK_SNAPSHOT"'
+        in normalized_rollback
+    )
     assert "point Nginx static assets at previous code release" in rollback
     assert 'write_receipt "ROLLED_BACK"' in rollback
 

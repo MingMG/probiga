@@ -2,14 +2,19 @@
 # -*- coding: utf-8 -*-
 """Attest existing raw A-share daily bars against row-level BigQMT history.
 
-Only rows whose OHLC, volume and amount match within frozen tolerances receive
-QMT provenance. Missing or mismatched source rows remain untouched.
+Only rows whose OHLC, volume and amount match within frozen tolerances and
+whose native QMT ``preClose`` is present receive QMT provenance.  The native
+reference price is copied to the target and bound in an append-only row-level
+attestation so corporate-action discontinuities cannot be hidden by
+``shift(close)``.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -17,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.engine import Connection, Engine, make_url
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -35,6 +40,422 @@ PRICE_TOLERANCE = 0.0001
 VOLUME_ABSOLUTE_TOLERANCE = 100.0
 VOLUME_REL_TOLERANCE = 0.0001
 AMOUNT_REL_TOLERANCE = 0.001
+ATTESTATION_PROTOCOL_VERSION = "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
+UNIVERSE_MANIFEST_SCHEMA = "probiga.qmt-daily-universe.v1"
+EXPECTED_STOCK_SET_SCHEMA = "probiga.qmt-expected-stock-set.v1"
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+ATTESTATION_TABLE_NAMES = (
+    "qmt_kline_attestation_run",
+    "qmt_kline_attestation_mismatch",
+    "qmt_kline_attestation_row",
+)
+ATTESTATION_SCHEMA_MIGRATION_TABLE = (
+    "qmt_kline_attestation_schema_migration"
+)
+TOLERANCE_MEDIUMTEXT_MIGRATION_KEY = (
+    "20260822_001_qmt_attestation_tolerance_mediumtext"
+)
+_TOLERANCE_MEDIUMTEXT_MIGRATION_PAYLOAD = {
+    "schema": "probiga.qmt-attestation-schema-migration.v1",
+    "migration_key": TOLERANCE_MEDIUMTEXT_MIGRATION_KEY,
+    "table": "qmt_kline_attestation_run",
+    "column": "tolerance_json",
+    "from": "TEXT NOT NULL",
+    "to": "MEDIUMTEXT NOT NULL",
+}
+
+# This contract is deliberately independent from CREATE TABLE IF NOT EXISTS.
+# Setup may create a missing table, but it must never silently bless or mutate
+# an older, drifted structure.  DATA_TYPE/length/precision are used instead of
+# COLUMN_TYPE so the same contract works on Oracle MySQL 5.7 and 8.x (which
+# differ in integer display-width metadata).
+_ATTESTATION_COLUMN_CONTRACTS: dict[
+    str,
+    tuple[
+        tuple[
+            str,
+            str,
+            int | None,
+            int | None,
+            int | None,
+            str,
+            str | None,
+            str,
+        ],
+        ...,
+    ],
+] = {
+    "qmt_kline_attestation_run": (
+        ("run_id", "varchar", 64, None, None, "NO", None, ""),
+        ("provider", "varchar", 32, None, None, "NO", None, ""),
+        ("start_date", "date", None, None, None, "NO", None, ""),
+        ("end_date", "date", None, None, None, "NO", None, ""),
+        ("status", "varchar", 40, None, None, "NO", None, ""),
+        ("target_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("qmt_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("matched_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("missing_qmt_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("mismatched_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("already_attested_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        ("updated_rows", "bigint", None, 19, 0, "NO", "0", ""),
+        (
+            "tolerance_json",
+            "mediumtext",
+            16777215,
+            None,
+            None,
+            "NO",
+            None,
+            "",
+        ),
+        ("started_at", "datetime", None, None, None, "NO", None, ""),
+        ("finished_at", "datetime", None, None, None, "YES", None, ""),
+        ("error_message", "text", 65535, None, None, "YES", None, ""),
+    ),
+    "qmt_kline_attestation_mismatch": (
+        ("id", "bigint", None, 19, 0, "NO", None, "auto_increment"),
+        ("run_id", "varchar", 64, None, None, "NO", None, ""),
+        ("trade_date", "date", None, None, None, "NO", None, ""),
+        ("stock_code", "varchar", 16, None, None, "NO", None, ""),
+        ("reason", "varchar", 40, None, None, "NO", None, ""),
+        ("target_close", "decimal", None, 20, 6, "YES", None, ""),
+        ("qmt_close", "decimal", None, 20, 6, "YES", None, ""),
+        ("target_volume", "decimal", None, 24, 6, "YES", None, ""),
+        ("qmt_volume", "decimal", None, 24, 6, "YES", None, ""),
+        ("target_amount", "decimal", None, 24, 6, "YES", None, ""),
+        ("qmt_amount", "decimal", None, 24, 6, "YES", None, ""),
+        ("created_at", "datetime", None, None, None, "NO", None, ""),
+    ),
+    "qmt_kline_attestation_row": (
+        ("attestation_id", "char", 64, None, None, "NO", None, ""),
+        ("run_id", "varchar", 64, None, None, "NO", None, ""),
+        ("target_id", "bigint", None, 19, 0, "NO", None, ""),
+        ("qmt_id", "bigint", None, 19, 0, "NO", None, ""),
+        ("trade_date", "date", None, None, None, "NO", None, ""),
+        ("stock_code", "varchar", 16, None, None, "NO", None, ""),
+        ("protocol_version", "varchar", 64, None, None, "NO", None, ""),
+        ("source_data_version", "varchar", 64, None, None, "NO", None, ""),
+        ("source_pre_close_origin", "varchar", 32, None, None, "NO", None, ""),
+        ("source_pre_close", "decimal", None, 20, 6, "NO", None, ""),
+        ("attested_open", "decimal", None, 20, 6, "NO", None, ""),
+        ("attested_close", "decimal", None, 20, 6, "NO", None, ""),
+        ("attested_high", "decimal", None, 20, 6, "NO", None, ""),
+        ("attested_low", "decimal", None, 20, 6, "NO", None, ""),
+        ("attested_volume", "decimal", None, 24, 6, "NO", None, ""),
+        ("attested_amount", "decimal", None, 24, 6, "NO", None, ""),
+        ("created_at", "datetime", None, None, None, "NO", None, ""),
+    ),
+}
+
+_ATTESTATION_INDEX_CONTRACTS: dict[
+    str, dict[str, tuple[int, tuple[str, ...]]]
+] = {
+    "qmt_kline_attestation_run": {
+        "PRIMARY": (0, ("run_id",)),
+        "idx_qmt_kline_attestation_range": (
+            1,
+            ("start_date", "end_date", "status"),
+        ),
+    },
+    "qmt_kline_attestation_mismatch": {
+        "PRIMARY": (0, ("id",)),
+        "uk_qmt_kline_attestation_mismatch": (
+            0,
+            ("run_id", "trade_date", "stock_code"),
+        ),
+        "idx_qmt_kline_mismatch_lookup": (
+            1,
+            ("trade_date", "stock_code"),
+        ),
+    },
+    "qmt_kline_attestation_row": {
+        "PRIMARY": (0, ("attestation_id",)),
+        "uk_qmt_kline_attestation_row_source": (
+            0,
+            ("target_id", "protocol_version", "source_data_version"),
+        ),
+        "idx_qmt_kline_attestation_row_date": (
+            1,
+            ("trade_date", "protocol_version", "stock_code"),
+        ),
+        "idx_qmt_kline_attestation_row_run": (1, ("run_id",)),
+    },
+}
+
+ATTESTATION_TRIGGER_STATEMENTS = {
+    "trg_qmt_kline_attestation_row_immutable_bu": """
+        CREATE TRIGGER trg_qmt_kline_attestation_row_immutable_bu
+        BEFORE UPDATE ON qmt_kline_attestation_row
+        FOR EACH ROW
+        BEGIN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'QMT row attestation is append only';
+        END
+    """,
+    "trg_qmt_kline_attestation_row_immutable_bd": """
+        CREATE TRIGGER trg_qmt_kline_attestation_row_immutable_bd
+        BEFORE DELETE ON qmt_kline_attestation_row
+        FOR EACH ROW
+        BEGIN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'QMT row attestation cannot be deleted';
+        END
+    """,
+}
+
+_ATTESTATION_TRIGGER_CONTRACTS = {
+    "trg_qmt_kline_attestation_row_immutable_bu": (
+        "BEFORE",
+        "UPDATE",
+        "qmt_kline_attestation_row",
+        "BEGIN SIGNAL SQLSTATE '45000' "
+        "SET MESSAGE_TEXT = 'QMT row attestation is append only'; END",
+    ),
+    "trg_qmt_kline_attestation_row_immutable_bd": (
+        "BEFORE",
+        "DELETE",
+        "qmt_kline_attestation_row",
+        "BEGIN SIGNAL SQLSTATE '45000' "
+        "SET MESSAGE_TEXT = 'QMT row attestation cannot be deleted'; END",
+    ),
+}
+
+
+class QmtAttestationSchemaError(RuntimeError):
+    """Raised when the frozen QMT attestation schema has drifted."""
+
+    def __init__(self, detail: dict[str, Any]):
+        self.detail = detail
+        errors = detail.get("errors") or ["unknown schema drift"]
+        super().__init__(
+            "QMT attestation frozen schema validation failed: "
+            + "; ".join(str(error) for error in errors[:20])
+        )
+
+
+def canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+TOLERANCE_MEDIUMTEXT_MIGRATION_HASH = canonical_digest(
+    _TOLERANCE_MEDIUMTEXT_MIGRATION_PAYLOAD
+)
+
+
+def _tolerance_json_column_contract(
+    connection: Connection,
+) -> tuple[str, int | None, str, str, str, str | None, str]:
+    rows = connection.execute(
+        text(
+            "SELECT DATA_TYPE AS data_type, "
+            "CHARACTER_MAXIMUM_LENGTH AS character_maximum_length, "
+            "IS_NULLABLE AS is_nullable, "
+            "CHARACTER_SET_NAME AS character_set_name, "
+            "COLLATION_NAME AS collation_name, "
+            "COLUMN_DEFAULT AS column_default, EXTRA AS extra "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() "
+            "AND BINARY TABLE_NAME=BINARY "
+            "'qmt_kline_attestation_run' "
+            "AND BINARY COLUMN_NAME=BINARY 'tolerance_json'"
+        )
+    ).mappings().all()
+    if len(rows) != 1:
+        raise QmtAttestationSchemaError(
+            {
+                "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+                "errors": [
+                    "qmt_kline_attestation_run.tolerance_json "
+                    "column identity differs"
+                ],
+            }
+        )
+    row = rows[0]
+    return (
+        str(row.get("data_type") or "").lower(),
+        (
+            int(row["character_maximum_length"])
+            if row.get("character_maximum_length") is not None
+            else None
+        ),
+        str(row.get("is_nullable") or "").upper(),
+        str(row.get("character_set_name") or "").lower(),
+        str(row.get("collation_name") or "").lower(),
+        _normalized_schema_default(row.get("column_default")),
+        str(row.get("extra") or "").lower(),
+    )
+
+
+def _ensure_tolerance_json_mediumtext_migration(
+    connection: Connection,
+) -> None:
+    """Apply only the one frozen legacy TEXT -> MEDIUMTEXT upgrade."""
+
+    marker_rows = connection.execute(
+        text(
+            "SELECT migration_hash FROM "
+            "qmt_kline_attestation_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ),
+        {"migration_key": TOLERANCE_MEDIUMTEXT_MIGRATION_KEY},
+    ).mappings().all()
+    column_contract = _tolerance_json_column_contract(connection)
+    legacy_contract = ("text", 65535, "NO", "utf8mb4")
+    target_contract = ("mediumtext", 16777215, "NO", "utf8mb4")
+    column_prefix = column_contract[:4]
+    metadata_valid = bool(
+        column_contract[4].startswith("utf8mb4_")
+        and column_contract[5] is None
+        and column_contract[6] == ""
+    )
+    if marker_rows:
+        if (
+            len(marker_rows) != 1
+            or str(marker_rows[0].get("migration_hash") or "")
+            != TOLERANCE_MEDIUMTEXT_MIGRATION_HASH
+            or column_prefix != target_contract
+            or not metadata_valid
+        ):
+            raise QmtAttestationSchemaError(
+                {
+                    "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+                    "errors": [
+                        "tolerance_json MEDIUMTEXT migration marker or "
+                        "post-migration contract differs"
+                    ],
+                }
+            )
+        return
+    if not metadata_valid or column_prefix not in {
+        legacy_contract,
+        target_contract,
+    }:
+        raise QmtAttestationSchemaError(
+            {
+                "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+                "errors": [
+                    "tolerance_json is neither the exact legacy TEXT "
+                    "contract nor the frozen MEDIUMTEXT contract"
+                ],
+            }
+        )
+    if column_prefix == legacy_contract:
+        connection.execute(
+            text(
+                "ALTER TABLE qmt_kline_attestation_run "
+                "MODIFY COLUMN tolerance_json MEDIUMTEXT NOT NULL"
+            )
+        )
+        migrated_contract = _tolerance_json_column_contract(connection)
+        if not (
+            migrated_contract[:4] == target_contract
+            and migrated_contract[4].startswith("utf8mb4_")
+            and migrated_contract[5] is None
+            and migrated_contract[6] == ""
+        ):
+            raise QmtAttestationSchemaError(
+                {
+                    "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+                    "errors": [
+                        "tolerance_json MEDIUMTEXT migration did not "
+                        "produce the frozen contract"
+                    ],
+                }
+            )
+    connection.execute(
+        text(
+            "INSERT INTO qmt_kline_attestation_schema_migration "
+            "(migration_key, migration_hash, completed_at) "
+            "VALUES (:migration_key, :migration_hash, NOW())"
+        ),
+        {
+            "migration_key": TOLERANCE_MEDIUMTEXT_MIGRATION_KEY,
+            "migration_hash": TOLERANCE_MEDIUMTEXT_MIGRATION_HASH,
+        },
+    )
+
+
+def expected_stock_set_contract(
+    trade_date: str,
+    stock_codes: list[str] | set[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    normalized_codes = sorted(
+        {str(stock_code).strip() for stock_code in stock_codes}
+    )
+    if not normalized_codes or any(not code for code in normalized_codes):
+        raise ValueError("QMT daily universe must be non-empty")
+    payload = {
+        "schema": EXPECTED_STOCK_SET_SCHEMA,
+        "trade_date": str(trade_date),
+        "stock_codes": normalized_codes,
+    }
+    return {
+        "stock_count": len(normalized_codes),
+        "stock_set_hash": canonical_digest(payload),
+    }
+
+
+def validated_universe_manifest(
+    tolerance_json: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> dict[str, dict[str, Any]]:
+    """Parse the immutable daily-universe contract of a COMPLETED run."""
+
+    if isinstance(tolerance_json, dict):
+        payload = tolerance_json
+    else:
+        try:
+            payload = json.loads(str(tolerance_json or ""))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("tolerance_json is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("tolerance_json must be an object")
+    if payload.get("attestation_protocol") != ATTESTATION_PROTOCOL_VERSION:
+        raise ValueError("attestation protocol differs")
+    if payload.get("universe_manifest_schema") != UNIVERSE_MANIFEST_SCHEMA:
+        raise ValueError("universe manifest schema differs")
+    daily = payload.get("daily_universe")
+    if not isinstance(daily, dict) or not daily:
+        raise ValueError("daily universe manifest must be non-empty")
+    normalized: dict[str, dict[str, Any]] = {}
+    for raw_day, raw_contract in daily.items():
+        day = str(raw_day or "")
+        try:
+            parsed_day = datetime.strptime(day, "%Y-%m-%d").date().isoformat()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("daily universe date is invalid") from exc
+        if parsed_day != day or not (start_date <= day <= end_date):
+            raise ValueError("daily universe date is outside run range")
+        if (
+            not isinstance(raw_contract, dict)
+            or set(raw_contract) != {"stock_count", "stock_set_hash"}
+        ):
+            raise ValueError("daily universe entry fields differ")
+        try:
+            stock_count = int(raw_contract.get("stock_count"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("daily universe stock_count is invalid") from exc
+        stock_set_hash = str(raw_contract.get("stock_set_hash") or "")
+        if (
+            stock_count <= 0
+            or not _LOWER_SHA256_RE.fullmatch(stock_set_hash)
+        ):
+            raise ValueError("daily universe count/hash is invalid")
+        normalized[day] = {
+            "stock_count": stock_count,
+            "stock_set_hash": stock_set_hash,
+        }
+    return dict(sorted(normalized.items()))
 
 
 def values_match(
@@ -47,13 +468,30 @@ def values_match(
 ) -> bool:
     def close_enough(left: Any, right: Any, absolute: float, relative: float = 0.0) -> bool:
         if left is None or right is None:
-            return left is None and right is None
+            return False
         left_value = float(left)
         right_value = float(right)
         tolerance = max(absolute, abs(right_value) * relative)
         return math.isfinite(left_value) and math.isfinite(right_value) and abs(left_value - right_value) <= tolerance
 
-    return all(
+    prices_are_positive = all(
+        target.get(field) is not None
+        and source.get(field) is not None
+        and float(target[field]) > 0
+        and float(source[field]) > 0
+        for field in ("open", "close", "high", "low")
+    )
+    non_price_values_are_nonnegative = bool(
+        target.get("volume") is not None
+        and source.get("volume") is not None
+        and target.get("amount") is not None
+        and source.get("amount") is not None
+        and float(target["volume"]) >= 0
+        and float(source["volume"]) >= 0
+        and float(target["amount"]) >= 0
+        and float(source["amount"]) >= 0
+    )
+    base_matches = prices_are_positive and non_price_values_are_nonnegative and all(
         close_enough(target.get(field), source.get(field), price_tolerance)
         for field in ("open", "close", "high", "low")
     ) and close_enough(
@@ -66,6 +504,11 @@ def values_match(
         source.get("amount"),
         1.0,
         amount_rel_tolerance,
+    )
+    return bool(
+        base_matches
+        and str(source.get("pre_close_origin") or "") == "NATIVE_QMT"
+        and float(source.get("pre_close") or 0) > 0
     )
 
 
@@ -98,7 +541,7 @@ def _table_names(engine: Engine) -> tuple[str, str]:
 
 
 def ensure_attestation_tables(engine: Engine) -> None:
-    statements = (
+    table_statements = (
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_run (
             run_id VARCHAR(64) PRIMARY KEY,
@@ -113,7 +556,7 @@ def ensure_attestation_tables(engine: Engine) -> None:
             mismatched_rows BIGINT NOT NULL DEFAULT 0,
             already_attested_rows BIGINT NOT NULL DEFAULT 0,
             updated_rows BIGINT NOT NULL DEFAULT 0,
-            tolerance_json TEXT NOT NULL,
+            tolerance_json MEDIUMTEXT NOT NULL,
             started_at DATETIME NOT NULL,
             finished_at DATETIME NULL,
             error_message TEXT NULL,
@@ -139,35 +582,429 @@ def ensure_attestation_tables(engine: Engine) -> None:
             KEY idx_qmt_kline_mismatch_lookup (trade_date, stock_code)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """,
+        """
+        CREATE TABLE IF NOT EXISTS qmt_kline_attestation_row (
+            attestation_id CHAR(64) NOT NULL PRIMARY KEY,
+            run_id VARCHAR(64) NOT NULL,
+            target_id BIGINT NOT NULL,
+            qmt_id BIGINT NOT NULL,
+            trade_date DATE NOT NULL,
+            stock_code VARCHAR(16) NOT NULL,
+            protocol_version VARCHAR(64) NOT NULL,
+            source_data_version VARCHAR(64) NOT NULL,
+            source_pre_close_origin VARCHAR(32) NOT NULL,
+            source_pre_close DECIMAL(20,6) NOT NULL,
+            attested_open DECIMAL(20,6) NOT NULL,
+            attested_close DECIMAL(20,6) NOT NULL,
+            attested_high DECIMAL(20,6) NOT NULL,
+            attested_low DECIMAL(20,6) NOT NULL,
+            attested_volume DECIMAL(24,6) NOT NULL,
+            attested_amount DECIMAL(24,6) NOT NULL,
+            created_at DATETIME NOT NULL,
+            UNIQUE KEY uk_qmt_kline_attestation_row_source
+                (target_id, protocol_version, source_data_version),
+            KEY idx_qmt_kline_attestation_row_date
+                (trade_date, protocol_version, stock_code),
+            KEY idx_qmt_kline_attestation_row_run (run_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS qmt_kline_attestation_schema_migration (
+            migration_key VARCHAR(100) NOT NULL PRIMARY KEY,
+            migration_hash CHAR(64) NOT NULL,
+            completed_at DATETIME NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """,
     )
     with engine.begin() as connection:
-        for statement in statements:
+        for statement in table_statements:
             connection.execute(text(statement))
+        _ensure_tolerance_json_mediumtext_migration(connection)
+    with engine.begin() as connection:
+        existing = {
+            str(row[0])
+            for row in connection.execute(text(
+                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                "WHERE TRIGGER_SCHEMA=DATABASE() "
+                "AND TRIGGER_NAME IN "
+                "('trg_qmt_kline_attestation_row_immutable_bu', "
+                "'trg_qmt_kline_attestation_row_immutable_bd')"
+            )).all()
+        }
+        for trigger_name, statement in ATTESTATION_TRIGGER_STATEMENTS.items():
+            if trigger_name not in existing:
+                connection.execute(text(statement))
+    validate_attestation_schema(engine)
+
+
+def _normalized_schema_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="strict")
+    return str(value)
+
+
+def _normalized_trigger_body(value: Any) -> str:
+    normalized = str(value or "").replace("`", "")
+    normalized = re.sub(
+        r"\bSQLSTATE\s+VALUE\b",
+        "SQLSTATE",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    normalized = re.sub(r"\s*=\s*", "=", normalized)
+    normalized = re.sub(r"\s*;\s*", ";", normalized)
+    return normalized
+
+
+def _validate_attestation_schema_connection(
+    connection: Connection,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    migration_rows = connection.execute(
+        text(
+            "SELECT migration_hash FROM "
+            "qmt_kline_attestation_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ),
+        {"migration_key": TOLERANCE_MEDIUMTEXT_MIGRATION_KEY},
+    ).mappings().all()
+    if (
+        len(migration_rows) != 1
+        or str(migration_rows[0].get("migration_hash") or "")
+        != TOLERANCE_MEDIUMTEXT_MIGRATION_HASH
+    ):
+        errors.append(
+            "tolerance_json MEDIUMTEXT migration marker/hash differs"
+        )
+    table_names_sql = ", ".join(
+        f"'{name}'" for name in ATTESTATION_TABLE_NAMES
+    )
+    table_rows = connection.execute(
+        text(
+            "SELECT TABLE_NAME AS table_name, ENGINE AS engine, "
+            "TABLE_COLLATION AS table_collation "
+            "FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=DATABASE() "
+            f"AND TABLE_NAME IN ({table_names_sql}) "
+            "ORDER BY BINARY TABLE_NAME"
+        )
+    ).mappings().all()
+    observed_tables = {
+        str(row.get("table_name") or ""): dict(row) for row in table_rows
+    }
+    if set(observed_tables) != set(ATTESTATION_TABLE_NAMES):
+        errors.append(
+            "table inventory differs: expected="
+            f"{sorted(ATTESTATION_TABLE_NAMES)!r}, "
+            f"observed={sorted(observed_tables)!r}"
+        )
+    for table_name in ATTESTATION_TABLE_NAMES:
+        row = observed_tables.get(table_name, {})
+        if str(row.get("engine") or "").lower() != "innodb":
+            errors.append(f"{table_name} engine is not InnoDB")
+        collation = str(row.get("table_collation") or "").lower()
+        if not collation.startswith("utf8mb4_"):
+            errors.append(f"{table_name} character set is not utf8mb4")
+
+    column_rows = connection.execute(
+        text(
+            "SELECT TABLE_NAME AS table_name, "
+            "COLUMN_NAME AS column_name, "
+            "ORDINAL_POSITION AS ordinal_position, "
+            "DATA_TYPE AS data_type, "
+            "CHARACTER_MAXIMUM_LENGTH AS character_maximum_length, "
+            "NUMERIC_PRECISION AS numeric_precision, "
+            "NUMERIC_SCALE AS numeric_scale, "
+            "IS_NULLABLE AS is_nullable, "
+            "COLUMN_DEFAULT AS column_default, EXTRA AS extra, "
+            "CHARACTER_SET_NAME AS character_set_name, "
+            "COLLATION_NAME AS collation_name "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() "
+            f"AND TABLE_NAME IN ({table_names_sql}) "
+            "ORDER BY BINARY TABLE_NAME, ORDINAL_POSITION"
+        )
+    ).mappings().all()
+    observed_columns: dict[str, list[tuple[Any, ...]]] = {
+        name: [] for name in ATTESTATION_TABLE_NAMES
+    }
+    for row in column_rows:
+        table_name = str(row.get("table_name") or "")
+        if table_name not in observed_columns:
+            errors.append(f"unexpected column table: {table_name}")
+            continue
+        data_type = str(row.get("data_type") or "").lower()
+        character_type = data_type in {
+            "char",
+            "varchar",
+            "text",
+            "mediumtext",
+        }
+        character_set = str(row.get("character_set_name") or "").lower()
+        column_collation = str(row.get("collation_name") or "").lower()
+        if character_type and (
+            character_set != "utf8mb4"
+            or not column_collation.startswith("utf8mb4_")
+        ):
+            errors.append(
+                f"{table_name}.{row.get('column_name')} "
+                "character set/collation differs"
+            )
+        if not character_type and (
+            row.get("character_set_name") is not None
+            or row.get("collation_name") is not None
+        ):
+            errors.append(
+                f"{table_name}.{row.get('column_name')} "
+                "unexpected character metadata"
+            )
+        observed_columns[table_name].append(
+            (
+                str(row.get("column_name") or ""),
+                data_type,
+                (
+                    int(row["character_maximum_length"])
+                    if row.get("character_maximum_length") is not None
+                    else None
+                ),
+                (
+                    int(row["numeric_precision"])
+                    if row.get("numeric_precision") is not None
+                    else None
+                ),
+                (
+                    int(row["numeric_scale"])
+                    if row.get("numeric_scale") is not None
+                    else None
+                ),
+                str(row.get("is_nullable") or "").upper(),
+                _normalized_schema_default(row.get("column_default")),
+                str(row.get("extra") or "").lower(),
+            )
+        )
+    for table_name, expected in _ATTESTATION_COLUMN_CONTRACTS.items():
+        observed = tuple(observed_columns.get(table_name, []))
+        if observed != expected:
+            errors.append(
+                f"{table_name} column contract differs: "
+                f"expected={expected!r}, observed={observed!r}"
+            )
+
+    index_rows = connection.execute(
+        text(
+            "SELECT TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
+            "NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index, "
+            "COLUMN_NAME AS column_name, SUB_PART AS sub_part, "
+            "INDEX_TYPE AS index_type "
+            "FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA=DATABASE() "
+            f"AND TABLE_NAME IN ({table_names_sql}) "
+            "ORDER BY BINARY TABLE_NAME, BINARY INDEX_NAME, SEQ_IN_INDEX"
+        )
+    ).mappings().all()
+    observed_indexes: dict[str, dict[str, dict[str, Any]]] = {
+        name: {} for name in ATTESTATION_TABLE_NAMES
+    }
+    for row in index_rows:
+        table_name = str(row.get("table_name") or "")
+        index_name = str(row.get("index_name") or "")
+        if table_name not in observed_indexes:
+            errors.append(f"unexpected index table: {table_name}")
+            continue
+        entry = observed_indexes[table_name].setdefault(
+            index_name,
+            {
+                "non_unique": int(row.get("non_unique") or 0),
+                "columns": [],
+                "valid": True,
+            },
+        )
+        entry["valid"] = bool(
+            entry["valid"]
+            and int(row.get("non_unique") or 0) == entry["non_unique"]
+            and row.get("sub_part") is None
+            and str(row.get("index_type") or "").upper() == "BTREE"
+            and int(row.get("seq_in_index") or 0)
+            == len(entry["columns"]) + 1
+        )
+        entry["columns"].append(str(row.get("column_name") or ""))
+    normalized_indexes = {
+        table_name: {
+            index_name: (
+                int(entry["non_unique"]),
+                tuple(entry["columns"]),
+            )
+            for index_name, entry in table_indexes.items()
+            if entry["valid"]
+        }
+        for table_name, table_indexes in observed_indexes.items()
+    }
+    for table_name, expected in _ATTESTATION_INDEX_CONTRACTS.items():
+        observed = normalized_indexes.get(table_name, {})
+        all_valid = all(
+            entry["valid"]
+            for entry in observed_indexes.get(table_name, {}).values()
+        )
+        if not all_valid or observed != expected:
+            errors.append(
+                f"{table_name} index contract differs: "
+                f"expected={expected!r}, observed={observed!r}"
+            )
+
+    trigger_rows = connection.execute(
+        text(
+            "SELECT TRIGGER_NAME AS trigger_name, "
+            "ACTION_TIMING AS action_timing, "
+            "EVENT_MANIPULATION AS event_manipulation, "
+            "EVENT_OBJECT_TABLE AS event_object_table, "
+            "ACTION_ORIENTATION AS action_orientation, "
+            "ACTION_STATEMENT AS action_statement "
+            "FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA=DATABASE() "
+            "AND BINARY EVENT_OBJECT_TABLE="
+            "BINARY 'qmt_kline_attestation_row' "
+            "ORDER BY BINARY TRIGGER_NAME"
+        )
+    ).mappings().all()
+    observed_triggers = {
+        str(row.get("trigger_name") or ""): dict(row)
+        for row in trigger_rows
+    }
+    if set(observed_triggers) != set(_ATTESTATION_TRIGGER_CONTRACTS):
+        errors.append(
+            "immutable trigger inventory differs: expected="
+            f"{sorted(_ATTESTATION_TRIGGER_CONTRACTS)!r}, "
+            f"observed={sorted(observed_triggers)!r}"
+        )
+    for trigger_name, expected in _ATTESTATION_TRIGGER_CONTRACTS.items():
+        row = observed_triggers.get(trigger_name, {})
+        timing, event, table_name, body = expected
+        observed_body = _normalized_trigger_body(
+            row.get("action_statement")
+        )
+        if (
+            str(row.get("action_timing") or "").upper() != timing
+            or str(row.get("event_manipulation") or "").upper() != event
+            or str(row.get("event_object_table") or "") != table_name
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or observed_body != _normalized_trigger_body(body)
+            or not re.search(
+                r"\bsignal\s+sqlstate\s+'45000'", observed_body
+            )
+        ):
+            errors.append(f"immutable trigger differs: {trigger_name}")
+
+    completed_run_rows = connection.execute(
+        text(
+            "SELECT run_id, start_date, end_date, tolerance_json "
+            "FROM qmt_kline_attestation_run "
+            "WHERE status='COMPLETED' ORDER BY start_date, end_date, run_id"
+        )
+    ).mappings().all()
+    completed_manifest_entry_count = 0
+    for row in completed_run_rows:
+        run_id = str(row.get("run_id") or "")
+        start_date = str(row.get("start_date") or "")[:10]
+        end_date = str(row.get("end_date") or "")[:10]
+        try:
+            manifest = validated_universe_manifest(
+                row.get("tolerance_json"),
+                start_date=start_date,
+                end_date=end_date,
+            )
+            completed_manifest_entry_count += len(manifest)
+        except Exception as exc:
+            errors.append(
+                f"completed run universe manifest invalid: "
+                f"{run_id or '<missing-run-id>'}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    detail = {
+        "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+        "table_names": sorted(observed_tables),
+        "table_count": len(observed_tables),
+        "column_count": sum(len(rows) for rows in observed_columns.values()),
+        "index_names": {
+            name: sorted(indexes) for name, indexes in observed_indexes.items()
+        },
+        "trigger_names": sorted(observed_triggers),
+        "trigger_count": len(observed_triggers),
+        "completed_run_count": len(completed_run_rows),
+        "completed_manifest_entry_count": completed_manifest_entry_count,
+        "errors": errors,
+    }
+    if errors:
+        raise QmtAttestationSchemaError(detail)
+    return detail
+
+
+def validate_attestation_schema(
+    bind: Engine | Connection,
+) -> dict[str, Any]:
+    """Fail closed unless the complete V2 attestation schema is frozen.
+
+    This is read-only.  In particular, it never repairs an old nullable row
+    ledger or replaces a drifted trigger; an operator must handle any mismatch
+    as an explicit schema migration and re-run production acceptance.
+    """
+
+    try:
+        if hasattr(bind, "execute"):
+            return _validate_attestation_schema_connection(bind)  # type: ignore[arg-type]
+        with bind.connect() as connection:
+            return _validate_attestation_schema_connection(connection)
+    except QmtAttestationSchemaError:
+        raise
+    except Exception as exc:
+        raise QmtAttestationSchemaError(
+            {
+                "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+                "errors": [f"{type(exc).__name__}: {exc}"],
+            }
+        ) from exc
 
 
 def _match_sql(target_alias: str = "t", source_alias: str = "q") -> str:
     price_checks = " AND ".join(
         (
-            f"(({target_alias}.`{field}` IS NULL AND {source_alias}.`{field}` IS NULL) OR "
-            f"({target_alias}.`{field}` IS NOT NULL AND {source_alias}.`{field}` IS NOT NULL "
-            f"AND ABS({target_alias}.`{field}` - {source_alias}.`{field}`) <= :price_tolerance))"
+            f"({target_alias}.`{field}` IS NOT NULL "
+            f"AND {source_alias}.`{field}` IS NOT NULL "
+            f"AND {target_alias}.`{field}` > 0 "
+            f"AND {source_alias}.`{field}` > 0 "
+            f"AND ABS({target_alias}.`{field}` - {source_alias}.`{field}`) "
+            f"<= :price_tolerance)"
         )
         for field in ("open", "close", "high", "low")
     )
     volume_check = (
-        f"(({target_alias}.volume IS NULL AND {source_alias}.volume IS NULL) OR "
-        f"({target_alias}.volume IS NOT NULL AND {source_alias}.volume IS NOT NULL "
+        f"({target_alias}.volume IS NOT NULL "
+        f"AND {source_alias}.volume IS NOT NULL "
+        f"AND {target_alias}.volume >= 0 AND {source_alias}.volume >= 0 "
         f"AND ABS({target_alias}.volume - {source_alias}.volume) <= "
         f"GREATEST(:volume_absolute_tolerance, "
-        f"ABS({source_alias}.volume) * :volume_rel_tolerance)))"
+        f"ABS({source_alias}.volume) * :volume_rel_tolerance))"
     )
     amount_check = (
-        f"(({target_alias}.amount IS NULL AND {source_alias}.amount IS NULL) OR "
-        f"({target_alias}.amount IS NOT NULL AND {source_alias}.amount IS NOT NULL "
+        f"({target_alias}.amount IS NOT NULL "
+        f"AND {source_alias}.amount IS NOT NULL "
+        f"AND {target_alias}.amount >= 0 AND {source_alias}.amount >= 0 "
         f"AND ABS({target_alias}.amount - {source_alias}.amount) <= "
-        f"GREATEST(1.0, ABS({source_alias}.amount) * :amount_rel_tolerance)))"
+        f"GREATEST(1.0, ABS({source_alias}.amount) * :amount_rel_tolerance))"
     )
-    return f"{price_checks} AND {volume_check} AND {amount_check}"
+    native_pre_close_check = (
+        f"{source_alias}.pre_close IS NOT NULL "
+        f"AND {source_alias}.pre_close > 0 "
+        f"AND BINARY {source_alias}.pre_close_origin="
+        "BINARY 'NATIVE_QMT'"
+    )
+    return (
+        f"{price_checks} AND {volume_check} AND {amount_check} "
+        f"AND {native_pre_close_check}"
+    )
 
 
 def attest_range(
@@ -180,10 +1017,13 @@ def attest_range(
     mismatch_sample_limit: int = 5000,
 ) -> dict[str, Any]:
     ensure_attestation_tables(engine)
+    validate_attestation_schema(engine)
     target_table, source_table = _table_names(engine)
     run_id = f"qmt_attest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     tolerances = {
+        "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
         "price_absolute": PRICE_TOLERANCE,
+        "pre_close_absolute": PRICE_TOLERANCE,
         "volume_absolute": VOLUME_ABSOLUTE_TOLERANCE,
         "volume_relative": VOLUME_REL_TOLERANCE,
         "amount_relative": AMOUNT_REL_TOLERANCE,
@@ -197,6 +1037,7 @@ def attest_range(
         "volume_absolute_tolerance": VOLUME_ABSOLUTE_TOLERANCE,
         "volume_rel_tolerance": VOLUME_REL_TOLERANCE,
         "amount_rel_tolerance": AMOUNT_REL_TOLERANCE,
+        "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
     }
     with engine.begin() as connection:
         connection.execute(
@@ -231,7 +1072,8 @@ def attest_range(
                     SELECT id AS target_id,
                            stock_code COLLATE utf8mb4_general_ci AS stock_code,
                            trade_date, `open`, `close`, `high`, `low`,
-                           volume, amount, data_source, quality_status
+                           volume, amount, pre_close,
+                           data_source, quality_status
                     FROM {target_table}
                     WHERE trade_date BETWEEN :start_date AND :end_date
                       AND k_type=1 AND adjust_type=0
@@ -256,6 +1098,7 @@ def attest_range(
                     CREATE TEMPORARY TABLE `{source_temp}` ENGINE=InnoDB AS
                     SELECT id AS qmt_id, stock_code, trade_date,
                            `open`, `close`, `high`, `low`, volume, amount,
+                           pre_close, pre_close_origin,
                            qmt_code, provider, source_time, received_at,
                            batch_id, data_version, permission_status
                     FROM {source_table}
@@ -283,6 +1126,19 @@ def attest_range(
                 ).scalar()
                 or 0
             )
+            source_only_rows = int(
+                connection.execute(text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM `{source_temp}` q
+                    LEFT JOIN `{target_temp}` t
+                      ON t.stock_code=q.stock_code
+                     AND t.trade_date=q.trade_date
+                    WHERE t.target_id IS NULL
+                    """
+                )).scalar()
+                or 0
+            )
             connection.execute(
                 text(
                     f"""
@@ -290,16 +1146,43 @@ def attest_range(
                     SELECT t.target_id, q.qmt_id,
                            t.trade_date, t.stock_code,
                            ({match_sql}) AS is_match,
-                           COALESCE((
-                               t.data_source=:provider
-                               AND t.quality_status='QMT_ATTESTED'
+                           COALESCE(EXISTS(
+                               SELECT 1
+                               FROM qmt_kline_attestation_row a
+                               WHERE a.target_id=t.target_id
+                                 AND a.qmt_id=q.qmt_id
+                                 AND BINARY a.protocol_version=
+                                     BINARY :attestation_protocol
+                                 AND BINARY a.source_data_version=
+                                     BINARY q.data_version
+                                 AND BINARY a.source_pre_close_origin=
+                                     BINARY q.pre_close_origin
+                                 AND a.source_pre_close=q.pre_close
+                                 AND a.attested_open=q.`open`
+                                 AND a.attested_close=q.`close`
+                                 AND a.attested_high=q.`high`
+                                 AND a.attested_low=q.`low`
+                                 AND a.attested_volume=q.volume
+                                 AND a.attested_amount=q.amount
+                                 AND t.pre_close=a.source_pre_close
+                                 AND t.`open`=a.attested_open
+                                 AND t.`close`=a.attested_close
+                                 AND t.`high`=a.attested_high
+                                 AND t.`low`=a.attested_low
+                                 AND t.volume=a.attested_volume
+                                 AND t.amount=a.attested_amount
                            ), 0) AS provenance_already,
                            t.close AS target_close, q.close AS qmt_close,
+                           t.pre_close AS target_pre_close,
+                           q.pre_close AS qmt_pre_close,
                            t.volume AS target_volume, q.volume AS qmt_volume,
                            t.amount AS target_amount, q.amount AS qmt_amount,
                            q.qmt_code, q.provider, q.source_time,
                            q.received_at, q.batch_id, q.data_version,
-                           q.permission_status
+                           q.permission_status, q.pre_close_origin,
+                           q.`open` AS qmt_open,
+                           q.`high` AS qmt_high,
+                           q.`low` AS qmt_low
                     FROM `{target_temp}` t
                     LEFT JOIN `{source_temp}` q
                       ON q.stock_code=t.stock_code
@@ -338,7 +1221,10 @@ def attest_range(
             matched_rows = int(aggregate["matched_rows"] or 0)
             missing_qmt_rows = int(aggregate["missing_qmt_rows"] or 0)
             joined_rows = int(aggregate["joined_rows"] or 0)
-            mismatched_rows = max(0, joined_rows - matched_rows)
+            mismatched_rows = max(
+                0,
+                joined_rows - matched_rows + source_only_rows,
+            )
             already_attested_rows = int(aggregate["already_attested_rows"] or 0)
             sample_limit = max(0, min(50000, int(mismatch_sample_limit)))
             if sample_limit:
@@ -376,8 +1262,96 @@ def attest_range(
                         ),
                         [{"run_id": run_id, **dict(row)} for row in mismatch_rows],
                     )
+                source_only_samples = connection.execute(
+                    text(
+                        f"""
+                        SELECT q.trade_date, q.stock_code,
+                               'SOURCE_ONLY' AS reason,
+                               NULL AS target_close,
+                               q.`close` AS qmt_close,
+                               NULL AS target_volume,
+                               q.volume AS qmt_volume,
+                               NULL AS target_amount,
+                               q.amount AS qmt_amount
+                        FROM `{source_temp}` q
+                        LEFT JOIN `{target_temp}` t
+                          ON t.stock_code=q.stock_code
+                         AND t.trade_date=q.trade_date
+                        WHERE t.target_id IS NULL
+                        ORDER BY q.trade_date, q.stock_code
+                        LIMIT {sample_limit}
+                        """
+                    )
+                ).mappings().all()
+                if source_only_samples:
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO qmt_kline_attestation_mismatch
+                            (run_id, trade_date, stock_code, reason,
+                             target_close, qmt_close, target_volume, qmt_volume,
+                             target_amount, qmt_amount, created_at)
+                            VALUES
+                            (:run_id, :trade_date, :stock_code, :reason,
+                             :target_close, :qmt_close, :target_volume, :qmt_volume,
+                             :target_amount, :qmt_amount, NOW())
+                            """
+                        ),
+                        [
+                            {"run_id": run_id, **dict(row)}
+                            for row in source_only_samples
+                        ],
+                    )
+            manifest_source_rows = connection.execute(
+                text(
+                    f"SELECT trade_date, stock_code "
+                    f"FROM `{compare_temp}` "
+                    "ORDER BY trade_date, stock_code"
+                )
+            ).mappings().all()
+            daily_stock_codes: dict[str, set[str]] = {}
+            for row in manifest_source_rows:
+                day = str(row.get("trade_date") or "")[:10]
+                stock_code = str(row.get("stock_code") or "").strip()
+                if not day or not stock_code:
+                    raise RuntimeError(
+                        "QMT attestation universe manifest source is invalid"
+                    )
+                daily_stock_codes.setdefault(day, set()).add(stock_code)
+            daily_universe = {
+                day: expected_stock_set_contract(day, stock_codes)
+                for day, stock_codes in sorted(daily_stock_codes.items())
+            }
+            run_tolerances = {
+                **tolerances,
+                "universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
+                "daily_universe": daily_universe,
+            }
+            manifest_row_count = sum(
+                int(contract["stock_count"])
+                for contract in daily_universe.values()
+            )
+            manifest_complete = bool(
+                daily_universe
+                and manifest_row_count == target_rows
+                and validated_universe_manifest(
+                    run_tolerances,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                == daily_universe
+            )
+            universe_complete = bool(
+                target_rows > 0
+                and matched_rows == target_rows
+                and source_only_rows == 0
+                and manifest_complete
+            )
             updated_rows = 0
-            if apply and matched_rows:
+            # Never stamp a partial universe.  Otherwise rows from a PARTIAL
+            # run can survive through the append-only uniqueness key and make
+            # a later complete run appear bound to incomplete evidence.
+            if apply and universe_complete:
                 updated_rows = int(
                     connection.execute(
                         text(
@@ -387,6 +1361,16 @@ def attest_range(
                               ON q.target_id=t.id
                             SET t.qmt_code=q.qmt_code,
                                 t.data_source=q.provider,
+                                t.`open`=q.qmt_open,
+                                t.`close`=q.qmt_close,
+                                t.`high`=q.qmt_high,
+                                t.`low`=q.qmt_low,
+                                t.volume=q.qmt_volume,
+                                t.amount=q.qmt_amount,
+                                t.pre_close=q.qmt_pre_close,
+                                t.`change`=q.qmt_close-q.qmt_pre_close,
+                                t.change_pct=(q.qmt_close-q.qmt_pre_close)
+                                    / q.qmt_pre_close * 100,
                                 t.source_time=q.source_time,
                                 t.received_at=q.received_at,
                                 t.batch_id=q.batch_id,
@@ -401,10 +1385,78 @@ def attest_range(
                     ).rowcount
                     or 0
                 )
-            if target_rows == 0:
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT IGNORE INTO qmt_kline_attestation_row (
+                            attestation_id, run_id, target_id, qmt_id,
+                            trade_date, stock_code, protocol_version,
+                            source_data_version, source_pre_close_origin,
+                            source_pre_close, attested_open, attested_close,
+                            attested_high, attested_low, attested_volume,
+                            attested_amount, created_at
+                        )
+                        SELECT SHA2(CONCAT_WS('|',
+                                   :attestation_protocol,
+                                   q.target_id, q.qmt_id,
+                                   q.data_version,
+                                   q.qmt_pre_close,
+                                   q.qmt_open, q.qmt_close,
+                                   q.qmt_high, q.qmt_low,
+                                   q.qmt_volume, q.qmt_amount), 256),
+                               :run_id, q.target_id, q.qmt_id,
+                               q.trade_date, q.stock_code,
+                               :attestation_protocol,
+                               q.data_version, q.pre_close_origin,
+                               q.qmt_pre_close, q.qmt_open, q.qmt_close,
+                               q.qmt_high, q.qmt_low,
+                               q.qmt_volume, q.qmt_amount, NOW()
+                        FROM `{compare_temp}` q
+                        WHERE q.is_match
+                        """
+                    ),
+                    params,
+                )
+                exact_readback_rows = int(
+                    connection.execute(
+                        text(
+                            f"""
+                            SELECT COUNT(DISTINCT q.target_id)
+                            FROM `{compare_temp}` q
+                            JOIN {target_table} t ON t.id=q.target_id
+                            JOIN qmt_kline_attestation_row a
+                              ON a.target_id=t.id
+                             AND BINARY a.protocol_version=
+                                 BINARY :attestation_protocol
+                             AND BINARY a.source_data_version=
+                                 BINARY t.data_version
+                             AND BINARY a.source_pre_close_origin=
+                                 BINARY 'NATIVE_QMT'
+                             AND a.source_pre_close=t.pre_close
+                             AND a.attested_open=t.`open`
+                             AND a.attested_close=t.`close`
+                             AND a.attested_high=t.`high`
+                             AND a.attested_low=t.`low`
+                             AND a.attested_volume=t.volume
+                             AND a.attested_amount=t.amount
+                            WHERE q.is_match
+                            """
+                        ),
+                        params,
+                    ).scalar()
+                    or 0
+                )
+                if exact_readback_rows != matched_rows:
+                    raise RuntimeError(
+                        "QMT attestation exact readback mismatch: "
+                        f"{exact_readback_rows}/{matched_rows}"
+                    )
+            if target_rows == 0 and qmt_rows == 0:
                 status = "EMPTY_TARGET"
-            elif matched_rows == target_rows:
+            elif universe_complete:
                 status = "COMPLETED" if apply else "DRY_RUN_COMPLETE"
+            elif target_rows == 0:
+                status = "BLOCKED_TARGET_INCOMPLETE"
             elif matched_rows == 0 and missing_qmt_rows == target_rows:
                 status = "BLOCKED_SOURCE_INCOMPLETE"
             else:
@@ -418,7 +1470,8 @@ def attest_range(
                         missing_qmt_rows=:missing_qmt_rows,
                         mismatched_rows=:mismatched_rows,
                         already_attested_rows=:already_attested_rows,
-                        updated_rows=:updated_rows, finished_at=NOW()
+                        updated_rows=:updated_rows,
+                        tolerance_json=:tolerance_json, finished_at=NOW()
                     WHERE run_id=:run_id
                     """
                 ),
@@ -432,6 +1485,12 @@ def attest_range(
                     "mismatched_rows": mismatched_rows,
                     "already_attested_rows": already_attested_rows,
                     "updated_rows": updated_rows,
+                    "tolerance_json": json.dumps(
+                        run_tolerances,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 },
             )
             for temporary in (compare_temp, source_temp, target_temp):
@@ -447,10 +1506,14 @@ def attest_range(
             "qmt_rows": qmt_rows,
             "matched_rows": matched_rows,
             "missing_qmt_rows": missing_qmt_rows,
+            "source_only_rows": source_only_rows,
             "mismatched_rows": mismatched_rows,
             "already_attested_rows": already_attested_rows,
             "updated_rows": updated_rows,
-            "tolerances": tolerances,
+            "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
+            "tolerances": run_tolerances,
+            "universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
+            "daily_universe": daily_universe,
         }
     except Exception as exc:
         with engine.begin() as connection:

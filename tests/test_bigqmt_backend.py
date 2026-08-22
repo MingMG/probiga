@@ -367,6 +367,7 @@ def test_daily_history_normalizes_qmt_lots_to_shares(monkeypatch):
                 "change": 0.1,
                 "change_pct": 2.44,
                 "pre_close": 4.1,
+                "pre_close_origin": "NATIVE_QMT",
             }]
         ),
     )
@@ -377,6 +378,35 @@ def test_daily_history_normalizes_qmt_lots_to_shares(monkeypatch):
 
     assert frame.iloc[0]["volume"] == 123400
     assert frame.iloc[0]["data_source"] == PROVIDER_ID
+    assert frame.iloc[0]["pre_close_origin"] == "NATIVE_QMT"
+
+
+def test_daily_history_never_promotes_missing_native_pre_close(monkeypatch):
+    monkeypatch.setattr(
+        "integrations.bigqmt.backend.bridge.kline",
+        lambda *_args, **_kwargs: pd.DataFrame(
+            [{
+                "qmt_code": "510300.SH",
+                "stock_code": "510300",
+                "trade_time": "2026-07-22 15:00:00",
+                "trade_date": "2026-07-22",
+                "open": 4.1,
+                "close": 4.2,
+                "high": 4.3,
+                "low": 4.0,
+                "volume": 1234,
+                "amount": 518280,
+                "pre_close": None,
+            }]
+        ),
+    )
+
+    frame = BigQmtBackend().fetch_kline(
+        ["510300"], "2026-07-22", "2026-07-22"
+    )
+
+    assert pd.isna(frame.iloc[0]["pre_close"])
+    assert frame.iloc[0]["pre_close_origin"] == "MISSING_NATIVE_QMT"
 
 
 def test_refresh_watchlist_prioritizes_production_portfolio(monkeypatch, tmp_path):

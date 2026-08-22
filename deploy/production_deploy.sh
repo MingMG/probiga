@@ -833,6 +833,10 @@ PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR=""
 declare -a PREVIOUS_LEGACY_SCHEDULER_DROPINS=()
 PREVIOUS_AI_WORKER_DROPIN=""
 PREVIOUS_LOCK_SNAPSHOT=""
+GOVERNANCE_TASK_SNAPSHOT=""
+GOVERNANCE_TASK_TOUCHED=0
+GOVERNANCE_INPUT_NOT_READY=0
+DATABASE_FORWARD_MIGRATION_STARTED=0
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
   [ -z "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR" ] || \
@@ -844,6 +848,7 @@ cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_AI_WORKER_DROPIN" ] || \
     rm -f -- "$PREVIOUS_AI_WORKER_DROPIN"
   [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
+  [ -z "$GOVERNANCE_TASK_SNAPSHOT" ] || rm -f -- "$GOVERNANCE_TASK_SNAPSHOT"
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
@@ -1180,6 +1185,7 @@ cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR" ] || \
     rm -rf -- "$PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR"
   [ -z "$PREVIOUS_LOCK_SNAPSHOT" ] || rm -f -- "$PREVIOUS_LOCK_SNAPSHOT"
+  [ -z "$GOVERNANCE_TASK_SNAPSHOT" ] || rm -f -- "$GOVERNANCE_TASK_SNAPSHOT"
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
@@ -1491,11 +1497,28 @@ install_prepared_dropins() {
       "$AI_WORKER_DROPIN"
   fi
 }
+run_prepared_python_tool() {
+  (
+    cd "$PREPARED_CODE_ROOT"
+    sudo -u "$SERVICE_USER" env \
+      GIT_OPTIONAL_LOCKS=0 \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+      PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
+      "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$@"
+  )
+}
 rollback() {
   local failed_status="${1:-$?}"
   local failed_line="${2:-0}"
   if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
-    trap - ERR TERM INT
+    trap - ERR TERM INT HUP
     exit "$failed_status"
   fi
   local rollback_failed=0
@@ -1505,7 +1528,7 @@ rollback() {
   local restoration_ready=1
   local service_active_state=""
   local services_quiescent=1
-  trap - ERR TERM INT
+  trap - ERR TERM INT HUP
   set +e
   if [ "$CUTOVER_STARTED" -eq 1 ]; then
     printf 'deploy_failure phase=cutover cutover_step=%s line=%s status=%s\n' \
@@ -1516,6 +1539,9 @@ rollback() {
   fi
   if [ "$CUTOVER_STARTED" -eq 0 ]; then
     echo "Release preparation failed; the running services were not stopped" >&2
+    if [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 1 ]; then
+      echo "Forward-only QMT schema preparation may remain installed; no database object will be rolled back or dropped" >&2
+    fi
     current_sha="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD 2>/dev/null)"
     ACTIVE_REQUIREMENTS_SHA256="$PREVIOUS_REQUIREMENTS_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
@@ -1533,6 +1559,9 @@ rollback() {
     exit "$failed_status"
   fi
   echo "Deployment failed; rolling back to $PREVIOUS_SHA" >&2
+  if [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 1 ]; then
+    echo "Database schema changes are forward-only additive; runtime and scheduler are being restored without dropping schema objects" >&2
+  fi
 
   rollback_failure() {
     echo "Rollback step failed: $1" >&2
@@ -1586,6 +1615,17 @@ rollback() {
     esac
   fi
   if [ "$services_quiescent" -eq 1 ]; then
+    if [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ]; then
+      if [ ! -s "$GOVERNANCE_TASK_SNAPSHOT" ]; then
+        rollback_failure "strategy governance task snapshot is missing"
+        restoration_ready=0
+      elif ! run_prepared_python_tool \
+        "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+        --restore-snapshot "$GOVERNANCE_TASK_SNAPSHOT"; then
+        rollback_failure "restore previous strategy governance task"
+        restoration_ready=0
+      fi
+    fi
     if [ "$restoration_ready" -eq 1 ]; then
       if [ "$PREVIOUS_DROPIN_PRESENT" -eq 1 ]; then
         if ! sudo install -o root -g root -m 0644 "$PREVIOUS_DROPIN" \
@@ -1801,13 +1841,25 @@ rollback() {
 trap 'rollback "$?" "$LINENO"' ERR
 trap 'rollback 143' TERM
 trap 'rollback 130' INT
+trap 'rollback 129' HUP
 # PREPARE: all network, dependency, and release validation work happens while
 # the old API remains active. This phase must not mutate the live checkout.
 CUTOVER_STEP=prepare_release
 prepare_release
 
-# CUTOVER: only quiesce writers, install the prevalidated runtime definition,
-# reload systemd, start, and prove health/static. The live checkout is untouched.
+# PREPARE DATABASE: perform the exact legacy TEXT -> MEDIUMTEXT migration and
+# validate the complete frozen QMT V2 schema while the existing API and
+# scheduler are still running.  This is forward-only; a failure stops the
+# deployment before any service or runtime definition is switched.
+CUTOVER_STEP=prepare_qmt_attestation_schema
+DATABASE_FORWARD_MIGRATION_STARTED=1
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
+  --schema-only
+
+# CUTOVER: quiesce writers, install the prevalidated runtime and governance
+# schema/task, run the bounded daily close, then start and prove health/static.
+# The live checkout remains untouched.
 CUTOVER_STARTED=1
 CUTOVER_STEP=stop_auxiliary_writers
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
@@ -1859,6 +1911,63 @@ cmp --silent "$PREPARED_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   cmp --silent "$PREPARED_AI_WORKER_DROPIN" "$AI_WORKER_DROPIN"
 fi
+CUTOVER_STEP=install_strategy_governance
+GOVERNANCE_TASK_SNAPSHOT="$(mktemp)"
+chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_SNAPSHOT"
+chmod 0600 "$GOVERNANCE_TASK_SNAPSHOT"
+DATABASE_FORWARD_MIGRATION_STARTED=1
+if ! run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+  --disabled --snapshot-file "$GOVERNANCE_TASK_SNAPSHOT"; then
+  if [ -s "$GOVERNANCE_TASK_SNAPSHOT" ]; then
+    GOVERNANCE_TASK_TOUCHED=1
+  fi
+  false
+fi
+GOVERNANCE_TASK_TOUCHED=1
+CUTOVER_STEP=prepare_strategy_governance_qmt_history
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"
+CUTOVER_STEP=run_strategy_governance
+GOVERNANCE_RUN_OUTPUT=""
+GOVERNANCE_RUN_STATUS=0
+if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py")"; then
+  GOVERNANCE_RUN_STATUS=0
+else
+  GOVERNANCE_RUN_STATUS=$?
+fi
+printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
+GOVERNANCE_JSON_STATUS="$(
+  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,sys; from datetime import date; payload=json.load(sys.stdin); status=payload.get("status") if isinstance(payload,dict) else None; blocked_keys={"status","reason","target_trade_date","input_trade_date","automatic_real_order_submission"}; target=payload.get("target_trade_date") if isinstance(payload,dict) else None; input_day=payload.get("input_trade_date") if isinstance(payload,dict) else None; dates_valid=isinstance(target,str) and isinstance(input_day,str) and all(not value or date.fromisoformat(value).isoformat()==value for value in (target,input_day)); blocked=status=="blocked" and set(payload)==blocked_keys and isinstance(payload.get("reason"),str) and bool(payload["reason"].strip()) and dates_valid and bool(target or not input_day) and payload.get("automatic_real_order_submission") is False; ok=status=="ok" and payload.get("automatic_real_order_submission") is False; normalized="blocked" if blocked else "ok" if ok else ""; print(normalized); raise SystemExit(0 if normalized else 2)'
+)"
+case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
+  0:ok) ;;
+  2:blocked)
+    GOVERNANCE_INPUT_NOT_READY=1
+    echo "Strategy governance input is not ready; schema and task checks remain mandatory" >&2
+    ;;
+  *)
+    printf 'strategy_governance invalid_result exit=%s json_status=%q\n' \
+      "$GOVERNANCE_RUN_STATUS" "$GOVERNANCE_JSON_STATUS" >&2
+    false
+    ;;
+esac
+CUTOVER_STEP=enable_strategy_governance_task
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"
+declare -a GOVERNANCE_HEALTH_ARGS=(
+  --compact
+  --expected-build-sha "$EXPECTED_SHA"
+)
+if [ "$GOVERNANCE_INPUT_NOT_READY" -eq 1 ]; then
+  GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)
+fi
+CUTOVER_STEP=verify_strategy_governance_before_start
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+  "${GOVERNANCE_HEALTH_ARGS[@]}"
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 CUTOVER_STEP=verify_no_scheduler_dropins
@@ -2004,6 +2113,10 @@ point_static_release_to_checkout "$PREPARED_CODE_ROOT"
 assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT"
 systemctl is-active --quiet probiga-scheduler
 systemctl is-enabled --quiet probiga-scheduler
+CUTOVER_STEP=verify_strategy_governance_after_start
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+  "${GOVERNANCE_HEALTH_ARGS[@]}"
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   if [ "$PREVIOUS_AI_WORKER_TIMER_ENABLED" -eq 1 ]; then
     sudo systemctl enable "$AI_WORKER_TIMER"
@@ -2049,4 +2162,4 @@ fi
 df -h / >&2
 write_receipt "DEPLOYED" "$EXPECTED_SHA"
 DEPLOY_SUCCEEDED=1
-trap - ERR TERM INT
+trap - ERR TERM INT HUP

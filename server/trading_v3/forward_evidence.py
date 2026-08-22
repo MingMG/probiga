@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections import defaultdict, deque
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable, Mapping
 
 from sqlalchemy import bindparam, text
@@ -12,11 +12,31 @@ from sqlalchemy.engine import Engine
 
 
 EXECUTED_FORWARD_PROTOCOL = "PAPER_EXECUTED_LEDGER_V1"
+EXIT_ALLOCATION_PROTOCOL = "PAPER_FIFO_EXIT_ALLOCATION_V1"
+INTENT_EPISODE_PROTOCOL = "PAPER_EXECUTED_INTENT_CASH_EPISODE_V1"
 ATTRIBUTION_VERSION = "V3_PRIMARY_FORECAST_SNAPSHOT_V1"
 EXECUTED_INTENT_REASONS = frozenset({
     "V3_PAPER_DISCOVERY",
     "V3_VALIDATED_POSITIVE",
 })
+
+
+def primary_strategy_version(
+    model_version: Any,
+    strategy_key: Any,
+) -> str:
+    """Return the immutable V3 strategy-sleeve version for one decision run."""
+
+    normalized_model_version = str(model_version or "").strip()
+    normalized_strategy_key = str(strategy_key or "").strip()
+    if not normalized_model_version or not normalized_strategy_key:
+        raise ValueError(
+            "V3 primary strategy version requires model_version and strategy_key"
+        )
+    value = f"{normalized_model_version}:{normalized_strategy_key}"
+    if len(value) > 160:
+        raise ValueError("V3 primary strategy version exceeds 160 characters")
+    return value
 
 
 def _decimal(value: Any) -> Decimal:
@@ -29,6 +49,74 @@ def _evidence_id(entry_fill_id: str, strategy_key: str) -> str:
             "utf-8"
         )
     ).hexdigest()
+
+
+def intent_episode_id(source_intent_id: Any, strategy_version: Any) -> str:
+    """Return the stable sample identity above immutable fill-level facts.
+
+    ``st_forward_trade_evidence_v3`` deliberately remains a fill-backed fact
+    ledger.  Statistical trade counts must use this intent/version identity,
+    so partial fills and execution slicing cannot manufacture extra samples.
+    """
+
+    normalized_intent_id = str(source_intent_id or "").strip()
+    normalized_strategy_version = str(strategy_version or "").strip()
+    if not normalized_intent_id or not normalized_strategy_version:
+        raise ValueError(
+            "forward intent episode requires source_intent_id and strategy_version"
+        )
+    if len(normalized_intent_id) > 64 or len(normalized_strategy_version) > 160:
+        raise ValueError("forward intent episode identity exceeds frozen limits")
+    return hashlib.sha256(
+        (
+            f"{normalized_intent_id}|{normalized_strategy_version}|"
+            f"{INTENT_EPISODE_PROTOCOL}"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _exit_allocation_id(
+    exit_fill_id: str,
+    allocation_sequence: int,
+    entry_fill_id: str,
+) -> str:
+    return hashlib.sha256(
+        (
+            f"{exit_fill_id}|{allocation_sequence}|{entry_fill_id}|"
+            f"{EXIT_ALLOCATION_PROTOCOL}"
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _fifo_allocated_amounts(
+    total: Decimal,
+    quantities: tuple[int, ...],
+    total_quantity: int,
+) -> tuple[Decimal, ...]:
+    """Allocate one raw amount exactly; the last FIFO effect owns the tail."""
+
+    if (
+        total_quantity <= 0
+        or not quantities
+        or any(quantity <= 0 for quantity in quantities)
+        or sum(quantities) != total_quantity
+    ):
+        raise ValueError("FIFO amount allocation requires complete fill coverage")
+    quantized_total = total.quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_HALF_UP,
+    )
+    allocated = [
+        (total * Decimal(quantity) / Decimal(total_quantity)).quantize(
+            Decimal("0.000001"),
+            rounding=ROUND_HALF_UP,
+        )
+        for quantity in quantities[:-1]
+    ]
+    allocated.append(quantized_total - sum(allocated, Decimal("0.000000")))
+    if allocated[-1] < 0 or sum(allocated) != quantized_total:
+        raise ValueError("FIFO amount allocation tail is invalid")
+    return tuple(allocated)
 
 
 def _ownership_hash(
@@ -71,9 +159,13 @@ def _strategy_keys(row: Mapping[str, Any]) -> tuple[str, ...]:
 def _sample_owner(
     row: Mapping[str, Any],
     forecast_ids: Mapping[tuple[str, str, str], str],
+    run_model_versions: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, str] | None, str]:
     if str(row.get("intent_reason_code") or "") not in EXECUTED_INTENT_REASONS:
         return None, "NOT_V3_ENTRY"
+    source_intent_id = str(row.get("intent_id") or "").strip()
+    if not source_intent_id:
+        return None, "SOURCE_INTENT_ID_MISSING"
     payload = _intent_evidence(row)
     relational_run_uid = str(row.get("decision_run_uid") or "")
     payload_run_uid = str(payload.get("run_uid") or "")
@@ -81,6 +173,15 @@ def _sample_owner(
         return None, "RELATIONAL_RUN_MISSING"
     if payload_run_uid and payload_run_uid != relational_run_uid:
         return None, "RUN_UID_MISMATCH"
+    relational_model_version = str(
+        (run_model_versions or {}).get(relational_run_uid) or ""
+    ).strip()
+    if not relational_model_version:
+        return None, "RUN_MODEL_VERSION_NOT_FOUND"
+    if str(payload.get("model_version") or "").strip() != (
+        relational_model_version
+    ):
+        return None, "INTENT_MODEL_VERSION_MISMATCH"
     stock_code = str(row.get("stock_code") or "")
     supporting = _strategy_keys(row)
     primary_strategy_key = str(
@@ -89,77 +190,62 @@ def _sample_owner(
     primary_forecast_id = str(
         payload.get("primary_forecast_id") or ""
     )
+    frozen_strategy_version = str(
+        payload.get("primary_strategy_version") or ""
+    ).strip()
     attribution_version = str(
         payload.get("attribution_version") or ""
     )
-    if primary_strategy_key:
-        if primary_strategy_key not in supporting:
-            return None, "PRIMARY_NOT_IN_SUPPORTING_SET"
-        expected_forecast_id = str(forecast_ids.get(
-            (
-                relational_run_uid,
-                stock_code,
-                primary_strategy_key,
-            ),
-            "",
-        ))
-        if not expected_forecast_id:
-            return None, "PRIMARY_FORECAST_NOT_FOUND"
-        if primary_forecast_id != expected_forecast_id:
-            return None, "PRIMARY_FORECAST_ID_MISMATCH"
-        expected_hash = _ownership_hash(
+    if not primary_strategy_key:
+        return None, "PRIMARY_STRATEGY_KEY_MISSING"
+    if primary_strategy_key not in supporting:
+        return None, "PRIMARY_NOT_IN_SUPPORTING_SET"
+    expected_strategy_version = primary_strategy_version(
+        relational_model_version,
+        primary_strategy_key,
+    )
+    if (
+        frozen_strategy_version
+        and frozen_strategy_version != expected_strategy_version
+    ):
+        return None, "PRIMARY_STRATEGY_VERSION_MISMATCH"
+    expected_forecast_id = str(forecast_ids.get(
+        (
             relational_run_uid,
-            primary_forecast_id,
             stock_code,
             primary_strategy_key,
-        )
-        if str(payload.get("ownership_hash") or "") != expected_hash:
-            return None, "OWNERSHIP_HASH_MISMATCH"
-        if attribution_version != ATTRIBUTION_VERSION:
-            return None, "ATTRIBUTION_VERSION_MISMATCH"
-        if str(payload.get("sample_owner_role") or "") != "PRIMARY":
-            return None, "OWNER_ROLE_MISMATCH"
-        return ({
-            "strategy_key": primary_strategy_key,
-            "source_forecast_id": primary_forecast_id,
-            "source_run_uid": relational_run_uid,
-            "source_intent_id": str(row.get("intent_id") or ""),
-            "sample_owner_role": "PRIMARY",
-            "attribution_status": "VERIFIED_SNAPSHOT",
-            "attribution_version": attribution_version,
-            "supporting_strategy_keys_json": json.dumps(
-                list(supporting),
-                ensure_ascii=False,
-            ),
-            "ownership_hash": expected_hash,
-        }, "")
-
-    # Compatibility is deliberately limited to a single unambiguous sleeve.
-    # Legacy multi-sleeve fills are quarantined instead of being duplicated
-    # into several learning ledgers.
-    if len(supporting) != 1:
-        return None, "LEGACY_OWNER_AMBIGUOUS"
-    primary_strategy_key = supporting[0]
-    primary_forecast_id = str(forecast_ids.get(
-        (relational_run_uid, stock_code, primary_strategy_key),
+        ),
         "",
     ))
-    if not primary_forecast_id:
-        return None, "LEGACY_FORECAST_NOT_FOUND"
+    if not expected_forecast_id:
+        return None, "PRIMARY_FORECAST_NOT_FOUND"
+    if primary_forecast_id != expected_forecast_id:
+        return None, "PRIMARY_FORECAST_ID_MISMATCH"
     expected_hash = _ownership_hash(
         relational_run_uid,
         primary_forecast_id,
         stock_code,
         primary_strategy_key,
     )
+    if str(payload.get("ownership_hash") or "") != expected_hash:
+        return None, "OWNERSHIP_HASH_MISMATCH"
+    if attribution_version != ATTRIBUTION_VERSION:
+        return None, "ATTRIBUTION_VERSION_MISMATCH"
+    if str(payload.get("sample_owner_role") or "") != "PRIMARY":
+        return None, "OWNER_ROLE_MISMATCH"
     return ({
         "strategy_key": primary_strategy_key,
+        "strategy_version": expected_strategy_version,
         "source_forecast_id": primary_forecast_id,
         "source_run_uid": relational_run_uid,
-        "source_intent_id": str(row.get("intent_id") or ""),
+        "source_intent_id": source_intent_id,
         "sample_owner_role": "PRIMARY",
-        "attribution_status": "LEGACY_SINGLE_STRATEGY_RESOLVED",
-        "attribution_version": "LEGACY_SINGLE_STRATEGY_V1",
+        "attribution_status": (
+            "VERIFIED_SNAPSHOT"
+            if frozen_strategy_version
+            else "LEGACY_VERSION_DERIVED"
+        ),
+        "attribution_version": attribution_version,
         "supporting_strategy_keys_json": json.dumps(
             list(supporting),
             ensure_ascii=False,
@@ -172,7 +258,9 @@ def reconstruct_executed_forward_records(
     fill_rows: Iterable[Mapping[str, Any]],
     *,
     forecast_ids: Mapping[tuple[str, str, str], str] | None = None,
+    run_model_versions: Mapping[str, str] | None = None,
     diagnostics: dict[str, int] | None = None,
+    allocation_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild actual V3 paper round trips from the append-only fill ledger.
 
@@ -185,6 +273,7 @@ def reconstruct_executed_forward_records(
     diagnostics = diagnostics if diagnostics is not None else {}
     fifo: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
     executed: dict[str, dict[str, Any]] = {}
+    all_lots: list[dict[str, Any]] = []
     ordered = sorted(
         (dict(row) for row in fill_rows),
         key=lambda row: (
@@ -199,7 +288,11 @@ def reconstruct_executed_forward_records(
         if not code or quantity <= 0:
             continue
         if side == "BUY":
-            owner, rejection = _sample_owner(row, forecast_ids)
+            owner, rejection = _sample_owner(
+                row,
+                forecast_ids,
+                run_model_versions,
+            )
             if rejection and rejection != "NOT_V3_ENTRY":
                 diagnostics[rejection] = diagnostics.get(rejection, 0) + 1
             lot = {
@@ -218,10 +311,12 @@ def reconstruct_executed_forward_records(
                 "exit_fee": Decimal("0"),
                 "exit_fill_ids": [],
                 "exit_order_ids": [],
+                "exit_allocations": [],
                 "exit_at": None,
                 "exit_reason": "",
             }
             fifo[code].append(lot)
+            all_lots.append(lot)
             if owner:
                 executed[lot["entry_fill_id"]] = lot
             continue
@@ -229,22 +324,76 @@ def reconstruct_executed_forward_records(
             continue
         sell_remaining = quantity
         sell_fee = _decimal(row.get("fee_amount"))
-        sell_price = _decimal(row.get("price"))
-        while sell_remaining > 0 and fifo[code]:
-            lot = fifo[code][0]
+        sell_gross = _decimal(row.get("gross_amount"))
+        fragments: list[tuple[dict[str, Any], int]] = []
+        # Stage the coverage decision before mutating any lot.  A malformed
+        # raw SELL must not leave the in-memory replay partially consumed.
+        for lot in fifo[code]:
+            if sell_remaining <= 0:
+                break
             consumed = min(sell_remaining, int(lot["remaining_quantity"]))
-            allocated_fee = sell_fee * Decimal(consumed) / Decimal(quantity)
+            fragments.append((lot, consumed))
+            sell_remaining -= consumed
+        if sell_remaining > 0 or sum(item[1] for item in fragments) != quantity:
+            diagnostics["SELL_FIFO_COVERAGE_GAP"] = (
+                diagnostics.get("SELL_FIFO_COVERAGE_GAP", 0) + 1
+            )
+            continue
+        for lot, consumed in fragments:
             lot["remaining_quantity"] -= consumed
             lot["closed_quantity"] += consumed
-            lot["exit_gross"] += sell_price * Decimal(consumed)
-            lot["exit_fee"] += allocated_fee
-            lot["exit_fill_ids"].append(str(row.get("fill_id") or ""))
-            lot["exit_order_ids"].append(str(row.get("order_id") or ""))
             lot["exit_at"] = row.get("filled_at")
             lot["exit_reason"] = str(row.get("intent_reason_code") or "")
-            sell_remaining -= consumed
-            if int(lot["remaining_quantity"]) <= 0:
-                fifo[code].popleft()
+        while fifo[code] and int(fifo[code][0]["remaining_quantity"]) <= 0:
+            fifo[code].popleft()
+        quantities = tuple(item[1] for item in fragments)
+        gross_allocations = _fifo_allocated_amounts(
+            sell_gross, quantities, quantity,
+        )
+        fee_allocations = _fifo_allocated_amounts(
+            sell_fee, quantities, quantity,
+        )
+        exit_fill_id = str(row.get("fill_id") or "")
+        exit_order_id = str(row.get("order_id") or "")
+        for sequence, ((lot, consumed), allocated_gross, allocated_fee) in enumerate(
+            zip(fragments, gross_allocations, fee_allocations)
+        ):
+            owner = dict(lot.get("owner") or {})
+            evidence_id = (
+                _evidence_id(
+                    str(lot["entry_fill_id"]),
+                    str(owner["strategy_key"]),
+                )
+                if owner
+                else None
+            )
+            allocation = {
+                "allocation_id": _exit_allocation_id(
+                    exit_fill_id,
+                    sequence,
+                    str(lot["entry_fill_id"]),
+                ),
+                "evidence_id": evidence_id,
+                "attribution_status": (
+                    "ATTRIBUTED" if evidence_id else "UNATTRIBUTED"
+                ),
+                "account_id": "",
+                "stock_code": code,
+                "entry_fill_id": str(lot["entry_fill_id"]),
+                "exit_fill_id": exit_fill_id,
+                "exit_order_id": exit_order_id,
+                "allocation_sequence": sequence,
+                "allocated_quantity": consumed,
+                "allocated_gross_cny": allocated_gross,
+                "allocated_fee_cny": allocated_fee,
+                "exit_filled_at": row.get("filled_at"),
+                "allocation_protocol_version": EXIT_ALLOCATION_PROTOCOL,
+            }
+            lot["exit_gross"] += allocated_gross
+            lot["exit_fee"] += allocated_fee
+            lot["exit_fill_ids"].append(exit_fill_id)
+            lot["exit_order_ids"].append(exit_order_id)
+            lot["exit_allocations"].append(allocation)
 
     records: list[dict[str, Any]] = []
     for lot in executed.values():
@@ -281,17 +430,20 @@ def reconstruct_executed_forward_records(
         owner = dict(lot["owner"] or {})
         strategy_key = str(owner["strategy_key"])
         source_run_uid = str(owner["source_run_uid"])
+        evidence_id = _evidence_id(
+            str(lot["entry_fill_id"]),
+            strategy_key,
+        )
+        exit_allocations = list(lot["exit_allocations"])
         records.append({
-                "evidence_id": _evidence_id(
-                    str(lot["entry_fill_id"]),
-                    strategy_key,
-                ),
+                "evidence_id": evidence_id,
                 "account_id": "",
                 "source_run_uid": source_run_uid,
                 "source_forecast_id": owner["source_forecast_id"],
                 "source_intent_id": owner["source_intent_id"],
                 "stock_code": lot["stock_code"],
                 "strategy_key": strategy_key,
+                "strategy_version": owner["strategy_version"],
                 "sample_owner_role": owner["sample_owner_role"],
                 "attribution_status": owner["attribution_status"],
                 "attribution_version": owner["attribution_version"],
@@ -336,8 +488,9 @@ def reconstruct_executed_forward_records(
                 "realized_mfe_pct": None,
                 "exit_reason": lot["exit_reason"],
                 "evidence_status": status,
+                "exit_allocations": exit_allocations,
             })
-    return sorted(
+    normalized_records = sorted(
         records,
         key=lambda item: (
             item["entry_at"] or datetime.min,
@@ -345,6 +498,13 @@ def reconstruct_executed_forward_records(
             item["strategy_key"],
         ),
     )
+    if allocation_rows is not None:
+        allocation_rows.extend(
+            allocation
+            for lot in all_lots
+            for allocation in lot["exit_allocations"]
+        )
+    return normalized_records
 
 
 def _attach_excursions(
@@ -407,6 +567,70 @@ def _attach_excursions(
         ) * 100.0
 
 
+def _allocation_contract(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    filled_at = row.get("exit_filled_at")
+    if isinstance(filled_at, datetime):
+        normalized_filled_at = filled_at.replace(microsecond=0).isoformat(
+            sep=" "
+        )
+    else:
+        normalized_filled_at = str(filled_at or "").replace("T", " ")
+    return (
+        str(row.get("allocation_id") or ""),
+        str(row.get("evidence_id") or ""),
+        str(row.get("attribution_status") or ""),
+        str(row.get("account_id") or ""),
+        str(row.get("stock_code") or ""),
+        str(row.get("entry_fill_id") or ""),
+        str(row.get("exit_fill_id") or ""),
+        str(row.get("exit_order_id") or ""),
+        int(row.get("allocation_sequence") or 0),
+        int(row.get("allocated_quantity") or 0),
+        str(_decimal(row.get("allocated_gross_cny")).quantize(
+            Decimal("0.000001")
+        )),
+        str(_decimal(row.get("allocated_fee_cny")).quantize(
+            Decimal("0.000001")
+        )),
+        normalized_filled_at,
+        str(row.get("allocation_protocol_version") or ""),
+    )
+
+
+def _assert_persisted_exit_allocations(
+    connection: Any,
+    allocation_rows: list[dict[str, Any]],
+    *,
+    account_id: str,
+) -> int:
+    expected = sorted(_allocation_contract(row) for row in allocation_rows)
+    statement = text(
+        """
+        SELECT allocation_id, evidence_id, attribution_status,
+               account_id, stock_code,
+               entry_fill_id, exit_fill_id, exit_order_id,
+               allocation_sequence, allocated_quantity,
+               allocated_gross_cny, allocated_fee_cny,
+               exit_filled_at, allocation_protocol_version
+        FROM st_forward_exit_allocation_v3
+        WHERE account_id = :account_id
+        ORDER BY exit_filled_at, exit_fill_id, allocation_sequence
+        """
+    )
+    observed = sorted(
+        _allocation_contract(row)
+        for row in connection.execute(
+            statement,
+            {"account_id": account_id},
+        ).mappings()
+    )
+    if observed != expected:
+        raise RuntimeError(
+            "persisted forward exit allocations differ from deterministic FIFO replay"
+        )
+    return len(observed)
+
+
 def sync_executed_forward_evidence(
     primary_engine: Engine,
     kline_engine: Engine,
@@ -440,12 +664,15 @@ def sync_executed_forward_evidence(
         if _strategy_keys(row)
     } - {""})
     forecast_ids: dict[tuple[str, str, str], str] = {}
+    run_model_versions: dict[str, str] = {}
     if run_uids:
         statement = text(
             """
-            SELECT forecast_id, run_uid, stock_code, strategy_key
-            FROM st_alpha_forecast_v3
-            WHERE run_uid IN :run_uids
+            SELECT f.forecast_id, f.run_uid, f.stock_code, f.strategy_key,
+                   r.model_version AS run_model_version
+            FROM st_alpha_forecast_v3 f
+            JOIN st_decision_run_v3 r ON r.run_uid = f.run_uid
+            WHERE f.run_uid IN :run_uids
             """
         ).bindparams(bindparam("run_uids", expanding=True))
         with primary_engine.connect() as connection:
@@ -458,14 +685,26 @@ def sync_executed_forward_evidence(
                     str(row["stock_code"]),
                     str(row["strategy_key"]),
                 )] = str(row["forecast_id"])
+                run_model_versions[str(row["run_uid"])] = str(
+                    row["run_model_version"]
+                )
     attribution_rejections: dict[str, int] = {}
+    exit_allocations: list[dict[str, Any]] = []
     records = reconstruct_executed_forward_records(
         fills,
         forecast_ids=forecast_ids,
+        run_model_versions=run_model_versions,
         diagnostics=attribution_rejections,
+        allocation_rows=exit_allocations,
     )
+    if attribution_rejections.get("SELL_FIFO_COVERAGE_GAP", 0):
+        raise RuntimeError(
+            "raw SELL fills do not have complete deterministic FIFO coverage"
+        )
     for item in records:
         item["account_id"] = account_id
+    for allocation in exit_allocations:
+        allocation["account_id"] = account_id
     _attach_excursions(records, kline_engine)
     now = datetime.now().replace(microsecond=0)
     with primary_engine.begin() as connection:
@@ -476,7 +715,8 @@ def sync_executed_forward_evidence(
                     INSERT INTO st_forward_trade_evidence_v3 (
                         evidence_id, account_id, source_run_uid,
                         source_forecast_id, source_intent_id,
-                        stock_code, strategy_key, sample_owner_role,
+                        stock_code, strategy_key, strategy_version,
+                        sample_owner_role,
                         attribution_status, attribution_version,
                         supporting_strategy_keys_json, ownership_hash,
                         evidence_kind, protocol_version,
@@ -491,7 +731,8 @@ def sync_executed_forward_evidence(
                     ) VALUES (
                         :evidence_id, :account_id, :source_run_uid,
                         :source_forecast_id, :source_intent_id,
-                        :stock_code, :strategy_key, :sample_owner_role,
+                        :stock_code, :strategy_key, :strategy_version,
+                        :sample_owner_role,
                         :attribution_status, :attribution_version,
                         :supporting_strategy_keys_json, :ownership_hash,
                         :evidence_kind, :protocol_version,
@@ -506,6 +747,11 @@ def sync_executed_forward_evidence(
                     )
                     ON DUPLICATE KEY UPDATE
                         protocol_version = VALUES(protocol_version),
+                        strategy_version = IF(
+                            strategy_version='',
+                            VALUES(strategy_version),
+                            strategy_version
+                        ),
                         closed_quantity = VALUES(closed_quantity),
                         exit_fill_ids_json = VALUES(exit_fill_ids_json),
                         exit_order_ids_json = VALUES(exit_order_ids_json),
@@ -525,12 +771,46 @@ def sync_executed_forward_evidence(
                 ),
                 {**item, "created_at": now, "updated_at": now},
             )
+        for allocation in exit_allocations:
+            connection.execute(
+                text(
+                    """
+                    INSERT IGNORE INTO st_forward_exit_allocation_v3 (
+                        allocation_id, evidence_id, attribution_status,
+                        account_id,
+                        stock_code, entry_fill_id, exit_fill_id,
+                        exit_order_id, allocation_sequence,
+                        allocated_quantity,
+                        allocated_gross_cny, allocated_fee_cny,
+                        exit_filled_at, allocation_protocol_version,
+                        created_at
+                    ) VALUES (
+                        :allocation_id, :evidence_id,
+                        :attribution_status, :account_id,
+                        :stock_code, :entry_fill_id, :exit_fill_id,
+                        :exit_order_id, :allocation_sequence,
+                        :allocated_quantity,
+                        :allocated_gross_cny, :allocated_fee_cny,
+                        :exit_filled_at, :allocation_protocol_version,
+                        :created_at
+                    )
+                    """
+                ),
+                {**allocation, "created_at": now},
+            )
+        allocation_count = _assert_persisted_exit_allocations(
+            connection,
+            exit_allocations,
+            account_id=account_id,
+        )
     return {
         "status": "ok",
         "protocol_version": EXECUTED_FORWARD_PROTOCOL,
         "attribution_version": ATTRIBUTION_VERSION,
         "fill_count": len(fills),
         "evidence_count": len(records),
+        "exit_allocation_protocol": EXIT_ALLOCATION_PROTOCOL,
+        "exit_allocation_count": allocation_count,
         "unattributed_v3_buy_fill_count": sum(
             attribution_rejections.values()
         ),

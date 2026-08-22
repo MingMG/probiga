@@ -653,6 +653,17 @@ def test_materializer_persists_rejected_risk_without_creating_order(
         for sql, params in connection.inserts
         if "INSERT IGNORE INTO st_risk_decision_v2" in sql
     )
+    intent_params = next(
+        params
+        for sql, params in connection.inserts
+        if "INSERT IGNORE INTO st_trade_intent_v2" in sql
+    )
+    intent_evidence = json.loads(intent_params["evidence_json"])
+    assert intent_evidence["model_version"] == "dynamic-test-version"
+    assert intent_evidence["primary_strategy_key"] == "right_side_trend"
+    assert intent_evidence["primary_strategy_version"] == (
+        "dynamic-test-version:right_side_trend"
+    )
     assert risk_params["decision_status"] == "REJECTED"
     assert risk_params["approved_quantity"] == 0
     assert risk_params["first_failure"] == "CASH_AVAILABLE"

@@ -13,6 +13,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "news_daily",
     "public_quote_failover",
     "stock_snapshot_daily",
+    "strategy_governance_daily",
     "trading_v2_intraday_activation",
     "trading_v2_job_worker",
     "trading_v2_level1_validation",

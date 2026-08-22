@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Body, Path, Query
+from fastapi import APIRouter, Body, Path, Query, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from server.engine.strategy_center import (
@@ -23,8 +24,19 @@ from server.engine.strategy_center import (
     latest_recommendation_date,
     normalize_trade_date,
     persist_strategy_center_snapshot,
-    set_strategy_enabled,
     versioned_strategy_configuration,
+)
+from server.engine.strategy_governance import (
+    GovernanceEvidenceNotReady,
+    governance_history,
+    governance_snapshot,
+    metric_evidence_detail,
+    record_metric_input,
+    review_metric_input,
+    register_combination,
+    register_strategy,
+    transition_lifecycle,
+    toggle_strategy_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,12 +46,137 @@ router = APIRouter()
 class StrategyToggleRequest(BaseModel):
     enabled: bool
     reason: str = Field(default="", max_length=500)
-    operator: str = Field(default="api", max_length=80)
 
 
 class StrategyRunRequest(BaseModel):
     trade_date: str = ""
     limit: int = Field(default=200, ge=1, le=500)
+
+
+class StrategyRegistrationRequest(BaseModel):
+    strategy_key: str = Field(min_length=3, max_length=80)
+    strategy_name: str = Field(min_length=1, max_length=120)
+    version: str = Field(min_length=1, max_length=160)
+    category: str = Field(default="未分类", max_length=80)
+    family_key: str = Field(default="", max_length=80)
+    description: str = Field(default="", max_length=1000)
+    evaluator_type: str = Field(default="external_evidence", max_length=40)
+    evaluator_config: dict[str, Any] = Field(default_factory=dict)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(default="注册策略版本", max_length=500)
+
+
+class StrategyCombinationRequest(BaseModel):
+    combination_key: str = Field(min_length=3, max_length=80)
+    combination_name: str = Field(min_length=1, max_length=120)
+    version: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=1000)
+    members: list[dict[str, Any]] = Field(min_length=2, max_length=50)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(default="注册组合版本", max_length=500)
+
+
+class LifecycleTransitionRequest(BaseModel):
+    next_status: str = Field(min_length=1, max_length=24)
+    reason: str = Field(min_length=1, max_length=500)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategyMetricEvidenceRequest(BaseModel):
+    strategy_key: str = Field(min_length=3, max_length=80)
+    entity_type: str = Field(
+        default="STRATEGY", pattern="^(STRATEGY|COMBINATION)$"
+    )
+    bound_strategy_version: str = Field(min_length=1, max_length=160)
+    as_of_date: str = Field(min_length=10, max_length=10)
+    window_days: int = Field(default=60)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    source: str = Field(default="manual_evidence", max_length=80)
+    evidence_protocol: str = Field(min_length=1, max_length=80)
+    artifact_hash: str = Field(
+        min_length=64, max_length=64, pattern="^[0-9a-f]{64}$"
+    )
+    artifact_manifest: dict[str, Any]
+    evidence_revision_at: str = Field(min_length=10, max_length=40)
+    reason: str = Field(default="新增验证证据", max_length=500)
+
+
+class StrategyMetricReviewRequest(BaseModel):
+    decision: str = Field(pattern="^(CONFIRM|REJECT)$")
+    reason: str = Field(min_length=1, max_length=500)
+
+
+def _request_actor(request: Request) -> str:
+    user = getattr(request.state, "auth_user", None)
+    user_id = getattr(user, "id", None)
+    if isinstance(user_id, int) and user_id > 0:
+        return f"user-id:{user_id}"[:80]
+    username = str(getattr(user, "username", "") or "").strip()
+    if username:
+        return f"user:{username}"[:80]
+    auth_kind = str(getattr(request.state, "auth_kind", "") or "").strip()
+    if auth_kind:
+        return f"auth:{auth_kind}"[:80]
+    return "api"
+
+
+def _request_role_actor(
+    request: Request,
+    *,
+    allowed_roles: frozenset[str],
+    action_label: str,
+) -> str:
+    """Require one active named account with an explicit governance role."""
+
+    user = getattr(request.state, "auth_user", None)
+    user_id = getattr(user, "id", None)
+    auth_kind = str(getattr(request.state, "auth_kind", "") or "").strip()
+    role = str(getattr(user, "role", "") or "").strip().upper()
+    if (
+        auth_kind == "account_session"
+        and isinstance(user_id, int)
+        and user_id > 0
+        and getattr(user, "is_active", False) is True
+        and role in allowed_roles
+    ):
+        return f"user-id:{user_id}"[:80]
+    roles = "、".join(sorted(allowed_roles))
+    raise PermissionError(
+        f"{action_label}仅允许实名账户角色 {roles}；旧管理令牌或其他角色无此权限"
+    )
+
+
+def _request_admin_actor(request: Request, action_label: str) -> str:
+    return _request_role_actor(
+        request,
+        allowed_roles=frozenset({"ADMIN"}),
+        action_label=action_label,
+    )
+
+
+def _request_reviewer_actor(request: Request) -> str:
+    return _request_role_actor(
+        request,
+        allowed_roles=frozenset({"EVIDENCE_REVIEWER"}),
+        action_label="指标证据独立复核",
+    )
+
+
+def _governance_api_error(
+    status_code: int, error: str, message: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "error": error,
+            "message": str(message)[:500],
+            "automatic_real_order_submission": False,
+        },
+    )
+
+
+_INTERNAL_GOVERNANCE_ERROR = "服务器内部错误；详细原因已写入服务日志"
 
 
 def _research_only_candidate(row: dict[str, Any]) -> dict[str, Any]:
@@ -131,6 +268,245 @@ def strategy_center_configuration():
         return versioned_strategy_configuration()
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:500]}
+
+
+@router.get("/strategy-center/governance")
+def strategy_center_governance(trade_date: str = Query(default="")):
+    """Return the dynamic registry, two arenas, layered pools and allocations."""
+
+    try:
+        return governance_snapshot(trade_date=trade_date, persist=False)
+    except Exception as exc:
+        logger.error("strategy governance snapshot failed: %s", exc, exc_info=True)
+        return {
+            "status": "degraded",
+            "trade_date": trade_date,
+            "summary": {},
+            "strategies": [],
+            "combinations": [],
+            "pools": {"observation": [], "confirmation": [], "tradable": []},
+            "allocations": [
+                {
+                    "target_type": "CASH",
+                    "target_key": "cash",
+                    "name": "现金",
+                    "simulated_weight_pct": 100.0,
+                    "reason": "治理数据不可用，保持现金",
+                    "real_order_authority": False,
+                }
+            ],
+            "automatic_real_order_submission": False,
+            "error": str(exc)[:500],
+        }
+
+
+@router.get("/strategy-center/governance/history")
+def strategy_center_governance_history(
+    limit: int = Query(default=100, ge=1, le=500),
+):
+    try:
+        return governance_history(limit)
+    except Exception as exc:
+        return {
+            "status": "degraded",
+            "metric_evidence": [],
+            "lifecycle_events": [],
+            "audit_events": [],
+            "runs": [],
+            "error": str(exc)[:500],
+        }
+
+
+@router.post("/strategy-center/registry")
+def strategy_center_register_strategy(payload: StrategyRegistrationRequest, request: Request):
+    try:
+        data = payload.model_dump()
+        return {
+            "status": "ok",
+            "strategy": register_strategy(
+                data,
+                operator=_request_admin_actor(request, "策略或版本注册"),
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_strategy_registration", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
+    except Exception as exc:
+        logger.error("strategy registration failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "strategy_registration_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/combinations")
+def strategy_center_register_combination(payload: StrategyCombinationRequest, request: Request):
+    try:
+        return {
+            "status": "ok",
+            "combination": register_combination(
+                payload.model_dump(),
+                operator=_request_admin_actor(request, "策略组合或版本注册"),
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_combination_registration", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
+    except Exception as exc:
+        logger.error("strategy combination registration failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "combination_registration_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/strategies/{strategy_key}/lifecycle")
+def strategy_center_transition_lifecycle(
+    payload: LifecycleTransitionRequest,
+    request: Request,
+    strategy_key: str = Path(..., min_length=3, max_length=80),
+):
+    try:
+        return {
+            "status": "ok",
+            "transition": transition_lifecycle(
+                strategy_key,
+                payload.next_status,
+                reason=payload.reason,
+                operator=_request_admin_actor(request, "策略生命周期变更"),
+                evidence=payload.evidence,
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_lifecycle_transition", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
+    except Exception as exc:
+        logger.error("strategy lifecycle transition failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "lifecycle_transition_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/combinations/{combination_key}/lifecycle")
+def strategy_center_transition_combination_lifecycle(
+    payload: LifecycleTransitionRequest,
+    request: Request,
+    combination_key: str = Path(..., min_length=3, max_length=80),
+):
+    try:
+        return {
+            "status": "ok",
+            "transition": transition_lifecycle(
+                combination_key,
+                payload.next_status,
+                reason=payload.reason,
+                operator=_request_admin_actor(request, "组合生命周期变更"),
+                evidence=payload.evidence,
+                entity_type="COMBINATION",
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_lifecycle_transition", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
+    except Exception as exc:
+        logger.error("combination lifecycle transition failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "lifecycle_transition_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/metrics")
+def strategy_center_add_metric_evidence(payload: StrategyMetricEvidenceRequest, request: Request):
+    try:
+        return {
+            "status": "ok",
+            "evidence": record_metric_input(
+                payload.model_dump(),
+                operator=_request_admin_actor(request, "指标证据提交"),
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_metric_evidence", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "metric_evidence_admin_required", str(exc))
+    except Exception as exc:
+        logger.error("strategy metric evidence failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "metric_evidence_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.get("/strategy-center/metrics/{evidence_id}")
+def strategy_center_metric_evidence_detail(
+    evidence_id: str = Path(..., min_length=32, max_length=32),
+):
+    try:
+        return {"status": "ok", "evidence": metric_evidence_detail(evidence_id)}
+    except ValueError as exc:
+        return _governance_api_error(404, "invalid_metric_evidence", str(exc))
+    except Exception as exc:
+        logger.error("strategy metric detail failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "metric_evidence_detail_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/metrics/{evidence_id}/review")
+def strategy_center_review_metric_evidence(
+    payload: StrategyMetricReviewRequest,
+    request: Request,
+    evidence_id: str = Path(..., min_length=32, max_length=32),
+):
+    try:
+        return {
+            "status": "ok",
+            "evidence": review_metric_input(
+                evidence_id,
+                decision=payload.decision,
+                reason=payload.reason,
+                operator=_request_reviewer_actor(request),
+            ),
+            "automatic_real_order_submission": False,
+        }
+    except ValueError as exc:
+        return _governance_api_error(422, "invalid_metric_review", str(exc))
+    except PermissionError as exc:
+        return _governance_api_error(403, "metric_reviewer_role_required", str(exc))
+    except Exception as exc:
+        logger.error("strategy metric review failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "metric_review_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
+@router.post("/strategy-center/governance/run")
+def strategy_center_run_governance(
+    payload: StrategyRunRequest | None = Body(default=None),
+    request: Request = None,
+):
+    payload = payload or StrategyRunRequest()
+    try:
+        operator = _request_admin_actor(request, "手工执行策略治理")
+        return governance_snapshot(
+            trade_date=payload.trade_date,
+            persist=True,
+            operator=operator,
+            strategy_limit=payload.limit,
+        )
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
+    except GovernanceEvidenceNotReady as exc:
+        return {
+            "status": "blocked",
+            "reason": str(exc),
+            "allocations": [{
+                "target_type": "CASH",
+                "target_key": "cash",
+                "name": "现金",
+                "simulated_weight_pct": 100.0,
+                "reason": "权威治理证据未就绪，保持现金",
+                "real_order_authority": False,
+            }],
+            "automatic_real_order_submission": False,
+        }
+    except Exception as exc:
+        logger.error("strategy governance run failed: %s", exc, exc_info=True)
+        return _governance_api_error(500, "governance_run_failed", _INTERNAL_GOVERNANCE_ERROR)
+
+
 @router.get("/strategy-center/etf-forward")
 def strategy_center_etf_forward(
     limit: int = Query(default=100, ge=1, le=500),
@@ -197,14 +573,27 @@ def strategy_center_strategies(trade_date: str = Query(default="")):
 @router.post("/strategy-center/strategies/{strategy_key}/toggle")
 def strategy_center_toggle(
     payload: StrategyToggleRequest,
-    strategy_key: str = Path(..., min_length=1, max_length=40),
+    strategy_key: str = Path(..., min_length=1, max_length=80),
+    request: Request = None,
 ):
     try:
-        return {"status": "ok", **set_strategy_enabled(strategy_key, payload.enabled, payload.reason, payload.operator)}
+        operator = _request_admin_actor(request, "策略启停")
+        return {"status": "ok", **toggle_strategy_enabled(
+            strategy_key, payload.enabled,
+            reason=payload.reason,
+            operator=operator,
+        )}
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
     except ValueError as exc:
-        return {"status": "error", "error": "invalid_strategy", "message": str(exc)}
+        return _governance_api_error(422, "invalid_strategy", str(exc))
     except Exception as exc:
-        return {"status": "error", "error": "strategy_config_unavailable", "message": str(exc)[:500]}
+        logger.error("strategy toggle failed: %s", exc, exc_info=True)
+        return _governance_api_error(
+            500,
+            "strategy_config_unavailable",
+            _INTERNAL_GOVERNANCE_ERROR,
+        )
 
 
 @router.get("/strategy-center/candidates")
@@ -313,13 +702,19 @@ def strategy_center_conflicts(trade_date: str = Query(default=""), limit: int = 
 
 
 @router.post("/strategy-center/run")
-def strategy_center_run(payload: StrategyRunRequest | None = Body(default=None)):
+def strategy_center_run(
+    payload: StrategyRunRequest | None = Body(default=None),
+    request: Request = None,
+):
     payload = payload or StrategyRunRequest()
     try:
+        _request_admin_actor(request, "手工刷新策略中心快照")
         snapshot = build_strategy_center_snapshot(payload.trade_date, payload.limit)
         if snapshot.get("source_status") == "missing":
             return {"status": "blocked", "reason": "strategy center data is not ready", "snapshot": snapshot}
         return persist_strategy_center_snapshot(snapshot)
+    except PermissionError as exc:
+        return _governance_api_error(403, "strategy_admin_required", str(exc))
     except Exception as exc:
         logger.error("strategy center run failed: %s", exc, exc_info=True)
         return {"status": "error", "error": str(exc)[:500]}

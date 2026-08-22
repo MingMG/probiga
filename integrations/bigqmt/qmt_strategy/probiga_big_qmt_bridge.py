@@ -150,18 +150,35 @@ def _time_text(value, period):
         if timestamp > 10000000000:
             timestamp = timestamp / 1000.0
         if timestamp > 1000000000:
-            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+            rendered = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(timestamp)
+            )
+            return (
+                rendered[:10] + " 15:00:00"
+                if period == "1d"
+                else rendered
+            )
     raw = str(value or "").strip()
     digits = _date_digits(raw)
     if len(digits) >= 14:
+        clock = (
+            ("15", "00", "00")
+            if period == "1d"
+            else (digits[8:10], digits[10:12], digits[12:14])
+        )
         return "%s-%s-%s %s:%s:%s" % (
-            digits[0:4], digits[4:6], digits[6:8], digits[8:10], digits[10:12], digits[12:14]
+            digits[0:4], digits[4:6], digits[6:8],
+            clock[0], clock[1], clock[2]
         )
     if len(digits) >= 8:
         suffix = "15:00:00" if period == "1d" else "00:00:00"
         return "%s-%s-%s %s" % (digits[0:4], digits[4:6], digits[6:8], suffix)
     if len(raw) >= 19 and raw[4:5] == "-":
-        return raw[:19]
+        return (
+            raw[:10] + " 15:00:00"
+            if period == "1d"
+            else raw[:19]
+        )
     return ""
 
 
@@ -410,7 +427,6 @@ def _bar_rows(data, period):
                 records = [(0, frame)]
         else:
             continue
-        previous_close = None
         for index_value, series in records:
             to_dict = getattr(series, "to_dict", None)
             record = to_dict() if callable(to_dict) else series if isinstance(series, dict) else {}
@@ -418,9 +434,23 @@ def _bar_rows(data, period):
             if not trade_time:
                 continue
             close = _float(record.get("close"))
-            pre_close = _float(record.get("preClose"), previous_close or 0.0)
-            change = close - pre_close if close > 0 and pre_close > 0 else 0.0
-            change_pct = change / pre_close * 100.0 if pre_close > 0 else 0.0
+            native_pre_close = _float(record.get("preClose"))
+            pre_close = native_pre_close if native_pre_close > 0 else None
+            pre_close_origin = (
+                "NATIVE_QMT"
+                if native_pre_close > 0
+                else "MISSING_NATIVE_QMT"
+            )
+            change = (
+                close - pre_close
+                if close > 0 and pre_close is not None
+                else 0.0
+            )
+            change_pct = (
+                change / pre_close * 100.0
+                if pre_close is not None
+                else 0.0
+            )
             common = {
                 "qmt_code": symbol,
                 "stock_code": symbol.split(".", 1)[0],
@@ -433,6 +463,7 @@ def _bar_rows(data, period):
                 "volume": max(0.0, _float(record.get("volume"))),
                 "amount": max(0.0, _float(record.get("amount"))),
                 "pre_close": pre_close,
+                "pre_close_origin": pre_close_origin,
                 "change": change,
                 "change_pct": change_pct,
             }
@@ -443,8 +474,6 @@ def _bar_rows(data, period):
                 common["price"] = close
                 common["avg_price"] = record.get("avgPrice")
             rows.append(common)
-            if close > 0:
-                previous_close = close
     return rows
 
 
@@ -455,18 +484,22 @@ def _market_rows(C, params, period):
     if params.get("download_history"):
         _download_history(symbols, period, start_time, end_time)
     count = int(params.get("count", -1) or 0) if period == "1m" else -1
+    # A synthetic filled bar is not an exchange observation and must never
+    # enter the daily governance universe.  Minute consumers retain their
+    # historical fill behavior; daily attestation requires actual raw bars.
+    fill_data = period != "1d"
     raw_reader = getattr(C, "get_market_data_ex_ori", None)
     if callable(raw_reader):
         data = raw_reader(
             [], symbols, period=period, start_time=start_time, end_time=end_time,
             count=count, dividend_type=str(params.get("dividend_type") or "none"),
-            fill_data=True, subscribe=False
+            fill_data=fill_data, subscribe=False
         )
     else:
         data = C.get_market_data_ex(
             [], symbols, period=period, start_time=start_time, end_time=end_time,
             count=count, dividend_type=str(params.get("dividend_type") or "none"),
-            fill_data=True, subscribe=False
+            fill_data=fill_data, subscribe=False
         )
     return _bar_rows(data, period)
 

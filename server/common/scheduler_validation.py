@@ -54,6 +54,8 @@ def is_market_closed_skip_output(output: str | None) -> bool:
 def scheduler_output_status(
     task: Mapping[str, Any],
     output: str | None,
+    *,
+    return_code: int | None = None,
 ) -> str | None:
     """Map a task's machine-readable result to scheduler semantics.
 
@@ -63,6 +65,49 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "strategy_governance_daily":
+        nonempty_lines = [
+            line.strip()
+            for line in str(output or "").splitlines()
+            if line.strip()
+        ]
+        if len(nonempty_lines) != 1:
+            return "failed" if return_code == 2 else None
+        try:
+            payload = json.loads(nonempty_lines[0])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "failed" if return_code == 2 else None
+        expected_keys = {
+            "status", "reason", "target_trade_date", "input_trade_date",
+            "automatic_real_order_submission",
+        }
+        if not isinstance(payload, Mapping) or set(payload) != expected_keys:
+            return "failed" if return_code == 2 else None
+        if str(payload.get("status") or "").strip().lower() != "blocked":
+            return "failed" if return_code == 2 else None
+        reason = str(payload.get("reason") or "").strip()
+        target_trade_date = str(payload.get("target_trade_date") or "").strip()
+        input_trade_date = str(payload.get("input_trade_date") or "").strip()
+        dates_valid = True
+        for value in (target_trade_date, input_trade_date):
+            if not value:
+                continue
+            try:
+                dates_valid = (
+                    dates_valid
+                    and date.fromisoformat(value).isoformat() == value
+                )
+            except ValueError:
+                dates_valid = False
+        contract_valid = bool(
+            reason
+            and dates_valid
+            and (target_trade_date or not input_trade_date)
+            and payload.get("automatic_real_order_submission") is False
+        )
+        if return_code != 2:
+            return "failed" if contract_valid else None
+        return "blocked" if contract_valid else "failed"
     if task_type not in {
         "trading_v2_level1_validation",
         "concept_constituent_east",
@@ -326,6 +371,16 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
     ),
     "market_overview_daily": (
         TableRequirement("sm_market_overview_daily", min_rows=1, date_col="trade_date", target="latest_kline_date", freshness_col="updated_at"),
+    ),
+    "strategy_governance_daily": (
+        TableRequirement(
+            "st_strategy_governance_run",
+            min_rows=1,
+            date_col="trade_date",
+            target="latest_kline_date",
+            where_sql="status = 'COMPLETED'",
+            freshness_col="finished_at",
+        ),
     ),
     "stock_snapshot_daily": (
         TableRequirement(

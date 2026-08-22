@@ -153,6 +153,16 @@ jobs:
           tests/test_health_endpoints.py
           tests/test_scheduler_script_policy.py
           tests/test_scheduler_runtime.py
+          tests/test_attest_qmt_daily_kline.py
+          tests/test_bigqmt_strategy_pre_close.py
+          tests/test_run_guojin_qmt_full_market_history_2024.py
+          tests/test_run_strategy_governance_daily.py
+          tests/test_prepare_strategy_governance_qmt_history.py
+          tests/test_strategy_governance.py
+          tests/test_strategy_governance_health.py
+          tests/test_strategy_governance_ui.py
+          tests/test_trading_v3_forward_evidence_version.py
+          tests/test_trading_v3_mysql_acceptance.py
 
       - name: Run Trading V3 Layer 4 release regressions
         run: >-

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
@@ -44,6 +46,14 @@ def _client() -> TestClient:
     @app.post("/api/portfolio/add")
     def portfolio_add():
         return {"status": "ok"}
+
+    @app.get("/api/strategy-center/dashboard")
+    def strategy_center_dashboard():
+        return {"status": "ok"}
+
+    @app.post("/api/strategy-center/metrics/{evidence_id}/review")
+    def strategy_center_review(evidence_id: str):
+        return {"status": "ok", "evidence_id": evidence_id}
 
     return TestClient(app)
 
@@ -109,6 +119,70 @@ def test_admin_auth_accepts_bearer_token(monkeypatch):
         get_settings.cache_clear()
 
     assert response.status_code == 200
+
+
+def _mock_account_session(monkeypatch, *, role: str, active: bool = True) -> None:
+    identity = SimpleNamespace(
+        user=SimpleNamespace(
+            id=17,
+            username="reviewer",
+            role=role,
+            is_active=active,
+        )
+    )
+    monkeypatch.setattr(admin_auth_module, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        admin_auth_module,
+        "resolve_session",
+        lambda engine, token: identity if token == "session-token" else None,
+    )
+
+
+def test_evidence_reviewer_is_limited_to_governance_read_and_exact_review_route(
+    monkeypatch,
+):
+    monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
+    _mock_account_session(monkeypatch, role="EVIDENCE_REVIEWER")
+    get_settings.cache_clear()
+    client = _client()
+    client.cookies.set("probiga_session", "session-token")
+    evidence_id = "a" * 32
+    try:
+        assert client.get("/api/strategy-center/dashboard").status_code == 200
+        assert (
+            client.post(f"/api/strategy-center/metrics/{evidence_id}/review").status_code
+            == 200
+        )
+
+        mutation = client.post("/api/portfolio/add")
+        unrelated_read = client.get("/api/scheduler/tasks")
+        malformed_review = client.post(
+            "/api/strategy-center/metrics/not-an-evidence-id/review"
+        )
+    finally:
+        client.close()
+        get_settings.cache_clear()
+
+    assert mutation.status_code == 403
+    assert mutation.json()["error"] == "account_role_forbidden"
+    assert unrelated_read.status_code == 403
+    assert unrelated_read.json()["error"] == "account_role_forbidden"
+    assert malformed_review.status_code == 403
+    assert malformed_review.json()["error"] == "account_role_forbidden"
+
+
+def test_admin_account_retains_full_protected_access(monkeypatch):
+    monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
+    _mock_account_session(monkeypatch, role="ADMIN")
+    get_settings.cache_clear()
+    client = _client()
+    client.cookies.set("probiga_session", "session-token")
+    try:
+        assert client.get("/api/scheduler/tasks").status_code == 200
+        assert client.post("/api/portfolio/add").status_code == 200
+    finally:
+        client.close()
+        get_settings.cache_clear()
 
 
 def test_admin_auth_can_be_disabled(monkeypatch):

@@ -247,6 +247,10 @@ def test_hold_lock_publishes_ready_file_and_releases_on_signal_file(
     assert json.loads(ready.read_text(encoding="utf-8"))["connection_id"] == 42
 
 
+def test_process_liveness_probe_never_signals_current_process() -> None:
+    assert maintenance_cli._process_is_alive(os.getpid()) is True
+
+
 def test_target_migration_contract_is_exact_and_forward_only() -> None:
     assert [item["version"] for item in maintenance_cli.TARGET_MIGRATIONS] == [
         "20260804_000_shadow_intelligence_runtime",

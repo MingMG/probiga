@@ -28,6 +28,7 @@ from .decision_truth import (
     canonical_target_ledger,
     decision_result_hash,
 )
+from .forward_evidence import primary_strategy_version
 
 
 ACTIVE_ORDER_STATES = (
@@ -1397,6 +1398,10 @@ def materialize_internal_paper_orders(
                 ),
                 "signal_strategy_keys": sorted(target_strategy_keys),
                 "primary_strategy_key": primary_strategy_key,
+                "primary_strategy_version": primary_strategy_version(
+                    run["model_version"],
+                    primary_strategy_key,
+                ),
                 "primary_forecast_id": primary_forecast_id,
                 "supporting_strategy_keys": target_strategy_keys,
                 "sample_owner_role": "PRIMARY",

@@ -13,7 +13,12 @@ import pytest
 
 from server.api import admin_auth
 from server.api.routers import auth as auth_router
-from server.auth.schema import auth_session, auth_user, reset_auth_schema_cache
+from server.auth.schema import (
+    auth_audit,
+    auth_session,
+    auth_user,
+    reset_auth_schema_cache,
+)
 from server.auth.service import registration_window_open
 from server.common.config import get_settings
 
@@ -130,6 +135,87 @@ def test_first_account_registration_login_refresh_and_logout(monkeypatch, tmp_pa
         )
         assert logged_in.status_code == 200
         assert client.get("/api/private").status_code == 200
+    finally:
+        client.close()
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_admin_can_create_independent_reviewer_but_reviewer_cannot_create_users(
+    monkeypatch,
+    tmp_path,
+):
+    client, engine = _build_client(monkeypatch, tmp_path)
+    try:
+        registered = client.post(
+            "/api/auth/register",
+            json={"username": "owner", "password": "correct-horse-2026"},
+        )
+        assert registered.status_code == 201
+
+        created = client.post(
+            "/api/auth/users",
+            json={
+                "username": "reviewer",
+                "password": "independent-review-2026",
+                "role": "EVIDENCE_REVIEWER",
+            },
+        )
+        assert created.status_code == 201
+        assert created.json()["user"] == {
+            "id": 2,
+            "username": "reviewer",
+            "role": "EVIDENCE_REVIEWER",
+            "is_active": True,
+        }
+        assert "password" not in created.text.lower()
+
+        with engine.connect() as conn:
+            users = conn.execute(
+                select(auth_user).order_by(auth_user.c.id)
+            ).mappings().all()
+            audit = conn.execute(
+                select(auth_audit)
+                .where(auth_audit.c.event_type == "USER_CREATED")
+            ).mappings().one()
+        assert [row["role"] for row in users] == [
+            "ADMIN",
+            "EVIDENCE_REVIEWER",
+        ]
+        assert audit["user_id"] == 1
+        assert "created_user_id=2" in audit["detail"]
+
+        assert client.post("/api/auth/logout").status_code == 200
+        reviewer_login = client.post(
+            "/api/auth/login",
+            json={
+                "username": "reviewer",
+                "password": "independent-review-2026",
+            },
+        )
+        assert reviewer_login.status_code == 200
+        denied = client.post(
+            "/api/auth/users",
+            json={
+                "username": "thirduser",
+                "password": "another-independent-2026",
+                "role": "EVIDENCE_REVIEWER",
+            },
+        )
+        assert denied.status_code == 403
+        assert denied.json()["error"] == "account_role_forbidden"
+
+        token_denied = client.post(
+            "/api/auth/users",
+            headers={"X-ProBigA-Admin-Token": "legacy-secret"},
+            json={
+                "username": "tokenuser",
+                "password": "legacy-token-cannot-create-2026",
+                "role": "EVIDENCE_REVIEWER",
+            },
+        )
+        assert token_denied.status_code == 403
+        assert token_denied.json()["error"] == "account_session_required"
     finally:
         client.close()
         engine.dispose()

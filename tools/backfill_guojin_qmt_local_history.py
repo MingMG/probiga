@@ -187,7 +187,13 @@ def main() -> int:
     parser.add_argument("--end-date", default="", help="YYYY-MM-DD or YYYYMMDD.")
     parser.add_argument("--trade-date", default="", help="One trading date for minute mode.")
     parser.add_argument("--batch-size", type=int, default=80)
-    parser.add_argument("--dividend-type", default="front", choices=["none", "front", "back", "qfq", "hfq"])
+    parser.add_argument("--dividend-type", default="none", choices=["none", "front", "back", "qfq", "hfq"])
+    parser.add_argument(
+        "--provider",
+        default="gj_big_qmt_inner",
+        choices=["gj_big_qmt_inner", "gj_qmt"],
+        help="Daily source route; governance requires gj_big_qmt_inner.",
+    )
     parser.add_argument("--gap-dataset", default="", choices=["", "sm_stock_kline.1d", "sm_stock_minute.1m"])
     parser.add_argument("--apply", action="store_true", help="Actually write rows and update sys_data_gap. Default is dry-run.")
     parser.add_argument("--json", action="store_true")
@@ -226,6 +232,7 @@ def main() -> int:
             end_date=args.end_date,
             batch_size=max(1, args.batch_size),
             dividend_type=args.dividend_type,
+            provider=args.provider,
             dry_run=dry_run,
         )
         payload = result_dict(result)
@@ -289,6 +296,7 @@ def main() -> int:
                         end_date=end_date,
                         batch_size=max(1, args.batch_size),
                         dividend_type=args.dividend_type,
+                        provider=args.provider,
                         dry_run=dry_run,
                     )
                 elif dataset == "sm_stock_minute.1m":

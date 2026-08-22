@@ -42,6 +42,7 @@ V3_TABLES = (
     "st_shadow_portfolio_v3",
     "st_opportunity_recall_v3",
     "st_forward_trade_evidence_v3",
+    "st_forward_exit_allocation_v3",
     "st_tca_v3",
     "st_model_registry_v3",
     "st_validation_result_v3",
@@ -429,6 +430,14 @@ class TradingV3Repository:
             "forward_evidence_ownership": (
                 "st_forward_trade_evidence_v3",
                 "ownership_hash",
+            ),
+            "forward_exit_allocation_protocol": (
+                "st_forward_exit_allocation_v3",
+                "allocation_protocol_version",
+            ),
+            "forward_exit_allocation_coverage": (
+                "st_forward_exit_allocation_v3",
+                "allocation_sequence",
             ),
             "counterfactual_evidence_kind": (
                 "st_counterfactual_v3",

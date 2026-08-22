@@ -45,6 +45,9 @@ from server.db.migrations_v2 import (
     run_v2_migrations,
 )
 from server.db.migrations_v3 import (
+    FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+    FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
+    V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
     MIGRATION_PROGRESS_TABLE,
     MIGRATION_TABLE_DDL,
     MIGRATIONS,
@@ -56,6 +59,7 @@ from server.db.migrations_v3 import (
     HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
     _checksum,
     run_v3_migrations,
+    validate_forward_exit_allocation_schema,
 )
 from server.integrations.v3_execution_projection import (
     bind_v3_execution_plan,
@@ -166,6 +170,9 @@ FROZEN_EXPECTED_V3_MIGRATIONS = (
     ("20260804_001_v3_execution_projection_outbox", "5f53bf5258705e410b93db2b5034bbf9683ebe03b17f854625f6854fb55f7e78", 4),
     ("20260817_000_horizon_protocol_v2_governance", "9430f7bf8014d8758339f6754ac51989283c648657b5fdb1db813ab32afce118", 10),
     ("20260817_001_horizon_candidate_ledger_registration", "88cbd1d4bd57fa65164d2d35e07a6344d9a8d8e255d09efb0e79cabfd0d8c522", 9),
+    (FORWARD_STRATEGY_VERSION_MIGRATION_VERSION, "08e0e3d6e6bb9b31227f33780eb54bf3afd38d226f456fa41985137614ce7602", 7),
+    (V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION, "5e7d735be4d24659786e17091b89df06e3dba713c3646fd00ef817a67bc8eedf", 8),
+    (FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION, "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a", 5),
 )
 
 FROZEN_V3_TABLES = frozenset(
@@ -183,6 +190,7 @@ FROZEN_V3_TABLES = frozenset(
         "st_execution_projection_outbox_v2",
         "st_execution_projection_worker_checkpoint_v3",
         "st_forward_trade_evidence_v3",
+        "st_forward_exit_allocation_v3",
         "st_hypothesis_evidence_v3",
         "st_horizon_forecast_contract_v3",
         "st_horizon_model_artifact_v3",
@@ -545,6 +553,7 @@ def _assert_final_schema(engine: Engine) -> tuple[int, int, int, int]:
     with engine.connect() as connection:
         validate_v3_projection_outbox_schema(connection)
         validate_horizon_candidate_ledger_schema(connection)
+        validate_forward_exit_allocation_schema(connection)
         ledger = tuple(
             (
                 str(row["version"]),

@@ -1482,6 +1482,78 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         self.assertEqual(status, "blocked")
 
+    def test_strategy_governance_blocked_output_requires_exact_exit_two_contract(self):
+        from server.common.scheduler_validation import scheduler_output_status
+
+        payload = {
+            "status": "blocked",
+            "reason": "权威交易日数据尚未就绪",
+            "target_trade_date": "2026-08-21",
+            "input_trade_date": "2026-08-20",
+            "automatic_real_order_submission": False,
+        }
+        task = {"task_type": "strategy_governance_daily"}
+        output = json.dumps(payload, ensure_ascii=False)
+        self.assertEqual(
+            scheduler_output_status(task, output, return_code=2),
+            "blocked",
+        )
+        self.assertEqual(
+            scheduler_output_status(task, output, return_code=0),
+            "failed",
+        )
+        self.assertEqual(
+            scheduler_output_status(
+                task, output + "\nunexpected log", return_code=2
+            ),
+            "failed",
+        )
+
+    def test_strategy_governance_blocked_output_rejects_forged_fields(self):
+        from server.common.scheduler_validation import scheduler_output_status
+
+        task = {"task_type": "strategy_governance_daily"}
+        invalid_payloads = [
+            {
+                "status": "blocked",
+                "reason": "",
+                "target_trade_date": "2026-08-21",
+                "input_trade_date": "2026-08-20",
+                "automatic_real_order_submission": False,
+            },
+            {
+                "status": "blocked",
+                "reason": "日历不可用",
+                "target_trade_date": "bad-date",
+                "input_trade_date": "",
+                "automatic_real_order_submission": False,
+            },
+            {
+                "status": "blocked",
+                "reason": "日历不可用",
+                "target_trade_date": "",
+                "input_trade_date": "2026-08-20",
+                "automatic_real_order_submission": False,
+            },
+            {
+                "status": "blocked",
+                "reason": "权威日数据未就绪",
+                "target_trade_date": "2026-08-21",
+                "input_trade_date": "2026-08-20",
+                "automatic_real_order_submission": True,
+            },
+        ]
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.assertEqual(
+                    scheduler_output_status(
+                        task,
+                        json.dumps(payload, ensure_ascii=False),
+                        return_code=2,
+                    ),
+                    "failed",
+                )
+
     def test_scheduler_quality_uses_cache_unless_forced(self):
         reports = [
             {"status": "PASS", "trade_date": "2026-07-01", "checks": []},

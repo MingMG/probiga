@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=41">
+    <link rel="stylesheet" href="/static/css/style.css?v=44">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/js/auth.js?v=2"></script>
 </head>
@@ -54,7 +54,7 @@
   <div class="sidebar-group">
     <div class="sidebar-group-title">研究工具</div>
     <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 选股工作台</button>
-    <button class="sidebar-item" data-tab="strategy-center" onclick="switchTab('strategy-center')">🧭 旧候选中心（研究）</button>
+    <button class="sidebar-item" data-tab="strategy-center" onclick="switchTab('strategy-center')">🏆 动态策略竞技场</button>
   </div>
 
   <div class="sidebar-group">
@@ -246,7 +246,7 @@ var API_BASE = '/api/hot-data';
 var PAGE_TITLES = {
   trading:'◎ 交易策略',
   screen:'🎯 选股工作台',
-  'strategy-center':'🧭 候选中心',
+  'strategy-center':'🏆 动态策略竞技场',
   command:'🧭 智能决策',
   'intraday-battle':'⚡ 盘中作战',
   monitor:'📺 市场监控',
@@ -262,7 +262,7 @@ var PAGE_TITLES = {
   mainforce:'🔍 主力行为分析',
   screen:'🎯 选股策略',
   'jq-picks':'🤖 聚宽策略',
-  'strategy-center':'🧭 策略中心',
+  'strategy-center':'🏆 动态策略竞技场',
   recommended:'💎 AI推荐买入',
   hunter:'🏹 狩猎场',
   portfolio:'📈 自选股',
@@ -275,6 +275,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 旧模拟交易（归档）'
 };
 </script>
-    <script src="/static/js/app.js?v=99"></script>
+    <script src="/static/js/app.js?v=104"></script>
 </body>
 </html>

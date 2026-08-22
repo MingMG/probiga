@@ -24,7 +24,10 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.common.kline_data import get_kline_engine
-from server.common.sql_reader import read_sql_rows
+from server.common.sql_reader import (
+    current_bound_sql_connection,
+    read_sql_rows,
+)
 from server.common.versioned_strategy_config import (
     legacy_strategy_merge_map,
     load_market_state_config,
@@ -710,6 +713,10 @@ def _db_read(sql: str, params: dict[str, Any] | None = None) -> list[dict[str, A
 
 
 def _db_write(sql: str, params: dict[str, Any] | None = None) -> None:
+    bound_connection = current_bound_sql_connection()
+    if bound_connection is not None:
+        bound_connection.execute(text(sql), params or {})
+        return
     engine = get_engine()
     with engine.begin() as connection:
         connection.execute(text(sql), params or {})
@@ -1494,19 +1501,22 @@ def _fuse_event_and_tape_risk(
     return snapshot
 
 
-def load_market_snapshot(trade_date: str) -> dict[str, Any]:
+def load_market_snapshot(
+    trade_date: str, *, use_cache: bool = True,
+) -> dict[str, Any]:
     """Combine current adapters with frozen, reproducible K-line fallbacks."""
     cache_ttl = 120 if trade_date == date.today().isoformat() else 600
     now_monotonic = time.monotonic()
-    with _MARKET_SNAPSHOT_CACHE_LOCK:
-        cached = _MARKET_SNAPSHOT_CACHE.get(trade_date)
-        if cached and now_monotonic - cached[0] < cache_ttl:
-            _MARKET_SNAPSHOT_CACHE.move_to_end(trade_date)
-            result = copy.deepcopy(cached[1])
-            result["cache_status"] = "hit"
-            return result
-        if cached:
-            _MARKET_SNAPSHOT_CACHE.pop(trade_date, None)
+    if use_cache:
+        with _MARKET_SNAPSHOT_CACHE_LOCK:
+            cached = _MARKET_SNAPSHOT_CACHE.get(trade_date)
+            if cached and now_monotonic - cached[0] < cache_ttl:
+                _MARKET_SNAPSHOT_CACHE.move_to_end(trade_date)
+                result = copy.deepcopy(cached[1])
+                result["cache_status"] = "hit"
+                return result
+            if cached:
+                _MARKET_SNAPSHOT_CACHE.pop(trade_date, None)
     snapshot: dict[str, Any] = {
         "trade_date": trade_date,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1604,11 +1614,14 @@ def load_market_snapshot(trade_date: str) -> dict[str, Any]:
     snapshot["market_state"] = state["key"]
     snapshot["state"] = state
     snapshot["cache_status"] = "fresh_compute"
-    with _MARKET_SNAPSHOT_CACHE_LOCK:
-        _MARKET_SNAPSHOT_CACHE[trade_date] = (time.monotonic(), copy.deepcopy(snapshot))
-        _MARKET_SNAPSHOT_CACHE.move_to_end(trade_date)
-        while len(_MARKET_SNAPSHOT_CACHE) > 32:
-            _MARKET_SNAPSHOT_CACHE.popitem(last=False)
+    if use_cache:
+        with _MARKET_SNAPSHOT_CACHE_LOCK:
+            _MARKET_SNAPSHOT_CACHE[trade_date] = (
+                time.monotonic(), copy.deepcopy(snapshot),
+            )
+            _MARKET_SNAPSHOT_CACHE.move_to_end(trade_date)
+            while len(_MARKET_SNAPSHOT_CACHE) > 32:
+                _MARKET_SNAPSHOT_CACHE.popitem(last=False)
     return snapshot
 
 
@@ -2101,12 +2114,14 @@ def load_persisted_strategy_center_compact(
     }
 
 
-def build_strategy_center_snapshot(trade_date: str = "", limit: int = 200) -> dict[str, Any]:
+def build_strategy_center_snapshot(
+    trade_date: str = "", limit: int = 200, *, fresh_market: bool = False,
+) -> dict[str, Any]:
     target = latest_recommendation_date(trade_date)
     if not target:
         target = normalize_trade_date(trade_date) or date.today().isoformat()
     reference_pool = load_reference_candidate_pool(target)
-    market = load_market_snapshot(target)
+    market = load_market_snapshot(target, use_cache=not fresh_market)
     configs = load_strategy_configs()
     metrics = load_strategy_metrics(target)
     rows = load_recommendation_rows(target, limit)
@@ -2180,8 +2195,11 @@ def build_strategy_center_snapshot(trade_date: str = "", limit: int = 200) -> di
     }
 
 
-def persist_strategy_center_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    ensure_strategy_center_tables()
+def persist_strategy_center_snapshot(
+    snapshot: dict[str, Any], *, ensure_tables: bool = True,
+) -> dict[str, Any]:
+    if ensure_tables:
+        ensure_strategy_center_tables()
     run_uid = uuid.uuid4().hex
     state = snapshot.get("market_state") or {}
     candidates = snapshot.get("candidates") or []

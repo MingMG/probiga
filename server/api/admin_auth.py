@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from urllib.parse import urlsplit
 
@@ -16,6 +17,14 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 ADMIN_TOKEN_HEADER = "X-ProBigA-Admin-Token"
 ADMIN_BEARER_SCHEME = "Bearer"
 SESSION_COOKIE = "probiga_session"
+
+ADMIN_ACCOUNT_ROLE = "ADMIN"
+EVIDENCE_REVIEWER_ROLE = "EVIDENCE_REVIEWER"
+REVIEWER_READ_PREFIXES = ("/api/strategy-center",)
+REVIEWER_PAGE_PATHS = {"/"}
+REVIEWER_REVIEW_PATH = re.compile(
+    r"^/api/strategy-center/metrics/[0-9a-f]{32}/review$"
+)
 
 PUBLIC_API_PREFIXES = (
     "/api/auth",
@@ -59,6 +68,8 @@ def _prefix_match(path: str, prefix: str) -> bool:
 
 def is_admin_protected_path(path: str, method: str) -> bool:
     normalized_path = path or "/"
+    if _prefix_match(normalized_path, "/api/auth/users"):
+        return True
     if any(_prefix_match(normalized_path, prefix) for prefix in PUBLIC_API_PREFIXES):
         return False
     if normalized_path in PUBLIC_PATHS:
@@ -200,6 +211,21 @@ def _origin_allowed(request: Request) -> bool:
         return False
 
 
+def _reviewer_request_allowed(path: str, method: str) -> bool:
+    """Limit independent reviewers to governance evidence inspection/review."""
+
+    normalized_path = path or "/"
+    normalized_method = method.upper()
+    if normalized_method in SAFE_METHODS:
+        return normalized_path in REVIEWER_PAGE_PATHS or any(
+            _prefix_match(normalized_path, prefix)
+            for prefix in REVIEWER_READ_PREFIXES
+        )
+    return normalized_method == "POST" and bool(
+        REVIEWER_REVIEW_PATH.fullmatch(normalized_path)
+    )
+
+
 def validate_admin_request(request: Request) -> Response | None:
     if not is_admin_protected_path(request.url.path, request.method):
         return None
@@ -245,8 +271,25 @@ def validate_admin_request(request: Request) -> Response | None:
                     "cross_site_request_blocked",
                     "已拒绝跨站操作请求。",
                 )
+            user = identity.user
+            role = str(getattr(user, "role", "") or "").strip().upper()
+            if getattr(user, "is_active", False) is not True:
+                return _admin_auth_response(
+                    403,
+                    "account_inactive",
+                    "当前账户已停用。",
+                )
+            if role != ADMIN_ACCOUNT_ROLE and not (
+                role == EVIDENCE_REVIEWER_ROLE
+                and _reviewer_request_allowed(request.url.path, request.method)
+            ):
+                return _admin_auth_response(
+                    403,
+                    "account_role_forbidden",
+                    "当前账户角色无权访问此接口。",
+                )
             request.state.auth_kind = "account_session"
-            request.state.auth_user = identity.user
+            request.state.auth_user = user
             request.state.auth_session = identity
             return None
 

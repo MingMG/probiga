@@ -81,6 +81,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "trading_v2_reconciliation",
         "trading_v2_level1_validation",
         "trading_v2_strategy_health",
+        "strategy_governance_daily",
         "stock_kline",
         "trading_v3_close_decision",
         "trading_v3_premarket_review",
@@ -104,6 +105,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v2_reconciliation": 4 * 60 * 60,
     "trading_v2_level1_validation": 4 * 60 * 60,
     "trading_v2_strategy_health": 4 * 60 * 60,
+    "strategy_governance_daily": 6 * 60 * 60,
     "stock_kline": 8 * 60 * 60,
     "trading_v3_close_decision": 8 * 60 * 60,
     "trading_v3_premarket_review": 3 * 60 * 60,
@@ -167,6 +169,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "stock_minute",
     "stock_minute_flow",
     "stock_snapshot_daily",
+    "strategy_governance_daily",
     "trading_v2_intraday_activation",
     "trading_v2_level1_validation",
     "trading_v2_paper_tick",
@@ -1389,7 +1392,9 @@ def _run_task_impl(
         # Preserve the Level-1 validator's explicit BLOCK state even though
         # its CLI exits non-zero.  BLOCK is not an execution failure and must
         # not be retried every fifteen minutes.
-        status = scheduler_output_status(row, machine_output) or status
+        status = scheduler_output_status(
+            row, machine_output, return_code=proc.returncode
+        ) or status
         if status == "success" and not is_market_closed_skip_output(output):
             validation = validate_scheduler_task_result(row, engine=engine, started_at=start_t)
             if validation.checked:

@@ -25,6 +25,7 @@ PASSWORD_SCHEME = "pbkdf2_sha256"
 PASSWORD_ITERATIONS = 600_000
 SESSION_TOKEN_BYTES = 32
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_.\-\u4e00-\u9fff]+$")
+MANAGED_USER_ROLES = frozenset({"ADMIN", "EVIDENCE_REVIEWER"})
 
 
 class AuthError(RuntimeError):
@@ -329,6 +330,95 @@ def register_first_admin(
             return issued
     except IntegrityError as exc:
         raise AuthError("registration_conflict", "账号初始化发生并发冲突，请刷新页面后重试。", status_code=409) from exc
+
+
+def create_managed_user(
+    engine: Engine,
+    *,
+    actor: AuthUser,
+    username: str,
+    password: str,
+    role: str = "EVIDENCE_REVIEWER",
+    client_ip: str = "",
+) -> AuthUser:
+    """Create a second named account through an authenticated admin action."""
+
+    ensure_auth_schema(engine)
+    display, normalized = normalize_username(username)
+    secret = validate_password(password, username=display)
+    normalized_role = str(role or "").strip().upper()
+    if normalized_role not in MANAGED_USER_ROLES:
+        raise AuthError(
+            "invalid_managed_role",
+            "账号角色只能是管理员或证据复核员。",
+            status_code=422,
+        )
+    password_hash = hash_password(secret)
+    now = utcnow()
+    try:
+        with engine.begin() as conn:
+            actor_row = conn.execute(
+                select(
+                    auth_user.c.id,
+                    auth_user.c.username,
+                    auth_user.c.role,
+                    auth_user.c.is_active,
+                )
+                .where(auth_user.c.id == int(actor.id))
+                .with_for_update()
+            ).mappings().first()
+            if not actor_row or not bool(actor_row["is_active"]):
+                raise AuthError(
+                    "managed_user_actor_invalid",
+                    "当前账号已失效，不能创建复核账号。",
+                    status_code=403,
+                )
+            if str(actor_row["role"] or "").upper() != "ADMIN":
+                raise AuthError(
+                    "admin_role_required",
+                    "只有管理员可以创建独立复核账号。",
+                    status_code=403,
+                )
+            result = conn.execute(
+                insert(auth_user).values(
+                    username=display,
+                    username_norm=normalized,
+                    password_hash=password_hash,
+                    role=normalized_role,
+                    is_active=True,
+                    failed_login_count=0,
+                    locked_until=None,
+                    password_changed_at=now,
+                    last_login_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            user_id = int(result.inserted_primary_key[0])
+            _audit(
+                conn,
+                event_type="USER_CREATED",
+                success=True,
+                username=str(actor_row["username"]),
+                user_id=int(actor_row["id"]),
+                client_ip=client_ip,
+                detail=(
+                    f"created_user_id={user_id};"
+                    f"created_username={display};role={normalized_role}"
+                ),
+            )
+        return AuthUser(
+            id=user_id,
+            username=display,
+            role=normalized_role,
+            is_active=True,
+        )
+    except IntegrityError as exc:
+        raise AuthError(
+            "managed_user_conflict",
+            "该账号已存在，请使用其他账号名。",
+            status_code=409,
+        ) from exc
 
 
 def authenticate(

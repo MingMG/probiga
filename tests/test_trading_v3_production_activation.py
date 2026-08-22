@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 import types
@@ -7,6 +8,55 @@ from pathlib import Path
 
 from tools import trading_v3_fourth_layer_readiness as readiness
 from tools import verify_trading_v3_production as production_verifier
+
+
+def test_production_verifier_requires_normalized_exit_allocation_conservation():
+    sql = production_verifier._FORWARD_EXIT_ALLOCATION_HEALTH_SQL
+    assert "st_forward_exit_allocation_v3" in sql
+    assert "PAPER_FIFO_EXIT_ALLOCATION_V1" in sql
+    assert "invalid_allocation_row_count" in sql
+    assert "invalid_non_tail_rounding_count" in sql
+    assert "invalid_sell_coverage_count" in sql
+    assert "coverage.allocated_quantity <> raw_sell.quantity" in sql
+    assert "coverage.allocated_gross_cny <>" in sql
+    assert "coverage.allocated_fee_cny <>" in sql
+    assert "allocation.attribution_status = 'UNATTRIBUTED'" in sql
+
+    clean = {
+        "allocation_row_count": 2,
+        "paper_sell_fill_count": 1,
+        "invalid_allocation_row_count": 0,
+        "invalid_non_tail_rounding_count": 0,
+        "invalid_sell_coverage_count": 0,
+    }
+    assert production_verifier._forward_exit_allocation_health_valid(clean)
+    for field in (
+        "invalid_allocation_row_count",
+        "invalid_non_tail_rounding_count",
+        "invalid_sell_coverage_count",
+    ):
+        assert not production_verifier._forward_exit_allocation_health_valid({
+            **clean,
+            field: 1,
+        })
+    assert not production_verifier._forward_exit_allocation_health_valid({
+        "query_error": "missing allocation ledger",
+    })
+    assert not production_verifier._forward_exit_allocation_health_valid({})
+    assert not production_verifier._forward_exit_allocation_health_valid({
+        **clean,
+        "allocation_row_count": -1,
+    })
+
+
+def test_production_verifier_accepts_only_declared_forward_owner_states():
+    source = inspect.getsource(production_verifier.main)
+    assert """e.attribution_status NOT IN (
+                           'VERIFIED_SNAPSHOT',
+                           'LEGACY_VERSION_DERIVED',
+                           'LEGACY_SINGLE_STRATEGY_RESOLVED'
+                        )""" in source
+    assert "forward_exit_allocation_ledger_conserved" in source
 
 
 def test_workstation_verifier_executes_only_the_active_release_command(

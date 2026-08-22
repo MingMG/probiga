@@ -99,6 +99,171 @@ def _query_ok(value: Any) -> bool:
     return True
 
 
+_FORWARD_EXIT_ALLOCATION_HEALTH_SQL = """
+SELECT
+    (SELECT COUNT(*)
+     FROM st_forward_exit_allocation_v3)
+        AS allocation_row_count,
+    (SELECT COUNT(*)
+     FROM st_fill_v2 raw_sell
+     WHERE raw_sell.account_id = 'paper-main-v2'
+       AND raw_sell.side = 'SELL')
+        AS paper_sell_fill_count,
+    (SELECT COUNT(*)
+     FROM st_forward_exit_allocation_v3 allocation
+     LEFT JOIN st_fill_v2 raw_sell
+       ON raw_sell.fill_id = allocation.exit_fill_id
+     LEFT JOIN st_fill_v2 raw_entry
+       ON raw_entry.fill_id = allocation.entry_fill_id
+     LEFT JOIN st_forward_trade_evidence_v3 parent
+       ON parent.evidence_id = allocation.evidence_id
+     WHERE allocation.allocation_protocol_version <>
+               'PAPER_FIFO_EXIT_ALLOCATION_V1'
+        OR BINARY allocation.allocation_id <> BINARY SHA2(CONCAT(
+               allocation.exit_fill_id, '|',
+               allocation.allocation_sequence, '|',
+               allocation.entry_fill_id, '|',
+               'PAPER_FIFO_EXIT_ALLOCATION_V1'
+           ), 256)
+        OR allocation.allocation_sequence < 0
+        OR allocation.allocated_quantity <= 0
+        OR allocation.allocated_gross_cny < 0
+        OR allocation.allocated_fee_cny < 0
+        OR raw_sell.fill_id IS NULL
+        OR raw_sell.side <> 'SELL'
+        OR raw_sell.account_id <> allocation.account_id
+        OR raw_sell.stock_code <> allocation.stock_code
+        OR raw_sell.order_id <> allocation.exit_order_id
+        OR raw_sell.filled_at <> allocation.exit_filled_at
+        OR raw_sell.quantity <= 0
+        OR allocation.allocated_quantity > raw_sell.quantity
+        OR raw_entry.fill_id IS NULL
+        OR raw_entry.side <> 'BUY'
+        OR raw_entry.account_id <> allocation.account_id
+        OR raw_entry.stock_code <> allocation.stock_code
+        OR raw_entry.filled_at > allocation.exit_filled_at
+        OR NOT (
+             (
+                 allocation.attribution_status = 'ATTRIBUTED'
+                 AND allocation.evidence_id IS NOT NULL
+                 AND parent.evidence_id IS NOT NULL
+                 AND parent.account_id = allocation.account_id
+                 AND parent.stock_code = allocation.stock_code
+                 AND parent.entry_fill_id = allocation.entry_fill_id
+                 AND parent.closed_quantity > 0
+                 AND parent.evidence_status IN (
+                     'PARTIALLY_CLOSED', 'MATURED'
+                 )
+                 AND parent.exit_at IS NOT NULL
+                 AND allocation.exit_filled_at <= parent.exit_at
+                 AND JSON_CONTAINS(
+                     IF(
+                         JSON_VALID(parent.exit_fill_ids_json),
+                         parent.exit_fill_ids_json,
+                         JSON_ARRAY()
+                     ),
+                     JSON_QUOTE(allocation.exit_fill_id)
+                 ) = 1
+                 AND JSON_CONTAINS(
+                     IF(
+                         JSON_VALID(parent.exit_order_ids_json),
+                         parent.exit_order_ids_json,
+                         JSON_ARRAY()
+                     ),
+                     JSON_QUOTE(allocation.exit_order_id)
+                 ) = 1
+             )
+             OR (
+                 allocation.attribution_status = 'UNATTRIBUTED'
+                 AND allocation.evidence_id IS NULL
+             )
+        )) AS invalid_allocation_row_count,
+    (SELECT COUNT(*)
+     FROM st_forward_exit_allocation_v3 allocation
+     JOIN (
+         SELECT exit_fill_id, MAX(allocation_sequence) AS maximum_sequence
+         FROM st_forward_exit_allocation_v3
+         GROUP BY exit_fill_id
+     ) sequence_tail
+       ON sequence_tail.exit_fill_id = allocation.exit_fill_id
+     JOIN st_fill_v2 raw_sell
+       ON raw_sell.fill_id = allocation.exit_fill_id
+      AND raw_sell.side = 'SELL'
+     WHERE allocation.allocation_sequence < sequence_tail.maximum_sequence
+       AND (
+           allocation.allocated_gross_cny <> ROUND(
+               raw_sell.gross_amount * allocation.allocated_quantity /
+               raw_sell.quantity,
+               6
+           )
+           OR allocation.allocated_fee_cny <> ROUND(
+               raw_sell.fee_amount * allocation.allocated_quantity /
+               raw_sell.quantity,
+               6
+           )
+       )) AS invalid_non_tail_rounding_count,
+    (SELECT COUNT(*)
+     FROM st_fill_v2 raw_sell
+     LEFT JOIN (
+         SELECT exit_fill_id,
+                COUNT(*) AS allocation_row_count,
+                COUNT(DISTINCT allocation_sequence)
+                    AS distinct_sequence_count,
+                MIN(allocation_sequence) AS minimum_sequence,
+                MAX(allocation_sequence) AS maximum_sequence,
+                SUM(allocated_quantity) AS allocated_quantity,
+                SUM(allocated_gross_cny) AS allocated_gross_cny,
+                SUM(allocated_fee_cny) AS allocated_fee_cny
+         FROM st_forward_exit_allocation_v3
+         GROUP BY exit_fill_id
+     ) coverage
+       ON coverage.exit_fill_id = raw_sell.fill_id
+     WHERE raw_sell.side = 'SELL'
+       AND (
+           raw_sell.account_id = 'paper-main-v2'
+           OR coverage.exit_fill_id IS NOT NULL
+       )
+       AND (
+           coverage.exit_fill_id IS NULL
+           OR coverage.allocation_row_count <= 0
+           OR coverage.distinct_sequence_count <>
+               coverage.allocation_row_count
+           OR coverage.minimum_sequence <> 0
+           OR coverage.maximum_sequence <>
+               coverage.allocation_row_count - 1
+           OR coverage.allocated_quantity <> raw_sell.quantity
+           OR coverage.allocated_gross_cny <>
+               CAST(raw_sell.gross_amount AS DECIMAL(20,6))
+           OR coverage.allocated_fee_cny <>
+               CAST(raw_sell.fee_amount AS DECIMAL(20,6))
+       )) AS invalid_sell_coverage_count
+"""
+
+
+def _forward_exit_allocation_health_valid(summary: Any) -> bool:
+    if not isinstance(summary, dict) or not _query_ok(summary):
+        return False
+    count_fields = (
+        "allocation_row_count",
+        "paper_sell_fill_count",
+        "invalid_allocation_row_count",
+        "invalid_non_tail_rounding_count",
+        "invalid_sell_coverage_count",
+    )
+    if not set(count_fields).issubset(summary):
+        return False
+    try:
+        counts = {field: int(summary[field]) for field in count_fields}
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(value >= 0 for value in counts.values())
+        and counts["invalid_allocation_row_count"] == 0
+        and counts["invalid_non_tail_rounding_count"] == 0
+        and counts["invalid_sell_coverage_count"] == 0
+    )
+
+
 _EXPECTED_REAL_TRADING_GUARDS = {
     "trg_trade_account_v2_real_disabled_bi": (
         "BEFORE", "INSERT", "st_trade_account_v2", "real_trading_enabled"
@@ -582,6 +747,10 @@ def main() -> int:
                 LIMIT 30
                 """,
             ),
+            "forward_exit_allocation": _safe_one(
+                primary,
+                _FORWARD_EXIT_ALLOCATION_HEALTH_SQL,
+            ),
             "portfolio_and_execution": _safe_one(
                 primary,
                 """
@@ -619,6 +788,7 @@ def main() -> int:
                         OR e.sample_owner_role <> 'PRIMARY'
                         OR e.attribution_status NOT IN (
                            'VERIFIED_SNAPSHOT',
+                           'LEGACY_VERSION_DERIVED',
                            'LEGACY_SINGLE_STRATEGY_RESOLVED'
                         )
                         OR CHAR_LENGTH(e.ownership_hash) <> 64
@@ -1024,6 +1194,7 @@ def main() -> int:
         account = evidence["account"]
         guards = evidence["real_trading_database_guards"]
         portfolio = evidence["portfolio_and_execution"]
+        forward_exit_allocation = evidence["forward_exit_allocation"]
         validation = evidence["latest_validation"] or {}
         active_models = evidence["active_models"]
         decision_runs = evidence["canonical_decision_runs"]
@@ -1086,6 +1257,11 @@ def main() -> int:
         )
         account_query_ok = bool(account) and _query_ok(account)
         portfolio_query_ok = bool(portfolio) and _query_ok(portfolio)
+        forward_exit_allocation_ok = (
+            _forward_exit_allocation_health_valid(
+                forward_exit_allocation
+            )
+        )
         legacy_task_types = {
             "trading_v2_premarket_decision",
             "trading_v2_intraday_activation",
@@ -1230,8 +1406,12 @@ def main() -> int:
             "execution_plan_state_consistent": int(
                 portfolio.get("stale_execution_plan_state_count") or 0
             ) == 0 and portfolio_query_ok,
+            "forward_exit_allocation_ledger_conserved": (
+                forward_exit_allocation_ok
+            ),
             "forward_learning_uses_executed_fills_only": (
                 portfolio_query_ok
+                and forward_exit_allocation_ok
                 and int(
                     portfolio.get("invalid_forward_evidence_count") or 0
                 ) == 0

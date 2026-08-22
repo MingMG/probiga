@@ -143,6 +143,7 @@ class QmtBackend:
             "change_pct",
             "turnover_ratio",
             "pre_close",
+            "pre_close_origin",
         ]
         return df.reindex(columns=cols)
 
@@ -167,11 +168,26 @@ class QmtBackend:
             df = frame.copy()
             df.index = pd.to_datetime(df.index, errors="coerce")
             df = df[df.index.notna()].sort_index()
-            prev_close = pd.to_numeric(df.get("close"), errors="coerce").shift(1)
+            # ``preClose`` is the exchange/QMT reference price and may differ
+            # materially from the preceding raw close on an ex-right day.
+            # Never synthesize it with shift(close): doing so hides corporate
+            # actions from downstream unadjusted-ledger validation.
+            prev_close = (
+                pd.to_numeric(df["preClose"], errors="coerce")
+                if "preClose" in df.columns
+                else pd.Series(index=df.index, dtype="float64")
+            )
             close = pd.to_numeric(df.get("close"), errors="coerce")
             change = close - prev_close
             change_pct = change / prev_close.replace({0: pd.NA}) * 100
             df["_pre_close"] = prev_close
+            df["_pre_close_origin"] = prev_close.map(
+                lambda value: (
+                    "NATIVE_QMT"
+                    if pd.notna(value) and float(value) > 0
+                    else "MISSING_NATIVE_QMT"
+                )
+            )
             df["_change"] = change
             df["_change_pct"] = change_pct
             if start_ts is not None:
@@ -203,6 +219,9 @@ class QmtBackend:
                         "change_pct": row.get("_change_pct"),
                         "turnover_ratio": row.get("turnover"),
                         "pre_close": row.get("_pre_close"),
+                        "pre_close_origin": row.get(
+                            "_pre_close_origin"
+                        ),
                     }
                 )
         return pd.DataFrame(rows)

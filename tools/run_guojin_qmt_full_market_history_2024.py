@@ -26,6 +26,9 @@ from integrations.qmt.local_history import (
     load_trade_dates,
 )
 from server.common.config import get_mysql_url
+from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
+
+PRODUCTION_KLINE_TABLE = "sm_stock_kline"
 
 
 def _source_engine():
@@ -87,11 +90,69 @@ def _latest_trade_date(source_engine) -> str:
 
 
 def _local_count(local_engine, *, table: str, trade_date: str) -> int:
+    native_raw_filter = (
+        " AND adjust_type=0 AND pre_close_origin='NATIVE_QMT'"
+        f" AND provider='{BIGQMT_PROVIDER_ID}'"
+        if table == LOCAL_KLINE_TABLE
+        else ""
+    )
     with local_engine.begin() as conn:
         return int(
-            conn.execute(text(f"SELECT COUNT(*) FROM `{table}` WHERE trade_date = :d"), {"d": trade_date}).scalar()
+            conn.execute(
+                text(
+                    f"SELECT COUNT(*) FROM `{table}` WHERE trade_date = :d"
+                    f"{native_raw_filter}"
+                ),
+                {"d": trade_date},
+            ).scalar()
             or 0
         )
+
+
+def _daily_stock_set(
+    engine,
+    *,
+    table: str,
+    trade_date: str,
+    require_native_qmt: bool,
+) -> set[str]:
+    native_raw_filter = (
+        " AND adjust_type=0 AND pre_close_origin='NATIVE_QMT'"
+        f" AND provider='{BIGQMT_PROVIDER_ID}'"
+        if require_native_qmt
+        else " AND adjust_type=0"
+    )
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT DISTINCT stock_code FROM `{table}` "
+                "WHERE trade_date = :d AND k_type=1 "
+                "AND stock_code REGEXP '^(0|3|6)'"
+                f"{native_raw_filter}"
+            ),
+            {"d": trade_date},
+        )
+        return {
+            str(row[0]).strip()
+            for row in rows
+            if row[0] is not None and str(row[0]).strip()
+        }
+
+
+def _daily_coverage_error(
+    *,
+    trade_date: str,
+    expected: set[str],
+    actual: set[str],
+) -> RuntimeError:
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    return RuntimeError(
+        "QMT daily coverage mismatch after backfill: "
+        f"trade_date={trade_date}, expected={len(expected)}, actual={len(actual)}, "
+        f"missing={len(missing)} sample={missing[:20]}, "
+        f"unexpected={len(unexpected)} sample={unexpected[:20]}"
+    )
 
 
 def _log(path: Path, payload: dict[str, Any]) -> None:
@@ -161,10 +222,36 @@ def run_full_history(
             _log(log_path, {"event": "stop_window_reached", "trade_date": trade_date})
             break
         if "daily" in modes:
-            expected_daily = max(1, int(stock_count * 0.80))
-            current_daily = _local_count(local_engine, table=LOCAL_KLINE_TABLE, trade_date=trade_date)
-            if resume and current_daily >= expected_daily:
-                _log(log_path, {"event": "skip_daily", "trade_date": trade_date, "rows": current_daily})
+            expected_daily_codes = _daily_stock_set(
+                source_engine,
+                table=PRODUCTION_KLINE_TABLE,
+                trade_date=trade_date,
+                require_native_qmt=False,
+            )
+            if not expected_daily_codes:
+                error = RuntimeError(
+                    "production daily target set is empty: "
+                    f"trade_date={trade_date}, table={PRODUCTION_KLINE_TABLE}"
+                )
+                _log(log_path, {"event": "daily_error", "trade_date": trade_date, "error": str(error)})
+                raise error
+            current_daily_codes = _daily_stock_set(
+                local_engine,
+                table=LOCAL_KLINE_TABLE,
+                trade_date=trade_date,
+                require_native_qmt=True,
+            )
+            if resume and current_daily_codes == expected_daily_codes:
+                _log(
+                    log_path,
+                    {
+                        "event": "skip_daily",
+                        "trade_date": trade_date,
+                        "rows": len(current_daily_codes),
+                        "expected_rows": len(expected_daily_codes),
+                        "coverage": "exact_stock_set",
+                    },
+                )
             else:
                 try:
                     result = backfill_daily_kline_local(
@@ -176,6 +263,28 @@ def run_full_history(
                         batch_size=daily_batch_size,
                         dry_run=False,
                     )
+                except Exception as exc:
+                    errors += 1
+                    _log(log_path, {"event": "daily_error", "trade_date": trade_date, "error": str(exc)})
+                else:
+                    verified_daily_codes = _daily_stock_set(
+                        local_engine,
+                        table=LOCAL_KLINE_TABLE,
+                        trade_date=trade_date,
+                        require_native_qmt=True,
+                    )
+                    if verified_daily_codes != expected_daily_codes:
+                        errors += 1
+                        error = _daily_coverage_error(
+                            trade_date=trade_date,
+                            expected=expected_daily_codes,
+                            actual=verified_daily_codes,
+                        )
+                        _log(
+                            log_path,
+                            {"event": "daily_error", "trade_date": trade_date, "error": str(error)},
+                        )
+                        raise error
                     daily_done += 1
                     _log(
                         log_path,
@@ -185,11 +294,11 @@ def run_full_history(
                             "fetched_rows": result.fetched_rows,
                             "written_rows": result.written_rows,
                             "batch_count": result.batch_count,
+                            "expected_rows": len(expected_daily_codes),
+                            "verified_rows": len(verified_daily_codes),
+                            "coverage": "exact_stock_set",
                         },
                     )
-                except Exception as exc:
-                    errors += 1
-                    _log(log_path, {"event": "daily_error", "trade_date": trade_date, "error": str(exc)})
         if _stop_time_reached(stop_at):
             stopped_by_window = True
             _log(log_path, {"event": "stop_window_reached", "trade_date": trade_date, "after": "daily"})
