@@ -4,12 +4,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _javascript_block(script: str, start: str, end: str) -> str:
+    return script.split(start, 1)[1].split(end, 1)[0]
+
+
 def test_strategy_governance_has_a_dedicated_navigation_page():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     assert "🏆 动态策略竞技场" in index
     assert "旧候选中心（研究）" not in index
     assert "style.css?v=44" in index
-    assert "app.js?v=104" in index
+    assert "app.js?v=105" in index
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():
@@ -45,6 +49,122 @@ def test_strategy_governance_page_exposes_both_arenas_and_three_pools():
     assert "行业侧重：" in script
     assert "正期望、盈亏比和利润因子只说明已确认的历史前向证据" in script
     assert "不代表未来一定盈利" in script
+
+
+def test_default_visible_pool_never_falls_back_to_overview_candidates():
+    """Overview stock A may exist, but the normative pool reads canonical only."""
+
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    render = _javascript_block(
+        script,
+        "    function renderStrategyCenter(container, data, governance, history) {",
+        "    window._renderStrategyCenterCandidates = function",
+    )
+    pool_renderer = _javascript_block(
+        script,
+        "    window._strategyPoolShow = function (level, button) {",
+        "\n    };\n\n    window._strategyRegistrationToggle",
+    )
+
+    canonical_position = render.index("strategyGovernanceHtml(governance, history)")
+    diagnostic_position = render.index(
+        '<details id="scResearchInputDiagnostics" class="sc-research-diagnostics">'
+    )
+    assert canonical_position < diagnostic_position
+    assert "研究输入诊断（非规范结果，默认收起）" in render
+    assert '<details id="scResearchInputDiagnostics" class="sc-research-diagnostics" open>' not in render
+    assert "不参与默认排名、规范票池或资金分配展示" in render
+    assert "未治理研究输入明细（非规范）" in render
+    assert "<span>候选股票池</span>" not in render
+    assert "<span>策略状态</span>" not in render
+
+    # Executable negative contract: even if overview candidates contain stock A,
+    # the normative renderer has no path to overview/data and selects only the
+    # canonical governance pool.
+    overview = {"candidates": [{"stock_code": "A"}]}
+    canonical = {"pools": {"observation": []}}
+    assert overview["candidates"][0]["stock_code"] == "A"
+    assert canonical["pools"]["observation"] == []
+    assert "window._strategyCenterData" not in pool_renderer
+    assert "var governance = window._strategyCenterGovernance || {};" in pool_renderer
+    assert "var selectedPool = (governance.pools || {})[level];" in pool_renderer
+
+
+def test_canonical_pool_renders_all_101_rows_without_silent_cap():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    pool_renderer = _javascript_block(
+        script,
+        "    window._strategyPoolShow = function (level, button) {",
+        "\n    };\n\n    window._strategyRegistrationToggle",
+    )
+    canonical_rows = [
+        {"stock_code": str(index).zfill(6)} for index in range(101)
+    ]
+
+    assert len(canonical_rows) == 101
+    assert "slice(0, 100)" not in pool_renderer
+    assert "slice(0,100)" not in pool_renderer
+    assert "var rows = Array.isArray(selectedPool) ? selectedPool : [];" in pool_renderer
+    assert "rows.forEach(function (row)" in pool_renderer
+    assert "规范票池完整展示 ' + rows.length + ' 条" in pool_renderer
+
+
+def test_strategy_governance_page_exposes_execution_and_profit_contracts():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    for label in (
+        "执行适配器",
+        "执行与资金证据链已就绪",
+        "影子候选执行已就绪",
+        "执行适配器未部署/无效",
+        "资金证据链：",
+        "未接通，仅可影子观察",
+        "影子候选可运行，资金证据链未接通",
+        "当前规范结果",
+        "实时预览（不生效）",
+        "动态适配器运行回执",
+        "零候选已留痕",
+        "逐成员",
+        "制品 SHA-256",
+        "成本模型代码",
+        "市场门禁：",
+        "风险上限：",
+        "胜率",
+        "盈亏比",
+        "行业侧重",
+        "正常新增风险",
+        "降权新增风险",
+        "暂停新增风险",
+        "数据未就绪",
+        "等待人工复核",
+    ):
+        assert label in script
+    for contract in (
+        "execution_binding",
+        "artifact_sha256",
+        "strategy_version: payload.version",
+        "commission_pct",
+        "stamp_tax_pct",
+        "slippage_pct",
+        "transfer_fee_pct",
+        "row.lane_rank || row.rank",
+        "row.industry_focus",
+        "funding_pipeline_ready",
+        "governance.adapter_capabilities",
+        "history.adapter_run_receipts",
+        "row.member_sleeves",
+        "sleeve_row_hash",
+        "scRegEvaluatorType",
+        "执行适配器、版本、制品或评估器类型不在服务器可信发布清单中",
+    ):
+        assert contract in script
+    assert "未通过执行绑定及内部模拟成交验证前不会进入票池" in script
+    assert "strategyTradingGateLabel(gate.status)" in script
+    assert "evaluator_type: 'external_evidence'" not in script
+    assert "Number((el('scRegRouteTrend') || {}).value)" not in script
+    assert "result_mode:'CANONICAL_UNAVAILABLE'" in script
+    assert "is_canonical:false" in script
+    assert "governance.adapter_capabilities = capabilityPayload.adapters" in script
+    assert "/api/strategy-center/governance/adapter-capabilities" in script
 
 
 def test_governance_document_matches_the_executable_twenty_day_gate():

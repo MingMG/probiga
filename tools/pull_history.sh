@@ -9,7 +9,10 @@
 set -e
 cd /opt/ProBigA
 source venv/bin/activate
-export MYSQL_URL="mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+if [[ -z "${MYSQL_URL:-}" && -z "${DATABASE_URL:-}" ]]; then
+    echo "MYSQL_URL or DATABASE_URL must be configured." >&2
+    exit 2
+fi
 
 NOW=$(date '+%Y-%m-%d %H:%M:%S')
 echo "========================================"
@@ -216,5 +219,5 @@ echo "  结束时间: $END"
 echo "========================================"
 echo ""
 echo "  查看数据量:"
-echo "    mysql -u root -pProBigA@70966 -e \"USE probiga; SELECT table_name, ROUND((data_length+index_length)/1024/1024,2) AS size_mb FROM information_schema.tables WHERE table_schema='probiga' ORDER BY size_mb DESC;\""
+echo "    python tools/_db_size.py"
 echo ""

@@ -18,7 +18,7 @@ import json
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-PROBIGA_API = "http://47.113.123.190:5001/api/strategy/picks/sync"
+PROBIGA_API = ""  # Fill with the approved HTTPS strategy-sync endpoint.
 STRATEGY_NAME = "动量选股策略"
 STRATEGY_DESC = "基于20日动量和成交量筛选强势股"
 
@@ -83,6 +83,8 @@ def run_strategy():
 # ==================== 同步到ProBigA ====================
 def sync_to_probiga(picks, strategy_name=STRATEGY_NAME, description=STRATEGY_DESC):
     """将选股结果同步到ProBigA系统"""
+    if not PROBIGA_API:
+        raise RuntimeError("请先配置经批准的 ProBigA HTTPS 同步地址")
     payload = {
         'strategy_name': strategy_name,
         'description': description,

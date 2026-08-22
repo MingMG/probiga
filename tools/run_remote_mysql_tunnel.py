@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import select
 import socket
 import sys
@@ -16,7 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.remote_support import remote_host, remote_user, ssh_connect_kwargs
+from tools.remote_support import (
+    production_ssh_client,
+    remote_host,
+    remote_user,
+    ssh_connect_kwargs,
+)
 
 
 def _configure_logging() -> None:
@@ -62,7 +66,6 @@ def _run_tunnel(
     ssh_host: str,
     ssh_port: int,
     ssh_user: str,
-    ssh_password: str,
     remote_bind_host: str,
     remote_bind_port: int,
     local_host: str,
@@ -75,15 +78,13 @@ def _run_tunnel(
     log = logging.getLogger("mysql_tunnel")
     retry_sleep = max(1.0, float(retry_min_seconds))
     while True:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client = production_ssh_client(paramiko)
         transport = None
         try:
             client.connect(**ssh_connect_kwargs(
                 hostname=ssh_host,
                 port=ssh_port,
                 username=ssh_user,
-                password=ssh_password,
                 timeout=connect_timeout,
                 banner_timeout=connect_timeout,
                 auth_timeout=connect_timeout,
@@ -129,7 +130,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ssh-host", default=remote_host())
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument("--ssh-user", default=remote_user())
-    parser.add_argument("--ssh-password")
     parser.add_argument("--remote-bind-host", default="127.0.0.1")
     parser.add_argument("--remote-bind-port", type=int, default=13306)
     parser.add_argument("--local-host", default="127.0.0.1")
@@ -143,16 +143,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    ssh_password = args.ssh_password or os.environ.get("PROBIGA_REMOTE_SSH_PASSWORD")
-    if not ssh_password:
-        raise SystemExit("missing SSH password; pass it by option or PROBIGA_REMOTE_SSH_PASSWORD")
-
     _configure_logging()
     _run_tunnel(
         ssh_host=args.ssh_host,
         ssh_port=args.ssh_port,
         ssh_user=args.ssh_user,
-        ssh_password=ssh_password,
         remote_bind_host=args.remote_bind_host,
         remote_bind_port=args.remote_bind_port,
         local_host=args.local_host,

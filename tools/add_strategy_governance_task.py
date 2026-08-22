@@ -59,7 +59,9 @@ def _write_snapshot(path: Path, rows: list[dict[str, Any]]) -> None:
         "format_version": 1,
         "task_type": TASK["task_type"],
         "script_path": TASK["script_path"],
-        "rows": rows,
+        "rows": json.loads(
+            json.dumps(rows, ensure_ascii=False, default=str, sort_keys=True)
+        ),
     }
     fd, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
@@ -73,7 +75,31 @@ def _write_snapshot(path: Path, rows: list[dict[str, Any]]) -> None:
         os.replace(temporary_name, path)
     finally:
         if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
+                os.unlink(temporary_name)
+
+
+def _verify_snapshot(engine, path: Path) -> dict[str, Any]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(raw, dict)
+        or raw.get("format_version") != 1
+        or raw.get("task_type") != TASK["task_type"]
+        or raw.get("script_path") != TASK["script_path"]
+        or not isinstance(raw.get("rows"), list)
+        or len(raw["rows"]) > 1
+    ):
+        raise RuntimeError("invalid strategy governance task snapshot")
+    observed = json.loads(
+        json.dumps(
+            _require_unique_task(engine),
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
+    )
+    if observed != raw["rows"]:
+        raise RuntimeError("strategy governance task differs from sealed snapshot")
+    return {"verified": True, "row_count": len(observed)}
 
 
 def _restore_snapshot(engine, path: Path) -> dict[str, Any]:
@@ -161,9 +187,46 @@ def main() -> int:
         default="",
         help="从部署前快照精确恢复任务定义",
     )
+    parser.add_argument(
+        "--capture-snapshot",
+        default="",
+        help="只读捕获当前唯一治理任务行，不安装或更新任务",
+    )
+    parser.add_argument(
+        "--verify-snapshot",
+        default="",
+        help="只读验证当前治理任务行与密封快照逐字段一致",
+    )
+    parser.add_argument(
+        "--schema-prepared",
+        action="store_true",
+        help=(
+            "只接受已由root部署迁移边界完整安装并验证的治理结构；"
+            "该模式绝不创建触发器"
+        ),
+    )
     args = parser.parse_args()
-    if args.restore_snapshot and (args.disabled or args.snapshot_file):
-        parser.error("--restore-snapshot cannot be combined with install options")
+    read_or_restore_modes = [
+        bool(args.restore_snapshot),
+        bool(args.capture_snapshot),
+        bool(args.verify_snapshot),
+    ]
+    if sum(read_or_restore_modes) > 1:
+        parser.error("snapshot capture, verification and restore are mutually exclusive")
+    if any(read_or_restore_modes) and (
+        args.disabled or args.snapshot_file or args.schema_prepared
+    ):
+        parser.error("snapshot-only modes cannot be combined with install options")
+    if (
+        os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+        == "production"
+        and not any(read_or_restore_modes)
+        and not args.schema_prepared
+    ):
+        parser.error(
+            "production task installation requires --schema-prepared; "
+            "runtime schema DDL is forbidden"
+        )
 
     load_project_env()
     engine = create_tool_engine()
@@ -178,6 +241,25 @@ def main() -> int:
                 )
             )
             return 0
+        if args.capture_snapshot:
+            rows = _require_unique_task(engine)
+            _write_snapshot(Path(args.capture_snapshot), rows)
+            print(
+                json.dumps(
+                    {"status": "ok", "captured": True, "row_count": len(rows)},
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.verify_snapshot:
+            result = _verify_snapshot(engine, Path(args.verify_snapshot))
+            print(
+                json.dumps(
+                    {"status": "ok", "snapshot_verified": True, "result": result},
+                    ensure_ascii=False,
+                )
+            )
+            return 0
 
         # Capture the scheduler state before any forward-only database
         # migration.  A later deployment failure can then always restore the
@@ -187,7 +269,11 @@ def main() -> int:
         if args.snapshot_file:
             _write_snapshot(Path(args.snapshot_file), existing_rows)
 
-        from server.engine.strategy_governance import ensure_and_seed_governance
+        from server.engine.strategy_governance import (
+            ensure_and_seed_governance,
+            validate_governance_append_only_triggers,
+            validate_metric_input_review_triggers,
+        )
         from server.db.migrations_v3 import run_v3_migrations
         from tools.attest_qmt_daily_kline import (
             ensure_attestation_tables,
@@ -197,10 +283,44 @@ def main() -> int:
         # The governance ledger consumes the exact strategy_version written by
         # the V3 paper-evidence path. Apply the additive, rollback-compatible
         # V3 expansion before creating/enabling the daily governance task.
-        migration_results = run_v3_migrations(engine)
-        ensure_attestation_tables(engine)
-        qmt_attestation_schema = validate_attestation_schema(engine)
-        ensure_and_seed_governance()
+        if args.schema_prepared:
+            migration_plan = run_v3_migrations(engine, dry_run=True)
+            pending = [
+                item.version for item in migration_plan if item.status != "exists"
+            ]
+            if pending:
+                raise RuntimeError(
+                    "strategy governance schema was not prepared before cutover: "
+                    + ", ".join(pending)
+                )
+            # The root deployment boundary already applied and fully validated
+            # these migrations while every writer was fenced. Reusing the
+            # read-only plan here removes any runtime-account CREATE TRIGGER
+            # path and closes a check/apply race during task installation.
+            migration_results = migration_plan
+            qmt_attestation_schema = validate_attestation_schema(engine)
+            with engine.connect() as connection:
+                metric_trigger_schema = validate_metric_input_review_triggers(
+                    connection
+                )
+                seeded_strategy_count = int(connection.execute(text(
+                    "SELECT COUNT(*) FROM st_strategy_registry"
+                )).scalar() or 0)
+            append_only_schema = validate_governance_append_only_triggers(engine)
+            if seeded_strategy_count <= 0:
+                raise RuntimeError(
+                    "strategy governance seed registry is empty after preparation"
+                )
+        else:
+            migration_results = run_v3_migrations(engine)
+            ensure_attestation_tables(engine)
+            qmt_attestation_schema = validate_attestation_schema(engine)
+            ensure_and_seed_governance()
+            with engine.connect() as connection:
+                metric_trigger_schema = validate_metric_input_review_triggers(
+                    connection
+                )
+            append_only_schema = validate_governance_append_only_triggers(engine)
         task = {**TASK, "enabled": 0 if args.disabled else 1}
         result = upsert_scheduler_task(
             engine,
@@ -230,6 +350,11 @@ def main() -> int:
                 ],
                 "snapshot_file": args.snapshot_file or None,
                 "qmt_attestation_schema": qmt_attestation_schema,
+                "governance_trigger_count": (
+                    int(metric_trigger_schema.get("trigger_count") or 0)
+                    + int(append_only_schema.get("trigger_count") or 0)
+                ),
+                "schema_prepared": bool(args.schema_prepared),
                 "result": result,
             },
             ensure_ascii=False,

@@ -15,6 +15,14 @@ from tools import validate_production_release_boundary as boundary
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _bash() -> str | None:
+    discovered = shutil.which("bash")
+    if discovered:
+        return discovered
+    git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    return str(git_bash) if git_bash.is_file() else None
+
+
 def _normalized_shell(source: str) -> str:
     """Join shell continuations without changing command ordering."""
 
@@ -175,9 +183,10 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     )
     workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
 
-    assert len(workflow_source) < 21_000
-    assert "deploy/production_deploy.sh" in workflow_source
-    assert "envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64" in workflow_source
+    assert len(workflow_source) < 27_000
+    assert "root-owned broker derives the input lock" in workflow_source
+    assert "envs: EXPECTED_SHA" in workflow_source
+    assert "RESOLVED_REQUIREMENTS_B64" not in workflow_source
     assert "${{" not in deploy_script
     assert "actions/checkout@v4" not in workflow
     assert "actions/setup-python@v5" not in workflow
@@ -194,8 +203,9 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'test "$SERVICE_USER" != root' in workflow
     assert 'WorkingDirectory=/opt/ProBigA' in deploy_script
     assert "Environment=GIT_OPTIONAL_LOCKS=0" in deploy_script
-    assert 'git config --system --add safe.directory "$REPOSITORY_ROOT"' in deploy_script
-    assert 'git config --system --add safe.directory "$LEGACY_ADATA_REPOSITORY"' in deploy_script
+    assert "git config --system" not in deploy_script
+    assert "/usr/bin/git --no-replace-objects" in deploy_script
+    assert "GIT_CONFIG_NOSYSTEM=1" in deploy_script
     assert "seal_release_checkout" in deploy_script
     assert "git ls-files --stage -z" in deploy_script
     assert "git clean" not in deploy_script
@@ -207,7 +217,7 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     )
     assert 'exec 9>"$DEPLOY_LOCK_FILE"' in deploy_script
     assert "flock -n 9" in deploy_script
-    assert "resolved_requirements_sha256" in workflow
+    assert "deploy/production_requirements.lock" in workflow
     assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in deploy_script
     assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in deploy_script
     assert not re.search(
@@ -237,25 +247,29 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "prune_release_temp_files" in deploy_script
     assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'path_is_runtime_referenced "$build_real"' in deploy_script
-    assert "command_timeout: 25m" in workflow
-    assert "probiga.deploy-receipt.v3" in workflow
-    assert '"expected_requirements_sha256":"%s"' in workflow
-    assert '"previous_requirements_sha256":"%s"' in workflow
-    assert '"active_requirements_sha256":"%s"' in workflow
+    assert "timeout-minutes: 60" in workflow
+    assert "command_timeout: 55m" in workflow
+    assert "probiga.deploy-receipt.v4" in workflow
+    assert '"expected_input_lock_sha256":"%s"' in workflow
+    assert '"previous_input_lock_sha256":"%s"' in workflow
+    assert '"active_input_lock_sha256":"%s"' in workflow
+    assert '"expected_resolved_freeze_sha256":"%s"' in workflow
+    assert '"active_resolved_freeze_sha256":"%s"' in workflow
     assert '"requirements_sha256":"%s"' not in workflow
     assert 'sudo chmod 0700 "$RECEIPT_DIR"' in workflow
     assert 'sudo mktemp' in workflow
-    assert 'sudo tee "$receipt_tmp"' in workflow
-    assert 'sudo chmod 0600 "$receipt_tmp"' in workflow
-    assert 'sudo mv -f "$receipt_tmp" "$RECEIPT_DIR/$RECEIPT_ID.json"' in workflow
+    assert "persist_deployed_receipt_pending" in deploy_script
+    assert "publish_deployed_receipt_pending" in deploy_script
+    assert 'mv -fT "$pending_tmp" "$ACTIVATION_RECEIPT_PENDING"' in deploy_script
+    assert 'mv -fT "$receipt_tmp" "$receipt_target"' in deploy_script
     assert 'sudo tee "$RECEIPT_DIR/$RECEIPT_ID.json"' not in workflow
-    assert 'git ls-remote "$TRUSTED_REMOTE" refs/heads/main' in root_broker
+    assert 'clean_git_ssh ls-remote "$TRUSTED_REMOTE" refs/heads/main' in root_broker
     assert (
-        '"${GIT[@]}" fetch --no-tags origin '
+        'clean_git_ssh --git-dir="$CODE_GIT_CACHE" fetch --no-tags origin '
         '"+refs/heads/main:refs/remotes/origin/main"'
         in _normalized_shell(root_broker)
     )
-    assert 'REMOTE_SHA="$(GIT_SSH_COMMAND="$REMOTE_GIT_SSH"' in root_broker
+    assert 'REMOTE_SHA="$(clean_git_ssh ls-remote' in root_broker
     assert (
         'git --git-dir="$CODE_GIT_CACHE" worktree add --detach'
         in _normalized_shell(deploy_script)
@@ -266,6 +280,167 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'if [ "$rollback_failed" -ne 0 ]; then' in workflow
     assert 'write_receipt "ROLLBACK_FAILED"' in workflow
     assert 'write_receipt "ROLLED_BACK"' in workflow
+
+
+def test_root_broker_has_exact_normal_and_recovery_argv_contracts() -> None:
+    broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(broker)
+    parser = _normalized_shell(_shell_function_bodies(broker)[
+        "parse_broker_invocation"
+    ])
+
+    assert 'case "$#" in' in parser
+    assert "1)" in parser
+    assert "2)" in parser
+    assert 'test "$1" = --recover-database-guard' in parser
+    assert "BROKER_OPERATION=deploy" in parser
+    assert "BROKER_OPERATION=recover-database-guard" in parser
+    assert "expected one trusted-main SHA or an exact guard recovery request" in parser
+    assert '[[ "$EXPECTED_RECOVERY_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]' in parser
+    assert 'test "$RECORDED_RECOVERY_SHA" = "$EXPECTED_RECOVERY_GUARD_SHA"' in broker
+    assert "probiga.database-writer-guard.v2" in broker
+    assert "probiga.database-writer-restore.v1" in broker
+    assert 'stat -c \'%U:%G\'' in broker
+    assert 'stat -c \'%a\'' in broker
+    assert '"${GIT[@]}" show "${EXPECTED_SHA}:deploy/production_deploy.sh"' in normalized
+    assert (
+        '"${GIT[@]}" show "${EXPECTED_RECOVERY_GUARD_SHA}:'
+        'deploy/production_deploy.sh"'
+        in normalized
+    )
+    assert "RECOVERY_PROTOCOL_VERSION=probiga-database-guard-recovery-v2" in broker
+    assert "REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2" in (
+        ROOT / "deploy/production_deploy.sh"
+    ).read_text(encoding="utf-8")
+    recovery_command = (
+        '/usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE" '
+        "--recover-database-guard"
+    )
+    assert recovery_command in normalized
+    assert normalized.count(recovery_command) == 1
+    assert 'bash "$BOOTSTRAP_FILE" "$@"' not in normalized
+
+    recovery_execution = normalized[
+        normalized.rindex("else\n  /usr/bin/env -i"):
+    ]
+    assert "IFS= read -r RESOLVED_REQUIREMENTS_B64" not in recovery_execution
+    assert "RESOLVED_REQUIREMENTS_B64=" not in recovery_execution
+    assert 'PROBIGA_RECOVERY_GUARD_SHA="$EXPECTED_RECOVERY_GUARD_SHA"' in recovery_execution
+
+
+def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the broker argv regression")
+    broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    parser_body = _shell_function_bodies(broker)["parse_broker_invocation"]
+    harness = (
+        "set -u\n"
+        "fail() { printf 'ERROR:%s\\n' \"$*\" >&2; exit 2; }\n"
+        "parse_broker_invocation() {\n"
+        + parser_body
+        + "}\n"
+        "parse_broker_invocation \"$@\"\n"
+        "printf '%s|%s|%s|%s|%s|%s\\n' \"$BROKER_OPERATION\" "
+        "\"$EXPECTED_SHA\" \"$EXPECTED_INPUT_LOCK_SHA256\" "
+        "\"$EXPECTED_ADATA_SHA\" \"$EXPECTED_ADATA_TREE_SHA256\" "
+        "\"$EXPECTED_RECOVERY_GUARD_SHA\"\n"
+    )
+    sha = "a" * 40
+    digest = "b" * 64
+    adata_sha = "c" * 40
+    tree = "d" * 64
+
+    normal = subprocess.run(
+        [bash, "-c", harness, "broker-test", sha],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert normal.returncode == 0, normal.stderr
+    assert normal.stdout.strip() == f"deploy|{sha}||||"
+
+    recovery = subprocess.run(
+        [bash, "-c", harness, "broker-test", "--recover-database-guard", sha],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert recovery.returncode == 0, recovery.stderr
+    assert recovery.stdout.strip() == f"recover-database-guard|||||{sha}"
+
+    capability = subprocess.run(
+        [bash, "-c", harness, "broker-test", "--capabilities"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert capability.returncode == 0, capability.stderr
+    assert capability.stdout.strip() == "capabilities|||||"
+
+    invalid_argv = (
+        (),
+        ("A" * 40,),
+        ("--recover-database-guard",),
+        ("--unknown", sha),
+        ("--recover-database-guard", "A" * 40),
+        (sha, digest),
+        (sha, digest, adata_sha),
+        (sha, digest, adata_sha, tree),
+        (sha, digest, adata_sha, tree, "extra"),
+        ("--recover-database-guard", digest, adata_sha, tree),
+    )
+    for argv in invalid_argv:
+        rejected = subprocess.run(
+            [bash, "-c", harness, "broker-test", *argv],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert rejected.returncode == 2, (argv, rejected.stdout, rejected.stderr)
+
+
+def test_manual_guard_recovery_workflow_is_isolated_and_strict() -> None:
+    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(workflow)
+
+    assert "workflow_dispatch:" in workflow
+    assert "recover_database_guard:" in workflow
+    assert "type: boolean" in workflow
+    assert "default: false" in workflow
+    assert "expected_guard_sha:" in workflow
+    assert "environment: production" in workflow
+    assert "timeout-minutes: 60" in workflow
+    assert "command_timeout: 55m" in workflow
+    assert "github.event_name == 'workflow_dispatch'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "inputs.recover_database_guard == true" in workflow
+    assert normalized.count(
+        'sudo -n /usr/local/sbin/probiga-production-deploy '
+        '--recover-database-guard "$EXPECTED_GUARD_SHA"'
+    ) == 1
+    assert "RESOLVED_REQUIREMENTS_B64" not in normalized[
+        normalized.index("recover-database-guard:", normalized.index("jobs:")):
+    ]
+    assert workflow.count("python tools/scan_tracked_secrets.py") == 2
+    before_scan = workflow.index(
+        "Scan tracked secrets before dependency installation"
+    )
+    dependency_install = workflow.index("Install regression dependencies")
+    after_scan = workflow.index(
+        "Scan tracked secrets after dependency installation"
+    )
+    assert before_scan < dependency_install < after_scan
 
 
 def test_production_deploy_publishes_an_immutable_code_release() -> None:
@@ -369,8 +544,8 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     required_prepare_commands = (
         'git --git-dir="$CODE_GIT_CACHE" worktree add',
         '-m venv "$EXPECTED_BUILD"',
-        '"$EXPECTED_BUILD/bin/python" -m pip install -r ',
-        '"$EXPECTED_BUILD/bin/python" -m pip wheel --no-deps ',
+        'clean_root_pip "$EXPECTED_BUILD/bin/python" install ',
+        '"$BOOTSTRAP_PYTHON" -I -m pip wheel --no-deps ',
         "tools/validate_production_release_boundary.py",
         "tools/ensure_quality_gate.py --validate-review-delivery",
         'release_identity_check 1 "$CODE_VALIDATION_ROOT"',
@@ -396,14 +571,15 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     assert len(prepare_calls) == 1
     prepare_call = prepare_calls[0]
     schema_prepare = deploy_script.index(
-        "CUTOVER_STEP=prepare_qmt_attestation_schema", prepare_call
+        "CUTOVER_STEP=preflight_strategy_governance_database_schema",
+        prepare_call,
     )
     schema_prepare_command = deploy_script.index(
         '"$PREPARED_CODE_ROOT/tools/'
-        'prepare_strategy_governance_qmt_history.py"',
+        'prepare_strategy_governance_schema.py"',
         schema_prepare,
     )
-    schema_only = deploy_script.index("--schema-only", schema_prepare_command)
+    schema_preflight = deploy_script.index("--phase preflight", schema_prepare_command)
     cutover_fence = deploy_script.index("CUTOVER_STARTED=1", prepare_call)
     first_cutover_stop = _required_shell_position(
         deploy_script[cutover_fence:], r"sudo systemctl stop\b"
@@ -412,11 +588,15 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         prepare_call
         < schema_prepare
         < schema_prepare_command
-        < schema_only
+        < schema_preflight
         < cutover_fence
         < first_cutover_stop
     )
-    assert "DATABASE_FORWARD_MIGRATION_STARTED=1" in deploy_script[
+    assert "prepare_strategy_governance_qmt_history.py" not in deploy_script[
+        schema_prepare:cutover_fence
+    ]
+    assert "--schema-only" not in deploy_script[schema_prepare:cutover_fence]
+    assert "DATABASE_FORWARD_MIGRATION_STARTED=1" not in deploy_script[
         schema_prepare:cutover_fence
     ]
 
@@ -516,10 +696,19 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     )
     writer_fence = downtime[writer_fence_start:dropin_install]
     expected_writer_fence_command = (
-        'sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0 '
+        'sudo -u "$SERVICE_USER" /usr/bin/env -i '
+        'PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 '
         "PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 "
         "PROBIGA_DEPLOYMENT_MODE=production "
+        'PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" '
         'PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" '
+        'PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" '
+        'PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" '
+        'PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" '
+        'PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" '
+        'PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" '
+        'PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256='
+        '"$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" '
         '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" '
         '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P '
         "tools/add_trading_v3_tasks.py --writer-fence "
@@ -535,18 +724,23 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     ]
     assert python_cutover_commands == [
         expected_writer_fence_command,
-        'if ! run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
-        '--disabled --snapshot-file "$GOVERNANCE_TASK_SNAPSHOT"; then',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"',
+        'if ! run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--disabled --schema-prepared; then',
         'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py")"; then',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"',
         'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--capture-snapshot "$GOVERNANCE_TASK_NEW_SOURCE"',
+        'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" '
         '"${GOVERNANCE_HEALTH_ARGS[@]}"',
+        '/usr/bin/python3.14 -I - "$ACTIVATION_RECEIPT_PENDING" '
+        '"$expected_release" <<\'PY\'',
     ]
     assert downtime.index(
         "prepare_strategy_governance_qmt_history.py"
@@ -660,12 +854,23 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     premarket_task = normalized.index(
         "--task-type analysis_premarket_external", premarket_probe
     )
-    code_cleanup = normalized.index(
-        'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"',
-        premarket_task,
+    receipt_pending = normalized.index(
+        "persist_deployed_receipt_pending", premarket_task
     )
     deployed_receipt = normalized.index(
-        'write_receipt "DEPLOYED" "$EXPECTED_SHA"', code_cleanup
+        "publish_deployed_receipt_pending", receipt_pending
+    )
+    journal_finalize = normalized.rindex(
+        "controlled_guard_finalize_successful_activation",
+        receipt_pending,
+        deployed_receipt,
+    )
+    journal_remove = normalized.index(
+        "activation_snapshot_remove_finalized", deployed_receipt
+    )
+    code_cleanup = normalized.index(
+        'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"',
+        journal_remove,
     )
     assert (
         service_start
@@ -674,7 +879,15 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         < governance_poststart_check
         < premarket_probe
     )
-    assert premarket_probe < premarket_task < code_cleanup < deployed_receipt
+    assert (
+        premarket_probe
+        < premarket_task
+        < receipt_pending
+        < journal_finalize
+        < deployed_receipt
+        < journal_remove
+        < code_cleanup
+    )
 
 
 def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
@@ -744,11 +957,8 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     assert "restore previous probiga drop-in" in rollback
     assert "restore previous AI recommendation worker drop-in" in rollback
     assert "restore previous strategy governance task" in rollback
-    assert (
-        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
-        '--restore-snapshot "$GOVERNANCE_TASK_SNAPSHOT"'
-        in normalized_rollback
-    )
+    assert "controlled_guard_restore_and_verify_governance_snapshot" in rollback
+    assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in rollback
     assert "point Nginx static assets at previous code release" in rollback
     assert 'write_receipt "ROLLED_BACK"' in rollback
 
@@ -805,10 +1015,27 @@ def test_previous_code_fallback_and_code_retention_keep_two_generations() -> Non
         'point_static_release_to_checkout "$PREPARED_CODE_ROOT"',
         service_start,
     )
-    receipt = normalized.index(
-        'write_receipt "DEPLOYED" "$EXPECTED_SHA"', prune_position
+    receipt_pending = normalized.index(
+        "persist_deployed_receipt_pending", static_switch
     )
-    assert service_start < static_switch < prune_position < receipt
+    journal_finalize = normalized.rindex(
+        "controlled_guard_finalize_successful_activation",
+        static_switch,
+        normalized.index("publish_deployed_receipt_pending", receipt_pending),
+    )
+    receipt = normalized.index("publish_deployed_receipt_pending", journal_finalize)
+    journal_remove = normalized.index(
+        "activation_snapshot_remove_finalized_before_deploy", receipt
+    )
+    assert (
+        service_start
+        < static_switch
+        < receipt_pending
+        < journal_finalize
+        < receipt
+        < journal_remove
+        < prune_position
+    )
 
 
 def test_warning_only_retention_helpers_fail_closed_on_unsafe_paths() -> None:
@@ -934,7 +1161,7 @@ def test_warning_only_retention_helpers_fail_closed_on_unsafe_paths() -> None:
 
 
 def test_code_retention_guards_survive_if_not_conditional_context() -> None:
-    bash = shutil.which("bash")
+    bash = _bash()
     if bash is None:
         pytest.skip("bash is required for the retention errexit regression")
 
@@ -1031,17 +1258,19 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     workflow = workflow_source + "\n" + deploy_script
 
     assert "pip install -e ./adata" not in workflow
-    assert (
-        "ADATA_RELEASE_SHA: b14f4e57b2175302f18b6eaf934f7dff9207a141"
-        in workflow
+    release_manifest = (ROOT / "deploy/production_release.env").read_text(
+        encoding="utf-8"
     )
+    assert (
+        "ADATA_RELEASE_SHA=b14f4e57b2175302f18b6eaf934f7dff9207a141"
+        in release_manifest
+    )
+    assert "deploy/production_release.env" in workflow_source
     assert "https://github.com/1nchaos/adata.git" in workflow
     assert "ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git" in workflow
-    assert (
-        "LEGACY_ADATA_GIT_CACHE=/opt/ProBigA/.release_sources/adata.git"
-        in workflow
-    )
-    assert 'git clone --mirror --no-hardlinks "$adata_seed"' in workflow
+    assert "LEGACY_ADATA_GIT_CACHE" not in workflow
+    assert 'git clone --mirror --no-hardlinks "$adata_seed"' not in workflow
+    assert "legacy mutable adata checkout cannot be used as a rollback seed" in workflow
     assert "http.lowSpeedTime=30" in workflow
     assert "EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "server.common.adata_release seal" in workflow
@@ -1049,7 +1278,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "PROBIGA_EXPECTED_ADATA_SHA" in workflow
     assert "PROBIGA_EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "PROBIGA_ADATA_SOURCE_DIR" in workflow
-    assert "probiga.deploy-receipt.v3" in workflow
+    assert "probiga.deploy-receipt.v4" in workflow
     assert "PROBIGA_ADMIN_AUTH_ENABLED=true" in workflow
     assert "systemctl stop probiga-scheduler" in workflow
     assert "systemctl disable probiga-scheduler" in workflow
@@ -1097,7 +1326,9 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     validate_boundary_env = deploy_script.rindex(
         "PYTHONDONTWRITEBYTECODE=1", 0, validate_boundary
     )
-    validate_scheduler_manifest = deploy_script.index("tools/ensure_quality_gate.py")
+    validate_scheduler_manifest = deploy_script.index(
+        "tools/ensure_quality_gate.py", validate_boundary
+    )
     restart_service = _required_shell_position(
         deploy_script[validate_scheduler_manifest:],
         r'sudo systemctl (?:start|restart) '
@@ -1105,7 +1336,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     ) + validate_scheduler_manifest
     assert validate_boundary - validate_boundary_env < 160
     assert validate_boundary < validate_scheduler_manifest < restart_service
-    assert 'sudo -u "$SERVICE_USER" env GIT_OPTIONAL_LOCKS=0' in workflow
+    assert 'sudo -u "$SERVICE_USER" /usr/bin/env -i' in workflow
     assert "tools/ensure_quality_gate.py --validate-review-delivery" in workflow
     assert "--apply-review-delivery-with-snapshot" not in workflow
     assert "--restore-review-delivery" not in workflow
@@ -1159,11 +1390,13 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "runtime_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256" in deploy_script
     assert "runtime_environment_value PROBIGA_ADATA_SOURCE_DIR" in deploy_script
     assert (
-        "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
+        "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
+        "API_EMBEDDED_SCHEDULER_ENABLED=false "
         in main_dropin
     )
     assert (
-        "ExecStart=/usr/bin/env API_EMBEDDED_SCHEDULER_ENABLED=false "
+        "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
+        "API_EMBEDDED_SCHEDULER_ENABLED=false "
         in scheduler_dropin
     )
     assert "PROBIGA_CODE_ROOT=$code_root" in main_dropin
@@ -1230,6 +1463,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert 'sudo rm -f "$legacy_main_dropin"' in deploy_script
     assert "main_identity missing_release_dropin=%q" in deploy_script
     assert "main_identity unexpected_dropin=%q" in deploy_script
+    assert '"$MAIN_DATABASE_WRITER_GUARD_DROPIN") ;;' in normalized
     assert "main_identity unexpected_argv0=%q" in deploy_script
     assert 'test "${MAIN_CMDLINE[4]}" = server.api.main:app' in deploy_script
     assert 'test "${MAIN_CMDLINE[5]}" = --app-dir' in deploy_script
@@ -1246,7 +1480,8 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "CUTOVER_STEP=verify_no_scheduler_dropins" in deploy_script
     assert "scheduler_identity unexpected_dropins=%q" in deploy_script
     assert (
-        'EXPECTED_SCHEDULER_DROPIN_PATHS="$SCHEDULER_LIMITS_DROPIN"'
+        'EXPECTED_SCHEDULER_DROPIN_PATHS='
+        '"$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN $SCHEDULER_LIMITS_DROPIN"'
         in deploy_script
     )
     assert (
@@ -1343,7 +1578,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         normalized.index('cat "$HEALTH_RESPONSE"'),
     )
     worker_restore = normalized.index(
-        'sudo systemctl start "$AI_WORKER_TIMER"',
+        "restore_ai_worker_previous_state",
         static_switch,
     )
     assert (
@@ -1549,3 +1784,1132 @@ def test_boundary_bytecode_scan_recurses_strategies_and_versions(
     assert "strategies/__pycache__/runner.cpython-314.pyc" in found
     assert "versions/release/__pycache__/manifest.cpython-314.pyo" in found
     assert "numpy/__init__.cp314-win_amd64.pyd" in found
+
+
+def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    schema_tool = (
+        ROOT / "tools/prepare_strategy_governance_schema.py"
+    ).read_text(encoding="utf-8")
+    function_bodies = _shell_function_bodies(deploy_script)
+
+    migration_runner = _normalized_shell(
+        function_bodies["run_prepared_database_migration_tool"]
+    )
+    runtime_runner = _normalized_shell(
+        function_bodies["run_prepared_python_tool"]
+    )
+    runtime_units = "\n".join(
+        function_bodies[name]
+        for name in (
+            "write_dropin",
+            "write_scheduler_dropin",
+            "write_ai_worker_dropin",
+        )
+    )
+
+    assert (
+        'ADMIN_OPTION_FILE = Path("/etc/probiga/mysql-trigger-admin.ini")'
+        in schema_tool
+    )
+    assert (
+        'MIGRATOR_OPTION_FILE = Path("/etc/probiga/mysql-migrator.ini")'
+        in schema_tool
+    )
+    assert 'FIXED_TLS_CA_FILE = Path("/etc/probiga/mysql84-ca.pem")' in schema_tool
+    assert "/etc/probiga/mysql-ca.pem" not in deploy_script
+    assert "/etc/probiga/mysql-ca.pem" not in schema_tool
+    assert 'EXPECTED_ADMIN_USER = "probiga_trigger_admin@127.0.0.1"' in schema_tool
+    assert 'EXPECTED_MIGRATOR_USER = "probiga_migrator@127.0.0.1"' in schema_tool
+    assert 'values["protocol"].casefold() != "tcp"' in schema_tool
+    assert "ssl_ca=str(ssl_ca)" in schema_tool
+    assert "ssl_verify_cert=True" in schema_tool
+    assert "prepare_strategy_governance_schema.py" in migration_runner
+    assert '[ "$1" = --phase ] && [ "$2" = preflight ]' in migration_runner
+    assert '[ "$1" = --phase ] && [ "$2" = recover ]' in migration_runner
+    assert '[ "$1" = --phase ] && [ "$2" = cutover ]' in migration_runner
+    assert '[ "$3" = --writers-fenced ]' in migration_runner
+    assert (
+        "database migration runner rejected non-allowlisted arguments"
+        in migration_runner
+    )
+    assert 'test "$entrypoint" = ' in migration_runner
+    assert '"$entrypoint" "$@"' in migration_runner
+    assert '"PYTHONPATH=$PREPARED_CODE_ROOT"' in migration_runner
+    assert '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT"' not in migration_runner
+    assert "run_prepared_database_migration_tool" not in runtime_runner
+    for forbidden in (
+        "SET GLOBAL",
+        "privileged_ddl_executor",
+        "prepare_strategy_governance_schema.py",
+    ):
+        assert forbidden not in runtime_runner
+        assert forbidden not in runtime_units
+
+    ordinary_runtime_source = "\n".join(
+        (migration_runner, runtime_runner, runtime_units, deploy_script)
+    )
+    assert not re.search(
+        r"\bSET\s+GLOBAL\s+log_bin_trust_function_creators\b",
+        ordinary_runtime_source,
+        flags=re.IGNORECASE,
+    )
+    assert len(
+        re.findall(
+            r"SET\s+GLOBAL\s+log_bin_trust_function_creators\s*=\s*(?:ON|OFF)",
+            schema_tool,
+            flags=re.IGNORECASE,
+        )
+    ) == 2
+    assert not re.search(
+        r"\bGRANT\s+SUPER\b", schema_tool, flags=re.IGNORECASE
+    )
+    assert not re.search(
+        r"(?:mysql|mariadb)://[^\s'\"]+:[^\s@'\"]+@",
+        "\n".join((deploy_script, schema_tool)),
+        flags=re.IGNORECASE,
+    )
+    assert schema_tool.count("SHOW GRANTS FOR CURRENT_USER()") >= 2
+    assert (
+        "runtime identity privileges differ from the audited boundary"
+        in schema_tool
+    )
+    for exact_runtime_policy in (
+        '"BIGA.*": frozenset({"SELECT"})',
+        '"PROBIGA.*": frozenset({',
+        '"PROBIGA_QMT_HISTORY.*": frozenset({"SELECT"})',
+        '"CREATE TEMPORARY TABLES"',
+        "len(global_entries) != 1",
+        'global_entries[0] != {"USAGE"}',
+        "privileges\n            != set(EXPECTED_RUNTIME_SCHEMA_PRIVILEGES[scope])",
+        '"require_ssl": True',
+        '"roles": []',
+        '"grant_option": False',
+    ):
+        assert exact_runtime_policy in schema_tool
+
+
+def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    history_tool = (
+        ROOT / "tools/prepare_strategy_governance_qmt_history.py"
+    ).read_text(encoding="utf-8")
+    history_start = history_tool.index("def prepare_governance_qmt_history(")
+    history_end = history_tool.index("def main(", history_start)
+    production_history = history_tool[history_start:history_end]
+    runner_definition = deploy_script.index(
+        "run_prepared_database_migration_tool() {"
+    )
+    runner_calls = [
+        match.start()
+        for match in re.finditer(
+            r"(?m)^[ \t]*run_prepared_database_migration_tool\b",
+            deploy_script,
+        )
+        if match.start() > runner_definition
+    ]
+    assert len(runner_calls) == 3
+    preflight_call, cutover_call, recover_call = runner_calls
+    restore_journal = deploy_script.index(
+        "CUTOVER_STEP=persist_database_writer_restore_journal"
+    )
+    cutover_fence = deploy_script.index("CUTOVER_STARTED=1")
+    first_service_stop = _required_shell_position(
+        deploy_script[cutover_fence:], r"sudo systemctl stop\b"
+    ) + cutover_fence
+    guard_dropins = deploy_script.index(
+        "CUTOVER_STEP=install_database_writer_guard_dropins", restore_journal
+    )
+    guard_file = deploy_script.index(
+        "CUTOVER_STEP=persist_database_writer_guard", guard_dropins
+    )
+    guard_daemon_reload = deploy_script.index(
+        "sudo systemctl daemon-reload", guard_file
+    )
+    writer_fence = deploy_script.index("CUTOVER_STEP=writer_fence", first_service_stop)
+    qmt_history = deploy_script.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", recover_call
+    )
+    task_install = deploy_script.index(
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"',
+        qmt_history,
+    )
+    install_units = deploy_script.index(
+        "CUTOVER_STEP=install_runtime_units", qmt_history
+    )
+    activation_journal_sync = deploy_script.index(
+        "CUTOVER_STEP=sync_activation_journal_before_guard_removal",
+        install_units,
+    )
+    guard_removal = deploy_script.index(
+        "CUTOVER_STEP=remove_database_writer_guard_after_full_prestart",
+        activation_journal_sync,
+    )
+    api_start = deploy_script.index("CUTOVER_STEP=start_api", guard_removal)
+
+    assert preflight_call < restore_journal < cutover_fence < first_service_stop
+    assert (
+        restore_journal
+        < guard_dropins
+        < guard_file
+        < guard_daemon_reload
+        < first_service_stop
+        < writer_fence
+        < cutover_call
+        < recover_call
+        < qmt_history
+        < install_units
+        < task_install
+        < activation_journal_sync
+        < guard_removal
+        < api_start
+    )
+    preflight_command = _normalized_shell(
+        deploy_script[preflight_call:restore_journal]
+    )
+    cutover_command = _normalized_shell(
+        deploy_script[cutover_call:recover_call]
+    )
+    recover_command = _normalized_shell(
+        deploy_script[recover_call:qmt_history]
+    )
+    assert "prepare_strategy_governance_schema.py" in preflight_command
+    assert "--phase preflight" in preflight_command
+    assert "--writers-fenced" not in preflight_command
+    assert "prepare_strategy_governance_schema.py" in cutover_command
+    assert "--phase cutover --writers-fenced" in cutover_command
+    assert "prepare_strategy_governance_schema.py" in recover_command
+    assert "--phase recover" in recover_command
+    assert "prepare_strategy_governance_qmt_history.py" not in preflight_command
+    assert "--schema-only" not in preflight_command
+    assert "ensure_attestation_tables(" not in production_history
+    assert "plan_legacy_completed_run_binding(" in production_history
+    assert "validate_attestation_schema(" in production_history
+    assert "schema_prepared=True" in production_history
+
+    task_command_end = deploy_script.index("; then", task_install)
+    task_command = _normalized_shell(
+        deploy_script[task_install:task_command_end]
+    )
+    assert "--schema-prepared" in task_command
+    task_path_line_start = deploy_script.rfind("\n", qmt_history, task_install)
+    task_line_start = deploy_script.rfind(
+        "\n", qmt_history, task_path_line_start
+    )
+    assert "run_prepared_python_tool" in deploy_script[
+        task_line_start:task_install
+    ]
+
+    rollback_start = deploy_script.index("rollback() {")
+    prepare_failure_start = deploy_script.index(
+        'if [ "$CUTOVER_STARTED" -eq 0 ]; then', rollback_start
+    )
+    prepare_failure_end = deploy_script.index(
+        'echo "Deployment failed; rolling back to $PREVIOUS_SHA"',
+        prepare_failure_start,
+    )
+    prepare_failure_path = deploy_script[
+        prepare_failure_start:prepare_failure_end
+    ]
+    assert "systemctl stop" not in prepare_failure_path
+    assert 'exit "$failed_status"' in prepare_failure_path
+
+
+def test_failed_cutover_guard_persists_and_never_restarts_any_writer() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+
+    assert "DATABASE_GUARD_MIGRATION_UNVERIFIED=0" in deploy_script
+    restore_journal = deploy_script.index(
+        "CUTOVER_STEP=persist_database_writer_restore_journal"
+    )
+    latch_on = deploy_script.index(
+        "DATABASE_GUARD_MIGRATION_UNVERIFIED=1",
+        restore_journal,
+    )
+    guard_dropins = deploy_script.index(
+        "CUTOVER_STEP=install_database_writer_guard_dropins", latch_on
+    )
+    guard_persist = deploy_script.index(
+        "persist_database_writer_guard", guard_dropins
+    )
+    first_stop = _required_shell_position(
+        deploy_script[guard_persist:], r"sudo systemctl (?:stop|disable)\b"
+    ) + guard_persist
+    schema_step = deploy_script.index(
+        "CUTOVER_STEP=prepare_strategy_governance_database_schema",
+        first_stop,
+    )
+    cutover_call = deploy_script.index(
+        "run_prepared_database_migration_tool", latch_on
+    )
+    recover_step = deploy_script.index(
+        "CUTOVER_STEP=recover_strategy_governance_database_trust",
+        cutover_call,
+    )
+    recover_call = deploy_script.index(
+        "run_prepared_database_migration_tool", recover_step
+    )
+    qmt_history = deploy_script.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", recover_call
+    )
+    guard_removal = deploy_script.index(
+        "remove_database_writer_guard_after_recovery", qmt_history
+    )
+    latch_off = deploy_script.index(
+        "DATABASE_GUARD_MIGRATION_UNVERIFIED=0", guard_removal
+    )
+    install_units = deploy_script.index("CUTOVER_STEP=install_runtime_units")
+    assert (
+        restore_journal
+        < latch_on
+        < guard_dropins
+        < guard_persist
+        < first_stop
+        < schema_step
+        < cutover_call
+        < recover_step
+        < recover_call
+        < qmt_history
+        < install_units
+        < guard_removal
+        < latch_off
+    )
+
+    assert "DATABASE_WRITER_GUARD_DIR=/var/lib/probiga/deploy-guards" in deploy_script
+    assert "ConditionPathExists=!$DATABASE_WRITER_GUARD_FILE" in deploy_script
+    for guard_dropin in (
+        "MAIN_DATABASE_WRITER_GUARD_DROPIN",
+        "SCHEDULER_DATABASE_WRITER_GUARD_DROPIN",
+        "AI_SERVICE_DATABASE_WRITER_GUARD_DROPIN",
+        "AI_TIMER_DATABASE_WRITER_GUARD_DROPIN",
+    ):
+        assert guard_dropin in deploy_script
+    assert "sudo chown root:root \"$guard_tmp\"" in deploy_script
+    assert "sudo chmod 0600 \"$guard_tmp\"" in deploy_script
+    assert "sudo sync -f \"$DATABASE_WRITER_GUARD_FILE\"" in deploy_script
+    assert 'sync -f "$DATABASE_WRITER_RESTORE_FILE"' in deploy_script
+    assert 'sync -f "$DATABASE_WRITER_GUARD_DIR"' in deploy_script
+
+    rollback_start = deploy_script.index("rollback() {")
+    rollback_end = deploy_script.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR", rollback_start
+    )
+    rollback = _normalized_shell(deploy_script[rollback_start:rollback_end])
+    assert 'write_receipt "BLOCKED_DATABASE_GUARDS"' in rollback
+    assert rollback.count("DATABASE_GUARD_MIGRATION_UNVERIFIED") >= 6
+    assert "DATABASE_WRITER_GUARD_PERSISTED" in rollback
+    assert '[ -e "$DATABASE_WRITER_GUARD_FILE" ]' in rollback
+    assert "persistent database writer guard was removed or changed" in rollback
+    assert "database writer guard drop-ins were removed or unloaded" in rollback
+    assert "remove_database_writer_guard_after_recovery" not in rollback
+    assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' not in rollback
+    assert re.search(
+        r'DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1[^\n]*'
+        r'(?:\n|.)*?systemctl stop "\$MAIN_SERVICE"',
+        rollback,
+    )
+    assert re.search(
+        r'DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1[^\n]*'
+        r'(?:\n|.)*?systemctl disable probiga-scheduler',
+        rollback,
+    )
+    assert re.search(
+        r'DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1[^\n]*'
+        r'(?:\n|.)*?systemctl disable "\$AI_WORKER_TIMER"',
+        rollback,
+    )
+    assert re.search(
+        r'DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1[^\n]*'
+        r'(?:\n|.)*?systemctl disable "\$AI_WORKER_SERVICE"',
+        rollback,
+    )
+    assert "probiga restarted after database writer block" in rollback
+    assert "probiga-scheduler restarted after database writer block" in rollback
+    assert "assert_ai_worker_writer_fence" in rollback
+
+
+def test_activation_journal_closes_every_cutover_guard_gap() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    function_bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy_script).items()
+    }
+    cutover = normalized.index(
+        "CUTOVER_STEP=persist_database_writer_restore_journal"
+    )
+    first_unit_mutation = _required_shell_position(
+        normalized[cutover:], r"sudo systemctl (?:stop|disable)\b"
+    ) + cutover
+    journal_write = normalized.index(
+        "\npersist_database_writer_restore_journal\n", cutover
+    ) + 1
+    marker_write = normalized.index(
+        "\npersist_database_writer_guard\n", journal_write
+    ) + 1
+    assert cutover < journal_write < marker_write < first_unit_mutation
+    journal_writer = function_bodies["persist_database_writer_restore_journal"]
+    journal_syncer = function_bodies["controlled_guard_sync_activation_journal"]
+    marker_writer = function_bodies["persist_database_writer_guard"]
+    assert "controlled_guard_write_restore_file" in journal_writer
+    assert "controlled_guard_sync_activation_journal" in journal_writer
+    assert 'sync -f "$DATABASE_WRITER_RESTORE_FILE"' in journal_syncer
+    assert 'sync -f "$DATABASE_WRITER_GUARD_DIR"' in journal_syncer
+    assert marker_writer.index('mv -fT "$guard_tmp"') < marker_writer.index(
+        'sync -f "$DATABASE_WRITER_GUARD_FILE"'
+    )
+
+    qmt = normalized.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history",
+        first_unit_mutation,
+    )
+    runtime_install = normalized.index("CUTOVER_STEP=install_runtime_units", qmt)
+    task_install = normalized.index("CUTOVER_STEP=install_strategy_governance", qmt)
+    prestart = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_before_start", task_install
+    )
+    activation_sync = normalized.index(
+        "CUTOVER_STEP=sync_activation_journal_before_guard_removal", prestart
+    )
+    guard_removal = normalized.index(
+        "CUTOVER_STEP=remove_database_writer_guard_after_full_prestart",
+        activation_sync,
+    )
+    api_start = normalized.index("CUTOVER_STEP=start_api", guard_removal)
+    assert (
+        qmt
+        < runtime_install
+        < task_install
+        < prestart
+        < activation_sync
+        < guard_removal
+        < api_start
+    )
+
+    poststart_health = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_after_start", api_start
+    )
+    ai_restore = normalized.index("restore_ai_worker_previous_state", poststart_health)
+    quality_gate = normalized.index(
+        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"', ai_restore
+    )
+    receipt_pending = normalized.index(
+        "persist_deployed_receipt_pending", quality_gate
+    )
+    receipt = normalized.index(
+        "publish_deployed_receipt_pending", receipt_pending
+    )
+    journal_cleanup = normalized.rindex(
+        "controlled_guard_finalize_successful_activation", receipt_pending, receipt
+    )
+    journal_remove = normalized.index(
+        "activation_snapshot_remove_finalized_before_deploy", receipt
+    )
+    assert api_start < poststart_health < ai_restore < quality_gate < receipt_pending
+    assert receipt_pending < journal_cleanup
+    assert journal_cleanup < receipt < journal_remove
+    cutover_body = normalized[cutover:journal_cleanup]
+    assert 'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"' not in cutover_body
+
+
+def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    function_bodies = _shell_function_bodies(deploy_script)
+    recovery = _normalized_shell(
+        function_bodies["controlled_database_guard_recovery"]
+    )
+    cleanup = _normalized_shell(function_bodies["controlled_guard_cleanup"])
+    cleanup_restore = _normalized_shell(
+        function_bodies["controlled_guard_restore_after_cleanup_failure"]
+    )
+    restore_file_writer = _normalized_shell(
+        function_bodies["controlled_guard_write_restore_file"]
+    )
+    restore_finalize = _normalized_shell(
+        function_bodies["controlled_guard_restore_and_finalize"]
+    )
+    restore_previous_states = _normalized_shell(
+        function_bodies["controlled_guard_restore_previous_writer_states"]
+    )
+    apply_unit_state = _normalized_shell(
+        function_bodies["controlled_guard_apply_unit_state"]
+    )
+    refence_after_restore_failure = _normalized_shell(
+        function_bodies["controlled_guard_refence_after_restore_failure"]
+    )
+    force_all_writers_fenced = _normalized_shell(
+        function_bodies["controlled_guard_force_all_writers_fenced"]
+    )
+    restore_only_recovery = _normalized_shell(
+        function_bodies["controlled_database_writer_restore_recovery"]
+    )
+    state_record_assertion = _normalized_shell(
+        function_bodies["controlled_guard_assert_state_record"]
+    )
+    guard_inventory = _normalized_shell(
+        function_bodies["database_writer_guard_inventory"]
+    )
+    writer_fence = _normalized_shell(
+        function_bodies["controlled_guard_assert_all_writers_fenced"]
+    )
+    inventory_fence = _normalized_shell(
+        function_bodies["controlled_guard_assert_unit_inventory_fenced"]
+    )
+    normalize_fence = _normalized_shell(
+        function_bodies["controlled_guard_normalize_unit_fenced"]
+    )
+    strict_fence = _normalized_shell(
+        function_bodies["controlled_guard_assert_unit_fenced"]
+    )
+    boundary = _normalized_shell(
+        function_bodies["controlled_guard_assert_boundary"]
+    )
+    dropin_boundary = _normalized_shell(
+        function_bodies["controlled_guard_assert_dropin_boundary"]
+    )
+    dropin_contract = _normalized_shell(
+        function_bodies["controlled_guard_assert_dropin_contract"]
+    )
+    marker_assertion = _normalized_shell(
+        function_bodies["controlled_guard_assert_marker"]
+    )
+    recover_validator = function_bodies["controlled_guard_validate_recover_json"]
+    resume_validator = function_bodies["controlled_guard_validate_resume_json"]
+    writer_fence_validator = function_bodies[
+        "controlled_guard_validate_writer_fence_json"
+    ]
+    preflight_validator = function_bodies[
+        "controlled_guard_validate_preflight_json"
+    ]
+    guarded_runner = _normalized_shell(
+        function_bodies["controlled_guard_run_schema_tool"]
+    )
+    guarded_writer_fence_runner = _normalized_shell(
+        function_bodies["controlled_guard_run_writer_fence"]
+    )
+
+    explicit_mode = deploy_script.index(
+        '[ "$1" = --recover-database-guard ]'
+    )
+    recovery_dispatch = deploy_script.index(
+        'if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then'
+    )
+    normal_release_inputs = deploy_script.index(
+        ': "${EXPECTED_SHA:?EXPECTED_SHA is required}"'
+    )
+    stale_guard_rejection = deploy_script.index(
+        "persistent database writer guard/restore state requires controlled recovery"
+    )
+    assert explicit_mode < recovery_dispatch < normal_release_inputs
+    assert recovery_dispatch < normal_release_inputs < stale_guard_rejection
+    assert 'test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"' in recovery
+    assert (
+        'test "$guarded_sha" = "$PROBIGA_RECOVERY_GUARD_SHA"'
+        in restore_only_recovery
+    )
+
+    repair_dropins = recovery.index("controlled_guard_install_dropins")
+    repair_reload = recovery.index("systemctl daemon-reload", repair_dropins)
+    initial_writer_fence = recovery.index(
+        "controlled_guard_force_all_writers_fenced", repair_reload
+    )
+    initial_boundary = recovery.index(
+        "controlled_guard_assert_boundary", initial_writer_fence
+    )
+    assert repair_dropins < repair_reload < initial_writer_fence < initial_boundary
+    assert "release=*" in recovery
+    assert '"$CODE_RELEASE_ROOT/$guarded_sha"' in recovery
+    assert '"$RELEASE_VENV_ROOT/$guarded_sha"' in recovery
+    assert 'git -C "$code_root" rev-parse HEAD' in recovery
+    assert "--phase" not in recovery
+    initial_recover_run = recovery.index(
+        'controlled_guard_run_schema_tool "$code_root" '
+        '"$release_venv" recover "$guarded_sha"'
+    )
+    initial_recover_check = recovery.index(
+        "controlled_guard_validate_recover_json", initial_recover_run
+    )
+    post_initial_recover_boundary = recovery.index(
+        "controlled_guard_assert_boundary", initial_recover_check
+    )
+    writer_fence_run = recovery.index(
+        "controlled_guard_run_writer_fence", post_initial_recover_boundary
+    )
+    writer_fence_check = recovery.index(
+        "controlled_guard_validate_writer_fence_json", writer_fence_run
+    )
+    post_writer_fence_boundary = recovery.index(
+        "controlled_guard_assert_boundary", writer_fence_check
+    )
+    resume_run = recovery.index(
+        'controlled_guard_run_schema_tool "$code_root" '
+        '"$release_venv" resume "$guarded_sha"',
+        post_writer_fence_boundary,
+    )
+    resume_check = recovery.index(
+        "controlled_guard_validate_resume_json", resume_run
+    )
+    post_resume_boundary = recovery.index(
+        "controlled_guard_assert_boundary", resume_check
+    )
+    final_recover_run = recovery.index(
+        'controlled_guard_run_schema_tool "$code_root" '
+        '"$release_venv" recover "$guarded_sha"',
+        post_resume_boundary,
+    )
+    final_recover_check = recovery.index(
+        "controlled_guard_validate_recover_json", final_recover_run
+    )
+    post_final_recover_boundary = recovery.index(
+        "controlled_guard_assert_boundary", final_recover_check
+    )
+    preflight_run = recovery.index(
+        'controlled_guard_run_schema_tool "$code_root" '
+        '"$release_venv" preflight "$guarded_sha"',
+        post_final_recover_boundary,
+    )
+    preflight_check = recovery.index("controlled_guard_validate_preflight_json")
+    final_boundary = recovery.index(
+        "controlled_guard_assert_boundary", preflight_check
+    )
+    restore_file_write = recovery.index(
+        "controlled_guard_write_restore_file", final_boundary
+    )
+    cleanup_call = recovery.index("controlled_guard_cleanup", restore_file_write)
+    restore_finalize_call = recovery.index(
+        "controlled_guard_restore_and_finalize", cleanup_call
+    )
+    assert (
+        initial_boundary
+        < initial_recover_run
+        < initial_recover_check
+        < post_initial_recover_boundary
+        < writer_fence_run
+        < writer_fence_check
+        < post_writer_fence_boundary
+        < resume_run
+        < resume_check
+        < post_resume_boundary
+        < final_recover_run
+        < final_recover_check
+        < post_final_recover_boundary
+        < preflight_run
+        < preflight_check
+        < final_boundary
+        < restore_file_write
+        < cleanup_call
+        < restore_finalize_call
+    )
+    assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' not in recovery
+
+    for unit in (
+        "probiga disabled",
+        "probiga-scheduler disabled",
+        "probiga-ai-recommendation-worker.service disabled:static",
+        "probiga-ai-recommendation-worker.timer disabled",
+    ):
+        assert unit in writer_fence
+    for activation_unit in (
+        "probiga-scheduler.timer",
+        "probiga-scheduler.path",
+        "probiga-scheduler.socket",
+    ):
+        assert activation_unit in writer_fence
+    assert "loaded)" in inventory_fence
+    assert "not-found)" in inventory_fence
+    assert 'LoadState --value "$unit")" = not-found' in inventory_fence
+    assert "failed)" in normalize_fence
+    assert 'test "${main_pid:-0}" = 0' in normalize_fence
+    assert 'test "${exec_main_pid:-0}" = 0' in normalize_fence
+    assert 'systemctl stop "$unit"' in normalize_fence
+    assert 'systemctl reset-failed "$unit"' in normalize_fence
+    assert 'test "$active_state" = inactive' in strict_fence
+    assert 'test "${main_pid:-0}" = 0' in strict_fence
+    assert 'test "${exec_main_pid:-0}" = 0' in strict_fence
+    assert "scheduler_unit=*" in recovery
+    assert "ai_service_unit=*" in recovery
+    assert "ai_timer_unit=*" in recovery
+    for guard_dropin in (
+        "MAIN_DATABASE_WRITER_GUARD_DROPIN",
+        "SCHEDULER_DATABASE_WRITER_GUARD_DROPIN",
+        "AI_SERVICE_DATABASE_WRITER_GUARD_DROPIN",
+        "AI_TIMER_DATABASE_WRITER_GUARD_DROPIN",
+    ):
+        assert guard_dropin in dropin_contract
+    assert "controlled_guard_assert_marker" in boundary
+    assert "controlled_guard_assert_storage" in marker_assertion
+    assert "probiga.database-writer-guard.v2" in marker_assertion
+    for inventory_line in (
+        'main_unit=$main_record',
+        'scheduler_unit=$scheduler_record',
+        'ai_service_unit=$ai_service_record',
+        'ai_timer_unit=$ai_timer_record',
+    ):
+        assert inventory_line in marker_assertion
+    for record_kind in ("main", "scheduler", "ai-service", "ai-timer"):
+        assert f"controlled_guard_assert_state_record {record_kind}" in marker_assertion
+    for exact_inventory in (
+        'loaded,$PREVIOUS_MAIN_ACTIVE_STATE,$PREVIOUS_MAIN_UNIT_FILE_STATE',
+        'loaded,$PREVIOUS_SCHEDULER_ACTIVE_STATE,$PREVIOUS_SCHEDULER_UNIT_FILE_STATE',
+        'loaded,$PREVIOUS_AI_WORKER_SERVICE_ACTIVE_STATE,$PREVIOUS_AI_WORKER_SERVICE_UNIT_FILE_STATE',
+        'loaded,$PREVIOUS_AI_WORKER_TIMER_ACTIVE_STATE,$PREVIOUS_AI_WORKER_TIMER_UNIT_FILE_STATE',
+    ):
+        assert exact_inventory in guard_inventory
+    assert "not-found,not-found,not-found" in guard_inventory
+    assert "main:loaded:active:enabled" in state_record_assertion
+    assert "scheduler:not-found:not-found:not-found" in state_record_assertion
+    assert "ai-service:loaded:active:static" in state_record_assertion
+    assert "ai-timer:not-found:not-found:not-found" in state_record_assertion
+    assert "controlled_guard_assert_dropin_boundary" in boundary
+    assert "controlled_guard_assert_all_writers_fenced" in dropin_boundary
+
+    for required_recovery_evidence in (
+        'p.get("trust_restoration_verified") is True',
+        'p.get("restore_primary_verified") is True',
+        'p.get("restore_secondary_verified") is True',
+        'p.get("runtime_trust_off_verified") is True',
+    ):
+        assert required_recovery_evidence in recover_validator
+    for required_resume_evidence in (
+        'p.get("phase")=="resume"',
+        'p.get("runtime_least_privilege_verified") is True',
+        'security.get("global_privileges")==["USAGE"]',
+        'security.get("schema_privileges")==expected_schema',
+        'security.get("require_ssl") is True',
+        'security.get("roles")==[]',
+        'security.get("grant_option") is False',
+        'p.get("runtime_definer_routine_count")==0',
+        'p.get("runtime_definer_routine_inventory_verified") is True',
+        'binding.get("legacy_binding_pending") is False',
+        'binding.get("legacy_binding_marker_present") is bool(binding['
+        '"legacy_run_count"])',
+        'p.get("trust_restoration_verified") is True',
+        'p.get("restore_primary_verified") is True',
+        'p.get("restore_secondary_verified") is True',
+        'p.get("runtime_trust_off_verified") is True',
+        'x.get("status") in {"applied","exists"}',
+        'repair.get("post_validation_verified") is True',
+        'candidates==sorted(set(candidates))',
+        'repaired==candidates',
+        'set(candidates)<=allowed',
+        'p.get("trigger_trust_window_count")==len(windows)',
+        'p["seeded_strategy_count"]>0',
+        'p["governance_trigger_count"]>0',
+    ):
+        assert required_resume_evidence in resume_validator
+    for required_writer_fence_evidence in (
+        'p.get("mode")=="writer-fence"',
+        'p.get("writer_fence_active") is True',
+        'p.get("layer4_writers_enabled") is False',
+        'q.get("checked") is True',
+        'q.get("ready") is True',
+        'q.get("live_writers")==[]',
+    ):
+        assert required_writer_fence_evidence in writer_fence_validator
+    for required_preflight_evidence in (
+        'p.get("runtime_least_privilege_verified") is True',
+        'security.get("global_privileges")==["USAGE"]',
+        'security.get("schema_privileges")==expected_schema',
+        'security.get("require_ssl") is True',
+        'security.get("roles")==[]',
+        'security.get("grant_option") is False',
+        'p.get("runtime_definer_routine_count")==0',
+        'p.get("runtime_definer_routine_inventory_verified") is True',
+        'binding.get("legacy_binding_pending") is False',
+        'binding.get("legacy_binding_marker_present") is bool(binding['
+        '"legacy_run_count"])',
+        'p.get("pending_v3_versions")==[]',
+        'x.get("status")=="exists"',
+        'trigger.get("metadata_frozen") is True',
+        'trigger.get("legacy_rehome_names")==[]',
+        'p["qmt_table_count"]>0',
+        'p["governance_table_count"]>0',
+    ):
+        assert required_preflight_evidence in preflight_validator
+    for exact_runtime_grant in (
+        '"BIGA.*":["SELECT"]',
+        '"PROBIGA.*":["ALTER","CREATE","CREATE TEMPORARY TABLES",'
+        '"DELETE","DROP","INDEX","INSERT","REFERENCES","SELECT","UPDATE"]',
+        '"PROBIGA_QMT_HISTORY.*":["SELECT"]',
+    ):
+        assert exact_runtime_grant in resume_validator
+        assert exact_runtime_grant in preflight_validator
+
+    assert cleanup.count("controlled_guard_restore_after_cleanup_failure") >= 2
+    assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' in cleanup
+    assert 'rm -f -- "$dropin"' not in cleanup
+    assert "controlled_guard_assert_dropin_boundary" in cleanup
+    assert "systemctl daemon-reload" not in cleanup
+    assert "controlled_guard_recreate_file" in cleanup_restore
+    assert "controlled_guard_install_dropins" in cleanup_restore
+    assert "systemctl daemon-reload" in cleanup_restore
+    assert "controlled_guard_force_all_writers_fenced" in cleanup_restore
+    assert "controlled_guard_assert_boundary" in cleanup_restore
+    assert "probiga.database-writer-restore.v1" in restore_file_writer
+    assert 'chown root:root "$restore_tmp"' in restore_file_writer
+    assert 'chmod 0600 "$restore_tmp"' in restore_file_writer
+    assert 'mv -fT "$restore_tmp" "$DATABASE_WRITER_RESTORE_FILE"' in restore_file_writer
+    assert 'sync -f "$DATABASE_WRITER_RESTORE_FILE"' in restore_file_writer
+    assert "controlled_guard_assert_restore_file" in restore_finalize
+    assert "controlled_guard_restore_previous_writer_states" in restore_finalize
+    assert restore_finalize.count("controlled_guard_refence_after_restore_failure") >= 2
+    assert 'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"' in restore_finalize
+    for unit in (
+        "probiga",
+        "probiga-scheduler",
+        "probiga-ai-recommendation-worker.service",
+        "probiga-ai-recommendation-worker.timer",
+    ):
+        assert f"controlled_guard_apply_unit_state {unit}" in restore_previous_states
+    assert "http://127.0.0.1/api/health" in restore_previous_states
+    for exact_action in (
+        'systemctl enable "$unit"',
+        'systemctl disable "$unit"',
+        'systemctl start "$unit"',
+        'systemctl stop "$unit"',
+        'test "$active_state" = "$expected_active"',
+        '"$expected_unit_file"',
+    ):
+        assert exact_action in apply_unit_state
+    refence_recreate = refence_after_restore_failure.index(
+        "controlled_guard_recreate_file"
+    )
+    refence_install = refence_after_restore_failure.index(
+        "controlled_guard_install_dropins", refence_recreate
+    )
+    refence_reload = refence_after_restore_failure.index(
+        "systemctl daemon-reload", refence_install
+    )
+    refence_force = refence_after_restore_failure.index(
+        "controlled_guard_force_all_writers_fenced", refence_reload
+    )
+    refence_boundary = refence_after_restore_failure.index(
+        "controlled_guard_assert_boundary", refence_force
+    )
+    assert refence_recreate < refence_install < refence_reload < refence_force
+    assert refence_force < refence_boundary
+    for unit in (
+        "probiga loaded disabled",
+        "probiga-scheduler",
+        "probiga-ai-recommendation-worker.service",
+        "probiga-ai-recommendation-worker.timer",
+        "probiga-scheduler.timer",
+        "probiga-scheduler.path",
+        "probiga-scheduler.socket",
+    ):
+        assert unit in force_all_writers_fenced
+    assert "probiga.database-writer-restore.v1" in restore_only_recovery
+    assert 'test ! -e "$DATABASE_WRITER_GUARD_FILE"' in restore_only_recovery
+    restore_marker = restore_only_recovery.index(
+        "controlled_guard_recreate_file"
+    )
+    restore_dropins = restore_only_recovery.index(
+        "controlled_guard_install_dropins", restore_marker
+    )
+    restore_reload = restore_only_recovery.index(
+        "systemctl daemon-reload", restore_dropins
+    )
+    restore_fence = restore_only_recovery.index(
+        "controlled_guard_force_all_writers_fenced", restore_reload
+    )
+    restore_boundary = restore_only_recovery.index(
+        "controlled_guard_assert_boundary", restore_fence
+    )
+    restore_cleanup = restore_only_recovery.index(
+        "controlled_guard_cleanup", restore_boundary
+    )
+    restore_exact = restore_only_recovery.index(
+        "controlled_guard_restore_and_finalize", restore_cleanup
+    )
+    assert (
+        restore_marker
+        < restore_dropins
+        < restore_reload
+        < restore_fence
+        < restore_boundary
+        < restore_cleanup
+        < restore_exact
+    )
+    assert "controlled_guard_refence_after_restore_failure" in restore_only_recovery
+    dispatch = _normalized_shell(
+        deploy_script[recovery_dispatch:normal_release_inputs]
+    )
+    assert 'if [ -e "$DATABASE_WRITER_GUARD_FILE" ]' in dispatch
+    assert 'elif [ -e "$DATABASE_WRITER_RESTORE_FILE" ]' in dispatch
+    assert "controlled_database_guard_recovery" in dispatch
+    assert "controlled_database_writer_restore_recovery" in dispatch
+    assert 'phase_args+=(--writers-fenced)' in guarded_runner
+    assert 'preflight|recover)' in guarded_runner
+    assert 'resume)' in guarded_runner
+    assert "--writer-fence" in guarded_writer_fence_runner
+    assert "--require-no-live-scheduler-writers" in guarded_writer_fence_runner
+    assert 'sudo -u "$service_user"' in guarded_writer_fence_runner
+    assert '"PYTHONPATH=$adata_source:$code_root"' in guarded_writer_fence_runner
+
+
+def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy).items()
+    }
+    create = _normalized_shell(deploy[
+        deploy.index("activation_snapshot_create() {"):
+        deploy.index("activation_snapshot_assert_old_set() {")
+    ])
+    assert "governance-task-old.json" in create
+    assert "governance-task-old.sha256" in create
+    assert "writer-state.sha256" in create
+    for field in (
+        "new_release=$EXPECTED_SHA",
+        "old_release=$PREVIOUS_RELEASE_REVISION",
+        "release_tree_sha256=$EXPECTED_RELEASE_TREE_SHA256",
+        "adapter_registry_seal_sha256=$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256",
+    ):
+        assert field in create
+
+    cutover = _normalized_shell(deploy[deploy.index("CUTOVER_STEP=prepare_release"):])
+    old_capture = cutover.index("CUTOVER_STEP=capture_strategy_governance_task_before_cutover")
+    journal = cutover.index("CUTOVER_STEP=persist_database_writer_restore_journal")
+    new_enable = cutover.index("CUTOVER_STEP=enable_strategy_governance_task")
+    new_capture = cutover.index("CUTOVER_STEP=capture_strategy_governance_task_after_enable")
+    new_seal = cutover.index("activation_snapshot_install_governance_new", new_capture)
+    new_verify = cutover.index("controlled_guard_governance_snapshot verify", new_seal)
+    assert old_capture < journal < new_enable < new_capture < new_seal < new_verify
+
+    old_restore = bodies["controlled_guard_restore_and_finalize"]
+    assert old_restore.index(
+        "controlled_guard_restore_and_verify_governance_snapshot"
+    ) < old_restore.index("controlled_guard_restore_previous_writer_states")
+    assert '"$old_runtime_sha"' in old_restore
+
+    recovery = bodies["controlled_activation_snapshot_only_recovery"]
+    old_branch = recovery[: recovery.index("activation_snapshot_restore_new_set")]
+    new_branch = recovery[recovery.index("activation_snapshot_restore_new_set"):]
+    assert old_branch.index(
+        '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"'
+    ) < old_branch.index("controlled_guard_restore_previous_writer_states")
+    assert new_branch.index(
+        '"$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"'
+    ) < new_branch.index("systemctl start probiga")
+    assert "publish_deployed_receipt_pending" in new_branch
+
+    success = cutover[cutover.index("CUTOVER_STEP=persist_deployed_receipt_pending"):]
+    pending = success.index("persist_deployed_receipt_pending")
+    finalized = success.index("controlled_guard_finalize_successful_activation")
+    published = success.index("publish_deployed_receipt_pending")
+    removed = success.index("activation_snapshot_remove_finalized_before_deploy")
+    assert pending < finalized < published < removed
+
+
+def test_runtime_identity_checks_every_active_writer_and_attested_environment() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _normalized_shell(
+        _shell_function_bodies(deploy)["controlled_guard_verify_restored_runtime"]
+    )
+    main = body.index('if [ "$main_active" = active ]; then')
+    scheduler = body.index(
+        'if [ "$scheduler_load" = loaded ] && [ "$scheduler_active" = active ]; then'
+    )
+    ai = body.index('if [ "$ai_service_load" = loaded ]; then')
+    assert main < scheduler < ai < body.rindex("return 0")
+    assert "return 0" not in body[main:scheduler]
+    for unit in ("probiga", "probiga-scheduler", "probiga-ai-recommendation-worker.service"):
+        assert unit in body
+    for identity in (
+        "PROBIGA_EXPECTED_GIT_SHA=$expected_sha",
+        "PROBIGA_CODE_ROOT=$code_root",
+        "PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha",
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha",
+    ):
+        assert body.count(identity) >= 3
+
+
+def test_new_systemd_units_and_activation_identity_bind_tree_and_registry_seal() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    for writer in ("write_dropin", "write_scheduler_dropin", "write_ai_worker_dropin"):
+        body = bodies[writer]
+        assert "Environment=PROBIGA_RELEASE_TREE_SHA256=" in body
+        assert "Environment=PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=" in body
+    assert deploy.count(
+        'grep -zFx -- "PROBIGA_RELEASE_TREE_SHA256=$EXPECTED_RELEASE_TREE_SHA256"'
+    ) >= 2
+    assert deploy.count(
+        '"PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256='
+        '$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256"'
+    ) >= 2
+    trigger = _normalized_shell(bodies["assert_scheduler_triggers_quiescent"])
+    assert 'if [ "$active_state" != inactive ]; then' in trigger
+    assert "disabled)" in trigger
+    assert "inactive|failed" not in trigger
+
+
+def test_database_guard_cleanup_keeps_fixed_systemd_fence_dropins() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    function_bodies = _shell_function_bodies(deploy_script)
+    cleanup = _normalized_shell(
+        function_bodies["remove_database_writer_guard_after_recovery"]
+    )
+    cleanup_restore = _normalized_shell(
+        function_bodies[
+            "restore_database_writer_guard_after_cleanup_failure"
+        ]
+    )
+
+    marker_removal = cleanup.index(
+        'sudo rm -f -- "$DATABASE_WRITER_GUARD_FILE"'
+    )
+    assert cleanup.index("assert_database_writer_guard_dropins_loaded") < marker_removal
+    assert cleanup.index(
+        "assert_database_writer_guard_dropins_loaded", marker_removal
+    ) > marker_removal
+    assert 'rm -f -- "$dropin"' not in cleanup
+    assert "systemctl daemon-reload" not in cleanup
+    assert cleanup.count(
+        "restore_database_writer_guard_after_cleanup_failure"
+    ) >= 3
+    assert "controlled_guard_recreate_file" in cleanup_restore
+    assert "controlled_guard_install_dropins" in cleanup_restore
+    assert "systemctl daemon-reload" in cleanup_restore
+    assert "controlled_guard_force_all_writers_fenced" in cleanup_restore
+    assert "controlled_guard_assert_boundary" in cleanup_restore
+    assert "controlled_guard_assert_dropin_boundary" in cleanup
+
+
+def test_ai_worker_service_and_timer_states_are_fenced_and_restored() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    function_bodies = _shell_function_bodies(deploy_script)
+    fence_assertion = _normalized_shell(
+        function_bodies["assert_ai_worker_writer_fence"]
+    )
+    restore = _normalized_shell(
+        function_bodies["restore_ai_worker_previous_state"]
+    )
+    restore_assertion = _normalized_shell(
+        function_bodies["assert_ai_worker_previous_state_restored"]
+    )
+
+    for state_name in (
+        "PREVIOUS_AI_WORKER_SERVICE_ACTIVE",
+        "PREVIOUS_AI_WORKER_SERVICE_ENABLED",
+        "PREVIOUS_AI_WORKER_SERVICE_UNIT_FILE_STATE",
+        "PREVIOUS_AI_WORKER_TIMER_ACTIVE",
+        "PREVIOUS_AI_WORKER_TIMER_ENABLED",
+        "PREVIOUS_AI_WORKER_TIMER_UNIT_FILE_STATE",
+    ):
+        assert state_name in deploy_script
+
+    assert '"$AI_WORKER_SERVICE"' in fence_assertion
+    assert '"$AI_WORKER_TIMER"' in fence_assertion
+    assert "ActiveState" in fence_assertion
+    assert "UnitFileState" in fence_assertion
+    assert "disabled|static" in fence_assertion
+    assert 'test "$timer_unit_file_state" = disabled' in fence_assertion
+    assert restore.count('systemctl enable "$AI_WORKER_SERVICE"') == 1
+    assert restore.count('systemctl disable "$AI_WORKER_SERVICE"') == 1
+    assert restore.count('systemctl start "$AI_WORKER_SERVICE"') == 1
+    assert restore.count('systemctl stop "$AI_WORKER_SERVICE"') == 1
+    assert restore.count('systemctl enable "$AI_WORKER_TIMER"') == 1
+    assert restore.count('systemctl disable "$AI_WORKER_TIMER"') == 1
+    assert restore.count('systemctl start "$AI_WORKER_TIMER"') == 1
+    assert restore.count('systemctl stop "$AI_WORKER_TIMER"') == 1
+    assert "PREVIOUS_AI_WORKER_SERVICE_UNIT_FILE_STATE" in restore_assertion
+    assert "PREVIOUS_AI_WORKER_TIMER_UNIT_FILE_STATE" in restore_assertion
+    assert "PREVIOUS_AI_WORKER_SERVICE_ACTIVE" in restore_assertion
+    assert "PREVIOUS_AI_WORKER_TIMER_ACTIVE" in restore_assertion
+
+    cutover_start = deploy_script.index("CUTOVER_STEP=stop_auxiliary_writers")
+    cutover_end = deploy_script.index("CUTOVER_STEP=stop_scheduler", cutover_start)
+    cutover = _normalized_shell(deploy_script[cutover_start:cutover_end])
+    timer_disable = cutover.index('systemctl disable "$AI_WORKER_TIMER"')
+    service_disable = cutover.index('systemctl disable "$AI_WORKER_SERVICE"')
+    timer_stop = cutover.index('systemctl stop "$AI_WORKER_TIMER"')
+    service_stop = cutover.index('systemctl stop "$AI_WORKER_SERVICE"')
+    fence_check = cutover.index("assert_ai_worker_writer_fence")
+    assert timer_disable < service_disable < timer_stop < service_stop < fence_check
+
+    rollback_start = deploy_script.index("rollback() {")
+    rollback_end = deploy_script.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR", rollback_start
+    )
+    rollback = _normalized_shell(deploy_script[rollback_start:rollback_end])
+    assert "restore_ai_worker_previous_state" in rollback
+    assert "assert_ai_worker_previous_state_restored" in rollback
+    assert 'systemctl disable "$AI_WORKER_SERVICE"' in rollback
+    assert 'systemctl disable "$AI_WORKER_TIMER"' in rollback
+    assert "assert_ai_worker_writer_fence" in rollback
+
+    success_start = deploy_script.index(
+        'if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then',
+        deploy_script.index("CUTOVER_STEP=verify_strategy_governance_after_start"),
+    )
+    success_end = deploy_script.index(
+        "assert_scheduler_triggers_quiescent", success_start
+    )
+    success = _normalized_shell(deploy_script[success_start:success_end])
+    assert "restore_ai_worker_previous_state" in success
+    assert "assert_ai_worker_previous_state_restored" in success
+
+
+def test_schema_preflight_is_read_only_and_global_trust_isolated() -> None:
+    schema_tool = (
+        ROOT / "tools/prepare_strategy_governance_schema.py"
+    ).read_text(encoding="utf-8")
+    preflight_start = schema_tool.index("def _preflight_schema(")
+    preflight_end = schema_tool.index("def _connect_admin(", preflight_start)
+    preflight = schema_tool[preflight_start:preflight_end]
+    trust_setter_start = schema_tool.index("def _set_trust(")
+    trust_setter_end = schema_tool.index("def _acquire_lock(", trust_setter_start)
+    trust_setter = schema_tool[trust_setter_start:trust_setter_end]
+    prepare_start = schema_tool.index("def prepare_schema(")
+    prepare_end = schema_tool.index("def main(", prepare_start)
+    prepare = schema_tool[prepare_start:prepare_end]
+
+    assert "run_v3_migrations(boundary.migrator_engine, dry_run=True)" in preflight
+    assert "validate_attestation_schema(" in preflight
+    assert "require_triggers=False" in preflight
+    assert "ensure_attestation_tables(" not in preflight
+    assert "ensure_strategy_governance_tables(" not in preflight
+    assert "seed_governance_registry(" not in preflight
+    assert "SET GLOBAL" not in preflight
+    assert not re.search(
+        r'execute\s*\(\s*(?:text\s*\(\s*)?["\']\s*'
+        r"(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE|TRUNCATE)\b",
+        preflight,
+        flags=re.IGNORECASE,
+    )
+
+    assert "SET GLOBAL log_bin_trust_function_creators = ON" in trust_setter
+    assert "SET GLOBAL log_bin_trust_function_creators = OFF" in trust_setter
+    assert 'if phase == "recover":' in prepare
+    assert 'if phase == "preflight":' in prepare
+    assert "else:" in prepare
+    assert "_recover_trust(recovery_boundary)" in prepare
+    assert "_preflight_schema(boundary)" in prepare
+    assert "_cutover_schema(" in prepare
+    assert 'repair_interrupted_legacy=phase == "resume"' in prepare
+    assert 'fenced_phases = {"cutover", "resume"}' in prepare
+    assert "if phase in fenced_phases and not writers_fenced:" in prepare
+    assert "_recover_trust(_open_recovery_boundary())" in prepare

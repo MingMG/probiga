@@ -1,4 +1,5 @@
 import inspect
+import json
 import os
 import re
 
@@ -30,6 +31,40 @@ def _bar(**overrides):
 
 def test_v2_protocol_name_is_frozen():
     assert ATTESTATION_PROTOCOL_VERSION == "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "CREATE TEMPORARY TABLE tmp_contract (id BIGINT)",
+        "DROP TEMPORARY TABLE IF EXISTS tmp_contract",
+        "SELECT 1",
+        "UPDATE qmt_kline_attestation_run SET status='FAILED'",
+    ),
+)
+def test_schema_prepared_sql_guard_allows_only_session_local_ddl(statement):
+    attester.assert_schema_prepared_statement_is_session_local(statement)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    (
+        "CREATE TABLE permanent_table (id BIGINT)",
+        "DROP TABLE permanent_table",
+        "ALTER TABLE permanent_table ADD COLUMN value INT",
+        "ALTER TABLE tmp_contract ADD PRIMARY KEY (id)",
+        "CREATE TRIGGER unsafe BEFORE INSERT ON t FOR EACH ROW SET @x=1",
+        "DROP TRIGGER unsafe",
+    ),
+)
+def test_schema_prepared_sql_guard_rejects_all_non_temporary_ddl(statement):
+    with pytest.raises(RuntimeError, match="CREATE/DROP TEMPORARY"):
+        attester.assert_schema_prepared_statement_is_session_local(statement)
+
+
+def test_schema_prepared_attester_contains_no_alter_ddl():
+    source = inspect.getsource(attester.attest_range).upper()
+    assert "ALTER TABLE" not in source
 
 
 def test_native_pre_close_can_replace_legacy_target_value():
@@ -78,7 +113,10 @@ def test_null_zero_or_negative_market_values_never_match(
 
 
 def test_append_only_triggers_are_never_dropped_during_attestation_setup():
-    source = inspect.getsource(attester.ensure_attestation_tables).upper()
+    source = (
+        inspect.getsource(attester.ensure_attestation_tables)
+        + inspect.getsource(attester._missing_attestation_trigger_statements)
+    ).upper()
     assert "DROP TRIGGER" not in source
     assert "INFORMATION_SCHEMA.TRIGGERS" in source
 
@@ -103,9 +141,11 @@ class _FrozenSchemaConnection:
         update_trigger_body="",
         completed_runs=(),
         table_engine="InnoDB",
-        table_collation="utf8mb4_general_ci",
+        table_collation=attester.QMT_ATTESTATION_COLLATION,
+        column_collation=attester.QMT_ATTESTATION_COLLATION,
         omit_index="",
         migration_hash=None,
+        legacy_marker_hash="",
     ):
         self.nullable_attested_open = nullable_attested_open
         self.extra_trigger = extra_trigger
@@ -113,20 +153,31 @@ class _FrozenSchemaConnection:
         self.completed_runs = list(completed_runs)
         self.table_engine = table_engine
         self.table_collation = table_collation
+        self.column_collation = column_collation
         self.omit_index = omit_index
         self.migration_hash = (
             attester.TOLERANCE_MEDIUMTEXT_MIGRATION_HASH
             if migration_hash is None
             else migration_hash
         )
+        self.legacy_marker_hash = legacy_marker_hash
 
     def execute(self, statement, params=None):
         sql = str(statement)
-        if "qmt_kline_attestation_schema_migration" in sql:
+        if (
+            "SELECT migration_hash FROM "
+            "qmt_kline_attestation_schema_migration" in sql
+        ):
+            marker_hash = (
+                self.legacy_marker_hash
+                if (params or {}).get("migration_key")
+                == attester.LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY
+                else self.migration_hash
+            )
             return _SchemaResult(
                 []
-                if not self.migration_hash
-                else [{"migration_hash": self.migration_hash}]
+                if not marker_hash
+                else [{"migration_hash": marker_hash}]
             )
         if "information_schema.TABLES" in sql:
             return _SchemaResult(
@@ -134,16 +185,9 @@ class _FrozenSchemaConnection:
                     {
                         "table_name": table_name,
                         "engine": self.table_engine,
-                        # Both 5.7 and 8.x utf8mb4 collations are valid.
-                        "table_collation": (
-                            self.table_collation
-                            if index == 0
-                            else "utf8mb4_0900_ai_ci"
-                        ),
+                        "table_collation": self.table_collation,
                     }
-                    for index, table_name in enumerate(
-                        attester.ATTESTATION_TABLE_NAMES
-                    )
+                    for table_name in attester.ATTESTATION_TABLE_NAMES
                 ]
             )
         if "information_schema.COLUMNS" in sql:
@@ -178,7 +222,7 @@ class _FrozenSchemaConnection:
                                 else None
                             ),
                             "collation_name": (
-                                "utf8mb4_bin"
+                                self.column_collation
                                 if contract[1]
                                 in {"char", "varchar", "text", "mediumtext"}
                                 else None
@@ -249,13 +293,13 @@ class _FrozenSchemaConnection:
         raise AssertionError(sql)
 
 
-def test_frozen_schema_validator_accepts_mysql57_and_mysql8_collations():
+def test_frozen_schema_validator_accepts_only_frozen_collation():
     detail = attester.validate_attestation_schema(
         _FrozenSchemaConnection()
     )
     assert detail["protocol_version"] == ATTESTATION_PROTOCOL_VERSION
-    assert detail["table_count"] == 3
-    assert detail["trigger_count"] == 2
+    assert detail["table_count"] == 4
+    assert detail["trigger_count"] == 4
     assert detail["errors"] == []
 
 
@@ -282,7 +326,15 @@ def test_frozen_schema_validator_accepts_mysql57_and_mysql8_collations():
         ),
         (
             _FrozenSchemaConnection(table_collation="latin1_swedish_ci"),
-            "character set is not utf8mb4",
+            "table collation differs",
+        ),
+        (
+            _FrozenSchemaConnection(table_collation="utf8mb4_0900_ai_ci"),
+            "table collation differs",
+        ),
+        (
+            _FrozenSchemaConnection(column_collation="utf8mb4_general_ci"),
+            "character set/collation differs",
         ),
         (
             _FrozenSchemaConnection(
@@ -341,7 +393,7 @@ class _MigrationConnection:
                     ),
                     "is_nullable": "NO",
                     "character_set_name": "utf8mb4",
-                    "collation_name": "utf8mb4_general_ci",
+                    "collation_name": attester.QMT_ATTESTATION_COLLATION,
                     "column_default": None,
                     "extra": "",
                 }]
@@ -454,11 +506,9 @@ def test_daily_universe_manifest_hash_and_parser_are_frozen():
             }
         ),
     }
-    tolerance_json = {
-        "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
-        "universe_manifest_schema": attester.UNIVERSE_MANIFEST_SCHEMA,
-        "daily_universe": {"2026-08-21": contract},
-    }
+    tolerance_json = attester.build_qmt_v2_manifest(
+        {"2026-08-21": contract}
+    )
     assert attester.validated_universe_manifest(
         tolerance_json,
         start_date="2026-08-21",
@@ -498,6 +548,109 @@ def test_completed_run_requires_parseable_universe_manifest():
         "completed run universe manifest invalid" in error
         for error in captured.value.detail["errors"]
     )
+
+
+def _legacy_completed_row(**changes):
+    row = {
+        "run_id": "legacy-run-1",
+        "provider": attester.PROVIDER_ID,
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-24",
+        "target_rows": 93519,
+        "qmt_rows": 94000,
+        "matched_rows": 93519,
+        "missing_qmt_rows": 0,
+        "mismatched_rows": 0,
+        "already_attested_rows": 0,
+        "updated_rows": 93519,
+        "tolerance_json": attester.LEGACY_TOLERANCE_JSON,
+    }
+    row.update(changes)
+    return row
+
+
+def test_exact_legacy_completed_run_is_only_relaxed_until_marker_binds_it():
+    row = _legacy_completed_row()
+    plan = attester.legacy_completed_run_binding_plan([row])
+    legacy_expectation = {
+        "expected_legacy_run_count": 1,
+        "expected_legacy_plan_hash": plan["plan_hash"],
+    }
+    relaxed = attester.validate_attestation_schema(
+        _FrozenSchemaConnection(completed_runs=[row]),
+        require_current_manifests=False,
+        **legacy_expectation,
+    )
+    assert relaxed["legacy_ineligible_run_count"] == 1
+    assert relaxed["legacy_binding_pending"] is True
+    assert relaxed["completed_current_manifest_run_count"] == 0
+    assert relaxed["completed_manifest_entry_count"] == 0
+
+    with pytest.raises(attester.QmtAttestationSchemaError, match="binding marker"):
+        attester.validate_attestation_schema(
+            _FrozenSchemaConnection(completed_runs=[row]),
+            **legacy_expectation,
+        )
+
+    strict = attester.validate_attestation_schema(
+        _FrozenSchemaConnection(
+            completed_runs=[row],
+            legacy_marker_hash=plan["plan_hash"],
+        ),
+        **legacy_expectation,
+    )
+    assert strict["legacy_binding_marker_verified"] is True
+    assert strict["legacy_binding_plan_hash"] == plan["plan_hash"]
+    assert strict["completed_manifest_entry_count"] == 0
+
+
+def test_production_legacy_grandfather_contract_is_frozen():
+    assert attester.EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT == 11
+    assert attester.EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH == (
+        "fc8328550615413445edf1055b3b88d70fa8b37e45ee331f682cf8f654779b54"
+    )
+    plan = attester.legacy_completed_run_binding_plan([
+        _legacy_completed_row()
+    ])
+
+    with pytest.raises(ValueError, match="release contract differs"):
+        attester.validate_legacy_completed_run_release_contract(
+            plan,
+            expected_run_count=(
+                attester.EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT
+            ),
+            expected_plan_hash=(
+                attester.EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"tolerance_json": "{"},
+        {"tolerance_json": attester.LEGACY_TOLERANCE_JSON + " "},
+        {"tolerance_json": json.dumps({
+            "amount_relative": 0.001,
+            "price_absolute": 0.0001,
+            "volume_absolute": 100.0,
+            "volume_relative": 0.0001,
+            "unexpected": True,
+        }, sort_keys=True)},
+        {"matched_rows": 93518},
+        {"qmt_rows": 93518},
+    ),
+)
+def test_relaxed_legacy_gate_still_rejects_json_hash_fields_and_counters(
+    changes,
+):
+    with pytest.raises(attester.QmtAttestationSchemaError):
+        attester.validate_attestation_schema(
+            _FrozenSchemaConnection(
+                completed_runs=[_legacy_completed_row(**changes)]
+            ),
+            require_current_manifests=False,
+        )
 
 
 def test_run_manifest_capacity_is_frozen_as_mediumtext():
@@ -562,9 +715,19 @@ def test_legacy_text_upgrade_and_frozen_rows_on_mysql57():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
 
-        attester.ensure_attestation_tables(engine)
+        def trigger_executor(statement):
+            with engine.begin() as connection:
+                connection.execute(text(statement))
+
+        attester.ensure_attestation_tables(
+            engine,
+            trigger_ddl_executor=trigger_executor,
+        )
         first = attester.validate_attestation_schema(engine)
-        attester.ensure_attestation_tables(engine)
+        attester.ensure_attestation_tables(
+            engine,
+            trigger_ddl_executor=trigger_executor,
+        )
         second = attester.validate_attestation_schema(engine)
         assert first["errors"] == second["errors"] == []
         with engine.begin() as connection:

@@ -8,8 +8,6 @@ import shlex
 from typing import Any, NoReturn, Sequence
 
 
-DEFAULT_REMOTE_SSH_HOST = "47.113.123.190"
-DEFAULT_REMOTE_SSH_USER = "root"
 DEFAULT_REMOTE_ROOT = "/opt/ProBigA"
 DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 30
 DEFAULT_SSH_AUTH_TIMEOUT_SECONDS = 30
@@ -33,28 +31,58 @@ class UnsafeProductionSshError(RuntimeError):
 
 
 def remote_host() -> str:
-    return os.environ.get("PROBIGA_REMOTE_SSH_HOST", DEFAULT_REMOTE_SSH_HOST).strip()
+    value = os.environ.get("PROBIGA_REMOTE_SSH_HOST", "").strip()
+    if not value:
+        raise UnsafeProductionSshError(
+            "PROBIGA_REMOTE_SSH_HOST is required for remote SSH"
+        )
+    return value
 
 
 def remote_user() -> str:
-    return os.environ.get("PROBIGA_REMOTE_SSH_USER", DEFAULT_REMOTE_SSH_USER).strip()
+    value = os.environ.get("PROBIGA_REMOTE_SSH_USER", "").strip()
+    if not value:
+        raise UnsafeProductionSshError(
+            "PROBIGA_REMOTE_SSH_USER is required for remote SSH"
+        )
+    return value
 
 
 def ssh_connect_kwargs(**overrides: Any) -> dict[str, Any]:
-    password_override = overrides.pop("password", None)
-    password = str(password_override or os.environ.get("PROBIGA_REMOTE_SSH_PASSWORD", "")).strip()
-    if not password:
-        raise RuntimeError("Missing PROBIGA_REMOTE_SSH_PASSWORD")
+    if "password" in overrides:
+        raise UnsafeProductionSshError(
+            "SSH passwords may only come from PROBIGA_REMOTE_SSH_PASSWORD"
+        )
+    hostname = str(overrides.pop("hostname", None) or remote_host()).strip()
+    username = str(overrides.pop("username", None) or remote_user()).strip()
+    key_value = str(
+        overrides.pop("key_filename", None)
+        or os.environ.get("PROBIGA_REMOTE_SSH_KEY_FILE", "")
+    ).strip()
+    password = os.environ.get("PROBIGA_REMOTE_SSH_PASSWORD", "").strip()
+    if not key_value and not password:
+        raise UnsafeProductionSshError(
+            "PROBIGA_REMOTE_SSH_KEY_FILE is required; legacy password "
+            "authentication requires explicit PROBIGA_REMOTE_SSH_PASSWORD"
+        )
     kwargs: dict[str, Any] = {
-        "hostname": remote_host(),
-        "username": remote_user(),
-        "password": password,
+        "hostname": hostname,
+        "username": username,
         "look_for_keys": False,
         "allow_agent": False,
         "timeout": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
         "auth_timeout": DEFAULT_SSH_AUTH_TIMEOUT_SECONDS,
         "banner_timeout": DEFAULT_SSH_BANNER_TIMEOUT_SECONDS,
     }
+    if key_value:
+        key_path = Path(key_value).expanduser().resolve()
+        if not key_path.is_file():
+            raise UnsafeProductionSshError(
+                f"SSH key file does not exist: {key_path}"
+            )
+        kwargs["key_filename"] = str(key_path)
+    else:
+        kwargs["password"] = password
     kwargs.update(overrides)
     return kwargs
 

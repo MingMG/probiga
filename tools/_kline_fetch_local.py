@@ -12,15 +12,17 @@ ensure_adata_import_path(ROOT)
 
 import pandas as pd
 from sqlalchemy import text
-from env_config import create_tool_engine, resolve_tool_mysql_url
+from env_config import create_tool_engine
 from server.common.batch_db import write_frame
+from server.common.config import get_kline_mysql_url
 
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
 
 def main():
-    remote_mysql_url = os.environ.get("REMOTE_MYSQL_URL") or resolve_tool_mysql_url()
-    engine = create_tool_engine(remote_mysql_url, connect_args={"connect_timeout": 30})
+    engine = create_tool_engine(
+        get_kline_mysql_url(), connect_args={"connect_timeout": 30}
+    )
 
     with engine.connect() as conn:
         all_codes = [r[0] for r in conn.execute(text("SELECT stock_code FROM si_all_code ORDER BY stock_code")).fetchall()]

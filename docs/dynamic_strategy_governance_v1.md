@@ -41,6 +41,12 @@
 
 组合不能只依赖成员分数或成员收益指标的加权平均取得资格。除成员均满足要求外，还必须由内部账本按冻结权重在窗口起点分配独立资金袖套，之后让成员权重随各自净值自然漂移；禁止假设每日无成本再平衡。组合据此重建自己的逐日虚拟净值，独立计算扣费后收益、回撤和每日收益序列，并具有该组合版本自己的 Walk-Forward 版本选择验证。若未来引入再平衡，必须注册新组合版本，冻结频率/阈值并扣除实际换仓成本。组合的版本化约束至少包括成员最大权重、最大成对相关性、相关性最少共同观测数、最大股票重合度和最大行业集中度；缺少任一约束所需的底层数据都应失败关闭。组合与其任一成员不得在同一资金分配中重复获得资金，避免形成未披露的重复敞口。
 
+### 2.4 动态执行适配器可信根
+
+数据库中的适配器名称、版本和制品 SHA 都只是声明，不能让任意 Python 对象取得执行权。部署端只接受可信发布根内、路径不含符号链接、由模块同名导出的具名 `types.FunctionType` 模块级纯函数；实例可调用对象、绑定方法、lambda、嵌套函数、闭包、默认参数、运行期导入、全局写入、非白名单 builtin、模块对象以及可变或不透明全局一律拒绝。制品指纹必须同时绑定适配器模块相对路径与文件 SHA-256、实际引用的项目模块文件 SHA-256、生产依赖锁 SHA-256、发布树 SHA-256 和 Python ABI。生产进程只有在可信启动清单提供预期 registry seal SHA-256 并显式封印后才可执行；未封印时能力页面和执行路径都失败关闭。
+
+每次动态候选运行把稳定的权威输入/输出与随机审计身份分开：`input_hash`、`output_hash` 和 `stable_result_hash` 不包含 `run_uid`、`completed_at` 或回执哈希；相同策略版本、绑定、交易日、输入和候选结果重复运行时，治理输入哈希和决定哈希必须相同。随机运行号、完成时间和回执哈希写入独立仅追加 `st_strategy_adapter_run_receipt`，零候选的完整运行同样留痕。当前尚未部署由独立生产者写入并以外键串联的 intent/order/fill/forward-evidence 持久链，因此调用方自造的自洽哈希链一律拒绝，动态策略 `funding_pipeline_ready` 固定为 `false`。
+
 ## 3. 中文生命周期
 
 页面只展示中文状态；内部代码仅用于接口兼容和审计。
@@ -58,6 +64,7 @@
 - 人工操作可以暂停、转回影子研究或淘汰，必须填写具体中文理由；但已经“暂停使用”的版本不能由人工直接恢复。
 - 人工操作不能直接授予“正常运行”或“降权运行”。这两个状态只能由每日治理基于已确认、足够新鲜且绑定精确版本的证据自动授予。
 - `SUSPENDED` 不能在同一轮直接跳到 `ACTIVE` 或 `REDUCE`。只有严格晚于暂停证据高水位的新证据达到初步恢复门槛时，每日治理才可把它恢复到 `SHADOW`；暂停前的连续通过次数全部作废，之后再重新累计完整确认。
+- `enabled=false` 和 `RETIRED` 版本绝不执行、绝不计入动态候选完成 quorum、绝不进入任一股票池或资金候选；`SUSPENDED` 只允许独立诊断展示，不进入 quorum、股票池或分配。每一层都必须重新校验，不能信任上游自报的 `paper_allocation_eligible=true`。
 - 自动升级、降权、暂停和恢复都必须记录门槛结果、证据哈希、目标交易日、运行编号及中文理由。
 - 排名和健康分不能覆盖任何盈利硬门槛，也不能改变人工不可直接授资的限制。
 
@@ -118,7 +125,7 @@ v3 产物必须携带完整的 `validation_protocol`：`label_horizon_days`、�
 
 每日市场状态是资金入口的上层开关，不是排名后的展示标签。每个策略版本必须冻结四种权威状态（趋势、宽幅震荡、风险下降、极端风险）的完整适配系数、路由策略版本和市场状态配置哈希；历史清单中未冻结路由契约的旧版本必须按“未配置、失败关闭”处理，不能推断默认适配。
 
-治理运行按当天权威市场状态为每个精确策略版本生成可复算的 `router_decision_hash`。组合路由必须由全部精确成员版本的路由共同决定；任一成员不适配、版本不一致或路由哈希缺失时，组合不得授资。模拟资金分配必须同时绑定目标版本、盈利门槛哈希、市场状态、适配分、路由决定哈希、中文生命周期、生命周期倍率和竞争前基础权重，并受当前市场状态的总风险上限约束。先以健康分和路由匹配度竞争基础预算，再对“正常运行”乘 1.00、“降权运行”乘 0.50，按 1bp 银行家舍入；折扣资金和风险上限外资金全部留在现金，禁止重新归一化把风险加给其他对象。策略状态仍可保持“正常运行”，但当前市场不适配时本轮权重必须为零；市场路由不能篡改长期盈利证据，也不能绕过盈利硬门槛。
+治理运行按当天权威市场状态为每个精确策略版本生成可复算的 `router_decision_hash`。组合路由必须由全部精确成员版本的路由共同决定；任一成员不适配、版本不一致或路由哈希缺失时，组合不得授资。模拟资金分配必须同时绑定目标版本、盈利门槛哈希、市场状态、适配分、路由决定哈希、中文生命周期、生命周期倍率和竞争前基础权重，并受当前市场状态的总风险上限约束。先以健康分和路由匹配度竞争基础预算，再对“正常运行”乘 1.00、“降权运行”乘 0.50，按 1bp 银行家舍入；折扣资金和风险上限外资金全部留在现金，禁止重新归一化把风险加给其他对象。组合不能只持久化一个平均倍率：每次分配必须输出并仅追加持久化精确 `member_sleeves`，逐成员记录策略版本、配置权重、base bp、成员/组合状态倍率、effective bp、现金折扣和逐行哈希；成员 base bp 等于组合 base bp，成员 effective bp 等于组合最终权重，effective 与折扣之和也必须逐 1bp 守恒。下游只认逐成员 `effective_weight_pct`，不得用组合表面权重绕过成员降权。策略状态仍可保持“正常运行”，但当前市场不适配时本轮权重必须为零；市场路由不能篡改长期盈利证据，也不能绕过盈利硬门槛。
 
 ## 5. 两类竞技排名
 
@@ -150,7 +157,7 @@ v3 产物必须携带完整的 `validation_protocol`：`label_horizon_days`、�
 
 `tools/run_strategy_governance_daily.py` 在底层候选快照完成并通过新鲜度校验后执行。默认生产调度由 `tools/add_strategy_governance_task.py` 安装，于 22:35 运行。默认目标不是“数据库里碰巧最新的一天”，而是交易日历给出的最近已收盘权威交易日；18:00 前按尚未结束的交易日回退，周末和节假日按交易日历回退。
 
-每日更新是每日重算市场路由、证据新鲜度、策略健康、生命周期资格、票池和模拟权重，不是覆盖不可变策略公式。信号逻辑、参数、成本模型或组合成员发生实质变化时必须随时注册新版本，从影子观察重新验证。运行参数中的 `limit` 只限制本轮底层股票候选输入规模，不限制注册表中的策略或组合数量；每日治理必须装载全部当前注册版本。
+每日更新是每日重算市场路由、证据新鲜度、策略健康、生命周期资格、票池和模拟权重，不是覆盖不可变策略公式。信号逻辑、参数、成本模型或组合成员发生实质变化时必须随时注册新版本，从影子观察重新验证。为保证票池完成证明，治理必须读取目标交易日的全部底层股票候选，且 `source_row_count` 必须精确等于 `loaded_row_count`；旧接口中的 `limit` 仅为兼容参数，不能截断权威输入。策略、组合和股票源都不得因该参数被静默截断。每日治理还必须在计算组合行业证据前完成当日行业历史的前瞻冻结；冻结失败时整轮阻断并保持现金。
 
 权威交易日或对应输入未就绪时，脚本必须只输出一个结构化对象并以退出码 2 结束：`status=blocked`、非空中文理由、权威目标日、实际输入日、真实下单权限关闭。调度器只对完全符合该契约的退出码 2 记录“阻断”；额外日志、字段缺失、日期无效、退出码伪造或真实下单权限非关闭一律记为失败。
 
@@ -191,8 +198,10 @@ v3 产物必须携带完整的 `validation_protocol`：`label_horizon_days`、�
 
 ## 9. API 边界
 
-- `GET /api/strategy-center/governance`：读取动态注册、两类竞技榜、三层票池和模拟分配。读取请求不得现场建表、播种或改变生命周期。
-- `GET /api/strategy-center/governance/history`：读取生命周期、证据审计和运行历史。
+- `GET /api/strategy-center/governance`：只读取最新 `is_canonical=1` 的完整不可变持久结果；除校验 `result_hash` 外，还必须独立重算路由、票池、分配、成员袖套、生命周期计划和最终决定哈希，并递归确认真实下单权限始终关闭。返回 `result_mode=CANONICAL_PERSISTED`；默认 GET 不实时重算。读取请求不得现场建表、播种或改变生命周期。
+- `GET /api/strategy-center/governance/preview`：明确请求一次 `result_mode=PREVIEW_REALTIME`、`is_canonical=false` 的研究诊断重算，不能替代默认 canonical 结果。
+- `GET /api/strategy-center/governance/adapter-capabilities`：读取已部署适配器、精确制品 SHA、可识别 evaluator types 和封印状态，不授予资金资格。
+- `GET /api/strategy-center/governance/history`：读取生命周期、证据审计、运行历史和 append-only 动态适配器运行回执。
 - `GET /api/strategy-center/metrics/{evidence_id}`：读取一份逐笔验证产物及服务端重算结果，供复核人检查。
 - `POST /api/strategy-center/registry`：注册新策略或不可覆盖的新版本。
 - `POST /api/strategy-center/combinations`：注册新组合或不可覆盖的组合版本。
@@ -202,7 +211,7 @@ v3 产物必须携带完整的 `validation_protocol`：`label_horizon_days`、�
 - `POST /api/strategy-center/combinations/{key}/lifecycle`：对组合执行相同的人工治理动作。
 - `POST /api/strategy-center/governance/run`：针对最新已确认交易日执行并原子持久化一次完整治理闭环。
 
-治理运行请求中的 `limit` 是底层股票候选读取上限，不是策略数量上限。动态策略和组合注册表不得因该参数被截断。
+治理运行请求中的 `limit` 是保留的兼容参数，不是策略数量或票池读取上限。权威候选必须全量读取，并以精确源行数、加载行数和明细哈希证明完成；动态策略、组合注册表和底层票池均不得因该参数被截断。
 
 所有写接口必须经过生产认证和同源保护，操作人由服务端身份生成，并具有幂等或冲突语义。职责必须分离：`ADMIN` 负责策略/组合注册、启停、生命周期治理、手工运行和外部证据提交；`EVIDENCE_REVIEWER` 只能独立确认或驳回证据，不能注册策略、提交证据或执行治理；旧管理令牌不能参与上述治理写操作。管理员可以通过 `POST /api/auth/users` 创建独立复核账号，但复核账号不能创建其他账号。参数错误、版本冲突、实体不存在、角色不符和服务端失败应使用相应的非 2xx HTTP 状态，不得用 HTTP 200 掩盖失败。
 
@@ -223,7 +232,27 @@ v3 产物必须携带完整的 `validation_protocol`：`label_horizon_days`、�
 
 运行 `tools/check_strategy_governance_health.py` 前必须完成数据库迁移和调度安装。验收必须失败关闭，并至少同时证明：
 
-- 13 张治理表由部署迁移预先创建（其中包含仅追加的治理结构迁移标记表），结构、唯一索引、数据回填完成标记和支持的 MySQL 版本均已实际验证；GET 接口不执行运行时 DDL、播种或生命周期写入。除此之外，V3 迁移 `20260822_001`、`002`、`003` 必须分别冻结前向策略版本、raw fill/cash 账本和逐笔 SELL 分配账本；003 的冻结合同为 5 条语句、精确校验和 `deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a`，并验证表、列、索引、外键、不可变触发器和实际拒绝 UPDATE/DELETE。QMT v2 逐行认证表及其不可变触发器也必须通过结构与数据绑定验收。
+### 11.1 数据库迁移权限与故障边界
+
+生产 MySQL 位于 Windows 主机，Linux 应用端经现有受控隧道以 TCP+TLS 连接，禁止再假设本机 MySQL socket、named pipe 或 Linux root 数据库身份。TLS CA 固定为 `/etc/probiga/mysql84-ca.pem`；必须与运行配置指向同一个普通文件，由 root 所有，不是符号链接，且文件及所有父目录不可由组或其他用户写入。发布使用三个彼此不同且无可激活角色的账号：`probiga_trigger_admin@127.0.0.1` 全局权限精确为 `SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE`，前者只用于切换 `log_bin_trust_function_creators`，后者只用于完整只读 routine 库存证明；`probiga_migrator@127.0.0.1` 只允许 `probiga.*` 的迁移权限；运行账号继续由 root-owned systemd EnvironmentFile 提供，全局只允许 `USAGE` 并强制 `REQUIRE SSL`。运行账号的 schema 权限必须精确为：`biga.* = SELECT`；`probiga.* = SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE TEMPORARY TABLES`；`probiga_qmt_history.* = SELECT`。必须拒绝 `ALL PRIVILEGES`、`TRIGGER`、`EVENT`、`CREATE/ALTER ROUTINE`、`EXECUTE`、`CREATE/SHOW VIEW`、`LOCK TABLES`、任何全局管理权限、`GRANT OPTION`、`PROXY`、角色以及表或列级旁路授权；三个 schema 中的 `SQL SECURITY DEFINER` routine 库存必须由具有完整可见性的独立管理员连接证明为零，运行与迁移账号仅补充证明自身未拥有此类 routine，不得用其受限视图冒充完整库存。
+
+管理与迁移凭据分别固定在 `/etc/probiga/mysql-trigger-admin.ini` 和 `/etc/probiga/mysql-migrator.ini`，必须为非符号链接、root:root、`0600`，父目录不可由组或其他用户写入；密码不得出现在命令行、项目环境变量、代码、日志、异常或部署回执中。这两个文件和上述精确运行权限必须在发布前的受控账号预置维护中完成；普通部署不创建账号、不传递密码、不放宽权限，缺少任一条件立即失败关闭。本次结构维护也不改变“生产交易激活仍为关闭”和“禁止自动真实下单”的边界。
+
+preflight 必须在旧服务仍正常运行时完成，并保持严格只读：逐项核验 Oracle MySQL 8.4.11、固定 server UUID/hostname/端口、TLS cipher、`log_bin=ON`、`binlog_format=ROW`、全局 trust 为 `OFF`、三个精确身份及权限范围、全部已登记 V3 的 checksum/statement count/物理结构、精确待迁移集合、QMT/治理表的全有或全无状态，以及所有已存在触发器的正文、时机、事件、目标表、`DEFINER`、SQL mode、字符集和排序规则。允许迁移的旧例外只限两条已审计的 `root@localhost` 交易账户保护触发器及其精确旧 SQL mode；任一部分匹配、额外触发器、跨库授权或未来迁移提前出现都必须阻断。
+
+cutover 顺序固定为：停止并禁用 AI worker 及 timer、scheduler 和 API；通过数据库 writer fence；为四个 systemd writer unit 安装固定 `ConditionPathExists` 保护并持久写入 root 所有的 guard v2，同时记录四个 unit 在 cutover 前的 load/active/unit-file 精确状态；用迁移账号在 trust=`OFF` 下完成表、列、索引和数据回填；只有确实缺失的冻结 `CREATE TRIGGER` 才允许由管理账号短暂把 trust 切到 `ON`，且每创建一条后立即恢复 `OFF`，通过原管理连接、新管理连接和独立运行连接三重读回验证。运行账号在所有层级都没有 `TRIGGER`、routine 或 event 创建权限，因此 trust 窗口不会为运行凭据增加新能力。触发器必须最终统一为 `probiga_migrator@127.0.0.1` DEFINER 和冻结的会话元数据。完全幂等、没有触发器差异的重跑不得打开 trust 窗口。
+
+结构完成后还必须单独执行一次 `recover` 验证、完成 QMT 历史协议升级及严格结构/数据检查，再由普通运行账号使用 `--schema-prepared` 做只读计划和调度安装。生产运行路径中的治理初始化只能只读验证已准备结构，不得执行永久 `CREATE`、任何 `ALTER`、触发器 DDL 或结构回填；QMT 历史认证为处理大批量数据可在当前数据库会话中执行 `CREATE TEMPORARY TABLE` / `DROP TEMPORARY TABLE`，临时表不得跨会话留存，除此之外的 DDL 一律由 SQL guard 拒绝。
+
+QMT 认证表、治理表及其全部字符列的冻结排序规则均为精确的 `utf8mb4_unicode_ci`，不能把其他 `utf8mb4_*` 视为等价。首次上线前必须只读盘点生产实际表/字段排序规则；任一不一致都属于发布前置阻断，只能另行设计、评审并在写入方已围栏的维护窗口执行受控转换，普通部署与历史认证任务不得自行 `CONVERT` 或悄悄修复。
+
+持久 guard 只能在 trust 三重确认为 `OFF`、全部迁移为 `exists`、QMT 与治理表完整、触发器无旧元数据且严格结构验证通过后清除。任一异常、信号中断、DROP 后 CREATE 失败、身份或权限漂移都保持 guard 及四个 systemd 条件，回滚只能恢复旧发布文件并保持所有 writer 停止/禁用，写入 `BLOCKED_DATABASE_GUARDS` 回执。SIGKILL 或 Linux 主机丢失不能执行 Python `finally`，因此后续只能进入显式 root 恢复模式：先修复并验证固定 drop-in、writer 和 guard 未被绕过，再用 guard 记录的不可变发布依次执行 admin-first `recover`、新一轮 L4 writer fence、`resume --writers-fenced`、再次 `recover` 和严格只读 preflight。`resume` 只能修复两条冻结 legacy trigger 中“完全缺失”的项，改名、正文或元数据漂移仍然拒绝，并必须返回 candidate/repaired/post-validation 证据。上述全部通过后才可清 guard；随后必须精确恢复 guard v2 记录的原 unit 状态并验证服务健康。清闩或状态恢复失败时必须立即按同一发布 SHA 重新上闩，停止并禁用全部 writer 及 activation unit；任何证据不全继续停机，禁止手工跳过验证后直接启动服务。
+
+QMT 旧协议首次绑定不得修改原运行行、不得伪造 V2 universe manifest，也不得计入授资证据。生产只允许将精确 11 条已完成旧行绑定为 `LEGACY_V1_INELIGIBLE_NO_UNIVERSE_MANIFEST`，其排序全行聚合 SHA-256 必须为 `fc8328550615413445edf1055b3b88d70fa8b37e45ee331f682cf8f654779b54`。首次追加 marker 前及之后的任何行数、原始容差 JSON、计数、日期、provider 或聚合哈希漂移都必须阻断。新历史只能由当前 V2 协议和真实逐日 manifest 产生。
+
+发布还有一条不可跳过的安全前置：代码库当前版本及历史中出现过的数据库/远程密码必须在独立维护窗完成轮换；已验证 `probiga-deploy` 公钥和受限 root broker 后，必须关闭 SSH root 登录、密码认证和交互式认证，并用新独立连接复验。源码中的明文删除不等于历史凭据已轮换；两项外部状态未完成前禁止生产上线。
+
+- 15 张治理表由部署迁移预先创建（新增独立动态适配器运行回执和 append-only 行业历史），结构、唯一索引、数据回填完成标记和支持的 MySQL 版本均已实际验证；GET 接口不执行运行时 DDL、播种或生命周期写入。行业约束只接受 `tools/sync_strategy_industry_history.py` 当日前瞻冻结的历史事实，拒绝把当前覆盖表回填成过去证明，且拒绝 cutoff 后、重复、哈希漂移或覆盖不全。除此之外，V3 迁移 `20260822_001`、`002`、`003` 必须分别冻结前向策略版本、raw fill/cash 账本和逐笔 SELL 分配账本；003 的冻结合同为 5 条语句、精确校验和 `deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a`，并验证表、列、索引、外键、不可变触发器和实际拒绝 UPDATE/DELETE。QMT v2 逐行认证表及其不可变触发器也必须通过结构与数据绑定验收。
 - 策略和组合数量不受固定目录限制；当前版本存在且能追溯到不可变配置哈希。
 - 已存在版本不能覆盖、回滚或借重复注册重置状态；新版本没有继承旧版本的授资证据。
 - 生命周期只包含五个受控状态，页面中文映射、恢复路径和淘汰终态正确；组合状态机可实际到达。

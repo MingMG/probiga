@@ -131,16 +131,80 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
         "sudo systemctl restart probiga-scheduler",
         start_api,
     )
-    deployed = normalized.index('write_receipt "DEPLOYED"', start_scheduler)
+    pending = normalized.index(
+        "persist_deployed_receipt_pending",
+        start_scheduler,
+    )
+    finalized = normalized.index(
+        'controlled_guard_finalize_successful_activation "$EXPECTED_SHA"',
+        pending,
+    )
+    deployed = normalized.index(
+        'publish_deployed_receipt_pending "$EXPECTED_SHA"',
+        finalized,
+    )
+    journal_removed = normalized.index(
+        "activation_snapshot_remove_finalized_before_deploy",
+        deployed,
+    )
 
-    assert stop_scheduler < stop_api < guard < start_api < start_scheduler < deployed
+    assert (
+        stop_scheduler
+        < stop_api
+        < guard
+        < start_api
+        < start_scheduler
+        < pending
+        < finalized
+        < deployed
+        < journal_removed
+    )
     assert "--writer-drain-timeout-seconds 150" in workflow
     assert 'if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then' in workflow
     assert "EXTERNAL_WRITER_BLOCKED=1" in workflow
     assert 'write_receipt "BLOCKED_EXTERNAL_WRITER"' in workflow
-    assert "keep probiga stopped after external writer block" in workflow
-    assert "keep scheduler stopped after external writer block" in workflow
-    assert "probiga-scheduler restarted after external writer block" in workflow
+    assert (
+        'if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] || '
+        "\\\n      [ \"$DATABASE_GUARD_MIGRATION_UNVERIFIED\" -eq 1 ]; then"
+        in workflow
+    )
+    assert "keep probiga stopped after database writer block" in workflow
+    assert "keep scheduler stopped after database writer block" in workflow
+    assert "probiga-scheduler restarted after database writer block" in workflow
+    rollback_start = workflow.index("rollback() {")
+    main_stop_message = workflow.index(
+        'rollback_failure "keep probiga stopped after database writer block"',
+        rollback_start,
+    )
+    main_block_start = workflow.rindex(
+        'if [ "$restoration_ready" -eq 1 ] &&',
+        rollback_start,
+        main_stop_message,
+    )
+    main_block_end = workflow.index(
+        'elif [ "$restoration_ready" -eq 1 ]; then',
+        main_stop_message,
+    )
+    main_block = workflow[main_block_start:main_block_end]
+    assert '"$EXTERNAL_WRITER_BLOCKED" -eq 1' in main_block
+    assert '"$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1' in main_block
+    assert 'sudo systemctl disable "$MAIN_SERVICE"' in main_block
+    assert 'sudo systemctl stop "$MAIN_SERVICE"' in main_block
+
+    scheduler_stop_message = workflow.index(
+        'rollback_failure "keep scheduler stopped after database writer block"',
+        main_block_end,
+    )
+    scheduler_block_start = workflow.rindex(
+        'if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] ||',
+        main_block_end,
+        scheduler_stop_message,
+    )
+    scheduler_block_end = workflow.index("    else", scheduler_stop_message)
+    scheduler_block = workflow[scheduler_block_start:scheduler_block_end]
+    assert '"$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1' in scheduler_block
+    assert "sudo systemctl disable probiga-scheduler" in scheduler_block
+    assert "sudo systemctl stop probiga-scheduler" in scheduler_block
 
 
 def test_fresh_scheduler_writer_evaluation_is_exact_and_fail_closed() -> None:

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
 import subprocess
 import sys
 from datetime import datetime
 
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 def run(script, args=[]):
     cmd = [sys.executable, script] + args

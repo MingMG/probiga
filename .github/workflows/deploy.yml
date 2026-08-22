@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      recover_database_guard:
+        description: Recover the exact root-owned production database guard journal
+        required: true
+        default: false
+        type: boolean
+      expected_guard_sha:
+        description: Exact 40-character release SHA recorded by the production guard
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -16,15 +27,11 @@ concurrency:
 jobs:
   trading-v4-ci-gate:
     name: Trading V4 Stage 0-3 gate
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-    outputs:
-      resolved_requirements_b64: ${{ steps.dependency_lock.outputs.payload }}
-      resolved_requirements_sha256: ${{ steps.dependency_lock.outputs.sha256 }}
-      adata_release_sha: ${{ steps.adata_release.outputs.git_sha }}
-      adata_tree_sha256: ${{ steps.adata_release.outputs.tree_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -33,20 +40,43 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
-          cache-dependency-path: requirements-platform.txt
+          cache-dependency-path: deploy/production_requirements.lock
+
+      - name: Scan tracked secrets before dependency installation
+        run: python tools/scan_tracked_secrets.py
 
       - name: Install regression dependencies
         run: |
           python -m pip install --upgrade pip
+          # CI test dependencies are not a production installation.  The
+          # production job independently requires the reviewed hashed cp314
+          # Linux lock and exact wheel manifest before it opens SSH.
           python -m pip install -r requirements-platform.txt
+
+      - name: Scan tracked secrets after dependency installation
+        run: python tools/scan_tracked_secrets.py
 
       - name: Build and install the pinned adata release
         id: adata_release
         shell: bash
-        env:
-          ADATA_RELEASE_SHA: b14f4e57b2175302f18b6eaf934f7dff9207a141
         run: |
           set -euo pipefail
+          mapfile -t release_manifest < deploy/production_release.env
+          test "${#release_manifest[@]}" -eq 10
+          test "${release_manifest[0]}" = \
+            PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION=2
+          test "${release_manifest[1]}" = \
+            PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_17_x86_64
+          case "${release_manifest[5]}" in
+            ADATA_RELEASE_SHA=*) \
+              ADATA_RELEASE_SHA="${release_manifest[5]#ADATA_RELEASE_SHA=}" ;;
+            *) exit 2 ;;
+          esac
+          case "${release_manifest[6]}" in
+            ADATA_TREE_SHA256=*) \
+              EXPECTED_ADATA_TREE_SHA256="${release_manifest[6]#ADATA_TREE_SHA256=}" ;;
+            *) exit 2 ;;
+          esac
           if [[ ! "$ADATA_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Repository variable ADATA_RELEASE_SHA must name a full lowercase Git commit" >&2
             exit 2
@@ -69,6 +99,7 @@ jobs:
           ADATA_TREE_SHA256="$(printf '%s' "$SEAL_JSON" | python -c \
             'import json,sys; print(json.load(sys.stdin)["tree_sha256"])')"
           [[ "$ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$ADATA_TREE_SHA256" = "$EXPECTED_ADATA_TREE_SHA256"
           chmod -R a-w "$ADATA_SOURCE"
           python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/adata-wheel" \
             "$ADATA_BUILD_SOURCE"
@@ -103,6 +134,19 @@ jobs:
             > "$RUNNER_TEMP/probiga-resolved-requirements.txt"
           echo "payload=$(base64 -w0 "$RUNNER_TEMP/probiga-resolved-requirements.txt")" \
             >> "$GITHUB_OUTPUT"
+
+      - name: Detect reviewed production lock readiness
+        id: production_lock
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t release_manifest < deploy/production_release.env
+          test "${#release_manifest[@]}" -eq 10
+          case "${release_manifest[2]}" in
+            PROBIGA_PRODUCTION_LOCK_STATUS=READY) echo "ready=true" >> "$GITHUB_OUTPUT" ;;
+            PROBIGA_PRODUCTION_LOCK_STATUS=BLOCKED_*) echo "ready=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "invalid production lock status" >&2; exit 2 ;;
+          esac
           echo "sha256=$(sha256sum "$RUNNER_TEMP/probiga-resolved-requirements.txt" | cut -d' ' -f1)" \
             >> "$GITHUB_OUTPUT"
 
@@ -173,7 +217,56 @@ jobs:
           tests/test_trading_v3_continuous_calibration.py
           tests/test_trading_v3_shadow_intelligence_runtime.py
           tests/test_trading_v3_production_activation.py
-          tests/test_trading_v3_research_api.py
+           tests/test_trading_v3_research_api.py
+
+      - name: Run the full suite in the exact production wheel set
+        if: ${{ steps.production_lock.outputs.ready == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t release_manifest < deploy/production_release.env
+          input_sha="${release_manifest[3]#INPUT_LOCK_SHA256=}"
+          manifest_sha="${release_manifest[4]#WHEEL_MANIFEST_SHA256=}"
+          test "$(sha256sum deploy/production_requirements.lock | cut -d' ' -f1)" = \
+            "$input_sha"
+          test "$(sha256sum deploy/production_wheel_manifest.lock | cut -d' ' -f1)" = \
+            "$manifest_sha"
+          production_venv="$RUNNER_TEMP/probiga-production-test-venv"
+          production_wheels="$RUNNER_TEMP/probiga-production-test-wheels"
+          python -m venv "$production_venv"
+          mkdir "$production_wheels"
+          PIP_CONFIG_FILE=/dev/null PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1 \
+            "$production_venv/bin/python" -I -m pip download \
+              --require-hashes --only-binary=:all: --no-deps \
+              --dest "$production_wheels" \
+              -r deploy/production_requirements.lock
+          python - "$production_wheels" <<'PY'
+          from pathlib import Path
+          import hashlib
+          import sys
+
+          wheelhouse = Path(sys.argv[1])
+          expected = {}
+          for raw in Path("deploy/production_wheel_manifest.lock").read_text(
+              encoding="utf-8"
+          ).splitlines():
+              if len(raw) > 66 and raw[64:66] == "  ":
+                  expected[raw[66:]] = raw[:64]
+          actual = {
+              item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+              for item in wheelhouse.iterdir()
+              if item.is_file()
+          }
+          if not expected or actual != expected:
+              raise SystemExit("downloaded production wheel set differs from manifest")
+          PY
+          PIP_CONFIG_FILE=/dev/null PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1 \
+            "$production_venv/bin/python" -I -m pip install \
+              --require-hashes --no-index --only-binary=:all: \
+              --find-links "$production_wheels" \
+              -r deploy/production_requirements.lock
+          "$production_venv/bin/python" -I -m pip check
+          PYTHONPATH="$PYTHONPATH" "$production_venv/bin/python" -P -m pytest -q
 
   deployment-disabled:
     name: Production deployment disabled
@@ -204,13 +297,63 @@ jobs:
           vars.PRODUCTION_DEPLOY_ENABLED == 'true' &&
           needs.trading-v4-ci-gate.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     environment: production
     concurrency:
       group: probiga-production-deploy
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Fail closed unless the complete production artifact lock is ready
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t release_manifest < deploy/production_release.env
+          test "${#release_manifest[@]}" -eq 10
+          test "${release_manifest[0]}" = \
+            PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION=2
+          test "${release_manifest[1]}" = \
+            PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_17_x86_64
+          test "${release_manifest[2]}" = PROBIGA_PRODUCTION_LOCK_STATUS=READY
+          INPUT_LOCK_SHA256="${release_manifest[3]#INPUT_LOCK_SHA256=}"
+          WHEEL_MANIFEST_SHA256="${release_manifest[4]#WHEEL_MANIFEST_SHA256=}"
+          [[ "$INPUT_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(sha256sum deploy/production_requirements.lock | cut -d' ' -f1)" = \
+            "$INPUT_LOCK_SHA256"
+          test "$(sha256sum deploy/production_wheel_manifest.lock | cut -d' ' -f1)" = \
+            "$WHEEL_MANIFEST_SHA256"
+          grep -Fx STATUS=READY deploy/production_wheel_manifest.lock >/dev/null
+          [[ "${release_manifest[9]}" =~ ^ADAPTER_REGISTRY_SEAL_SHA256=[0-9a-f]{64}$ ]]
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          lock = Path("deploy/production_requirements.lock").read_text(encoding="utf-8")
+          logical = []
+          pending = ""
+          for raw in lock.splitlines():
+              line = raw.strip()
+              if not line or line.startswith("#"):
+                  continue
+              pending += (" " if pending else "") + line.rstrip("\\").strip()
+              if line.endswith("\\"):
+                  continue
+              logical.append(pending)
+              pending = ""
+          if pending or not logical:
+              raise SystemExit("production lock is empty or malformed")
+          for requirement in logical:
+              if requirement.startswith(("--only-binary", "--no-index")):
+                  continue
+              if "==" not in requirement or not re.search(
+                  r"--hash=sha256:[0-9a-f]{64}(?:\s|$)", requirement
+              ):
+                  raise SystemExit(
+                      f"unhashed or unpinned production requirement: {requirement}"
+                  )
+          PY
 
       - name: Validate production SSH identity
         shell: bash
@@ -254,26 +397,96 @@ jobs:
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           EXPECTED_SHA: ${{ github.sha }}
-          RESOLVED_REQUIREMENTS_B64: ${{ needs.trading-v4-ci-gate.outputs.resolved_requirements_b64 }}
-          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.trading-v4-ci-gate.outputs.resolved_requirements_sha256 }}
-          EXPECTED_ADATA_SHA: ${{ needs.trading-v4-ci-gate.outputs.adata_release_sha }}
-          EXPECTED_ADATA_TREE_SHA256: ${{ needs.trading-v4-ci-gate.outputs.adata_tree_sha256 }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
-          command_timeout: 25m
-          envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64,EXPECTED_REQUIREMENTS_SHA256,EXPECTED_ADATA_SHA,EXPECTED_ADATA_TREE_SHA256
+          command_timeout: 55m
+          envs: EXPECTED_SHA
           script: |
             set -Eeuo pipefail
-            cd /opt/ProBigA
             [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-            # The root-owned broker executes deploy/production_deploy.sh from
-            # the requested, independently fetched and verified main revision.
-            printf '%s\n' "$RESOLVED_REQUIREMENTS_B64" | \
-              sudo -n /usr/local/sbin/probiga-production-deploy \
-                "$EXPECTED_SHA" \
-                "$EXPECTED_REQUIREMENTS_SHA256" \
-                "$EXPECTED_ADATA_SHA" \
-                "$EXPECTED_ADATA_TREE_SHA256"
+            EXPECTED_CAPABILITIES="$(cat <<'EOF'
+            probiga.production-deploy.capabilities.v1
+            deploy_protocol=probiga-production-deploy-v4
+            recovery_protocol=probiga-database-guard-recovery-v2
+            artifact_protocol=probiga-trusted-artifacts-v2
+            snapshot_only_recovery=true
+            input_and_freeze_digests=true
+            governance_task_snapshot=true
+            receipt_pending_recovery=true
+            activation_release_identity=true
+            release_tree_and_adapter_seal=true
+            EOF
+            )"
+            ACTUAL_CAPABILITIES="$(sudo -n \
+              /usr/local/sbin/probiga-production-deploy --capabilities)"
+            test "$ACTUAL_CAPABILITIES" = "$EXPECTED_CAPABILITIES"
+            # Only the current trusted-main SHA crosses the unprivileged SSH
+            # boundary. The root-owned broker derives the input lock, exact
+            # wheel manifest, adata commit and adata tree digest from it.
+            sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"
+
+  recover-database-guard:
+    name: Recover production database guard
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          github.ref == 'refs/heads/main' &&
+          inputs.recover_database_guard == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    concurrency:
+      group: probiga-production-deploy
+      cancel-in-progress: false
+    steps:
+      - name: Validate production SSH identity and recovery SHA
+        shell: bash
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST_FINGERPRINT: ${{ secrets.SERVER_HOST_FINGERPRINT }}
+          EXPECTED_GUARD_SHA: ${{ inputs.expected_guard_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$SERVER_HOST"
+          test -n "$SERVER_USER"
+          test "$SERVER_USER" != root
+          test -n "$SSH_PRIVATE_KEY"
+          [[ "$SERVER_HOST_FINGERPRINT" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]
+          [[ "$EXPECTED_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Recover the exact production database guard
+        uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
+        env:
+          EXPECTED_GUARD_SHA: ${{ inputs.expected_guard_sha }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
+          command_timeout: 55m
+          envs: EXPECTED_GUARD_SHA
+          script: |
+            set -Eeuo pipefail
+            [[ "$EXPECTED_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]
+            EXPECTED_CAPABILITIES="$(cat <<'EOF'
+            probiga.production-deploy.capabilities.v1
+            deploy_protocol=probiga-production-deploy-v4
+            recovery_protocol=probiga-database-guard-recovery-v2
+            artifact_protocol=probiga-trusted-artifacts-v2
+            snapshot_only_recovery=true
+            input_and_freeze_digests=true
+            governance_task_snapshot=true
+            receipt_pending_recovery=true
+            activation_release_identity=true
+            release_tree_and_adapter_seal=true
+            EOF
+            )"
+            ACTUAL_CAPABILITIES="$(sudo -n \
+              /usr/local/sbin/probiga-production-deploy --capabilities)"
+            test "$ACTUAL_CAPABILITIES" = "$EXPECTED_CAPABILITIES"
+            sudo -n /usr/local/sbin/probiga-production-deploy \
+              --recover-database-guard "$EXPECTED_GUARD_SHA"

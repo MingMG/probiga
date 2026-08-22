@@ -1,0 +1,11 @@
+# PROBIGA_PRODUCTION_REQUIREMENTS_LOCK_VERSION=2
+# STATUS=BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED
+# TARGET=cp314-manylinux_2_17_x86_64
+#
+# This is deliberately not a usable requirements file.  The previous file
+# pinned only direct dependencies and omitted both transitive dependencies and
+# artifact hashes, so treating it as a production lock would create a false
+# supply-chain guarantee.  Regenerate this file on the exact Linux/Python 3.14
+# target, review every transitive dependency, and require one or more
+# ``--hash=sha256:...`` values on every installable requirement.  Then update
+# the trusted wheel manifest and release manifest in the same commit.

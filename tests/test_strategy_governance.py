@@ -4,8 +4,10 @@ from copy import deepcopy
 from datetime import date, timedelta
 from decimal import Decimal
 import inspect
+import hashlib
 import json
 import os
+import re
 from types import SimpleNamespace
 import uuid
 
@@ -372,13 +374,9 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         }
         for day in descending
     }
-    valid_tolerance = {
-        "attestation_protocol": (
-            governance_module.QMT_PRECLOSE_ATTESTATION_PROTOCOL
-        ),
-        "universe_manifest_schema": "probiga.qmt-daily-universe.v1",
-        "daily_universe": daily_universe,
-    }
+    valid_tolerance = governance_module.build_qmt_v2_manifest(
+        daily_universe
+    )
     completed_run_rows = [
         {
             "run_id": "completed-v2-full-universe",
@@ -515,8 +513,11 @@ def test_reduce_lifecycle_halves_competitive_budget_and_keeps_cash():
         "funding_gate_hash": "a" * 64,
         "strategy_name": "正期望策略",
         "ranking_score": 90.0,
+        "enabled": True,
+        "profit_gate_passed": True,
         "market_route": {
             "market_state": "trend_bullish",
+            "eligible": True,
             "market_match_score": 100.0,
             "router_decision_hash": "b" * 64,
         },
@@ -1541,6 +1542,9 @@ def test_internal_economics_plus_external_selection_can_pass_funding(monkeypatch
         "selection_artifact_hash": metrics[60]["artifact_hash"],
         "strategy_key": "profitable_internal",
         "strategy_version": "v1",
+        "execution_binding_hash": "",
+        "adapter_artifact_sha256": "",
+        "cost_model_hash": "",
         "window_days": 60,
     })
     # External research values can attest selection but cannot replace money,
@@ -1675,8 +1679,43 @@ def test_combination_builds_independent_nav_and_enforces_correlation_overlap(mon
     assert len(ledger["equity_curve"]) == 60
     assert ledger["daily_records"][0]["return_pct"] == pytest.approx(1.0)
     assert ledger["equity_curve"][0]["equity"] == pytest.approx(101.0)
+    snapshot_id = "d" * 64
+    industry_rows = []
+    for code, name, source_id in (
+        ("000001", "银行", "1"), ("000002", "电子", "2"),
+    ):
+        row_payload = {
+            "snapshot_id": snapshot_id,
+            "trade_date": "2026-03-21",
+            "as_of_exclusive": "2026-03-22T00:00:00",
+            "stock_code": code,
+            "industry_name": name,
+            "industry_type": "L1",
+            "source_system": "test",
+            "source_fact_id": source_id,
+            "source_effective_at": "2026-01-01T00:00:00",
+            "source_etl_sync_at": "2026-01-01T00:00:00",
+        }
+        industry_rows.append({
+            **row_payload, "row_hash": governance_module._digest(row_payload),
+        })
+    industry_payload = {
+        "schema": "probiga.governance-industry-snapshot.v2",
+        "snapshot_id": snapshot_id,
+        "trade_date": "2026-03-21",
+        "as_of_exclusive": "2026-03-22T00:00:00",
+        "status": "COMPLETED",
+        "requested_stock_codes": ["000001", "000002"],
+        "rows": industry_rows,
+        "reason": "行业快照已按治理交易日冻结",
+    }
+    industry_snapshot = {
+        **industry_payload,
+        "snapshot_hash": governance_module._digest(industry_payload),
+    }
     evaluation = governance_module._combination_constraint_evaluation(
-        combination, members
+        combination, members, trade_date="2026-03-21",
+        industry_snapshot=industry_snapshot,
     )
     assert evaluation["passed"] is True
     assert evaluation["pairwise_correlations"][0]["correlation"] == (
@@ -1694,7 +1733,8 @@ def test_combination_builds_independent_nav_and_enforces_correlation_overlap(mon
         "internal_stock_exposure"
     ] = {"000001": "10000"}
     rejected = governance_module._combination_constraint_evaluation(
-        combination, concentrated
+        combination, concentrated, trade_date="2026-03-21",
+        industry_snapshot=industry_snapshot,
     )
     assert rejected["passed"] is False
     assert rejected["pairwise_correlations"][0]["passed"] is False
@@ -1872,9 +1912,9 @@ def test_metric_artifact_and_dataset_have_one_global_entity_version_owner(
 
 
 def test_metric_artifact_global_owner_has_additive_database_constraints():
-    source = inspect.getsource(
-        governance_module.ensure_strategy_governance_tables
-    )
+    source = "\n".join(
+        governance_module.governance_table_ddl_statements()
+    ) + inspect.getsource(governance_module.ensure_strategy_governance_tables)
     assert (
         "UNIQUE KEY uk_strategy_metric_artifact_global (artifact_hash)"
         in source
@@ -1884,6 +1924,239 @@ def test_metric_artifact_global_owner_has_additive_database_constraints():
         in source
     )
     assert "GROUP BY {hash_column} HAVING COUNT(*)>1" in source
+
+
+def test_governance_schema_contract_covers_every_frozen_table_column_and_index():
+    contract = governance_module._governance_table_schema_contract()
+
+    assert set(contract) == set(governance_module.GOVERNANCE_TABLE_NAMES)
+    assert len(contract) == 15
+    assert sum(len(item["columns"]) for item in contract.values()) == 222
+    assert sum(len(item["indexes"]) for item in contract.values()) == 45
+    assert all(item["columns"] for item in contract.values())
+    assert all("PRIMARY" in item["indexes"] for item in contract.values())
+
+
+class _GovernanceSchemaResult:
+    def __init__(self, rows):
+        self.rows = [dict(row) for row in rows]
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+
+class _GovernanceSchemaConnection:
+    def __init__(self, *, table_collation=None, column_collation=None):
+        self.contracts = governance_module._governance_table_schema_contract()
+        self.table_collation = (
+            table_collation or governance_module.GOVERNANCE_SCHEMA_COLLATION
+        )
+        self.column_collation = (
+            column_collation or governance_module.GOVERNANCE_SCHEMA_COLLATION
+        )
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        if "information_schema.TABLES" in sql:
+            return _GovernanceSchemaResult([
+                {
+                    "table_name": table_name,
+                    "engine": "InnoDB",
+                    "table_collation": self.table_collation,
+                }
+                for table_name in sorted(self.contracts)
+            ])
+        if "information_schema.COLUMNS" in sql:
+            rows = []
+            for table_name in sorted(self.contracts):
+                for ordinal, expected in enumerate(
+                    self.contracts[table_name]["columns"], 1,
+                ):
+                    base_type = expected["column_type"].split("(", 1)[0]
+                    character_type = base_type in {
+                        "char", "varchar", "text", "mediumtext", "longtext",
+                    }
+                    extra = []
+                    if expected["auto_increment"]:
+                        extra.append("auto_increment")
+                    if expected["on_update_current_timestamp"]:
+                        extra.append("on update CURRENT_TIMESTAMP")
+                    rows.append({
+                        "table_name": table_name,
+                        "column_name": expected["name"],
+                        "ordinal_position": ordinal,
+                        "column_type": expected["column_type"],
+                        "is_nullable": expected["nullable"],
+                        "column_default": expected["default"],
+                        "extra": " ".join(extra),
+                        "character_set_name": (
+                            "utf8mb4" if character_type else None
+                        ),
+                        "collation_name": (
+                            self.column_collation if character_type else None
+                        ),
+                    })
+            return _GovernanceSchemaResult(rows)
+        if "information_schema.STATISTICS" in sql:
+            return _GovernanceSchemaResult([
+                {
+                    "table_name": table_name,
+                    "index_name": index_name,
+                    "non_unique": non_unique,
+                    "seq_in_index": sequence,
+                    "column_name": column_name,
+                    "sub_part": None,
+                    "index_type": "BTREE",
+                }
+                for table_name in sorted(self.contracts)
+                for index_name, (non_unique, columns) in (
+                    self.contracts[table_name]["indexes"].items()
+                )
+                for sequence, column_name in enumerate(columns, 1)
+            ])
+        raise AssertionError(sql)
+
+
+def test_governance_schema_requires_exact_utf8mb4_collation():
+    detail = governance_module.validate_governance_table_schema(
+        _GovernanceSchemaConnection()
+    )
+    assert detail == {"table_count": 15, "column_count": 222, "index_count": 45}
+
+    with pytest.raises(RuntimeError, match="表引擎或字符集漂移"):
+        governance_module.validate_governance_table_schema(
+            _GovernanceSchemaConnection(
+                table_collation="utf8mb4_0900_ai_ci"
+            )
+        )
+    with pytest.raises(RuntimeError, match="字段契约漂移"):
+        governance_module.validate_governance_table_schema(
+            _GovernanceSchemaConnection(
+                column_collation="utf8mb4_general_ci"
+            )
+        )
+
+
+def test_default_seed_contract_binds_every_combination_to_current_versions():
+    contract = governance_module._default_governance_seed_contract()
+    strategies = contract["strategies"]
+    combinations = contract["combinations"]
+
+    assert len(strategies) == 12
+    assert len(combinations) == 6
+    for key, strategy in strategies.items():
+        assert strategy["strategy_key"] == key
+        assert strategy["version_hash"] == governance_module._strategy_version_digest(
+            strategy_key=key,
+            version=strategy["current_version"],
+            evaluator_type=strategy["evaluator_type"],
+            evaluator_config=strategy["evaluator_config"],
+            parameters=strategy["parameters"],
+            source_kind=strategy["source_kind"],
+        )
+    for key, combination in combinations.items():
+        assert combination["combination_key"] == key
+        assert len(combination["members"]) >= 2
+        assert sum(item["weight"] for item in combination["members"]) == pytest.approx(1)
+        assert all(
+            item["strategy_version"]
+            == strategies[item["strategy_key"]]["current_version"]
+            for item in combination["members"]
+        )
+        expected_hash = governance_module._digest({
+            "members": combination["members"],
+            "constraints": combination["constraints"],
+        })
+        assert combination["config_hash"] == expected_hash
+        assert combination["current_version"] == f"seed-{expected_hash[:16]}"
+
+
+class _SeedContractResult:
+    def __init__(self, rows):
+        self.rows = [dict(row) for row in rows]
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+
+class _SeedContractConnection:
+    def __init__(self, strategy_rows, combination_rows):
+        self.strategy_rows = strategy_rows
+        self.combination_rows = combination_rows
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        if "FROM st_strategy_registry r" in sql:
+            return _SeedContractResult(self.strategy_rows)
+        if "FROM st_strategy_combination c" in sql:
+            return _SeedContractResult(self.combination_rows)
+        raise AssertionError(sql)
+
+
+class _SeedContractEngine:
+    def __init__(self, strategy_rows, combination_rows):
+        self.connection = _SeedContractConnection(
+            strategy_rows,
+            combination_rows,
+        )
+
+    def connect(self):
+        return __import__("contextlib").nullcontext(self.connection)
+
+
+def _seed_contract_rows():
+    contract = governance_module._default_governance_seed_contract()
+    strategies = [
+        {
+            **item,
+            "current_status": "SHADOW",
+            "evaluator_config_json": item["evaluator_config"],
+            "parameters_json": item["parameters"],
+            "recovery_conditions_json": governance_module._recovery_conditions(),
+        }
+        for item in contract["strategies"].values()
+    ]
+    combinations = [
+        {
+            **item,
+            "current_status": "SHADOW",
+            "members_json": item["members"],
+            "constraints_json": item["constraints"],
+        }
+        for item in contract["combinations"].values()
+    ]
+    return strategies, combinations
+
+
+def test_exact_default_seed_validator_rejects_version_or_member_drift():
+    strategy_rows, combination_rows = _seed_contract_rows()
+    detail = governance_module.validate_default_governance_seed_contract(
+        _SeedContractEngine(strategy_rows, combination_rows),
+        require_initial_shadow=True,
+    )
+    assert detail["seeded_strategy_count"] == 12
+    assert detail["seeded_combination_count"] == 6
+    assert len(detail["seed_contract_hash"]) == 64
+
+    drifted_strategies = deepcopy(strategy_rows)
+    drifted_strategies[0]["current_version"] += ":drift"
+    with pytest.raises(RuntimeError, match="默认治理策略播种漂移"):
+        governance_module.validate_default_governance_seed_contract(
+            _SeedContractEngine(drifted_strategies, combination_rows)
+        )
+
+    drifted_combinations = deepcopy(combination_rows)
+    drifted_combinations[0]["members_json"][0]["strategy_version"] += ":drift"
+    with pytest.raises(RuntimeError, match="默认治理组合播种状态或内容漂移"):
+        governance_module.validate_default_governance_seed_contract(
+            _SeedContractEngine(strategy_rows, drifted_combinations)
+        )
 
 
 def test_validation_artifact_rejects_self_reported_inflated_profit_factor():
@@ -2332,6 +2605,8 @@ def test_strategy_funding_requires_the_same_confirmed_gate_in_all_three_windows(
         "current_version": "v1",
         "current_status": "ACTIVE",
         "enabled": True,
+        "execution_adapter_executable": True,
+        "execution_adapter_reason": "测试适配器已就绪",
         "market_route": {
             "eligible": True,
             "reason": "适配",
@@ -2769,7 +3044,7 @@ def test_governance_api_keeps_real_order_authority_closed(monkeypatch):
     }
     monkeypatch.setattr(
         strategy_center_router,
-        "governance_snapshot",
+        "load_canonical_governance_snapshot",
         lambda **_kwargs: expected,
     )
     app = FastAPI()
@@ -2999,21 +3274,52 @@ def test_daily_governance_task_is_scheduler_safe_and_validated():
     assert requirement.table == "st_strategy_governance_run"
     assert requirement.where_sql == "status = 'COMPLETED'"
     installer_source = inspect.getsource(governance_task_installer.main)
-    assert installer_source.index("run_v3_migrations(engine)") < (
-        installer_source.index("ensure_attestation_tables(engine)")
+    assert '"--schema-prepared"' in installer_source
+    prepared_start = installer_source.index("if args.schema_prepared:")
+    fallback_start = installer_source.index("else:", prepared_start)
+    prepared_branch = installer_source[prepared_start:fallback_start]
+    assert "run_v3_migrations(engine, dry_run=True)" in prepared_branch
+    assert not re.search(
+        r"run_v3_migrations\(engine\s*\)", prepared_branch
     )
-    assert installer_source.index("ensure_attestation_tables(engine)") < (
-        installer_source.index("validate_attestation_schema(engine)")
-    )
-    assert installer_source.index("validate_attestation_schema(engine)") < (
-        installer_source.index("ensure_and_seed_governance()")
-    )
+    assert "ensure_attestation_tables" not in prepared_branch
+    assert "ensure_and_seed_governance" not in prepared_branch
+    assert "validate_attestation_schema(engine)" in prepared_branch
+    assert "validate_metric_input_review_triggers" in prepared_branch
+    assert "validate_governance_append_only_triggers" in prepared_branch
     assert installer_source.index("if args.restore_snapshot:") < (
-        installer_source.index("run_v3_migrations(engine)")
+        prepared_start
     )
     assert installer_source.index("_write_snapshot(") < (
-        installer_source.index("run_v3_migrations(engine)")
+        prepared_start
     )
+
+
+def test_production_runtime_never_reenters_governance_schema_ddl(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(governance_module, "_SEED_READY", False)
+    monkeypatch.setattr(
+        governance_module,
+        "validate_prepared_governance_runtime",
+        lambda: calls.append("validate") or {"table_count": 15},
+    )
+    monkeypatch.setattr(
+        governance_module,
+        "ensure_strategy_governance_tables",
+        lambda: pytest.fail("production runtime attempted governance DDL"),
+    )
+    monkeypatch.setattr(
+        governance_module,
+        "seed_governance_registry",
+        lambda: pytest.fail("production runtime attempted schema seeding"),
+    )
+
+    governance_module.ensure_and_seed_governance()
+    governance_module.ensure_and_seed_governance()
+
+    assert calls == ["validate"]
+    assert governance_module._SEED_READY is True
 
 
 class _MetricTriggerResult:
@@ -3112,7 +3418,10 @@ def test_metric_input_review_trigger_contract_covers_every_core_column():
 def test_metric_input_review_trigger_ensure_creates_only_missing_contracts():
     connection = _MetricTriggerConnection()
 
-    governance_module._ensure_metric_input_review_triggers(connection)
+    governance_module._ensure_metric_input_review_triggers(
+        connection,
+        trigger_ddl_executor=connection.execute,
+    )
 
     assert set(connection.created) == set(
         governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS
@@ -3187,7 +3496,10 @@ def _governance_trigger_rows():
 def test_governance_ledger_trigger_ensure_creates_only_missing_contracts():
     connection = _GovernanceTriggerConnection()
 
-    governance_module._ensure_governance_append_only_triggers(connection)
+    governance_module._ensure_governance_append_only_triggers(
+        connection,
+        trigger_ddl_executor=connection.execute,
+    )
 
     assert set(connection.created) == set(
         governance_module.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
@@ -3195,7 +3507,7 @@ def test_governance_ledger_trigger_ensure_creates_only_missing_contracts():
     detail = governance_module.validate_governance_append_only_triggers(
         connection
     )
-    assert detail["trigger_count"] == 18
+    assert detail["trigger_count"] == 22
     assert detail["errors"] == []
     assert "DROP TRIGGER" not in inspect.getsource(
         governance_module._ensure_governance_append_only_triggers
@@ -3767,6 +4079,8 @@ def test_governance_ledgers_are_frozen_and_new_versions_insert_on_mysql57():
         "st_strategy_combination_health_snapshot",
         "st_strategy_pool_snapshot",
         "st_strategy_allocation_snapshot",
+        "st_strategy_adapter_run_receipt",
+        "st_strategy_industry_history",
     )
     all_tables = (*simple_tables, "st_strategy_governance_run")
     try:
@@ -3817,7 +4131,8 @@ def test_governance_ledgers_are_frozen_and_new_versions_insert_on_mysql57():
                     shadow_count INT NOT NULL, combination_count INT NOT NULL,
                     observation_count INT NOT NULL, confirmation_count INT NOT NULL,
                     tradable_count INT NOT NULL, allocation_count INT NOT NULL,
-                    summary_json LONGTEXT NOT NULL, created_at DATETIME NOT NULL,
+                    summary_json LONGTEXT NOT NULL, result_json LONGTEXT NOT NULL,
+                    result_hash CHAR(64) NOT NULL, created_at DATETIME NOT NULL,
                     finished_at DATETIME NULL
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """))
@@ -3829,7 +4144,7 @@ def test_governance_ledgers_are_frozen_and_new_versions_insert_on_mysql57():
             detail = governance_module.validate_governance_append_only_triggers(
                 connection
             )
-            assert detail["trigger_count"] == 18
+            assert detail["trigger_count"] == 22
             connection.execute(text(
                 "INSERT INTO st_strategy_version VALUES "
                 "('alpha','v1',:version_hash,:content_hash,'content-v1')"
@@ -3847,13 +4162,14 @@ def test_governance_ledgers_are_frozen_and_new_versions_insert_on_mysql57():
                 (:run_uid, '2026-08-21', 1, '', 1, 'range', 'fresh', 1,
                  :input_hash, :build_sha, 'router-v1', :router_hash,
                  :decision_hash, 'COMPLETED', 1, 0, 1, 0, 0, 0, 0, 0,
-                 '{}', NOW(), NOW())
+                 '{}', '{}', :result_hash, NOW(), NOW())
             """), {
                 "run_uid": "a" * 32,
                 "input_hash": "4" * 64,
                 "build_sha": "5" * 40,
                 "router_hash": "6" * 64,
                 "decision_hash": "7" * 64,
+                "result_hash": hashlib.sha256(b"{}").hexdigest(),
             })
 
         forbidden = (

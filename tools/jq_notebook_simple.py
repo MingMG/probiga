@@ -15,7 +15,7 @@ import json
 from datetime import datetime, timedelta
 
 # ==================== 配置 ====================
-PROBIGA_API = "http://47.113.123.190:5001/api/strategy/picks/sync"
+PROBIGA_API = ""  # Fill with the approved HTTPS strategy-sync endpoint.
 STRATEGY_NAME = "动量选股策略"
 STRATEGY_DESC = "基于20日动量和成交量筛选强势股"
 
@@ -77,6 +77,9 @@ payload = {
     'pick_date': today,
     'picks': picks
 }
+
+if not PROBIGA_API:
+    raise RuntimeError("请先配置经批准的 ProBigA HTTPS 同步地址")
 
 try:
     resp = requests.post(PROBIGA_API, json=payload, timeout=10)

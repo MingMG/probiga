@@ -1,5 +1,7 @@
-import pymysql
-conn = pymysql.connect(host='47.113.123.190', port=3306, user='root', password='ProBigA@70966', database='probiga')
+from env_config import create_tool_engine
+
+engine = create_tool_engine()
+conn = engine.raw_connection()
 cur = conn.cursor()
 try:
     cur.execute("ALTER TABLE st_scheduled_tasks ADD COLUMN interval_minutes INT DEFAULT 0 AFTER cron_time")
@@ -17,3 +19,4 @@ for row in cur.fetchall():
     print(row)
 cur.close()
 conn.close()
+engine.dispose()

@@ -4,10 +4,8 @@ import os
 import sys
 from sqlalchemy import create_engine, text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+engine = create_tool_engine()
 
 ALTERS = [
     "ALTER TABLE `st_hot_rank_fused` ADD COLUMN `xq_rank` INT DEFAULT NULL COMMENT '雪球热股排名' AFTER `ths_rank`",

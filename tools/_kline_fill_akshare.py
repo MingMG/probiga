@@ -3,13 +3,13 @@
 import time
 import pandas as pd
 import akshare as ak
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
 
-engine = create_engine(MYSQL_URL)
+engine = create_tool_engine()
 
 with engine.connect() as conn:
     all_codes = [r[0] for r in conn.execute(text("SELECT stock_code FROM si_all_code ORDER BY stock_code")).fetchall()]

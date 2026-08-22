@@ -4,11 +4,11 @@ import os
 import sys
 from datetime import datetime
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 
 GROUP_RULES = [
     ("复盘数据", ["热股榜", "人气榜", "热股", "融合", "强势股", "fetch_hot_rank", "fetch_hot_pop", "merge_hot_rank"]),

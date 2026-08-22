@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 import sys
-import os
 sys.path.insert(0, "/opt/ProBigA")
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 from server.engine.stock_analysis_engine import StockAnalysisEngine
 

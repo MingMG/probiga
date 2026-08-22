@@ -15,7 +15,7 @@
   python tools/find_buy_candidates.py --skip-ai   # 只跑量化筛选，不调 AI
 
 环境变量：
-  MYSQL_URL      — 数据库连接（默认 mysql+pymysql://root:123456@localhost:3306/probiga）
+  MYSQL_URL      — 数据库连接（必须显式配置；也可使用 DATABASE_URL）
   DEEPSEEK_API_KEY — DeepSeek API Key（不设则跳过 AI 评分）
 """
 from __future__ import annotations
@@ -35,12 +35,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine()
 
 
 def _latest_trade_date(engine, table: str, col: str = "trade_date") -> str:

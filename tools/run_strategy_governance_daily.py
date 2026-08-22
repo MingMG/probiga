@@ -29,6 +29,26 @@ def _create_tool_engine():
     return create_tool_engine()
 
 
+def _capture_industry_history(target_trade_date: str) -> dict:
+    """Freeze the same-day industry facts before combination governance."""
+
+    from tools.sync_strategy_industry_history import capture_industry_history
+
+    engine = _create_tool_engine()
+    try:
+        return capture_industry_history(engine, trade_date=target_trade_date)
+    finally:
+        engine.dispose()
+
+
+def _bootstrap_execution_adapters() -> dict:
+    from server.engine.strategy_execution_adapters import (
+        bootstrap_strategy_execution_adapter_registry,
+    )
+
+    return bootstrap_strategy_execution_adapter_registry()
+
+
 def _blocked(
     reason: str,
     target_trade_date: str = "",
@@ -78,6 +98,9 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=500)
     args = parser.parse_args()
     _load_project_env()
+    # Standalone scheduler processes must use the same sealed code manifest as
+    # the API process. This happens before calendar reads or any governance write.
+    _bootstrap_execution_adapters()
 
     requested_trade_date = str(args.trade_date or "").strip()
     calendar_engine = _create_tool_engine()
@@ -102,6 +125,17 @@ def main() -> int:
             "指定交易日不是权威已收盘交易日"
             f"（要求{target_trade_date}，指定{requested_trade_date}）；"
             "未写入治理状态，模拟资金保持现金",
+            target_trade_date,
+        )
+
+    try:
+        _capture_industry_history(target_trade_date)
+    except Exception as exc:
+        return _blocked(
+            "当日行业历史冻结未完成；组合行业证据不可复算，"
+            "未写入治理状态，模拟资金保持现金"
+            f"（{type(exc).__name__}: {str(exc)[:300]}）",
+            target_trade_date,
             target_trade_date,
         )
 

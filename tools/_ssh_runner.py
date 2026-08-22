@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-import paramiko
+from remote_support import production_ssh_client, production_ssh_connect_kwargs
 
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('47.113.123.190', username='root', password='ProBigA@2026', look_for_keys=False, allow_agent=False)
+ssh = production_ssh_client()
+ssh.connect(**production_ssh_connect_kwargs())
 
 sftp = ssh.open_sftp()
 lines = [
-    "from sqlalchemy import create_engine, text",
-    "c = create_engine('mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4').connect()",
+    "from sqlalchemy import text",
+    "from tools.env_config import create_tool_engine",
+    "c = create_tool_engine().connect()",
     "",
     "# Current task args",
     "rows = c.execute(text('SELECT id, task_name, script_path, script_args, date_param, cron_time FROM st_scheduled_tasks ORDER BY sort_order')).fetchall()",

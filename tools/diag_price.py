@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-engine = create_engine('mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4')
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 with engine.connect() as c:
     a = c.execute(text("SELECT COUNT(*) FROM sm_stock_current")).scalar()
     b = c.execute(text("SELECT COUNT(*) FROM sm_stock_kline")).scalar()

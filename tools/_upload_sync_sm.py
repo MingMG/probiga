@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-import paramiko
+from remote_support import production_ssh_client, production_ssh_connect_kwargs
 import os
 
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('47.113.123.190', username='root', password='ProBigA@2026', look_for_keys=False, allow_agent=False)
+ssh = production_ssh_client()
+ssh.connect(**production_ssh_connect_kwargs())
 
 sftp = ssh.open_sftp()
 

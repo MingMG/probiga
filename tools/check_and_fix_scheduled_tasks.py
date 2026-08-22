@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import create_engine, text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 # 需要确保存在的任务列表
 REQUIRED_TASKS = [
@@ -50,8 +50,7 @@ OPTIONAL_TASKS = [
 
 
 def main():
-    mysql_url = os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL
-    engine = create_engine(mysql_url, pool_pre_ping=True)
+    engine = create_tool_engine()
 
     print("=" * 60)
     print("检查定时任务配置")

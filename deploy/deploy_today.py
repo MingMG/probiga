@@ -1,12 +1,20 @@
 """Deploy today's changes to server via paramiko."""
-import paramiko
 import os
+import sys
+from pathlib import Path
 
-SERVER = '47.113.123.190'
-USER = 'root'
-PASSWORD = 'ProBigA@2026'
-REMOTE = '/opt/ProBigA'
-LOCAL = r'E:\My Code\ProBigA'
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.remote_support import (
+    production_ssh_client,
+    production_ssh_connect_kwargs,
+    remote_root,
+)
+
+REMOTE = remote_root()
+LOCAL = str(ROOT)
 
 # Modified files
 files = [
@@ -62,9 +70,8 @@ all_files = files + new_files
 
 # Connect
 print('Connecting to server...')
-client = paramiko.SSHClient()
-client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect(SERVER, username=USER, password=PASSWORD, timeout=30)
+client = production_ssh_client()
+client.connect(**production_ssh_connect_kwargs(timeout=30))
 sftp = client.open_sftp()
 
 # Upload

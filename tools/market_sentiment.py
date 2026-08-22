@@ -36,7 +36,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 INDEX_MAP = {
     "000016": "上证50",
@@ -50,8 +50,7 @@ INDEX_MAP = {
 
 
 def _engine():
-    url = os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
-    return create_engine(url, pool_pre_ping=True)
+    return create_tool_engine()
 
 
 def _to_date_str(val: any) -> str:

@@ -898,9 +898,11 @@ if (!(Test-LegacyMiniQmtEnabled)) {
     }
 }
 
-$sshPassword = $env:PROBIGA_REMOTE_SSH_PASSWORD
-if ($sshPassword) {
-    $env:PROBIGA_REMOTE_SSH_PASSWORD = $sshPassword
+$sshKeyFile = $env:PROBIGA_REMOTE_SSH_KEY_FILE
+$sshHost = $env:PROBIGA_REMOTE_SSH_HOST
+$sshUser = $env:PROBIGA_REMOTE_SSH_USER
+$sshKnownHosts = $env:PROBIGA_SSH_KNOWN_HOSTS
+if ($sshKeyFile -and $sshHost -and $sshUser -and $sshKnownHosts) {
     Ensure-Process `
         -PythonExe $python `
         -ScriptName "run_remote_mysql_tunnel.py" `
@@ -908,7 +910,7 @@ if ($sshPassword) {
         -StdOutPath (Join-Path $DataDir "mysql_tunnel.out.log") `
         -StdErrPath (Join-Path $DataDir "mysql_tunnel.err.log")
 } else {
-    Write-Warning "Skip remote MySQL tunnel: set PROBIGA_REMOTE_SSH_PASSWORD to enable it."
+    Write-Warning "Skip remote MySQL tunnel: configure SSH host, user, key file, and known-hosts file."
 }
 
 Stop-DuplicateProcesses

@@ -1,0 +1,1786 @@
+from __future__ import annotations
+
+import json
+import stat
+from contextlib import nullcontext
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tools import prepare_strategy_governance_schema as schema
+
+
+ADMIN_GRANTS = (
+    "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+    "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
+)
+MIGRATOR_GRANTS = (
+    "GRANT USAGE ON *.* TO `probiga_migrator`@`127.0.0.1` REQUIRE SSL",
+    "GRANT ALL PRIVILEGES ON `probiga`.* TO "
+    "`probiga_migrator`@`127.0.0.1`",
+)
+RUNTIME_GRANTS = (
+    "GRANT USAGE ON *.* TO `probiga_runtime`@`127.0.0.1` REQUIRE SSL",
+    "GRANT SELECT ON `biga`.* TO "
+    "`probiga_runtime`@`127.0.0.1`",
+    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, "
+    "REFERENCES, CREATE TEMPORARY TABLES ON `probiga`.* TO "
+    "`probiga_runtime`@`127.0.0.1`",
+    "GRANT SELECT ON `probiga_qmt_history`.* TO "
+    "`probiga_runtime`@`127.0.0.1`",
+)
+
+
+def _target_state(
+    *,
+    user: str = schema.EXPECTED_RUNTIME_USER,
+    database: str | None = schema.DATABASE_NAME,
+    trust: int = 0,
+    **changes,
+) -> schema.TargetState:
+    state = schema.TargetState(
+        mysql_version="8.4.11",
+        version_comment="MySQL Community Server - GPL",
+        database_name=database,
+        authenticated_user=user,
+        active_roles="NONE",
+        server_uuid=schema.EXPECTED_SERVER_UUID,
+        server_port=schema.EXPECTED_SERVER_PORT,
+        server_hostname=schema.EXPECTED_SERVER_HOSTNAME,
+        log_bin=1,
+        binlog_format="ROW",
+        trust_creators=trust,
+        session_sql_mode=schema.EXPECTED_SQL_MODE,
+        character_set_client=schema.EXPECTED_CHARACTER_SET_CLIENT,
+        collation_connection=schema.EXPECTED_COLLATION_CONNECTION,
+        database_collation=schema.EXPECTED_DATABASE_COLLATION,
+        tls_cipher="TLS_AES_256_GCM_SHA384",
+    )
+    return replace(state, **changes)
+
+
+class _FakeParent:
+    def __init__(self, *, owner: int = 0, mode: int = 0o755) -> None:
+        self.owner = owner
+        self.mode = mode
+
+    def stat(self):
+        return SimpleNamespace(
+            st_uid=self.owner,
+            st_mode=stat.S_IFDIR | self.mode,
+        )
+
+
+class _FakeProtectedPath:
+    def __init__(
+        self,
+        *,
+        absolute: bool = True,
+        symlink: bool = False,
+        owner: int = 0,
+        mode: int = 0o600,
+        regular: bool = True,
+        parent_owner: int = 0,
+        parent_mode: int = 0o755,
+    ) -> None:
+        self.absolute = absolute
+        self.symlink = symlink
+        self.owner = owner
+        self.mode = mode
+        self.regular = regular
+        self.parent = _FakeParent(owner=parent_owner, mode=parent_mode)
+
+    def is_absolute(self):
+        return self.absolute
+
+    def is_symlink(self):
+        return self.symlink
+
+    def lstat(self):
+        return SimpleNamespace(
+            st_uid=self.owner,
+            st_mode=(stat.S_IFREG if self.regular else stat.S_IFDIR) | self.mode,
+        )
+
+    def resolve(self, *, strict):
+        assert strict is True
+        return self
+
+    def stat(self):
+        return self.lstat()
+
+
+class _InventoryResult:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+
+class _InventoryConnection:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.statements: list[str] = []
+
+    def execute(self, statement, _params=None):
+        self.statements.append(str(statement))
+        return _InventoryResult(self.rows)
+
+
+def _contract(
+    name: str,
+    *,
+    table: str = "controlled_ledger",
+) -> schema.TriggerContract:
+    return schema.TriggerContract(
+        name=name,
+        timing="BEFORE",
+        event="UPDATE",
+        table=table,
+        body="SET NEW.value = OLD.value",
+        normalizer="governance",
+        owner="test",
+    )
+
+
+def _trigger_row(
+    contract: schema.TriggerContract,
+    *,
+    definer: str = schema.EXPECTED_MIGRATOR_USER,
+    sql_mode: str = schema.EXPECTED_SQL_MODE,
+    **changes,
+):
+    row = {
+        "trigger_name": contract.name,
+        "definer": definer,
+        "action_timing": contract.timing,
+        "event_manipulation": contract.event,
+        "event_object_table": contract.table,
+        "action_orientation": "ROW",
+        "action_statement": contract.body,
+        "sql_mode": sql_mode,
+        "character_set_client": schema.EXPECTED_CHARACTER_SET_CLIENT,
+        "collation_connection": schema.EXPECTED_COLLATION_CONNECTION,
+        "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+    }
+    row.update(changes)
+    return row
+
+
+class _RuntimeEngine:
+    def __init__(self, *, state: schema.TargetState | None = None) -> None:
+        self.state = state or _target_state()
+        self.dispose_count = 0
+
+    def dispose(self):
+        self.dispose_count += 1
+
+    def connect(self):
+        return nullcontext(SimpleNamespace(state=self.state))
+
+
+def _boundary(*, trust: int = 0) -> schema.DatabaseBoundary:
+    return schema.DatabaseBoundary(
+        runtime_engine=_RuntimeEngine(state=_target_state(trust=0)),
+        migrator_engine=None,
+        admin_credential=schema.OptionCredential(
+            path=Path("/etc/probiga/mysql-trigger-admin.ini"),
+            host="127.0.0.1",
+            port=3306,
+            user="probiga_trigger_admin",
+            password="A" * 64,
+        ),
+        migrator_credential=None,
+        ssl_ca=Path("/etc/probiga/mysql84-ca.pem"),
+        runtime_state=_target_state(trust=trust),
+        admin_state=_target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=trust,
+        ),
+        migrator_state=None,
+    )
+
+
+def test_fixed_production_option_file_paths_are_not_caller_controlled():
+    assert schema.ADMIN_OPTION_FILE == Path(
+        "/etc/probiga/mysql-trigger-admin.ini"
+    )
+    assert schema.MIGRATOR_OPTION_FILE == Path("/etc/probiga/mysql-migrator.ini")
+
+
+@pytest.mark.parametrize(
+    ("os_name", "uid"),
+    (("nt", 0), ("posix", 1001)),
+)
+def test_root_execution_gate_rejects_non_production_broker(
+    monkeypatch,
+    os_name,
+    uid,
+):
+    monkeypatch.setattr(
+        schema,
+        "os",
+        SimpleNamespace(name=os_name, geteuid=lambda: uid),
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="must run as root",
+    ):
+        schema._require_root_execution()
+
+
+def test_root_execution_gate_accepts_posix_root(monkeypatch):
+    monkeypatch.setattr(
+        schema,
+        "os",
+        SimpleNamespace(name="posix", geteuid=lambda: 0),
+    )
+    schema._require_root_execution()
+
+
+def test_protected_option_file_accepts_only_root_private_regular_file(
+    monkeypatch,
+):
+    candidate = _FakeProtectedPath()
+    monkeypatch.setattr(schema.os.path, "lexists", lambda path: path is candidate)
+
+    assert schema._protected_option_file(candidate) is candidate
+
+
+@pytest.mark.parametrize(
+    ("candidate", "exists", "message"),
+    (
+        (_FakeProtectedPath(absolute=False), True, "missing or not absolute"),
+        (_FakeProtectedPath(), False, "missing or not absolute"),
+        (_FakeProtectedPath(symlink=True), True, "must not be a symlink"),
+        (_FakeProtectedPath(owner=1001), True, "ownership or mode is unsafe"),
+        (_FakeProtectedPath(mode=0o640), True, "ownership or mode is unsafe"),
+        (
+            _FakeProtectedPath(regular=False),
+            True,
+            "ownership or mode is unsafe",
+        ),
+        (
+            _FakeProtectedPath(parent_owner=1001),
+            True,
+            "ownership or mode is unsafe",
+        ),
+        (
+            _FakeProtectedPath(parent_mode=0o775),
+            True,
+            "ownership or mode is unsafe",
+        ),
+    ),
+)
+def test_protected_option_file_rejects_path_symlink_owner_and_mode(
+    monkeypatch,
+    candidate,
+    exists,
+    message,
+):
+    monkeypatch.setattr(schema.os.path, "lexists", lambda _path: exists)
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError, match=message):
+        schema._protected_option_file(candidate)
+
+
+def test_option_file_parser_accepts_only_exact_tcp_credential_shape(
+    monkeypatch,
+    tmp_path,
+):
+    password = "A0_-" * 16
+    path = tmp_path / "admin.ini"
+    path.write_text(
+        "[client]\n"
+        "protocol=tcp\n"
+        "host=127.0.0.1\n"
+        "port=3306\n"
+        "user=probiga_trigger_admin\n"
+        f"password={password}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(schema, "_protected_option_file", lambda value: value)
+
+    credential = schema._read_option_credential(
+        path,
+        expected_user="probiga_trigger_admin",
+    )
+
+    assert credential == schema.OptionCredential(
+        path=path,
+        host="127.0.0.1",
+        port=3306,
+        user="probiga_trigger_admin",
+        password=password,
+    )
+    assert password not in repr(credential)
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        "[mysql]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64 + "\nssl-mode=REQUIRED",
+        "[client]\nprotocol=socket\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=db.internal\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3307\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=root\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=short",
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 47 + "!",
+    ),
+)
+def test_option_file_parser_rejects_wrong_shape_target_or_password(
+    monkeypatch,
+    tmp_path,
+    body,
+):
+    path = tmp_path / "credential.ini"
+    path.write_text(body + "\n", encoding="utf-8")
+    monkeypatch.setattr(schema, "_protected_option_file", lambda value: value)
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._read_option_credential(
+            path,
+            expected_user="probiga_trigger_admin",
+        )
+
+
+def test_option_connection_is_remote_tcp_tls_and_disables_local_infile(
+    monkeypatch,
+):
+    observed = {}
+    connection = SimpleNamespace()
+
+    def fake_connect(**kwargs):
+        observed.update(kwargs)
+        return connection
+
+    monkeypatch.setattr(schema.pymysql, "connect", fake_connect)
+    credential = schema.OptionCredential(
+        path=Path("/etc/probiga/mysql-trigger-admin.ini"),
+        host="127.0.0.1",
+        port=3306,
+        user="probiga_trigger_admin",
+        password="A" * 64,
+    )
+
+    assert schema._connect_option(
+        credential,
+        Path("/etc/probiga/mysql84-ca.pem"),
+        database=None,
+        configure_trigger_session=False,
+        autocommit=True,
+    ) is connection
+    assert observed["host"] == "127.0.0.1"
+    assert observed["port"] == 3306
+    assert observed["user"] == "probiga_trigger_admin"
+    assert observed["database"] is None
+    assert str(observed["ssl_ca"]).replace("\\", "/") == (
+        "/etc/probiga/mysql84-ca.pem"
+    )
+    assert observed["ssl_verify_cert"] is True
+    assert observed["local_infile"] is False
+    assert "unix_socket" not in observed
+    assert "read_default_file" not in observed
+
+
+def test_all_three_database_identity_grant_boundaries_accept_exact_grants():
+    schema._validate_admin_grants(ADMIN_GRANTS)
+    schema._validate_migrator_grants(MIGRATOR_GRANTS)
+    schema._validate_runtime_grants(RUNTIME_GRANTS)
+
+
+def test_runtime_grant_summary_is_exact_and_safe_to_publish():
+    detail = schema._runtime_grant_summary(RUNTIME_GRANTS)
+
+    assert detail == {
+        "global_privileges": ["USAGE"],
+        "schema_privileges": {
+            "BIGA.*": ["SELECT"],
+            "PROBIGA.*": [
+                "ALTER",
+                "CREATE",
+                "CREATE TEMPORARY TABLES",
+                "DELETE",
+                "DROP",
+                "INDEX",
+                "INSERT",
+                "REFERENCES",
+                "SELECT",
+                "UPDATE",
+            ],
+            "PROBIGA_QMT_HISTORY.*": ["SELECT"],
+        },
+        "require_ssl": True,
+        "roles": [],
+        "grant_option": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "forged_grant",
+    (
+        "GRANT ALL PRIVILEGES ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, TRIGGER ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, EVENT ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, CREATE ROUTINE ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, ALTER ROUTINE ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, EXECUTE ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, CREATE VIEW ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, SHOW VIEW ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, LOCK TABLES ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+    ),
+)
+def test_runtime_grants_reject_all_trust_window_capabilities(forged_grant):
+    forged = tuple(
+        grant if "ON `probiga`.*" not in grant else forged_grant
+        for grant in RUNTIME_GRANTS
+    )
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_runtime_grants(forged)
+
+
+class _RoutineInventoryResult:
+    def __init__(self, rows=()):
+        self.rows = [dict(row) for row in rows]
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+
+class _RoutineInventoryConnection:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.statements: list[str] = []
+
+    def execute(self, statement, _params=None):
+        sql = str(statement).strip()
+        self.statements.append(sql)
+        return _RoutineInventoryResult(self.rows)
+
+
+def test_runtime_definer_routine_inventory_is_read_only_and_empty():
+    connection = _RoutineInventoryConnection()
+
+    detail = schema._validate_no_runtime_definer_routines(connection)
+
+    assert detail == {
+        "runtime_definer_routine_count": 0,
+        "runtime_definer_routine_inventory_verified": True,
+    }
+    assert len(connection.statements) == 1
+    assert connection.statements[0].upper().startswith("SELECT ")
+    assert "SECURITY_TYPE" in connection.statements[0]
+
+
+def test_runtime_definer_routine_inventory_fails_closed_on_any_row():
+    connection = _RoutineInventoryConnection([{
+        "routine_schema": "probiga",
+        "routine_name": "unsafe_definer",
+        "routine_type": "FUNCTION",
+    }])
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="SQL SECURITY DEFINER",
+    ):
+        schema._validate_no_runtime_definer_routines(connection)
+
+
+class _RoutineAuditCursor:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.statements = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement):
+        self.statements.append(statement)
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+class _RoutineAuditConnection:
+    def __init__(self, rows=()):
+        self.audit_cursor = _RoutineAuditCursor(rows)
+
+    def cursor(self):
+        return self.audit_cursor
+
+
+def test_complete_routine_inventory_requires_independent_admin_proof():
+    connection = _RoutineAuditConnection()
+
+    detail = schema._validate_complete_routine_inventory_dbapi(connection)
+
+    assert detail["runtime_definer_routine_inventory_complete"] is True
+    assert detail["runtime_definer_routine_inventory_authority"] == (
+        schema.EXPECTED_ADMIN_USER
+    )
+    assert detail["runtime_definer_routine_inventory_schemas"] == [
+        "biga", "probiga", "probiga_qmt_history",
+    ]
+    sql = connection.audit_cursor.statements[0]
+    assert "CURRENT_USER()" not in sql
+    assert "('BIGA', 'PROBIGA', 'PROBIGA_QMT_HISTORY')" in sql
+
+
+def test_runtime_and_migrator_routine_checks_are_self_only():
+    for identity in ("runtime", "migrator"):
+        connection = _RoutineInventoryConnection()
+        assert schema._validate_no_self_definer_routines(
+            connection,
+            identity=identity,
+        ) == {f"{identity}_self_definer_routine_count": 0}
+        assert "DEFINER=BINARY CURRENT_USER()" in connection.statements[0]
+
+
+def test_admin_inventory_authority_rejects_missing_show_routine():
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_admin_grants((
+            "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO "
+            "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
+        ))
+
+
+@pytest.mark.parametrize(
+    "grants",
+    (
+        ADMIN_GRANTS
+        + (
+            "GRANT SUPER ON *.* TO "
+            "`probiga_trigger_admin`@`127.0.0.1`",
+        ),
+        ADMIN_GRANTS
+        + (
+            "GRANT SELECT ON `probiga`.* TO "
+            "`probiga_trigger_admin`@`127.0.0.1`",
+        ),
+        ADMIN_GRANTS
+        + (
+            "GRANT SELECT ON `other_schema`.* TO "
+            "`probiga_trigger_admin`@`127.0.0.1`",
+        ),
+    ),
+)
+def test_admin_grants_reject_every_extra_global_or_schema_privilege(grants):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_admin_grants(grants)
+
+
+@pytest.mark.parametrize(
+    "grants",
+    (
+        (
+            MIGRATOR_GRANTS[0],
+            "GRANT SELECT ON `probiga`.* TO "
+            "`probiga_migrator`@`127.0.0.1`",
+        ),
+        MIGRATOR_GRANTS
+        + (
+            "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO "
+            "`probiga_migrator`@`127.0.0.1`",
+        ),
+        MIGRATOR_GRANTS
+        + (
+            "GRANT SELECT ON `other_schema`.* TO "
+            "`probiga_migrator`@`127.0.0.1`",
+        ),
+    ),
+)
+def test_migrator_grants_require_one_exact_probiga_only_boundary(grants):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_migrator_grants(grants)
+
+
+@pytest.mark.parametrize(
+    "grants",
+    (
+        RUNTIME_GRANTS
+        + (
+            "GRANT SUPER ON *.* TO `probiga_runtime`@`127.0.0.1`",
+        ),
+        RUNTIME_GRANTS
+        + (
+            "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO "
+            "`probiga_runtime`@`127.0.0.1`",
+        ),
+        RUNTIME_GRANTS
+        + (
+            "GRANT SELECT ON `other_schema`.* TO "
+            "`probiga_runtime`@`127.0.0.1`",
+        ),
+        (RUNTIME_GRANTS[0],),
+        RUNTIME_GRANTS[1:],
+    ),
+)
+def test_runtime_grants_reject_admin_cross_schema_or_missing_schema_rights(
+    grants,
+):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_runtime_grants(grants)
+
+
+@pytest.mark.parametrize(
+    "validator",
+    (
+        schema._validate_admin_grants,
+        schema._validate_migrator_grants,
+        schema._validate_runtime_grants,
+    ),
+)
+@pytest.mark.parametrize(
+    "grants",
+    (
+        (
+            "GRANT `schema_admin`@`%` TO "
+            "`database_user`@`127.0.0.1`",
+        ),
+        (
+            "GRANT USAGE ON *.* TO `database_user`@`127.0.0.1` REQUIRE SSL",
+            "GRANT SELECT ON `probiga`.* TO "
+            "`database_user`@`127.0.0.1` WITH GRANT OPTION",
+        ),
+    ),
+)
+def test_every_database_identity_rejects_roles_and_grant_option(
+    validator,
+    grants,
+):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        validator(grants)
+
+
+def test_target_state_is_built_from_fixed_server_and_session_metadata():
+    row = {
+        "mysql_version": "8.4.11",
+        "version_comment_value": "MySQL Community Server - GPL",
+        "database_name": schema.DATABASE_NAME,
+        "authenticated_user": schema.EXPECTED_RUNTIME_USER,
+        "active_roles": "NONE",
+        "server_uuid_value": schema.EXPECTED_SERVER_UUID.upper(),
+        "server_port": "3306",
+        "server_hostname": schema.EXPECTED_SERVER_HOSTNAME,
+        "log_bin": "ON",
+        "binlog_format": "row",
+        "trust_creators": "OFF",
+        "session_sql_mode": schema.EXPECTED_SQL_MODE,
+        "character_set_client": schema.EXPECTED_CHARACTER_SET_CLIENT,
+        "collation_connection": schema.EXPECTED_COLLATION_CONNECTION,
+        "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+    }
+
+    assert schema._state_from_row(row, "TLS_AES_256_GCM_SHA384") == _target_state()
+
+
+def test_exact_runtime_and_admin_target_states_are_accepted():
+    schema._validate_target_state(
+        _target_state(),
+        expected_user=schema.EXPECTED_RUNTIME_USER,
+        require_database=True,
+        expected_trust=0,
+        require_trigger_session=True,
+    )
+    schema._validate_target_state(
+        _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+        ),
+        expected_user=schema.EXPECTED_ADMIN_USER,
+        require_database=False,
+        expected_trust=0,
+        require_trigger_session=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"mysql_version": "8.4.10"},
+        {"version_comment": "MariaDB Server"},
+        {"server_uuid": "00000000-0000-0000-0000-000000000000"},
+        {"server_port": 3307},
+        {"server_hostname": "OTHER-HOST"},
+        {"authenticated_user": schema.EXPECTED_ADMIN_USER},
+        {"active_roles": "`schema_admin`@`%`"},
+        {"log_bin": 0},
+        {"binlog_format": "STATEMENT"},
+        {"trust_creators": 1},
+        {"tls_cipher": ""},
+    ),
+)
+def test_target_state_rejects_version_identity_tls_trust_or_server_drift(changes):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_target_state(
+            replace(_target_state(), **changes),
+            expected_user=schema.EXPECTED_RUNTIME_USER,
+            require_database=True,
+            expected_trust=0,
+            require_trigger_session=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"database_name": "other"},
+        {"session_sql_mode": "STRICT_TRANS_TABLES"},
+        {"character_set_client": "latin1"},
+        {"collation_connection": "utf8mb4_0900_ai_ci"},
+        {"database_collation": "utf8mb4_0900_ai_ci"},
+    ),
+)
+def test_target_state_rejects_database_or_trigger_session_metadata_drift(changes):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_target_state(
+            replace(_target_state(), **changes),
+            expected_user=schema.EXPECTED_RUNTIME_USER,
+            require_database=True,
+            expected_trust=0,
+            require_trigger_session=True,
+        )
+
+
+def test_cutover_requires_writer_fence_before_environment_or_database_access(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        schema,
+        "load_project_env",
+        lambda: pytest.fail("writer-fence rejection must precede environment load"),
+    )
+    monkeypatch.setattr(
+        schema,
+        "_open_boundary",
+        lambda **_kwargs: pytest.fail("writer-fence rejection must precede DB access"),
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="verified writer fence",
+    ):
+        schema.prepare_schema(phase="cutover", writers_fenced=False)
+
+
+def test_trigger_inventory_allows_required_and_optional_absence(monkeypatch):
+    required = _contract("trg_required")
+    optional = _contract("trg_optional")
+    connection = _InventoryConnection([_trigger_row(required)])
+    monkeypatch.setattr(
+        schema,
+        "_normalized_trigger_body",
+        lambda _contract, value: " ".join(str(value).upper().split()),
+    )
+
+    detail = schema.validate_release_trigger_contracts(
+        connection,
+        required={required.name: required},
+        optional={optional.name: optional},
+    )
+
+    assert detail == {
+        "required_count": 1,
+        "optional_count": 1,
+        "observed_count": 1,
+        "definer": schema.EXPECTED_MIGRATOR_USER,
+        "metadata_frozen": True,
+        "legacy_rehome_names": [],
+    }
+    assert all(
+        statement.lstrip().startswith("SELECT ")
+        for statement in connection.statements
+    )
+
+
+@pytest.mark.parametrize("case", ("missing", "forbidden", "unexpected"))
+def test_trigger_inventory_rejects_missing_forbidden_and_unexpected(
+    monkeypatch,
+    case,
+):
+    expected = _contract("trg_expected")
+    forbidden = _contract("trg_forbidden")
+    unexpected = _contract("trg_unexpected")
+    rows = {
+        "missing": [],
+        "forbidden": [_trigger_row(expected), _trigger_row(forbidden)],
+        "unexpected": [_trigger_row(expected), _trigger_row(unexpected)],
+    }[case]
+    monkeypatch.setattr(
+        schema,
+        "_normalized_trigger_body",
+        lambda _contract, value: " ".join(str(value).upper().split()),
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="inventory is incomplete or unexpected",
+    ):
+        schema.validate_release_trigger_contracts(
+            _InventoryConnection(rows),
+            required={expected.name: expected},
+            optional={},
+            forbidden_names=(forbidden.name,),
+        )
+
+
+def test_both_exact_legacy_metadata_pairs_are_the_only_rehome_exceptions(
+    monkeypatch,
+):
+    contracts = {
+        name: _contract(name, table="trade_account_v2")
+        for name in schema.LEGACY_TRIGGER_REHOME_METADATA
+    }
+    rows = [
+        _trigger_row(
+            contract,
+            definer=schema.LEGACY_TRIGGER_REHOME_METADATA[name][0],
+            sql_mode=schema.LEGACY_TRIGGER_REHOME_METADATA[name][1],
+        )
+        for name, contract in contracts.items()
+    ]
+    monkeypatch.setattr(
+        schema,
+        "_normalized_trigger_body",
+        lambda _contract, value: " ".join(str(value).upper().split()),
+    )
+
+    detail = schema.validate_release_trigger_contracts(
+        _InventoryConnection(rows),
+        required=contracts,
+        optional={},
+        allow_legacy_rehome=True,
+    )
+
+    assert detail["legacy_rehome_names"] == sorted(
+        schema.LEGACY_TRIGGER_REHOME_METADATA
+    )
+
+
+@pytest.mark.parametrize(
+    ("definer", "sql_mode", "allow_legacy"),
+    (
+        ("root@127.0.0.1", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION", True),
+        ("root@localhost", schema.EXPECTED_SQL_MODE, True),
+        ("root@localhost", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION", False),
+    ),
+)
+def test_legacy_rehome_exception_rejects_every_partial_or_unapproved_match(
+    monkeypatch,
+    definer,
+    sql_mode,
+    allow_legacy,
+):
+    name = "trg_trade_account_v2_real_disabled_bi"
+    contract = _contract(name, table="trade_account_v2")
+    monkeypatch.setattr(schema, "_normalized_trigger_body", lambda *_args: "same")
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="physical metadata differs",
+    ):
+        schema.validate_release_trigger_contracts(
+            _InventoryConnection(
+                [_trigger_row(contract, definer=definer, sql_mode=sql_mode)]
+            ),
+            required={name: contract},
+            optional={},
+            allow_legacy_rehome=allow_legacy,
+        )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        {"definer": "root@localhost"},
+        {"sql_mode": "STRICT_TRANS_TABLES"},
+    ),
+)
+def test_nonlegacy_trigger_rejects_wrong_definer_or_sql_mode(
+    monkeypatch,
+    metadata,
+):
+    contract = _contract("trg_current")
+    monkeypatch.setattr(schema, "_normalized_trigger_body", lambda *_args: "same")
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="physical metadata differs",
+    ):
+        schema.validate_release_trigger_contracts(
+            _InventoryConnection([_trigger_row(contract, **metadata)]),
+            required={contract.name: contract},
+            optional={},
+        )
+
+
+class _AdminConnection:
+    def __init__(self, *, trust: int, fail_read: bool = False) -> None:
+        self.trust = trust
+        self.fail_read = fail_read
+        self.open = True
+        self.closed = False
+
+    def close(self):
+        self.open = False
+        self.closed = True
+
+
+def _install_restoration_fakes(
+    monkeypatch,
+    *,
+    secondary_fails: bool = False,
+):
+    fresh: list[_AdminConnection] = []
+
+    def connect_admin(_boundary):
+        connection = _AdminConnection(
+            trust=0,
+            fail_read=secondary_fails and not fresh,
+        )
+        fresh.append(connection)
+        return connection
+
+    def read_admin(connection):
+        if connection.fail_read:
+            raise RuntimeError("secondary verification unavailable")
+        return _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=connection.trust,
+        )
+
+    monkeypatch.setattr(schema, "_connect_admin", connect_admin)
+    monkeypatch.setattr(schema, "_read_dbapi_state", read_admin)
+    monkeypatch.setattr(
+        schema,
+        "_set_trust",
+        lambda connection, *, enabled: setattr(
+            connection,
+            "trust",
+            int(enabled),
+        ),
+    )
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
+    monkeypatch.setattr(
+        schema,
+        "_read_sa_state",
+        lambda connection: connection.state,
+    )
+    monkeypatch.setattr(schema, "_sa_grants", lambda _connection: RUNTIME_GRANTS)
+    return fresh
+
+
+def test_restore_forces_off_then_verifies_fresh_admin_and_runtime(
+    monkeypatch,
+):
+    boundary = _boundary(trust=1)
+    primary = _AdminConnection(trust=1)
+    fresh = _install_restoration_fakes(monkeypatch)
+
+    result = schema._restore_and_double_verify(boundary, primary)
+
+    assert result == {
+        "restore_primary_verified": True,
+        "restore_secondary_verified": True,
+        "runtime_trust_off_verified": True,
+    }
+    assert primary.trust == 0
+    assert len(fresh) == 1
+    assert fresh[0].closed is True
+    assert boundary.runtime_engine.dispose_count == 1
+
+
+def test_restore_reports_failure_when_fresh_admin_cannot_verify_off(
+    monkeypatch,
+):
+    boundary = _boundary(trust=1)
+    primary = _AdminConnection(trust=1)
+    _install_restoration_fakes(monkeypatch, secondary_fails=True)
+
+    result = schema._restore_and_double_verify(boundary, primary)
+
+    assert result == {
+        "restore_primary_verified": True,
+        "restore_secondary_verified": False,
+        "runtime_trust_off_verified": True,
+    }
+
+
+class _TriggerCursor:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, _params=None):
+        self.owner.events.append("execute-create")
+        self.owner.statements.append(str(statement))
+        if self.owner.fail_create:
+            raise RuntimeError("injected trigger DDL failure")
+
+
+class _TriggerMigratorConnection:
+    def __init__(self, admin, events, *, fail_create=False):
+        self.admin = admin
+        self.events = events
+        self.fail_create = fail_create
+        self.statements: list[str] = []
+        self.open = True
+
+    def cursor(self):
+        return _TriggerCursor(self)
+
+    def close(self):
+        self.events.append("close-migrator")
+        self.open = False
+
+
+def _install_trigger_executor_fakes(monkeypatch, *, fail_create=False):
+    admin = _AdminConnection(trust=0)
+    boundary = _boundary(trust=0)
+    boundary.migrator_engine = SimpleNamespace()
+    events: list[str] = []
+    migrator = _TriggerMigratorConnection(
+        admin,
+        events,
+        fail_create=fail_create,
+    )
+
+    def read_state(connection):
+        if connection is admin:
+            events.append(f"read-admin-{admin.trust}")
+            return _target_state(
+                user=schema.EXPECTED_ADMIN_USER,
+                database=None,
+                trust=admin.trust,
+            )
+        events.append(f"read-migrator-{admin.trust}")
+        return _target_state(
+            user=schema.EXPECTED_MIGRATOR_USER,
+            trust=admin.trust,
+        )
+
+    monkeypatch.setattr(schema, "_read_dbapi_state", read_state)
+    monkeypatch.setattr(
+        schema,
+        "_owns_window_lock",
+        lambda _admin: events.append("owns-lock") or True,
+    )
+
+    def connect_migrator(_boundary):
+        assert admin.trust == 0
+        events.append("connect-migrator-off")
+        return migrator
+
+    monkeypatch.setattr(schema, "_connect_migrator", connect_migrator)
+    monkeypatch.setattr(
+        schema,
+        "_dbapi_grants",
+        lambda connection: (
+            ADMIN_GRANTS if connection is admin else MIGRATOR_GRANTS
+        ),
+    )
+    monkeypatch.setattr(
+        schema,
+        "_dbapi_trigger_exists",
+        lambda _connection, _name: events.append("prove-trigger-absent") or False,
+    )
+
+    def set_trust(connection, *, enabled):
+        assert connection is admin
+        events.append("set-on" if enabled else "set-off")
+        admin.trust = int(enabled)
+
+    monkeypatch.setattr(schema, "_set_trust", set_trust)
+
+    def restore(_boundary, primary):
+        assert primary is admin
+        events.append("restore-off")
+        admin.trust = 0
+        return {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": True,
+            "runtime_trust_off_verified": True,
+        }
+
+    monkeypatch.setattr(schema, "_restore_and_double_verify", restore)
+    return boundary, admin, migrator, events
+
+
+def test_trigger_executor_opens_one_short_window_for_one_frozen_create(
+    monkeypatch,
+):
+    boundary, admin, migrator, events = _install_trigger_executor_fakes(
+        monkeypatch
+    )
+    contract = _contract("trg_window")
+    statement = (
+        "CREATE TRIGGER `trg_window` BEFORE UPDATE ON `controlled_ledger` "
+        "FOR EACH ROW SET NEW.value = OLD.value"
+    )
+    evidence = {
+        "trigger_trust_window_count": 0,
+        "trigger_trust_window_names": [],
+    }
+    execute = schema._build_trigger_ddl_executor(
+        boundary,
+        admin,
+        (contract,),
+        evidence,
+    )
+
+    execute(statement)
+
+    assert admin.trust == 0
+    assert migrator.statements == [statement]
+    assert events == [
+        "read-admin-0",
+        "owns-lock",
+        "connect-migrator-off",
+        "read-migrator-0",
+        "prove-trigger-absent",
+        "set-on",
+        "execute-create",
+        "restore-off",
+        "close-migrator",
+    ]
+    window_start = events.index("set-on")
+    assert events[window_start : window_start + 3] == [
+        "set-on",
+        "execute-create",
+        "restore-off",
+    ]
+    assert evidence["trigger_trust_window_count"] == 1
+    assert evidence["trigger_trust_window_names"] == ["trg_window"]
+    assert evidence["last_trigger_window_restoration"][
+        "trust_restoration_verified"
+    ] is True
+
+
+def test_trigger_executor_rejects_nonfrozen_create_before_database_access(
+    monkeypatch,
+):
+    boundary, admin, _migrator, events = _install_trigger_executor_fakes(
+        monkeypatch
+    )
+    execute = schema._build_trigger_ddl_executor(
+        boundary,
+        admin,
+        (_contract("trg_window"),),
+        {},
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="frozen release contract",
+    ):
+        execute(
+            "CREATE TRIGGER `trg_window` BEFORE UPDATE ON `controlled_ledger` "
+            "FOR EACH ROW SET NEW.value = 0"
+        )
+
+    assert events == []
+    assert admin.trust == 0
+
+
+def test_trigger_executor_restores_off_after_create_failure(monkeypatch):
+    boundary, admin, _migrator, events = _install_trigger_executor_fakes(
+        monkeypatch,
+        fail_create=True,
+    )
+    execute = schema._build_trigger_ddl_executor(
+        boundary,
+        admin,
+        (_contract("trg_window"),),
+        {},
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="frozen trigger creation failed",
+    ) as caught:
+        execute(
+            "CREATE TRIGGER `trg_window` BEFORE UPDATE ON `controlled_ledger` "
+            "FOR EACH ROW SET NEW.value = OLD.value"
+        )
+
+    assert admin.trust == 0
+    assert events[-3:] == ["execute-create", "restore-off", "close-migrator"]
+    assert caught.value.safety_evidence == {
+        "global_trust_changed": True,
+        "trust_restoration_verified": True,
+        "trigger_name": "trg_window",
+        "restore_primary_verified": True,
+        "restore_secondary_verified": True,
+        "runtime_trust_off_verified": True,
+    }
+
+
+class _NoDeltaEngine:
+    def connect(self):
+        return nullcontext(SimpleNamespace())
+
+
+def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
+    monkeypatch,
+):
+    from server.api.routers import _engine as api_engine_module
+    from server.db import migrations_v3
+    from server.engine import strategy_governance
+    from tools import attest_qmt_daily_kline
+    from tools import prepare_strategy_governance_qmt_history as qmt_history
+
+    boundary = _boundary(trust=0)
+    boundary.migrator_engine = _NoDeltaEngine()
+    admin = _AdminConnection(trust=0)
+    calls: list[str] = []
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(
+        schema,
+        "_read_dbapi_state",
+        lambda _connection: _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=0,
+        ),
+    )
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
+    monkeypatch.setattr(
+        schema,
+        "_set_trust",
+        lambda *_args, **_kwargs: pytest.fail("no-delta cutover enabled trust"),
+    )
+    monkeypatch.setattr(schema, "_all_v3_trigger_contracts", lambda: ())
+    monkeypatch.setattr(schema, "_final_v3_trigger_contracts", lambda: {})
+    monkeypatch.setattr(schema, "_non_v3_trigger_contracts", lambda: {})
+    monkeypatch.setattr(schema, "_v3_trigger_states", lambda _plan: ({}, {}))
+    monkeypatch.setattr(
+        schema,
+        "_runtime_least_privilege_evidence",
+        lambda _boundary: {
+            "runtime_least_privilege_verified": True,
+            "runtime_definer_routine_count": 0,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_restore_and_double_verify",
+        lambda _boundary, _admin: calls.append("triple-off") or {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": True,
+            "runtime_trust_off_verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_rehome_legacy_triggers",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_release_trigger_contracts",
+        lambda *_args, **_kwargs: {"observed_count": 0},
+    )
+
+    def fake_migrations(_engine, *, dry_run=False, **kwargs):
+        if not dry_run:
+            assert callable(kwargs.get("trigger_ddl_executor"))
+        return []
+
+    monkeypatch.setattr(migrations_v3, "run_v3_migrations", fake_migrations)
+    monkeypatch.setattr(
+        attest_qmt_daily_kline,
+        "ensure_attestation_tables",
+        lambda _engine, **kwargs: (
+            calls.append("qmt-schema-off"),
+            assert_callable(kwargs.get("trigger_ddl_executor")),
+        ),
+    )
+    monkeypatch.setattr(
+        attest_qmt_daily_kline,
+        "validate_attestation_schema",
+        lambda *_args, **_kwargs: {"errors": []},
+    )
+    monkeypatch.setattr(
+        qmt_history,
+        "apply_legacy_completed_run_binding",
+        lambda _engine: {"legacy_run_count": 0},
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "ensure_strategy_governance_tables",
+        lambda **kwargs: (
+            calls.append("governance-schema-off"),
+            assert_callable(kwargs.get("trigger_ddl_executor")),
+        ),
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "seed_governance_registry",
+        lambda: calls.append("seed"),
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_metric_input_review_triggers",
+        lambda _connection: {"trigger_count": 0},
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_governance_table_schema",
+        lambda _connection: {
+            "table_count": 15,
+            "column_count": 1,
+            "index_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_governance_append_only_triggers",
+        lambda _engine: {"trigger_count": 0},
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_default_governance_seed_contract",
+        lambda *_args, **_kwargs: {
+            "seeded_strategy_count": 12,
+            "seeded_combination_count": 6,
+            "seed_contract_hash": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        api_engine_module,
+        "get_engine",
+        lambda: _NoDeltaEngine(),
+    )
+    monkeypatch.setattr(api_engine_module, "dispose_engine", lambda: None)
+
+    detail = schema._cutover_schema(boundary)
+
+    assert detail["trigger_trust_window_count"] == 0
+    assert detail["trigger_trust_window_names"] == []
+    assert detail["global_trust_changed"] is False
+    assert detail["trust_restoration_verified"] is True
+    assert detail["runtime_least_privilege_verified"] is True
+    assert calls.count("triple-off") == 1
+
+
+def assert_callable(value):
+    assert callable(value)
+
+
+class _RepairConnection:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def execute(self, statement, _params=None):
+        sql = str(statement).strip()
+        if sql.upper().startswith("SELECT "):
+            return _InventoryResult(self.engine.rows)
+        match = schema._DROP_TRIGGER_RE.fullmatch(sql)
+        if match is not None:
+            name = match.group(1)
+            self.engine.events.append(f"drop:{name}")
+            self.engine.rows = [
+                row for row in self.engine.rows
+                if row["trigger_name"] != name
+            ]
+            return _InventoryResult([])
+        raise AssertionError(sql)
+
+
+class _RepairEngine:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.events: list[str] = []
+
+    def connect(self):
+        return nullcontext(_RepairConnection(self))
+
+    def begin(self):
+        return nullcontext(_RepairConnection(self))
+
+
+def _legacy_repair_contracts():
+    return {
+        name: _contract(name, table="trade_account_v2")
+        for name in schema.LEGACY_TRIGGER_REHOME_METADATA
+    }
+
+
+def test_drop_failure_recover_then_guarded_resume_repairs_only_absent_legacy(
+    monkeypatch,
+):
+    contracts = _legacy_repair_contracts()
+    rows = [
+        _trigger_row(
+            contract,
+            definer=schema.LEGACY_TRIGGER_REHOME_METADATA[name][0],
+            sql_mode=schema.LEGACY_TRIGGER_REHOME_METADATA[name][1],
+        )
+        for name, contract in contracts.items()
+    ]
+    engine = _RepairEngine(rows)
+    interrupted_name = sorted(contracts)[0]
+
+    def interrupted_create(_statement):
+        engine.events.append(f"interrupted-create:{interrupted_name}")
+        raise RuntimeError("injected failure after committed DROP")
+
+    with pytest.raises(RuntimeError, match="committed DROP"):
+        schema._rehome_legacy_triggers(
+            engine,
+            contracts,
+            trigger_ddl_executor=interrupted_create,
+        )
+    assert {row["trigger_name"] for row in engine.rows} == (
+        set(contracts) - {interrupted_name}
+    )
+
+    admin = _AdminConnection(trust=1)
+    boundary = _boundary(trust=1)
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(
+        schema,
+        "_read_dbapi_state",
+        lambda connection: _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=connection.trust,
+        ),
+    )
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
+
+    def recover_admin_off(_boundary, primary):
+        engine.events.append("recover-admin-off")
+        primary.trust = 0
+        return {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": True,
+        }
+
+    monkeypatch.setattr(schema, "_restore_and_verify_admin", recover_admin_off)
+    monkeypatch.setattr(schema, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        schema,
+        "create_tool_engine",
+        lambda **_kwargs: _RuntimeEngine(),
+    )
+    monkeypatch.setattr(
+        schema,
+        "_verify_runtime_trust_off",
+        lambda _engine: True,
+    )
+
+    recovery = schema._recover_trust(boundary)
+    assert recovery["trust_restoration_verified"] is True
+    assert admin.trust == 0
+
+    def repair_create(statement):
+        contract = schema._frozen_trigger_contract_for_statement(
+            statement,
+            contracts.values(),
+        )
+        engine.events.append(f"resume-create:{contract.name}")
+        engine.rows.append(_trigger_row(contract))
+
+    repair = schema._repair_interrupted_legacy_rehome(
+        engine,
+        contracts,
+        trigger_ddl_executor=repair_create,
+    )
+
+    assert repair == {
+        "candidate_names": [interrupted_name],
+        "repaired_names": [interrupted_name],
+        "post_validation_verified": True,
+    }
+    assert engine.events == [
+        f"drop:{interrupted_name}",
+        f"interrupted-create:{interrupted_name}",
+        "recover-admin-off",
+        f"resume-create:{interrupted_name}",
+    ]
+    assert {row["trigger_name"] for row in engine.rows} == set(contracts)
+
+
+def test_guarded_resume_rejects_renamed_trigger_on_legacy_controlled_table():
+    contracts = _legacy_repair_contracts()
+    existing_name = sorted(contracts)[1]
+    unexpected = _contract(
+        "trg_trade_account_v2_renamed_unsafe",
+        table="trade_account_v2",
+    )
+    engine = _RepairEngine([
+        _trigger_row(contracts[existing_name]),
+        _trigger_row(unexpected),
+    ])
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="inventory is incomplete or unexpected",
+    ):
+        schema._repair_interrupted_legacy_rehome(
+            engine,
+            contracts,
+            trigger_ddl_executor=lambda _statement: pytest.fail(
+                "drifted resume reached CREATE"
+            ),
+        )
+
+
+@pytest.mark.parametrize("all_verified", (True, False))
+def test_recover_succeeds_only_after_every_independent_verification(
+    monkeypatch,
+    all_verified,
+):
+    boundary = _boundary(trust=1)
+    admin = _AdminConnection(trust=1)
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
+    monkeypatch.setattr(
+        schema,
+        "_read_dbapi_state",
+        lambda connection: _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=connection.trust,
+        ),
+    )
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
+    def force_off(_boundary, primary):
+        primary.trust = 0
+        return {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": all_verified,
+        }
+
+    monkeypatch.setattr(schema, "_restore_and_verify_admin", force_off)
+    monkeypatch.setattr(schema, "load_project_env", lambda: None)
+    runtime_engine = _RuntimeEngine()
+    monkeypatch.setattr(
+        schema,
+        "create_tool_engine",
+        lambda **_kwargs: runtime_engine,
+    )
+    monkeypatch.setattr(
+        schema,
+        "_verify_runtime_trust_off",
+        lambda _engine: True,
+    )
+
+    if all_verified:
+        result = schema._recover_trust(boundary)
+        assert result["trust_restoration_verified"] is True
+        assert result["global_trust_changed"] is True
+    else:
+        with pytest.raises(
+            schema.PrivilegedSchemaPreparationError,
+            match="could not recover",
+        ) as caught:
+            schema._recover_trust(boundary)
+        assert caught.value.safety_evidence["trust_restoration_verified"] is False
+    assert admin.closed is True
+
+
+def test_recover_forces_admin_off_before_broken_project_environment(
+    monkeypatch,
+):
+    boundary = _boundary(trust=1)
+    admin = _AdminConnection(trust=1)
+    order: list[str] = []
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    def read_state(connection):
+        order.append("read-admin-state")
+        return _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=connection.trust,
+        )
+
+    monkeypatch.setattr(schema, "_read_dbapi_state", read_state)
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
+
+    def restore_admin(_boundary, primary):
+        order.append("admin-off")
+        primary.trust = 0
+        return {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": True,
+        }
+
+    monkeypatch.setattr(schema, "_restore_and_verify_admin", restore_admin)
+
+    def broken_environment():
+        order.append("load-env")
+        raise RuntimeError("corrupt env")
+
+    monkeypatch.setattr(schema, "load_project_env", broken_environment)
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+        schema._recover_trust(boundary)
+
+    assert order == ["admin-off", "read-admin-state", "load-env"]
+    assert caught.value.safety_evidence == {
+        "global_trust_changed": True,
+        "trust_restoration_verified": False,
+        "restore_primary_verified": True,
+        "restore_secondary_verified": True,
+        "runtime_trust_off_verified": False,
+    }
+
+
+class _ReadOnlyResult:
+    def __iter__(self):
+        return iter(())
+
+
+class _ReadOnlyConnection:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    def execute(self, statement, _params=None):
+        sql = str(statement).strip()
+        self.statements.append(sql)
+        if not sql.upper().startswith("SELECT "):
+            raise AssertionError(f"preflight attempted mutation: {sql}")
+        return _ReadOnlyResult()
+
+
+class _ReadOnlyEngine:
+    def __init__(self) -> None:
+        self.connection = _ReadOnlyConnection()
+
+    def connect(self):
+        return nullcontext(self.connection)
+
+
+def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
+    from server.db import migrations_v3
+    from server.engine import strategy_governance
+    from tools import attest_qmt_daily_kline
+
+    engine = _ReadOnlyEngine()
+    dry_run_calls: list[bool] = []
+
+    def dry_run_only(observed_engine, *, dry_run=False, **_kwargs):
+        assert observed_engine is engine
+        dry_run_calls.append(dry_run)
+        return []
+
+    monkeypatch.setattr(migrations_v3, "run_v3_migrations", dry_run_only)
+    monkeypatch.setattr(schema, "_v3_trigger_states", lambda _plan: ({}, {}))
+    monkeypatch.setattr(schema, "_non_v3_trigger_contracts", lambda: {})
+    monkeypatch.setattr(
+        schema,
+        "_runtime_least_privilege_evidence",
+        lambda _boundary: {"runtime_least_privilege_verified": True},
+    )
+    monkeypatch.setattr(
+        attest_qmt_daily_kline,
+        "ensure_attestation_tables",
+        lambda *_args, **_kwargs: pytest.fail("preflight called QMT DDL"),
+    )
+    monkeypatch.setattr(
+        strategy_governance,
+        "ensure_strategy_governance_tables",
+        lambda *_args, **_kwargs: pytest.fail("preflight called governance DDL"),
+    )
+    boundary = SimpleNamespace(migrator_engine=engine)
+
+    detail = schema._preflight_schema(boundary)
+
+    assert dry_run_calls == [True]
+    assert detail["qmt_table_count"] == 0
+    assert detail["governance_table_count"] == 0
+    assert engine.connection.statements
+    assert all(
+        statement.upper().startswith("SELECT ")
+        for statement in engine.connection.statements
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        RuntimeError(
+            "mysql+pymysql://probiga_migrator:do-not-print@127.0.0.1/probiga"
+        ),
+        schema.PrivilegedSchemaPreparationError(
+            "password=hunter2 token=super-secret",
+            safety_evidence={
+                "global_trust_changed": True,
+                "trust_restoration_verified": False,
+            },
+        ),
+    ),
+)
+def test_cli_failure_is_generic_and_never_prints_credentials(
+    monkeypatch,
+    capsys,
+    error,
+):
+    monkeypatch.setattr(
+        schema,
+        "prepare_schema",
+        lambda **_kwargs: (_ for _ in ()).throw(error),
+    )
+
+    assert schema.main(["--phase", "preflight"]) == 2
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["status"] == "blocked"
+    assert payload["reason"].endswith("database schema preparation failed closed")
+    assert payload["runtime_privileges_changed"] is False
+    assert payload["automatic_real_order_submission"] is False
+    for secret in (
+        "do-not-print",
+        "hunter2",
+        "super-secret",
+        "probiga_migrator:",
+    ):
+        assert secret not in output

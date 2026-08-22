@@ -7,7 +7,9 @@ import os, sys, subprocess
 from datetime import datetime, timedelta
 
 # 设环境变量
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3307/probiga?charset=utf8mb4"
+from tools.env_config import resolve_tool_mysql_url
+
+resolve_tool_mysql_url()
 os.environ["SM_MAX_STOCKS"] = "200"
 os.environ["SM_HTTP_RETRIES"] = "3"
 os.environ["SM_REQUEST_SLEEP"] = "0.5"

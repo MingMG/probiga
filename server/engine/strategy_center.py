@@ -39,6 +39,10 @@ from server.common.versioned_strategy_config import (
     strategy_score_field_map,
 )
 from server.engine.market_state_v2 import transition_market_state
+from server.engine.strategy_execution_adapters import (
+    execute_dynamic_adapter_candidate_batch,
+    persist_strategy_adapter_run_receipt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +106,153 @@ def _json_value(value: Any, default: Any) -> Any:
 
 def _json_text(value: Any, default: Any) -> str:
     return json.dumps(_json_value(value, default), ensure_ascii=False, separators=(",", ":"))
+
+
+def _canonical_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _candidate_source_contract(
+    trade_date: str,
+    rows: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    *,
+    reference_pool: dict[str, Any] | None = None,
+    dynamic_adapter_statuses: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Prove that an empty candidate list came from a completed source read."""
+
+    target = normalize_trade_date(trade_date)
+    source = "dated_reference_pool" if reference_pool else "st_recommended_stocks"
+    status = "COMPLETED"
+    reason = "候选源读取完成，零行也有明确完成证明"
+    query_completed = True
+    source_row_count = len(rows)
+    if reference_pool:
+        if not target or not reference_pool.get("_path"):
+            status, query_completed = "INCOMPLETE", False
+            reason = "日期化候选源缺少可验证路径或交易日"
+    elif not _table_exists("st_recommended_stocks"):
+        status, query_completed = "MISSING", False
+        reason = "候选源表st_recommended_stocks不存在"
+    else:
+        columns = _table_columns("st_recommended_stocks")
+        if not {"stock_code", "pick_date"}.issubset(columns):
+            status, query_completed = "INVALID_SCHEMA", False
+            reason = "候选源表缺少stock_code或pick_date"
+        else:
+            try:
+                count_rows = _db_read(
+                    "SELECT COUNT(*) AS cnt FROM st_recommended_stocks "
+                    "WHERE pick_date=:trade_date",
+                    {"trade_date": target},
+                )
+                source_row_count = int(
+                    count_rows[0].get("cnt") if count_rows else 0
+                )
+                if source_row_count != len(rows):
+                    status, query_completed = "INCOMPLETE", False
+                    reason = (
+                        "候选源明细未完整读取："
+                        f"源行数{source_row_count}，已加载{len(rows)}"
+                    )
+            except Exception as exc:
+                status, query_completed = "INCOMPLETE", False
+                reason = f"候选源完成证明查询失败：{type(exc).__name__}"
+    dynamic_statuses = [
+        dict(item) for item in (dynamic_adapter_statuses or [])
+        if isinstance(item, dict) and str(item.get("strategy_key") or "")
+    ]
+    invalid_dynamic_runs = [
+        item for item in dynamic_statuses
+        if item.get("enabled") is True
+        and str(item.get("lifecycle_status") or "")
+        not in {"RETIRED", "SUSPENDED"}
+        and str(item.get("adapter_capability_status") or "")
+        == "RESEARCH_READY"
+        and item.get("run_receipt_valid") is not True
+    ]
+    if invalid_dynamic_runs:
+        status, query_completed = "INCOMPLETE", False
+        reason = "动态策略候选运行缺少完整CandidateBatch回执"
+    dynamic_receipts = [
+        dict(item.get("candidate_run_receipt") or {})
+        for item in sorted(
+            dynamic_statuses,
+            key=lambda value: str(value.get("strategy_key") or ""),
+        )
+        if item.get("run_receipt_valid") is True
+    ]
+    dynamic_results = [
+        {
+            "strategy_key": str(item.get("strategy_key") or ""),
+            "strategy_version": str(item.get("strategy_version") or ""),
+            "execution_binding_hash": str(
+                item.get("execution_binding_hash") or ""
+            ),
+            "adapter_artifact_sha256": str(
+                item.get("adapter_artifact_sha256") or ""
+            ),
+            "cost_model_hash": str(item.get("cost_model_hash") or ""),
+            "trade_date": target,
+            "candidate_input_hash": str(
+                item.get("candidate_input_hash") or ""
+            ),
+            "candidate_output_hash": str(
+                item.get("candidate_output_hash") or ""
+            ),
+            "candidate_stable_result_hash": str(
+                item.get("candidate_stable_result_hash") or ""
+            ),
+            "candidate_count": int(item.get("candidate_count") or 0),
+            "status": str(item.get("status") or ""),
+        }
+        for item in sorted(
+            dynamic_statuses,
+            key=lambda value: (
+                str(value.get("strategy_key") or ""),
+                str(value.get("strategy_version") or ""),
+            ),
+        )
+        if item.get("run_receipt_valid") is True
+    ]
+    payload = {
+        "schema": "probiga.strategy-candidate-source.v2",
+        "source": source,
+        "status": status,
+        "query_completed": query_completed,
+        "trade_date": target,
+        "data_date": target,
+        "source_row_count": source_row_count,
+        "loaded_row_count": len(rows),
+        "loaded_rows_hash": _canonical_hash(rows),
+        "candidate_count": len(candidates),
+        "candidate_identity": sorted(
+            {
+                str(item.get("stock_code") or "").zfill(6)
+                for item in candidates
+                if str(item.get("stock_code") or "").strip()
+            }
+        ),
+        "dynamic_adapter_results": dynamic_results,
+        "dynamic_adapter_results_hash": _canonical_hash(dynamic_results),
+        "reason": reason,
+    }
+    return {
+        **payload,
+        "source_hash": _canonical_hash(payload),
+        # Audit identities remain visible, but do not revise the authoritative
+        # candidate-source hash when stable input/output are unchanged.
+        "dynamic_adapter_receipts": dynamic_receipts,
+    }
 
 
 def normalize_trade_date(value: str | None) -> str:
@@ -631,6 +782,12 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
             or row.get("industry")
             or ""
         ),
+        "industry_name": (
+            row.get("industry_name")
+            or row.get("sector_industry_name")
+            or row.get("industry")
+            or ""
+        ),
         "db_verified": bool(row.get("db_verified")),
         "db_close": row.get("db_close"),
         "db_verification_reason": row.get("db_verification_reason"),
@@ -640,7 +797,14 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
     }
 
 
-def aggregate_candidates(rows: Iterable[dict[str, Any]], market: dict[str, Any], configs: dict[str, dict[str, Any]] | None = None, metrics: dict[str, dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def aggregate_candidates(
+    rows: Iterable[dict[str, Any]],
+    market: dict[str, Any],
+    configs: dict[str, dict[str, Any]] | None = None,
+    metrics: dict[str, dict[str, Any]] | None = None,
+    *,
+    additional_signals: Iterable[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     configs = configs or {}
     metrics = metrics or {}
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -649,12 +813,31 @@ def aggregate_candidates(rows: Iterable[dict[str, Any]], market: dict[str, Any],
             signal = adapt_recommendation_row(row, key, market, configs.get(key), metrics.get(key))
             if signal.get("stock_code"):
                 grouped[signal["stock_code"]].append(signal)
+    for raw_signal in additional_signals or ():
+        if not isinstance(raw_signal, dict):
+            continue
+        signal = dict(raw_signal)
+        code = str(signal.get("stock_code") or "").strip().zfill(6)
+        if code and signal.get("strategy_key"):
+            signal["stock_code"] = code
+            grouped[code].append(signal)
 
     candidates: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     for code, signals in grouped.items():
         decision = resolve_conflict(signals, str(market.get("market_state") or ""))
         best = max(signals, key=lambda item: (_num(item.get("effective_score"), 0.0) or 0.0, _num(item.get("model_confidence"), 0.0) or 0.0))
+        industry_by_strategy = {
+            str(item.get("strategy_key") or ""): str(
+                item.get("industry_name") or item.get("theme_code") or ""
+            ).strip()
+            for item in signals
+            if str(item.get("strategy_key") or "").strip()
+            and str(
+                item.get("industry_name") or item.get("theme_code") or ""
+            ).strip()
+        }
+        industry_names = sorted(set(industry_by_strategy.values()))
         candidate = {
             "priority": best.get("reference_priority") or ("A" if decision["final_status"] in {"READY", "WATCH"} and decision["final_direction"] == "BUY" else "B"),
             "stock_code": code,
@@ -687,6 +870,13 @@ def aggregate_candidates(rows: Iterable[dict[str, Any]], market: dict[str, Any],
             "reference_source": best.get("reference_source"),
             "reference_as_of_date": best.get("reference_as_of_date"),
             "theme_code": best.get("theme_code") or "",
+            "industry_name": (
+                best.get("industry_name")
+                or best.get("theme_code")
+                or ""
+            ),
+            "industry_names": industry_names,
+            "industry_by_strategy": industry_by_strategy,
             "db_verified": all(bool(item.get("db_verified")) for item in signals if item.get("reference_fixture")) if any(item.get("reference_fixture") for item in signals) else None,
             "db_close": best.get("db_close"),
             "db_verification_reason": best.get("db_verification_reason"),
@@ -1155,7 +1345,9 @@ def _reference_candidate_rows(pool: dict[str, Any], limit: int) -> list[dict[str
     position_limits = pool.get("position_limits") if isinstance(pool.get("position_limits"), dict) else {}
     global_gate = pool.get("global_gate") if isinstance(pool.get("global_gate"), dict) else {}
     rows: list[dict[str, Any]] = []
-    for item in candidates[:max(1, min(500, int(limit)))]:
+    # Governance completion is only valid for the complete dated fixture.
+    _ = limit
+    for item in candidates:
         code = str(item.get("stock_code") or "").zfill(6)
         strategy_keys = [
             str(value).strip() for value in (item.get("strategy_keys") or [])
@@ -1242,13 +1434,15 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
             return []
         if not target:
             return []
-        limit = max(1, min(500, int(limit)))
+        # Retain the argument for API compatibility; authoritative inputs must
+        # be read in full. Presentation limits belong after governance.
+        _ = max(1, int(limit))
         select_sql = ", ".join(f"`{column}`" for column in sorted(selected))
         order_column = "final_trade_score" if "final_trade_score" in selected else ("ai_score" if "ai_score" in selected else "stock_code")
         rows = _db_read(
             f"SELECT {select_sql} FROM st_recommended_stocks "
             f"WHERE pick_date = :trade_date "
-            f"ORDER BY `{order_column}` DESC LIMIT {limit}",
+            f"ORDER BY `{order_column}` DESC, `stock_code` ASC",
             {"trade_date": target},
         )
         if rows and not all(
@@ -1997,6 +2191,21 @@ def load_persisted_strategy_center_compact(
             continue
         data_snapshot = _json_value(signal.pop("data_snapshot_json", None), {})
         signal["data_date"] = normalize_trade_date(data_snapshot.get("data_date"))
+        signal["industry_name"] = str(
+            data_snapshot.get("industry_name")
+            or data_snapshot.get("theme_code")
+            or ""
+        )
+        for binding_field in (
+            "strategy_version", "strategy_version_hash",
+            "execution_binding_hash", "adapter_artifact_sha256",
+            "cost_model_hash", "candidate_run_uid",
+            "candidate_receipt_hash", "candidate_input_hash",
+            "candidate_output_hash",
+        ):
+            signal[binding_field] = str(
+                data_snapshot.get(binding_field) or ""
+            )
         grouped[code].append(signal)
 
     candidates: list[dict[str, Any]] = []
@@ -2011,6 +2220,15 @@ def load_persisted_strategy_center_compact(
                 _num(item.get("model_confidence"), 0.0) or 0.0,
             ),
         )
+        industry_by_strategy = {
+            str(item.get("strategy_key") or ""): str(
+                item.get("industry_name") or ""
+            ).strip()
+            for item in stock_signals
+            if str(item.get("strategy_key") or "").strip()
+            and str(item.get("industry_name") or "").strip()
+        }
+        industry_names = sorted(set(industry_by_strategy.values()))
         candidate = {
             "priority": (
                 "A"
@@ -2051,6 +2269,9 @@ def load_persisted_strategy_center_compact(
             "blocking_reasons": decision["blocking_reasons"],
             "data_date": best.get("data_date")
             or normalize_trade_date(run.get("trade_date")),
+            "industry_name": best.get("industry_name") or "",
+            "industry_names": industry_names,
+            "industry_by_strategy": industry_by_strategy,
         }
         candidates.append(candidate)
         if decision["conflict"] or decision["final_status"] in {"BLOCKED", "CONFLICT"}:
@@ -2092,6 +2313,23 @@ def load_persisted_strategy_center_compact(
     else:
         gate_status = "ALLOW_NEW_BUY"
         gate_reason = "市场状态允许生成研究候选，仍需价格和板块条件确认"
+    source_payload = {
+        "schema": "probiga.strategy-candidate-source.v1",
+        "source": "st_strategy_center_run",
+        "status": "COMPLETED",
+        "query_completed": True,
+        "trade_date": normalize_trade_date(run.get("trade_date")),
+        "data_date": normalize_trade_date(run.get("trade_date")),
+        "source_row_count": len(signals),
+        "loaded_row_count": len(signals),
+        "candidate_count": len(candidates),
+        "candidate_identity": sorted(
+            str(item.get("stock_code") or "") for item in candidates
+        ),
+        "completed_run_uid": str(run.get("run_uid") or ""),
+        "completed_at": str(run.get("finished_at") or ""),
+        "reason": "已完成策略中心运行提供候选源证明",
+    }
     return {
         "status": "ok",
         "trade_date": normalize_trade_date(run.get("trade_date")),
@@ -2103,6 +2341,10 @@ def load_persisted_strategy_center_compact(
         "is_stale": False,
         "market_state": market_state,
         "global_gate": {"status": gate_status, "reason": gate_reason},
+        "candidate_source": {
+            **source_payload,
+            "source_hash": _canonical_hash(source_payload),
+        },
         "candidates": candidates,
         "conflicts": conflicts,
         "summary": {
@@ -2112,6 +2354,144 @@ def load_persisted_strategy_center_compact(
         "disclaimer": "仅用于研究候选和风险提示；未经明确确认不会执行任何交易。",
         "persisted_run_uid": run["run_uid"],
     }
+
+
+def _dynamic_execution_signals(
+    *,
+    trade_date: str,
+    recommendation_rows: list[dict[str, Any]],
+    market: dict[str, Any],
+    configs: dict[str, dict[str, Any]],
+    metrics: dict[str, dict[str, Any]],
+    persist_receipts: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Discover any number of code-backed dynamic strategy adapters."""
+
+    try:
+        from server.engine.strategy_governance import load_registry
+
+        registry = load_registry()
+    except Exception as exc:
+        logger.debug("dynamic strategy adapter discovery unavailable: %s", exc)
+        return [], [{
+            "strategy_key": "",
+            "status": "DISCOVERY_UNAVAILABLE",
+            "status_label": "执行适配器未部署/无效",
+            "reason": f"动态适配器发现不可用：{type(exc).__name__}",
+        }]
+    context = {
+        "trade_date": trade_date,
+        "recommendation_rows": tuple(copy.deepcopy(recommendation_rows)),
+        "market": copy.deepcopy(market),
+        "configs": copy.deepcopy(configs),
+        "metrics": copy.deepcopy(metrics),
+    }
+    signals: list[dict[str, Any]] = []
+    statuses: list[dict[str, Any]] = []
+    for strategy in registry:
+        if str(strategy.get("source_kind") or "") != "runtime_registry":
+            continue
+        lifecycle = str(strategy.get("current_status") or "")
+        enabled = strategy.get("enabled") is True
+        adapter = strategy.get("execution_adapter") or {}
+        status = {
+            "strategy_key": str(strategy.get("strategy_key") or ""),
+            "strategy_version": str(strategy.get("current_version") or ""),
+            "enabled": enabled,
+            "lifecycle_status": lifecycle,
+            "status": str(adapter.get("status") or "UNDEPLOYED_OR_INVALID"),
+            "status_label": str(
+                adapter.get("status_label") or "执行适配器未部署/无效"
+            ),
+            "reason": str(
+                adapter.get("reason") or "执行适配器未部署/无效"
+            ),
+            "adapter_capability_status": str(
+                adapter.get("status") or "UNDEPLOYED_OR_INVALID"
+            ),
+            "execution_binding_hash": str(
+                adapter.get("execution_binding_hash") or ""
+            ),
+            "adapter_artifact_sha256": str(
+                adapter.get("artifact_sha256") or ""
+            ),
+            "cost_model_hash": str(adapter.get("cost_model_hash") or ""),
+            "funding_pipeline_ready": (
+                adapter.get("funding_pipeline_ready") is True
+            ),
+            "run_receipt_valid": False,
+        }
+        statuses.append(status)
+        if not enabled:
+            status.update({
+                "status": "DISABLED",
+                "status_label": "已禁用（禁止执行）",
+                "reason": "策略已禁用，不执行、不进入候选源完成quorum或股票池",
+            })
+            continue
+        if lifecycle == "RETIRED":
+            status.update({
+                "status": "RETIRED",
+                "status_label": "已淘汰（禁止执行）",
+                "reason": "策略已淘汰，不执行、不进入候选源完成quorum或股票池",
+            })
+            continue
+        if lifecycle == "SUSPENDED":
+            status.update({
+                "status": "DIAGNOSTIC_ONLY",
+                "status_label": "暂停诊断",
+                "reason": "策略已暂停，仅保留独立诊断能力，不进入候选源quorum或股票池",
+            })
+            continue
+        if adapter.get("executable") is not True:
+            continue
+        try:
+            execution = execute_dynamic_adapter_candidate_batch(
+                strategy, context
+            )
+            receipt = execution["receipt"]
+            if persist_receipts:
+                connection = current_bound_sql_connection()
+                if connection is None:
+                    raise RuntimeError("持久化动态适配器回执缺少治理事务连接")
+                persist_strategy_adapter_run_receipt(connection, receipt)
+            signals.extend(execution["signals"])
+            status.update({
+                "status": "SHADOW_RUN_COMPLETED",
+                "status_label": "影子候选运行完成",
+                "reason": "CandidateBatch输入、输出、身份与运行回执校验通过；未授予资金资格",
+                "run_receipt_valid": True,
+                "candidate_receipt_hash": str(
+                    receipt.get("receipt_hash") or ""
+                ),
+                "candidate_input_hash": str(receipt.get("input_hash") or ""),
+                "candidate_output_hash": str(
+                    receipt.get("output_hash") or ""
+                ),
+                "candidate_stable_result_hash": str(
+                    receipt.get("stable_result_hash") or ""
+                ),
+                "candidate_count": int(receipt.get("candidate_count") or 0),
+                "candidate_run_uid": str(receipt.get("run_uid") or ""),
+                "candidate_completed_at": str(
+                    receipt.get("completed_at") or ""
+                ),
+                "candidate_run_receipt": dict(receipt),
+            })
+        except Exception as exc:
+            if persist_receipts:
+                raise
+            status.update({
+                "status": "ADAPTER_RUNTIME_INVALID",
+                "status_label": "执行适配器未部署/无效",
+                "reason": f"执行适配器候选校验失败：{type(exc).__name__}",
+                "run_receipt_valid": False,
+            })
+            logger.warning(
+                "dynamic strategy adapter rejected for %s: %s",
+                strategy.get("strategy_key"), exc,
+            )
+    return signals, statuses
 
 
 def build_strategy_center_snapshot(
@@ -2125,7 +2505,34 @@ def build_strategy_center_snapshot(
     configs = load_strategy_configs()
     metrics = load_strategy_metrics(target)
     rows = load_recommendation_rows(target, limit)
-    candidates, conflicts = aggregate_candidates(rows, {**market, "market_state": (market.get("state") or {}).get("key", market.get("market_state"))}, configs, metrics)
+    normalized_market = {
+        **market,
+        "market_state": (market.get("state") or {}).get(
+            "key", market.get("market_state")
+        ),
+    }
+    dynamic_signals, dynamic_adapter_statuses = _dynamic_execution_signals(
+        trade_date=target,
+        recommendation_rows=rows,
+        market=normalized_market,
+        configs=configs,
+        metrics=metrics,
+        persist_receipts=fresh_market,
+    )
+    candidates, conflicts = aggregate_candidates(
+        rows,
+        normalized_market,
+        configs,
+        metrics,
+        additional_signals=dynamic_signals,
+    )
+    candidate_source = _candidate_source_contract(
+        target,
+        rows,
+        candidates,
+        reference_pool=reference_pool,
+        dynamic_adapter_statuses=dynamic_adapter_statuses,
+    )
     state = market.get("state") or infer_market_state(market)
     gate_status = "ALLOW_NEW_BUY"
     gate_reason = "市场状态允许生成研究候选，仍需价格和板块条件确认"
@@ -2135,6 +2542,11 @@ def build_strategy_center_snapshot(
         gate_status, gate_reason = "REDUCE_NEW_BUY", f"{state.get('name')}模式自动降权新增买入"
     if market.get("source_status") == "missing" or state.get("key") == "unknown":
         gate_status, gate_reason = "DATA_NOT_READY", "市场状态数据缺失，不生成确定性动作"
+    if candidate_source.get("status") != "COMPLETED":
+        gate_status = "DATA_NOT_READY"
+        gate_reason = str(
+            candidate_source.get("reason") or "候选源尚未完成"
+        )
     if reference_pool:
         reference_gate = reference_pool.get("global_gate") if isinstance(reference_pool.get("global_gate"), dict) else {}
         gate_status = "REVIEW_REQUIRED"
@@ -2172,6 +2584,8 @@ def build_strategy_center_snapshot(
             "automatic_order_submission": False,
         },
         "reference_pool": reference_meta,
+        "candidate_source": candidate_source,
+        "dynamic_adapter_statuses": dynamic_adapter_statuses,
         "market_state": state,
         "global_gate": {
             "status": gate_status,
@@ -2239,7 +2653,7 @@ def persist_strategy_center_snapshot(
                 "risk_level": signal.get("risk_level"), "gate_status": signal.get("gate_status"), "gate_reason": signal.get("gate_reason"), "entry_low": signal.get("entry_low"), "entry_high": signal.get("entry_high"),
                 "stop_loss": signal.get("stop_loss"), "take_profit_1": signal.get("take_profit_1"), "take_profit_2": signal.get("take_profit_2"), "no_chase_price": signal.get("no_chase_price"),
                 "risk_reward_ratio": signal.get("risk_reward_ratio"), "today_signal": signal.get("today_signal"), "trigger_conditions_json": _json_text(signal.get("trigger_conditions"), []),
-                "evidence_chain_json": _json_text(signal.get("evidence_chain"), []), "data_snapshot_json": _json_text({"data_date": signal.get("data_date"), "adapter_mode": signal.get("adapter_mode")}, {}),
+                "evidence_chain_json": _json_text(signal.get("evidence_chain"), []), "data_snapshot_json": _json_text({"data_date": signal.get("data_date"), "adapter_mode": signal.get("adapter_mode"), "industry_name": signal.get("industry_name") or signal.get("theme_code") or "", "theme_code": signal.get("theme_code") or "", "strategy_version": signal.get("strategy_version") or "", "strategy_version_hash": signal.get("strategy_version_hash") or "", "execution_binding_hash": signal.get("execution_binding_hash") or "", "adapter_artifact_sha256": signal.get("adapter_artifact_sha256") or "", "cost_model_hash": signal.get("cost_model_hash") or "", "candidate_run_uid": signal.get("candidate_run_uid") or "", "candidate_receipt_hash": signal.get("candidate_receipt_hash") or "", "candidate_input_hash": signal.get("candidate_input_hash") or "", "candidate_output_hash": signal.get("candidate_output_hash") or ""}, {}),
                 "model_version": signal.get("model_version") or str(load_stock_manifest()["manifest_version"])[:40],
             })
     for conflict in conflicts:

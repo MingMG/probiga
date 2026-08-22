@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os
 import sys
-from sqlalchemy import create_engine, text
+from pathlib import Path
 
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
-mysql_url = os.environ.get("MYSQL_URL", "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4")
-engine = create_engine(mysql_url, pool_pre_ping=True)
+from sqlalchemy import text
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 
 with engine.connect() as conn:
     print("=" * 60)

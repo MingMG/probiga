@@ -12,6 +12,18 @@ from server.engine import strategy_center as strategy_center_engine
 from server.engine import strategy_governance as governance_engine
 
 
+@pytest.fixture(autouse=True)
+def _completed_industry_capture(monkeypatch):
+    monkeypatch.setattr(
+        daily, "_bootstrap_execution_adapters", lambda: {"registry_sealed": True},
+    )
+    monkeypatch.setattr(
+        daily,
+        "_capture_industry_history",
+        lambda target: {"status": "COMPLETED", "trade_date": target},
+    )
+
+
 def test_daily_entrypoint_delegates_build_and_persistence_to_locked_governance():
     source = inspect.getsource(daily.main)
     assert "build_strategy_center_snapshot" not in source
@@ -204,6 +216,34 @@ def test_explicit_trade_date_cannot_bypass_authoritative_day(
         "automatic_real_order_submission": False,
     }
     assert engine.disposed is True
+
+
+def test_industry_capture_failure_blocks_before_governance_write(
+    monkeypatch, capsys,
+):
+    engine = _CalendarEngine("2026-08-21")
+    governance_called = False
+
+    def fail_capture(_target):
+        raise RuntimeError("source count mismatch")
+
+    def governance_must_not_run(**_kwargs):
+        nonlocal governance_called
+        governance_called = True
+        return {"status": "ok"}
+
+    monkeypatch.setattr(daily, "_load_project_env", lambda: None)
+    monkeypatch.setattr(daily, "_create_tool_engine", lambda: engine)
+    monkeypatch.setattr(daily, "_capture_industry_history", fail_capture)
+    monkeypatch.setattr(governance_engine, "governance_snapshot", governance_must_not_run)
+    monkeypatch.setattr(sys, "argv", ["run_strategy_governance_daily.py"])
+
+    assert daily.main() == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "blocked"
+    assert "行业历史冻结未完成" in payload["reason"]
+    assert payload["automatic_real_order_submission"] is False
+    assert governance_called is False
 
 
 def test_old_self_consistent_snapshot_is_not_accepted_for_target_date():

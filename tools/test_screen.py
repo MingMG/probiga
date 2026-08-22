@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import sys
-import os
 
 sys.path.insert(0, "/opt/ProBigA")
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
-from sqlalchemy import create_engine
-engine = create_engine(os.environ["MYSQL_URL"])
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 trade_date = "2026-06-02"
 
 from tools.screen_stocks import run_trend_strong, run_low_start, run_trend, run_flow

@@ -45,10 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-MYSQL_URL = os.environ.get(
-    "MYSQL_URL",
-    "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4",
-)
+from tools.env_config import create_tool_engine
 
 # ── 核心配置：通过 push2delay IP 访问 push2his ──
 PROXY_IP = "61.129.129.48"       # push2delay 的 IP
@@ -217,7 +214,7 @@ def main():
     parser.add_argument("date", nargs="?", default=None, help=argparse.SUPPRESS)  # 兼容调度器传入日期
     args = parser.parse_args()
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine()
     stock_codes = get_stock_codes(engine)
 
     if args.resume:

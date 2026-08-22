@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -2474,6 +2474,118 @@ def _normalized_sql(value: object) -> str:
     return " ".join(str(value or "").replace("`", "").split()).casefold()
 
 
+def _sql_string_literal_tokens(
+    value: object,
+) -> tuple[tuple[bool, str], ...]:
+    """Split SQL without mistaking quoted payloads for executable tokens.
+
+    MySQL accepts doubled quote characters and, unless
+    ``NO_BACKSLASH_ESCAPES`` is active, backslash escapes inside string
+    literals.  Trigger metadata may also contain comments or quoted
+    identifiers whose quote characters must not start a string.  Returning
+    the delimiters with each literal lets callers rewrite only executable SQL
+    while preserving ``MESSAGE_TEXT`` and other literal payloads byte-for-byte.
+    """
+
+    source = str(value or "")
+    tokens: list[tuple[bool, str]] = []
+    outside_start = 0
+    index = 0
+    length = len(source)
+
+    while index < length:
+        character = source[index]
+
+        # Quotes inside comments are not SQL string delimiters.  Keep comments
+        # in the outside token because they are not literal payloads, but skip
+        # over them atomically while locating real string boundaries.
+        if character == "#":
+            newline = source.find("\n", index + 1)
+            index = length if newline < 0 else newline + 1
+            continue
+        if (
+            character == "-"
+            and index + 2 < length
+            and source[index + 1] == "-"
+            and source[index + 2].isspace()
+        ):
+            newline = source.find("\n", index + 3)
+            index = length if newline < 0 else newline + 1
+            continue
+        if (
+            character == "/"
+            and index + 1 < length
+            and source[index + 1] == "*"
+        ):
+            comment_end = source.find("*/", index + 2)
+            index = length if comment_end < 0 else comment_end + 2
+            continue
+
+        # A quoted identifier can legally contain quote characters.  Skip it
+        # as one outside region so those characters cannot confuse the string
+        # scanner.  Doubled backticks represent an escaped backtick.
+        if character == "`":
+            index += 1
+            while index < length:
+                if source[index] != "`":
+                    index += 1
+                    continue
+                if index + 1 < length and source[index + 1] == "`":
+                    index += 2
+                    continue
+                index += 1
+                break
+            continue
+
+        if character not in {"'", '"'}:
+            index += 1
+            continue
+
+        if outside_start < index:
+            tokens.append((False, source[outside_start:index]))
+        quote = character
+        literal_start = index
+        index += 1
+        while index < length:
+            character = source[index]
+            if character == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if character != quote:
+                index += 1
+                continue
+            if index + 1 < length and source[index + 1] == quote:
+                index += 2
+                continue
+            index += 1
+            break
+        tokens.append((True, source[literal_start:index]))
+        outside_start = index
+
+    if outside_start < length:
+        tokens.append((False, source[outside_start:]))
+    return tuple(tokens)
+
+
+def _normalized_trigger_sql(value: object) -> str:
+    """Canonicalize MySQL trigger metadata without rewriting literals."""
+
+    normalized: list[str] = []
+    for is_literal, token in _sql_string_literal_tokens(value):
+        if is_literal:
+            normalized.append(token)
+            continue
+        outside = token.replace("`", "")
+        outside = re.sub(
+            r"\bSQLSTATE\s+VALUE\b",
+            "SQLSTATE",
+            outside,
+            flags=re.IGNORECASE,
+        )
+        normalized.append(re.sub(r"\s+", " ", outside).casefold())
+    return "".join(normalized).strip()
+
+
 def _ddl_statement_already_applied(
     connection: Connection,
     statement: str,
@@ -2517,8 +2629,8 @@ def _ddl_statement_already_applied(
             str(row["EVENT_OBJECT_TABLE"]).casefold() == table_name.casefold()
             and str(row["ACTION_TIMING"]).upper() == timing.upper()
             and str(row["EVENT_MANIPULATION"]).upper() == event.upper()
-            and _normalized_sql(row["ACTION_STATEMENT"])
-            == _normalized_sql(body)
+            and _normalized_trigger_sql(row["ACTION_STATEMENT"])
+            == _normalized_trigger_sql(body)
         )
         if not exact:
             raise RuntimeError(
@@ -2864,6 +2976,7 @@ def _validate_applied_migration(
     connection: Connection,
     *,
     version: str,
+    reconcile_legacy_rows: bool = True,
 ) -> None:
     if version == SHADOW_INTELLIGENCE_MIGRATION_VERSION:
         validate_shadow_intelligence_schema(connection)
@@ -2878,7 +2991,8 @@ def _validate_applied_migration(
         # records written by rollback-compatible old code after the additive
         # column was installed; the update trigger permits only this one-way,
         # fully related empty-to-exact promotion.
-        connection.execute(text(FORWARD_STRATEGY_VERSION_DDL[2]))
+        if reconcile_legacy_rows:
+            connection.execute(text(FORWARD_STRATEGY_VERSION_DDL[2]))
         row = connection.execute(
             text(
                 "SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT "
@@ -2928,6 +3042,7 @@ def _run_v3_migrations_unlocked(
     dry_run: bool,
     connection: Connection | None,
     acceptance_fault_hook: V3MigrationAcceptanceFaultHook | None,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> list[V3MigrationResult]:
     if not _mysql_dialect(engine):
         if not dry_run:
@@ -2958,16 +3073,26 @@ def _run_v3_migrations_unlocked(
                 if table_exists:
                     row = connection.execute(
                         text(
-                            "SELECT checksum FROM schema_migration_v3 "
+                            "SELECT checksum, statement_count "
+                            "FROM schema_migration_v3 "
                             "WHERE version = :version"
                         ),
                         {"version": version},
                     ).mappings().first()
                     if row is not None:
-                        if str(row["checksum"]) != _checksum(statements):
+                        if (
+                            str(row["checksum"]) != _checksum(statements)
+                            or type(row["statement_count"]) is not int
+                            or row["statement_count"] != len(statements)
+                        ):
                             raise RuntimeError(
-                                f"applied V3 migration checksum changed: {version}"
+                                f"applied V3 migration contract changed: {version}"
                             )
+                        _validate_applied_migration(
+                            connection,
+                            version=version,
+                            reconcile_legacy_rows=False,
+                        )
                         status = "exists"
                 results.append(V3MigrationResult(version, status, len(statements)))
             return results
@@ -3020,7 +3145,25 @@ def _run_v3_migrations_unlocked(
                         statement,
                     )
                     if not recovered:
-                        connection.execute(text(statement))
+                        if statement.lstrip().upper().startswith(
+                            "CREATE TRIGGER "
+                        ):
+                            if trigger_ddl_executor is None:
+                                raise RuntimeError(
+                                    "missing V3 trigger requires the explicit "
+                                    "trigger DDL executor"
+                                )
+                            trigger_ddl_executor(statement)
+                            if not _ddl_statement_already_applied(
+                                connection,
+                                statement,
+                            ):
+                                raise RuntimeError(
+                                    "V3 trigger DDL executor did not install "
+                                    "the frozen trigger contract"
+                                )
+                        else:
+                            connection.execute(text(statement))
                         connection.commit()
                         if acceptance_fault_hook is not None:
                             acceptance_fault_hook.raise_if_matches(
@@ -3081,11 +3224,18 @@ def run_v3_migrations(
     *,
     dry_run: bool = False,
     acceptance_fault_hook: V3MigrationAcceptanceFaultHook | None = None,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> list[V3MigrationResult]:
     """Apply V3 under one MySQL named lock with statement-level recovery."""
 
     if type(dry_run) is not bool:
         raise TypeError("dry_run must be bool")
+    if trigger_ddl_executor is not None and not callable(
+        trigger_ddl_executor
+    ):
+        raise TypeError("trigger_ddl_executor must be callable")
+    if dry_run and trigger_ddl_executor is not None:
+        raise ValueError("trigger_ddl_executor is unavailable for dry-run migrations")
     if acceptance_fault_hook is not None:
         if type(acceptance_fault_hook) is not V3MigrationAcceptanceFaultHook:
             raise TypeError(
@@ -3102,6 +3252,7 @@ def run_v3_migrations(
             dry_run=dry_run,
             connection=None,
             acceptance_fault_hook=acceptance_fault_hook,
+            trigger_ddl_executor=None,
         )
     with mysql_named_lock(
         engine,
@@ -3113,6 +3264,7 @@ def run_v3_migrations(
             dry_run=False,
             connection=connection,
             acceptance_fault_hook=acceptance_fault_hook,
+            trigger_ddl_executor=trigger_ddl_executor,
         )
 
 

@@ -32,12 +32,15 @@ def main():
         print("等待超时，东财API仍未恢复", flush=True)
         return 1
     
-    import pymysql
-    conn = pymysql.connect(host='localhost', user='root', password='ProBigA@70966', database='probiga', charset='utf8mb4')
+    from tools.env_config import create_tool_engine
+    engine = create_tool_engine()
+    conn = engine.raw_connection()
     cur = conn.cursor()
     cur.execute('SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily')
     latest = cur.fetchone()[0]
+    cur.close()
     conn.close()
+    engine.dispose()
     
     import datetime
     today = datetime.date.today()

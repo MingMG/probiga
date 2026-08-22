@@ -30,6 +30,7 @@ from server.engine.strategy_governance import (
     GovernanceEvidenceNotReady,
     governance_history,
     governance_snapshot,
+    load_canonical_governance_snapshot,
     metric_evidence_detail,
     record_metric_input,
     review_metric_input,
@@ -37,6 +38,9 @@ from server.engine.strategy_governance import (
     register_strategy,
     transition_lifecycle,
     toggle_strategy_enabled,
+)
+from server.engine.strategy_execution_adapters import (
+    strategy_execution_adapter_capabilities,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,7 @@ class StrategyRegistrationRequest(BaseModel):
     description: str = Field(default="", max_length=1000)
     evaluator_type: str = Field(default="external_evidence", max_length=40)
     evaluator_config: dict[str, Any] = Field(default_factory=dict)
+    execution_binding: dict[str, Any] | None = None
     parameters: dict[str, Any] = Field(default_factory=dict)
     reason: str = Field(default="注册策略版本", max_length=500)
 
@@ -272,14 +277,16 @@ def strategy_center_configuration():
 
 @router.get("/strategy-center/governance")
 def strategy_center_governance(trade_date: str = Query(default="")):
-    """Return the dynamic registry, two arenas, layered pools and allocations."""
+    """Return the latest immutable canonical full governance result."""
 
     try:
-        return governance_snapshot(trade_date=trade_date, persist=False)
+        return load_canonical_governance_snapshot(trade_date=trade_date)
     except Exception as exc:
         logger.error("strategy governance snapshot failed: %s", exc, exc_info=True)
         return {
             "status": "degraded",
+            "result_mode": "CANONICAL_UNAVAILABLE",
+            "is_canonical": False,
             "trade_date": trade_date,
             "summary": {},
             "strategies": [],
@@ -300,6 +307,35 @@ def strategy_center_governance(trade_date: str = Query(default="")):
         }
 
 
+@router.get("/strategy-center/governance/preview")
+def strategy_center_governance_preview(
+    trade_date: str = Query(default=""),
+):
+    """Explicit, noncanonical realtime recomputation for research diagnostics."""
+
+    try:
+        result = governance_snapshot(trade_date=trade_date, persist=False)
+        return {
+            **result,
+            "result_mode": "PREVIEW_REALTIME",
+            "is_canonical": False,
+        }
+    except Exception as exc:
+        logger.error("strategy governance preview failed: %s", exc, exc_info=True)
+        return _governance_api_error(
+            503, "governance_preview_failed", _INTERNAL_GOVERNANCE_ERROR,
+        )
+
+
+@router.get("/strategy-center/governance/adapter-capabilities")
+def strategy_center_governance_adapter_capabilities():
+    return {
+        "status": "ok",
+        **strategy_execution_adapter_capabilities(),
+        "automatic_real_order_submission": False,
+    }
+
+
 @router.get("/strategy-center/governance/history")
 def strategy_center_governance_history(
     limit: int = Query(default=100, ge=1, le=500),
@@ -310,6 +346,7 @@ def strategy_center_governance_history(
         return {
             "status": "degraded",
             "metric_evidence": [],
+            "adapter_run_receipts": [],
             "lifecycle_events": [],
             "audit_events": [],
             "runs": [],
@@ -492,6 +529,7 @@ def strategy_center_run_governance(
         return {
             "status": "blocked",
             "reason": str(exc),
+            "blocking_record": exc.blocking_record,
             "allocations": [{
                 "target_type": "CASH",
                 "target_key": "cash",

@@ -3498,9 +3498,76 @@
         return '<strong>' + escHtml(row.correlation_status || '约束证据待验证') + '</strong><small>' + relationship + '</small><small>行业侧重：' + industryFocus + '</small>';
     }
 
+    function strategyGovernanceMetricValue(row, metrics, key) {
+        metrics = metrics || {};
+        if (metrics[key] != null && metrics[key] !== '') return metrics[key];
+        return (row || {})[key];
+    }
+
+    function strategyExecutionAdapterSummary(row) {
+        row = row || {};
+        var adapter = row.execution_adapter || {};
+        var executable = adapter.executable === true || row.execution_adapter_executable === true;
+        var fundingReady = adapter.funding_pipeline_ready === true || row.funding_pipeline_ready === true;
+        var label = adapter.status_label || (executable ? (fundingReady ? '执行与资金证据链已就绪' : '影子候选执行已就绪') : '执行适配器未部署/无效');
+        var reason = adapter.reason || row.execution_adapter_reason || '未绑定可验证的执行适配器';
+        var identity = [adapter.adapter_key, adapter.adapter_version].filter(Boolean).join(' / ');
+        var bindingHash = adapter.execution_binding_hash || row.execution_binding_hash || '';
+        return '<span class="sc-gate-result ' + (executable && fundingReady ? 'pass' : 'fail') + '">' + escHtml(label) + '</span>' +
+            '<small>' + escHtml(reason) + '</small>' +
+            '<small>资金证据链：' + (fundingReady ? '已接通' : '未接通，仅可影子观察') + '</small>' +
+            (identity ? '<small>' + escHtml(identity) + '</small>' : '') +
+            (bindingHash ? '<small>绑定 ' + escHtml(String(bindingHash).slice(0, 12)) + '</small>' : '');
+    }
+
+    function strategyMemberSleevesSummary(row) {
+        var sleeves = Array.isArray((row || {}).member_sleeves) ? row.member_sleeves : [];
+        if (!sleeves.length) return '';
+        return '<div class="sc-sleeve-list">' + sleeves.map(function (item) {
+            var key = item.strategy_name || item.strategy_key || '未知成员';
+            var version = item.strategy_version || '-';
+            var status = strategyLifecycleLabel(item.member_lifecycle_status || item.lifecycle_status);
+            var configured = item.configured_weight_pct;
+            var base = item.base_weight_pct;
+            var effective = item.effective_weight_pct;
+            var discount = item.discount_to_cash_pct;
+            if (base == null && item.base_basis_points != null) base = Number(item.base_basis_points) / 100;
+            if (effective == null && item.effective_basis_points != null) effective = Number(item.effective_basis_points) / 100;
+            if (discount == null && item.discount_to_cash_basis_points != null) discount = Number(item.discount_to_cash_basis_points) / 100;
+            return '<small><strong>' + escHtml(key) + '</strong> ' + escHtml(version) + ' · ' + escHtml(status) +
+                ' · 原始 ' + strategyGovernanceMetric(configured, '%', 2) +
+                ' · 基础 ' + strategyGovernanceMetric(base, '%', 2) +
+                ' · 生效 ' + strategyGovernanceMetric(effective, '%', 2) +
+                ' · 留现金 ' + strategyGovernanceMetric(discount, '%', 2) +
+                (item.sleeve_row_hash ? ' · ' + escHtml(String(item.sleeve_row_hash).slice(0, 12)) : '') + '</small>';
+        }).join('') + '</div>';
+    }
+
+    function strategyIndustryFocusSummary(row) {
+        row = row || {};
+        var focus = Array.isArray(row.industry_focus) ? row.industry_focus.slice(0, 3) : [];
+        var text = focus.map(function (item) {
+            return String(item.industry_name || '未分类') + ' ' + strategyGovernanceMetric(item.candidate_share_pct, '%', 1);
+        }).join('、');
+        return '<strong>' + escHtml(row.primary_industry || '待形成行业侧重') + '</strong><small>' +
+            escHtml(text || '尚无有效候选样本') + '</small><small>' +
+            strategyGovernanceMetric(row.industry_candidate_count, '', 0) + ' 个行业候选</small>';
+    }
+
     function strategyLifecycleLabel(status) {
         var labels = {ACTIVE:'正常运行',REDUCE:'降权运行',SHADOW:'影子观察',SUSPENDED:'暂停使用',RETIRED:'已淘汰'};
         return labels[String(status || '').toUpperCase()] || '未知状态';
+    }
+
+    function strategyTradingGateLabel(status) {
+        var labels = {
+            ALLOW_NEW_BUY:'正常新增风险',
+            REDUCE_NEW_BUY:'降权新增风险',
+            BLOCK_NEW_BUY:'暂停新增风险',
+            DATA_NOT_READY:'数据未就绪',
+            REVIEW_REQUIRED:'等待人工复核'
+        };
+        return labels[String(status || '').toUpperCase()] || '市场门禁待确认';
     }
 
     function strategyLifecycleTone(status) {
@@ -3534,21 +3601,39 @@
         var summary = governance.summary || {};
         var strategies = Array.isArray(governance.strategies) ? governance.strategies : [];
         var combinations = Array.isArray(governance.combinations) ? governance.combinations : [];
+        var adapterCapabilities = Array.isArray(governance.adapter_capabilities) ? governance.adapter_capabilities : [];
         var pools = governance.pools || {};
         var allocations = Array.isArray(governance.allocations) ? governance.allocations : [];
         var lifecycle = Array.isArray(history.lifecycle_events) ? history.lifecycle_events : [];
         var audits = Array.isArray(history.audit_events) ? history.audit_events : [];
         var runs = Array.isArray(history.runs) ? history.runs : [];
         var metricEvidence = Array.isArray(history.metric_evidence) ? history.metric_evidence : [];
+        var tradingGate = governance.trading_gate || {};
+        var tradingGateLabel = summary.trading_gate_status_label || tradingGate.status_label || strategyTradingGateLabel(summary.trading_gate_status || tradingGate.status);
+        var marketRiskCap = summary.market_risk_cap_pct;
+        if (marketRiskCap == null) marketRiskCap = tradingGate.market_risk_cap_pct;
         var authRole = String(((((window._strategyCenterAuth || {}).user) || {}).role) || '').toUpperCase();
         var canAdmin = authRole === 'ADMIN';
         var canReview = authRole === 'EVIDENCE_REVIEWER';
         var roleLabel = canAdmin ? '管理员' : (canReview ? '证据复核员' : '只读账号');
+        var resultMode = String(governance.result_mode || '').toUpperCase();
+        var canonicalLabel = governance.is_canonical === true || resultMode.indexOf('CANONICAL_PERSISTED') === 0 ? '当前规范结果' : (resultMode.indexOf('PREVIEW') === 0 ? '实时预览（不生效）' : (resultMode === 'CANONICAL_UNAVAILABLE' ? '尚无规范结果' : '结果状态待确认'));
+        window._strategyCenterAdapterCapabilities = adapterCapabilities;
+        var adapterCapabilityOptions = '<option value="">仅登记研究元数据，不绑定执行代码</option>' + adapterCapabilities.map(function (item, index) {
+            var evaluatorTypes = Array.isArray(item.evaluator_types) ? item.evaluator_types.join(' / ') : '';
+            var label = (item.adapter_key || '未命名适配器') + ' · ' + (item.adapter_version || '-') + (evaluatorTypes ? ' · ' + evaluatorTypes : '');
+            return '<option value="' + index + '">' + escHtml(label) + '</option>';
+        }).join('');
         var h = '<section class="sc-governance">';
         h += '<div class="sc-section-title"><span>动态策略治理总览</span><small>策略数量不设上限 · 每日重新评估 · 无合格策略保持现金</small></div>';
-        h += '<div class="sc-governance-toolbar">' + (canAdmin ? '<button id="scGovernanceRunBtn" class="sc-btn primary" onclick="window._strategyGovernanceRun()">执行最新数据日治理</button><button class="sc-btn" onclick="window._strategyRegistrationToggle()">新增策略 / 新版本</button><button class="sc-btn" onclick="window._strategyCombinationToggle()">新增组合 / 新版本</button><button class="sc-btn" onclick="window._strategyReviewerToggle()">创建独立复核账号</button>' : '') + '<span>当前职责：' + escHtml(roleLabel) + '</span><span>真实下单权限：关闭</span><span>模拟现金：' + strategyGovernanceMetric(summary.cash_weight_pct, '%', 1) + '</span><span>构建：' + escHtml(String(governance.build_commit_sha || '-').slice(0, 12)) + '</span><span>路由：' + escHtml(String(governance.router_snapshot_hash || '-').slice(0, 12)) + '</span><span>决策哈希：' + escHtml(String(governance.decision_hash || '-').slice(0, 12)) + '</span></div>';
+        h += '<div class="sc-governance-toolbar">' + (canAdmin ? '<button id="scGovernanceRunBtn" class="sc-btn primary" onclick="window._strategyGovernanceRun()">执行最新数据日治理</button><button class="sc-btn" onclick="window._strategyRegistrationToggle()">新增策略 / 新版本</button><button class="sc-btn" onclick="window._strategyCombinationToggle()">新增组合 / 新版本</button><button class="sc-btn" onclick="window._strategyReviewerToggle()">创建独立复核账号</button>' : '') + '<span>当前职责：' + escHtml(roleLabel) + '</span><span>结果口径：' + escHtml(canonicalLabel) + '</span><span>真实下单权限：关闭</span><span>市场门禁：' + escHtml(tradingGateLabel) + '</span><span>风险上限：' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</span><span>模拟现金：' + strategyGovernanceMetric(summary.cash_weight_pct, '%', 1) + '</span><span>构建：' + escHtml(String(governance.build_commit_sha || '-').slice(0, 12)) + '</span><span>路由：' + escHtml(String(governance.router_snapshot_hash || '-').slice(0, 12)) + '</span><span>决策哈希：' + escHtml(String(governance.decision_hash || '-').slice(0, 12)) + '</span></div>';
         h += '<div class="sc-governance-notice"><strong>收益口径说明</strong><span>正期望、盈亏比和利润因子只说明已确认的历史前向证据在扣除真实费用后达到门槛，不代表未来一定盈利，也不构成收益承诺。任何证据、行情或风险门槛失败时不新增模拟风险，资金回到现金。</span></div>';
-        h += '<div id="scRegistrationForm" class="sc-registration" style="display:none"><div><label>策略代码<input id="scRegKey" placeholder="例如 earnings_surprise"></label><label>中文名称<input id="scRegName" placeholder="业绩超预期漂移"></label><label>版本<input id="scRegVersion" placeholder="v1.0.0"></label><label>分类<input id="scRegCategory" placeholder="事件/趋势/轮动"></label><label>最大持有日<input id="scRegMaxHold" type="number" min="1" max="250" step="1" placeholder="1~250"></label></div><div><label>趋势偏多系数<input id="scRegRouteTrend" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>高位震荡系数<input id="scRegRouteRange" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>风险下降系数<input id="scRegRouteRisk" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>极端事件系数<input value="0" disabled></label></div><label>说明<textarea id="scRegDescription" placeholder="策略适用市场、入场逻辑、失效条件"></textarea></label><button class="sc-btn primary" onclick="window._strategyRegister()">注册并进入影子观察</button><small>注册只冻结治理版本；仍需部署同版本信号适配器并生产内部模拟成交证据。未完成前不会获得模拟资金。</small></div>';
+        h += '<div id="scRegistrationForm" class="sc-registration" style="display:none">';
+        h += '<div><label>策略代码<input id="scRegKey" placeholder="例如 earnings_surprise"></label><label>中文名称<input id="scRegName" placeholder="业绩超预期漂移"></label><label>版本<input id="scRegVersion" placeholder="v1.0.0"></label><label>分类<input id="scRegCategory" placeholder="事件/趋势/轮动"></label><label>最大持有日<input id="scRegMaxHold" type="number" min="1" max="250" step="1" placeholder="1~250"></label></div>';
+        h += '<div><label>趋势偏多系数<input id="scRegRouteTrend" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>高位震荡系数<input id="scRegRouteRange" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>风险下降系数<input id="scRegRouteRisk" type="number" min="0" max="1.5" step="0.05" placeholder="0~1.5"></label><label>极端事件系数<input value="0" disabled></label></div>';
+        h += '<div><label>已部署执行适配器（可选）<select id="scRegAdapterCapability" onchange="window._strategyAdapterCapabilityApply()">' + adapterCapabilityOptions + '</select></label><label>评估器类型<select id="scRegEvaluatorType"><option value="external_evidence">外部研究证据（仅影子）</option></select></label><label>执行适配器代码<input id="scRegAdapterKey" readonly placeholder="由已部署能力自动填写"></label><label>适配器版本<input id="scRegAdapterVersion" readonly placeholder="由已部署能力自动填写"></label><label>制品 SHA-256<input id="scRegArtifactSha" readonly maxlength="64" placeholder="由服务器可信清单提供"></label><label>成本模型代码<input id="scRegCostModelKey" placeholder="例如 cn_a_share_v1"></label><label>币种<input value="CNY" disabled></label></div>';
+        h += '<div><label>单边佣金(%)<input id="scRegCommission" type="number" min="0" max="10" step="0.000001" placeholder="必须明确填写"></label><label>卖出印花税(%)<input id="scRegStampTax" type="number" min="0" max="10" step="0.000001" placeholder="必须明确填写"></label><label>单边滑点(%)<input id="scRegSlippage" type="number" min="0" max="10" step="0.000001" placeholder="必须明确填写"></label><label>单边过户费(%)<input id="scRegTransferFee" type="number" min="0" max="10" step="0.000001" placeholder="必须明确填写"></label></div>';
+        h += '<label>说明<textarea id="scRegDescription" placeholder="策略适用市场、入场逻辑、失效条件"></textarea></label><button class="sc-btn primary" onclick="window._strategyRegister()">注册并进入影子观察</button><small>可以只登记研究元数据；执行适配器只能从服务器可信发布清单选择，不能由页面自报制品哈希。代码、版本、评估器类型和四项 CNY 成本必须精确一致。未通过执行绑定及内部模拟成交验证前不会进入票池或获得模拟资金。</small></div>';
         h += '<div id="scCombinationForm" class="sc-registration" style="display:none"><div><label>组合代码<input id="scComboKey" placeholder="例如 earnings_trend_mix"></label><label>中文名称<input id="scComboName" placeholder="业绩趋势组合"></label><label>版本<input id="scComboVersion" placeholder="v1.0.0"></label></div><label>成员与原始权重<textarea id="scComboMembers" placeholder="right_side_trend=45, theme_diffusion=35, low_base_ignition=20"></textarea></label><div><label>单成员上限<input id="scComboMaxMember" type="number" min="0.05" max="1" step="0.05" value="0.60"></label><label>相关系数上限<input id="scComboMaxCorr" type="number" min="-1" max="1" step="0.05" value="0.80"></label><label>同步观测下限<input id="scComboMinCorrObs" type="number" min="20" max="5000" step="1" value="60"></label><label>个股重叠上限(%)<input id="scComboMaxOverlap" type="number" min="0" max="100" step="1" value="40"></label><label>单行业上限(%)<input id="scComboMaxIndustry" type="number" min="1" max="100" step="1" value="45"></label></div><label>说明<textarea id="scComboDescription" placeholder="组合适用市场、成员分工、相关性和失效条件"></textarea></label><button class="sc-btn primary" onclick="window._strategyCombinationRegister()">冻结当前成员版本并进入影子观察</button><small>至少两个已注册成员；系统会冻结精确成员版本、权重和相关性/个股/行业约束，组合必须生成独立内部日频净值后才可能获得模拟资金。</small></div>';
         if (canAdmin) h += '<div id="scReviewerForm" class="sc-registration" style="display:none"><div><label>独立复核账号<input id="scReviewerName" autocomplete="off" placeholder="例如 strategy_reviewer"></label><label>初始密码<input id="scReviewerPassword" type="password" autocomplete="new-password" placeholder="至少10位，仅当次提交"></label><label>角色<input value="证据复核员" disabled></label></div><button class="sc-btn primary" onclick="window._strategyReviewerCreate()">由管理员创建复核账号</button><small>管理员负责提交证据，证据复核员只负责确认或驳回；二者必须使用不同实名账号。密码不会显示、回传或写入治理日志，旧管理令牌没有治理写权限。</small></div>';
         h += '<div class="sc-stats governance">';
@@ -3556,34 +3641,50 @@
         h += '</div>';
         h += '<div class="sc-lifecycle-legend"><span class="active">正常运行</span><span class="reduce">降权运行</span><span class="shadow">影子观察</span><span class="suspended">暂停使用</span><span class="retired">已淘汰</span><em>页面只显示中文状态；内部代码仅用于审计和接口兼容。</em></div>';
         if (governance.input_ready === false) h += '<div class="sc-warning">治理输入未就绪：' + escHtml(governance.input_reason || '数据新鲜度或日期校验未通过') + '。当前不会更新生命周期，也不会生成模拟资金候选。</div>';
+        h += '<div class="sc-governance-notice"><strong>今日市场路由</strong><span>' + escHtml(tradingGateLabel) + '；' + escHtml(summary.trading_gate_reason || tradingGate.reason || '等待市场门禁证据') + '。组合新增风险总上限 ' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '，额度之外保持现金。</span></div>';
         if (governance.error) h += '<div class="sc-warning">治理数据降级：' + escHtml(governance.error) + '</div>';
 
         h += '<div class="sc-section-title"><span>单策略竞技场</span><small>20日近期稳定、60日盈利门槛、120日长期稳定必须共同通过</small></div>';
-        h += '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名/赛道</th><th>策略与版本</th><th>中文状态</th><th>健康分</th><th>20/60/120窗口证据</th><th>样本/覆盖</th><th>扣费后净期望</th><th>盈亏比</th><th>利润因子</th><th>最大回撤</th><th>准入结果与理由</th><th>恢复条件</th><th>治理操作</th></tr></thead><tbody>';
+        h += '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名/赛道</th><th>策略与版本</th><th>执行适配器</th><th>行业侧重</th><th>中文状态</th><th>健康分</th><th>20/60/120窗口证据</th><th>样本/覆盖</th><th>胜率</th><th>扣费后净期望</th><th>盈亏比</th><th>利润因子</th><th>最大回撤</th><th>准入结果与理由</th><th>恢复条件</th><th>治理操作</th></tr></thead><tbody>';
         strategies.forEach(function (row) {
             var m = row.primary_metrics || {};
             var evidenceBlocks = Array.isArray(row.evidence_block_reasons) ? row.evidence_block_reasons.join('；') : '';
-            h += '<tr><td><strong>#' + (row.lane_rank || '-') + '</strong><small>' + escHtml(row.lane || '-') + '</small></td><td><strong>' + escHtml(row.strategy_name || row.strategy_key) + '</strong><small>' + escHtml(row.strategy_key || '-') + ' · ' + escHtml(row.current_version || '-') + '</small></td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td><strong>' + strategyGovernanceMetric(row.ranking_score, '', 1) + '</strong></td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + '</td><td>' + strategyGovernanceMetric(m.completed_trades, '', 0) + '笔<small>' + strategyGovernanceMetric(m.coverage_days, '', 0) + '日</small></td><td>' + strategyGovernanceMetric(m.net_expectancy_pct, '%', 3) + '</td><td>' + strategyGovernanceMetric(m.payoff_ratio, '', 2) + '</td><td>' + strategyGovernanceMetric(m.profit_factor, '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '内部日频组合权益' : '交易序列诊断') + '</small></td><td><span class="sc-gate-result ' + (row.profit_gate_passed && row.market_route_eligible ? 'pass' : 'fail') + '">' + (row.profit_gate_passed && row.market_route_eligible ? '盈利与行情均通过' : '继续验证/当前不路由') + '</span><small>' + escHtml(row.profit_gate_reason || row.recommendation_reason || '-') + '</small>' + (evidenceBlocks ? '<small>证据账本阻断：' + escHtml(evidenceBlocks) + '</small>' : '') + '<small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small></td><td class="sc-wrap">' + escHtml((row.recovery_conditions || []).join('；') || '-') + '</td><td>' + strategyGovernanceActions(row, 'STRATEGY') + '</td></tr>';
+            var adapterExecutable = ((row.execution_adapter || {}).executable === true) || row.execution_adapter_executable === true;
+            var fundingPipelineReady = ((row.execution_adapter || {}).funding_pipeline_ready === true) || row.funding_pipeline_ready === true;
+            var strategyAdmissionReady = row.profit_gate_passed && row.market_route_eligible && adapterExecutable && fundingPipelineReady;
+            h += '<tr><td><strong>#' + (row.lane_rank || '-') + '</strong><small>' + escHtml(row.lane || '-') + '</small></td><td><strong>' + escHtml(row.strategy_name || row.strategy_key) + '</strong><small>' + escHtml(row.strategy_key || '-') + ' · ' + escHtml(row.current_version || '-') + '</small></td><td>' + strategyExecutionAdapterSummary(row) + '</td><td>' + strategyIndustryFocusSummary(row) + '</td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td><strong>' + strategyGovernanceMetric(row.ranking_score, '', 1) + '</strong></td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + '</td><td>' + strategyGovernanceMetric(m.completed_trades, '', 0) + '笔<small>' + strategyGovernanceMetric(m.coverage_days, '', 0) + '日</small></td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'win_rate_pct'), '%', 1) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'net_expectancy_pct'), '%', 3) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'payoff_ratio'), '', 2) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'profit_factor'), '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '内部日频组合权益' : '交易序列诊断') + '</small></td><td><span class="sc-gate-result ' + (strategyAdmissionReady ? 'pass' : 'fail') + '">' + (strategyAdmissionReady ? '盈利、执行、资金证据与行情均通过' : (!fundingPipelineReady && adapterExecutable ? '影子候选可运行，资金证据链未接通' : '继续验证/当前不路由')) + '</span><small>' + escHtml(row.profit_gate_reason || row.recommendation_reason || '-') + '</small>' + (evidenceBlocks ? '<small>证据账本阻断：' + escHtml(evidenceBlocks) + '</small>' : '') + '<small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small></td><td class="sc-wrap">' + escHtml((row.recovery_conditions || []).join('；') || '-') + '</td><td>' + strategyGovernanceActions(row, 'STRATEGY') + '</td></tr>';
         });
-        if (!strategies.length) h += '<tr><td colspan="13" class="sc-empty-cell">尚无已注册策略</td></tr>';
+        if (!strategies.length) h += '<tr><td colspan="16" class="sc-empty-cell">尚无已注册策略</td></tr>';
         h += '</tbody></table></div>';
 
         h += '<div class="sc-section-title"><span>组合策略竞技场</span><small>成员表现、组合回撤、集中度和独立验证分别计算</small></div>';
-        h += '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名</th><th>组合</th><th>中文状态</th><th>组合分</th><th>20/60/120窗口证据</th><th>成员与权重</th><th>净期望</th><th>利润因子</th><th>回撤</th><th>相关性/个股重叠/行业</th><th>准入</th><th>治理操作</th></tr></thead><tbody>';
+        h += '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名/赛道</th><th>组合</th><th>中文状态</th><th>组合分</th><th>20/60/120窗口证据</th><th>成员与权重</th><th>胜率</th><th>净期望</th><th>盈亏比</th><th>利润因子</th><th>回撤</th><th>相关性/个股重叠/行业</th><th>准入</th><th>治理操作</th></tr></thead><tbody>';
+        var combinationAllocations = {};
+        allocations.forEach(function (item) { if (item.target_type === 'COMBINATION') combinationAllocations[item.target_key] = item; });
         combinations.forEach(function (row) {
             var m = (row.metrics || {})['60'] || row.primary_metrics || {};
             var members = (row.member_details || []).map(function (item) { return item.strategy_name + ' ' + Number(item.weight * 100).toFixed(0) + '%'; }).join('、');
-            h += '<tr><td>#' + (row.rank || '-') + '</td><td><strong>' + escHtml(row.combination_name || row.combination_key) + '</strong><small>' + escHtml(row.current_version || '-') + '</small></td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td>' + strategyGovernanceMetric(row.ranking_score, '', 1) + '</td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + '</td><td class="sc-wrap">' + escHtml(members || '-') + '</td><td>' + strategyGovernanceMetric(m.net_expectancy_pct, '%', 3) + '</td><td>' + strategyGovernanceMetric(m.profit_factor, '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '内部独立组合净值' : '交易序列诊断') + '</small></td><td class="sc-wrap">' + strategyCombinationConstraintSummary(row) + '</td><td><span class="sc-gate-result ' + (row.paper_allocation_eligible ? 'pass' : 'fail') + '">' + (row.paper_allocation_eligible ? '可获模拟资金' : '继续验证/当前不路由') + '</span><small>' + escHtml(row.gate_reason || '-') + '</small><small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small></td><td>' + strategyGovernanceActions(row, 'COMBINATION') + '</td></tr>';
+            var sleeveDetails = strategyMemberSleevesSummary(combinationAllocations[row.combination_key] || row);
+            h += '<tr><td><strong>#' + (row.lane_rank || row.rank || '-') + '</strong><small>' + escHtml(row.lane || '-') + '</small></td><td><strong>' + escHtml(row.combination_name || row.combination_key) + '</strong><small>' + escHtml(row.current_version || '-') + '</small></td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td>' + strategyGovernanceMetric(row.ranking_score, '', 1) + '</td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + '</td><td class="sc-wrap">' + escHtml(members || '-') + sleeveDetails + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'win_rate_pct'), '%', 1) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'net_expectancy_pct'), '%', 3) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'payoff_ratio'), '', 2) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'profit_factor'), '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '内部独立组合净值' : '交易序列诊断') + '</small></td><td class="sc-wrap">' + strategyCombinationConstraintSummary(row) + '</td><td><span class="sc-gate-result ' + (row.paper_allocation_eligible ? 'pass' : 'fail') + '">' + (row.paper_allocation_eligible ? '可获模拟资金' : '继续验证/当前不路由') + '</span><small>' + escHtml(row.gate_reason || '-') + '</small><small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small></td><td>' + strategyGovernanceActions(row, 'COMBINATION') + '</td></tr>';
         });
-        if (!combinations.length) h += '<tr><td colspan="12" class="sc-empty-cell">尚无组合策略</td></tr>';
+        if (!combinations.length) h += '<tr><td colspan="14" class="sc-empty-cell">尚无组合策略</td></tr>';
         h += '</tbody></table></div>';
 
-        h += '<div class="sc-section-title"><span>今日分层票池</span><small>观察池始终可用；确认池等待价格与数据；可交易池允许为空</small></div>';
+        h += '<div class="sc-section-title"><span>今日分层票池</span><small>观察池始终可用；确认池等待价格与数据；可交易池允许为空 · ' + escHtml(tradingGateLabel) + ' · 风险上限 ' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</small></div>';
         h += '<div class="sc-pool-tabs"><button class="active" onclick="window._strategyPoolShow(\'observation\',this)">观察池 ' + ((pools.observation || []).length) + '</button><button onclick="window._strategyPoolShow(\'confirmation\',this)">等待确认池 ' + ((pools.confirmation || []).length) + '</button><button onclick="window._strategyPoolShow(\'tradable\',this)">可交易池 ' + ((pools.tradable || []).length) + '</button></div><div id="scGovernancePool"></div>';
 
-        h += '<div class="sc-section-title"><span>模拟资金分配</span><small>只分配给通过盈利硬门槛且适配当前市场的策略或组合</small></div><div class="sc-allocation-grid">';
-        allocations.forEach(function (row) { h += '<div class="' + (row.target_type === 'CASH' ? 'cash' : 'risk') + '"><strong>' + escHtml(row.name || row.target_key) + '</strong><b>' + strategyGovernanceMetric(row.simulated_weight_pct, '%', 1) + '</b><span>' + escHtml(row.reason || '-') + '</span></div>'; });
+        h += '<div class="sc-section-title"><span>模拟资金分配</span><small>只分配给通过盈利硬门槛且适配当前市场的策略或组合；组合逐成员展示基础、生效及留现金袖套</small></div><div class="sc-allocation-grid">';
+        allocations.forEach(function (row) { h += '<div class="' + (row.target_type === 'CASH' ? 'cash' : 'risk') + '"><strong>' + escHtml(row.name || row.target_key) + '</strong><b>' + strategyGovernanceMetric(row.simulated_weight_pct, '%', 1) + '</b><span>' + escHtml(row.reason || '-') + '</span>' + strategyMemberSleevesSummary(row) + '</div>'; });
         h += '</div>';
+
+        var adapterRunReceipts = Array.isArray(history.adapter_run_receipts) ? history.adapter_run_receipts : [];
+        h += '<div class="sc-section-title"><span>动态适配器运行回执</span><small>零候选也单独留档；运行号和完成时间只用于审计，不改变同日权威决策哈希</small></div><div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>交易日/完成时间</th><th>策略/版本</th><th>适配器</th><th>结果</th><th>候选数</th><th>输入/输出哈希</th><th>回执哈希</th></tr></thead><tbody>';
+        adapterRunReceipts.slice(0, 30).forEach(function (row) {
+            var ok = String(row.status || '').toUpperCase() === 'COMPLETED' && row.hash_valid !== false;
+            h += '<tr><td>' + escHtml(row.trade_date || '-') + '<small>' + escHtml(row.completed_at || '-') + '</small></td><td>' + escHtml(row.strategy_key || '-') + '<small>' + escHtml(row.strategy_version || '-') + '</small></td><td>' + escHtml(row.adapter_key || '-') + '<small>' + escHtml(row.adapter_version || '-') + '</small></td><td><span class="sc-gate-result ' + (ok ? 'pass' : 'fail') + '">' + (ok ? '运行完成' : '运行无效/失败') + '</span><small>' + escHtml(row.reason || '-') + '</small></td><td>' + Number(row.candidate_count || 0) + '<small>' + (Number(row.candidate_count || 0) === 0 ? '零候选已留痕' : '候选身份已绑定') + '</small></td><td>' + escHtml(String(row.input_hash || '-').slice(0, 12)) + '<small>' + escHtml(String(row.output_hash || '-').slice(0, 12)) + '</small></td><td>' + escHtml(String(row.receipt_hash || '-').slice(0, 16)) + '<small>' + escHtml(String(row.run_uid || '-').slice(0, 12)) + '</small></td></tr>';
+        });
+        if (!adapterRunReceipts.length) h += '<tr><td colspan="7" class="sc-empty-cell">尚无已持久化的动态适配器运行回执；动态策略保持影子观察</td></tr>';
+        h += '</tbody></table></div>';
 
         h += '<div class="sc-section-title"><span>独立证据复核台账</span><small>证据提交、版本绑定、底层样本哈希和独立复核结果单独留档</small></div><div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>提交时间</th><th>对象/版本</th><th>窗口/截止日</th><th>复核状态</th><th>样本/覆盖</th><th>净期望/盈亏比</th><th>利润因子/回撤</th><th>协议与高水位</th><th>提交/复核人</th><th>产物/样本哈希</th><th>复核操作</th></tr></thead><tbody>';
         metricEvidence.slice(0, 30).forEach(function (row) {
@@ -3618,23 +3719,28 @@
         var target = d || currentDateValue();
         setStatus('正在加载策略中心...');
         Promise.all([
-            fetchRawJsonWithTimeout('/api/strategy-center/overview?trade_date=' + encodeURIComponent(target) + '&limit=250', 45000),
-            fetchRawJsonWithTimeout('/api/strategy-center/governance?trade_date=' + encodeURIComponent(target), 60000).catch(function (err) { return {status:'degraded', input_ready:false, input_reason:'治理接口暂时不可用', strategies:[], combinations:[], pools:{observation:[],confirmation:[],tradable:[]}, allocations:[{target_type:'CASH',target_key:'cash',name:'现金',simulated_weight_pct:100,reason:'治理接口不可用，保持现金'}], error:err && err.message ? err.message : '请求失败'}; }),
+            fetchRawJsonWithTimeout('/api/strategy-center/overview?trade_date=' + encodeURIComponent(target) + '&limit=250', 45000).catch(function (err) { return {status:'degraded', trade_date:target, strategies:[], candidates:[], conflicts:[], summary:{}, error:'研究输入诊断接口暂时不可用：' + (err && err.message ? err.message : '请求失败')}; }),
+            fetchRawJsonWithTimeout('/api/strategy-center/governance?trade_date=' + encodeURIComponent(target), 60000).catch(function (err) { return {status:'degraded', result_mode:'CANONICAL_UNAVAILABLE', is_canonical:false, input_ready:false, input_reason:'治理接口暂时不可用', strategies:[], combinations:[], pools:{observation:[],confirmation:[],tradable:[]}, allocations:[{target_type:'CASH',target_key:'cash',name:'现金',simulated_weight_pct:100,reason:'治理接口不可用，保持现金'}], error:err && err.message ? err.message : '请求失败'}; }),
             fetchRawJsonWithTimeout('/api/strategy-center/governance/history?limit=80', 30000).catch(function () { return {metric_evidence:[], lifecycle_events:[], audit_events:[], runs:[]}; }),
-            fetchRawJsonWithTimeout('/api/auth/status', 15000).catch(function () { return {authenticated:false}; })
+            fetchRawJsonWithTimeout('/api/auth/status', 15000).catch(function () { return {authenticated:false}; }),
+            fetchRawJsonWithTimeout('/api/strategy-center/governance/adapter-capabilities', 30000).catch(function () { return {adapters:[]}; })
         ])
             .then(function (payloads) {
                 var data = payloads[0] || {};
                 var governance = payloads[1] || {};
                 var history = payloads[2] || {};
                 window._strategyCenterAuth = payloads[3] || {};
+                var capabilityPayload = payloads[4] || {};
+                if (Array.isArray(capabilityPayload.adapters)) governance.adapter_capabilities = capabilityPayload.adapters;
+                else if (!Array.isArray(governance.adapter_capabilities)) governance.adapter_capabilities = [];
                 window._strategyCenterData = data || {};
                 window._strategyCenterGovernance = governance;
                 window._strategyCenterGovernanceHistory = history;
                 window._strategyCenterDate = target;
                 renderStrategyCenter(container, data || {}, governance, history);
-                var degraded = data.status === 'degraded' || data.is_stale === true || governance.status === 'degraded' || governance.input_ready === false;
-                setStatus(degraded ? '策略治理数据降级' : '动态策略治理已就绪', degraded);
+                var governanceDegraded = governance.status === 'degraded' || governance.input_ready === false;
+                var diagnosticsDegraded = data.status === 'degraded' || data.is_stale === true;
+                setStatus(governanceDegraded ? '规范策略治理数据降级' : (diagnosticsDegraded ? '规范策略治理已就绪；研究输入诊断降级' : '动态策略治理已就绪'), governanceDegraded);
             })
             .catch(function (err) {
                 container.innerHTML = '<div class="sc-empty"><strong>策略中心暂时无法加载</strong><p>' + escHtml(err && err.message ? err.message : '请求失败') + '</p><button class="sc-btn" onclick="window._strategyCenterReload()">重新加载</button></div>';
@@ -3659,14 +3765,16 @@
         var categories = [];
         strategies.forEach(function (item) { if (item.category && categories.indexOf(item.category) < 0) categories.push(item.category); });
         var h = '<div class="sc-page">';
+        h += strategyGovernanceHtml(governance, history);
+        h += '<details id="scResearchInputDiagnostics" class="sc-research-diagnostics"><summary><strong>研究输入诊断（非规范结果，默认收起）</strong><span>仅用于排查底层适配器输入；不参与默认排名、规范票池或资金分配展示</span></summary><div class="sc-research-diagnostics-body">';
         h += '<div class="sc-hero" style="border-left-color:' + escAttr(stateColor) + '">';
-        h += '<div><div class="sc-kicker">ALPHAPILOT 风格研究策略中心</div><h2>市场状态 · ' + escHtml(state.name || strategyCenterLabel(stateKey)) + '</h2>';
+        h += '<div><div class="sc-kicker">研究输入诊断 · 非规范结果</div><h2>输入市场环境 · ' + escHtml(state.name || strategyCenterLabel(stateKey)) + '</h2>';
         h += '<p>' + escHtml(state.description || '当前状态仅用于策略适配和研究提示') + '</p></div>';
         h += '<div class="sc-hero-meta"><span class="sc-pill" style="background:' + escAttr(stateColor) + ';color:#fff">置信度 ' + (state.confidence != null ? fmt(state.confidence, 0) + '%' : '暂无') + '</span>';
         h += '<span>数据日 ' + escHtml(data.data_date || data.trade_date || '-') + '</span><span>' + (data.is_stale ? '数据需复核' : '数据新鲜') + '</span></div></div>';
         var gate = data.global_gate || {};
         var gateClass = String(gate.status || '').indexOf('BLOCK') >= 0 || gate.status === 'DATA_NOT_READY' ? 'risk' : (gate.status === 'ALLOW_NEW_BUY' ? 'buy' : 'watch');
-        h += '<div class="sc-gate ' + gateClass + '"><strong>新增买入边界：' + escHtml(gate.status || 'DATA_NOT_READY') + '</strong><span>' + escHtml(gate.reason || '暂无门禁说明') + '</span><em>仅研究建议，未经明确确认不会执行交易</em></div>';
+        h += '<div class="sc-gate ' + gateClass + '"><strong>输入层门禁诊断（不生效）：' + escHtml(strategyTradingGateLabel(gate.status)) + '</strong><span>' + escHtml(gate.reason || '暂无门禁说明') + '</span><em>仅用于研究输入排查，不代表规范治理结论</em></div>';
         var reference = data.reference_pool || {};
         if (reference.enabled) {
             var limits = reference.position_limits || {};
@@ -3675,14 +3783,13 @@
         }
         if (data.error) h += '<div class="sc-warning">' + escHtml(data.error) + '</div>';
         h += '<div class="sc-stats">';
-        h += '<div><strong>' + (summary.strategy_count != null ? summary.strategy_count : strategies.length) + '</strong><span>策略总数</span></div>';
-        h += '<div><strong>' + (summary.enabled_count != null ? summary.enabled_count : '-') + '</strong><span>已启用</span></div>';
-        h += '<div><strong>' + (summary.candidate_count != null ? summary.candidate_count : candidates.length) + '</strong><span>候选股票</span></div>';
-        h += '<div><strong>' + (summary.conflict_count != null ? summary.conflict_count : conflicts.length) + '</strong><span>冲突裁决</span></div>';
+        h += '<div><strong>' + (summary.strategy_count != null ? summary.strategy_count : strategies.length) + '</strong><span>输入适配器数</span></div>';
+        h += '<div><strong>' + (summary.enabled_count != null ? summary.enabled_count : '-') + '</strong><span>配置启用</span></div>';
+        h += '<div><strong>' + (summary.candidate_count != null ? summary.candidate_count : candidates.length) + '</strong><span>原始研究输入</span></div>';
+        h += '<div><strong>' + (summary.conflict_count != null ? summary.conflict_count : conflicts.length) + '</strong><span>输入冲突</span></div>';
         h += '<div><strong>' + (summary.buy_count != null ? summary.buy_count : '-') + '</strong><span>偏多观察</span></div></div>';
-        h += strategyGovernanceHtml(governance, history);
-        h += '<div class="sc-section-title"><span>底层信号适配器</span><small>保留原有信号公式与候选裁决，作为动态治理层的输入</small></div>';
-        h += '<div class="sc-section-title"><span>策略状态</span><small>启停只影响后续研究信号；历史指标保留</small></div>';
+        h += '<div class="sc-section-title"><span>研究输入适配器诊断</span><small>底层公式和原始裁决仅作为治理输入，不是规范排名</small></div>';
+        h += '<div class="sc-section-title"><span>输入适配器配置（不代表治理状态）</span><small>启停只影响后续研究输入；正式生命周期以 canonical 治理结果为准</small></div>';
         h += '<div class="sc-strategy-grid">';
         strategies.forEach(function (item) {
             var tone = item.effective_weight != null && Number(item.effective_weight) > 0 ? 'active' : 'muted';
@@ -3696,7 +3803,7 @@
         });
         if (!strategies.length) h += '<div class="sc-empty">暂无策略配置</div>';
         h += '</div>';
-        h += '<div class="sc-section-title"><span>候选股票池</span><small>策略分类筛选 · 横向比较 · 冲突裁决</small></div>';
+        h += '<div class="sc-section-title"><span>未治理研究输入明细（非规范）</span><small>仅用于诊断策略分类、横向比较和原始冲突</small></div>';
         h += '<div class="sc-filter-row"><select id="scStrategyFilter" onchange="window._strategyCenterFilter()"><option value="">全部策略</option>';
         strategies.forEach(function (item) { h += '<option value="' + escAttr(item.key) + '">' + escHtml(item.name || item.key) + '</option>'; });
         h += '</select><select id="scCategoryFilter" onchange="window._strategyCenterFilter()"><option value="">全部分类</option>';
@@ -3704,14 +3811,14 @@
         h += '</select><select id="scStatusFilter" onchange="window._strategyCenterFilter()"><option value="">全部状态</option><option value="READY">确认前候选</option><option value="WATCH">观察</option><option value="CONFLICT">信号冲突</option><option value="BLOCKED">已阻断</option><option value="SELL_ALERT">风险提醒</option></select>';
         h += '<select id="scDirectionFilter" onchange="window._strategyCenterFilter()"><option value="">全部方向</option><option value="BUY">偏多</option><option value="HOLD">中性</option><option value="SELL">偏空</option></select><button class="sc-btn" onclick="window._strategyCenterReload()">刷新数据</button></div>';
         h += '<div id="scCandidateTable"></div>';
-        h += '<div class="sc-section-title"><span>冲突裁决</span><small>硬门禁优先，多空有效权重接近时转为观察</small></div><div id="scConflictList">';
+        h += '<div class="sc-section-title"><span>研究输入冲突诊断</span><small>仅解释底层输入如何产生冲突，不代表 canonical 治理裁决</small></div><div id="scConflictList">';
         if (conflicts.length) {
             conflicts.forEach(function (item) {
                 var decision = item.decision || {};
                 h += '<details class="sc-conflict"><summary>' + escHtml(item.stock_code + ' ' + (item.stock_name || '')) + ' · ' + escHtml(strategyCenterStatus(decision.final_status)) + '</summary><div><p>' + escHtml(decision.conflict_summary || '-') + '</p><p>偏多 ' + fmt(decision.buy_score, 1) + ' / 偏空 ' + fmt(decision.sell_score, 1) + ' / 中性 ' + fmt(decision.hold_score, 1) + '</p><pre>' + escHtml(strategyCenterJson(item.signals || [])) + '</pre></div></details>';
             });
         } else h += '<div class="sc-empty compact">当前没有需要展开的冲突记录</div>';
-        h += '</div><div class="sc-disclaimer">' + escHtml(data.disclaimer || '仅用于研究候选和风险提示；未经明确确认不会执行任何交易。') + '</div></div>';
+        h += '</div><div class="sc-disclaimer">' + escHtml(data.disclaimer || '仅用于研究候选和风险提示；未经明确确认不会执行任何交易。') + '</div></div></details></div>';
         container.innerHTML = h;
         window._renderStrategyCenterCandidates(candidates, strategyMap);
         window._strategyPoolShow('observation');
@@ -3771,7 +3878,8 @@
 
     window._strategyPoolShow = function (level, button) {
         var governance = window._strategyCenterGovernance || {};
-        var rows = ((governance.pools || {})[level] || []).slice(0, 100);
+        var selectedPool = (governance.pools || {})[level];
+        var rows = Array.isArray(selectedPool) ? selectedPool : [];
         var target = el('scGovernancePool');
         if (!target) return;
         if (button && button.parentNode) {
@@ -3783,12 +3891,28 @@
             html += '<tr><td>#' + (row.rank || '-') + '</td><td><strong>' + escHtml(row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_name || '-') + '</small></td><td>' + escHtml(row.industry_name || '未分类') + '</td><td>' + escHtml(row.dominant_strategy_name || row.dominant_strategy || '-') + '</td><td>' + strategyGovernanceMetric(row.opportunity_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.execution_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.risk_reward_ratio, '', 2) + '</td><td>' + escHtml(strategyCenterStatus(row.final_status)) + '</td><td class="sc-wrap">' + escHtml(row.reason || (row.blocking_reasons || []).join('；') || '-') + '</td><td>' + escHtml((row.evidence || {}).data_date || '-') + '</td></tr>';
         });
         if (!rows.length) html += '<tr><td colspan="10" class="sc-empty-cell">本层票池为空。这是有效结果，不会为了凑数量强制生成买入候选。</td></tr>';
-        target.innerHTML = html + '</tbody></table></div>';
+        target.innerHTML = html + '</tbody></table></div><div class="sc-table-note">规范票池完整展示 ' + rows.length + ' 条；总数与当前 canonical 快照一致。</div>';
     };
 
     window._strategyRegistrationToggle = function () {
         var node = el('scRegistrationForm');
         if (node) node.style.display = node.style.display === 'none' ? 'block' : 'none';
+    };
+
+    window._strategyAdapterCapabilityApply = function () {
+        var select = el('scRegAdapterCapability');
+        var capabilities = Array.isArray(window._strategyCenterAdapterCapabilities) ? window._strategyCenterAdapterCapabilities : [];
+        var rawIndex = select ? String(select.value || '') : '';
+        var capability = rawIndex === '' ? null : capabilities[Number(rawIndex)];
+        var evaluator = el('scRegEvaluatorType');
+        var evaluatorTypes = capability && Array.isArray(capability.evaluator_types) ? capability.evaluator_types : ['external_evidence'];
+        if (evaluator) evaluator.innerHTML = evaluatorTypes.map(function (value) { return '<option value="' + escAttr(value) + '">' + escHtml(value) + '</option>'; }).join('');
+        var values = {
+            scRegAdapterKey: capability ? capability.adapter_key : '',
+            scRegAdapterVersion: capability ? capability.adapter_version : '',
+            scRegArtifactSha: capability ? capability.artifact_sha256 : ''
+        };
+        Object.keys(values).forEach(function (id) { var node = el(id); if (node) node.value = values[id] || ''; });
     };
 
     window._strategyCombinationToggle = function () {
@@ -3820,22 +3944,69 @@
     };
 
     window._strategyRegister = function () {
+        var evaluatorType = String((el('scRegEvaluatorType') || {}).value || '').trim();
+        if (!evaluatorType) { window.alert('请选择明确的评估器类型'); return; }
+        var routeValues = ['scRegRouteTrend','scRegRouteRange','scRegRouteRisk'].map(function (id) { return String((el(id) || {}).value || '').trim(); });
+        if (routeValues.some(function (value) { return value === '' || !isFinite(Number(value)) || Number(value) < 0 || Number(value) > 1.5; })) { window.alert('三种市场路由系数必须明确填写，且均在0至1.5之间'); return; }
+        var maxHoldingRaw = String((el('scRegMaxHold') || {}).value || '').trim();
+        if (maxHoldingRaw === '' || !/^\d+$/.test(maxHoldingRaw) || Number(maxHoldingRaw) < 1 || Number(maxHoldingRaw) > 250) { window.alert('最大持有日必须是1至250之间的整数'); return; }
         var payload = {
             strategy_key: (el('scRegKey') || {}).value || '',
             strategy_name: (el('scRegName') || {}).value || '',
             version: (el('scRegVersion') || {}).value || '',
             category: (el('scRegCategory') || {}).value || '未分类',
             description: (el('scRegDescription') || {}).value || '',
-            evaluator_type: 'external_evidence',
+            evaluator_type: evaluatorType,
             evaluator_config: {market_regime_multipliers: {
-                trend_bullish: Number((el('scRegRouteTrend') || {}).value),
-                high_range: Number((el('scRegRouteRange') || {}).value),
-                risk_declining: Number((el('scRegRouteRisk') || {}).value),
+                trend_bullish: Number(routeValues[0]),
+                high_range: Number(routeValues[1]),
+                risk_declining: Number(routeValues[2]),
                 extreme_event: 0
             }},
-            parameters: {max_holding_days: Number((el('scRegMaxHold') || {}).value)},
+            parameters: {max_holding_days: Number(maxHoldingRaw)},
             reason: '策略治理页面注册新策略或新版本'
         };
+        var adapterKey = String((el('scRegAdapterKey') || {}).value || '').trim().toLowerCase();
+        var adapterVersion = String((el('scRegAdapterVersion') || {}).value || '').trim();
+        var artifactSha = String((el('scRegArtifactSha') || {}).value || '').trim();
+        var costModelKey = String((el('scRegCostModelKey') || {}).value || '').trim().toLowerCase();
+        var costInputs = {
+            commission_pct: String((el('scRegCommission') || {}).value || '').trim(),
+            stamp_tax_pct: String((el('scRegStampTax') || {}).value || '').trim(),
+            slippage_pct: String((el('scRegSlippage') || {}).value || '').trim(),
+            transfer_fee_pct: String((el('scRegTransferFee') || {}).value || '').trim()
+        };
+        var bindingRequested = !!(adapterKey || adapterVersion || artifactSha || costModelKey || Object.keys(costInputs).some(function (key) { return costInputs[key] !== ''; }));
+        if (bindingRequested) {
+            var capabilities = Array.isArray(window._strategyCenterAdapterCapabilities) ? window._strategyCenterAdapterCapabilities : [];
+            var matchedCapability = capabilities.some(function (item) {
+                return String(item.adapter_key || '') === adapterKey && String(item.adapter_version || '') === adapterVersion && String(item.artifact_sha256 || '') === artifactSha && Array.isArray(item.evaluator_types) && item.evaluator_types.indexOf(evaluatorType) >= 0;
+            });
+            if (!matchedCapability) { window.alert('执行适配器、版本、制品或评估器类型不在服务器可信发布清单中'); return; }
+            if (!/^[a-z][a-z0-9_.-]{2,79}$/.test(adapterKey)) { window.alert('执行适配器代码格式无效'); return; }
+            if (!/^[0-9A-Za-z][0-9A-Za-z_.:-]{0,159}$/.test(adapterVersion)) { window.alert('执行适配器版本格式无效'); return; }
+            if (!/^[0-9a-f]{64}$/.test(artifactSha)) { window.alert('制品 SHA-256 必须是64位小写十六进制'); return; }
+            if (!/^[a-z][a-z0-9_.-]{2,79}$/.test(costModelKey)) { window.alert('成本模型代码格式无效'); return; }
+            var invalidCost = Object.keys(costInputs).some(function (key) {
+                var value = Number(costInputs[key]);
+                return costInputs[key] === '' || !isFinite(value) || value < 0 || value > 10;
+            });
+            if (invalidCost) { window.alert('佣金、印花税、滑点和过户费必须全部明确填写，且均在0至10之间'); return; }
+            payload.execution_binding = {
+                adapter_key: adapterKey,
+                adapter_version: adapterVersion,
+                strategy_version: payload.version,
+                artifact_sha256: artifactSha,
+                cost_model: {
+                    model_key: costModelKey,
+                    currency: 'CNY',
+                    commission_pct: Number(costInputs.commission_pct),
+                    stamp_tax_pct: Number(costInputs.stamp_tax_pct),
+                    slippage_pct: Number(costInputs.slippage_pct),
+                    transfer_fee_pct: Number(costInputs.transfer_fee_pct)
+                }
+            };
+        }
         fetch('/api/strategy-center/registry', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
             .then(function (response) { return response.json(); })
             .then(function (result) { if (result.status !== 'ok') throw new Error(result.message || result.error || '注册失败'); window._strategyCenterReload(); })

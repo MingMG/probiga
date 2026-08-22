@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-MYSQL_URL = os.environ.get("MYSQL_URL", "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4")
+from tools.env_config import create_tool_engine
 
 HEADERS = {
     'Host': 'finance.pae.baidu.com',
@@ -133,7 +133,7 @@ def sync_date(engine, target_date):
 def main():
     sys.stdout.reconfigure(line_buffering=True)
 
-    engine = create_engine(MYSQL_URL, pool_pre_ping=True)
+    engine = create_tool_engine()
 
     # 要同步的日期列表
     dates_to_sync = ["2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-05-30", "2026-06-02"]

@@ -107,6 +107,8 @@ def test_ssh_connect_kwargs_uses_remote_helpers(monkeypatch):
 
 
 def test_ssh_connect_kwargs_adds_default_timeouts(monkeypatch):
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_PASSWORD", "secret")
 
     kwargs = ssh_connect_kwargs()
@@ -116,12 +118,30 @@ def test_ssh_connect_kwargs_adds_default_timeouts(monkeypatch):
     assert kwargs["banner_timeout"] == DEFAULT_SSH_BANNER_TIMEOUT_SECONDS
 
 
-def test_ssh_connect_kwargs_accepts_password_override(monkeypatch):
+def test_ssh_connect_kwargs_rejects_password_override(monkeypatch):
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
     monkeypatch.delenv("PROBIGA_REMOTE_SSH_PASSWORD", raising=False)
 
-    kwargs = ssh_connect_kwargs(password="from-option")
+    with pytest.raises(
+        UnsafeProductionSshError,
+        match="may only come from PROBIGA_REMOTE_SSH_PASSWORD",
+    ):
+        ssh_connect_kwargs(password="from-option")
 
-    assert kwargs["password"] == "from-option"
+
+def test_ssh_connect_kwargs_prefers_explicit_key(monkeypatch, tmp_path):
+    key = tmp_path / "deploy-key"
+    key.write_text("test-only-key-placeholder", encoding="utf-8")
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_KEY_FILE", str(key))
+    monkeypatch.setenv("PROBIGA_REMOTE_SSH_PASSWORD", "legacy-secret")
+
+    kwargs = ssh_connect_kwargs()
+
+    assert kwargs["key_filename"] == str(key.resolve())
+    assert "password" not in kwargs
 
 
 def test_mysql_tunnel_defaults_to_remote_support(monkeypatch):

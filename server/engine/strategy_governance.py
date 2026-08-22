@@ -19,7 +19,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +32,12 @@ from server.common.sql_reader import (
     bind_sql_connection,
     current_bound_sql_connection,
     read_sql_rows,
+)
+from server.common.qmt_attestation_contract import (
+    ATTESTATION_PROTOCOL_VERSION as QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+    build_qmt_v2_manifest,
+    expected_stock_set_contract,
+    validated_universe_manifest,
 )
 from server.common.versioned_strategy_config import (
     legacy_strategy_merge_map,
@@ -46,6 +52,13 @@ from server.trading_v3.forward_evidence import (
     INTENT_EPISODE_PROTOCOL,
     intent_episode_id,
 )
+from server.engine.strategy_execution_adapters import (
+    normalize_execution_binding,
+    strategy_execution_adapter_capabilities,
+    strategy_execution_adapter_status,
+    validate_strategy_adapter_run_receipt,
+    verify_persisted_strategy_adapter_run_receipt,
+)
 
 
 LIFECYCLE_LABELS: dict[str, str] = {
@@ -56,9 +69,38 @@ LIFECYCLE_LABELS: dict[str, str] = {
     "RETIRED": "已淘汰",
 }
 
+GOVERNANCE_TABLE_NAMES = (
+    "st_strategy_governance_schema_migration",
+    "st_strategy_registry",
+    "st_strategy_version",
+    "st_strategy_lifecycle_event",
+    "st_strategy_metric_input",
+    "st_strategy_health_snapshot",
+    "st_strategy_combination",
+    "st_strategy_combination_version",
+    "st_strategy_combination_health_snapshot",
+    "st_strategy_governance_run",
+    "st_strategy_pool_snapshot",
+    "st_strategy_allocation_snapshot",
+    "st_strategy_adapter_run_receipt",
+    "st_strategy_industry_history",
+    "st_strategy_governance_audit",
+)
+GOVERNANCE_SCHEMA_COLLATION = "utf8mb4_unicode_ci"
+
 
 class GovernanceEvidenceNotReady(RuntimeError):
     """Authoritative market/evidence inputs are incomplete but not corrupt."""
+
+    def __init__(self, message: str, *, blocking_record: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.blocking_record = blocking_record or {
+            "schema": "probiga.strategy-governance-block.v1",
+            "status": "INPUT_NOT_READY",
+            "status_label": "治理输入未就绪",
+            "reason": str(message),
+            "automatic_real_order_submission": False,
+        }
 
 EVIDENCE_STATUS_LABELS: dict[str, str] = {
     "PENDING": "等待独立复核",
@@ -119,15 +161,15 @@ MARKET_REGIME_STATES = (
     "extreme_event",
 )
 MARKET_ROUTER_POLICY_VERSION = "strategy_market_router.v1"
-ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v2"
+ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v3"
+DAILY_NAV_RANKING_BASIS = "DAILY_NET_NAV_20_60_120_V1"
+DAILY_NAV_RANKING_BASIS_LABEL = "同口径20/60/120日扣费后日频净值健康分"
+ALLOCATION_TYPE_LANE_POLICY = "FIXED_EQUAL_LANES_NO_CROSS_TYPE_RAW_SCORE_V1"
 POOL_ROW_SCHEMA = "probiga.strategy-pool-row.v1"
 POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
 AUTOMATIC_TRANSITION_PLAN_SCHEMA = (
     "probiga.strategy-automatic-transition-plan.v1"
-)
-QMT_PRECLOSE_ATTESTATION_PROTOCOL = (
-    "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
 )
 MARKET_RISK_CAP_PCT = {
     "trend_bullish": 85.0,
@@ -337,6 +379,8 @@ _GOVERNANCE_SNAPSHOT_TRIGGER_TABLES = {
     ),
     "strategy_pool_snapshot": "st_strategy_pool_snapshot",
     "strategy_allocation_snapshot": "st_strategy_allocation_snapshot",
+    "strategy_adapter_run_receipt": "st_strategy_adapter_run_receipt",
+    "strategy_industry_history": "st_strategy_industry_history",
 }
 for _trigger_stem, _trigger_table in (
     _GOVERNANCE_SNAPSHOT_TRIGGER_TABLES.items()
@@ -390,6 +434,8 @@ _GOVERNANCE_RUN_BINARY_COLUMNS = (
     "decision_hash",
     "status",
     "summary_json",
+    "result_json",
+    "result_hash",
 )
 _GOVERNANCE_RUN_VALUE_COLUMNS = (
     "trade_date",
@@ -929,7 +975,11 @@ def validate_metric_input_review_triggers(connection) -> dict[str, Any]:
     return detail
 
 
-def _ensure_metric_input_review_triggers(connection) -> None:
+def _ensure_metric_input_review_triggers(
+    connection,
+    *,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+) -> None:
     """Create only missing guards; existing drift is never replaced."""
 
     rows = _metric_input_trigger_inventory(connection)
@@ -961,13 +1011,20 @@ def _ensure_metric_input_review_triggers(connection) -> None:
                 "策略指标证据复核触发器正文漂移，拒绝继续部署："
                 + trigger_name
             )
-    for trigger_name in sorted(expected_names - set(observed)):
+    missing_names = sorted(expected_names - set(observed))
+    if missing_names and trigger_ddl_executor is None:
+        raise RuntimeError(
+            "策略指标证据缺少触发器，且未提供显式触发器DDL执行器"
+        )
+    for trigger_name in missing_names:
         contract = METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[trigger_name]
-        connection.execute(text(
+        statement = (
             f"CREATE TRIGGER {trigger_name} {contract['timing']} "
             f"{contract['event']} ON {contract['table']} FOR EACH ROW "
             f"{contract['body']}"
-        ))
+        )
+        assert trigger_ddl_executor is not None
+        trigger_ddl_executor(statement)
     validate_metric_input_review_triggers(connection)
 
 
@@ -1060,7 +1117,11 @@ def _validate_governance_append_only_triggers_connection(
     return detail
 
 
-def _ensure_governance_append_only_triggers(connection) -> None:
+def _ensure_governance_append_only_triggers(
+    connection,
+    *,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+) -> None:
     """Create only missing guards and reject every existing drift."""
 
     rows = _governance_append_only_trigger_inventory(connection)
@@ -1096,10 +1157,20 @@ def _ensure_governance_append_only_triggers(connection) -> None:
                     f"existing append-only trigger differs: {trigger_name}"
                 ],
             })
-    for trigger_name in sorted(expected_names - set(observed)):
-        connection.execute(text(
+    missing_names = sorted(expected_names - set(observed))
+    if missing_names and trigger_ddl_executor is None:
+        raise GovernanceAppendOnlySchemaError({
+            "trigger_names": sorted(observed),
+            "errors": [
+                "missing append-only triggers require the explicit trigger "
+                "DDL executor"
+            ],
+        })
+    for trigger_name in missing_names:
+        assert trigger_ddl_executor is not None
+        trigger_ddl_executor(
             GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS[trigger_name]
-        ))
+        )
     _validate_governance_append_only_triggers_connection(connection)
 
 
@@ -1354,16 +1425,16 @@ def _ensure_strategy_content_hash_schema(connection) -> None:
         })
 
 
-def ensure_strategy_governance_tables() -> None:
-    """Create the governance schema without changing execution authority."""
+def governance_table_ddl_statements() -> tuple[str, ...]:
+    """Return the frozen create-table source used by setup and validation."""
 
-    statements = (
+    return (
         """
         CREATE TABLE IF NOT EXISTS st_strategy_governance_schema_migration (
             migration_key VARCHAR(80) PRIMARY KEY,
             migration_hash CHAR(64) NOT NULL,
             completed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_registry (
@@ -1383,7 +1454,7 @@ def ensure_strategy_governance_tables() -> None:
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             KEY idx_strategy_registry_status (current_status, enabled),
             KEY idx_strategy_registry_family (family_key, strategy_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_version (
@@ -1402,7 +1473,7 @@ def ensure_strategy_governance_tables() -> None:
             UNIQUE KEY uk_strategy_version_content
                 (strategy_key, content_hash),
             KEY idx_strategy_version_hash (strategy_key, version_hash)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_lifecycle_event (
@@ -1421,7 +1492,7 @@ def ensure_strategy_governance_tables() -> None:
             occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uk_strategy_lifecycle_event_hash (event_hash),
             KEY idx_strategy_lifecycle_entity (entity_type, entity_key, occurred_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_metric_input (
@@ -1458,7 +1529,7 @@ def ensure_strategy_governance_tables() -> None:
             UNIQUE KEY uk_strategy_metric_artifact_global (artifact_hash),
             UNIQUE KEY uk_strategy_metric_dataset_global (source_dataset_hash),
             KEY idx_strategy_metric_latest (entity_type, strategy_key, strategy_version, as_of_date, window_days)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_health_snapshot (
@@ -1493,7 +1564,7 @@ def ensure_strategy_governance_tables() -> None:
             PRIMARY KEY (run_uid, strategy_key, strategy_version, window_days),
             KEY idx_strategy_health_latest (strategy_key, trade_date, window_days),
             KEY idx_strategy_health_gate (profit_gate_passed, trade_date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_combination (
@@ -1508,7 +1579,7 @@ def ensure_strategy_governance_tables() -> None:
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             KEY idx_strategy_combination_status (current_status, enabled)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_combination_version (
@@ -1522,7 +1593,7 @@ def ensure_strategy_governance_tables() -> None:
             PRIMARY KEY (combination_key, version),
             UNIQUE KEY uk_strategy_combination_hash
                 (combination_key, config_hash)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_combination_health_snapshot (
@@ -1540,7 +1611,7 @@ def ensure_strategy_governance_tables() -> None:
             PRIMARY KEY (run_uid, combination_key, combination_version),
             KEY idx_combination_health_latest
                 (combination_key, trade_date, profit_gate_passed)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_governance_run (
@@ -1567,13 +1638,15 @@ def ensure_strategy_governance_tables() -> None:
             tradable_count INT NOT NULL DEFAULT 0,
             allocation_count INT NOT NULL DEFAULT 0,
             summary_json LONGTEXT NOT NULL,
+            result_json LONGTEXT NOT NULL,
+            result_hash CHAR(64) NOT NULL,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             finished_at DATETIME DEFAULT NULL,
             UNIQUE KEY uk_strategy_governance_decision (decision_hash),
             KEY idx_strategy_governance_run_date (trade_date, created_at),
             KEY idx_strategy_governance_canonical
                 (trade_date, is_canonical, run_revision)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_pool_snapshot (
@@ -1594,7 +1667,7 @@ def ensure_strategy_governance_tables() -> None:
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (run_uid, pool_level, stock_code),
             KEY idx_strategy_pool_date (trade_date, pool_level, rank_no)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_allocation_snapshot (
@@ -1611,11 +1684,66 @@ def ensure_strategy_governance_tables() -> None:
             lifecycle_risk_multiplier DECIMAL(8,4) NOT NULL DEFAULT 0,
             base_competitive_weight_pct DECIMAL(10,4) NOT NULL DEFAULT 0,
             simulated_weight_pct DECIMAL(10,4) NOT NULL,
+            member_sleeves_json LONGTEXT NOT NULL,
+            member_sleeve_hash CHAR(64) NOT NULL DEFAULT '',
+            cash_discount_bp INT NOT NULL DEFAULT 0,
             reason VARCHAR(500) NOT NULL,
             real_order_authority TINYINT(1) NOT NULL DEFAULT 0,
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (run_uid, target_type, target_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS st_strategy_adapter_run_receipt (
+            run_uid CHAR(32) PRIMARY KEY,
+            strategy_key VARCHAR(80) NOT NULL,
+            strategy_version VARCHAR(160) NOT NULL,
+            strategy_version_hash CHAR(64) NOT NULL,
+            execution_binding_hash CHAR(64) NOT NULL,
+            adapter_artifact_sha256 CHAR(64) NOT NULL,
+            cost_model_hash CHAR(64) NOT NULL,
+            adapter_key VARCHAR(80) NOT NULL,
+            adapter_version VARCHAR(160) NOT NULL,
+            trade_date DATE NOT NULL,
+            completed_at DATETIME(6) NOT NULL,
+            status VARCHAR(24) NOT NULL,
+            input_hash CHAR(64) NOT NULL,
+            output_hash CHAR(64) NOT NULL,
+            stable_result_hash CHAR(64) NOT NULL,
+            candidate_count INT NOT NULL,
+            candidate_identity_json LONGTEXT NOT NULL,
+            receipt_json LONGTEXT NOT NULL,
+            receipt_hash CHAR(64) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uk_strategy_adapter_receipt_hash (receipt_hash),
+            KEY idx_strategy_adapter_stable_result
+                (strategy_key, strategy_version, trade_date,
+                 execution_binding_hash, stable_result_hash),
+            KEY idx_strategy_adapter_input
+                (trade_date, input_hash, output_hash)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS st_strategy_industry_history (
+            snapshot_id CHAR(64) NOT NULL,
+            trade_date DATE NOT NULL,
+            as_of_exclusive DATETIME(6) NOT NULL,
+            stock_code VARCHAR(16) NOT NULL,
+            industry_name VARCHAR(120) NOT NULL,
+            industry_type VARCHAR(40) NOT NULL,
+            source_system VARCHAR(80) NOT NULL,
+            source_fact_id VARCHAR(160) NOT NULL,
+            source_effective_at DATETIME(6) NOT NULL,
+            source_etl_sync_at DATETIME(6) NOT NULL,
+            row_hash CHAR(64) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (snapshot_id, stock_code),
+            UNIQUE KEY uk_strategy_industry_row_hash (row_hash),
+            UNIQUE KEY uk_strategy_industry_source_fact
+                (source_system, source_fact_id),
+            KEY idx_strategy_industry_asof
+                (trade_date, as_of_exclusive, stock_code)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS st_strategy_governance_audit (
@@ -1633,10 +1761,317 @@ def ensure_strategy_governance_tables() -> None:
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY uk_strategy_governance_audit_hash (audit_hash),
             KEY idx_strategy_governance_audit_entity (entity_type, entity_key, created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     )
-    with get_engine().begin() as connection:
+
+
+def _split_governance_ddl_items(body: str) -> list[str]:
+    items: list[str] = []
+    start = 0
+    depth = 0
+    quoted = False
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "'":
+            if quoted and index + 1 < len(body) and body[index + 1] == "'":
+                index += 2
+                continue
+            quoted = not quoted
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                items.append(body[start:index].strip())
+                start = index + 1
+        index += 1
+    items.append(body[start:].strip())
+    return [item for item in items if item]
+
+
+def _governance_table_schema_contract() -> dict[str, dict[str, Any]]:
+    contracts: dict[str, dict[str, Any]] = {}
+    for statement in governance_table_ddl_statements():
+        match = re.search(
+            r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z0-9_]+)\s*"
+            r"\((.*)\)\s*ENGINE=InnoDB",
+            statement,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match is None:
+            raise RuntimeError("治理建表语句无法生成冻结结构契约")
+        table_name, body = match.groups()
+        columns: list[dict[str, Any]] = []
+        indexes: dict[str, tuple[int, tuple[str, ...]]] = {}
+        for item in _split_governance_ddl_items(body):
+            normalized = " ".join(item.split())
+            primary = re.fullmatch(
+                r"PRIMARY KEY\s*\((.+)\)",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+            keyed = re.fullmatch(
+                r"(UNIQUE\s+)?KEY\s+([a-z0-9_]+)\s*\((.+)\)",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+            if primary is not None or keyed is not None:
+                raw_columns = (
+                    primary.group(1) if primary is not None else keyed.group(3)
+                )
+                index_name = "PRIMARY" if primary is not None else keyed.group(2)
+                non_unique = 0 if primary is not None or keyed.group(1) else 1
+                indexes[index_name] = (
+                    non_unique,
+                    tuple(
+                        value.strip().strip("`")
+                        for value in raw_columns.split(",")
+                    ),
+                )
+                continue
+            column = re.match(
+                r"`?([a-z0-9_]+)`?\s+([a-z]+(?:\(\d+(?:,\d+)?\))?)(.*)$",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+            if column is None:
+                raise RuntimeError(
+                    f"治理字段声明无法生成冻结结构契约：{table_name}"
+                )
+            column_name, column_type, suffix = column.groups()
+            default_match = re.search(
+                r"\bDEFAULT\s+('(?:''|[^'])*'|CURRENT_TIMESTAMP|NULL|"
+                r"-?\d+(?:\.\d+)?)",
+                suffix,
+                flags=re.IGNORECASE,
+            )
+            default: str | None = None
+            if default_match is not None:
+                default = default_match.group(1)
+                if default.startswith("'") and default.endswith("'"):
+                    default = default[1:-1].replace("''", "'")
+                elif default.upper() == "NULL":
+                    default = None
+                elif default.upper() == "CURRENT_TIMESTAMP":
+                    default = "CURRENT_TIMESTAMP"
+            columns.append({
+                "name": column_name,
+                "column_type": column_type.casefold(),
+                "nullable": "NO" if re.search(
+                    r"\bNOT\s+NULL\b", suffix, flags=re.IGNORECASE
+                ) else "YES",
+                "default": default,
+                "auto_increment": bool(re.search(
+                    r"\bAUTO_INCREMENT\b", suffix, flags=re.IGNORECASE
+                )),
+                "on_update_current_timestamp": bool(re.search(
+                    r"\bON\s+UPDATE\s+CURRENT_TIMESTAMP\b",
+                    suffix,
+                    flags=re.IGNORECASE,
+                )),
+            })
+            inline_primary = re.search(
+                r"\bPRIMARY\s+KEY\b", suffix, flags=re.IGNORECASE
+            )
+            if inline_primary:
+                indexes["PRIMARY"] = (0, (column_name,))
+        contracts[table_name] = {
+            "columns": columns,
+            "indexes": indexes,
+        }
+    if set(contracts) != set(GOVERNANCE_TABLE_NAMES):
+        raise RuntimeError("治理建表语句集合与冻结表清单不一致")
+    return contracts
+
+
+def _normalized_governance_column_default(
+    value: Any,
+    column_type: str,
+) -> Any:
+    if value is None:
+        return None
+    raw = str(value)
+    base_type = column_type.split("(", 1)[0]
+    if base_type in {"tinyint", "int", "bigint", "decimal"}:
+        try:
+            return Decimal(raw).normalize()
+        except InvalidOperation:
+            return raw
+    if base_type in {"datetime", "timestamp"} and raw.casefold().replace(
+        "()", ""
+    ) == "current_timestamp":
+        return "current_timestamp"
+    return raw
+
+
+def validate_governance_table_schema(connection) -> dict[str, int]:
+    """Read-only exact engine/column/index gate for all governance tables."""
+
+    contracts = _governance_table_schema_contract()
+    placeholders = ", ".join(
+        f"'{name}'" for name in sorted(contracts)
+    )
+    table_rows = connection.execute(text(
+        "SELECT TABLE_NAME AS table_name, ENGINE AS engine, "
+        "TABLE_COLLATION AS table_collation FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ("
+        f"{placeholders}) ORDER BY BINARY TABLE_NAME"
+    )).mappings().all()
+    observed_tables = {
+        str(row.get("table_name") or ""): dict(row) for row in table_rows
+    }
+    if set(observed_tables) != set(contracts):
+        raise RuntimeError("生产治理表清单不完整或包含结构漂移")
+    for name, row in observed_tables.items():
+        if (
+            str(row.get("engine") or "").casefold() != "innodb"
+            or str(row.get("table_collation") or "").casefold()
+            != GOVERNANCE_SCHEMA_COLLATION
+        ):
+            raise RuntimeError(f"生产治理表引擎或字符集漂移：{name}")
+
+    column_rows = connection.execute(text(
+        "SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name, "
+        "ORDINAL_POSITION AS ordinal_position, COLUMN_TYPE AS column_type, "
+        "IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, "
+        "EXTRA AS extra, CHARACTER_SET_NAME AS character_set_name, "
+        "COLLATION_NAME AS collation_name "
+        "FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() "
+        f"AND TABLE_NAME IN ({placeholders}) "
+        "ORDER BY BINARY TABLE_NAME, ORDINAL_POSITION"
+    )).mappings().all()
+    observed_columns: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in contracts
+    }
+    for row in column_rows:
+        table_name = str(row.get("table_name") or "")
+        if table_name not in observed_columns:
+            raise RuntimeError("生产治理字段归属表异常")
+        observed_columns[table_name].append(dict(row))
+    for table_name, contract in contracts.items():
+        expected_columns = contract["columns"]
+        rows = observed_columns[table_name]
+        if len(rows) != len(expected_columns):
+            raise RuntimeError(f"生产治理字段数量漂移：{table_name}")
+        for ordinal, (row, expected) in enumerate(
+            zip(rows, expected_columns),
+            1,
+        ):
+            extra = str(row.get("extra") or "").casefold()
+            character_type = expected["column_type"].split("(", 1)[0] in {
+                "char", "varchar", "text", "mediumtext", "longtext",
+            }
+            if (
+                int(row.get("ordinal_position") or 0) != ordinal
+                or str(row.get("column_name") or "") != expected["name"]
+                or str(row.get("column_type") or "").casefold()
+                != expected["column_type"]
+                or str(row.get("is_nullable") or "").upper()
+                != expected["nullable"]
+                or _normalized_governance_column_default(
+                    row.get("column_default"), expected["column_type"]
+                ) != _normalized_governance_column_default(
+                    expected["default"], expected["column_type"]
+                )
+                or ("auto_increment" in extra)
+                != expected["auto_increment"]
+                or ("on update current_timestamp" in extra)
+                != expected["on_update_current_timestamp"]
+                or (
+                    character_type
+                    and (
+                        str(row.get("character_set_name") or "").casefold()
+                        != "utf8mb4"
+                        or str(row.get("collation_name") or "").casefold()
+                        != GOVERNANCE_SCHEMA_COLLATION
+                    )
+                )
+                or (
+                    not character_type
+                    and (
+                        row.get("character_set_name") is not None
+                        or row.get("collation_name") is not None
+                    )
+                )
+            ):
+                raise RuntimeError(
+                    f"生产治理字段契约漂移：{table_name}.{expected['name']}"
+                )
+
+    index_rows = connection.execute(text(
+        "SELECT TABLE_NAME AS table_name, INDEX_NAME AS index_name, "
+        "NON_UNIQUE AS non_unique, SEQ_IN_INDEX AS seq_in_index, "
+        "COLUMN_NAME AS column_name, SUB_PART AS sub_part, "
+        "INDEX_TYPE AS index_type FROM information_schema.STATISTICS "
+        "WHERE TABLE_SCHEMA=DATABASE() "
+        f"AND TABLE_NAME IN ({placeholders}) "
+        "ORDER BY BINARY TABLE_NAME, BINARY INDEX_NAME, SEQ_IN_INDEX"
+    )).mappings().all()
+    observed_indexes: dict[str, dict[str, dict[str, Any]]] = {
+        name: {} for name in contracts
+    }
+    for row in index_rows:
+        table_name = str(row.get("table_name") or "")
+        index_name = str(row.get("index_name") or "")
+        if table_name not in observed_indexes:
+            raise RuntimeError("生产治理索引归属表异常")
+        entry = observed_indexes[table_name].setdefault(index_name, {
+            "non_unique": int(row.get("non_unique") or 0),
+            "columns": [],
+            "valid": True,
+        })
+        entry["valid"] = bool(
+            entry["valid"]
+            and entry["non_unique"] == int(row.get("non_unique") or 0)
+            and int(row.get("seq_in_index") or 0)
+            == len(entry["columns"]) + 1
+            and row.get("sub_part") is None
+            and str(row.get("index_type") or "").upper() == "BTREE"
+        )
+        entry["columns"].append(str(row.get("column_name") or ""))
+    for table_name, contract in contracts.items():
+        normalized = {
+            name: (entry["non_unique"], tuple(entry["columns"]))
+            for name, entry in observed_indexes[table_name].items()
+            if entry["valid"]
+        }
+        if normalized != contract["indexes"]:
+            raise RuntimeError(f"生产治理索引契约漂移：{table_name}")
+    return {
+        "table_count": len(contracts),
+        "column_count": sum(
+            len(contract["columns"]) for contract in contracts.values()
+        ),
+        "index_count": sum(
+            len(contract["indexes"]) for contract in contracts.values()
+        ),
+    }
+
+
+def ensure_strategy_governance_tables(
+    *,
+    engine: Any | None = None,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+) -> None:
+    """Create governance schema without changing execution authority.
+
+    Normal callers use the shared runtime engine.  The production release
+    broker supplies its separately authenticated, schema-scoped migration
+    engine while all writers are fenced.  That preserves the established
+    migration-account trigger ``DEFINER`` without granting global authority to
+    the runtime account.
+    """
+
+    if trigger_ddl_executor is not None and not callable(
+        trigger_ddl_executor
+    ):
+        raise TypeError("trigger_ddl_executor must be callable")
+    statements = governance_table_ddl_statements()
+    schema_engine = engine or get_engine()
+    with schema_engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
         metric_entity_type = connection.execute(
@@ -1721,12 +2156,33 @@ def ensure_strategy_governance_tables() -> None:
             ("router_policy_version", "VARCHAR(80) NOT NULL DEFAULT ''"),
             ("router_snapshot_hash", "CHAR(64) NOT NULL DEFAULT ''"),
             ("decision_hash", "CHAR(64) NULL"),
+            ("result_json", "LONGTEXT NULL"),
+            ("result_hash", "CHAR(64) NOT NULL DEFAULT ''"),
         ):
             if column_name not in run_columns:
                 connection.execute(text(
                     f"ALTER TABLE st_strategy_governance_run "
                     f"ADD COLUMN {column_name} {definition}"
                 ))
+        connection.execute(text(
+            "UPDATE st_strategy_governance_run SET result_json='{}' "
+            "WHERE result_json IS NULL OR result_json=''"
+        ))
+        connection.execute(text(
+            "UPDATE st_strategy_governance_run SET result_hash=SHA2(result_json, 256) "
+            "WHERE result_hash='' OR result_hash IS NULL"
+        ))
+        result_json_nullable = connection.execute(text(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() "
+            "AND table_name='st_strategy_governance_run' "
+            "AND column_name='result_json'"
+        )).scalar()
+        if str(result_json_nullable or "").upper() != "NO":
+            connection.execute(text(
+                "ALTER TABLE st_strategy_governance_run "
+                "MODIFY COLUMN result_json LONGTEXT NOT NULL"
+            ))
         migration_row = connection.execute(text(
             "SELECT migration_hash "
             "FROM st_strategy_governance_schema_migration "
@@ -1851,12 +2307,31 @@ def ensure_strategy_governance_tables() -> None:
             ("lifecycle_status_label", "VARCHAR(40) NOT NULL DEFAULT ''"),
             ("lifecycle_risk_multiplier", "DECIMAL(8,4) NOT NULL DEFAULT 0"),
             ("base_competitive_weight_pct", "DECIMAL(10,4) NOT NULL DEFAULT 0"),
+            ("member_sleeves_json", "LONGTEXT NULL"),
+            ("member_sleeve_hash", "CHAR(64) NOT NULL DEFAULT ''"),
+            ("cash_discount_bp", "INT NOT NULL DEFAULT 0"),
         ):
             if column_name not in allocation_columns:
                 connection.execute(text(
                     "ALTER TABLE st_strategy_allocation_snapshot "
                     f"ADD COLUMN {column_name} {definition}"
                 ))
+        connection.execute(text(
+            "UPDATE st_strategy_allocation_snapshot "
+            "SET member_sleeves_json='[]' "
+            "WHERE member_sleeves_json IS NULL OR member_sleeves_json=''"
+        ))
+        member_json_nullable = connection.execute(text(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() "
+            "AND table_name='st_strategy_allocation_snapshot' "
+            "AND column_name='member_sleeves_json'"
+        )).scalar()
+        if str(member_json_nullable or "").upper() != "NO":
+            connection.execute(text(
+                "ALTER TABLE st_strategy_allocation_snapshot "
+                "MODIFY COLUMN member_sleeves_json LONGTEXT NOT NULL"
+            ))
         for table_name, index_name, columns in (
             (
                 "st_strategy_governance_run",
@@ -1920,8 +2395,16 @@ def ensure_strategy_governance_tables() -> None:
                     f"{index_name} ({columns})"
                 ))
         _ensure_strategy_content_hash_schema(connection)
-        _ensure_metric_input_review_triggers(connection)
-        _ensure_governance_append_only_triggers(connection)
+    with schema_engine.connect() as connection:
+        _ensure_metric_input_review_triggers(
+            connection,
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
+        _ensure_governance_append_only_triggers(
+            connection,
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
+        connection.commit()
 
 
 def _audit_record(
@@ -2384,20 +2867,47 @@ def seed_v3_strategies() -> None:
                 )
 
 
+DEFAULT_SEEDED_COMBINATIONS = (
+    (
+        "trend_attack", "趋势进攻组合", "趋势、短线与日内的分层进攻组合",
+        {"main_wave": 0.50, "short_term": 0.30, "ultra_short": 0.20},
+    ),
+    (
+        "balanced_rotation", "均衡轮动组合", "短线轮动、波段与趋势的均衡组合",
+        {"short_term": 0.40, "swing": 0.35, "main_wave": 0.25},
+    ),
+    (
+        "defensive_observation", "防守观察组合", "以波段和低频轮动为主的防守观察组合",
+        {"swing": 0.60, "short_term": 0.40},
+    ),
+    (
+        "v3_mainline_attack", "V3主线进攻组合",
+        "右侧主升、板块扩散和低位点火的主线组合",
+        {"right_side_trend": 0.45, "theme_diffusion": 0.35,
+         "low_base_ignition": 0.20},
+    ),
+    (
+        "v3_event_rotation", "V3事件轮动组合",
+        "事件漂移、盘中超预期和板块扩散的催化组合",
+        {"event_drift": 0.40, "intraday_surprise": 0.35,
+         "theme_diffusion": 0.25},
+    ),
+    (
+        "v3_defensive_repair", "V3防守修复组合",
+        "质量动量、弱市主线和超跌修复的防守组合",
+        {"quality_momentum": 0.40,
+         "weak_market_structural_mainline": 0.35,
+         "oversold_reversal": 0.25},
+    ),
+)
+
+
 def seed_default_combinations() -> None:
-    defaults = (
-        ("trend_attack", "趋势进攻组合", "趋势、短线与日内的分层进攻组合", {"main_wave": 0.50, "short_term": 0.30, "ultra_short": 0.20}),
-        ("balanced_rotation", "均衡轮动组合", "短线轮动、波段与趋势的均衡组合", {"short_term": 0.40, "swing": 0.35, "main_wave": 0.25}),
-        ("defensive_observation", "防守观察组合", "以波段和低频轮动为主的防守观察组合", {"swing": 0.60, "short_term": 0.40}),
-        ("v3_mainline_attack", "V3主线进攻组合", "右侧主升、板块扩散和低位点火的主线组合", {"right_side_trend": 0.45, "theme_diffusion": 0.35, "low_base_ignition": 0.20}),
-        ("v3_event_rotation", "V3事件轮动组合", "事件漂移、盘中超预期和板块扩散的催化组合", {"event_drift": 0.40, "intraday_surprise": 0.35, "theme_diffusion": 0.25}),
-        ("v3_defensive_repair", "V3防守修复组合", "质量动量、弱市主线和超跌修复的防守组合", {"quality_momentum": 0.40, "weak_market_structural_mainline": 0.35, "oversold_reversal": 0.25}),
-    )
     registered = {
         row["strategy_key"]: row["current_version"]
         for row in load_registry()
     }
-    for key, name, description, weights in defaults:
+    for key, name, description, weights in DEFAULT_SEEDED_COMBINATIONS:
         available = {member: weight for member, weight in weights.items() if member in registered}
         if len(available) < 2:
             continue
@@ -2534,18 +3044,383 @@ def seed_default_combinations() -> None:
             ), params)
 
 
-def ensure_and_seed_governance() -> None:
+def _default_governance_seed_contract() -> dict[str, Any]:
+    manifest = load_stock_manifest()
+    manifest_version = str(manifest["manifest_version"])
+    manifest_by_key = {
+        str(item["key"]): item for item in manifest["strategies"]
+    }
+    market_config = load_market_state_config()
+    strategies: dict[str, dict[str, Any]] = {}
+    for catalog_item in stock_strategy_catalog():
+        key = str(catalog_item["key"])
+        raw = manifest_by_key[key]
+        version = f"{manifest_version}:{key}"
+        evaluator = {
+            "score_field": raw.get("score_field"),
+            "model_version": manifest.get("model_version"),
+            "market_regime_multipliers": _manifest_regime_multipliers(key),
+            "market_router_policy_version": MARKET_ROUTER_POLICY_VERSION,
+            "market_state_config_version": market_config["config_version"],
+            "market_state_config_hash": market_state_config_hash(),
+        }
+        parameters = dict(raw.get("parameters") or {})
+        strategies[key] = {
+            "strategy_key": key,
+            "strategy_name": str(catalog_item["name"]),
+            "category": str(catalog_item["category"]),
+            "family_key": key,
+            "description": str(catalog_item.get("description") or ""),
+            "owner_name": "manifest_registry",
+            "discovery_mode": "manifest_adapter",
+            "enabled": 1,
+            "current_version": version,
+            "evaluator_type": "manifest_score_adapter",
+            "evaluator_config": evaluator,
+            "parameters": parameters,
+            "source_kind": "immutable_manifest",
+            "created_by": "manifest_registry",
+            "version_hash": _strategy_version_digest(
+                strategy_key=key,
+                version=version,
+                evaluator_type="manifest_score_adapter",
+                evaluator_config=evaluator,
+                parameters=parameters,
+                source_kind="immutable_manifest",
+            ),
+            "content_hash": _strategy_content_digest(
+                strategy_key=key,
+                evaluator_type="manifest_score_adapter",
+                evaluator_config=evaluator,
+                parameters=parameters,
+                source_kind="immutable_manifest",
+            ),
+        }
+
+    v3_config = load_v3_config()
+    model_version = str(v3_config.get("strategy_version") or "").strip()
+    sleeves = v3_config.get("sleeves")
+    if not model_version or not isinstance(sleeves, dict):
+        raise RuntimeError("V3策略配置不能生成默认播种验收契约")
+    for raw_key, raw_sleeve in sorted(sleeves.items()):
+        key = validate_strategy_key(str(raw_key))
+        sleeve = raw_sleeve if isinstance(raw_sleeve, dict) else {}
+        version = f"{model_version}:{key}"
+        evaluator = {
+            "strategy_key": key,
+            "model_version": model_version,
+            "evidence_owner": "primary_strategy_key",
+            "market_regime_policy": "UNCONFIGURED_FAIL_CLOSED",
+        }
+        parameters = dict(sleeve)
+        strategies[key] = {
+            "strategy_key": key,
+            "strategy_name": str(V3_STRATEGY_LABELS.get(key, key)),
+            "category": "V3前向策略",
+            "family_key": key,
+            "description": str(
+                sleeve.get("description") or "V3独立策略袖套"
+            ),
+            "owner_name": "v3_registry",
+            "discovery_mode": "v3_sleeve_adapter",
+            "enabled": 1,
+            "current_version": version,
+            "evaluator_type": "v3_primary_sleeve_adapter",
+            "evaluator_config": evaluator,
+            "parameters": parameters,
+            "source_kind": "immutable_v3_sleeve",
+            "created_by": "v3_registry",
+            "version_hash": _strategy_version_digest(
+                strategy_key=key,
+                version=version,
+                evaluator_type="v3_primary_sleeve_adapter",
+                evaluator_config=evaluator,
+                parameters=parameters,
+                source_kind="immutable_v3_sleeve",
+            ),
+            "content_hash": _strategy_content_digest(
+                strategy_key=key,
+                evaluator_type="v3_primary_sleeve_adapter",
+                evaluator_config=evaluator,
+                parameters=parameters,
+                source_kind="immutable_v3_sleeve",
+            ),
+        }
+
+    combinations: dict[str, dict[str, Any]] = {}
+    versions = {
+        key: contract["current_version"]
+        for key, contract in strategies.items()
+    }
+    for key, name, description, weights in DEFAULT_SEEDED_COMBINATIONS:
+        available = {
+            member: weight for member, weight in weights.items()
+            if member in versions
+        }
+        if len(available) < 2:
+            continue
+        total = sum(available.values())
+        members = [
+            {
+                "strategy_key": member,
+                "strategy_version": versions[member],
+                "weight": round(weight / total, 8),
+            }
+            for member, weight in available.items()
+        ]
+        constraints = _validated_combination_constraints({})
+        config_hash = _digest({
+            "members": members,
+            "constraints": constraints,
+        })
+        combinations[key] = {
+            "combination_key": key,
+            "combination_name": name,
+            "description": description,
+            "owner_name": "system_seed",
+            "enabled": 1,
+            "current_version": f"seed-{config_hash[:16]}",
+            "members": members,
+            "constraints": constraints,
+            "config_hash": config_hash,
+            "created_by": "system_seed",
+        }
+    return {
+        "strategies": strategies,
+        "combinations": combinations,
+    }
+
+
+def _strict_seed_json(value: Any, *, expected_type: type) -> Any:
+    try:
+        parsed = value if isinstance(value, expected_type) else json.loads(
+            str(value)
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("默认治理播种JSON损坏") from exc
+    if not isinstance(parsed, expected_type):
+        raise RuntimeError("默认治理播种JSON类型漂移")
+    return parsed
+
+
+def validate_default_governance_seed_contract(
+    engine: Any | None = None,
+    *,
+    require_initial_shadow: bool = False,
+) -> dict[str, Any]:
+    """Read-only proof that every built-in seed has its exact frozen version."""
+
+    if type(require_initial_shadow) is not bool:
+        raise TypeError("require_initial_shadow must be bool")
+    expected = _default_governance_seed_contract()
+    strategy_contracts = expected["strategies"]
+    combination_contracts = expected["combinations"]
+    runtime_engine = engine or get_engine()
+    strategy_params = {
+        f"strategy_{index}": key
+        for index, key in enumerate(sorted(strategy_contracts))
+    }
+    strategy_placeholders = ", ".join(
+        f":{key}" for key in strategy_params
+    )
+    combination_params = {
+        f"combination_{index}": key
+        for index, key in enumerate(sorted(combination_contracts))
+    }
+    combination_placeholders = ", ".join(
+        f":{key}" for key in combination_params
+    )
+    with runtime_engine.connect() as connection:
+        strategy_rows = connection.execute(text(
+            "SELECT r.strategy_key, r.strategy_name, r.category, "
+            "r.family_key, r.description, r.owner_name, r.discovery_mode, "
+            "r.enabled, r.current_version, r.current_status, "
+            "r.recovery_conditions_json, v.version_hash, v.content_hash, "
+            "v.evaluator_type, v.evaluator_config_json, v.parameters_json, "
+            "v.source_kind, v.created_by FROM st_strategy_registry r "
+            "LEFT JOIN st_strategy_version v ON "
+            "v.strategy_key=r.strategy_key AND v.version=r.current_version "
+            f"WHERE r.strategy_key IN ({strategy_placeholders}) "
+            "ORDER BY BINARY r.strategy_key"
+        ), strategy_params).mappings().all()
+        combination_rows = connection.execute(text(
+            "SELECT c.combination_key, c.combination_name, c.description, "
+            "c.owner_name, c.enabled, c.current_version, c.current_status, "
+            "v.members_json, v.constraints_json, v.config_hash, v.created_by "
+            "FROM st_strategy_combination c LEFT JOIN "
+            "st_strategy_combination_version v ON "
+            "v.combination_key=c.combination_key "
+            "AND v.version=c.current_version "
+            f"WHERE c.combination_key IN ({combination_placeholders}) "
+            "ORDER BY BINARY c.combination_key"
+        ), combination_params).mappings().all()
+    observed_strategies = {
+        str(row.get("strategy_key") or ""): dict(row)
+        for row in strategy_rows
+    }
+    if set(observed_strategies) != set(strategy_contracts):
+        raise RuntimeError("默认治理策略播种集合不完整")
+    for key, contract in strategy_contracts.items():
+        row = observed_strategies[key]
+        for field in (
+            "strategy_name", "category", "family_key", "description",
+            "owner_name", "discovery_mode", "current_version",
+            "version_hash", "content_hash", "evaluator_type",
+            "source_kind", "created_by",
+        ):
+            if str(row.get(field) or "") != str(contract[field]):
+                raise RuntimeError(f"默认治理策略播种漂移：{key}.{field}")
+        status = str(row.get("current_status") or "")
+        if (
+            int(row.get("enabled") or 0) != 1
+            or status not in LIFECYCLE_LABELS
+            or (require_initial_shadow and status != "SHADOW")
+            or _strict_seed_json(
+                row.get("evaluator_config_json"), expected_type=dict
+            ) != contract["evaluator_config"]
+            or _strict_seed_json(
+                row.get("parameters_json"), expected_type=dict
+            ) != contract["parameters"]
+            or _strict_seed_json(
+                row.get("recovery_conditions_json"), expected_type=list
+            ) != _recovery_conditions()
+        ):
+            raise RuntimeError(f"默认治理策略播种状态或内容漂移：{key}")
+
+    observed_combinations = {
+        str(row.get("combination_key") or ""): dict(row)
+        for row in combination_rows
+    }
+    if set(observed_combinations) != set(combination_contracts):
+        raise RuntimeError("默认治理组合播种集合不完整")
+    for key, contract in combination_contracts.items():
+        row = observed_combinations[key]
+        for field in (
+            "combination_name", "description", "owner_name",
+            "current_version", "config_hash", "created_by",
+        ):
+            if str(row.get(field) or "") != str(contract[field]):
+                raise RuntimeError(f"默认治理组合播种漂移：{key}.{field}")
+        status = str(row.get("current_status") or "")
+        if (
+            int(row.get("enabled") or 0) != 1
+            or status not in LIFECYCLE_LABELS
+            or (require_initial_shadow and status != "SHADOW")
+            or _strict_seed_json(
+                row.get("members_json"), expected_type=list
+            ) != contract["members"]
+            or _strict_seed_json(
+                row.get("constraints_json"), expected_type=dict
+            ) != contract["constraints"]
+        ):
+            raise RuntimeError(f"默认治理组合播种状态或内容漂移：{key}")
+    contract_hash = _digest(expected)
+    return {
+        "seeded_strategy_count": len(strategy_contracts),
+        "seeded_combination_count": len(combination_contracts),
+        "seed_contract_hash": contract_hash,
+        "initial_shadow_required": require_initial_shadow,
+    }
+
+
+def seed_governance_registry() -> None:
+    """Idempotently seed governance rows after the schema is verified."""
+
     global _SEED_READY
     if _SEED_READY:
         return
     with _SEED_LOCK:
         if _SEED_READY:
             return
-        ensure_strategy_governance_tables()
         seed_manifest_strategies()
         seed_v3_strategies()
         seed_default_combinations()
         _SEED_READY = True
+
+
+def validate_prepared_governance_runtime(
+    engine: Any | None = None,
+) -> dict[str, int]:
+    """Read-only production gate for the pre-migrated governance schema."""
+
+    runtime_engine = engine or get_engine()
+    expected_migrations = {
+        RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
+        STRATEGY_CONTENT_HASH_MIGRATION_KEY: STRATEGY_CONTENT_HASH_MIGRATION_HASH,
+    }
+    with runtime_engine.connect() as connection:
+        observed_tables = {
+            str(row[0])
+            for row in connection.execute(
+                text(
+                    "SELECT TABLE_NAME FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=DATABASE()"
+                )
+            )
+            if str(row[0]) in GOVERNANCE_TABLE_NAMES
+        }
+        if observed_tables != set(GOVERNANCE_TABLE_NAMES):
+            raise RuntimeError("生产治理结构尚未由迁移账号完整准备")
+        migration_rows = connection.execute(
+            text(
+                "SELECT migration_key, migration_hash "
+                "FROM st_strategy_governance_schema_migration "
+                "WHERE migration_key IN (:run_revision, :content_hash)"
+            ),
+            {
+                "run_revision": RUN_REVISION_MIGRATION_KEY,
+                "content_hash": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
+            },
+        ).mappings().all()
+        observed_migrations = {
+            str(row.get("migration_key") or ""): str(
+                row.get("migration_hash") or ""
+            )
+            for row in migration_rows
+        }
+        if observed_migrations != expected_migrations:
+            raise RuntimeError("生产治理结构迁移标记不完整或已漂移")
+        metric = validate_metric_input_review_triggers(connection)
+        schema_detail = validate_governance_table_schema(connection)
+    append_only = validate_governance_append_only_triggers(runtime_engine)
+    seed_detail = validate_default_governance_seed_contract(runtime_engine)
+    return {
+        "table_count": int(schema_detail["table_count"]),
+        "column_count": int(schema_detail["column_count"]),
+        "index_count": int(schema_detail["index_count"]),
+        "migration_count": len(observed_migrations),
+        "seeded_strategy_count": int(seed_detail["seeded_strategy_count"]),
+        "seeded_combination_count": int(
+            seed_detail["seeded_combination_count"]
+        ),
+        "seed_contract_hash": str(seed_detail["seed_contract_hash"]),
+        "trigger_count": int(metric.get("trigger_count") or 0)
+        + int(append_only.get("trigger_count") or 0),
+    }
+
+
+def ensure_and_seed_governance() -> None:
+    global _SEED_READY
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+        if _SEED_READY:
+            return
+        with _SEED_LOCK:
+            if _SEED_READY:
+                return
+            validate_prepared_governance_runtime()
+            _SEED_READY = True
+        return
+    development_engine = get_engine()
+
+    def development_trigger_ddl_executor(statement: str) -> None:
+        with development_engine.begin() as connection:
+            connection.execute(text(statement))
+
+    ensure_strategy_governance_tables(
+        engine=development_engine,
+        trigger_ddl_executor=development_trigger_ddl_executor,
+    )
+    seed_governance_registry()
 
 
 def load_registry() -> list[dict[str, Any]]:
@@ -2596,6 +3471,31 @@ def load_registry() -> list[dict[str, Any]]:
             )
         except (TypeError, ValueError):
             row["version_integrity_valid"] = False
+        adapter_status = strategy_execution_adapter_status(row)
+        row["execution_adapter"] = adapter_status
+        row["execution_adapter_executable"] = (
+            adapter_status.get("executable") is True
+        )
+        row["execution_adapter_reason"] = str(
+            adapter_status.get("reason") or "执行适配器未部署/无效"
+        )
+        row["execution_binding_hash"] = str(
+            adapter_status.get("execution_binding_hash") or ""
+        )
+        row["adapter_artifact_sha256"] = str(
+            adapter_status.get("artifact_sha256") or ""
+        )
+        row["cost_model_hash"] = str(
+            adapter_status.get("cost_model_hash") or ""
+        )
+        row["funding_pipeline_ready"] = (
+            adapter_status.get("funding_pipeline_ready") is True
+        )
+        row["funding_pipeline_reason"] = (
+            "动态策略意图、订单、成交和前向证据已完成精确绑定"
+            if row["funding_pipeline_ready"]
+            else "动态策略仅接通影子候选；意图、订单、成交、前向证据的精确绑定闭环尚未部署"
+        )
     return rows
 
 
@@ -2619,6 +3519,23 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
         parameters
     )
     evaluator_config = dict(evaluator_config_raw)
+    top_level_binding = payload.get("execution_binding")
+    nested_binding = evaluator_config.get("execution_adapter")
+    if (
+        top_level_binding is not None
+        and nested_binding is not None
+        and top_level_binding != nested_binding
+    ):
+        raise ValueError("execution_binding与evaluator_config中的适配器绑定不一致")
+    binding_raw = (
+        top_level_binding
+        if top_level_binding is not None else nested_binding
+    )
+    if binding_raw is not None:
+        evaluator_config["execution_adapter"] = normalize_execution_binding(
+            binding_raw,
+            strategy_version=version,
+        )
     evaluator_config["market_regime_multipliers"] = (
         _validated_market_regime_multipliers(
             evaluator_config.get("market_regime_multipliers")
@@ -3315,14 +4232,9 @@ def _authoritative_session_windows(
             + "、".join(universe_failures[:5])
         )
     expected_universes = {
-        day: {
-            "stock_count": len(universe_sets[day]["target"]),
-            "stock_set_hash": _digest({
-                "schema": "probiga.qmt-expected-stock-set.v1",
-                "trade_date": day,
-                "stock_codes": sorted(universe_sets[day]["target"]),
-            }),
-        }
+        day: expected_stock_set_contract(
+            day, universe_sets[day]["target"]
+        )
         for day in expected_days
     }
     matching_manifest_runs: dict[str, set[str]] = {
@@ -3337,19 +4249,16 @@ def _authoritative_session_windows(
             run_end = _trade_date(row.get("end_date"), default_today=False)
         except ValueError:
             continue
-        tolerance = _json(row.get("tolerance_json"), None)
-        if (
-            not run_id
-            or run_start > run_end
-            or not isinstance(tolerance, dict)
-            or tolerance.get("attestation_protocol")
-            != QMT_PRECLOSE_ATTESTATION_PROTOCOL
-            or tolerance.get("universe_manifest_schema")
-            != "probiga.qmt-daily-universe.v1"
-            or not isinstance(tolerance.get("daily_universe"), dict)
-        ):
+        if not run_id or run_start > run_end:
             continue
-        daily_universe = tolerance["daily_universe"]
+        try:
+            daily_universe = validated_universe_manifest(
+                row.get("tolerance_json"),
+                start_date=run_start,
+                end_date=run_end,
+            )
+        except (TypeError, ValueError):
+            continue
         for day in expected_days:
             if not (run_start <= day <= run_end):
                 continue
@@ -6238,6 +7147,7 @@ def _load_forward_records(
 def _internal_strategy_portfolio_ledger(
     records: list[dict[str, Any]], *, as_of_date: str,
     strategy_key: str, strategy_version: str, version_hash: str,
+    execution_binding_hash: str | None = None,
 ) -> dict[str, Any]:
     """Rebuild a version-bound, unlevered virtual sleeve from internal fills."""
 
@@ -6249,6 +7159,15 @@ def _internal_strategy_portfolio_ledger(
             raise ValueError("内部组合账本必须绑定唯一模拟账户")
         if not _HASH_PATTERN.fullmatch(str(version_hash or "")):
             raise ValueError("内部组合账本缺少不可变策略版本哈希")
+        effective_execution_binding_hash = (
+            None if execution_binding_hash is None
+            else str(execution_binding_hash)
+        )
+        if (
+            effective_execution_binding_hash is not None
+            and not _HASH_PATTERN.fullmatch(effective_execution_binding_hash)
+        ):
+            raise ValueError("内部组合账本缺少适配器与成本模型绑定哈希")
         account_id = next(iter(account_ids))
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -6837,6 +7756,10 @@ def _internal_strategy_portfolio_ledger(
             },
             "equity_curve": equity_curve,
         }
+        if effective_execution_binding_hash is not None:
+            ledger_payload["execution_binding_hash"] = (
+                effective_execution_binding_hash
+            )
         return {
             "valid": True,
             "funding_provenance": "INTERNAL_PORTFOLIO_LEDGER_V1",
@@ -6846,6 +7769,9 @@ def _internal_strategy_portfolio_ledger(
             "portfolio_coverage_days": len(equity_curve),
             "internal_ledger_hash": _digest(ledger_payload),
             "internal_ledger_schema": ledger_payload["schema"],
+            "execution_binding_hash": (
+                effective_execution_binding_hash or ""
+            ),
             "equity_curve": equity_curve,
             "daily_records": daily_records,
             "trade_exposures": [
@@ -7072,6 +7998,11 @@ def _strategy_market_route(
     reasons: list[str] = []
     if strategy.get("version_integrity_valid") is False:
         reasons.append("不可变策略版本内容哈希校验失败")
+    if strategy.get("execution_adapter_executable") is not True:
+        reasons.append(str(
+            strategy.get("execution_adapter_reason")
+            or "执行适配器未部署/无效"
+        ))
     if not input_ready:
         reasons.append(input_reason)
     if state not in MARKET_REGIME_STATES:
@@ -7118,7 +8049,56 @@ def _strategy_market_route(
 def _attach_market_routes(
     snapshot: dict[str, Any], registry: list[dict[str, Any]],
 ) -> None:
+    runtime_statuses = {
+        str(item.get("strategy_key") or ""): item
+        for item in (snapshot.get("dynamic_adapter_statuses") or [])
+        if isinstance(item, dict) and str(item.get("strategy_key") or "")
+    }
     for strategy in registry:
+        if str(strategy.get("source_kind") or "") == "runtime_registry":
+            runtime = runtime_statuses.get(
+                str(strategy.get("strategy_key") or "")
+            )
+            if (
+                not isinstance(runtime, dict)
+                or str(runtime.get("status") or "")
+                != "SHADOW_RUN_COMPLETED"
+                or str(runtime.get("strategy_version") or "")
+                != str(strategy.get("current_version") or "")
+                or str(runtime.get("execution_binding_hash") or "")
+                != str(strategy.get("execution_binding_hash") or "")
+                or str(runtime.get("adapter_artifact_sha256") or "")
+                != str(strategy.get("adapter_artifact_sha256") or "")
+                or str(runtime.get("cost_model_hash") or "")
+                != str(strategy.get("cost_model_hash") or "")
+                or runtime.get("run_receipt_valid") is not True
+                or not _HASH_PATTERN.fullmatch(str(
+                    runtime.get("candidate_receipt_hash") or ""
+                ))
+                or not _HASH_PATTERN.fullmatch(str(
+                    runtime.get("candidate_input_hash") or ""
+                ))
+                or not _HASH_PATTERN.fullmatch(str(
+                    runtime.get("candidate_output_hash") or ""
+                ))
+            ):
+                strategy["execution_adapter_executable"] = False
+                strategy["execution_adapter_reason"] = str(
+                    (runtime or {}).get("reason")
+                    or "执行适配器未部署/无效：本次候选生成缺少版本绑定运行证明"
+                )
+                strategy["candidate_run_receipt_valid"] = False
+            else:
+                strategy["candidate_run_receipt_valid"] = True
+                strategy["candidate_receipt_hash"] = str(
+                    runtime.get("candidate_receipt_hash") or ""
+                )
+                strategy["candidate_input_hash"] = str(
+                    runtime.get("candidate_input_hash") or ""
+                )
+                strategy["candidate_output_hash"] = str(
+                    runtime.get("candidate_output_hash") or ""
+                )
         strategy["market_route"] = _strategy_market_route(snapshot, strategy)
 
 
@@ -7155,6 +8135,11 @@ def _metrics_for_registry(
             strategy_key=key,
             strategy_version=str(row["current_version"]),
             version_hash=str(row.get("version_hash") or ""),
+            execution_binding_hash=(
+                str(row.get("execution_binding_hash") or "")
+                if str(row.get("source_kind") or "") == "runtime_registry"
+                else None
+            ),
         )
         try:
             strategy_episodes = _aggregate_forward_intent_episodes(
@@ -7301,6 +8286,15 @@ def _metrics_for_registry(
                         "selection_artifact_hash": metrics.get("artifact_hash"),
                         "strategy_key": key,
                         "strategy_version": row["current_version"],
+                        "execution_binding_hash": str(
+                            row.get("execution_binding_hash") or ""
+                        ),
+                        "adapter_artifact_sha256": str(
+                            row.get("adapter_artifact_sha256") or ""
+                        ),
+                        "cost_model_hash": str(
+                            row.get("cost_model_hash") or ""
+                        ),
                         "window_days": window,
                     })
             elif override is not None:
@@ -7317,6 +8311,15 @@ def _metrics_for_registry(
                     walk_forward_verified=False,
                 )
             metrics["forward_episode_protocol"] = INTENT_EPISODE_PROTOCOL
+            metrics["execution_binding_hash"] = str(
+                row.get("execution_binding_hash") or ""
+            )
+            metrics["adapter_artifact_sha256"] = str(
+                row.get("adapter_artifact_sha256") or ""
+            )
+            metrics["cost_model_hash"] = str(
+                row.get("cost_model_hash") or ""
+            )
             metrics["forward_episode_valid"] = episode_valid
             metrics["forward_episode_reason"] = episode_reason
             metrics["forward_fill_fact_count"] = len(strategy_records)
@@ -7655,6 +8658,9 @@ def toggle_strategy_enabled(
                 _connection=connection,
                 _verified_manual_disable_reenable=verified_manual_reenable,
             )
+        post_transition_status = str(
+            transition.get("next_status") or current_status
+        )
         updated = connection.execute(text(
             """
             UPDATE st_strategy_registry
@@ -7665,7 +8671,7 @@ def toggle_strategy_enabled(
         ), {
             "enabled": 1 if enabled else 0, "key": key,
             "version": str(rows[0].get("current_version") or ""),
-            "current_status": current_status,
+            "current_status": post_transition_status,
             "current_enabled": 1 if current_enabled else 0,
         })
         if updated.rowcount != 1:
@@ -7751,8 +8757,16 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         short_gate = short["profit_gate"]
         short_gate_passed = bool(short_gate["passed"])
         enabled = bool(item.get("enabled"))
+        adapter_executable = item.get("execution_adapter_executable") is True
+        runtime_strategy = (
+            str(item.get("source_kind") or "") == "runtime_registry"
+        )
+        funding_pipeline_ready = bool(
+            not runtime_strategy or item.get("funding_pipeline_ready") is True
+        )
         overall_gate_passed = bool(
-            enabled and short_gate_passed
+            enabled and adapter_executable and funding_pipeline_ready
+            and short_gate_passed
             and medium_gate["passed"] and long_gate["passed"]
         )
         failed_windows = []
@@ -7763,6 +8777,16 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         ))
         if not enabled:
             failed_windows.append("策略已禁用")
+        if not adapter_executable:
+            failed_windows.append(
+                str(item.get("execution_adapter_reason")
+                    or "执行适配器未部署/无效")
+            )
+        if not funding_pipeline_ready:
+            failed_windows.append(str(
+                item.get("funding_pipeline_reason")
+                or "动态策略资金证据闭环尚未部署，仅允许影子研究"
+            ))
         if not short_gate_passed:
             failed_windows.append(
                 "20日近期稳定性"
@@ -7801,8 +8825,19 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
             **item,
             "lane": "正式赛道" if status in {"ACTIVE", "REDUCE"} else "观察赛道" if status == "SHADOW" else "暂停赛道" if status == "SUSPENDED" else "历史档案",
             "ranking_score": ranking_score,
+            "ranking_basis": DAILY_NAV_RANKING_BASIS,
+            "ranking_basis_label": DAILY_NAV_RANKING_BASIS_LABEL,
             "profit_gate_passed": overall_gate_passed,
             "profit_gate_reason": overall_reason,
+            "execution_adapter_executable": adapter_executable,
+            "execution_adapter_reason": str(
+                item.get("execution_adapter_reason")
+                or "执行适配器未部署/无效"
+            ),
+            "funding_pipeline_ready": funding_pipeline_ready,
+            "funding_pipeline_reason": str(
+                item.get("funding_pipeline_reason") or ""
+            ),
             "evidence_block_reasons": evidence_block_reasons,
             "market_route": market_route,
             "market_route_eligible": market_route.get("eligible") is True,
@@ -7816,9 +8851,14 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
             "funding_evidence_revision_at": funding_evidence_revision_at,
             "metrics": {str(window): window_metrics[window] for window in WINDOWS},
             "primary_metrics": primary,
+            "win_rate_pct": primary.get("win_rate_pct"),
+            "payoff_ratio": primary.get("payoff_ratio"),
+            "profit_factor": primary.get("profit_factor"),
+            "net_expectancy_pct": primary.get("net_expectancy_pct"),
             "paper_allocation_eligible": (
                 status in {"ACTIVE", "REDUCE"}
                 and overall_gate_passed
+                and adapter_executable
                 and market_route.get("eligible") is True
             ),
             "real_order_authority": False,
@@ -8328,8 +9368,126 @@ def _internal_combination_portfolio_ledger(
         return {"valid": False, "reason": str(exc)[:500]}
 
 
+def _frozen_industry_snapshot(
+    trade_date: str, stock_codes: Iterable[str],
+) -> dict[str, Any]:
+    """Freeze an as-of industry mapping; missing facts fail replay closed."""
+
+    target = _trade_date(trade_date, default_today=False)
+    codes = sorted({
+        str(code).strip().zfill(6) for code in stock_codes
+        if re.fullmatch(r"[0-9]{1,6}", str(code).strip())
+    })
+    rows_payload: list[dict[str, Any]] = []
+    reason = "append-only行业历史已按治理交易日冻结"
+    status = "COMPLETED"
+    snapshot_id = ""
+    if not codes:
+        status, reason = "INCOMPLETE", "组合没有可冻结的持仓行业暴露"
+    else:
+        try:
+            table_ready = _strict_table_exists(
+                "st_strategy_industry_history"
+            )
+        except Exception:
+            table_ready = False
+    if codes and not table_ready:
+        status, reason = "MISSING", "缺少可按交易日冻结的行业事实表或字段"
+    elif codes:
+        code_params = {
+            f"industry_code_{index}": code
+            for index, code in enumerate(codes)
+        }
+        placeholders = ",".join(f":{key}" for key in code_params)
+        cutoff = (
+            date.fromisoformat(target) + timedelta(days=1)
+        ).isoformat() + "T00:00:00"
+        try:
+            industry_rows = _db_read(
+                "SELECT snapshot_id, trade_date, as_of_exclusive, stock_code, "
+                "industry_name, industry_type, source_system, source_fact_id, "
+                "source_effective_at, source_etl_sync_at, row_hash "
+                "FROM st_strategy_industry_history "
+                f"WHERE stock_code IN ({placeholders}) "
+                "AND trade_date=:industry_trade_date "
+                "AND as_of_exclusive=:industry_cutoff "
+                "ORDER BY stock_code, snapshot_id",
+                {
+                    **code_params,
+                    "industry_trade_date": target,
+                    "industry_cutoff": cutoff,
+                },
+            )
+        except Exception:
+            industry_rows = []
+            status = "INCOMPLETE"
+            reason = "行业快照查询未完成"
+        seen: set[str] = set()
+        snapshot_ids: set[str] = set()
+        for row in industry_rows:
+            code = str(row.get("stock_code") or "").strip().zfill(6)
+            name = str(row.get("industry_name") or "").strip()
+            source_effective_at = _normalize_evidence_revision(
+                row.get("source_effective_at")
+            )
+            source_etl_sync_at = _normalize_evidence_revision(
+                row.get("source_etl_sync_at")
+            )
+            observed_snapshot_id = str(row.get("snapshot_id") or "")
+            row_payload = {
+                "snapshot_id": observed_snapshot_id,
+                "trade_date": target,
+                "as_of_exclusive": cutoff,
+                "stock_code": code,
+                "industry_name": name,
+                "industry_type": str(row.get("industry_type") or ""),
+                "source_system": str(row.get("source_system") or ""),
+                "source_fact_id": str(row.get("source_fact_id") or ""),
+                "source_effective_at": source_effective_at,
+                "source_etl_sync_at": source_etl_sync_at,
+            }
+            if (
+                code not in codes or code in seen or not name
+                or not _HASH_PATTERN.fullmatch(observed_snapshot_id)
+                or not source_effective_at or not source_etl_sync_at
+                or source_effective_at >= cutoff
+                or source_etl_sync_at >= cutoff
+                or _digest(row_payload) != str(row.get("row_hash") or "")
+            ):
+                status = "INVALID"
+                reason = "append-only行业历史存在重复、越界或哈希漂移"
+                continue
+            seen.add(code)
+            snapshot_ids.add(observed_snapshot_id)
+            rows_payload.append({**row_payload, "row_hash": str(row.get("row_hash") or "")})
+        missing = sorted(set(codes) - seen)
+        if missing:
+            status = "INCOMPLETE"
+            reason = "治理交易日前行业快照不完整：" + "、".join(missing)
+        elif len(snapshot_ids) != 1:
+            status = "INVALID"
+            reason = "行业历史同一治理日存在多个snapshot_id"
+        else:
+            snapshot_id = next(iter(snapshot_ids))
+    payload = {
+        "schema": "probiga.governance-industry-snapshot.v2",
+        "snapshot_id": snapshot_id,
+        "trade_date": target,
+        "as_of_exclusive": (
+            date.fromisoformat(target) + timedelta(days=1)
+        ).isoformat() + "T00:00:00",
+        "status": status,
+        "requested_stock_codes": codes,
+        "rows": sorted(rows_payload, key=lambda item: item["stock_code"]),
+        "reason": reason,
+    }
+    return {**payload, "snapshot_hash": _digest(payload)}
+
+
 def _combination_constraint_evaluation(
     combination: dict[str, Any], members: list[dict[str, Any]],
+    *, trade_date: str | None = None,
+    industry_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     constraints = _validated_combination_constraints(
         combination.get("constraints")
@@ -8451,38 +9609,115 @@ def _combination_constraint_evaluation(
         if exposure_sum > 0:
             for code, value in exposures.items():
                 combined_stock[code] += member_weight * value / exposure_sum
+    effective_industry_snapshot = industry_snapshot
+    if effective_industry_snapshot is None and trade_date:
+        effective_industry_snapshot = _frozen_industry_snapshot(
+            trade_date, combined_stock
+        )
+    effective_industry_snapshot = (
+        effective_industry_snapshot
+        if isinstance(effective_industry_snapshot, dict) else {}
+    )
+    snapshot_payload = {
+        str(key): value
+        for key, value in effective_industry_snapshot.items()
+        if str(key) != "snapshot_hash"
+    }
+    expected_industry_codes = sorted(combined_stock)
+    expected_cutoff = (
+        date.fromisoformat(_trade_date(trade_date, default_today=False))
+        + timedelta(days=1)
+    ).isoformat() + "T00:00:00" if trade_date else ""
+    industry_rows = effective_industry_snapshot.get("rows")
+    industry_rows = industry_rows if isinstance(industry_rows, list) else []
+    observed_codes = [
+        str(row.get("stock_code") or "")
+        for row in industry_rows if isinstance(row, dict)
+    ]
+    snapshot_id = str(effective_industry_snapshot.get("snapshot_id") or "")
+    row_contract_valid = bool(industry_rows)
+    for row in industry_rows:
+        if not isinstance(row, dict):
+            row_contract_valid = False
+            break
+        row_hash = str(row.get("row_hash") or "")
+        row_payload = {
+            str(key): value for key, value in row.items()
+            if str(key) != "row_hash"
+        }
+        source_effective = _normalize_evidence_revision(
+            row.get("source_effective_at")
+        )
+        source_sync = _normalize_evidence_revision(
+            row.get("source_etl_sync_at")
+        )
+        if (
+            set(row) != {
+                "snapshot_id", "trade_date", "as_of_exclusive",
+                "stock_code", "industry_name", "industry_type",
+                "source_system", "source_fact_id", "source_effective_at",
+                "source_etl_sync_at", "row_hash",
+            }
+            or str(row.get("snapshot_id") or "") != snapshot_id
+            or str(row.get("trade_date") or "")
+            != _trade_date(trade_date, default_today=False)
+            or str(row.get("as_of_exclusive") or "") != expected_cutoff
+            or not source_effective or not source_sync
+            or source_effective >= expected_cutoff
+            or source_sync >= expected_cutoff
+            or not _HASH_PATTERN.fullmatch(row_hash)
+            or _digest(row_payload) != row_hash
+        ):
+            row_contract_valid = False
+            break
+    industry_snapshot_valid = bool(
+        set(effective_industry_snapshot) == {
+            "schema", "snapshot_id", "trade_date", "as_of_exclusive",
+            "status", "requested_stock_codes", "rows", "reason",
+            "snapshot_hash",
+        }
+        and effective_industry_snapshot.get("schema")
+        == "probiga.governance-industry-snapshot.v2"
+        and
+        effective_industry_snapshot.get("status") == "COMPLETED"
+        and trade_date
+        and str(effective_industry_snapshot.get("trade_date") or "")
+        == _trade_date(trade_date, default_today=False)
+        and _HASH_PATTERN.fullmatch(str(
+            effective_industry_snapshot.get("snapshot_hash") or ""
+        ))
+        and _digest(snapshot_payload)
+        == str(effective_industry_snapshot.get("snapshot_hash") or "")
+        and _HASH_PATTERN.fullmatch(snapshot_id)
+        and str(effective_industry_snapshot.get("as_of_exclusive") or "")
+        == expected_cutoff
+        and effective_industry_snapshot.get("requested_stock_codes")
+        == expected_industry_codes
+        and observed_codes == expected_industry_codes
+        and len(observed_codes) == len(set(observed_codes))
+        and row_contract_valid
+    )
+    industry_by_code = {
+        str(row.get("stock_code") or ""): str(
+            row.get("industry_name") or ""
+        )
+        for row in (effective_industry_snapshot.get("rows") or [])
+        if isinstance(row, dict)
+    } if industry_snapshot_valid else {}
     industry_weights: dict[str, Decimal] = defaultdict(Decimal)
     missing_industry: list[str] = []
-    if combined_stock:
-        code_params = {
-            f"industry_code_{index}": code
-            for index, code in enumerate(sorted(combined_stock))
-        }
-        placeholders = ",".join(f":{key}" for key in code_params)
-        industry_rows = _db_read(
-            "SELECT stock_code, industry_name, etl_sync_at, id "
-            "FROM si_industry_sw "
-            f"WHERE stock_code IN ({placeholders}) "
-            "AND industry_type IN ('L1','一级行业','申万一级','SW2021') "
-            "ORDER BY stock_code, etl_sync_at DESC, id DESC",
-            code_params,
-        )
-        industry_by_code: dict[str, str] = {}
-        for row in industry_rows:
-            code = str(row.get("stock_code") or "")
-            name = str(row.get("industry_name") or "").strip()
-            if code and name and code not in industry_by_code:
-                industry_by_code[code] = name
-        for code, weight in combined_stock.items():
-            industry = industry_by_code.get(code)
-            if industry:
-                industry_weights[industry] += weight
-            else:
-                missing_industry.append(code)
+    for code, weight in combined_stock.items():
+        industry = industry_by_code.get(code)
+        if industry:
+            industry_weights[industry] += weight
+        else:
+            missing_industry.append(code)
     maximum_industry = max(industry_weights.values(), default=Decimal("0"))
     checks.append({
         "name": "单一行业集中度",
         "passed": (
+            industry_snapshot_valid
+            and
             bool(industry_weights)
             and not missing_industry
             and float(maximum_industry * Decimal("100"))
@@ -8491,6 +9726,14 @@ def _combination_constraint_evaluation(
         "actual_pct": round(float(maximum_industry * Decimal("100")), 4),
         "limit_pct": constraints["maximum_industry_weight_pct"],
         "missing_industry_codes": sorted(missing_industry),
+        "industry_snapshot_valid": industry_snapshot_valid,
+        "industry_snapshot_reason": str(
+            effective_industry_snapshot.get("reason")
+            or "缺少治理交易日冻结行业快照"
+        ),
+        "industry_snapshot_hash": str(
+            effective_industry_snapshot.get("snapshot_hash") or ""
+        ),
     })
     payload = {
         "schema": "probiga.combination-constraint-evaluation.v1",
@@ -8500,6 +9743,7 @@ def _combination_constraint_evaluation(
         "checks": checks,
         "pairwise_correlations": pairwise,
         "pairwise_stock_overlaps": stock_overlaps,
+        "industry_snapshot": effective_industry_snapshot,
         "industry_weights_pct": {
             key: round(float(value * Decimal("100")), 4)
             for key, value in sorted(industry_weights.items())
@@ -8522,6 +9766,10 @@ def _combination_rankings(
     by_key = {row["strategy_key"]: row for row in strategies}
     target = date.fromisoformat(trade_date)
     rows = []
+    lane_order = {
+        "ACTIVE": 0, "REDUCE": 0, "SHADOW": 1,
+        "SUSPENDED": 2, "RETIRED": 3,
+    }
     for combo in combinations:
         members = []
         missing = []
@@ -8550,6 +9798,13 @@ def _combination_rankings(
                 "version_match": version_match,
             })
         total = sum(item["weight"] for item in members) or 1.0
+        member_sleeve_risk_multiplier = sum(
+            item["weight"]
+            * LIFECYCLE_RISK_MULTIPLIER.get(
+                str(item["strategy"].get("current_status") or ""), 0.0
+            )
+            for item in members
+        ) / total if members else 0.0
         market_route = _combination_market_route(
             combo, members, version_mismatches, trade_date
         )
@@ -8785,7 +10040,7 @@ def _combination_rankings(
             )
         )
         constraint_evaluation = _combination_constraint_evaluation(
-            combo, members
+            combo, members, trade_date=trade_date
         )
         concentration_penalty = max(0.0, concentration - 0.5) * 20.0
         base_score = independent_health if has_all_independent_evidence else score
@@ -8812,9 +10067,21 @@ def _combination_rankings(
                 item["strategy"]["strategy_key"]: {
                     "frozen": item["frozen_version"],
                     "current": item["strategy"]["current_version"],
+                    "lifecycle_status": str(
+                        item["strategy"].get("current_status") or ""
+                    ),
+                    "lifecycle_risk_multiplier": (
+                        LIFECYCLE_RISK_MULTIPLIER.get(
+                            str(item["strategy"].get("current_status") or ""),
+                            0.0,
+                        )
+                    ),
                 }
                 for item in members
             },
+            "member_sleeve_risk_multiplier": round(
+                member_sleeve_risk_multiplier, 8
+            ),
             "router_decision_hash": market_route["router_decision_hash"],
             "constraint_evaluation_hash": constraint_evaluation[
                 "evaluation_hash"
@@ -8862,10 +10129,30 @@ def _combination_rankings(
         )
         rows.append({
             **combo,
+            "lane": (
+                "正式赛道" if status in {"ACTIVE", "REDUCE"}
+                else "观察赛道" if status == "SHADOW"
+                else "暂停赛道" if status == "SUSPENDED"
+                else "历史档案"
+            ),
             "ranking_score": round(adjusted_score, 2),
-            "member_details": [{"strategy_key": item["strategy"]["strategy_key"], "strategy_name": item["strategy"]["strategy_name"], "strategy_version": item["frozen_version"], "current_strategy_version": item["strategy"]["current_version"], "version_match": item["version_match"], "weight": round(item["weight"] / total, 4), "status_label": item["strategy"]["status_label"], "contribution_score": round(item["weight"] / total * item["strategy"]["ranking_score"], 2)} for item in members],
+            "ranking_basis": DAILY_NAV_RANKING_BASIS,
+            "ranking_basis_label": DAILY_NAV_RANKING_BASIS_LABEL,
+            "member_sleeve_risk_multiplier": round(
+                member_sleeve_risk_multiplier, 8
+            ),
+            "member_sleeve_discount_pct": round(
+                (1.0 - member_sleeve_risk_multiplier) * 100.0, 4
+            ),
+            "member_details": [{"strategy_key": item["strategy"]["strategy_key"], "strategy_name": item["strategy"]["strategy_name"], "strategy_version": item["frozen_version"], "current_strategy_version": item["strategy"]["current_version"], "version_match": item["version_match"], "weight": round(item["weight"] / total, 8), "status_label": item["strategy"]["status_label"], "lifecycle_status": str(item["strategy"].get("current_status") or ""), "lifecycle_risk_multiplier": LIFECYCLE_RISK_MULTIPLIER.get(str(item["strategy"].get("current_status") or ""), 0.0), "effective_weight_after_lifecycle": round(item["weight"] / total * LIFECYCLE_RISK_MULTIPLIER.get(str(item["strategy"].get("current_status") or ""), 0.0), 6), "contribution_score": round(item["weight"] / total * item["strategy"]["ranking_score"], 2)} for item in members],
             "metrics": {str(window): window_metrics[window] for window in WINDOWS},
             "primary_metrics": window_metrics[60],
+            "win_rate_pct": window_metrics[60].get("win_rate_pct"),
+            "payoff_ratio": window_metrics[60].get("payoff_ratio"),
+            "profit_factor": window_metrics[60].get("profit_factor"),
+            "net_expectancy_pct": window_metrics[60].get(
+                "net_expectancy_pct"
+            ),
             "member_aggregate_metrics": member_aggregate,
             "has_independent_evidence": has_all_independent_evidence,
             "profit_gate_passed": profit_gate_passed,
@@ -8899,9 +10186,16 @@ def _combination_rankings(
             "member_version_mismatches": version_mismatches,
             "real_order_authority": False,
         })
-    rows.sort(key=lambda row: (-float(row["ranking_score"]), row["combination_key"]))
+    rows.sort(key=lambda row: (
+        lane_order.get(row["current_status"], 9),
+        -float(row["ranking_score"]),
+        row["combination_key"],
+    ))
+    lane_ranks: dict[str, int] = defaultdict(int)
     for index, row in enumerate(rows, 1):
         row["rank"] = index
+        lane_ranks[row["lane"]] += 1
+        row["lane_rank"] = lane_ranks[row["lane"]]
     return rows
 
 
@@ -8922,14 +10216,196 @@ def governance_input_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
         return False, "底层票池交易日或数据日格式无效"
     if data_day != trade_day:
         return False, "底层票池交易日与数据日不一致"
+    candidate_source = snapshot.get("candidate_source")
+    if not isinstance(candidate_source, dict):
+        return False, "候选源缺少完成证明，不能把空结果视为合法票池"
+    if (
+        str(candidate_source.get("status") or "") != "COMPLETED"
+        or candidate_source.get("query_completed") is not True
+    ):
+        return False, str(
+            candidate_source.get("reason")
+            or "候选源尚未完成，禁止更新生命周期和模拟资金"
+        )
+    source_hash = str(candidate_source.get("source_hash") or "")
+    source_schema = str(candidate_source.get("schema") or "")
+    excluded_source_hash_fields = {"source_hash"}
+    if source_schema == "probiga.strategy-candidate-source.v2":
+        excluded_source_hash_fields.add("dynamic_adapter_receipts")
+    source_payload = {
+        str(key): value
+        for key, value in candidate_source.items()
+        if str(key) not in excluded_source_hash_fields
+    }
+    if (
+        not _HASH_PATTERN.fullmatch(source_hash)
+        or _digest(source_payload) != source_hash
+    ):
+        return False, "候选源完成证明哈希无效"
+    try:
+        source_trade_date = _trade_date(
+            candidate_source.get("trade_date"), default_today=False,
+        )
+        source_data_date = _trade_date(
+            candidate_source.get("data_date"), default_today=False,
+        )
+    except ValueError:
+        return False, "候选源完成证明日期无效"
+    if source_trade_date != trade_day or source_data_date != data_day:
+        return False, "候选源完成证明与治理交易日不一致"
+    candidates = snapshot.get("candidates")
+    if not isinstance(candidates, list):
+        return False, "候选源结果不是列表"
+    if (
+        _int(candidate_source.get("source_row_count"), -1) < 0
+        or _int(candidate_source.get("loaded_row_count"), -1) < 0
+        or _int(candidate_source.get("loaded_row_count"), -1)
+        != _int(candidate_source.get("source_row_count"), -2)
+        or _int(candidate_source.get("candidate_count"), -1)
+        != len(candidates)
+    ):
+        return False, "候选源完成证明行数与实际票池不一致"
+    loaded_rows_hash = str(candidate_source.get("loaded_rows_hash") or "")
+    if not _HASH_PATTERN.fullmatch(loaded_rows_hash):
+        return False, "候选源完成证明缺少完整明细哈希"
+    actual_identity = sorted({
+        str(item.get("stock_code") or "").strip().zfill(6)
+        for item in candidates if isinstance(item, dict)
+        and str(item.get("stock_code") or "").strip()
+    })
+    declared_identity = candidate_source.get("candidate_identity")
+    if (
+        not isinstance(declared_identity, list)
+        or [str(value) for value in declared_identity] != actual_identity
+    ):
+        return False, "候选源完成证明证券身份与实际票池不一致"
+    runtime_statuses = [
+        item for item in (snapshot.get("dynamic_adapter_statuses") or [])
+        if isinstance(item, dict)
+        and str(item.get("strategy_key") or "")
+        and str(item.get("adapter_capability_status") or "")
+        == "RESEARCH_READY"
+        and item.get("enabled") is True
+        and str(item.get("lifecycle_status") or "")
+        not in {"RETIRED", "SUSPENDED"}
+    ]
+    receipts = candidate_source.get("dynamic_adapter_receipts")
+    if runtime_statuses:
+        if not isinstance(receipts, list) or len(receipts) != len(runtime_statuses):
+            return False, "动态策略候选源缺少逐策略运行回执"
+        results = candidate_source.get("dynamic_adapter_results")
+        results_hash = str(
+            candidate_source.get("dynamic_adapter_results_hash") or ""
+        )
+        if (
+            source_schema != "probiga.strategy-candidate-source.v2"
+            or not isinstance(results, list)
+            or len(results) != len(runtime_statuses)
+            or not _HASH_PATTERN.fullmatch(results_hash)
+            or _digest(results) != results_hash
+        ):
+            return False, "动态策略候选稳定结果集合哈希无效"
+        by_identity = {
+            (
+                str(item.get("strategy_key") or ""),
+                str(item.get("strategy_version") or ""),
+            ): item
+            for item in receipts if isinstance(item, dict)
+        }
+        for runtime in runtime_statuses:
+            identity = (
+                str(runtime.get("strategy_key") or ""),
+                str(runtime.get("strategy_version") or ""),
+            )
+            receipt = by_identity.get(identity)
+            if not isinstance(receipt, dict):
+                return False, "动态策略候选运行回执身份缺失"
+            try:
+                verified_receipt = validate_strategy_adapter_run_receipt(receipt)
+            except ValueError:
+                return False, "动态策略CandidateBatch运行回执无效或字段不精确"
+            receipt_hash = str(verified_receipt.get("receipt_hash") or "")
+            result = next((
+                item for item in results
+                if isinstance(item, dict)
+                and str(item.get("strategy_key") or "") == identity[0]
+                and str(item.get("strategy_version") or "") == identity[1]
+            ), None)
+            if (
+                not isinstance(result, dict)
+                or receipt_hash != str(runtime.get("candidate_receipt_hash") or "")
+                or str(receipt.get("execution_binding_hash") or "")
+                != str(runtime.get("execution_binding_hash") or "")
+                or str(receipt.get("adapter_artifact_sha256") or "")
+                != str(runtime.get("adapter_artifact_sha256") or "")
+                or str(receipt.get("cost_model_hash") or "")
+                != str(runtime.get("cost_model_hash") or "")
+                or str(receipt.get("trade_date") or "") != trade_day
+                or str(receipt.get("input_hash") or "")
+                != str(result.get("candidate_input_hash") or "")
+                or str(receipt.get("output_hash") or "")
+                != str(result.get("candidate_output_hash") or "")
+                or str(receipt.get("stable_result_hash") or "")
+                != str(result.get("candidate_stable_result_hash") or "")
+                or _int(receipt.get("candidate_count"), -1)
+                != _int(result.get("candidate_count"), -2)
+            ):
+                return False, "动态策略CandidateBatch运行回执无效或身份不一致"
     return True, "底层票池数据新鲜且日期一致"
 
 
-def _snapshot_trading_allowed(snapshot: dict[str, Any]) -> bool:
-    ready, _ = governance_input_ready(snapshot)
+def _snapshot_trading_gate(snapshot: dict[str, Any]) -> dict[str, Any]:
+    ready, input_reason = governance_input_ready(snapshot)
     gate = snapshot.get("global_gate")
-    gate_status = str(gate.get("status") or "") if isinstance(gate, dict) else ""
-    return ready and gate_status == "ALLOW_NEW_BUY"
+    gate_status = (
+        str(gate.get("status") or "").upper()
+        if isinstance(gate, dict) else "MISSING"
+    )
+    gate_reason = (
+        str(gate.get("reason") or "")
+        if isinstance(gate, dict) else "缺少全局市场门禁"
+    )
+    market = snapshot.get("market_state")
+    market = market if isinstance(market, dict) else {}
+    market_state = str(market.get("key") or "unknown")
+    risk_cap = MARKET_RISK_CAP_PCT.get(market_state, 0.0)
+    allowed_statuses = {"ALLOW_NEW_BUY", "REDUCE_NEW_BUY"}
+    trading_allowed = bool(
+        ready and gate_status in allowed_statuses and risk_cap > 0
+    )
+    if not ready:
+        reason = input_reason
+    elif gate_status not in allowed_statuses:
+        reason = gate_reason or f"全局门禁{gate_status or 'MISSING'}阻断新增模拟资金"
+    elif risk_cap <= 0:
+        reason = "当前市场状态风险上限为0，禁止新增模拟资金"
+    elif gate_status == "REDUCE_NEW_BUY":
+        reason = f"市场降权门禁允许模拟资金候选，总风险上限{risk_cap:.2f}%"
+    else:
+        reason = f"市场门禁允许模拟资金候选，总风险上限{risk_cap:.2f}%"
+    return {
+        "schema": "probiga.strategy-trading-gate.v1",
+        "status": gate_status,
+        "status_label": (
+            "降权允许新增模拟资金"
+            if gate_status == "REDUCE_NEW_BUY"
+            else "允许新增模拟资金"
+            if gate_status == "ALLOW_NEW_BUY"
+            else "禁止新增模拟资金"
+        ),
+        "input_ready": ready,
+        "trading_allowed": trading_allowed,
+        "market_state": market_state,
+        "market_risk_cap_pct": risk_cap,
+        "reason": reason,
+        "candidate_source_hash": str(
+            (snapshot.get("candidate_source") or {}).get("source_hash") or ""
+        ),
+    }
+
+
+def _snapshot_trading_allowed(snapshot: dict[str, Any]) -> bool:
+    return _snapshot_trading_gate(snapshot)["trading_allowed"] is True
 
 
 def _pool_score_text(value: Any) -> str | None:
@@ -8985,6 +10461,17 @@ def _pool_runtime_row_contract(
         "dominant_strategy": str(row.get("dominant_strategy") or ""),
         "strategies": [str(value) for value in strategies],
         "industry_name": str(row.get("industry_name") or ""),
+        "industry_names": sorted({
+            str(value) for value in (row.get("industry_names") or [])
+            if str(value)
+        }),
+        "industry_by_strategy": {
+            str(key): str(value)
+            for key, value in sorted(
+                (row.get("industry_by_strategy") or {}).items()
+            )
+            if str(key) and str(value)
+        },
         "gate_status": str(row.get("gate_status") or "观察"),
         "reason": reason,
         "evidence": evidence,
@@ -9102,17 +10589,56 @@ def _automatic_transition_plan_contract(
     return payload, _digest(payload)
 
 
-def _build_pools(snapshot: dict[str, Any], strategies: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _build_pools(
+    snapshot: dict[str, Any], strategies: list[dict[str, Any]],
+) -> dict[str, Any]:
     strategy_map = {row["strategy_key"]: row for row in strategies}
-    trading_allowed = _snapshot_trading_allowed(snapshot)
+    trading_gate = _snapshot_trading_gate(snapshot)
+    trading_allowed = trading_gate["trading_allowed"] is True
     observation = []
     confirmation = []
     tradable = []
     for candidate in snapshot.get("candidates") or []:
-        keys = [str(key) for key in candidate.get("strategies") or []]
+        raw_keys = [str(key) for key in candidate.get("strategies") or []]
+        keys = list(dict.fromkeys(raw_keys))
+        # Candidate-level scores/status/reason may have been aggregated from
+        # every raw contributor.  Silently deleting an ineligible contributor
+        # while retaining those aggregate fields would let a suspended or
+        # forged strategy lend its confidence/payoff to an active strategy.
+        # Without a separately hash-bound per-signal recomputation, the whole
+        # contaminated candidate must therefore stay out of every pool.
+        if not keys or any(
+            key not in strategy_map
+            or strategy_map[key].get("execution_adapter_executable") is not True
+            or strategy_map[key].get("enabled") is not True
+            or str(strategy_map[key].get("current_status") or "")
+            not in {"ACTIVE", "REDUCE", "SHADOW"}
+            for key in keys
+        ):
+            continue
         member_rows = [strategy_map[key] for key in keys if key in strategy_map]
-        dominant_key = str(candidate.get("dominant_strategy") or (keys[0] if keys else ""))
+        dominant_key = str(candidate.get("dominant_strategy") or "")
+        if dominant_key not in keys:
+            dominant_key = keys[0]
         dominant_row = strategy_map.get(dominant_key)
+        raw_industry_by_strategy = candidate.get("industry_by_strategy")
+        raw_industry_by_strategy = (
+            raw_industry_by_strategy
+            if isinstance(raw_industry_by_strategy, dict) else {}
+        )
+        industry_by_strategy = {
+            key: str(raw_industry_by_strategy.get(key) or "").strip()
+            for key in keys
+            if str(raw_industry_by_strategy.get(key) or "").strip()
+        }
+        fallback_industry = str(
+            candidate.get("industry_name") or candidate.get("industry")
+            or candidate.get("theme_code") or ""
+        ).strip()
+        for key in keys:
+            if key not in industry_by_strategy and fallback_industry:
+                industry_by_strategy[key] = fallback_industry
+        industry_names = sorted(set(industry_by_strategy.values()))
         best_health = float(dominant_row["ranking_score"]) if dominant_row else 0.0
         confidence = _num(candidate.get("model_confidence"), 0.0) or 0.0
         risk_reward = _num(candidate.get("risk_reward_ratio"), None)
@@ -9129,7 +10655,9 @@ def _build_pools(snapshot: dict[str, Any], strategies: list[dict[str, Any]]) -> 
                 str(dominant_row.get("strategy_name") or dominant_key)
                 if dominant_row else dominant_key
             ),
-            "industry_name": candidate.get("industry_name") or candidate.get("industry") or "",
+            "industry_name": candidate.get("industry_name") or candidate.get("industry") or candidate.get("theme_code") or "",
+            "industry_names": industry_names,
+            "industry_by_strategy": industry_by_strategy,
             "opportunity_score": opportunity,
             "execution_score": execution,
             "model_confidence": candidate.get("model_confidence"),
@@ -9137,7 +10665,7 @@ def _build_pools(snapshot: dict[str, Any], strategies: list[dict[str, Any]]) -> 
             "final_status": final_status,
             "blocking_reasons": blocking,
             "reason": candidate.get("today_signal") or candidate.get("conflict_summary") or "等待验证",
-            "evidence": {"data_date": candidate.get("data_date"), "risk_level": candidate.get("risk_level"), "source_status": snapshot.get("source_status")},
+            "evidence": {"data_date": candidate.get("data_date"), "risk_level": candidate.get("risk_level"), "source_status": snapshot.get("source_status"), "trading_gate_status": trading_gate["status"], "market_risk_cap_pct": trading_gate["market_risk_cap_pct"], "candidate_source_hash": trading_gate["candidate_source_hash"]},
             "real_order_authority": False,
         }
         observation.append(row)
@@ -9150,12 +10678,27 @@ def _build_pools(snapshot: dict[str, Any], strategies: list[dict[str, Any]]) -> 
             dominant_row and dominant_row["paper_allocation_eligible"]
         )
         if trading_allowed and final_status == "READY" and dominant_eligible and all_signal_strategies_eligible and not blocking and risk_reward is not None and risk_reward >= PROFIT_GATE_POLICY["minimum_payoff_ratio"]:
-            tradable.append({**row, "gate_status": "模拟资金候选", "paper_allocation_eligible": True})
+            tradable.append({
+                **row,
+                "gate_status": (
+                    "降权模拟资金候选"
+                    if trading_gate["status"] == "REDUCE_NEW_BUY"
+                    else "模拟资金候选"
+                ),
+                "market_gate_status": trading_gate["status"],
+                "market_risk_cap_pct": trading_gate["market_risk_cap_pct"],
+                "paper_allocation_eligible": True,
+            })
     for pool in (observation, confirmation, tradable):
         pool.sort(key=lambda row: (-float(row["opportunity_score"]), -float(row["execution_score"]), str(row["stock_code"])))
         for index, row in enumerate(pool, 1):
             row["rank"] = index
-    return {"observation": observation, "confirmation": confirmation, "tradable": tradable}
+    return {
+        "observation": observation,
+        "confirmation": confirmation,
+        "tradable": tradable,
+        "trading_gate": trading_gate,
+    }
 
 
 def _allocation_candidate_contract(
@@ -9180,6 +10723,13 @@ def _allocation_candidate_contract(
             "enabled": bool(row.get("enabled")),
             "funding_gate_hash": row["funding_gate_hash"],
             "ranking_score": round(float(row["ranking_score"]), 4),
+            "ranking_basis": str(
+                row.get("ranking_basis") or DAILY_NAV_RANKING_BASIS
+            ),
+            "ranking_basis_label": str(
+                row.get("ranking_basis_label")
+                or DAILY_NAV_RANKING_BASIS_LABEL
+            ),
             "profit_gate_passed": bool(row.get("profit_gate_passed")),
             "paper_allocation_eligible": bool(
                 row.get("paper_allocation_eligible")
@@ -9195,13 +10745,54 @@ def _allocation_candidate_contract(
             "lifecycle_status_label": LIFECYCLE_LABELS.get(
                 str(row.get("current_status") or ""), "未知状态"
             ),
-            "lifecycle_risk_multiplier": LIFECYCLE_RISK_MULTIPLIER.get(
-                str(row.get("current_status") or ""), 0.0
+            "combination_lifecycle_risk_multiplier": (
+                LIFECYCLE_RISK_MULTIPLIER.get(
+                    str(row.get("current_status") or ""), 0.0
+                )
+            ),
+            "member_sleeve_risk_multiplier": round(
+                _num(row.get("member_sleeve_risk_multiplier"), 0.0)
+                or 0.0,
+                8,
+            ),
+            "lifecycle_risk_multiplier": round(
+                LIFECYCLE_RISK_MULTIPLIER.get(
+                    str(row.get("current_status") or ""), 0.0
+                )
+                * (
+                    _num(row.get("member_sleeve_risk_multiplier"), 0.0)
+                    or 0.0
+                ),
+                8,
             ),
             "constraint_passed": (
                 (row.get("constraint_evaluation") or {}).get("passed")
                 is True
             ),
+            "member_sleeves_source": [
+                {
+                    "strategy_key": str(item.get("strategy_key") or ""),
+                    "strategy_version": str(
+                        item.get("strategy_version") or ""
+                    ),
+                    "current_strategy_version": str(
+                        item.get("current_strategy_version") or ""
+                    ),
+                    "version_match": item.get("version_match") is True,
+                    "original_weight": round(
+                        _num(item.get("weight"), 0.0) or 0.0, 8
+                    ),
+                    "member_lifecycle_status": str(
+                        item.get("lifecycle_status") or ""
+                    ),
+                    "member_lifecycle_multiplier": round(
+                        _num(item.get("lifecycle_risk_multiplier"), 0.0)
+                        or 0.0,
+                        8,
+                    ),
+                }
+                for item in (row.get("member_details") or [])
+            ],
         })
     for row in strategies:
         route = row.get("market_route") or {}
@@ -9213,6 +10804,13 @@ def _allocation_candidate_contract(
             "enabled": bool(row.get("enabled")),
             "funding_gate_hash": row["funding_gate_hash"],
             "ranking_score": round(float(row["ranking_score"]), 4),
+            "ranking_basis": str(
+                row.get("ranking_basis") or DAILY_NAV_RANKING_BASIS
+            ),
+            "ranking_basis_label": str(
+                row.get("ranking_basis_label")
+                or DAILY_NAV_RANKING_BASIS_LABEL
+            ),
             "profit_gate_passed": bool(row.get("profit_gate_passed")),
             "paper_allocation_eligible": bool(
                 row.get("paper_allocation_eligible")
@@ -9237,10 +10835,190 @@ def _allocation_candidate_contract(
     return candidates
 
 
+def _largest_remainder_basis_points(
+    total_basis_points: int,
+    weighted_keys: list[tuple[str, Decimal]],
+) -> dict[str, int]:
+    """Allocate an integer bp budget deterministically with exact conservation."""
+
+    if total_basis_points < 0 or not weighted_keys:
+        raise ValueError("逐成员袖套bp预算或权重无效")
+    total_weight = sum((weight for _key, weight in weighted_keys), Decimal("0"))
+    if not total_weight.is_finite() or total_weight <= 0:
+        raise ValueError("逐成员袖套权重合计无效")
+    raw = {
+        key: Decimal(total_basis_points) * weight / total_weight
+        for key, weight in weighted_keys
+    }
+    assigned = {key: int(value) for key, value in raw.items()}
+    remainder = total_basis_points - sum(assigned.values())
+    order = sorted(
+        raw,
+        key=lambda key: (-(raw[key] - Decimal(assigned[key])), key),
+    )
+    for key in order[:remainder]:
+        assigned[key] += 1
+    if sum(assigned.values()) != total_basis_points:
+        raise RuntimeError("逐成员袖套base bp未守恒")
+    return assigned
+
+
+def _combination_member_sleeve_contract(
+    row: dict[str, Any], base_basis_points: int,
+) -> tuple[list[dict[str, Any]], str, int, int]:
+    sources = row.get("member_sleeves_source")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("组合分配缺少逐成员袖套来源")
+    identities: set[str] = set()
+    weighted: list[tuple[str, Decimal]] = []
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in sources:
+        key = str(item.get("strategy_key") or "")
+        weight = Decimal(str(item.get("original_weight") or "0"))
+        if (
+            not key
+            or key in identities
+            or not weight.is_finite()
+            or weight <= 0
+            or item.get("version_match") is not True
+        ):
+            raise ValueError("组合逐成员袖套身份、版本或权重无效")
+        identities.add(key)
+        weighted.append((key, weight))
+        by_key[key] = item
+    base_by_key = _largest_remainder_basis_points(base_basis_points, weighted)
+    combination_status = str(row.get("lifecycle_status") or "")
+    combination_multiplier = Decimal(str(
+        LIFECYCLE_RISK_MULTIPLIER.get(combination_status, 0.0)
+    ))
+    sleeves: list[dict[str, Any]] = []
+    effective_total = 0
+    for key in sorted(base_by_key):
+        source = by_key[key]
+        member_status = str(source.get("member_lifecycle_status") or "")
+        member_multiplier = Decimal(str(
+            LIFECYCLE_RISK_MULTIPLIER.get(member_status, 0.0)
+        ))
+        declared_member_multiplier = Decimal(str(
+            source.get("member_lifecycle_multiplier") or "0"
+        ))
+        if declared_member_multiplier != member_multiplier:
+            raise ValueError("组合逐成员生命周期倍率与冻结枚举不一致")
+        base_bp = base_by_key[key]
+        effective_bp = int(
+            (
+                Decimal(base_bp)
+                * member_multiplier
+                * combination_multiplier
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN)
+        )
+        if effective_bp < 0 or effective_bp > base_bp:
+            raise ValueError("组合逐成员有效bp越界")
+        effective_total += effective_bp
+        sleeve_row = {
+            "strategy_key": key,
+            "strategy_version": str(source.get("strategy_version") or ""),
+            "current_strategy_version": str(
+                source.get("current_strategy_version") or ""
+            ),
+            "original_weight": format(
+                Decimal(str(source.get("original_weight") or "0")), ".8f"
+            ),
+            "configured_weight_pct": round(
+                float(Decimal(str(source.get("original_weight") or "0")) * 100),
+                8,
+            ),
+            "base_bp": base_bp,
+            "base_weight_pct": base_bp / 100.0,
+            "member_lifecycle_status": member_status,
+            "member_lifecycle_multiplier": format(member_multiplier, ".8f"),
+            "member_multiplier": float(member_multiplier),
+            "combination_lifecycle_status": combination_status,
+            "combination_lifecycle_multiplier": format(
+                combination_multiplier, ".8f"
+            ),
+            "combination_multiplier": float(combination_multiplier),
+            "effective_bp": effective_bp,
+            "effective_weight_pct": effective_bp / 100.0,
+            "cash_discount_bp": base_bp - effective_bp,
+            "discount_to_cash_pct": (base_bp - effective_bp) / 100.0,
+        }
+        sleeves.append({
+            **sleeve_row,
+            "sleeve_row_hash": _digest({
+                "schema": "probiga.strategy-combination-member-sleeve-row.v1",
+                **sleeve_row,
+            }),
+        })
+    cash_discount_bp = base_basis_points - effective_total
+    if (
+        sum(item["base_bp"] for item in sleeves) != base_basis_points
+        or sum(item["effective_bp"] for item in sleeves) != effective_total
+        or sum(item["cash_discount_bp"] for item in sleeves)
+        != cash_discount_bp
+    ):
+        raise RuntimeError("组合逐成员袖套未满足1bp守恒")
+    payload = {
+        "schema": "probiga.strategy-combination-member-sleeves.v1",
+        "combination_key": str(row.get("target_key") or ""),
+        "combination_version": str(row.get("target_version") or ""),
+        "base_bp": base_basis_points,
+        "effective_bp": effective_total,
+        "cash_discount_bp": cash_discount_bp,
+        "members": sleeves,
+    }
+    return sleeves, _digest(payload), effective_total, cash_discount_bp
+
+
+def _attach_pool_industry_focus(
+    strategies: list[dict[str, Any]], pools: dict[str, Any],
+) -> None:
+    """Aggregate visible stock-pool industries onto each strategy rank row."""
+
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    total: dict[str, int] = defaultdict(int)
+    for pool_row in pools.get("observation") or []:
+        for key in {
+            str(value) for value in (pool_row.get("strategies") or [])
+            if str(value)
+        }:
+            by_strategy = pool_row.get("industry_by_strategy")
+            by_strategy = by_strategy if isinstance(by_strategy, dict) else {}
+            industry = str(
+                by_strategy.get(key)
+                or pool_row.get("industry_name")
+                or "未分类"
+            ).strip()
+            counts[key][industry] += 1
+            total[key] += 1
+    for strategy in strategies:
+        key = str(strategy.get("strategy_key") or "")
+        denominator = total.get(key, 0)
+        focus = [
+            {
+                "industry_name": industry,
+                "candidate_count": count,
+                "candidate_share_pct": round(
+                    count / denominator * 100.0, 2
+                ) if denominator else 0.0,
+            }
+            for industry, count in sorted(
+                counts.get(key, {}).items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        strategy["industry_candidate_count"] = denominator
+        strategy["industry_focus"] = focus
+        strategy["primary_industry"] = (
+            focus[0]["industry_name"] if focus else "暂无票池行业"
+        )
+
+
 def _allocation(
     strategies: list[dict[str, Any]], combinations: list[dict[str, Any]],
     market_state: str, *, trading_allowed: bool,
     candidate_contract: list[dict[str, Any]] | None = None,
+    trading_gate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     contract = (
         candidate_contract
@@ -9255,6 +11033,13 @@ def _allocation(
             "funding_gate_hash": row["funding_gate_hash"],
             "name": row["target_name"],
             "score": row["ranking_score"],
+            "ranking_basis": str(
+                row.get("ranking_basis") or DAILY_NAV_RANKING_BASIS
+            ),
+            "ranking_basis_label": str(
+                row.get("ranking_basis_label")
+                or DAILY_NAV_RANKING_BASIS_LABEL
+            ),
             "market_state": row["market_state"],
             "market_match_score": row["market_match_score"],
             "router_decision_hash": row["router_decision_hash"],
@@ -9264,68 +11049,148 @@ def _allocation(
             "lifecycle_risk_multiplier": row[
                 "lifecycle_risk_multiplier"
             ],
+            "member_sleeves_source": row.get("member_sleeves_source") or [],
         }
         for row in contract
-        if row.get("paper_allocation_eligible") is True
+        if (
+            row.get("paper_allocation_eligible") is True
+            and row.get("enabled") is True
+            and row.get("profit_gate_passed") is True
+            and row.get("market_route_eligible") is True
+            and str(row.get("lifecycle_status") or "")
+            in {"ACTIVE", "REDUCE"}
+            and (
+                row.get("target_type") != "COMBINATION"
+                or row.get("constraint_passed") is True
+            )
+        )
     ]
-    # A combination and any of its member sleeves may not receive capital in
-    # the same snapshot.  The higher regime-adjusted score wins deterministically.
-    candidates.sort(key=lambda row: (
-        -float(row["score"]) * float(row["market_match_score"]) / 100.0,
-        row["target_type"], row["target_key"],
-    ))
-    selected: list[dict[str, Any]] = []
+    candidates = [
+        row for row in candidates
+        if row["ranking_basis"] == DAILY_NAV_RANKING_BASIS
+    ]
+    # Strategies and combinations compete only inside their own fixed lane.
+    # This avoids comparing raw scores across different portfolio objects.
+    # A selected combination owns its member exposures by explicit policy;
+    # member strategies are not selected again in the strategy lane.
+    combinations_lane = sorted(
+        (row for row in candidates if row["target_type"] == "COMBINATION"),
+        key=lambda row: (
+            -float(row["score"]) * float(row["market_match_score"]) / 100.0,
+            row["target_key"],
+        ),
+    )
+    strategies_lane = sorted(
+        (row for row in candidates if row["target_type"] == "STRATEGY"),
+        key=lambda row: (
+            -float(row["score"]) * float(row["market_match_score"]) / 100.0,
+            row["target_key"],
+        ),
+    )
+    selected_combinations: list[dict[str, Any]] = []
     used_exposures: set[str] = set()
-    for row in candidates:
+    for row in combinations_lane:
         exposures = set(row["exposure_keys"])
         if not exposures or exposures.intersection(used_exposures):
             continue
-        selected.append(row)
+        selected_combinations.append(row)
         used_exposures.update(exposures)
-    candidates = selected
+    selected_strategies = [
+        row for row in strategies_lane
+        if set(row["exposure_keys"])
+        and not set(row["exposure_keys"]).intersection(used_exposures)
+    ]
+    candidates = selected_combinations + selected_strategies
     cap = MARKET_RISK_CAP_PCT.get(market_state, 0.0)
+    gate_status = str((trading_gate or {}).get("status") or "")
+    gate_reason = str((trading_gate or {}).get("reason") or "")
     if not trading_allowed or not candidates or cap <= 0:
-        return [{"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": 100.0, "reason": "没有策略或组合同时通过盈利硬门槛与当前市场状态门槛", "real_order_authority": False}]
-    total = sum(
-        max(0.0001, float(row["score"]) * float(row["market_match_score"]) / 100.0)
-        for row in candidates
-    )
+        return [{"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": gate_reason or "没有策略或组合同时通过盈利硬门槛与当前市场状态门槛", "real_order_authority": False}]
     cap_basis_points = int(round(cap * 100))
-    raw_basis_points = [
-        cap_basis_points
-        * max(0.0001, float(row["score"]) * float(row["market_match_score"]) / 100.0)
-        / total
+    nonempty_lanes = [
+        lane for lane in (selected_combinations, selected_strategies) if lane
+    ]
+    lane_base = cap_basis_points // len(nonempty_lanes)
+    lane_remainder = cap_basis_points - lane_base * len(nonempty_lanes)
+    assigned_by_identity: dict[tuple[str, str], int] = {}
+    for lane_index, lane in enumerate(nonempty_lanes):
+        lane_budget = lane_base + (1 if lane_index < lane_remainder else 0)
+        lane_total = sum(
+            max(
+                0.0001,
+                float(row["score"])
+                * float(row["market_match_score"]) / 100.0,
+            )
+            for row in lane
+        )
+        raw_lane = [
+            lane_budget
+            * max(
+                0.0001,
+                float(row["score"])
+                * float(row["market_match_score"]) / 100.0,
+            )
+            / lane_total
+            for row in lane
+        ]
+        assigned_lane = [int(value) for value in raw_lane]
+        remainder = lane_budget - sum(assigned_lane)
+        order = sorted(
+            range(len(lane)),
+            key=lambda index: (
+                -(raw_lane[index] - assigned_lane[index]),
+                lane[index]["target_key"],
+            ),
+        )
+        for index in order[:remainder]:
+            assigned_lane[index] += 1
+        for row, basis_points in zip(lane, assigned_lane):
+            assigned_by_identity[(row["target_type"], row["target_key"])] = (
+                basis_points
+            )
+    assigned = [
+        assigned_by_identity[(row["target_type"], row["target_key"])]
         for row in candidates
     ]
-    assigned = [int(value) for value in raw_basis_points]
-    remainder = cap_basis_points - sum(assigned)
-    order = sorted(
-        range(len(candidates)),
-        key=lambda index: (-(raw_basis_points[index] - assigned[index]), candidates[index]["target_key"]),
-    )
-    for index in order[:remainder]:
-        assigned[index] += 1
     result = []
     assigned_after_lifecycle = 0
     for row, base_basis_points in zip(candidates, assigned):
-        lifecycle_multiplier = Decimal(str(
-            row.get("lifecycle_risk_multiplier") or "0"
-        ))
-        basis_points = int(
-            (Decimal(base_basis_points) * lifecycle_multiplier).quantize(
-                Decimal("1"), rounding=ROUND_HALF_EVEN
+        member_sleeves: list[dict[str, Any]] = []
+        member_sleeve_hash = ""
+        if row["target_type"] == "COMBINATION":
+            (
+                member_sleeves,
+                member_sleeve_hash,
+                basis_points,
+                cash_discount_bp,
+            ) = _combination_member_sleeve_contract(row, base_basis_points)
+            lifecycle_multiplier = (
+                Decimal(basis_points) / Decimal(base_basis_points)
+                if base_basis_points > 0 else Decimal("0")
             )
-        )
+        else:
+            lifecycle_multiplier = Decimal(str(
+                row.get("lifecycle_risk_multiplier") or "0"
+            ))
+            basis_points = int(
+                (Decimal(base_basis_points) * lifecycle_multiplier).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_EVEN
+                )
+            )
+            cash_discount_bp = base_basis_points - basis_points
         if basis_points <= 0:
             continue
         assigned_after_lifecycle += basis_points
-        public_row = {key: value for key, value in row.items() if key != "exposure_keys"}
+        public_row = {
+            key: value for key, value in row.items()
+            if key not in {"exposure_keys", "member_sleeves_source"}
+        }
         lifecycle_reason = (
-            "；处于降权运行，竞争预算按50%折扣且折扣资金留在现金"
+            "；组合状态或成员袖套处于降权运行，折扣资金留在现金"
             if lifecycle_multiplier < Decimal("1") else ""
         )
-        result.append({**public_row, "simulated_weight_pct": basis_points / 100.0, "base_competitive_weight_pct": base_basis_points / 100.0, "reason": f"盈利门槛通过且适配{market_state}，按健康分与路由匹配度竞争分配{lifecycle_reason}", "real_order_authority": False})
-    result.append({"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": (10_000 - assigned_after_lifecycle) / 100.0, "reason": "当前市场风险预算及生命周期降权折扣资金保留", "real_order_authority": False})
+        result.append({**public_row, "allocation_type_lane_policy": ALLOCATION_TYPE_LANE_POLICY, "simulated_weight_pct": basis_points / 100.0, "base_competitive_weight_pct": base_basis_points / 100.0, "member_sleeves": member_sleeves, "member_sleeve_hash": member_sleeve_hash, "cash_discount_bp": cash_discount_bp, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": f"盈利门槛通过且适配{market_state}，在同类型日频净值赛道内按健康分与路由匹配度分配；全局风险上限{cap:.2f}%{lifecycle_reason}", "real_order_authority": False})
+    result.append({"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": (10_000 - assigned_after_lifecycle) / 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": "当前市场风险预算及生命周期降权折扣资金保留", "real_order_authority": False})
     return result
 
 
@@ -9334,8 +11199,149 @@ def _allocation_snapshot_contract(
 ) -> list[dict[str, Any]]:
     rows = []
     for row in allocations:
+        target_type = str(row.get("target_type") or "")
+        base_bp = int(round(
+            (_num(row.get("base_competitive_weight_pct"), 0.0) or 0.0)
+            * 100
+        ))
+        effective_bp = int(round(
+            (_num(row.get("simulated_weight_pct"), 0.0) or 0.0) * 100
+        ))
+        cash_discount_bp = _int(row.get("cash_discount_bp"), 0)
+        member_sleeves = row.get("member_sleeves") or []
+        member_sleeve_hash = str(row.get("member_sleeve_hash") or "")
+        if target_type == "COMBINATION":
+            expected_sleeve_fields = {
+                "strategy_key", "strategy_version", "current_strategy_version",
+                "original_weight", "configured_weight_pct", "base_bp",
+                "base_weight_pct", "member_lifecycle_status",
+                "member_lifecycle_multiplier", "member_multiplier",
+                "combination_lifecycle_status",
+                "combination_lifecycle_multiplier", "combination_multiplier",
+                "effective_bp", "effective_weight_pct", "cash_discount_bp",
+                "discount_to_cash_pct", "sleeve_row_hash",
+            }
+            sleeve_payload = {
+                "schema": "probiga.strategy-combination-member-sleeves.v1",
+                "combination_key": str(row.get("target_key") or ""),
+                "combination_version": str(row.get("target_version") or ""),
+                "base_bp": base_bp,
+                "effective_bp": effective_bp,
+                "cash_discount_bp": cash_discount_bp,
+                "members": member_sleeves,
+            }
+            if (
+                not isinstance(member_sleeves, list)
+                or not member_sleeves
+                or not _HASH_PATTERN.fullmatch(member_sleeve_hash)
+                or _digest(sleeve_payload) != member_sleeve_hash
+                or sum(_int(item.get("base_bp"), -1) for item in member_sleeves)
+                != base_bp
+                or sum(_int(item.get("effective_bp"), -1) for item in member_sleeves)
+                != effective_bp
+                or sum(_int(item.get("cash_discount_bp"), -1) for item in member_sleeves)
+                != cash_discount_bp
+                or effective_bp + cash_discount_bp != base_bp
+                or [
+                    str(item.get("strategy_key") or "")
+                    for item in member_sleeves
+                ] != sorted({
+                    str(item.get("strategy_key") or "")
+                    for item in member_sleeves
+                })
+                or any(
+                    not isinstance(item, dict)
+                    or set(item) != expected_sleeve_fields
+                    or not _HASH_PATTERN.fullmatch(str(
+                        item.get("sleeve_row_hash") or ""
+                    ))
+                    or _digest({
+                        "schema": (
+                            "probiga.strategy-combination-member-sleeve-row.v1"
+                        ),
+                        **{
+                            str(key): value for key, value in item.items()
+                            if str(key) != "sleeve_row_hash"
+                        },
+                    }) != str(item.get("sleeve_row_hash") or "")
+                    for item in member_sleeves
+                )
+            ):
+                raise ValueError("组合分配逐成员袖套哈希或1bp守恒无效")
+            combination_status = str(row.get("lifecycle_status") or "")
+            combination_multiplier = Decimal(str(
+                LIFECYCLE_RISK_MULTIPLIER.get(combination_status, -1.0)
+            ))
+            weighted_members: list[tuple[str, Decimal]] = []
+            for item in member_sleeves:
+                def required_decimal(field: str) -> Decimal:
+                    raw_value = item.get(field)
+                    if raw_value is None:
+                        return Decimal("-1")
+                    try:
+                        return Decimal(str(raw_value))
+                    except (InvalidOperation, TypeError, ValueError):
+                        return Decimal("-1")
+
+                member_status = str(item.get("member_lifecycle_status") or "")
+                member_multiplier = Decimal(str(
+                    LIFECYCLE_RISK_MULTIPLIER.get(member_status, -1.0)
+                ))
+                original_weight = required_decimal("original_weight")
+                item_base_bp = _int(item.get("base_bp"), -1)
+                expected_effective_bp = int((
+                    Decimal(item_base_bp)
+                    * member_multiplier
+                    * combination_multiplier
+                ).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN))
+                if (
+                    combination_multiplier < 0
+                    or member_multiplier < 0
+                    or not original_weight.is_finite()
+                    or original_weight <= 0
+                    or str(item.get("strategy_version") or "")
+                    != str(item.get("current_strategy_version") or "")
+                    or required_decimal("member_lifecycle_multiplier")
+                    != member_multiplier
+                    or required_decimal("combination_lifecycle_multiplier")
+                    != combination_multiplier
+                    or required_decimal("member_multiplier")
+                    != member_multiplier
+                    or required_decimal("combination_multiplier")
+                    != combination_multiplier
+                    or required_decimal("configured_weight_pct")
+                    != original_weight * Decimal("100")
+                    or required_decimal("base_weight_pct")
+                    != Decimal(item_base_bp) / Decimal("100")
+                    or _int(item.get("effective_bp"), -1)
+                    != expected_effective_bp
+                    or required_decimal("effective_weight_pct")
+                    != Decimal(expected_effective_bp) / Decimal("100")
+                    or _int(item.get("cash_discount_bp"), -1)
+                    != item_base_bp - expected_effective_bp
+                    or required_decimal("discount_to_cash_pct")
+                    != Decimal(item_base_bp - expected_effective_bp)
+                    / Decimal("100")
+                    or str(item.get("combination_lifecycle_status") or "")
+                    != combination_status
+                ):
+                    raise ValueError("组合分配逐成员生命周期或bp公式无效")
+                weighted_members.append((
+                    str(item.get("strategy_key") or ""), original_weight,
+                ))
+            expected_base_by_key = _largest_remainder_basis_points(
+                base_bp, weighted_members,
+            )
+            if any(
+                _int(item.get("base_bp"), -1)
+                != expected_base_by_key[str(item.get("strategy_key") or "")]
+                for item in member_sleeves
+            ):
+                raise ValueError("组合分配逐成员基础权重不是最大余数精确分配")
+        elif member_sleeves or member_sleeve_hash:
+            raise ValueError("非组合分配不得伪造逐成员袖套")
         rows.append({
-            "target_type": str(row.get("target_type") or ""),
+            "target_type": target_type,
             "target_key": str(row.get("target_key") or ""),
             "target_version": str(row.get("target_version") or ""),
             "funding_gate_hash": str(row.get("funding_gate_hash") or ""),
@@ -9361,6 +11367,9 @@ def _allocation_snapshot_contract(
             "simulated_weight_pct": round(
                 _num(row.get("simulated_weight_pct"), 0.0) or 0.0, 4,
             ),
+            "member_sleeves": member_sleeves,
+            "member_sleeve_hash": member_sleeve_hash,
+            "cash_discount_bp": cash_discount_bp,
             "real_order_authority": bool(
                 row.get("real_order_authority")
             ),
@@ -9486,6 +11495,17 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
         != _int(pool_snapshot.get("row_count"), -2)
     ):
         raise ValueError("股票池快照在持久化前发生变化")
+    stored_result = {
+        **payload,
+        "result_mode": "CANONICAL_PERSISTED",
+        "is_canonical": True,
+        "idempotent_replay": False,
+    }
+    result_json = _json_text(stored_result)
+    result_hash = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+    payload["result_mode"] = "CANONICAL_PERSISTED"
+    payload["is_canonical"] = True
+    payload["canonical_result_hash"] = result_hash
     connection.execute(
         text("""
         INSERT INTO st_strategy_governance_run
@@ -9495,16 +11515,17 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
          router_snapshot_hash, decision_hash, status,
          strategy_count, formal_count,
          shadow_count, combination_count, observation_count, confirmation_count,
-         tradable_count, allocation_count, summary_json, finished_at)
+         tradable_count, allocation_count, summary_json, result_json,
+         result_hash, finished_at)
         VALUES (:run_uid, :trade_date, :run_revision,
                 :supersedes_run_uid, 1, :market_state, :source_status, 1,
                 :input_hash, :build_commit_sha, :router_policy_version,
                 :router_snapshot_hash, :decision_hash, 'COMPLETED', :strategy_count,
                 :formal_count, :shadow_count, :combination_count, :observation_count,
                 :confirmation_count, :tradable_count, :allocation_count,
-                :summary_json, NOW())
+                :summary_json, :result_json, :result_hash, NOW())
         """),
-        {"run_uid": run_uid, "trade_date": payload["trade_date"], "run_revision": payload["run_revision"], "supersedes_run_uid": payload.get("supersedes_run_uid") or "", "market_state": payload["market_state"].get("key") or "unknown", "source_status": payload["source_status"], "input_hash": payload["input_hash"], "build_commit_sha": payload["build_commit_sha"], "router_policy_version": payload["router_policy_version"], "router_snapshot_hash": payload["router_snapshot_hash"], "decision_hash": payload["decision_hash"], **{key: summary[key] for key in ("strategy_count", "formal_count", "shadow_count", "combination_count", "observation_count", "confirmation_count", "tradable_count", "allocation_count")}, "summary_json": _json_text(summary)},
+        {"run_uid": run_uid, "trade_date": payload["trade_date"], "run_revision": payload["run_revision"], "supersedes_run_uid": payload.get("supersedes_run_uid") or "", "market_state": payload["market_state"].get("key") or "unknown", "source_status": payload["source_status"], "input_hash": payload["input_hash"], "build_commit_sha": payload["build_commit_sha"], "router_policy_version": payload["router_policy_version"], "router_snapshot_hash": payload["router_snapshot_hash"], "decision_hash": payload["decision_hash"], **{key: summary[key] for key in ("strategy_count", "formal_count", "shadow_count", "combination_count", "observation_count", "confirmation_count", "tradable_count", "allocation_count")}, "summary_json": _json_text(summary), "result_json": result_json, "result_hash": result_hash},
     )
     levels = (("OBSERVATION", payload["pools"]["observation"]), ("CONFIRMATION", payload["pools"]["confirmation"]), ("TRADABLE", payload["pools"]["tradable"]))
     for level, rows in levels:
@@ -9539,14 +11560,17 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
              router_decision_hash, lifecycle_status,
              lifecycle_status_label, lifecycle_risk_multiplier,
              base_competitive_weight_pct, simulated_weight_pct,
+             member_sleeves_json, member_sleeve_hash, cash_discount_bp,
              reason, real_order_authority)
             VALUES (:run_uid, :target_type, :target_key, :target_version,
                     :funding_gate_hash, :market_state, :market_match_score,
                     :router_decision_hash, :lifecycle_status,
                     :lifecycle_status_label, :lifecycle_risk_multiplier,
-                    :base_competitive_weight_pct, :weight, :reason, 0)
+                    :base_competitive_weight_pct, :weight,
+                    :member_sleeves_json, :member_sleeve_hash,
+                    :cash_discount_bp, :reason, 0)
             """),
-            {"run_uid": run_uid, "target_type": row["target_type"], "target_key": row["target_key"], "target_version": row.get("target_version") or "", "funding_gate_hash": row.get("funding_gate_hash") or "", "market_state": row.get("market_state") or "", "market_match_score": row.get("market_match_score"), "router_decision_hash": row.get("router_decision_hash") or "", "lifecycle_status": row.get("lifecycle_status") or "", "lifecycle_status_label": row.get("lifecycle_status_label") or "", "lifecycle_risk_multiplier": row.get("lifecycle_risk_multiplier") or 0, "base_competitive_weight_pct": row.get("base_competitive_weight_pct") or 0, "weight": row["simulated_weight_pct"], "reason": row["reason"][:500]},
+            {"run_uid": run_uid, "target_type": row["target_type"], "target_key": row["target_key"], "target_version": row.get("target_version") or "", "funding_gate_hash": row.get("funding_gate_hash") or "", "market_state": row.get("market_state") or "", "market_match_score": row.get("market_match_score"), "router_decision_hash": row.get("router_decision_hash") or "", "lifecycle_status": row.get("lifecycle_status") or "", "lifecycle_status_label": row.get("lifecycle_status_label") or "", "lifecycle_risk_multiplier": row.get("lifecycle_risk_multiplier") or 0, "base_competitive_weight_pct": row.get("base_competitive_weight_pct") or 0, "weight": row["simulated_weight_pct"], "member_sleeves_json": _json_text(row.get("member_sleeves") or []), "member_sleeve_hash": row.get("member_sleeve_hash") or "", "cash_discount_bp": _int(row.get("cash_discount_bp"), 0), "reason": row["reason"][:500]},
         )
     _append_audit_connection(
         connection,
@@ -9586,6 +11610,23 @@ def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
         return (
             "SUSPENDED" if current in {"ACTIVE", "REDUCE"} else "SHADOW",
             "不可变策略版本内容哈希校验失败",
+        )
+    if row.get("execution_adapter_executable") is not True:
+        return (
+            "SUSPENDED" if current in {"ACTIVE", "REDUCE"} else "SHADOW",
+            str(row.get("execution_adapter_reason")
+                or "执行适配器未部署/无效"),
+        )
+    if (
+        str(row.get("source_kind") or "") == "runtime_registry"
+        and row.get("funding_pipeline_ready") is not True
+    ):
+        return (
+            "SUSPENDED" if current in {"ACTIVE", "REDUCE"} else "SHADOW",
+            str(
+                row.get("funding_pipeline_reason")
+                or "动态策略资金证据闭环尚未部署，仅允许影子研究"
+            ),
         )
     if not row.get("enabled"):
         return "SUSPENDED", "策略已禁用，不授予模拟资金资格"
@@ -9762,9 +11803,281 @@ def _latest_completed_governance_date() -> str:
     return str(rows[0].get("trade_date") or "")[:10] if rows else ""
 
 
+def _require_no_real_order_authority(value: Any, *, path: str = "result") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            name = str(key)
+            if name in {"real_order_authority", "automatic_real_order_submission"}:
+                if item is not False:
+                    raise RuntimeError(f"canonical治理结果包含真实下单权限：{path}.{name}")
+            _require_no_real_order_authority(item, path=f"{path}.{name}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _require_no_real_order_authority(item, path=f"{path}[{index}]")
+
+
+def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
+    """Independently replay canonical hashes and non-trading invariants."""
+
+    _require_no_real_order_authority(result)
+    trade_date = _trade_date(result.get("trade_date"), default_today=False)
+    market = result.get("market_state")
+    summary = result.get("summary")
+    strategies = result.get("strategies")
+    combinations = result.get("combinations")
+    pools = result.get("pools")
+    allocations = result.get("allocations")
+    candidates = result.get("allocation_candidate_set")
+    router_snapshot = result.get("router_snapshot")
+    transition_plan = result.get("automatic_transition_plan")
+    if (
+        result.get("status") != "ok"
+        or result.get("input_ready") is not True
+        or result.get("status_labels") != LIFECYCLE_LABELS
+        or str(result.get("allocation_policy_version") or "")
+        != ALLOCATION_POLICY_VERSION
+        or str(result.get("router_policy_version") or "")
+        != MARKET_ROUTER_POLICY_VERSION
+        or not isinstance(market, dict)
+        or not isinstance(summary, dict)
+        or not isinstance(strategies, list)
+        or not isinstance(combinations, list)
+        or not isinstance(pools, dict)
+        or not isinstance(allocations, list)
+        or not isinstance(candidates, list)
+        or not isinstance(router_snapshot, dict)
+        or not isinstance(transition_plan, dict)
+    ):
+        raise RuntimeError("canonical治理完整结果缺少可复算决策字段")
+    market_state = str(market.get("key") or "unknown")
+    risk_cap = MARKET_RISK_CAP_PCT.get(market_state, 0.0)
+    candidate_payload = {
+        "schema": "probiga.strategy-allocation-candidate-set.v1",
+        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "trade_date": trade_date,
+        "market_state": market_state,
+        "candidates": candidates,
+    }
+    candidate_hash = _digest(candidate_payload)
+    allocation_rows = _allocation_snapshot_contract(allocations)
+    allocation_payload = {
+        "schema": "probiga.strategy-allocation-snapshot.v1",
+        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "trade_date": trade_date,
+        "market_state": market_state,
+        "market_risk_cap_pct": risk_cap,
+        "trading_gate_passed": result.get("trading_gate_passed") is True,
+        "candidate_set_hash": candidate_hash,
+        "allocations": allocation_rows,
+    }
+    allocation_hash = _digest(allocation_payload)
+    allocation_total_bp = sum(int(round(
+        (_num(item.get("simulated_weight_pct"), 0.0) or 0.0) * 100
+    )) for item in allocations)
+    cash_rows = [
+        item for item in allocations
+        if str(item.get("target_type") or "") == "CASH"
+    ]
+    funded_bp = sum(int(round(
+        (_num(item.get("simulated_weight_pct"), 0.0) or 0.0) * 100
+    )) for item in allocations if str(item.get("target_type") or "") != "CASH")
+    if (
+        candidate_hash != str(result.get("candidate_set_hash") or "")
+        or candidate_hash != str(summary.get("candidate_set_hash") or "")
+        or allocation_hash != str(result.get("allocation_snapshot_hash") or "")
+        or allocation_hash != str(summary.get("allocation_snapshot_hash") or "")
+        or allocation_total_bp != 10_000
+        or len(cash_rows) != 1
+        or funded_bp > int(round(risk_cap * 100))
+        or any(item.get("real_order_authority") is not False for item in allocations)
+    ):
+        raise RuntimeError("canonical治理资金分配公式、哈希或现金守恒无效")
+    pool_snapshot, pool_hash, _row_hashes = _pool_snapshot_contract(
+        trade_date, pools,
+    )
+    if (
+        pool_snapshot != result.get("pool_snapshot")
+        or pool_hash != str(result.get("pool_snapshot_hash") or "")
+        or pool_hash != str(summary.get("pool_snapshot_hash") or "")
+    ):
+        raise RuntimeError("canonical治理股票池快照不可复算")
+    expected_strategy_routes = {
+        str(item.get("strategy_key") or ""): str(
+            (item.get("market_route") or {}).get("router_decision_hash") or ""
+        )
+        for item in sorted(strategies, key=lambda row: str(row.get("strategy_key") or ""))
+    }
+    expected_combination_routes = {
+        str(item.get("combination_key") or ""): str(
+            (item.get("market_route") or {}).get("router_decision_hash") or ""
+        )
+        for item in sorted(
+            combinations, key=lambda row: str(row.get("combination_key") or "")
+        )
+    }
+    if (
+        router_snapshot.get("schema")
+        != "probiga.strategy-market-router-snapshot.v1"
+        or router_snapshot.get("policy_version") != MARKET_ROUTER_POLICY_VERSION
+        or router_snapshot.get("trade_date") != trade_date
+        or router_snapshot.get("market_state") != market_state
+        or router_snapshot.get("strategy_routes") != expected_strategy_routes
+        or router_snapshot.get("combination_routes")
+        != expected_combination_routes
+        or _digest(router_snapshot)
+        != str(result.get("router_snapshot_hash") or "")
+    ):
+        raise RuntimeError("canonical治理市场路由快照不可复算")
+    transition_hash = _digest(transition_plan)
+    if (
+        set(transition_plan) != {
+            "schema", "trade_date", "transition_count", "transitions",
+        }
+        or transition_plan.get("schema") != AUTOMATIC_TRANSITION_PLAN_SCHEMA
+        or transition_plan.get("trade_date") != trade_date
+        or not isinstance(transition_plan.get("transitions"), list)
+        or _int(transition_plan.get("transition_count"), -1)
+        != len(transition_plan.get("transitions") or [])
+        or transition_hash
+        != str(result.get("automatic_transition_plan_hash") or "")
+        or transition_hash
+        != str(summary.get("automatic_transition_plan_hash") or "")
+    ):
+        raise RuntimeError("canonical治理生命周期计划不可复算")
+    expected_decision = _digest({
+        "schema": "strategy-governance-decision.v6",
+        "trade_date": trade_date,
+        "build_commit_sha": str(result.get("build_commit_sha") or ""),
+        "input_hash": str(result.get("input_hash") or ""),
+        "router_snapshot_hash": str(result.get("router_snapshot_hash") or ""),
+        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "trading_gate_passed": result.get("trading_gate_passed") is True,
+        "market_risk_cap_pct": risk_cap,
+        "allocation_candidate_count": len(candidates),
+        "eligible_candidate_count": sum(
+            item.get("paper_allocation_eligible") is True for item in candidates
+        ),
+        "candidate_set_hash": candidate_hash,
+        "allocation_snapshot_hash": allocation_hash,
+        "pool_snapshot_hash": pool_hash,
+        "strategies": [{
+            "strategy_key": str(item.get("strategy_key") or ""),
+            "strategy_version": str(item.get("current_version") or ""),
+            "enabled": bool(item.get("enabled")),
+            "projected_status": str(item.get("current_status") or ""),
+            "funding_gate_hash": str(item.get("funding_gate_hash") or ""),
+        } for item in strategies],
+        "combinations": [{
+            "combination_key": str(item.get("combination_key") or ""),
+            "combination_version": str(item.get("current_version") or ""),
+            "enabled": bool(item.get("enabled")),
+            "projected_status": str(item.get("current_status") or ""),
+            "funding_gate_hash": str(item.get("funding_gate_hash") or ""),
+        } for item in combinations],
+    })
+    if (
+        expected_decision != str(result.get("decision_hash") or "")
+        or _int(summary.get("allocation_candidate_count"), -1) != len(candidates)
+        or _int(summary.get("eligible_candidate_count"), -1)
+        != sum(item.get("paper_allocation_eligible") is True for item in candidates)
+        or _num(summary.get("market_risk_cap_pct"), -1.0) != risk_cap
+    ):
+        raise RuntimeError("canonical治理决策哈希或汇总不可复算")
+
+
+def _canonical_governance_result_from_row(
+    row: dict[str, Any],
+) -> dict[str, Any]:
+    raw = row.get("result_json")
+    if not isinstance(raw, str) or not raw:
+        raise RuntimeError("canonical治理运行缺少完整持久结果")
+    expected_hash = str(row.get("result_hash") or "")
+    if (
+        not _HASH_PATTERN.fullmatch(expected_hash)
+        or hashlib.sha256(raw.encode("utf-8")).hexdigest() != expected_hash
+    ):
+        raise RuntimeError("canonical治理完整结果哈希无效")
+    result = _json(raw, None)
+    if (
+        not isinstance(result, dict)
+        or str(result.get("run_uid") or "") != str(row.get("run_uid") or "")
+        or str(result.get("trade_date") or "")[:10]
+        != str(row.get("trade_date") or "")[:10]
+        or str(result.get("input_hash") or "")
+        != str(row.get("input_hash") or "")
+        or str(result.get("decision_hash") or "")
+        != str(row.get("decision_hash") or "")
+        or result.get("is_canonical") is not True
+        or str(result.get("result_mode") or "") != "CANONICAL_PERSISTED"
+    ):
+        raise RuntimeError("canonical治理完整结果身份与运行账本不一致")
+    _validate_canonical_governance_result(result)
+    return {
+        **result,
+        "canonical_result_hash": expected_hash,
+        "result_mode": "CANONICAL_PERSISTED",
+        "is_canonical": True,
+    }
+
+
+def load_canonical_governance_snapshot(
+    trade_date: str = "",
+) -> dict[str, Any]:
+    """Read, never recompute, the latest immutable canonical full result."""
+
+    if not _table_exists("st_strategy_governance_run"):
+        raise RuntimeError("策略治理表尚未由部署流程创建")
+    requested = str(trade_date or "").strip()[:10]
+    params: dict[str, Any] = {}
+    where = ""
+    if requested:
+        requested = _trade_date(requested, default_today=False)
+        where = "AND trade_date=:trade_date"
+        params["trade_date"] = requested
+    rows = _db_read(
+        "SELECT run_uid, trade_date, input_hash, decision_hash, result_json, "
+        "result_hash FROM st_strategy_governance_run "
+        "WHERE status='COMPLETED' AND is_canonical=1 "
+        f"{where} ORDER BY trade_date DESC, run_revision DESC, created_at DESC "
+        "LIMIT 2",
+        params,
+    )
+    if not rows:
+        raise RuntimeError("尚无可展示的canonical完整治理结果；请先运行日终治理")
+    if len(rows) > 1 and (
+        requested
+        or str(rows[0].get("trade_date") or "")[:10]
+        == str(rows[1].get("trade_date") or "")[:10]
+    ):
+        raise RuntimeError("同一交易日存在多条canonical治理结果")
+    return _canonical_governance_result_from_row(rows[0])
+
+
 def _governance_build_commit_sha() -> str:
     value = str(os.getenv("PROBIGA_BUILD_COMMIT_SHA") or "").strip()
     return value[:64] if value else "WORKTREE_UNVERSIONED"
+
+
+_DYNAMIC_AUDIT_ONLY_KEYS = frozenset({
+    "candidate_run_uid", "candidate_receipt_hash", "candidate_completed_at",
+    "candidate_run_receipt", "dynamic_adapter_receipts",
+})
+
+
+def _stable_dynamic_input(value: Any) -> Any:
+    """Remove per-attempt audit ids while preserving authoritative facts."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_dynamic_input(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _DYNAMIC_AUDIT_ONLY_KEYS
+        }
+    if isinstance(value, list):
+        return [_stable_dynamic_input(item) for item in value]
+    if isinstance(value, tuple):
+        return [_stable_dynamic_input(item) for item in value]
+    return value
 
 
 def _governance_source_input_hash(snapshot: dict[str, Any]) -> str:
@@ -9780,8 +12093,14 @@ def _governance_source_input_hash(snapshot: dict[str, Any]) -> str:
         "configuration": snapshot.get("configuration"),
         "market_state": snapshot.get("market_state"),
         "global_gate": snapshot.get("global_gate"),
+        "candidate_source": _stable_dynamic_input(
+            snapshot.get("candidate_source")
+        ),
+        "dynamic_adapter_statuses": _stable_dynamic_input(snapshot.get(
+            "dynamic_adapter_statuses"
+        ) or []),
         "strategies": snapshot.get("strategies") or [],
-        "candidates": snapshot.get("candidates") or [],
+        "candidates": _stable_dynamic_input(snapshot.get("candidates") or []),
         "conflicts": snapshot.get("conflicts") or [],
     })
 
@@ -9847,7 +12166,21 @@ def governance_snapshot(
     if persist:
         if not input_ready:
             raise GovernanceEvidenceNotReady(
-                f"治理输入未通过新鲜度校验：{input_reason}"
+                f"治理输入未通过新鲜度校验：{input_reason}",
+                blocking_record={
+                    "schema": "probiga.strategy-governance-block.v1",
+                    "status": "INPUT_NOT_READY",
+                    "status_label": "治理输入未就绪",
+                    "trade_date": target,
+                    "reason": input_reason,
+                    "candidate_source": (
+                        strategy_snapshot.get("candidate_source") or {}
+                    ),
+                    "global_gate": (
+                        strategy_snapshot.get("global_gate") or {}
+                    ),
+                    "automatic_real_order_submission": False,
+                },
             )
         _require_authoritative_closed_trade_date(target)
         try:
@@ -9938,6 +12271,7 @@ def governance_snapshot(
             row["paper_allocation_eligible"] = (
                 recommended in {"ACTIVE", "REDUCE"}
                 and row["profit_gate_passed"]
+                and row.get("execution_adapter_executable") is True
                 and row.get("market_route_eligible") is True
             )
             row["lane"] = "正式赛道" if recommended in {"ACTIVE", "REDUCE"} else "观察赛道" if recommended == "SHADOW" else "暂停赛道" if recommended == "SUSPENDED" else "历史档案"
@@ -10040,12 +12374,35 @@ def governance_snapshot(
                 and (row.get("constraint_evaluation") or {}).get("passed")
                 is True
             )
+            row["lane"] = (
+                "正式赛道" if recommended in {"ACTIVE", "REDUCE"}
+                else "观察赛道" if recommended == "SHADOW"
+                else "暂停赛道" if recommended == "SUSPENDED"
+                else "历史档案"
+            )
+    if persist:
+        combination_lane_order = {
+            "ACTIVE": 0, "REDUCE": 0, "SHADOW": 1,
+            "SUSPENDED": 2, "RETIRED": 3,
+        }
+        combinations.sort(key=lambda row: (
+            combination_lane_order.get(row["current_status"], 9),
+            -float(row["ranking_score"]),
+            row["combination_key"],
+        ))
+        combination_lane_ranks: dict[str, int] = defaultdict(int)
+        for index, row in enumerate(combinations, 1):
+            row["rank"] = index
+            combination_lane_ranks[row["lane"]] += 1
+            row["lane_rank"] = combination_lane_ranks[row["lane"]]
     market_state = strategy_snapshot.get("market_state") or {"key": "unknown", "name": "数据不足"}
     pools = _build_pools(strategy_snapshot, rankings)
+    _attach_pool_industry_focus(rankings, pools)
     pool_snapshot, pool_snapshot_hash, _pool_row_hashes = (
         _pool_snapshot_contract(target, pools)
     )
-    trading_allowed = _snapshot_trading_allowed(strategy_snapshot)
+    trading_gate = _snapshot_trading_gate(strategy_snapshot)
+    trading_allowed = trading_gate["trading_allowed"] is True
     allocation_candidates = _allocation_candidate_contract(
         rankings, combinations,
     )
@@ -10061,6 +12418,7 @@ def governance_snapshot(
         rankings, combinations, str(market_state.get("key") or "unknown"),
         trading_allowed=trading_allowed,
         candidate_contract=allocation_candidates,
+        trading_gate=trading_gate,
     )
     allocation_snapshot_rows = _allocation_snapshot_contract(allocations)
     allocation_snapshot_payload = {
@@ -10123,6 +12481,9 @@ def governance_snapshot(
         "router_snapshot_hash": router_snapshot_hash,
         "allocation_policy_version": ALLOCATION_POLICY_VERSION,
         "trading_gate_passed": bool(trading_allowed),
+        "trading_gate_status": trading_gate["status"],
+        "trading_gate_status_label": trading_gate["status_label"],
+        "trading_gate_reason": trading_gate["reason"],
         "market_risk_cap_pct": MARKET_RISK_CAP_PCT.get(
             str(market_state.get("key") or "unknown"), 0.0,
         ),
@@ -10177,6 +12538,7 @@ def governance_snapshot(
     })
     payload = {
         "status": "ok",
+        "result_mode": "PERSIST_CANDIDATE" if persist else "PREVIEW_REALTIME",
         "run_uid": run_uid,
         "run_revision": 0,
         "supersedes_run_uid": "",
@@ -10203,8 +12565,13 @@ def governance_snapshot(
         "idempotent_replay": False,
         "operator": str(operator or "daily_governance")[:80],
         "trading_gate_passed": trading_allowed,
+        "trading_gate": trading_gate,
+        "candidate_source": strategy_snapshot.get("candidate_source") or {},
         "market_state": market_state,
         "status_labels": LIFECYCLE_LABELS,
+        "adapter_capabilities": strategy_execution_adapter_capabilities()[
+            "adapters"
+        ],
         "profit_gate_policy": PROFIT_GATE_POLICY,
         "health_score_weights": HEALTH_SCORE_WEIGHTS,
         "summary": summary,
@@ -10264,7 +12631,8 @@ def governance_snapshot(
                     )
                 existing = connection.execute(text(
                     "SELECT run_uid, run_revision, supersedes_run_uid, "
-                    "is_canonical FROM st_strategy_governance_run "
+                    "is_canonical, trade_date, input_hash, decision_hash, "
+                    "result_json, result_hash FROM st_strategy_governance_run "
                     "WHERE decision_hash=:decision_hash "
                     "AND status='COMPLETED' LIMIT 1"
                 ), {"decision_hash": decision_hash}).mappings().first()
@@ -10274,16 +12642,10 @@ def governance_snapshot(
                             "该决定哈希仅存在于已被替代的历史修订；"
                             "必须使用新的输入高水位或构建版本重新治理"
                         )
-                    payload["run_uid"] = str(existing.get("run_uid") or "")
-                    payload["run_revision"] = _int(
-                        existing.get("run_revision"), 1
-                    )
-                    payload["supersedes_run_uid"] = str(
-                        existing.get("supersedes_run_uid") or ""
-                    )
-                    payload["is_canonical"] = True
-                    payload["idempotent_replay"] = True
-                    return payload
+                    return {
+                        **_canonical_governance_result_from_row(dict(existing)),
+                        "idempotent_replay": True,
+                    }
                 # Recheck the date while holding the cross-process writer lock.
                 latest = connection.execute(text(
                     "SELECT MAX(trade_date) AS trade_date "
@@ -10343,13 +12705,15 @@ def governance_snapshot(
                         entity_type=plan["entity_type"], automatic=True,
                         _connection=connection,
                     ))
+                payload["lifecycle_transitions"] = transitions
                 _persist_health(connection, run_uid, target, rankings)
                 _persist_combinations(connection, payload)
                 _persist_run(connection, payload)
         except IntegrityError:
             existing = _db_read(
                 "SELECT run_uid, run_revision, supersedes_run_uid, "
-                "is_canonical FROM st_strategy_governance_run "
+                "is_canonical, trade_date, input_hash, decision_hash, "
+                "result_json, result_hash FROM st_strategy_governance_run "
                 "WHERE decision_hash=:decision_hash "
                 "AND status='COMPLETED' LIMIT 1",
                 {"decision_hash": decision_hash},
@@ -10357,16 +12721,10 @@ def governance_snapshot(
             if existing:
                 if not bool(_int(existing[0].get("is_canonical"))):
                     raise
-                payload["run_uid"] = str(existing[0].get("run_uid") or "")
-                payload["run_revision"] = _int(
-                    existing[0].get("run_revision"), 1
-                )
-                payload["supersedes_run_uid"] = str(
-                    existing[0].get("supersedes_run_uid") or ""
-                )
-                payload["is_canonical"] = True
-                payload["idempotent_replay"] = True
-                return payload
+                return {
+                    **_canonical_governance_result_from_row(existing[0]),
+                    "idempotent_replay": True,
+                }
             raise
         payload["lifecycle_transitions"] = transitions
     return payload
@@ -10432,10 +12790,35 @@ def governance_history(limit: int = 100) -> dict[str, Any]:
                 "cost_stress_expectancy_pct",
             )
         }
+    adapter_run_receipts = _db_read(
+        "SELECT run_uid, strategy_key, strategy_version, "
+        "strategy_version_hash, trade_date, completed_at, status, "
+        "execution_binding_hash, adapter_artifact_sha256, cost_model_hash, "
+        "adapter_key, adapter_version, input_hash, output_hash, "
+        "stable_result_hash, candidate_count, candidate_identity_json, "
+        "receipt_json, receipt_hash, created_at "
+        "FROM st_strategy_adapter_run_receipt "
+        "ORDER BY completed_at DESC, run_uid DESC LIMIT :limit",
+        {"limit": limit},
+    )
+    for row in adapter_run_receipts:
+        raw_receipt = _json(row.get("receipt_json"), None)
+        try:
+            verified = verify_persisted_strategy_adapter_run_receipt(
+                raw_receipt, row,
+            )
+            row["candidate_identity"] = verified["candidate_identity"]
+            row["hash_valid"] = True
+        except ValueError:
+            row["candidate_identity"] = []
+            row["hash_valid"] = False
+        row.pop("receipt_json", None)
+        row.pop("candidate_identity_json", None)
     return {
         "status": "ok",
         "evidence_status_labels": EVIDENCE_STATUS_LABELS,
         "metric_evidence": metric_evidence,
+        "adapter_run_receipts": adapter_run_receipts,
         "lifecycle_events": lifecycle_events,
         "audit_events": audit_events,
         "runs": _db_read(
@@ -10467,6 +12850,7 @@ __all__ = [
     "governance_history",
     "governance_input_ready",
     "governance_snapshot",
+    "load_canonical_governance_snapshot",
     "metric_evidence_detail",
     "record_metric_input",
     "recommend_lifecycle_status",

@@ -12,12 +12,11 @@ if str(ROOT) not in sys.path:
 
 from sqlalchemy import create_engine, text
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 
 def main():
-    mysql_url = os.environ.get("MYSQL_URL") or DEFAULT_MYSQL_URL
-    engine = create_engine(mysql_url, pool_pre_ping=True)
+    engine = create_tool_engine()
 
     # 检查是否已存在新浪热股任务
     with engine.connect() as conn:

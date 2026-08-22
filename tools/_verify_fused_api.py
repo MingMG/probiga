@@ -1,8 +1,8 @@
-import paramiko, json
+import json
+from remote_support import production_ssh_client, production_ssh_connect_kwargs
 
-ssh = paramiko.SSHClient()
-ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-ssh.connect('47.113.123.190', username='root', password='ProBigA@2026', look_for_keys=False, allow_agent=False)
+ssh = production_ssh_client()
+ssh.connect(**production_ssh_connect_kwargs())
 
 cmd1 = 'curl -s "http://127.0.0.1:8000/api/hot-data/fused?snapshot_date=2026-05-09&top=10"'
 stdin, stdout, stderr = ssh.exec_command(cmd1, timeout=15)

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-engine = create_engine("mysql+pymysql://root:ProBigA%4070966@47.113.123.190:3306/probiga?charset=utf8mb4", connect_args={"connect_timeout": 30})
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 
 with engine.connect() as conn:
     print("=== 最近交易日数据 ===")

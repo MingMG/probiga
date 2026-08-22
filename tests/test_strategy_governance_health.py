@@ -480,7 +480,18 @@ COMBINATION_MEMBER_DETAILS = [
         "current_strategy_version": "v1",
         "version_match": True,
         "weight": 0.5,
-        "status_label": "正常运行",
+        "status_label": (
+            "正常运行" if key == "strategy_a" else "影子观察"
+        ),
+        "lifecycle_status": (
+            "ACTIVE" if key == "strategy_a" else "SHADOW"
+        ),
+        "lifecycle_risk_multiplier": (
+            1.0 if key == "strategy_a" else 0.0
+        ),
+        "effective_weight_after_lifecycle": (
+            0.5 if key == "strategy_a" else 0.0
+        ),
         "contribution_score": 40.0,
     }
     for key in sorted(STRATEGY_ROUTES)
@@ -511,9 +522,14 @@ COMBINATION_GATE_HASH = health._canonical_digest(
             item["strategy_key"]: {
                 "frozen": item["strategy_version"],
                 "current": item["current_strategy_version"],
+                "lifecycle_status": item["lifecycle_status"],
+                "lifecycle_risk_multiplier": item[
+                    "lifecycle_risk_multiplier"
+                ],
             }
             for item in COMBINATION_MEMBER_DETAILS
         },
+        "member_sleeve_risk_multiplier": 0.5,
         "router_decision_hash": COMBINATION_ROUTE["router_decision_hash"],
         "constraint_evaluation_hash": COMBINATION_CONSTRAINT_EVALUATION[
             "evaluation_hash"
@@ -675,6 +691,9 @@ def _fixture_allocation_rows() -> list[dict]:
             "lifecycle_risk_multiplier": Decimal("0.0000"),
             "base_competitive_weight_pct": Decimal("0.0000"),
             "simulated_weight_pct": Decimal("15.0000"),
+            "member_sleeves_json": [],
+            "member_sleeve_hash": "",
+            "cash_discount_bp": 0,
             "real_order_authority": 0,
         },
         {
@@ -692,6 +711,9 @@ def _fixture_allocation_rows() -> list[dict]:
             "lifecycle_risk_multiplier": Decimal("1.0000"),
             "base_competitive_weight_pct": Decimal("85.0000"),
             "simulated_weight_pct": Decimal("85.0000"),
+            "member_sleeves_json": [],
+            "member_sleeve_hash": "",
+            "cash_discount_bp": 0,
             "real_order_authority": 0,
         },
     ]
@@ -758,10 +780,14 @@ def _fixture_allocation_contract(
     combination_route: dict | None = None,
     combination_gate_hash: str = COMBINATION_GATE_HASH,
     combination_profit_gate_passed: bool = False,
+    combination_member_details: list[dict] | None = None,
     strategy_a_status: str = "ACTIVE",
     automatic_transition_plan_hash: str | None = None,
 ) -> dict:
     combination_route = combination_route or COMBINATION_ROUTE
+    combination_member_details = (
+        combination_member_details or COMBINATION_MEMBER_DETAILS
+    )
     bindings = {}
     for key, route in STRATEGY_ROUTES.items():
         active = key == "strategy_a"
@@ -794,6 +820,30 @@ def _fixture_allocation_contract(
         "lifecycle_status": "SHADOW",
         "profit_gate_passed": combination_profit_gate_passed,
         "constraint_passed": True,
+        "member_sleeve_risk_multiplier": Decimal(str(round(
+            sum(
+                float(item["weight"])
+                * float(item["lifecycle_risk_multiplier"])
+                for item in combination_member_details
+            ),
+            8,
+        ))),
+        "member_sleeves_source": [
+            {
+                "strategy_key": item["strategy_key"],
+                "strategy_version": item["strategy_version"],
+                "current_strategy_version": item[
+                    "current_strategy_version"
+                ],
+                "version_match": item["version_match"],
+                "original_weight": item["weight"],
+                "member_lifecycle_status": item["lifecycle_status"],
+                "member_lifecycle_multiplier": item[
+                    "lifecycle_risk_multiplier"
+                ],
+            }
+            for item in combination_member_details
+        ],
     }
     candidates, errors = health._allocation_candidate_contract(bindings)
     assert not errors
@@ -1105,6 +1155,10 @@ class _GovernanceHealthEngine:
 
     def execute(self, sql, params):
         if "FROM qmt_kline_attestation_schema_migration" in sql:
+            if params.get("migration_key") == (
+                qmt_attester.LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY
+            ):
+                return _Result([])
             return _Result(
                 [{
                     "migration_hash": (
@@ -1127,7 +1181,9 @@ class _GovernanceHealthEngine:
                     {
                         "table_name": table_name,
                         "engine": "InnoDB",
-                        "table_collation": "utf8mb4_general_ci",
+                        "table_collation": (
+                            qmt_attester.QMT_ATTESTATION_COLLATION
+                        ),
                     }
                     for table_name in qmt_attester.ATTESTATION_TABLE_NAMES
                 ]
@@ -1156,7 +1212,7 @@ class _GovernanceHealthEngine:
                             else None
                         ),
                         "collation_name": (
-                            "utf8mb4_general_ci"
+                            qmt_attester.QMT_ATTESTATION_COLLATION
                             if column[1]
                             in {"char", "varchar", "text", "mediumtext"}
                             else None
@@ -2063,6 +2119,9 @@ class _GovernanceHealthEngine:
                         "lifecycle_risk_multiplier": Decimal("0.0000"),
                         "base_competitive_weight_pct": Decimal("0.0000"),
                         "simulated_weight_pct": Decimal("15.0000"),
+                        "member_sleeves_json": [],
+                        "member_sleeve_hash": "",
+                        "cash_discount_bp": 0,
                         "real_order_authority": 0,
                         "strategy_registry_key": None,
                         "strategy_current_version": None,
@@ -2090,6 +2149,9 @@ class _GovernanceHealthEngine:
                         "lifecycle_risk_multiplier": Decimal("1.0000"),
                         "base_competitive_weight_pct": Decimal("85.0000"),
                         "simulated_weight_pct": Decimal("85.0000"),
+                        "member_sleeves_json": [],
+                        "member_sleeve_hash": "",
+                        "cash_discount_bp": 0,
                         "real_order_authority": 0,
                         "strategy_registry_key": "strategy_a",
                         "strategy_current_version": "v1",
@@ -2683,7 +2745,18 @@ def test_combination_member_version_drift_uses_current_member_ranking_and_fails_
             "current_strategy_version": "v1",
             "version_match": False,
             "weight": 0.5,
-            "status_label": "正常运行",
+            "status_label": (
+                "正常运行" if key == "strategy_a" else "影子观察"
+            ),
+            "lifecycle_status": (
+                "ACTIVE" if key == "strategy_a" else "SHADOW"
+            ),
+            "lifecycle_risk_multiplier": (
+                1.0 if key == "strategy_a" else 0.0
+            ),
+            "effective_weight_after_lifecycle": (
+                0.5 if key == "strategy_a" else 0.0
+            ),
             "contribution_score": 40.0,
         }
         for key in sorted(STRATEGY_ROUTES)
@@ -2694,9 +2767,17 @@ def test_combination_member_version_drift_uses_current_member_ranking_and_fails_
             "combination_version": "v1",
             "window_evidence": window_evidence,
             "member_versions": {
-                key: {"frozen": "v0", "current": "v1"}
-                for key in sorted(STRATEGY_ROUTES)
+                item["strategy_key"]: {
+                    "frozen": "v0",
+                    "current": "v1",
+                    "lifecycle_status": item["lifecycle_status"],
+                    "lifecycle_risk_multiplier": item[
+                        "lifecycle_risk_multiplier"
+                    ],
+                }
+                for item in member_details
             },
+            "member_sleeve_risk_multiplier": 0.5,
             "router_decision_hash": route["router_decision_hash"],
             "constraint_evaluation_hash": COMBINATION_CONSTRAINT_EVALUATION[
                 "evaluation_hash"
@@ -2784,6 +2865,7 @@ def test_combination_member_version_drift_uses_current_member_ranking_and_fails_
         combination_route=route,
         combination_gate_hash=gate_hash,
         combination_profit_gate_passed=False,
+        combination_member_details=member_details,
     )
     run["router_snapshot_hash"] = router_snapshot_hash
     run["decision_hash"] = allocation_contract["decision_hash"]
@@ -3138,19 +3220,15 @@ def test_qmt_pre_close_v2_requires_row_table_and_current_snapshot_binding(
         }
     }
     observed_sql = []
-    tolerance_json = {
-        "attestation_protocol": health.QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-        "universe_manifest_schema": (
-            qmt_attester.UNIVERSE_MANIFEST_SCHEMA
-        ),
-        "daily_universe": {
+    tolerance_json = qmt_attester.build_qmt_v2_manifest(
+        {
             day: qmt_attester.expected_stock_set_contract(
                 day,
                 ["000001", "600000"],
             )
             for day in sessions
-        },
-    }
+        }
+    )
 
     def valid_read(sql, params=None):
         observed_sql.append(sql)
@@ -3261,17 +3339,15 @@ def test_qmt_pre_close_v2_rejects_batch_only_or_stale_row_coverage(
             }
         }
     }
-    tolerance_json = {
-        "attestation_protocol": health.QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-        "universe_manifest_schema": qmt_attester.UNIVERSE_MANIFEST_SCHEMA,
-        "daily_universe": {
+    tolerance_json = qmt_attester.build_qmt_v2_manifest(
+        {
             day: qmt_attester.expected_stock_set_contract(
                 day,
                 ["000001", "600000"],
             )
             for day in sessions
-        },
-    }
+        }
+    )
 
     def stale_read(sql, params=None):
         if "information_schema.tables" in sql:
@@ -3315,9 +3391,71 @@ def test_health_recomputes_reduce_discount_and_keeps_budget_in_cash(
     monkeypatch,
 ):
     _fixed_trade_date(monkeypatch)
+    reduced_member_details = deepcopy(COMBINATION_MEMBER_DETAILS)
+    reduced_member_details[0].update(
+        {
+            "status_label": "降权运行",
+            "lifecycle_status": "REDUCE",
+            "lifecycle_risk_multiplier": 0.5,
+            "effective_weight_after_lifecycle": 0.25,
+        }
+    )
+    reduced_combination_gate_hash = health._canonical_digest(
+        {
+            "combination_key": "combo_a",
+            "combination_version": "v1",
+            "window_evidence": COMBINATION_WINDOW_EVIDENCE,
+            "member_versions": {
+                item["strategy_key"]: {
+                    "frozen": item["strategy_version"],
+                    "current": item["current_strategy_version"],
+                    "lifecycle_status": item["lifecycle_status"],
+                    "lifecycle_risk_multiplier": item[
+                        "lifecycle_risk_multiplier"
+                    ],
+                }
+                for item in reduced_member_details
+            },
+            "member_sleeve_risk_multiplier": 0.25,
+            "router_decision_hash": COMBINATION_ROUTE[
+                "router_decision_hash"
+            ],
+            "constraint_evaluation_hash": (
+                COMBINATION_CONSTRAINT_EVALUATION["evaluation_hash"]
+            ),
+            "profit_gate_passed": False,
+        }
+    )
+    reduced_combination_rows = _valid_combination_router_rows()
+    for combo_row in reduced_combination_rows:
+        payload = combo_row["evidence_json"]
+        payload["member_details"] = reduced_member_details
+        payload["funding_gate_hash"] = reduced_combination_gate_hash
+        combo_row["result_hash"] = health._canonical_digest(payload)
 
     class _ReduceAllocationEngine(_GovernanceHealthEngine):
         def execute(self, sql, params):
+            if "SELECT h.combination_key, h.combination_version" in sql:
+                return _Result(deepcopy(reduced_combination_rows))
+            if (
+                "SELECT combination_key, combination_version, evidence_json"
+                in sql
+            ):
+                return _Result(
+                    [
+                        {
+                            "combination_key": "combo_a",
+                            "combination_version": "v1",
+                            "ranking_score": Decimal("80.0000"),
+                            "evidence_json": {
+                                "overall_profit_gate_passed": False,
+                                "funding_gate_hash": (
+                                    reduced_combination_gate_hash
+                                ),
+                            },
+                        }
+                    ]
+                )
             result = super().execute(sql, params)
             if "SELECT h.strategy_key, h.strategy_version" in sql:
                 for row in result._rows:
@@ -3338,13 +3476,16 @@ def test_health_recomputes_reduce_discount_and_keeps_budget_in_cash(
                         "lifecycle_risk_multiplier": Decimal("0.5000"),
                         "base_competitive_weight_pct": Decimal("85.0000"),
                         "simulated_weight_pct": Decimal("42.5000"),
+                        "cash_discount_bp": 4250,
                     }
                 )
             return result
 
     run = _completed_run()
     allocation_contract = _fixture_allocation_contract(
-        strategy_a_status="REDUCE"
+        strategy_a_status="REDUCE",
+        combination_gate_hash=reduced_combination_gate_hash,
+        combination_member_details=reduced_member_details,
     )
     run["decision_hash"] = allocation_contract["decision_hash"]
     run["summary_json"].update(
@@ -3455,6 +3596,368 @@ def test_allocation_replay_keeps_zero_bp_candidate_in_denominator():
     assert passed is True
     assert replayed == expected
     assert detail["errors"] == []
+
+
+def _v3_combination_allocation_fixture():
+    member_specs = (
+        ("member_active", "ACTIVE", Decimal("0.60000000")),
+        ("member_reduce", "REDUCE", Decimal("0.40000000")),
+    )
+    bindings = {}
+    for key, status, _weight in member_specs:
+        bindings[("STRATEGY", key, "v1")] = {
+            "router_decision_hash": health._canonical_digest(
+                {"route": key}
+            ),
+            "market_match_score": Decimal("100.0000"),
+            "market_state": MARKET_STATE,
+            "eligible": True,
+            "paper_allocation_eligible": True,
+            "funding_gate_hash": health._canonical_digest({"gate": key}),
+            "members": frozenset({key}),
+            "ranking_score": Decimal("95.0000"),
+            "target_name": key,
+            "enabled": True,
+            "lifecycle_status": status,
+            "profit_gate_passed": True,
+            "constraint_passed": True,
+        }
+    bindings[("STRATEGY", "standalone", "v1")] = {
+        "router_decision_hash": health._canonical_digest(
+            {"route": "standalone"}
+        ),
+        "market_match_score": Decimal("100.0000"),
+        "market_state": MARKET_STATE,
+        "eligible": True,
+        "paper_allocation_eligible": True,
+        "funding_gate_hash": health._canonical_digest(
+            {"gate": "standalone"}
+        ),
+        "members": frozenset({"standalone"}),
+        "ranking_score": Decimal("5.0000"),
+        "target_name": "standalone",
+        "enabled": True,
+        "lifecycle_status": "ACTIVE",
+        "profit_gate_passed": True,
+        "constraint_passed": True,
+    }
+    bindings[("COMBINATION", "combo_reduce_member", "v1")] = {
+        "router_decision_hash": health._canonical_digest(
+            {"route": "combo_reduce_member"}
+        ),
+        "market_match_score": Decimal("100.0000"),
+        "market_state": MARKET_STATE,
+        "eligible": True,
+        "paper_allocation_eligible": True,
+        "funding_gate_hash": health._canonical_digest(
+            {"gate": "combo_reduce_member"}
+        ),
+        "members": frozenset(key for key, _status, _weight in member_specs),
+        "ranking_score": Decimal("10.0000"),
+        "target_name": "combo_reduce_member",
+        "enabled": True,
+        "lifecycle_status": "ACTIVE",
+        "profit_gate_passed": True,
+        "constraint_passed": True,
+        "member_sleeve_risk_multiplier": Decimal("0.80000000"),
+        "member_sleeves_source": [
+            {
+                "strategy_key": key,
+                "strategy_version": "v1",
+                "current_strategy_version": "v1",
+                "version_match": True,
+                "original_weight": float(weight),
+                "member_lifecycle_status": status,
+                "member_lifecycle_multiplier": (
+                    1.0 if status == "ACTIVE" else 0.5
+                ),
+            }
+            for key, status, weight in member_specs
+        ],
+    }
+    candidates, errors = health._allocation_candidate_contract(bindings)
+    assert errors == []
+    allocations = health._expected_allocation_snapshot(
+        candidates,
+        market_state=MARKET_STATE,
+        trading_gate_passed=True,
+    )
+    run = {
+        "trade_date": TRADE_DATE,
+        "market_state": MARKET_STATE,
+        "build_commit_sha": BUILD_SHA,
+        "input_hash": "c" * 64,
+        "router_snapshot_hash": "d" * 64,
+        "decision_hash": "",
+        "summary_json": {
+            "allocation_policy_version": health.ALLOCATION_POLICY_VERSION,
+            "trading_gate_passed": True,
+            "market_risk_cap_pct": 85.0,
+            "allocation_candidate_count": len(candidates),
+            "eligible_candidate_count": len(candidates),
+            "allocation_count": 2,
+            "pool_row_count": 0,
+            "pool_snapshot_hash": "e" * 64,
+            "automatic_transition_count": 0,
+            "automatic_transition_plan_hash": "f" * 64,
+            "cash_weight_pct": next(
+                row["simulated_weight_pct"]
+                for row in allocations
+                if row["target_type"] == "CASH"
+            ),
+        },
+    }
+    _passed, detail, _rows = health._allocation_decision_contract_check(
+        run, bindings, allocations, TRADE_DATE
+    )
+    run["summary_json"].update(
+        {
+            "candidate_set_hash": detail["expected_candidate_set_hash"],
+            "allocation_snapshot_hash": detail[
+                "expected_allocation_snapshot_hash"
+            ],
+        }
+    )
+    run["decision_hash"] = detail["expected_decision_hash"]
+    passed, detail, replayed = health._allocation_decision_contract_check(
+        run, bindings, allocations, TRADE_DATE
+    )
+    assert passed is True
+    assert detail["errors"] == []
+    assert replayed == allocations
+    return bindings, run, allocations
+
+
+def test_v3_allocation_uses_fixed_type_lanes_and_reduce_member_sleeves():
+    _bindings, _run, allocations = _v3_combination_allocation_fixture()
+
+    combination = next(
+        row for row in allocations if row["target_type"] == "COMBINATION"
+    )
+    standalone = next(
+        row for row in allocations if row["target_key"] == "standalone"
+    )
+    cash = next(row for row in allocations if row["target_type"] == "CASH")
+
+    assert combination["base_competitive_weight_pct"] == 42.5
+    assert standalone["base_competitive_weight_pct"] == 42.5
+    assert combination["simulated_weight_pct"] == 34.0
+    assert combination["cash_discount_bp"] == 850
+    assert cash["simulated_weight_pct"] == 23.5
+    assert [
+        (row["strategy_key"], row["base_bp"], row["effective_bp"])
+        for row in combination["member_sleeves"]
+    ] == [
+        ("member_active", 2550, 2550),
+        ("member_reduce", 1700, 850),
+    ]
+
+
+def test_health_v3_allocation_replay_matches_runtime_normative_contract():
+    from server.engine import strategy_governance as governance_module
+
+    bindings, _run, expected = _v3_combination_allocation_fixture()
+    candidates, errors = health._allocation_candidate_contract(bindings)
+    assert errors == []
+    runtime_allocations = governance_module._allocation(
+        [],
+        [],
+        MARKET_STATE,
+        trading_allowed=True,
+        candidate_contract=deepcopy(candidates),
+        trading_gate={"status": "OPEN", "reason": "fixture"},
+    )
+    runtime_snapshot = governance_module._allocation_snapshot_contract(
+        runtime_allocations
+    )
+    stored_rows = [
+        {
+            **{
+                key: value
+                for key, value in row.items()
+                if key != "member_sleeves"
+            },
+            "member_sleeves_json": json.dumps(
+                row["member_sleeves"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        for row in runtime_snapshot
+    ]
+
+    assert health.ALLOCATION_POLICY_VERSION == (
+        governance_module.ALLOCATION_POLICY_VERSION
+    )
+    assert health.DAILY_NAV_RANKING_BASIS == (
+        governance_module.DAILY_NAV_RANKING_BASIS
+    )
+    assert health.ALLOCATION_TYPE_LANE_POLICY == (
+        governance_module.ALLOCATION_TYPE_LANE_POLICY
+    )
+    assert runtime_snapshot == expected
+    assert health._stored_allocation_snapshot(stored_rows) == expected
+
+
+_MEMBER_SLEEVE_TAMPERS = {
+    "strategy_key": "tampered_key",
+    "strategy_version": "tampered_version",
+    "current_strategy_version": "tampered_current_version",
+    "original_weight": "0.61000000",
+    "configured_weight_pct": 61.0,
+    "base_bp": 2549,
+    "base_weight_pct": 25.49,
+    "member_lifecycle_status": "REDUCE",
+    "member_lifecycle_multiplier": "0.50000000",
+    "member_multiplier": 0.5,
+    "combination_lifecycle_status": "REDUCE",
+    "combination_lifecycle_multiplier": "0.50000000",
+    "combination_multiplier": 0.5,
+    "effective_bp": 2549,
+    "effective_weight_pct": 25.49,
+    "cash_discount_bp": 1,
+    "discount_to_cash_pct": 0.01,
+    "sleeve_row_hash": "0" * 64,
+}
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    list(_MEMBER_SLEEVE_TAMPERS.items()),
+    ids=list(_MEMBER_SLEEVE_TAMPERS),
+)
+def test_v3_allocation_replay_rejects_every_tampered_member_sleeve_field(
+    field,
+    tampered_value,
+):
+    bindings, run, allocations = _v3_combination_allocation_fixture()
+    tampered = deepcopy(allocations)
+    combination = next(
+        row for row in tampered if row["target_type"] == "COMBINATION"
+    )
+    combination["member_sleeves"][0][field] = tampered_value
+
+    passed, detail, _replayed = health._allocation_decision_contract_check(
+        run, bindings, tampered, TRADE_DATE
+    )
+
+    assert passed is False
+    assert any(
+        error["reason"] == "persisted allocation replay differs"
+        for error in detail["errors"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    (("member_sleeve_hash", "0" * 64), ("cash_discount_bp", 849)),
+)
+def test_v3_allocation_replay_rejects_tampered_sleeve_aggregate_fields(
+    field,
+    tampered_value,
+):
+    bindings, run, allocations = _v3_combination_allocation_fixture()
+    tampered = deepcopy(allocations)
+    combination = next(
+        row for row in tampered if row["target_type"] == "COMBINATION"
+    )
+    combination[field] = tampered_value
+
+    passed, detail, _replayed = health._allocation_decision_contract_check(
+        run, bindings, tampered, TRADE_DATE
+    )
+
+    assert passed is False
+    assert any(
+        error["reason"] == "persisted allocation replay differs"
+        for error in detail["errors"]
+    )
+
+
+def test_v3_replay_rejects_self_consistent_rehashed_member_sleeve_forgery():
+    bindings, run, allocations = _v3_combination_allocation_fixture()
+    tampered = deepcopy(allocations)
+    combination = next(
+        row for row in tampered if row["target_type"] == "COMBINATION"
+    )
+    sleeve = combination["member_sleeves"][0]
+    sleeve.update(
+        {
+            "member_lifecycle_status": "REDUCE",
+            "member_lifecycle_multiplier": "0.50000000",
+            "member_multiplier": 0.5,
+            "effective_bp": 1275,
+            "effective_weight_pct": 12.75,
+            "cash_discount_bp": 1275,
+            "discount_to_cash_pct": 12.75,
+        }
+    )
+    sleeve["sleeve_row_hash"] = health._canonical_digest(
+        {
+            "schema": "probiga.strategy-combination-member-sleeve-row.v1",
+            **{
+                key: value
+                for key, value in sleeve.items()
+                if key != "sleeve_row_hash"
+            },
+        }
+    )
+    combination["simulated_weight_pct"] = 21.25
+    combination["cash_discount_bp"] = 2125
+    combination["member_sleeve_hash"] = health._canonical_digest(
+        {
+            "schema": "probiga.strategy-combination-member-sleeves.v1",
+            "combination_key": combination["target_key"],
+            "combination_version": combination["target_version"],
+            "base_bp": 4250,
+            "effective_bp": 2125,
+            "cash_discount_bp": 2125,
+            "members": combination["member_sleeves"],
+        }
+    )
+    cash = next(row for row in tampered if row["target_type"] == "CASH")
+    cash["simulated_weight_pct"] = 36.25
+
+    forged_run = deepcopy(run)
+    normalized_tampered = health._stored_allocation_snapshot(tampered)
+    forged_allocation_hash = health._canonical_digest(
+        {
+            "schema": "probiga.strategy-allocation-snapshot.v1",
+            "allocation_policy_version": health.ALLOCATION_POLICY_VERSION,
+            "trade_date": TRADE_DATE,
+            "market_state": MARKET_STATE,
+            "market_risk_cap_pct": 85.0,
+            "trading_gate_passed": True,
+            "candidate_set_hash": forged_run["summary_json"][
+                "candidate_set_hash"
+            ],
+            "allocations": normalized_tampered,
+        }
+    )
+    forged_run["summary_json"].update(
+        {
+            "allocation_snapshot_hash": forged_allocation_hash,
+            "cash_weight_pct": 36.25,
+        }
+    )
+    _passed, detail, _rows = health._allocation_decision_contract_check(
+        forged_run, bindings, tampered, TRADE_DATE
+    )
+    forged_run["decision_hash"] = detail["expected_decision_hash"]
+
+    passed, detail, _rows = health._allocation_decision_contract_check(
+        forged_run, bindings, tampered, TRADE_DATE
+    )
+
+    assert passed is False
+    assert detail["stored_allocation_snapshot_hash"] == (
+        forged_allocation_hash
+    )
+    assert any(
+        error["reason"] == "persisted allocation replay differs"
+        for error in detail["errors"]
+    )
 
 
 def test_health_rejects_reduce_weight_redistributed_back_to_risk_cap(

@@ -53,7 +53,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 # ═══════════════════════════════════════════
 # 配置
@@ -84,7 +84,7 @@ UNIT_MULTIPLIERS = {"亿": 1e8, "万": 1e4}
 # ═══════════════════════════════════════════
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return resolve_tool_mysql_url()
 
 
 def _read_stock_codes(engine) -> list[str]:
@@ -642,7 +642,7 @@ def main():
                         help="只显示计划，不实际执行")
     args = parser.parse_args()
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(_mysql_url())
 
     if args.today_only:
         crawl_today_batch(engine)

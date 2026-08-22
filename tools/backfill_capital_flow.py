@@ -24,7 +24,7 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-DEFAULT_MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 # ── 慢速参数（东财限流极严，必须非常慢）──
 REQUEST_DELAY = 3.0       # 基础间隔 3 秒
@@ -46,7 +46,7 @@ _HEADERS = {
 
 
 def _mysql_url() -> str:
-    return os.environ.get("MYSQL_URL", DEFAULT_MYSQL_URL)
+    return resolve_tool_mysql_url()
 
 
 def _read_stock_codes(engine):
@@ -210,7 +210,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只列出待补日期，不实际执行")
     args = parser.parse_args()
 
-    engine = create_engine(_mysql_url(), pool_pre_ping=True)
+    engine = create_tool_engine(_mysql_url())
     stock_codes = _read_stock_codes(engine)
 
     # 找出需要补的日期

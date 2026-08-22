@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """导出 probiga 数据库到 SQL 文件"""
 import numpy as np
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+
+from tools.env_config import create_tool_engine
 import pandas as pd
 
-engine = create_engine("mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4", pool_pre_ping=True)
+engine = create_tool_engine()
 
 with engine.connect() as c:
     tables = [r[0] for r in c.execute(text("SHOW TABLES")).fetchall()]

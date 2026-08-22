@@ -56,7 +56,7 @@ from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
     update_scheduler_task,
 )
-from tools.remote_support import DEFAULT_REMOTE_SSH_HOST
+from tools.remote_support import remote_host
 
 
 _last_remote_portfolio_codes: list[str] = []
@@ -799,7 +799,7 @@ def _production_portfolio_url() -> str:
         or os.environ.get("PROBIGA_BASE_URL", "").strip()
     )
     if not base:
-        host = os.environ.get("PROBIGA_REMOTE_SSH_HOST", DEFAULT_REMOTE_SSH_HOST).strip()
+        host = remote_host()
         base = host if "://" in host else f"http://{host}"
     return f"{base.rstrip('/')}/api/portfolio/codes"
 

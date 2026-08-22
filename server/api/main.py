@@ -27,6 +27,9 @@ from server.api.scheduler_runtime import start_embedded_scheduler, stop_embedded
 from server.common.config import get_api_lifespan_config, get_api_observability_config
 from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
+from server.engine.strategy_execution_adapters import (
+    bootstrap_strategy_execution_adapter_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +123,9 @@ def dispose_shared_engines() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Fail before starting any background worker if the production code-owned
+    # adapter manifest is absent, unexpected, or does not match the release seal.
+    bootstrap_strategy_execution_adapter_registry()
     start_embedded_scheduler()
     api_lifespan = get_api_lifespan_config()
     qmt_live_runtime_started = False

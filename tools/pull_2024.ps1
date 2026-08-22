@@ -2,13 +2,15 @@
 # ============================================================================
 # ProBigA 历史数据拉取（2024-01-01 起，不含K线）
 # 使用方法：
-#   1. 先开隧道：ssh -L 3307:127.0.0.1:3306 root@47.113.123.190
+#   1. 如需隧道，先配置 SSH host/user/key/known-hosts 并运行受控隧道工具。
 #   2. 在本窗口执行（必须管理员权限）：Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 #   3. 执行本脚本：.\tools\pull_2024.ps1
 # ============================================================================
 $ErrorActionPreference = "Continue"
 
-$ENV:MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3307/probiga?charset=utf8mb4"
+if (-not $env:MYSQL_URL -and -not $env:DATABASE_URL) {
+    throw "MYSQL_URL or DATABASE_URL must be configured."
+}
 $ENV:SM_MAX_STOCKS = "200"
 $ENV:SM_HTTP_RETRIES = "3"
 $ENV:SM_REQUEST_SLEEP = "0.5"
@@ -141,6 +143,6 @@ Write-Host "  🎉 全部数据拉取完成！" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "  查看数据量："
-Write-Host "  python -c 'from sqlalchemy import create_engine,text; e=create_engine(\"mysql+pymysql://root:ProBigA%4070966@127.0.0.1:3307/probiga?charset=utf8mb4\"); c=e.connect(); [print(f\"{t}: {c.execute(text(\"SELECT COUNT(*) FROM \"+t)).scalar()} 行\") for t in [\"st_hot_rank_ths\",\"st_hot_concept_ths_daily\",\"st_hot_rank_fused\",\"st_hot_rank_multi_day\",\"st_a_list_daily\",\"sm_stock_capital_flow_daily\"]]; c.close()'"
+Write-Host "  python tools/_db_size.py"
 Write-Host ""
 pause

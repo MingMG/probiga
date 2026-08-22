@@ -2,7 +2,10 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 set PORT=8010
-if not defined MYSQL_URL set "MYSQL_URL=mysql+pymysql://root:ProBigA%%4070966@localhost:3306/probiga?charset=utf8mb4"
+if not defined MYSQL_URL if not defined DATABASE_URL (
+    echo ERROR: MYSQL_URL or DATABASE_URL must be configured.
+    exit /b 2
+)
 echo ============================================
 echo   ProBigA 看板启动中...
 echo ============================================

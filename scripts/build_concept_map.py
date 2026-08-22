@@ -8,12 +8,19 @@
 3. 去重后写入 si_stock_concept_map
 """
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from datetime import datetime
+from pathlib import Path
+import sys
 import warnings
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 warnings.filterwarnings('ignore')
 
-DB_URL = 'mysql+pymysql://root:ProBigA%4070966@47.113.123.190:3306/probiga'
+from tools.env_config import create_tool_engine
 
 # 需要过滤的概念关键词
 FILTER_KEYWORDS = (
@@ -27,7 +34,7 @@ FILTER_KEYWORDS = (
 
 
 def build_concept_map():
-    engine = create_engine(DB_URL)
+    engine = create_tool_engine()
 
     print("[1/4] 读取概念映射数据...")
     df = pd.read_sql(text("""

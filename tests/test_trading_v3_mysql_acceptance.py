@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -460,6 +461,255 @@ def test_v3_runner_dry_run_is_non_mutating_on_non_mysql():
     assert [item.statement_count for item in results] == [
         len(tuple(item["statements"])) for item in MIGRATIONS
     ]
+
+
+def test_v3_dry_run_rejects_trigger_executor_before_any_write():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with pytest.raises(ValueError, match="unavailable for dry-run"):
+            run_v3_migrations(
+                engine,
+                dry_run=True,
+                trigger_ddl_executor=lambda _statement: None,
+            )
+    finally:
+        engine.dispose()
+
+
+def test_v3_runner_delegates_only_missing_create_trigger(monkeypatch):
+    table_ddl = "CREATE TABLE st_callback_test (id BIGINT PRIMARY KEY)"
+    trigger_ddl = (
+        "CREATE TRIGGER trg_callback_test BEFORE UPDATE ON st_callback_test "
+        "FOR EACH ROW SET NEW.id=OLD.id"
+    )
+    statements = (table_ddl, trigger_ddl)
+    checksum = migrations_v3._checksum(statements)
+    executed: list[str] = []
+    delegated: list[str] = []
+    progress: list[tuple[int, int]] = []
+    trigger_installed = False
+    applied_reads = 0
+
+    class _Connection:
+        def execute(self, statement, _params=None):
+            executed.append(str(statement).strip())
+            return SimpleNamespace()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    connection = _Connection()
+
+    def applied_record(_connection, _version):
+        nonlocal applied_reads
+        applied_reads += 1
+        if applied_reads == 1:
+            return None
+        return SimpleNamespace(
+            checksum=checksum,
+            statement_count=len(statements),
+        )
+
+    def already_applied(_connection, statement):
+        if str(statement) == trigger_ddl:
+            return trigger_installed
+        return False
+
+    def trigger_executor(statement):
+        nonlocal trigger_installed
+        delegated.append(statement)
+        trigger_installed = True
+
+    monkeypatch.setattr(migrations_v3, "_mysql_dialect", lambda _engine: True)
+    monkeypatch.setattr(migrations_v3, "MIGRATIONS", ({
+        "version": "test_trigger_callback",
+        "statements": statements,
+    },))
+    monkeypatch.setattr(migrations_v3, "_validate_migration_server", lambda *_: None)
+    monkeypatch.setattr(migrations_v3, "_ensure_migration_metadata", lambda *_: None)
+    monkeypatch.setattr(migrations_v3, "_applied_record", applied_record)
+    monkeypatch.setattr(migrations_v3, "_progress_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        migrations_v3,
+        "_ddl_statement_already_applied",
+        already_applied,
+    )
+    monkeypatch.setattr(
+        migrations_v3,
+        "_mark_progress",
+        lambda _connection, *, previous_count, next_count, **_kwargs: (
+            progress.append((previous_count, next_count))
+        ),
+    )
+    monkeypatch.setattr(
+        migrations_v3,
+        "_validate_applied_migration",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = migrations_v3._run_v3_migrations_unlocked(
+        SimpleNamespace(),
+        dry_run=False,
+        connection=connection,
+        acceptance_fault_hook=None,
+        trigger_ddl_executor=trigger_executor,
+    )
+
+    assert delegated == [trigger_ddl]
+    assert table_ddl in executed
+    assert trigger_ddl not in executed
+    assert progress == [(0, 1), (1, 2)]
+    assert [(item.version, item.status, item.statement_count) for item in result] == [
+        ("test_trigger_callback", "applied", 2)
+    ]
+
+
+def test_v3_runner_refuses_missing_trigger_without_explicit_executor(monkeypatch):
+    trigger_ddl = (
+        "CREATE TRIGGER trg_callback_test BEFORE UPDATE ON st_callback_test "
+        "FOR EACH ROW SET NEW.id=OLD.id"
+    )
+
+    class _Connection:
+        def execute(self, _statement, _params=None):
+            return SimpleNamespace()
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+    monkeypatch.setattr(migrations_v3, "_mysql_dialect", lambda _engine: True)
+    monkeypatch.setattr(migrations_v3, "MIGRATIONS", ({
+        "version": "test_missing_trigger_executor",
+        "statements": (trigger_ddl,),
+    },))
+    monkeypatch.setattr(migrations_v3, "_validate_migration_server", lambda *_: None)
+    monkeypatch.setattr(migrations_v3, "_ensure_migration_metadata", lambda *_: None)
+    monkeypatch.setattr(migrations_v3, "_applied_record", lambda *_: None)
+    monkeypatch.setattr(migrations_v3, "_progress_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        migrations_v3,
+        "_ddl_statement_already_applied",
+        lambda *_args: False,
+    )
+
+    with pytest.raises(RuntimeError, match="explicit trigger DDL executor"):
+        migrations_v3._run_v3_migrations_unlocked(
+            SimpleNamespace(),
+            dry_run=False,
+            connection=_Connection(),
+            acceptance_fault_hook=None,
+        )
+
+
+def test_v3_mysql_dry_run_validates_ledger_count_and_physical_contract(
+    monkeypatch,
+):
+    statements = ("CREATE TABLE st_read_only_contract (id BIGINT)",)
+    version = "test_read_only_contract"
+    checksum = migrations_v3._checksum(statements)
+    validations: list[tuple[str, bool]] = []
+
+    class _Rows:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {"checksum": checksum, "statement_count": 1}
+
+    class _Connection:
+        def execute(self, sql, _params=None):
+            rendered = str(sql)
+            assert "SELECT checksum, statement_count" in rendered
+            return _Rows()
+
+        def close(self):
+            return None
+
+    class _Engine:
+        def connect(self):
+            return _Connection()
+
+    monkeypatch.setattr(migrations_v3, "_mysql_dialect", lambda _engine: True)
+    monkeypatch.setattr(migrations_v3, "_table_exists", lambda *_args: True)
+    monkeypatch.setattr(
+        migrations_v3,
+        "MIGRATIONS",
+        ({"version": version, "statements": statements},),
+    )
+    monkeypatch.setattr(
+        migrations_v3,
+        "_validate_applied_migration",
+        lambda _connection, *, version, reconcile_legacy_rows: validations.append(
+            (version, reconcile_legacy_rows)
+        ),
+    )
+
+    results = migrations_v3._run_v3_migrations_unlocked(
+        _Engine(),  # type: ignore[arg-type]
+        dry_run=True,
+        connection=None,
+        acceptance_fault_hook=None,
+    )
+
+    assert [(item.version, item.status) for item in results] == [
+        (version, "exists")
+    ]
+    assert validations == [(version, False)]
+
+
+def test_v3_mysql_dry_run_rejects_statement_count_drift(monkeypatch):
+    statements = ("CREATE TABLE st_read_only_contract (id BIGINT)",)
+    checksum = migrations_v3._checksum(statements)
+
+    class _Rows:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return {"checksum": checksum, "statement_count": 2}
+
+    class _Connection:
+        def execute(self, _sql, _params=None):
+            return _Rows()
+
+        def close(self):
+            return None
+
+    class _Engine:
+        def connect(self):
+            return _Connection()
+
+    monkeypatch.setattr(migrations_v3, "_mysql_dialect", lambda _engine: True)
+    monkeypatch.setattr(migrations_v3, "_table_exists", lambda *_args: True)
+    monkeypatch.setattr(
+        migrations_v3,
+        "MIGRATIONS",
+        ({"version": "test_count_drift", "statements": statements},),
+    )
+
+    with pytest.raises(RuntimeError, match="contract changed"):
+        migrations_v3._run_v3_migrations_unlocked(
+            _Engine(),  # type: ignore[arg-type]
+            dry_run=True,
+            connection=None,
+            acceptance_fault_hook=None,
+        )
+
+
+def test_trigger_metadata_normalization_preserves_sqlstate_value_literals():
+    normalized = migrations_v3._normalized_trigger_sql(
+        "BEGIN SIGNAL SQLSTATE VALUE '45000' "
+        "SET MESSAGE_TEXT='Keep SQLSTATE VALUE  exactly'; END"
+    )
+
+    assert "signal sqlstate '45000'" in normalized
+    assert "'Keep SQLSTATE VALUE  exactly'" in normalized
 
 
 def test_outbox_acceptance_fault_hook_is_narrow_and_one_shot():

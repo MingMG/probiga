@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """添加模拟交易定时任务到数据库（盘中每1分钟扫描）"""
 
-import os
 import sys
 from pathlib import Path
 
@@ -10,20 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-def _read_env_url():
-    env_path = ROOT / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("MYSQL_URL="):
-                return line.split("=", 1)[1].strip()
-    return "mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine
 
 
 def main():
-    mysql_url = os.environ.get("MYSQL_URL") or _read_env_url()
-    engine = create_engine(mysql_url, pool_pre_ping=True)
+    engine = create_tool_engine()
 
     with engine.connect() as conn:
         # 检查是否已存在

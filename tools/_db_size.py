@@ -1,5 +1,7 @@
-from sqlalchemy import create_engine, text
-e = create_engine("mysql+pymysql://root:123456@localhost:3306/probiga?charset=utf8mb4", pool_pre_ping=True)
+from sqlalchemy import text
+
+from tools.env_config import create_tool_engine
+e = create_tool_engine()
 with e.connect() as c:
     r = c.execute(text("""
         SELECT table_name, ROUND(((data_length + index_length) / 1024 / 1024), 2) AS size_mb

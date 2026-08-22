@@ -1,7 +1,7 @@
 # 线上服务器 AI推荐到模拟交易全流程验证报告
 
 生成时间：2026-06-14  
-验证环境：线上服务器 `47.113.123.190`，项目目录 `/opt/ProBigA`  
+验证环境：线上服务器 `<production-host-from-inventory>`，项目目录 `/opt/ProBigA`
 验证方式：通过 SSH 登录线上服务器，在服务器本地调用 `/opt/ProBigA` 代码、线上 MySQL、线上 FastAPI `127.0.0.1:8000`
 
 ## 1. 本次纠正
@@ -267,4 +267,3 @@ AI signal status is WATCH; waiting for confirmation
 3. 修调度任务状态，避免任务实际未跑但系统不告警。
 4. 增加更多 T+1 有买入样本的 forward 验证。
 5. 对主升浪策略单独复盘，当前线上回测中主升浪收益为负，短线/波段更强。
-

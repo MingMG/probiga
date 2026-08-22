@@ -1,0 +1,5 @@
+PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1
+TARGET=cp314-manylinux_2_17_x86_64
+STATUS=BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED
+# No wheel entry is trusted until the complete Linux cp314 hash lock is built
+# and reviewed. READY manifests use exactly: <sha256><two spaces><wheel-name>.

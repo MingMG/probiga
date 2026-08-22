@@ -17,9 +17,10 @@ import math
 import re
 import sys
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine, make_url
@@ -34,27 +35,59 @@ from server.common.batch_db import (
     create_batch_engine,
     qualified_table_name,
 )
+from server.common.qmt_attestation_contract import (
+    AMOUNT_REL_TOLERANCE,
+    ATTESTATION_PROTOCOL_VERSION,
+    EXPECTED_STOCK_SET_SCHEMA,
+    PRICE_TOLERANCE,
+    QMT_ATTESTATION_COLLATION,
+    QMT_V2_TOLERANCE_VALUES,
+    UNIVERSE_MANIFEST_SCHEMA,
+    VOLUME_ABSOLUTE_TOLERANCE,
+    VOLUME_REL_TOLERANCE,
+    build_qmt_v2_manifest,
+    canonical_digest,
+    expected_stock_set_contract,
+    validated_universe_manifest,
+)
 from tools.env_config import load_project_env
 
-PRICE_TOLERANCE = 0.0001
-VOLUME_ABSOLUTE_TOLERANCE = 100.0
-VOLUME_REL_TOLERANCE = 0.0001
-AMOUNT_REL_TOLERANCE = 0.001
-ATTESTATION_PROTOCOL_VERSION = "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
-UNIVERSE_MANIFEST_SCHEMA = "probiga.qmt-daily-universe.v1"
-EXPECTED_STOCK_SET_SCHEMA = "probiga.qmt-expected-stock-set.v1"
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 ATTESTATION_TABLE_NAMES = (
     "qmt_kline_attestation_run",
     "qmt_kline_attestation_mismatch",
     "qmt_kline_attestation_row",
+    "qmt_kline_attestation_schema_migration",
 )
 ATTESTATION_SCHEMA_MIGRATION_TABLE = (
     "qmt_kline_attestation_schema_migration"
 )
 TOLERANCE_MEDIUMTEXT_MIGRATION_KEY = (
     "20260822_001_qmt_attestation_tolerance_mediumtext"
+)
+LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY = (
+    "20260822_002_qmt_legacy_v1_ineligible_manifest_binding"
+)
+LEGACY_MANIFEST_BINDING_SCHEMA = (
+    "probiga.qmt-legacy-ineligible-manifest-binding.v1"
+)
+LEGACY_MANIFEST_DISPOSITION = (
+    "LEGACY_V1_INELIGIBLE_NO_UNIVERSE_MANIFEST"
+)
+EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT = 11
+EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH = (
+    "fc8328550615413445edf1055b3b88d70fa8b37e45ee331f682cf8f654779b54"
+)
+# The deployed pre-V2 writer serialized this exact four-key object with
+# ``json.dumps(..., sort_keys=True)``.  No alternate whitespace, key order,
+# tolerance or additional field is grandfathered.
+LEGACY_TOLERANCE_JSON = (
+    '{"amount_relative": 0.001, "price_absolute": 0.0001, '
+    '"volume_absolute": 100.0, "volume_relative": 0.0001}'
+)
+LEGACY_TOLERANCE_JSON_SHA256 = (
+    "707a02cceef18d45ed7f689ae460a3abbf78079a3ebb37c761ecb17839007bde"
 )
 _TOLERANCE_MEDIUMTEXT_MIGRATION_PAYLOAD = {
     "schema": "probiga.qmt-attestation-schema-migration.v1",
@@ -86,6 +119,11 @@ _ATTESTATION_COLUMN_CONTRACTS: dict[
         ...,
     ],
 ] = {
+    "qmt_kline_attestation_schema_migration": (
+        ("migration_key", "varchar", 100, None, None, "NO", None, ""),
+        ("migration_hash", "char", 64, None, None, "NO", None, ""),
+        ("completed_at", "datetime", None, None, None, "NO", None, ""),
+    ),
     "qmt_kline_attestation_run": (
         ("run_id", "varchar", 64, None, None, "NO", None, ""),
         ("provider", "varchar", 32, None, None, "NO", None, ""),
@@ -151,6 +189,9 @@ _ATTESTATION_COLUMN_CONTRACTS: dict[
 _ATTESTATION_INDEX_CONTRACTS: dict[
     str, dict[str, tuple[int, tuple[str, ...]]]
 ] = {
+    "qmt_kline_attestation_schema_migration": {
+        "PRIMARY": (0, ("migration_key",)),
+    },
     "qmt_kline_attestation_run": {
         "PRIMARY": (0, ("run_id",)),
         "idx_qmt_kline_attestation_range": (
@@ -202,6 +243,24 @@ ATTESTATION_TRIGGER_STATEMENTS = {
             SET MESSAGE_TEXT = 'QMT row attestation cannot be deleted';
         END
     """,
+    "trg_qmt_attestation_schema_migration_immutable_bu": """
+        CREATE TRIGGER trg_qmt_attestation_schema_migration_immutable_bu
+        BEFORE UPDATE ON qmt_kline_attestation_schema_migration
+        FOR EACH ROW
+        BEGIN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'QMT schema migration marker is append only';
+        END
+    """,
+    "trg_qmt_attestation_schema_migration_immutable_bd": """
+        CREATE TRIGGER trg_qmt_attestation_schema_migration_immutable_bd
+        BEFORE DELETE ON qmt_kline_attestation_schema_migration
+        FOR EACH ROW
+        BEGIN
+            SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'QMT schema migration marker cannot be deleted';
+        END
+    """,
 }
 
 _ATTESTATION_TRIGGER_CONTRACTS = {
@@ -219,6 +278,20 @@ _ATTESTATION_TRIGGER_CONTRACTS = {
         "BEGIN SIGNAL SQLSTATE '45000' "
         "SET MESSAGE_TEXT = 'QMT row attestation cannot be deleted'; END",
     ),
+    "trg_qmt_attestation_schema_migration_immutable_bu": (
+        "BEFORE",
+        "UPDATE",
+        "qmt_kline_attestation_schema_migration",
+        "BEGIN SIGNAL SQLSTATE '45000' "
+        "SET MESSAGE_TEXT = 'QMT schema migration marker is append only'; END",
+    ),
+    "trg_qmt_attestation_schema_migration_immutable_bd": (
+        "BEFORE",
+        "DELETE",
+        "qmt_kline_attestation_schema_migration",
+        "BEGIN SIGNAL SQLSTATE '45000' "
+        "SET MESSAGE_TEXT = 'QMT schema migration marker cannot be deleted'; END",
+    ),
 }
 
 
@@ -234,15 +307,48 @@ class QmtAttestationSchemaError(RuntimeError):
         )
 
 
-def canonical_digest(value: Any) -> str:
-    encoded = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+_DDL_STATEMENT_RE = re.compile(
+    r"^\s*(?:/\*.*?\*/\s*)*(CREATE|ALTER|DROP)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_SESSION_LOCAL_TEMPORARY_DDL_RE = re.compile(
+    r"^\s*(?:/\*.*?\*/\s*)*(?:CREATE|DROP)\s+TEMPORARY\s+TABLE\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def assert_schema_prepared_statement_is_session_local(statement: Any) -> None:
+    """Reject permanent or ALTER DDL in the production history path."""
+
+    sql = str(statement)
+    if _DDL_STATEMENT_RE.match(sql) and not (
+        _SESSION_LOCAL_TEMPORARY_DDL_RE.match(sql)
+    ):
+        raise RuntimeError(
+            "schema_prepared history path permits only CREATE/DROP "
+            "TEMPORARY TABLE DDL"
+        )
+
+
+class _SessionLocalDdlConnection:
+    def __init__(self, connection: Connection):
+        self._connection = connection
+
+    def execute(self, statement, *args, **kwargs):
+        assert_schema_prepared_statement_is_session_local(statement)
+        return self._connection.execute(statement, *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+
+@contextmanager
+def _attestation_transaction(engine: Engine, *, schema_prepared: bool):
+    with engine.begin() as connection:
+        if schema_prepared:
+            yield _SessionLocalDdlConnection(connection)
+        else:
+            yield connection
 
 
 TOLERANCE_MEDIUMTEXT_MIGRATION_HASH = canonical_digest(
@@ -312,7 +418,7 @@ def _ensure_tolerance_json_mediumtext_migration(
     target_contract = ("mediumtext", 16777215, "NO", "utf8mb4")
     column_prefix = column_contract[:4]
     metadata_valid = bool(
-        column_contract[4].startswith("utf8mb4_")
+        column_contract[4] == QMT_ATTESTATION_COLLATION
         and column_contract[5] is None
         and column_contract[6] == ""
     )
@@ -357,7 +463,7 @@ def _ensure_tolerance_json_mediumtext_migration(
         migrated_contract = _tolerance_json_column_contract(connection)
         if not (
             migrated_contract[:4] == target_contract
-            and migrated_contract[4].startswith("utf8mb4_")
+            and migrated_contract[4] == QMT_ATTESTATION_COLLATION
             and migrated_contract[5] is None
             and migrated_contract[6] == ""
         ):
@@ -383,79 +489,135 @@ def _ensure_tolerance_json_mediumtext_migration(
     )
 
 
-def expected_stock_set_contract(
-    trade_date: str,
-    stock_codes: list[str] | set[str] | tuple[str, ...],
-) -> dict[str, Any]:
-    normalized_codes = sorted(
-        {str(stock_code).strip() for stock_code in stock_codes}
+def _legacy_completed_run_binding(row: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the one known legacy COMPLETED row without upgrading evidence.
+
+    The old protocol did not persist an immutable daily universe, so these
+    rows can never become V2 funding evidence.  We only bind their exact
+    historical identity and counters into an append-only migration marker.
+    """
+
+    run_id = str(row.get("run_id") or "").strip()
+    start_date = str(row.get("start_date") or "")[:10]
+    end_date = str(row.get("end_date") or "")[:10]
+    try:
+        parsed_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        parsed_end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("legacy completed run date is invalid") from exc
+    if (
+        not run_id
+        or len(run_id) > 64
+        or parsed_start.isoformat() != start_date
+        or parsed_end.isoformat() != end_date
+        or parsed_start > parsed_end
+        or str(row.get("provider") or "") != PROVIDER_ID
+    ):
+        raise ValueError("legacy completed run identity differs")
+
+    raw_tolerance = row.get("tolerance_json")
+    if not isinstance(raw_tolerance, str):
+        raise ValueError("legacy tolerance JSON is not the exact stored text")
+    raw_hash = hashlib.sha256(raw_tolerance.encode("utf-8")).hexdigest()
+    if (
+        raw_tolerance != LEGACY_TOLERANCE_JSON
+        or raw_hash != LEGACY_TOLERANCE_JSON_SHA256
+    ):
+        raise ValueError("legacy tolerance JSON contract differs")
+    try:
+        parsed_tolerance = json.loads(raw_tolerance)
+    except json.JSONDecodeError as exc:  # pragma: no cover - hash is stronger
+        raise ValueError("legacy tolerance JSON is invalid") from exc
+    if parsed_tolerance != {
+        "amount_relative": AMOUNT_REL_TOLERANCE,
+        "price_absolute": PRICE_TOLERANCE,
+        "volume_absolute": VOLUME_ABSOLUTE_TOLERANCE,
+        "volume_relative": VOLUME_REL_TOLERANCE,
+    }:
+        raise ValueError("legacy tolerance values differ")
+
+    counter_names = (
+        "target_rows",
+        "qmt_rows",
+        "matched_rows",
+        "missing_qmt_rows",
+        "mismatched_rows",
+        "already_attested_rows",
+        "updated_rows",
     )
-    if not normalized_codes or any(not code for code in normalized_codes):
-        raise ValueError("QMT daily universe must be non-empty")
+    try:
+        counters = {
+            name: int(row.get(name) or 0) for name in counter_names
+        }
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("legacy completed run counters are invalid") from exc
+    target_rows = counters["target_rows"]
+    if (
+        target_rows <= 0
+        or counters["qmt_rows"] < target_rows
+        or counters["matched_rows"] != target_rows
+        or counters["missing_qmt_rows"] != 0
+        or counters["mismatched_rows"] != 0
+        or counters["already_attested_rows"] < 0
+        or counters["already_attested_rows"] > target_rows
+        or counters["updated_rows"] < 0
+        or counters["updated_rows"] > target_rows
+    ):
+        raise ValueError("legacy completed run counters are not self-consistent")
+    return {
+        "run_id": run_id,
+        "provider": PROVIDER_ID,
+        "start_date": start_date,
+        "end_date": end_date,
+        **counters,
+        "tolerance_json_sha256": raw_hash,
+        "disposition": LEGACY_MANIFEST_DISPOSITION,
+    }
+
+
+def legacy_completed_run_binding_plan(
+    rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    bindings = sorted(
+        (_legacy_completed_run_binding(dict(row)) for row in rows),
+        key=lambda item: (
+            item["start_date"],
+            item["end_date"],
+            item["run_id"],
+        ),
+    )
+    run_ids = [str(item["run_id"]) for item in bindings]
+    if len(run_ids) != len(set(run_ids)):
+        raise ValueError("legacy completed run identity is duplicated")
     payload = {
-        "schema": EXPECTED_STOCK_SET_SCHEMA,
-        "trade_date": str(trade_date),
-        "stock_codes": normalized_codes,
+        "schema": LEGACY_MANIFEST_BINDING_SCHEMA,
+        "disposition": LEGACY_MANIFEST_DISPOSITION,
+        "legacy_run_count": len(bindings),
+        "runs": bindings,
     }
     return {
-        "stock_count": len(normalized_codes),
-        "stock_set_hash": canonical_digest(payload),
+        **payload,
+        "plan_hash": canonical_digest(payload),
     }
 
 
-def validated_universe_manifest(
-    tolerance_json: Any,
+def validate_legacy_completed_run_release_contract(
+    plan: dict[str, Any],
     *,
-    start_date: str,
-    end_date: str,
-) -> dict[str, dict[str, Any]]:
-    """Parse the immutable daily-universe contract of a COMPLETED run."""
-
-    if isinstance(tolerance_json, dict):
-        payload = tolerance_json
-    else:
-        try:
-            payload = json.loads(str(tolerance_json or ""))
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("tolerance_json is not valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("tolerance_json must be an object")
-    if payload.get("attestation_protocol") != ATTESTATION_PROTOCOL_VERSION:
-        raise ValueError("attestation protocol differs")
-    if payload.get("universe_manifest_schema") != UNIVERSE_MANIFEST_SCHEMA:
-        raise ValueError("universe manifest schema differs")
-    daily = payload.get("daily_universe")
-    if not isinstance(daily, dict) or not daily:
-        raise ValueError("daily universe manifest must be non-empty")
-    normalized: dict[str, dict[str, Any]] = {}
-    for raw_day, raw_contract in daily.items():
-        day = str(raw_day or "")
-        try:
-            parsed_day = datetime.strptime(day, "%Y-%m-%d").date().isoformat()
-        except (TypeError, ValueError) as exc:
-            raise ValueError("daily universe date is invalid") from exc
-        if parsed_day != day or not (start_date <= day <= end_date):
-            raise ValueError("daily universe date is outside run range")
-        if (
-            not isinstance(raw_contract, dict)
-            or set(raw_contract) != {"stock_count", "stock_set_hash"}
-        ):
-            raise ValueError("daily universe entry fields differ")
-        try:
-            stock_count = int(raw_contract.get("stock_count"))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("daily universe stock_count is invalid") from exc
-        stock_set_hash = str(raw_contract.get("stock_set_hash") or "")
-        if (
-            stock_count <= 0
-            or not _LOWER_SHA256_RE.fullmatch(stock_set_hash)
-        ):
-            raise ValueError("daily universe count/hash is invalid")
-        normalized[day] = {
-            "stock_count": stock_count,
-            "stock_set_hash": stock_set_hash,
-        }
-    return dict(sorted(normalized.items()))
+    expected_run_count: int,
+    expected_plan_hash: str,
+) -> None:
+    if (
+        type(expected_run_count) is not int
+        or expected_run_count <= 0
+        or not _LOWER_SHA256_RE.fullmatch(str(expected_plan_hash or ""))
+    ):
+        raise ValueError("legacy release expectation is invalid")
+    if (
+        int(plan.get("legacy_run_count") or 0) != expected_run_count
+        or str(plan.get("plan_hash") or "") != expected_plan_hash
+    ):
+        raise ValueError("legacy completed run release contract differs")
 
 
 def values_match(
@@ -540,7 +702,91 @@ def _table_names(engine: Engine) -> tuple[str, str]:
     )
 
 
-def ensure_attestation_tables(engine: Engine) -> None:
+def _normalized_trigger_body(value: Any) -> str:
+    normalized = str(value or "").replace("`", "")
+    normalized = re.sub(
+        r"\bSQLSTATE\s+VALUE\b",
+        "SQLSTATE",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
+    normalized = re.sub(r"\s*=\s*", "=", normalized)
+    normalized = re.sub(r"\s*;\s*", ";", normalized)
+    return normalized
+
+
+def _missing_attestation_trigger_statements(
+    connection: Connection,
+) -> tuple[str, ...]:
+    """Return only missing frozen guards and reject every existing drift."""
+
+    rows = connection.execute(text(
+        "SELECT TRIGGER_NAME AS trigger_name, "
+        "ACTION_TIMING AS action_timing, "
+        "EVENT_MANIPULATION AS event_manipulation, "
+        "EVENT_OBJECT_TABLE AS event_object_table, "
+        "ACTION_ORIENTATION AS action_orientation, "
+        "ACTION_STATEMENT AS action_statement "
+        "FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA=DATABASE() "
+        "AND EVENT_OBJECT_TABLE IN "
+        "('qmt_kline_attestation_row', "
+        "'qmt_kline_attestation_schema_migration') "
+        "ORDER BY BINARY TRIGGER_NAME"
+    )).mappings().all()
+    observed = {
+        str(row.get("trigger_name") or ""): dict(row) for row in rows
+    }
+    expected_names = set(_ATTESTATION_TRIGGER_CONTRACTS)
+    unexpected = sorted(set(observed) - expected_names)
+    if unexpected:
+        raise QmtAttestationSchemaError({
+            "errors": [
+                "unexpected immutable triggers: " + ", ".join(unexpected)
+            ]
+        })
+    for trigger_name, row in observed.items():
+        timing, event, table_name, body = _ATTESTATION_TRIGGER_CONTRACTS[
+            trigger_name
+        ]
+        if (
+            str(row.get("action_timing") or "").upper() != timing
+            or str(row.get("event_manipulation") or "").upper() != event
+            or str(row.get("event_object_table") or "") != table_name
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or _normalized_trigger_body(row.get("action_statement"))
+            != _normalized_trigger_body(body)
+        ):
+            raise QmtAttestationSchemaError({
+                "errors": [f"existing immutable trigger differs: {trigger_name}"]
+            })
+    return tuple(
+        ATTESTATION_TRIGGER_STATEMENTS[name]
+        for name in sorted(expected_names - set(observed))
+    )
+
+
+def ensure_attestation_tables(
+    engine: Engine,
+    *,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+    allow_legacy_manifest_candidates: bool = False,
+) -> None:
+    """Prepare tables while delegating every missing trigger explicitly.
+
+    Table, column, index and backfill work is deliberately separate from
+    trigger creation.  In production the release broker supplies a narrowly
+    validated executor which opens one short global-trust window per missing
+    frozen trigger.  Normal runtime callers never receive that authority.
+    """
+
+    if trigger_ddl_executor is not None and not callable(
+        trigger_ddl_executor
+    ):
+        raise TypeError("trigger_ddl_executor must be callable")
+    if type(allow_legacy_manifest_candidates) is not bool:
+        raise TypeError("allow_legacy_manifest_candidates must be bool")
     table_statements = (
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_run (
@@ -562,6 +808,7 @@ def ensure_attestation_tables(engine: Engine) -> None:
             error_message TEXT NULL,
             KEY idx_qmt_kline_attestation_range (start_date, end_date, status)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_mismatch (
@@ -581,6 +828,7 @@ def ensure_attestation_tables(engine: Engine) -> None:
                 (run_id, trade_date, stock_code),
             KEY idx_qmt_kline_mismatch_lookup (trade_date, stock_code)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_row (
@@ -607,6 +855,7 @@ def ensure_attestation_tables(engine: Engine) -> None:
                 (trade_date, protocol_version, stock_code),
             KEY idx_qmt_kline_attestation_row_run (run_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci
         """,
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_schema_migration (
@@ -614,27 +863,29 @@ def ensure_attestation_tables(engine: Engine) -> None:
             migration_hash CHAR(64) NOT NULL,
             completed_at DATETIME NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+          COLLATE=utf8mb4_unicode_ci
         """,
     )
     with engine.begin() as connection:
         for statement in table_statements:
             connection.execute(text(statement))
         _ensure_tolerance_json_mediumtext_migration(connection)
-    with engine.begin() as connection:
-        existing = {
-            str(row[0])
-            for row in connection.execute(text(
-                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
-                "WHERE TRIGGER_SCHEMA=DATABASE() "
-                "AND TRIGGER_NAME IN "
-                "('trg_qmt_kline_attestation_row_immutable_bu', "
-                "'trg_qmt_kline_attestation_row_immutable_bd')"
-            )).all()
-        }
-        for trigger_name, statement in ATTESTATION_TRIGGER_STATEMENTS.items():
-            if trigger_name not in existing:
-                connection.execute(text(statement))
-    validate_attestation_schema(engine)
+    with engine.connect() as connection:
+        missing_statements = _missing_attestation_trigger_statements(connection)
+    if missing_statements and trigger_ddl_executor is None:
+        raise QmtAttestationSchemaError({
+            "errors": [
+                "missing immutable triggers require the explicit trigger "
+                "DDL executor"
+            ]
+        })
+    for statement in missing_statements:
+        assert trigger_ddl_executor is not None
+        trigger_ddl_executor(statement)
+    validate_attestation_schema(
+        engine,
+        require_current_manifests=not allow_legacy_manifest_candidates,
+    )
 
 
 def _normalized_schema_default(value: Any) -> str | None:
@@ -645,22 +896,17 @@ def _normalized_schema_default(value: Any) -> str | None:
     return str(value)
 
 
-def _normalized_trigger_body(value: Any) -> str:
-    normalized = str(value or "").replace("`", "")
-    normalized = re.sub(
-        r"\bSQLSTATE\s+VALUE\b",
-        "SQLSTATE",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    normalized = re.sub(r"\s+", " ", normalized).strip().lower()
-    normalized = re.sub(r"\s*=\s*", "=", normalized)
-    normalized = re.sub(r"\s*;\s*", ";", normalized)
-    return normalized
-
-
 def _validate_attestation_schema_connection(
     connection: Connection,
+    *,
+    require_triggers: bool = True,
+    require_current_manifests: bool = True,
+    expected_legacy_run_count: int = (
+        EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT
+    ),
+    expected_legacy_plan_hash: str = (
+        EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH
+    ),
 ) -> dict[str, Any]:
     errors: list[str] = []
     migration_rows = connection.execute(
@@ -706,8 +952,8 @@ def _validate_attestation_schema_connection(
         if str(row.get("engine") or "").lower() != "innodb":
             errors.append(f"{table_name} engine is not InnoDB")
         collation = str(row.get("table_collation") or "").lower()
-        if not collation.startswith("utf8mb4_"):
-            errors.append(f"{table_name} character set is not utf8mb4")
+        if collation != QMT_ATTESTATION_COLLATION:
+            errors.append(f"{table_name} table collation differs")
 
     column_rows = connection.execute(
         text(
@@ -747,7 +993,7 @@ def _validate_attestation_schema_connection(
         column_collation = str(row.get("collation_name") or "").lower()
         if character_type and (
             character_set != "utf8mb4"
-            or not column_collation.startswith("utf8mb4_")
+            or column_collation != QMT_ATTESTATION_COLLATION
         ):
             errors.append(
                 f"{table_name}.{row.get('column_name')} "
@@ -864,8 +1110,9 @@ def _validate_attestation_schema_connection(
             "ACTION_STATEMENT AS action_statement "
             "FROM information_schema.TRIGGERS "
             "WHERE TRIGGER_SCHEMA=DATABASE() "
-            "AND BINARY EVENT_OBJECT_TABLE="
-            "BINARY 'qmt_kline_attestation_row' "
+            "AND EVENT_OBJECT_TABLE IN "
+            "('qmt_kline_attestation_row', "
+            "'qmt_kline_attestation_schema_migration') "
             "ORDER BY BINARY TRIGGER_NAME"
         )
     ).mappings().all()
@@ -873,14 +1120,22 @@ def _validate_attestation_schema_connection(
         str(row.get("trigger_name") or ""): dict(row)
         for row in trigger_rows
     }
-    if set(observed_triggers) != set(_ATTESTATION_TRIGGER_CONTRACTS):
+    unexpected_triggers = set(observed_triggers) - set(
+        _ATTESTATION_TRIGGER_CONTRACTS
+    )
+    missing_triggers = set(_ATTESTATION_TRIGGER_CONTRACTS) - set(
+        observed_triggers
+    )
+    if unexpected_triggers or (require_triggers and missing_triggers):
         errors.append(
             "immutable trigger inventory differs: expected="
             f"{sorted(_ATTESTATION_TRIGGER_CONTRACTS)!r}, "
             f"observed={sorted(observed_triggers)!r}"
         )
-    for trigger_name, expected in _ATTESTATION_TRIGGER_CONTRACTS.items():
-        row = observed_triggers.get(trigger_name, {})
+    for trigger_name, row in observed_triggers.items():
+        expected = _ATTESTATION_TRIGGER_CONTRACTS.get(trigger_name)
+        if expected is None:
+            continue
         timing, event, table_name, body = expected
         observed_body = _normalized_trigger_body(
             row.get("action_statement")
@@ -899,12 +1154,17 @@ def _validate_attestation_schema_connection(
 
     completed_run_rows = connection.execute(
         text(
-            "SELECT run_id, start_date, end_date, tolerance_json "
+            "SELECT run_id, provider, start_date, end_date, "
+            "target_rows, qmt_rows, matched_rows, missing_qmt_rows, "
+            "mismatched_rows, already_attested_rows, updated_rows, "
+            "tolerance_json "
             "FROM qmt_kline_attestation_run "
             "WHERE status='COMPLETED' ORDER BY start_date, end_date, run_id"
         )
     ).mappings().all()
     completed_manifest_entry_count = 0
+    current_manifest_run_count = 0
+    legacy_rows: list[dict[str, Any]] = []
     for row in completed_run_rows:
         run_id = str(row.get("run_id") or "")
         start_date = str(row.get("start_date") or "")[:10]
@@ -916,12 +1176,65 @@ def _validate_attestation_schema_connection(
                 end_date=end_date,
             )
             completed_manifest_entry_count += len(manifest)
+            current_manifest_run_count += 1
         except Exception as exc:
-            errors.append(
-                f"completed run universe manifest invalid: "
-                f"{run_id or '<missing-run-id>'}: "
-                f"{type(exc).__name__}: {exc}"
+            try:
+                _legacy_completed_run_binding(dict(row))
+                legacy_rows.append(dict(row))
+            except Exception as legacy_exc:
+                errors.append(
+                    f"completed run universe manifest invalid: "
+                    f"{run_id or '<missing-run-id>'}: "
+                    f"{type(exc).__name__}: {exc}; legacy contract: "
+                    f"{type(legacy_exc).__name__}: {legacy_exc}"
+                )
+
+    legacy_plan: dict[str, Any] | None = None
+    try:
+        legacy_plan = legacy_completed_run_binding_plan(legacy_rows)
+        if legacy_rows:
+            validate_legacy_completed_run_release_contract(
+                legacy_plan,
+                expected_run_count=expected_legacy_run_count,
+                expected_plan_hash=expected_legacy_plan_hash,
             )
+    except Exception as exc:
+        errors.append(
+            "legacy completed run binding plan invalid: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    legacy_marker_rows = connection.execute(
+        text(
+            "SELECT migration_hash FROM "
+            "qmt_kline_attestation_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ),
+        {"migration_key": LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY},
+    ).mappings().all()
+    legacy_marker_verified = False
+    expected_legacy_hash = str(
+        (legacy_plan or {}).get("plan_hash") or ""
+    )
+    if legacy_rows:
+        if not legacy_marker_rows:
+            if require_current_manifests:
+                errors.append(
+                    "legacy completed runs lack their ineligible binding marker"
+                )
+        elif (
+            len(legacy_marker_rows) != 1
+            or str(legacy_marker_rows[0].get("migration_hash") or "")
+            != expected_legacy_hash
+        ):
+            errors.append(
+                "legacy completed run binding marker/hash differs"
+            )
+        else:
+            legacy_marker_verified = True
+    elif legacy_marker_rows:
+        errors.append(
+            "legacy completed run binding marker exists without bound rows"
+        )
 
     detail = {
         "protocol_version": ATTESTATION_PROTOCOL_VERSION,
@@ -934,7 +1247,14 @@ def _validate_attestation_schema_connection(
         "trigger_names": sorted(observed_triggers),
         "trigger_count": len(observed_triggers),
         "completed_run_count": len(completed_run_rows),
+        "completed_current_manifest_run_count": current_manifest_run_count,
         "completed_manifest_entry_count": completed_manifest_entry_count,
+        "legacy_ineligible_run_count": len(legacy_rows),
+        "legacy_binding_plan_hash": expected_legacy_hash,
+        "legacy_binding_marker_verified": legacy_marker_verified,
+        "legacy_binding_pending": bool(
+            legacy_rows and not legacy_marker_rows
+        ),
         "errors": errors,
     }
     if errors:
@@ -944,6 +1264,15 @@ def _validate_attestation_schema_connection(
 
 def validate_attestation_schema(
     bind: Engine | Connection,
+    *,
+    require_triggers: bool = True,
+    require_current_manifests: bool = True,
+    expected_legacy_run_count: int = (
+        EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT
+    ),
+    expected_legacy_plan_hash: str = (
+        EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH
+    ),
 ) -> dict[str, Any]:
     """Fail closed unless the complete V2 attestation schema is frozen.
 
@@ -954,9 +1283,21 @@ def validate_attestation_schema(
 
     try:
         if hasattr(bind, "execute"):
-            return _validate_attestation_schema_connection(bind)  # type: ignore[arg-type]
+            return _validate_attestation_schema_connection(  # type: ignore[arg-type]
+                bind,
+                require_triggers=require_triggers,
+                require_current_manifests=require_current_manifests,
+                expected_legacy_run_count=expected_legacy_run_count,
+                expected_legacy_plan_hash=expected_legacy_plan_hash,
+            )
         with bind.connect() as connection:
-            return _validate_attestation_schema_connection(connection)
+            return _validate_attestation_schema_connection(
+                connection,
+                require_triggers=require_triggers,
+                require_current_manifests=require_current_manifests,
+                expected_legacy_run_count=expected_legacy_run_count,
+                expected_legacy_plan_hash=expected_legacy_plan_hash,
+            )
     except QmtAttestationSchemaError:
         raise
     except Exception as exc:
@@ -1015,18 +1356,27 @@ def attest_range(
     apply: bool,
     provider: str = PROVIDER_ID,
     mismatch_sample_limit: int = 5000,
+    schema_prepared: bool = False,
 ) -> dict[str, Any]:
-    ensure_attestation_tables(engine)
-    validate_attestation_schema(engine)
+    if type(schema_prepared) is not bool:
+        raise TypeError("schema_prepared must be bool")
+    if schema_prepared:
+        validate_attestation_schema(engine)
+    else:
+        def direct_trigger_ddl_executor(statement: str) -> None:
+            with engine.begin() as connection:
+                connection.execute(text(statement))
+
+        ensure_attestation_tables(
+            engine,
+            trigger_ddl_executor=direct_trigger_ddl_executor,
+        )
+        validate_attestation_schema(engine)
     target_table, source_table = _table_names(engine)
     run_id = f"qmt_attest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     tolerances = {
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
-        "price_absolute": PRICE_TOLERANCE,
-        "pre_close_absolute": PRICE_TOLERANCE,
-        "volume_absolute": VOLUME_ABSOLUTE_TOLERANCE,
-        "volume_relative": VOLUME_REL_TOLERANCE,
-        "amount_relative": AMOUNT_REL_TOLERANCE,
+        **dict(QMT_V2_TOLERANCE_VALUES),
     }
     params = {
         "run_id": run_id,
@@ -1039,7 +1389,9 @@ def attest_range(
         "amount_rel_tolerance": AMOUNT_REL_TOLERANCE,
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
     }
-    with engine.begin() as connection:
+    with _attestation_transaction(
+        engine, schema_prepared=schema_prepared,
+    ) as connection:
         connection.execute(
             text(
                 """
@@ -1058,7 +1410,9 @@ def attest_range(
     source_temp = "tmp_qmt_attest_source"
     compare_temp = "tmp_qmt_attest_compare"
     try:
-        with engine.begin() as connection:
+        with _attestation_transaction(
+            engine, schema_prepared=schema_prepared,
+        ) as connection:
             # Pull each indexed date range sequentially once.  Comparing the
             # two compact temporary tables is substantially faster than
             # repeating random cross-schema lookups for counters, mismatch
@@ -1068,12 +1422,26 @@ def attest_range(
             connection.execute(
                 text(
                     f"""
-                    CREATE TEMPORARY TABLE `{target_temp}` ENGINE=InnoDB AS
+                    CREATE TEMPORARY TABLE `{target_temp}` (
+                        target_id BIGINT NOT NULL,
+                        stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_unicode_ci NOT NULL,
+                        trade_date DATE NOT NULL,
+                        `open` DECIMAL(20,6) NULL,
+                        `close` DECIMAL(20,6) NULL,
+                        `high` DECIMAL(20,6) NULL,
+                        `low` DECIMAL(20,6) NULL,
+                        volume DECIMAL(24,6) NULL,
+                        amount DECIMAL(24,6) NULL,
+                        pre_close DECIMAL(20,6) NULL,
+                        PRIMARY KEY (target_id),
+                        UNIQUE KEY uk_tmp_qmt_attest_target
+                            (stock_code, trade_date)
+                    ) ENGINE=InnoDB AS
                     SELECT id AS target_id,
-                           stock_code COLLATE utf8mb4_general_ci AS stock_code,
+                           stock_code,
                            trade_date, `open`, `close`, `high`, `low`,
-                           volume, amount, pre_close,
-                           data_source, quality_status
+                           volume, amount, pre_close
                     FROM {target_table}
                     WHERE trade_date BETWEEN :start_date AND :end_date
                       AND k_type=1 AND adjust_type=0
@@ -1085,17 +1453,30 @@ def attest_range(
             connection.execute(
                 text(
                     f"""
-                    ALTER TABLE `{target_temp}`
-                    ADD PRIMARY KEY (target_id),
-                    ADD UNIQUE KEY uk_tmp_qmt_attest_target
-                        (stock_code, trade_date)
-                    """
-                )
-            )
-            connection.execute(
-                text(
-                    f"""
-                    CREATE TEMPORARY TABLE `{source_temp}` ENGINE=InnoDB AS
+                    CREATE TEMPORARY TABLE `{source_temp}` (
+                        qmt_id BIGINT NOT NULL,
+                        stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_unicode_ci NOT NULL,
+                        trade_date DATE NOT NULL,
+                        `open` DECIMAL(20,6) NULL,
+                        `close` DECIMAL(20,6) NULL,
+                        `high` DECIMAL(20,6) NULL,
+                        `low` DECIMAL(20,6) NULL,
+                        volume DECIMAL(24,6) NULL,
+                        amount DECIMAL(24,6) NULL,
+                        pre_close DECIMAL(20,6) NULL,
+                        pre_close_origin VARCHAR(32) NULL,
+                        qmt_code VARCHAR(32) NULL,
+                        provider VARCHAR(32) NULL,
+                        source_time DATETIME NULL,
+                        received_at DATETIME NULL,
+                        batch_id VARCHAR(64) NULL,
+                        data_version VARCHAR(64) NULL,
+                        permission_status VARCHAR(32) NULL,
+                        PRIMARY KEY (qmt_id),
+                        UNIQUE KEY uk_tmp_qmt_attest_source
+                            (stock_code, trade_date)
+                    ) ENGINE=InnoDB AS
                     SELECT id AS qmt_id, stock_code, trade_date,
                            `open`, `close`, `high`, `low`, volume, amount,
                            pre_close, pre_close_origin,
@@ -1109,16 +1490,6 @@ def attest_range(
                     """
                 ),
                 params,
-            )
-            connection.execute(
-                text(
-                    f"""
-                    ALTER TABLE `{source_temp}`
-                    ADD PRIMARY KEY (qmt_id),
-                    ADD UNIQUE KEY uk_tmp_qmt_attest_source
-                        (stock_code, trade_date)
-                    """
-                )
             )
             qmt_rows = int(
                 connection.execute(
@@ -1142,7 +1513,37 @@ def attest_range(
             connection.execute(
                 text(
                     f"""
-                    CREATE TEMPORARY TABLE `{compare_temp}` ENGINE=InnoDB AS
+                    CREATE TEMPORARY TABLE `{compare_temp}` (
+                        target_id BIGINT NOT NULL,
+                        qmt_id BIGINT NULL,
+                        trade_date DATE NOT NULL,
+                        stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_unicode_ci NOT NULL,
+                        is_match TINYINT NULL,
+                        provenance_already TINYINT NOT NULL,
+                        target_close DECIMAL(20,6) NULL,
+                        qmt_close DECIMAL(20,6) NULL,
+                        target_pre_close DECIMAL(20,6) NULL,
+                        qmt_pre_close DECIMAL(20,6) NULL,
+                        target_volume DECIMAL(24,6) NULL,
+                        qmt_volume DECIMAL(24,6) NULL,
+                        target_amount DECIMAL(24,6) NULL,
+                        qmt_amount DECIMAL(24,6) NULL,
+                        qmt_code VARCHAR(32) NULL,
+                        provider VARCHAR(32) NULL,
+                        source_time DATETIME NULL,
+                        received_at DATETIME NULL,
+                        batch_id VARCHAR(64) NULL,
+                        data_version VARCHAR(64) NULL,
+                        permission_status VARCHAR(32) NULL,
+                        pre_close_origin VARCHAR(32) NULL,
+                        qmt_open DECIMAL(20,6) NULL,
+                        qmt_high DECIMAL(20,6) NULL,
+                        qmt_low DECIMAL(20,6) NULL,
+                        PRIMARY KEY (target_id),
+                        KEY idx_tmp_qmt_attest_match (is_match),
+                        KEY idx_tmp_qmt_attest_source (qmt_id)
+                    ) ENGINE=InnoDB AS
                     SELECT t.target_id, q.qmt_id,
                            t.trade_date, t.stock_code,
                            ({match_sql}) AS is_match,
@@ -1190,16 +1591,6 @@ def attest_range(
                     """
                 ),
                 params,
-            )
-            connection.execute(
-                text(
-                    f"""
-                    ALTER TABLE `{compare_temp}`
-                    ADD PRIMARY KEY (target_id),
-                    ADD KEY idx_tmp_qmt_attest_match (is_match),
-                    ADD KEY idx_tmp_qmt_attest_source (qmt_id)
-                    """
-                )
             )
             aggregate = connection.execute(
                 text(
@@ -1322,11 +1713,7 @@ def attest_range(
                 day: expected_stock_set_contract(day, stock_codes)
                 for day, stock_codes in sorted(daily_stock_codes.items())
             }
-            run_tolerances = {
-                **tolerances,
-                "universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
-                "daily_universe": daily_universe,
-            }
+            run_tolerances = build_qmt_v2_manifest(daily_universe)
             manifest_row_count = sum(
                 int(contract["stock_count"])
                 for contract in daily_universe.values()
@@ -1516,7 +1903,9 @@ def attest_range(
             "daily_universe": daily_universe,
         }
     except Exception as exc:
-        with engine.begin() as connection:
+        with _attestation_transaction(
+            engine, schema_prepared=schema_prepared,
+        ) as connection:
             connection.execute(
                 text(
                     """

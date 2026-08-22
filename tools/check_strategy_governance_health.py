@@ -56,6 +56,8 @@ GOVERNANCE_TABLES = (
     "st_strategy_governance_run",
     "st_strategy_pool_snapshot",
     "st_strategy_allocation_snapshot",
+    "st_strategy_adapter_run_receipt",
+    "st_strategy_industry_history",
     "st_strategy_governance_audit",
 )
 REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
@@ -271,8 +273,51 @@ REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
             "lifecycle_risk_multiplier",
             "base_competitive_weight_pct",
             "simulated_weight_pct",
+            "member_sleeves_json",
+            "member_sleeve_hash",
+            "cash_discount_bp",
             "reason",
             "real_order_authority",
+            "created_at",
+        }
+    ),
+    "st_strategy_adapter_run_receipt": frozenset(
+        {
+            "run_uid",
+            "strategy_key",
+            "strategy_version",
+            "strategy_version_hash",
+            "execution_binding_hash",
+            "adapter_artifact_sha256",
+            "cost_model_hash",
+            "adapter_key",
+            "adapter_version",
+            "trade_date",
+            "completed_at",
+            "status",
+            "input_hash",
+            "output_hash",
+            "stable_result_hash",
+            "candidate_count",
+            "candidate_identity_json",
+            "receipt_json",
+            "receipt_hash",
+            "created_at",
+        }
+    ),
+    "st_strategy_industry_history": frozenset(
+        {
+            "snapshot_id",
+            "trade_date",
+            "as_of_exclusive",
+            "stock_code",
+            "industry_name",
+            "industry_type",
+            "source_system",
+            "source_fact_id",
+            "source_effective_at",
+            "source_etl_sync_at",
+            "row_hash",
             "created_at",
         }
     ),
@@ -328,6 +373,22 @@ REQUIRED_INDEXES: dict[str, frozenset[str]] = {
     ),
     "st_strategy_pool_snapshot": frozenset({"PRIMARY"}),
     "st_strategy_allocation_snapshot": frozenset({"PRIMARY"}),
+    "st_strategy_adapter_run_receipt": frozenset(
+        {
+            "PRIMARY",
+            "uk_strategy_adapter_receipt_hash",
+            "idx_strategy_adapter_stable_result",
+            "idx_strategy_adapter_input",
+        }
+    ),
+    "st_strategy_industry_history": frozenset(
+        {
+            "PRIMARY",
+            "uk_strategy_industry_row_hash",
+            "uk_strategy_industry_source_fact",
+            "idx_strategy_industry_asof",
+        }
+    ),
     "st_strategy_lifecycle_event": frozenset(
         {"PRIMARY", "uk_strategy_lifecycle_event_hash"}
     ),
@@ -439,6 +500,36 @@ REQUIRED_INDEX_CONTRACTS: dict[
     "st_strategy_allocation_snapshot": {
         "PRIMARY": (("run_uid", "target_type", "target_key"), True)
     },
+    "st_strategy_adapter_run_receipt": {
+        "PRIMARY": (("run_uid",), True),
+        "uk_strategy_adapter_receipt_hash": (("receipt_hash",), True),
+        "idx_strategy_adapter_stable_result": (
+            (
+                "strategy_key",
+                "strategy_version",
+                "trade_date",
+                "execution_binding_hash",
+                "stable_result_hash",
+            ),
+            False,
+        ),
+        "idx_strategy_adapter_input": (
+            ("trade_date", "input_hash", "output_hash"),
+            False,
+        ),
+    },
+    "st_strategy_industry_history": {
+        "PRIMARY": (("snapshot_id", "stock_code"), True),
+        "uk_strategy_industry_row_hash": (("row_hash",), True),
+        "uk_strategy_industry_source_fact": (
+            ("source_system", "source_fact_id"),
+            True,
+        ),
+        "idx_strategy_industry_asof": (
+            ("trade_date", "as_of_exclusive", "stock_code"),
+            False,
+        ),
+    },
     "st_strategy_governance_audit": {
         "PRIMARY": (("audit_id",), True),
         "uk_strategy_governance_audit_hash": (("audit_hash",), True),
@@ -449,7 +540,10 @@ EXPECTED_WINDOWS = (20, 60, 120)
 BUILD_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 RESULT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 ROUTER_POLICY_VERSION = "strategy_market_router.v1"
-ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v2"
+ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v3"
+DAILY_NAV_RANKING_BASIS = "DAILY_NET_NAV_20_60_120_V1"
+DAILY_NAV_RANKING_BASIS_LABEL = "同口径20/60/120日扣费后日频净值健康分"
+ALLOCATION_TYPE_LANE_POLICY = "FIXED_EQUAL_LANES_NO_CROSS_TYPE_RAW_SCORE_V1"
 POOL_ROW_SCHEMA = "probiga.strategy-pool-row.v1"
 POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
@@ -3343,7 +3437,8 @@ def _all_governance_snapshot_history_check(
         "funding_gate_hash, market_state, market_match_score, "
         "router_decision_hash, lifecycle_status, lifecycle_status_label, "
         "lifecycle_risk_multiplier, base_competitive_weight_pct, "
-        "simulated_weight_pct, real_order_authority "
+        "simulated_weight_pct, member_sleeves_json, member_sleeve_hash, "
+        "cash_discount_bp, real_order_authority "
         "FROM st_strategy_allocation_snapshot ORDER BY BINARY run_uid, "
         "BINARY target_type, BINARY target_key",
     )
@@ -4515,6 +4610,9 @@ def _market_router_binding(
             "version_match",
             "weight",
             "status_label",
+            "lifecycle_status",
+            "lifecycle_risk_multiplier",
+            "effective_weight_after_lifecycle",
             "contribution_score",
         }
         detail_by_key = {
@@ -4535,8 +4633,9 @@ def _market_router_binding(
             and len(detail_by_key) == len(member_specs)
             and member_total > 0
         )
-        frozen_versions: dict[str, dict[str, str]] = {}
+        frozen_versions: dict[str, dict[str, Any]] = {}
         version_mismatch_present = False
+        member_sleeve_risk_multiplier = Decimal("0")
         for member in member_specs:
             member_key = member["strategy_key"]
             detail = detail_by_key.get(member_key)
@@ -4549,10 +4648,6 @@ def _market_router_binding(
             version_mismatch_present = (
                 version_mismatch_present or not version_match
             )
-            frozen_versions[member_key] = {
-                "frozen": frozen_version,
-                "current": current_version,
-            }
             ranking = (
                 current_binding[1].get("ranking_score")
                 if current_binding
@@ -4564,6 +4659,23 @@ def _market_router_binding(
                 and member_total > 0
                 else None
             )
+            member_status = str(
+                (current_binding or ("", {}))[1].get("lifecycle_status")
+                or ""
+            )
+            member_multiplier = LIFECYCLE_RISK_MULTIPLIER.get(
+                member_status, Decimal("0")
+            )
+            if normalized_weight is not None:
+                member_sleeve_risk_multiplier += (
+                    normalized_weight * member_multiplier
+                )
+            frozen_versions[member_key] = {
+                "frozen": frozen_version,
+                "current": current_version,
+                "lifecycle_status": member_status,
+                "lifecycle_risk_multiplier": float(member_multiplier),
+            }
             expected_contribution = (
                 Decimal(
                     str(round(float(normalized_weight * ranking), 2))
@@ -4582,10 +4694,23 @@ def _market_router_binding(
                 and type(detail.get("version_match")) is bool
                 and detail.get("version_match") is version_match
                 and bool(str(detail.get("strategy_name") or "").strip())
-                and bool(str(detail.get("status_label") or "").strip())
+                and str(detail.get("status_label") or "")
+                == LIFECYCLE_LABELS.get(member_status, "未知状态")
+                and str(detail.get("lifecycle_status") or "")
+                == member_status
+                and _decimal(detail.get("lifecycle_risk_multiplier"))
+                == member_multiplier
                 and _decimal(detail.get("weight"))
                 == (
-                    Decimal(str(round(float(normalized_weight), 4)))
+                    Decimal(str(round(float(normalized_weight), 8)))
+                    if normalized_weight is not None
+                    else None
+                )
+                and _decimal(detail.get("effective_weight_after_lifecycle"))
+                == (
+                    Decimal(str(round(
+                        float(normalized_weight * member_multiplier), 6
+                    )))
                     if normalized_weight is not None
                     else None
                 )
@@ -4686,6 +4811,10 @@ def _market_router_binding(
                     for window in EXPECTED_WINDOWS
                 },
                 "member_versions": frozen_versions,
+                "member_sleeve_risk_multiplier": round(
+                    float(member_sleeve_risk_multiplier),
+                    8,
+                ),
                 "router_decision_hash": route_hash,
                 "constraint_evaluation_hash": constraint_evaluation_hash,
                 "profit_gate_passed": expected_overall_gate,
@@ -4717,6 +4846,36 @@ def _market_router_binding(
             "profit_gate_passed": expected_overall_gate,
             "constraint_passed": constraint_evaluation.get("passed")
             is True,
+            "member_sleeve_risk_multiplier": Decimal(str(round(
+                float(member_sleeve_risk_multiplier),
+                8,
+            ))),
+            "member_sleeves_source": [
+                {
+                    "strategy_key": str(item.get("strategy_key") or ""),
+                    "strategy_version": str(
+                        item.get("strategy_version") or ""
+                    ),
+                    "current_strategy_version": str(
+                        item.get("current_strategy_version") or ""
+                    ),
+                    "version_match": item.get("version_match") is True,
+                    "original_weight": round(
+                        float(_decimal(item.get("weight")) or 0), 8
+                    ),
+                    "member_lifecycle_status": str(
+                        item.get("lifecycle_status") or ""
+                    ),
+                    "member_lifecycle_multiplier": round(
+                        float(
+                            _decimal(item.get("lifecycle_risk_multiplier"))
+                            or 0
+                        ),
+                        8,
+                    ),
+                }
+                for item in member_details
+            ],
         }
 
     snapshot_payload = {
@@ -4808,6 +4967,16 @@ def _allocation_candidate_contract(
             binding.get("paper_allocation_eligible") is True
         )
         multiplier = LIFECYCLE_RISK_MULTIPLIER.get(status, Decimal("0"))
+        member_sleeve_multiplier = (
+            binding.get("member_sleeve_risk_multiplier")
+            if target_type == "COMBINATION"
+            else None
+        )
+        member_sleeves_source = (
+            binding.get("member_sleeves_source")
+            if target_type == "COMBINATION"
+            else None
+        )
         valid = (
             target_type in {"STRATEGY", "COMBINATION"}
             and bool(target_key)
@@ -4822,6 +4991,16 @@ def _allocation_candidate_contract(
             and RESULT_HASH_RE.fullmatch(router_decision_hash) is not None
             and bool(exposures)
             and paper_eligible is expected_paper_eligible
+            and (
+                target_type != "COMBINATION"
+                or (
+                    isinstance(member_sleeve_multiplier, Decimal)
+                    and Decimal("0") <= member_sleeve_multiplier
+                    <= Decimal("1")
+                    and isinstance(member_sleeves_source, list)
+                    and bool(member_sleeves_source)
+                )
+            )
         )
         if not valid:
             errors.append(
@@ -4840,6 +5019,8 @@ def _allocation_candidate_contract(
                 "enabled": enabled,
                 "funding_gate_hash": funding_gate_hash,
                 "ranking_score": round(float(ranking_score or 0), 4),
+                "ranking_basis": DAILY_NAV_RANKING_BASIS,
+                "ranking_basis_label": DAILY_NAV_RANKING_BASIS_LABEL,
                 "profit_gate_passed": profit_gate_passed,
                 "paper_allocation_eligible": paper_eligible,
                 "market_state": str(binding.get("market_state") or ""),
@@ -4855,10 +5036,193 @@ def _allocation_candidate_contract(
                 ),
                 "lifecycle_risk_multiplier": round(float(multiplier), 4),
                 "constraint_passed": constraint_passed,
+                **(
+                    {
+                        "combination_lifecycle_risk_multiplier": round(
+                            float(multiplier), 4
+                        ),
+                        "member_sleeve_risk_multiplier": round(
+                            float(member_sleeve_multiplier or 0), 8
+                        ),
+                        "lifecycle_risk_multiplier": round(
+                            float(
+                                multiplier
+                                * (member_sleeve_multiplier or Decimal("0"))
+                            ),
+                            8,
+                        ),
+                        "member_sleeves_source": member_sleeves_source or [],
+                    }
+                    if target_type == "COMBINATION"
+                    else {}
+                ),
             }
         )
     candidates.sort(key=lambda row: (row["target_type"], row["target_key"]))
     return candidates, errors
+
+
+def _largest_remainder_basis_points(
+    total_basis_points: int,
+    weighted_keys: list[tuple[str, Decimal]],
+) -> dict[str, int]:
+    """Replay deterministic integer-bp allocation with exact conservation."""
+
+    if total_basis_points < 0 or not weighted_keys:
+        raise ValueError("member sleeve bp budget or weights are invalid")
+    total_weight = sum(
+        (weight for _key, weight in weighted_keys), Decimal("0")
+    )
+    if not total_weight.is_finite() or total_weight <= 0:
+        raise ValueError("member sleeve total weight is invalid")
+    raw = {
+        key: Decimal(total_basis_points) * weight / total_weight
+        for key, weight in weighted_keys
+    }
+    assigned = {key: int(value) for key, value in raw.items()}
+    remainder = total_basis_points - sum(assigned.values())
+    order = sorted(
+        raw,
+        key=lambda key: (-(raw[key] - Decimal(assigned[key])), key),
+    )
+    for key in order[:remainder]:
+        assigned[key] += 1
+    if sum(assigned.values()) != total_basis_points:
+        raise RuntimeError("member sleeve base bp is not conserved")
+    return assigned
+
+
+def _combination_member_sleeve_contract(
+    row: dict[str, Any], base_basis_points: int,
+) -> tuple[list[dict[str, Any]], str, int, int]:
+    """Independently replay the immutable v3 per-member sleeve contract."""
+
+    sources = row.get("member_sleeves_source")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("combination allocation lacks member sleeve sources")
+    identities: set[str] = set()
+    weighted: list[tuple[str, Decimal]] = []
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in sources:
+        if not isinstance(item, dict):
+            raise ValueError("combination member sleeve source is invalid")
+        key = str(item.get("strategy_key") or "")
+        weight = Decimal(str(item.get("original_weight") or "0"))
+        if (
+            not key
+            or key in identities
+            or not weight.is_finite()
+            or weight <= 0
+            or item.get("version_match") is not True
+        ):
+            raise ValueError(
+                "combination member sleeve identity/version/weight is invalid"
+            )
+        identities.add(key)
+        weighted.append((key, weight))
+        by_key[key] = item
+    base_by_key = _largest_remainder_basis_points(
+        base_basis_points, weighted
+    )
+    combination_status = str(row.get("lifecycle_status") or "")
+    combination_multiplier = LIFECYCLE_RISK_MULTIPLIER.get(
+        combination_status, Decimal("0")
+    )
+    sleeves: list[dict[str, Any]] = []
+    effective_total = 0
+    for key in sorted(base_by_key):
+        source = by_key[key]
+        member_status = str(source.get("member_lifecycle_status") or "")
+        member_multiplier = LIFECYCLE_RISK_MULTIPLIER.get(
+            member_status, Decimal("0")
+        )
+        declared_member_multiplier = Decimal(str(
+            source.get("member_lifecycle_multiplier") or "0"
+        ))
+        if declared_member_multiplier != member_multiplier:
+            raise ValueError(
+                "member lifecycle multiplier differs from frozen enum"
+            )
+        base_bp = base_by_key[key]
+        effective_bp = int(
+            (
+                Decimal(base_bp)
+                * member_multiplier
+                * combination_multiplier
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN)
+        )
+        if effective_bp < 0 or effective_bp > base_bp:
+            raise ValueError("member effective bp is outside its base sleeve")
+        effective_total += effective_bp
+        sleeve_row = {
+            "strategy_key": key,
+            "strategy_version": str(source.get("strategy_version") or ""),
+            "current_strategy_version": str(
+                source.get("current_strategy_version") or ""
+            ),
+            "original_weight": format(
+                Decimal(str(source.get("original_weight") or "0")), ".8f"
+            ),
+            "configured_weight_pct": round(
+                float(
+                    Decimal(str(source.get("original_weight") or "0"))
+                    * 100
+                ),
+                8,
+            ),
+            "base_bp": base_bp,
+            "base_weight_pct": base_bp / 100.0,
+            "member_lifecycle_status": member_status,
+            "member_lifecycle_multiplier": format(
+                member_multiplier, ".8f"
+            ),
+            "member_multiplier": float(member_multiplier),
+            "combination_lifecycle_status": combination_status,
+            "combination_lifecycle_multiplier": format(
+                combination_multiplier, ".8f"
+            ),
+            "combination_multiplier": float(combination_multiplier),
+            "effective_bp": effective_bp,
+            "effective_weight_pct": effective_bp / 100.0,
+            "cash_discount_bp": base_bp - effective_bp,
+            "discount_to_cash_pct": (base_bp - effective_bp) / 100.0,
+        }
+        sleeves.append(
+            {
+                **sleeve_row,
+                "sleeve_row_hash": _canonical_digest(
+                    {
+                        "schema": (
+                            "probiga.strategy-combination-member-sleeve-row.v1"
+                        ),
+                        **sleeve_row,
+                    }
+                ),
+            }
+        )
+    cash_discount_bp = base_basis_points - effective_total
+    if (
+        sum(item["base_bp"] for item in sleeves) != base_basis_points
+        or sum(item["effective_bp"] for item in sleeves) != effective_total
+        or sum(item["cash_discount_bp"] for item in sleeves)
+        != cash_discount_bp
+    ):
+        raise RuntimeError("combination member sleeves do not conserve 1bp")
+    payload = {
+        "schema": "probiga.strategy-combination-member-sleeves.v1",
+        "combination_key": str(row.get("target_key") or ""),
+        "combination_version": str(row.get("target_version") or ""),
+        "base_bp": base_basis_points,
+        "effective_bp": effective_total,
+        "cash_discount_bp": cash_discount_bp,
+        "members": sleeves,
+    }
+    return (
+        sleeves,
+        _canonical_digest(payload),
+        effective_total,
+        cash_discount_bp,
+    )
 
 
 def _expected_allocation_snapshot(
@@ -4867,30 +5231,62 @@ def _expected_allocation_snapshot(
     market_state: str,
     trading_gate_passed: bool,
 ) -> list[dict[str, Any]]:
-    """Independently replay overlap, largest remainder and REDUCE discount."""
+    """Independently replay v3 fixed lanes and per-member lifecycle sleeves."""
 
     eligible = [
         dict(row)
         for row in candidates
-        if row.get("paper_allocation_eligible") is True
+        if (
+            row.get("paper_allocation_eligible") is True
+            and row.get("enabled") is True
+            and row.get("profit_gate_passed") is True
+            and row.get("market_route_eligible") is True
+            and str(row.get("lifecycle_status") or "")
+            in {"ACTIVE", "REDUCE"}
+            and (
+                row.get("target_type") != "COMBINATION"
+                or row.get("constraint_passed") is True
+            )
+            and row.get("ranking_basis") == DAILY_NAV_RANKING_BASIS
+        )
     ]
-    eligible.sort(
+    combinations_lane = sorted(
+        (
+            row for row in eligible
+            if row["target_type"] == "COMBINATION"
+        ),
         key=lambda row: (
             -float(row["ranking_score"])
             * float(row["market_match_score"])
             / 100.0,
-            row["target_type"],
             row["target_key"],
-        )
+        ),
     )
-    selected: list[dict[str, Any]] = []
+    strategies_lane = sorted(
+        (row for row in eligible if row["target_type"] == "STRATEGY"),
+        key=lambda row: (
+            -float(row["ranking_score"])
+            * float(row["market_match_score"])
+            / 100.0,
+            row["target_key"],
+        ),
+    )
+    selected_combinations: list[dict[str, Any]] = []
     used_exposures: set[str] = set()
-    for row in eligible:
+    for row in combinations_lane:
         exposures = set(row.get("exposure_keys") or ())
         if not exposures or exposures.intersection(used_exposures):
             continue
-        selected.append(row)
+        selected_combinations.append(row)
         used_exposures.update(exposures)
+    selected_strategies = [
+        row for row in strategies_lane
+        if set(row.get("exposure_keys") or ())
+        and not set(row.get("exposure_keys") or ()).intersection(
+            used_exposures
+        )
+    ]
+    selected = selected_combinations + selected_strategies
 
     risk_cap = MARKET_RISK_CAP_PCT.get(market_state)
     allocations: list[dict[str, Any]] = []
@@ -4901,41 +5297,73 @@ def _expected_allocation_snapshot(
         and risk_cap is not None
         and risk_cap > 0
     ):
-        competitive_values = [
-            max(
-                0.0001,
-                float(row["ranking_score"])
-                * float(row["market_match_score"])
-                / 100.0,
+        cap_basis_points = int(round(float(risk_cap) * 100))
+        nonempty_lanes = [
+            lane
+            for lane in (selected_combinations, selected_strategies)
+            if lane
+        ]
+        lane_base = cap_basis_points // len(nonempty_lanes)
+        lane_remainder = cap_basis_points - lane_base * len(nonempty_lanes)
+        assigned_by_identity: dict[tuple[str, str], int] = {}
+        for lane_index, lane in enumerate(nonempty_lanes):
+            lane_budget = lane_base + (
+                1 if lane_index < lane_remainder else 0
             )
+            lane_values = [
+                max(
+                    0.0001,
+                    float(row["ranking_score"])
+                    * float(row["market_match_score"])
+                    / 100.0,
+                )
+                for row in lane
+            ]
+            lane_total = sum(lane_values)
+            raw_lane = [
+                lane_budget * value / lane_total for value in lane_values
+            ]
+            assigned_lane = [int(value) for value in raw_lane]
+            remainder = lane_budget - sum(assigned_lane)
+            order = sorted(
+                range(len(lane)),
+                key=lambda index: (
+                    -(raw_lane[index] - assigned_lane[index]),
+                    lane[index]["target_key"],
+                ),
+            )
+            for index in order[:remainder]:
+                assigned_lane[index] += 1
+            for row, basis_points in zip(lane, assigned_lane):
+                assigned_by_identity[
+                    (row["target_type"], row["target_key"])
+                ] = basis_points
+        assigned = [
+            assigned_by_identity[(row["target_type"], row["target_key"])]
             for row in selected
         ]
-        competitive_total = sum(competitive_values)
-        cap_basis_points = int(round(float(risk_cap) * 100))
-        raw_basis_points = [
-            cap_basis_points * value / competitive_total
-            for value in competitive_values
-        ]
-        assigned = [int(value) for value in raw_basis_points]
-        remainder = cap_basis_points - sum(assigned)
-        remainder_order = sorted(
-            range(len(selected)),
-            key=lambda index: (
-                -(raw_basis_points[index] - assigned[index]),
-                selected[index]["target_key"],
-            ),
-        )
-        for index in remainder_order[:remainder]:
-            assigned[index] += 1
         for row, base_basis_points in zip(selected, assigned):
-            multiplier = Decimal(
-                str(row.get("lifecycle_risk_multiplier") or "0")
-            )
-            basis_points = int(
-                (Decimal(base_basis_points) * multiplier).quantize(
-                    Decimal("1"), rounding=ROUND_HALF_EVEN
+            member_sleeves: list[dict[str, Any]] = []
+            member_sleeve_hash = ""
+            if row["target_type"] == "COMBINATION":
+                (
+                    member_sleeves,
+                    member_sleeve_hash,
+                    basis_points,
+                    cash_discount_bp,
+                ) = _combination_member_sleeve_contract(
+                    row, base_basis_points
                 )
-            )
+            else:
+                multiplier = Decimal(
+                    str(row.get("lifecycle_risk_multiplier") or "0")
+                )
+                basis_points = int(
+                    (Decimal(base_basis_points) * multiplier).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_EVEN
+                    )
+                )
+                cash_discount_bp = base_basis_points - basis_points
             if basis_points <= 0:
                 continue
             assigned_after_lifecycle += basis_points
@@ -4963,6 +5391,9 @@ def _expected_allocation_snapshot(
                     "simulated_weight_pct": round(
                         basis_points / 100.0, 4
                     ),
+                    "member_sleeves": member_sleeves,
+                    "member_sleeve_hash": member_sleeve_hash,
+                    "cash_discount_bp": cash_discount_bp,
                     "real_order_authority": False,
                 }
             )
@@ -4982,6 +5413,9 @@ def _expected_allocation_snapshot(
             "simulated_weight_pct": round(
                 (10_000 - assigned_after_lifecycle) / 100.0, 4
             ),
+            "member_sleeves": [],
+            "member_sleeve_hash": "",
+            "cash_discount_bp": 0,
             "real_order_authority": False,
         }
     )
@@ -4994,6 +5428,16 @@ def _stored_allocation_snapshot(
 ) -> list[dict[str, Any]]:
     rows = []
     for row in allocation_rows:
+        member_sleeves_value = (
+            row.get("member_sleeves_json")
+            if "member_sleeves_json" in row
+            else row.get("member_sleeves")
+        )
+        member_sleeves = _json_array(member_sleeves_value)
+        if member_sleeves is None:
+            # Preserve structural invalidity in the snapshot so replay fails
+            # closed instead of silently treating malformed JSON as empty.
+            member_sleeves = [{"invalid_member_sleeves_json": True}]
         rows.append(
             {
                 "target_type": str(row.get("target_type") or ""),
@@ -5028,6 +5472,13 @@ def _stored_allocation_snapshot(
                         _decimal(row.get("simulated_weight_pct")) or 0
                     ),
                     4,
+                ),
+                "member_sleeves": member_sleeves,
+                "member_sleeve_hash": str(
+                    row.get("member_sleeve_hash") or ""
+                ),
+                "cash_discount_bp": _integer(
+                    row.get("cash_discount_bp")
                 ),
                 "real_order_authority": bool(
                     _integer(row.get("real_order_authority"))
@@ -5296,11 +5747,18 @@ def _allocation_decision_contract_check(
         "candidates": candidates,
     }
     candidate_hash = _canonical_digest(candidate_payload)
-    expected_allocations = _expected_allocation_snapshot(
-        candidates,
-        market_state=market_state,
-        trading_gate_passed=trading_gate_passed,
-    )
+    allocation_replay_errors: list[dict[str, Any]] = []
+    try:
+        expected_allocations = _expected_allocation_snapshot(
+            candidates,
+            market_state=market_state,
+            trading_gate_passed=trading_gate_passed,
+        )
+    except (ArithmeticError, KeyError, RuntimeError, TypeError, ValueError):
+        expected_allocations = []
+        allocation_replay_errors.append(
+            {"reason": "allocation v3 replay inputs are invalid"}
+        )
     stored_allocations = _stored_allocation_snapshot(allocation_rows)
     allocation_payload = {
         "schema": "probiga.strategy-allocation-snapshot.v1",
@@ -5398,7 +5856,7 @@ def _allocation_decision_contract_check(
         ),
         None,
     )
-    errors = list(candidate_errors)
+    errors = [*candidate_errors, *allocation_replay_errors]
     summary_valid = (
         summary.get("allocation_policy_version")
         == ALLOCATION_POLICY_VERSION
@@ -7193,7 +7651,8 @@ def collect_governance_health(
             "a.router_decision_hash, a.lifecycle_status, "
             "a.lifecycle_status_label, a.lifecycle_risk_multiplier, "
             "a.base_competitive_weight_pct, a.simulated_weight_pct, "
-            "a.real_order_authority, "
+            "a.member_sleeves_json, a.member_sleeve_hash, "
+            "a.cash_discount_bp, a.real_order_authority, "
             "r.strategy_key AS strategy_registry_key, "
             "r.current_version AS strategy_current_version, "
             "r.current_status AS strategy_current_status, "
@@ -7306,6 +7765,11 @@ def collect_governance_health(
                 item.get("base_competitive_weight_pct")
             )
             weight = _decimal(item.get("simulated_weight_pct"))
+            member_sleeves = _json_array(item.get("member_sleeves_json"))
+            member_sleeve_hash = str(
+                item.get("member_sleeve_hash") or ""
+            )
+            cash_discount_bp = _integer(item.get("cash_discount_bp"))
             eligible = False
             if target_type == "CASH":
                 eligible = (
@@ -7320,6 +7784,9 @@ def collect_governance_health(
                     and lifecycle_risk_multiplier == Decimal("0")
                     and base_competitive_weight == Decimal("0")
                     and weight is not None
+                    and member_sleeves == []
+                    and member_sleeve_hash == ""
+                    and cash_discount_bp == 0
                 )
                 cash_weight = weight
             elif target_type == "STRATEGY":
@@ -7404,6 +7871,26 @@ def collect_governance_health(
                 expected_multiplier = LIFECYCLE_RISK_MULTIPLIER.get(
                     registry_status
                 )
+                route = route_bindings.get(
+                    (target_type, target_key, target_version)
+                )
+                if target_type == "COMBINATION":
+                    expected_multiplier = (
+                        Decimal(str(round(
+                            float(
+                                expected_multiplier
+                                * (
+                                    (route or {}).get(
+                                        "member_sleeve_risk_multiplier"
+                                    )
+                                    or Decimal("0")
+                                )
+                            ),
+                            4,
+                        )))
+                        if expected_multiplier is not None
+                        else None
+                    )
                 ranking_score = competitive_scores.get(
                     (target_type, target_key, target_version)
                 )
@@ -7416,6 +7903,29 @@ def collect_governance_health(
                     and base_competitive_weight is not None
                     and base_competitive_weight > 0
                     and ranking_score is not None
+                    and member_sleeves is not None
+                    and (
+                        (
+                            target_type == "COMBINATION"
+                            and bool(member_sleeves)
+                            and RESULT_HASH_RE.fullmatch(
+                                member_sleeve_hash
+                            )
+                            is not None
+                        )
+                        or (
+                            target_type == "STRATEGY"
+                            and member_sleeves == []
+                            and member_sleeve_hash == ""
+                        )
+                    )
+                    and cash_discount_bp
+                    == int(
+                        (
+                            (base_competitive_weight - weight)
+                            * Decimal("100")
+                        ).quantize(Decimal("1"), rounding=ROUND_HALF_EVEN)
+                    )
                 )
                 eligible = eligible and lifecycle_valid
                 lifecycle_budget_rows.append(
@@ -7435,9 +7945,6 @@ def collect_governance_health(
                         ),
                         "simulated_weight_pct": weight,
                     }
-                )
-                route = route_bindings.get(
-                    (target_type, target_key, target_version)
                 )
                 exposures = set((route or {}).get("members") or ())
                 overlap = sorted(selected_exposures & exposures)
@@ -7614,15 +8121,29 @@ def main() -> int:
     from tools.env_config import create_tool_engine, load_project_env
 
     load_project_env()
-    engine = create_tool_engine()
+    engine = None
     try:
         try:
+            from server.engine.strategy_execution_adapters import (
+                bootstrap_strategy_execution_adapter_registry,
+            )
+
+            adapter_registry = bootstrap_strategy_execution_adapter_registry()
+            engine = create_tool_engine()
             result = collect_governance_health(
                 engine,
                 expected_build_sha=args.expected_build_sha,
                 expected_trade_date=args.expected_trade_date,
                 allow_input_not_ready=args.allow_input_not_ready,
             )
+            result["adapter_registry"] = {
+                "registry_sealed": adapter_registry["registry_sealed"],
+                "registry_seal_hash": adapter_registry["registry_seal_hash"],
+                "production_execution_ready": adapter_registry[
+                    "production_execution_ready"
+                ],
+                "adapter_count": len(adapter_registry["adapters"]),
+            }
         except Exception as exc:
             result = {
                 "status": "FAIL",
@@ -7631,7 +8152,8 @@ def main() -> int:
                 "automatic_real_order_submission": False,
             }
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
     print(
         json.dumps(
             result,

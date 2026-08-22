@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 import sys
-import os
 
 sys.path.insert(0, "/opt/ProBigA")
-os.environ["MYSQL_URL"] = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 import logging
+
+from tools.env_config import create_tool_engine
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-engine = create_engine(os.environ["MYSQL_URL"])
+engine = create_tool_engine()
 trade_date = "2026-06-02"
 min_score = 70
 top_per_mode = 30

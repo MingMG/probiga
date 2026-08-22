@@ -3,9 +3,9 @@
 import time
 import requests
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-MYSQL_URL = "mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4"
+from tools.env_config import create_tool_engine
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
 
@@ -48,7 +48,7 @@ def fetch_kline_adata(code, start, end):
         session.close()
 
 def main():
-    engine = create_engine(MYSQL_URL)
+    engine = create_tool_engine()
     all_codes = get_stock_codes(engine)
     existing = get_existing_codes(engine)
     missing = [c for c in all_codes if c not in existing]

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+
+from tools.env_config import create_tool_engine
 import urllib.request, json
 
-engine = create_engine("mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4")
+engine = create_tool_engine()
 with engine.connect() as conn:
     # Get a real concept_code from hot_daily that has constituents
     rows = conn.execute(text("""

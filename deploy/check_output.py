@@ -1,6 +1,15 @@
-from sqlalchemy import create_engine, text
+import sys
+from pathlib import Path
 
-engine = create_engine("mysql+pymysql://root:ProBigA%4070966@localhost:3306/probiga?charset=utf8mb4")
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sqlalchemy import text
+
+from tools.env_config import create_tool_engine
+
+engine = create_tool_engine()
 with engine.connect() as conn:
     rows = conn.execute(text(
         "SELECT id, task_name, last_run_status, LEFT(last_run_output, 200) as out "
