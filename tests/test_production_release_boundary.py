@@ -2826,6 +2826,40 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "prepare_strategy_governance_schema.py" not in recovery
 
     assert "activation_snapshot_validate" in capture
+    assert 'local old_runtime_sha="$2"' in capture
+    assert 'local release_venv="$RELEASE_VENV_ROOT/$old_runtime_sha"' in capture
+    assert '$RELEASE_VENV_ROOT/$guarded_sha' not in capture
+    assert (
+        'test "$(activation_snapshot_old_release "$guarded_sha")" = '
+        '"$old_runtime_sha"'
+    ) in capture
+    assert (
+        'test "$(<"$release_venv/.probiga.gitsha")" = "$old_runtime_sha"'
+        in capture
+    )
+    assert "release_identity_lines[3]#release_tree_sha256=" in capture
+    assert (
+        "release_identity_lines[4]#adapter_registry_seal_sha256=" in capture
+    )
+    legacy_runtime_identity = capture.index(
+        'if [ -e "$release_venv/.release-tree.sha256" ]'
+    )
+    legacy_runtime_identity_end = capture.index("fi", legacy_runtime_identity)
+    legacy_runtime_identity_block = capture[
+        legacy_runtime_identity:legacy_runtime_identity_end
+    ]
+    for marker in (
+        ".release-tree.sha256",
+        ".adapter-registry-seal.sha256",
+    ):
+        assert f'[ -e "$release_venv/{marker}" ]' in legacy_runtime_identity_block
+        assert f'[ -L "$release_venv/{marker}" ]' in legacy_runtime_identity_block
+        assert f'test -f "$release_venv/{marker}"' in legacy_runtime_identity_block
+        assert f'test ! -L "$release_venv/{marker}"' in legacy_runtime_identity_block
+    assert (
+        'controlled_guard_capture_current_governance_snapshot "$guarded_sha" '
+        '"$old_runtime_sha"'
+    ) in recovery
     assert 'git -C "$code_root" rev-parse HEAD' in capture
     assert "status --porcelain=v1 --untracked-files=all" in capture
     assert "local capture_root=/tmp" in capture

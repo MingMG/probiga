@@ -1821,8 +1821,9 @@ controlled_guard_restore_and_verify_governance_snapshot() {
 }
 controlled_guard_capture_current_governance_snapshot() {
   local guarded_sha="$1"
+  local old_runtime_sha="$2"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
-  local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local release_venv="$RELEASE_VENV_ROOT/$old_runtime_sha"
   local release_venv_target
   local service_user
   local adata_sha
@@ -1830,11 +1831,34 @@ controlled_guard_capture_current_governance_snapshot() {
   local adata_source
   local release_tree_sha
   local adapter_registry_seal_sha
+  local runtime_release_tree_sha
+  local runtime_adapter_registry_seal_sha
   local capture_root=/tmp
   local current_snapshot
   local capture_valid=1
+  local -a release_identity_lines=()
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$old_runtime_sha" != "$guarded_sha" || return 1
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
+  test "$(activation_snapshot_old_release "$guarded_sha")" = \
+    "$old_runtime_sha" || return 1
+  mapfile -t release_identity_lines < "$ACTIVATION_RELEASE_IDENTITY" || return 1
+  test "${#release_identity_lines[@]}" -eq 5 || return 1
+  case "${release_identity_lines[3]}" in
+    release_tree_sha256=*)
+      release_tree_sha="${release_identity_lines[3]#release_tree_sha256=}"
+      ;;
+    *) return 1 ;;
+  esac
+  case "${release_identity_lines[4]}" in
+    adapter_registry_seal_sha256=*)
+      adapter_registry_seal_sha="${release_identity_lines[4]#adapter_registry_seal_sha256=}"
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
     return 1
   controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || \
@@ -1853,17 +1877,31 @@ controlled_guard_capture_current_governance_snapshot() {
     status --porcelain=v1 --untracked-files=all)" || return 1
   test -L "$release_venv" || return 1
   test -x "$release_venv/bin/python" || return 1
-  test "$(<"$release_venv/.probiga.gitsha")" = "$guarded_sha" || return 1
+  test "$(<"$release_venv/.probiga.gitsha")" = "$old_runtime_sha" || return 1
   adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
   adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
-  release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
-  adapter_registry_seal_sha="$(
-    <"$release_venv/.adapter-registry-seal.sha256"
-  )" || return 1
   [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  # The sealed old runtime may predate the paired tree/adapter attestations.
+  # If either marker exists, both must be regular, non-symlink, valid markers;
+  # a legacy runtime is accepted only when both are completely absent.
+  if [ -e "$release_venv/.release-tree.sha256" ] || \
+    [ -L "$release_venv/.release-tree.sha256" ] || \
+    [ -e "$release_venv/.adapter-registry-seal.sha256" ] || \
+    [ -L "$release_venv/.adapter-registry-seal.sha256" ]; then
+    test -f "$release_venv/.release-tree.sha256" || return 1
+    test ! -L "$release_venv/.release-tree.sha256" || return 1
+    test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
+    test ! -L "$release_venv/.adapter-registry-seal.sha256" || return 1
+    runtime_release_tree_sha="$(
+      <"$release_venv/.release-tree.sha256"
+    )" || return 1
+    runtime_adapter_registry_seal_sha="$(
+      <"$release_venv/.adapter-registry-seal.sha256"
+    )" || return 1
+    [[ "$runtime_release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$runtime_adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  fi
   adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
   test -d "$adata_source" || return 1
   test ! -L "$adata_source" || return 1
@@ -2078,8 +2116,8 @@ controlled_v2_rollback_only_recovery() {
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
-  controlled_guard_capture_current_governance_snapshot "$guarded_sha" || \
-    return 1
+  controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
+    "$old_runtime_sha" || return 1
   controlled_guard_cleanup "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   if ! controlled_guard_restore_previous_writer_states "$main_record" \
