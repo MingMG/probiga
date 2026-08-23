@@ -6284,17 +6284,16 @@ point_static_release_to_checkout "$PREPARED_CODE_ROOT"
 assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT"
 systemctl is-active --quiet probiga-scheduler
 systemctl is-enabled --quiet probiga-scheduler
-CUTOVER_STEP=verify_strategy_governance_after_start
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-  "${GOVERNANCE_HEALTH_ARGS[@]}"
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  CUTOVER_STEP=restore_ai_worker_previous_state
   restore_ai_worker_previous_state
   assert_ai_worker_runtime "$EXPECTED_SHA" \
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$PREPARED_CODE_ROOT"
   assert_ai_worker_previous_state_restored
 fi
+CUTOVER_STEP=verify_scheduler_triggers_quiescent
 assert_scheduler_triggers_quiescent
+CUTOVER_STEP=verify_premarket_quality_gate
 sudo -u "$SERVICE_USER" /usr/bin/env -i \
   PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
   PROBIGA_DEPLOYMENT_MODE=production \

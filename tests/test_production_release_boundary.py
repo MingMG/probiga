@@ -253,8 +253,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "prune_release_temp_files" in deploy_script
     assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'path_is_runtime_referenced "$build_real"' in deploy_script
-    assert "timeout-minutes: 60" in workflow
-    assert "command_timeout: 55m" in workflow
+    assert "timeout-minutes: 80" in workflow
+    assert "command_timeout: 75m" in workflow
     assert "probiga.deploy-receipt.v4" in workflow
     assert '"expected_input_lock_sha256":"%s"' in workflow
     assert '"previous_input_lock_sha256":"%s"' in workflow
@@ -452,8 +452,8 @@ def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
     assert "workflow_dispatch:" not in workflow
     assert "recover_database_guard:" not in workflow
     assert "environment: production" in workflow
-    assert "timeout-minutes: 60" in workflow
-    assert "command_timeout: 55m" in workflow
+    assert "timeout-minutes: 80" in workflow
+    assert "command_timeout: 75m" in workflow
     assert "--recover-database-guard" not in normalized
     assert "v2 production deploy broker cannot authorize recovery" in engine
     assert workflow.count("python tools/scan_tracked_secrets.py") == 2
@@ -916,12 +916,18 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     static_switch = normalized.index(
         'point_static_release_to_checkout "$PREPARED_CODE_ROOT"', health
     )
-    governance_poststart_check = normalized.index(
-        "CUTOVER_STEP=verify_strategy_governance_after_start", static_switch
+    ai_restore = normalized.index(
+        "CUTOVER_STEP=restore_ai_worker_previous_state", static_switch
+    )
+    scheduler_quiescence = normalized.index(
+        "CUTOVER_STEP=verify_scheduler_triggers_quiescent", ai_restore
+    )
+    quality_gate = normalized.index(
+        "CUTOVER_STEP=verify_premarket_quality_gate", scheduler_quiescence
     )
     premarket_probe = normalized.index(
         '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"',
-        governance_poststart_check,
+        quality_gate,
     )
     premarket_task = normalized.index(
         "--task-type analysis_premarket_external", premarket_probe
@@ -948,7 +954,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         service_start
         < health
         < static_switch
-        < governance_poststart_check
+        < ai_restore
+        < scheduler_quiescence
+        < quality_gate
         < premarket_probe
     )
     assert (
@@ -960,6 +968,30 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         < journal_remove
         < code_cleanup
     )
+
+
+def test_normal_activation_runs_one_prestart_governance_health_check() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    activation_start = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_before_start"
+    )
+    activation_end = normalized.index("DEPLOY_SUCCEEDED=1", activation_start)
+    activation = normalized[activation_start:activation_end]
+    governance_health = (
+        '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py"'
+    )
+    guard_removal = activation.index(
+        "CUTOVER_STEP=remove_database_writer_guard_after_full_prestart"
+    )
+    api_start = activation.index("CUTOVER_STEP=start_api", guard_removal)
+
+    assert activation.count(governance_health) == 1
+    assert activation.index(governance_health) < guard_removal < api_start
+    assert governance_health not in activation[api_start:]
+    assert "CUTOVER_STEP=verify_strategy_governance_after_start" not in activation
 
 
 def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
@@ -2507,12 +2539,24 @@ def test_activation_journal_closes_every_cutover_guard_gap() -> None:
         < api_start
     )
 
-    poststart_health = normalized.index(
-        "CUTOVER_STEP=verify_strategy_governance_after_start", api_start
+    ai_restore_step = normalized.index(
+        "CUTOVER_STEP=restore_ai_worker_previous_state", api_start
     )
-    ai_restore = normalized.index("restore_ai_worker_previous_state", poststart_health)
+    ai_restore = normalized.index(
+        "restore_ai_worker_previous_state",
+        ai_restore_step + len("CUTOVER_STEP=restore_ai_worker_previous_state"),
+    )
+    scheduler_quiescence_step = normalized.index(
+        "CUTOVER_STEP=verify_scheduler_triggers_quiescent", ai_restore
+    )
+    scheduler_quiescence = normalized.index(
+        "assert_scheduler_triggers_quiescent", scheduler_quiescence_step
+    )
+    quality_gate_step = normalized.index(
+        "CUTOVER_STEP=verify_premarket_quality_gate", scheduler_quiescence
+    )
     quality_gate = normalized.index(
-        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"', ai_restore
+        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"', quality_gate_step
     )
     receipt_pending = normalized.index(
         "persist_deployed_receipt_pending", quality_gate
@@ -2526,7 +2570,16 @@ def test_activation_journal_closes_every_cutover_guard_gap() -> None:
     journal_remove = normalized.index(
         "activation_snapshot_remove_finalized_before_deploy", receipt
     )
-    assert api_start < poststart_health < ai_restore < quality_gate < receipt_pending
+    assert (
+        api_start
+        < ai_restore_step
+        < ai_restore
+        < scheduler_quiescence_step
+        < scheduler_quiescence
+        < quality_gate_step
+        < quality_gate
+        < receipt_pending
+    )
     assert receipt_pending < journal_cleanup
     assert journal_cleanup < receipt < journal_remove
     cutover_body = normalized[cutover:journal_cleanup]
@@ -3469,11 +3522,10 @@ def test_ai_worker_service_and_timer_states_are_fenced_and_restored() -> None:
     assert "assert_ai_worker_writer_fence" in rollback
 
     success_start = deploy_script.index(
-        'if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then',
-        deploy_script.index("CUTOVER_STEP=verify_strategy_governance_after_start"),
+        "CUTOVER_STEP=restore_ai_worker_previous_state"
     )
     success_end = deploy_script.index(
-        "assert_scheduler_triggers_quiescent", success_start
+        "CUTOVER_STEP=verify_scheduler_triggers_quiescent", success_start
     )
     success = _normalized_shell(deploy_script[success_start:success_end])
     assert "restore_ai_worker_previous_state" in success
