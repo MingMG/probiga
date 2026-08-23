@@ -2133,7 +2133,6 @@ controlled_v2_rollback_only_recovery() {
   local scheduler_record
   local ai_service_record
   local ai_timer_record
-  local governance_new_present=0
   local -a state_lines=()
   test "$DEPLOY_OPERATION" = deploy || return 1
   test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
@@ -2162,7 +2161,6 @@ controlled_v2_rollback_only_recovery() {
         # the complete, hash-verified pair; partial or changed evidence stays
         # fenced.
         activation_snapshot_validate_governance_new || return 1
-        governance_new_present=1
       fi
       ;;
     *)
@@ -2238,13 +2236,10 @@ controlled_v2_rollback_only_recovery() {
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
-  if [ "$governance_new_present" -eq 1 ]; then
-    # The forward cutover may have changed the governance task before it
-    # failed.  Restore the sealed old task while every writer is still fenced,
-    # then independently recapture it below before writers are released.
-    controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
-      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
-  fi
+  # A failed release venv is deliberately removed during rollback.  Reuse the
+  # sealed old runtime with the guarded release's read-only capture tool and
+  # require an exact match; any governance drift remains fenced for explicit
+  # recovery instead of depending on the removed forward venv or writing here.
   controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
     "$old_runtime_sha" || return 1
   controlled_guard_cleanup "$guarded_sha" "$main_record" \
