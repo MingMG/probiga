@@ -1275,11 +1275,18 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "server.common.adata_release seal" in workflow
     assert "pip wheel --no-deps" in workflow
+    assert (
+        'rev-parse \\\n'
+        '            "FETCH_HEAD^{commit}"'
+    ) in workflow_source
+    assert 'archive "$FETCHED_ADATA_SHA"' in workflow_source
     assert "PROBIGA_EXPECTED_ADATA_SHA" in workflow
     assert "PROBIGA_EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "PROBIGA_ADATA_SOURCE_DIR" in workflow
     assert "probiga.deploy-receipt.v4" in workflow
     assert "PROBIGA_ADMIN_AUTH_ENABLED=true" in workflow
+    assert "\n          tests/test_trading_v3_research_api.py\n" in workflow_source
+    assert "\n           tests/test_trading_v3_research_api.py\n" not in workflow_source
     assert "systemctl stop probiga-scheduler" in workflow
     assert "systemctl disable probiga-scheduler" in workflow
     assert 'print(f"{sys.version_info.major}.{sys.version_info.minor}")' in workflow

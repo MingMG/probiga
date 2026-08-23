@@ -87,19 +87,28 @@ jobs:
           git init --bare "$ADATA_GIT"
           git --git-dir="$ADATA_GIT" remote add origin https://github.com/1nchaos/adata.git
           git --git-dir="$ADATA_GIT" fetch --no-tags --depth=1 origin "$ADATA_RELEASE_SHA"
-          test "$(git --git-dir="$ADATA_GIT" rev-parse "${ADATA_RELEASE_SHA}^{commit}")" = \
-            "$ADATA_RELEASE_SHA"
+          FETCHED_ADATA_SHA="$(git --git-dir="$ADATA_GIT" rev-parse \
+            "FETCH_HEAD^{commit}")"
+          if [ "$FETCHED_ADATA_SHA" != "$ADATA_RELEASE_SHA" ]; then
+            echo "fetched adata commit differs from the reviewed release manifest" >&2
+            exit 2
+          fi
           mkdir "$ADATA_SOURCE" "$ADATA_BUILD_SOURCE"
-          git --git-dir="$ADATA_GIT" archive "$ADATA_RELEASE_SHA" \
+          git --git-dir="$ADATA_GIT" archive "$FETCHED_ADATA_SHA" \
             | tar -xf - -C "$ADATA_SOURCE"
-          git --git-dir="$ADATA_GIT" archive "$ADATA_RELEASE_SHA" \
+          git --git-dir="$ADATA_GIT" archive "$FETCHED_ADATA_SHA" \
             | tar -xf - -C "$ADATA_BUILD_SOURCE"
           SEAL_JSON="$(python -m server.common.adata_release seal \
             --source "$ADATA_SOURCE" --git-sha "$ADATA_RELEASE_SHA")"
           ADATA_TREE_SHA256="$(printf '%s' "$SEAL_JSON" | python -c \
             'import json,sys; print(json.load(sys.stdin)["tree_sha256"])')"
           [[ "$ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          test "$ADATA_TREE_SHA256" = "$EXPECTED_ADATA_TREE_SHA256"
+          if [ "$ADATA_TREE_SHA256" != "$EXPECTED_ADATA_TREE_SHA256" ]; then
+            echo "adata tree digest differs from the reviewed release manifest" >&2
+            echo "expected=$EXPECTED_ADATA_TREE_SHA256" >&2
+            echo "actual=$ADATA_TREE_SHA256" >&2
+            exit 2
+          fi
           chmod -R a-w "$ADATA_SOURCE"
           python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/adata-wheel" \
             "$ADATA_BUILD_SOURCE"
@@ -217,7 +226,7 @@ jobs:
           tests/test_trading_v3_continuous_calibration.py
           tests/test_trading_v3_shadow_intelligence_runtime.py
           tests/test_trading_v3_production_activation.py
-           tests/test_trading_v3_research_api.py
+          tests/test_trading_v3_research_api.py
 
       - name: Run the full suite in the exact production wheel set
         if: ${{ steps.production_lock.outputs.ready == 'true' }}
