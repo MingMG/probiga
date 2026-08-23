@@ -345,6 +345,12 @@ def test_readiness_preflight_is_select_only_and_requires_exact_native_matches(
     assert "INNER JOIN" in connection.statements[2][0]
     assert "matched_target_count" in connection.statements[2][0]
     assert "pre_close_origin" in connection.statements[2][0]
+    assert "AND period='1d' AND k_type=1 AND adjust_type=0" in (
+        connection.statements[1][0]
+    )
+    assert "AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0" in (
+        connection.statements[2][0]
+    )
     assert attester.QMT_ATTESTATION_COLLATION in connection.statements[2][0]
     assert all(
         params == {
@@ -640,6 +646,72 @@ def test_schema_only_cli_fails_closed_and_disposes_engine(monkeypatch, capsys):
     assert "schema drift" in payload["reason"]
     assert payload["automatic_real_order_submission"] is False
     assert engine.disposed is True
+
+
+def test_readiness_cli_uses_and_disposes_protected_windows_engines(
+    monkeypatch,
+    capsys,
+):
+    from tools import backfill_guojin_qmt_local_history as backfill_tool
+
+    class Engine:
+        def __init__(self, name):
+            self.name = name
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    primary = Engine("primary")
+    history = Engine("history")
+    events = []
+    monkeypatch.setattr(preparation, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        preparation,
+        "create_batch_engine",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("configured production engine must not be opened")
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (primary, history),
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda engine, *, local_history_engine: events.append(
+            (engine, local_history_engine)
+        )
+        or ("target", "source"),
+    )
+
+    def fake_readiness(engine, *, table_resolver):
+        assert table_resolver(engine) == ("target", "source")
+        return {"status": "ready", "mode": "readiness-only"}
+
+    monkeypatch.setattr(
+        preparation,
+        "preflight_governance_qmt_history_readiness",
+        fake_readiness,
+    )
+
+    assert preparation.main(
+        ["--readiness-only", "--windows-local-option-file"]
+    ) == 0
+    assert events == [(primary, history)]
+    assert primary.disposed is True
+    assert history.disposed is True
+    assert __import__("json").loads(capsys.readouterr().out)["status"] == "ready"
+
+
+def test_windows_option_file_is_rejected_outside_readiness(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        preparation.main(["--schema-only", "--windows-local-option-file"])
+
+    assert exc_info.value.code == 2
+    assert "only valid with --readiness-only" in capsys.readouterr().err
 
 
 def test_latest_closed_sessions_requires_exact_count_and_high_watermark():

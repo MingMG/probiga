@@ -35,6 +35,12 @@ def test_v2_protocol_name_is_frozen():
     assert ATTESTATION_PROTOCOL_VERSION == "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
 
 
+def test_attestation_source_window_requires_daily_k_type():
+    source = inspect.getsource(attester.attest_range)
+
+    assert "AND period='1d' AND k_type=1 AND adjust_type=0" in source
+
+
 @pytest.mark.parametrize(
     "statement",
     (
@@ -120,6 +126,101 @@ def test_attester_validates_qualified_history_before_run_ledger_write(
         )
 
     assert target_engine.business_writes == []
+
+
+def test_table_names_accepts_explicit_protected_local_history_engine(
+    monkeypatch,
+):
+    class FakeEngine:
+        def __init__(self, url):
+            self.url = make_url(url)
+
+    target_engine = FakeEngine("mysql+pymysql:///probiga")
+    history_engine = FakeEngine("mysql+pymysql:///probiga_qmt_history")
+    events = []
+    monkeypatch.setattr(
+        attester,
+        "get_local_history_engine",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("configured history engine must not be opened")
+        ),
+    )
+    monkeypatch.setattr(
+        attester,
+        "validate_local_history_provenance_schema",
+        lambda engine, *, database: events.append((engine, database)),
+    )
+
+    target_table, source_table = attester._table_names(
+        target_engine,
+        local_history_engine=history_engine,
+    )
+
+    assert target_table == "`probiga`.`sm_stock_kline`"
+    assert source_table == "`probiga_qmt_history`.`qmt_local_stock_kline`"
+    assert events == [(target_engine, "probiga_qmt_history")]
+
+
+def test_main_windows_option_file_route_disposes_both_engines(
+    monkeypatch,
+    capsys,
+):
+    from tools import backfill_guojin_qmt_local_history as backfill_tool
+
+    class FakeEngine:
+        def __init__(self, name):
+            self.name = name
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    primary = FakeEngine("primary")
+    history = FakeEngine("history")
+    monkeypatch.setattr(attester, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        attester,
+        "create_batch_engine",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("configured production engine must not be opened")
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (primary, history),
+    )
+    calls = []
+
+    def fake_attest(engine, **kwargs):
+        calls.append((engine, kwargs))
+        return {"status": "COMPLETED"}
+
+    monkeypatch.setattr(attester, "attest_range", fake_attest)
+    monkeypatch.setattr(
+        attester.sys,
+        "argv",
+        [
+            "attest_qmt_daily_kline.py",
+            "--start-date",
+            "2026-03-16",
+            "--end-date",
+            "2026-03-27",
+            "--provider",
+            "gj_big_qmt_inner",
+            "--apply",
+            "--json",
+            "--windows-local-option-file",
+        ],
+    )
+
+    assert attester.main() == 0
+    assert calls[0][0] is primary
+    assert calls[0][1]["local_history_engine"] is history
+    assert calls[0][1]["apply"] is True
+    assert primary.disposed is True
+    assert history.disposed is True
+    assert json.loads(capsys.readouterr().out)["status"] == "COMPLETED"
 
 
 def test_native_pre_close_can_replace_legacy_target_value():
@@ -812,6 +913,18 @@ def test_apply_is_all_or_nothing_and_exactly_read_back():
     assert "exact_readback_rows" in source
     assert "exact_readback_rows != matched_rows" in source
     assert "source_only_rows == 0" in normalized
+
+
+def test_full_window_attestation_bounds_database_statements_to_ten_sessions():
+    source = inspect.getsource(attester.attest_range)
+
+    assert attester.ATTESTATION_SESSION_CHUNK_SIZE == 10
+    assert "SELECT DISTINCT trade_date" in source
+    assert source.count("ATTESTATION_SESSION_CHUNK_SIZE") >= 2
+    assert source.count("q.trade_date BETWEEN :chunk_start_date") >= 3
+    assert "t.trade_date BETWEEN :chunk_start_date" in source
+    assert "exact_readback_rows = already_attested_rows" in source
+    assert "AND NOT COALESCE(q.provenance_already, 0)" in source
 
 
 def test_daily_universe_manifest_hash_and_parser_are_frozen():

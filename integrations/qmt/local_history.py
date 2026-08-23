@@ -86,6 +86,7 @@ class LocalBackfillBatchResult:
     written_rows: int
     skipped: bool
     error: str | None = None
+    allowed_missing_codes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -885,9 +886,30 @@ def backfill_daily_kline_local(
     dividend_type: str = "none",
     provider: str = BIGQMT_PROVIDER_ID,
     dry_run: bool = False,
+    allowed_missing_stock_codes: Sequence[str] = (),
 ) -> LocalBackfillResult:
     if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
         raise ValueError("daily QMT history provider is not supported")
+    requested_stock_codes = list(
+        dict.fromkeys(
+            str(code or "").strip().split(".", 1)[0].zfill(6)
+            for code in stock_codes
+            if str(code or "").strip()
+        )
+    )
+    if not requested_stock_codes:
+        raise ValueError("daily QMT history requires at least one stock code")
+    allowed_missing_codes = {
+        str(code or "").strip().split(".", 1)[0].zfill(6)
+        for code in allowed_missing_stock_codes
+        if str(code or "").strip()
+    }
+    unknown_allowed_codes = sorted(allowed_missing_codes - set(requested_stock_codes))
+    if unknown_allowed_codes:
+        raise ValueError(
+            "allowed missing stock codes must be included in the requested universe: "
+            f"count={len(unknown_allowed_codes)}, sample={unknown_allowed_codes[:10]}"
+        )
     ensure_local_history_tables(local_engine)
     run_id = f"qmt_hist_kline_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     batches: list[LocalBackfillBatchResult] = []
@@ -900,21 +922,31 @@ def backfill_daily_kline_local(
         period="1d",
         start_date=start_date,
         end_date=end_date,
-        requested_codes=len(stock_codes),
+        requested_codes=len(requested_stock_codes),
         provider=provider,
         extra={
             "dry_run": dry_run,
             "dividend_type": dividend_type,
             "batch_size": batch_size,
             "provider": provider,
+            "allowed_missing_stock_codes": sorted(allowed_missing_codes),
+            "allowed_missing_stock_code_count": len(allowed_missing_codes),
         },
     )
     status = "SUCCESS"
     error_message: str | None = None
     try:
-        for batch in _chunked(list(stock_codes), batch_size):
+        for batch in _chunked(requested_stock_codes, batch_size):
             qmt_codes = [to_qmt_symbol(code) for code in batch]
             qmt_codes = [code for code in qmt_codes if code]
+            if len(qmt_codes) != len(batch):
+                unsupported = sorted(
+                    code for code in batch if not to_qmt_symbol(code)
+                )
+                raise RuntimeError(
+                    "QMT daily batch contains unsupported stock codes: "
+                    f"count={len(unsupported)}, sample={unsupported[:10]}"
+                )
             if provider == BIGQMT_PROVIDER_ID:
                 from integrations.bigqmt.backend import BigQmtBackend
 
@@ -941,8 +973,36 @@ def backfill_daily_kline_local(
                 batch_id=run_id,
                 provider=provider,
             )
+            fetched_codes = {
+                str(row.get("stock_code") or "").strip().zfill(6)
+                for row in rows
+                if str(row.get("stock_code") or "").strip()
+            }
+            expected_codes = set(batch)
+            missing_codes = sorted(expected_codes - fetched_codes)
+            allowed_batch_missing_codes = sorted(
+                set(missing_codes) & allowed_missing_codes
+            )
+            fatal_missing_codes = sorted(
+                set(missing_codes) - allowed_missing_codes
+            )
+            unexpected_codes = sorted(fetched_codes - expected_codes)
+            if fatal_missing_codes or unexpected_codes:
+                raise RuntimeError(
+                    "QMT daily batch coverage is incomplete: "
+                    f"requested_codes={len(expected_codes)}, "
+                    f"fetched_rows={len(rows)}, "
+                    f"fetched_codes={len(fetched_codes)}, "
+                    f"missing_count={len(missing_codes)}, "
+                    f"missing_sample={missing_codes[:10]}, "
+                    f"allowed_missing_count={len(allowed_batch_missing_codes)}, "
+                    f"fatal_missing_count={len(fatal_missing_codes)}, "
+                    f"fatal_missing_sample={fatal_missing_codes[:10]}, "
+                    f"unexpected_count={len(unexpected_codes)}, "
+                    f"unexpected_sample={unexpected_codes[:10]}"
+                )
             fetched_total += len(rows)
-            written = 0 if dry_run else _upsert_rows(
+            written = 0 if dry_run or not rows else _upsert_rows(
                 local_engine,
                 table_name=LOCAL_KLINE_TABLE,
                 rows=rows,
@@ -959,6 +1019,7 @@ def backfill_daily_kline_local(
                     fetched_rows=len(rows),
                     written_rows=written,
                     skipped=dry_run,
+                    allowed_missing_codes=tuple(allowed_batch_missing_codes),
                 )
             )
     except Exception as exc:
@@ -981,7 +1042,7 @@ def backfill_daily_kline_local(
         local_database=str(make_url(str(local_engine.url)).database or ""),
         start_date=_normalize_date(start_date),
         end_date=_normalize_date(end_date),
-        code_count=len(stock_codes),
+        code_count=len(requested_stock_codes),
         batch_count=len(batches),
         fetched_rows=fetched_total,
         written_rows=written_total,

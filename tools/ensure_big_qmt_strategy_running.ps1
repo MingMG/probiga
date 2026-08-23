@@ -660,7 +660,7 @@ try {
             @{
                 SearchX = 0.325
                 SearchY = 0.065
-                EditX = 0.458
+                EditX = 0.474
                 EditY = 0.133
             },
             @{
@@ -719,8 +719,9 @@ try {
     }
 
     if (!$healthy) {
-        # QMT 2.1.19: run is the second labeled action above the editor.
-        Invoke-WindowClick $editorHandle 0.356 0.150
+        # QMT 2.1.19 full-screen editor: run is the second labeled action in
+        # the compact toolbar immediately above the source pane.
+        Invoke-WindowClick $editorHandle 0.183 0.095
     }
 
     $deadline = (Get-Date).AddSeconds(55)

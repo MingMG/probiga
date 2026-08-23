@@ -323,7 +323,7 @@ def preflight_governance_qmt_history_readiness(
                            END) AS native_row_count
                 FROM {source_table}
                 WHERE trade_date BETWEEN :start_date AND :end_date
-                  AND period='1d' AND adjust_type=0
+                  AND period='1d' AND k_type=1 AND adjust_type=0
                   AND provider=:provider
                   AND stock_code REGEXP '^(0|3|6)'
                 GROUP BY trade_date
@@ -354,7 +354,7 @@ def preflight_governance_qmt_history_readiness(
                       ON q.stock_code COLLATE {QMT_ATTESTATION_COLLATION}
                          =t.stock_code
                      AND q.trade_date=t.trade_date
-                     AND q.period='1d' AND q.adjust_type=0
+                     AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0
                      AND q.provider=:provider
                     WHERE t.trade_date BETWEEN :start_date AND :end_date
                       AND t.k_type=1 AND t.adjust_type=0
@@ -581,15 +581,44 @@ def main(argv: list[str] | None = None) -> int:
             "120-session target before service cutover"
         ),
     )
+    parser.add_argument(
+        "--windows-local-option-file",
+        action="store_true",
+        help=(
+            "For --readiness-only, use the fixed protected Windows MySQL "
+            "option file for primary and QMT history schemas."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.windows_local_option_file and not args.readiness_only:
+        parser.error(
+            "--windows-local-option-file is only valid with --readiness-only"
+        )
     load_project_env()
-    engine = create_batch_engine(future=True)
+    local_history_engine = None
+    if args.windows_local_option_file:
+        from tools.backfill_guojin_qmt_local_history import (
+            _windows_local_engines,
+        )
+
+        engine, local_history_engine = _windows_local_engines()
+    else:
+        engine = create_batch_engine(future=True)
     try:
         try:
             if args.schema_only:
                 result = prepare_attestation_schema(engine)
             elif args.readiness_only:
-                result = preflight_governance_qmt_history_readiness(engine)
+                table_resolver = None
+                if local_history_engine is not None:
+                    table_resolver = lambda target_engine: _table_names(
+                        target_engine,
+                        local_history_engine=local_history_engine,
+                    )
+                result = preflight_governance_qmt_history_readiness(
+                    engine,
+                    table_resolver=table_resolver,
+                )
             else:
                 result = prepare_governance_qmt_history(
                     engine,
@@ -612,6 +641,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         engine.dispose()
+        if local_history_engine is not None:
+            local_history_engine.dispose()
 
 
 if __name__ == "__main__":

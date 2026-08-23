@@ -1,0 +1,1286 @@
+from __future__ import annotations
+
+import json
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy.engine import make_url
+
+from integrations.qmt import local_history
+from integrations.qmt.local_history import (
+    LOCAL_KLINE_TABLE,
+    LocalBackfillBatchResult,
+    LocalBackfillResult,
+)
+from tools import backfill_guojin_qmt_local_history as backfill_tool
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _SequenceConnection:
+    def __init__(self, result_sets):
+        self.result_sets = list(result_sets)
+        self.statements = []
+
+    def execute(self, statement, params=None):
+        self.statements.append((str(statement), dict(params or {})))
+        return _Rows(self.result_sets.pop(0))
+
+
+class _SequenceEngine:
+    def __init__(self, result_sets):
+        self.connection = _SequenceConnection(result_sets)
+
+    def begin(self):
+        return nullcontext(self.connection)
+
+
+class _DisposableEngine:
+    def __init__(self, database):
+        self.url = make_url(f"mysql+pymysql:///{database}")
+        self.disposed = False
+
+    def dispose(self):
+        self.disposed = True
+
+
+def _result(*, code_count=2, fetched_rows=2, written_rows=0):
+    return LocalBackfillResult(
+        run_id="run-1",
+        dataset=LOCAL_KLINE_TABLE,
+        status="SUCCESS",
+        local_database="probiga_qmt_history",
+        start_date="2026-08-19",
+        end_date="2026-08-19",
+        code_count=code_count,
+        batch_count=1,
+        fetched_rows=fetched_rows,
+        written_rows=written_rows,
+        batches=[
+            LocalBackfillBatchResult(
+                dataset=LOCAL_KLINE_TABLE,
+                period="1d",
+                start_date="2026-08-19",
+                end_date="2026-08-19",
+                requested_codes=code_count,
+                fetched_rows=fetched_rows,
+                written_rows=written_rows,
+                skipped=written_rows == 0,
+            )
+        ],
+    )
+
+
+def test_target_window_universe_uses_exact_a_share_union_and_dates():
+    engine = _SequenceEngine(
+        [
+            [("2026-08-18",), ("2026-08-19",)],
+            [("2026-08-18",), ("2026-08-19",)],
+            [("600000",), ("000001",), ("000001",), ("300001",)],
+        ]
+    )
+
+    codes, trade_dates = backfill_tool._target_window_codes(
+        engine,
+        start_date="20260818",
+        end_date="2026-08-19",
+    )
+
+    assert codes == ["000001", "300001", "600000"]
+    assert trade_dates == ["2026-08-18", "2026-08-19"]
+    assert len(engine.connection.statements) == 3
+    assert all(
+        params == {
+            "start_date": "2026-08-18",
+            "end_date": "2026-08-19",
+        }
+        for _sql, params in engine.connection.statements
+    )
+    target_sql = " ".join(
+        sql for sql, _params in engine.connection.statements[1:]
+    )
+    assert "adjust_type=0" in target_sql
+    assert "stock_code REGEXP '^(0|3|6)'" in target_sql
+    assert "SELECT DISTINCT stock_code" in target_sql
+
+
+def test_target_window_universe_rejects_missing_target_trade_date():
+    engine = _SequenceEngine(
+        [
+            [("2026-08-18",), ("2026-08-19",)],
+            [("2026-08-18",)],
+            [("000001",)],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="target daily window is incomplete"):
+        backfill_tool._target_window_codes(
+            engine,
+            start_date="2026-08-18",
+            end_date="2026-08-19",
+        )
+
+
+def test_target_window_unattestable_codes_requires_all_pre_close_invalid():
+    engine = _SequenceEngine([[('688693',), ('000001',)]])
+
+    codes = backfill_tool._target_window_unattestable_codes(
+        engine,
+        start_date="20260316",
+        end_date="2026-03-27",
+    )
+
+    assert codes == ["000001", "688693"]
+    sql, params = engine.connection.statements[0]
+    assert "GROUP BY stock_code" in sql
+    assert "HAVING SUM" in sql
+    assert "pre_close IS NOT NULL AND pre_close > 0" in sql
+    assert "volume=0" in sql
+    assert "pre_close=`close`" in sql
+    assert "adjust_type=0" in sql
+    assert params == {
+        "start_date": "2026-03-16",
+        "end_date": "2026-03-27",
+    }
+
+
+def test_universe_proof_is_sorted_deduplicated_and_stable():
+    first = backfill_tool._universe_proof(
+        ["600000", "000001", "000001"],
+        source=backfill_tool.TARGET_WINDOW_UNIVERSE_SOURCE,
+        start_date="20260818",
+        end_date="20260819",
+        target_trade_dates=["2026-08-18", "2026-08-19"],
+    )
+    second = backfill_tool._universe_proof(
+        ["000001", "600000"],
+        source=backfill_tool.TARGET_WINDOW_UNIVERSE_SOURCE,
+        start_date="2026-08-18",
+        end_date="2026-08-19",
+        target_trade_dates=["2026-08-18", "2026-08-19"],
+    )
+
+    assert first == second
+    assert first["stock_count"] == 2
+    assert first["target_trade_date_count"] == 2
+    assert len(first["stock_codes_sha256"]) == 64
+
+
+def test_target_source_only_repair_inserts_missing_native_rows_only():
+    class _Result:
+        def __init__(self, *, scalar_value=None, rowcount=0):
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(scalar_value=556),
+                _Result(rowcount=556),
+                _Result(scalar_value=0),
+            ]
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), dict(params or {})))
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    engine = _Engine()
+    result = backfill_tool._repair_target_source_only_rows(
+        engine,
+        start_date="20260302",
+        end_date="2026-03-13",
+        provider="gj_big_qmt_inner",
+    )
+
+    assert result == {
+        "status": "APPLIED",
+        "provider": "gj_big_qmt_inner",
+        "start_date": "2026-03-02",
+        "end_date": "2026-03-13",
+        "source_only_before": 556,
+        "inserted_rows": 556,
+        "source_only_after": 0,
+        "existing_rows_updated": 0,
+    }
+    statements = "\n".join(sql for sql, _params in engine.connection.statements)
+    assert "INSERT INTO `probiga`.`sm_stock_kline`" in statements
+    assert "`probiga_qmt_history`.`qmt_local_stock_kline`" in statements
+    assert (
+        "t.stock_code=s.stock_code COLLATE utf8mb4_unicode_ci"
+        in statements
+    )
+    assert "BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'" in statements
+    assert "t.id IS NULL" in statements
+    assert "UPDATE" not in statements.upper()
+    assert all(
+        params == {
+            "start_date": "2026-03-02",
+            "end_date": "2026-03-13",
+            "provider": "gj_big_qmt_inner",
+        }
+        for _sql, params in engine.connection.statements
+    )
+
+
+def test_target_source_only_repair_fails_closed_on_count_drift():
+    class _Result:
+        def __init__(self, *, scalar_value=None, rowcount=0):
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(scalar_value=2),
+                _Result(rowcount=1),
+                _Result(scalar_value=1),
+            ]
+
+        def execute(self, _statement, _params=None):
+            return self.results.pop(0)
+
+    class _Engine:
+        def begin(self):
+            return nullcontext(_Connection())
+
+    with pytest.raises(RuntimeError, match="target repair is incomplete"):
+        backfill_tool._repair_target_source_only_rows(
+            _Engine(),
+            start_date="2026-03-02",
+            end_date="2026-03-13",
+            provider="gj_big_qmt_inner",
+        )
+
+
+def test_target_source_only_repair_cli_requires_strict_local_apply(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(["daily", "--repair-target-source-only"])
+
+    assert exc_info.value.code == 2
+    assert "requires daily mode" in capsys.readouterr().err
+
+
+def test_invalid_target_quarantine_preserves_full_rows_before_delete():
+    class _Result:
+        def __init__(self, *, rows=None, scalar_value=None, rowcount=0):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(),
+                _Result(
+                    rows=[
+                        {
+                            "id": 71,
+                            "stock_code": "688693",
+                            "short_name": "test",
+                            "trade_time": "2026-03-16 15:00:00",
+                            "trade_date": "2026-03-16",
+                            "k_type": 1,
+                            "adjust_type": 0,
+                            "open": "45.75",
+                            "close": "45.75",
+                            "high": "45.75",
+                            "low": "45.75",
+                            "volume": "0",
+                            "amount": "0",
+                            "change": None,
+                            "change_pct": None,
+                            "turnover_ratio": None,
+                            "pre_close": "0",
+                            "etl_sync_at": "2026-08-23 20:00:00",
+                            "qmt_code": "688693.SH",
+                            "data_source": "gj_big_qmt_inner",
+                            "source_time": "2026-03-16 15:00:00",
+                            "received_at": "2026-08-23 20:00:00",
+                            "batch_id": "old-run",
+                            "data_version": "old-version",
+                            "quality_status": "QMT_ATTESTED",
+                            "permission_status": "SUPPORTED",
+                        },
+                        {
+                            "id": 72,
+                            "stock_code": "300955",
+                            "short_name": "suspended",
+                            "trade_time": "2026-03-17 15:00:00",
+                            "trade_date": "2026-03-17",
+                            "k_type": 1,
+                            "adjust_type": 0,
+                            "open": "32.68",
+                            "close": "32.68",
+                            "high": "32.68",
+                            "low": "32.68",
+                            "volume": "0",
+                            "amount": "0",
+                            "change": "0",
+                            "change_pct": "0",
+                            "turnover_ratio": "0",
+                            "pre_close": "32.68",
+                            "etl_sync_at": "2026-08-23 20:00:00",
+                            "qmt_code": "300955.SZ",
+                            "data_source": "gj_big_qmt_inner",
+                            "source_time": "2026-03-17 15:00:00",
+                            "received_at": "2026-08-23 20:00:00",
+                            "batch_id": "old-synthetic-run",
+                            "data_version": "old-synthetic-version",
+                            "quality_status": "QMT_ATTESTED",
+                            "permission_status": "SUPPORTED",
+                        },
+                    ]
+                ),
+                _Result(scalar_value=0),
+                _Result(scalar_value=0),
+                _Result(scalar_value=0),
+                _Result(scalar_value=0),
+                _Result(rowcount=2),
+                _Result(rowcount=2),
+                _Result(scalar_value=0),
+                _Result(scalar_value=0),
+                _Result(rowcount=1),
+            ]
+            self.statements = []
+            self.begin_count = 0
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), params))
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            self.connection.begin_count += 1
+            return nullcontext(self.connection)
+
+    engine = _Engine()
+    result = backfill_tool._quarantine_invalid_target_rows_without_native(
+        engine,
+        start_date="20260316",
+        end_date="2026-03-27",
+        provider="gj_big_qmt_inner",
+    )
+
+    assert result["status"] == "APPLIED"
+    assert result["selected_rows"] == 2
+    assert result["candidate_target_rows_checked"] == 2
+    assert result["invalid_target_rows_checked"] == 1
+    assert result["synthetic_target_rows_checked"] == 1
+    assert result["native_backed_invalid_rows"] == 0
+    assert result["native_backed_synthetic_rows"] == 0
+    assert result["audit_copied_rows"] == 2
+    assert result["deleted_rows"] == 2
+    assert result["remaining_rows"] == 0
+    assert result["recoverable"] is True
+    assert result["existing_valid_target_rows_updated"] == 0
+    assert len(result["row_set_sha256"]) == 64
+    assert engine.connection.begin_count == 2
+
+    statements = [sql for sql, _params in engine.connection.statements]
+    combined = "\n".join(statements)
+    assert "CREATE TABLE IF NOT EXISTS" in statements[0]
+    assert "row_payload LONGTEXT NOT NULL" in statements[0]
+    assert "FOR UPDATE" in combined
+    assert "NOT EXISTS" in combined
+    assert "BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'" in combined
+    assert "INSERT INTO `probiga`.`qmt_target_daily_quarantine`" in combined
+    assert "DELETE t" in combined
+    assert "sm_stock_kline_target_quarantine" in statements[-1]
+    assert combined.index("INSERT INTO `probiga`.`qmt_target_daily_quarantine`") < (
+        combined.index("DELETE t")
+    )
+
+    quarantine_params = next(
+        params
+        for sql, params in engine.connection.statements
+        if "INSERT INTO `probiga`.`qmt_target_daily_quarantine`" in sql
+    )
+    assert isinstance(quarantine_params, list)
+    assert len(quarantine_params) == 2
+    by_id = {item["original_id"]: item for item in quarantine_params}
+    preserved = json.loads(by_id[71]["row_payload"])
+    assert preserved["id"] == 71
+    assert preserved["stock_code"] == "688693"
+    assert preserved["pre_close"] == "0"
+    assert preserved["data_source"] == "gj_big_qmt_inner"
+    assert len(by_id[71]["row_sha256"]) == 64
+    assert by_id[71]["action"] == (
+        backfill_tool.TARGET_INVALID_QUARANTINE_ACTION
+    )
+    synthetic = json.loads(by_id[72]["row_payload"])
+    assert synthetic["pre_close"] == "32.68"
+    assert synthetic["volume"] == "0"
+    assert by_id[72]["action"] == (
+        backfill_tool.TARGET_SYNTHETIC_QUARANTINE_ACTION
+    )
+
+    audit_params = engine.connection.statements[-1][1]
+    audit = json.loads(audit_params["extra_json"])
+    assert audit["recoverable"] is True
+    assert audit["full_row_payload_preserved"] is True
+    assert audit["existing_valid_target_rows_updated"] == 0
+    assert audit["selected_action_counts"] == {
+        backfill_tool.TARGET_INVALID_QUARANTINE_ACTION: 1,
+        backfill_tool.TARGET_SYNTHETIC_QUARANTINE_ACTION: 1,
+    }
+
+
+def test_invalid_target_quarantine_fails_closed_on_count_drift():
+    class _Result:
+        def __init__(self, *, rows=None, scalar_value=None, rowcount=0):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(),
+                _Result(
+                    rows=[
+                        {
+                            "id": 71,
+                            "stock_code": "688693",
+                            "trade_date": "2026-03-16",
+                            "k_type": 1,
+                            "adjust_type": 0,
+                        }
+                    ]
+                ),
+                _Result(scalar_value=0),
+                _Result(scalar_value=0),
+                _Result(rowcount=1),
+                _Result(rowcount=0),
+                _Result(scalar_value=1),
+            ]
+
+        def execute(self, _statement, _params=None):
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    with pytest.raises(RuntimeError, match="quarantine is incomplete"):
+        backfill_tool._quarantine_invalid_target_rows_without_native(
+            _Engine(),
+            start_date="2026-03-16",
+            end_date="2026-03-27",
+            provider="gj_big_qmt_inner",
+        )
+
+
+def test_target_quarantine_fails_closed_above_bounded_row_limit():
+    class _Result:
+        def __init__(self, *, rows=None):
+            self.rows = list(rows or [])
+            self.rowcount = 0
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return 0
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(),
+                _Result(
+                    rows=[
+                        {
+                            "id": offset,
+                            "stock_code": str(offset).zfill(6),
+                            "trade_date": "2026-03-16",
+                            "pre_close": 0,
+                        }
+                        for offset in range(3)
+                    ]
+                ),
+                _Result(),
+                _Result(),
+                _Result(),
+            ]
+
+        def execute(self, _statement, _params=None):
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    with pytest.raises(RuntimeError, match="exceeds the bounded row limit"):
+        backfill_tool._quarantine_invalid_target_rows_without_native(
+            _Engine(),
+            start_date="2026-03-16",
+            end_date="2026-03-27",
+            provider="gj_big_qmt_inner",
+            max_rows=2,
+        )
+
+
+def test_invalid_target_quarantine_keeps_rows_with_valid_native_source():
+    class _Result:
+        def __init__(self, *, rows=None, scalar_value=None, rowcount=0):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(),
+                _Result(
+                    rows=[
+                        {
+                            "id": 72,
+                            "stock_code": "301682",
+                            "trade_date": "2026-03-25",
+                            "k_type": 1,
+                            "adjust_type": 0,
+                        }
+                    ]
+                ),
+                _Result(scalar_value=9001),
+                _Result(rowcount=1),
+            ]
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), params))
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    engine = _Engine()
+    result = backfill_tool._quarantine_invalid_target_rows_without_native(
+        engine,
+        start_date="2026-03-16",
+        end_date="2026-03-27",
+        provider="gj_big_qmt_inner",
+    )
+
+    assert result["invalid_target_rows_checked"] == 1
+    assert result["native_backed_invalid_rows"] == 1
+    assert result["selected_rows"] == 0
+    assert result["deleted_rows"] == 0
+    combined = "\n".join(sql for sql, _params in engine.connection.statements)
+    assert "FORCE INDEX (uk_qmt_local_kline)" in combined
+    assert "DELETE t" not in combined
+
+
+def test_invalid_target_quarantine_stops_before_delete_on_audit_conflict():
+    class _Result:
+        def __init__(self, *, rows=None, scalar_value=None):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = 0
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(),
+                _Result(
+                    rows=[
+                        {
+                            "id": 71,
+                            "stock_code": "688693",
+                            "trade_date": "2026-03-16",
+                            "k_type": 1,
+                            "adjust_type": 0,
+                        }
+                    ]
+                ),
+                _Result(scalar_value=0),
+                _Result(scalar_value=1),
+            ]
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), params))
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    engine = _Engine()
+    with pytest.raises(RuntimeError, match="existing audit copy"):
+        backfill_tool._quarantine_invalid_target_rows_without_native(
+            engine,
+            start_date="2026-03-16",
+            end_date="2026-03-27",
+            provider="gj_big_qmt_inner",
+        )
+
+    combined = "\n".join(sql for sql, _params in engine.connection.statements)
+    assert "DELETE t" not in combined
+    assert "sm_stock_kline_target_quarantine'," not in combined
+
+
+def test_invalid_target_quarantine_cli_requires_full_strict_chain(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(
+            ["daily", "--quarantine-invalid-target-no-native"]
+        )
+
+    assert exc_info.value.code == 2
+    assert "requires --quarantine-source-only-legacy" in capsys.readouterr().err
+
+
+def test_source_only_legacy_quarantine_is_audited_and_non_destructive():
+    class _Result:
+        def __init__(
+            self,
+            *,
+            rows=None,
+            scalar_value=None,
+            rowcount=0,
+        ):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self):
+            self.results = [
+                _Result(
+                    rows=[
+                        {
+                            "id": 7,
+                            "stock_code": "000001",
+                            "trade_date": "2026-03-02",
+                            "adjust_type": 0,
+                            "data_version": "legacy-a",
+                        },
+                        {
+                            "id": 9,
+                            "stock_code": "600000",
+                            "trade_date": "2026-03-03",
+                            "adjust_type": 0,
+                            "data_version": "legacy-b",
+                        },
+                    ]
+                ),
+                _Result(scalar_value=0),
+                _Result(rowcount=2),
+                _Result(scalar_value=0),
+                _Result(rowcount=1),
+            ]
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), dict(params or {})))
+            return self.results.pop(0)
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            return nullcontext(self.connection)
+
+    engine = _Engine()
+    result = backfill_tool._quarantine_source_only_legacy_rows(
+        engine,
+        start_date="20260302",
+        end_date="2026-03-13",
+        provider="gj_big_qmt_inner",
+    )
+
+    assert result["status"] == "APPLIED"
+    assert result["selected_rows"] == 2
+    assert result["quarantined_rows"] == 2
+    assert result["remaining_rows"] == 0
+    assert result["existing_target_rows_updated"] == 0
+    assert len(result["row_identity_sha256"]) == 64
+    statements = "\n".join(sql for sql, _params in engine.connection.statements)
+    assert "FOR UPDATE" in statements
+    assert "BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'" in statements
+    assert "SET s.provider=:quarantine_provider" in statements
+    assert "qmt_local_stock_kline_quarantine" in statements
+    assert "DELETE" not in statements.upper()
+    audit_params = engine.connection.statements[-1][1]
+    audit = json.loads(audit_params["extra_json"])
+    assert audit["reason"] == "SOURCE_ONLY_UNVERIFIED_LEGACY"
+    assert audit["existing_target_rows_updated"] == 0
+    assert audit_params["row_count"] == 2
+    assert audit_params["requested_codes"] == 2
+
+
+def test_source_only_legacy_quarantine_cli_requires_native_repair(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(
+            ["daily", "--quarantine-source-only-legacy"]
+        )
+
+    assert exc_info.value.code == 2
+    assert "requires --repair-target-source-only" in capsys.readouterr().err
+
+
+def test_windows_option_file_route_uses_safe_urls_and_fixed_databases(
+    monkeypatch,
+):
+    history_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+
+    class _DbapiConnection:
+        def select_db(self, database):
+            events.append(("select_db", database))
+
+        def close(self):
+            events.append("dbapi_close")
+
+    class _Scalar:
+        def scalar(self):
+            return "probiga"
+
+    class _PrimaryConnection:
+        def execute(self, statement, params=None):
+            events.append(("execute", str(statement), dict(params or {})))
+            return _Scalar()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class _PrimaryEngine(_DisposableEngine):
+        def connect(self):
+            return _PrimaryConnection()
+
+    def fake_create_engine(url, *, creator, **kwargs):
+        rendered = url.render_as_string(hide_password=False)
+        events.append(("url", rendered, kwargs))
+        creator()
+        return _PrimaryEngine("probiga")
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "_create_windows_local_history_engine",
+        lambda: history_engine,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_local_mysql84_boundary",
+        lambda engine: events.append(("boundary", engine)) or {"ready": True},
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_connect_from_windows_option_file",
+        lambda path: events.append(("option_file", path)) or _DbapiConnection(),
+    )
+    monkeypatch.setattr(backfill_tool, "create_engine", fake_create_engine)
+
+    primary_engine, returned_history = backfill_tool._windows_local_engines()
+
+    assert returned_history is history_engine
+    assert primary_engine.url.username is None
+    assert primary_engine.url.password is None
+    rendered_urls = [event[1] for event in events if event[0] == "url"]
+    assert rendered_urls == ["mysql+pymysql:///probiga"]
+    assert ("select_db", "probiga") in events
+    assert ("boundary", history_engine) in events
+
+
+def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
+    source_engine = object()
+    local_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (source_engine, local_engine),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "ensure_local_history_tables",
+        lambda engine: events.append(("ensure", engine)),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_codes",
+        lambda engine, **kwargs: (
+            ["000001", "600000"],
+            ["2026-08-19"],
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_acquire_lock",
+        lambda path: events.append(("acquire", path)) or (True, ""),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_release_lock",
+        lambda path: events.append(("release", path)),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "backfill_daily_kline_local",
+        lambda **kwargs: events.append(("backfill", kwargs)) or _result(),
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "daily",
+            "--windows-local-option-file",
+            "--target-window-universe",
+            "--start-date",
+            "2026-08-19",
+            "--end-date",
+            "2026-08-19",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "SUCCESS"
+    assert payload["connection_mode"] == "fixed_protected_windows_option_file"
+    assert payload["universe"]["source"] == (
+        "sm_stock_kline.target_window_exact_union"
+    )
+    assert payload["universe"]["stock_count"] == 2
+    assert payload["universe"]["target_trade_date_count"] == 1
+    assert events[1] == ("acquire", backfill_tool.DAILY_LOCK_PATH)
+    assert events[-1] == ("release", backfill_tool.DAILY_LOCK_PATH)
+
+
+def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
+    monkeypatch,
+    capsys,
+):
+    source_engine = object()
+    local_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (source_engine, local_engine),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "ensure_local_history_tables",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_codes",
+        lambda _engine, **_kwargs: (
+            ["600000", "688693"],
+            ["2026-03-16"],
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_unattestable_codes",
+        lambda _engine, **_kwargs: events.append("allow-list")
+        or ["688693"],
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_acquire_lock",
+        lambda _path: (True, ""),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_release_lock",
+        lambda _path: events.append("release"),
+    )
+
+    def fake_backfill(**kwargs):
+        events.append(("backfill", kwargs))
+        return _result(code_count=2, fetched_rows=1, written_rows=1)
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "backfill_daily_kline_local",
+        fake_backfill,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_quarantine_invalid_target_rows_without_native",
+        lambda _engine, **_kwargs: events.append("target-quarantine")
+        or {"status": "APPLIED", "deleted_rows": 1},
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_repair_target_source_only_rows",
+        lambda _engine, **_kwargs: events.append("target-repair")
+        or {"status": "APPLIED"},
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_quarantine_source_only_legacy_rows",
+        lambda _engine, **_kwargs: events.append("legacy-quarantine")
+        or {"status": "APPLIED"},
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "daily",
+            "--windows-local-option-file",
+            "--target-window-universe",
+            "--repair-target-source-only",
+            "--quarantine-source-only-legacy",
+            "--quarantine-invalid-target-no-native",
+            "--provider",
+            "gj_big_qmt_inner",
+            "--dividend-type",
+            "none",
+            "--start-date",
+            "2026-03-16",
+            "--end-date",
+            "2026-03-27",
+            "--apply",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    event_names = [event[0] if isinstance(event, tuple) else event for event in events]
+    assert event_names == [
+        "allow-list",
+        "backfill",
+        "target-quarantine",
+        "target-repair",
+        "legacy-quarantine",
+        "release",
+    ]
+    backfill_kwargs = events[1][1]
+    assert backfill_kwargs["allowed_missing_stock_codes"] == ["688693"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["allowed_missing_target_codes"]["stock_codes"] == [
+        "688693"
+    ]
+    assert payload["invalid_target_quarantine"]["deleted_rows"] == 1
+
+
+def test_daily_main_lock_contention_is_nonzero_and_does_not_fetch(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(backfill_tool, "_source_engine", lambda: object())
+    monkeypatch.setattr(
+        backfill_tool,
+        "get_local_history_engine",
+        lambda _url=None: _DisposableEngine("probiga_qmt_history"),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "ensure_local_history_tables",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_codes_from_arg",
+        lambda _engine, _codes, *, limit: ["000001"],
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_acquire_lock",
+        lambda _path: (False, "1234 2026-08-23T12:00:00"),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "backfill_daily_kline_local",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("QMT fetch must not start")
+        ),
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "daily",
+            "--codes",
+            "000001",
+            "--start-date",
+            "2026-08-19",
+            "--end-date",
+            "2026-08-19",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "already_running"
+    assert payload["mode"] == "daily"
+
+
+def test_atomic_daily_lock_allows_one_owner(tmp_path):
+    lock_path = tmp_path / "daily.lock"
+
+    acquired, owner = backfill_tool._acquire_lock(lock_path)
+    second_acquired, second_owner = backfill_tool._acquire_lock(lock_path)
+
+    assert acquired is True
+    assert owner == ""
+    assert second_acquired is False
+    assert second_owner.startswith(str(backfill_tool.os.getpid()))
+    backfill_tool._release_lock(lock_path)
+    assert not lock_path.exists()
+
+
+def test_atomic_daily_lock_never_unlinks_a_fresh_initializing_owner(tmp_path):
+    lock_path = tmp_path / "daily.lock"
+    lock_path.write_bytes(b"")
+
+    acquired, owner = backfill_tool._acquire_lock(lock_path)
+
+    assert acquired is False
+    assert owner == "lock_initializing"
+    assert lock_path.exists()
+
+
+def _patch_daily_dependencies(monkeypatch, prepared_rows):
+    monkeypatch.setattr(
+        local_history,
+        "ensure_local_history_tables",
+        lambda _engine: None,
+    )
+    run_events = []
+    monkeypatch.setattr(
+        local_history,
+        "_record_run_start",
+        lambda *_args, **kwargs: run_events.append(("start", kwargs)),
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_record_run_finish",
+        lambda *_args, **kwargs: run_events.append(("finish", kwargs)),
+    )
+    monkeypatch.setattr(
+        "integrations.bigqmt.backend.BigQmtBackend.fetch_kline",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_prepare_kline_rows",
+        lambda *_args, **_kwargs: list(prepared_rows),
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("incomplete batch must not be written")
+        ),
+    )
+    return run_events
+
+
+@pytest.mark.parametrize(
+    "prepared_rows, expected_fragment",
+    [
+        ([], "fetched_rows=0"),
+        ([{"stock_code": "000001"}], "missing_count=1"),
+    ],
+)
+def test_daily_backfill_fails_closed_on_empty_or_missing_batch(
+    monkeypatch,
+    prepared_rows,
+    expected_fragment,
+):
+    run_events = _patch_daily_dependencies(monkeypatch, prepared_rows)
+    local_engine = _DisposableEngine("probiga_qmt_history")
+
+    with pytest.raises(RuntimeError, match=expected_fragment):
+        local_history.backfill_daily_kline_local(
+            source_engine=object(),
+            local_engine=local_engine,
+            stock_codes=["000001", "600000"],
+            start_date="2026-08-19",
+            end_date="2026-08-19",
+            batch_size=2,
+            dry_run=False,
+        )
+
+    assert run_events[0][0] == "start"
+    assert run_events[-1][0] == "finish"
+    assert run_events[-1][1]["status"] == "FAILED"
+    assert expected_fragment in run_events[-1][1]["error_message"]
+
+
+@pytest.mark.parametrize(
+    "prepared_rows",
+    [[], [{"stock_code": "000001"}]],
+)
+def test_daily_backfill_allows_only_explicitly_proven_missing_codes(
+    monkeypatch,
+    prepared_rows,
+):
+    requested_codes = ["600000"] if not prepared_rows else ["000001", "600000"]
+    run_events = _patch_daily_dependencies(monkeypatch, prepared_rows)
+    local_engine = _DisposableEngine("probiga_qmt_history")
+
+    result = local_history.backfill_daily_kline_local(
+        source_engine=object(),
+        local_engine=local_engine,
+        stock_codes=requested_codes,
+        allowed_missing_stock_codes=["600000"],
+        start_date="2026-08-19",
+        end_date="2026-08-19",
+        batch_size=2,
+        dry_run=True,
+    )
+
+    assert result.status == "SUCCESS"
+    assert result.batches[0].allowed_missing_codes == ("600000",)
+    assert result.batches[0].written_rows == 0
+    assert run_events[0][1]["extra"]["allowed_missing_stock_codes"] == [
+        "600000"
+    ]
+    assert run_events[-1][1]["status"] == "SUCCESS"
+
+
+def test_daily_backfill_deduplicates_normalized_requested_codes(monkeypatch):
+    run_events = _patch_daily_dependencies(
+        monkeypatch,
+        [{"stock_code": "000001"}, {"stock_code": "600000"}],
+    )
+
+    result = local_history.backfill_daily_kline_local(
+        source_engine=object(),
+        local_engine=_DisposableEngine("probiga_qmt_history"),
+        stock_codes=["000001.SZ", "600000", "000001"],
+        start_date="2026-08-19",
+        end_date="2026-08-19",
+        batch_size=10,
+        dry_run=True,
+    )
+
+    assert result.code_count == 2
+    assert result.batches[0].requested_codes == 2
+    assert run_events[0][1]["requested_codes"] == 2
+    assert run_events[-1][1]["status"] == "SUCCESS"
+
+
+def test_daily_backfill_rejects_allowed_code_outside_requested_universe(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        local_history,
+        "ensure_local_history_tables",
+        lambda _engine: (_ for _ in ()).throw(
+            AssertionError("invalid allow-list must fail before schema access")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be included"):
+        local_history.backfill_daily_kline_local(
+            source_engine=object(),
+            local_engine=object(),
+            stock_codes=["000001"],
+            allowed_missing_stock_codes=["600000"],
+            start_date="2026-08-19",
+            end_date="2026-08-19",
+        )
+
+
+def test_daily_backfill_rejects_empty_requested_universe_before_run(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        local_history,
+        "ensure_local_history_tables",
+        lambda _engine: (_ for _ in ()).throw(
+            AssertionError("empty universe must fail before schema access")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="at least one stock code"):
+        local_history.backfill_daily_kline_local(
+            source_engine=object(),
+            local_engine=object(),
+            stock_codes=[],
+            start_date="2026-08-19",
+            end_date="2026-08-19",
+        )

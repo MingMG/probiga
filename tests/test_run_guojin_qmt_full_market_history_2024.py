@@ -128,3 +128,33 @@ def test_daily_run_hard_fails_when_production_target_set_is_empty(monkeypatch, t
 
     with pytest.raises(RuntimeError, match="production daily target set is empty"):
         _run(tmp_path)
+
+
+def test_pid_alive_checks_current_process_without_signalling_it():
+    assert history_job._pid_alive(history_job.os.getpid()) is True
+    assert history_job._pid_alive(-1) is False
+
+
+def test_history_job_lock_is_atomic_and_owned(tmp_path):
+    lock_path = tmp_path / "history.lock"
+
+    acquired, owner = history_job._acquire_lock(lock_path)
+    second_acquired, second_owner = history_job._acquire_lock(lock_path)
+
+    assert acquired is True
+    assert owner == ""
+    assert second_acquired is False
+    assert second_owner.startswith(str(history_job.os.getpid()))
+    history_job._release_lock(lock_path)
+    assert not lock_path.exists()
+
+
+def test_history_job_lock_never_unlinks_a_fresh_initializing_owner(tmp_path):
+    lock_path = tmp_path / "history.lock"
+    lock_path.write_bytes(b"")
+
+    acquired, owner = history_job._acquire_lock(lock_path)
+
+    assert acquired is False
+    assert owner == "lock_initializing"
+    assert lock_path.exists()

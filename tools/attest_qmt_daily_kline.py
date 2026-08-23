@@ -90,6 +90,7 @@ EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT = 11
 EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH = (
     "fc8328550615413445edf1055b3b88d70fa8b37e45ee331f682cf8f654779b54"
 )
+ATTESTATION_SESSION_CHUNK_SIZE = 10
 # The deployed pre-V2 writer serialized this exact four-key object with
 # ``json.dumps(..., sort_keys=True)``.  No alternate whitespace, key order,
 # tolerance or additional field is grandfathered.
@@ -695,9 +696,13 @@ def values_match(
     )
 
 
-def _table_names(engine: Engine) -> tuple[str, str]:
+def _table_names(
+    engine: Engine,
+    *,
+    local_history_engine: Engine | None = None,
+) -> tuple[str, str]:
     target_url = make_url(str(engine.url))
-    local_engine = get_local_history_engine()
+    local_engine = local_history_engine or get_local_history_engine()
     local_url = make_url(str(local_engine.url))
     target_host = (target_url.host or "localhost").lower()
     local_host = (local_url.host or "localhost").lower()
@@ -1677,6 +1682,7 @@ def attest_range(
     provider: str = PROVIDER_ID,
     mismatch_sample_limit: int = 5000,
     schema_prepared: bool = False,
+    local_history_engine: Engine | None = None,
 ) -> dict[str, Any]:
     if type(schema_prepared) is not bool:
         raise TypeError("schema_prepared must be bool")
@@ -1685,7 +1691,10 @@ def attest_range(
     else:
         ensure_attestation_tables(engine)
         validate_attestation_schema(engine)
-    target_table, source_table = _table_names(engine)
+    target_table, source_table = _table_names(
+        engine,
+        local_history_engine=local_history_engine,
+    )
     run_id = f"qmt_attest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     tolerances = {
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
@@ -1797,7 +1806,7 @@ def attest_range(
                            batch_id, data_version, permission_status
                     FROM {source_table}
                     WHERE trade_date BETWEEN :start_date AND :end_date
-                      AND period='1d' AND adjust_type=0
+                      AND period='1d' AND k_type=1 AND adjust_type=0
                       AND provider=:provider
                       AND stock_code REGEXP '^(0|3|6)'
                     """
@@ -1855,56 +1864,96 @@ def attest_range(
                         qmt_low DECIMAL(20,6) NULL,
                         PRIMARY KEY (target_id),
                         KEY idx_tmp_qmt_attest_match (is_match),
-                        KEY idx_tmp_qmt_attest_source (qmt_id)
-                    ) ENGINE=InnoDB AS
-                    SELECT t.target_id, q.qmt_id,
-                           t.trade_date, t.stock_code,
-                           ({match_sql}) AS is_match,
-                           COALESCE(EXISTS(
-                               SELECT 1
-                               FROM qmt_kline_attestation_row a
-                               WHERE a.target_id=t.target_id
-                                 AND a.qmt_id=q.qmt_id
-                                 AND BINARY a.protocol_version=
-                                     BINARY :attestation_protocol
-                                 AND BINARY a.source_data_version=
-                                     BINARY q.data_version
-                                 AND BINARY a.source_pre_close_origin=
-                                     BINARY q.pre_close_origin
-                                 AND a.source_pre_close=q.pre_close
-                                 AND a.attested_open=q.`open`
-                                 AND a.attested_close=q.`close`
-                                 AND a.attested_high=q.`high`
-                                 AND a.attested_low=q.`low`
-                                 AND a.attested_volume=q.volume
-                                 AND a.attested_amount=q.amount
-                                 AND t.pre_close=a.source_pre_close
-                                 AND t.`open`=a.attested_open
-                                 AND t.`close`=a.attested_close
-                                 AND t.`high`=a.attested_high
-                                 AND t.`low`=a.attested_low
-                                 AND t.volume=a.attested_volume
-                                 AND t.amount=a.attested_amount
-                           ), 0) AS provenance_already,
-                           t.close AS target_close, q.close AS qmt_close,
-                           t.pre_close AS target_pre_close,
-                           q.pre_close AS qmt_pre_close,
-                           t.volume AS target_volume, q.volume AS qmt_volume,
-                           t.amount AS target_amount, q.amount AS qmt_amount,
-                           q.qmt_code, q.provider, q.source_time,
-                           q.received_at, q.batch_id, q.data_version,
-                           q.permission_status, q.pre_close_origin,
-                           q.`open` AS qmt_open,
-                           q.`high` AS qmt_high,
-                           q.`low` AS qmt_low
-                    FROM `{target_temp}` t
-                    LEFT JOIN `{source_temp}` q
-                      ON q.stock_code=t.stock_code
-                     AND q.trade_date=t.trade_date
+                        KEY idx_tmp_qmt_attest_source (qmt_id),
+                        KEY idx_tmp_qmt_attest_pending
+                            (is_match, provenance_already, trade_date)
+                    ) ENGINE=InnoDB
                     """
                 ),
-                params,
             )
+            # Keep every individual comparison statement below the same
+            # ten-session size proven by the production backfill batches.
+            # A single 120-session correlated provenance lookup can exceed a
+            # defensive 30-second DB read timeout even when every row is
+            # valid; chunking changes only execution shape, not the snapshot
+            # or the final all-or-nothing transaction.
+            compare_session_rows = connection.execute(text(
+                f"SELECT DISTINCT trade_date FROM `{target_temp}` "
+                "ORDER BY trade_date"
+            )).mappings().all()
+            compare_sessions = [
+                str(row.get("trade_date") or "")[:10]
+                for row in compare_session_rows
+            ]
+            if any(not value for value in compare_sessions):
+                raise RuntimeError("QMT attestation target session is invalid")
+            for offset in range(
+                0,
+                len(compare_sessions),
+                ATTESTATION_SESSION_CHUNK_SIZE,
+            ):
+                session_chunk = compare_sessions[
+                    offset:offset + ATTESTATION_SESSION_CHUNK_SIZE
+                ]
+                chunk_params = {
+                    **params,
+                    "chunk_start_date": session_chunk[0],
+                    "chunk_end_date": session_chunk[-1],
+                }
+                connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO `{compare_temp}`
+                        SELECT t.target_id, q.qmt_id,
+                               t.trade_date, t.stock_code,
+                               ({match_sql}) AS is_match,
+                               COALESCE(EXISTS(
+                                   SELECT 1
+                                   FROM qmt_kline_attestation_row a
+                                   WHERE a.target_id=t.target_id
+                                     AND a.qmt_id=q.qmt_id
+                                     AND BINARY a.protocol_version=
+                                         BINARY :attestation_protocol
+                                     AND BINARY a.source_data_version=
+                                         BINARY q.data_version
+                                     AND BINARY a.source_pre_close_origin=
+                                         BINARY q.pre_close_origin
+                                     AND a.source_pre_close=q.pre_close
+                                     AND a.attested_open=q.`open`
+                                     AND a.attested_close=q.`close`
+                                     AND a.attested_high=q.`high`
+                                     AND a.attested_low=q.`low`
+                                     AND a.attested_volume=q.volume
+                                     AND a.attested_amount=q.amount
+                                     AND t.pre_close=a.source_pre_close
+                                     AND t.`open`=a.attested_open
+                                     AND t.`close`=a.attested_close
+                                     AND t.`high`=a.attested_high
+                                     AND t.`low`=a.attested_low
+                                     AND t.volume=a.attested_volume
+                                     AND t.amount=a.attested_amount
+                               ), 0) AS provenance_already,
+                               t.close AS target_close, q.close AS qmt_close,
+                               t.pre_close AS target_pre_close,
+                               q.pre_close AS qmt_pre_close,
+                               t.volume AS target_volume, q.volume AS qmt_volume,
+                               t.amount AS target_amount, q.amount AS qmt_amount,
+                               q.qmt_code, q.provider, q.source_time,
+                               q.received_at, q.batch_id, q.data_version,
+                               q.permission_status, q.pre_close_origin,
+                               q.`open` AS qmt_open,
+                               q.`high` AS qmt_high,
+                               q.`low` AS qmt_low
+                        FROM `{target_temp}` t
+                        LEFT JOIN `{source_temp}` q
+                          ON q.stock_code=t.stock_code
+                         AND q.trade_date=t.trade_date
+                        WHERE t.trade_date BETWEEN :chunk_start_date
+                                               AND :chunk_end_date
+                        """
+                    ),
+                    chunk_params,
+                )
             aggregate = connection.execute(
                 text(
                     f"""
@@ -2052,100 +2101,123 @@ def attest_range(
             # run can survive through the append-only uniqueness key and make
             # a later complete run appear bound to incomplete evidence.
             if apply and universe_complete:
-                updated_rows = int(
+                exact_readback_rows = already_attested_rows
+                for offset in range(
+                    0,
+                    len(compare_sessions),
+                    ATTESTATION_SESSION_CHUNK_SIZE,
+                ):
+                    session_chunk = compare_sessions[
+                        offset:offset + ATTESTATION_SESSION_CHUNK_SIZE
+                    ]
+                    chunk_params = {
+                        **params,
+                        "chunk_start_date": session_chunk[0],
+                        "chunk_end_date": session_chunk[-1],
+                    }
+                    updated_rows += int(
+                        connection.execute(
+                            text(
+                                f"""
+                                UPDATE {target_table} t
+                                INNER JOIN `{compare_temp}` q
+                                  ON q.target_id=t.id
+                                SET t.qmt_code=q.qmt_code,
+                                    t.data_source=q.provider,
+                                    t.`open`=q.qmt_open,
+                                    t.`close`=q.qmt_close,
+                                    t.`high`=q.qmt_high,
+                                    t.`low`=q.qmt_low,
+                                    t.volume=q.qmt_volume,
+                                    t.amount=q.qmt_amount,
+                                    t.pre_close=q.qmt_pre_close,
+                                    t.`change`=q.qmt_close-q.qmt_pre_close,
+                                    t.change_pct=(q.qmt_close-q.qmt_pre_close)
+                                        / q.qmt_pre_close * 100,
+                                    t.source_time=q.source_time,
+                                    t.received_at=q.received_at,
+                                    t.batch_id=q.batch_id,
+                                    t.data_version=q.data_version,
+                                    t.quality_status='QMT_ATTESTED',
+                                    t.permission_status=q.permission_status,
+                                    t.etl_sync_at=NOW()
+                                WHERE q.is_match
+                                  AND NOT COALESCE(q.provenance_already, 0)
+                                  AND q.trade_date BETWEEN :chunk_start_date
+                                                       AND :chunk_end_date
+                                """
+                            ),
+                            chunk_params,
+                        ).rowcount
+                        or 0
+                    )
                     connection.execute(
                         text(
                             f"""
-                            UPDATE {target_table} t
-                            INNER JOIN `{compare_temp}` q
-                              ON q.target_id=t.id
-                            SET t.qmt_code=q.qmt_code,
-                                t.data_source=q.provider,
-                                t.`open`=q.qmt_open,
-                                t.`close`=q.qmt_close,
-                                t.`high`=q.qmt_high,
-                                t.`low`=q.qmt_low,
-                                t.volume=q.qmt_volume,
-                                t.amount=q.qmt_amount,
-                                t.pre_close=q.qmt_pre_close,
-                                t.`change`=q.qmt_close-q.qmt_pre_close,
-                                t.change_pct=(q.qmt_close-q.qmt_pre_close)
-                                    / q.qmt_pre_close * 100,
-                                t.source_time=q.source_time,
-                                t.received_at=q.received_at,
-                                t.batch_id=q.batch_id,
-                                t.data_version=q.data_version,
-                                t.quality_status='QMT_ATTESTED',
-                                t.permission_status=q.permission_status,
-                                t.etl_sync_at=NOW()
+                            INSERT IGNORE INTO qmt_kline_attestation_row (
+                                attestation_id, run_id, target_id, qmt_id,
+                                trade_date, stock_code, protocol_version,
+                                source_data_version, source_pre_close_origin,
+                                source_pre_close, attested_open, attested_close,
+                                attested_high, attested_low, attested_volume,
+                                attested_amount, created_at
+                            )
+                            SELECT SHA2(CONCAT_WS('|',
+                                       :attestation_protocol,
+                                       q.target_id, q.qmt_id,
+                                       q.data_version,
+                                       q.qmt_pre_close,
+                                       q.qmt_open, q.qmt_close,
+                                       q.qmt_high, q.qmt_low,
+                                       q.qmt_volume, q.qmt_amount), 256),
+                                   :run_id, q.target_id, q.qmt_id,
+                                   q.trade_date, q.stock_code,
+                                   :attestation_protocol,
+                                   q.data_version, q.pre_close_origin,
+                                   q.qmt_pre_close, q.qmt_open, q.qmt_close,
+                                   q.qmt_high, q.qmt_low,
+                                   q.qmt_volume, q.qmt_amount, NOW()
+                            FROM `{compare_temp}` q
                             WHERE q.is_match
                               AND NOT COALESCE(q.provenance_already, 0)
+                              AND q.trade_date BETWEEN :chunk_start_date
+                                                   AND :chunk_end_date
                             """
                         ),
-                    ).rowcount
-                    or 0
-                )
-                connection.execute(
-                    text(
-                        f"""
-                        INSERT IGNORE INTO qmt_kline_attestation_row (
-                            attestation_id, run_id, target_id, qmt_id,
-                            trade_date, stock_code, protocol_version,
-                            source_data_version, source_pre_close_origin,
-                            source_pre_close, attested_open, attested_close,
-                            attested_high, attested_low, attested_volume,
-                            attested_amount, created_at
-                        )
-                        SELECT SHA2(CONCAT_WS('|',
-                                   :attestation_protocol,
-                                   q.target_id, q.qmt_id,
-                                   q.data_version,
-                                   q.qmt_pre_close,
-                                   q.qmt_open, q.qmt_close,
-                                   q.qmt_high, q.qmt_low,
-                                   q.qmt_volume, q.qmt_amount), 256),
-                               :run_id, q.target_id, q.qmt_id,
-                               q.trade_date, q.stock_code,
-                               :attestation_protocol,
-                               q.data_version, q.pre_close_origin,
-                               q.qmt_pre_close, q.qmt_open, q.qmt_close,
-                               q.qmt_high, q.qmt_low,
-                               q.qmt_volume, q.qmt_amount, NOW()
-                        FROM `{compare_temp}` q
-                        WHERE q.is_match
-                        """
-                    ),
-                    params,
-                )
-                exact_readback_rows = int(
-                    connection.execute(
-                        text(
-                            f"""
-                            SELECT COUNT(DISTINCT q.target_id)
-                            FROM `{compare_temp}` q
-                            JOIN {target_table} t ON t.id=q.target_id
-                            JOIN qmt_kline_attestation_row a
-                              ON a.target_id=t.id
-                             AND BINARY a.protocol_version=
-                                 BINARY :attestation_protocol
-                             AND BINARY a.source_data_version=
-                                 BINARY t.data_version
-                             AND BINARY a.source_pre_close_origin=
-                                 BINARY 'NATIVE_QMT'
-                             AND a.source_pre_close=t.pre_close
-                             AND a.attested_open=t.`open`
-                             AND a.attested_close=t.`close`
-                             AND a.attested_high=t.`high`
-                             AND a.attested_low=t.`low`
-                             AND a.attested_volume=t.volume
-                             AND a.attested_amount=t.amount
-                            WHERE q.is_match
-                            """
-                        ),
-                        params,
-                    ).scalar()
-                    or 0
-                )
+                        chunk_params,
+                    )
+                    exact_readback_rows += int(
+                        connection.execute(
+                            text(
+                                f"""
+                                SELECT COUNT(DISTINCT q.target_id)
+                                FROM `{compare_temp}` q
+                                JOIN {target_table} t ON t.id=q.target_id
+                                JOIN qmt_kline_attestation_row a
+                                  ON a.target_id=t.id
+                                 AND BINARY a.protocol_version=
+                                     BINARY :attestation_protocol
+                                 AND BINARY a.source_data_version=
+                                     BINARY t.data_version
+                                 AND BINARY a.source_pre_close_origin=
+                                     BINARY 'NATIVE_QMT'
+                                 AND a.source_pre_close=t.pre_close
+                                 AND a.attested_open=t.`open`
+                                 AND a.attested_close=t.`close`
+                                 AND a.attested_high=t.`high`
+                                 AND a.attested_low=t.`low`
+                                 AND a.attested_volume=t.volume
+                                 AND a.attested_amount=t.amount
+                                WHERE q.is_match
+                                  AND NOT COALESCE(q.provenance_already, 0)
+                                  AND q.trade_date BETWEEN :chunk_start_date
+                                                       AND :chunk_end_date
+                                """
+                            ),
+                            chunk_params,
+                        ).scalar()
+                        or 0
+                    )
                 if exact_readback_rows != matched_rows:
                     raise RuntimeError(
                         "QMT attestation exact readback mismatch: "
@@ -2241,17 +2313,40 @@ def main() -> int:
     parser.add_argument("--mismatch-sample-limit", type=int, default=5000)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--windows-local-option-file",
+        action="store_true",
+        help=(
+            "Use the fixed protected Windows MySQL option file for both "
+            "the local primary and QMT history schemas."
+        ),
+    )
     args = parser.parse_args()
     load_project_env()
-    engine = create_batch_engine(future=True)
-    result = attest_range(
-        engine,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        apply=args.apply,
-        provider=args.provider,
-        mismatch_sample_limit=args.mismatch_sample_limit,
-    )
+    local_history_engine = None
+    if args.windows_local_option_file:
+        from tools.backfill_guojin_qmt_local_history import (
+            _windows_local_engines,
+        )
+
+        engine, local_history_engine = _windows_local_engines()
+    else:
+        engine = create_batch_engine(future=True)
+    try:
+        result = attest_range(
+            engine,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            apply=args.apply,
+            provider=args.provider,
+            mismatch_sample_limit=args.mismatch_sample_limit,
+            local_history_engine=local_history_engine,
+        )
+    finally:
+        if args.windows_local_option_file:
+            engine.dispose()
+            assert local_history_engine is not None
+            local_history_engine.dispose()
     print(
         json.dumps(result, ensure_ascii=False, default=str)
         if args.json

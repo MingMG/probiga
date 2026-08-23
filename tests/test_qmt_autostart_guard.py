@@ -54,11 +54,11 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert "0.470 0.030" in source
     assert "SearchX = 0.325" in source
     assert "SearchY = 0.065" in source
-    assert "EditX = 0.458" in source
+    assert "EditX = 0.474" in source
     assert "EditY = 0.133" in source
     assert "SearchX = 0.125" in source
     assert "SearchX = 0.380" in source
-    assert "0.356 0.150" in source
+    assert "0.183 0.095" in source
     assert "last_price" not in source
 
 

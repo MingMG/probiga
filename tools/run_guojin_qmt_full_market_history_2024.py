@@ -29,6 +29,7 @@ from server.common.config import get_mysql_url
 from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
 
 PRODUCTION_KLINE_TABLE = "sm_stock_kline"
+LOCK_INITIALIZATION_GRACE_SECONDS = 5.0
 
 
 def _source_engine():
@@ -38,6 +39,41 @@ def _source_engine():
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        )
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -47,16 +83,67 @@ def _pid_alive(pid: int) -> bool:
 
 def _acquire_lock(lock_path: Path) -> tuple[bool, str]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if lock_path.exists():
-        raw = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
+    payload = f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}"
+    owner = ""
+    for _attempt in range(3):
         try:
-            existing_pid = int(raw.split()[0])
+            descriptor = os.open(
+                lock_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+        except FileExistsError:
+            before = None
+            try:
+                before = lock_path.stat()
+                owner = lock_path.read_text(
+                    encoding="utf-8", errors="ignore"
+                ).strip()
+                existing_pid = int(owner.split()[0])
+            except (OSError, ValueError, IndexError):
+                existing_pid = 0
+            if _pid_alive(existing_pid):
+                return False, owner
+            if (
+                existing_pid <= 0
+                and before is not None
+                and max(0.0, time.time() - before.st_mtime)
+                < LOCK_INITIALIZATION_GRACE_SECONDS
+            ):
+                return False, owner or "lock_initializing"
+            try:
+                if before is None:
+                    continue
+                after = lock_path.stat()
+                before_identity = (
+                    before.st_ino,
+                    before.st_size,
+                    before.st_mtime_ns,
+                )
+                after_identity = (
+                    after.st_ino,
+                    after.st_size,
+                    after.st_mtime_ns,
+                )
+                if before_identity == after_identity:
+                    lock_path.unlink()
+            except (OSError, UnboundLocalError):
+                pass
+            continue
+        except OSError as exc:
+            return False, f"lock_error:{type(exc).__name__}"
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
         except Exception:
-            existing_pid = 0
-        if _pid_alive(existing_pid):
-            return False, raw
-    lock_path.write_text(f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}", encoding="utf-8")
-    return True, ""
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            lock_path.unlink(missing_ok=True)
+            raise
+        return True, ""
+    return False, owner or "stale_lock_could_not_be_replaced"
 
 
 def _release_lock(lock_path: Path) -> None:
