@@ -14,10 +14,15 @@ unset PIP_CONFIG_FILE PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST \
   PIP_TARGET PIP_PREFIX PIP_USER PIP_CACHE_DIR PYTHONHOME PYTHONSTARTUP \
   PYTHONUSERBASE PYTHONINSPECT 2>/dev/null || true
 
+REPOSITORY_ROOT=/opt/ProBigA
+
 # Every Git call in this engine resolves to the absolute executable under a
 # new, fixed environment.  This applies even when helpers run from an `if` or
 # rollback context and prevents replace refs, alternate object databases,
-# caller config, hooks, fsmonitor helpers, and external diff drivers.
+# caller config, hooks, fsmonitor helpers, and external diff drivers.  The
+# legacy live checkout predates the root broker and may be owned by its service
+# account, so trust that one exact path for this process without mutating any
+# global or system Git configuration.
 git() {
   /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -29,6 +34,7 @@ git() {
     GIT_OPTIONAL_LOCKS=0 \
     GIT_TERMINAL_PROMPT=0 \
     /usr/bin/git --no-replace-objects \
+      -c "safe.directory=$REPOSITORY_ROOT" \
       -c core.hooksPath=/dev/null \
       -c core.fsmonitor=false \
       -c diff.external= \
@@ -74,7 +80,6 @@ assert_root_owned_bare_cache() {
     2>/dev/null || true)" || return 1
   return 0
 }
-REPOSITORY_ROOT=/opt/ProBigA
 CODE_GIT_CACHE=/var/lib/probiga/release-sources/probiga.git
 CODE_RELEASE_ROOT=/opt/ProBigA-releases
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs

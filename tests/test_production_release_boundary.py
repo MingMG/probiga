@@ -288,6 +288,32 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert 'write_receipt "ROLLED_BACK"' in workflow
 
 
+def test_deploy_git_trust_is_exact_process_local_and_available_from_start() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    git_body = _shell_function_bodies(deploy_script)["git"]
+
+    repository_assignment = deploy_script.index(
+        "REPOSITORY_ROOT=/opt/ProBigA"
+    )
+    git_wrapper = deploy_script.index("\ngit() {")
+    first_legacy_git_read = deploy_script.index(
+        'LEGACY_LIVE_SHA="$(git rev-parse HEAD)"'
+    )
+
+    assert repository_assignment < git_wrapper < first_legacy_git_read
+    assert '-c "safe.directory=$REPOSITORY_ROOT"' in git_body
+    assert git_body.index('-c "safe.directory=$REPOSITORY_ROOT"') < (
+        git_body.index('"$@"')
+    )
+    assert "safe.directory=*" not in deploy_script
+    assert "safe.directory='*'" not in deploy_script
+    assert "safe.directory=\"*\"" not in deploy_script
+    assert "git config --global" not in deploy_script
+    assert "git config --system" not in deploy_script
+
+
 def test_root_broker_has_exact_normal_and_recovery_argv_contracts() -> None:
     broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
         encoding="utf-8"
