@@ -82,10 +82,10 @@ def test_attester_validates_qualified_history_before_run_ledger_write(
             raise AssertionError("business transaction started before source validation")
 
     target_engine = FakeEngine(
-        "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+        "mysql+pymysql://runtime@127.0.0.1:13306/probiga"
     )
     history_engine = FakeEngine(
-        "mysql+pymysql://runtime:secret@localhost:13306/"
+        "mysql+pymysql://runtime@localhost:13306/"
         "probiga_qmt_history"
     )
     monkeypatch.setattr(
