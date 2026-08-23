@@ -2990,16 +2990,23 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     )
     assert 'test "$guarded_sha" != "$EXPECTED_SHA"' in recovery
     assert (
-        "prepared|restoring-old|old-set-restored|old-runtime-verified"
+        "prepared|runtime-units-installing|runtime-units-installed|"
+        " restoring-old|old-set-restored|old-runtime-verified"
         in recovery
     )
     for disallowed_phase in (
-        "runtime-units-installing",
-        "runtime-units-installed",
         "new-runtime-verified",
         "finalized",
     ):
         assert disallowed_phase not in recovery
+    assert 'if [ "$phase" = runtime-units-installed ]' in recovery
+    assert "activation_snapshot_validate_governance_new" in recovery
+    for state_path in (
+        "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT",
+        "$ACTIVATION_GOVERNANCE_NEW_SHA",
+    ):
+        assert f'[ -e "{state_path}" ]' in recovery
+        assert f'[ -L "{state_path}" ]' in recovery
     assert 'test "${#state_lines[@]}" -eq 6' in recovery
     assert "controlled_guard_recreate_file" in recovery
     assert "controlled_guard_force_all_writers_fenced" in recovery
@@ -3021,8 +3028,11 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "activation_snapshot_restore_old_set", boundary
     )
     old_set = recovery.index("activation_snapshot_assert_old_set", restore_old_set)
+    governance_restore = recovery.index(
+        "controlled_guard_restore_and_verify_governance_snapshot", old_set
+    )
     governance = recovery.index(
-        "controlled_guard_capture_current_governance_snapshot", old_set
+        "controlled_guard_capture_current_governance_snapshot", governance_restore
     )
     cleanup = recovery.index("controlled_guard_cleanup", governance)
     restore_states = recovery.index(
@@ -3047,6 +3057,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         < boundary
         < restore_old_set
         < old_set
+        < governance_restore
         < governance
         < cleanup
         < restore_states

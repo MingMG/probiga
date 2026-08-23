@@ -540,3 +540,63 @@ test "$(<"$COUNTER")" -eq 9 || exit 23
         timeout=20,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_ai_runtime_assertion_accepts_legacy_env_only_for_previous_rollback(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable AI runtime regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(source)["assert_ai_worker_runtime"]
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    harness = f"""
+set -uo pipefail
+SERVICE_USER=probiga
+AI_WORKER_SERVICE=probiga-ai-recommendation-worker.service
+RELEASE_VENV_ROOT=/venv
+CODE_RELEASE_ROOT=/code
+EXPECTED_SHA={new_sha}
+EXECSTART='/usr/bin/env GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA={old_sha} PROBIGA_CODE_ROOT=/code/{old_sha} /venv/{old_sha}/bin/python -P /code/{old_sha}/tools/run_ai_recommendation_worker.py --once'
+systemctl() {{
+  local property="$3"
+  case "$property" in
+    User|Group) printf '%s\n' "$SERVICE_USER" ;;
+    WorkingDirectory) printf '%s\n' /opt/ProBigA ;;
+    ExecStart) printf '%s\n' "$EXECSTART" ;;
+    *) return 84 ;;
+  esac
+}}
+assert_ai_worker_runtime() {{
+{body}
+}}
+if assert_ai_worker_runtime {old_sha}; then
+  echo 'strict verification accepted a legacy environment' >&2
+  exit 30
+fi
+assert_ai_worker_runtime {old_sha} /venv/{old_sha} /code/{old_sha} \
+  legacy-rollback || exit 31
+EXPECTED_SHA={old_sha}
+if assert_ai_worker_runtime {old_sha} /venv/{old_sha} /code/{old_sha} \
+    legacy-rollback; then
+  echo 'legacy rollback accepted the forward target revision' >&2
+  exit 32
+fi
+EXPECTED_SHA={new_sha}
+EXECSTART='/usr/bin/env PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 /venv/{old_sha}/bin/python -P /code/{new_sha}/tools/run_ai_recommendation_worker.py --once'
+if assert_ai_worker_runtime {old_sha} /venv/{old_sha} /code/{old_sha} \
+    legacy-rollback; then
+  echo 'legacy rollback accepted a different code root' >&2
+  exit 33
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

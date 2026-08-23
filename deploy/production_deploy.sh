@@ -2146,13 +2146,25 @@ controlled_v2_rollback_only_recovery() {
   test "$old_runtime_sha" != "$guarded_sha" || return 1
   phase="$(activation_snapshot_phase)" || return 1
   case "$phase" in
-    prepared|restoring-old|old-set-restored|old-runtime-verified) ;;
+    prepared|runtime-units-installing|runtime-units-installed|\
+    restoring-old|old-set-restored|old-runtime-verified) ;;
     *) return 1 ;;
   esac
-  test ! -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-  test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-  test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
-  test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+  if [ "$phase" = runtime-units-installed ] && \
+    { [ -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
+      [ -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
+      [ -e "$ACTIVATION_GOVERNANCE_NEW_SHA" ] || \
+      [ -L "$ACTIVATION_GOVERNANCE_NEW_SHA" ]; }; then
+    # A same-process cutover failure can occur after the new governance task
+    # was sealed but before the new runtime was started.  Accept only the
+    # complete, hash-verified pair; a partial or changed pair remains fenced.
+    activation_snapshot_validate_governance_new || return 1
+  else
+    test ! -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+    test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+    test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+    test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+  fi
   test ! -e "$ACTIVATION_RECEIPT_PENDING" || return 1
   test ! -L "$ACTIVATION_RECEIPT_PENDING" || return 1
   test ! -e "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
@@ -2219,6 +2231,13 @@ controlled_v2_rollback_only_recovery() {
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  if [ "$phase" = runtime-units-installed ]; then
+    # The forward cutover may have changed the governance task before it
+    # failed.  Restore the sealed old task while every writer is still fenced,
+    # then independently recapture it below before writers are released.
+    controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  fi
   controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
     "$old_runtime_sha" || return 1
   controlled_guard_cleanup "$guarded_sha" "$main_record" \
@@ -3608,8 +3627,13 @@ assert_ai_worker_runtime() {
   local revision="$1"
   local venv_path="${2:-$RELEASE_VENV_ROOT/$revision}"
   local code_root="${3:-$CODE_RELEASE_ROOT/$revision}"
+  local verification_mode="${4:-strict}"
   local release_tree_sha adapter_registry_seal_sha
   local has_attested_identity=0
+  case "$verification_mode" in
+    strict|legacy-rollback) ;;
+    *) return 1 ;;
+  esac
   if [ "$revision" = "${EXPECTED_SHA:-}" ] || \
     [ -e "$venv_path/.release-tree.sha256" ] || \
     [ -e "$venv_path/.adapter-registry-seal.sha256" ]; then
@@ -3633,9 +3657,14 @@ assert_ai_worker_runtime() {
     | grep -F -- 'PYTHONDONTWRITEBYTECODE=1' >/dev/null || return 1
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
     | grep -F -- 'PYTHONSAFEPATH=1' >/dev/null || return 1
-  systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
-    | grep -F -- '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin' \
-      >/dev/null || return 1
+  if ! systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+      | grep -F -- '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin' \
+        >/dev/null; then
+    test "$verification_mode" = legacy-rollback || return 1
+    test "$revision" != "${EXPECTED_SHA:-}" || return 1
+    systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
+      | grep -F -- '/usr/bin/env ' >/dev/null || return 1
+  fi
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
     | grep -F -- "$venv_path/bin/python" >/dev/null || return 1
   systemctl show -p ExecStart --value "$AI_WORKER_SERVICE" \
@@ -5675,7 +5704,7 @@ rollback() {
       [ "$PREVIOUS_AI_WORKER_DROPIN_PRESENT" -eq 1 ] && \
       [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
       assert_ai_worker_runtime "$PREVIOUS_RELEASE_REVISION" \
-        "$PREVIOUS_VENV" "$PREVIOUS_CODE_ROOT" || \
+        "$PREVIOUS_VENV" "$PREVIOUS_CODE_ROOT" legacy-rollback || \
         rollback_failure "verify previous AI recommendation worker runtime"
     fi
   fi
