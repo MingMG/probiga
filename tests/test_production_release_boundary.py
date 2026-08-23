@@ -1265,6 +1265,11 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
         "ADATA_RELEASE_SHA=b14f4e57b2175302f18b6eaf934f7dff9207a141"
         in release_manifest
     )
+    assert (
+        "ADATA_TREE_SHA256="
+        "17126239386512958368e428a0c72630cb3c1b20d6ff41bcc2234ebf5159a1a7"
+        in release_manifest
+    )
     assert "deploy/production_release.env" in workflow_source
     assert "https://github.com/1nchaos/adata.git" in workflow
     assert "ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git" in workflow
@@ -1275,6 +1280,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     assert "EXPECTED_ADATA_TREE_SHA256" in workflow
     assert "server.common.adata_release seal" in workflow
     assert "pip wheel --no-deps" in workflow
+    assert 'config core.autocrlf false' in workflow_source
     assert (
         'rev-parse \\\n'
         '            "FETCH_HEAD^{commit}"'

@@ -85,6 +85,7 @@ jobs:
           ADATA_SOURCE="$RUNNER_TEMP/probiga-adata-source"
           ADATA_BUILD_SOURCE="$RUNNER_TEMP/probiga-adata-build-source"
           git init --bare "$ADATA_GIT"
+          git --git-dir="$ADATA_GIT" config core.autocrlf false
           git --git-dir="$ADATA_GIT" remote add origin https://github.com/1nchaos/adata.git
           git --git-dir="$ADATA_GIT" fetch --no-tags --depth=1 origin "$ADATA_RELEASE_SHA"
           FETCHED_ADATA_SHA="$(git --git-dir="$ADATA_GIT" rev-parse \
