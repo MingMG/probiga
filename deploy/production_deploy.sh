@@ -1811,10 +1811,17 @@ controlled_guard_governance_snapshot() {
     PYTHONPATH="$adata_source:$code_root" \
     "$release_venv/bin/python" -P \
     "$code_root/tools/add_strategy_governance_task.py" \
-    "--${action}-snapshot" "$snapshot" || return 1
+    "--${action}-snapshot" - < "$snapshot" || return 1
   return 0
 }
 controlled_guard_restore_and_verify_governance_snapshot() {
+  # Most rollback attempts fail before the scheduler row is changed.  Prove
+  # that case first and avoid unnecessary database writes.  A mismatch falls
+  # through to the exact restore, whose own failure remains visible.
+  if controlled_guard_governance_snapshot verify "$1" "$2" \
+      >/dev/null 2>&1; then
+    return 0
+  fi
   controlled_guard_governance_snapshot restore "$1" "$2" || return 1
   controlled_guard_governance_snapshot verify "$1" "$2" || return 1
   return 0

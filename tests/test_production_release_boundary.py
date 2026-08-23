@@ -2963,6 +2963,33 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     ) < old_restore.index("controlled_guard_restore_previous_writer_states")
     assert '"$old_runtime_sha"' in old_restore
 
+    snapshot_handoff = bodies["controlled_guard_governance_snapshot"]
+    # The activation snapshot remains root:root 0600.  Root opens the sealed
+    # file for stdin before sudo changes identity, so the service process can
+    # consume the exact bytes without gaining path access or write access.
+    assert '"--${action}-snapshot" - < "$snapshot"' in snapshot_handoff
+    assert '"--${action}-snapshot" "$snapshot"' not in snapshot_handoff
+    assert snapshot_handoff.index(
+        'controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600'
+    ) < snapshot_handoff.index('sudo -u "$service_user"')
+
+    restore_and_verify = bodies[
+        "controlled_guard_restore_and_verify_governance_snapshot"
+    ]
+    initial_verify = restore_and_verify.index(
+        "controlled_guard_governance_snapshot verify"
+    )
+    restore = restore_and_verify.index(
+        "controlled_guard_governance_snapshot restore",
+        initial_verify,
+    )
+    final_verify = restore_and_verify.index(
+        "controlled_guard_governance_snapshot verify",
+        restore,
+    )
+    assert initial_verify < restore < final_verify
+    assert "return 0" in restore_and_verify[initial_verify:restore]
+
     recovery = bodies["controlled_activation_snapshot_only_recovery"]
     old_branch = recovery[: recovery.index("activation_snapshot_restore_new_set")]
     new_branch = recovery[recovery.index("activation_snapshot_restore_new_set"):]

@@ -1747,6 +1747,16 @@ def _governance_table_schema_contract() -> dict[str, dict[str, Any]]:
             )
             if inline_primary:
                 indexes["PRIMARY"] = (0, (column_name,))
+        # MySQL makes every PRIMARY KEY column NOT NULL even when the DDL
+        # omits the redundant spelling.  The frozen contract must model the
+        # metadata MySQL actually exposes through information_schema, for
+        # both inline and table-level primary-key declarations.
+        primary_index = indexes.get("PRIMARY")
+        if primary_index is not None:
+            primary_columns = set(primary_index[1])
+            for column in columns:
+                if column["name"] in primary_columns:
+                    column["nullable"] = "NO"
         contracts[table_name] = {
             "columns": columns,
             "indexes": indexes,

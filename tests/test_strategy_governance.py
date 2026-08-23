@@ -3,11 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import date, timedelta
 from decimal import Decimal
+import io
 import inspect
 import hashlib
 import json
 import os
+from pathlib import Path
 import re
+import sys
 from types import SimpleNamespace
 import uuid
 
@@ -1935,6 +1938,18 @@ def test_governance_schema_contract_covers_every_frozen_table_column_and_index()
     assert sum(len(item["indexes"]) for item in contract.values()) == 45
     assert all(item["columns"] for item in contract.values())
     assert all("PRIMARY" in item["indexes"] for item in contract.values())
+    for item in contract.values():
+        primary_columns = set(item["indexes"]["PRIMARY"][1])
+        assert all(
+            column["nullable"] == "NO"
+            for column in item["columns"]
+            if column["name"] in primary_columns
+        )
+    metric_columns = {
+        column["name"]: column
+        for column in contract["st_strategy_metric_input"]["columns"]
+    }
+    assert metric_columns["reviewed_at"]["nullable"] == "YES"
 
 
 class _GovernanceSchemaResult:
@@ -3312,6 +3327,29 @@ def test_daily_governance_task_is_scheduler_safe_and_validated():
     assert installer_source.index("_write_snapshot(") < (
         prepared_start
     )
+
+
+def test_governance_task_snapshot_can_be_read_from_sealed_stdin(monkeypatch):
+    payload = {
+        "format_version": 1,
+        "task_type": GOVERNANCE_TASK["task_type"],
+        "script_path": GOVERNANCE_TASK["script_path"],
+        "rows": [{"task_name": "动态策略治理每日更新"}],
+    }
+    stdin = io.TextIOWrapper(
+        io.BytesIO(json.dumps(
+            payload,
+            ensure_ascii=False,
+        ).encode("utf-8")),
+        encoding="ascii",
+    )
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        stdin,
+    )
+
+    assert governance_task_installer._read_snapshot(Path("-")) == payload
 
 
 def test_production_runtime_never_reenters_governance_schema_ddl(monkeypatch):

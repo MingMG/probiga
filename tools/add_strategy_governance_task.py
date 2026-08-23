@@ -78,8 +78,16 @@ def _write_snapshot(path: Path, rows: list[dict[str, Any]]) -> None:
                 os.unlink(temporary_name)
 
 
-def _verify_snapshot(engine, path: Path) -> dict[str, Any]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _read_snapshot(path: Path) -> dict[str, Any]:
+    # ``-`` is the standard stream sentinel.  The root deployment broker can
+    # open a sealed root:root 0600 snapshot and hand its read-only stdin to the
+    # unprivileged service process without weakening the file's permissions.
+    raw_text = (
+        sys.stdin.buffer.read().decode("utf-8")
+        if str(path) == "-"
+        else path.read_text(encoding="utf-8")
+    )
+    raw = json.loads(raw_text)
     if (
         not isinstance(raw, dict)
         or raw.get("format_version") != 1
@@ -89,6 +97,11 @@ def _verify_snapshot(engine, path: Path) -> dict[str, Any]:
         or len(raw["rows"]) > 1
     ):
         raise RuntimeError("invalid strategy governance task snapshot")
+    return raw
+
+
+def _verify_snapshot(engine, path: Path) -> dict[str, Any]:
+    raw = _read_snapshot(path)
     observed = json.loads(
         json.dumps(
             _require_unique_task(engine),
@@ -103,16 +116,7 @@ def _verify_snapshot(engine, path: Path) -> dict[str, Any]:
 
 
 def _restore_snapshot(engine, path: Path) -> dict[str, Any]:
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(raw, dict)
-        or raw.get("format_version") != 1
-        or raw.get("task_type") != TASK["task_type"]
-        or raw.get("script_path") != TASK["script_path"]
-        or not isinstance(raw.get("rows"), list)
-        or len(raw["rows"]) > 1
-    ):
-        raise RuntimeError("invalid strategy governance task snapshot")
+    raw = _read_snapshot(path)
     prior_rows = raw["rows"]
     current_rows = _require_unique_task(engine)
     columns = table_columns(engine)
@@ -185,7 +189,7 @@ def main() -> int:
     parser.add_argument(
         "--restore-snapshot",
         default="",
-        help="从部署前快照精确恢复任务定义",
+        help="从部署前快照精确恢复任务定义；传 - 时从标准输入读取",
     )
     parser.add_argument(
         "--capture-snapshot",
@@ -195,7 +199,7 @@ def main() -> int:
     parser.add_argument(
         "--verify-snapshot",
         default="",
-        help="只读验证当前治理任务行与密封快照逐字段一致",
+        help="只读验证当前治理任务行与密封快照逐字段一致；传 - 时从标准输入读取",
     )
     parser.add_argument(
         "--schema-prepared",
