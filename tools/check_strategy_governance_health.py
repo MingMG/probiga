@@ -1723,7 +1723,8 @@ def _forward_strategy_version_data_check(
         LEFT JOIN ({backfill_relation}) backfill_rel
           ON backfill_rel.evidence_id=e.evidence_id
         LEFT JOIN st_strategy_registry current_strategy
-          ON current_strategy.strategy_key=e.strategy_key
+          ON BINARY current_strategy.strategy_key=
+             BINARY e.strategy_key
          AND BINARY current_strategy.current_version=
              BINARY e.strategy_version
     """

@@ -2933,6 +2933,14 @@ def test_forward_version_relations_allow_only_true_quarantine():
                 assert " LIMIT " not in f" {sql.upper()} "
                 assert sql.count("'LEGACY_VERSION_DERIVED'") == 1
                 assert sql.count("e2.source_run_uid<>''") == 2
+                assert (
+                    "ON BINARY current_strategy.strategy_key="
+                    "\n             BINARY e.strategy_key"
+                ) in sql
+                assert (
+                    "AND BINARY current_strategy.current_version="
+                    "\n             BINARY e.strategy_version"
+                ) in sql
                 return _Result(
                     [
                         {
