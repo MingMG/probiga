@@ -37,17 +37,20 @@ from server.common.scheduler_tasks import read_fresh_scheduler_writers
 from server.common.trading_v3_maintenance import (
     TRADING_V3_MAINTENANCE_LOCK_NAME,
 )
-from server.db.migrations_v3 import MIGRATIONS, run_v3_migrations
+from server.db.migrations_v3 import (
+    HORIZON_CANDIDATE_LEDGER_RDS_DDL,
+    HORIZON_PROTOCOL_V2_RDS_DDL,
+    MIGRATIONS,
+    SHADOW_INTELLIGENCE_RDS_DDL,
+    run_v3_migrations,
+)
 from server.trading_v3.horizon_candidate_ledger_schema import (
-    HORIZON_CANDIDATE_LEDGER_DDL,
     HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
 )
 from server.trading_v3.horizon_protocol_v2_schema import (
-    HORIZON_PROTOCOL_V2_DDL,
     HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
 )
 from server.trading_v3.shadow_intelligence_schema import (
-    SHADOW_INTELLIGENCE_DDL,
     SHADOW_INTELLIGENCE_MIGRATION_VERSION,
 )
 from tools.env_config import create_tool_engine, load_project_env
@@ -69,18 +72,18 @@ def _checksum(statements: Sequence[str]) -> str:
 TARGET_MIGRATIONS: tuple[dict[str, Any], ...] = (
     {
         "version": SHADOW_INTELLIGENCE_MIGRATION_VERSION,
-        "checksum": _checksum(SHADOW_INTELLIGENCE_DDL),
-        "statement_count": len(SHADOW_INTELLIGENCE_DDL),
+        "checksum": _checksum(SHADOW_INTELLIGENCE_RDS_DDL),
+        "statement_count": len(SHADOW_INTELLIGENCE_RDS_DDL),
     },
     {
         "version": HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
-        "checksum": _checksum(HORIZON_PROTOCOL_V2_DDL),
-        "statement_count": len(HORIZON_PROTOCOL_V2_DDL),
+        "checksum": _checksum(HORIZON_PROTOCOL_V2_RDS_DDL),
+        "statement_count": len(HORIZON_PROTOCOL_V2_RDS_DDL),
     },
     {
         "version": HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
-        "checksum": _checksum(HORIZON_CANDIDATE_LEDGER_DDL),
-        "statement_count": len(HORIZON_CANDIDATE_LEDGER_DDL),
+        "checksum": _checksum(HORIZON_CANDIDATE_LEDGER_RDS_DDL),
+        "statement_count": len(HORIZON_CANDIDATE_LEDGER_RDS_DDL),
     },
 )
 TARGET_BY_VERSION = {

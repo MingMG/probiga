@@ -184,9 +184,14 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
 
     assert len(workflow_source) < 27_000
-    assert "root-owned broker derives the input lock" in workflow_source
-    assert "envs: EXPECTED_SHA" in workflow_source
-    assert "RESOLVED_REQUIREMENTS_B64" not in workflow_source
+    assert "resolved_requirements_b64:" in workflow_source
+    assert "resolved_requirements_sha256:" in workflow_source
+    assert (
+        "envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64,"
+        "EXPECTED_REQUIREMENTS_SHA256,EXPECTED_ADATA_SHA,"
+        "EXPECTED_ADATA_TREE_SHA256" in workflow_source
+    )
+    assert "RESOLVED_REQUIREMENTS_B64" in workflow_source
     assert "${{" not in deploy_script
     assert "actions/checkout@v4" not in workflow
     assert "actions/setup-python@v5" not in workflow
@@ -217,7 +222,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     )
     assert 'exec 9>"$DEPLOY_LOCK_FILE"' in deploy_script
     assert "flock -n 9" in deploy_script
-    assert "deploy/production_requirements.lock" in workflow
+    assert "validate_ci_resolved_freeze" in deploy_script
+    assert "prepare_ci_resolved_wheelhouse" in deploy_script
     assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in deploy_script
     assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in deploy_script
     assert not re.search(
@@ -408,30 +414,22 @@ def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
         assert rejected.returncode == 2, (argv, rejected.stdout, rejected.stderr)
 
 
-def test_manual_guard_recovery_workflow_is_isolated_and_strict() -> None:
+def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
     workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    engine = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
     normalized = _normalized_shell(workflow)
 
-    assert "workflow_dispatch:" in workflow
-    assert "recover_database_guard:" in workflow
-    assert "type: boolean" in workflow
-    assert "default: false" in workflow
-    assert "expected_guard_sha:" in workflow
+    assert "workflow_dispatch:" not in workflow
+    assert "recover_database_guard:" not in workflow
     assert "environment: production" in workflow
     assert "timeout-minutes: 60" in workflow
     assert "command_timeout: 55m" in workflow
-    assert "github.event_name == 'workflow_dispatch'" in workflow
-    assert "github.ref == 'refs/heads/main'" in workflow
-    assert "inputs.recover_database_guard == true" in workflow
-    assert normalized.count(
-        'sudo -n /usr/local/sbin/probiga-production-deploy '
-        '--recover-database-guard "$EXPECTED_GUARD_SHA"'
-    ) == 1
-    assert "RESOLVED_REQUIREMENTS_B64" not in normalized[
-        normalized.index("recover-database-guard:", normalized.index("jobs:")):
-    ]
+    assert "--recover-database-guard" not in normalized
+    assert "v2 production deploy broker cannot authorize recovery" in engine
     assert workflow.count("python tools/scan_tracked_secrets.py") == 2
     before_scan = workflow.index(
         "Scan tracked secrets before dependency installation"
@@ -441,6 +439,43 @@ def test_manual_guard_recovery_workflow_is_isolated_and_strict() -> None:
         "Scan tracked secrets after dependency installation"
     )
     assert before_scan < dependency_install < after_scan
+
+
+def test_v2_rds_safe_cutover_never_invokes_the_privileged_migrator() -> None:
+    engine = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    prepare_database = engine.index("# PREPARE DATABASE:")
+    v4_preflight = engine.index(
+        'if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then',
+        prepare_database,
+    )
+    v4_preflight_end = engine.index("\nfi", v4_preflight)
+    assert "prepare_strategy_governance_schema.py" in engine[
+        v4_preflight:v4_preflight_end
+    ]
+    assert "--phase preflight" in engine[v4_preflight:v4_preflight_end]
+
+    writer_fence = engine.index("CUTOVER_STEP=writer_fence")
+    v2_cutover = engine.index(
+        'if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then',
+        writer_fence,
+    )
+    v4_cutover = engine.index("\nelse\n", v2_cutover)
+    qmt_history = engine.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", v4_cutover
+    )
+    v2_branch = engine[v2_cutover:v4_cutover]
+    v4_branch = engine[v4_cutover:qmt_history]
+
+    assert "prepare_strategy_governance_rds_safe_schema" in v2_branch
+    assert "add_strategy_governance_task.py" in v2_branch
+    assert "--disabled; then" in v2_branch
+    assert "run_prepared_database_migration_tool" not in v2_branch
+    assert "prepare_strategy_governance_schema.py" not in v2_branch
+    assert "--phase cutover --writers-fenced" in v4_branch
+    assert "--phase recover" in v4_branch
 
 
 def test_production_deploy_publishes_an_immutable_code_release() -> None:
@@ -724,6 +759,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     ]
     assert python_cutover_commands == [
         expected_writer_fence_command,
+        'if ! run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--disabled; then',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"',
         'if ! run_prepared_python_tool '

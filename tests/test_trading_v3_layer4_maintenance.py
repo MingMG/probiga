@@ -258,9 +258,9 @@ def test_target_migration_contract_is_exact_and_forward_only() -> None:
         "20260817_001_horizon_candidate_ledger_registration",
     ]
     assert [item["statement_count"] for item in maintenance_cli.TARGET_MIGRATIONS] == [
-        46,
         10,
-        9,
+        2,
+        1,
     ]
     assert all(
         len(str(item["checksum"])) == 64

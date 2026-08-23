@@ -3285,8 +3285,17 @@ def test_daily_governance_task_is_scheduler_safe_and_validated():
     assert "ensure_attestation_tables" not in prepared_branch
     assert "ensure_and_seed_governance" not in prepared_branch
     assert "validate_attestation_schema(engine)" in prepared_branch
-    assert "validate_metric_input_review_triggers" in prepared_branch
-    assert "validate_governance_append_only_triggers" in prepared_branch
+    assert "validate_prepared_governance_runtime(engine)" in prepared_branch
+    assert "validate_metric_input_review_triggers" not in prepared_branch
+    assert "validate_governance_append_only_triggers" not in prepared_branch
+    fallback_branch = installer_source[fallback_start:]
+    assert "run_v3_migrations(engine)" in fallback_branch
+    assert "ensure_attestation_tables(engine)" in fallback_branch
+    assert "ensure_strategy_governance_tables(engine=engine)" in fallback_branch
+    assert "seed_governance_registry()" in fallback_branch
+    assert "validate_prepared_governance_runtime(engine)" in fallback_branch
+    assert "CREATE TRIGGER" not in fallback_branch.upper()
+    assert "parser.error" not in installer_source[prepared_start:]
     assert installer_source.index("if args.restore_snapshot:") < (
         prepared_start
     )
@@ -3322,243 +3331,54 @@ def test_production_runtime_never_reenters_governance_schema_ddl(monkeypatch):
     assert governance_module._SEED_READY is True
 
 
-class _MetricTriggerResult:
-    def __init__(self, rows=()):
-        self._rows = [dict(row) for row in rows]
-
-    def mappings(self):
-        return self
-
-    def all(self):
-        return list(self._rows)
+class _NoTriggerDatabaseAccess:
+    def execute(self, *_args, **_kwargs):
+        raise AssertionError("trigger inventory or DDL must not be executed")
 
 
-class _MetricTriggerConnection:
-    def __init__(self, rows=()):
-        self.rows = {
-            str(row["trigger_name"]): dict(row) for row in rows
-        }
-        self.created: list[str] = []
+def test_managed_mysql_governance_setup_has_no_trigger_contracts_or_ddl():
+    assert governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS == {}
+    assert governance_module.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS == {}
+    assert governance_module.GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS == {}
 
-    def execute(self, statement, _params=None):
-        sql = str(statement)
-        if "FROM information_schema.TRIGGERS" in sql:
-            return _MetricTriggerResult(
-                self.rows[name] for name in sorted(self.rows)
-            )
-        if sql.startswith("CREATE TRIGGER "):
-            trigger_name = sql.split()[2]
-            contract = (
-                governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[
-                    trigger_name
-                ]
-            )
-            self.created.append(trigger_name)
-            self.rows[trigger_name] = {
-                "trigger_name": trigger_name,
-                "action_timing": contract["timing"],
-                "event_manipulation": contract["event"],
-                "event_object_table": contract["table"],
-                "action_orientation": "ROW",
-                "action_statement": contract["body"],
-            }
-            return _MetricTriggerResult()
-        raise AssertionError(f"unexpected SQL: {sql}")
-
-
-def _metric_trigger_rows():
-    return [
-        {
-            "trigger_name": trigger_name,
-            "action_timing": contract["timing"],
-            "event_manipulation": contract["event"],
-            "event_object_table": contract["table"],
-            "action_orientation": "ROW",
-            "action_statement": contract["body"],
-        }
-        for trigger_name, contract in (
-            governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items()
-        )
-    ]
-
-
-def test_metric_input_review_trigger_contract_covers_every_core_column():
-    update_body = (
-        governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[
-            "trg_strategy_metric_input_review_bu"
-        ]["body"]
-    )
-    for column_name in (
-        "evidence_id",
-        "entity_type",
-        "strategy_key",
-        "strategy_version",
-        "as_of_date",
-        "window_days",
-        "metrics_json",
-        "source",
-        "evidence_protocol",
-        "artifact_hash",
-        "artifact_json",
-        "source_dataset_hash",
-        "evidence_revision_at",
-        "funding_provenance",
-        "submitted_by",
-        "evidence_hash",
-        "created_at",
-    ):
-        assert f"OLD.{column_name}" in update_body
-        assert f"NEW.{column_name}" in update_body
-    assert "OLD.verification_status = BINARY 'PENDING'" in update_body
-    assert "NEW.verification_status = BINARY 'CONFIRMED'" in update_body
-    assert "NEW.verification_status = BINARY 'REJECTED'" in update_body
-    assert "NEW.reviewed_by <> BINARY NEW.submitted_by" in update_body
-
-
-def test_metric_input_review_trigger_ensure_creates_only_missing_contracts():
-    connection = _MetricTriggerConnection()
-
+    executor_calls = []
     governance_module._ensure_metric_input_review_triggers(
-        connection,
-        trigger_ddl_executor=connection.execute,
+        _NoTriggerDatabaseAccess(),
+        trigger_ddl_executor=executor_calls.append,
     )
-
-    assert set(connection.created) == set(
-        governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS
-    )
-    detail = governance_module.validate_metric_input_review_triggers(
-        connection
-    )
-    assert detail["trigger_count"] == 2
-    assert detail["errors"] == []
-
-
-def test_metric_input_review_trigger_ensure_rejects_drift_without_replacing():
-    rows = _metric_trigger_rows()
-    rows[0]["action_statement"] += " SET @drift=1;"
-    connection = _MetricTriggerConnection(rows)
-
-    with pytest.raises(RuntimeError, match="触发器正文漂移"):
-        governance_module._ensure_metric_input_review_triggers(connection)
-
-    assert connection.created == []
-
-
-class _GovernanceTriggerConnection:
-    def __init__(self, rows=()):
-        self.rows = {
-            str(row["trigger_name"]): dict(row) for row in rows
-        }
-        self.created: list[str] = []
-
-    def execute(self, statement, _params=None):
-        sql = str(statement).strip()
-        if "FROM information_schema.TRIGGERS" in sql:
-            return _MetricTriggerResult(
-                self.rows[name] for name in sorted(self.rows)
-            )
-        if sql.startswith("CREATE TRIGGER "):
-            trigger_name = sql.split()[2]
-            timing, event, table_name, body = (
-                governance_module
-                .GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS[trigger_name]
-            )
-            self.created.append(trigger_name)
-            self.rows[trigger_name] = {
-                "trigger_name": trigger_name,
-                "action_timing": timing,
-                "event_manipulation": event,
-                "event_object_table": table_name,
-                "action_orientation": "ROW",
-                "action_statement": body,
-            }
-            return _MetricTriggerResult()
-        raise AssertionError(f"unexpected SQL: {sql}")
-
-
-def _governance_trigger_rows():
-    return [
-        {
-            "trigger_name": trigger_name,
-            "action_timing": timing,
-            "event_manipulation": event,
-            "event_object_table": table_name,
-            "action_orientation": "ROW",
-            "action_statement": body,
-        }
-        for trigger_name, (timing, event, table_name, body) in (
-            governance_module
-            .GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.items()
-        )
-    ]
-
-
-def test_governance_ledger_trigger_ensure_creates_only_missing_contracts():
-    connection = _GovernanceTriggerConnection()
-
     governance_module._ensure_governance_append_only_triggers(
-        connection,
-        trigger_ddl_executor=connection.execute,
+        _NoTriggerDatabaseAccess(),
+        trigger_ddl_executor=executor_calls.append,
+    )
+    assert executor_calls == []
+
+
+def test_legacy_trigger_validators_report_application_enforcement_without_sql():
+    metric = governance_module.validate_metric_input_review_triggers(
+        _NoTriggerDatabaseAccess()
+    )
+    append_only = governance_module.validate_governance_append_only_triggers(
+        _NoTriggerDatabaseAccess()
     )
 
-    assert set(connection.created) == set(
-        governance_module.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
-    )
-    detail = governance_module.validate_governance_append_only_triggers(
-        connection
-    )
-    assert detail["trigger_count"] == 22
-    assert detail["errors"] == []
-    assert "DROP TRIGGER" not in inspect.getsource(
-        governance_module._ensure_governance_append_only_triggers
-    ).upper()
+    assert metric["trigger_count"] == append_only["trigger_count"] == 0
+    assert metric["database_triggers_required"] is False
+    assert append_only["database_triggers_required"] is False
+    assert "state_machine" in metric["enforcement"]
+    assert "hash_replay" in append_only["enforcement"]
 
 
-@pytest.mark.parametrize("drift_kind", ["missing", "body", "extra"])
-def test_governance_ledger_trigger_validator_rejects_every_drift(
-    drift_kind,
-):
-    rows = _governance_trigger_rows()
-    if drift_kind == "missing":
-        rows.pop()
-    elif drift_kind == "body":
-        rows[0]["action_statement"] = "BEGIN SET @unsafe=1; END"
-    else:
-        rows.append({
-            "trigger_name": "trg_strategy_unreviewed_extra",
-            "action_timing": "BEFORE",
-            "event_manipulation": "DELETE",
-            "event_object_table": "st_strategy_version",
-            "action_orientation": "ROW",
-            "action_statement": "BEGIN SIGNAL SQLSTATE '45000'; END",
-        })
+def test_metric_review_application_state_machine_is_atomic_and_audited():
+    source = inspect.getsource(governance_module.review_metric_input)
 
-    with pytest.raises(governance_module.GovernanceAppendOnlySchemaError):
-        governance_module.validate_governance_append_only_triggers(
-            _GovernanceTriggerConnection(rows)
-        )
-
-
-def test_governance_run_trigger_allows_only_null_safe_canonical_demotion():
-    body = governance_module.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS[
-        "trg_strategy_governance_run_frozen_bu"
-    ][3]
-    assert "OLD.is_canonical <=> 1" in body
-    assert "NEW.is_canonical <=> 0" in body
-    for column_name in (
-        "run_uid",
-        "trade_date",
-        "run_revision",
-        "supersedes_run_uid",
-        "input_hash",
-        "decision_hash",
-        "summary_json",
-        "created_at",
-        "finished_at",
-    ):
-        assert f"OLD.{column_name}" in body
-        assert f"NEW.{column_name}" in body
-    assert "SIGNAL SQLSTATE '45000'" in body
+    assert "WHERE evidence_id=:evidence_id FOR UPDATE" in source
+    assert 'if current_status != "PENDING"' in source
+    assert "submitter == reviewer" in source
+    assert "AND verification_status='PENDING'" in source
+    assert "updated.rowcount != 1" in source
+    assert "_append_audit_connection(" in source
+    assert '"CONFIRM_METRIC_EVIDENCE"' in source
+    assert '"REJECT_METRIC_EVIDENCE"' in source
 
 
 def _stored_metric_audit(params, created_at):

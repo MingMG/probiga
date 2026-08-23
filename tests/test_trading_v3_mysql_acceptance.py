@@ -9,15 +9,21 @@ from sqlalchemy import create_engine
 import server.db.migrations_v3 as migrations_v3
 from server.db.migrations_v3 import (
     FORWARD_EXIT_ALLOCATION_DDL,
+    FORWARD_EXIT_ALLOCATION_RDS_DDL,
     FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
     FORWARD_STRATEGY_VERSION_DDL,
+    FORWARD_STRATEGY_VERSION_RDS_DDL,
     FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
     V2_RAW_LEDGER_IMMUTABILITY_DDL,
+    V2_RAW_LEDGER_IMMUTABILITY_RDS_DDL,
     V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
     MIGRATION_PROGRESS_TABLE_DDL,
     MIGRATION_TABLE_DDL,
     MIGRATIONS,
+    SHADOW_INTELLIGENCE_RDS_DDL,
+    HORIZON_CANDIDATE_LEDGER_RDS_DDL,
     HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
+    HORIZON_PROTOCOL_V2_RDS_DDL,
     HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
     V3MigrationAcceptanceFaultHook,
     V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
@@ -34,28 +40,28 @@ def test_frozen_v3_acceptance_contract_matches_source():
     assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 27
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-1] == (
         FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
-        "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a",
-        5,
+        "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460",
+        1,
     )
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
         V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
-        "5e7d735be4d24659786e17091b89df06e3dba713c3646fd00ef817a67bc8eedf",
-        8,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        0,
     )
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
         FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
-        "08e0e3d6e6bb9b31227f33780eb54bf3afd38d226f456fa41985137614ce7602",
-        7,
+        "1804a2d2c3473e98c1be77d03d324e61cb5cdb5682e7d87cf647841218b756e6",
+        3,
     )
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-4] == (
         HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
-        "88cbd1d4bd57fa65164d2d35e07a6344d9a8d8e255d09efb0e79cabfd0d8c522",
-        9,
+        "82e113beb6328c8590e66173ea2aca0b832650ec3796539a4ba9bd37bc29ab05",
+        1,
     )
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-5] == (
         HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
-        "9430f7bf8014d8758339f6754ac51989283c648657b5fdb1db813ab32afce118",
-        10,
+        "6eb0c66266b2c9103f2d65bf932dc1576d16c9b249a78a2704376b4f19e32a3b",
+        2,
     )
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-6] == (
         V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
@@ -65,65 +71,52 @@ def test_frozen_v3_acceptance_contract_matches_source():
     assert len(acceptance.FROZEN_V3_TABLES) == 30
 
 
-def test_horizon_protocol_v2_migration_is_additive_and_fail_closed():
+def test_shadow_and_horizon_protocol_migrations_are_rds_portable():
     old = next(
         item for item in MIGRATIONS
         if item["version"] == "20260804_000_shadow_intelligence_runtime"
     )
-    assert migrations_v3._checksum(tuple(old["statements"])) == (
-        "b09f22e64601c91023b866e6cc90c3bffedc3e7bae131457e1c65ee41ce91735"
+    old_statements = tuple(old["statements"])
+    assert old_statements == SHADOW_INTELLIGENCE_RDS_DDL
+    assert len(old_statements) == 10
+    assert migrations_v3._checksum(old_statements) == (
+        "25f3a14c56c3cb7ec701192cb4d736eaad6c2592c6ad9e4b698081c549f1c3c6"
     )
+    assert all("TRIGGER" not in statement.upper() for statement in old_statements)
     migration = next(
         item for item in MIGRATIONS
         if item["version"] == HORIZON_PROTOCOL_V2_MIGRATION_VERSION
     )
     statements = tuple(str(item) for item in migration["statements"])
-    assert len(statements) == 10
-    creates = [
-        statement for statement in statements
-        if statement.lstrip().upper().startswith("CREATE TRIGGER")
-    ]
-    assert len(creates) == 4
-    contract = "\n".join(creates)
-    assert contract.upper().count("BEFORE INSERT") == 4
-    assert "historical horizon protocol is audit-only" in contract
-    assert "training_receipt_status = 'PROCESS_VERIFIED'" in contract
-    assert "diagnostic selection cannot become paper eligible" in contract
-    assert "order_authority = 0" in contract
+    assert statements == HORIZON_PROTOCOL_V2_RDS_DDL
+    assert len(statements) == 2
+    assert statements[0].lstrip().upper().startswith("ALTER TABLE")
+    assert statements[1].lstrip().upper().startswith("CREATE INDEX")
+    assert all("TRIGGER" not in statement.upper() for statement in statements)
 
 
-def test_horizon_candidate_ledger_migration_is_additive_and_fail_closed():
+def test_horizon_candidate_ledger_migration_is_additive_and_rds_portable():
     migration = next(
         item for item in MIGRATIONS
         if item["version"] == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION
     )
     statements = tuple(str(item) for item in migration["statements"])
-    assert len(statements) == 9
+    assert statements == HORIZON_CANDIDATE_LEDGER_RDS_DDL
+    assert len(statements) == 1
     assert statements[0].lstrip().upper().startswith("ALTER TABLE")
     assert "DROP CHECK chk_v3_horizon_model_protocol_projection" in statements[0]
     assert statements[0].count("ADD COLUMN") == 5
-    creates = [
-        statement for statement in statements
-        if statement.lstrip().upper().startswith("CREATE TRIGGER")
-    ]
-    assert len(creates) == 4
-    contract = "\n".join(creates)
-    assert "candidate_ledger_schema_version" in contract
-    assert "registration_verification_hash" in contract
-    assert "PROCESS_VERIFIED_LEDGER_REGISTRATION_V1" in contract
-    assert "artifact_status = 'OOS_VERIFIED'" in contract
-    assert "training_receipt_status = 'PROCESS_VERIFIED'" in contract
-    assert "order_authority = 0" in contract
+    assert "TRIGGER" not in statements[0].upper()
 
 
-def test_forward_strategy_version_migration_is_additive_and_fail_closed():
+def test_forward_strategy_version_migration_is_additive_and_rds_portable():
     migration = next(
         item for item in MIGRATIONS
         if item["version"] == FORWARD_STRATEGY_VERSION_MIGRATION_VERSION
     )
     statements = tuple(str(item) for item in migration["statements"])
-    assert statements == FORWARD_STRATEGY_VERSION_DDL
-    assert len(statements) == 7
+    assert statements == FORWARD_STRATEGY_VERSION_RDS_DDL
+    assert len(statements) == 3
     assert "ADD COLUMN strategy_version VARCHAR(160) NOT NULL DEFAULT ''" in (
         statements[0]
     )
@@ -139,59 +132,28 @@ def test_forward_strategy_version_migration_is_additive_and_fail_closed():
     assert "'$.primary_forecast_id'" in backfill
     assert "'$.ownership_hash'" in backfill
     assert "SET e.strategy_version = CONCAT(" in backfill
-    insert_trigger = statements[4]
-    # Expand phase stays rollback-compatible: legacy code may omit the new
-    # column, while every non-empty version must satisfy the strict relation.
-    assert "OR NEW.strategy_version = ''" not in insert_trigger.split(
-        "IF NOT EXISTS", 1
-    )[0]
-    assert "NEW.strategy_version = ''" in insert_trigger
-    assert "OR (" in insert_trigger
-    assert "JOIN st_decision_run_v3 r" in insert_trigger
-    assert "JOIN st_trade_intent_v2 i" in insert_trigger
-    assert "i.stock_code = NEW.stock_code" in insert_trigger
-    assert "f.strategy_key = NEW.strategy_key" in insert_trigger
-    assert "CONCAT(" in insert_trigger
-    assert "r.model_version" in insert_trigger
-    assert "'$.model_version'" in insert_trigger
-    assert "'$.primary_strategy_key'" in insert_trigger
-    assert "'$.primary_strategy_version'" in insert_trigger
-    assert "JSON_VALID(i.evidence_json)" in insert_trigger
-    assert "BINARY NEW.strategy_version = BINARY CONCAT(" in insert_trigger
-    assert (
-        "BINARY NEW.strategy_version <> BINARY OLD.strategy_version"
-        in statements[6]
-    )
-    assert "OLD.strategy_version <> ''" in statements[6]
-    assert "V3 executed evidence version promotion invalid" in statements[6]
+    assert all("TRIGGER" not in statement.upper() for statement in statements)
+    assert len(FORWARD_STRATEGY_VERSION_DDL) == 7
 
 
-def test_raw_fill_and_cash_ledgers_are_frozen_by_forward_migration():
+def test_raw_fill_and_cash_ledger_migration_is_rds_portable_noop():
     migration = next(
         item for item in MIGRATIONS
         if item["version"] == V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION
     )
     statements = tuple(str(item) for item in migration["statements"])
-    assert statements == V2_RAW_LEDGER_IMMUTABILITY_DDL
-    assert len(statements) == 8
-    contract = "\n".join(statements)
-    assert contract.upper().count("BEFORE UPDATE ON") == 2
-    assert contract.upper().count("BEFORE DELETE ON") == 2
-    assert "BEFORE UPDATE ON st_fill_v2" in contract
-    assert "BEFORE DELETE ON st_fill_v2" in contract
-    assert "BEFORE UPDATE ON st_cash_ledger_v2" in contract
-    assert "BEFORE DELETE ON st_cash_ledger_v2" in contract
-    assert contract.count("SIGNAL SQLSTATE '45000'") == 4
+    assert statements == V2_RAW_LEDGER_IMMUTABILITY_RDS_DDL == ()
+    assert len(V2_RAW_LEDGER_IMMUTABILITY_DDL) == 8
 
 
-def test_forward_exit_allocation_migration_is_normalized_and_append_only():
+def test_forward_exit_allocation_migration_is_normalized_and_rds_portable():
     migration = next(
         item for item in MIGRATIONS
         if item["version"] == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION
     )
     statements = tuple(str(item) for item in migration["statements"])
-    assert statements == FORWARD_EXIT_ALLOCATION_DDL
-    assert len(statements) == 5
+    assert statements == FORWARD_EXIT_ALLOCATION_RDS_DDL
+    assert len(statements) == 1
     table = statements[0]
     assert "CREATE TABLE IF NOT EXISTS st_forward_exit_allocation_v3" in table
     assert "UNIQUE KEY uk_v3_forward_exit_evidence_fill" in table
@@ -202,10 +164,8 @@ def test_forward_exit_allocation_migration_is_normalized_and_append_only():
     assert "allocation_sequence BIGINT NOT NULL" in table
     assert "FOREIGN KEY (evidence_id)" in table
     assert "FOREIGN KEY (exit_fill_id)" in table
-    contract = "\n".join(statements)
-    assert "BEFORE UPDATE ON st_forward_exit_allocation_v3" in contract
-    assert "BEFORE DELETE ON st_forward_exit_allocation_v3" in contract
-    assert contract.count("SIGNAL SQLSTATE '45000'") == 2
+    assert "TRIGGER" not in table.upper()
+    assert len(FORWARD_EXIT_ALLOCATION_DDL) == 5
 
 
 @pytest.mark.parametrize(
@@ -432,7 +392,7 @@ def test_controlled_prerequisites_are_explicit_and_never_fabricate_ledgers():
 
 def test_combined_schema_inventory_is_frozen_and_isolated():
     assert len(acceptance._expected_final_tables()) == 86
-    assert len(acceptance._final_trigger_contract()) == 89
+    assert len(acceptance._final_trigger_contract()) == 61
     assert "st_execution_projection_outbox_v2" in (
         acceptance._expected_final_tables()
     )
@@ -735,7 +695,7 @@ def test_outbox_acceptance_fault_hook_is_narrow_and_one_shot():
         engine.dispose()
 
 
-@pytest.mark.parametrize("committed_count", (1, 2, 4, 6, 8))
+@pytest.mark.parametrize("committed_count", (1,))
 def test_horizon_protocol_v2_fault_hook_covers_recoverable_ddl_boundaries(
     committed_count,
 ):
@@ -755,7 +715,7 @@ def test_horizon_protocol_v2_fault_hook_covers_recoverable_ddl_boundaries(
     assert hook.triggered is True
 
 
-@pytest.mark.parametrize("unsupported_count", (0, 3, 5, 7, 9, 10))
+@pytest.mark.parametrize("unsupported_count", (0, 2, 3, 4, 6, 8, 10))
 def test_horizon_protocol_v2_fault_hook_rejects_non_firing_boundaries(
     unsupported_count,
 ):
@@ -765,7 +725,7 @@ def test_horizon_protocol_v2_fault_hook_rejects_non_firing_boundaries(
         )
 
 
-@pytest.mark.parametrize("committed_count", (1, 3, 5, 7))
+@pytest.mark.parametrize("committed_count", (1,))
 def test_horizon_candidate_ledger_fault_hook_covers_recoverable_boundaries(
     committed_count,
 ):
@@ -777,7 +737,7 @@ def test_horizon_candidate_ledger_fault_hook_covers_recoverable_boundaries(
     hook.validate()
 
 
-@pytest.mark.parametrize("unsupported_count", (0, 2, 4, 6, 8, 9))
+@pytest.mark.parametrize("unsupported_count", (0, 2, 3, 4, 5, 7, 9))
 def test_horizon_candidate_ledger_fault_hook_rejects_other_boundaries(
     unsupported_count,
 ):

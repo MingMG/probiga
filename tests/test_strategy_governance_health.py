@@ -3011,10 +3011,12 @@ def test_health_invokes_frozen_exit_allocation_schema_and_fifo_replay(
     replay = checks["forward_exit_allocation_v3_fifo_conservation"]
     assert schema["passed"] is True
     assert schema["detail"]["frozen_checksum"] == (
-        "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a"
+        "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
-    assert schema["detail"]["frozen_statement_count"] == 5
+    assert schema["detail"]["frozen_statement_count"] == 1
     assert schema["detail"]["frozen_migration_count"] == 27
+    assert schema["detail"]["database_triggers_required"] is False
+    assert schema["detail"]["database_trigger_inventory_checked"] is False
     assert replay["passed"] is True
     assert replay["detail"]["raw_sell_count"] == 1
     assert replay["detail"]["expected_allocation_count"] == 1
@@ -4098,7 +4100,7 @@ def test_input_not_ready_cannot_waive_qmt_frozen_schema_drift(
         "_qmt_attestation_frozen_schema_check",
         lambda _connection: (
             False,
-            {"errors": ["immutable trigger inventory differs"]},
+            {"errors": ["immutable unique-index inventory differs"]},
         ),
     )
 
@@ -4736,108 +4738,30 @@ def test_allow_input_not_ready_treats_null_authority_as_forbidden(
     assert authority["passed"] is False
 
 
-def test_allow_input_not_ready_does_not_waive_forward_trigger_drift(
-    monkeypatch,
-):
+def test_rds_schema_health_never_inventories_database_triggers(monkeypatch):
     _fixed_trade_date(monkeypatch)
 
-    class _DriftedForwardTriggerEngine(_GovernanceHealthEngine):
+    class _NoTriggerInventoryEngine(_GovernanceHealthEngine):
         def execute(self, sql, params):
-            result = super().execute(sql, params)
-            if "FROM information_schema.triggers" in sql:
-                result._rows[0]["action_statement"] = "BEGIN SET @unsafe=1; END"
-            return result
+            assert "information_schema.triggers" not in str(sql).casefold()
+            return super().execute(sql, params)
 
     result = health.collect_governance_health(
-        _DriftedForwardTriggerEngine(runs=[]),
+        _NoTriggerInventoryEngine(runs=[]),
         expected_build_sha=BUILD_SHA,
         allow_input_not_ready=True,
     )
-    assert result["status"] == "FAIL"
-    forward_schema = next(
-        check
-        for check in result["checks"]
-        if check["name"] == "forward_strategy_version_schema"
-    )
-    assert forward_schema["passed"] is False
-    assert forward_schema["detail"]["trigger_errors"] == [
-        "drifted trigger: trg_v3_forward_owner_required_bi"
-    ]
-
-
-def test_forward_strategy_version_rejects_extra_table_trigger(monkeypatch):
-    _fixed_trade_date(monkeypatch)
-
-    class _ExtraForwardTriggerEngine(_GovernanceHealthEngine):
-        def execute(self, sql, params):
-            result = super().execute(sql, params)
-            if "FROM information_schema.triggers" in sql:
-                result._rows.append(
-                    {
-                        "trigger_name": "trg_v3_unreviewed_extra_ai",
-                        "event_object_table": "st_forward_trade_evidence_v3",
-                        "action_timing": "AFTER",
-                        "event_manipulation": "INSERT",
-                        "action_statement": "BEGIN SET @unexpected=1; END",
-                    }
-                )
-            return result
-
-    result = health.collect_governance_health(
-        _ExtraForwardTriggerEngine(runs=[]),
-        expected_build_sha=BUILD_SHA,
-        allow_input_not_ready=True,
-    )
-
-    assert result["status"] == "FAIL"
-    forward_schema = next(
-        check
-        for check in result["checks"]
-        if check["name"] == "forward_strategy_version_schema"
-    )
-    assert forward_schema["passed"] is False
-    assert "forward trigger inventory differs" in forward_schema[
-        "detail"
-    ]["trigger_errors"]
-
-
-def test_raw_fill_cash_immutability_rejects_extra_trigger(monkeypatch):
-    _fixed_trade_date(monkeypatch)
-
-    class _ExtraRawLedgerTriggerEngine(_GovernanceHealthEngine):
-        def execute(self, sql, params):
-            result = super().execute(sql, params)
-            if (
-                "FROM information_schema.triggers" in sql
-                and "st_cash_ledger_v2" in sql
-            ):
-                result._rows.append(
-                    {
-                        "trigger_name": "trg_cash_ledger_v2_unreviewed_ai",
-                        "event_object_table": "st_cash_ledger_v2",
-                        "action_timing": "AFTER",
-                        "event_manipulation": "INSERT",
-                        "action_statement": "BEGIN SET @unexpected=1; END",
-                    }
-                )
-            return result
-
-    result = health.collect_governance_health(
-        _ExtraRawLedgerTriggerEngine(runs=[]),
-        expected_build_sha=BUILD_SHA,
-        allow_input_not_ready=True,
-    )
-
-    assert result["status"] == "FAIL"
-    raw_schema = next(
-        check
-        for check in result["checks"]
-        if check["name"] == "v2_raw_fill_cash_ledgers_are_immutable"
-    )
-    assert raw_schema["passed"] is False
-    assert "raw-ledger trigger inventory differs" in raw_schema[
-        "detail"
-    ]["trigger_errors"]
+    assert result["status"] == "PASS"
+    checks = {check["name"]: check for check in result["checks"]}
+    for name in (
+        "strategy_metric_input_application_state_machine",
+        "governance_append_only_application_integrity",
+        "forward_strategy_version_schema",
+        "v2_raw_fill_cash_ledgers_are_immutable",
+        "forward_exit_allocation_v3_frozen_schema",
+    ):
+        assert checks[name]["passed"] is True
+        assert checks[name]["detail"]["database_triggers_required"] is False
 
 
 def test_passing_snapshot_cannot_claim_unconfirmed_evidence(monkeypatch):
@@ -5342,84 +5266,20 @@ def test_market_router_risk_cap_is_exact(monkeypatch):
     assert budget["passed"] is False
 
 
-def test_metric_input_review_trigger_health_contract_is_independently_frozen():
-    from server.engine import strategy_governance as governance_module
+def test_application_integrity_health_contracts_need_no_trigger_inventory():
+    class _NoDatabaseAccess:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("database trigger inventory must not be queried")
 
-    connection = _Connection(_GovernanceHealthEngine())
-    passed, detail = health._metric_input_review_trigger_check(connection)
-    assert passed is True
-    assert detail["errors"] == []
-    assert detail["trigger_count"] == 2
-    for trigger_name, contract in (
-        governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items()
-    ):
-        expected_hash = health.METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[
-            trigger_name
-        ][3]
-        actual_hash = health.hashlib.sha256(
-            health._normalized_metric_input_trigger_body(
-                contract["body"]
-            ).encode("utf-8")
-        ).hexdigest()
-        assert actual_hash == expected_hash
-
-
-@pytest.mark.parametrize(
-    "drift_kind", ("body", "literal", "event", "missing", "extra")
-)
-def test_metric_input_review_trigger_health_rejects_every_drift(drift_kind):
-    class _DriftedMetricTriggerEngine(_GovernanceHealthEngine):
-        def execute(self, sql, params):
-            result = super().execute(sql, params)
-            if (
-                "information_schema.TRIGGERS" in sql
-                and "st_strategy_metric_input" in sql
-            ):
-                if drift_kind == "body":
-                    result._rows[0]["action_statement"] += " SET @drift=1;"
-                elif drift_kind == "literal":
-                    result._rows[0]["action_statement"] = result._rows[0][
-                        "action_statement"
-                    ].replace("'PENDING'", "'pending'")
-                elif drift_kind == "event":
-                    result._rows[0]["event_manipulation"] = "INSERT"
-                elif drift_kind == "missing":
-                    result._rows.pop()
-                else:
-                    result._rows.append({
-                        **result._rows[0],
-                        "trigger_name": "trg_strategy_metric_input_extra",
-                    })
-            return result
-
-    connection = _Connection(_DriftedMetricTriggerEngine())
-    passed, detail = health._metric_input_review_trigger_check(connection)
-    assert passed is False
-
-
-@pytest.mark.parametrize("drift_kind", ["missing", "body"])
-def test_governance_ledger_trigger_health_rejects_missing_or_drift(
-    drift_kind,
-):
-    class _TriggerDriftEngine(_GovernanceHealthEngine):
-        def execute(self, sql, params):
-            result = super().execute(sql, params)
-            if (
-                "information_schema.TRIGGERS" in sql
-                and "st_strategy_lifecycle_event" in sql
-                and "st_strategy_governance_audit" in sql
-            ):
-                if drift_kind == "missing":
-                    result._rows.pop()
-                else:
-                    result._rows[0]["action_statement"] = (
-                        "BEGIN SET @unsafe=1; END"
-                    )
-            return result
-
-    passed, detail = health._governance_append_only_trigger_check(
-        _Connection(_TriggerDriftEngine())
+    connection = _NoDatabaseAccess()
+    metric_passed, metric = health._metric_input_review_trigger_check(connection)
+    ledger_passed, ledger = health._governance_append_only_trigger_check(
+        connection
     )
 
-    assert passed is False
-    assert detail["errors"]
+    assert metric_passed is ledger_passed is True
+    assert metric["trigger_count"] == ledger["trigger_count"] == 0
+    assert metric["database_triggers_required"] is False
+    assert ledger["database_triggers_required"] is False
+    assert "state_machine" in metric["enforcement"]
+    assert "hash_replay" in ledger["enforcement"]

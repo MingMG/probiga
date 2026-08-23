@@ -535,11 +535,18 @@ def validate_horizon_candidate_ledger_server(connection: Connection) -> None:
 
 def validate_horizon_candidate_ledger_schema(
     connection: Connection,
+    *,
+    require_triggers: bool = True,
+    require_isolated_server: bool = True,
 ) -> None:
     """Validate the current V3 ledger registry without rewriting V1/V2."""
 
-    validate_horizon_candidate_ledger_server(connection)
-    validate_horizon_protocol_v2_schema(connection)
+    if require_isolated_server:
+        validate_horizon_candidate_ledger_server(connection)
+    validate_horizon_protocol_v2_schema(
+        connection,
+        require_triggers=require_triggers,
+    )
     rows = connection.execute(text(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT "
         "FROM information_schema.COLUMNS "
@@ -582,6 +589,9 @@ def validate_horizon_candidate_ledger_schema(
     )
     if any(marker not in normalized_check for marker in check_markers):
         raise RuntimeError("V3 horizon candidate-ledger check drift")
+
+    if not require_triggers:
+        return
 
     trigger_rows = connection.execute(text(
         "SELECT TRIGGER_NAME, ACTION_STATEMENT "

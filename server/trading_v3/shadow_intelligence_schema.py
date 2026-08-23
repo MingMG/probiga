@@ -1578,7 +1578,11 @@ _EXPECTED_TRIGGERS = frozenset({
 })
 
 
-def validate_shadow_intelligence_schema(connection: Connection) -> None:
+def validate_shadow_intelligence_schema(
+    connection: Connection,
+    *,
+    require_triggers: bool = True,
+) -> None:
     """Reject a partially applied or type-drifted Shadow schema."""
 
     for table_name, expected in _EXPECTED_COLUMN_TYPES.items():
@@ -1696,6 +1700,9 @@ def validate_shadow_intelligence_schema(connection: Connection) -> None:
             raise RuntimeError(
                 f"V3 shadow intelligence check body drift: {name}"
             )
+    if not require_triggers:
+        return
+
     triggers = {
         str(item)
         for item in connection.execute(

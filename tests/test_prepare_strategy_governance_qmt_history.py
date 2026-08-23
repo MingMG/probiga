@@ -53,30 +53,38 @@ def _install_prepared_schema(monkeypatch):
     monkeypatch.setattr(
         preparation,
         "validate_attestation_schema",
-        lambda _engine: {"table_count": 4, "trigger_count": 4},
+        lambda _engine: {"table_count": 4, "trigger_count": 0},
     )
 
 
-def test_schema_preparation_is_strict_validation_only(monkeypatch):
+def test_schema_preparation_creates_trigger_free_tables_then_validates(monkeypatch):
     calls = []
+    monkeypatch.setattr(
+        preparation,
+        "ensure_attestation_tables",
+        lambda engine: calls.append(("ensure", engine)),
+    )
     monkeypatch.setattr(
         preparation,
         "validate_attestation_schema",
         lambda engine: calls.append(("validate", engine)) or {
             "table_count": 4,
-            "trigger_count": 4,
+            "trigger_count": 0,
+            "immutability_enforcement": "application_hashes",
         },
     )
 
     result = preparation.prepare_attestation_schema("engine")
 
-    assert calls == [("validate", "engine")]
+    assert calls == [("ensure", "engine"), ("validate", "engine")]
     assert result == {
         "status": "ok",
         "mode": "schema-only",
         "attestation_protocol": preparation.ATTESTATION_PROTOCOL_VERSION,
         "table_count": 4,
-        "trigger_count": 4,
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "immutability_enforcement": "application_hashes",
         "automatic_real_order_submission": False,
     }
 

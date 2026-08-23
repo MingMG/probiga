@@ -166,13 +166,13 @@ FROZEN_EXPECTED_V3_MIGRATIONS = (
     ("20260802_002_generic_theme_signal_ledger", "3f1ca400f243d8aa69f46d2d418c0c07e4bfce8ca38ee9a153b03278e879dca6", 8),
     ("20260802_003_news_point_in_time_knowledge", "3885c522999aa32bf4e74d8d2846a36be5672bef9583b4f685610d3a339c470c", 8),
     ("20260803_001_v3_execution_projection_subscriber", "6ef9383dac24775a8a804517c35b01c180613c4d21a0a29e6bd6cfa1ec4bb6dc", 17),
-    ("20260804_000_shadow_intelligence_runtime", "b09f22e64601c91023b866e6cc90c3bffedc3e7bae131457e1c65ee41ce91735", 46),
+    ("20260804_000_shadow_intelligence_runtime", "25f3a14c56c3cb7ec701192cb4d736eaad6c2592c6ad9e4b698081c549f1c3c6", 10),
     ("20260804_001_v3_execution_projection_outbox", "5f53bf5258705e410b93db2b5034bbf9683ebe03b17f854625f6854fb55f7e78", 4),
-    ("20260817_000_horizon_protocol_v2_governance", "9430f7bf8014d8758339f6754ac51989283c648657b5fdb1db813ab32afce118", 10),
-    ("20260817_001_horizon_candidate_ledger_registration", "88cbd1d4bd57fa65164d2d35e07a6344d9a8d8e255d09efb0e79cabfd0d8c522", 9),
-    (FORWARD_STRATEGY_VERSION_MIGRATION_VERSION, "08e0e3d6e6bb9b31227f33780eb54bf3afd38d226f456fa41985137614ce7602", 7),
-    (V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION, "5e7d735be4d24659786e17091b89df06e3dba713c3646fd00ef817a67bc8eedf", 8),
-    (FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION, "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a", 5),
+    ("20260817_000_horizon_protocol_v2_governance", "6eb0c66266b2c9103f2d65bf932dc1576d16c9b249a78a2704376b4f19e32a3b", 2),
+    ("20260817_001_horizon_candidate_ledger_registration", "82e113beb6328c8590e66173ea2aca0b832650ec3796539a4ba9bd37bc29ab05", 1),
+    (FORWARD_STRATEGY_VERSION_MIGRATION_VERSION, "1804a2d2c3473e98c1be77d03d324e61cb5cdb5682e7d87cf647841218b756e6", 3),
+    (V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0),
+    (FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION, "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460", 1),
 )
 
 FROZEN_V3_TABLES = frozenset(
@@ -552,7 +552,11 @@ def _assert_final_schema(engine: Engine) -> tuple[int, int, int, int]:
     expected_ledger = _declared_v3_contract()
     with engine.connect() as connection:
         validate_v3_projection_outbox_schema(connection)
-        validate_horizon_candidate_ledger_schema(connection)
+        validate_horizon_candidate_ledger_schema(
+            connection,
+            require_triggers=False,
+            require_isolated_server=False,
+        )
         validate_forward_exit_allocation_schema(connection)
         ledger = tuple(
             (
@@ -842,7 +846,7 @@ def run_mysql_acceptance(
     expected_server_uuid: str,
     mode: str = "serial-replay",
     concurrency: int = 2,
-    partial_statement_count: int = 2,
+    partial_statement_count: int = 1,
     tls_config: MySQLAcceptanceTLSConfig | None = None,
 ) -> V3MySQLAcceptanceReport:
     _assert_frozen_contract()
@@ -861,19 +865,18 @@ def run_mysql_acceptance(
     if mode == "horizon-v2-partial-recovery":
         if (
             type(partial_statement_count) is not int
-            or partial_statement_count not in {1, 2, 4, 6, 8}
+            or partial_statement_count != 1
         ):
             raise ValueError(
-                "horizon V2 partial_statement_count must be one of 1, 2, 4, 6, 8"
+                "horizon V2 partial_statement_count must be 1"
             )
     elif mode == "horizon-v3-ledger-partial-recovery":
         if (
             type(partial_statement_count) is not int
-            or partial_statement_count not in {1, 3, 5, 7}
+            or partial_statement_count != 1
         ):
             raise ValueError(
-                "horizon V3 ledger partial_statement_count must be one of "
-                "1, 3, 5, 7"
+                "horizon V3 ledger partial_statement_count must be 1"
             )
     elif type(partial_statement_count) is not int or not (
         1 <= partial_statement_count < 4
@@ -974,10 +977,6 @@ def run_mysql_acceptance(
             partial_horizon_counts = _horizon_v2_partial_object_counts(engine)
             expected_partial_counts = {
                 1: (3, 1, 0, 0),
-                2: (3, 1, 1, 0),
-                4: (3, 1, 1, 1),
-                6: (3, 1, 1, 2),
-                8: (3, 1, 1, 3),
             }[partial_statement_count]
             if partial_horizon_counts != expected_partial_counts:
                 raise RuntimeError(
@@ -1019,9 +1018,6 @@ def run_mysql_acceptance(
             )
             expected_partial_counts = {
                 1: (5, 1, 1, 0),
-                3: (5, 1, 1, 1),
-                5: (5, 1, 1, 2),
-                7: (5, 1, 1, 3),
             }[partial_statement_count]
             if partial_horizon_counts != expected_partial_counts:
                 raise RuntimeError(
@@ -1130,7 +1126,7 @@ def _parser() -> argparse.ArgumentParser:
         default="serial-replay",
     )
     parser.add_argument("--concurrency", type=int, default=2)
-    parser.add_argument("--partial-statement-count", type=int, default=2)
+    parser.add_argument("--partial-statement-count", type=int, default=1)
     return parser
 
 

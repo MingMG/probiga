@@ -1,10 +1,8 @@
 import hashlib
 import json
 import re
-import os
 import shutil
 import subprocess
-import textwrap
 from pathlib import Path
 
 
@@ -43,113 +41,31 @@ def test_workflow_uses_fixed_root_owned_deploy_broker() -> None:
     assert "bash \"$DEPLOY_BOOTSTRAP\"" not in workflow
 
 
-def test_old_broker_capabilities_fail_before_the_deploy_command() -> None:
-    bash = _bash()
-    if bash is None:
-        return
+def test_workflow_uses_the_stable_v2_broker_contract() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"
     )
-    blocks = re.findall(
-        r"EXPECTED_CAPABILITIES=\"\$\(cat <<'EOF'\r?\n"
-        r"(.*?)\r?\n\s*EOF\r?\n\s*\)\"",
-        workflow,
-        re.DOTALL,
+    normalized = _normalized_shell(workflow)
+    assert "--capabilities" not in workflow
+    assert "resolved_requirements_b64:" in workflow
+    assert "resolved_requirements_sha256:" in workflow
+    assert (
+        'printf \'%s\\n\' "$RESOLVED_REQUIREMENTS_B64" | '
+        'sudo -n /usr/local/sbin/probiga-production-deploy '
+        '"$EXPECTED_SHA" "$EXPECTED_REQUIREMENTS_SHA256" '
+        '"$EXPECTED_ADATA_SHA" "$EXPECTED_ADATA_TREE_SHA256"'
+        in normalized
     )
-    assert len(blocks) == 2
-    expected = textwrap.dedent(blocks[0]).strip()
-    assert textwrap.dedent(blocks[1]).strip() == expected
-    script = (
-        "set -Eeuo pipefail\n"
-        "EXPECTED_CAPABILITIES=\"$(cat <<'EOF'\n"
-        + expected
-        + "\nEOF\n)\"\n"
-        "test \"$ACTUAL_CAPABILITIES\" = \"$EXPECTED_CAPABILITIES\"\n"
-        "printf 'DEPLOY_COMMAND_REACHED\\n'\n"
-    )
-    old_v3 = expected.replace(
-        "deploy_protocol=probiga-production-deploy-v4",
-        "deploy_protocol=probiga-production-deploy-v3",
-    )
-    rejected = subprocess.run(
-        [bash, "-c", script],
-        env={**os.environ, "ACTUAL_CAPABILITIES": old_v3},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert rejected.returncode != 0
-    assert "DEPLOY_COMMAND_REACHED" not in rejected.stdout
-    legacy_v4 = "\n".join(
-        line
-        for line in expected.splitlines()
-        if not line.startswith((
-            "governance_task_snapshot=",
-            "receipt_pending_recovery=",
-            "activation_release_identity=",
-            "release_tree_and_adapter_seal=",
-        ))
-    )
-    rejected_legacy_v4 = subprocess.run(
-        [bash, "-c", script],
-        env={**os.environ, "ACTUAL_CAPABILITIES": legacy_v4},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert rejected_legacy_v4.returncode != 0
-    assert "DEPLOY_COMMAND_REACHED" not in rejected_legacy_v4.stdout
-    accepted = subprocess.run(
-        [bash, "-c", script],
-        env={**os.environ, "ACTUAL_CAPABILITIES": expected},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert accepted.returncode == 0, accepted.stderr
-    assert accepted.stdout.strip() == "DEPLOY_COMMAND_REACHED"
-
-    remote = workflow[workflow.index("script: |", workflow.index("deploy:")):]
-    capability_probe = remote.index("--capabilities")
-    deploy_command = remote.index(
-        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
-    )
-    assert capability_probe < deploy_command
 
 
-def test_blocked_wheel_lock_exits_before_any_remote_deploy(tmp_path: Path) -> None:
-    bash = _bash()
-    if bash is None:
-        return
-    marker = (tmp_path / "remote-command-reached").as_posix()
-    script = f"""
-set -Eeuo pipefail
-mapfile -t release_manifest < deploy/production_release.env
-test "${{#release_manifest[@]}}" -eq 10
-test "${{release_manifest[2]}}" = PROBIGA_PRODUCTION_LOCK_STATUS=READY
-printf reached > {marker!r}
-"""
-    completed = subprocess.run(
-        [bash, "-c", script],
-        cwd=ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert completed.returncode != 0
-    assert not (tmp_path / "remote-command-reached").exists()
+def test_v2_deploy_does_not_depend_on_the_blocked_static_wheel_lock() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"
     )
-    gate = workflow.index(
-        "Fail closed unless the complete production artifact lock is ready"
-    )
-    remote = workflow.index("Deploy to Alibaba Cloud ECS", gate)
-    assert gate < remote
+    deploy = workflow[workflow.index("\n  deploy:"):]
+    assert "Fail closed unless the complete production artifact lock" not in deploy
+    assert "PROBIGA_PRODUCTION_LOCK_STATUS=READY" not in deploy
+    assert "EXPECTED_REQUIREMENTS_SHA256" in deploy
 
 
 def test_clean_git_ignores_hostile_environment_and_replace_refs(
@@ -302,20 +218,23 @@ def test_broker_binds_release_tree_registry_seal_and_snapshot_identity() -> None
     ).hexdigest()
 
 
-def test_ci_full_suite_is_bound_to_exact_cp314_linux_wheel_manifest() -> None:
+def test_v2_engine_builds_and_verifies_an_isolated_runtime_wheelhouse() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"
     )
-    start = workflow.index("Run the full suite in the exact production wheel set")
-    end = workflow.index("\n  deployment-disabled:", start)
-    block = workflow[start:end]
-    assert "steps.production_lock.outputs.ready == 'true'" in block
-    assert "sha256sum deploy/production_requirements.lock" in block
-    assert "sha256sum deploy/production_wheel_manifest.lock" in block
-    assert "--require-hashes --only-binary=:all: --no-deps" in block
-    assert "actual != expected" in block
-    assert "--require-hashes --no-index --only-binary=:all:" in block
-    assert '"$production_venv/bin/python" -P -m pytest -q' in block
+    engine = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "Freeze the tested dependency set" in workflow
+    assert "pip freeze --all --exclude-editable" in workflow
+    assert "validate_ci_resolved_freeze" in engine
+    assert "prepare_ci_resolved_wheelhouse" in engine
+    assert "--only-binary=:all: --no-deps" in engine
+    assert "PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1" in engine
+    assert "SOURCE=ci-resolved-freeze-v1" in engine
+    assert "--no-index --only-binary=:all:" in engine
+    assert 'cmp --silent "$RESOLVED_LOCK"' in engine
+    assert '"$venv_path/bin/python" -I -m pip check' in engine
 
 
 def test_broker_and_engine_use_fd_locks_and_a_versioned_protocol() -> None:
@@ -347,10 +266,10 @@ def test_broker_and_engine_use_fd_locks_and_a_versioned_protocol() -> None:
     assert "flock -n 8" in broker
     assert not re.search(r"\b(?:mkdir|rmdir)\b[^\n]*BROKER_LOCK", broker)
 
-    assert "REQUIRED_DEPLOY_PROTOCOL=probiga-production-deploy-v4" in engine
+    assert "REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4" in engine
+    assert "COMPATIBLE_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2" in engine
     protocol_guard = engine.index(
-        'if [ "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" '
-        '!= "$REQUIRED_DEPLOY_PROTOCOL" ]; then'
+        'case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in'
     )
     assert "production deploy broker protocol mismatch" in engine
     assert protocol_guard < engine.index(": \"${EXPECTED_SHA:")

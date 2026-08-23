@@ -58,7 +58,15 @@ assert_root_owned_bare_cache() {
   test -z "$(git --git-dir="$cache" for-each-ref \
     --format='%(refname)' refs/replace)" || return 1
   if [ -d "$cache/hooks" ]; then
-    test -z "$(find -P "$cache/hooks" -mindepth 1 -print -quit)" || return 1
+    # The installed v2 broker initialized this root-owned mirror with Git's
+    # stock `*.sample` hook templates.  They are not hook entrypoints and every
+    # Git call in this engine also pins core.hooksPath=/dev/null.  Permit only
+    # those inert templates; any real hook, nested path, foreign owner, or
+    # group/other-writable file still fails closed.
+    unsafe="$(find -P "$cache/hooks" -mindepth 1 -maxdepth 1 \
+      \( ! -type f -o ! -name '*.sample' -o ! -user root -o ! -group root \
+         -o -perm /022 \) -print -quit)" || return 1
+    test -z "$unsafe" || return 1
   fi
   test -z "$(git --git-dir="$cache" config --local --name-only \
     --get-regexp \
@@ -74,23 +82,42 @@ ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 DEPLOY_LOCK_ROOT=/run/probiga
 DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
-REQUIRED_DEPLOY_PROTOCOL=probiga-production-deploy-v4
+REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
+COMPATIBLE_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
+DEPLOY_ARTIFACT_MODE=""
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "production deploy engine must run through the root broker" >&2
   exit 2
 fi
-if [ "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" != "$REQUIRED_DEPLOY_PROTOCOL" ]; then
-  echo "production deploy broker protocol mismatch; install the new root broker out of band" >&2
-  exit 2
-fi
-if [ "${PROBIGA_RECOVERY_PROTOCOL_VERSION:-}" != \
-  "$REQUIRED_RECOVERY_PROTOCOL" ]; then
-  echo "production deploy recovery broker capability mismatch; install the new root broker out of band" >&2
-  exit 2
-fi
+case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in
+  "$REQUIRED_DEPLOY_PROTOCOL_V4")
+    DEPLOY_ARTIFACT_MODE=static-wheel-lock-v2
+    if [ "${PROBIGA_RECOVERY_PROTOCOL_VERSION:-}" != \
+      "$REQUIRED_RECOVERY_PROTOCOL" ]; then
+      echo "production deploy recovery broker capability mismatch; install the new root broker out of band" >&2
+      exit 2
+    fi
+    ;;
+  "$COMPATIBLE_DEPLOY_PROTOCOL_V2")
+    DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+    if [ -n "${PROBIGA_RECOVERY_PROTOCOL_VERSION:-}" ] || \
+      [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ]; then
+      echo "v2 production deploy broker cannot authorize recovery" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "production deploy broker protocol mismatch" >&2
+    exit 2
+    ;;
+esac
 DEPLOY_OPERATION=deploy
 if [ "$#" -eq 1 ] && [ "$1" = --recover-database-guard ]; then
+  if [ "$DEPLOY_ARTIFACT_MODE" != static-wheel-lock-v2 ]; then
+    echo "v2 production deploy broker cannot authorize recovery" >&2
+    exit 2
+  fi
   DEPLOY_OPERATION=recover-database-guard
 elif [ "$#" -ne 0 ]; then
   echo "production deploy engine rejected unsupported arguments" >&2
@@ -2369,25 +2396,53 @@ if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
 fi
 : "${EXPECTED_SHA:?EXPECTED_SHA is required}"
 : "${RESOLVED_REQUIREMENTS_B64:?RESOLVED_REQUIREMENTS_B64 is required}"
-: "${EXPECTED_INPUT_LOCK_SHA256:?EXPECTED_INPUT_LOCK_SHA256 is required}"
-: "${TRUSTED_WHEEL_MANIFEST_B64:?TRUSTED_WHEEL_MANIFEST_B64 is required}"
-: "${EXPECTED_WHEEL_MANIFEST_SHA256:?EXPECTED_WHEEL_MANIFEST_SHA256 is required}"
 : "${EXPECTED_ADATA_SHA:?EXPECTED_ADATA_SHA is required}"
 : "${EXPECTED_ADATA_TREE_SHA256:?EXPECTED_ADATA_TREE_SHA256 is required}"
-: "${EXPECTED_RELEASE_TREE_SHA256:?EXPECTED_RELEASE_TREE_SHA256 is required}"
-: "${EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256:?EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256 is required}"
+[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+  : "${EXPECTED_REQUIREMENTS_SHA256:?EXPECTED_REQUIREMENTS_SHA256 is required}"
+  [[ "$EXPECTED_REQUIREMENTS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  if [ -n "${EXPECTED_INPUT_LOCK_SHA256:-}" ] && \
+    [ "$EXPECTED_INPUT_LOCK_SHA256" != "$EXPECTED_REQUIREMENTS_SHA256" ]; then
+    echo "v2 dependency digest aliases differ" >&2
+    exit 2
+  fi
+  EXPECTED_INPUT_LOCK_SHA256="$EXPECTED_REQUIREMENTS_SHA256"
+  test -z "${TRUSTED_WHEEL_MANIFEST_B64:-}"
+  EXPECTED_WHEEL_MANIFEST_SHA256=""
+else
+  : "${EXPECTED_INPUT_LOCK_SHA256:?EXPECTED_INPUT_LOCK_SHA256 is required}"
+  : "${TRUSTED_WHEEL_MANIFEST_B64:?TRUSTED_WHEEL_MANIFEST_B64 is required}"
+  : "${EXPECTED_WHEEL_MANIFEST_SHA256:?EXPECTED_WHEEL_MANIFEST_SHA256 is required}"
+  : "${EXPECTED_RELEASE_TREE_SHA256:?EXPECTED_RELEASE_TREE_SHA256 is required}"
+  : "${EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256:?EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256 is required}"
+  [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$EXPECTED_RELEASE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+fi
 [[ "$EXPECTED_ADATA_SHA" =~ ^[0-9a-f]{40}$ ]]
 [[ "$EXPECTED_ADATA_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$EXPECTED_INPUT_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]]
-[[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-[[ "$EXPECTED_RELEASE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-[[ "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
 ENGINE_RELEASE_TREE_OID="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
   "${EXPECTED_SHA}^{tree}")"
 [[ "$ENGINE_RELEASE_TREE_OID" =~ ^[0-9a-f]{40,64}$ ]]
-test "$(printf '{"kind":"git-tree","tree":"%s"}' \
-  "$ENGINE_RELEASE_TREE_OID" | sha256sum | cut -d' ' -f1)" = \
-  "$EXPECTED_RELEASE_TREE_SHA256"
+ENGINE_RELEASE_TREE_SHA256="$(printf '{"kind":"git-tree","tree":"%s"}' \
+  "$ENGINE_RELEASE_TREE_OID" | sha256sum | cut -d' ' -f1)"
+[[ "$ENGINE_RELEASE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+  EXPECTED_RELEASE_TREE_SHA256="$ENGINE_RELEASE_TREE_SHA256"
+  ENGINE_RELEASE_MANIFEST="$(git --git-dir="$CODE_GIT_CACHE" show \
+    "${EXPECTED_SHA}:deploy/production_release.env")"
+  test "$(printf '%s\n' "$ENGINE_RELEASE_MANIFEST" | \
+    grep -c '^ADAPTER_REGISTRY_SEAL_SHA256=[0-9a-f]\{64\}$')" -eq 1
+  EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$(printf '%s\n' \
+    "$ENGINE_RELEASE_MANIFEST" | sed -n \
+    's/^ADAPTER_REGISTRY_SEAL_SHA256=//p')"
+  [[ "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  unset ENGINE_RELEASE_MANIFEST
+else
+  test "$ENGINE_RELEASE_TREE_SHA256" = "$EXPECTED_RELEASE_TREE_SHA256"
+fi
 LEGACY_LIVE_SHA="$(git rev-parse HEAD)"
 PREVIOUS_SHA="$LEGACY_LIVE_SHA"
 DEPLOY_MAIN_BASHPID="$BASHPID"
@@ -2410,7 +2465,7 @@ render_receipt_file() {
     "${EXPECTED_RESOLVED_FREEZE_SHA256:-}" \
     "${PREVIOUS_RESOLVED_FREEZE_SHA256:-}" \
     "${ACTIVE_RESOLVED_FREEZE_SHA256:-}" \
-    "$EXPECTED_WHEEL_MANIFEST_SHA256" "$EXPECTED_ADATA_SHA" \
+    "${EXPECTED_WHEEL_MANIFEST_SHA256:-}" "$EXPECTED_ADATA_SHA" \
     "$EXPECTED_ADATA_TREE_SHA256" "${PREVIOUS_ADATA_SHA:-}" \
     "${PREVIOUS_ADATA_TREE_SHA256:-}" "${ACTIVE_ADATA_SHA:-}" \
     "${ACTIVE_ADATA_TREE_SHA256:-}" \
@@ -2481,10 +2536,19 @@ test "$SERVICE_USER" != root
 BUILD_USER=probiga-build
 test "$BUILD_USER" != "$SERVICE_USER"
 test "$BUILD_USER" != root
+if ! id "$BUILD_USER" >/dev/null 2>&1 && \
+  [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+  # The stable v2 broker predates the dedicated package-build identity.  It is
+  # safe for the root engine to provision this non-login account once; no
+  # credential, home directory, role, or service permission is granted.
+  /usr/sbin/useradd --system --no-create-home --home-dir /var/empty \
+    --shell /usr/sbin/nologin "$BUILD_USER"
+fi
 id "$BUILD_USER" >/dev/null 2>&1 || {
   echo "dedicated non-login build account probiga-build is required" >&2
   exit 2
 }
+test "$(id -u "$BUILD_USER")" -ne 0
 BUILD_SHELL="$(getent passwd "$BUILD_USER" | cut -d: -f7)"
 case "$BUILD_SHELL" in
   /usr/sbin/nologin|/sbin/nologin|/bin/false) ;;
@@ -4010,6 +4074,7 @@ cleanup_prepare_artifacts() {
 verify_venv_dependency_lock() {
   local venv_path="$1"
   local observed_lock
+  [[ "${EXPECTED_WHEEL_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
   observed_lock="$(mktemp)"
   if ! "$venv_path/bin/python" -m pip freeze --all --exclude-editable \
     | awk 'tolower($0) !~ /^adata([[:space:]]|==|@)/' \
@@ -4037,6 +4102,24 @@ verify_venv_dependency_lock() {
       "$EXPECTED_RELEASE_TREE_SHA256" || \
     ! test "$(cat "$venv_path/.adapter-registry-seal.sha256")" = \
       "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256"; then
+    rm -f "$observed_lock"
+    return 1
+  fi
+  if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
+    { ! test -f "$venv_path/.wheel-manifest" || \
+      ! test -f "$venv_path/.artifact-mode" || \
+      ! grep -Fx ci-resolved-freeze-v1 "$venv_path/.artifact-mode" >/dev/null || \
+      ! test "$(sha256sum "$venv_path/.wheel-manifest" | cut -d' ' -f1)" = \
+        "$EXPECTED_WHEEL_MANIFEST_SHA256" || \
+      ! cmp --silent "$venv_path/.requirements.input" \
+        "$venv_path/.requirements.freeze" || \
+      ! test "$(cat "$venv_path/.requirements.freeze.sha256")" = \
+        "$EXPECTED_INPUT_LOCK_SHA256"; }; then
+    rm -f "$observed_lock"
+    return 1
+  fi
+  if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
+    ! "$venv_path/bin/python" -I -m pip check >/dev/null; then
     rm -f "$observed_lock"
     return 1
   fi
@@ -4088,6 +4171,35 @@ for requirement in logical:
         raise SystemExit(2)
     if not re.search(r"--hash=sha256:[0-9a-f]{64}(?:\s|$)", requirement):
         raise SystemExit(2)
+PY
+}
+
+validate_ci_resolved_freeze() {
+  local freeze_file="$1"
+  "$BOOTSTRAP_PYTHON" -I - "$freeze_file" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+if "\r" in text or not text.endswith("\n"):
+    raise SystemExit(2)
+lines = text.splitlines()
+if not lines or lines != sorted(lines):
+    raise SystemExit(2)
+pattern = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*=="
+    r"[A-Za-z0-9][A-Za-z0-9._+!-]*"
+)
+normalized = []
+for line in lines:
+    if line != line.strip() or pattern.fullmatch(line) is None:
+        raise SystemExit(2)
+    name = line.split("==", 1)[0]
+    normalized.append(re.sub(r"[-_.]+", "-", name).lower())
+if len(normalized) != len(set(normalized)):
+    raise SystemExit(2)
 PY
 }
 
@@ -4146,6 +4258,77 @@ prepare_trusted_wheelhouse() {
   sudo -u "$BUILD_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
   return 0
 }
+
+prepare_ci_resolved_wheelhouse() {
+  local actual_files
+  local artifact_root=/var/lib/probiga/release-artifacts
+  local wheel_file
+  local wheel_sha
+  test ! -L "$artifact_root" || return 1
+  install -d -o root -g root -m 0755 "$artifact_root" || return 1
+  test "$(readlink -f "$artifact_root")" = "$artifact_root" || return 1
+  TRUSTED_WHEELHOUSE="$(mktemp -d \
+    "$artifact_root/.wheelhouse-$EXPECTED_SHA.XXXXXX")" || return 1
+  chown "$BUILD_USER:$BUILD_USER" "$TRUSTED_WHEELHOUSE" || return 1
+  chmod 0700 "$TRUSTED_WHEELHOUSE" || return 1
+  sudo -u "$BUILD_USER" /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/var/empty \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    PIP_CONFIG_FILE=/dev/null \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_INPUT=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONNOUSERSITE=1 \
+    "$BOOTSTRAP_PYTHON" -I -m pip download \
+      --only-binary=:all: --no-deps \
+      --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
+  chown -R root:root "$TRUSTED_WHEELHOUSE" || return 1
+  chmod -R a+rX,a-w "$TRUSTED_WHEELHOUSE" || return 1
+  actual_files="$(mktemp)" || return 1
+  if ! find "$TRUSTED_WHEELHOUSE" -mindepth 1 -maxdepth 1 -type f \
+      -printf '%f\n' | LC_ALL=C sort > "$actual_files" || \
+    ! test -s "$actual_files" || \
+    grep -Ev '^[A-Za-z0-9_.+-]+\.whl$' "$actual_files" | grep -q .; then
+    rm -f -- "$actual_files"
+    return 1
+  fi
+  TRUSTED_WHEEL_MANIFEST="$(mktemp)" || {
+    rm -f -- "$actual_files"
+    return 1
+  }
+  printf '%s\n' \
+    PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1 \
+    TARGET=cp314-manylinux_2_17_x86_64 \
+    SOURCE=ci-resolved-freeze-v1 > "$TRUSTED_WHEEL_MANIFEST" || {
+      rm -f -- "$actual_files"
+      return 1
+    }
+  while IFS= read -r wheel_file; do
+    wheel_sha="$(sha256sum "$TRUSTED_WHEELHOUSE/$wheel_file" | \
+      cut -d' ' -f1)" || {
+        rm -f -- "$actual_files"
+        return 1
+      }
+    [[ "$wheel_sha" =~ ^[0-9a-f]{64}$ ]] || {
+      rm -f -- "$actual_files"
+      return 1
+    }
+    printf '%s  %s\n' "$wheel_sha" "$wheel_file" \
+      >> "$TRUSTED_WHEEL_MANIFEST" || {
+        rm -f -- "$actual_files"
+        return 1
+      }
+  done < "$actual_files"
+  rm -f -- "$actual_files" || return 1
+  EXPECTED_WHEEL_MANIFEST_SHA256="$(sha256sum \
+    "$TRUSTED_WHEEL_MANIFEST" | cut -d' ' -f1)"
+  [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  sudo -u "$SERVICE_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
+  sudo -u "$BUILD_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
+  return 0
+}
+
 prepare_code_staging() {
   local cache_parent
   cache_parent="$(dirname "$CODE_GIT_CACHE")"
@@ -4254,18 +4437,25 @@ prepare_release_venv() {
   printf '%s' "$RESOLVED_REQUIREMENTS_B64" | base64 -d > "$RESOLVED_LOCK"
   test "$(sha256sum "$RESOLVED_LOCK" | cut -d' ' -f1)" = \
     "$EXPECTED_INPUT_LOCK_SHA256"
-  validate_hashed_requirements_lock "$RESOLVED_LOCK"
-  TRUSTED_WHEEL_MANIFEST="$(mktemp)"
-  printf '%s' "$TRUSTED_WHEEL_MANIFEST_B64" | base64 -d > \
-    "$TRUSTED_WHEEL_MANIFEST"
-  test "$(sha256sum "$TRUSTED_WHEEL_MANIFEST" | cut -d' ' -f1)" = \
-    "$EXPECTED_WHEEL_MANIFEST_SHA256"
-  grep -Fx PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1 \
-    "$TRUSTED_WHEEL_MANIFEST" >/dev/null
-  grep -Fx TARGET=cp314-manylinux_2_17_x86_64 \
-    "$TRUSTED_WHEEL_MANIFEST" >/dev/null
-  grep -Fx STATUS=READY "$TRUSTED_WHEEL_MANIFEST" >/dev/null
-  prepare_trusted_wheelhouse
+  if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+    validate_ci_resolved_freeze "$RESOLVED_LOCK"
+    # The isolated non-login build account downloads wheels, so it needs
+    # read-only access to this non-secret package/version list.
+    chmod 0444 "$RESOLVED_LOCK"
+  else
+    validate_hashed_requirements_lock "$RESOLVED_LOCK"
+    TRUSTED_WHEEL_MANIFEST="$(mktemp)"
+    printf '%s' "$TRUSTED_WHEEL_MANIFEST_B64" | base64 -d > \
+      "$TRUSTED_WHEEL_MANIFEST"
+    test "$(sha256sum "$TRUSTED_WHEEL_MANIFEST" | cut -d' ' -f1)" = \
+      "$EXPECTED_WHEEL_MANIFEST_SHA256"
+    grep -Fx PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1 \
+      "$TRUSTED_WHEEL_MANIFEST" >/dev/null
+    grep -Fx TARGET=cp314-manylinux_2_17_x86_64 \
+      "$TRUSTED_WHEEL_MANIFEST" >/dev/null
+    grep -Fx STATUS=READY "$TRUSTED_WHEEL_MANIFEST" >/dev/null
+    prepare_trusted_wheelhouse
+  fi
   if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
     test -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
     EXPECTED_VENV_TARGET="$(readlink -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA")"
@@ -4274,6 +4464,14 @@ prepare_release_venv() {
       *) echo "release venv target escaped its immutable root" >&2; return 2 ;;
     esac
     test "$(dirname "$EXPECTED_VENV_TARGET")" = "$RELEASE_VENV_ROOT"
+    if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+      test -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.artifact-mode"
+      grep -Fx ci-resolved-freeze-v1 \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.artifact-mode" >/dev/null
+      EXPECTED_WHEEL_MANIFEST_SHA256="$(cat \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.wheel-manifest.sha256")"
+      [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+    fi
     test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.requirements.input.sha256")" = \
       "$EXPECTED_INPUT_LOCK_SHA256"
     test "$(cat "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.wheel-manifest.sha256")" = \
@@ -4297,11 +4495,21 @@ prepare_release_venv() {
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/.requirements.freeze.sha256")"
     [[ "$EXPECTED_RESOLVED_FREEZE_SHA256" =~ ^[0-9a-f]{64}$ ]]
   else
+    if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+      prepare_ci_resolved_wheelhouse
+    fi
+    [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
     EXPECTED_BUILD="$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-$RANDOM"
     "$BOOTSTRAP_PYTHON" -I -m venv "$EXPECTED_BUILD"
-    clean_root_pip "$EXPECTED_BUILD/bin/python" install \
-      --require-hashes --no-index --only-binary=:all: \
-      --find-links "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" --quiet
+    if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+      clean_root_pip "$EXPECTED_BUILD/bin/python" install \
+        --no-index --only-binary=:all: \
+        --find-links "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" --quiet
+    else
+      clean_root_pip "$EXPECTED_BUILD/bin/python" install \
+        --require-hashes --no-index --only-binary=:all: \
+        --find-links "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" --quiet
+    fi
     ADATA_BUILD_SOURCE="$(mktemp -d \
       /var/lib/probiga/release-artifacts/.adata-source.XXXXXX)"
     ADATA_WHEEL_DIR="$(mktemp -d \
@@ -4337,6 +4545,14 @@ prepare_release_venv() {
     EXPECTED_RESOLVED_FREEZE_SHA256="$(sha256sum \
       "$EXPECTED_BUILD/.requirements.freeze" | cut -d' ' -f1)"
     [[ "$EXPECTED_RESOLVED_FREEZE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+    if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+      cmp --silent "$RESOLVED_LOCK" "$EXPECTED_BUILD/.requirements.freeze"
+      test "$EXPECTED_RESOLVED_FREEZE_SHA256" = "$EXPECTED_INPUT_LOCK_SHA256"
+      install -o root -g root -m 0444 "$TRUSTED_WHEEL_MANIFEST" \
+        "$EXPECTED_BUILD/.wheel-manifest"
+      printf '%s\n' ci-resolved-freeze-v1 \
+        > "$EXPECTED_BUILD/.artifact-mode"
+    fi
     printf '%s\n' "$EXPECTED_INPUT_LOCK_SHA256" \
       > "$EXPECTED_BUILD/.requirements.input.sha256"
     printf '%s\n' "$EXPECTED_RESOLVED_FREEZE_SHA256" \
@@ -4368,10 +4584,12 @@ prepare_release_venv() {
   sudo -u "$SERVICE_USER" test -x "$RELEASE_VENV_ROOT"
   rm -f "$RESOLVED_LOCK"
   RESOLVED_LOCK=""
-  rm -f "$TRUSTED_WHEEL_MANIFEST"
+  [ -z "$TRUSTED_WHEEL_MANIFEST" ] || rm -f "$TRUSTED_WHEEL_MANIFEST"
   TRUSTED_WHEEL_MANIFEST=""
-  chmod -R u+rwX "$TRUSTED_WHEELHOUSE"
-  rm -rf "$TRUSTED_WHEELHOUSE"
+  if [ -n "$TRUSTED_WHEELHOUSE" ]; then
+    chmod -R u+rwX "$TRUSTED_WHEELHOUSE"
+    rm -rf "$TRUSTED_WHEELHOUSE"
+  fi
   TRUSTED_WHEELHOUSE=""
   rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
   ADATA_BUILD_SOURCE=""
@@ -5059,10 +5277,12 @@ prepare_release
 # PREPARE DATABASE: read-only verification of the fixed TLS administrator and
 # migrator identities, target server, grants, trust=OFF and existing schema.
 # No DDL or DML is accepted while the old writers remain active.
-CUTOVER_STEP=preflight_strategy_governance_database_schema
-run_prepared_database_migration_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-  --phase preflight
+if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
+  CUTOVER_STEP=preflight_strategy_governance_database_schema
+  run_prepared_database_migration_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+    --phase preflight
+fi
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
@@ -5151,15 +5371,32 @@ fi
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   assert_ai_worker_writer_fence
 fi
-CUTOVER_STEP=prepare_strategy_governance_database_schema
-DATABASE_FORWARD_MIGRATION_STARTED=1
-run_prepared_database_migration_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-  --phase cutover --writers-fenced
-CUTOVER_STEP=recover_strategy_governance_database_trust
-run_prepared_database_migration_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-  --phase recover
+if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+  # Alibaba Cloud RDS keeps binary logging enabled and does not expose
+  # log_bin_trust_function_creators/SUPER to tenants.  The v2 release path
+  # therefore applies the RDS-safe additive schema through the runtime account
+  # only after every writer is fenced.  The task stays disabled until the same
+  # schema is revalidated by the normal installation step below.
+  CUTOVER_STEP=prepare_strategy_governance_rds_safe_schema
+  DATABASE_FORWARD_MIGRATION_STARTED=1
+  if ! run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+    --disabled; then
+    GOVERNANCE_TASK_TOUCHED=1
+    false
+  fi
+  GOVERNANCE_TASK_TOUCHED=1
+else
+  CUTOVER_STEP=prepare_strategy_governance_database_schema
+  DATABASE_FORWARD_MIGRATION_STARTED=1
+  run_prepared_database_migration_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+    --phase cutover --writers-fenced
+  CUTOVER_STEP=recover_strategy_governance_database_trust
+  run_prepared_database_migration_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+    --phase recover
+fi
 CUTOVER_STEP=prepare_strategy_governance_qmt_history
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"

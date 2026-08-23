@@ -36,6 +36,7 @@ from tools.attest_qmt_daily_kline import (
     LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY,
     _legacy_completed_run_binding,
     attest_range,
+    ensure_attestation_tables,
     legacy_completed_run_binding_plan,
     validate_legacy_completed_run_release_contract,
     validate_attestation_schema,
@@ -190,8 +191,9 @@ def apply_legacy_completed_run_binding(
 
 
 def prepare_attestation_schema(engine) -> dict[str, Any]:
-    """Read-only proof that the privileged cutover prepared the V2 schema."""
+    """Create and validate the trigger-free QMT V2 table/index schema."""
 
+    ensure_attestation_tables(engine)
     detail = validate_attestation_schema(engine)
     return {
         "status": "ok",
@@ -199,6 +201,8 @@ def prepare_attestation_schema(engine) -> dict[str, Any]:
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
         "table_count": int(detail.get("table_count") or 0),
         "trigger_count": int(detail.get("trigger_count") or 0),
+        "database_triggers_required": False,
+        "immutability_enforcement": detail.get("immutability_enforcement"),
         "automatic_real_order_submission": False,
     }
 
@@ -238,9 +242,9 @@ def prepare_governance_qmt_history(
     *,
     attester: Callable[..., dict[str, Any]] = attest_range,
 ) -> dict[str, Any]:
-    # Production history preparation has no schema authority.  The fenced
-    # migrator cutover must already have appended the legacy-ineligible marker
-    # and installed every frozen table/trigger contract.
+    # Production history preparation has no schema authority.  Schema-only
+    # preparation must already have installed the frozen tables/indexes and the
+    # legacy-ineligible marker.  Database triggers are not part of this gate.
     legacy_binding = plan_legacy_completed_run_binding(engine)
     if (
         legacy_binding["legacy_run_count"]

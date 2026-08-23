@@ -310,10 +310,17 @@ _EXPECTED_TRIGGERS: Mapping[str, tuple[str, ...]] = {
 }
 
 
-def validate_horizon_protocol_v2_schema(connection: Connection) -> None:
+def validate_horizon_protocol_v2_schema(
+    connection: Connection,
+    *,
+    require_triggers: bool = True,
+) -> None:
     """Verify the additive V2 protocol migration without weakening V1 DDL."""
 
-    validate_shadow_intelligence_schema(connection)
+    validate_shadow_intelligence_schema(
+        connection,
+        require_triggers=require_triggers,
+    )
     rows = connection.execute(text(
         "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT "
         "FROM information_schema.COLUMNS "
@@ -380,6 +387,9 @@ def validate_horizon_protocol_v2_schema(connection: Connection) -> None:
         "selection_policy_hash",
     )):
         raise RuntimeError("V3 horizon protocol V2 check drift")
+
+    if not require_triggers:
+        return
 
     trigger_rows = connection.execute(text(
         "SELECT TRIGGER_NAME, ACTION_STATEMENT "

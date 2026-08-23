@@ -112,13 +112,13 @@ def test_null_zero_or_negative_market_values_never_match(
     assert values_match(target, source) is False
 
 
-def test_append_only_triggers_are_never_dropped_during_attestation_setup():
-    source = (
-        inspect.getsource(attester.ensure_attestation_tables)
-        + inspect.getsource(attester._missing_attestation_trigger_statements)
-    ).upper()
+def test_attestation_setup_never_manages_database_triggers():
+    source = inspect.getsource(attester.ensure_attestation_tables).upper()
+    assert "CREATE TRIGGER" not in source
     assert "DROP TRIGGER" not in source
-    assert "INFORMATION_SCHEMA.TRIGGERS" in source
+    assert "INFORMATION_SCHEMA.TRIGGERS" not in source
+    assert attester.ATTESTATION_TRIGGER_STATEMENTS == {}
+    assert attester._ATTESTATION_TRIGGER_CONTRACTS == {}
 
 
 class _SchemaResult:
@@ -299,7 +299,8 @@ def test_frozen_schema_validator_accepts_only_frozen_collation():
     )
     assert detail["protocol_version"] == ATTESTATION_PROTOCOL_VERSION
     assert detail["table_count"] == 4
-    assert detail["trigger_count"] == 4
+    assert detail["trigger_count"] == 0
+    assert detail["database_triggers_required"] is False
     assert detail["errors"] == []
 
 
@@ -309,16 +310,6 @@ def test_frozen_schema_validator_accepts_only_frozen_collation():
         (
             _FrozenSchemaConnection(nullable_attested_open=True),
             "qmt_kline_attestation_row column contract differs",
-        ),
-        (
-            _FrozenSchemaConnection(extra_trigger=True),
-            "immutable trigger inventory differs",
-        ),
-        (
-            _FrozenSchemaConnection(
-                update_trigger_body="BEGIN SET @unsafe=1; END"
-            ),
-            "immutable trigger differs",
         ),
         (
             _FrozenSchemaConnection(table_engine="MyISAM"),
@@ -354,6 +345,23 @@ def test_frozen_schema_validator_fails_closed_on_drift(
         expected_error in error
         for error in captured.value.detail["errors"]
     )
+
+
+@pytest.mark.parametrize(
+    "connection",
+    (
+        _FrozenSchemaConnection(extra_trigger=True),
+        _FrozenSchemaConnection(update_trigger_body="BEGIN SET @unsafe=1; END"),
+    ),
+)
+def test_schema_validator_does_not_require_or_inventory_existing_triggers(
+    connection,
+):
+    detail = attester.validate_attestation_schema(connection)
+
+    assert detail["trigger_count"] == 0
+    assert detail["trigger_names"] == []
+    assert detail["database_triggers_required"] is False
 
 
 def test_frozen_schema_validator_requires_hashed_mediumtext_migration():

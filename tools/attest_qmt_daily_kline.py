@@ -294,6 +294,16 @@ _ATTESTATION_TRIGGER_CONTRACTS = {
     ),
 }
 
+# Alibaba Cloud RDS keeps ``log_bin_trust_function_creators`` disabled on the
+# production instance.  QMT evidence integrity is therefore enforced by the
+# application transaction, immutable evidence hashes and the unique source
+# identity below, rather than by database triggers.  Keep these exported
+# mappings empty so older migration tooling also stops planning CREATE TRIGGER
+# statements.  Triggers already installed by an earlier release are unmanaged
+# and may remain in place.
+ATTESTATION_TRIGGER_STATEMENTS.clear()
+_ATTESTATION_TRIGGER_CONTRACTS.clear()
+
 
 class QmtAttestationSchemaError(RuntimeError):
     """Raised when the frozen QMT attestation schema has drifted."""
@@ -719,52 +729,10 @@ def _normalized_trigger_body(value: Any) -> str:
 def _missing_attestation_trigger_statements(
     connection: Connection,
 ) -> tuple[str, ...]:
-    """Return only missing frozen guards and reject every existing drift."""
+    """Compatibility shim: QMT schema setup no longer manages triggers."""
 
-    rows = connection.execute(text(
-        "SELECT TRIGGER_NAME AS trigger_name, "
-        "ACTION_TIMING AS action_timing, "
-        "EVENT_MANIPULATION AS event_manipulation, "
-        "EVENT_OBJECT_TABLE AS event_object_table, "
-        "ACTION_ORIENTATION AS action_orientation, "
-        "ACTION_STATEMENT AS action_statement "
-        "FROM information_schema.TRIGGERS "
-        "WHERE TRIGGER_SCHEMA=DATABASE() "
-        "AND EVENT_OBJECT_TABLE IN "
-        "('qmt_kline_attestation_row', "
-        "'qmt_kline_attestation_schema_migration') "
-        "ORDER BY BINARY TRIGGER_NAME"
-    )).mappings().all()
-    observed = {
-        str(row.get("trigger_name") or ""): dict(row) for row in rows
-    }
-    expected_names = set(_ATTESTATION_TRIGGER_CONTRACTS)
-    unexpected = sorted(set(observed) - expected_names)
-    if unexpected:
-        raise QmtAttestationSchemaError({
-            "errors": [
-                "unexpected immutable triggers: " + ", ".join(unexpected)
-            ]
-        })
-    for trigger_name, row in observed.items():
-        timing, event, table_name, body = _ATTESTATION_TRIGGER_CONTRACTS[
-            trigger_name
-        ]
-        if (
-            str(row.get("action_timing") or "").upper() != timing
-            or str(row.get("event_manipulation") or "").upper() != event
-            or str(row.get("event_object_table") or "") != table_name
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or _normalized_trigger_body(row.get("action_statement"))
-            != _normalized_trigger_body(body)
-        ):
-            raise QmtAttestationSchemaError({
-                "errors": [f"existing immutable trigger differs: {trigger_name}"]
-            })
-    return tuple(
-        ATTESTATION_TRIGGER_STATEMENTS[name]
-        for name in sorted(expected_names - set(observed))
-    )
+    del connection
+    return ()
 
 
 def ensure_attestation_tables(
@@ -773,12 +741,12 @@ def ensure_attestation_tables(
     trigger_ddl_executor: Callable[[str], None] | None = None,
     allow_legacy_manifest_candidates: bool = False,
 ) -> None:
-    """Prepare tables while delegating every missing trigger explicitly.
+    """Prepare the table, column, index and migration-marker contract.
 
-    Table, column, index and backfill work is deliberately separate from
-    trigger creation.  In production the release broker supplies a narrowly
-    validated executor which opens one short global-trust window per missing
-    frozen trigger.  Normal runtime callers never receive that authority.
+    ``trigger_ddl_executor`` remains as a backward-compatible keyword but is
+    never invoked.  This keeps first-time setup compatible with managed MySQL
+    services that disallow trigger creation while leaving any existing legal
+    triggers untouched.
     """
 
     if trigger_ddl_executor is not None and not callable(
@@ -870,18 +838,6 @@ def ensure_attestation_tables(
         for statement in table_statements:
             connection.execute(text(statement))
         _ensure_tolerance_json_mediumtext_migration(connection)
-    with engine.connect() as connection:
-        missing_statements = _missing_attestation_trigger_statements(connection)
-    if missing_statements and trigger_ddl_executor is None:
-        raise QmtAttestationSchemaError({
-            "errors": [
-                "missing immutable triggers require the explicit trigger "
-                "DDL executor"
-            ]
-        })
-    for statement in missing_statements:
-        assert trigger_ddl_executor is not None
-        trigger_ddl_executor(statement)
     validate_attestation_schema(
         engine,
         require_current_manifests=not allow_legacy_manifest_candidates,
@@ -1100,58 +1056,6 @@ def _validate_attestation_schema_connection(
                 f"expected={expected!r}, observed={observed!r}"
             )
 
-    trigger_rows = connection.execute(
-        text(
-            "SELECT TRIGGER_NAME AS trigger_name, "
-            "ACTION_TIMING AS action_timing, "
-            "EVENT_MANIPULATION AS event_manipulation, "
-            "EVENT_OBJECT_TABLE AS event_object_table, "
-            "ACTION_ORIENTATION AS action_orientation, "
-            "ACTION_STATEMENT AS action_statement "
-            "FROM information_schema.TRIGGERS "
-            "WHERE TRIGGER_SCHEMA=DATABASE() "
-            "AND EVENT_OBJECT_TABLE IN "
-            "('qmt_kline_attestation_row', "
-            "'qmt_kline_attestation_schema_migration') "
-            "ORDER BY BINARY TRIGGER_NAME"
-        )
-    ).mappings().all()
-    observed_triggers = {
-        str(row.get("trigger_name") or ""): dict(row)
-        for row in trigger_rows
-    }
-    unexpected_triggers = set(observed_triggers) - set(
-        _ATTESTATION_TRIGGER_CONTRACTS
-    )
-    missing_triggers = set(_ATTESTATION_TRIGGER_CONTRACTS) - set(
-        observed_triggers
-    )
-    if unexpected_triggers or (require_triggers and missing_triggers):
-        errors.append(
-            "immutable trigger inventory differs: expected="
-            f"{sorted(_ATTESTATION_TRIGGER_CONTRACTS)!r}, "
-            f"observed={sorted(observed_triggers)!r}"
-        )
-    for trigger_name, row in observed_triggers.items():
-        expected = _ATTESTATION_TRIGGER_CONTRACTS.get(trigger_name)
-        if expected is None:
-            continue
-        timing, event, table_name, body = expected
-        observed_body = _normalized_trigger_body(
-            row.get("action_statement")
-        )
-        if (
-            str(row.get("action_timing") or "").upper() != timing
-            or str(row.get("event_manipulation") or "").upper() != event
-            or str(row.get("event_object_table") or "") != table_name
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or observed_body != _normalized_trigger_body(body)
-            or not re.search(
-                r"\bsignal\s+sqlstate\s+'45000'", observed_body
-            )
-        ):
-            errors.append(f"immutable trigger differs: {trigger_name}")
-
     completed_run_rows = connection.execute(
         text(
             "SELECT run_id, provider, start_date, end_date, "
@@ -1244,8 +1148,12 @@ def _validate_attestation_schema_connection(
         "index_names": {
             name: sorted(indexes) for name, indexes in observed_indexes.items()
         },
-        "trigger_names": sorted(observed_triggers),
-        "trigger_count": len(observed_triggers),
+        "trigger_names": [],
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "immutability_enforcement": (
+            "application_transaction_unique_identity_and_evidence_hash"
+        ),
         "completed_run_count": len(completed_run_rows),
         "completed_current_manifest_run_count": current_manifest_run_count,
         "completed_manifest_entry_count": completed_manifest_entry_count,
@@ -1274,11 +1182,11 @@ def validate_attestation_schema(
         EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH
     ),
 ) -> dict[str, Any]:
-    """Fail closed unless the complete V2 attestation schema is frozen.
+    """Fail closed unless the complete V2 table/index contract is frozen.
 
     This is read-only.  In particular, it never repairs an old nullable row
-    ledger or replaces a drifted trigger; an operator must handle any mismatch
-    as an explicit schema migration and re-run production acceptance.
+    ledger.  ``require_triggers`` is retained only for caller compatibility;
+    managed-database deployments do not require or inspect database triggers.
     """
 
     try:
@@ -1363,14 +1271,7 @@ def attest_range(
     if schema_prepared:
         validate_attestation_schema(engine)
     else:
-        def direct_trigger_ddl_executor(statement: str) -> None:
-            with engine.begin() as connection:
-                connection.execute(text(statement))
-
-        ensure_attestation_tables(
-            engine,
-            trigger_ddl_executor=direct_trigger_ddl_executor,
-        )
+        ensure_attestation_tables(engine)
         validate_attestation_schema(engine)
     target_table, source_table = _table_names(engine)
     run_id = f"qmt_attest_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"

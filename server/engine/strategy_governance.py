@@ -512,6 +512,14 @@ GOVERNANCE_APPEND_ONLY_TABLES = (
     *_GOVERNANCE_SNAPSHOT_TRIGGER_TABLES.values(),
     "st_strategy_governance_run",
 )
+
+# Version, lifecycle, snapshot and audit immutability is enforced by append-only
+# application writers, unique identities and full hash replay.  Emptying these
+# exported plans prevents every setup path (including the legacy privileged
+# migrator) from issuing CREATE TRIGGER on managed RDS.  Existing triggers are
+# intentionally neither queried nor removed.
+GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.clear()
+GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.clear()
 _LEGACY_MAP = legacy_strategy_merge_map()
 _SEED_LOCK = threading.Lock()
 _SEED_READY = False
@@ -887,6 +895,14 @@ METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS: dict[str, dict[str, str]] = {
     },
 }
 
+# Managed production MySQL does not grant the deployment account authority to
+# create binary-log protected triggers.  Review transitions are enforced by
+# ``review_metric_input`` under a row lock and are independently replayed from
+# hash-bound audit rows.  Export an empty trigger contract so legacy migration
+# tooling also stops planning these database objects; an already-installed
+# trigger may remain without becoming a deployment prerequisite.
+METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.clear()
+
 
 def _normalized_metric_input_trigger_body(value: Any) -> str:
     """Canonicalize information_schema text without weakening the contract."""
@@ -926,53 +942,23 @@ def _metric_input_trigger_inventory(connection) -> list[dict[str, Any]]:
 
 
 def validate_metric_input_review_triggers(connection) -> dict[str, Any]:
-    """Fail closed unless metric evidence has the exact frozen guards."""
+    """Return the application-level review enforcement contract.
 
-    rows = _metric_input_trigger_inventory(connection)
-    observed = {
-        str(row.get("trigger_name") or ""): row for row in rows
-    }
-    expected_names = set(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
-    errors: list[str] = []
-    if set(observed) != expected_names:
-        errors.append(
-            "trigger inventory differs: expected="
-            f"{sorted(expected_names)!r}, observed={sorted(observed)!r}"
-        )
-    for trigger_name, expected in (
-        METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items()
-    ):
-        row = observed.get(trigger_name, {})
-        observed_body = _normalized_metric_input_trigger_body(
-            row.get("action_statement")
-        )
-        if (
-            str(row.get("action_timing") or "").upper()
-            != expected["timing"]
-            or str(row.get("event_manipulation") or "").upper()
-            != expected["event"]
-            or str(row.get("event_object_table") or "")
-            != expected["table"]
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or observed_body
-            != _normalized_metric_input_trigger_body(expected["body"])
-            or not re.search(
-                r"\bsignal\s+sqlstate\s+'45000'", observed_body
-            )
-        ):
-            errors.append(f"metric input trigger differs: {trigger_name}")
-    detail = {
+    The historical function name is retained for callers during a rolling
+    release, but this validator deliberately performs no trigger inventory
+    query and treats existing database triggers as unmanaged, compatible
+    guards.
+    """
+
+    del connection
+    return {
         "table": "st_strategy_metric_input",
-        "trigger_names": sorted(observed),
-        "trigger_count": len(observed),
-        "errors": errors,
+        "trigger_names": [],
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "enforcement": "row_lock_state_machine_and_hash_bound_audit",
+        "errors": [],
     }
-    if errors:
-        raise RuntimeError(
-            "策略指标证据复核触发器契约漂移，拒绝继续部署："
-            + "; ".join(errors)
-        )
-    return detail
 
 
 def _ensure_metric_input_review_triggers(
@@ -980,52 +966,11 @@ def _ensure_metric_input_review_triggers(
     *,
     trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> None:
-    """Create only missing guards; existing drift is never replaced."""
+    """Compatibility shim; governance setup no longer manages triggers."""
 
-    rows = _metric_input_trigger_inventory(connection)
-    observed = {
-        str(row.get("trigger_name") or ""): row for row in rows
-    }
-    expected_names = set(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
-    unexpected = sorted(set(observed) - expected_names)
-    if unexpected:
-        raise RuntimeError(
-            "策略指标证据存在未登记触发器，拒绝继续部署："
-            + "、".join(unexpected)
-        )
-    for trigger_name, row in observed.items():
-        expected = METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[trigger_name]
-        if (
-            str(row.get("action_timing") or "").upper()
-            != expected["timing"]
-            or str(row.get("event_manipulation") or "").upper()
-            != expected["event"]
-            or str(row.get("event_object_table") or "")
-            != expected["table"]
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or _normalized_metric_input_trigger_body(
-                row.get("action_statement")
-            ) != _normalized_metric_input_trigger_body(expected["body"])
-        ):
-            raise RuntimeError(
-                "策略指标证据复核触发器正文漂移，拒绝继续部署："
-                + trigger_name
-            )
-    missing_names = sorted(expected_names - set(observed))
-    if missing_names and trigger_ddl_executor is None:
-        raise RuntimeError(
-            "策略指标证据缺少触发器，且未提供显式触发器DDL执行器"
-        )
-    for trigger_name in missing_names:
-        contract = METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[trigger_name]
-        statement = (
-            f"CREATE TRIGGER {trigger_name} {contract['timing']} "
-            f"{contract['event']} ON {contract['table']} FOR EACH ROW "
-            f"{contract['body']}"
-        )
-        assert trigger_ddl_executor is not None
-        trigger_ddl_executor(statement)
-    validate_metric_input_review_triggers(connection)
+    del connection
+    if trigger_ddl_executor is not None and not callable(trigger_ddl_executor):
+        raise TypeError("trigger_ddl_executor must be callable")
 
 
 class GovernanceAppendOnlySchemaError(RuntimeError):
@@ -1075,46 +1020,15 @@ def _governance_append_only_trigger_inventory(connection):
 def _validate_governance_append_only_triggers_connection(
     connection,
 ) -> dict[str, Any]:
-    rows = _governance_append_only_trigger_inventory(connection)
-    observed = {
-        str(row.get("trigger_name") or ""): dict(row) for row in rows
-    }
-    errors: list[str] = []
-    if set(observed) != set(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS):
-        errors.append(
-            "append-only trigger inventory differs: expected="
-            f"{sorted(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS)!r}, "
-            f"observed={sorted(observed)!r}"
-        )
-    for trigger_name, expected in (
-        GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.items()
-    ):
-        row = observed.get(trigger_name, {})
-        timing, event, table_name, body = expected
-        observed_body = _normalized_governance_trigger_body(
-            row.get("action_statement")
-        )
-        if (
-            str(row.get("action_timing") or "").upper() != timing
-            or str(row.get("event_manipulation") or "").upper() != event
-            or str(row.get("event_object_table") or "") != table_name
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or observed_body
-            != _normalized_governance_trigger_body(body)
-            or not re.search(
-                r"\bsignal\s+sqlstate\s+'45000'", observed_body
-            )
-        ):
-            errors.append(f"append-only trigger differs: {trigger_name}")
-    detail = {
+    del connection
+    return {
         "table_names": list(GOVERNANCE_APPEND_ONLY_TABLES),
-        "trigger_names": sorted(observed),
-        "trigger_count": len(observed),
-        "errors": errors,
+        "trigger_names": [],
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "enforcement": "append_only_writers_unique_identity_and_hash_replay",
+        "errors": [],
     }
-    if errors:
-        raise GovernanceAppendOnlySchemaError(detail)
-    return detail
 
 
 def _ensure_governance_append_only_triggers(
@@ -1122,60 +1036,15 @@ def _ensure_governance_append_only_triggers(
     *,
     trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> None:
-    """Create only missing guards and reject every existing drift."""
+    """Compatibility shim; governance setup no longer manages triggers."""
 
-    rows = _governance_append_only_trigger_inventory(connection)
-    observed = {
-        str(row.get("trigger_name") or ""): dict(row) for row in rows
-    }
-    expected_names = set(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS)
-    unexpected = sorted(set(observed) - expected_names)
-    if unexpected:
-        raise GovernanceAppendOnlySchemaError({
-            "trigger_names": sorted(observed),
-            "errors": [
-                "unexpected append-only triggers: " + ", ".join(unexpected)
-            ],
-        })
-    for trigger_name, row in observed.items():
-        timing, event, table_name, body = (
-            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS[trigger_name]
-        )
-        if (
-            str(row.get("action_timing") or "").upper() != timing
-            or str(row.get("event_manipulation") or "").upper() != event
-            or str(row.get("event_object_table") or "") != table_name
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or _normalized_governance_trigger_body(
-                row.get("action_statement")
-            )
-            != _normalized_governance_trigger_body(body)
-        ):
-            raise GovernanceAppendOnlySchemaError({
-                "trigger_names": sorted(observed),
-                "errors": [
-                    f"existing append-only trigger differs: {trigger_name}"
-                ],
-            })
-    missing_names = sorted(expected_names - set(observed))
-    if missing_names and trigger_ddl_executor is None:
-        raise GovernanceAppendOnlySchemaError({
-            "trigger_names": sorted(observed),
-            "errors": [
-                "missing append-only triggers require the explicit trigger "
-                "DDL executor"
-            ],
-        })
-    for trigger_name in missing_names:
-        assert trigger_ddl_executor is not None
-        trigger_ddl_executor(
-            GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS[trigger_name]
-        )
-    _validate_governance_append_only_triggers_connection(connection)
+    del connection
+    if trigger_ddl_executor is not None and not callable(trigger_ddl_executor):
+        raise TypeError("trigger_ddl_executor must be callable")
 
 
 def validate_governance_append_only_triggers(bind) -> dict[str, Any]:
-    """Read-only, fail-closed validation of all eight ledger guards."""
+    """Return the application-level append-only enforcement contract."""
 
     try:
         if hasattr(bind, "execute"):
@@ -2056,13 +1925,12 @@ def ensure_strategy_governance_tables(
     engine: Any | None = None,
     trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> None:
-    """Create governance schema without changing execution authority.
+    """Create governance tables, columns and indexes without trigger DDL.
 
     Normal callers use the shared runtime engine.  The production release
     broker supplies its separately authenticated, schema-scoped migration
-    engine while all writers are fenced.  That preserves the established
-    migration-account trigger ``DEFINER`` without granting global authority to
-    the runtime account.
+    engine while all writers are fenced.  ``trigger_ddl_executor`` is retained
+    for rolling compatibility but is never invoked.
     """
 
     if trigger_ddl_executor is not None and not callable(
@@ -2395,16 +2263,6 @@ def ensure_strategy_governance_tables(
                     f"{index_name} ({columns})"
                 ))
         _ensure_strategy_content_hash_schema(connection)
-    with schema_engine.connect() as connection:
-        _ensure_metric_input_review_triggers(
-            connection,
-            trigger_ddl_executor=trigger_ddl_executor,
-        )
-        _ensure_governance_append_only_triggers(
-            connection,
-            trigger_ddl_executor=trigger_ddl_executor,
-        )
-        connection.commit()
 
 
 def _audit_record(
@@ -3340,7 +3198,7 @@ def seed_governance_registry() -> None:
 
 def validate_prepared_governance_runtime(
     engine: Any | None = None,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Read-only production gate for the pre-migrated governance schema."""
 
     runtime_engine = engine or get_engine()
@@ -3380,9 +3238,7 @@ def validate_prepared_governance_runtime(
         }
         if observed_migrations != expected_migrations:
             raise RuntimeError("生产治理结构迁移标记不完整或已漂移")
-        metric = validate_metric_input_review_triggers(connection)
         schema_detail = validate_governance_table_schema(connection)
-    append_only = validate_governance_append_only_triggers(runtime_engine)
     seed_detail = validate_default_governance_seed_contract(runtime_engine)
     return {
         "table_count": int(schema_detail["table_count"]),
@@ -3394,8 +3250,11 @@ def validate_prepared_governance_runtime(
             seed_detail["seeded_combination_count"]
         ),
         "seed_contract_hash": str(seed_detail["seed_contract_hash"]),
-        "trigger_count": int(metric.get("trigger_count") or 0)
-        + int(append_only.get("trigger_count") or 0),
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "immutability_enforcement": (
+            "application_state_machine_unique_identity_and_hash_replay"
+        ),
     }
 
 
@@ -3412,13 +3271,8 @@ def ensure_and_seed_governance() -> None:
         return
     development_engine = get_engine()
 
-    def development_trigger_ddl_executor(statement: str) -> None:
-        with development_engine.begin() as connection:
-            connection.execute(text(statement))
-
     ensure_strategy_governance_tables(
         engine=development_engine,
-        trigger_ddl_executor=development_trigger_ddl_executor,
     )
     seed_governance_registry()
 

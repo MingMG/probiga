@@ -28,6 +28,11 @@ from server.common.scheduler_authority import (
     PRODUCTION_SCHEDULER_MODE,
     scheduler_authority_contract,
 )
+from server.db.migrations_v3 import (
+    HORIZON_CANDIDATE_LEDGER_RDS_DDL,
+    HORIZON_PROTOCOL_V2_RDS_DDL,
+    SHADOW_INTELLIGENCE_RDS_DDL,
+)
 from server.trading_v3.horizon_candidate_ledger_schema import (
     CANDIDATE_EVALUATION_LEDGER_SCHEMA,
     CURRENT_HORIZON_ARTIFACT_SCHEMA,
@@ -36,17 +41,14 @@ from server.trading_v3.horizon_candidate_ledger_schema import (
     CURRENT_HORIZON_SELECTION_PROTOCOL,
     HISTORICAL_HORIZON_ARTIFACT_SCHEMA_V1,
     HISTORICAL_HORIZON_ARTIFACT_SCHEMA_V2,
-    HORIZON_CANDIDATE_LEDGER_DDL,
     HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
     validate_horizon_candidate_ledger_schema,
 )
 from server.trading_v3.horizon_protocol_v2_schema import (
-    HORIZON_PROTOCOL_V2_DDL,
     HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
     validate_horizon_protocol_v2_schema,
 )
 from server.trading_v3.shadow_intelligence_schema import (
-    SHADOW_INTELLIGENCE_DDL,
     SHADOW_INTELLIGENCE_MIGRATION_VERSION,
     validate_shadow_intelligence_schema,
 )
@@ -79,7 +81,7 @@ def _expected_layer4_scheduler_tasks() -> dict[str, dict[str, Any]]:
 
 
 def _expected_migration() -> dict[str, Any]:
-    statements = tuple(SHADOW_INTELLIGENCE_DDL)
+    statements = SHADOW_INTELLIGENCE_RDS_DDL
     checksum = hashlib.sha256(
         "\n".join(item.strip() for item in statements).encode("utf-8")
     ).hexdigest()
@@ -91,7 +93,7 @@ def _expected_migration() -> dict[str, Any]:
 
 
 def _expected_protocol_migration() -> dict[str, Any]:
-    statements = tuple(HORIZON_PROTOCOL_V2_DDL)
+    statements = HORIZON_PROTOCOL_V2_RDS_DDL
     checksum = hashlib.sha256(
         "\n".join(item.strip() for item in statements).encode("utf-8")
     ).hexdigest()
@@ -103,7 +105,7 @@ def _expected_protocol_migration() -> dict[str, Any]:
 
 
 def _expected_candidate_ledger_migration() -> dict[str, Any]:
-    statements = tuple(HORIZON_CANDIDATE_LEDGER_DDL)
+    statements = HORIZON_CANDIDATE_LEDGER_RDS_DDL
     checksum = hashlib.sha256(
         "\n".join(item.strip() for item in statements).encode("utf-8")
     ).hexdigest()
@@ -180,16 +182,30 @@ def evaluate_migration_state(
 
 def collect_migration_readiness(engine: Engine) -> dict[str, Any]:
     expected_migrations = (
-        ("shadow", _expected_migration(), validate_shadow_intelligence_schema),
+        (
+            "shadow",
+            _expected_migration(),
+            lambda connection: validate_shadow_intelligence_schema(
+                connection,
+                require_triggers=False,
+            ),
+        ),
         (
             "horizon_protocol_v2",
             _expected_protocol_migration(),
-            validate_horizon_protocol_v2_schema,
+            lambda connection: validate_horizon_protocol_v2_schema(
+                connection,
+                require_triggers=False,
+            ),
         ),
         (
             "horizon_candidate_ledger_v3",
             _expected_candidate_ledger_migration(),
-            validate_horizon_candidate_ledger_schema,
+            lambda connection: validate_horizon_candidate_ledger_schema(
+                connection,
+                require_triggers=False,
+                require_isolated_server=False,
+            ),
         ),
     )
     results: dict[str, dict[str, Any]] = {}

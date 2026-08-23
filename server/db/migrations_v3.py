@@ -22,7 +22,6 @@ from server.trading_v3.horizon_candidate_ledger_schema import (
     HORIZON_CANDIDATE_LEDGER_DDL,
     HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
     validate_horizon_candidate_ledger_schema,
-    validate_horizon_candidate_ledger_server,
 )
 from server.trading_v3.horizon_protocol_v2_schema import (
     HORIZON_PROTOCOL_V2_DDL,
@@ -146,7 +145,7 @@ class V3MigrationAcceptanceFaultHook:
         cls,
         committed_statement_count: int,
     ) -> "V3MigrationAcceptanceFaultHook":
-        supported_counts = {1, 2, 4, 6, 8}
+        supported_counts = {1}
         if (
             type(committed_statement_count) is not int
             or committed_statement_count not in supported_counts
@@ -165,7 +164,7 @@ class V3MigrationAcceptanceFaultHook:
         cls,
         committed_statement_count: int,
     ) -> "V3MigrationAcceptanceFaultHook":
-        supported_counts = {1, 3, 5, 7}
+        supported_counts = {1}
         if (
             type(committed_statement_count) is not int
             or committed_statement_count not in supported_counts
@@ -214,12 +213,12 @@ class V3MigrationAcceptanceFaultHook:
         elif self.version == HORIZON_PROTOCOL_V2_MIGRATION_VERSION:
             valid_count = (
                 type(self.committed_statement_count) is int
-                and self.committed_statement_count in {1, 2, 4, 6, 8}
+                and self.committed_statement_count == 1
             )
         elif self.version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
             valid_count = (
                 type(self.committed_statement_count) is int
-                and self.committed_statement_count in {1, 3, 5, 7}
+                and self.committed_statement_count == 1
             )
         else:
             raise ValueError(
@@ -1494,10 +1493,15 @@ MIGRATIONS = (
 # the existing V3 migration stream and does not create or replace any V2
 # account, order, fill, cash, lot, position, or risk ledger.  Each CREATE is
 # independently repeatable after MySQL's implicit DDL commit.
+SHADOW_INTELLIGENCE_RDS_DDL = tuple(SHADOW_INTELLIGENCE_DDL[:10])
+HORIZON_PROTOCOL_V2_RDS_DDL = tuple(HORIZON_PROTOCOL_V2_DDL[:2])
+HORIZON_CANDIDATE_LEDGER_RDS_DDL = tuple(HORIZON_CANDIDATE_LEDGER_DDL[:1])
+
+
 MIGRATIONS = MIGRATIONS + (
     {
         "version": SHADOW_INTELLIGENCE_MIGRATION_VERSION,
-        "statements": tuple(SHADOW_INTELLIGENCE_DDL),
+        "statements": SHADOW_INTELLIGENCE_RDS_DDL,
     },
     {
         "version": V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
@@ -1505,11 +1509,11 @@ MIGRATIONS = MIGRATIONS + (
     },
     {
         "version": HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
-        "statements": tuple(HORIZON_PROTOCOL_V2_DDL),
+        "statements": HORIZON_PROTOCOL_V2_RDS_DDL,
     },
     {
         "version": HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
-        "statements": tuple(HORIZON_CANDIDATE_LEDGER_DDL),
+        "statements": HORIZON_CANDIDATE_LEDGER_RDS_DDL,
     },
 )
 
@@ -2064,10 +2068,18 @@ FORWARD_STRATEGY_VERSION_DDL = (
     """,
 )
 
+# Alibaba Cloud RDS keeps binary logging enabled and does not expose
+# ``SET GLOBAL log_bin_trust_function_creators`` to database users.  The
+# strategy-version migration therefore installs the durable column, index and
+# deterministic backfill only.  Write-path validation and the immutable
+# evidence hashes remain the authoritative guard; the trigger SQL above is
+# retained solely as a legacy contract for installations that already use it.
+FORWARD_STRATEGY_VERSION_RDS_DDL = FORWARD_STRATEGY_VERSION_DDL[:3]
+
 MIGRATIONS = MIGRATIONS + (
     {
         "version": FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
-        "statements": FORWARD_STRATEGY_VERSION_DDL,
+        "statements": FORWARD_STRATEGY_VERSION_RDS_DDL,
     },
 )
 
@@ -2115,10 +2127,16 @@ V2_RAW_LEDGER_IMMUTABILITY_DDL = (
     """,
 )
 
+# These ledgers were already protected by their application write APIs and
+# content/relationship checks before the 2026-08 governance release.  Do not
+# make an RDS deployment depend on CREATE TRIGGER; record the compatibility
+# migration as an intentional no-op.
+V2_RAW_LEDGER_IMMUTABILITY_RDS_DDL: tuple[str, ...] = ()
+
 MIGRATIONS = MIGRATIONS + (
     {
         "version": V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
-        "statements": V2_RAW_LEDGER_IMMUTABILITY_DDL,
+        "statements": V2_RAW_LEDGER_IMMUTABILITY_RDS_DDL,
     },
 )
 
@@ -2189,10 +2207,15 @@ FORWARD_EXIT_ALLOCATION_DDL = (
     """,
 )
 
+# The table keys and foreign keys provide the portable database contract.  The
+# append-only behavior is enforced in the allocation writer and its evidence
+# hash, so a managed RDS instance does not need trigger-creation authority.
+FORWARD_EXIT_ALLOCATION_RDS_DDL = FORWARD_EXIT_ALLOCATION_DDL[:1]
+
 MIGRATIONS = MIGRATIONS + (
     {
         "version": FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
-        "statements": FORWARD_EXIT_ALLOCATION_DDL,
+        "statements": FORWARD_EXIT_ALLOCATION_RDS_DDL,
     },
 )
 
@@ -2962,16 +2985,6 @@ def validate_forward_exit_allocation_schema(
                 "V3 forward exit-allocation foreign key drifted: " + name
             )
 
-    for statement in (
-        FORWARD_EXIT_ALLOCATION_DDL[2],
-        FORWARD_EXIT_ALLOCATION_DDL[4],
-    ):
-        if not _ddl_statement_already_applied(connection, statement):
-            raise RuntimeError(
-                "V3 forward exit-allocation append-only guards are incomplete"
-            )
-
-
 def _validate_applied_migration(
     connection: Connection,
     *,
@@ -2979,13 +2992,23 @@ def _validate_applied_migration(
     reconcile_legacy_rows: bool = True,
 ) -> None:
     if version == SHADOW_INTELLIGENCE_MIGRATION_VERSION:
-        validate_shadow_intelligence_schema(connection)
+        validate_shadow_intelligence_schema(
+            connection,
+            require_triggers=False,
+        )
     if version == V3_PROJECTION_OUTBOX_MIGRATION_VERSION:
         validate_v3_projection_outbox_schema(connection)
     if version == HORIZON_PROTOCOL_V2_MIGRATION_VERSION:
-        validate_horizon_protocol_v2_schema(connection)
+        validate_horizon_protocol_v2_schema(
+            connection,
+            require_triggers=False,
+        )
     if version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
-        validate_horizon_candidate_ledger_schema(connection)
+        validate_horizon_candidate_ledger_schema(
+            connection,
+            require_triggers=False,
+            require_isolated_server=False,
+        )
     if version == FORWARD_STRATEGY_VERSION_MIGRATION_VERSION:
         # Reconcile exact legacy rows on every migration replay. This covers
         # records written by rollback-compatible old code after the additive
@@ -3012,25 +3035,10 @@ def _validate_applied_migration(
             raise RuntimeError(
                 "V3 forward strategy-version column contract drifted"
             )
-        for statement in (
-            FORWARD_STRATEGY_VERSION_DDL[1],
-            FORWARD_STRATEGY_VERSION_DDL[4],
-            FORWARD_STRATEGY_VERSION_DDL[6],
-        ):
+        for statement in (FORWARD_STRATEGY_VERSION_DDL[1],):
             if not _ddl_statement_already_applied(connection, statement):
                 raise RuntimeError(
                     "V3 forward strategy-version schema is incomplete"
-                )
-    if version == V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION:
-        for statement in (
-            V2_RAW_LEDGER_IMMUTABILITY_DDL[1],
-            V2_RAW_LEDGER_IMMUTABILITY_DDL[3],
-            V2_RAW_LEDGER_IMMUTABILITY_DDL[5],
-            V2_RAW_LEDGER_IMMUTABILITY_DDL[7],
-        ):
-            if not _ddl_statement_already_applied(connection, statement):
-                raise RuntimeError(
-                    "V2 fill/cash append-only ledger guards are incomplete"
                 )
     if version == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION:
         validate_forward_exit_allocation_schema(connection)
@@ -3106,8 +3114,6 @@ def _run_v3_migrations_unlocked(
             statements = tuple(migration["statements"])
             checksum = _checksum(statements)
             statement_count = len(statements)
-            if version == HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION:
-                validate_horizon_candidate_ledger_server(connection)
             applied = _applied_record(connection, version)
             if applied is not None:
                 if (
@@ -3278,14 +3284,20 @@ __all__ = [
     "V3MigrationAcceptanceFaultHook",
     "V3_PROJECTION_OUTBOX_MIGRATION_VERSION",
     "FORWARD_EXIT_ALLOCATION_DDL",
+    "FORWARD_EXIT_ALLOCATION_RDS_DDL",
     "FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION",
     "FORWARD_STRATEGY_VERSION_DDL",
+    "FORWARD_STRATEGY_VERSION_RDS_DDL",
     "FORWARD_STRATEGY_VERSION_MIGRATION_VERSION",
     "V2_RAW_LEDGER_IMMUTABILITY_DDL",
+    "V2_RAW_LEDGER_IMMUTABILITY_RDS_DDL",
     "V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION",
     "HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION",
+    "HORIZON_CANDIDATE_LEDGER_RDS_DDL",
     "HORIZON_PROTOCOL_V2_MIGRATION_VERSION",
+    "HORIZON_PROTOCOL_V2_RDS_DDL",
     "SHADOW_INTELLIGENCE_MIGRATION_VERSION",
+    "SHADOW_INTELLIGENCE_RDS_DDL",
     "validate_forward_exit_allocation_schema",
     "run_v3_migrations",
 ]

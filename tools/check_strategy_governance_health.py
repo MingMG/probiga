@@ -43,6 +43,7 @@ METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS = {
         "58e40642ad1887fae025bacb964b2de6b90cd293ff25aa03c404eb1136911f77",
     ),
 }
+METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.clear()
 GOVERNANCE_TABLES = (
     "st_strategy_governance_schema_migration",
     "st_strategy_registry",
@@ -1195,7 +1196,7 @@ def _qmt_row_attestation_binding_check(
 def _qmt_attestation_frozen_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Independently require the frozen V2 proof tables and triggers."""
+    """Independently require the frozen V2 proof tables and indexes."""
 
     from tools.attest_qmt_daily_kline import (
         QmtAttestationSchemaError,
@@ -1233,82 +1234,32 @@ def _normalized_metric_input_trigger_body(value: Any) -> str:
 def _metric_input_review_trigger_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Require the exact one-way review and delete guards in production."""
+    """Compatibility report for application-level metric review enforcement."""
 
-    try:
-        rows = connection.execute(text(
-            "SELECT TRIGGER_NAME AS trigger_name, "
-            "ACTION_TIMING AS action_timing, "
-            "EVENT_MANIPULATION AS event_manipulation, "
-            "EVENT_OBJECT_TABLE AS event_object_table, "
-            "ACTION_ORIENTATION AS action_orientation, "
-            "ACTION_STATEMENT AS action_statement "
-            "FROM information_schema.TRIGGERS "
-            "WHERE TRIGGER_SCHEMA=DATABASE() "
-            "AND EVENT_OBJECT_TABLE='st_strategy_metric_input' "
-            "ORDER BY BINARY TRIGGER_NAME"
-        )).mappings().all()
-    except Exception as exc:
-        return False, {"errors": [f"{type(exc).__name__}: {exc}"]}
-    observed = {
-        str(row.get("trigger_name") or ""): dict(row) for row in rows
-    }
-    errors: list[str] = []
-    expected_names = set(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
-    if set(observed) != expected_names:
-        errors.append(
-            "metric input trigger inventory differs: expected="
-            f"{sorted(expected_names)!r}, observed={sorted(observed)!r}"
-        )
-    observed_hashes: dict[str, str] = {}
-    for trigger_name, expected in (
-        METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items()
-    ):
-        timing, event, table_name, body_hash = expected
-        row = observed.get(trigger_name, {})
-        normalized_body = _normalized_metric_input_trigger_body(
-            row.get("action_statement")
-        )
-        observed_hash = hashlib.sha256(
-            normalized_body.encode("utf-8")
-        ).hexdigest()
-        observed_hashes[trigger_name] = observed_hash
-        if (
-            str(row.get("action_timing") or "").upper() != timing
-            or str(row.get("event_manipulation") or "").upper() != event
-            or str(row.get("event_object_table") or "") != table_name
-            or str(row.get("action_orientation") or "").upper() != "ROW"
-            or observed_hash != body_hash
-            or not re.search(
-                r"\bsignal\s+sqlstate\s+'45000'", normalized_body
-            )
-        ):
-            errors.append(f"metric input trigger differs: {trigger_name}")
-    return not errors, {
+    del connection
+    return True, {
         "table": "st_strategy_metric_input",
-        "trigger_names": sorted(observed),
-        "trigger_count": len(observed),
-        "body_hashes": observed_hashes,
-        "errors": errors,
+        "trigger_names": [],
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "enforcement": "row_lock_state_machine_and_hash_bound_audit",
+        "errors": [],
     }
 
 
 def _governance_append_only_trigger_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Require the exact eight UPDATE/DELETE rejection guards."""
+    """Compatibility report for application-level append-only enforcement."""
 
-    from server.engine.strategy_governance import (
-        GovernanceAppendOnlySchemaError,
-        validate_governance_append_only_triggers,
-    )
-
-    try:
-        return True, validate_governance_append_only_triggers(connection)
-    except GovernanceAppendOnlySchemaError as exc:
-        return False, exc.detail
-    except Exception as exc:
-        return False, {"errors": [f"{type(exc).__name__}: {exc}"]}
+    del connection
+    return True, {
+        "trigger_names": [],
+        "trigger_count": 0,
+        "database_triggers_required": False,
+        "enforcement": "append_only_writers_unique_identity_and_hash_replay",
+        "errors": [],
+    }
 
 
 def _schema_checks(connection, add) -> tuple[set[str], bool]:
@@ -1493,16 +1444,13 @@ def _scheduler_checks(connection, existing: set[str], add) -> bool:
 def _forward_strategy_version_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Verify the exact additive V3 strategy-version migration contract."""
+    """Verify the trigger-free additive V3 strategy-version contract."""
 
     try:
         from server.db.migrations_v3 import (
-            FORWARD_STRATEGY_VERSION_DDL,
             FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
             MIGRATIONS,
             _checksum,
-            _CREATE_TRIGGER_RE,
-            _normalized_sql,
         )
 
         declared = [
@@ -1515,6 +1463,11 @@ def _forward_strategy_version_schema_check(
         statements = tuple(declared[0]["statements"])
         expected_checksum = _checksum(statements)
         expected_statement_count = len(statements)
+        declaration_valid = (
+            expected_statement_count == 3
+            and expected_checksum
+            == "1804a2d2c3473e98c1be77d03d324e61cb5cdb5682e7d87cf647841218b756e6"
+        )
         ledger_rows = _rows(
             connection,
             "SELECT version, checksum, statement_count "
@@ -1573,93 +1526,23 @@ def _forward_strategy_version_schema_check(
             and all(row.get("sub_part") is None for row in index_rows)
         )
 
-        expected_triggers: dict[str, tuple[str, str, str, str]] = {}
-        for statement in FORWARD_STRATEGY_VERSION_DDL:
-            match = _CREATE_TRIGGER_RE.match(str(statement))
-            if match is None:
-                continue
-            name, timing, event, table_name, body = match.groups()
-            expected_triggers[name] = (timing, event, table_name, body)
-        trigger_names = sorted(expected_triggers)
-        trigger_rows = _rows(
-            connection,
-            "SELECT TRIGGER_NAME AS trigger_name, "
-            "EVENT_OBJECT_TABLE AS event_object_table, "
-            "ACTION_TIMING AS action_timing, "
-            "EVENT_MANIPULATION AS event_manipulation, "
-            "ACTION_STATEMENT AS action_statement "
-            "FROM information_schema.triggers "
-            "WHERE trigger_schema=DATABASE() "
-            "AND event_object_table='st_forward_trade_evidence_v3'",
-        )
-        observed_triggers = {
-            str(row.get("trigger_name") or ""): row for row in trigger_rows
-        }
-        trigger_errors: list[str] = []
-        for name, (timing, event, table_name, body) in expected_triggers.items():
-            row = observed_triggers.get(name)
-            if row is None:
-                trigger_errors.append(f"missing trigger: {name}")
-                continue
-            if not (
-                str(row.get("event_object_table") or "").casefold()
-                == table_name.casefold()
-                and str(row.get("action_timing") or "").upper()
-                == timing.upper()
-                and str(row.get("event_manipulation") or "").upper()
-                == event.upper()
-                and _normalized_sql(row.get("action_statement"))
-                == _normalized_sql(body)
-            ):
-                trigger_errors.append(f"drifted trigger: {name}")
-        if set(observed_triggers) != set(expected_triggers):
-            trigger_errors.append("forward trigger inventory differs")
-        insert_body = _normalized_sql(
-            expected_triggers.get(
-                "trg_v3_forward_owner_required_bi", ("", "", "", "")
-            )[3]
-        )
-        update_body = _normalized_sql(
-            expected_triggers.get(
-                "trg_v3_forward_owner_immutable_bu", ("", "", "", "")
-            )[3]
-        )
-        legacy_empty_compatible = "new.strategy_version = '' or (" in insert_body
-        nonempty_relation_strict = all(
-            token in insert_body
-            for token in (
-                "binary new.strategy_version = binary concat(",
-                "$.primary_strategy_key",
-                "$.primary_strategy_version",
-                "json_valid(i.evidence_json)",
-            )
-        )
-        update_immutable = (
-            "binary new.strategy_version <> binary old.strategy_version"
-            in update_body
-        )
-        triggers_valid = (
-            len(expected_triggers) == 2
-            and not trigger_errors
-            and legacy_empty_compatible
-            and nonempty_relation_strict
-            and update_immutable
-        )
-        valid = ledger_valid and column_valid and index_valid and triggers_valid
+        valid = declaration_valid and ledger_valid and column_valid and index_valid
         return valid, {
             "migration_version": FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
             "expected_checksum": expected_checksum,
             "expected_statement_count": expected_statement_count,
+            "declaration_valid": declaration_valid,
             "ledger_rows": ledger_rows,
             "column": column,
             "index_columns": [
                 row.get("column_name") for row in index_rows
             ],
-            "trigger_names": trigger_names,
-            "trigger_errors": trigger_errors,
-            "legacy_empty_strategy_version_compatible": legacy_empty_compatible,
-            "nonempty_strategy_version_relation_strict": nonempty_relation_strict,
-            "strategy_version_update_immutable": update_immutable,
+            "database_triggers_required": False,
+            "database_trigger_inventory_checked": False,
+            "existing_database_triggers": "unmanaged_and_allowed",
+            "immutability_enforcement": (
+                "application_writer_relation_checks_and_evidence_hash_replay"
+            ),
         }
     except Exception as exc:
         return False, {
@@ -1888,16 +1771,13 @@ def _forward_strategy_version_data_check(
 def _v2_raw_ledger_immutability_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Verify the exact V3 migration freezing raw fill/cash facts."""
+    """Verify the RDS-safe raw-ledger application-integrity marker."""
 
     try:
         from server.db.migrations_v3 import (
             MIGRATIONS,
-            V2_RAW_LEDGER_IMMUTABILITY_DDL,
             V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
             _checksum,
-            _CREATE_TRIGGER_RE,
-            _normalized_sql,
         )
 
         declared = [
@@ -1911,6 +1791,11 @@ def _v2_raw_ledger_immutability_schema_check(
         statements = tuple(declared[0]["statements"])
         expected_checksum = _checksum(statements)
         expected_statement_count = len(statements)
+        declaration_valid = (
+            expected_statement_count == 0
+            and expected_checksum
+            == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
         ledger_rows = _rows(
             connection,
             "SELECT version, checksum, statement_count "
@@ -1926,57 +1811,20 @@ def _v2_raw_ledger_immutability_schema_check(
             and _integer(ledger_rows[0].get("statement_count"))
             == expected_statement_count
         )
-        expected_triggers: dict[str, tuple[str, str, str, str]] = {}
-        for statement in V2_RAW_LEDGER_IMMUTABILITY_DDL:
-            match = _CREATE_TRIGGER_RE.match(str(statement))
-            if match is None:
-                continue
-            name, timing, event, table_name, body = match.groups()
-            expected_triggers[name] = (timing, event, table_name, body)
-        trigger_rows = _rows(
-            connection,
-            "SELECT TRIGGER_NAME AS trigger_name, "
-            "EVENT_OBJECT_TABLE AS event_object_table, "
-            "ACTION_TIMING AS action_timing, "
-            "EVENT_MANIPULATION AS event_manipulation, "
-            "ACTION_STATEMENT AS action_statement "
-            "FROM information_schema.triggers "
-            "WHERE trigger_schema=DATABASE() "
-            "AND event_object_table IN ('st_fill_v2','st_cash_ledger_v2')",
-        )
-        observed = {
-            str(row.get("trigger_name") or ""): row for row in trigger_rows
-        }
-        errors: list[str] = []
-        for name, (timing, event, table_name, body) in expected_triggers.items():
-            row = observed.get(name)
-            if row is None:
-                errors.append(f"missing trigger: {name}")
-                continue
-            if not (
-                str(row.get("event_object_table") or "").casefold()
-                == table_name.casefold()
-                and str(row.get("action_timing") or "").upper()
-                == timing.upper()
-                and str(row.get("event_manipulation") or "").upper()
-                == event.upper()
-                and _normalized_sql(row.get("action_statement"))
-                == _normalized_sql(body)
-            ):
-                errors.append(f"drifted trigger: {name}")
-        if set(observed) != set(expected_triggers):
-            errors.append("raw-ledger trigger inventory differs")
-        triggers_valid = len(expected_triggers) == 4 and not errors
-        return ledger_valid and triggers_valid, {
+        return declaration_valid and ledger_valid, {
             "migration_version": (
                 V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION
             ),
             "expected_checksum": expected_checksum,
             "expected_statement_count": expected_statement_count,
+            "declaration_valid": declaration_valid,
             "ledger_rows": ledger_rows,
-            "expected_trigger_names": sorted(expected_triggers),
-            "observed_trigger_names": sorted(observed),
-            "trigger_errors": errors,
+            "database_triggers_required": False,
+            "database_trigger_inventory_checked": False,
+            "existing_database_triggers": "unmanaged_and_allowed",
+            "immutability_enforcement": (
+                "application_append_only_writers_and_accounting_evidence_hashes"
+            ),
         }
     except Exception as exc:
         return False, {"error": f"{type(exc).__name__}: {exc}"}
@@ -1985,22 +1833,19 @@ def _v2_raw_ledger_immutability_schema_check(
 def _forward_exit_allocation_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Verify the frozen 003 FIFO exit-allocation schema and ledger."""
+    """Verify the trigger-free 003 FIFO exit-allocation schema and ledger."""
 
     frozen_checksum = (
-        "deeff7acffcea37b535a25a3f00216b91b15ffb8c2d9bf8fa05db7426e32053a"
+        "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
-    frozen_statement_count = 5
+    frozen_statement_count = 1
     frozen_migration_count = 27
     errors: list[str] = []
     try:
         from server.db.migrations_v3 import (
-            FORWARD_EXIT_ALLOCATION_DDL,
             FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
             MIGRATIONS,
             _checksum,
-            _CREATE_TRIGGER_RE,
-            _normalized_sql,
         )
 
         declared = [
@@ -2261,49 +2106,6 @@ def _forward_exit_allocation_schema_check(
                     "forward exit-allocation foreign key differs: " + name
                 )
 
-        expected_triggers: dict[str, tuple[str, str, str, str]] = {}
-        for statement in statements:
-            match = _CREATE_TRIGGER_RE.match(str(statement))
-            if match is None:
-                continue
-            name, timing, event, table_name, body = match.groups()
-            expected_triggers[name] = (timing, event, table_name, body)
-        trigger_rows = _rows(
-            connection,
-            "SELECT TRIGGER_NAME AS trigger_name, "
-            "EVENT_OBJECT_TABLE AS event_object_table, "
-            "ACTION_TIMING AS action_timing, "
-            "EVENT_MANIPULATION AS event_manipulation, "
-            "ACTION_STATEMENT AS action_statement "
-            "FROM information_schema.triggers "
-            "WHERE trigger_schema=DATABASE() "
-            "AND event_object_table='st_forward_exit_allocation_v3'",
-        )
-        observed_triggers = {
-            str(row.get("trigger_name") or ""): row
-            for row in trigger_rows
-        }
-        if len(expected_triggers) != 2:
-            errors.append("003 declared trigger count differs")
-        if set(observed_triggers) != set(expected_triggers):
-            errors.append("forward exit-allocation trigger inventory differs")
-        for name, (timing, event, table_name, body) in (
-            expected_triggers.items()
-        ):
-            row = observed_triggers.get(name, {})
-            if not (
-                str(row.get("event_object_table") or "").casefold()
-                == table_name.casefold()
-                and str(row.get("action_timing") or "").upper()
-                == timing.upper()
-                and str(row.get("event_manipulation") or "").upper()
-                == event.upper()
-                and _normalized_sql(row.get("action_statement"))
-                == _normalized_sql(body)
-            ):
-                errors.append(
-                    "forward exit-allocation trigger differs: " + name
-                )
         return not errors, {
             "migration_version": (
                 FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION
@@ -2322,7 +2124,12 @@ def _forward_exit_allocation_schema_check(
             "column_count": len(columns),
             "index_names": sorted(observed_indexes),
             "foreign_key_names": sorted(observed_foreign_keys),
-            "trigger_names": sorted(observed_triggers),
+            "database_triggers_required": False,
+            "database_trigger_inventory_checked": False,
+            "existing_database_triggers": "unmanaged_and_allowed",
+            "immutability_enforcement": (
+                "application_fifo_writer_unique_keys_foreign_keys_and_hash_replay"
+            ),
             "errors": errors[:100],
         }
     except Exception as exc:
@@ -6574,20 +6381,20 @@ def collect_governance_health(
     with engine.connect() as connection:
         existing, schema_ok = _schema_checks(connection, add)
         scheduler_ok = _scheduler_checks(connection, existing, add)
-        metric_trigger_ok, metric_trigger_detail = (
+        metric_integrity_ok, metric_integrity_detail = (
             _metric_input_review_trigger_check(connection)
         )
         add(
-            "strategy_metric_input_review_triggers_frozen",
-            metric_trigger_ok,
-            metric_trigger_detail,
+            "strategy_metric_input_application_state_machine",
+            metric_integrity_ok,
+            metric_integrity_detail,
         )
-        schema_ok = schema_ok and metric_trigger_ok
+        schema_ok = schema_ok and metric_integrity_ok
         append_only_ok, append_only_detail = (
             _governance_append_only_trigger_check(connection)
         )
         add(
-            "governance_append_only_triggers_frozen",
+            "governance_append_only_application_integrity",
             append_only_ok,
             append_only_detail,
         )

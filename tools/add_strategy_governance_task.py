@@ -201,8 +201,8 @@ def main() -> int:
         "--schema-prepared",
         action="store_true",
         help=(
-            "只接受已由root部署迁移边界完整安装并验证的治理结构；"
-            "该模式绝不创建触发器"
+            "只读验证已提前安装的治理表、索引和迁移标记；"
+            "不传时由本部署工具自动执行RDS安全的无触发器结构准备"
         ),
     )
     args = parser.parse_args()
@@ -217,17 +217,6 @@ def main() -> int:
         args.disabled or args.snapshot_file or args.schema_prepared
     ):
         parser.error("snapshot-only modes cannot be combined with install options")
-    if (
-        os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
-        == "production"
-        and not any(read_or_restore_modes)
-        and not args.schema_prepared
-    ):
-        parser.error(
-            "production task installation requires --schema-prepared; "
-            "runtime schema DDL is forbidden"
-        )
-
     load_project_env()
     engine = create_tool_engine()
     try:
@@ -270,9 +259,9 @@ def main() -> int:
             _write_snapshot(Path(args.snapshot_file), existing_rows)
 
         from server.engine.strategy_governance import (
-            ensure_and_seed_governance,
-            validate_governance_append_only_triggers,
-            validate_metric_input_review_triggers,
+            ensure_strategy_governance_tables,
+            seed_governance_registry,
+            validate_prepared_governance_runtime,
         )
         from server.db.migrations_v3 import run_v3_migrations
         from tools.attest_qmt_daily_kline import (
@@ -293,34 +282,20 @@ def main() -> int:
                     "strategy governance schema was not prepared before cutover: "
                     + ", ".join(pending)
                 )
-            # The root deployment boundary already applied and fully validated
-            # these migrations while every writer was fenced. Reusing the
-            # read-only plan here removes any runtime-account CREATE TRIGGER
-            # path and closes a check/apply race during task installation.
+            # The deployment boundary already applied and fully validated the
+            # table/index migrations while every writer was fenced. Reusing
+            # the read-only plan here closes a check/apply race during task
+            # installation without requiring database triggers.
             migration_results = migration_plan
             qmt_attestation_schema = validate_attestation_schema(engine)
-            with engine.connect() as connection:
-                metric_trigger_schema = validate_metric_input_review_triggers(
-                    connection
-                )
-                seeded_strategy_count = int(connection.execute(text(
-                    "SELECT COUNT(*) FROM st_strategy_registry"
-                )).scalar() or 0)
-            append_only_schema = validate_governance_append_only_triggers(engine)
-            if seeded_strategy_count <= 0:
-                raise RuntimeError(
-                    "strategy governance seed registry is empty after preparation"
-                )
+            governance_schema = validate_prepared_governance_runtime(engine)
         else:
             migration_results = run_v3_migrations(engine)
             ensure_attestation_tables(engine)
             qmt_attestation_schema = validate_attestation_schema(engine)
-            ensure_and_seed_governance()
-            with engine.connect() as connection:
-                metric_trigger_schema = validate_metric_input_review_triggers(
-                    connection
-                )
-            append_only_schema = validate_governance_append_only_triggers(engine)
+            ensure_strategy_governance_tables(engine=engine)
+            seed_governance_registry()
+            governance_schema = validate_prepared_governance_runtime(engine)
         task = {**TASK, "enabled": 0 if args.disabled else 1}
         result = upsert_scheduler_task(
             engine,
@@ -350,10 +325,9 @@ def main() -> int:
                 ],
                 "snapshot_file": args.snapshot_file or None,
                 "qmt_attestation_schema": qmt_attestation_schema,
-                "governance_trigger_count": (
-                    int(metric_trigger_schema.get("trigger_count") or 0)
-                    + int(append_only_schema.get("trigger_count") or 0)
-                ),
+                "governance_trigger_count": 0,
+                "database_triggers_required": False,
+                "governance_schema": governance_schema,
                 "schema_prepared": bool(args.schema_prepared),
                 "result": result,
             },
