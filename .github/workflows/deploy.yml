@@ -40,7 +40,9 @@ jobs:
 
       - name: Install regression dependencies
         run: |
-          python -m pip install --upgrade pip
+          # adata uses setuptools' legacy backend; freeze the exact backend
+          # that both CI and the offline production build will execute.
+          python -m pip install --upgrade pip setuptools
           python -m pip install -r requirements-platform.txt
 
       - name: Scan tracked secrets after dependency installation
@@ -101,8 +103,8 @@ jobs:
             exit 2
           fi
           chmod -R a-w "$ADATA_SOURCE"
-          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/adata-wheel" \
-            "$ADATA_BUILD_SOURCE"
+          python -m pip wheel --no-deps --no-build-isolation --no-index \
+            --wheel-dir "$RUNNER_TEMP/adata-wheel" "$ADATA_BUILD_SOURCE"
           mapfile -t ADATA_WHEELS < <(find "$RUNNER_TEMP/adata-wheel" -maxdepth 1 \
             -type f -name '*.whl' -print)
           test "${#ADATA_WHEELS[@]}" -eq 1

@@ -226,14 +226,26 @@ def test_v2_engine_builds_and_verifies_an_isolated_runtime_wheelhouse() -> None:
         encoding="utf-8"
     )
     assert "Freeze the tested dependency set" in workflow
+    assert "python -m pip install --upgrade pip setuptools" in workflow
     assert "pip freeze --all --exclude-editable" in workflow
+    assert (
+        "python -m pip wheel --no-deps --no-build-isolation --no-index"
+        in _normalized_shell(workflow)
+    )
     assert "validate_ci_resolved_freeze" in engine
+    assert 'if "setuptools" not in normalized:' in engine
     assert "prepare_ci_resolved_wheelhouse" in engine
     assert "--only-binary=:all: --no-deps" in engine
     assert "PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1" in engine
     assert "SOURCE=ci-resolved-freeze-v1" in engine
     assert "--no-index --only-binary=:all:" in engine
     assert 'cmp --silent "$RESOLVED_LOCK"' in engine
+    assert (
+        '"$EXPECTED_BUILD/bin/python" -I -m pip wheel --no-deps '
+        "--no-build-isolation --no-index"
+        in _normalized_shell(engine)
+    )
+    assert 'sudo -u "$BUILD_USER" test ! -w "$EXPECTED_BUILD"' in engine
     assert '"$venv_path/bin/python" -I -m pip check' in engine
 
 

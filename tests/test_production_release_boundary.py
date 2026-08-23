@@ -606,7 +606,7 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         'git --git-dir="$CODE_GIT_CACHE" worktree add',
         '-m venv "$EXPECTED_BUILD"',
         'clean_root_pip "$EXPECTED_BUILD/bin/python" install ',
-        '"$BOOTSTRAP_PYTHON" -I -m pip wheel --no-deps ',
+        '"$EXPECTED_BUILD/bin/python" -I -m pip wheel --no-deps ',
         "tools/validate_production_release_boundary.py",
         "tools/ensure_quality_gate.py --validate-review-delivery",
         'release_identity_check 1 "$CODE_VALIDATION_ROOT"',

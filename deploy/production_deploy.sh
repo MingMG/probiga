@@ -4205,6 +4205,8 @@ for line in lines:
     normalized.append(re.sub(r"[-_.]+", "-", name).lower())
 if len(normalized) != len(set(normalized)):
     raise SystemExit(2)
+if "setuptools" not in normalized:
+    raise SystemExit(2)
 PY
 }
 
@@ -4515,6 +4517,8 @@ prepare_release_venv() {
         --require-hashes --no-index --only-binary=:all: \
         --find-links "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" --quiet
     fi
+    sudo -u "$BUILD_USER" test -x "$EXPECTED_BUILD/bin/python"
+    sudo -u "$BUILD_USER" test ! -w "$EXPECTED_BUILD"
     ADATA_BUILD_SOURCE="$(mktemp -d \
       /var/lib/probiga/release-artifacts/.adata-source.XXXXXX)"
     ADATA_WHEEL_DIR="$(mktemp -d \
@@ -4522,12 +4526,15 @@ prepare_release_venv() {
     git --git-dir="$ADATA_GIT_CACHE" archive "$EXPECTED_ADATA_SHA" \
       | tar -xf - -C "$ADATA_BUILD_SOURCE"
     chown -R "$BUILD_USER:$BUILD_USER" "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"
+    # Build with the backend version carried by the CI-resolved freeze.  The
+    # bootstrap interpreter intentionally has no mutable build packages.
     sudo -u "$BUILD_USER" /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       HOME=/var/empty LANG=C.UTF-8 LC_ALL=C.UTF-8 \
       PIP_CONFIG_FILE=/dev/null PIP_DISABLE_PIP_VERSION_CHECK=1 \
       PIP_NO_INPUT=1 PIP_NO_CACHE_DIR=1 PYTHONNOUSERSITE=1 \
-      "$BOOTSTRAP_PYTHON" -I -m pip wheel --no-deps --no-build-isolation \
+      "$EXPECTED_BUILD/bin/python" -I -m pip wheel --no-deps \
+        --no-build-isolation --no-index \
         --wheel-dir "$ADATA_WHEEL_DIR" "$ADATA_BUILD_SOURCE" --quiet
     mapfile -t adata_wheels < <(find "$ADATA_WHEEL_DIR" -maxdepth 1 \
       -type f -name '*.whl' -print)
