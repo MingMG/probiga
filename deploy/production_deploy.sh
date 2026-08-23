@@ -5180,6 +5180,90 @@ run_prepared_python_tool() {
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$@"
   )
 }
+prepared_governance_snapshot() {
+  local action="$1"
+  local entrypoint="$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"
+  local snapshot="$2"
+  case "$action" in
+    restore|verify) ;;
+    *)
+      echo "prepared_governance_snapshot invalid_action" >&2
+      return 1
+      ;;
+  esac
+  if [ "$PREPARED_CODE_ROOT" != "$CODE_RELEASE_ROOT/$EXPECTED_SHA" ]; then
+    echo "prepared_governance_snapshot invalid_code_root" >&2
+    return 1
+  fi
+  if [ ! -d "$PREPARED_CODE_ROOT" ] || [ -L "$PREPARED_CODE_ROOT" ]; then
+    echo "prepared_governance_snapshot invalid_code_tree" >&2
+    return 1
+  fi
+  if [ ! -f "$entrypoint" ] || [ -L "$entrypoint" ]; then
+    echo "prepared_governance_snapshot invalid_entrypoint" >&2
+    return 1
+  fi
+  if [ "$(stat -c '%U:%G' "$entrypoint")" != root:root ]; then
+    echo "prepared_governance_snapshot invalid_entrypoint_owner" >&2
+    return 1
+  fi
+  if ! sudo -u "$SERVICE_USER" test ! -w "$entrypoint"; then
+    echo "prepared_governance_snapshot entrypoint_write_check_failed" >&2
+    return 1
+  fi
+  case "$snapshot" in
+    "$GOVERNANCE_TASK_OLD_SOURCE")
+      if [ "$action" != verify ]; then
+        echo "prepared_governance_snapshot source_restore_rejected" >&2
+        return 1
+      fi
+      ;;
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT")
+      if ! controlled_guard_assert_file \
+        "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || \
+        [ "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" != \
+          "$(sha256sum "$snapshot" | cut -d' ' -f1)" ]; then
+        echo "prepared_governance_snapshot invalid_old_seal" >&2
+        return 1
+      fi
+      ;;
+    "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
+      if [ "$action" != verify ]; then
+        echo "prepared_governance_snapshot new_restore_rejected" >&2
+        return 1
+      fi
+      if ! activation_snapshot_validate_governance_new; then
+        echo "prepared_governance_snapshot invalid_new_seal" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "prepared_governance_snapshot invalid_snapshot" >&2
+      return 1
+      ;;
+  esac
+  if ! controlled_guard_assert_file "$snapshot" 600 || \
+    [ ! -s "$snapshot" ]; then
+    echo "prepared_governance_snapshot invalid_snapshot_file" >&2
+    return 1
+  fi
+  if ! run_prepared_python_tool "$entrypoint" \
+    "--${action}-snapshot" - < "$snapshot"; then
+    echo "prepared_governance_snapshot ${action}_failed" >&2
+    return 1
+  fi
+  return 0
+}
+prepared_restore_and_verify_governance_snapshot() {
+  # The scheduler row is normally unchanged.  Verify first so rollback avoids
+  # an unnecessary write, then restore the exact sealed state only on mismatch.
+  if prepared_governance_snapshot verify "$1" >/dev/null 2>&1; then
+    return 0
+  fi
+  prepared_governance_snapshot restore "$1" || return 1
+  prepared_governance_snapshot verify "$1" || return 1
+  return 0
+}
 run_prepared_database_migration_tool() {
   local entrypoint="$1"
   shift
@@ -5355,8 +5439,8 @@ rollback() {
       if [ ! -s "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
         rollback_failure "strategy governance task snapshot is missing"
         restoration_ready=0
-      elif ! controlled_guard_restore_and_verify_governance_snapshot \
-        "$EXPECTED_SHA" "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
+      elif ! prepared_restore_and_verify_governance_snapshot \
+        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
         rollback_failure "restore previous strategy governance task"
         restoration_ready=0
       fi
@@ -5696,6 +5780,11 @@ run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
   --capture-snapshot "$GOVERNANCE_TASK_OLD_SOURCE"
 test -s "$GOVERNANCE_TASK_OLD_SOURCE"
+chown root:root "$GOVERNANCE_TASK_OLD_SOURCE"
+chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
+controlled_guard_assert_file "$GOVERNANCE_TASK_OLD_SOURCE" 600
+CUTOVER_STEP=preflight_strategy_governance_rollback_channel
+prepared_governance_snapshot verify "$GOVERNANCE_TASK_OLD_SOURCE"
 
 # CUTOVER: persist the exact pre-cutover activation journal before the first
 # stop/disable.  A completed journal is always present before any writer state
@@ -5872,8 +5961,7 @@ run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
   --capture-snapshot "$GOVERNANCE_TASK_NEW_SOURCE"
 activation_snapshot_install_governance_new "$GOVERNANCE_TASK_NEW_SOURCE"
-controlled_guard_governance_snapshot verify "$EXPECTED_SHA" \
-  "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+prepared_governance_snapshot verify "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
 declare -a GOVERNANCE_HEALTH_ARGS=(
   --compact
   --expected-build-sha "$EXPECTED_SHA"

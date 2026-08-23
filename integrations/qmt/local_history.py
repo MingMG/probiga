@@ -24,6 +24,23 @@ CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
 LOCAL_KLINE_TABLE = "qmt_local_stock_kline"
 LOCAL_MINUTE_TABLE = "qmt_local_stock_minute"
 LOCAL_RUN_TABLE = "qmt_local_backfill_run"
+_IDENTITY_QUERY_KEYS = frozenset(
+    {
+        "database",
+        "db",
+        "host",
+        "init_command",
+        "named_pipe",
+        "passwd",
+        "password",
+        "port",
+        "read_default_file",
+        "read_default_group",
+        "unix_socket",
+        "user",
+        "username",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -98,18 +115,29 @@ def _normalize_date(value: str | date | datetime) -> str:
     return str(value or "").strip()[:10]
 
 
+def _dialect_family(drivername: str) -> str:
+    dialect = (drivername or "").split("+", 1)[0].lower()
+    return "mysql" if dialect in {"mysql", "mariadb"} else dialect
+
+
+def _has_identity_query_overrides(raw_url: str) -> bool:
+    if not raw_url:
+        return False
+    query_keys = {str(key).lower() for key in make_url(raw_url).query}
+    return bool(query_keys & _IDENTITY_QUERY_KEYS)
+
+
 def _same_database(url_a: str, url_b: str) -> bool:
     if not url_a or not url_b:
         return False
     a = make_url(url_a)
     b = make_url(url_b)
     return (
-        (a.drivername or "").split("+", 1)[0] == (b.drivername or "").split("+", 1)[0]
+        _dialect_family(a.drivername) == _dialect_family(b.drivername)
         and (a.host or "localhost").lower() in {(b.host or "localhost").lower(), "localhost", "127.0.0.1"}
         and (b.host or "localhost").lower() in {(a.host or "localhost").lower(), "localhost", "127.0.0.1"}
         and int(a.port or 3306) == int(b.port or 3306)
         and (a.database or "") == (b.database or "")
-        and (a.username or "") == (b.username or "")
     )
 
 
@@ -125,24 +153,63 @@ def _same_server_and_user(url_a: str, url_b: str) -> bool:
         localhost_aliases
     )
     return (
-        (a.drivername or "").split("+", 1)[0]
-        == (b.drivername or "").split("+", 1)[0]
+        _dialect_family(a.drivername) == _dialect_family(b.drivername)
         and hosts_match
         and int(a.port or 3306) == int(b.port or 3306)
         and (a.username or "") == (b.username or "")
     )
 
 
+def _dedicated_tunnel_history_url(base_url: str) -> str:
+    """Derive the dedicated history schema only for the production tunnel."""
+    if not base_url:
+        return ""
+    parsed = make_url(base_url)
+    if (
+        (parsed.drivername or "").lower() != "mysql+pymysql"
+        or (parsed.host or "").lower() not in {"localhost", "127.0.0.1"}
+        or (parsed.database or "") != "probiga"
+        or _has_identity_query_overrides(base_url)
+    ):
+        return ""
+    return parsed.set(database="probiga_qmt_history").render_as_string(
+        hide_password=False
+    )
+
+
 def get_local_history_engine(local_url: str | None = None) -> Engine:
     prod = get_mysql_url(required=False)
+    if prod and _has_identity_query_overrides(prod):
+        raise RuntimeError(
+            "生产 MYSQL_URL 含数据库身份覆盖参数，QMT 历史库已拒绝执行"
+        )
+
     try:
         resolved = (local_url or get_qmt_history_mysql_url(required=True)).strip()
     except RuntimeError:
-        prod_url = make_url(prod) if prod else None
-        if prod_url and (prod_url.host or "localhost").lower() in {"localhost", "127.0.0.1"}:
-            resolved = prod_url.set(database="probiga_qmt_history").render_as_string(hide_password=False)
-        else:
+        resolved = _dedicated_tunnel_history_url(prod)
+        if not resolved:
             raise
+    if make_url(resolved).drivername.lower() != "mysql+pymysql":
+        raise RuntimeError("QMT 历史库仅允许显式 mysql+pymysql URL")
+    if _has_identity_query_overrides(resolved):
+        raise RuntimeError(
+            "QMT 历史库 URL 含数据库身份覆盖参数，已拒绝执行"
+        )
+    if prod and _same_database(resolved, prod):
+        # The production API reaches RDS through a fixed local tunnel.  A
+        # legacy environment may therefore point QMT_HISTORY_MYSQL_URL at the
+        # primary schema by mistake.  Route that one local-tunnel case to the
+        # dedicated, read-only history schema; never reinterpret a remote URL.
+        prod_history = _dedicated_tunnel_history_url(prod)
+        resolved_history = _dedicated_tunnel_history_url(resolved)
+        if not prod_history or not resolved_history:
+            raise RuntimeError(
+                "QMT 历史本地库配置与生产 MYSQL_URL 相同，已拒绝执行"
+            )
+        # Derive from the explicitly configured history URL so a dedicated
+        # history identity and all connection parameters remain intact.
+        resolved = resolved_history
     if prod and _same_database(resolved, prod):
         raise RuntimeError("QMT 历史本地库配置与生产 MYSQL_URL 相同，已拒绝执行")
     return create_engine(resolved, pool_pre_ping=True, future=True)

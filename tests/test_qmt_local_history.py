@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from integrations.qmt.local_history import (
     LOCAL_KLINE_TABLE,
     LOCAL_MINUTE_TABLE,
     _data_version,
+    _dedicated_tunnel_history_url,
+    _has_identity_query_overrides,
     _normalize_date,
     _same_database,
+    get_local_history_engine,
 )
 from tools.backfill_guojin_qmt_local_history import _resolve_limits
 
@@ -29,6 +34,232 @@ def test_same_database_allows_different_local_history_database():
     local = "mysql+pymysql://root:pass@127.0.0.1:3306/probiga_qmt_history?charset=utf8mb4"
 
     assert _same_database(local, prod) is False
+
+
+def test_same_database_rejects_same_schema_even_with_different_user():
+    prod = "mysql+pymysql://runtime:pass@127.0.0.1:3306/probiga"
+    local = "mysql+pymysql://history:pass@localhost:3306/probiga"
+
+    assert _same_database(local, prod) is True
+
+
+def test_same_database_normalizes_mysql_and_mariadb_dialects():
+    prod = "mysql+pymysql://runtime:pass@127.0.0.1:3306/probiga"
+    local = "mariadb+pymysql://history:pass@localhost:3306/probiga"
+
+    assert _same_database(local, prod) is True
+
+
+def test_equal_local_tunnel_config_routes_to_dedicated_history_schema(
+    monkeypatch,
+):
+    prod = (
+        "mysql+pymysql://runtime:secret@127.0.0.1:13306/"
+        "probiga?charset=utf8mb4"
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: prod,
+    )
+
+    engine = get_local_history_engine()
+    try:
+        assert engine.url.database == "probiga_qmt_history"
+        assert engine.url.host == "127.0.0.1"
+        assert engine.url.port == 13306
+        assert engine.url.username == "runtime"
+        assert engine.url.password == "secret"
+    finally:
+        engine.dispose()
+
+
+def test_equal_local_tunnel_config_preserves_explicit_history_identity(
+    monkeypatch,
+):
+    prod = "mysql+pymysql://runtime:primary@127.0.0.1:13306/probiga"
+    history = (
+        "mysql+pymysql://history:dedicated@localhost:13306/"
+        "probiga?charset=utf8mb4"
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: history,
+    )
+
+    engine = get_local_history_engine()
+    try:
+        assert engine.url.database == "probiga_qmt_history"
+        assert engine.url.host == "localhost"
+        assert engine.url.port == 13306
+        assert engine.url.username == "history"
+        assert engine.url.password == "dedicated"
+        assert engine.url.query["charset"] == "utf8mb4"
+    finally:
+        engine.dispose()
+
+
+def test_missing_history_config_derives_exact_loopback_history_schema(
+    monkeypatch,
+):
+    prod = "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+
+    def missing_history_url(required=True):
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        missing_history_url,
+    )
+
+    engine = get_local_history_engine()
+    try:
+        assert engine.url.database == "probiga_qmt_history"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "mysql+pymysql://runtime:secret@/probiga",
+        "mysql+pymysql://runtime:secret@[::1]:13306/probiga",
+        "mysql+pymysql://runtime:secret@127.0.0.1:13306/other",
+        "postgresql://runtime:secret@127.0.0.1:13306/probiga",
+        "mysql+pyodbc://runtime:secret@127.0.0.1:13306/probiga",
+    ],
+)
+def test_dedicated_tunnel_history_url_fails_closed_outside_exact_contract(
+    base_url,
+):
+    assert _dedicated_tunnel_history_url(base_url) == ""
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "database=probiga",
+        "host=db.example",
+        "port=3306",
+        "unix_socket=%2Ftmp%2Fmysql.sock",
+        "init_command=USE%20probiga",
+        "read_default_file=%2Ftmp%2Fmysql.cnf",
+        "named_pipe=1",
+    ],
+)
+def test_database_identity_query_overrides_are_rejected(monkeypatch, query):
+    prod = "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+    history = (
+        "mysql+pymysql://history:secret@127.0.0.1:13306/"
+        f"probiga_qmt_history?{query}"
+    )
+    assert _has_identity_query_overrides(history) is True
+    assert _dedicated_tunnel_history_url(f"{prod}?{query}") == ""
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: history,
+    )
+
+    with pytest.raises(RuntimeError, match="身份覆盖参数"):
+        get_local_history_engine()
+
+
+def test_non_pymysql_history_driver_is_rejected(monkeypatch):
+    prod = "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+    history = (
+        "mysql+pyodbc://history:secret@127.0.0.1:13306/"
+        "probiga_qmt_history?odbc_connect=hidden"
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: history,
+    )
+
+    with pytest.raises(RuntimeError, match=r"mysql\+pymysql"):
+        get_local_history_engine()
+
+
+def test_safe_connection_query_parameters_are_preserved(monkeypatch):
+    prod = "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+    history = (
+        "mysql+pymysql://history:secret@127.0.0.1:13306/"
+        "probiga_qmt_history?charset=utf8mb4&connect_timeout=10"
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: history,
+    )
+
+    engine = get_local_history_engine()
+    try:
+        assert engine.url.query["charset"] == "utf8mb4"
+        assert engine.url.query["connect_timeout"] == "10"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "same_database_url",
+    [
+        "mysql+pymysql://runtime:secret@/probiga",
+        "mysql+pymysql://runtime:secret@[::1]:13306/probiga",
+        "mysql+pymysql://runtime:secret@127.0.0.1:13306/other",
+        "postgresql://runtime:secret@127.0.0.1:13306/probiga",
+    ],
+)
+def test_equal_non_contract_database_config_remains_blocked(
+    monkeypatch,
+    same_database_url,
+):
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: same_database_url,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: same_database_url,
+    )
+
+    with pytest.raises(RuntimeError):
+        get_local_history_engine()
+
+
+def test_equal_remote_production_config_remains_blocked(monkeypatch):
+    prod = "mysql+pymysql://runtime:secret@db.example:3306/probiga"
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        lambda required=True: prod,
+    )
+
+    with pytest.raises(RuntimeError, match="相同"):
+        get_local_history_engine()
 
 
 def test_normalize_date_accepts_compact_and_datetime_values():

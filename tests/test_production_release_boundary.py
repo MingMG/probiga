@@ -1021,7 +1021,8 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     assert "restore previous probiga drop-in" in rollback
     assert "restore previous AI recommendation worker drop-in" in rollback
     assert "restore previous strategy governance task" in rollback
-    assert "controlled_guard_restore_and_verify_governance_snapshot" in rollback
+    assert "prepared_restore_and_verify_governance_snapshot" in rollback
+    assert "controlled_guard_restore_and_verify_governance_snapshot" not in rollback
     assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in rollback
     assert "point Nginx static assets at previous code release" in rollback
     assert 'write_receipt "ROLLED_BACK"' in rollback
@@ -2950,12 +2951,44 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
 
     cutover = _normalized_shell(deploy[deploy.index("CUTOVER_STEP=prepare_release"):])
     old_capture = cutover.index("CUTOVER_STEP=capture_strategy_governance_task_before_cutover")
+    old_seal = cutover.index(
+        'chown root:root "$GOVERNANCE_TASK_OLD_SOURCE"', old_capture
+    )
+    rollback_preflight = cutover.index(
+        "CUTOVER_STEP=preflight_strategy_governance_rollback_channel",
+        old_seal,
+    )
+    rollback_preflight_verify = cutover.index(
+        'prepared_governance_snapshot verify "$GOVERNANCE_TASK_OLD_SOURCE"',
+        rollback_preflight,
+    )
     journal = cutover.index("CUTOVER_STEP=persist_database_writer_restore_journal")
+    cutover_started = cutover.index("CUTOVER_STARTED=1", journal)
+    first_writer_stop = cutover.index("CUTOVER_STEP=stop_auxiliary_writers", cutover_started)
     new_enable = cutover.index("CUTOVER_STEP=enable_strategy_governance_task")
     new_capture = cutover.index("CUTOVER_STEP=capture_strategy_governance_task_after_enable")
     new_seal = cutover.index("activation_snapshot_install_governance_new", new_capture)
-    new_verify = cutover.index("controlled_guard_governance_snapshot verify", new_seal)
-    assert old_capture < journal < new_enable < new_capture < new_seal < new_verify
+    new_verify = cutover.index("prepared_governance_snapshot verify", new_seal)
+    assert (
+        old_capture
+        < old_seal
+        < rollback_preflight
+        < rollback_preflight_verify
+        < journal
+        < cutover_started
+        < first_writer_stop
+        < new_enable
+        < new_capture
+        < new_seal
+        < new_verify
+    )
+    assert 'chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"' in cutover[
+        old_seal:rollback_preflight
+    ]
+    assert (
+        'controlled_guard_assert_file "$GOVERNANCE_TASK_OLD_SOURCE" 600'
+        in cutover[old_seal:rollback_preflight]
+    )
 
     old_restore = bodies["controlled_guard_restore_and_finalize"]
     assert old_restore.index(
@@ -2989,6 +3022,40 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     )
     assert initial_verify < restore < final_verify
     assert "return 0" in restore_and_verify[initial_verify:restore]
+
+    prepared_handoff = bodies["prepared_governance_snapshot"]
+    assert "restore|verify" in prepared_handoff
+    assert "source_restore_rejected" in prepared_handoff
+    assert "new_restore_rejected" in prepared_handoff
+    assert '"$GOVERNANCE_TASK_OLD_SOURCE"' in prepared_handoff
+    assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in prepared_handoff
+    assert '"$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"' in prepared_handoff
+    assert 'controlled_guard_assert_file "$snapshot" 600' in prepared_handoff
+    assert '[ -L "$PREPARED_CODE_ROOT" ]' in prepared_handoff
+    assert '[ -L "$entrypoint" ]' in prepared_handoff
+    assert 'test ! -w "$entrypoint"' in prepared_handoff
+    assert '"--${action}-snapshot" - < "$snapshot"' in prepared_handoff
+    assert 'run_prepared_python_tool "$entrypoint"' in prepared_handoff
+    prepared_restore = bodies[
+        "prepared_restore_and_verify_governance_snapshot"
+    ]
+    initial_prepared_verify = prepared_restore.index(
+        "prepared_governance_snapshot verify"
+    )
+    prepared_restore_call = prepared_restore.index(
+        "prepared_governance_snapshot restore", initial_prepared_verify
+    )
+    final_prepared_verify = prepared_restore.index(
+        "prepared_governance_snapshot verify", prepared_restore_call
+    )
+    assert (
+        initial_prepared_verify
+        < prepared_restore_call
+        < final_prepared_verify
+    )
+    assert "return 0" in prepared_restore[
+        initial_prepared_verify:prepared_restore_call
+    ]
 
     recovery = bodies["controlled_activation_snapshot_only_recovery"]
     old_branch = recovery[: recovery.index("activation_snapshot_restore_new_set")]
