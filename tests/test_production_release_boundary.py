@@ -253,8 +253,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "prune_release_temp_files" in deploy_script
     assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'path_is_runtime_referenced "$build_real"' in deploy_script
-    assert "timeout-minutes: 80" in workflow
-    assert "command_timeout: 75m" in workflow
+    assert "timeout-minutes: 165" in workflow
+    assert "command_timeout: 150m" in workflow
     assert "probiga.deploy-receipt.v4" in workflow
     assert '"expected_input_lock_sha256":"%s"' in workflow
     assert '"previous_input_lock_sha256":"%s"' in workflow
@@ -452,8 +452,8 @@ def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
     assert "workflow_dispatch:" not in workflow
     assert "recover_database_guard:" not in workflow
     assert "environment: production" in workflow
-    assert "timeout-minutes: 80" in workflow
-    assert "command_timeout: 75m" in workflow
+    assert "timeout-minutes: 165" in workflow
+    assert "command_timeout: 150m" in workflow
     assert "--recover-database-guard" not in normalized
     assert "v2 production deploy broker cannot authorize recovery" in engine
     assert workflow.count("python tools/scan_tracked_secrets.py") == 2
@@ -3055,6 +3055,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     ]
     venv_seal = bodies["controlled_guard_assert_immutable_venv_tree"]
     verifier = bodies["controlled_guard_verify_restored_runtime"]
+    gate_deadline = bodies["controlled_guard_run_gate_with_deadline"]
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
     assert (
@@ -3281,6 +3282,15 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     )
     quality_gate = verifier.index("ensure_quality_gate.py", governance_health)
     assert runtime_health < rollback_gate < governance_health < quality_gate
+    assert verifier.count(
+        "controlled_guard_run_gate_with_deadline "
+        '"$CONTROLLED_DATABASE_GATE_TIMEOUT"'
+    ) == 2
+    assert "/usr/bin/timeout --signal=TERM" in gate_deadline
+    assert '"--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER"' in gate_deadline
+    assert "--foreground" not in gate_deadline
+    assert "CONTROLLED_DATABASE_GATE_TIMEOUT=30m" in normalized
+    assert "CONTROLLED_DATABASE_GATE_KILL_AFTER=30s" in normalized
 
     service_user = normalized.index('test "$SERVICE_USER" != root')
     caller = normalized.index(
@@ -3306,6 +3316,92 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "ACTIVATION_UNIT_SNAPSHOT_PHASE" in caller_block
     assert "old-runtime-verified" in caller_block
     assert "controlled_v2_rollback_only_recovery" in caller_block
+    assert "if ! controlled_v2_rollback_only_recovery" not in caller_block
+    assert "exec 7>&2" in caller_block
+    assert "v2_recovery_failure" in caller_block
+
+    forward_choice = recovery.rindex(
+        "controlled_v2_forward_preserve_no_receipt_recovery"
+    )
+    old_governance_choice = recovery.index(
+        'controlled_guard_governance_snapshot verify "$guarded_sha" '
+        '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"',
+        forward_choice,
+    )
+    assert forward_choice < old_governance_choice
+    assert "activation_snapshot_assert_new_set" not in recovery[
+        recovery.rfind('if { [ "$phase" = runtime-units-installed ]', 0, forward_choice) :
+        forward_choice
+    ]
+
+
+def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy).items()
+    }
+    preserve = bodies["controlled_v2_forward_preserve_no_receipt_recovery"]
+    removal = bodies[
+        "activation_snapshot_remove_new_runtime_preserved_no_receipt"
+    ]
+    fenced_verify = preserve.index(
+        'controlled_guard_verify_restored_runtime "$fenced_main_record"'
+    )
+    full_gate = preserve.index('"$fenced_ai_timer_record" full', fenced_verify)
+    refence_on_gate_failure = preserve.index(
+        "controlled_guard_refence_after_restore_failure", full_gate
+    )
+    failure_return = preserve.index("return 1", refence_on_gate_failure)
+    boundary_recheck = preserve.index(
+        "controlled_guard_assert_boundary", full_gate
+    )
+    cleanup = preserve.index("controlled_guard_cleanup", boundary_recheck)
+    runtime_verify = preserve.index(
+        'controlled_guard_verify_restored_runtime "$forward_main_record"',
+        cleanup,
+    )
+    rollback_only = preserve.index(
+        '"$ai_timer_record" rollback-only', runtime_verify
+    )
+    live_governance = preserve.index(
+        "controlled_guard_governance_snapshot verify", rollback_only
+    )
+    commit = preserve.index(
+        "new-runtime-preserved-no-receipt", live_governance
+    )
+    remove_restore = preserve.index(
+        'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"', commit
+    )
+    retire = preserve.index(
+        "activation_snapshot_remove_new_runtime_preserved_no_receipt",
+        remove_restore,
+    )
+    assert (
+        fenced_verify
+        < full_gate
+        < boundary_recheck
+        < refence_on_gate_failure
+        < failure_return
+        < cleanup
+        < runtime_verify
+        < rollback_only
+        < live_governance
+        < commit
+        < remove_restore
+        < retire
+    )
+
+    atomic_retire = removal.index("activation_snapshot_retire_verified_transaction")
+    for path in (
+        "$DATABASE_WRITER_GUARD_FILE",
+        "$DATABASE_WRITER_RESTORE_FILE",
+    ):
+        assert f'test ! -e "{path}"' in removal[:atomic_retire]
+        assert f'test ! -L "{path}"' in removal[:atomic_retire]
+    assert "publish_deployed_receipt_pending" not in removal
 
 
 def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:

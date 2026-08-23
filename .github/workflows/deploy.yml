@@ -237,7 +237,9 @@ jobs:
           vars.PRODUCTION_DEPLOY_ENABLED == 'true' &&
           needs.trading-v4-ci-gate.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    # An interrupted release is fully re-attested before the requested release
+    # runs its own gates. Keep a 15-minute runner margin over the SSH command.
+    timeout-minutes: 165
     environment: production
     concurrency:
       group: probiga-production-deploy
@@ -296,7 +298,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
-          command_timeout: 75m
+          command_timeout: 150m
           envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64,EXPECTED_REQUIREMENTS_SHA256,EXPECTED_ADATA_SHA,EXPECTED_ADATA_TREE_SHA256
           script: |
             set -Eeuo pipefail

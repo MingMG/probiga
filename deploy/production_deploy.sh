@@ -175,6 +175,13 @@ ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pendi
 ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pending.sha256"
 V2_FORWARD_FINALIZED_SHA=""
 V2_FORWARD_FINALIZED_REQUEST_MATCH=0
+V2_RECOVERY_STEP=not-started
+# A completed production health scan has taken about 21 minutes.  Bound each
+# direct database gate at 30 minutes so a wedged query cannot leave every
+# writer fenced forever, while preserving measured headroom for a healthy run.
+CONTROLLED_DATABASE_GATE_TIMEOUT=30m
+CONTROLLED_DATABASE_GATE_KILL_AFTER=30s
+readonly CONTROLLED_DATABASE_GATE_TIMEOUT CONTROLLED_DATABASE_GATE_KILL_AFTER
 ACTIVATION_RELEASE_IDENTITY="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity"
 ACTIVATION_RELEASE_IDENTITY_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity.sha256"
 RECEIPT_DIR=/var/lib/probiga/deploy-receipts
@@ -359,6 +366,13 @@ valid = (
 raise SystemExit(0 if valid else 2)
 PY
 }
+activation_snapshot_assert_pending_receipt_absent() {
+  test ! -e "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test ! -L "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test ! -e "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+  test ! -L "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+  return 0
+}
 activation_snapshot_receipt_matches_current_v2_request() {
   local expected_release="$1"
   activation_snapshot_validate_receipt_pending "$expected_release" || return 1
@@ -537,6 +551,7 @@ activation_snapshot_phase() {
   case "$phase" in
     prepared|runtime-units-installing|runtime-units-installed|\
     restoring-old|old-set-restored|old-runtime-verified|\
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt|\
     new-runtime-verified|finalized) ;;
     *) return 1 ;;
   esac
@@ -549,11 +564,17 @@ activation_snapshot_set_phase() {
   case "$next_phase" in
     prepared|runtime-units-installing|runtime-units-installed|\
     restoring-old|old-set-restored|old-runtime-verified|\
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt|\
     new-runtime-verified|finalized) ;;
     *) return 1 ;;
   esac
   activation_snapshot_validate "$expected_release" >/dev/null || return 1
   case "$next_phase" in
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt)
+      activation_snapshot_validate_new "$expected_release" || return 1
+      activation_snapshot_validate_governance_new || return 1
+      activation_snapshot_assert_pending_receipt_absent || return 1
+      ;;
     new-runtime-verified|finalized)
       activation_snapshot_validate_governance_new || return 1
       activation_snapshot_validate_receipt_pending "$expected_release" || return 1
@@ -631,6 +652,11 @@ activation_snapshot_validate() {
   activation_snapshot_phase_unchecked >/dev/null || return 1
   phase="$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" || return 1
   case "$phase" in
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt)
+      activation_snapshot_validate_new "$expected_release" || return 1
+      activation_snapshot_validate_governance_new || return 1
+      activation_snapshot_assert_pending_receipt_absent || return 1
+      ;;
     new-runtime-verified|finalized)
       activation_snapshot_validate_governance_new || return 1
       activation_snapshot_validate_receipt_pending "$expected_release" || return 1
@@ -644,6 +670,7 @@ activation_snapshot_phase_unchecked() {
   case "$phase" in
     prepared|runtime-units-installing|runtime-units-installed|\
     restoring-old|old-set-restored|old-runtime-verified|\
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt|\
     new-runtime-verified|finalized) return 0 ;;
     *) return 1 ;;
   esac
@@ -656,7 +683,8 @@ activation_snapshot_committed_phase_for_release() {
   test "$recorded_release" = "$expected_release" || return 1
   phase="$(activation_snapshot_phase)" || return 1
   case "$phase" in
-    old-runtime-verified|new-runtime-verified|finalized) ;;
+    old-runtime-verified|new-runtime-preserved-no-receipt|\
+    new-runtime-verified|finalized) ;;
     *) return 1 ;;
   esac
   printf '%s\n' "$phase"
@@ -733,6 +761,25 @@ activation_snapshot_remove_old_runtime_verified() {
   phase="$(activation_snapshot_phase)" || return 1
   test "$phase" = old-runtime-verified || return 1
   activation_snapshot_assert_old_set "$recorded_release" || return 1
+  activation_snapshot_retire_verified_transaction || return 1
+  test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  return 0
+}
+activation_snapshot_remove_new_runtime_preserved_no_receipt() {
+  local recorded_release
+  local phase
+  recorded_release="$(activation_snapshot_recorded_release)" || return 1
+  activation_snapshot_validate_new "$recorded_release" || return 1
+  activation_snapshot_validate_governance_new || return 1
+  activation_snapshot_assert_pending_receipt_absent || return 1
+  phase="$(activation_snapshot_phase)" || return 1
+  test "$phase" = new-runtime-preserved-no-receipt || return 1
+  activation_snapshot_assert_new_set "$recorded_release" || return 1
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
   activation_snapshot_retire_verified_transaction || return 1
   test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
   test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
@@ -1654,6 +1701,19 @@ controlled_guard_restore_previous_writer_states() {
   fi
   return 0
 }
+controlled_guard_run_gate_with_deadline() {
+  local deadline="$1"
+  shift
+  [[ "$deadline" =~ ^[1-9][0-9]*[smh]$ ]] || return 1
+  [[ "$CONTROLLED_DATABASE_GATE_KILL_AFTER" =~ ^[1-9][0-9]*[smh]$ ]] || \
+    return 1
+  test "$#" -gt 0 || return 1
+  test -x /usr/bin/timeout || return 1
+  # GNU timeout's default process-group mode is intentional: after TERM and the
+  # grace period, KILL must cover sudo and every Python/DB descendant.
+  /usr/bin/timeout --signal=TERM \
+    "--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER" "$deadline" "$@"
+}
 controlled_guard_verify_restored_runtime() {
   local main_record="$1"
   local scheduler_record="$2"
@@ -1862,7 +1922,9 @@ controlled_guard_verify_restored_runtime() {
     # the default full verification below.
     return 0
   fi
-  sudo -u "$service_user" /usr/bin/env -i \
+  controlled_guard_run_gate_with_deadline \
+    "$CONTROLLED_DATABASE_GATE_TIMEOUT" \
+    /usr/bin/sudo -u "$service_user" /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
@@ -1875,7 +1937,9 @@ controlled_guard_verify_restored_runtime() {
     "PYTHONPATH=$adata_source:$code_root" "$python_path" -P \
     "$code_root/tools/check_strategy_governance_health.py" --compact \
     --expected-build-sha "$expected_sha" || return 1
-  sudo -u "$service_user" /usr/bin/env -i \
+  controlled_guard_run_gate_with_deadline \
+    "$CONTROLLED_DATABASE_GATE_TIMEOUT" \
+    /usr/bin/sudo -u "$service_user" /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
@@ -2418,6 +2482,283 @@ activation_snapshot_allows_missing_guard_for_recovery() {
     *) return 1 ;;
   esac
 }
+controlled_v2_forward_preserve_no_receipt_recovery() {
+  local guarded_sha
+  local old_runtime_sha
+  local phase
+  local main_record
+  local scheduler_record
+  local forward_main_record
+  local forward_scheduler_record=loaded,active,enabled
+  local fenced_main_record=loaded,inactive,disabled
+  local fenced_scheduler_record=loaded,inactive,disabled
+  local fenced_ai_service_record
+  local fenced_ai_timer_record
+  local ai_service_load ai_service_active ai_service_unit_file
+  local ai_timer_load ai_timer_active ai_timer_unit_file
+  local ai_service_record
+  local ai_timer_record
+  local main_load main_active main_unit_file
+  local scheduler_load scheduler_active scheduler_unit_file
+  local fence_status=0
+  local -a state_lines=()
+  V2_RECOVERY_STEP=forward-validate-request
+  case "$DEPLOY_OPERATION:$DEPLOY_ARTIFACT_MODE" in
+    deploy:ci-resolved-freeze-v1)
+      [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+      ;;
+    recover-database-guard:static-wheel-lock-v2) ;;
+    *) return 1 ;;
+  esac
+  V2_RECOVERY_STEP=forward-validate-transaction
+  guarded_sha="$(activation_snapshot_recorded_release)" || return 1
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  old_runtime_sha="$(activation_snapshot_old_release "$guarded_sha")" || \
+    return 1
+  [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$old_runtime_sha" != "$guarded_sha" || return 1
+  phase="$(activation_snapshot_phase)" || return 1
+  case "$phase" in
+    runtime-units-installed|restoring-old|restoring-new-no-receipt|\
+    new-runtime-preserved-no-receipt) ;;
+    *) return 1 ;;
+  esac
+  activation_snapshot_validate_new "$guarded_sha" || return 1
+  activation_snapshot_validate_governance_new || return 1
+  activation_snapshot_assert_pending_receipt_absent || return 1
+  controlled_guard_assert_governance_restore_runtime "$guarded_sha" || return 1
+  controlled_guard_assert_directory || return 1
+  controlled_guard_assert_file "$ACTIVATION_UNIT_SNAPSHOT_STATE" 600 || \
+    return 1
+  mapfile -t state_lines < "$ACTIVATION_UNIT_SNAPSHOT_STATE" || return 1
+  test "${#state_lines[@]}" -eq 6 || return 1
+  test "${state_lines[0]}" = probiga.database-writer-restore.v1 || return 1
+  test "${state_lines[1]}" = "release=$guarded_sha" || return 1
+  case "${state_lines[2]}" in
+    main_unit=*) main_record="${state_lines[2]#main_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[3]}" in
+    scheduler_unit=*) scheduler_record="${state_lines[3]#scheduler_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[4]}" in
+    ai_service_unit=*) ai_service_record="${state_lines[4]#ai_service_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[5]}" in
+    ai_timer_unit=*) ai_timer_record="${state_lines[5]#ai_timer_unit=}" ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_state_record main "$main_record" || return 1
+  controlled_guard_assert_state_record scheduler "$scheduler_record" || return 1
+  controlled_guard_assert_state_record ai-service "$ai_service_record" || return 1
+  controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
+  IFS=, read -r main_load main_active main_unit_file <<< "$main_record" || \
+    return 1
+  IFS=, read -r scheduler_load scheduler_active scheduler_unit_file \
+    <<< "$scheduler_record" || return 1
+  test "$main_load" = loaded || return 1
+  case "$main_active" in active|inactive) ;; *) return 1 ;; esac
+  case "$main_unit_file" in enabled|disabled) ;; *) return 1 ;; esac
+  forward_main_record="loaded,active,$main_unit_file"
+  test "$scheduler_load" = loaded || return 1
+  case "$scheduler_active" in active|inactive) ;; *) return 1 ;; esac
+  case "$scheduler_unit_file" in enabled|disabled) ;; *) return 1 ;; esac
+  IFS=, read -r ai_service_load ai_service_active ai_service_unit_file \
+    <<< "$ai_service_record" || return 1
+  IFS=, read -r ai_timer_load ai_timer_active ai_timer_unit_file \
+    <<< "$ai_timer_record" || return 1
+  case "$ai_service_load" in
+    loaded)
+      case "$ai_service_unit_file" in
+        static) fenced_ai_service_record=loaded,inactive,static ;;
+        enabled|disabled) fenced_ai_service_record=loaded,inactive,disabled ;;
+        *) return 1 ;;
+      esac
+      ;;
+    not-found) fenced_ai_service_record=not-found,not-found,not-found ;;
+    *) return 1 ;;
+  esac
+  case "$ai_timer_load" in
+    loaded) fenced_ai_timer_record=loaded,inactive,disabled ;;
+    not-found) fenced_ai_timer_record=not-found,not-found,not-found ;;
+    *) return 1 ;;
+  esac
+
+  if [ "$phase" = new-runtime-preserved-no-receipt ]; then
+    # This phase is the durable commit point.  Never fence or stop a runtime
+    # which was already fully re-attested; only revalidate it and finish the
+    # atomic journal retirement after an interrupted cleanup.
+    V2_RECOVERY_STEP=forward-commit-revalidate
+    test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+    test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+    if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+      [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
+        "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+        return 1
+    fi
+    activation_snapshot_assert_new_set "$guarded_sha" || return 1
+    controlled_guard_assert_dropin_contract loaded \
+      "${ai_service_record%%,*}" "${ai_timer_record%%,*}" || return 1
+    controlled_guard_verify_restored_runtime "$forward_main_record" \
+      "$forward_scheduler_record" "$guarded_sha" "$ai_service_record" \
+      "$ai_timer_record" rollback-only || return 1
+    controlled_guard_governance_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+    activation_snapshot_assert_pending_receipt_absent || return 1
+    if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+      [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      V2_RECOVERY_STEP=forward-commit-remove-restore
+      rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
+      sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
+      test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+      test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
+    fi
+    V2_RECOVERY_STEP=forward-commit-retire
+    activation_snapshot_remove_new_runtime_preserved_no_receipt || return 1
+    echo "v2 recovery finalized preserved runtime $guarded_sha without receipt" \
+      >&2
+    V2_RECOVERY_STEP=complete
+    return 0
+  fi
+
+  V2_RECOVERY_STEP=forward-validate-restore-journal
+  controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
+    [ -L "$DATABASE_WRITER_GUARD_FILE" ]; then
+    controlled_guard_assert_marker "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  else
+    controlled_guard_recreate_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  fi
+  V2_RECOVERY_STEP=forward-fence
+  controlled_guard_install_dropins || fence_status=$?
+  if [ "$fence_status" -eq 0 ]; then
+    systemctl daemon-reload || fence_status=$?
+  fi
+  if [ "$fence_status" -eq 0 ]; then
+    controlled_guard_force_all_writers_fenced "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+      fence_status=$?
+  fi
+  if [ "$fence_status" -eq 0 ]; then
+    controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+      fence_status=$?
+  fi
+  if [ "$fence_status" -ne 0 ]; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  if [ "$phase" = runtime-units-installed ] || [ "$phase" = restoring-old ]; then
+    V2_RECOVERY_STEP=forward-probe-governance
+    if ! controlled_guard_governance_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" >/dev/null 2>&1 || \
+      ! activation_snapshot_set_phase "$guarded_sha" \
+        restoring-new-no-receipt; then
+      controlled_guard_refence_after_restore_failure "$guarded_sha" \
+        "$main_record" "$scheduler_record" "$ai_service_record" \
+        "$ai_timer_record" || true
+      return 1
+    fi
+  fi
+  V2_RECOVERY_STEP=forward-restore-units
+  if ! activation_snapshot_restore_new_set "$guarded_sha" || \
+    ! systemctl daemon-reload || \
+    ! activation_snapshot_assert_new_set "$guarded_sha" || \
+    ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-verify-governance-fenced
+  if ! controlled_guard_governance_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-verify-gates-fenced
+  if ! controlled_guard_verify_restored_runtime "$fenced_main_record" \
+      "$fenced_scheduler_record" "$guarded_sha" \
+      "$fenced_ai_service_record" "$fenced_ai_timer_record" full || \
+    ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-remove-fence
+  if ! controlled_guard_cleanup "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-verify-runtime
+  # The full governance and quality gates passed while every writer remained
+  # fenced above.  Start the exact forward processes only now, then verify their
+  # PID/environment/command line and both HTTP boundaries without repeating the
+  # long database scans.  A committed cleanup retry follows the same rule.
+  if ! controlled_guard_verify_restored_runtime "$forward_main_record" \
+      "$forward_scheduler_record" "$guarded_sha" "$ai_service_record" \
+      "$ai_timer_record" rollback-only || \
+    ! controlled_guard_governance_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
+    ! activation_snapshot_assert_pending_receipt_absent; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-commit-phase
+  if ! activation_snapshot_set_phase "$guarded_sha" \
+      new-runtime-preserved-no-receipt; then
+    # The phase rename is the logical commit and precedes its fsync checks.  If
+    # one of those checks reports a fault after the rename, revalidate the exact
+    # committed state and preserve the online runtime instead of re-fencing it.
+    if ! activation_snapshot_validate "$guarded_sha" >/dev/null || \
+      [ "$(activation_snapshot_phase)" != \
+        new-runtime-preserved-no-receipt ]; then
+      controlled_guard_refence_after_restore_failure "$guarded_sha" \
+        "$main_record" "$scheduler_record" "$ai_service_record" \
+        "$ai_timer_record" || true
+      return 1
+    fi
+  fi
+  # The phase above is the durable commit.  Cleanup faults from this point must
+  # preserve the fully verified forward runtime online for the next read-mostly
+  # retry and must never enter the rollback/refence path.
+  V2_RECOVERY_STEP=forward-remove-restore
+  if ! rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || \
+    ! sync -f "$DATABASE_WRITER_GUARD_DIR" || \
+    [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-retire
+  activation_snapshot_remove_new_runtime_preserved_no_receipt || return 1
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  echo "v2 recovery preserved verified runtime $guarded_sha without receipt" >&2
+  V2_RECOVERY_STEP=complete
+  return 0
+}
 controlled_v2_rollback_only_recovery() {
   local guarded_sha
   local old_runtime_sha
@@ -2429,9 +2770,11 @@ controlled_v2_rollback_only_recovery() {
   local fence_status=0
   local restore_forward_governance=0
   local -a state_lines=()
+  V2_RECOVERY_STEP=rollback-validate-request
   test "$DEPLOY_OPERATION" = deploy || return 1
   test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
   [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  V2_RECOVERY_STEP=rollback-validate-transaction
   guarded_sha="$(activation_snapshot_recorded_release)" || return 1
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   old_runtime_sha="$(activation_snapshot_old_release "$guarded_sha")" || \
@@ -2439,6 +2782,12 @@ controlled_v2_rollback_only_recovery() {
   [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   test "$old_runtime_sha" != "$guarded_sha" || return 1
   phase="$(activation_snapshot_phase)" || return 1
+  case "$phase" in
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt)
+      controlled_v2_forward_preserve_no_receipt_recovery || return 1
+      return 0
+      ;;
+  esac
   case "$phase" in
     prepared|runtime-units-installing|runtime-units-installed|\
     restoring-old|old-set-restored|old-runtime-verified) ;;
@@ -2453,6 +2802,7 @@ controlled_v2_rollback_only_recovery() {
       # an exact OLD match before recovery is allowed to continue.
       if [ -e "$RELEASE_VENV_ROOT/$guarded_sha" ] || \
         [ -L "$RELEASE_VENV_ROOT/$guarded_sha" ]; then
+        V2_RECOVERY_STEP=rollback-validate-forward-runtime
         controlled_guard_assert_governance_restore_runtime "$guarded_sha" || \
           return 1
         restore_forward_governance=1
@@ -2484,6 +2834,7 @@ controlled_v2_rollback_only_recovery() {
   esac
   activation_snapshot_validate_rollback_receipt_state \
     "$guarded_sha" "$phase" || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-state
   controlled_guard_assert_directory || return 1
   controlled_guard_assert_file "$ACTIVATION_UNIT_SNAPSHOT_STATE" 600 || \
     return 1
@@ -2568,6 +2919,7 @@ controlled_v2_rollback_only_recovery() {
   # Reapply the complete fence even when a prior interrupted attempt already
   # recreated the marker.  Marker creation, drop-in loading and writer stops
   # are separate durable steps, so this sequence must itself be idempotent.
+  V2_RECOVERY_STEP=rollback-fence
   controlled_guard_install_dropins || fence_status=$?
   if [ "$fence_status" -eq 0 ]; then
     systemctl daemon-reload || fence_status=$?
@@ -2588,14 +2940,39 @@ controlled_v2_rollback_only_recovery() {
       "$ai_service_record" "$ai_timer_record" || true
     return 1
   fi
-  if [ "$restore_forward_governance" -eq 1 ] && \
-    ! controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
-      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
-    controlled_guard_refence_after_restore_failure \
-      "$guarded_sha" "$main_record" "$scheduler_record" \
-      "$ai_service_record" "$ai_timer_record" || true
-    return 1
+  if { [ "$phase" = runtime-units-installed ] || \
+      [ "$phase" = restoring-old ]; } && \
+    activation_snapshot_assert_pending_receipt_absent && \
+    activation_snapshot_validate_new "$guarded_sha" && \
+    controlled_guard_assert_governance_restore_runtime "$guarded_sha" && \
+    controlled_guard_governance_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" >/dev/null 2>&1; then
+    # Prefer the exact sealed forward state even when OLD and NEW governance
+    # happen to be identical.  The durable phase proves that forward unit
+    # installation began, while this probe proves the live database is exactly
+    # the captured NEW state.  The dedicated recovery restores any partially
+    # changed unit set before re-attesting the runtime.
+    V2_RECOVERY_STEP=forward-preserve
+    controlled_v2_forward_preserve_no_receipt_recovery || return 1
+    return 0
   fi
+  if [ "$restore_forward_governance" -eq 1 ]; then
+    V2_RECOVERY_STEP=rollback-probe-old-governance
+    if controlled_guard_governance_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" >/dev/null 2>&1; then
+      :
+    else
+      V2_RECOVERY_STEP=rollback-restore-old-governance
+      if ! controlled_guard_restore_and_verify_governance_snapshot \
+          "$guarded_sha" "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
+        controlled_guard_refence_after_restore_failure \
+          "$guarded_sha" "$main_record" "$scheduler_record" \
+          "$ai_service_record" "$ai_timer_record" || true
+        return 1
+      fi
+    fi
+  fi
+  V2_RECOVERY_STEP=rollback-restore-old-units
   if ! activation_snapshot_restore_old_set "$guarded_sha" || \
     ! systemctl daemon-reload || \
     ! activation_snapshot_assert_old_set "$guarded_sha" || \
@@ -2610,6 +2987,7 @@ controlled_v2_rollback_only_recovery() {
   # sealed old runtime with the guarded release's read-only capture tool and
   # require an exact match; any governance drift remains fenced for explicit
   # recovery instead of depending on the removed forward venv or writing here.
+  V2_RECOVERY_STEP=rollback-verify-old-governance
   if ! controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
       "$old_runtime_sha" || \
     ! controlled_guard_cleanup "$guarded_sha" "$main_record" \
@@ -2619,17 +2997,28 @@ controlled_v2_rollback_only_recovery() {
       "$ai_service_record" "$ai_timer_record" || true
     return 1
   fi
+  V2_RECOVERY_STEP=rollback-verify-old-runtime
   if ! controlled_guard_restore_previous_writer_states "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
     ! controlled_guard_verify_restored_runtime "$main_record" \
       "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \
-      "$ai_timer_record" rollback-only || \
-    ! activation_snapshot_set_phase "$guarded_sha" old-runtime-verified; then
+      "$ai_timer_record" rollback-only; then
     controlled_guard_refence_after_restore_failure \
       "$guarded_sha" "$main_record" "$scheduler_record" \
       "$ai_service_record" "$ai_timer_record" || true
     return 1
   fi
+  V2_RECOVERY_STEP=rollback-commit-phase
+  if ! activation_snapshot_set_phase "$guarded_sha" old-runtime-verified; then
+    if ! activation_snapshot_validate "$guarded_sha" >/dev/null || \
+      [ "$(activation_snapshot_phase)" != old-runtime-verified ]; then
+      controlled_guard_refence_after_restore_failure \
+        "$guarded_sha" "$main_record" "$scheduler_record" \
+        "$ai_service_record" "$ai_timer_record" || true
+      return 1
+    fi
+  fi
+  V2_RECOVERY_STEP=rollback-retire
   if ! rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || \
     ! sync -f "$DATABASE_WRITER_GUARD_DIR" || \
     [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
@@ -2646,6 +3035,7 @@ controlled_v2_rollback_only_recovery() {
   test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
   test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
   echo "v2 rollback-only recovery restored sealed runtime $old_runtime_sha" >&2
+  V2_RECOVERY_STEP=complete
   return 0
 }
 controlled_v2_forward_finalize_recovery() {
@@ -3183,7 +3573,8 @@ controlled_activation_snapshot_only_recovery() {
     return 1
   phase="$(activation_snapshot_phase)" || return 1
   case "$phase" in
-    old-runtime-verified|new-runtime-verified|finalized) ;;
+    old-runtime-verified|new-runtime-preserved-no-receipt|\
+    new-runtime-verified|finalized) ;;
     *) return 1 ;;
   esac
   test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
@@ -3206,6 +3597,28 @@ controlled_activation_snapshot_only_recovery() {
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
     controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  fi
+  if [ "$phase" = new-runtime-preserved-no-receipt ]; then
+    activation_snapshot_validate_governance_new || return 1
+    activation_snapshot_assert_pending_receipt_absent || return 1
+    activation_snapshot_assert_new_set "$guarded_sha" || return 1
+    IFS=, read -r _main_load main_active main_unit_file <<< "$main_record" || \
+      return 1
+    case "$main_unit_file" in enabled|disabled) ;; *) return 1 ;; esac
+    controlled_guard_assert_dropin_contract loaded \
+      "${ai_service_record%%,*}" "${ai_timer_record%%,*}" || return 1
+    controlled_guard_verify_restored_runtime \
+      "loaded,active,$main_unit_file" loaded,active,enabled "$guarded_sha" \
+      "$ai_service_record" "$ai_timer_record" rollback-only || return 1
+    controlled_guard_governance_snapshot verify "$guarded_sha" \
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+    if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+      [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
+      sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
+    fi
+    activation_snapshot_remove_new_runtime_preserved_no_receipt || return 1
+    return 0
   fi
   if [ "$phase" = old-runtime-verified ]; then
     activation_snapshot_restore_old_set "$guarded_sha" || return 1
@@ -3275,8 +3688,16 @@ controlled_activation_snapshot_only_recovery() {
 }
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
   if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
+    { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+        restoring-new-no-receipt ] || \
+      [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+        new-runtime-preserved-no-receipt ]; }; then
+    controlled_v2_forward_preserve_no_receipt_recovery
+  elif [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
     [ ! -e "$DATABASE_WRITER_GUARD_FILE" ] && \
     { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ] || \
+      [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+        new-runtime-preserved-no-receipt ] || \
       [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = new-runtime-verified ] || \
       [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = finalized ]; }; then
     controlled_activation_snapshot_only_recovery
@@ -3438,6 +3859,12 @@ precutover_failure() {
   write_receipt "PREFLIGHT_FAILED" "$PREVIOUS_SHA" || true
   exit "$failed_status"
 }
+v2_recovery_failure() {
+  local failed_status="$1"
+  local failed_line="$2"
+  printf 'v2 recovery failed step=%s\n' "${V2_RECOVERY_STEP:-unknown}" >&7 || true
+  precutover_failure "$failed_status" "$failed_line"
+}
 trap 'precutover_failure "$?" "$LINENO"' ERR
 trap 'precutover_failure 143 "$LINENO"' TERM
 trap 'precutover_failure 130 "$LINENO"' INT
@@ -3474,13 +3901,26 @@ if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ] || \
     { [ -f "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
       [ ! -L "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
-      [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ]; }; }; then
+      { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+          restoring-new-no-receipt ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+          new-runtime-preserved-no-receipt ]; }; }; }; then
   CUTOVER_STEP=v2_rollback_only_recovery
   # This bounded recovery owns a durable journal and must converge after the
   # caller disconnects.  Do not let transport signals interrupt it between
   # fencing and old-runtime verification; ERR still fails closed.
   trap '' TERM INT HUP
+  V2_RECOVERY_STEP=dispatch
+  # Keep the recovery call out of an if/!/|| condition: Bash disables errexit
+  # throughout every nested helper in those contexts.  A dedicated descriptor
+  # preserves one sanitized checkpoint while ordinary recovery output remains
+  # detached from a transport which may close at any time.
+  exec 7>&2
+  trap 'v2_recovery_failure "$?" "$LINENO"' ERR
   controlled_v2_rollback_only_recovery >/dev/null 2>&1
+  exec 7>&-
+  trap 'precutover_failure "$?" "$LINENO"' ERR
   trap 'precutover_failure 143 "$LINENO"' TERM
   trap 'precutover_failure 130 "$LINENO"' INT
   trap 'precutover_failure 129 "$LINENO"' HUP

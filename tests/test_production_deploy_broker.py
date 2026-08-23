@@ -218,6 +218,42 @@ def test_broker_binds_release_tree_registry_seal_and_snapshot_identity() -> None
     ).hexdigest()
 
 
+def test_broker_validates_and_routes_no_receipt_forward_recovery_phases() -> None:
+    broker = (ROOT / "deploy" / "production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    snapshot = _shell_function_body(broker, "activation_snapshot_release")
+    assert "restoring-new-no-receipt" in snapshot
+    assert "new-runtime-preserved-no-receipt" in snapshot
+    phase_enum = snapshot.index("restoring-new-no-receipt")
+    no_receipt_start = snapshot.index("restoring-new-no-receipt", phase_enum + 1)
+    no_receipt = snapshot[
+        no_receipt_start : snapshot.index(
+            "new-runtime-verified|finalized", no_receipt_start
+        )
+    ]
+    assert "ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" in no_receipt
+    assert "ACTIVATION_GOVERNANCE_NEW_SHA" in no_receipt
+    assert "ACTIVATION_RECEIPT_PENDING" in no_receipt
+    assert "ACTIVATION_RECEIPT_PENDING_SHA" in no_receipt
+    assert "test ! -e" in no_receipt
+    assert "test ! -L" in no_receipt
+
+    recovery = broker[broker.index('if [ "$BROKER_OPERATION" = recover-database-guard ]'):]
+    snapshot_only_start = recovery.index(
+        'SNAPSHOT_RECOVERY_PHASE="$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")"'
+    )
+    snapshot_only = recovery[
+        snapshot_only_start : recovery.index(
+            "RECOVERY_STATE_COUNT=$((RECOVERY_STATE_COUNT + 1))",
+            snapshot_only_start,
+        )
+    ]
+    assert "new-runtime-preserved-no-receipt" in snapshot_only
+    assert "restoring-new-no-receipt" in snapshot_only
+    assert "intermediate forward recovery requires a restore journal" in snapshot_only
+
+
 def test_v2_engine_builds_and_verifies_an_isolated_runtime_wheelhouse() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"

@@ -404,6 +404,7 @@ activation_snapshot_release() {
   case "$phase" in
     prepared|runtime-units-installing|runtime-units-installed|\
     restoring-old|old-set-restored|old-runtime-verified|\
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt|\
     new-runtime-verified|finalized) ;;
     *) fail "activation transaction phase is invalid" ;;
   esac
@@ -417,6 +418,25 @@ activation_snapshot_release() {
     "$(sha256sum "$ACTIVATION_RELEASE_IDENTITY" | cut -d' ' -f1)" || \
     fail "activation release identity digest differs"
   case "$phase" in
+    restoring-new-no-receipt|new-runtime-preserved-no-receipt)
+      for path in "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" \
+        "$ACTIVATION_GOVERNANCE_NEW_SHA"; do
+        test -f "$path" || fail "preserved activation metadata is missing"
+        test ! -L "$path" || fail "preserved activation metadata is a symlink"
+        test "$(stat -c '%U:%G' "$path")" = root:root || \
+          fail "preserved activation metadata owner differs"
+        test "$(stat -c '%a' "$path")" = 600 || \
+          fail "preserved activation metadata mode differs"
+      done
+      test "$(<"$ACTIVATION_GOVERNANCE_NEW_SHA")" = \
+        "$(sha256sum "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" | cut -d' ' -f1)" || \
+        fail "activation new governance snapshot digest differs"
+      for path in "$ACTIVATION_RECEIPT_PENDING" \
+        "$ACTIVATION_RECEIPT_PENDING_SHA"; do
+        test ! -e "$path" || fail "no-receipt activation contains a receipt"
+        test ! -L "$path" || fail "no-receipt activation receipt is a symlink"
+      done
+      ;;
     new-runtime-verified|finalized)
       for path in "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" \
         "$ACTIVATION_GOVERNANCE_NEW_SHA" "$ACTIVATION_RECEIPT_PENDING" \
@@ -593,7 +613,19 @@ if [ "$BROKER_OPERATION" = recover-database-guard ]; then
     elif [ -z "$RECORDED_RECOVERY_SHA" ]; then
       SNAPSHOT_RECOVERY_PHASE="$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")"
       case "$SNAPSHOT_RECOVERY_PHASE" in
-        old-runtime-verified|new-runtime-verified|finalized)
+        old-runtime-verified|new-runtime-preserved-no-receipt|\
+        new-runtime-verified|finalized)
+          RECORDED_RECOVERY_SHA="$SNAPSHOT_RECOVERY_SHA"
+          ;;
+        restoring-new-no-receipt)
+          # The forward-preserve recovery may have removed its guard before the
+          # durable runtime commit while its sealed restore journal still binds
+          # the same release.  Permit that exact intermediate pair; the journal
+          # parser below independently authenticates and cross-checks its SHA.
+          test -f "$DATABASE_WRITER_RESTORE_FILE" || \
+            fail "intermediate forward recovery requires a restore journal"
+          test ! -L "$DATABASE_WRITER_RESTORE_FILE" || \
+            fail "intermediate forward restore journal is a symlink"
           RECORDED_RECOVERY_SHA="$SNAPSHOT_RECOVERY_SHA"
           ;;
         *)
