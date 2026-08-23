@@ -1819,6 +1819,82 @@ controlled_guard_restore_and_verify_governance_snapshot() {
   controlled_guard_governance_snapshot verify "$1" "$2" || return 1
   return 0
 }
+controlled_guard_assert_immutable_venv_tree() {
+  local bootstrap_entry=/usr/bin/python3.14
+  local expected_owner=root
+  local expected_owner_group=root:root
+  local tree_root="$1"
+  local trusted_bootstrap_python
+  local unsafe_path
+  test -d "$tree_root" || return 1
+  test ! -L "$tree_root" || return 1
+  test -x "$bootstrap_entry" || return 1
+  test "$(stat -c '%U:%G' "$bootstrap_entry")" = \
+    "$expected_owner_group" || return 1
+  trusted_bootstrap_python="$(readlink -f -- "$bootstrap_entry")" || return 1
+  test -n "$trusted_bootstrap_python" || return 1
+  unsafe_path="$(find -P "$tree_root" -xdev ! -user "$expected_owner" \
+    -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  # Symlink permission bits are conventionally 0777 and do not make their
+  # targets writable.  Check write bits only on concrete nodes, then validate
+  # every root-owned link and its resolved target separately.
+  unsafe_path="$(find -P "$tree_root" -xdev ! -type l -perm /022 \
+    -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  VENV_TREE_ROOT="$tree_root" find -P "$tree_root" -xdev -type l \
+    -exec /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      VENV_BOOTSTRAP_ENTRY="$bootstrap_entry" \
+      VENV_EXPECTED_OWNER_GROUP="$expected_owner_group" \
+      VENV_TREE_ROOT="$tree_root" \
+      VENV_TRUSTED_BOOTSTRAP_PYTHON="$trusted_bootstrap_python" \
+      /usr/bin/bash --noprofile --norc -c '
+        set -u
+        for link_path in "$@"; do
+          test -L "$link_path" || exit 1
+          test "$(stat -c "%U:%G" "$link_path")" = \
+            "$VENV_EXPECTED_OWNER_GROUP" || exit 1
+          raw_target="$(readlink -- "$link_path")" || exit 1
+          test -n "$raw_target" || exit 1
+          case "$raw_target" in
+            /*)
+              case "$raw_target" in
+                "$VENV_BOOTSTRAP_ENTRY"|"$VENV_TRUSTED_BOOTSTRAP_PYTHON") ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            *)
+              lexical_target="$(/usr/bin/realpath -ms -- \
+                "$(dirname -- "$link_path")/$raw_target")" || exit 1
+              case "$lexical_target" in
+                "$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+          esac
+          resolved="$(readlink -f -- "$link_path")" || exit 1
+          test -e "$resolved" || exit 1
+          case "$resolved" in
+            "$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*) ;;
+            "$VENV_TRUSTED_BOOTSTRAP_PYTHON")
+              trusted_path="$resolved"
+              while :; do
+                test ! -L "$trusted_path" || exit 1
+                test "$(stat -c "%U:%G" "$trusted_path")" = \
+                  "$VENV_EXPECTED_OWNER_GROUP" || exit 1
+                trusted_mode="$(stat -c "%a" "$trusted_path")" || exit 1
+                test $((8#$trusted_mode & 8#022)) -eq 0 || exit 1
+                test "$trusted_path" != / || break
+                trusted_path="$(dirname "$trusted_path")" || exit 1
+              done
+              ;;
+            *) exit 1 ;;
+          esac
+        done
+      ' _ {} + || return 1
+  return 0
+}
 controlled_guard_capture_current_governance_snapshot() {
   local guarded_sha="$1"
   local old_runtime_sha="$2"
@@ -1916,8 +1992,7 @@ controlled_guard_capture_current_governance_snapshot() {
   esac
   test "$(dirname "$release_venv_target")" = "$RELEASE_VENV_ROOT" || return 1
   test "$(stat -c '%U' "$release_venv_target")" = root || return 1
-  test -z "$(find -P "$release_venv_target" -xdev \
-    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  controlled_guard_assert_immutable_venv_tree "$release_venv_target" || return 1
   sudo -u "$service_user" test ! -w "$release_venv_target" || return 1
   test "$(readlink -f "$adata_source")" = "$adata_source" || return 1
   test "$(stat -c '%U' "$adata_source")" = root || return 1

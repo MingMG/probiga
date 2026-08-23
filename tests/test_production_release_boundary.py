@@ -2746,6 +2746,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     }
     recovery = bodies["controlled_v2_rollback_only_recovery"]
     capture = bodies["controlled_guard_capture_current_governance_snapshot"]
+    venv_seal = bodies["controlled_guard_assert_immutable_venv_tree"]
     verifier = bodies["controlled_guard_verify_restored_runtime"]
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
@@ -2829,6 +2830,21 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert 'local old_runtime_sha="$2"' in capture
     assert 'local release_venv="$RELEASE_VENV_ROOT/$old_runtime_sha"' in capture
     assert '$RELEASE_VENV_ROOT/$guarded_sha' not in capture
+    assert "controlled_guard_assert_immutable_venv_tree" in capture
+    assert "local expected_owner=root" in venv_seal
+    assert "local expected_owner_group=root:root" in venv_seal
+    assert '! -user "$expected_owner"' in venv_seal
+    assert '! -type l -perm /022' in venv_seal
+    assert "-type l" in venv_seal
+    assert "shift" not in venv_seal
+    assert 'readlink -- "$link_path"' in venv_seal
+    assert "/usr/bin/realpath -ms" in venv_seal
+    assert 'readlink -f -- "$link_path"' in venv_seal
+    assert '"$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*' in venv_seal
+    assert 'local bootstrap_entry=/usr/bin/python3.14' in venv_seal
+    assert 'readlink -f -- "$bootstrap_entry"' in venv_seal
+    assert '"$VENV_BOOTSTRAP_ENTRY"' in venv_seal
+    assert '"$VENV_TRUSTED_BOOTSTRAP_PYTHON"' in venv_seal
     assert (
         'test "$(activation_snapshot_old_release "$guarded_sha")" = '
         '"$old_runtime_sha"'

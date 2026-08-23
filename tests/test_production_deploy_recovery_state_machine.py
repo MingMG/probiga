@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -367,6 +368,90 @@ fi
         capture_output=True,
         text=True,
         timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_immutable_venv_tree_accepts_safe_links_and_rejects_writes_and_escape(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable venv seal regression")
+    if os.name == "nt":
+        pytest.skip("Windows cannot faithfully create and chmod POSIX venv symlinks")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(source)[
+        "controlled_guard_assert_immutable_venv_tree"
+    ]
+    tree = (tmp_path / "build-old-runtime").as_posix()
+    escape_tree = (tmp_path / "build-escape-runtime").as_posix()
+    bootstrap = (tmp_path / "trusted-python3.14").as_posix()
+    attacker_link = (tmp_path / "attacker-python").as_posix()
+    body = body.replace(
+        "local bootstrap_entry=/usr/bin/python3.14",
+        'local bootstrap_entry="$TEST_BOOTSTRAP"',
+    )
+    body = body.replace(
+        "local expected_owner=root",
+        'local expected_owner="$TEST_OWNER_NAME"',
+    )
+    body = body.replace(
+        "local expected_owner_group=root:root",
+        'local expected_owner_group="$TEST_OWNER_GROUP"',
+    )
+    harness = f"""
+set -u
+TREE={tree!r}
+ESCAPE_TREE={escape_tree!r}
+TEST_BOOTSTRAP={bootstrap!r}
+ATTACKER_LINK={attacker_link!r}
+mkdir -p "$TREE/bin" "$TREE/lib"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_BOOTSTRAP"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TREE/bin/python3.14"
+ln -s python3.14 "$TREE/bin/python"
+ln -s lib "$TREE/lib64"
+chmod 0555 "$TEST_BOOTSTRAP" "$TREE" "$TREE/bin" "$TREE/lib" \
+  "$TREE/bin/python3.14"
+TEST_OWNER_NAME="$(stat -c '%U' "$TREE")"
+TEST_OWNER_GROUP="$(stat -c '%U:%G' "$TREE")"
+controlled_guard_assert_immutable_venv_tree() {{
+{body}
+}}
+controlled_guard_assert_immutable_venv_tree "$TREE" || exit 20
+chmod 0755 "$TREE"
+printf 'writable\n' > "$TREE/writable"
+chmod 0666 "$TREE/writable"
+chmod 0555 "$TREE"
+if controlled_guard_assert_immutable_venv_tree "$TREE"; then
+  echo 'writable regular file unexpectedly accepted' >&2
+  exit 21
+fi
+chmod 0755 "$TREE"
+rm -f "$TREE/writable"
+chmod 0555 "$TREE"
+mkdir -p "$ESCAPE_TREE"
+ln -s /tmp "$ESCAPE_TREE/only-link"
+chmod 0555 "$ESCAPE_TREE"
+if controlled_guard_assert_immutable_venv_tree "$ESCAPE_TREE"; then
+  echo 'single escaping symlink unexpectedly accepted' >&2
+  exit 22
+fi
+ln -s "$TEST_BOOTSTRAP" "$ATTACKER_LINK"
+chmod 0755 "$TREE"
+ln -s "$ATTACKER_LINK" "$TREE/external-chain"
+chmod 0555 "$TREE"
+if controlled_guard_assert_immutable_venv_tree "$TREE"; then
+  echo 'external intermediate symlink unexpectedly accepted' >&2
+  exit 23
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
