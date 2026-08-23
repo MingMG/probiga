@@ -2133,6 +2133,7 @@ controlled_v2_rollback_only_recovery() {
   local scheduler_record
   local ai_service_record
   local ai_timer_record
+  local governance_new_present=0
   local -a state_lines=()
   test "$DEPLOY_OPERATION" = deploy || return 1
   test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
@@ -2150,21 +2151,27 @@ controlled_v2_rollback_only_recovery() {
     restoring-old|old-set-restored|old-runtime-verified) ;;
     *) return 1 ;;
   esac
-  if [ "$phase" = runtime-units-installed ] && \
-    { [ -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
-      [ -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
-      [ -e "$ACTIVATION_GOVERNANCE_NEW_SHA" ] || \
-      [ -L "$ACTIVATION_GOVERNANCE_NEW_SHA" ]; }; then
-    # A same-process cutover failure can occur after the new governance task
-    # was sealed but before the new runtime was started.  Accept only the
-    # complete, hash-verified pair; a partial or changed pair remains fenced.
-    activation_snapshot_validate_governance_new || return 1
-  else
-    test ! -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-    test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-    test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
-    test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
-  fi
+  case "$phase" in
+    runtime-units-installed|restoring-old|old-set-restored|old-runtime-verified)
+      if [ -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
+        [ -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ] || \
+        [ -e "$ACTIVATION_GOVERNANCE_NEW_SHA" ] || \
+        [ -L "$ACTIVATION_GOVERNANCE_NEW_SHA" ]; then
+        # A same-process rollback retains the sealed forward snapshot after it
+        # advances the journal to restoring-old/old-set-restored.  Accept only
+        # the complete, hash-verified pair; partial or changed evidence stays
+        # fenced.
+        activation_snapshot_validate_governance_new || return 1
+        governance_new_present=1
+      fi
+      ;;
+    *)
+      test ! -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+      test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+      test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+      test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+      ;;
+  esac
   test ! -e "$ACTIVATION_RECEIPT_PENDING" || return 1
   test ! -L "$ACTIVATION_RECEIPT_PENDING" || return 1
   test ! -e "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
@@ -2231,7 +2238,7 @@ controlled_v2_rollback_only_recovery() {
   activation_snapshot_assert_old_set "$guarded_sha" || return 1
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
-  if [ "$phase" = runtime-units-installed ]; then
+  if [ "$governance_new_present" -eq 1 ]; then
     # The forward cutover may have changed the governance task before it
     # failed.  Restore the sealed old task while every writer is still fenced,
     # then independently recapture it below before writers are released.

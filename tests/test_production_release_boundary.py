@@ -2999,8 +2999,13 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "finalized",
     ):
         assert disallowed_phase not in recovery
-    assert 'if [ "$phase" = runtime-units-installed ]' in recovery
+    assert (
+        "runtime-units-installed|restoring-old|old-set-restored|"
+        "old-runtime-verified"
+        in recovery
+    )
     assert "activation_snapshot_validate_governance_new" in recovery
+    assert "governance_new_present=1" in recovery
     for state_path in (
         "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT",
         "$ACTIVATION_GOVERNANCE_NEW_SHA",
@@ -3028,8 +3033,12 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "activation_snapshot_restore_old_set", boundary
     )
     old_set = recovery.index("activation_snapshot_assert_old_set", restore_old_set)
+    governance_evidence_gate = recovery.index(
+        'if [ "$governance_new_present" -eq 1 ]', old_set
+    )
     governance_restore = recovery.index(
-        "controlled_guard_restore_and_verify_governance_snapshot", old_set
+        "controlled_guard_restore_and_verify_governance_snapshot",
+        governance_evidence_gate,
     )
     governance = recovery.index(
         "controlled_guard_capture_current_governance_snapshot", governance_restore
@@ -3057,6 +3066,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         < boundary
         < restore_old_set
         < old_set
+        < governance_evidence_gate
         < governance_restore
         < governance
         < cleanup
