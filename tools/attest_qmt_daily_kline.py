@@ -31,7 +31,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.bigqmt.spool import PROVIDER_ID
-from integrations.qmt.local_history import get_local_history_engine
+from integrations.qmt.local_history import (
+    get_local_history_engine,
+    validate_local_history_provenance_schema,
+)
 from server.common.batch_db import (
     create_batch_engine,
     qualified_table_name,
@@ -714,6 +717,13 @@ def _table_names(engine: Engine) -> tuple[str, str]:
         )
     if not target_url.database or not local_url.database:
         raise RuntimeError("target and QMT history database names are required")
+    # This SELECT-only contract check must run before attest_range inserts its
+    # RUNNING ledger row.  A legacy source table is never interpreted through
+    # a synthetic NATIVE_QMT fallback.
+    validate_local_history_provenance_schema(
+        engine,
+        database=local_url.database,
+    )
     return (
         qualified_table_name(target_url.database, "sm_stock_kline"),
         qualified_table_name(local_url.database, "qmt_local_stock_kline"),

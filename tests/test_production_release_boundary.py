@@ -653,9 +653,12 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         < cutover_fence
         < first_cutover_stop
     )
-    assert "prepare_strategy_governance_qmt_history.py" not in deploy_script[
-        schema_prepare:cutover_fence
-    ]
+    pre_cutover = _normalized_shell(
+        deploy_script[schema_prepare:cutover_fence]
+    )
+    assert pre_cutover.count("prepare_strategy_governance_qmt_history.py") == 1
+    assert "--readiness-only" in pre_cutover
+    assert "--apply" not in pre_cutover
     assert "--schema-only" not in deploy_script[schema_prepare:cutover_fence]
     assert "DATABASE_FORWARD_MIGRATION_STARTED=1" not in deploy_script[
         schema_prepare:cutover_fence
@@ -789,7 +792,12 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--disabled --writers-fenced-schema-preparation; then',
         'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"',
+        '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" '
+        '--expected-target-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE" '
+        '--expected-start-date "$QMT_HISTORY_START_DATE" '
+        '--expected-end-date "$QMT_HISTORY_END_DATE" '
+        '--expected-session-window-sha256 '
+        '"$QMT_HISTORY_SESSION_WINDOW_SHA256"',
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--disabled --schema-prepared; then',
@@ -981,7 +989,62 @@ def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
     assert "|| true" not in gate_body
     assert "GOVERNANCE_INPUT_NOT_READY" not in gate_body
     assert "--allow-input-not-ready" not in gate_body
+    for argument in (
+        "--expected-target-trade-date",
+        "--expected-start-date",
+        "--expected-end-date",
+        "--expected-session-window-sha256",
+    ):
+        assert gate_body.count(argument) == 1
+    assert '"$QMT_HISTORY_TARGET_TRADE_DATE"' in gate_body
+    assert '"$QMT_HISTORY_START_DATE"' in gate_body
+    assert '"$QMT_HISTORY_END_DATE"' in gate_body
+    assert '"$QMT_HISTORY_SESSION_WINDOW_SHA256"' in gate_body
     assert "set -Eeuo pipefail" in normalized
+
+
+def test_qmt_history_provenance_schema_is_checked_before_cutover() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    provenance_preflight = normalized.index(
+        "CUTOVER_STEP=preflight_qmt_local_history_provenance_schema"
+    )
+    governance_snapshot = normalized.index(
+        "CUTOVER_STEP=capture_strategy_governance_task_before_cutover",
+        provenance_preflight,
+    )
+    cutover_started = normalized.index("CUTOVER_STARTED=1", governance_snapshot)
+    preflight_body = normalized[provenance_preflight:governance_snapshot]
+    readiness = preflight_body.index(
+        "CUTOVER_STEP=preflight_strategy_governance_qmt_history_readiness"
+    )
+
+    assert provenance_preflight < governance_snapshot < cutover_started
+    assert preflight_body.count(
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/'
+        'migrate_qmt_local_history_provenance.py" --check-via-primary'
+    ) == 1
+    assert 'QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool' in preflight_body
+    assert '"$BOOTSTRAP_PYTHON" -I -c' in preflight_body
+    assert "json.load(sys.stdin)" in preflight_body
+    assert "session_window_sha256" in preflight_body
+    assert "readonly QMT_HISTORY_TARGET_TRADE_DATE" in preflight_body
+    window_binding = preflight_body[
+        readiness:preflight_body.index("GOVERNANCE_TASK_OLD_SOURCE=", readiness)
+    ]
+    assert "mktemp" not in window_binding
+    assert "if run_prepared_python_tool" not in preflight_body
+    assert "|| true" not in preflight_body
+    assert "--apply" not in preflight_body
+    assert preflight_body.index("--check-via-primary") < readiness
+    assert preflight_body.count(
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/'
+        'prepare_strategy_governance_qmt_history.py" --readiness-only'
+    ) == 1
 
 
 def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None:
@@ -2062,7 +2125,9 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert "--phase cutover --writers-fenced" in cutover_command
     assert "prepare_strategy_governance_schema.py" in recover_command
     assert "--phase recover" in recover_command
-    assert "prepare_strategy_governance_qmt_history.py" not in preflight_command
+    assert "prepare_strategy_governance_qmt_history.py" in preflight_command
+    assert "--readiness-only" in preflight_command
+    assert "--apply" not in preflight_command
     assert "--schema-only" not in preflight_command
     assert "ensure_attestation_tables(" not in production_history
     assert "plan_legacy_completed_run_binding(" in production_history
@@ -2097,7 +2162,7 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert 'exit "$failed_status"' in prepare_failure_path
 
 
-def test_failed_cutover_guard_persists_and_never_restarts_any_writer() -> None:
+def test_uncertified_failed_cutover_guard_persists_and_never_restarts_any_writer() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -2211,6 +2276,175 @@ def test_failed_cutover_guard_persists_and_never_restarts_any_writer() -> None:
     assert "probiga restarted after database writer block" in rollback
     assert "probiga-scheduler restarted after database writer block" in rollback
     assert "assert_ai_worker_writer_fence" in rollback
+
+
+def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy_script).items()
+    }
+    rollback_start = deploy_script.index("rollback() {")
+    rollback_end = deploy_script.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR", rollback_start
+    )
+    rollback = _normalized_shell(deploy_script[rollback_start:rollback_end])
+    release = bodies["prepared_v2_rollback_release_database_guard"]
+    finalize = bodies["controlled_guard_restore_and_finalize"]
+
+    for requirement in (
+        'test "$DEPLOY_OPERATION" = deploy',
+        'test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1',
+        'test "$EXTERNAL_WRITER_BLOCKED" -eq 0',
+        'test "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1',
+        'test "$DATABASE_WRITER_GUARD_PERSISTED" -eq 1',
+        'test "$DATABASE_WRITER_RESTORE_PERSISTED" -eq 1',
+    ):
+        assert requirement in release
+
+    restore_file = release.index("controlled_guard_assert_restore_file")
+    boundary = release.index("controlled_guard_assert_boundary", restore_file)
+    restore_old = release.index("activation_snapshot_restore_old_set", boundary)
+    daemon_reload = release.index("systemctl daemon-reload", restore_old)
+    old_set = release.index("activation_snapshot_assert_old_set", daemon_reload)
+    post_restore_boundary = release.index(
+        "controlled_guard_assert_boundary", old_set
+    )
+    prepared_verify = release.index(
+        "prepared_governance_snapshot verify", post_restore_boundary
+    )
+    cross_runtime_verify = release.index(
+        "controlled_guard_capture_current_governance_snapshot",
+        prepared_verify,
+    )
+    triggers = release.index(
+        "assert_scheduler_triggers_quiescent", cross_runtime_verify
+    )
+    cleanup = release.index("controlled_guard_cleanup", triggers)
+    assert (
+        restore_file
+        < boundary
+        < restore_old
+        < daemon_reload
+        < old_set
+        < post_restore_boundary
+        < prepared_verify
+        < cross_runtime_verify
+        < triggers
+        < cleanup
+    )
+    assert 'test "$old_runtime_sha" = "$PREVIOUS_RELEASE_REVISION"' in release
+
+    rollback_gate = rollback.index(
+        '[ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]'
+    )
+    release_call = rollback.index(
+        "prepared_v2_rollback_release_database_guard", rollback_gate
+    )
+    guard_clear = rollback.index(
+        "DATABASE_WRITER_GUARD_PERSISTED=0", release_call
+    )
+    migration_clear = rollback.index(
+        "DATABASE_GUARD_MIGRATION_UNVERIFIED=0", guard_clear
+    )
+    first_main_start = rollback.index(
+        'sudo systemctl start "$MAIN_SERVICE"', migration_clear
+    )
+    assert rollback_gate < release_call < guard_clear < migration_clear
+    assert migration_clear < first_main_start
+    assert (
+        '"certify and release the v2 database guard for previous runtime"'
+        in rollback[release_call:guard_clear]
+    )
+    for gate in (
+        '[ "$restoration_ready" -eq 1 ]',
+        '[ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ]',
+        '[ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]',
+    ):
+        assert gate in rollback[rollback_gate - 300:release_call]
+
+    finalize_call = rollback.index(
+        "controlled_guard_restore_and_finalize", first_main_start
+    )
+    runtime_route = rollback.index(
+        'case "$DEPLOY_ARTIFACT_MODE" in', first_main_start
+    )
+    ci_route = rollback.index(
+        "ci-resolved-freeze-v1) guard_governance_runtime=prepared",
+        runtime_route,
+    )
+    assert runtime_route < ci_route < finalize_call
+    assert (
+        '"$guard_governance_runtime"; then'
+        in rollback[finalize_call:finalize_call + 500]
+    )
+    assert 'local governance_runtime="${6:-controlled}"' in finalize
+    assert 'test "$DEPLOY_OPERATION" = deploy' in finalize
+    assert 'test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in finalize
+    assert 'test "$guarded_sha" = "$EXPECTED_SHA"' in finalize
+    controlled_restore = finalize.index(
+        "controlled_guard_restore_and_verify_governance_snapshot"
+    )
+    prepared_finalize_verify = finalize.index(
+        "prepared_governance_snapshot verify"
+    )
+    writer_restore = finalize.index("controlled_guard_restore_previous_writer_states")
+    assert controlled_restore < writer_restore
+    assert prepared_finalize_verify < writer_restore
+    assert "any drift must re-fence" in finalize
+
+    # Persistent recovery never opts into the same-process prepared runtime.
+    for name in (
+        "controlled_database_guard_recovery",
+        "controlled_database_writer_restore_recovery",
+    ):
+        recovery = bodies[name]
+        recovery_finalize = recovery.index("controlled_guard_restore_and_finalize")
+        assert " prepared" not in recovery[
+            recovery_finalize:recovery_finalize + 300
+        ]
+
+
+def test_static_wheel_normal_rollback_uses_controlled_governance_runtime() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    rollback_start = deploy_script.index("rollback() {")
+    rollback_end = deploy_script.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR", rollback_start
+    )
+    rollback = _normalized_shell(deploy_script[rollback_start:rollback_end])
+    triggers = rollback.index("assert_scheduler_triggers_quiescent")
+    runtime_route = rollback.index(
+        'case "$DEPLOY_ARTIFACT_MODE" in', triggers
+    )
+    finalizer_gate = rollback.index(
+        'if [ "$rollback_failed" -eq 0 ]', runtime_route
+    )
+    route = rollback[runtime_route:finalizer_gate]
+    finalize_call = rollback.index(
+        "controlled_guard_restore_and_finalize", finalizer_gate
+    )
+
+    assert (
+        "ci-resolved-freeze-v1) guard_governance_runtime=prepared ;;"
+        in route
+    )
+    assert (
+        "static-wheel-lock-v2) guard_governance_runtime=controlled ;;"
+        in route
+    )
+    assert (
+        '*) rollback_failure "select the rollback governance runtime" ;;'
+        in route
+    )
+    assert (
+        '"$guard_governance_runtime"; then'
+        in rollback[finalize_call:finalize_call + 500]
+    )
+    assert " prepared; then" not in rollback[finalize_call:finalize_call + 500]
 
 
 def test_activation_journal_closes_every_cutover_guard_gap() -> None:

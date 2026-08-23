@@ -12,6 +12,17 @@ def _sessions(count=120):
     return [(start + timedelta(days=index)).isoformat() for index in range(count)]
 
 
+def _frozen_window(sessions):
+    return {
+        "expected_target_trade_date": sessions[-1],
+        "expected_start_date": sessions[0],
+        "expected_end_date": sessions[-1],
+        "expected_session_window_sha256": preparation._session_window_sha256(
+            sessions
+        ),
+    }
+
+
 def _complete_result(sessions):
     daily = {
         day: {"stock_count": 2, "stock_set_hash": str(index % 10) * 64}
@@ -109,7 +120,7 @@ def test_prepare_requires_and_attests_exact_120_closed_sessions(monkeypatch):
         return _complete_result(sessions)
 
     result = preparation.prepare_governance_qmt_history(
-        "engine", attester=fake_attester,
+        "engine", attester=fake_attester, **_frozen_window(sessions),
     )
 
     assert result["status"] == "ok"
@@ -178,7 +189,9 @@ def test_prepare_fails_closed_for_partial_or_inexact_attestation(
         match="未完整覆盖120",
     ):
         preparation.prepare_governance_qmt_history(
-            "engine", attester=lambda *_args, **_kwargs: deepcopy(payload),
+            "engine",
+            attester=lambda *_args, **_kwargs: deepcopy(payload),
+            **_frozen_window(sessions),
         )
 
 
@@ -236,6 +249,270 @@ class _BindingContext:
 
     def __exit__(self, *_args):
         return False
+
+
+class _ReadinessConnection:
+    def __init__(self, target_rows, source_rows, exact_rows):
+        self.target_rows = list(target_rows)
+        self.source_rows = list(source_rows)
+        self.exact_rows = list(exact_rows)
+        self.statements = []
+
+    def execute(self, statement, params=None):
+        sql = str(statement).strip()
+        self.statements.append((sql, dict(params or {})))
+        if "joined_pair_count" in sql:
+            return _BindingResult(self.exact_rows)
+        if "sm_stock_kline" in sql:
+            return _BindingResult(self.target_rows)
+        if "qmt_local_stock_kline" in sql:
+            return _BindingResult(self.source_rows)
+        raise AssertionError(sql)
+
+
+def _readiness_rows(sessions):
+    target_rows = [
+        {"trade_date": day, "row_count": 2, "unique_stock_count": 2}
+        for day in sessions
+    ]
+    source_rows = [
+        {
+            "trade_date": day,
+            "row_count": 2,
+            "unique_stock_count": 2,
+            "native_row_count": 2,
+        }
+        for day in sessions
+    ]
+    exact_rows = [
+        {
+            "trade_date": day,
+            "joined_pair_count": 2,
+            "joined_target_count": 2,
+            "joined_source_count": 2,
+            "matched_target_count": 2,
+            "matched_source_count": 2,
+        }
+        for day in sessions
+    ]
+    return target_rows, source_rows, exact_rows
+
+
+def test_readiness_preflight_is_select_only_and_requires_exact_native_matches(
+    monkeypatch,
+):
+    sessions = _sessions()
+    target_rows, source_rows, exact_rows = _readiness_rows(sessions)
+    connection = _ReadinessConnection(target_rows, source_rows, exact_rows)
+    engine = _BindingEngine(connection)
+    monkeypatch.setattr(
+        preparation, "validate_attestation_schema", lambda _engine: {"errors": []}
+    )
+    monkeypatch.setattr(
+        preparation,
+        "authoritative_closed_trade_date",
+        lambda _engine: sessions[-1],
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: sessions,
+    )
+
+    result = preparation.preflight_governance_qmt_history_readiness(
+        engine,
+        table_resolver=lambda _engine: (
+            "`probiga`.`sm_stock_kline`",
+            "`probiga_qmt_history`.`qmt_local_stock_kline`",
+        ),
+    )
+
+    assert result["status"] == "ok"
+    assert result["mode"] == "readiness-only"
+    assert result["session_count"] == 120
+    assert result["target_rows"] == 240
+    assert result["native_qmt_rows"] == 240
+    assert result["exact_matched_rows"] == 240
+    assert result["session_window_sha256"] == preparation._session_window_sha256(
+        sessions
+    )
+    assert result["database_writes"] is False
+    assert len(connection.statements) == 3
+    assert all(
+        sql.upper().startswith("SELECT ")
+        for sql, _params in connection.statements
+    )
+    assert "INNER JOIN" in connection.statements[2][0]
+    assert "matched_target_count" in connection.statements[2][0]
+    assert "pre_close_origin" in connection.statements[2][0]
+    assert attester.QMT_ATTESTATION_COLLATION in connection.statements[2][0]
+    assert all(
+        params == {
+            "provider": attester.PROVIDER_ID,
+            "start_date": sessions[0],
+            "end_date": sessions[-1],
+            "price_tolerance": attester.PRICE_TOLERANCE,
+            "volume_absolute_tolerance": attester.VOLUME_ABSOLUTE_TOLERANCE,
+            "volume_rel_tolerance": attester.VOLUME_REL_TOLERANCE,
+            "amount_rel_tolerance": attester.AMOUNT_REL_TOLERANCE,
+        }
+        for _sql, params in connection.statements
+    )
+
+
+@pytest.mark.parametrize("failure", ["missing_day", "count", "provenance"])
+def test_readiness_preflight_blocks_incomplete_source_before_cutover(
+    monkeypatch, failure,
+):
+    sessions = _sessions()
+    target_rows, source_rows, exact_rows = _readiness_rows(sessions)
+    if failure == "missing_day":
+        source_rows.pop()
+    elif failure == "count":
+        source_rows[-1]["row_count"] = 1
+        source_rows[-1]["native_row_count"] = 1
+    else:
+        source_rows[-1]["native_row_count"] = 1
+    engine = _BindingEngine(
+        _ReadinessConnection(target_rows, source_rows, exact_rows)
+    )
+    monkeypatch.setattr(
+        preparation, "validate_attestation_schema", lambda _engine: {"errors": []}
+    )
+    monkeypatch.setattr(
+        preparation,
+        "authoritative_closed_trade_date",
+        lambda _engine: sessions[-1],
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: sessions,
+    )
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="拒绝进入停服务切换",
+    ):
+        preparation.preflight_governance_qmt_history_readiness(
+            engine,
+            table_resolver=lambda _engine: (
+                "`probiga`.`sm_stock_kline`",
+                "`probiga_qmt_history`.`qmt_local_stock_kline`",
+            ),
+        )
+
+
+def test_readiness_preflight_blocks_equal_count_stock_substitution(monkeypatch):
+    sessions = _sessions()
+    target_rows, source_rows, exact_rows = _readiness_rows(sessions)
+    # Target and source still each contain two rows, but only one stock key is
+    # shared.  Daily count-only readiness would incorrectly accept this.
+    exact_rows[-1].update(
+        joined_pair_count=1,
+        joined_target_count=1,
+        joined_source_count=1,
+        matched_target_count=1,
+        matched_source_count=1,
+    )
+    engine = _BindingEngine(
+        _ReadinessConnection(target_rows, source_rows, exact_rows)
+    )
+    monkeypatch.setattr(
+        preparation, "validate_attestation_schema", lambda _engine: {"errors": []}
+    )
+    monkeypatch.setattr(
+        preparation, "authoritative_closed_trade_date", lambda _engine: sessions[-1]
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: sessions,
+    )
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="相同股票集合",
+    ):
+        preparation.preflight_governance_qmt_history_readiness(
+            engine,
+            table_resolver=lambda _engine: (
+                "`probiga`.`sm_stock_kline`",
+                "`probiga_qmt_history`.`qmt_local_stock_kline`",
+            ),
+        )
+
+
+def test_readiness_preflight_blocks_ohlcv_value_mismatch(monkeypatch):
+    sessions = _sessions()
+    target_rows, source_rows, exact_rows = _readiness_rows(sessions)
+    # The universe joins exactly, but one row fails the formal frozen OHLCV
+    # tolerance predicate returned by the production attester's match SQL.
+    exact_rows[-1].update(matched_target_count=1, matched_source_count=1)
+    engine = _BindingEngine(
+        _ReadinessConnection(target_rows, source_rows, exact_rows)
+    )
+    monkeypatch.setattr(
+        preparation, "validate_attestation_schema", lambda _engine: {"errors": []}
+    )
+    monkeypatch.setattr(
+        preparation, "authoritative_closed_trade_date", lambda _engine: sessions[-1]
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: sessions,
+    )
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="OHLC/量额",
+    ):
+        preparation.preflight_governance_qmt_history_readiness(
+            engine,
+            table_resolver=lambda _engine: (
+                "`probiga`.`sm_stock_kline`",
+                "`probiga_qmt_history`.`qmt_local_stock_kline`",
+            ),
+        )
+
+
+@pytest.mark.parametrize("drift", ["target", "sessions"])
+def test_prepare_blocks_frozen_window_drift_before_attestation(monkeypatch, drift):
+    _install_prepared_schema(monkeypatch)
+    sessions = _sessions()
+    observed_sessions = list(sessions)
+    observed_target = sessions[-1]
+    if drift == "target":
+        observed_target = (date.fromisoformat(sessions[-1]) + timedelta(days=1)).isoformat()
+    else:
+        observed_sessions[50], observed_sessions[51] = (
+            observed_sessions[51],
+            observed_sessions[50],
+        )
+    monkeypatch.setattr(
+        preparation,
+        "authoritative_closed_trade_date",
+        lambda _engine: observed_target,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: observed_sessions,
+    )
+    calls = []
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="窗口",
+    ):
+        preparation.prepare_governance_qmt_history(
+            "engine",
+            attester=lambda *_args, **_kwargs: calls.append(True),
+            **_frozen_window(sessions),
+        )
+
+    assert calls == []
 
 
 def _legacy_binding_row(**changes):

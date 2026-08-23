@@ -2061,9 +2061,19 @@ controlled_guard_restore_and_finalize() {
   local ai_service_record="$4"
   local ai_timer_record="$5"
   local guarded_sha="$1"
+  local governance_runtime="${6:-controlled}"
   local main_record="$2"
   local old_runtime_sha="$guarded_sha"
   local scheduler_record="$3"
+  case "$governance_runtime" in
+    controlled) ;;
+    prepared)
+      test "$DEPLOY_OPERATION" = deploy || return 1
+      test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
+      test "$guarded_sha" = "$EXPECTED_SHA" || return 1
+      ;;
+    *) return 1 ;;
+  esac
   controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] || \
@@ -2073,8 +2083,19 @@ controlled_guard_restore_and_finalize() {
     activation_snapshot_restore_old_set "$guarded_sha" || return 1
     systemctl daemon-reload || return 1
     activation_snapshot_assert_old_set "$guarded_sha" || return 1
-    controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
-      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+    case "$governance_runtime" in
+      controlled)
+        controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
+          "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+        ;;
+      prepared)
+        # The same-process rollback restored and cross-runtime verified this
+        # state before the guard was removed.  Once old writers are running,
+        # any drift must re-fence rather than trigger another database write.
+        prepared_governance_snapshot verify \
+          "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+        ;;
+    esac
   fi
   if ! controlled_guard_restore_previous_writer_states "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
@@ -4002,6 +4023,8 @@ GOVERNANCE_TASK_OLD_SOURCE=""
 GOVERNANCE_TASK_NEW_SOURCE=""
 GOVERNANCE_TASK_TOUCHED=0
 GOVERNANCE_INPUT_NOT_READY=0
+QMT_HISTORY_PREFLIGHT_OUTPUT=""
+QMT_HISTORY_WINDOW=""
 DATABASE_FORWARD_MIGRATION_STARTED=0
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
@@ -5264,6 +5287,41 @@ prepared_restore_and_verify_governance_snapshot() {
   prepared_governance_snapshot verify "$1" || return 1
   return 0
 }
+prepared_v2_rollback_release_database_guard() {
+  local ai_service_record
+  local ai_timer_record
+  local main_record
+  local old_runtime_sha
+  local scheduler_record
+  test "$DEPLOY_OPERATION" = deploy || return 1
+  test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
+  test "$EXTERNAL_WRITER_BLOCKED" -eq 0 || return 1
+  test "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 || return 1
+  test "$DATABASE_WRITER_GUARD_PERSISTED" -eq 1 || return 1
+  test "$DATABASE_WRITER_RESTORE_PERSISTED" -eq 1 || return 1
+  old_runtime_sha="$(activation_snapshot_old_release "$EXPECTED_SHA")" || \
+    return 1
+  test "$old_runtime_sha" = "$PREVIOUS_RELEASE_REVISION" || return 1
+  read -r main_record scheduler_record ai_service_record ai_timer_record \
+    < <(database_writer_guard_inventory) || return 1
+  controlled_guard_assert_restore_file "$EXPECTED_SHA" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  controlled_guard_assert_boundary "$EXPECTED_SHA" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  activation_snapshot_restore_old_set "$EXPECTED_SHA" || return 1
+  systemctl daemon-reload || return 1
+  activation_snapshot_assert_old_set "$EXPECTED_SHA" || return 1
+  controlled_guard_assert_boundary "$EXPECTED_SHA" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  prepared_governance_snapshot verify \
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  controlled_guard_capture_current_governance_snapshot "$EXPECTED_SHA" \
+    "$old_runtime_sha" || return 1
+  assert_scheduler_triggers_quiescent || return 1
+  controlled_guard_cleanup "$EXPECTED_SHA" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  return 0
+}
 run_prepared_database_migration_tool() {
   local entrypoint="$1"
   shift
@@ -5318,6 +5376,7 @@ rollback() {
   local committed_phase=""
   local guard_ai_service_record=""
   local guard_ai_timer_record=""
+  local guard_governance_runtime=""
   local guard_main_record=""
   local guard_scheduler_record=""
   local observed_scheduler_active=0
@@ -5528,6 +5587,18 @@ rollback() {
       restoration_ready=0
     fi
     if [ "$restoration_ready" -eq 1 ] && \
+      [ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ] && \
+      [ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ] && \
+      [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
+      if ! prepared_v2_rollback_release_database_guard; then
+        rollback_failure \
+          "certify and release the v2 database guard for previous runtime"
+      else
+        DATABASE_WRITER_GUARD_PERSISTED=0
+        DATABASE_GUARD_MIGRATION_UNVERIFIED=0
+      fi
+    fi
+    if [ "$restoration_ready" -eq 1 ] && \
       { [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] || \
         [ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1 ]; }; then
       sudo systemctl disable "$MAIN_SERVICE" || \
@@ -5694,6 +5765,11 @@ rollback() {
   assert_scheduler_triggers_quiescent || \
     rollback_failure "verify scheduler activation units remain quiescent"
 
+  case "$DEPLOY_ARTIFACT_MODE" in
+    ci-resolved-freeze-v1) guard_governance_runtime=prepared ;;
+    static-wheel-lock-v2) guard_governance_runtime=controlled ;;
+    *) rollback_failure "select the rollback governance runtime" ;;
+  esac
   if [ "$rollback_failed" -eq 0 ] && \
     [ "$EXTERNAL_WRITER_BLOCKED" -eq 0 ] && \
     [ "$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 0 ]; then
@@ -5703,7 +5779,8 @@ rollback() {
       [ "$DATABASE_WRITER_RESTORE_PERSISTED" -ne 1 ] || \
       ! controlled_guard_restore_and_finalize "$EXPECTED_SHA" \
         "$guard_main_record" "$guard_scheduler_record" \
-        "$guard_ai_service_record" "$guard_ai_timer_record"; then
+        "$guard_ai_service_record" "$guard_ai_timer_record" \
+        "$guard_governance_runtime"; then
       rollback_failure "finalize the activation recovery journal"
     else
       DATABASE_WRITER_RESTORE_PERSISTED=0
@@ -5772,6 +5849,25 @@ if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
     "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
     --phase preflight
 fi
+CUTOVER_STEP=preflight_qmt_local_history_provenance_schema
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
+  --check-via-primary
+CUTOVER_STEP=preflight_strategy_governance_qmt_history_readiness
+QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
+  --readiness-only)"
+printf '%s\n' "$QMT_HISTORY_PREFLIGHT_OUTPUT"
+QMT_HISTORY_WINDOW="$(
+  printf '%s' "$QMT_HISTORY_PREFLIGHT_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,re,sys; from datetime import date; p=json.load(sys.stdin); keys={"status","mode","target_trade_date","session_count","start_date","end_date","session_window_sha256","target_rows","native_qmt_rows","exact_matched_rows","database_writes","automatic_real_order_submission"}; values=[p.get(k) for k in ("target_trade_date","start_date","end_date")]; canonical=isinstance(p,dict) and all(isinstance(x,str) and date.fromisoformat(x).isoformat()==x for x in values); counts=type(p.get("target_rows")) is int and p["target_rows"]>0 and p.get("native_qmt_rows")==p["target_rows"] and p.get("exact_matched_rows")==p["target_rows"]; ok=set(p)==keys and p.get("status")=="ok" and p.get("mode")=="readiness-only" and p.get("session_count")==120 and canonical and values[0]==values[2] and values[1]<=values[2] and isinstance(p.get("session_window_sha256"),str) and re.fullmatch(r"[0-9a-f]{64}",p["session_window_sha256"]) and counts and p.get("database_writes") is False and p.get("automatic_real_order_submission") is False; print(*values,p.get("session_window_sha256","")) if ok else None; raise SystemExit(0 if ok else 2)'
+)"
+read -r QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
+  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256 \
+  QMT_HISTORY_WINDOW_EXTRA <<< "$QMT_HISTORY_WINDOW"
+test -z "$QMT_HISTORY_WINDOW_EXTRA"
+readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
+  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
@@ -5893,7 +5989,12 @@ else
 fi
 CUTOVER_STEP=prepare_strategy_governance_qmt_history
 run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
+  --expected-target-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE" \
+  --expected-start-date "$QMT_HISTORY_START_DATE" \
+  --expected-end-date "$QMT_HISTORY_END_DATE" \
+  --expected-session-window-sha256 \
+    "$QMT_HISTORY_SESSION_WINDOW_SHA256"
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
 CUTOVER_STEP=verify_installed_runtime_units

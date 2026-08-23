@@ -24,6 +24,34 @@ CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
 LOCAL_KLINE_TABLE = "qmt_local_stock_kline"
 LOCAL_MINUTE_TABLE = "qmt_local_stock_minute"
 LOCAL_RUN_TABLE = "qmt_local_backfill_run"
+LOCAL_KLINE_PROVENANCE_COLUMN = "pre_close_origin"
+LOCAL_KLINE_LEGACY_PROVENANCE = "UNVERIFIED_LEGACY"
+LOCAL_KLINE_NATIVE_PROVENANCE = "NATIVE_QMT"
+LOCAL_HISTORY_MIGRATION_LOCK_WAIT_SECONDS = 30
+LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS = frozenset(
+    {
+        "id",
+        "provider",
+        "qmt_code",
+        "stock_code",
+        "period",
+        "trade_date",
+        "adjust_type",
+        "open",
+        "close",
+        "high",
+        "low",
+        "volume",
+        "amount",
+        "pre_close",
+        LOCAL_KLINE_PROVENANCE_COLUMN,
+        "source_time",
+        "received_at",
+        "batch_id",
+        "data_version",
+        "permission_status",
+    }
+)
 _IDENTITY_QUERY_KEYS = frozenset(
     {
         "database",
@@ -41,6 +69,10 @@ _IDENTITY_QUERY_KEYS = frozenset(
         "username",
     }
 )
+
+
+class LocalHistoryProvenanceSchemaError(RuntimeError):
+    """The QMT source table cannot satisfy the frozen provenance contract."""
 
 
 @dataclass(frozen=True)
@@ -215,7 +247,210 @@ def get_local_history_engine(local_url: str | None = None) -> Engine:
     return create_engine(resolved, pool_pre_ping=True, future=True)
 
 
+def _bind_database_name(bind: Any, database: str | None) -> str:
+    resolved = str(database or "").strip()
+    if not resolved:
+        engine = getattr(bind, "engine", bind)
+        url = getattr(engine, "url", None)
+        resolved = str(getattr(url, "database", "") or "").strip()
+    if not resolved:
+        raise LocalHistoryProvenanceSchemaError(
+            "QMT history database name is required for qualified schema validation"
+        )
+    return resolved
+
+
+def _quoted_identifier(value: str) -> str:
+    return f"`{str(value).replace('`', '``')}`"
+
+
+def _normalized_column_default(value: Any) -> str:
+    normalized = str(value or "").strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1]
+    return normalized
+
+
+def local_history_provenance_schema_snapshot(
+    bind: Any,
+    *,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Read the qualified QMT daily source contract without mutating it."""
+
+    database_name = _bind_database_name(bind, database)
+    qualified_table = (
+        f"{_quoted_identifier(database_name)}."
+        f"{_quoted_identifier(LOCAL_KLINE_TABLE)}"
+    )
+    inspector = inspect(bind)
+    table_exists = bool(
+        inspector.has_table(LOCAL_KLINE_TABLE, schema=database_name)
+    )
+    columns = (
+        inspector.get_columns(LOCAL_KLINE_TABLE, schema=database_name)
+        if table_exists
+        else []
+    )
+    by_name = {
+        str(column.get("name") or ""): column
+        for column in columns
+        if str(column.get("name") or "")
+    }
+    missing_columns = sorted(
+        LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS - set(by_name)
+    )
+    provenance = by_name.get(LOCAL_KLINE_PROVENANCE_COLUMN)
+    provenance_type = (
+        " ".join(str(provenance.get("type") or "").lower().split())
+        if provenance
+        else ""
+    )
+    provenance_nullable = (
+        bool(provenance.get("nullable")) if provenance else None
+    )
+    provenance_default = (
+        _normalized_column_default(provenance.get("default"))
+        if provenance
+        else ""
+    )
+    contract_errors: list[str] = []
+    if not table_exists:
+        contract_errors.append("qualified source table is missing")
+    if missing_columns:
+        contract_errors.append(
+            "required columns are missing: " + ", ".join(missing_columns)
+        )
+    if provenance is not None:
+        if not provenance_type.startswith("varchar(32)"):
+            contract_errors.append(
+                "pre_close_origin must be VARCHAR(32)"
+            )
+        if provenance_nullable is not False:
+            contract_errors.append("pre_close_origin must be NOT NULL")
+        if provenance_default != LOCAL_KLINE_LEGACY_PROVENANCE:
+            contract_errors.append(
+                "pre_close_origin default must be UNVERIFIED_LEGACY"
+            )
+    return {
+        "database": database_name,
+        "table": LOCAL_KLINE_TABLE,
+        "qualified_table": qualified_table,
+        "table_exists": table_exists,
+        "column_count": len(by_name),
+        "required_columns": sorted(LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS),
+        "missing_columns": missing_columns,
+        "provenance_column": LOCAL_KLINE_PROVENANCE_COLUMN,
+        "provenance_type": provenance_type,
+        "provenance_nullable": provenance_nullable,
+        "provenance_default": provenance_default,
+        "legacy_rows_default_to": LOCAL_KLINE_LEGACY_PROVENANCE,
+        "ready": not contract_errors,
+        "errors": contract_errors,
+    }
+
+
+def validate_local_history_provenance_schema(
+    bind: Any,
+    *,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless the qualified attestation source is provenance-safe."""
+
+    snapshot = local_history_provenance_schema_snapshot(
+        bind,
+        database=database,
+    )
+    if not snapshot["ready"]:
+        raise LocalHistoryProvenanceSchemaError(
+            f"QMT 历史来源表契约未准备: {snapshot['qualified_table']}: "
+            + "; ".join(snapshot["errors"])
+            + "; 请在获授权的 QMT 历史库迁移边界显式运行 "
+            "tools/migrate_qmt_local_history_provenance.py --apply"
+        )
+    return snapshot
+
+
+def migrate_local_history_provenance_schema(
+    engine: Engine,
+    *,
+    apply: bool = False,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Add only the legacy-ineligible provenance column, then read it back."""
+
+    if type(apply) is not bool:
+        raise TypeError("apply must be bool")
+    snapshot = local_history_provenance_schema_snapshot(
+        engine,
+        database=database,
+    )
+    if not snapshot["table_exists"]:
+        raise LocalHistoryProvenanceSchemaError(
+            f"QMT 历史来源表不存在: {snapshot['qualified_table']}"
+        )
+    missing = set(snapshot["missing_columns"])
+    if not missing:
+        validated = validate_local_history_provenance_schema(
+            engine,
+            database=snapshot["database"],
+        )
+        return {**validated, "status": "exists", "applied": False}
+    if missing != {LOCAL_KLINE_PROVENANCE_COLUMN}:
+        raise LocalHistoryProvenanceSchemaError(
+            f"QMT 历史来源表缺少不可自动兼容的列: "
+            + ", ".join(sorted(missing))
+        )
+    if not apply:
+        return {
+            **snapshot,
+            "status": "migration_required",
+            "applied": False,
+        }
+
+    qualified_table = str(snapshot["qualified_table"])
+    statement = text(
+        f"ALTER TABLE {qualified_table} "
+        f"ADD COLUMN {_quoted_identifier(LOCAL_KLINE_PROVENANCE_COLUMN)} "
+        "VARCHAR(32) NOT NULL DEFAULT 'UNVERIFIED_LEGACY' AFTER `pre_close`, "
+        "ALGORITHM=INSTANT"
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "SET SESSION lock_wait_timeout="
+                f"{LOCAL_HISTORY_MIGRATION_LOCK_WAIT_SECONDS}"
+            ))
+            connection.execute(statement)
+    except Exception as exc:
+        try:
+            validated = validate_local_history_provenance_schema(
+                engine,
+                database=snapshot["database"],
+            )
+        except LocalHistoryProvenanceSchemaError:
+            raise exc
+        return {**validated, "status": "exists", "applied": False}
+    validated = validate_local_history_provenance_schema(
+        engine,
+        database=snapshot["database"],
+    )
+    return {**validated, "status": "applied", "applied": True}
+
+
 def ensure_local_history_tables(engine: Engine) -> None:
+    database_name = _bind_database_name(engine, None)
+    if inspect(engine).has_table(LOCAL_KLINE_TABLE, schema=database_name):
+        # Existing tables must be migrated explicitly.  Never smuggle a DDL
+        # upgrade into a capture/backfill path that is about to write evidence.
+        validate_local_history_provenance_schema(
+            engine,
+            database=database_name,
+        )
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -319,17 +554,10 @@ def ensure_local_history_tables(engine: Engine) -> None:
                 """
             )
         )
-    column_names = {
-        str(column.get("name") or "")
-        for column in inspect(engine).get_columns(LOCAL_KLINE_TABLE)
-    }
-    if "pre_close_origin" not in column_names:
-        with engine.begin() as conn:
-            conn.execute(text(
-                f"ALTER TABLE {LOCAL_KLINE_TABLE} "
-                "ADD COLUMN pre_close_origin VARCHAR(32) NOT NULL "
-                "DEFAULT 'UNVERIFIED_LEGACY' AFTER pre_close"
-            ))
+    validate_local_history_provenance_schema(
+        engine,
+        database=database_name,
+    )
 
 
 def load_stock_codes(source_engine: Engine, *, codes: Sequence[str] | None = None, limit: int = 0) -> list[str]:
@@ -547,6 +775,10 @@ def persist_daily_kline_capture(
             raise RuntimeError("QMT history database name is required")
         target_engine = source_engine
         table_name = f"{history_database}.{LOCAL_KLINE_TABLE}"
+        validate_local_history_provenance_schema(
+            target_engine,
+            database=history_database,
+        )
     else:
         ensure_local_history_tables(target_engine)
     rows = _prepare_kline_rows(

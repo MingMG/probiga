@@ -10,8 +10,11 @@ are exactly equal.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,15 +29,23 @@ from server.common.authoritative_market_clock import (
 )
 from server.common.batch_db import create_batch_engine
 from server.common.qmt_attestation_contract import (
+    AMOUNT_REL_TOLERANCE,
     ATTESTATION_PROTOCOL_VERSION,
+    PRICE_TOLERANCE,
+    QMT_ATTESTATION_COLLATION,
     UNIVERSE_MANIFEST_SCHEMA,
+    VOLUME_ABSOLUTE_TOLERANCE,
+    VOLUME_REL_TOLERANCE,
     validated_universe_manifest,
 )
 from tools.attest_qmt_daily_kline import (
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH,
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT,
     LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY,
+    PROVIDER_ID,
     _legacy_completed_run_binding,
+    _match_sql,
+    _table_names,
     attest_range,
     ensure_attestation_tables,
     legacy_completed_run_binding_plan,
@@ -45,6 +56,8 @@ from tools.env_config import load_project_env
 
 
 REQUIRED_GOVERNANCE_SESSIONS = 120
+_LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SESSION_WINDOW_DOMAIN = b"probiga.qmt-governance-session-window.v1\x00"
 
 
 class GovernanceQmtHistoryNotReady(RuntimeError):
@@ -237,9 +250,201 @@ def _latest_closed_sessions(
     return sessions
 
 
+def _session_window_sha256(sessions: list[str]) -> str:
+    if (
+        len(sessions) != REQUIRED_GOVERNANCE_SESSIONS
+        or sessions != sorted(set(sessions))
+    ):
+        raise GovernanceQmtHistoryNotReady("QMT治理会话窗口不是120个有序唯一交易日")
+    hasher = hashlib.sha256(_SESSION_WINDOW_DOMAIN)
+    for value in sessions:
+        try:
+            canonical = date.fromisoformat(value).isoformat()
+        except (TypeError, ValueError) as exc:
+            raise GovernanceQmtHistoryNotReady("QMT治理会话窗口含无效交易日") from exc
+        if canonical != value:
+            raise GovernanceQmtHistoryNotReady("QMT治理会话窗口含非规范交易日")
+        hasher.update(value.encode("ascii"))
+        hasher.update(b"\x00")
+    return hasher.hexdigest()
+
+
+def preflight_governance_qmt_history_readiness(
+    engine,
+    *,
+    table_resolver: Callable[[Any], tuple[str, str]] | None = None,
+) -> dict[str, Any]:
+    """Prove source coverage without creating ledgers or changing market rows."""
+
+    validate_attestation_schema(engine)
+    target_trade_date = authoritative_closed_trade_date(engine)
+    if not target_trade_date:
+        raise GovernanceQmtHistoryNotReady("权威交易日历没有已收盘交易日")
+    sessions = _latest_closed_sessions(
+        engine,
+        target_trade_date=target_trade_date,
+    )
+    target_table, source_table = (table_resolver or _table_names)(engine)
+    params = {
+        "provider": PROVIDER_ID,
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "price_tolerance": PRICE_TOLERANCE,
+        "volume_absolute_tolerance": VOLUME_ABSOLUTE_TOLERANCE,
+        "volume_rel_tolerance": VOLUME_REL_TOLERANCE,
+        "amount_rel_tolerance": AMOUNT_REL_TOLERANCE,
+    }
+    match_sql = _match_sql("t", "q")
+    with engine.connect() as connection:
+        target_rows = connection.execute(
+            text(
+                f"""
+                SELECT trade_date, COUNT(*) AS row_count,
+                       COUNT(DISTINCT stock_code) AS unique_stock_count
+                FROM {target_table}
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND k_type=1 AND adjust_type=0
+                  AND stock_code REGEXP '^(0|3|6)'
+                GROUP BY trade_date
+                ORDER BY trade_date
+                """
+            ),
+            params,
+        ).mappings().all()
+        source_rows = connection.execute(
+            text(
+                f"""
+                SELECT trade_date, COUNT(*) AS row_count,
+                       COUNT(DISTINCT stock_code) AS unique_stock_count,
+                       SUM(CASE
+                             WHEN BINARY pre_close_origin=BINARY 'NATIVE_QMT'
+                              AND pre_close IS NOT NULL AND pre_close > 0
+                             THEN 1 ELSE 0
+                           END) AS native_row_count
+                FROM {source_table}
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND period='1d' AND adjust_type=0
+                  AND provider=:provider
+                  AND stock_code REGEXP '^(0|3|6)'
+                GROUP BY trade_date
+                ORDER BY trade_date
+                """
+            ),
+            params,
+        ).mappings().all()
+        exact_rows = connection.execute(
+            text(
+                f"""
+                SELECT trade_date,
+                       COUNT(*) AS joined_pair_count,
+                       COUNT(DISTINCT target_id) AS joined_target_count,
+                       COUNT(DISTINCT source_id) AS joined_source_count,
+                       COUNT(DISTINCT CASE WHEN is_match
+                                          THEN target_id END)
+                           AS matched_target_count,
+                       COUNT(DISTINCT CASE WHEN is_match
+                                          THEN source_id END)
+                           AS matched_source_count
+                FROM (
+                    SELECT t.id AS target_id, q.id AS source_id,
+                           t.trade_date AS trade_date,
+                           ({match_sql}) AS is_match
+                    FROM {target_table} t
+                    INNER JOIN {source_table} q
+                      ON q.stock_code COLLATE {QMT_ATTESTATION_COLLATION}
+                         =t.stock_code
+                     AND q.trade_date=t.trade_date
+                     AND q.period='1d' AND q.adjust_type=0
+                     AND q.provider=:provider
+                    WHERE t.trade_date BETWEEN :start_date AND :end_date
+                      AND t.k_type=1 AND t.adjust_type=0
+                      AND t.stock_code REGEXP '^(0|3|6)'
+                      AND q.stock_code REGEXP '^(0|3|6)'
+                ) exact_match_rows
+                GROUP BY trade_date
+                ORDER BY trade_date
+                """
+            ),
+            params,
+        ).mappings().all()
+
+    def keyed(
+        rows: list[Any], *, evidence_name: str,
+    ) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        for raw_row in rows:
+            row = dict(raw_row)
+            trade_date = str(row.get("trade_date") or "")[:10]
+            if len(trade_date) != 10 or trade_date in result:
+                raise GovernanceQmtHistoryNotReady(
+                    f"QMT发布前{evidence_name}证据包含无效或重复交易日，"
+                    "拒绝进入停服务切换"
+                )
+            result[trade_date] = row
+        return result
+
+    target_by_day = keyed(target_rows, evidence_name="目标")
+    source_by_day = keyed(source_rows, evidence_name="来源")
+    exact_by_day = keyed(exact_rows, evidence_name="精确匹配")
+    expected_days = set(sessions)
+    exact_days = (
+        set(target_by_day)
+        == expected_days
+        == set(source_by_day)
+        == set(exact_by_day)
+    )
+
+    def day_is_exact(day: str) -> bool:
+        target = target_by_day[day]
+        source = source_by_day[day]
+        exact = exact_by_day[day]
+        target_count = int(target.get("row_count") or 0)
+        source_count = int(source.get("row_count") or 0)
+        return bool(
+            target_count > 0
+            and int(target.get("unique_stock_count") or 0) == target_count
+            and source_count == target_count
+            and int(source.get("unique_stock_count") or 0) == source_count
+            and int(source.get("native_row_count") or 0) == source_count
+            and int(exact.get("joined_pair_count") or 0) == target_count
+            and int(exact.get("joined_target_count") or 0) == target_count
+            and int(exact.get("joined_source_count") or 0) == source_count
+            and int(exact.get("matched_target_count") or 0) == target_count
+            and int(exact.get("matched_source_count") or 0) == source_count
+        )
+
+    if not exact_days or not all(day_is_exact(day) for day in sessions):
+        raise GovernanceQmtHistoryNotReady(
+            "QMT来源尚未以相同股票集合、正式冻结容差内的OHLC/量额和"
+            "原生preClose逐日精确覆盖120个权威交易日，"
+            "拒绝进入停服务切换"
+        )
+    target_total = sum(
+        int(target_by_day[day].get("row_count") or 0) for day in sessions
+    )
+    return {
+        "status": "ok",
+        "mode": "readiness-only",
+        "target_trade_date": target_trade_date,
+        "session_count": len(sessions),
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "session_window_sha256": _session_window_sha256(sessions),
+        "target_rows": target_total,
+        "native_qmt_rows": target_total,
+        "exact_matched_rows": target_total,
+        "database_writes": False,
+        "automatic_real_order_submission": False,
+    }
+
+
 def prepare_governance_qmt_history(
     engine,
     *,
+    expected_target_trade_date: str,
+    expected_start_date: str,
+    expected_end_date: str,
+    expected_session_window_sha256: str,
     attester: Callable[..., dict[str, Any]] = attest_range,
 ) -> dict[str, Any]:
     # Production history preparation has no schema authority.  Schema-only
@@ -257,10 +462,39 @@ def prepare_governance_qmt_history(
     target_trade_date = authoritative_closed_trade_date(engine)
     if not target_trade_date:
         raise GovernanceQmtHistoryNotReady("权威交易日历没有已收盘交易日")
+    try:
+        expected_dates = tuple(
+            date.fromisoformat(value).isoformat()
+            for value in (
+                expected_target_trade_date,
+                expected_start_date,
+                expected_end_date,
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise GovernanceQmtHistoryNotReady("冻结的QMT治理窗口日期无效") from exc
+    if (
+        expected_dates
+        != (
+            expected_target_trade_date,
+            expected_start_date,
+            expected_end_date,
+        )
+        or expected_end_date != expected_target_trade_date
+        or not _LOWER_SHA256_RE.fullmatch(expected_session_window_sha256 or "")
+        or target_trade_date != expected_target_trade_date
+    ):
+        raise GovernanceQmtHistoryNotReady("QMT治理窗口在发布切换期间发生漂移")
     sessions = _latest_closed_sessions(
         engine,
-        target_trade_date=target_trade_date,
+        target_trade_date=expected_target_trade_date,
     )
+    if (
+        sessions[0] != expected_start_date
+        or sessions[-1] != expected_end_date
+        or _session_window_sha256(sessions) != expected_session_window_sha256
+    ):
+        raise GovernanceQmtHistoryNotReady("QMT治理120会话窗口与发布前冻结证据不一致")
     result = attester(
         engine,
         start_date=sessions[0],
@@ -326,7 +560,8 @@ def prepare_governance_qmt_history(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--schema-only",
         action="store_true",
         help=(
@@ -334,16 +569,37 @@ def main(argv: list[str] | None = None) -> int:
             "reading or writing market history"
         ),
     )
+    parser.add_argument("--expected-target-trade-date")
+    parser.add_argument("--expected-start-date")
+    parser.add_argument("--expected-end-date")
+    parser.add_argument("--expected-session-window-sha256")
+    mode.add_argument(
+        "--readiness-only",
+        action="store_true",
+        help=(
+            "read-only proof that native-QMT source counts cover the exact "
+            "120-session target before service cutover"
+        ),
+    )
     args = parser.parse_args(argv)
     load_project_env()
     engine = create_batch_engine(future=True)
     try:
         try:
-            result = (
-                prepare_attestation_schema(engine)
-                if args.schema_only
-                else prepare_governance_qmt_history(engine)
-            )
+            if args.schema_only:
+                result = prepare_attestation_schema(engine)
+            elif args.readiness_only:
+                result = preflight_governance_qmt_history_readiness(engine)
+            else:
+                result = prepare_governance_qmt_history(
+                    engine,
+                    expected_target_trade_date=args.expected_target_trade_date,
+                    expected_start_date=args.expected_start_date,
+                    expected_end_date=args.expected_end_date,
+                    expected_session_window_sha256=(
+                        args.expected_session_window_sha256
+                    ),
+                )
         except Exception as exc:
             print(json.dumps({
                 "status": "blocked",

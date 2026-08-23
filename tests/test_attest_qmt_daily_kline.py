@@ -6,6 +6,7 @@ import re
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DatabaseError
 
 from tools import attest_qmt_daily_kline as attester
@@ -66,6 +67,59 @@ def test_schema_prepared_sql_guard_rejects_all_non_temporary_ddl(statement):
 def test_schema_prepared_attester_contains_no_alter_ddl():
     source = inspect.getsource(attester.attest_range).upper()
     assert "ALTER TABLE" not in source
+
+
+def test_attester_validates_qualified_history_before_run_ledger_write(
+    monkeypatch,
+):
+    class FakeEngine:
+        def __init__(self, url):
+            self.url = make_url(url)
+            self.business_writes = []
+
+        def begin(self):
+            self.business_writes.append("begin")
+            raise AssertionError("business transaction started before source validation")
+
+    target_engine = FakeEngine(
+        "mysql+pymysql://runtime:secret@127.0.0.1:13306/probiga"
+    )
+    history_engine = FakeEngine(
+        "mysql+pymysql://runtime:secret@localhost:13306/"
+        "probiga_qmt_history"
+    )
+    monkeypatch.setattr(
+        attester,
+        "validate_attestation_schema",
+        lambda *_args, **_kwargs: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        attester,
+        "get_local_history_engine",
+        lambda: history_engine,
+    )
+
+    def blocked_source_schema(engine, *, database=None):
+        assert engine is target_engine
+        assert database == "probiga_qmt_history"
+        raise RuntimeError("provenance schema missing")
+
+    monkeypatch.setattr(
+        attester,
+        "validate_local_history_provenance_schema",
+        blocked_source_schema,
+    )
+
+    with pytest.raises(RuntimeError, match="provenance schema missing"):
+        attester.attest_range(
+            target_engine,
+            start_date="2026-03-02",
+            end_date="2026-08-21",
+            apply=True,
+            schema_prepared=True,
+        )
+
+    assert target_engine.business_writes == []
 
 
 def test_native_pre_close_can_replace_legacy_target_value():

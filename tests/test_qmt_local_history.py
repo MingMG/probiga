@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.engine import make_url
 
+from integrations.qmt import local_history
 from integrations.qmt.local_history import (
     LOCAL_KLINE_TABLE,
+    LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS,
+    LOCAL_KLINE_LEGACY_PROVENANCE,
     LOCAL_MINUTE_TABLE,
+    LocalHistoryProvenanceSchemaError,
     _data_version,
     _dedicated_tunnel_history_url,
     _has_identity_query_overrides,
     _normalize_date,
     _same_database,
     get_local_history_engine,
+    migrate_local_history_provenance_schema,
+    validate_local_history_provenance_schema,
 )
 from tools.backfill_guojin_qmt_local_history import _resolve_limits
 
@@ -286,3 +294,169 @@ def test_daily_limit_still_limits_stock_universe():
 
     assert limits.stock_limit == 50
     assert limits.gap_limit == 20
+
+
+def _provenance_columns(
+    *,
+    include_origin: bool,
+    origin_default: str = LOCAL_KLINE_LEGACY_PROVENANCE,
+):
+    columns = []
+    for name in sorted(LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS):
+        if name == "pre_close_origin" and not include_origin:
+            continue
+        columns.append(
+            {
+                "name": name,
+                "type": (
+                    'VARCHAR(32) COLLATE "utf8mb4_general_ci"'
+                    if name == "pre_close_origin"
+                    else "TEXT"
+                ),
+                "nullable": False,
+                "default": (
+                    f"'{origin_default}'"
+                    if name == "pre_close_origin"
+                    else None
+                ),
+            }
+        )
+    return columns
+
+
+class _SchemaInspector:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def has_table(self, table_name, *, schema=None):
+        self.engine.inspections.append(("has_table", schema, table_name))
+        return self.engine.table_exists
+
+    def get_columns(self, table_name, *, schema=None):
+        self.engine.inspections.append(("get_columns", schema, table_name))
+        return list(self.engine.columns)
+
+
+class _SchemaBegin:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def __enter__(self):
+        return self.engine
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
+class _SchemaEngine:
+    def __init__(self, columns):
+        self.url = make_url(
+            "mysql+pymysql://history:secret@127.0.0.1:13306/"
+            "probiga_qmt_history"
+        )
+        self.table_exists = True
+        self.columns = list(columns)
+        self.inspections = []
+        self.statements = []
+
+    def begin(self):
+        return _SchemaBegin(self)
+
+    def execute(self, statement):
+        sql = str(statement)
+        self.statements.append(sql)
+        if "ADD COLUMN `pre_close_origin`" in sql:
+            self.columns.append(
+                {
+                    "name": "pre_close_origin",
+                    "type": 'VARCHAR(32) COLLATE "utf8mb4_general_ci"',
+                    "nullable": False,
+                    "default": f"'{LOCAL_KLINE_LEGACY_PROVENANCE}'",
+                }
+            )
+        return SimpleNamespace(rowcount=0)
+
+
+def test_provenance_schema_validation_reads_exact_qualified_table(monkeypatch):
+    engine = _SchemaEngine(_provenance_columns(include_origin=True))
+    monkeypatch.setattr(
+        local_history,
+        "inspect",
+        lambda bind: _SchemaInspector(bind),
+    )
+
+    result = validate_local_history_provenance_schema(engine)
+
+    assert result["ready"] is True
+    assert result["qualified_table"] == (
+        "`probiga_qmt_history`.`qmt_local_stock_kline`"
+    )
+    assert result["legacy_rows_default_to"] == "UNVERIFIED_LEGACY"
+    assert engine.statements == []
+
+
+def test_provenance_schema_validation_blocks_missing_origin_without_write(
+    monkeypatch,
+):
+    engine = _SchemaEngine(_provenance_columns(include_origin=False))
+    monkeypatch.setattr(
+        local_history,
+        "inspect",
+        lambda bind: _SchemaInspector(bind),
+    )
+
+    with pytest.raises(
+        LocalHistoryProvenanceSchemaError,
+        match="pre_close_origin",
+    ):
+        validate_local_history_provenance_schema(engine)
+
+    assert engine.statements == []
+
+
+def test_provenance_migration_is_explicit_instant_and_legacy_ineligible(
+    monkeypatch,
+):
+    engine = _SchemaEngine(_provenance_columns(include_origin=False))
+    monkeypatch.setattr(
+        local_history,
+        "inspect",
+        lambda bind: _SchemaInspector(bind),
+    )
+
+    planned = migrate_local_history_provenance_schema(engine, apply=False)
+    assert planned["status"] == "migration_required"
+    assert planned["applied"] is False
+    assert engine.statements == []
+
+    applied = migrate_local_history_provenance_schema(engine, apply=True)
+
+    assert applied["status"] == "applied"
+    assert applied["ready"] is True
+    assert engine.statements[0] == "SET SESSION lock_wait_timeout=30"
+    assert len(engine.statements) == 2
+    ddl = engine.statements[1]
+    assert "`probiga_qmt_history`.`qmt_local_stock_kline`" in ddl
+    assert "DEFAULT 'UNVERIFIED_LEGACY'" in ddl
+    assert "ALGORITHM=INSTANT" in ddl
+    assert "NATIVE_QMT" not in ddl
+
+
+def test_provenance_schema_rejects_native_default(monkeypatch):
+    engine = _SchemaEngine(
+        _provenance_columns(
+            include_origin=True,
+            origin_default="NATIVE_QMT",
+        )
+    )
+    monkeypatch.setattr(
+        local_history,
+        "inspect",
+        lambda bind: _SchemaInspector(bind),
+    )
+
+    with pytest.raises(
+        LocalHistoryProvenanceSchemaError,
+        match="default must be UNVERIFIED_LEGACY",
+    ):
+        validate_local_history_provenance_schema(engine)
