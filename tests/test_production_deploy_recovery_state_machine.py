@@ -2041,25 +2041,28 @@ def test_controlled_database_gate_deadline_kills_uncooperative_process_group(
         pytest.skip("bash is required for the executable gate deadline test")
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
     deadline = _function(
-        "controlled_guard_run_gate_with_deadline",
+        "controlled_guard_run_service_gate_with_deadline",
         _shell_function_bodies(source)[
-            "controlled_guard_run_gate_with_deadline"
+            "controlled_guard_run_service_gate_with_deadline"
         ],
+    ).replace('/usr/bin/sudo -u "$service_user" ', "").replace(
+        "test -x /usr/bin/sudo || return 1", "true"
     )
     pid_file = (tmp_path / "deadline-child.pid").as_posix()
     harness = f"""
 set -u
 CONTROLLED_DATABASE_GATE_KILL_AFTER=1s
+CONTROLLED_DATABASE_GATE_TIMEOUT=1s
 PID_FILE={pid_file!r}
 {deadline}
 started="$(date +%s)"
 set +e
-controlled_guard_run_gate_with_deadline 1s /usr/bin/bash -c \
+controlled_guard_run_service_gate_with_deadline test-user /usr/bin/bash -c \
   'trap "" TERM; sleep 30 & child=$!; printf "%s\\n" "$child" > "$1"; wait "$child"' \
   deadline-child "$PID_FILE"
 status=$?
 set -e
-case "$status" in 124|137) ;; *) exit 20 ;; esac
+test "$status" -eq 1 || exit 20
 elapsed=$(( $(date +%s) - started ))
 test "$elapsed" -le 8 || exit 21
 test -s "$PID_FILE" || exit 22

@@ -3055,7 +3055,10 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     ]
     venv_seal = bodies["controlled_guard_assert_immutable_venv_tree"]
     verifier = bodies["controlled_guard_verify_restored_runtime"]
-    gate_deadline = bodies["controlled_guard_run_gate_with_deadline"]
+    gate_deadline = bodies[
+        "controlled_guard_run_service_gate_with_deadline"
+    ]
+    governance_snapshot = bodies["controlled_guard_governance_snapshot"]
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
     assert (
@@ -3283,14 +3286,27 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     quality_gate = verifier.index("ensure_quality_gate.py", governance_health)
     assert runtime_health < rollback_gate < governance_health < quality_gate
     assert verifier.count(
-        "controlled_guard_run_gate_with_deadline "
-        '"$CONTROLLED_DATABASE_GATE_TIMEOUT"'
+        'controlled_guard_run_service_gate_with_deadline "$service_user"'
     ) == 2
-    assert "/usr/bin/timeout --signal=TERM" in gate_deadline
+    sudo_boundary = gate_deadline.index('/usr/bin/sudo -u "$service_user"')
+    timeout_boundary = gate_deadline.index(
+        "/usr/bin/timeout --signal=TERM", sudo_boundary
+    )
+    assert sudo_boundary < timeout_boundary
     assert '"--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER"' in gate_deadline
     assert "--foreground" not in gate_deadline
     assert "CONTROLLED_DATABASE_GATE_TIMEOUT=30m" in normalized
     assert "CONTROLLED_DATABASE_GATE_KILL_AFTER=30s" in normalized
+    assert (
+        'controlled_guard_run_service_gate_with_deadline "$service_user"'
+        in governance_snapshot
+    )
+    assert (
+        'controlled_guard_run_service_gate_with_deadline "$service_user"'
+        in capture
+    )
+    assert 'sudo -u "$service_user" /usr/bin/env -i' not in governance_snapshot
+    assert 'sudo -u "$service_user" /usr/bin/env -i' not in capture
 
     service_user = normalized.index('test "$SERVICE_USER" != root')
     caller = normalized.index(
@@ -3726,9 +3742,12 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     # consume the exact bytes without gaining path access or write access.
     assert '"--${action}-snapshot" - < "$snapshot"' in snapshot_handoff
     assert '"--${action}-snapshot" "$snapshot"' not in snapshot_handoff
+    deadline_handoff = snapshot_handoff.index(
+        'controlled_guard_run_service_gate_with_deadline "$service_user"'
+    )
     assert snapshot_handoff.index(
         'controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600'
-    ) < snapshot_handoff.index('sudo -u "$service_user"')
+    ) < deadline_handoff
 
     restore_and_verify = bodies[
         "controlled_guard_restore_and_verify_governance_snapshot"

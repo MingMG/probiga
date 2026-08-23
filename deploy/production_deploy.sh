@@ -1701,18 +1701,26 @@ controlled_guard_restore_previous_writer_states() {
   fi
   return 0
 }
-controlled_guard_run_gate_with_deadline() {
-  local deadline="$1"
+controlled_guard_run_service_gate_with_deadline() {
+  local service_user="$1"
   shift
-  [[ "$deadline" =~ ^[1-9][0-9]*[smh]$ ]] || return 1
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  [[ "$CONTROLLED_DATABASE_GATE_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || \
+    return 1
   [[ "$CONTROLLED_DATABASE_GATE_KILL_AFTER" =~ ^[1-9][0-9]*[smh]$ ]] || \
     return 1
   test "$#" -gt 0 || return 1
+  test -x /usr/bin/sudo || return 1
   test -x /usr/bin/timeout || return 1
   # GNU timeout's default process-group mode is intentional: after TERM and the
-  # grace period, KILL must cover sudo and every Python/DB descendant.
-  /usr/bin/timeout --signal=TERM \
-    "--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER" "$deadline" "$@"
+  # grace period, KILL must cover every Python/DB descendant.  Run timeout after
+  # sudo has dropped privileges so sudo/use_pty cannot put Python outside the
+  # process group which timeout owns.
+  /usr/bin/sudo -u "$service_user" /usr/bin/timeout --signal=TERM \
+    "--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
+    "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$@" || return 1
+  return 0
 }
 controlled_guard_verify_restored_runtime() {
   local main_record="$1"
@@ -1922,9 +1930,8 @@ controlled_guard_verify_restored_runtime() {
     # the default full verification below.
     return 0
   fi
-  controlled_guard_run_gate_with_deadline \
-    "$CONTROLLED_DATABASE_GATE_TIMEOUT" \
-    /usr/bin/sudo -u "$service_user" /usr/bin/env -i \
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
@@ -1937,9 +1944,8 @@ controlled_guard_verify_restored_runtime() {
     "PYTHONPATH=$adata_source:$code_root" "$python_path" -P \
     "$code_root/tools/check_strategy_governance_health.py" --compact \
     --expected-build-sha "$expected_sha" || return 1
-  controlled_guard_run_gate_with_deadline \
-    "$CONTROLLED_DATABASE_GATE_TIMEOUT" \
-    /usr/bin/sudo -u "$service_user" /usr/bin/env -i \
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
@@ -2075,7 +2081,8 @@ controlled_guard_governance_snapshot() {
   service_user="$(systemctl show -p User --value probiga)" || return 1
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
-  sudo -u "$service_user" /usr/bin/env -i \
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
@@ -2376,7 +2383,8 @@ controlled_guard_capture_current_governance_snapshot() {
   test "$(dirname "$current_snapshot")" = "$capture_root" || return 1
   if chown "$service_user:$service_user" "$current_snapshot" && \
     chmod 0600 "$current_snapshot" && \
-    sudo -u "$service_user" /usr/bin/env -i \
+    controlled_guard_run_service_gate_with_deadline "$service_user" \
+      /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
