@@ -3275,6 +3275,8 @@ def test_daily_governance_task_is_scheduler_safe_and_validated():
     assert requirement.where_sql == "status = 'COMPLETED'"
     installer_source = inspect.getsource(governance_task_installer.main)
     assert '"--schema-prepared"' in installer_source
+    assert '"--writers-fenced-schema-preparation"' in installer_source
+    assert "args.writers_fenced_schema_preparation" in installer_source
     prepared_start = installer_source.index("if args.schema_prepared:")
     fallback_start = installer_source.index("else:", prepared_start)
     prepared_branch = installer_source[prepared_start:fallback_start]
@@ -3291,6 +3293,14 @@ def test_daily_governance_task_is_scheduler_safe_and_validated():
     fallback_branch = installer_source[fallback_start:]
     assert "run_v3_migrations(engine)" in fallback_branch
     assert "ensure_attestation_tables(engine)" in fallback_branch
+    assert "migrate_legacy_attestation_collation(" in fallback_branch
+    assert "writers_fenced=True" in fallback_branch
+    assert "apply_legacy_completed_run_binding(engine)" in fallback_branch
+    assert (
+        fallback_branch.index("migrate_legacy_attestation_collation(")
+        < fallback_branch.index("apply_legacy_completed_run_binding(engine)")
+        < fallback_branch.index("ensure_attestation_tables(engine)")
+    )
     assert "ensure_strategy_governance_tables(engine=engine)" in fallback_branch
     assert "seed_governance_registry()" in fallback_branch
     assert "validate_prepared_governance_runtime(engine)" in fallback_branch

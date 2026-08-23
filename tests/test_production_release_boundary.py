@@ -497,7 +497,7 @@ def test_v2_rds_safe_cutover_never_invokes_the_privileged_migrator() -> None:
 
     assert "prepare_strategy_governance_rds_safe_schema" in v2_branch
     assert "add_strategy_governance_task.py" in v2_branch
-    assert "--disabled; then" in v2_branch
+    assert "--disabled --writers-fenced-schema-preparation; then" in v2_branch
     assert "run_prepared_database_migration_tool" not in v2_branch
     assert "prepare_strategy_governance_schema.py" not in v2_branch
     assert "--phase cutover --writers-fenced" in v4_branch
@@ -787,7 +787,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         expected_writer_fence_command,
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
-        '--disabled; then',
+        '--disabled --writers-fenced-schema-preparation; then',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py"',
         'if ! run_prepared_python_tool '
@@ -2733,6 +2733,146 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert "--require-no-live-scheduler-writers" in guarded_writer_fence_runner
     assert 'sudo -u "$service_user"' in guarded_writer_fence_runner
     assert '"PYTHONPATH=$adata_source:$code_root"' in guarded_writer_fence_runner
+
+
+def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy)
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy).items()
+    }
+    recovery = bodies["controlled_v2_rollback_only_recovery"]
+    capture = bodies["controlled_guard_capture_current_governance_snapshot"]
+    verifier = bodies["controlled_guard_verify_restored_runtime"]
+
+    assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
+    assert (
+        'test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in recovery
+    )
+    assert 'test "$guarded_sha" != "$EXPECTED_SHA"' in recovery
+    assert (
+        "prepared|restoring-old|old-set-restored|old-runtime-verified"
+        in recovery
+    )
+    for disallowed_phase in (
+        "runtime-units-installing",
+        "runtime-units-installed",
+        "new-runtime-verified",
+        "finalized",
+    ):
+        assert disallowed_phase not in recovery
+    assert 'test "${#state_lines[@]}" -eq 6' in recovery
+    assert "controlled_guard_recreate_file" in recovery
+    assert "controlled_guard_force_all_writers_fenced" in recovery
+    assert 'test "$phase" = old-runtime-verified' in recovery
+    guard_branch_end = recovery.index("fi", recovery.index(
+        "controlled_guard_recreate_file"
+    ))
+    install_fence = recovery.index("controlled_guard_install_dropins", guard_branch_end)
+    reload_fence = recovery.index("systemctl daemon-reload", install_fence)
+    force_fence = recovery.index(
+        "controlled_guard_force_all_writers_fenced", reload_fence
+    )
+
+    marker = recovery.index("controlled_guard_assert_marker")
+    restore_file = recovery.index("controlled_guard_assert_restore_file")
+    boundary = recovery.index("controlled_guard_assert_boundary", marker)
+    assert guard_branch_end < install_fence < reload_fence < force_fence < boundary
+    restore_old_set = recovery.index(
+        "activation_snapshot_restore_old_set", boundary
+    )
+    old_set = recovery.index("activation_snapshot_assert_old_set", restore_old_set)
+    governance = recovery.index(
+        "controlled_guard_capture_current_governance_snapshot", old_set
+    )
+    cleanup = recovery.index("controlled_guard_cleanup", governance)
+    restore_states = recovery.index(
+        "controlled_guard_restore_previous_writer_states", cleanup
+    )
+    verify_runtime = recovery.index(
+        "controlled_guard_verify_restored_runtime", restore_states
+    )
+    verified_phase = recovery.index(
+        "old-runtime-verified", verify_runtime
+    )
+    restore_journal_remove = recovery.index(
+        'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"', verified_phase
+    )
+    activation_journal_remove = recovery.index(
+        "activation_snapshot_remove_old_runtime_verified",
+        restore_journal_remove,
+    )
+    assert (
+        restore_file
+        < marker
+        < boundary
+        < restore_old_set
+        < old_set
+        < governance
+        < cleanup
+        < restore_states
+        < verify_runtime
+        < verified_phase
+        < restore_journal_remove
+        < activation_journal_remove
+    )
+    assert "rollback-only" in recovery
+    assert recovery.count("controlled_guard_refence_after_restore_failure") == 2
+    assert "controlled_guard_write_restore_file" in recovery
+    assert "prepare_strategy_governance_qmt_history.py" not in recovery
+    assert "prepare_strategy_governance_schema.py" not in recovery
+
+    assert "activation_snapshot_validate" in capture
+    assert 'git -C "$code_root" rev-parse HEAD' in capture
+    assert "status --porcelain=v1 --untracked-files=all" in capture
+    assert "local capture_root=/tmp" in capture
+    assert 'test "$(stat -c \'%a\' "$capture_root")" = 1777' in capture
+    assert 'chown "$service_user:$service_user" "$current_snapshot"' in capture
+    capture_call = capture.index('--capture-snapshot "$current_snapshot"')
+    compare = capture.index('cmp --silent "$current_snapshot"', capture_call)
+    capture_cleanup = capture.index('rm -f -- "$current_snapshot"', compare)
+    assert capture_call < compare < capture_cleanup
+    assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in capture[compare:]
+    assert "--restore-snapshot" not in capture
+
+    assert 'local verification_mode="${6:-full}"' in verifier
+    runtime_health = verifier.rindex("http://127.0.0.1/api/health/runtime")
+    rollback_gate = verifier.index(
+        'if [ "$verification_mode" = rollback-only ]; then'
+    )
+    governance_health = verifier.index(
+        "check_strategy_governance_health.py", rollback_gate
+    )
+    quality_gate = verifier.index("ensure_quality_gate.py", governance_health)
+    assert runtime_health < rollback_gate < governance_health < quality_gate
+
+    service_user = normalized.index('test "$SERVICE_USER" != root')
+    caller = normalized.index(
+        "CUTOVER_STEP=v2_rollback_only_recovery", service_user
+    )
+    previous_state = normalized.index(
+        "PREVIOUS_MAIN_ACTIVE_STATE=", caller
+    )
+    stale_guard_rejection = normalized.index(
+        "persistent database writer guard/restore state requires controlled recovery",
+        previous_state,
+    )
+    assert service_user < caller < previous_state < stale_guard_rejection
+    caller_block = normalized[service_user:previous_state]
+    assert '"$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in caller_block
+    for state_path in (
+        "DATABASE_WRITER_GUARD_FILE",
+        "DATABASE_WRITER_RESTORE_FILE",
+        "ACTIVATION_UNIT_SNAPSHOT_DIR",
+    ):
+        assert f'[ -e "${state_path}" ]' in caller_block
+        assert f'[ -L "${state_path}" ]' in caller_block
+    assert "ACTIVATION_UNIT_SNAPSHOT_PHASE" in caller_block
+    assert "old-runtime-verified" in caller_block
+    assert "controlled_v2_rollback_only_recovery" in caller_block
 
 
 def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None:

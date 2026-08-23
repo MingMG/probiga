@@ -205,6 +205,13 @@ def main() -> int:
             "不传时由本部署工具自动执行RDS安全的无触发器结构准备"
         ),
     )
+    parser.add_argument(
+        "--writers-fenced-schema-preparation",
+        action="store_true",
+        help=(
+            "仅在所有生产写入器已停止时，允许执行严格证明的RDS安全QMT排序规则迁移"
+        ),
+    )
     args = parser.parse_args()
     read_or_restore_modes = [
         bool(args.restore_snapshot),
@@ -214,9 +221,19 @@ def main() -> int:
     if sum(read_or_restore_modes) > 1:
         parser.error("snapshot capture, verification and restore are mutually exclusive")
     if any(read_or_restore_modes) and (
-        args.disabled or args.snapshot_file or args.schema_prepared
+        args.disabled
+        or args.snapshot_file
+        or args.schema_prepared
+        or args.writers_fenced_schema_preparation
     ):
         parser.error("snapshot-only modes cannot be combined with install options")
+    if args.writers_fenced_schema_preparation and (
+        args.schema_prepared or not args.disabled
+    ):
+        parser.error(
+            "writers-fenced schema preparation requires --disabled and cannot "
+            "be combined with --schema-prepared"
+        )
     load_project_env()
     engine = create_tool_engine()
     try:
@@ -266,7 +283,11 @@ def main() -> int:
         from server.db.migrations_v3 import run_v3_migrations
         from tools.attest_qmt_daily_kline import (
             ensure_attestation_tables,
+            migrate_legacy_attestation_collation,
             validate_attestation_schema,
+        )
+        from tools.prepare_strategy_governance_qmt_history import (
+            apply_legacy_completed_run_binding,
         )
 
         # The governance ledger consumes the exact strategy_version written by
@@ -291,6 +312,16 @@ def main() -> int:
             governance_schema = validate_prepared_governance_runtime(engine)
         else:
             migration_results = run_v3_migrations(engine)
+            qmt_collation_migration = None
+            qmt_legacy_binding_migration = None
+            if args.writers_fenced_schema_preparation:
+                qmt_collation_migration = migrate_legacy_attestation_collation(
+                    engine,
+                    writers_fenced=True,
+                )
+                qmt_legacy_binding_migration = (
+                    apply_legacy_completed_run_binding(engine)
+                )
             ensure_attestation_tables(engine)
             qmt_attestation_schema = validate_attestation_schema(engine)
             ensure_strategy_governance_tables(engine=engine)
@@ -325,6 +356,16 @@ def main() -> int:
                 ],
                 "snapshot_file": args.snapshot_file or None,
                 "qmt_attestation_schema": qmt_attestation_schema,
+                "qmt_collation_migration": (
+                    qmt_collation_migration
+                    if not args.schema_prepared
+                    else None
+                ),
+                "qmt_legacy_binding_migration": (
+                    qmt_legacy_binding_migration
+                    if not args.schema_prepared
+                    else None
+                ),
                 "governance_trigger_count": 0,
                 "database_triggers_required": False,
                 "governance_schema": governance_schema,

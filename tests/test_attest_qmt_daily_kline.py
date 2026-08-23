@@ -1,3 +1,4 @@
+import hashlib
 import inspect
 import json
 import os
@@ -302,6 +303,264 @@ def test_frozen_schema_validator_accepts_only_frozen_collation():
     assert detail["trigger_count"] == 0
     assert detail["database_triggers_required"] is False
     assert detail["errors"] == []
+
+
+def test_legacy_collation_is_accepted_only_by_private_fenced_migration_gate():
+    connection = _FrozenSchemaConnection(
+        table_collation=attester.QMT_ATTESTATION_LEGACY_COLLATION,
+        column_collation=attester.QMT_ATTESTATION_LEGACY_COLLATION,
+    )
+
+    with pytest.raises(attester.QmtAttestationSchemaError):
+        attester.validate_attestation_schema(connection)
+    detail = attester._validate_attestation_schema_connection(
+        connection,
+        allow_legacy_collation=True,
+    )
+
+    assert set(detail["table_collations"].values()) == {
+        attester.QMT_ATTESTATION_LEGACY_COLLATION
+    }
+
+
+class _CollationMigrationConnection:
+    def __init__(self):
+        self.collations = {
+            table: attester.QMT_ATTESTATION_LEGACY_COLLATION
+            for table in attester.ATTESTATION_TABLE_NAMES
+        }
+        self.markers = {}
+        self.statements = []
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        params = dict(params or {})
+        self.statements.append(sql)
+        if sql.startswith("SELECT migration_hash"):
+            marker = self.markers.get(params["migration_key"])
+            return _SchemaResult([] if marker is None else [{"migration_hash": marker}])
+        if sql.startswith("INSERT INTO qmt_kline_attestation_schema_migration"):
+            self.markers[params["migration_key"]] = params["migration_hash"]
+            return _SchemaResult([])
+        if sql.startswith("ALTER TABLE `"):
+            table_name = sql.split("`", 2)[1]
+            self.collations[table_name] = attester.QMT_ATTESTATION_COLLATION
+            return _SchemaResult([])
+        raise AssertionError(sql)
+
+
+class _CollationMigrationEngine:
+    def __init__(self):
+        self.connection = _CollationMigrationConnection()
+
+    def begin(self):
+        connection = self.connection
+
+        class _Context:
+            def __enter__(self):
+                return connection
+
+            def __exit__(self, *_args):
+                return False
+
+        return _Context()
+
+    def connect(self):
+        return self.begin()
+
+
+def test_fenced_collation_migration_is_resumable_and_never_uses_triggers(
+    monkeypatch,
+):
+    engine = _CollationMigrationEngine()
+
+    def validate(
+        connection,
+        *,
+        allow_legacy_collation=False,
+        require_current_manifests=True,
+        **_kwargs,
+    ):
+        assert require_current_manifests is False
+        if not allow_legacy_collation:
+            assert set(connection.collations.values()) == {
+                attester.QMT_ATTESTATION_COLLATION
+            }
+        return {"table_collations": dict(connection.collations)}
+
+    monkeypatch.setattr(
+        attester, "_validate_attestation_schema_connection", validate
+    )
+    proof_version = {"value": 1}
+    monkeypatch.setattr(
+        attester,
+        "_attestation_table_row_proof",
+        lambda _connection, table_name, **_kwargs: {
+            "row_count": proof_version["value"],
+            "row_sha256": hashlib.sha256(
+                f"{table_name}:{proof_version['value']}".encode()
+            ).hexdigest(),
+        },
+    )
+
+    with pytest.raises(ValueError, match="writers_fenced=True"):
+        attester.migrate_legacy_attestation_collation(
+            engine, writers_fenced=False
+        )
+    first = attester.migrate_legacy_attestation_collation(
+        engine, writers_fenced=True
+    )
+    # Attestation ledgers are append-only and may grow after the one-time DDL.
+    # The durable migration marker therefore binds the DDL contract, while the
+    # transient before/after row proof guards the conversion itself.
+    proof_version["value"] = 2
+    second = attester.migrate_legacy_attestation_collation(
+        engine, writers_fenced=True
+    )
+
+    assert [item["action"] for item in first["operations"]] == [
+        "converted"
+    ] * 4
+    assert [item["action"] for item in second["operations"]] == [
+        "already_target"
+    ] * 4
+    assert len(engine.connection.markers) == 8
+    assert sum(sql.startswith("ALTER TABLE `") for sql in engine.connection.statements) == 4
+    assert not any("TRIGGER" in sql.upper() for sql in engine.connection.statements)
+
+
+def test_fenced_collation_migration_never_blesses_failed_row_proof(
+    monkeypatch,
+):
+    engine = _CollationMigrationEngine()
+
+    def validate(
+        connection,
+        *,
+        allow_legacy_collation=False,
+        require_current_manifests=True,
+        **_kwargs,
+    ):
+        assert require_current_manifests is False
+        if not allow_legacy_collation:
+            assert set(connection.collations.values()) == {
+                attester.QMT_ATTESTATION_COLLATION
+            }
+        return {"table_collations": dict(connection.collations)}
+
+    monkeypatch.setattr(
+        attester, "_validate_attestation_schema_connection", validate
+    )
+    first_table = attester.ATTESTATION_TABLE_NAMES[0]
+    proof_calls = {first_table: 0}
+
+    def drifting_proof(_connection, table_name, **_kwargs):
+        proof_calls[table_name] = proof_calls.get(table_name, 0) + 1
+        version = 1 if proof_calls[table_name] <= 2 else 2
+        return {
+            "row_count": version,
+            "row_sha256": hashlib.sha256(
+                f"{table_name}:{version}".encode()
+            ).hexdigest(),
+        }
+
+    monkeypatch.setattr(
+        attester,
+        "_attestation_table_row_proof",
+        drifting_proof,
+    )
+
+    with pytest.raises(
+        attester.QmtAttestationSchemaError,
+        match="row proof changed during conversion",
+    ):
+        attester.migrate_legacy_attestation_collation(
+            engine,
+            writers_fenced=True,
+        )
+
+    pending_key, complete_key, _contract_hash = (
+        attester._collation_marker_contract(first_table)
+    )
+    assert engine.connection.collations[first_table] == (
+        attester.QMT_ATTESTATION_COLLATION
+    )
+    assert pending_key in engine.connection.markers
+    assert complete_key not in engine.connection.markers
+    with pytest.raises(
+        attester.QmtAttestationSchemaError,
+        match="pending row proof differs",
+    ):
+        attester.migrate_legacy_attestation_collation(
+            engine,
+            writers_fenced=True,
+        )
+
+
+def test_fenced_collation_migration_finalizes_matching_interrupted_ddl(
+    monkeypatch,
+):
+    engine = _CollationMigrationEngine()
+
+    def validate(
+        connection,
+        *,
+        allow_legacy_collation=False,
+        require_current_manifests=True,
+        **_kwargs,
+    ):
+        assert require_current_manifests is False
+        if not allow_legacy_collation:
+            assert set(connection.collations.values()) == {
+                attester.QMT_ATTESTATION_COLLATION
+            }
+        return {"table_collations": dict(connection.collations)}
+
+    monkeypatch.setattr(
+        attester, "_validate_attestation_schema_connection", validate
+    )
+
+    def stable_proof(_connection, table_name, **_kwargs):
+        return {
+            "row_count": 1,
+            "row_sha256": hashlib.sha256(table_name.encode()).hexdigest(),
+        }
+
+    monkeypatch.setattr(
+        attester,
+        "_attestation_table_row_proof",
+        stable_proof,
+    )
+    first_table = attester.ATTESTATION_TABLE_NAMES[0]
+    pending_key, complete_key, contract_hash = (
+        attester._collation_marker_contract(first_table)
+    )
+    proof = stable_proof(engine.connection, first_table)
+    engine.connection.markers[pending_key] = attester._collation_pending_hash(
+        first_table,
+        contract_hash,
+        proof,
+    )
+    engine.connection.collations[first_table] = (
+        attester.QMT_ATTESTATION_COLLATION
+    )
+
+    result = attester.migrate_legacy_attestation_collation(
+        engine,
+        writers_fenced=True,
+    )
+
+    assert result["operations"][0]["action"] == "finalized_after_interrupt"
+    assert engine.connection.markers[complete_key] == (
+        attester._collation_complete_hash(
+            first_table,
+            contract_hash,
+            engine.connection.markers[pending_key],
+        )
+    )
+    assert set(engine.connection.collations.values()) == {
+        attester.QMT_ATTESTATION_COLLATION
+    }
 
 
 @pytest.mark.parametrize(

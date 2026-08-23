@@ -1445,6 +1445,7 @@ controlled_guard_verify_restored_runtime() {
   local expected_sha="$3"
   local ai_service_record="$4"
   local ai_timer_record="$5"
+  local verification_mode="${6:-full}"
   local main_load main_active main_unit_file
   local scheduler_load scheduler_active scheduler_unit_file
   local ai_service_load ai_service_active ai_service_unit_file
@@ -1459,6 +1460,10 @@ controlled_guard_verify_restored_runtime() {
   local snapshot_release=""
   local -a cmdline=()
   local -a attested_env=()
+  case "$verification_mode" in
+    full|rollback-only) ;;
+    *) return 1 ;;
+  esac
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   IFS=, read -r main_load main_active main_unit_file <<< "$main_record" || return 1
   IFS=, read -r scheduler_load scheduler_active scheduler_unit_file \
@@ -1635,6 +1640,13 @@ controlled_guard_verify_restored_runtime() {
       *) return 1 ;;
     esac
   done
+  if [ "$verification_mode" = rollback-only ]; then
+    # The rollback-only path deliberately proves the sealed old runtime and
+    # its two HTTP health boundaries without re-running the failed forward
+    # schema/governance validator.  Normal deploy and privileged recovery keep
+    # the default full verification below.
+    return 0
+  fi
   sudo -u "$service_user" /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
@@ -1807,6 +1819,124 @@ controlled_guard_restore_and_verify_governance_snapshot() {
   controlled_guard_governance_snapshot verify "$1" "$2" || return 1
   return 0
 }
+controlled_guard_capture_current_governance_snapshot() {
+  local guarded_sha="$1"
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local release_venv_target
+  local service_user
+  local adata_sha
+  local adata_tree_sha
+  local adata_source
+  local release_tree_sha
+  local adapter_registry_seal_sha
+  local capture_root=/tmp
+  local current_snapshot
+  local capture_valid=1
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
+  controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
+    return 1
+  controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || \
+    return 1
+  test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
+    return 1
+  test -d "$code_root" || return 1
+  test ! -L "$code_root" || return 1
+  test "$(readlink -f "$code_root")" = "$code_root" || return 1
+  test "$(stat -c '%U:%G' "$code_root")" = root:root || return 1
+  test -z "$(find -P "$code_root" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
+  test -z "$(git -C "$code_root" \
+    status --porcelain=v1 --untracked-files=all)" || return 1
+  test -L "$release_venv" || return 1
+  test -x "$release_venv/bin/python" || return 1
+  test "$(<"$release_venv/.probiga.gitsha")" = "$guarded_sha" || return 1
+  adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
+  adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
+  release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
+  adapter_registry_seal_sha="$(
+    <"$release_venv/.adapter-registry-seal.sha256"
+  )" || return 1
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  test -d "$adata_source" || return 1
+  test ! -L "$adata_source" || return 1
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  sudo -u "$service_user" test ! -w "$code_root" || return 1
+  release_venv_target="$(readlink -f "$release_venv")" || return 1
+  case "$release_venv_target" in
+    "$RELEASE_VENV_ROOT"/build-*) ;;
+    *) return 1 ;;
+  esac
+  test "$(dirname "$release_venv_target")" = "$RELEASE_VENV_ROOT" || return 1
+  test "$(stat -c '%U' "$release_venv_target")" = root || return 1
+  test -z "$(find -P "$release_venv_target" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  sudo -u "$service_user" test ! -w "$release_venv_target" || return 1
+  test "$(readlink -f "$adata_source")" = "$adata_source" || return 1
+  test "$(stat -c '%U' "$adata_source")" = root || return 1
+  test "$(<"$adata_source/.probiga-adata.gitsha")" = "$adata_sha" || return 1
+  test "$(<"$adata_source/.probiga-adata.tree.sha256")" = \
+    "$adata_tree_sha" || return 1
+  test -z "$(find -P "$adata_source" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  sudo -u "$service_user" test ! -w "$adata_source" || return 1
+  test -d "$capture_root" || return 1
+  test ! -L "$capture_root" || return 1
+  test "$(readlink -f "$capture_root")" = "$capture_root" || return 1
+  test "$(stat -c '%U:%G' "$capture_root")" = root:root || return 1
+  test "$(stat -c '%a' "$capture_root")" = 1777 || return 1
+  current_snapshot="$(mktemp \
+    "$capture_root/.probiga-governance-capture.XXXXXX")" || return 1
+  case "$current_snapshot" in
+    "$capture_root"/.probiga-governance-capture.*) ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_file "$current_snapshot" 600 || return 1
+  test "$(dirname "$current_snapshot")" = "$capture_root" || return 1
+  if chown "$service_user:$service_user" "$current_snapshot" && \
+    chmod 0600 "$current_snapshot" && \
+    sudo -u "$service_user" /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+      PROBIGA_CODE_ROOT="$code_root" \
+      PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+      PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+      PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
+      PYTHONPATH="$adata_source:$code_root" \
+      "$release_venv/bin/python" -P \
+      "$code_root/tools/add_strategy_governance_task.py" \
+      --capture-snapshot "$current_snapshot" && \
+    test -f "$current_snapshot" && test ! -L "$current_snapshot" && \
+    test "$(stat -c '%U:%G' "$current_snapshot")" = \
+      "$service_user:$service_user" && \
+    test "$(stat -c '%a' "$current_snapshot")" = 600 && \
+    chown root:root "$current_snapshot" && chmod 0600 "$current_snapshot" && \
+    controlled_guard_assert_file "$current_snapshot" 600 && \
+    cmp --silent "$current_snapshot" \
+      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
+    capture_valid=0
+  fi
+  if ! rm -f -- "$current_snapshot" || [ -e "$current_snapshot" ] || \
+    [ -L "$current_snapshot" ]; then
+    return 1
+  fi
+  test "$capture_valid" -eq 0 || return 1
+  return 0
+}
 controlled_guard_restore_and_finalize() {
   local ai_service_record="$4"
   local ai_timer_record="$5"
@@ -1852,6 +1982,136 @@ controlled_guard_restore_and_finalize() {
       "$ai_service_record" "$ai_timer_record" || true
     return 1
   fi
+  return 0
+}
+controlled_v2_rollback_only_recovery() {
+  local guarded_sha
+  local old_runtime_sha
+  local phase
+  local main_record
+  local scheduler_record
+  local ai_service_record
+  local ai_timer_record
+  local -a state_lines=()
+  test "$DEPLOY_OPERATION" = deploy || return 1
+  test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
+  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  guarded_sha="$(activation_snapshot_recorded_release)" || return 1
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$guarded_sha" != "$EXPECTED_SHA" || return 1
+  old_runtime_sha="$(activation_snapshot_old_release "$guarded_sha")" || \
+    return 1
+  [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$old_runtime_sha" != "$guarded_sha" || return 1
+  phase="$(activation_snapshot_phase)" || return 1
+  case "$phase" in
+    prepared|restoring-old|old-set-restored|old-runtime-verified) ;;
+    *) return 1 ;;
+  esac
+  test ! -e "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+  test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+  test ! -e "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test ! -L "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test ! -e "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+  test ! -L "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+  controlled_guard_assert_directory || return 1
+  controlled_guard_assert_file "$ACTIVATION_UNIT_SNAPSHOT_STATE" 600 || \
+    return 1
+  mapfile -t state_lines < "$ACTIVATION_UNIT_SNAPSHOT_STATE" || return 1
+  test "${#state_lines[@]}" -eq 6 || return 1
+  test "${state_lines[0]}" = probiga.database-writer-restore.v1 || return 1
+  test "${state_lines[1]}" = "release=$guarded_sha" || return 1
+  case "${state_lines[2]}" in
+    main_unit=*) main_record="${state_lines[2]#main_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[3]}" in
+    scheduler_unit=*) scheduler_record="${state_lines[3]#scheduler_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[4]}" in
+    ai_service_unit=*) ai_service_record="${state_lines[4]#ai_service_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[5]}" in
+    ai_timer_unit=*) ai_timer_record="${state_lines[5]#ai_timer_unit=}" ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_state_record main "$main_record" || return 1
+  controlled_guard_assert_state_record scheduler "$scheduler_record" || return 1
+  controlled_guard_assert_state_record ai-service "$ai_service_record" || return 1
+  controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
+  if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  else
+    test "$phase" = old-runtime-verified || return 1
+    controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  fi
+  if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
+    [ -L "$DATABASE_WRITER_GUARD_FILE" ]; then
+    controlled_guard_assert_marker "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  else
+    case "$phase" in
+      old-set-restored|old-runtime-verified) ;;
+      *) return 1 ;;
+    esac
+    controlled_guard_recreate_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  fi
+  # Reapply the complete fence even when a prior interrupted attempt already
+  # recreated the marker.  Marker creation, drop-in loading and writer stops
+  # are separate durable steps, so this sequence must itself be idempotent.
+  controlled_guard_install_dropins || return 1
+  systemctl daemon-reload || return 1
+  controlled_guard_force_all_writers_fenced "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  activation_snapshot_restore_old_set "$guarded_sha" || return 1
+  systemctl daemon-reload || return 1
+  activation_snapshot_assert_old_set "$guarded_sha" || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  controlled_guard_capture_current_governance_snapshot "$guarded_sha" || \
+    return 1
+  controlled_guard_cleanup "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  if ! controlled_guard_restore_previous_writer_states "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+    ! controlled_guard_verify_restored_runtime "$main_record" \
+      "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \
+      "$ai_timer_record" rollback-only || \
+    ! activation_snapshot_set_phase "$guarded_sha" old-runtime-verified; then
+    controlled_guard_refence_after_restore_failure \
+      "$guarded_sha" "$main_record" "$scheduler_record" \
+      "$ai_service_record" "$ai_timer_record" || true
+    return 1
+  fi
+  if ! rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || \
+    ! sync -f "$DATABASE_WRITER_GUARD_DIR" || \
+    [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    [ -L "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    ! activation_snapshot_remove_old_runtime_verified; then
+    controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || true
+    controlled_guard_refence_after_restore_failure \
+      "$guarded_sha" "$main_record" "$scheduler_record" \
+      "$ai_service_record" "$ai_timer_record" || true
+    return 1
+  fi
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  echo "v2 rollback-only recovery restored sealed runtime $old_runtime_sha" >&2
   return 0
 }
 controlled_guard_sync_activation_journal() {
@@ -2538,6 +2798,19 @@ MAIN_SERVICE=probiga
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
+if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
+  { [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] || \
+    [ -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" ]; } && \
+  { [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
+    [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
+    [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    [ -L "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    { [ -f "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
+      [ ! -L "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
+      [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ]; }; }; then
+  CUTOVER_STEP=v2_rollback_only_recovery
+  controlled_v2_rollback_only_recovery
+fi
 BUILD_USER=probiga-build
 test "$BUILD_USER" != "$SERVICE_USER"
 test "$BUILD_USER" != root
@@ -5393,7 +5666,7 @@ if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
   DATABASE_FORWARD_MIGRATION_STARTED=1
   if ! run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
-    --disabled; then
+    --disabled --writers-fenced-schema-preparation; then
     GOVERNANCE_TASK_TOUCHED=1
     false
   fi

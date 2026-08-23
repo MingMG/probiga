@@ -19,6 +19,7 @@ import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,6 +42,7 @@ from server.common.qmt_attestation_contract import (
     EXPECTED_STOCK_SET_SCHEMA,
     PRICE_TOLERANCE,
     QMT_ATTESTATION_COLLATION,
+    QMT_ATTESTATION_LEGACY_COLLATION,
     QMT_V2_TOLERANCE_VALUES,
     UNIVERSE_MANIFEST_SCHEMA,
     VOLUME_ABSOLUTE_TOLERANCE,
@@ -65,6 +67,12 @@ ATTESTATION_SCHEMA_MIGRATION_TABLE = (
 )
 TOLERANCE_MEDIUMTEXT_MIGRATION_KEY = (
     "20260822_001_qmt_attestation_tolerance_mediumtext"
+)
+COLLATION_MIGRATION_MARKER_PREFIX = (
+    "20260823_001_qmt_attestation_unicode_ci:"
+)
+COLLATION_MIGRATION_PROTOCOL = (
+    "probiga.qmt-attestation-collation-migration.v1"
 )
 LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY = (
     "20260822_002_qmt_legacy_v1_ineligible_manifest_binding"
@@ -735,6 +743,388 @@ def _missing_attestation_trigger_statements(
     return ()
 
 
+_ATTESTATION_ROW_ORDER = {
+    "qmt_kline_attestation_run": "BINARY run_id",
+    "qmt_kline_attestation_mismatch": "id",
+    "qmt_kline_attestation_row": "BINARY attestation_id",
+    "qmt_kline_attestation_schema_migration": "BINARY migration_key",
+}
+
+
+def _collation_proof_value(value: Any) -> Any:
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    if isinstance(value, Decimal):
+        return {"decimal": format(value, "f")}
+    if isinstance(value, bytes):
+        return {"bytes_hex": value.hex()}
+    if hasattr(value, "isoformat"):
+        return {"iso8601": value.isoformat()}
+    raise TypeError(f"unsupported QMT row-proof value: {type(value).__name__}")
+
+
+def _attestation_table_row_proof(
+    connection: Connection,
+    table_name: str,
+    *,
+    exclude_migration_keys: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    if table_name not in ATTESTATION_TABLE_NAMES:
+        raise ValueError("unknown QMT attestation table")
+    if exclude_migration_keys and (
+        table_name != ATTESTATION_SCHEMA_MIGRATION_TABLE
+        or len(set(exclude_migration_keys)) != len(exclude_migration_keys)
+        or any(not key for key in exclude_migration_keys)
+    ):
+        raise ValueError("migration-key exclusion is only valid for the marker table")
+    columns = tuple(
+        contract[0] for contract in _ATTESTATION_COLUMN_CONTRACTS[table_name]
+    )
+    select_columns = ",".join(f"`{column}`" for column in columns)
+    where = ""
+    params: dict[str, Any] = {}
+    if exclude_migration_keys:
+        predicates = []
+        for index, migration_key in enumerate(exclude_migration_keys):
+            parameter = f"excluded_migration_key_{index}"
+            predicates.append(f"BINARY migration_key<>BINARY :{parameter}")
+            params[parameter] = migration_key
+        where = " WHERE " + " AND ".join(predicates)
+    statement = text(
+        f"SELECT {select_columns} FROM `{table_name}`{where} "
+        f"ORDER BY {_ATTESTATION_ROW_ORDER[table_name]}"
+    )
+    stream = connection.execution_options(
+        stream_results=True, max_row_buffer=512
+    ).execute(statement, params).mappings()
+    hasher = hashlib.sha256()
+    hasher.update(b"probiga.qmt-attestation-row-proof.v1\x00")
+    hasher.update(table_name.encode("ascii") + b"\x00")
+    count = 0
+    try:
+        while True:
+            rows = stream.fetchmany(512)
+            if not rows:
+                break
+            for row in rows:
+                if set(row) != set(columns):
+                    raise RuntimeError("QMT row-proof columns differ")
+                encoded = json.dumps(
+                    [
+                        [column, _collation_proof_value(row[column])]
+                        for column in columns
+                    ],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                hasher.update(len(encoded).to_bytes(8, "big"))
+                hasher.update(encoded)
+                count += 1
+    finally:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    return {"row_count": count, "row_sha256": hasher.hexdigest()}
+
+
+def _collation_marker_contract(
+    table_name: str,
+) -> tuple[str, str, str]:
+    pending_key = COLLATION_MIGRATION_MARKER_PREFIX + "pending:" + table_name
+    complete_key = COLLATION_MIGRATION_MARKER_PREFIX + "complete:" + table_name
+    if max(len(pending_key), len(complete_key)) > 100:
+        raise AssertionError("QMT collation marker key is too long")
+    contract_hash = canonical_digest(
+        {
+            "schema": COLLATION_MIGRATION_PROTOCOL,
+            "table": table_name,
+            "from_collation": QMT_ATTESTATION_LEGACY_COLLATION,
+            "to_collation": QMT_ATTESTATION_COLLATION,
+            "ddl": (
+                f"ALTER TABLE `{table_name}` CONVERT TO CHARACTER SET utf8mb4 "
+                f"COLLATE {QMT_ATTESTATION_COLLATION}"
+            ),
+        }
+    )
+    return pending_key, complete_key, contract_hash
+
+
+def _collation_pending_hash(
+    table_name: str,
+    contract_hash: str,
+    proof: dict[str, Any],
+) -> str:
+    return canonical_digest(
+        {
+            "schema": COLLATION_MIGRATION_PROTOCOL + ".pending-proof.v1",
+            "table": table_name,
+            "contract_hash": contract_hash,
+            **proof,
+        }
+    )
+
+
+def _collation_complete_hash(
+    table_name: str,
+    contract_hash: str,
+    pending_hash: str,
+) -> str:
+    return canonical_digest(
+        {
+            "schema": COLLATION_MIGRATION_PROTOCOL + ".complete-proof.v1",
+            "table": table_name,
+            "contract_hash": contract_hash,
+            "pending_hash": pending_hash,
+        }
+    )
+
+
+def _read_collation_marker(
+    connection: Connection,
+    migration_key: str,
+) -> str | None:
+    rows = connection.execute(
+        text(
+            "SELECT migration_hash FROM "
+            "qmt_kline_attestation_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ),
+        {"migration_key": migration_key},
+    ).mappings().all()
+    if len(rows) > 1:
+        raise QmtAttestationSchemaError(
+            {"errors": [f"duplicate QMT migration marker: {migration_key}"]}
+        )
+    if not rows:
+        return None
+    marker_hash = str(rows[0].get("migration_hash") or "")
+    if not _LOWER_SHA256_RE.fullmatch(marker_hash):
+        raise QmtAttestationSchemaError(
+            {"errors": [f"invalid QMT migration marker: {migration_key}"]}
+        )
+    return marker_hash
+
+
+def _insert_collation_marker(
+    connection: Connection,
+    migration_key: str,
+    migration_hash: str,
+) -> None:
+    connection.execute(
+        text(
+            "INSERT INTO qmt_kline_attestation_schema_migration "
+            "(migration_key, migration_hash, completed_at) "
+            "VALUES (:migration_key, :migration_hash, NOW())"
+        ),
+        {"migration_key": migration_key, "migration_hash": migration_hash},
+    )
+
+
+def migrate_legacy_attestation_collation(
+    engine: Engine,
+    *,
+    writers_fenced: bool,
+) -> dict[str, Any]:
+    """Convert only an exact legacy QMT schema under an explicit writer fence."""
+
+    if writers_fenced is not True:
+        raise ValueError("QMT collation migration requires writers_fenced=True")
+    operations: list[dict[str, Any]] = []
+    with engine.connect() as connection:
+        _validate_attestation_schema_connection(
+            connection,
+            allow_legacy_collation=True,
+            require_current_manifests=False,
+        )
+    for table_name in ATTESTATION_TABLE_NAMES:
+        pending_key, complete_key, contract_hash = (
+            _collation_marker_contract(table_name)
+        )
+        proof_exclusions = (
+            (pending_key, complete_key)
+            if table_name == ATTESTATION_SCHEMA_MIGRATION_TABLE
+            else ()
+        )
+        with engine.begin() as connection:
+            detail = _validate_attestation_schema_connection(
+                connection,
+                allow_legacy_collation=True,
+                require_current_manifests=False,
+            )
+            observed = str(detail["table_collations"].get(table_name) or "")
+            proof = _attestation_table_row_proof(
+                connection,
+                table_name,
+                exclude_migration_keys=proof_exclusions,
+            )
+            pending_hash = _collation_pending_hash(
+                table_name,
+                contract_hash,
+                proof,
+            )
+            observed_pending = _read_collation_marker(connection, pending_key)
+            observed_complete = _read_collation_marker(connection, complete_key)
+            if observed_complete is not None:
+                if observed_pending is None or observed_complete != (
+                    _collation_complete_hash(
+                        table_name,
+                        contract_hash,
+                        observed_pending,
+                    )
+                ):
+                    raise QmtAttestationSchemaError(
+                        {"errors": [f"{table_name} completion marker differs"]}
+                    )
+            if observed == QMT_ATTESTATION_COLLATION:
+                if observed_pending is None:
+                    raise QmtAttestationSchemaError(
+                        {
+                            "errors": [
+                                f"{table_name} target collation lacks migration proof"
+                            ]
+                        }
+                    )
+                action = "already_target"
+                if observed_complete is None:
+                    if observed_pending != pending_hash:
+                        raise QmtAttestationSchemaError(
+                            {"errors": [f"{table_name} pending row proof differs"]}
+                        )
+                    _insert_collation_marker(
+                        connection,
+                        complete_key,
+                        _collation_complete_hash(
+                            table_name,
+                            contract_hash,
+                            pending_hash,
+                        ),
+                    )
+                    action = "finalized_after_interrupt"
+                operations.append(
+                    {"table_name": table_name, "action": action, **proof}
+                )
+                continue
+            if observed != QMT_ATTESTATION_LEGACY_COLLATION:
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} legacy collation differs"]}
+                )
+            if observed_complete is not None:
+                raise QmtAttestationSchemaError(
+                    {
+                        "errors": [
+                            f"{table_name} completion marker precedes conversion"
+                        ]
+                    }
+                )
+            if observed_pending is not None and observed_pending != pending_hash:
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} pending row proof differs"]}
+                )
+            if observed_pending is None:
+                _insert_collation_marker(
+                    connection,
+                    pending_key,
+                    pending_hash,
+                )
+        # Each stage has its own committed transaction.  MySQL DDL commits
+        # implicitly; a process interruption therefore leaves a durable
+        # pending proof that the next fenced deployment can verify and resume.
+        with engine.begin() as connection:
+            detail = _validate_attestation_schema_connection(
+                connection,
+                allow_legacy_collation=True,
+                require_current_manifests=False,
+            )
+            if detail["table_collations"].get(table_name) != (
+                QMT_ATTESTATION_LEGACY_COLLATION
+            ):
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} source collation changed"]}
+                )
+            current_proof = _attestation_table_row_proof(
+                connection,
+                table_name,
+                exclude_migration_keys=proof_exclusions,
+            )
+            if current_proof != proof or (
+                _read_collation_marker(connection, pending_key) != pending_hash
+            ):
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} pending row proof changed"]}
+                )
+            if _read_collation_marker(connection, complete_key) is not None:
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} completed before conversion"]}
+                )
+            connection.execute(
+                text(
+                    f"ALTER TABLE `{table_name}` CONVERT TO CHARACTER SET "
+                    f"utf8mb4 COLLATE {QMT_ATTESTATION_COLLATION}"
+                )
+            )
+        with engine.begin() as connection:
+            detail = _validate_attestation_schema_connection(
+                connection,
+                allow_legacy_collation=True,
+                require_current_manifests=False,
+            )
+            if detail["table_collations"].get(table_name) != (
+                QMT_ATTESTATION_COLLATION
+            ):
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} collation conversion failed"]}
+                )
+            post_proof = _attestation_table_row_proof(
+                connection,
+                table_name,
+                exclude_migration_keys=proof_exclusions,
+            )
+            if post_proof != proof:
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} row proof changed during conversion"]}
+                )
+            if _read_collation_marker(connection, pending_key) != pending_hash:
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} pending marker changed"]}
+                )
+            observed_complete = _read_collation_marker(connection, complete_key)
+            if observed_complete is None:
+                _insert_collation_marker(
+                    connection,
+                    complete_key,
+                    _collation_complete_hash(
+                        table_name,
+                        contract_hash,
+                        pending_hash,
+                    ),
+                )
+            elif observed_complete != _collation_complete_hash(
+                table_name,
+                contract_hash,
+                pending_hash,
+            ):
+                raise QmtAttestationSchemaError(
+                    {"errors": [f"{table_name} completion marker differs"]}
+                )
+            operations.append(
+                {"table_name": table_name, "action": "converted", **proof}
+            )
+    with engine.connect() as connection:
+        final_schema = _validate_attestation_schema_connection(
+            connection,
+            require_current_manifests=False,
+        )
+    return {
+        "status": "ok",
+        "writers_fenced": True,
+        "source_collation": QMT_ATTESTATION_LEGACY_COLLATION,
+        "target_collation": QMT_ATTESTATION_COLLATION,
+        "operations": operations,
+        "schema": final_schema,
+        "database_triggers_required": False,
+    }
+
+
 def ensure_attestation_tables(
     engine: Engine,
     *,
@@ -857,6 +1247,7 @@ def _validate_attestation_schema_connection(
     *,
     require_triggers: bool = True,
     require_current_manifests: bool = True,
+    allow_legacy_collation: bool = False,
     expected_legacy_run_count: int = (
         EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT
     ),
@@ -864,6 +1255,8 @@ def _validate_attestation_schema_connection(
         EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH
     ),
 ) -> dict[str, Any]:
+    if type(allow_legacy_collation) is not bool:
+        raise TypeError("allow_legacy_collation must be bool")
     errors: list[str] = []
     migration_rows = connection.execute(
         text(
@@ -897,6 +1290,10 @@ def _validate_attestation_schema_connection(
     observed_tables = {
         str(row.get("table_name") or ""): dict(row) for row in table_rows
     }
+    allowed_collations = {QMT_ATTESTATION_COLLATION}
+    if allow_legacy_collation:
+        allowed_collations.add(QMT_ATTESTATION_LEGACY_COLLATION)
+    observed_table_collations: dict[str, str] = {}
     if set(observed_tables) != set(ATTESTATION_TABLE_NAMES):
         errors.append(
             "table inventory differs: expected="
@@ -908,7 +1305,8 @@ def _validate_attestation_schema_connection(
         if str(row.get("engine") or "").lower() != "innodb":
             errors.append(f"{table_name} engine is not InnoDB")
         collation = str(row.get("table_collation") or "").lower()
-        if collation != QMT_ATTESTATION_COLLATION:
+        observed_table_collations[table_name] = collation
+        if collation not in allowed_collations:
             errors.append(f"{table_name} table collation differs")
 
     column_rows = connection.execute(
@@ -947,9 +1345,12 @@ def _validate_attestation_schema_connection(
         }
         character_set = str(row.get("character_set_name") or "").lower()
         column_collation = str(row.get("collation_name") or "").lower()
+        expected_column_collation = observed_table_collations.get(
+            table_name, QMT_ATTESTATION_COLLATION
+        )
         if character_type and (
             character_set != "utf8mb4"
-            or column_collation != QMT_ATTESTATION_COLLATION
+            or column_collation != expected_column_collation
         ):
             errors.append(
                 f"{table_name}.{row.get('column_name')} "
@@ -1154,6 +1555,7 @@ def _validate_attestation_schema_connection(
         "immutability_enforcement": (
             "application_transaction_unique_identity_and_evidence_hash"
         ),
+        "table_collations": observed_table_collations,
         "completed_run_count": len(completed_run_rows),
         "completed_current_manifest_run_count": current_manifest_run_count,
         "completed_manifest_entry_count": completed_manifest_entry_count,
