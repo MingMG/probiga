@@ -2013,6 +2013,7 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
     assert '"PYTHONPATH=$PREPARED_CODE_ROOT"' in migration_runner
     assert '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT"' not in migration_runner
     assert "run_prepared_database_migration_tool" not in runtime_runner
+    assert 'cd "$PREPARED_CODE_ROOT" || return 1' in runtime_runner
     for forbidden in (
         "SET GLOBAL",
         "privileged_ddl_executor",
@@ -2928,7 +2929,16 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'sync -f "$DATABASE_WRITER_RESTORE_FILE"' in restore_file_writer
     assert "controlled_guard_assert_restore_file" in restore_finalize
     assert "controlled_guard_restore_previous_writer_states" in restore_finalize
-    assert restore_finalize.count("controlled_guard_refence_after_restore_failure") >= 2
+    assert restore_finalize.count("controlled_guard_refence_after_restore_failure") >= 1
+    old_runtime_commit = restore_finalize.index(
+        'activation_snapshot_set_phase "$guarded_sha" old-runtime-verified'
+    )
+    restore_finalize_after_commit = restore_finalize[old_runtime_commit:]
+    assert (
+        "controlled_guard_refence_after_restore_failure"
+        not in restore_finalize_after_commit
+    )
+    assert "controlled_guard_write_restore_file" not in restore_finalize_after_commit
     assert 'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"' in restore_finalize
     for unit in (
         "probiga",
@@ -3034,6 +3044,15 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     }
     recovery = bodies["controlled_v2_rollback_only_recovery"]
     capture = bodies["controlled_guard_capture_current_governance_snapshot"]
+    restore_runtime = bodies[
+        "controlled_guard_assert_governance_restore_runtime"
+    ]
+    rollback_receipt = bodies[
+        "activation_snapshot_validate_rollback_receipt_state"
+    ]
+    missing_guard = bodies[
+        "activation_snapshot_allows_missing_guard_for_recovery"
+    ]
     venv_seal = bodies["controlled_guard_assert_immutable_venv_tree"]
     verifier = bodies["controlled_guard_verify_restored_runtime"]
 
@@ -3041,23 +3060,44 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert (
         'test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in recovery
     )
-    assert 'test "$guarded_sha" != "$EXPECTED_SHA"' in recovery
+    assert 'test "$guarded_sha" != "$EXPECTED_SHA"' not in recovery
     assert (
         "prepared|runtime-units-installing|runtime-units-installed|"
         " restoring-old|old-set-restored|old-runtime-verified"
         in recovery
     )
+    phase_gate = recovery[
+        recovery.index('phase="$(activation_snapshot_phase)"'):
+        recovery.index("esac", recovery.index('phase="$(activation_snapshot_phase)"'))
+    ]
     for disallowed_phase in (
         "new-runtime-verified",
         "finalized",
     ):
-        assert disallowed_phase not in recovery
+        assert disallowed_phase not in phase_gate
     assert (
         "runtime-units-installed|restoring-old|old-set-restored|"
         "old-runtime-verified"
         in recovery
     )
     assert "activation_snapshot_validate_governance_new" in recovery
+    receipt_validation = recovery.index(
+        "activation_snapshot_validate_rollback_receipt_state"
+    )
+    writer_state = recovery.index('test "${#state_lines[@]}" -eq 6')
+    assert receipt_validation < writer_state
+    assert (
+        "runtime-units-installed|restoring-old|old-set-restored|"
+        " old-runtime-verified"
+        in rollback_receipt
+    )
+    assert "activation_snapshot_validate_receipt_pending" in rollback_receipt
+    for receipt_path in (
+        "$ACTIVATION_RECEIPT_PENDING",
+        "$ACTIVATION_RECEIPT_PENDING_SHA",
+    ):
+        assert f'[ -e "{receipt_path}" ]' in rollback_receipt
+        assert f'[ -L "{receipt_path}" ]' in rollback_receipt
     for state_path in (
         "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT",
         "$ACTIVATION_GOVERNANCE_NEW_SHA",
@@ -3068,6 +3108,12 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "controlled_guard_recreate_file" in recovery
     assert "controlled_guard_force_all_writers_fenced" in recovery
     assert 'test "$phase" = old-runtime-verified' in recovery
+    assert "activation_snapshot_allows_missing_guard_for_recovery" in recovery
+    assert (
+        "prepared|runtime-units-installed|restoring-old|old-set-restored|"
+        " old-runtime-verified"
+        in missing_guard
+    )
     guard_branch_end = recovery.index("fi", recovery.index(
         "controlled_guard_recreate_file"
     ))
@@ -3080,15 +3126,31 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     marker = recovery.index("controlled_guard_assert_marker")
     restore_file = recovery.index("controlled_guard_assert_restore_file")
     boundary = recovery.index("controlled_guard_assert_boundary", marker)
-    assert guard_branch_end < install_fence < reload_fence < force_fence < boundary
+    fence_failure = recovery.index(
+        'if [ "$fence_status" -ne 0 ]', boundary
+    )
+    refence = recovery.index(
+        "controlled_guard_refence_after_restore_failure", fence_failure
+    )
+    assert (
+        guard_branch_end
+        < install_fence
+        < reload_fence
+        < force_fence
+        < boundary
+        < fence_failure
+        < refence
+    )
     restore_old_set = recovery.index(
         "activation_snapshot_restore_old_set", boundary
+    )
+    restore_governance = recovery.index(
+        "controlled_guard_restore_and_verify_governance_snapshot", boundary
     )
     old_set = recovery.index("activation_snapshot_assert_old_set", restore_old_set)
     governance = recovery.index(
         "controlled_guard_capture_current_governance_snapshot", old_set
     )
-    assert "controlled_guard_restore_and_verify_governance_snapshot" not in recovery
     cleanup = recovery.index("controlled_guard_cleanup", governance)
     restore_states = recovery.index(
         "controlled_guard_restore_previous_writer_states", cleanup
@@ -3110,6 +3172,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         restore_file
         < marker
         < boundary
+        < restore_governance
         < restore_old_set
         < old_set
         < governance
@@ -3121,10 +3184,30 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         < activation_journal_remove
     )
     assert "rollback-only" in recovery
-    assert recovery.count("controlled_guard_refence_after_restore_failure") == 2
+    assert recovery.count("controlled_guard_refence_after_restore_failure") >= 5
     assert "controlled_guard_write_restore_file" in recovery
     assert "prepare_strategy_governance_qmt_history.py" not in recovery
     assert "prepare_strategy_governance_schema.py" not in recovery
+
+    ready_check = recovery.index(
+        "controlled_guard_assert_governance_restore_runtime"
+    )
+    venv_present = recovery.index(
+        '[ -e "$RELEASE_VENV_ROOT/$guarded_sha" ]'
+    )
+    fallback_capture = recovery.index(
+        "controlled_guard_capture_current_governance_snapshot", ready_check
+    )
+    state_validation = recovery.index('test "${#state_lines[@]}" -eq 6')
+    assert venv_present < ready_check < fallback_capture < state_validation
+    assert "controlled_guard_assert_governance_restore_runtime \"$guarded_sha\" || return 1" in recovery[
+        venv_present:fallback_capture
+    ]
+    assert 'activation_snapshot_validate "$guarded_sha"' in restore_runtime
+    assert 'git -C "$code_root" rev-parse HEAD' in restore_runtime
+    assert "status --porcelain=v1 --untracked-files=all" in restore_runtime
+    assert "controlled_guard_assert_immutable_venv_tree" in restore_runtime
+    assert 'test "$service_user" != root' in restore_runtime
 
     assert "activation_snapshot_validate" in capture
     assert 'local old_runtime_sha="$2"' in capture
@@ -3223,6 +3306,252 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "ACTIVATION_UNIT_SNAPSHOT_PHASE" in caller_block
     assert "old-runtime-verified" in caller_block
     assert "controlled_v2_rollback_only_recovery" in caller_block
+
+
+def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy)
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy).items()
+    }
+
+    set_options = deploy.index("set -Eeuo pipefail")
+    global_pipe = deploy.index("trap '' PIPE", set_options)
+    umask = deploy.index("umask 022", global_pipe)
+    assert set_options < global_pipe < umask
+
+    detach = bodies["detach_failure_handler_from_transport"]
+    ignore_signals = detach.index("trap '' PIPE TERM INT HUP")
+    clear_err = detach.index("trap - ERR", ignore_signals)
+    disable_errexit = detach.index("set +e", clear_err)
+    detach_fds = detach.index("exec >/dev/null 2>&1", disable_errexit)
+    assert ignore_signals < clear_err < disable_errexit < detach_fds
+
+    precutover = bodies["precutover_failure"]
+    precutover_detach = precutover.index("detach_failure_handler_from_transport")
+    precutover_output = precutover.index("deploy_failure phase=preflight")
+    precutover_receipt = precutover.index("write_receipt", precutover_output)
+    assert precutover_detach < precutover_output < precutover_receipt
+    rollback = bodies["rollback"]
+    rollback_detach = rollback.index("detach_failure_handler_from_transport")
+    success_gate = rollback.index('if [ "${DEPLOY_SUCCEEDED:-0}" -eq 1 ]')
+    rollback_state = rollback.index('if [ -e "$DATABASE_WRITER_GUARD_FILE" ]')
+    rollback_output = rollback.index("deploy_failure phase=", rollback_state)
+    assert rollback_detach < success_gate < rollback_state < rollback_output
+
+    forward = bodies["controlled_v2_forward_finalize_recovery"]
+    for phase in ("new-runtime-verified", "finalized"):
+        assert phase in forward
+    new_set = forward.index("activation_snapshot_assert_new_set")
+    receipt = forward.index("activation_snapshot_validate_receipt_pending")
+    request_identity = forward.index(
+        "activation_snapshot_receipt_matches_current_v2_request"
+    )
+    runtime = forward.index("controlled_guard_verify_restored_runtime")
+    governance = forward.index("controlled_guard_governance_snapshot verify")
+    restore_remove = forward.index('rm -f -- "$DATABASE_WRITER_RESTORE_FILE"')
+    finalized = forward.index("activation_snapshot_set_phase", restore_remove)
+    journal_remove = forward.index(
+        "activation_snapshot_remove_finalized_before_deploy", finalized
+    )
+    assert (
+        receipt
+        < request_identity
+        < new_set
+        < runtime
+        < governance
+        < restore_remove
+        < finalized
+    )
+    assert finalized < journal_remove
+    assert "rollback-only" in forward
+
+    removal = bodies["activation_snapshot_remove_finalized_before_deploy"]
+    publish = removal.index("publish_deployed_receipt_pending")
+    atomic_retire = removal.index("activation_snapshot_retire_verified_transaction")
+    assert publish < atomic_retire
+
+    retire = bodies["activation_snapshot_retire_verified_transaction"]
+    retire_target = retire.index("mktemp -d")
+    clear_placeholder = retire.index('rmdir -- "$retired_dir"', retire_target)
+    logical_commit = retire.index(
+        'mv -T -- "$ACTIVATION_UNIT_SNAPSHOT_DIR" "$retired_dir"',
+        clear_placeholder,
+    )
+    tombstone_cleanup = retire.index('rm -rf -- "$retired_dir"', logical_commit)
+    assert retire_target < clear_placeholder < logical_commit < tombstone_cleanup
+
+    service_user = normalized.index('test "$SERVICE_USER" != root')
+    forward_call = normalized.index(
+        "CUTOVER_STEP=v2_forward_finalize_recovery", service_user
+    )
+    rollback_call = normalized.index(
+        "CUTOVER_STEP=v2_rollback_only_recovery", forward_call
+    )
+    forward_window = normalized[forward_call:rollback_call]
+    assert "trap '' TERM INT HUP" in forward_window
+    assert (
+        "controlled_v2_forward_finalize_recovery >/dev/null 2>&1"
+        in forward_window
+    )
+    same_sha = forward_window.index(
+        '[ "$V2_FORWARD_FINALIZED_SHA" = "$EXPECTED_SHA" ]'
+    )
+    request_match = forward_window.index(
+        '[ "$V2_FORWARD_FINALIZED_REQUEST_MATCH" -eq 1 ]', same_sha
+    )
+    same_sha_exit = forward_window.index("exit 0", same_sha)
+    restore_signal_handlers = forward_window.index(
+        "precutover_failure 143", same_sha_exit
+    )
+    assert same_sha < request_match < same_sha_exit < restore_signal_handlers
+    for signal, status in (("TERM", 143), ("INT", 130), ("HUP", 129)):
+        assert f"precutover_failure {status}" in forward_window
+        assert signal in forward_window
+    previous_state = normalized.index("PREVIOUS_MAIN_ACTIVE_STATE=", rollback_call)
+    rollback_window = normalized[rollback_call:previous_state]
+    assert "trap '' TERM INT HUP" in rollback_window
+    assert (
+        "controlled_v2_rollback_only_recovery >/dev/null 2>&1"
+        in rollback_window
+    )
+
+    success_start = normalized.rindex(
+        "CUTOVER_STEP=persist_deployed_receipt_pending"
+    )
+    success = normalized[success_start:]
+    success_publish = success.index("publish_deployed_receipt_pending")
+    success_flag = success.index("DEPLOY_SUCCEEDED=1", success_publish)
+    ignore_success_signals = success.index("trap '' TERM INT HUP", success_flag)
+    success_remove = success.index(
+        "activation_snapshot_remove_finalized_before_deploy",
+        ignore_success_signals,
+    )
+    clear_handlers = success.index("trap - ERR TERM INT HUP", success_remove)
+    assert (
+        success_publish
+        < success_flag
+        < ignore_success_signals
+        < success_remove
+        < clear_handlers
+    )
+
+    finalize = bodies["controlled_guard_finalize_successful_activation"]
+    verified_commit = finalize.index(
+        "activation_snapshot_set_phase \"$guarded_sha\" new-runtime-verified"
+    )
+    finalize_after_commit = finalize[verified_commit:]
+    assert "controlled_guard_refence_after_restore_failure" not in finalize_after_commit
+    assert "controlled_guard_write_restore_file" not in finalize_after_commit
+
+    cleanup = bodies["cleanup_prepare_artifacts"]
+    journal_reference = cleanup.index(
+        '[ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ]'
+    )
+    runtime_reference = cleanup.index("path_is_runtime_referenced")
+    venv_link_remove = cleanup.index(
+        'rm -f -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA"'
+    )
+    venv_build_remove = cleanup.index('rm -rf -- "$EXPECTED_BUILD"')
+    assert (
+        journal_reference
+        < runtime_reference
+        < venv_link_remove
+        < venv_build_remove
+    )
+
+
+def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy)
+    body = _normalized_shell(
+        _shell_function_bodies(deploy)["prepared_request_is_already_active"]
+    )
+    runtime_recheck = _normalized_shell(
+        _shell_function_bodies(deploy)[
+            "assert_prepared_runtime_units_still_current"
+        ]
+    )
+    for final_runtime_identity in (
+        'cmp --silent "$MAIN_RELEASE_DROPIN" "$PREPARED_MAIN_DROPIN"',
+        'cmp --silent "$SCHEDULER_UNIT" "$PREPARED_SCHEDULER_DROPIN"',
+        "NeedDaemonReload",
+    ):
+        assert final_runtime_identity in runtime_recheck
+    for exact_identity in (
+        'test "$PREVIOUS_SHA" = "$EXPECTED_SHA"',
+        'test "$PREVIOUS_INPUT_LOCK_SHA256" = "$EXPECTED_INPUT_LOCK_SHA256"',
+        '"$EXPECTED_RESOLVED_FREEZE_SHA256"',
+        'test "$PREVIOUS_ADATA_SHA" = "$EXPECTED_ADATA_SHA"',
+        '"$EXPECTED_ADATA_TREE_SHA256"',
+        'test "$PREVIOUS_CODE_ROOT" = "$PREPARED_CODE_ROOT"',
+        'test "$PREVIOUS_VENV" = "$RELEASE_VENV_ROOT/$EXPECTED_SHA"',
+        'cmp --silent "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"',
+        'cmp --silent "$MAIN_RELEASE_DROPIN" "$PREPARED_MAIN_DROPIN"',
+        'cmp --silent "$PREVIOUS_SCHEDULER_DROPIN"',
+        'cmp --silent "$SCHEDULER_UNIT" "$PREPARED_SCHEDULER_DROPIN"',
+        "assert_database_writer_guard_dropins_loaded",
+        "--property=DropInPaths --value",
+        "API_EMBEDDED_SCHEDULER_ENABLED=false",
+        "PROBIGA_DEPLOYMENT_MODE=production",
+        "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT",
+        'PROBIGA_RELEASE_TREE_SHA256=$EXPECTED_RELEASE_TREE_SHA256',
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=",
+        "http://127.0.0.1/api/health/runtime",
+        "assert_nginx_static_matches_checkout",
+        "assert_scheduler_triggers_quiescent",
+        "finalized_receipt_matches_current_v2_request",
+        "tools/check_strategy_governance_health.py",
+        '--expected-build-sha "$EXPECTED_SHA"',
+        "assert_prepared_runtime_units_still_current",
+    ):
+        assert exact_identity in body
+    for forbidden_mutation in (
+        "systemctl start",
+        "systemctl stop",
+        "systemctl enable",
+        "systemctl disable",
+        "activation_snapshot_create",
+        "persist_database_writer_restore_journal",
+    ):
+        assert forbidden_mutation not in body
+
+    prepare = normalized.index("CUTOVER_STEP=prepare_release")
+    prepare_call = normalized.index("prepare_release", prepare)
+    same_sha_gate = normalized.index(
+        'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then', prepare_call
+    )
+    database_preflight = normalized.index(
+        "# PREPARE DATABASE:", same_sha_gate
+    )
+    cutover_journal = normalized.index(
+        "CUTOVER_STEP=persist_database_writer_restore_journal",
+        database_preflight,
+    )
+    noop = normalized[same_sha_gate:database_preflight]
+    verifier = noop.index("if ! prepared_request_is_already_active; then")
+    mismatch = noop.index("complete finalized request identity", verifier)
+    fail_closed = noop.index("false", mismatch)
+    ignore_transport = noop.index("trap '' TERM INT HUP")
+    receipt = noop.index('write_receipt DEPLOYED "$EXPECTED_SHA"')
+    success = noop.index("DEPLOY_SUCCEEDED=1", receipt)
+    clear_handlers = noop.index("trap - ERR TERM INT HUP", success)
+    successful_exit = noop.index("exit 0", clear_handlers)
+    assert (
+        prepare
+        < prepare_call
+        < same_sha_gate
+        < database_preflight
+        < cutover_journal
+    )
+    assert verifier < mismatch < fail_closed < ignore_transport
+    assert ignore_transport < receipt < success < clear_handlers < successful_exit
+    assert "persist_database_writer_restore_journal" not in noop
 
 
 def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None:

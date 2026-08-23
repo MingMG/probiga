@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -314,6 +317,1487 @@ test "$(<"$UNIT_B")" = new-scheduler
     assert completed.returncode == 0, (
         (completed.stdout or "") + (completed.stderr or "") + numbered
     )
+
+
+def test_rollback_receipt_state_accepts_canonical_poststart_receipt(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable receipt-state regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(source)[
+        "activation_snapshot_validate_rollback_receipt_state"
+    ]
+    pending = (tmp_path / "deployed-receipt-pending.json").as_posix()
+    pending_sha = (tmp_path / "deployed-receipt-pending.sha256").as_posix()
+    expected_sha = "a" * 40
+    harness = f"""
+set -u
+ACTIVATION_RECEIPT_PENDING={pending!r}
+ACTIVATION_RECEIPT_PENDING_SHA={pending_sha!r}
+activation_snapshot_validate_receipt_pending() {{
+  test -f "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test ! -L "$ACTIVATION_RECEIPT_PENDING" || return 1
+  test "$(<"$ACTIVATION_RECEIPT_PENDING")" = "$1" || return 1
+  if [ -e "$ACTIVATION_RECEIPT_PENDING_SHA" ] || \
+    [ -L "$ACTIVATION_RECEIPT_PENDING_SHA" ]; then
+    test -f "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+    test ! -L "$ACTIVATION_RECEIPT_PENDING_SHA" || return 1
+    test "$(<"$ACTIVATION_RECEIPT_PENDING_SHA")" = sealed || return 1
+  fi
+}}
+activation_snapshot_validate_rollback_receipt_state() {{
+{body}
+}}
+activation_snapshot_validate_rollback_receipt_state {expected_sha} prepared || exit 20
+printf '%s\n' {expected_sha} > "$ACTIVATION_RECEIPT_PENDING"
+activation_snapshot_validate_rollback_receipt_state \
+  {expected_sha} runtime-units-installed || exit 21
+printf '%s\n' sealed > "$ACTIVATION_RECEIPT_PENDING_SHA"
+for phase in runtime-units-installed restoring-old old-set-restored \
+    old-runtime-verified; do
+  activation_snapshot_validate_rollback_receipt_state \
+    {expected_sha} "$phase" || exit 22
+done
+for phase in prepared runtime-units-installing; do
+  if activation_snapshot_validate_rollback_receipt_state \
+      {expected_sha} "$phase"; then
+    echo "pre-start phase $phase accepted a pending receipt" >&2
+    exit 23
+  fi
+done
+printf '%s\n' changed > "$ACTIVATION_RECEIPT_PENDING_SHA"
+if activation_snapshot_validate_rollback_receipt_state \
+    {expected_sha} old-runtime-verified; then
+  echo 'changed pending receipt hash unexpectedly validated' >&2
+  exit 24
+fi
+rm -f "$ACTIVATION_RECEIPT_PENDING"
+printf '%s\n' sealed > "$ACTIVATION_RECEIPT_PENDING_SHA"
+if activation_snapshot_validate_rollback_receipt_state \
+    {expected_sha} runtime-units-installed; then
+  echo 'orphan pending receipt hash unexpectedly validated' >&2
+  exit 25
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_pending_receipt_json_is_recoverable_without_redundant_checksum(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable receipt validator test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    validator = _function(
+        "activation_snapshot_validate_receipt_pending",
+        _shell_function_bodies(source)[
+            "activation_snapshot_validate_receipt_pending"
+        ],
+    ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
+    expected_sha = "a" * 40
+    receipt = tmp_path / "deployed-receipt-pending.json"
+    receipt_sha = tmp_path / "deployed-receipt-pending.sha256"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": "probiga.deploy-receipt.v4",
+                "status": "DEPLOYED",
+                "expected_sha": expected_sha,
+                "active_sha": expected_sha,
+            }
+        ),
+        encoding="utf-8",
+    )
+    python_executable = Path(shutil.which("python") or sys.executable).as_posix()
+    harness = f"""
+set -u
+TEST_PYTHON={python_executable!r}
+ACTIVATION_RECEIPT_PENDING={receipt.as_posix()!r}
+ACTIVATION_RECEIPT_PENDING_SHA={receipt_sha.as_posix()!r}
+controlled_guard_assert_file() {{
+  test -f "$1" || return 1
+  test ! -L "$1" || return 1
+}}
+{validator}
+activation_snapshot_validate_receipt_pending {expected_sha} || exit 20
+sha256sum "$ACTIVATION_RECEIPT_PENDING" | cut -d' ' -f1 \
+  > "$ACTIVATION_RECEIPT_PENDING_SHA"
+activation_snapshot_validate_receipt_pending {expected_sha} || exit 21
+printf '%064d\n' 0 > "$ACTIVATION_RECEIPT_PENDING_SHA"
+if activation_snapshot_validate_receipt_pending {expected_sha}; then
+  exit 22
+fi
+rm -f "$ACTIVATION_RECEIPT_PENDING"
+if activation_snapshot_validate_receipt_pending {expected_sha}; then
+  exit 23
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_governance_snapshot_is_recoverable_without_redundant_checksum(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the governance snapshot validator test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    validator = _function(
+        "activation_snapshot_validate_governance_new",
+        _shell_function_bodies(source)["activation_snapshot_validate_governance_new"],
+    )
+    snapshot = tmp_path / "governance-task-new.json"
+    snapshot_sha = tmp_path / "governance-task-new.sha256"
+    snapshot.write_text('{"tasks":[]}', encoding="utf-8")
+    harness = f"""
+set -u
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT={snapshot.as_posix()!r}
+ACTIVATION_GOVERNANCE_NEW_SHA={snapshot_sha.as_posix()!r}
+controlled_guard_assert_file() {{
+  test -f "$1" || return 1
+  test ! -L "$1" || return 1
+}}
+{validator}
+activation_snapshot_validate_governance_new || exit 20
+sha256sum "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" | cut -d' ' -f1 \
+  > "$ACTIVATION_GOVERNANCE_NEW_SHA"
+activation_snapshot_validate_governance_new || exit 21
+printf '%064d\n' 0 > "$ACTIVATION_GOVERNANCE_NEW_SHA"
+if activation_snapshot_validate_governance_new; then
+  exit 22
+fi
+rm -f "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+if activation_snapshot_validate_governance_new; then
+  exit 23
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_missing_guard_is_recreated_only_for_retryable_recovery_phases() -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable missing-guard regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(source)[
+        "activation_snapshot_allows_missing_guard_for_recovery"
+    ]
+    harness = f"""
+set -u
+activation_snapshot_allows_missing_guard_for_recovery() {{
+{body}
+}}
+    for phase in prepared runtime-units-installed restoring-old old-set-restored \
+        old-runtime-verified; do
+  activation_snapshot_allows_missing_guard_for_recovery "$phase" || exit 20
+done
+    for phase in runtime-units-installing new-runtime-verified \
+        finalized; do
+  if activation_snapshot_allows_missing_guard_for_recovery "$phase"; then
+    echo "unsafe missing-guard phase $phase was accepted" >&2
+    exit 21
+  fi
+done
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("phase", "has_new_pair", "guard_present", "same_target"),
+    (
+        ("prepared", False, True, False),
+        ("prepared", False, False, False),
+        ("runtime-units-installing", False, True, False),
+        ("runtime-units-installed", True, False, False),
+        ("runtime-units-installed", True, False, True),
+        ("old-runtime-verified", True, True, False),
+    ),
+)
+def test_interrupted_recovery_restores_governance_before_old_runtime(
+    tmp_path: Path,
+    phase: str,
+    has_new_pair: bool,
+    guard_present: bool,
+    same_target: bool,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable post-start recovery test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery = _function(
+        "controlled_v2_rollback_only_recovery",
+        _shell_function_bodies(source)["controlled_v2_rollback_only_recovery"],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    old_sha = "b" * 40
+    expected_sha = guarded_sha if same_target else "c" * 40
+    new_pair_setup = ""
+    if has_new_pair:
+        new_pair_setup = """
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf 'sealed\n' > "$ACTIVATION_GOVERNANCE_NEW_SHA"
+"""
+    guard_setup = ': > "$DATABASE_WRITER_GUARD_FILE"' if guard_present else ""
+    expected_trace = [] if phase == "old-runtime-verified" else ["ready"]
+    if has_new_pair:
+        expected_trace.append("validate-new")
+    if not guard_present:
+        expected_trace.append("recreate")
+    expected_trace.extend(("install-fence", "reload", "fence", "boundary"))
+    if phase != "old-runtime-verified":
+        expected_trace.append("restore-governance")
+    expected_trace.extend(
+        (
+            "restore-old-set",
+            "reload",
+            "assert-old-set",
+            "boundary",
+            "capture-old",
+            "cleanup",
+            "restore-writers",
+            "verify-old",
+            "phase-old-runtime-verified",
+            "remove-journal",
+        )
+    )
+    expected_trace_text = "\n".join(expected_trace) + "\n"
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={expected_sha}
+GUARDED_SHA={guarded_sha}
+OLD_SHA={old_sha}
+DEPLOY_OPERATION=deploy
+DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/old.json"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+ACTIVATION_GOVERNANCE_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.sha256"
+ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
+ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
+DB_STATE="$TEST_ROOT/db-state"
+PHASE_STATE="$TEST_ROOT/phase-state"
+TRACE="$TEST_ROOT/trace"
+FENCED=0
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR" "$RELEASE_VENV_ROOT"
+: > "$RELEASE_VENV_ROOT/$GUARDED_SHA"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=loaded,inactive,static \
+  ai_timer_unit=loaded,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'old\n' > "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+{new_pair_setup}
+printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+{guard_setup}
+printf '%s\n' {('old' if phase == 'old-runtime-verified' else 'new')!r} > "$DB_STATE"
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_old_release() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  printf '%s\n' "$OLD_SHA"
+}}
+activation_snapshot_phase() {{ printf '%s\n' {phase!r}; }}
+controlled_guard_assert_governance_restore_runtime() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  printf 'ready\n' >> "$TRACE"
+}}
+activation_snapshot_validate_governance_new() {{
+  test "$(<"$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")" = new || return 1
+  test "$(<"$ACTIVATION_GOVERNANCE_NEW_SHA")" = sealed || return 1
+  printf 'validate-new\n' >> "$TRACE"
+}}
+activation_snapshot_validate_rollback_receipt_state() {{ return 0; }}
+controlled_guard_assert_directory() {{ test -d "$DATABASE_WRITER_GUARD_DIR"; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ test -f "$DATABASE_WRITER_RESTORE_FILE"; }}
+controlled_guard_assert_marker() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+activation_snapshot_allows_missing_guard_for_recovery() {{
+  case "$1" in
+    prepared|runtime-units-installed|restoring-old|old-set-restored|old-runtime-verified) ;;
+    *) return 1 ;;
+  esac
+}}
+controlled_guard_recreate_file() {{
+  : > "$DATABASE_WRITER_GUARD_FILE"
+  printf 'recreate\n' >> "$TRACE"
+}}
+controlled_guard_install_dropins() {{ printf 'install-fence\n' >> "$TRACE"; }}
+systemctl() {{
+  test "$1:${{2:-}}" = daemon-reload: || return 1
+  printf 'reload\n' >> "$TRACE"
+}}
+controlled_guard_force_all_writers_fenced() {{
+  FENCED=1
+  printf 'fence\n' >> "$TRACE"
+  kill -HUP "$BASHPID"
+}}
+controlled_guard_assert_boundary() {{
+  test "$FENCED" -eq 1 || return 1
+  test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+  printf 'boundary\n' >> "$TRACE"
+}}
+controlled_guard_refence_after_restore_failure() {{
+  printf 'unexpected-refence\n' >> "$TRACE"
+  return 1
+}}
+controlled_guard_restore_and_verify_governance_snapshot() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  test "$2" = "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  test "$FENCED" -eq 1 || return 1
+  case "$(<"$DB_STATE")" in new|old) ;; *) return 1 ;; esac
+  printf 'old\n' > "$DB_STATE"
+  printf 'restore-governance\n' >> "$TRACE"
+  kill -TERM "$BASHPID"
+}}
+activation_snapshot_restore_old_set() {{
+  test "$(<"$DB_STATE")" = old || return 1
+  printf 'old-set-restored\n' > "$PHASE_STATE"
+  printf 'restore-old-set\n' >> "$TRACE"
+}}
+activation_snapshot_assert_old_set() {{
+  test "$(<"$PHASE_STATE")" = old-set-restored || return 1
+  printf 'assert-old-set\n' >> "$TRACE"
+}}
+controlled_guard_capture_current_governance_snapshot() {{
+  test "$1:$2" = "$GUARDED_SHA:$OLD_SHA" || return 1
+  test "$(<"$DB_STATE")" = old || return 1
+  printf 'capture-old\n' >> "$TRACE"
+  kill -INT "$BASHPID"
+}}
+controlled_guard_cleanup() {{
+  test "$(<"$DB_STATE")" = old || return 1
+  rm -f "$DATABASE_WRITER_GUARD_FILE"
+  printf 'cleanup\n' >> "$TRACE"
+}}
+controlled_guard_restore_previous_writer_states() {{
+  test "$(<"$DB_STATE")" = old || return 1
+  printf 'restore-writers\n' >> "$TRACE"
+}}
+controlled_guard_verify_restored_runtime() {{
+  test "$3" = "$OLD_SHA" || return 1
+  test "$6" = rollback-only || return 1
+  test "$(<"$DB_STATE")" = old || return 1
+  printf 'verify-old\n' >> "$TRACE"
+}}
+activation_snapshot_set_phase() {{
+  test "$1:$2" = "$GUARDED_SHA:old-runtime-verified" || return 1
+  printf 'phase-old-runtime-verified\n' >> "$TRACE"
+}}
+sync() {{ return 0; }}
+controlled_guard_write_restore_file() {{ return 1; }}
+activation_snapshot_remove_old_runtime_verified() {{
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-journal\n' >> "$TRACE"
+}}
+{recovery}
+trap '' TERM INT HUP
+controlled_v2_rollback_only_recovery || exit 30
+test "$(<"$DB_STATE")" = old || exit 31
+test ! -e "$DATABASE_WRITER_GUARD_FILE" || exit 32
+test ! -e "$DATABASE_WRITER_RESTORE_FILE" || exit 33
+test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 34
+cat > "$TEST_ROOT/expected-trace" <<'EOF'
+{expected_trace_text}EOF
+cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 35
+"""
+    harness_path = tmp_path / "poststart-recovery-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_old_runtime_verified_cleanup_fault_stays_online_and_retry_converges(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable old-finalize recovery test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery = _function(
+        "controlled_v2_rollback_only_recovery",
+        _shell_function_bodies(source)["controlled_v2_rollback_only_recovery"],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    old_sha = "b" * 40
+    expected_trace = """assert-old-set
+capture-old
+verify-old
+cleanup-fault
+assert-old-set
+capture-old
+verify-old
+remove-journal
+"""
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={'c' * 40}
+GUARDED_SHA={guarded_sha}
+OLD_SHA={old_sha}
+DEPLOY_OPERATION=deploy
+DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/old.json"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+ACTIVATION_GOVERNANCE_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.sha256"
+ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
+ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
+FAULT_ONCE="$TEST_ROOT/cleanup-failed-once"
+SERVICE_STATE="$TEST_ROOT/service-state"
+TRACE="$TEST_ROOT/trace"
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR" "$RELEASE_VENV_ROOT"
+: > "$RELEASE_VENV_ROOT/$GUARDED_SHA"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=loaded,inactive,static \
+  ai_timer_unit=loaded,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'old\n' > "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+printf 'active\n' > "$SERVICE_STATE"
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_old_release() {{ printf '%s\n' "$OLD_SHA"; }}
+activation_snapshot_phase() {{ printf 'old-runtime-verified\n'; }}
+activation_snapshot_validate_rollback_receipt_state() {{ return 0; }}
+controlled_guard_assert_directory() {{ test -d "$DATABASE_WRITER_GUARD_DIR"; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ test -f "$DATABASE_WRITER_RESTORE_FILE"; }}
+activation_snapshot_assert_old_set() {{
+  test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  printf 'assert-old-set\n' >> "$TRACE"
+}}
+controlled_guard_capture_current_governance_snapshot() {{
+  test "$1:$2" = "$GUARDED_SHA:$OLD_SHA" || return 1
+  printf 'capture-old\n' >> "$TRACE"
+}}
+controlled_guard_verify_restored_runtime() {{
+  test "$3:$6" = "$OLD_SHA:rollback-only" || return 1
+  test "$(<"$SERVICE_STATE")" = active || return 1
+  printf 'verify-old\n' >> "$TRACE"
+}}
+activation_snapshot_remove_old_runtime_verified() {{
+  if [ ! -e "$FAULT_ONCE" ]; then
+    : > "$FAULT_ONCE"
+    printf 'cleanup-fault\n' >> "$TRACE"
+    return 99
+  fi
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-journal\n' >> "$TRACE"
+}}
+controlled_guard_refence_after_restore_failure() {{
+  printf 'stopped\n' > "$SERVICE_STATE"
+  printf 'unexpected-refence\n' >> "$TRACE"
+  return 1
+}}
+controlled_guard_recreate_file() {{
+  printf 'unexpected-recreate\n' >> "$TRACE"
+  return 1
+}}
+sync() {{ return 0; }}
+{recovery}
+if controlled_v2_rollback_only_recovery; then
+  exit 30
+fi
+test "$(<"$SERVICE_STATE")" = active || exit 31
+test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 32
+test ! -e "$DATABASE_WRITER_RESTORE_FILE" || exit 33
+controlled_v2_rollback_only_recovery || exit 34
+test "$(<"$SERVICE_STATE")" = active || exit 35
+test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 36
+cat > "$TEST_ROOT/expected-trace" <<'EOF'
+{expected_trace}EOF
+cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 37
+"""
+    harness_path = tmp_path / "old-finalize-recovery-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_verified_transaction_retire_is_logically_atomic_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable transaction-retire test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    retire = _function(
+        "activation_snapshot_retire_verified_transaction",
+        _shell_function_bodies(source)[
+            "activation_snapshot_retire_verified_transaction"
+        ],
+    )
+    root = tmp_path.as_posix()
+    harness = f"""
+set -Eeuo pipefail
+DATABASE_WRITER_GUARD_DIR={root!r}/guards
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/activation-unit-transaction"
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf 'sealed\n' > "$ACTIVATION_UNIT_SNAPSHOT_DIR/manifest"
+sync() {{ return 99; }}
+rm() {{
+  if [ "$1:${{2:-}}" = -rf:-- ] && \
+    [[ "${{3:-}}" = "$DATABASE_WRITER_GUARD_DIR"/.activation-unit-transaction.retired.* ]]; then
+    return 98
+  fi
+  command rm "$@"
+}}
+{retire}
+exec 2>&-
+activation_snapshot_retire_verified_transaction || exit 30
+test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 31
+test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 32
+mapfile -t retired < <(find "$DATABASE_WRITER_GUARD_DIR" -maxdepth 1 \
+  -type d -name '.activation-unit-transaction.retired.*' -print)
+test "${{#retired[@]}}" -eq 1 || exit 33
+test "$(<"${{retired[0]}}/manifest")" = sealed || exit 34
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_exact_live_request_noop_gate_is_strict_and_read_only(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable idempotent deploy test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    gate = _function(
+        "prepared_request_is_already_active",
+        _shell_function_bodies(source)["prepared_request_is_already_active"],
+    )
+    runtime_units = _function(
+        "assert_prepared_runtime_units_still_current",
+        _shell_function_bodies(source)[
+            "assert_prepared_runtime_units_still_current"
+        ],
+    )
+    root = tmp_path.as_posix()
+    sha = "a" * 40
+    lock_sha = "b" * 64
+    adata_sha = "c" * 40
+    adata_tree_sha = "d" * 64
+    release_tree_sha = "e" * 64
+    adapter_sha = "f" * 64
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={sha}
+EXPECTED_INPUT_LOCK_SHA256={lock_sha}
+EXPECTED_RESOLVED_FREEZE_SHA256={lock_sha}
+EXPECTED_ADATA_SHA={adata_sha}
+EXPECTED_ADATA_TREE_SHA256={adata_tree_sha}
+EXPECTED_RELEASE_TREE_SHA256={release_tree_sha}
+EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256={adapter_sha}
+PREVIOUS_SHA="$EXPECTED_SHA"
+PREVIOUS_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
+PREVIOUS_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
+PREVIOUS_ADATA_SHA="$EXPECTED_ADATA_SHA"
+PREVIOUS_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
+ADATA_SOURCE="$TEST_ROOT/adata"
+PREVIOUS_ADATA_SOURCE="$ADATA_SOURCE"
+PREPARED_CODE_ROOT="$TEST_ROOT/releases/$EXPECTED_SHA"
+PREVIOUS_CODE_ROOT="$PREPARED_CODE_ROOT"
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+PREVIOUS_VENV="$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+PREVIOUS_DROPIN="$TEST_ROOT/main.previous"
+PREPARED_MAIN_DROPIN="$TEST_ROOT/main.prepared"
+MAIN_RELEASE_DROPIN="$TEST_ROOT/main.installed"
+PREVIOUS_SCHEDULER_DROPIN="$TEST_ROOT/scheduler.previous"
+PREPARED_SCHEDULER_DROPIN="$TEST_ROOT/scheduler.prepared"
+SCHEDULER_UNIT="$TEST_ROOT/scheduler.installed"
+PREVIOUS_AI_WORKER_DROPIN="$TEST_ROOT/ai.previous"
+PREPARED_AI_WORKER_DROPIN=""
+AI_WORKER_DROPIN="$TEST_ROOT/ai.installed"
+PREVIOUS_DROPIN_PRESENT=1
+PREVIOUS_SCHEDULER_DROPIN_PRESENT=1
+PREVIOUS_AI_WORKER_DROPIN_PRESENT=0
+PREVIOUS_MAIN_ACTIVE_STATE=active
+PREVIOUS_MAIN_UNIT_FILE_STATE=enabled
+SCHEDULER_UNIT_PRESENT=1
+AI_WORKER_UNIT_PRESENT=0
+MAIN_SERVICE=probiga
+PREVIOUS_LEGACY_MAIN_DROPINS=()
+PREVIOUS_LEGACY_SCHEDULER_DROPINS=()
+LEGACY_MAIN_OVERRIDE_DROPINS=()
+LEGACY_SCHEDULER_OVERRIDE_DROPINS=()
+MAIN_LIMITS_DROPIN="$TEST_ROOT/main-limits.conf"
+MAIN_MARKET_RADAR_DROPIN="$TEST_ROOT/main-market-radar.conf"
+MAIN_SERVICE_USER_DROPIN="$TEST_ROOT/main-service-user.conf"
+MAIN_DATABASE_WRITER_GUARD_DROPIN="$TEST_ROOT/main-writer-guard.conf"
+SCHEDULER_DATABASE_WRITER_GUARD_DROPIN="$TEST_ROOT/scheduler-writer-guard.conf"
+SCHEDULER_LIMITS_DROPIN="$TEST_ROOT/scheduler-limits.conf"
+mkdir -p "$ADATA_SOURCE" "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT"
+printf 'main\n' > "$PREVIOUS_DROPIN"
+cp "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"
+cp "$PREPARED_MAIN_DROPIN" "$MAIN_RELEASE_DROPIN"
+printf 'scheduler\n' > "$PREVIOUS_SCHEDULER_DROPIN"
+cp "$PREVIOUS_SCHEDULER_DROPIN" "$PREPARED_SCHEDULER_DROPIN"
+cp "$PREPARED_SCHEDULER_DROPIN" "$SCHEDULER_UNIT"
+TEST_PID=$$
+NEED_DAEMON_RELOAD=no
+ROTATE_PID_ON_HEALTH=0
+HEALTH_STATUS=0
+systemctl() {{
+  case "$*" in
+    "show -p ActiveState --value probiga") printf 'active\n' ;;
+    "show -p UnitFileState --value probiga") printf 'enabled\n' ;;
+    "show -p ActiveState --value probiga-scheduler") printf 'active\n' ;;
+    "show -p UnitFileState --value probiga-scheduler") printf 'enabled\n' ;;
+    "show -p MainPID --value probiga"|\
+    "show -p MainPID --value probiga-scheduler") printf '%s\n' "$TEST_PID" ;;
+    "show -p NeedDaemonReload --value probiga"|\
+    "show -p NeedDaemonReload --value probiga-scheduler")
+      printf '%s\n' "$NEED_DAEMON_RELOAD"
+      ;;
+    "show probiga --property=DropInPaths --value")
+      printf '%s %s\n' "$MAIN_RELEASE_DROPIN" \
+        "$MAIN_DATABASE_WRITER_GUARD_DROPIN"
+      ;;
+    "show probiga-scheduler --property=DropInPaths --value")
+      printf '%s\n' "$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN"
+      ;;
+    *) return 90 ;;
+  esac
+}}
+sudo() {{ "$@"; }}
+grep() {{ return 0; }}
+curl() {{ return 0; }}
+mapfile() {{
+  local target="${{@: -1}}"
+  case "$target" in
+    main_cmdline)
+      main_cmdline=("$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -m \
+        uvicorn server.api.main:app --app-dir "$PREPARED_CODE_ROOT")
+      ;;
+    scheduler_cmdline)
+      scheduler_cmdline=("$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+        "$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py")
+      ;;
+    *) return 91 ;;
+  esac
+}}
+assert_nginx_static_matches_checkout() {{ test "$1" = "$PREPARED_CODE_ROOT"; }}
+assert_ai_worker_runtime() {{ return 92; }}
+assert_ai_worker_previous_state_restored() {{ return 93; }}
+assert_scheduler_triggers_quiescent() {{ return 0; }}
+assert_database_writer_guard_dropins_loaded() {{ return 0; }}
+controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
+finalized_receipt_matches_current_v2_request() {{ return 0; }}
+run_prepared_python_tool() {{
+  test "$1" = \
+    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" || return 94
+  if [ "$ROTATE_PID_ON_HEALTH" -eq 1 ]; then
+    TEST_PID=$((TEST_PID + 1))
+  fi
+  return "$HEALTH_STATUS"
+}}
+{runtime_units}
+{gate}
+prepared_request_is_already_active || exit 20
+PREVIOUS_INPUT_LOCK_SHA256={'0' * 64}
+if prepared_request_is_already_active; then
+  exit 21
+fi
+PREVIOUS_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
+printf 'drifted\n' > "$MAIN_RELEASE_DROPIN"
+if prepared_request_is_already_active; then
+  exit 22
+fi
+cp "$PREPARED_MAIN_DROPIN" "$MAIN_RELEASE_DROPIN"
+ROTATE_PID_ON_HEALTH=1
+if prepared_request_is_already_active; then
+  exit 23
+fi
+ROTATE_PID_ON_HEALTH=0
+NEED_DAEMON_RELOAD=yes
+if prepared_request_is_already_active; then
+  exit 24
+fi
+NEED_DAEMON_RELOAD=no
+HEALTH_STATUS=1
+if prepared_request_is_already_active; then
+  exit 25
+fi
+test ! -e "$TEST_ROOT/mutation" || exit 26
+"""
+    harness_path = tmp_path / "exact-live-request-noop-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_same_sha_request_identity_mismatch_fails_before_database_phase(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable idempotent deploy test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    prepare = source.index("CUTOVER_STEP=prepare_release")
+    gate_start = source.index(
+        'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then', prepare
+    )
+    database = source.index("# PREPARE DATABASE:", gate_start)
+    gate = source[gate_start:database]
+    marker = (tmp_path / "database-reached").as_posix()
+    sha = "a" * 40
+    failed = subprocess.run(
+        [
+            bash,
+            "-c",
+            f"""
+set -Eeuo pipefail
+PREVIOUS_SHA={sha}
+EXPECTED_SHA={sha}
+prepared_request_is_already_active() {{ return 1; }}
+{gate}
+printf reached > {marker!r}
+""",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert failed.returncode != 0
+    assert "complete finalized request identity" in failed.stderr
+    assert not (tmp_path / "database-reached").exists()
+
+    continued = subprocess.run(
+        [
+            bash,
+            "-c",
+            f"""
+set -Eeuo pipefail
+PREVIOUS_SHA={'b' * 40}
+EXPECTED_SHA={sha}
+prepared_request_is_already_active() {{ return 1; }}
+{gate}
+printf reached > {marker!r}
+""",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert continued.returncode == 0, continued.stdout + continued.stderr
+    assert (tmp_path / "database-reached").read_text() == "reached"
+
+
+def test_nginx_static_identity_fails_closed_inside_conditional_verifier(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable static identity test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    helper = _function(
+        "assert_nginx_static_matches_checkout",
+        _shell_function_bodies(source)["assert_nginx_static_matches_checkout"],
+    )
+    root = tmp_path.as_posix()
+    harness = f"""
+set -Eeuo pipefail
+TEST_ROOT={root!r}
+CHECKOUT="$TEST_ROOT/checkout"
+WRONG_CHECKOUT="$TEST_ROOT/wrong-checkout"
+STATIC_RELEASE_LINK="$TEST_ROOT/current"
+mkdir -p "$CHECKOUT/server/static/js" "$CHECKOUT/server/static/css" \
+  "$WRONG_CHECKOUT"
+printf js > "$CHECKOUT/server/static/js/app.js"
+printf css > "$CHECKOUT/server/static/css/style.css"
+curl() {{
+  case "${{@: -1}}" in
+    */js/app.js) printf js ;;
+    */css/style.css) printf css ;;
+    *) return 90 ;;
+  esac
+}}
+{helper}
+if assert_nginx_static_matches_checkout "$CHECKOUT"; then
+  exit 20
+fi
+ln -s "$WRONG_CHECKOUT" "$STATIC_RELEASE_LINK"
+if assert_nginx_static_matches_checkout "$CHECKOUT"; then
+  exit 21
+fi
+"""
+    harness_path = tmp_path / "static-identity-conditional-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_closed_transport_enters_and_completes_failure_handler(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable transport regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    preamble = source[: source.index("umask 022")]
+    assert preamble.index("set -Eeuo pipefail") < preamble.index("trap '' PIPE")
+    pipe_trap = next(
+        line for line in preamble.splitlines() if line.strip() == "trap '' PIPE"
+    )
+    bodies = _shell_function_bodies(source)
+    detach = _function(
+        "detach_failure_handler_from_transport",
+        bodies["detach_failure_handler_from_transport"],
+    )
+    precutover = _function(
+        "precutover_failure",
+        bodies["precutover_failure"],
+    )
+    sentinel = tmp_path / "transport-handler-complete"
+    harness = f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+{pipe_trap}
+SENTINEL="$1"
+DEPLOY_MAIN_BASHPID="$BASHPID"
+PREVIOUS_SHA={'a' * 40}
+{detach}
+write_receipt() {{
+  test "$1" = PREFLIGHT_FAILED || return 1
+  test "$2" = "$PREVIOUS_SHA" || return 1
+  printf 'entered\n' > "$SENTINEL"
+  kill -HUP "$BASHPID"
+  printf 'hup\n' >> "$SENTINEL"
+  kill -TERM "$BASHPID"
+  printf 'term\n' >> "$SENTINEL"
+  kill -INT "$BASHPID"
+  printf 'int\n' >> "$SENTINEL"
+}}
+{precutover}
+trap 'precutover_failure "$?" "$LINENO"' ERR
+for ((index = 0; index < 10000; index++)); do
+  printf 'transport-output-%s\n' "$index"
+done
+exit 90
+"""
+    harness_path = tmp_path / "transport-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    outer = r"""
+set +e
+bash "$1" "$2" 2>&1 | head -c 1 >/dev/null
+producer_status="${PIPESTATUS[0]}"
+test "$producer_status" -ne 0 || exit 80
+test "$producer_status" -ne 141 || exit 81
+test -f "$2" || exit 82
+test "$(printf '%s,' $(<"$2"))" = 'entered,hup,term,int,' || exit 83
+"""
+    completed = subprocess.run(
+        [bash, "-c", outer, "transport-test", harness_path.as_posix(), sentinel.as_posix()],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_exit_cleanup_retains_transaction_referenced_forward_venv(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable venv-retention regression")
+    if os.name == "nt":
+        pytest.skip("Windows Git Bash cannot faithfully model POSIX venv symlinks")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    cleanup = _function(
+        "cleanup_prepare_artifacts",
+        _shell_function_bodies(source)["cleanup_prepare_artifacts"],
+    )
+    root = tmp_path.as_posix()
+    expected_sha = "a" * 40
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={expected_sha}
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+EXPECTED_BUILD="$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-test"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$TEST_ROOT/guards/transaction"
+DEPLOY_SUCCEEDED=0
+NEW_VENV_LINK=1
+STAGING_WORKTREE=
+RESOLVED_LOCK=
+TRUSTED_WHEEL_MANIFEST=
+TRUSTED_WHEELHOUSE=
+HEALTH_RESPONSE=
+ADATA_SOURCE_BUILD=
+ADATA_BUILD_SOURCE=
+ADATA_WHEEL_DIR=
+ADATA_CACHE_BUILD=
+PREVIOUS_DROPIN=
+PREVIOUS_SCHEDULER_DROPIN=
+PREVIOUS_AI_WORKER_DROPIN=
+PREVIOUS_LEGACY_MAIN_DROPIN_DIR=
+PREVIOUS_LEGACY_SCHEDULER_DROPIN_DIR=
+PREVIOUS_LOCK_SNAPSHOT=
+GOVERNANCE_TASK_OLD_SOURCE=
+GOVERNANCE_TASK_NEW_SOURCE=
+PREPARED_MAIN_DROPIN=
+PREPARED_SCHEDULER_DROPIN=
+PREPARED_AI_WORKER_DROPIN=
+mkdir -p "$EXPECTED_BUILD/bin" "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '#!/usr/bin/env bash\n' > "$EXPECTED_BUILD/bin/python"
+ln -s "$EXPECTED_BUILD" "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+cleanup_staging_worktree() {{ return 0; }}
+path_is_runtime_referenced() {{ return 1; }}
+{cleanup}
+cleanup_prepare_artifacts || exit 20
+test -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA" || exit 21
+test -d "$EXPECTED_BUILD" || exit 22
+rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+cleanup_prepare_artifacts || exit 23
+test ! -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" || exit 24
+test ! -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA" || exit 25
+test ! -e "$EXPECTED_BUILD" || exit 26
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("phase", "has_restore", "same_target", "request_matches"),
+    (
+        ("new-runtime-verified", True, False, False),
+        ("new-runtime-verified", False, True, True),
+        ("finalized", False, False, False),
+        ("finalized", False, True, False),
+    ),
+)
+def test_forward_finalize_recovery_closes_every_receipt_window(
+    tmp_path: Path,
+    phase: str,
+    has_restore: bool,
+    same_target: bool,
+    request_matches: bool,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable forward-finalize test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    forward = _function(
+        "controlled_v2_forward_finalize_recovery",
+        _shell_function_bodies(source)["controlled_v2_forward_finalize_recovery"],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    expected_sha = guarded_sha if same_target else "b" * 40
+    restore_setup = (
+        'printf "restore\\n" > "$DATABASE_WRITER_RESTORE_FILE"'
+        if has_restore
+        else ""
+    )
+    expected_trace = [
+        "validate",
+        "validate-new",
+        "validate-governance",
+        "validate-receipt",
+    ]
+    if same_target:
+        expected_trace.append("match-request")
+    expected_trace.extend(
+        ("assert-new", "dropin-contract", "verify-runtime", "verify-governance")
+    )
+    if has_restore:
+        expected_trace.append("assert-restore")
+    if phase == "new-runtime-verified":
+        expected_trace.append("set-finalized")
+    expected_trace.extend(("publish", "remove-journal"))
+    expected_trace_text = "\n".join(expected_trace) + "\n"
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={expected_sha}
+GUARDED_SHA={guarded_sha}
+REQUEST_MATCH={int(request_matches)}
+DEPLOY_OPERATION=deploy
+DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+TRACE="$TEST_ROOT/trace"
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=loaded,inactive,static \
+  ai_timer_unit=loaded,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf '%s\n' {phase!r} > "$PHASE_STATE"
+{restore_setup}
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_phase() {{ printf '%s\n' "$(<"$PHASE_STATE")"; }}
+activation_snapshot_validate() {{ printf 'validate\n' >> "$TRACE"; }}
+activation_snapshot_validate_new() {{ printf 'validate-new\n' >> "$TRACE"; }}
+activation_snapshot_validate_governance_new() {{
+  printf 'validate-governance\n' >> "$TRACE"
+}}
+activation_snapshot_validate_receipt_pending() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  printf 'validate-receipt\n' >> "$TRACE"
+}}
+activation_snapshot_receipt_matches_current_v2_request() {{
+  test "$1" = "$EXPECTED_SHA" || return 1
+  printf 'match-request\n' >> "$TRACE"
+  test "$REQUEST_MATCH" -eq 1
+}}
+activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_dropin_contract() {{
+  test "$1:$2:$3" = loaded:loaded:loaded || return 1
+  printf 'dropin-contract\n' >> "$TRACE"
+}}
+controlled_guard_verify_restored_runtime() {{
+  test "$1:$2:$3:$6" = \
+    "loaded,active,enabled:loaded,active,enabled:$GUARDED_SHA:rollback-only" || \
+    return 1
+  printf 'verify-runtime\n' >> "$TRACE"
+  kill -HUP "$BASHPID"
+}}
+controlled_guard_governance_snapshot() {{
+  test "$1:$2:$3" = \
+    "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  printf 'verify-governance\n' >> "$TRACE"
+}}
+controlled_guard_assert_restore_file() {{
+  test -f "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  printf 'assert-restore\n' >> "$TRACE"
+}}
+sync() {{ return 0; }}
+activation_snapshot_set_phase() {{
+  test "$1:$2" = "$GUARDED_SHA:finalized" || return 1
+  printf 'finalized\n' > "$PHASE_STATE"
+  printf 'set-finalized\n' >> "$TRACE"
+}}
+publish_deployed_receipt_pending() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  printf 'publish\n' >> "$TRACE"
+}}
+activation_snapshot_remove_finalized_before_deploy() {{
+  test "$(<"$PHASE_STATE")" = finalized || return 1
+  publish_deployed_receipt_pending "$GUARDED_SHA" || return 1
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-journal\n' >> "$TRACE"
+}}
+{forward}
+trap '' TERM INT HUP
+controlled_v2_forward_finalize_recovery || exit 30
+test "$V2_FORWARD_FINALIZED_SHA" = "$GUARDED_SHA" || exit 301
+test "$V2_FORWARD_FINALIZED_REQUEST_MATCH" -eq "$REQUEST_MATCH" || exit 302
+test ! -e "$DATABASE_WRITER_GUARD_FILE" || exit 31
+test ! -L "$DATABASE_WRITER_GUARD_FILE" || exit 32
+test ! -e "$DATABASE_WRITER_RESTORE_FILE" || exit 33
+test ! -L "$DATABASE_WRITER_RESTORE_FILE" || exit 34
+test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 35
+cat > "$TEST_ROOT/expected-trace" <<'EOF'
+{expected_trace_text}EOF
+cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 36
+"""
+    harness_path = tmp_path / "forward-finalize-recovery-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "mismatch_field",
+    (
+        None,
+        "expected_sha",
+        "active_sha",
+        "expected_input_lock_sha256",
+        "active_input_lock_sha256",
+        "expected_resolved_freeze_sha256",
+        "active_resolved_freeze_sha256",
+        "expected_adata_sha",
+        "active_adata_sha",
+        "expected_adata_tree_sha256",
+        "active_adata_tree_sha256",
+    ),
+)
+def test_same_sha_forward_finalize_requires_exact_request_artifact_identity(
+    tmp_path: Path,
+    mismatch_field: str | None,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable receipt identity test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    helper = _function(
+        "activation_snapshot_receipt_matches_current_v2_request",
+        _shell_function_bodies(source)[
+            "activation_snapshot_receipt_matches_current_v2_request"
+        ],
+    ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
+    release_sha = "a" * 40
+    input_lock_sha256 = "b" * 64
+    adata_sha = "c" * 40
+    adata_tree_sha256 = "d" * 64
+    payload = {
+        "schema_version": "probiga.deploy-receipt.v4",
+        "status": "DEPLOYED",
+        "expected_sha": release_sha,
+        "active_sha": release_sha,
+        "expected_input_lock_sha256": input_lock_sha256,
+        "active_input_lock_sha256": input_lock_sha256,
+        "expected_resolved_freeze_sha256": input_lock_sha256,
+        "active_resolved_freeze_sha256": input_lock_sha256,
+        "expected_adata_sha": adata_sha,
+        "active_adata_sha": adata_sha,
+        "expected_adata_tree_sha256": adata_tree_sha256,
+        "active_adata_tree_sha256": adata_tree_sha256,
+    }
+    if mismatch_field is not None:
+        payload[mismatch_field] = "e" * len(str(payload[mismatch_field]))
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    python_executable = Path(shutil.which("python") or sys.executable).as_posix()
+    harness = f"""
+set -u
+TEST_PYTHON={python_executable!r}
+ACTIVATION_RECEIPT_PENDING={receipt.as_posix()!r}
+EXPECTED_SHA={release_sha}
+EXPECTED_INPUT_LOCK_SHA256={input_lock_sha256}
+EXPECTED_ADATA_SHA={adata_sha}
+EXPECTED_ADATA_TREE_SHA256={adata_tree_sha256}
+activation_snapshot_validate_receipt_pending() {{
+  test "$1" = "$EXPECTED_SHA" || return 1
+}}
+{helper}
+activation_snapshot_receipt_matches_current_v2_request "$EXPECTED_SHA"
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if mismatch_field is None:
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+    else:
+        assert completed.returncode != 0
+
+
+def test_finalized_receipt_requires_content_hash_and_exact_request_identity(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable receipt identity test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    helper = _function(
+        "finalized_receipt_matches_current_v2_request",
+        _shell_function_bodies(source)[
+            "finalized_receipt_matches_current_v2_request"
+        ],
+    ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
+    helper = helper.replace(
+        'test "$(readlink -f "$RECEIPT_DIR")" = "$RECEIPT_DIR" || return 1',
+        "true",
+    ).replace(
+        'test "$(stat -c \'%U:%G\' "$RECEIPT_DIR")" = root:root || return 1',
+        "true",
+    ).replace(
+        'test "$(stat -c \'%a\' "$RECEIPT_DIR")" = 700 || return 1',
+        "true",
+    )
+    release_sha = "a" * 40
+    input_lock_sha256 = "b" * 64
+    freeze_sha256 = "c" * 64
+    wheel_sha256 = "d" * 64
+    adata_sha = "e" * 40
+    adata_tree_sha256 = "f" * 64
+    payload = {
+        "schema_version": "probiga.deploy-receipt.v4",
+        "status": "DEPLOYED",
+        "expected_sha": release_sha,
+        "active_sha": release_sha,
+        "expected_input_lock_sha256": input_lock_sha256,
+        "active_input_lock_sha256": input_lock_sha256,
+        "expected_resolved_freeze_sha256": freeze_sha256,
+        "active_resolved_freeze_sha256": freeze_sha256,
+        "expected_wheel_manifest_sha256": wheel_sha256,
+        "expected_adata_sha": adata_sha,
+        "active_adata_sha": adata_sha,
+        "expected_adata_tree_sha256": adata_tree_sha256,
+        "active_adata_tree_sha256": adata_tree_sha256,
+    }
+    receipt_dir = tmp_path / "receipts"
+    receipt_dir.mkdir()
+    python_executable = Path(shutil.which("python") or sys.executable).as_posix()
+    harness = f"""
+set -u
+TEST_PYTHON={python_executable!r}
+RECEIPT_DIR={receipt_dir.as_posix()!r}
+EXPECTED_SHA={release_sha}
+EXPECTED_INPUT_LOCK_SHA256={input_lock_sha256}
+EXPECTED_RESOLVED_FREEZE_SHA256={freeze_sha256}
+EXPECTED_WHEEL_MANIFEST_SHA256={wheel_sha256}
+EXPECTED_ADATA_SHA={adata_sha}
+EXPECTED_ADATA_TREE_SHA256={adata_tree_sha256}
+controlled_guard_assert_file() {{
+  test -f "$1" || return 1
+  test ! -L "$1" || return 1
+}}
+{helper}
+finalized_receipt_matches_current_v2_request
+"""
+
+    def run_validator(candidate_payload: dict[str, str], *, valid_hash: bool) -> int:
+        for existing in receipt_dir.iterdir():
+            existing.unlink()
+        content = json.dumps(candidate_payload, separators=(",", ":")).encode()
+        digest = hashlib.sha256(content).hexdigest()
+        if not valid_hash:
+            digest = "0" * 64
+        receipt = receipt_dir / f"{release_sha}-finalized-{digest}.json"
+        receipt.write_bytes(content)
+        completed = subprocess.run(
+            [bash, "-c", harness],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        return completed.returncode
+
+    assert run_validator(payload, valid_hash=True) == 0
+    mismatch = dict(payload)
+    mismatch["active_input_lock_sha256"] = "0" * 64
+    assert run_validator(mismatch, valid_hash=True) != 0
+    assert run_validator(payload, valid_hash=False) != 0
+
+
+@pytest.mark.parametrize("fault", ("rm", "sync", "finalized-phase"))
+def test_verified_runtime_cleanup_fault_never_refences_live_writers(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable finalize fault test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    finalize = _function(
+        "controlled_guard_finalize_successful_activation",
+        _shell_function_bodies(source)[
+            "controlled_guard_finalize_successful_activation"
+        ],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+FAULT={fault!r}
+GUARDED_SHA={guarded_sha}
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+PHASE_STATE="$TEST_ROOT/phase"
+UNSAFE_MUTATION="$TEST_ROOT/unsafe-mutation"
+mkdir -p "$DATABASE_WRITER_GUARD_DIR"
+printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+printf 'runtime-units-installed\n' > "$PHASE_STATE"
+controlled_guard_sync_activation_journal() {{ return 0; }}
+controlled_guard_assert_dropin_contract() {{ return 0; }}
+systemctl() {{
+  if [ "$1" != show ]; then
+    : > "$UNSAFE_MUTATION"
+    return 90
+  fi
+  case "$3:${{5:-}}" in
+    LoadState:probiga|LoadState:probiga-scheduler) printf 'loaded\n' ;;
+    ActiveState:probiga|ActiveState:probiga-scheduler) printf 'active\n' ;;
+    UnitFileState:probiga|UnitFileState:probiga-scheduler) printf 'enabled\n' ;;
+    *) return 91 ;;
+  esac
+}}
+controlled_guard_apply_unit_state() {{ return 0; }}
+curl() {{ return 0; }}
+activation_snapshot_validate() {{ return 0; }}
+activation_snapshot_validate_new() {{ return 0; }}
+activation_snapshot_assert_new_set() {{ return 0; }}
+activation_snapshot_set_phase() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  if [ "$2" = finalized ] && [ "$FAULT" = finalized-phase ]; then
+    return 92
+  fi
+  printf '%s\n' "$2" > "$PHASE_STATE"
+}}
+controlled_guard_write_restore_file() {{ : > "$UNSAFE_MUTATION"; return 1; }}
+controlled_guard_refence_after_restore_failure() {{
+  : > "$UNSAFE_MUTATION"
+  return 1
+}}
+rm() {{
+  if [ "$FAULT" = rm ] && [ "${{*: -1}}" = "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    return 93
+  fi
+  command rm "$@"
+}}
+sync() {{
+  if [ "$FAULT" = sync ] && [ "${{*: -1}}" = "$DATABASE_WRITER_GUARD_DIR" ]; then
+    return 94
+  fi
+  return 0
+}}
+{finalize}
+if controlled_guard_finalize_successful_activation "$GUARDED_SHA" \
+    loaded,active,enabled loaded,active,enabled \
+    loaded,inactive,static loaded,inactive,disabled; then
+  echo "fault $FAULT unexpectedly finalized" >&2
+  exit 20
+fi
+test "$(<"$PHASE_STATE")" = new-runtime-verified || exit 21
+test ! -e "$UNSAFE_MUTATION" || exit 22
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_guard_state_helpers_do_not_lose_early_failures_under_if_not() -> None:
