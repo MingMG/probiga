@@ -947,6 +947,9 @@ PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
 DB_STATE="$TEST_ROOT/governance-state"
 TRACE="$TEST_ROOT/trace"
 V2_RECOVERY_STEP=not-started
+CUTOVER_DEADLINE=9999999999
+RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=
+RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=
 mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
 printf '%s\n' probiga.database-writer-restore.v1 \
   "release=$GUARDED_SHA" \
@@ -996,6 +999,17 @@ controlled_guard_assert_boundary() {{
   test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
   printf 'boundary\n' >> "$TRACE"
 }}
+controlled_guard_assert_activation_deadline() {{
+  test "$1" = "$CUTOVER_DEADLINE"
+}}
+controlled_guard_install_recovery_cutover_dropins() {{
+  test "$1" = "$CUTOVER_DEADLINE" || return 1
+  printf 'install-cutover-deadline\n' >> "$TRACE"
+}}
+controlled_guard_remove_recovery_cutover_dropins() {{
+  test "$1" = "$CUTOVER_DEADLINE" || return 1
+  printf 'remove-cutover-deadline\n' >> "$TRACE"
+}}
 controlled_guard_refence_after_restore_failure() {{
   printf 'unexpected-refence\n' >> "$TRACE"
   return 1
@@ -1032,22 +1046,28 @@ activation_snapshot_set_phase() {{
 activation_snapshot_restore_new_set() {{ printf 'restore-new\n' >> "$TRACE"; }}
 activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
 controlled_guard_cleanup() {{
+  test "$6" = "$CUTOVER_DEADLINE" || return 1
   test "$(<"$DB_STATE")" = new || return 1
   rm -f "$DATABASE_WRITER_GUARD_FILE"
   printf 'remove-fence\n' >> "$TRACE"
 }}
 controlled_guard_verify_restored_runtime() {{
   test "$3" = "$GUARDED_SHA" || return 1
-  case "$6" in
+    case "$6" in
     full)
+      test "${{7:-}}" = recover-input-readiness || return 1
       test "$1:$2:$4:$5" = \
         "loaded,inactive,disabled:loaded,inactive,disabled:loaded,inactive,static:loaded,inactive,disabled" || \
         return 1
       test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
       test "$(<"$DB_STATE")" = new || return 1
+      RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=2026-08-21
+      RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$CUTOVER_DEADLINE"
       printf 'verify-gates-fenced\n' >> "$TRACE"
       ;;
     rollback-only)
+      test "$#" -eq 8 || return 1
+      test "$7:$8" = "strict:$CUTOVER_DEADLINE" || return 1
       test "$1:$2:$4:$5" = \
         "loaded,active,enabled:loaded,active,enabled:loaded,inactive,static:loaded,inactive,disabled" || \
         return 1
@@ -1083,6 +1103,8 @@ test "$(grep -c '^phase-restoring-new-no-receipt$' "$TRACE")" -eq \
 test "$(grep -c '^phase-new-runtime-preserved-no-receipt$' "$TRACE")" -eq 1 || exit 39
 test "$(grep -c '^verify-gates-fenced$' "$TRACE")" -eq 1 || exit 40
 test "$(grep -c '^verify-runtime$' "$TRACE")" -eq 1 || exit 41
+test "$(grep -c '^install-cutover-deadline$' "$TRACE")" -eq 1 || exit 46
+test "$(grep -c '^remove-cutover-deadline$' "$TRACE")" -eq 1 || exit 47
 test "$(grep -c '^retire-no-receipt$' "$TRACE")" -eq 1 || exit 42
 test "$(grep -c '^revalidate-commit$' "$TRACE")" -eq 1 || exit 43
 test "$(grep -c '^restore-live-new$' "$TRACE")" -eq \
@@ -1090,6 +1112,349 @@ test "$(grep -c '^restore-live-new$' "$TRACE")" -eq \
 test "$(grep -c '^verify-live-new$' "$TRACE")" -eq 3 || exit 45
 """
     harness_path = tmp_path / "forward-preserve-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    ("governance-recheck", "governance-health-final", "governance-date-final"),
+)
+def test_forward_recovery_gate_failure_refences_without_cleanup_or_start(
+    tmp_path: Path,
+    failure_code: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable forward gate failure test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery = _function(
+        "controlled_v2_forward_preserve_no_receipt_recovery",
+        _shell_function_bodies(source)[
+            "controlled_v2_forward_preserve_no_receipt_recovery"
+        ],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+FAILURE_CODE={failure_code!r}
+EXPECTED_SHA={'c' * 40}
+GUARDED_SHA={guarded_sha}
+DEPLOY_OPERATION=deploy
+DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
+ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
+PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+TRACE="$TEST_ROOT/trace"
+UNSAFE_CLEANUP="$TEST_ROOT/unsafe-cleanup"
+UNSAFE_START="$TEST_ROOT/unsafe-start"
+V2_RECOVERY_STEP=not-started
+RESTORED_RUNTIME_FAILURE_CODE=
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=loaded,inactive,static \
+  ai_timer_unit=loaded,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf 'restoring-new-no-receipt\n' > "$PHASE_STATE"
+printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_old_release() {{ printf '%s\n' "{'b' * 40}"; }}
+activation_snapshot_phase() {{ printf '%s\n' "$(<"$PHASE_STATE")"; }}
+activation_snapshot_validate_new() {{ return 0; }}
+activation_snapshot_validate_governance_new() {{ return 0; }}
+activation_snapshot_assert_pending_receipt_absent() {{ return 0; }}
+controlled_guard_assert_governance_restore_runtime() {{ return 0; }}
+controlled_guard_assert_directory() {{ test -d "$DATABASE_WRITER_GUARD_DIR"; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ test -f "$DATABASE_WRITER_RESTORE_FILE"; }}
+controlled_guard_assert_marker() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+controlled_guard_recreate_file() {{ return 90; }}
+controlled_guard_install_dropins() {{ printf 'install-fence\n' >> "$TRACE"; }}
+systemctl() {{ test "$1" = daemon-reload || return 1; }}
+controlled_guard_force_all_writers_fenced() {{ printf 'fence\n' >> "$TRACE"; }}
+controlled_guard_assert_boundary() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+controlled_guard_governance_contract_snapshot() {{
+  test "$1:$2:$3" = \
+    "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  printf 'verify-governance\n' >> "$TRACE"
+}}
+activation_snapshot_restore_new_set() {{ printf 'restore-new\n' >> "$TRACE"; }}
+activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
+controlled_guard_verify_restored_runtime() {{
+  test "$3" = "$GUARDED_SHA" || return 1
+  case "$6" in
+    full)
+      test "$7" = recover-input-readiness || return 1
+      RESTORED_RUNTIME_FAILURE_CODE="$FAILURE_CODE"
+      printf 'full-gate-%s\n' "$FAILURE_CODE" >> "$TRACE"
+      return 1
+      ;;
+    rollback-only)
+      : > "$UNSAFE_START"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}}
+controlled_guard_cleanup() {{ : > "$UNSAFE_CLEANUP"; return 0; }}
+controlled_guard_refence_after_restore_failure() {{
+  test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+  printf 'refence\n' >> "$TRACE"
+}}
+{recovery}
+if controlled_v2_forward_preserve_no_receipt_recovery; then exit 30; fi
+test "$V2_RECOVERY_STEP" = \
+  "forward-verify-gates-fenced-$FAILURE_CODE" || exit 31
+test -f "$DATABASE_WRITER_GUARD_FILE" || exit 32
+test -f "$DATABASE_WRITER_RESTORE_FILE" || exit 33
+test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 34
+test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || exit 35
+test ! -e "$UNSAFE_CLEANUP" || exit 36
+test ! -e "$UNSAFE_START" || exit 37
+test "$(grep -c '^refence$' "$TRACE")" -eq 1 || exit 38
+test "$(grep -n -E 'full-gate-|refence' "$TRACE" | cut -d: -f2 | \
+  paste -sd, -)" = "full-gate-$FAILURE_CODE,refence" || exit 39
+"""
+    harness_path = tmp_path / f"forward-gate-failure-{failure_code}.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_final_authoritative_date_change_fails_with_bounded_code(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable final date test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    python_executable = Path(shutil.which("python") or sys.executable).as_posix()
+    cutover_parser = _function(
+        "controlled_guard_parse_governance_cutover_result",
+        bodies["controlled_guard_parse_governance_cutover_result"],
+    ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
+    verifier_start = source.index("controlled_guard_verify_restored_runtime() {")
+    quality_start = source.index(
+        "  RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure", verifier_start
+    )
+    date_start = source.index(
+        '  if [ "$input_readiness_mode" = recover-input-readiness ]; then',
+        quality_start,
+    )
+    date_end = source.index(
+        '  RESTORED_RUNTIME_FAILURE_CODE=""', date_start
+    )
+    date_probe = source[date_start:date_end]
+    root = tmp_path.as_posix()
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+TEST_PYTHON={python_executable!r}
+ACTIVATION_UNIT_SNAPSHOT_DIR="$TEST_ROOT/transaction"
+CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS=10800
+input_readiness_mode=recover-input-readiness
+service_user=probiga
+code_root="$TEST_ROOT/code"
+python_path=/guarded/python
+governance_trade_date=2026-08-21
+cutover_probe_code=embedded-recovery-owned-probe
+governance_result_file=
+governance_result_status=0
+RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
+guarded_command_prefix=(/usr/bin/env -i)
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR" "$code_root"
+controlled_guard_assert_file() {{
+  test "$2" = 600 || return 1
+  test -f "$1"
+}}
+controlled_guard_capture_service_gate_with_deadline() {{
+  test "$1:$3" = "$service_user:$code_root" || return 1
+  printf '%s\n' \
+    '{{"trade_date":"2026-08-22","sample_epoch":1782000000,"next_cutoff_epoch":1782020000,"safe_before_epoch":1782009200,"reserve_seconds":10800}}' \
+    > "$2"
+  return 0
+}}
+{cutover_parser}
+run_final_date_probe() {{
+{date_probe}
+  return 0
+}}
+if run_final_date_probe; then exit 30; fi
+test "$RESTORED_RUNTIME_FAILURE_CODE" = governance-date-final || exit 31
+test -z "$(find "$ACTIVATION_UNIT_SNAPSHOT_DIR" -maxdepth 1 \
+  -name '.governance-date-final.*' -print -quit)" || exit 32
+"""
+    harness_path = tmp_path / "final-authoritative-date-change.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_governance_cutover_probe_is_embedded_and_compiles() -> None:
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    probe = bodies["controlled_guard_governance_cutover_probe_code"]
+    match = re.search(r"<<'PY'\n(?P<code>.*?)\nPY", probe, re.DOTALL)
+    assert match is not None
+    code = match.group("code")
+    compile(code, "<controlled-recovery-cutover-probe>", "exec")
+    assert "authoritative_closed_trade_date" in code
+    assert "create_tool_engine" in code
+    assert "check_governance_cutover_window.py" not in source
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("stale-result", "pre-cleanup", "cleanup-critical", "pre-start", "safe"),
+)
+def test_forward_cutover_deadline_tail_refences_before_unsafe_start(
+    tmp_path: Path,
+    fault: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable cutover tail test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery_start = source.index(
+        "controlled_v2_forward_preserve_no_receipt_recovery() {"
+    )
+    tail_start = source.index(
+        '  governance_trade_date="$RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE"',
+        recovery_start,
+    )
+    tail_end = source.index(
+        "  V2_RECOVERY_STEP=forward-commit-phase", tail_start
+    )
+    cutover_tail = source[tail_start:tail_end]
+    root = tmp_path.as_posix()
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+FAULT={fault!r}
+GUARDED_SHA={'a' * 40}
+guarded_sha="$GUARDED_SHA"
+CUTOVER_DEADLINE=9999999999
+DATABASE_WRITER_GUARD_FILE="$TEST_ROOT/guard"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$TEST_ROOT/new.json"
+TRACE="$TEST_ROOT/trace"
+main_record=loaded,active,enabled
+scheduler_record=loaded,active,enabled
+ai_service_record=loaded,inactive,static
+ai_timer_record=loaded,inactive,disabled
+forward_main_record=loaded,active,enabled
+forward_scheduler_record=loaded,active,enabled
+RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=2026-08-21
+RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$CUTOVER_DEADLINE"
+V2_RECOVERY_STEP=not-started
+DEADLINE_CALLS=0
+mkdir -p "$TEST_ROOT"
+printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+: > "$TRACE"
+if [ "$FAULT" = stale-result ]; then
+  RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=
+fi
+controlled_guard_assert_activation_deadline() {{
+  DEADLINE_CALLS=$((DEADLINE_CALLS + 1))
+  test "$1" = "$CUTOVER_DEADLINE" || return 1
+  if [ "$FAULT" = pre-cleanup ] && [ "$DEADLINE_CALLS" -ge 2 ]; then
+    return 1
+  fi
+}}
+controlled_guard_install_recovery_cutover_dropins() {{
+  test "$1" = "$CUTOVER_DEADLINE" || return 1
+  printf 'install-cutover\n' >> "$TRACE"
+}}
+controlled_guard_assert_boundary() {{
+  test -f "$DATABASE_WRITER_GUARD_FILE"
+}}
+controlled_guard_cleanup() {{
+  test "$6" = "$CUTOVER_DEADLINE" || return 1
+  printf 'cleanup\n' >> "$TRACE"
+  if [ "$FAULT" = cleanup-critical ]; then return 1; fi
+  rm -f "$DATABASE_WRITER_GUARD_FILE"
+}}
+controlled_guard_verify_restored_runtime() {{
+  test "$6:$7:$8" = "rollback-only:strict:$CUTOVER_DEADLINE" || return 1
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  if [ "$FAULT" = pre-start ]; then return 1; fi
+  printf 'start\n' >> "$TRACE"
+}}
+controlled_guard_governance_contract_snapshot() {{
+  test "$1:$2:$3" = \
+    "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+}}
+activation_snapshot_assert_pending_receipt_absent() {{ return 0; }}
+controlled_guard_remove_recovery_cutover_dropins() {{
+  test "$1" = "$CUTOVER_DEADLINE" || return 1
+  printf 'remove-cutover\n' >> "$TRACE"
+}}
+controlled_guard_refence_after_restore_failure() {{
+  printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+  printf 'refence\n' >> "$TRACE"
+}}
+run_cutover_tail() {{
+{cutover_tail}
+  return 0
+}}
+if [ "$FAULT" = safe ]; then
+  run_cutover_tail || exit 30
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || exit 31
+  test "$(grep -c '^start$' "$TRACE")" -eq 1 || exit 32
+  test "$(grep -c '^remove-cutover$' "$TRACE")" -eq 1 || exit 33
+  ! grep -q '^refence$' "$TRACE" || exit 34
+else
+  if run_cutover_tail; then exit 35; fi
+  test -f "$DATABASE_WRITER_GUARD_FILE" || exit 36
+  test "$(grep -c '^refence$' "$TRACE")" -eq 1 || exit 37
+  ! grep -q '^start$' "$TRACE" || exit 38
+  if [ "$FAULT" = stale-result ] || [ "$FAULT" = pre-cleanup ]; then
+    ! grep -q '^cleanup$' "$TRACE" || exit 39
+  fi
+fi
+"""
+    harness_path = tmp_path / f"forward-cutover-tail-{fault}.sh"
     harness_path.write_text(harness, encoding="utf-8", newline="\n")
     completed = subprocess.run(
         [bash, str(harness_path)],
@@ -2237,6 +2602,529 @@ exit 24
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_captured_database_gate_preserves_blocked_exit_status(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable capture gate test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    capture = _function(
+        "controlled_guard_capture_service_gate_with_deadline",
+        _shell_function_bodies(source)[
+            "controlled_guard_capture_service_gate_with_deadline"
+        ],
+    ).replace(
+        'test -x /usr/bin/sudo || return 1',
+        "true",
+    ).replace(
+        '/usr/bin/sudo -u "$service_user" /usr/bin/timeout',
+        "/usr/bin/timeout",
+    )
+    output_file = (tmp_path / "captured-output.json").as_posix()
+    working_directory = tmp_path.as_posix()
+    harness = f"""
+set -Eeuo pipefail
+CONTROLLED_DATABASE_GATE_KILL_AFTER=1s
+CONTROLLED_DATABASE_GATE_TIMEOUT=5s
+OUTPUT_FILE={output_file!r}
+WORKING_DIRECTORY={working_directory!r}
+: > "$OUTPUT_FILE"
+chmod 600 "$OUTPUT_FILE"
+controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
+{capture}
+if controlled_guard_capture_service_gate_with_deadline test-user \
+    "$OUTPUT_FILE" "$WORKING_DIRECTORY" /usr/bin/bash -c \
+    'printf "%s\\n" blocked-result; exit 2'; then
+  status=0
+else
+  status=$?
+fi
+test "$status" -eq 2 || exit 20
+test "$(<"$OUTPUT_FILE")" = blocked-result || exit 21
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_governance_recovery_parsers_bind_disposition_identity_and_fields(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable governance parser test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    python_executable = Path(shutil.which("python") or sys.executable).as_posix()
+    parsers = "".join(
+        _function(name, bodies[name])
+        for name in (
+            "controlled_guard_parse_governance_health_result",
+            "controlled_guard_parse_governance_cutover_result",
+            "controlled_guard_parse_governance_runner_result",
+        )
+    ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
+    result_file = tmp_path / "governance-result.json"
+    harness = f"""
+set -u
+TEST_PYTHON={python_executable!r}
+RESULT_FILE={result_file.as_posix()!r}
+CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS=10800
+controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
+{parsers}
+parser="$1"
+shift
+"$parser" "$RESULT_FILE" "$@"
+"""
+    harness_path = tmp_path / "governance-parser-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+
+    def run_parser(
+        parser: str,
+        payload: object,
+        *arguments: str,
+    ) -> subprocess.CompletedProcess[str]:
+        content = payload if isinstance(payload, str) else json.dumps(payload)
+        result_file.write_text(content, encoding="utf-8")
+        return subprocess.run(
+            [bash, str(harness_path), parser, *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+
+    def clone(payload: dict[str, object]) -> dict[str, object]:
+        return json.loads(json.dumps(payload))
+
+    expected_sha = "a" * 40
+    trade_date = "2026-08-21"
+    adapter = {
+        "registry_sealed": True,
+        "production_execution_ready": True,
+        "registry_seal_hash": "b" * 64,
+        "adapter_count": 0,
+    }
+    completed_health: dict[str, object] = {
+        "status": "PASS",
+        "run_disposition": "completed",
+        "automatic_real_order_submission": False,
+        "expected": {
+            "build_commit_sha": expected_sha,
+            "trade_date": trade_date,
+            "trade_date_source": "command_line_verified_against_calendar",
+        },
+        "checks": [
+            {"name": "adapter_registry_sealed", "passed": True, "waived": False},
+            {
+                "name": "authoritative_date_has_one_canonical_revision",
+                "passed": True,
+                "waived": False,
+            },
+            {"name": "expected_build_date_run", "passed": True, "waived": False},
+        ],
+        "adapter_registry": adapter,
+    }
+    input_not_ready_health = clone(completed_health)
+    input_not_ready_health["run_disposition"] = "input_not_ready"
+    for check in input_not_ready_health["checks"]:
+        if check["name"] in {
+            "authoritative_date_has_one_canonical_revision",
+            "expected_build_date_run",
+        }:
+            check["waived"] = True
+
+    completed = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        completed_health,
+        expected_sha,
+        "completed",
+        trade_date,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == trade_date
+    allowed = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        input_not_ready_health,
+        expected_sha,
+        "input_not_ready",
+        trade_date,
+    )
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    assert allowed.stdout.strip() == trade_date
+    authoritative_health = clone(completed_health)
+    authoritative_health["expected"]["trade_date_source"] = (
+        "authoritative_closed_trading_calendar_day"
+    )
+    authoritative = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        authoritative_health,
+        expected_sha,
+        "completed",
+    )
+    assert (
+        authoritative.returncode == 0
+    ), authoritative.stdout + authoritative.stderr
+    assert authoritative.stdout.strip() == trade_date
+
+    invalid_health_payloads: list[tuple[dict[str, object], str, str]] = []
+    sha_drift = clone(completed_health)
+    sha_drift["expected"]["build_commit_sha"] = "c" * 40
+    invalid_health_payloads.append((sha_drift, "completed", trade_date))
+    waiver_drift = clone(input_not_ready_health)
+    waiver_drift["checks"][1]["waived"] = False
+    invalid_health_payloads.append(
+        (waiver_drift, "input_not_ready", trade_date)
+    )
+    adapter_drift = clone(completed_health)
+    adapter_drift["adapter_registry"]["registry_sealed"] = False
+    invalid_health_payloads.append((adapter_drift, "completed", trade_date))
+    failed_check = clone(completed_health)
+    failed_check["checks"][0]["passed"] = False
+    invalid_health_payloads.append((failed_check, "completed", trade_date))
+    unsafe_order_flag = clone(completed_health)
+    unsafe_order_flag["automatic_real_order_submission"] = True
+    invalid_health_payloads.append((unsafe_order_flag, "completed", trade_date))
+    extra_top_level = clone(completed_health)
+    extra_top_level["unexpected"] = True
+    invalid_health_payloads.append((extra_top_level, "completed", trade_date))
+    negative_adapter_count = clone(completed_health)
+    negative_adapter_count["adapter_registry"]["adapter_count"] = -1
+    invalid_health_payloads.append(
+        (negative_adapter_count, "completed", trade_date)
+    )
+    source_drift = clone(completed_health)
+    source_drift["expected"]["trade_date_source"] = "unexpected"
+    invalid_health_payloads.append((source_drift, "completed", trade_date))
+    for payload, disposition, expected_date in invalid_health_payloads:
+        rejected = run_parser(
+            "controlled_guard_parse_governance_health_result",
+            payload,
+            expected_sha,
+            disposition,
+            expected_date,
+        )
+        assert rejected.returncode != 0
+    date_drift = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        completed_health,
+        expected_sha,
+        "completed",
+        "2026-08-20",
+    )
+    assert date_drift.returncode != 0
+    duplicate_health_key = json.dumps(completed_health).replace(
+        '"status": "PASS"',
+        '"status": "PASS", "status": "PASS"',
+        1,
+    )
+    duplicate_health = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        duplicate_health_key,
+        expected_sha,
+        "completed",
+        trade_date,
+    )
+    assert duplicate_health.returncode != 0
+
+    cutover_sample = 1_782_000_000
+    cutover_cutoff = cutover_sample + 20_000
+    cutover_payload: dict[str, object] = {
+        "trade_date": trade_date,
+        "sample_epoch": cutover_sample,
+        "next_cutoff_epoch": cutover_cutoff,
+        "safe_before_epoch": cutover_cutoff - 10_800,
+        "reserve_seconds": 10_800,
+    }
+    cutover = run_parser(
+        "controlled_guard_parse_governance_cutover_result",
+        cutover_payload,
+        trade_date,
+    )
+    assert cutover.returncode == 0, cutover.stdout + cutover.stderr
+    assert cutover.stdout.strip() == str(cutover_cutoff - 10_800)
+    invalid_cutover_payloads = []
+    for field, value in (
+        ("trade_date", "2026-08-20"),
+        ("sample_epoch", True),
+        ("next_cutoff_epoch", cutover_sample),
+        ("safe_before_epoch", cutover_sample),
+        ("reserve_seconds", 10_799),
+    ):
+        invalid = clone(cutover_payload)
+        invalid[field] = value
+        invalid_cutover_payloads.append(invalid)
+    extra_cutover = clone(cutover_payload)
+    extra_cutover["unexpected"] = True
+    invalid_cutover_payloads.append(extra_cutover)
+    exact_deadline = clone(cutover_payload)
+    exact_deadline["next_cutoff_epoch"] = cutover_sample + 10_800
+    exact_deadline["safe_before_epoch"] = cutover_sample
+    invalid_cutover_payloads.append(exact_deadline)
+    for payload in invalid_cutover_payloads:
+        rejected = run_parser(
+            "controlled_guard_parse_governance_cutover_result",
+            payload,
+            trade_date,
+        )
+        assert rejected.returncode != 0
+    duplicate_cutover = json.dumps(cutover_payload).replace(
+        '"trade_date": "2026-08-21"',
+        '"trade_date": "2026-08-21", "trade_date": "2026-08-21"',
+        1,
+    )
+    rejected_duplicate_cutover = run_parser(
+        "controlled_guard_parse_governance_cutover_result",
+        duplicate_cutover,
+        trade_date,
+    )
+    assert rejected_duplicate_cutover.returncode != 0
+
+    completed_runner: dict[str, object] = {
+        "status": "ok",
+        "run_uid": "d" * 32,
+        "trade_date": trade_date,
+        "summary": {},
+        "lifecycle_transitions": [],
+        "allocations": [],
+        "automatic_real_order_submission": False,
+    }
+    blocked_runner: dict[str, object] = {
+        "status": "blocked",
+        "reason": "market inputs are not ready",
+        "target_trade_date": trade_date,
+        "input_trade_date": trade_date,
+        "automatic_real_order_submission": False,
+    }
+    completed = run_parser(
+        "controlled_guard_parse_governance_runner_result",
+        completed_runner,
+        "0",
+        trade_date,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.strip() == "completed"
+    blocked = run_parser(
+        "controlled_guard_parse_governance_runner_result",
+        blocked_runner,
+        "2",
+        trade_date,
+    )
+    assert blocked.returncode == 0, blocked.stdout + blocked.stderr
+    assert blocked.stdout.strip() == "input_not_ready"
+
+    runner_field_drift = clone(completed_runner)
+    runner_field_drift["unexpected"] = True
+    runner_date_drift = clone(completed_runner)
+    runner_date_drift["trade_date"] = "2026-08-20"
+    runner_unsafe_flag = clone(blocked_runner)
+    runner_unsafe_flag["automatic_real_order_submission"] = True
+    invalid_runner_cases = (
+        (completed_runner, "2"),
+        (blocked_runner, "0"),
+        (completed_runner, "124"),
+        (runner_field_drift, "0"),
+        (runner_date_drift, "0"),
+        (runner_unsafe_flag, "2"),
+        ("{malformed", "0"),
+        (
+            json.dumps(completed_runner).replace(
+                '"status": "ok"',
+                '"status": "ok", "status": "ok"',
+                1,
+            ),
+            "0",
+        ),
+    )
+    for payload, status in invalid_runner_cases:
+        rejected = run_parser(
+            "controlled_guard_parse_governance_runner_result",
+            payload,
+            status,
+            trade_date,
+        )
+        assert rejected.returncode != 0
+
+
+def test_recovery_cutover_deadline_and_dropin_contract_are_executable(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable cutover contract test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    helpers = "".join(
+        _function(name, bodies[name])
+        for name in (
+            "controlled_guard_assert_activation_deadline",
+            "controlled_guard_cutover_exec_line",
+            "controlled_guard_assert_recovery_cutover_dropin",
+        )
+    ).replace('/usr/bin/date +%s', 'printf "%s\\n" "$NOW_EPOCH"')
+    main_dropin = (tmp_path / "main-cutover.conf").as_posix()
+    scheduler_dropin = (tmp_path / "scheduler-cutover.conf").as_posix()
+    ai_dropin = (tmp_path / "ai-cutover.conf").as_posix()
+    harness = f"""
+set -u
+MAIN_RECOVERY_CUTOVER_DROPIN={main_dropin!r}
+SCHEDULER_RECOVERY_CUTOVER_DROPIN={scheduler_dropin!r}
+AI_SERVICE_RECOVERY_CUTOVER_DROPIN={ai_dropin!r}
+DEADLINE=1782000000
+NOW_EPOCH=1781999999
+controlled_guard_assert_file() {{
+  test -f "$1" && test ! -L "$1" && test "$2" = 644
+}}
+{helpers}
+controlled_guard_assert_activation_deadline "$DEADLINE" || exit 20
+NOW_EPOCH="$DEADLINE"
+if controlled_guard_assert_activation_deadline "$DEADLINE"; then exit 21; fi
+printf '%s\n' '[Service]' > "$MAIN_RECOVERY_CUTOVER_DROPIN"
+controlled_guard_cutover_exec_line "$DEADLINE" \
+  >> "$MAIN_RECOVERY_CUTOVER_DROPIN" || exit 22
+controlled_guard_assert_recovery_cutover_dropin \
+  "$MAIN_RECOVERY_CUTOVER_DROPIN" "$DEADLINE" || exit 23
+if controlled_guard_assert_recovery_cutover_dropin \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN" 1782000001; then exit 24; fi
+printf '%s\n' unexpected >> "$MAIN_RECOVERY_CUTOVER_DROPIN"
+if controlled_guard_assert_recovery_cutover_dropin \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN"; then exit 25; fi
+"""
+    harness_path = tmp_path / "cutover-contract-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_cleanup_deadline_expires_before_guard_removal(tmp_path: Path) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable cleanup deadline test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    cleanup = _function(
+        "controlled_guard_cleanup",
+        _shell_function_bodies(source)["controlled_guard_cleanup"],
+    )
+    guard = (tmp_path / "guard").as_posix()
+    harness = f"""
+set -u
+DATABASE_WRITER_GUARD_FILE={guard!r}
+DATABASE_WRITER_GUARD_DIR={tmp_path.as_posix()!r}
+EXPIRED=1
+printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+controlled_guard_assert_boundary() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+controlled_guard_assert_activation_deadline() {{ test "$EXPIRED" -eq 0; }}
+controlled_guard_assert_dropin_boundary() {{ return 0; }}
+controlled_guard_restore_after_cleanup_failure() {{ return 90; }}
+sync() {{ return 0; }}
+{cleanup}
+if controlled_guard_cleanup {'a' * 40} loaded,active,enabled \
+    loaded,active,enabled loaded,inactive,static loaded,inactive,disabled \
+    1782000000; then exit 20; fi
+test -f "$DATABASE_WRITER_GUARD_FILE" || exit 21
+EXPIRED=0
+controlled_guard_cleanup {'a' * 40} loaded,active,enabled \
+  loaded,active,enabled loaded,inactive,static loaded,inactive,disabled \
+  1782000000 || exit 22
+test ! -e "$DATABASE_WRITER_GUARD_FILE" || exit 23
+"""
+    harness_path = tmp_path / "cleanup-deadline-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_unit_start_rechecks_deadline_and_uses_internal_timeout(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable unit deadline test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    apply_state = _function(
+        "controlled_guard_apply_unit_state",
+        _shell_function_bodies(source)["controlled_guard_apply_unit_state"],
+    ).replace("test -x /usr/bin/timeout || return 1", "true").replace(
+        "/usr/bin/timeout --signal=TERM --kill-after=10s",
+        "timeout --signal=TERM --kill-after=10s",
+    )
+    trace = (tmp_path / "trace").as_posix()
+    harness = f"""
+set -u
+TRACE={trace!r}
+EXPIRED=1
+CONTROLLED_RECOVERY_UNIT_START_TIMEOUT=2m
+: > "$TRACE"
+controlled_guard_assert_activation_deadline() {{ test "$EXPIRED" -eq 0; }}
+systemctl() {{
+  case "$1" in
+    show)
+      case "$3" in
+        LoadState) printf 'loaded\n' ;;
+        UnitFileState) printf 'enabled\n' ;;
+        ActiveState) printf 'active\n' ;;
+        *) return 1 ;;
+      esac
+      ;;
+    enable) return 0 ;;
+    start) printf 'start-%s\n' "$2" >> "$TRACE" ;;
+    *) return 1 ;;
+  esac
+}}
+timeout() {{
+  test "$1:$2:$3:$4:$5:$6" = \
+    "--signal=TERM:--kill-after=10s:2m:systemctl:start:probiga" || return 1
+  systemctl "$5" "$6"
+}}
+{apply_state}
+if controlled_guard_apply_unit_state probiga loaded,active,enabled \
+    1782000000; then exit 20; fi
+test ! -s "$TRACE" || exit 21
+EXPIRED=0
+controlled_guard_apply_unit_state probiga loaded,active,enabled \
+  1782000000 || exit 22
+test "$(<"$TRACE")" = start-probiga || exit 23
+"""
+    harness_path = tmp_path / "unit-start-deadline-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_finalized_receipt_requires_content_hash_and_exact_request_identity(
     tmp_path: Path,
 ) -> None:
@@ -2475,6 +3363,67 @@ fi
         check=False,
         capture_output=True,
         text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_inactive_disabled_timer_accepts_empty_pids_and_rejects_nonzero() -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable timer PID regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(source)["controlled_guard_apply_unit_state"]
+    shell_function = _function("controlled_guard_apply_unit_state", body)
+    harness = f"""
+set -u
+TIMER=probiga-ai-recommendation-worker.timer
+TEST_MAIN_PID=
+TEST_EXEC_MAIN_PID=
+systemctl() {{
+  local operation="$1"
+  shift
+  case "$operation" in
+    show)
+      local property="$2"
+      local unit="${{@: -1}}"
+      test "$unit" = "$TIMER" || return 80
+      case "$property" in
+        LoadState) printf 'loaded\n' ;;
+        UnitFileState) printf 'disabled\n' ;;
+        ActiveState) printf 'inactive\n' ;;
+        MainPID) printf '%s\n' "$TEST_MAIN_PID" ;;
+        ExecMainPID) printf '%s\n' "$TEST_EXEC_MAIN_PID" ;;
+        *) return 81 ;;
+      esac
+      ;;
+    disable|stop)
+      test "$1" = "$TIMER" || return 82
+      ;;
+    *) return 83 ;;
+  esac
+}}
+{shell_function}
+controlled_guard_apply_unit_state "$TIMER" loaded,inactive,disabled || exit 11
+TEST_MAIN_PID=101
+if controlled_guard_apply_unit_state "$TIMER" loaded,inactive,disabled; then
+  echo 'nonzero MainPID was accepted' >&2
+  exit 12
+fi
+TEST_MAIN_PID=
+TEST_EXEC_MAIN_PID=202
+if controlled_guard_apply_unit_state "$TIMER" loaded,inactive,disabled; then
+  echo 'nonzero ExecMainPID was accepted' >&2
+  exit 13
+fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=15,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr

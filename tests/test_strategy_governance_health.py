@@ -2497,6 +2497,26 @@ def test_health_accepts_one_complete_exact_build_date_run(monkeypatch):
     assert all(check["passed"] for check in result["checks"])
 
 
+def test_allow_input_not_ready_matches_strict_for_complete_exact_run(
+    monkeypatch,
+):
+    _fixed_trade_date(monkeypatch)
+    strict_result = health.collect_governance_health(
+        _GovernanceHealthEngine(runs=[_completed_run()]),
+        expected_build_sha=BUILD_SHA,
+    )
+    allowed_result = health.collect_governance_health(
+        _GovernanceHealthEngine(runs=[_completed_run()]),
+        expected_build_sha=BUILD_SHA,
+        allow_input_not_ready=True,
+    )
+
+    assert allowed_result == strict_result
+    assert allowed_result["status"] == "PASS"
+    assert allowed_result["run_disposition"] == "completed"
+    assert not any(check["waived"] for check in allowed_result["checks"])
+
+
 def test_automatic_lifecycle_history_is_exactly_bound_to_run_and_audit():
     run, event, transition_audit, run_audit = (
         _automatic_lifecycle_history_fixture()
@@ -4065,6 +4085,44 @@ def test_input_not_ready_waives_only_missing_run(monkeypatch):
         or check["name"].startswith("daily_scheduler_")
         or check["name"] == "required_tables"
     )
+
+
+def test_input_not_ready_without_authoritative_date_still_fails_closed(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        health,
+        "_authoritative_trade_date",
+        lambda _engine, _explicit="": (
+            "",
+            "authoritative_closed_trading_calendar_day",
+        ),
+    )
+
+    result = health.collect_governance_health(
+        _GovernanceHealthEngine(runs=[]),
+        expected_build_sha=BUILD_SHA,
+        allow_input_not_ready=True,
+    )
+
+    assert result["status"] == "FAIL"
+    assert result["run_disposition"] == "input_not_ready"
+    checks = {check["name"]: check for check in result["checks"]}
+    assert checks["authoritative_trade_date"]["passed"] is True
+    assert checks["authoritative_trade_date"]["waived"] is True
+    assert [
+        check["name"] for check in result["checks"] if check["waived"]
+    ] == [
+        "authoritative_trade_date",
+        "authoritative_date_has_one_canonical_revision",
+        "expected_build_date_run",
+    ]
+    for name in (
+        "authoritative_session_windows_qmt_close_attested",
+        "qmt_pre_close_v2_rows_bind_current_kline",
+    ):
+        assert checks[name]["passed"] is False
+        assert checks[name]["waived"] is False
 
 
 def test_input_not_ready_cannot_waive_missing_qmt_row_attestations(

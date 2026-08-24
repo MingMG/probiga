@@ -3054,10 +3054,28 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "activation_snapshot_allows_missing_guard_for_recovery"
     ]
     venv_seal = bodies["controlled_guard_assert_immutable_venv_tree"]
-    verifier = bodies["controlled_guard_verify_restored_runtime"]
+    verifier = _normalized_shell(deploy[
+        deploy.index("controlled_guard_verify_restored_runtime() {"):
+        deploy.index("controlled_guard_force_unit_fenced() {")
+    ])
     gate_deadline = bodies[
         "controlled_guard_run_service_gate_with_deadline"
     ]
+    capture_deadline = bodies[
+        "controlled_guard_capture_service_gate_with_deadline"
+    ]
+    health_result_parser = _normalized_shell(deploy[
+        deploy.index("controlled_guard_parse_governance_health_result() {"):
+        deploy.index("controlled_guard_parse_governance_cutover_result() {")
+    ])
+    cutover_result_parser = _normalized_shell(deploy[
+        deploy.index("controlled_guard_parse_governance_cutover_result() {"):
+        deploy.index("controlled_guard_parse_governance_runner_result() {")
+    ])
+    runner_result_parser = _normalized_shell(deploy[
+        deploy.index("controlled_guard_parse_governance_runner_result() {"):
+        deploy.index("controlled_guard_verify_restored_runtime() {")
+    ])
     governance_snapshot = bodies["controlled_guard_governance_snapshot"]
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
@@ -3276,18 +3294,128 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "--restore-snapshot" not in capture
 
     assert 'local verification_mode="${6:-full}"' in verifier
+    assert 'local input_readiness_mode="${7:-strict}"' in verifier
+    assert 'local activation_deadline_epoch="${8:-}"' in verifier
+    assert "strict|recover-input-readiness)" in verifier
     runtime_health = verifier.rindex("http://127.0.0.1/api/health/runtime")
     rollback_gate = verifier.index(
         'if [ "$verification_mode" = rollback-only ]; then'
     )
-    governance_health = verifier.index(
-        "check_strategy_governance_health.py", rollback_gate
+    recovery_readiness = verifier.index(
+        'if [ "$input_readiness_mode" = recover-input-readiness ]; then',
+        rollback_gate,
     )
-    quality_gate = verifier.index("ensure_quality_gate.py", governance_health)
-    assert runtime_health < rollback_gate < governance_health < quality_gate
+    strict_capture = verifier.index(
+        ".governance-health-strict.", recovery_readiness
+    )
+    strict_parse = verifier.index(
+        "controlled_guard_parse_governance_health_result", strict_capture
+    )
+    probe_capture = verifier.index(
+        ".governance-health-probe.", strict_parse
+    )
+    probe_allow = verifier.index(
+        '"${governance_health_args[@]}" --allow-input-not-ready',
+        probe_capture,
+    )
+    probe_parse = verifier.index(
+        "controlled_guard_parse_governance_health_result", probe_allow
+    )
+    runner_capture = verifier.index(".governance-recheck.", probe_parse)
+    fixed_date_runner = verifier.index(
+        '--trade-date "$governance_trade_date"', runner_capture
+    )
+    runner_parse = verifier.index(
+        "controlled_guard_parse_governance_runner_result", fixed_date_runner
+    )
+    final_expected_date = verifier.index(
+        '--expected-trade-date "$governance_trade_date"', runner_parse
+    )
+    final_allow = verifier.index(
+        "governance_health_args+=(--allow-input-not-ready)",
+        final_expected_date,
+    )
+    final_capture = verifier.index(
+        ".governance-health-final.", final_allow
+    )
+    final_parse = verifier.index(
+        "controlled_guard_parse_governance_health_result", final_capture
+    )
+    normal_strict_health = verifier.index(
+        "RESTORED_RUNTIME_FAILURE_CODE=governance-health", final_parse
+    )
+    quality_gate = verifier.index(
+        "ensure_quality_gate.py", normal_strict_health
+    )
+    final_date_capture = verifier.index(
+        ".governance-date-final.", quality_gate
+    )
+    final_authoritative_date = verifier.index(
+        '"$python_path" -P -c', final_date_capture
+    )
+    final_date_match = verifier.index(
+        "controlled_guard_parse_governance_cutover_result",
+        final_authoritative_date,
+    )
+    final_deadline = verifier.index(
+        'RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$cutover_deadline_epoch"',
+        final_date_match,
+    )
+    assert (
+        runtime_health
+        < rollback_gate
+        < recovery_readiness
+        < strict_capture
+        < strict_parse
+        < probe_capture
+        < probe_allow
+        < probe_parse
+        < runner_capture
+        < fixed_date_runner
+        < runner_parse
+        < final_expected_date
+        < final_allow
+        < final_capture
+        < final_parse
+        < normal_strict_health
+        < quality_gate
+        < final_date_capture
+        < final_authoritative_date
+        < final_date_match
+        < final_deadline
+    )
+    assert verifier.count("--allow-input-not-ready") == 2
+    assert verifier.count(
+        'controlled_guard_capture_service_gate_with_deadline "$service_user"'
+    ) == 5
+    assert "RESTORED_RUNTIME_FAILURE_CODE=runtime-identity" in verifier
+    assert "RESTORED_RUNTIME_FAILURE_CODE=governance-health" in verifier
+    for failure_code in (
+        "governance-health-strict",
+        "governance-health-probe",
+        "governance-recheck",
+        "governance-health-final",
+        "governance-date-final",
+    ):
+        assert f"RESTORED_RUNTIME_FAILURE_CODE={failure_code}" in verifier
+    assert "RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure" in verifier
     assert verifier.count(
         'controlled_guard_run_service_gate_with_deadline "$service_user"'
     ) == 2
+    assert 'return "$gate_status"' in capture_deadline
+    assert ') > "$output_file" || gate_status=$?' in capture_deadline
+    assert "completed|input_not_ready)" in health_result_parser
+    assert "registry_sealed" in health_result_parser
+    assert "production_execution_ready" in health_result_parser
+    assert "trade_date_source" in health_result_parser
+    assert "safe_before_epoch" in cutover_result_parser
+    assert "cutoff - safe_before == reserve" in cutover_result_parser
+    assert "sample < safe_before" in cutover_result_parser
+    assert "controlled_guard_governance_cutover_probe_code" in normalized
+    assert '"$cutover_probe_code"' in verifier
+    assert "check_governance_cutover_window.py" not in normalized
+    assert "0|2)" in runner_result_parser
+    assert "set(payload) == required" in runner_result_parser
     sudo_boundary = gate_deadline.index('/usr/bin/sudo -u "$service_user"')
     timeout_boundary = gate_deadline.index(
         "/usr/bin/timeout --signal=TERM", sudo_boundary
@@ -3392,14 +3520,29 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         'controlled_guard_verify_restored_runtime "$fenced_main_record"'
     )
     full_gate = preserve.index('"$fenced_ai_timer_record" full', fenced_verify)
+    recovery_readiness = preserve.index("recover-input-readiness", full_gate)
     refence_on_gate_failure = preserve.index(
-        "controlled_guard_refence_after_restore_failure", full_gate
+        "controlled_guard_refence_after_restore_failure", recovery_readiness
     )
-    failure_return = preserve.index("return 1", refence_on_gate_failure)
+    gate_failure_return = preserve.index("return 1", refence_on_gate_failure)
+    cutover_result = preserve.index(
+        'cutover_deadline_epoch="$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH"',
+        gate_failure_return,
+    )
+    install_cutover_gate = preserve.index(
+        "controlled_guard_install_recovery_cutover_dropins", cutover_result
+    )
     boundary_recheck = preserve.index(
-        "controlled_guard_assert_boundary", full_gate
+        "controlled_guard_assert_boundary", install_cutover_gate
     )
-    cleanup = preserve.index("controlled_guard_cleanup", boundary_recheck)
+    refence_on_boundary_failure = preserve.index(
+        "controlled_guard_refence_after_restore_failure", boundary_recheck
+    )
+    boundary_failure_return = preserve.index("return 1", refence_on_boundary_failure)
+    precleanup_deadline = preserve.index(
+        "controlled_guard_assert_activation_deadline", boundary_failure_return
+    )
+    cleanup = preserve.index("controlled_guard_cleanup", precleanup_deadline)
     runtime_verify = preserve.index(
         'controlled_guard_verify_restored_runtime "$forward_main_record"',
         cleanup,
@@ -3410,8 +3553,11 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
     live_governance = preserve.index(
         "controlled_guard_governance_contract_snapshot verify", rollback_only
     )
+    remove_cutover_gate = preserve.index(
+        "controlled_guard_remove_recovery_cutover_dropins", live_governance
+    )
     commit = preserve.index(
-        "new-runtime-preserved-no-receipt", live_governance
+        "new-runtime-preserved-no-receipt", remove_cutover_gate
     )
     remove_restore = preserve.index(
         'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"', commit
@@ -3429,16 +3575,41 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         < restore_units
         < fenced_verify
         < full_gate
-        < boundary_recheck
+        < recovery_readiness
         < refence_on_gate_failure
-        < failure_return
+        < gate_failure_return
+        < cutover_result
+        < install_cutover_gate
+        < boundary_recheck
+        < refence_on_boundary_failure
+        < boundary_failure_return
+        < precleanup_deadline
         < cleanup
         < runtime_verify
         < rollback_only
         < live_governance
+        < remove_cutover_gate
         < commit
         < remove_restore
         < retire
+    )
+    for failure_code in (
+        "runtime-identity",
+        "governance-health",
+        "governance-health-strict",
+        "governance-health-probe",
+        "governance-recheck",
+        "governance-health-final",
+        "governance-date-final",
+        "premarket-task-ensure",
+    ):
+        assert failure_code in preserve
+    assert "allow-input-not-ready" not in preserve
+    assert "forward-verify-boundary-fenced" in preserve
+    assert '"$cutover_deadline_epoch"' in preserve[cleanup:runtime_verify]
+    assert (
+        'rollback-only strict "$cutover_deadline_epoch"'
+        in preserve[runtime_verify:live_governance]
     )
     assert "controlled_guard_restore_and_verify_governance_snapshot" not in preserve
     assert "controlled_guard_governance_snapshot" not in preserve

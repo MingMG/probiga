@@ -89,6 +89,9 @@ CODE_RELEASE_ROOT=/opt/ProBigA-releases
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL=""
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256=""
 GOVERNANCE_CONTRACT_FAILURE_CODE=""
+RESTORED_RUNTIME_FAILURE_CODE=""
+RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
+RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
@@ -193,11 +196,16 @@ V2_RECOVERY_STEP=not-started
 # writer fenced forever, while preserving measured headroom for a healthy run.
 CONTROLLED_DATABASE_GATE_TIMEOUT=30m
 CONTROLLED_DATABASE_GATE_KILL_AFTER=30s
-readonly CONTROLLED_DATABASE_GATE_TIMEOUT CONTROLLED_DATABASE_GATE_KILL_AFTER
+CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS=10800
+CONTROLLED_RECOVERY_UNIT_START_TIMEOUT=2m
+readonly CONTROLLED_DATABASE_GATE_TIMEOUT CONTROLLED_DATABASE_GATE_KILL_AFTER \
+  CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS \
+  CONTROLLED_RECOVERY_UNIT_START_TIMEOUT
 ACTIVATION_RELEASE_IDENTITY="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity"
 ACTIVATION_RELEASE_IDENTITY_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity.sha256"
 RECEIPT_DIR=/var/lib/probiga/deploy-receipts
 DATABASE_WRITER_GUARD_DROPIN_NAME=database-writer-guard.conf
+RECOVERY_CUTOVER_DROPIN_NAME=zzzzzz-probiga-governance-cutover.conf
 MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf
 SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service
 AI_WORKER_DROPIN=/etc/systemd/system/probiga-ai-recommendation-worker.service.d/release-runtime.conf
@@ -206,6 +214,9 @@ MAIN_DATABASE_WRITER_GUARD_DROPIN="/etc/systemd/system/probiga.service.d/$DATABA
 SCHEDULER_DATABASE_WRITER_GUARD_DROPIN="/etc/systemd/system/probiga-scheduler.service.d/$DATABASE_WRITER_GUARD_DROPIN_NAME"
 AI_SERVICE_DATABASE_WRITER_GUARD_DROPIN="/etc/systemd/system/probiga-ai-recommendation-worker.service.d/$DATABASE_WRITER_GUARD_DROPIN_NAME"
 AI_TIMER_DATABASE_WRITER_GUARD_DROPIN="/etc/systemd/system/probiga-ai-recommendation-worker.timer.d/$DATABASE_WRITER_GUARD_DROPIN_NAME"
+MAIN_RECOVERY_CUTOVER_DROPIN="/etc/systemd/system/probiga.service.d/$RECOVERY_CUTOVER_DROPIN_NAME"
+SCHEDULER_RECOVERY_CUTOVER_DROPIN="/etc/systemd/system/probiga-scheduler.service.d/$RECOVERY_CUTOVER_DROPIN_NAME"
+AI_SERVICE_RECOVERY_CUTOVER_DROPIN="/etc/systemd/system/probiga-ai-recommendation-worker.service.d/$RECOVERY_CUTOVER_DROPIN_NAME"
 declare -a DATABASE_WRITER_GUARD_DROPINS=(
   "$MAIN_DATABASE_WRITER_GUARD_DROPIN"
   "$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN"
@@ -1562,6 +1573,199 @@ controlled_guard_install_dropins() {
   rm -f -- "$prepared_dropin" || return 1
   return 0
 }
+controlled_guard_assert_activation_deadline() {
+  local deadline_epoch="$1"
+  local now_epoch
+  [[ "$deadline_epoch" =~ ^[1-9][0-9]{9,11}$ ]] || return 1
+  now_epoch="$(/usr/bin/date +%s)" || return 1
+  [[ "$now_epoch" =~ ^[1-9][0-9]{9,11}$ ]] || return 1
+  test "$now_epoch" -lt "$deadline_epoch" || return 1
+  return 0
+}
+controlled_guard_cutover_exec_line() {
+  local deadline_epoch="$1"
+  [[ "$deadline_epoch" =~ ^[1-9][0-9]{9,11}$ ]] || return 1
+  printf "%s%s%s\n" \
+    "ExecStartPre=/usr/bin/python3.14 -I -c 'import sys,time;" \
+    "sys.exit(0 if int(time.time()) < $deadline_epoch" \
+    " else 1)'"
+}
+controlled_guard_assert_recovery_cutover_dropin() {
+  local deadline_epoch="${2:-}"
+  local embedded_deadline
+  local path="$1"
+  local prefix
+  local suffix
+  local -a lines=()
+  case "$path" in
+    "$MAIN_RECOVERY_CUTOVER_DROPIN"|\
+    "$SCHEDULER_RECOVERY_CUTOVER_DROPIN"|\
+    "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN") ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_file "$path" 644 || return 1
+  mapfile -t lines < "$path" || return 1
+  test "${#lines[@]}" -eq 2 || return 1
+  test "${lines[0]}" = '[Service]' || return 1
+  prefix="ExecStartPre=/usr/bin/python3.14 -I -c 'import sys,time;sys.exit(0 if int(time.time()) < "
+  suffix=" else 1)'"
+  case "${lines[1]}" in
+    "$prefix"*"$suffix") ;;
+    *) return 1 ;;
+  esac
+  embedded_deadline="${lines[1]#"$prefix"}"
+  embedded_deadline="${embedded_deadline%"$suffix"}"
+  [[ "$embedded_deadline" =~ ^[1-9][0-9]{9,11}$ ]] || return 1
+  if [ -n "$deadline_epoch" ]; then
+    test "$embedded_deadline" = "$deadline_epoch" || return 1
+  fi
+  return 0
+}
+controlled_guard_install_recovery_cutover_dropin() {
+  local deadline_epoch="$2"
+  local parent
+  local path="$1"
+  local prepared_dropin
+  controlled_guard_assert_activation_deadline "$deadline_epoch" || return 1
+  case "$path" in
+    "$MAIN_RECOVERY_CUTOVER_DROPIN"|\
+    "$SCHEDULER_RECOVERY_CUTOVER_DROPIN"|\
+    "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN") ;;
+    *) return 1 ;;
+  esac
+  parent="$(dirname "$path")" || return 1
+  test -d "$parent" || return 1
+  test ! -L "$parent" || return 1
+  test "$(readlink -f "$parent")" = "$parent" || return 1
+  test "$(stat -c '%U:%G' "$parent")" = root:root || return 1
+  test "$(stat -c '%a' "$parent")" = 755 || return 1
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    controlled_guard_assert_recovery_cutover_dropin "$path" || return 1
+  fi
+  prepared_dropin="$(mktemp "$parent/.recovery-cutover.XXXXXX")" || return 1
+  if ! printf '%s\n' '[Service]' > "$prepared_dropin" || \
+    ! controlled_guard_cutover_exec_line "$deadline_epoch" \
+      >> "$prepared_dropin" || \
+    ! chown root:root "$prepared_dropin" || \
+    ! chmod 0644 "$prepared_dropin" || \
+    ! sync -f "$prepared_dropin" || \
+    ! mv -fT "$prepared_dropin" "$path" || \
+    ! sync -f "$parent"; then
+    rm -f -- "$prepared_dropin"
+    return 1
+  fi
+  controlled_guard_assert_recovery_cutover_dropin \
+    "$path" "$deadline_epoch" || return 1
+  return 0
+}
+controlled_guard_assert_recovery_cutover_loaded() {
+  local deadline_epoch="$3"
+  local path="$2"
+  local unit="$1"
+  local -a loaded_dropins=()
+  controlled_guard_assert_recovery_cutover_dropin \
+    "$path" "$deadline_epoch" || return 1
+  read -r -a loaded_dropins <<< \
+    "$(systemctl show -p DropInPaths --value "$unit")" || return 1
+  test "${#loaded_dropins[@]}" -gt 0 || return 1
+  test "${loaded_dropins[-1]}" = "$path" || return 1
+  return 0
+}
+controlled_guard_assert_recovery_cutover_unloaded() {
+  local loaded_dropin
+  local path="$2"
+  local unit="$1"
+  local -a loaded_dropins=()
+  read -r -a loaded_dropins <<< \
+    "$(systemctl show -p DropInPaths --value "$unit")" || return 1
+  for loaded_dropin in "${loaded_dropins[@]}"; do
+    test "$loaded_dropin" != "$path" || return 1
+  done
+  return 0
+}
+controlled_guard_install_recovery_cutover_dropins() {
+  local ai_service_load="${3%%,*}"
+  local deadline_epoch="$1"
+  local scheduler_load="${2%%,*}"
+  controlled_guard_install_recovery_cutover_dropin \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  if [ "$scheduler_load" = loaded ]; then
+    controlled_guard_install_recovery_cutover_dropin \
+      "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  else
+    test "$scheduler_load" = not-found || return 1
+    test ! -e "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" || return 1
+    test ! -L "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" || return 1
+  fi
+  if [ "$ai_service_load" = loaded ]; then
+    controlled_guard_install_recovery_cutover_dropin \
+      "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  else
+    test "$ai_service_load" = not-found || return 1
+    test ! -e "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" || return 1
+    test ! -L "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" || return 1
+  fi
+  systemctl daemon-reload || return 1
+  controlled_guard_assert_recovery_cutover_loaded probiga \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  if [ "$scheduler_load" = loaded ]; then
+    controlled_guard_assert_recovery_cutover_loaded probiga-scheduler \
+      "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  fi
+  if [ "$ai_service_load" = loaded ]; then
+    controlled_guard_assert_recovery_cutover_loaded \
+      probiga-ai-recommendation-worker.service \
+      "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  fi
+  return 0
+}
+controlled_guard_remove_recovery_cutover_dropin() {
+  local deadline_epoch="$2"
+  local parent
+  local path="$1"
+  controlled_guard_assert_recovery_cutover_dropin \
+    "$path" "$deadline_epoch" || return 1
+  parent="$(dirname "$path")" || return 1
+  rm -f -- "$path" || return 1
+  sync -f "$parent" || return 1
+  test ! -e "$path" || return 1
+  test ! -L "$path" || return 1
+  return 0
+}
+controlled_guard_remove_recovery_cutover_dropins() {
+  local ai_service_load="${3%%,*}"
+  local deadline_epoch="$1"
+  local scheduler_load="${2%%,*}"
+  controlled_guard_remove_recovery_cutover_dropin \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  if [ "$scheduler_load" = loaded ]; then
+    controlled_guard_remove_recovery_cutover_dropin \
+      "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  fi
+  if [ "$ai_service_load" = loaded ]; then
+    controlled_guard_remove_recovery_cutover_dropin \
+      "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" "$deadline_epoch" || return 1
+  fi
+  systemctl daemon-reload || return 1
+  for path in "$MAIN_RECOVERY_CUTOVER_DROPIN" \
+    "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" \
+    "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN"; do
+    test ! -e "$path" || return 1
+    test ! -L "$path" || return 1
+  done
+  controlled_guard_assert_recovery_cutover_unloaded probiga \
+    "$MAIN_RECOVERY_CUTOVER_DROPIN" || return 1
+  if [ "$scheduler_load" = loaded ]; then
+    controlled_guard_assert_recovery_cutover_unloaded probiga-scheduler \
+      "$SCHEDULER_RECOVERY_CUTOVER_DROPIN" || return 1
+  fi
+  if [ "$ai_service_load" = loaded ]; then
+    controlled_guard_assert_recovery_cutover_unloaded \
+      probiga-ai-recommendation-worker.service \
+      "$AI_SERVICE_RECOVERY_CUTOVER_DROPIN" || return 1
+  fi
+  return 0
+}
 controlled_guard_recreate_file() {
   local ai_service_record="$4"
   local ai_timer_record="$5"
@@ -1619,6 +1823,7 @@ controlled_guard_restore_after_cleanup_failure() {
 controlled_guard_cleanup() {
   local ai_service_record="$4"
   local ai_timer_record="$5"
+  local activation_deadline_epoch="${6:-}"
   local guarded_sha="$1"
   local main_record="$2"
   local scheduler_record="$3"
@@ -1627,6 +1832,10 @@ controlled_guard_cleanup() {
   local ai_timer_load="${ai_timer_record%%,*}"
   controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  if [ -n "$activation_deadline_epoch" ]; then
+    controlled_guard_assert_activation_deadline \
+      "$activation_deadline_epoch" || return 1
+  fi
   if ! rm -f -- "$DATABASE_WRITER_GUARD_FILE" || \
     ! sync -f "$DATABASE_WRITER_GUARD_DIR"; then
     controlled_guard_restore_after_cleanup_failure \
@@ -1647,9 +1856,12 @@ controlled_guard_cleanup() {
 }
 controlled_guard_apply_unit_state() {
   local active_state
+  local activation_deadline_epoch="${3:-}"
+  local exec_main_pid
   local expected_active
   local expected_load
   local expected_unit_file
+  local main_pid
   local record="$2"
   local unit="$1"
   IFS=, read -r expected_load expected_active expected_unit_file <<< "$record" || \
@@ -1671,7 +1883,20 @@ controlled_guard_apply_unit_state() {
     *) return 1 ;;
   esac
   case "$expected_active" in
-    active) systemctl start "$unit" || return 1 ;;
+    active)
+      if [ -n "$activation_deadline_epoch" ]; then
+        controlled_guard_assert_activation_deadline \
+          "$activation_deadline_epoch" || return 1
+        [[ "$CONTROLLED_RECOVERY_UNIT_START_TIMEOUT" =~ \
+          ^[1-9][0-9]*[smh]$ ]] || return 1
+        test -x /usr/bin/timeout || return 1
+        /usr/bin/timeout --signal=TERM --kill-after=10s \
+          "$CONTROLLED_RECOVERY_UNIT_START_TIMEOUT" \
+          systemctl start "$unit" || return 1
+      else
+        systemctl start "$unit" || return 1
+      fi
+      ;;
     inactive) systemctl stop "$unit" || return 1 ;;
     *) return 1 ;;
   esac
@@ -1681,8 +1906,10 @@ controlled_guard_apply_unit_state() {
   active_state="$(systemctl show -p ActiveState --value "$unit")" || return 1
   test "$active_state" = "$expected_active" || return 1
   if [ "$expected_active" = inactive ]; then
-    test "$(systemctl show -p MainPID --value "$unit")" = 0 || return 1
-    test "$(systemctl show -p ExecMainPID --value "$unit")" = 0 || return 1
+    main_pid="$(systemctl show -p MainPID --value "$unit")" || return 1
+    exec_main_pid="$(systemctl show -p ExecMainPID --value "$unit")" || return 1
+    test "${main_pid:-0}" = 0 || return 1
+    test "${exec_main_pid:-0}" = 0 || return 1
   fi
   return 0
 }
@@ -1734,6 +1961,350 @@ controlled_guard_run_service_gate_with_deadline() {
     "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$@" || return 1
   return 0
 }
+controlled_guard_capture_service_gate_with_deadline() {
+  local service_user="$1"
+  local output_file="$2"
+  local working_directory="$3"
+  local gate_status=0
+  shift 3
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  [[ "$CONTROLLED_DATABASE_GATE_TIMEOUT" =~ ^[1-9][0-9]*[smh]$ ]] || \
+    return 1
+  [[ "$CONTROLLED_DATABASE_GATE_KILL_AFTER" =~ ^[1-9][0-9]*[smh]$ ]] || \
+    return 1
+  test "$#" -gt 0 || return 1
+  test -x /usr/bin/sudo || return 1
+  test -x /usr/bin/timeout || return 1
+  controlled_guard_assert_file "$output_file" 600 || return 1
+  test -d "$working_directory" || return 1
+  test ! -L "$working_directory" || return 1
+  (
+    # Apply the limit before the captured descriptor reaches any child so a
+    # broken sealed producer cannot fill the filesystem before post-validation.
+    # Git for Windows exposes ulimit -f but cannot change it; the production
+    # broker always runs this path under Linux Bash.
+    case "$OSTYPE" in
+      linux*) ulimit -f 1024 || exit 1 ;;
+    esac
+    cd "$working_directory" || exit 1
+    /usr/bin/sudo -u "$service_user" /usr/bin/timeout --signal=TERM \
+      "--kill-after=$CONTROLLED_DATABASE_GATE_KILL_AFTER" \
+      "$CONTROLLED_DATABASE_GATE_TIMEOUT" "$@"
+  ) > "$output_file" || gate_status=$?
+  controlled_guard_assert_file "$output_file" 600 || return 1
+  test "$(stat -c '%s' "$output_file")" -le 1048576 || return 1
+  return "$gate_status"
+}
+controlled_guard_parse_governance_health_result() {
+  local result_file="$1"
+  local expected_sha="$2"
+  local expected_disposition="$3"
+  local expected_trade_date="${4:-}"
+  controlled_guard_assert_file "$result_file" 600 || return 1
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  case "$expected_disposition" in
+    completed|input_not_ready) ;;
+    *) return 1 ;;
+  esac
+  /usr/bin/python3.14 -I - "$result_file" "$expected_sha" \
+    "$expected_disposition" "$expected_trade_date" <<'PY'
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_sha, expected_disposition, expected_date = sys.argv[2:]
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+try:
+    payload = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+    )
+except Exception:
+    raise SystemExit(2)
+if not isinstance(payload, dict):
+    raise SystemExit(2)
+expected = payload.get("expected")
+checks = payload.get("checks")
+adapter = payload.get("adapter_registry")
+expected_source = (
+    "command_line_verified_against_calendar"
+    if expected_date
+    else "authoritative_closed_trading_calendar_day"
+)
+valid = (
+    set(payload)
+    == {
+        "status",
+        "run_disposition",
+        "expected",
+        "checks",
+        "automatic_real_order_submission",
+        "adapter_registry",
+    }
+    and payload.get("status") == "PASS"
+    and payload.get("run_disposition") == expected_disposition
+    and payload.get("automatic_real_order_submission") is False
+    and isinstance(expected, dict)
+    and set(expected)
+    == {"build_commit_sha", "trade_date", "trade_date_source"}
+    and expected.get("build_commit_sha") == expected_sha
+    and expected.get("trade_date_source") == expected_source
+    and isinstance(checks, list)
+    and bool(checks)
+    and isinstance(adapter, dict)
+    and set(adapter)
+    == {
+        "registry_sealed",
+        "registry_seal_hash",
+        "production_execution_ready",
+        "adapter_count",
+    }
+    and adapter.get("registry_sealed") is True
+    and adapter.get("production_execution_ready") is True
+    and re.fullmatch(
+        r"[0-9a-f]{64}", str(adapter.get("registry_seal_hash") or "")
+    ) is not None
+    and isinstance(adapter.get("adapter_count"), int)
+    and not isinstance(adapter.get("adapter_count"), bool)
+    and adapter.get("adapter_count") >= 0
+)
+trade_date = str(expected.get("trade_date") or "") if isinstance(expected, dict) else ""
+try:
+    valid = valid and date.fromisoformat(trade_date).isoformat() == trade_date
+except (TypeError, ValueError):
+    valid = False
+if expected_date:
+    valid = valid and trade_date == expected_date
+names = []
+waived = []
+if isinstance(checks, list):
+    for check in checks:
+        if not isinstance(check, dict) or check.get("passed") is not True:
+            valid = False
+            continue
+        name = check.get("name")
+        if not isinstance(name, str) or not name:
+            valid = False
+            continue
+        names.append(name)
+        if check.get("waived") is True:
+            waived.append(name)
+        elif check.get("waived") not in (False, None):
+            valid = False
+if len(names) != len(set(names)):
+    valid = False
+expected_waived = (
+    {
+        "authoritative_date_has_one_canonical_revision",
+        "expected_build_date_run",
+    }
+    if expected_disposition == "input_not_ready"
+    else set()
+)
+valid = valid and set(waived) == expected_waived and len(waived) == len(expected_waived)
+if not valid:
+    raise SystemExit(2)
+print(trade_date)
+PY
+}
+controlled_guard_governance_cutover_probe_code() {
+  # This producer is owned by the authenticated recovery engine rather than by
+  # the guarded release.  That is required when recovering a legacy release
+  # which predates the cutover probe, while all imported clock/database code is
+  # still loaded from the sealed guarded release and its virtual environment.
+  /usr/bin/cat <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta
+
+from server.common.authoritative_market_clock import (
+    DAILY_CLOSE_READY_HOUR,
+    PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date,
+)
+from tools.env_config import create_tool_engine, load_project_env
+
+reserve = int(sys.argv[1])
+if reserve <= 0:
+    raise SystemExit(2)
+load_project_env()
+sample = datetime.now(PRODUCTION_TIMEZONE)
+cutoff = sample.replace(
+    hour=DAILY_CLOSE_READY_HOUR,
+    minute=0,
+    second=0,
+    microsecond=0,
+)
+if sample >= cutoff:
+    cutoff += timedelta(days=1)
+safe_before = cutoff - timedelta(seconds=reserve)
+engine = create_tool_engine()
+try:
+    trade_date = authoritative_closed_trade_date(engine, now=sample)
+finally:
+    engine.dispose()
+payload = {
+    "trade_date": trade_date,
+    "sample_epoch": int(sample.timestamp()),
+    "next_cutoff_epoch": int(cutoff.timestamp()),
+    "safe_before_epoch": int(safe_before.timestamp()),
+    "reserve_seconds": reserve,
+    }
+print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+PY
+}
+controlled_guard_parse_governance_cutover_result() {
+  local result_file="$1"
+  local expected_trade_date="$2"
+  controlled_guard_assert_file "$result_file" 600 || return 1
+  /usr/bin/python3.14 -I - "$result_file" "$expected_trade_date" \
+    "$CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS" <<'PY'
+import json
+import sys
+from datetime import date
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_date = sys.argv[2]
+reserve = int(sys.argv[3])
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+try:
+    payload = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+    )
+    expected_date = date.fromisoformat(expected_date).isoformat()
+except Exception:
+    raise SystemExit(2)
+required = {
+    "trade_date",
+    "sample_epoch",
+    "next_cutoff_epoch",
+    "safe_before_epoch",
+    "reserve_seconds",
+    }
+valid = isinstance(payload, dict) and set(payload) == required
+if valid:
+    integer_fields = (
+        "sample_epoch",
+        "next_cutoff_epoch",
+        "safe_before_epoch",
+        "reserve_seconds",
+    )
+    valid = all(
+        type(payload.get(field)) is int and payload[field] > 0
+        for field in integer_fields
+    )
+if valid:
+    sample = payload["sample_epoch"]
+    cutoff = payload["next_cutoff_epoch"]
+    safe_before = payload["safe_before_epoch"]
+    valid = (
+        payload.get("trade_date") == expected_date
+        and payload["reserve_seconds"] == reserve
+        and cutoff > sample
+        and cutoff - safe_before == reserve
+        and sample < safe_before
+        and cutoff - sample <= 86400
+    )
+if not valid:
+    raise SystemExit(2)
+print(payload["safe_before_epoch"])
+PY
+}
+controlled_guard_parse_governance_runner_result() {
+  local result_file="$1"
+  local runner_status="$2"
+  local expected_trade_date="$3"
+  controlled_guard_assert_file "$result_file" 600 || return 1
+  case "$runner_status" in 0|2) ;; *) return 1 ;; esac
+  /usr/bin/python3.14 -I - "$result_file" "$runner_status" \
+    "$expected_trade_date" <<'PY'
+import json
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+path = Path(sys.argv[1])
+runner_status = int(sys.argv[2])
+expected_date = sys.argv[3]
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+try:
+    payload = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=unique_object
+    )
+    expected_date = date.fromisoformat(expected_date).isoformat()
+except Exception:
+    raise SystemExit(2)
+if not isinstance(payload, dict):
+    raise SystemExit(2)
+if runner_status == 0:
+    required = {
+        "status",
+        "run_uid",
+        "trade_date",
+        "summary",
+        "lifecycle_transitions",
+        "allocations",
+        "automatic_real_order_submission",
+    }
+    valid = (
+        set(payload) == required
+        and payload.get("status") == "ok"
+        and re.fullmatch(r"[0-9a-f]{32}", str(payload.get("run_uid") or ""))
+        is not None
+        and payload.get("trade_date") == expected_date
+        and isinstance(payload.get("summary"), dict)
+        and isinstance(payload.get("lifecycle_transitions"), list)
+        and isinstance(payload.get("allocations"), list)
+        and payload.get("automatic_real_order_submission") is False
+    )
+    disposition = "completed"
+else:
+    required = {
+        "status",
+        "reason",
+        "target_trade_date",
+        "input_trade_date",
+        "automatic_real_order_submission",
+    }
+    input_date = payload.get("input_trade_date")
+    valid = (
+        set(payload) == required
+        and payload.get("status") == "blocked"
+        and isinstance(payload.get("reason"), str)
+        and bool(payload["reason"].strip())
+        and payload.get("target_trade_date") == expected_date
+        and input_date in ("", expected_date)
+        and payload.get("automatic_real_order_submission") is False
+    )
+    disposition = "input_not_ready"
+if not valid:
+    raise SystemExit(2)
+print(disposition)
+PY
+}
 controlled_guard_verify_restored_runtime() {
   local main_record="$1"
   local scheduler_record="$2"
@@ -1745,20 +2316,43 @@ controlled_guard_verify_restored_runtime() {
   local scheduler_load scheduler_active scheduler_unit_file
   local ai_service_load ai_service_active ai_service_unit_file
   local ai_timer_load ai_timer_active ai_timer_unit_file
+  local input_readiness_mode="${7:-strict}"
+  local activation_deadline_epoch="${8:-}"
   local code_root="$CODE_RELEASE_ROOT/$expected_sha"
   local release_venv="$RELEASE_VENV_ROOT/$expected_sha"
   local python_path="$release_venv/bin/python"
   local adata_sha adata_tree_sha adata_source service_user pid
   local release_tree_sha adapter_registry_seal_sha
+  local governance_result_file=""
+  local governance_result_status=0
+  local governance_trade_date=""
+  local cutover_deadline_epoch=""
+  local cutover_probe_code=""
+  local runner_disposition=""
   local require_attested_identity=0
   local has_attested_identity=0
   local snapshot_release=""
   local -a cmdline=()
   local -a attested_env=()
+  local -a guarded_command_prefix=()
+  local -a governance_health_args=()
+  RESTORED_RUNTIME_FAILURE_CODE=runtime-identity
+  RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
+  RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
   case "$verification_mode" in
     full|rollback-only) ;;
     *) return 1 ;;
   esac
+  case "$input_readiness_mode" in
+    strict|recover-input-readiness) ;;
+    *) return 1 ;;
+  esac
+  if [ -n "$activation_deadline_epoch" ]; then
+    test "$verification_mode:$input_readiness_mode" = \
+      rollback-only:strict || return 1
+    controlled_guard_assert_activation_deadline \
+      "$activation_deadline_epoch" || return 1
+  fi
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   IFS=, read -r main_load main_active main_unit_file <<< "$main_record" || return 1
   IFS=, read -r scheduler_load scheduler_active scheduler_unit_file \
@@ -1767,12 +2361,14 @@ controlled_guard_verify_restored_runtime() {
     <<< "$ai_service_record" || return 1
   IFS=, read -r ai_timer_load ai_timer_active ai_timer_unit_file \
     <<< "$ai_timer_record" || return 1
-  controlled_guard_apply_unit_state probiga "$main_record" || return 1
-  controlled_guard_apply_unit_state probiga-scheduler "$scheduler_record" || return 1
+  controlled_guard_apply_unit_state probiga "$main_record" \
+    "$activation_deadline_epoch" || return 1
+  controlled_guard_apply_unit_state probiga-scheduler "$scheduler_record" \
+    "$activation_deadline_epoch" || return 1
   controlled_guard_apply_unit_state probiga-ai-recommendation-worker.service \
-    "$ai_service_record" || return 1
+    "$ai_service_record" "$activation_deadline_epoch" || return 1
   controlled_guard_apply_unit_state probiga-ai-recommendation-worker.timer \
-    "$ai_timer_record" || return 1
+    "$ai_timer_record" "$activation_deadline_epoch" || return 1
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test "$(git -C "$code_root" rev-parse HEAD)" = "$expected_sha" || return 1
@@ -1939,36 +2535,238 @@ controlled_guard_verify_restored_runtime() {
     # its two HTTP health boundaries without re-running the failed forward
     # schema/governance validator.  Normal deploy and privileged recovery keep
     # the default full verification below.
+    RESTORED_RUNTIME_FAILURE_CODE=""
     return 0
   fi
-  controlled_guard_run_service_gate_with_deadline "$service_user" \
+  governance_health_args=(
+    --compact
+    --expected-build-sha "$expected_sha"
+  )
+  guarded_command_prefix=(
     /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    PROBIGA_DEPLOYMENT_MODE=production \
-    PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
-    PROBIGA_BUILD_COMMIT_SHA="$expected_sha" \
-    PROBIGA_CODE_ROOT="$code_root" \
-    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
-    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
-    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
-    "${attested_env[@]}" \
-    "PYTHONPATH=$adata_source:$code_root" "$python_path" -P \
-    "$code_root/tools/check_strategy_governance_health.py" --compact \
-    --expected-build-sha "$expected_sha" || return 1
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin
+    GIT_OPTIONAL_LOCKS=0
+    PYTHONDONTWRITEBYTECODE=1
+    PYTHONSAFEPATH=1
+    PROBIGA_DEPLOYMENT_MODE=production
+    "PROBIGA_EXPECTED_GIT_SHA=$expected_sha"
+    "PROBIGA_BUILD_COMMIT_SHA=$expected_sha"
+    "PROBIGA_CODE_ROOT=$code_root"
+    "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha"
+    "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha"
+    "PROBIGA_ADATA_SOURCE_DIR=$adata_source"
+    "${attested_env[@]}"
+    "PYTHONPATH=$adata_source:$code_root"
+  )
+  if [ "$input_readiness_mode" = recover-input-readiness ]; then
+    # Legacy activation journals did not seal the daily runner disposition.
+    # Never infer it from a missing row: first try strict health, then use the
+    # allow-mode checker only as an exact, read-only probe.  A clean missing-run
+    # probe must be followed by a fresh guarded runner result bound to the same
+    # trade date before any waiver can authorize the final health gate.
+    test "$main_load:$main_active" = loaded:inactive || return 1
+    test "$scheduler_load:$scheduler_active" = loaded:inactive || return 1
+    case "$ai_service_load:$ai_service_active" in
+      loaded:inactive|not-found:not-found) ;;
+      *) return 1 ;;
+    esac
+    case "$ai_timer_load:$ai_timer_active" in
+      loaded:inactive|not-found:not-found) ;;
+      *) return 1 ;;
+    esac
+    test "$snapshot_release" = "$expected_sha" || return 1
+    activation_snapshot_validate "$expected_sha" >/dev/null || return 1
+    activation_snapshot_validate_governance_new || return 1
+    sudo -u "$service_user" test ! -w "$code_root" || return 1
+    sudo -u "$service_user" test -r \
+      "$code_root/tools/check_strategy_governance_health.py" || return 1
+    sudo -u "$service_user" test -r \
+      "$code_root/tools/run_strategy_governance_daily.py" || return 1
+    cutover_probe_code="$(
+      controlled_guard_governance_cutover_probe_code
+    )" || return 1
+    test -n "$cutover_probe_code" || return 1
+
+    governance_result_file="$(mktemp \
+      "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-health-strict.XXXXXX")" || \
+      return 1
+    controlled_guard_assert_file "$governance_result_file" 600 || return 1
+    RESTORED_RUNTIME_FAILURE_CODE=governance-health-strict
+    if controlled_guard_capture_service_gate_with_deadline "$service_user" \
+        "$governance_result_file" "$code_root" \
+        "${guarded_command_prefix[@]}" "$python_path" -P \
+        "$code_root/tools/check_strategy_governance_health.py" \
+        "${governance_health_args[@]}"; then
+      governance_result_status=0
+    else
+      governance_result_status=$?
+    fi
+    if [ "$governance_result_status" -eq 0 ]; then
+      if ! governance_trade_date="$(
+          controlled_guard_parse_governance_health_result \
+            "$governance_result_file" "$expected_sha" completed
+        )"; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      /usr/bin/cat -- "$governance_result_file"
+      rm -f -- "$governance_result_file" || return 1
+      governance_result_file=""
+    else
+      rm -f -- "$governance_result_file" || return 1
+      governance_result_file=""
+      test "$governance_result_status" -eq 1 || return 1
+      governance_result_file="$(mktemp \
+        "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-health-probe.XXXXXX")" || \
+        return 1
+      controlled_guard_assert_file "$governance_result_file" 600 || return 1
+      RESTORED_RUNTIME_FAILURE_CODE=governance-health-probe
+      if controlled_guard_capture_service_gate_with_deadline "$service_user" \
+          "$governance_result_file" "$code_root" \
+          "${guarded_command_prefix[@]}" "$python_path" -P \
+          "$code_root/tools/check_strategy_governance_health.py" \
+          "${governance_health_args[@]}" --allow-input-not-ready; then
+        governance_result_status=0
+      else
+        governance_result_status=$?
+      fi
+      if [ "$governance_result_status" -ne 0 ]; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      if ! governance_trade_date="$(
+          controlled_guard_parse_governance_health_result \
+            "$governance_result_file" "$expected_sha" input_not_ready
+        )"; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      /usr/bin/cat -- "$governance_result_file"
+      rm -f -- "$governance_result_file" || return 1
+      governance_result_file=""
+
+      controlled_guard_apply_unit_state probiga "$main_record" || return 1
+      controlled_guard_apply_unit_state probiga-scheduler \
+        "$scheduler_record" || return 1
+      controlled_guard_apply_unit_state \
+        probiga-ai-recommendation-worker.service "$ai_service_record" || \
+        return 1
+      controlled_guard_apply_unit_state \
+        probiga-ai-recommendation-worker.timer "$ai_timer_record" || return 1
+      governance_result_file="$(mktemp \
+        "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-recheck.XXXXXX")" || \
+        return 1
+      controlled_guard_assert_file "$governance_result_file" 600 || return 1
+      RESTORED_RUNTIME_FAILURE_CODE=governance-recheck
+      if controlled_guard_capture_service_gate_with_deadline "$service_user" \
+          "$governance_result_file" "$code_root" \
+          "${guarded_command_prefix[@]}" "$python_path" -P \
+          "$code_root/tools/run_strategy_governance_daily.py" \
+          --trade-date "$governance_trade_date"; then
+        governance_result_status=0
+      else
+        governance_result_status=$?
+      fi
+      case "$governance_result_status" in 0|2) ;; *)
+        rm -f -- "$governance_result_file"
+        return 1
+      esac
+      if ! runner_disposition="$(
+          controlled_guard_parse_governance_runner_result \
+            "$governance_result_file" "$governance_result_status" \
+            "$governance_trade_date"
+        )"; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      rm -f -- "$governance_result_file" || return 1
+      governance_result_file=""
+      printf 'recovery_governance_recheck disposition=%s trade_date=%s\n' \
+        "$runner_disposition" "$governance_trade_date"
+
+      governance_health_args+=(
+        --expected-trade-date "$governance_trade_date"
+      )
+      if [ "$runner_disposition" = input_not_ready ]; then
+        governance_health_args+=(--allow-input-not-ready)
+      else
+        test "$runner_disposition" = completed || return 1
+      fi
+      governance_result_file="$(mktemp \
+        "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-health-final.XXXXXX")" || \
+        return 1
+      controlled_guard_assert_file "$governance_result_file" 600 || return 1
+      RESTORED_RUNTIME_FAILURE_CODE=governance-health-final
+      if controlled_guard_capture_service_gate_with_deadline "$service_user" \
+          "$governance_result_file" "$code_root" \
+          "${guarded_command_prefix[@]}" "$python_path" -P \
+          "$code_root/tools/check_strategy_governance_health.py" \
+          "${governance_health_args[@]}"; then
+        governance_result_status=0
+      else
+        governance_result_status=$?
+      fi
+      if [ "$governance_result_status" -ne 0 ]; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      if ! controlled_guard_parse_governance_health_result \
+          "$governance_result_file" "$expected_sha" "$runner_disposition" \
+          "$governance_trade_date" >/dev/null; then
+        rm -f -- "$governance_result_file"
+        return 1
+      fi
+      /usr/bin/cat -- "$governance_result_file"
+      rm -f -- "$governance_result_file" || return 1
+      governance_result_file=""
+    fi
+  else
+    RESTORED_RUNTIME_FAILURE_CODE=governance-health
+    controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "${guarded_command_prefix[@]}" "$python_path" -P \
+      "$code_root/tools/check_strategy_governance_health.py" \
+      "${governance_health_args[@]}" || return 1
+  fi
+  RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
   controlled_guard_run_service_gate_with_deadline "$service_user" \
-    /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    PROBIGA_DEPLOYMENT_MODE=production \
-    PROBIGA_EXPECTED_GIT_SHA="$expected_sha" \
-    PROBIGA_BUILD_COMMIT_SHA="$expected_sha" \
-    PROBIGA_CODE_ROOT="$code_root" \
-    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
-    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
-    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
-    "${attested_env[@]}" \
-    "PYTHONPATH=$adata_source:$code_root" "$python_path" -P \
+    "${guarded_command_prefix[@]}" "$python_path" -P \
     "$code_root/tools/ensure_quality_gate.py" \
     --task-type analysis_premarket_external || return 1
+  if [ "$input_readiness_mode" = recover-input-readiness ]; then
+    RESTORED_RUNTIME_FAILURE_CODE=governance-date-final
+    governance_result_file="$(mktemp \
+      "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-date-final.XXXXXX")" || \
+      return 1
+    controlled_guard_assert_file "$governance_result_file" 600 || return 1
+    if controlled_guard_capture_service_gate_with_deadline "$service_user" \
+        "$governance_result_file" "$code_root" \
+        "${guarded_command_prefix[@]}" "$python_path" -P -c \
+        "$cutover_probe_code" \
+        "$CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS"; then
+      governance_result_status=0
+    else
+      governance_result_status=$?
+    fi
+    if [ "$governance_result_status" -ne 0 ]; then
+      rm -f -- "$governance_result_file"
+      return 1
+    fi
+    if ! cutover_deadline_epoch="$(
+        controlled_guard_parse_governance_cutover_result \
+          "$governance_result_file" "$governance_trade_date"
+      )"; then
+      rm -f -- "$governance_result_file"
+      return 1
+    fi
+    /usr/bin/cat -- "$governance_result_file"
+    rm -f -- "$governance_result_file" || return 1
+    governance_result_file=""
+    controlled_guard_assert_activation_deadline \
+      "$cutover_deadline_epoch" || return 1
+    RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE="$governance_trade_date"
+    RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$cutover_deadline_epoch"
+  fi
+  RESTORED_RUNTIME_FAILURE_CODE=""
   return 0
 }
 controlled_guard_force_unit_fenced() {
@@ -2704,7 +3502,12 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   local scheduler_load scheduler_active scheduler_unit_file
   local fence_status=0
   local governance_failure_code=""
+  local governance_trade_date=""
+  local cutover_deadline_epoch=""
+  local runtime_failure_code=""
   local -a state_lines=()
+  RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
+  RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
   V2_RECOVERY_STEP=forward-validate-request
   case "$DEPLOY_OPERATION:$DEPLOY_ARTIFACT_MODE" in
     deploy:ci-resolved-freeze-v1)
@@ -2943,9 +3746,53 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   V2_RECOVERY_STEP=forward-verify-gates-fenced
   if ! controlled_guard_verify_restored_runtime "$fenced_main_record" \
       "$fenced_scheduler_record" "$guarded_sha" \
-      "$fenced_ai_service_record" "$fenced_ai_timer_record" full || \
-    ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$fenced_ai_service_record" "$fenced_ai_timer_record" full \
+      recover-input-readiness; then
+    runtime_failure_code="${RESTORED_RUNTIME_FAILURE_CODE:-unknown}"
+    case "$runtime_failure_code" in
+      runtime-identity|governance-health|governance-health-strict|\
+      governance-health-probe|governance-recheck|governance-health-final|\
+      governance-date-final|premarket-task-ensure) ;;
+      *) runtime_failure_code=unknown ;;
+    esac
+    V2_RECOVERY_STEP="forward-verify-gates-fenced-$runtime_failure_code"
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  governance_trade_date="$RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE"
+  cutover_deadline_epoch="$RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH"
+  if [[ ! "$governance_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || \
+    [[ ! "$cutover_deadline_epoch" =~ ^[1-9][0-9]{9,11}$ ]] || \
+    ! controlled_guard_assert_activation_deadline \
+      "$cutover_deadline_epoch"; then
+    V2_RECOVERY_STEP=forward-verify-cutover-result-fenced
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-install-cutover-deadline-fenced
+  if ! controlled_guard_install_recovery_cutover_dropins \
+      "$cutover_deadline_epoch" "$scheduler_record" \
+      "$ai_service_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-verify-boundary-fenced
+  if ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-verify-cutover-deadline-fenced
+  if ! controlled_guard_assert_activation_deadline \
+      "$cutover_deadline_epoch"; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
       "$main_record" "$scheduler_record" "$ai_service_record" \
       "$ai_timer_record" || true
@@ -2953,7 +3800,8 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   fi
   V2_RECOVERY_STEP=forward-remove-fence
   if ! controlled_guard_cleanup "$guarded_sha" "$main_record" \
-      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" \
+      "$cutover_deadline_epoch"; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
       "$main_record" "$scheduler_record" "$ai_service_record" \
       "$ai_timer_record" || true
@@ -2966,10 +3814,19 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   # long database scans.  A committed cleanup retry follows the same rule.
   if ! controlled_guard_verify_restored_runtime "$forward_main_record" \
       "$forward_scheduler_record" "$guarded_sha" "$ai_service_record" \
-      "$ai_timer_record" rollback-only || \
+      "$ai_timer_record" rollback-only strict "$cutover_deadline_epoch" || \
     ! controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
     ! activation_snapshot_assert_pending_receipt_absent; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
+  fi
+  V2_RECOVERY_STEP=forward-remove-cutover-deadline
+  if ! controlled_guard_remove_recovery_cutover_dropins \
+      "$cutover_deadline_epoch" "$scheduler_record" \
+      "$ai_service_record"; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
       "$main_record" "$scheduler_record" "$ai_service_record" \
       "$ai_timer_record" || true
