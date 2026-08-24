@@ -86,6 +86,8 @@ assert_root_owned_bare_cache() {
 }
 CODE_GIT_CACHE=/var/lib/probiga/release-sources/probiga.git
 CODE_RELEASE_ROOT=/opt/ProBigA-releases
+CONTROLLED_GOVERNANCE_CONTRACT_TOOL=""
+CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256=""
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
@@ -153,6 +155,15 @@ if ! flock -n 9; then
   exit 2
 fi
 release_lock() {
+  if [ -n "${CONTROLLED_GOVERNANCE_CONTRACT_TOOL:-}" ]; then
+    case "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" in
+      /tmp/.probiga-governance-contract.*)
+        rm -f -- "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || true
+        ;;
+    esac
+    CONTROLLED_GOVERNANCE_CONTRACT_TOOL=""
+    CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256=""
+  fi
   if declare -F cleanup_prepare_artifacts >/dev/null 2>&1; then
     cleanup_prepare_artifacts || true
   fi
@@ -2100,6 +2111,116 @@ controlled_guard_governance_snapshot() {
     "--${action}-snapshot" - < "$snapshot" || return 1
   return 0
 }
+materialize_controlled_governance_contract_tool() {
+  local source_digest
+  local source_sha="$1"
+  local tool_size
+  test -z "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  test -z "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" || return 1
+  [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git --git-dir="$CODE_GIT_CACHE" cat-file -e "${source_sha}^{commit}" || \
+    return 1
+  test -d /tmp || return 1
+  test ! -L /tmp || return 1
+  test "$(readlink -f /tmp)" = /tmp || return 1
+  test "$(stat -c '%U:%G' /tmp)" = root:root || return 1
+  test "$(stat -c '%a' /tmp)" = 1777 || return 1
+  CONTROLLED_GOVERNANCE_CONTRACT_TOOL="$(mktemp \
+    /tmp/.probiga-governance-contract.XXXXXX)" || return 1
+  case "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" in
+    /tmp/.probiga-governance-contract.*) ;;
+    *) return 1 ;;
+  esac
+  if ! git --git-dir="$CODE_GIT_CACHE" show \
+      "${source_sha}:deploy/production_governance_contract_recovery.py" \
+      > "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || \
+    ! chown root:root "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || \
+    ! chmod 0444 "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || \
+    ! sync -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"; then
+    return 1
+  fi
+  controlled_guard_assert_file "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" 444 || \
+    return 1
+  test "$(dirname "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" = /tmp || return 1
+  test "$(readlink -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" = \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  tool_size="$(stat -c '%s' "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" || return 1
+  [[ "$tool_size" =~ ^[0-9]+$ ]] || return 1
+  test "$tool_size" -gt 0 || return 1
+  test "$tool_size" -le 131072 || return 1
+  source_digest="$(git --git-dir="$CODE_GIT_CACHE" show \
+    "${source_sha}:deploy/production_governance_contract_recovery.py" | \
+    sha256sum | cut -d' ' -f1)" || return 1
+  [[ "$source_digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256="$(
+    sha256sum "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" | cut -d' ' -f1
+  )" || return 1
+  test "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" = "$source_digest" || \
+    return 1
+  return 0
+}
+controlled_guard_governance_contract_snapshot() {
+  local action="$1"
+  local guarded_sha="$2"
+  local snapshot="$3"
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local service_user adata_sha adata_tree_sha adata_source
+  local release_tree_sha adapter_registry_seal_sha tool_digest
+  case "$action" in restore|verify) ;; *) return 1 ;; esac
+  test "$snapshot" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  activation_snapshot_validate_governance_new || return 1
+  controlled_guard_assert_governance_restore_runtime "$guarded_sha" || return 1
+  test -n "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  [[ "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    return 1
+  case "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" in
+    /tmp/.probiga-governance-contract.*) ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_file "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" 444 || \
+    return 1
+  test "$(readlink -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" = \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  tool_digest="$(sha256sum "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" | \
+    cut -d' ' -f1)" || return 1
+  test "$tool_digest" = "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" || \
+    return 1
+  adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
+  adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
+  release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
+  adapter_registry_seal_sha="$(
+    <"$release_venv/.adapter-registry-seal.sha256"
+  )" || return 1
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  sudo -u "$service_user" test -r \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+    PROBIGA_CODE_ROOT="$code_root" \
+    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+    PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
+    PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
+    PYTHONPATH="$adata_source:$code_root" \
+    "$release_venv/bin/python" -P \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" < "$snapshot" || \
+    return 1
+  return 0
+}
 controlled_guard_restore_and_verify_governance_snapshot() {
   # Most rollback attempts fail before the scheduler row is changed.  Prove
   # that case first and avoid unnecessary database writes.  A mismatch falls
@@ -2613,7 +2734,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
     controlled_guard_verify_restored_runtime "$forward_main_record" \
       "$forward_scheduler_record" "$guarded_sha" "$ai_service_record" \
       "$ai_timer_record" rollback-only || return 1
-    controlled_guard_governance_snapshot verify "$guarded_sha" \
+    controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
     activation_snapshot_assert_pending_receipt_absent || return 1
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
@@ -2665,16 +2786,30 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
     return 1
   fi
   if [ "$phase" = runtime-units-installed ] || [ "$phase" = restoring-old ]; then
-    V2_RECOVERY_STEP=forward-probe-governance
-    if ! controlled_guard_governance_snapshot verify "$guarded_sha" \
-        "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" >/dev/null 2>&1 || \
-      ! activation_snapshot_set_phase "$guarded_sha" \
+    # The sealed NEW governance pair is created only after the guarded release
+    # installed, captured and verified its task contract.  Persist forward
+    # intent before changing that state so an interruption can never fall back
+    # to the now-incompatible OLD restore path.
+    V2_RECOVERY_STEP=forward-begin-governance-restore
+    if ! activation_snapshot_set_phase "$guarded_sha" \
         restoring-new-no-receipt; then
       controlled_guard_refence_after_restore_failure "$guarded_sha" \
         "$main_record" "$scheduler_record" "$ai_service_record" \
         "$ai_timer_record" || true
       return 1
     fi
+  fi
+  V2_RECOVERY_STEP=forward-restore-governance-fenced
+  if ! controlled_guard_governance_contract_snapshot restore \
+      "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
+    ! controlled_guard_governance_contract_snapshot verify \
+      "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
+    ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    controlled_guard_refence_after_restore_failure "$guarded_sha" \
+      "$main_record" "$scheduler_record" "$ai_service_record" \
+      "$ai_timer_record" || true
+    return 1
   fi
   V2_RECOVERY_STEP=forward-restore-units
   if ! activation_snapshot_restore_new_set "$guarded_sha" || \
@@ -2688,7 +2823,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
     return 1
   fi
   V2_RECOVERY_STEP=forward-verify-governance-fenced
-  if ! controlled_guard_governance_snapshot verify "$guarded_sha" \
+  if ! controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
       "$main_record" "$scheduler_record" "$ai_service_record" \
@@ -2722,7 +2857,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   if ! controlled_guard_verify_restored_runtime "$forward_main_record" \
       "$forward_scheduler_record" "$guarded_sha" "$ai_service_record" \
       "$ai_timer_record" rollback-only || \
-    ! controlled_guard_governance_snapshot verify "$guarded_sha" \
+    ! controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
     ! activation_snapshot_assert_pending_receipt_absent; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
@@ -2952,14 +3087,15 @@ controlled_v2_rollback_only_recovery() {
       [ "$phase" = restoring-old ]; } && \
     activation_snapshot_assert_pending_receipt_absent && \
     activation_snapshot_validate_new "$guarded_sha" && \
+    activation_snapshot_validate_governance_new && \
     controlled_guard_assert_governance_restore_runtime "$guarded_sha" && \
-    controlled_guard_governance_snapshot verify "$guarded_sha" \
-      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" >/dev/null 2>&1; then
-    # Prefer the exact sealed forward state even when OLD and NEW governance
-    # happen to be identical.  The durable phase proves that forward unit
-    # installation began, while this probe proves the live database is exactly
-    # the captured NEW state.  The dedicated recovery restores any partially
-    # changed unit set before re-attesting the runtime.
+    controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
+    # Prefer the sealed forward target even when a prior OLD rollback attempt
+    # partially changed live governance.  The dedicated recovery durably
+    # commits forward intent, restores only the sealed NEW stable task contract
+    # (never scheduler runtime/audit columns) and any partially changed NEW unit
+    # set, then re-attests everything while all writers remain fenced.
     V2_RECOVERY_STEP=forward-preserve
     controlled_v2_forward_preserve_no_receipt_recovery || return 1
     return 0
@@ -3119,7 +3255,7 @@ controlled_v2_forward_finalize_recovery() {
   controlled_guard_verify_restored_runtime \
     "loaded,active,$main_unit_file" loaded,active,enabled "$guarded_sha" \
     "$ai_service_record" "$ai_timer_record" rollback-only || return 1
-  controlled_guard_governance_snapshot verify "$guarded_sha" \
+  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
     "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
   if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
@@ -3618,7 +3754,7 @@ controlled_activation_snapshot_only_recovery() {
     controlled_guard_verify_restored_runtime \
       "loaded,active,$main_unit_file" loaded,active,enabled "$guarded_sha" \
       "$ai_service_record" "$ai_timer_record" rollback-only || return 1
-    controlled_guard_governance_snapshot verify "$guarded_sha" \
+    controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
       [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
@@ -3652,7 +3788,9 @@ controlled_activation_snapshot_only_recovery() {
   activation_snapshot_restore_new_set "$guarded_sha" || return 1
   systemctl daemon-reload || return 1
   activation_snapshot_assert_new_set "$guarded_sha" || return 1
-  controlled_guard_restore_and_verify_governance_snapshot "$guarded_sha" \
+  controlled_guard_governance_contract_snapshot restore "$guarded_sha" \
+    "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
     "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
   IFS=, read -r _main_load main_active main_unit_file <<< "$main_record" || \
     return 1
@@ -3695,6 +3833,8 @@ controlled_activation_snapshot_only_recovery() {
   return 0
 }
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
+  materialize_controlled_governance_contract_tool \
+    "$PROBIGA_RECOVERY_GUARD_SHA"
   if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
     { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
         restoring-new-no-receipt ] || \
@@ -3881,6 +4021,7 @@ MAIN_SERVICE=probiga
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
+materialize_controlled_governance_contract_tool "$EXPECTED_SHA"
 if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
   [ -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
   [ ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \

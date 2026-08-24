@@ -893,10 +893,18 @@ cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 37
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize("phase", ("runtime-units-installed", "restoring-old"))
+@pytest.mark.parametrize(
+    ("phase", "expected_begin_writes"),
+    (
+        ("runtime-units-installed", 1),
+        ("restoring-old", 1),
+        ("restoring-new-no-receipt", 0),
+    ),
+)
 def test_forward_no_receipt_recovery_restarts_exact_new_runtime_and_retires(
     tmp_path: Path,
     phase: str,
+    expected_begin_writes: int,
 ) -> None:
     bash = _bash()
     if bash is None:
@@ -928,6 +936,7 @@ ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
 ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
 ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
 PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+DB_STATE="$TEST_ROOT/governance-state"
 TRACE="$TEST_ROOT/trace"
 V2_RECOVERY_STEP=not-started
 mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
@@ -939,6 +948,7 @@ printf '%s\n' probiga.database-writer-restore.v1 \
   ai_timer_unit=loaded,inactive,disabled \
   > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
 printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf 'old-or-partial\n' > "$DB_STATE"
 printf '%s\n' {phase!r} > "$PHASE_STATE"
 printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
 printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
@@ -982,10 +992,22 @@ controlled_guard_refence_after_restore_failure() {{
   printf 'unexpected-refence\n' >> "$TRACE"
   return 1
 }}
-controlled_guard_governance_snapshot() {{
-  test "$1:$2:$3" = \
-    "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-  printf 'verify-live-new\n' >> "$TRACE"
+controlled_guard_governance_contract_snapshot() {{
+  test "$2:$3" = \
+    "$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || return 1
+  case "$1" in
+    restore)
+      test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+      printf 'new\n' > "$DB_STATE"
+      printf 'restore-live-new\n' >> "$TRACE"
+      ;;
+    verify)
+      test "$(<"$DB_STATE")" = new || return 1
+      printf 'verify-live-new\n' >> "$TRACE"
+      ;;
+    *) return 1 ;;
+  esac
 }}
 activation_snapshot_set_phase() {{
   test "$1" = "$GUARDED_SHA" || return 1
@@ -1002,6 +1024,7 @@ activation_snapshot_set_phase() {{
 activation_snapshot_restore_new_set() {{ printf 'restore-new\n' >> "$TRACE"; }}
 activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
 controlled_guard_cleanup() {{
+  test "$(<"$DB_STATE")" = new || return 1
   rm -f "$DATABASE_WRITER_GUARD_FILE"
   printf 'remove-fence\n' >> "$TRACE"
 }}
@@ -1013,6 +1036,7 @@ controlled_guard_verify_restored_runtime() {{
         "loaded,inactive,disabled:loaded,inactive,disabled:loaded,inactive,static:loaded,inactive,disabled" || \
         return 1
       test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+      test "$(<"$DB_STATE")" = new || return 1
       printf 'verify-gates-fenced\n' >> "$TRACE"
       ;;
     rollback-only)
@@ -1046,14 +1070,126 @@ test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 34
 test ! -e "$ACTIVATION_RECEIPT_PENDING" || exit 35
 test ! -e "$ACTIVATION_RECEIPT_PENDING_SHA" || exit 36
 ! grep -q '^unexpected-' "$TRACE" || exit 37
-test "$(grep -c '^phase-restoring-new-no-receipt$' "$TRACE")" -eq 1 || exit 38
+test "$(grep -c '^phase-restoring-new-no-receipt$' "$TRACE")" -eq \
+  {expected_begin_writes} || exit 38
 test "$(grep -c '^phase-new-runtime-preserved-no-receipt$' "$TRACE")" -eq 1 || exit 39
 test "$(grep -c '^verify-gates-fenced$' "$TRACE")" -eq 1 || exit 40
 test "$(grep -c '^verify-runtime$' "$TRACE")" -eq 1 || exit 41
 test "$(grep -c '^retire-no-receipt$' "$TRACE")" -eq 1 || exit 42
 test "$(grep -c '^revalidate-commit$' "$TRACE")" -eq 1 || exit 43
+test "$(grep -c '^restore-live-new$' "$TRACE")" -eq 1 || exit 44
+test "$(grep -c '^verify-live-new$' "$TRACE")" -eq 3 || exit 45
 """
     harness_path = tmp_path / "forward-preserve-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_forward_contract_restore_failure_stays_durably_fenced(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable forward failure test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery = _function(
+        "controlled_v2_forward_preserve_no_receipt_recovery",
+        _shell_function_bodies(source)[
+            "controlled_v2_forward_preserve_no_receipt_recovery"
+        ],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+EXPECTED_SHA={'c' * 40}
+GUARDED_SHA={guarded_sha}
+DEPLOY_OPERATION=deploy
+DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
+ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
+PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+TRACE="$TEST_ROOT/trace"
+V2_RECOVERY_STEP=not-started
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=loaded,inactive,static \
+  ai_timer_unit=loaded,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf 'runtime-units-installed\n' > "$PHASE_STATE"
+printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_old_release() {{ printf '%s\n' "{'b' * 40}"; }}
+activation_snapshot_phase() {{ printf '%s\n' "$(<"$PHASE_STATE")"; }}
+activation_snapshot_validate_new() {{ return 0; }}
+activation_snapshot_validate_governance_new() {{ return 0; }}
+activation_snapshot_assert_pending_receipt_absent() {{ return 0; }}
+controlled_guard_assert_governance_restore_runtime() {{ return 0; }}
+controlled_guard_assert_directory() {{ return 0; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ test -f "$DATABASE_WRITER_RESTORE_FILE"; }}
+controlled_guard_assert_marker() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+controlled_guard_recreate_file() {{ return 1; }}
+controlled_guard_install_dropins() {{ printf 'install-fence\n' >> "$TRACE"; }}
+systemctl() {{ test "$1" = daemon-reload || return 1; }}
+controlled_guard_force_all_writers_fenced() {{ printf 'fence\n' >> "$TRACE"; }}
+controlled_guard_assert_boundary() {{ test -f "$DATABASE_WRITER_GUARD_FILE"; }}
+activation_snapshot_set_phase() {{
+  test "$1:$2" = "$GUARDED_SHA:restoring-new-no-receipt" || return 1
+  printf '%s\n' "$2" > "$PHASE_STATE"
+  printf 'phase-restoring-new\n' >> "$TRACE"
+}}
+controlled_guard_governance_contract_snapshot() {{
+  test "$1:$2:$3" = \
+    "restore:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || return 1
+  test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
+  printf 'contract-restore-failed\n' >> "$TRACE"
+  return 1
+}}
+controlled_guard_refence_after_restore_failure() {{
+  test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || return 1
+  : > "$DATABASE_WRITER_GUARD_FILE"
+  printf 'refenced\n' >> "$TRACE"
+}}
+{recovery}
+if controlled_v2_forward_preserve_no_receipt_recovery; then exit 30; fi
+test "$V2_RECOVERY_STEP" = forward-restore-governance-fenced || exit 31
+test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || exit 32
+test -f "$DATABASE_WRITER_GUARD_FILE" || exit 33
+test -f "$DATABASE_WRITER_RESTORE_FILE" || exit 34
+test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 35
+test "$(grep -c '^phase-restoring-new$' "$TRACE")" -eq 1 || exit 36
+test "$(grep -c '^contract-restore-failed$' "$TRACE")" -eq 1 || exit 37
+test "$(grep -c '^refenced$' "$TRACE")" -eq 1 || exit 38
+test "$(grep -n -E 'phase-restoring-new|contract-restore-failed|refenced' \
+  "$TRACE" | cut -d: -f2 | paste -sd, -)" = \
+  phase-restoring-new,contract-restore-failed,refenced || exit 39
+"""
+    harness_path = tmp_path / "forward-contract-failure-harness.sh"
     harness_path.write_text(harness, encoding="utf-8", newline="\n")
     completed = subprocess.run(
         [bash, str(harness_path)],
@@ -1129,7 +1265,11 @@ controlled_guard_verify_restored_runtime() {{
   test "$3:$6" = "$GUARDED_SHA:rollback-only" || return 1
   printf 'verify-online\n' >> "$TRACE"
 }}
-controlled_guard_governance_snapshot() {{ printf 'verify-governance\n' >> "$TRACE"; }}
+controlled_guard_governance_contract_snapshot() {{
+  test "$1:$2:$3" = \
+    "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  printf 'verify-governance\n' >> "$TRACE"
+}}
 controlled_guard_recreate_file() {{ printf 'unexpected-refence\n' >> "$TRACE"; return 1; }}
 controlled_guard_install_dropins() {{ printf 'unexpected-refence\n' >> "$TRACE"; return 1; }}
 controlled_guard_force_all_writers_fenced() {{ printf 'unexpected-refence\n' >> "$TRACE"; return 1; }}
@@ -1164,7 +1304,7 @@ test "$(grep -c '^retire$' "$TRACE")" -eq 1 || exit 36
 
 
 @pytest.mark.parametrize("phase", ("runtime-units-installed", "restoring-old"))
-def test_rollback_entry_prefers_exact_new_state_even_when_old_also_matches(
+def test_rollback_entry_prefers_sealed_new_target_without_live_new_match(
     tmp_path: Path,
     phase: str,
 ) -> None:
@@ -1233,11 +1373,8 @@ controlled_guard_refence_after_restore_failure() {{ printf 'unexpected-refence\n
 activation_snapshot_assert_pending_receipt_absent() {{ printf 'receipt-absent\n' >> "$TRACE"; }}
 activation_snapshot_validate_new() {{ printf 'validate-new-units\n' >> "$TRACE"; }}
 controlled_guard_governance_snapshot() {{
-  case "$3" in
-    "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT") printf 'verify-new\n' >> "$TRACE"; return 0 ;;
-    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT") printf 'unexpected-verify-old\n' >> "$TRACE"; return 0 ;;
-    *) return 1 ;;
-  esac
+  printf 'unexpected-live-governance\n' >> "$TRACE"
+  return 1
 }}
 controlled_v2_forward_preserve_no_receipt_recovery() {{
   printf 'preserve-new\n' >> "$TRACE"
@@ -1250,7 +1387,7 @@ activation_snapshot_restore_old_set() {{ printf 'unexpected-restore-old\n' >> "$
 controlled_v2_rollback_only_recovery || exit 30
 test "$V2_RECOVERY_STEP" = forward-preserve || exit 31
 ! grep -q '^unexpected-' "$TRACE" || exit 32
-test "$(grep -c '^verify-new$' "$TRACE")" -eq 1 || exit 33
+test "$(grep -c '^validate-new-snapshot$' "$TRACE")" -eq 2 || exit 33
 test "$(grep -c '^preserve-new$' "$TRACE")" -eq 1 || exit 34
 """
     harness_path = tmp_path / "new-priority-router-harness.sh"
@@ -1898,7 +2035,7 @@ controlled_guard_verify_restored_runtime() {{
   printf 'verify-runtime\n' >> "$TRACE"
   kill -HUP "$BASHPID"
 }}
-controlled_guard_governance_snapshot() {{
+controlled_guard_governance_contract_snapshot() {{
   test "$1:$2:$3" = \
     "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
   printf 'verify-governance\n' >> "$TRACE"

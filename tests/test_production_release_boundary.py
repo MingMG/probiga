@@ -3345,10 +3345,13 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         forward_choice,
     )
     assert forward_choice < old_governance_choice
-    assert "activation_snapshot_assert_new_set" not in recovery[
-        recovery.rfind('if { [ "$phase" = runtime-units-installed ]', 0, forward_choice) :
-        forward_choice
-    ]
+    selector_start = recovery.rfind(
+        'if { [ "$phase" = runtime-units-installed ]', 0, forward_choice
+    )
+    selector = recovery[selector_start:forward_choice]
+    assert "activation_snapshot_assert_new_set" not in selector
+    assert "activation_snapshot_validate_governance_new" in selector
+    assert "controlled_guard_governance_snapshot verify" not in selector
 
 
 def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -> None:
@@ -3363,6 +3366,21 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
     removal = bodies[
         "activation_snapshot_remove_new_runtime_preserved_no_receipt"
     ]
+    begin_forward = preserve.index(
+        'activation_snapshot_set_phase "$guarded_sha" '
+        "restoring-new-no-receipt"
+    )
+    restore_governance = preserve.index(
+        "controlled_guard_governance_contract_snapshot restore",
+        begin_forward,
+    )
+    verify_governance = preserve.index(
+        "controlled_guard_governance_contract_snapshot verify",
+        restore_governance,
+    )
+    restore_units = preserve.index(
+        "activation_snapshot_restore_new_set", verify_governance
+    )
     fenced_verify = preserve.index(
         'controlled_guard_verify_restored_runtime "$fenced_main_record"'
     )
@@ -3383,7 +3401,7 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         '"$ai_timer_record" rollback-only', runtime_verify
     )
     live_governance = preserve.index(
-        "controlled_guard_governance_snapshot verify", rollback_only
+        "controlled_guard_governance_contract_snapshot verify", rollback_only
     )
     commit = preserve.index(
         "new-runtime-preserved-no-receipt", live_governance
@@ -3396,7 +3414,11 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         remove_restore,
     )
     assert (
-        fenced_verify
+        begin_forward
+        < restore_governance
+        < verify_governance
+        < restore_units
+        < fenced_verify
         < full_gate
         < boundary_recheck
         < refence_on_gate_failure
@@ -3409,6 +3431,8 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         < remove_restore
         < retire
     )
+    assert "controlled_guard_restore_and_verify_governance_snapshot" not in preserve
+    assert "controlled_guard_governance_snapshot" not in preserve
 
     atomic_retire = removal.index("activation_snapshot_retire_verified_transaction")
     for path in (
@@ -3463,7 +3487,9 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
         "activation_snapshot_receipt_matches_current_v2_request"
     )
     runtime = forward.index("controlled_guard_verify_restored_runtime")
-    governance = forward.index("controlled_guard_governance_snapshot verify")
+    governance = forward.index(
+        "controlled_guard_governance_contract_snapshot verify"
+    )
     restore_remove = forward.index('rm -f -- "$DATABASE_WRITER_RESTORE_FILE"')
     finalized = forward.index("activation_snapshot_set_phase", restore_remove)
     journal_remove = forward.index(
@@ -3817,6 +3843,83 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     published = success.index("publish_deployed_receipt_pending")
     removed = success.index("activation_snapshot_remove_finalized_before_deploy")
     assert pending < finalized < published < removed
+
+
+def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    for regression in (
+        "tests/test_production_deploy_broker.py",
+        "tests/test_production_deploy_recovery_state_machine.py",
+        "tests/test_production_governance_contract_recovery.py",
+    ):
+        assert regression in workflow
+    bodies = {
+        name: _normalized_shell(body)
+        for name, body in _shell_function_bodies(deploy).items()
+    }
+    materialize = bodies["materialize_controlled_governance_contract_tool"]
+    assert 'local source_sha="$1"' in materialize
+    assert (
+        'git --git-dir="$CODE_GIT_CACHE" cat-file -e '
+        '"${source_sha}^{commit}"'
+        in materialize
+    )
+    assert (
+        '"${source_sha}:deploy/'
+        'production_governance_contract_recovery.py"'
+        in materialize
+    )
+    assert "mktemp /tmp/.probiga-governance-contract.XXXXXX" in materialize
+    assert 'chown root:root "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"' in materialize
+    assert 'chmod 0444 "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"' in materialize
+    assert 'test "$tool_size" -le 131072' in materialize
+    assert materialize.count("sha256sum") >= 2
+    assert (
+        'test "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" = '
+        '"$source_digest"'
+        in materialize
+    )
+
+    release_lock = bodies["release_lock"]
+    assert "/tmp/.probiga-governance-contract.*" in release_lock
+    assert 'rm -f -- "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"' in release_lock
+
+    handoff = bodies["controlled_guard_governance_contract_snapshot"]
+    assert 'case "$action" in restore|verify)' in handoff
+    assert (
+        'test "$snapshot" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"'
+        in handoff
+    )
+    assert "activation_snapshot_validate_governance_new" in handoff
+    assert "controlled_guard_assert_governance_restore_runtime" in handoff
+    digest_check = handoff.index(
+        'test "$tool_digest" = '
+        '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256"'
+    )
+    deadline = handoff.index("controlled_guard_run_service_gate_with_deadline")
+    assert digest_check < deadline
+    assert 'sudo -u "$service_user" test -r' in handoff[:deadline]
+    assert '"$release_venv/bin/python" -P' in handoff[deadline:]
+    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action"' in handoff
+    assert '< "$snapshot"' in handoff
+    assert "EXPECTED_SHA" not in handoff
+    assert "PREPARED_CODE_ROOT" not in handoff
+
+    normalized = _normalized_shell(deploy)
+    assert (
+        "materialize_controlled_governance_contract_tool "
+        '"$PROBIGA_RECOVERY_GUARD_SHA"'
+        in normalized
+    )
+    assert (
+        'materialize_controlled_governance_contract_tool "$EXPECTED_SHA"'
+        in normalized
+    )
 
 
 def test_runtime_identity_checks_every_active_writer_and_attested_environment() -> None:
