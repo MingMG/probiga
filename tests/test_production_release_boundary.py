@@ -3951,6 +3951,115 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     )
 
 
+def test_governance_contract_handoff_reads_all_release_metadata_before_runner(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the governance metadata regression")
+
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    handoff_body = _shell_function_bodies(deploy)[
+        "controlled_guard_governance_contract_snapshot"
+    ]
+    handoff_definition = (
+        "controlled_guard_governance_contract_snapshot() {\n"
+        + handoff_body
+        + "}\n"
+    )
+    harness = (
+        "set -Eeuo pipefail\n"
+        + handoff_definition
+        + r'''
+sandbox="$(mktemp -d)"
+controlled_tool="$(mktemp /tmp/.probiga-governance-contract.XXXXXX)"
+trap 'command chmod 0600 "$controlled_tool" 2>/dev/null || true; command rm -f -- "$controlled_tool"; command rm -rf -- "$sandbox"' EXIT
+
+guarded_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expected_adata_sha=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+expected_adata_tree_sha=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+expected_release_tree_sha=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+expected_adapter_seal_sha=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+
+CODE_RELEASE_ROOT="$sandbox/releases"
+RELEASE_VENV_ROOT="$sandbox/venvs"
+ADATA_RUNTIME_ROOT="$sandbox/adata"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$sandbox/governance-new.json"
+CONTROLLED_GOVERNANCE_CONTRACT_TOOL="$controlled_tool"
+runner_trace="$sandbox/runner-trace"
+
+mkdir -p "$CODE_RELEASE_ROOT/$guarded_sha"
+mkdir -p "$RELEASE_VENV_ROOT/$guarded_sha/bin"
+mkdir -p "$ADATA_RUNTIME_ROOT/$expected_adata_sha-$expected_adata_tree_sha"
+printf '%s\n' "$expected_adata_sha" > "$RELEASE_VENV_ROOT/$guarded_sha/.adata.gitsha"
+printf '%s\n' "$expected_adata_tree_sha" > "$RELEASE_VENV_ROOT/$guarded_sha/.adata.tree.sha256"
+printf '%s\n' "$expected_release_tree_sha" > "$RELEASE_VENV_ROOT/$guarded_sha/.release-tree.sha256"
+printf '%s\n' "$expected_adapter_seal_sha" > "$RELEASE_VENV_ROOT/$guarded_sha/.adapter-registry-seal.sha256"
+printf '%s\n' snapshot > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf '%s\n' tool > "$controlled_tool"
+chmod 0444 "$controlled_tool"
+CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256="$(sha256sum "$controlled_tool" | cut -d' ' -f1)"
+
+activation_snapshot_validate_governance_new() { return 0; }
+controlled_guard_assert_governance_restore_runtime() { return 0; }
+controlled_guard_assert_file() { test -f "$1"; }
+systemctl() { printf '%s\n' probiga; }
+sudo() { return 0; }
+controlled_guard_run_service_gate_with_deadline() {
+  local argument
+  local observed_adata=""
+  local observed_adata_tree=""
+  local observed_release_tree=""
+  local observed_adapter=""
+  for argument in "$@"; do
+    case "$argument" in
+      PROBIGA_EXPECTED_ADATA_SHA=*) observed_adata="${argument#*=}" ;;
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256=*) observed_adata_tree="${argument#*=}" ;;
+      PROBIGA_RELEASE_TREE_SHA256=*) observed_release_tree="${argument#*=}" ;;
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=*) observed_adapter="${argument#*=}" ;;
+    esac
+  done
+  test "$observed_adata" = "$expected_adata_sha" || return 81
+  test "$observed_adata_tree" = "$expected_adata_tree_sha" || return 82
+  test "$observed_release_tree" = "$expected_release_tree_sha" || return 83
+  test "$observed_adapter" = "$expected_adapter_seal_sha" || return 84
+  printf '%s,%s,%s,%s\n' \
+    "${#observed_adata}" "${#observed_adata_tree}" \
+    "${#observed_release_tree}" "${#observed_adapter}" > "$runner_trace"
+  return 0
+}
+
+GOVERNANCE_CONTRACT_FAILURE_CODE=unset
+controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+  "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || exit 90
+test "$GOVERNANCE_CONTRACT_FAILURE_CODE" = "" || exit 91
+test "$(<"$runner_trace")" = 40,64,64,64 || exit 92
+'''
+    )
+    harness_path = tmp_path / "governance-metadata-handoff.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_deploy_has_no_multiline_redirection_only_command_substitution() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert re.search(r"\$\([ \t]*\r?\n[ \t]*<", deploy) is None
+
+
 def test_runtime_identity_checks_every_active_writer_and_attested_environment() -> None:
     deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"

@@ -1797,9 +1797,8 @@ controlled_guard_verify_restored_runtime() {
     test -f "$release_venv/.release-tree.sha256" || return 1
     test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
     release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
-    adapter_registry_seal_sha="$(
-      <"$release_venv/.adapter-registry-seal.sha256"
-    )" || return 1
+    adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adapter-registry-seal.sha256")" || return 1
     [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     has_attested_identity=1
@@ -2080,9 +2079,8 @@ controlled_guard_governance_snapshot() {
   adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
   adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
   release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
-  adapter_registry_seal_sha="$(
-    <"$release_venv/.adapter-registry-seal.sha256"
-  )" || return 1
+  adapter_registry_seal_sha="$(/usr/bin/cat -- \
+    "$release_venv/.adapter-registry-seal.sha256")" || return 1
   [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -2210,21 +2208,23 @@ controlled_guard_governance_contract_snapshot() {
   fi
   test "$tool_digest" = "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" || \
     { GOVERNANCE_CONTRACT_FAILURE_CODE=tool-digest; return 1; }
-  if ! adata_sha="$(<"$release_venv/.adata.gitsha")"; then
+  if ! adata_sha="$(/usr/bin/cat -- "$release_venv/.adata.gitsha")"; then
     GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
     return 1
   fi
-  if ! adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")"; then
+  if ! adata_tree_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adata.tree.sha256")"; then
     GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
     return 1
   fi
-  if ! release_tree_sha="$(<"$release_venv/.release-tree.sha256")"; then
+  if ! release_tree_sha="$(/usr/bin/cat -- \
+      "$release_venv/.release-tree.sha256")"; then
     GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
     return 1
   fi
-  adapter_registry_seal_sha="$(
-    <"$release_venv/.adapter-registry-seal.sha256"
-  )" || { GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata; return 1; }
+  adapter_registry_seal_sha="$(/usr/bin/cat -- \
+    "$release_venv/.adapter-registry-seal.sha256")" || \
+    { GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata; return 1; }
   if [[ ! "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || \
     [[ ! "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || \
     [[ ! "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || \
@@ -2531,12 +2531,10 @@ controlled_guard_capture_current_governance_snapshot() {
     test ! -L "$release_venv/.release-tree.sha256" || return 1
     test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
     test ! -L "$release_venv/.adapter-registry-seal.sha256" || return 1
-    runtime_release_tree_sha="$(
-      <"$release_venv/.release-tree.sha256"
-    )" || return 1
-    runtime_adapter_registry_seal_sha="$(
-      <"$release_venv/.adapter-registry-seal.sha256"
-    )" || return 1
+    runtime_release_tree_sha="$(/usr/bin/cat -- \
+      "$release_venv/.release-tree.sha256")" || return 1
+    runtime_adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adapter-registry-seal.sha256")" || return 1
     [[ "$runtime_release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$runtime_adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   fi
@@ -3488,9 +3486,8 @@ controlled_guard_run_schema_tool() {
     test -f "$release_venv/.release-tree.sha256" || return 1
     test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
     release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
-    adapter_registry_seal_sha="$(
-      <"$release_venv/.adapter-registry-seal.sha256"
-    )" || return 1
+    adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adapter-registry-seal.sha256")" || return 1
     [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     attested_env+=(
@@ -3533,9 +3530,8 @@ controlled_guard_run_writer_fence() {
     test -f "$release_venv/.release-tree.sha256" || return 1
     test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
     release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
-    adapter_registry_seal_sha="$(
-      <"$release_venv/.adapter-registry-seal.sha256"
-    )" || return 1
+    adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adapter-registry-seal.sha256")" || return 1
     [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     attested_env+=(
@@ -4855,9 +4851,8 @@ assert_ai_worker_runtime() {
     test -f "$venv_path/.release-tree.sha256" || return 1
     test -f "$venv_path/.adapter-registry-seal.sha256" || return 1
     release_tree_sha="$(<"$venv_path/.release-tree.sha256")" || return 1
-    adapter_registry_seal_sha="$(
-      <"$venv_path/.adapter-registry-seal.sha256"
-    )" || return 1
+    adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$venv_path/.adapter-registry-seal.sha256")" || return 1
     [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
     has_attested_identity=1
