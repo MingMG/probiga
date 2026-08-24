@@ -339,3 +339,40 @@ def test_snapshot_reader_requires_exactly_one_row(row_count: int) -> None:
 
     with pytest.raises(RuntimeError, match="invalid sealed"):
         recovery._read_snapshot(io.StringIO(json.dumps(payload)))
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        ("invalid sealed governance contract snapshot", "snapshot-envelope"),
+        ("sealed governance task identity differs", "sealed-identity"),
+        ("governance enabled must be int", "contract-shape"),
+        ("st_scheduled_tasks must use InnoDB", "engine-schema"),
+        ("live governance scheduler identity is not unique: 2", "live-count"),
+        ("live governance scheduler task id differs", "live-id"),
+        ("live governance scheduler task_type differs", "live-identity"),
+        ("live governance scheduler contract differs from sealed NEW", "projection"),
+        ("governance contract restore changed many rows", "update-rowcount"),
+        (
+            "governance runtime or audit fields changed during restore",
+            "volatile-drift",
+        ),
+        ("database connection failed with private details", "database-runtime"),
+    ],
+)
+def test_failure_diagnostics_are_bounded_static_codes(
+    message: str, expected_code: str
+) -> None:
+    assert recovery._static_failure_code(RuntimeError(message)) == expected_code
+
+
+def test_cli_failure_emits_only_the_static_code(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(recovery.sys, "stdin", io.StringIO("{}"))
+
+    assert recovery.main(["verify"]) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "probiga_governance_contract_failure=snapshot-envelope\n"
+    )

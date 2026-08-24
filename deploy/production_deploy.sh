@@ -88,6 +88,7 @@ CODE_GIT_CACHE=/var/lib/probiga/release-sources/probiga.git
 CODE_RELEASE_ROOT=/opt/ProBigA-releases
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL=""
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256=""
+GOVERNANCE_CONTRACT_FAILURE_CODE=""
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
@@ -2165,61 +2166,135 @@ controlled_guard_governance_contract_snapshot() {
   local snapshot="$3"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local gate_output=""
   local service_user adata_sha adata_tree_sha adata_source
   local release_tree_sha adapter_registry_seal_sha tool_digest
-  case "$action" in restore|verify) ;; *) return 1 ;; esac
-  test "$snapshot" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-  activation_snapshot_validate_governance_new || return 1
-  controlled_guard_assert_governance_restore_runtime "$guarded_sha" || return 1
-  test -n "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
-  [[ "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+  GOVERNANCE_CONTRACT_FAILURE_CODE=""
+  case "$action" in
+    restore|verify) ;;
+    *) GOVERNANCE_CONTRACT_FAILURE_CODE=action; return 1 ;;
+  esac
+  if [ "$snapshot" != "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-path
     return 1
+  fi
+  if ! activation_snapshot_validate_governance_new; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
+    return 1
+  fi
+  if ! controlled_guard_assert_governance_restore_runtime "$guarded_sha"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=runtime-attestation
+    return 1
+  fi
+  if [ -z "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" ]; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=tool-presence
+    return 1
+  fi
+  [[ "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    { GOVERNANCE_CONTRACT_FAILURE_CODE=tool-digest; return 1; }
   case "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" in
     /tmp/.probiga-governance-contract.*) ;;
-    *) return 1 ;;
+    *) GOVERNANCE_CONTRACT_FAILURE_CODE=tool-path; return 1 ;;
   esac
   controlled_guard_assert_file "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" 444 || \
+    { GOVERNANCE_CONTRACT_FAILURE_CODE=tool-permission; return 1; }
+  if [ "$(readlink -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" != \
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" ]; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=tool-path
     return 1
-  test "$(readlink -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" = \
-    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
-  tool_digest="$(sha256sum "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" | \
-    cut -d' ' -f1)" || return 1
+  fi
+  if ! tool_digest="$(sha256sum "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" | \
+      cut -d' ' -f1)"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=tool-digest
+    return 1
+  fi
   test "$tool_digest" = "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" || \
+    { GOVERNANCE_CONTRACT_FAILURE_CODE=tool-digest; return 1; }
+  if ! adata_sha="$(<"$release_venv/.adata.gitsha")"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
     return 1
-  adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
-  adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
-  release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
+  fi
+  if ! adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
+    return 1
+  fi
+  if ! release_tree_sha="$(<"$release_venv/.release-tree.sha256")"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
+    return 1
+  fi
   adapter_registry_seal_sha="$(
     <"$release_venv/.adapter-registry-seal.sha256"
-  )" || return 1
-  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
-  service_user="$(systemctl show -p User --value probiga)" || return 1
-  test -n "$service_user" || return 1
-  test "$service_user" != root || return 1
-  sudo -u "$service_user" test -r \
-    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
-  controlled_guard_run_service_gate_with_deadline "$service_user" \
-    /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-    PROBIGA_DEPLOYMENT_MODE=production \
-    PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
-    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
-    PROBIGA_CODE_ROOT="$code_root" \
-    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
-    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
-    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
-    PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
-    PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
-    PYTHONPATH="$adata_source:$code_root" \
-    "$release_venv/bin/python" -P \
-    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" < "$snapshot" || \
+  )" || { GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata; return 1; }
+  if [[ ! "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || \
+    [[ ! "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || \
+    [[ ! "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || \
+    [[ ! "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=release-metadata
     return 1
-  return 0
+  fi
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  if ! service_user="$(systemctl show -p User --value probiga)"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=service-user
+    return 1
+  fi
+  if [ -z "$service_user" ] || [ "$service_user" = root ]; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=service-user
+    return 1
+  fi
+  if ! sudo -u "$service_user" test -r \
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"; then
+    GOVERNANCE_CONTRACT_FAILURE_CODE=tool-readability
+    return 1
+  fi
+  if gate_output="$(
+    (
+      cd "$code_root" || exit 1
+      controlled_guard_run_service_gate_with_deadline "$service_user" \
+        /usr/bin/env -i \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+        PROBIGA_DEPLOYMENT_MODE=production \
+        PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+        PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+        PROBIGA_CODE_ROOT="$code_root" \
+        PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+        PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+        PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+        PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
+        PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
+        PYTHONPATH="$adata_source:$code_root" \
+        "$release_venv/bin/python" -P \
+        "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" < "$snapshot"
+    ) 2>&1
+  )"; then
+    return 0
+  fi
+  case "$gate_output" in
+    *"probiga_governance_contract_failure=snapshot-envelope"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-envelope ;;
+    *"probiga_governance_contract_failure=sealed-identity"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=sealed-identity ;;
+    *"probiga_governance_contract_failure=contract-shape"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=contract-shape ;;
+    *"probiga_governance_contract_failure=engine-schema"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=engine-schema ;;
+    *"probiga_governance_contract_failure=live-count"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=live-count ;;
+    *"probiga_governance_contract_failure=live-id"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=live-id ;;
+    *"probiga_governance_contract_failure=live-identity"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=live-identity ;;
+    *"probiga_governance_contract_failure=projection"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=projection ;;
+    *"probiga_governance_contract_failure=update-rowcount"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=update-rowcount ;;
+    *"probiga_governance_contract_failure=volatile-drift"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=volatile-drift ;;
+    *"probiga_governance_contract_failure=database-runtime"*)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=database-runtime ;;
+    *) GOVERNANCE_CONTRACT_FAILURE_CODE=runner ;;
+  esac
+  return 1
 }
 controlled_guard_restore_and_verify_governance_snapshot() {
   # Most rollback attempts fail before the scheduler row is changed.  Prove
@@ -2630,6 +2705,7 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   local main_load main_active main_unit_file
   local scheduler_load scheduler_active scheduler_unit_file
   local fence_status=0
+  local governance_failure_code=""
   local -a state_lines=()
   V2_RECOVERY_STEP=forward-validate-request
   case "$DEPLOY_OPERATION:$DEPLOY_ARTIFACT_MODE" in
@@ -2799,12 +2875,48 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
       return 1
     fi
   fi
-  V2_RECOVERY_STEP=forward-restore-governance-fenced
-  if ! controlled_guard_governance_contract_snapshot restore \
-      "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
-    ! controlled_guard_governance_contract_snapshot verify \
-      "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
-    ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+  V2_RECOVERY_STEP=forward-governance-verify-current
+  if ! controlled_guard_governance_contract_snapshot verify \
+      "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
+    V2_RECOVERY_STEP=forward-governance-restore-exec
+    if ! controlled_guard_governance_contract_snapshot restore \
+        "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
+      governance_failure_code="${GOVERNANCE_CONTRACT_FAILURE_CODE:-unknown}"
+      case "$governance_failure_code" in
+        action|snapshot-path|snapshot-seal|runtime-attestation|tool-presence|\
+        tool-digest|tool-path|tool-permission|release-metadata|service-user|\
+        tool-readability|snapshot-envelope|sealed-identity|contract-shape|\
+        engine-schema|live-count|live-id|live-identity|projection|\
+        update-rowcount|volatile-drift|database-runtime|runner) ;;
+        *) governance_failure_code=unknown ;;
+      esac
+      V2_RECOVERY_STEP="forward-governance-restore-$governance_failure_code"
+      controlled_guard_refence_after_restore_failure "$guarded_sha" \
+        "$main_record" "$scheduler_record" "$ai_service_record" \
+        "$ai_timer_record" || true
+      return 1
+    fi
+    V2_RECOVERY_STEP=forward-governance-verify-after-restore
+    if ! controlled_guard_governance_contract_snapshot verify \
+        "$guarded_sha" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"; then
+      governance_failure_code="${GOVERNANCE_CONTRACT_FAILURE_CODE:-unknown}"
+      case "$governance_failure_code" in
+        action|snapshot-path|snapshot-seal|runtime-attestation|tool-presence|\
+        tool-digest|tool-path|tool-permission|release-metadata|service-user|\
+        tool-readability|snapshot-envelope|sealed-identity|contract-shape|\
+        engine-schema|live-count|live-id|live-identity|projection|\
+        update-rowcount|volatile-drift|database-runtime|runner) ;;
+        *) governance_failure_code=unknown ;;
+      esac
+      V2_RECOVERY_STEP="forward-governance-verify-$governance_failure_code"
+      controlled_guard_refence_after_restore_failure "$guarded_sha" \
+        "$main_record" "$scheduler_record" "$ai_service_record" \
+        "$ai_timer_record" || true
+      return 1
+    fi
+  fi
+  V2_RECOVERY_STEP=forward-governance-boundary
+  if ! controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record"; then
     controlled_guard_refence_after_restore_failure "$guarded_sha" \
       "$main_record" "$scheduler_record" "$ai_service_record" \

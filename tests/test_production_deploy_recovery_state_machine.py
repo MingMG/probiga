@@ -894,17 +894,25 @@ cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 37
 
 
 @pytest.mark.parametrize(
-    ("phase", "expected_begin_writes"),
     (
-        ("runtime-units-installed", 1),
-        ("restoring-old", 1),
-        ("restoring-new-no-receipt", 0),
+        "phase",
+        "expected_begin_writes",
+        "initial_db_state",
+        "expected_contract_restores",
+    ),
+    (
+        ("runtime-units-installed", 1, "old-or-partial", 1),
+        ("restoring-old", 1, "old-or-partial", 1),
+        ("restoring-new-no-receipt", 0, "old-or-partial", 1),
+        ("restoring-new-no-receipt", 0, "new", 0),
     ),
 )
 def test_forward_no_receipt_recovery_restarts_exact_new_runtime_and_retires(
     tmp_path: Path,
     phase: str,
     expected_begin_writes: int,
+    initial_db_state: str,
+    expected_contract_restores: int,
 ) -> None:
     bash = _bash()
     if bash is None:
@@ -948,7 +956,7 @@ printf '%s\n' probiga.database-writer-restore.v1 \
   ai_timer_unit=loaded,inactive,disabled \
   > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
 printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
-printf 'old-or-partial\n' > "$DB_STATE"
+printf '%s\n' {initial_db_state!r} > "$DB_STATE"
 printf '%s\n' {phase!r} > "$PHASE_STATE"
 printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
 printf 'guard\n' > "$DATABASE_WRITER_GUARD_FILE"
@@ -1077,7 +1085,8 @@ test "$(grep -c '^verify-gates-fenced$' "$TRACE")" -eq 1 || exit 40
 test "$(grep -c '^verify-runtime$' "$TRACE")" -eq 1 || exit 41
 test "$(grep -c '^retire-no-receipt$' "$TRACE")" -eq 1 || exit 42
 test "$(grep -c '^revalidate-commit$' "$TRACE")" -eq 1 || exit 43
-test "$(grep -c '^restore-live-new$' "$TRACE")" -eq 1 || exit 44
+test "$(grep -c '^restore-live-new$' "$TRACE")" -eq \
+  {expected_contract_restores} || exit 44
 test "$(grep -c '^verify-live-new$' "$TRACE")" -eq 3 || exit 45
 """
     harness_path = tmp_path / "forward-preserve-harness.sh"
@@ -1168,6 +1177,7 @@ controlled_guard_governance_contract_snapshot() {{
   test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || return 1
   test -f "$DATABASE_WRITER_GUARD_FILE" || return 1
   printf 'contract-restore-failed\n' >> "$TRACE"
+  GOVERNANCE_CONTRACT_FAILURE_CODE=runner
   return 1
 }}
 controlled_guard_refence_after_restore_failure() {{
@@ -1177,7 +1187,7 @@ controlled_guard_refence_after_restore_failure() {{
 }}
 {recovery}
 if controlled_v2_forward_preserve_no_receipt_recovery; then exit 30; fi
-test "$V2_RECOVERY_STEP" = forward-restore-governance-fenced || exit 31
+test "$V2_RECOVERY_STEP" = forward-governance-restore-runner || exit 31
 test "$(<"$PHASE_STATE")" = restoring-new-no-receipt || exit 32
 test -f "$DATABASE_WRITER_GUARD_FILE" || exit 33
 test -f "$DATABASE_WRITER_RESTORE_FILE" || exit 34

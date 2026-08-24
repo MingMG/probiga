@@ -29,6 +29,46 @@ _CLOCK_RE = re.compile(
 )
 
 
+def _static_failure_code(error: Exception) -> str:
+    """Return a bounded diagnostic code without exposing SQL or row values."""
+    message = str(error)
+    if message.startswith("invalid sealed governance contract snapshot"):
+        return "snapshot-envelope"
+    if message.startswith("sealed governance task identity differs"):
+        return "sealed-identity"
+    if message.startswith("sealed NEW governance task contract is unexpected"):
+        return "projection"
+    if message.startswith("sealed governance snapshot") or message.startswith(
+        "guarded governance payload columns"
+    ):
+        return "contract-shape"
+    if message.startswith("governance cron_time") or (
+        message.startswith("governance ") and " must be " in message
+    ):
+        return "contract-shape"
+    if message.startswith("governance contract recovery requires MySQL") or (
+        message.startswith("st_scheduled_tasks must use InnoDB")
+    ) or message.startswith("governance scheduler schema misses"):
+        return "engine-schema"
+    if message.startswith("live governance scheduler identity is not unique"):
+        return "live-count"
+    if message.startswith("live governance scheduler task id differs"):
+        return "live-id"
+    if message.startswith("live governance scheduler task_type differs") or (
+        message.startswith("live governance scheduler script_path differs")
+    ) or message.startswith("governance identity differs"):
+        return "live-identity"
+    if message.startswith("live governance scheduler contract differs"):
+        return "projection"
+    if message.startswith("governance contract restore changed many rows"):
+        return "update-rowcount"
+    if message.startswith("governance runtime or audit fields changed"):
+        return "volatile-drift"
+    if message.startswith("unsupported governance contract action"):
+        return "contract-shape"
+    return "database-runtime"
+
+
 def _read_snapshot(stream: TextIO) -> dict[str, Any]:
     raw = json.load(stream)
     if (
@@ -318,13 +358,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("action", choices=("restore", "verify"))
     args = parser.parse_args(argv)
-    expected = _read_snapshot(sys.stdin)
-    load_project_env()
-    engine = create_tool_engine()
     try:
-        result = reconcile_contract(engine, expected, action=args.action)
-    finally:
-        engine.dispose()
+        expected = _read_snapshot(sys.stdin)
+        load_project_env()
+        engine = create_tool_engine()
+        try:
+            result = reconcile_contract(engine, expected, action=args.action)
+        finally:
+            engine.dispose()
+    except Exception as error:  # noqa: BLE001 - emit only a bounded static code
+        print(
+            "probiga_governance_contract_failure="
+            f"{_static_failure_code(error)}",
+            file=sys.stderr,
+        )
+        return 2
     print(
         json.dumps(
             {"status": "ok", "governance_contract": result},

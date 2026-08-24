@@ -3370,16 +3370,23 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
         'activation_snapshot_set_phase "$guarded_sha" '
         "restoring-new-no-receipt"
     )
-    restore_governance = preserve.index(
-        "controlled_guard_governance_contract_snapshot restore",
+    verify_current_governance = preserve.index(
+        "controlled_guard_governance_contract_snapshot verify",
         begin_forward,
     )
-    verify_governance = preserve.index(
+    restore_governance = preserve.index(
+        "controlled_guard_governance_contract_snapshot restore",
+        verify_current_governance,
+    )
+    verify_restored_governance = preserve.index(
         "controlled_guard_governance_contract_snapshot verify",
         restore_governance,
     )
+    governance_boundary = preserve.index(
+        "controlled_guard_assert_boundary", verify_restored_governance
+    )
     restore_units = preserve.index(
-        "activation_snapshot_restore_new_set", verify_governance
+        "activation_snapshot_restore_new_set", governance_boundary
     )
     fenced_verify = preserve.index(
         'controlled_guard_verify_restored_runtime "$fenced_main_record"'
@@ -3415,8 +3422,10 @@ def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -
     )
     assert (
         begin_forward
+        < verify_current_governance
         < restore_governance
-        < verify_governance
+        < verify_restored_governance
+        < governance_boundary
         < restore_units
         < fenced_verify
         < full_gate
@@ -3890,9 +3899,10 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     assert 'rm -f -- "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL"' in release_lock
 
     handoff = bodies["controlled_guard_governance_contract_snapshot"]
-    assert 'case "$action" in restore|verify)' in handoff
+    assert 'case "$action" in' in handoff
+    assert "restore|verify)" in handoff
     assert (
-        'test "$snapshot" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"'
+        'if [ "$snapshot" != "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]'
         in handoff
     )
     assert "activation_snapshot_validate_governance_new" in handoff
@@ -3904,9 +3914,28 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     deadline = handoff.index("controlled_guard_run_service_gate_with_deadline")
     assert digest_check < deadline
     assert 'sudo -u "$service_user" test -r' in handoff[:deadline]
+    assert 'cd "$code_root"' in handoff[:deadline]
     assert '"$release_venv/bin/python" -P' in handoff[deadline:]
     assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action"' in handoff
     assert '< "$snapshot"' in handoff
+    for failure_code in (
+        "snapshot-envelope",
+        "sealed-identity",
+        "contract-shape",
+        "engine-schema",
+        "live-count",
+        "live-id",
+        "live-identity",
+        "projection",
+        "update-rowcount",
+        "volatile-drift",
+        "database-runtime",
+    ):
+        assert (
+            f"probiga_governance_contract_failure={failure_code}" in handoff
+        )
+    assert 'printf "%s\\n" "$gate_output"' not in handoff
+    assert 'echo "$gate_output"' not in handoff
     assert "EXPECTED_SHA" not in handoff
     assert "PREPARED_CODE_ROOT" not in handoff
 
