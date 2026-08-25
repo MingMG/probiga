@@ -9183,9 +9183,6 @@ prepare_release_venv() {
     "$EXPECTED_INPUT_LOCK_SHA256"
   if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
     validate_ci_resolved_freeze "$RESOLVED_LOCK"
-    # The isolated non-login build account downloads wheels, so it needs
-    # read-only access to this non-secret package/version list.
-    chmod 0444 "$RESOLVED_LOCK"
   else
     validate_hashed_requirements_lock "$RESOLVED_LOCK"
     TRUSTED_WHEEL_MANIFEST="$(mktemp)"
@@ -9198,6 +9195,11 @@ prepare_release_venv() {
     grep -Fx TARGET=cp314-manylinux_2_28_x86_64 \
       "$TRUSTED_WHEEL_MANIFEST" >/dev/null
     grep -Fx STATUS=READY "$TRUSTED_WHEEL_MANIFEST" >/dev/null
+  fi
+  # Both artifact modes use the isolated non-login build account to download
+  # wheels. It needs read-only access to this validated, non-secret lock file.
+  chmod 0444 "$RESOLVED_LOCK"
+  if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
     prepare_trusted_wheelhouse
   fi
   if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then

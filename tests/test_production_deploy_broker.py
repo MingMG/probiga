@@ -360,6 +360,13 @@ def test_v4_engine_builds_and_verifies_a_hashed_static_wheelhouse() -> None:
     assert "TARGET=cp314-manylinux_2_28_x86_64" in engine
     assert "STATUS=READY" in engine
     assert "--require-hashes --no-index --only-binary=:all:" in engine
+    prepare_release_venv = _shell_function_body(engine, "prepare_release_venv")
+    validated_lock = prepare_release_venv.index(
+        'validate_hashed_requirements_lock "$RESOLVED_LOCK"'
+    )
+    readable_lock = prepare_release_venv.index('chmod 0444 "$RESOLVED_LOCK"')
+    isolated_download = prepare_release_venv.index("prepare_trusted_wheelhouse")
+    assert validated_lock < readable_lock < isolated_download
     assert (
         '"$EXPECTED_BUILD/bin/python" -I -m pip wheel --no-deps '
         "--no-build-isolation --no-index"
