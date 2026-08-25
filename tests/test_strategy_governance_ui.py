@@ -13,7 +13,7 @@ def test_strategy_governance_has_a_dedicated_navigation_page():
     assert "🏆 动态策略竞技场" in index
     assert "旧候选中心（研究）" not in index
     assert "style.css?v=44" in index
-    assert "app.js?v=105" in index
+    assert "app.js?v=112" in index
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():
@@ -41,14 +41,82 @@ def test_strategy_governance_page_exposes_both_arenas_and_three_pools():
     assert "_strategyCombinationRegister" in script
     assert "观察池" in script
     assert "等待确认池" in script
-    assert "可交易池" in script
+    assert "模拟可交易池" in script
+    assert "INTERNAL_PORTFOLIO_CHECKPOINT_FACT_LEDGER_V3" in script
+    assert "旧版内部账本，仅供历史展示" in script
     assert "20/60/120窗口证据" in script
     assert "strategyGovernanceWindowSummary(row)" in script
     assert "strategyCombinationConstraintSummary(row)" in script
     assert "相关性/个股重叠/行业" in script
     assert "行业侧重：" in script
-    assert "正期望、盈亏比和利润因子只说明已确认的历史前向证据" in script
+    assert "客户端声明信号榜只比较经双人复核、结构可重算的外部提交" in script
+    assert "提交来源未与权威行情逐行认证" in script
+    assert "成交实证榜只比较内部模拟成交、实际费用和逐日净值" in script
+    assert "共享账户里同票未成交不会被伪造成 fill" in script
+    assert "信号榜不授予模拟资金" in script
     assert "不代表未来一定盈利" in script
+    assert "成员事实链复算配方" in script
+    assert "不生成独立组合现金事实" in script
+    assert "recipe.recipe_hash" in script
+    assert "观察池始终可用" not in script
+    assert "观察池用于展示可审计研究候选且允许为空" in script
+    assert "精确日期行业/概念成分归属" in script
+    assert "来源特定板块热度" in script
+    assert "按成分股聚合的强弱" in script
+    assert "QMT原生 .BKZS 板块指数" in script
+    assert "未认证的 .BKZS 不用合成曲线补齐" in script
+    assert "strategyStatisticalProofSummary(row, metric, windowDays)" in script
+    assert "单侧95%下界" in script
+    assert "有效样本" in script
+    assert "正式健康分" in script
+    assert "点估计" in script
+    assert "服务端BY多重检验" in script
+    assert "全族" in script
+    assert "内部非重叠时序" in script
+    assert "精确间隔确认" in script
+    assert "不可变日历回执已绑定" in script
+
+
+def test_large_rankings_use_revision_bound_server_pagination():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    governance_renderer = _javascript_block(
+        script,
+        "    function strategyGovernanceHtml(governance, history) {",
+        "    function renderStrategyCenter(container, data, governance, history) {",
+    )
+
+    assert "strategyGovernancePaginationHtml" in governance_renderer
+    assert "rankingPages.strategy" in governance_renderer
+    assert "rankingPages.combination" in governance_renderer
+    assert "每页最多 ' + limit + ' 条" in script
+    assert "/api/strategy-center/governance/rankings/" in script
+    assert "canonical_result_hash:String(governance.canonical_result_hash" in script
+    assert "window._strategyGovernanceRankingPage" in script
+    assert "window._strategyGovernanceRankingSearch" in script
+
+
+def test_lifecycle_and_audit_history_are_independently_server_paged():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    governance_renderer = _javascript_block(
+        script,
+        "    function strategyGovernanceHtml(governance, history) {",
+        "    function loadStrategyCenterPage(d, container) {",
+    )
+
+    assert "/api/strategy-center/governance/history/lifecycle?limit=50" in script
+    assert "/api/strategy-center/governance/history/audit?limit=50" in script
+    assert "window._strategyGovernanceHistoryPage" in script
+    assert "strategyGovernanceHistoryPaginationHtml" in governance_renderer
+    assert "historyPages.lifecycle" in governance_renderer
+    assert "historyPages.audit" in governance_renderer
+    assert "较新一页" in script
+    assert "更早一页" in script
+    assert "对象代码筛选" in script
+    assert "lifecycle.slice(0, 30)" not in governance_renderer
+    assert "audits.slice(0, 30)" not in governance_renderer
+    assert "page.raw_payload_inline !== false" in script
+    assert "result.automatic_real_order_submission !== false" in script
+    assert "result.real_order_authority !== false" in script
 
 
 def test_default_visible_pool_never_falls_back_to_overview_candidates():
@@ -113,12 +181,12 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     for label in (
         "执行适配器",
-        "执行与资金证据链已就绪",
-        "影子候选执行已就绪",
-        "执行适配器未部署/无效",
-        "资金证据链：",
-        "未接通，仅可影子观察",
-        "影子候选可运行，资金证据链未接通",
+        "执行适配器与模拟链成熟证据已就绪",
+        "模拟链结构已就绪，证据积累中",
+        "执行适配器未部署",
+        "内部模拟链：",
+        "模拟链校验失败",
+        "成熟证据已通过复算",
         "当前规范结果",
         "实时预览（不生效）",
         "动态适配器运行回执",
@@ -130,6 +198,9 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
         "风险上限：",
         "胜率",
         "盈亏比",
+        "双榜成绩",
+        "成交实证",
+        "独立信号",
         "行业侧重",
         "正常新增风险",
         "降权新增风险",
@@ -138,6 +209,14 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
         "等待人工复核",
     ):
         assert label in script
+    for stale_label in (
+        "执行与资金证据链已就绪",
+        "影子候选执行已就绪",
+        "执行适配器未部署/无效",
+        "未接通，仅可影子观察",
+        "资金证据链未接通",
+    ):
+        assert stale_label not in script
     for contract in (
         "execution_binding",
         "artifact_sha256",
@@ -146,7 +225,9 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
         "stamp_tax_pct",
         "slippage_pct",
         "transfer_fee_pct",
-        "row.lane_rank || row.rank",
+        "row.execution_evidence_rank",
+        "row.signal_validation_rank",
+        "row.independent_evidence_rank",
         "row.industry_focus",
         "funding_pipeline_ready",
         "governance.adapter_capabilities",
@@ -157,7 +238,8 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
         "执行适配器、版本、制品或评估器类型不在服务器可信发布清单中",
     ):
         assert contract in script
-    assert "未通过执行绑定及内部模拟成交验证前不会进入票池" in script
+    assert "只有后续执行适配器在内部模拟账户产生可重算成交、费用和逐日净值" in script
+    assert "才会进入模拟可交易池" in script
     assert "strategyTradingGateLabel(gate.status)" in script
     assert "evaluator_type: 'external_evidence'" not in script
     assert "Number((el('scRegRouteTrend') || {}).value)" not in script
@@ -165,6 +247,12 @@ def test_strategy_governance_page_exposes_execution_and_profit_contracts():
     assert "is_canonical:false" in script
     assert "governance.adapter_capabilities = capabilityPayload.adapters" in script
     assert "/api/strategy-center/governance/adapter-capabilities" in script
+    assert "row.lane_rank || row.rank" not in script
+    assert "盈利日占比（资金口径）" in script
+    assert "日均净收益（资金口径）" in script
+    assert "日频盈亏比" in script
+    assert "日频PF" in script
+    assert "逐笔胜率/盈亏比仅属于交易诊断或独立信号研究口径" in script
 
 
 def test_governance_document_matches_the_executable_twenty_day_gate():
@@ -174,27 +262,85 @@ def test_governance_document_matches_the_executable_twenty_day_gate():
     for contract in (
         "内部成熟交易不少于 20 笔",
         "内部组合净值覆盖不少于 20 个权威交易日",
-        "选择验证不少于 20 笔且覆盖不少于 20 个权威交易日",
         "利润因子严格大于 1.00",
-        "毛期望 - 1.5 × 内部账本实际成本",
+        "日均毛收益 - 1.5 × 内部账本实际日均成本",
         "按生成端四位小数口径重算",
         "策略和组合均调用同一个规范窗口门槛",
         "不代表未来一定盈利",
+        "最佳 5 个盈利日贡献不超过 70%",
+        "逐笔胜率、逐笔盈亏比和逐笔头部贡献",
     ):
         assert contract in document
+    assert "外部 v3 声明既不是必要条件" in document
+    assert "选择验证不少于" not in document
 
 
-def test_strategy_governance_page_exposes_independent_evidence_ledger():
+def test_strategy_governance_page_exposes_unattested_research_ledger():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
-    assert "独立证据复核台账" in script
+    assert "外部研究声明复核台账" in script
     assert "等待独立复核" in script or "verification_status_label" in script
     assert "source_dataset_hash" in script
+    assert "该哈希不是权威行情源认证" in script
+    assert "不是内部账本资金资格的必要条件" in script
     assert "等待暂停后新证据自动恢复" in script
     assert "add('恢复影子'" not in script
     assert "EVIDENCE_REVIEWER" in script
     assert "仅管理员可治理" in script
     assert "请由证据复核员登录处理" in script
     assert "/api/auth/status" in script
+
+
+def test_governance_rank_and_dynamic_evidence_labels_fail_closed():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    for contract in (
+        "officialStrategyRank",
+        "officialCombinationRank",
+        "row.execution_evidence_comparable === true",
+        "row.execution_evidence_rank",
+        "row.signal_validation_rank",
+        "row.has_independent_evidence === true ? row.independent_evidence_rank : null",
+        "未入榜",
+        "模拟链为空，正在积累首批证据",
+        "影子试验已产生，等待成熟闭环",
+        "模拟链证据无效，已阻断",
+        "成熟证据已通过复算",
+        "基础设施就绪、动态执行未启用",
+        "真实下单权限保持关闭",
+    ):
+        assert contract in script
+    assert "row.has_independent_evidence === true ? (row.lane_rank || row.rank) : null" not in script
+
+
+def test_challenger_ui_uses_two_stage_artifact_replay_without_fake_claims():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    for contract in (
+        "_strategyChallengerEvidenceSubmit",
+        "/challengers/' + encodeURIComponent(challengerId) + '/evidence",
+        "提交可重算产物",
+        "REVIEW_PENDING",
+        "decision:decision",
+        "服务器重算结构与哈希",
+        "复核通过最多晋级为无资金影子版本",
+        "注册入口只允许从未存在过的新策略代码",
+    ):
+        assert contract in script
+    for removed_claim in (
+        "deflated_sharpe_probability",
+        "probability_of_backtest_overfitting",
+        "false_discovery_rate_q",
+        "Deflated Sharpe",
+        "DSR ",
+        "PBO ",
+        "FDR q",
+    ):
+        assert removed_claim not in script
+    review_block = _javascript_block(
+        script,
+        "    window._strategyChallengerReview = function (challengerId) {",
+        "\n    };\n\n    window._strategyChallengerPromote",
+    )
+    assert "metrics:" not in review_block
+    assert "artifact_hash" not in review_block
 
 
 def test_governance_history_shows_canonical_revision_state_in_chinese():

@@ -17,6 +17,7 @@ from server.auth.schema import (
     auth_audit,
     auth_session,
     auth_user,
+    privileged_migrate_auth_schema,
     reset_auth_schema_cache,
 )
 from server.auth.service import registration_window_open
@@ -41,6 +42,7 @@ def _build_client(monkeypatch, tmp_path) -> tuple[TestClient, object]:
         connect_args={"check_same_thread": False},
     )
     reset_auth_schema_cache(engine)
+    privileged_migrate_auth_schema(engine)
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
     monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "legacy-secret")
     monkeypatch.setenv("PROBIGA_AUTH_COOKIE_SECURE", "false")

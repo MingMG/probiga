@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from datetime import date
+import inspect
 
+import pytest
+
+from integrations.qmt import reconciliation
 from integrations.qmt.reconciliation import _coverage_status, _price_consistency_status
 from tools.ensure_quality_gate import TASKS
 
@@ -49,6 +53,42 @@ def test_qmt_catalog_refresh_task_is_registered():
     assert task["cron_time"] == "01:10"
     assert task["script_path"] == "tools/setup_guojin_qmt_catalog.py"
     assert task["enabled"] == 1
+
+
+def test_qmt_reference_sync_captures_immutable_calendar_receipt():
+    task = next(item for item in TASKS if item["task_type"] == "qmt_reference_incremental")
+
+    assert "--include-calendar" in task["script_args"]
+
+
+def test_daily_reconciliation_is_exact_and_uses_independent_roots():
+    source = inspect.getsource(reconciliation.build_coverage_results)
+    previous_dates_source = inspect.getsource(
+        reconciliation._previous_trade_dates
+    )
+    expected_source = inspect.getsource(reconciliation._expected_stock_sets)
+
+    assert 'status = "PASS" if not missing and not unexpected else "FAIL"' in source
+    assert '"exact_set_required": dataset == "sm_stock_kline.1d"' in source
+    assert "load_stock_catalog" in expected_source
+    assert "load_trade_calendar_receipt" in expected_source
+    assert "si_all_code" not in expected_source
+    assert "sm_stock_kline" not in previous_dates_source
+
+
+def test_nightly_reconciliation_fails_closed_before_business_dml_on_schema_drift(
+    monkeypatch,
+):
+    class _Engine:
+        def begin(self):
+            raise AssertionError("business DML must not start before schema validation")
+
+    def reject_schema(_engine):
+        raise RuntimeError("audit schema drift")
+
+    monkeypatch.setattr(reconciliation, "validate_audit_schema", reject_schema)
+    with pytest.raises(RuntimeError, match="audit schema drift"):
+        reconciliation.run_nightly_reconciliation(_Engine())
 
 
 def test_qmt_local_gap_repair_execute_task_is_registered():

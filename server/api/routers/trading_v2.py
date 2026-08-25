@@ -1,6 +1,7 @@
 """Read-only V2 trading APIs. Recalculation is never performed by GET."""
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -24,12 +25,30 @@ from server.trading_v2.jobs import enqueue_job, transition_strategy
 
 
 router = APIRouter(prefix="/v2", tags=["trading-v2"])
+logger = logging.getLogger(__name__)
 
 _NEW_BUY_ACTIONS = frozenset({"BUY", "OPEN", "ADD", "BUY_READY"})
 _ACTIONABLE_SIGNAL_STATUSES = frozenset({"CONFIRM", "BUY_READY"})
 _BUY_COMPETITION_STATUSES = frozenset(
     {"ELIGIBLE", "PAPER_TRIAL_ELIGIBLE"}
 )
+
+
+def _degraded_read_error(operation: str, exc: Exception) -> dict[str, str]:
+    """Log private diagnostics while returning a stable public error."""
+
+    incident_id = uuid.uuid4().hex
+    logger.error(
+        "Trading V2 read failed: incident_id=%s exception_type=%s operation=%s",
+        incident_id,
+        type(exc).__name__,
+        operation,
+    )
+    return {
+        "error_code": f"{operation}_unavailable",
+        "error": "数据暂不可用，请稍后重试",
+        "incident_id": incident_id,
+    }
 
 
 class BacktestJobRequest(BaseModel):
@@ -418,7 +437,7 @@ def intraday_decisions(
             "decision_count": 0,
             "order_created_count": 0,
             "automatic_real_order_submission": False,
-            "error": str(exc)[:500],
+            **_degraded_read_error("intraday_summary", exc),
         }
         status = "degraded"
     return _envelope(
@@ -541,7 +560,7 @@ def etf_forward(limit: int = Query(default=100, ge=1, le=500)):
     except Exception as exc:
         data = {
             "status": "degraded",
-            "error": str(exc)[:500],
+            **_degraded_read_error("etf_forward", exc),
             "strategies": [],
             "observations": [],
             "observation_count": 0,
@@ -554,6 +573,8 @@ def etf_forward(limit: int = Query(default=100, ge=1, le=500)):
 
 @router.get("/system/data-evidence")
 def data_evidence():
+    """Expose component truth without flattening nested errors into OK."""
+
     repository = _repo()
     snapshot = repository.latest_snapshot()
     errors: list[str] = []
@@ -561,7 +582,8 @@ def data_evidence():
         qmt_attestation = load_qmt_kline_attestation_status(limit=3)
     except Exception as exc:
         qmt_attestation = {"status": "degraded", "runs": []}
-        errors.append(f"qmt_attestation: {exc}")
+        _degraded_read_error("qmt_attestation", exc)
+        errors.append("qmt_attestation_unavailable")
     membership: dict[str, Any] = {}
     for member_type in ("concept", "industry"):
         try:
@@ -572,22 +594,129 @@ def data_evidence():
         except Exception as exc:
             membership[member_type] = {
                 "status": "degraded",
+                "data_category": "POINT_IN_TIME_CONSTITUENT_MEMBERSHIP",
+                "data_category_label": (
+                    "概念成分归属历史"
+                    if member_type == "concept"
+                    else "行业成分归属历史"
+                ),
+                "excluded_data_categories": [
+                    "SECTOR_HEAT_HISTORY",
+                    "SECTOR_ROTATION_HISTORY",
+                ],
                 "runs": [],
                 "data": [],
+                "snapshot_complete": False,
             }
-            errors.append(f"{member_type}_membership: {exc}")
+            _degraded_read_error(f"{member_type}_membership", exc)
+            errors.append(f"{member_type}_membership_unavailable")
     level1 = repository.execution_capability(
         "B-003_RELIABLE_LEVEL1_BID_ASK"
     )
+    component_status = {
+        "qmt_kline_attestation": str(
+            qmt_attestation.get("status") or "unavailable"
+        ).lower(),
+        "concept_membership": str(
+            (membership.get("concept") or {}).get("status")
+            or "unavailable"
+        ).lower(),
+        "industry_membership": str(
+            (membership.get("industry") or {}).get("status")
+            or "unavailable"
+        ).lower(),
+        "level1_execution_capability": str(
+            (level1 or {}).get("status") or "unavailable"
+        ).upper(),
+    }
+    component_issues: list[str] = []
+    if component_status["qmt_kline_attestation"] != "complete":
+        component_issues.append(
+            "QMT旧日K线逐行补证尚未完整"
+        )
+    for member_type in ("concept", "industry"):
+        result = membership.get(member_type) or {}
+        if (
+            str(result.get("status") or "").lower() != "verified"
+            or result.get("snapshot_complete") is not True
+        ):
+            component_issues.append(
+                f"{member_type}成员快照未完整验真"
+            )
+    membership_and_kline_history_ready = not errors and not component_issues
+    excluded_historical_scopes = [
+        "SECTOR_HEAT_HISTORY",
+        "SECTOR_ROTATION_HISTORY",
+        "QMT_NATIVE_SECTOR_INDEX_REALTIME",
+        "QMT_NATIVE_SECTOR_INDEX_MINUTE",
+        "QMT_NATIVE_SECTOR_INDEX_DAILY_HISTORY",
+    ]
     data = {
         "qmt_kline_attestation": qmt_attestation,
         "membership": membership,
         "level1": level1,
         "errors": errors,
+        "component_status": component_status,
+        "component_issues": component_issues,
+        "membership_and_kline_history_ready": (
+            membership_and_kline_history_ready
+        ),
+        # Backward-compatible bool. Its exact, deliberately narrow scope is
+        # published beside it; it must never be interpreted as all industry
+        # history being available.
+        "historical_data_ready": membership_and_kline_history_ready,
+        "historical_data_ready_scope": (
+            "QMT_KLINE_ATTESTATION_AND_POINT_IN_TIME_MEMBERSHIP_ONLY"
+        ),
+        "verified_historical_scopes": [
+            "QMT_DAILY_KLINE_ATTESTATION",
+            "POINT_IN_TIME_CONCEPT_MEMBERSHIP",
+            "POINT_IN_TIME_INDUSTRY_MEMBERSHIP",
+        ],
+        "all_historical_data_ready": False,
+        "unverified_or_excluded_historical_scopes": (
+            excluded_historical_scopes
+        ),
+        "membership_data_boundary": {
+            "category": "POINT_IN_TIME_CONSTITUENT_MEMBERSHIP",
+            "description": "概念/行业成分归属快照，与热度历史、轮动历史分开",
+            "excluded_categories": excluded_historical_scopes,
+        },
+        "industry_history_evidence_categories": {
+            "point_in_time_constituent_membership": {
+                "label": "行业/概念成分归属历史",
+                "semantics": "指定日期的证券与板块归属关系，不含板块强弱或价格",
+                "ready": membership_and_kline_history_ready,
+                "source": "QMT_POINT_IN_TIME_MEMBERSHIP_SNAPSHOT",
+                "native_sector_index": False,
+            },
+            "source_specific_sector_heat_history": {
+                "label": "来源特定板块热度历史",
+                "semantics": "第三方来源自己的热度/排名口径，不等于QMT板块指数",
+                "ready": False,
+                "status": "NOT_VERIFIED_BY_THIS_ENDPOINT",
+                "native_sector_index": False,
+            },
+            "constituent_aggregated_strength_history": {
+                "label": "成分股聚合强弱历史",
+                "semantics": "由成分股行情按冻结成员集合派生，不是原生板块指数价格",
+                "ready": False,
+                "status": "NOT_VERIFIED_BY_THIS_ENDPOINT",
+                "native_sector_index": False,
+            },
+            "qmt_native_bkzs_index_history": {
+                "label": "QMT原生.BKZS板块指数历史",
+                "semantics": "仅接受完成代码识别、合约和逐行行情认证的原生指数数据",
+                "ready": False,
+                "status": "NOT_ATTESTED",
+                "synthetic_substitution_allowed": False,
+                "native_sector_index": True,
+            },
+        },
     }
     return _envelope(
         data,
-        status="degraded" if errors else "ok",
+        status="ok" if membership_and_kline_history_ready else "degraded",
         snapshot=snapshot,
     )
 
@@ -607,7 +736,7 @@ def system_operations():
             "workers": [],
             "real_trading_guards": [],
             "running_backtest_count": None,
-            "error": str(exc)[:500],
+            **_degraded_read_error("operations", exc),
         }
         status = "degraded"
     return _envelope(data, status=status, snapshot=snapshot)

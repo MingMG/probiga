@@ -1,47 +1,27 @@
 #!/usr/bin/env python3
-from remote_support import production_ssh_client, production_ssh_connect_kwargs
-import os
+"""Retired mutable-file production maintenance entrypoint.
 
-ssh = production_ssh_client()
-ssh.connect(**production_ssh_connect_kwargs())
+Production releases are accepted only through the audited GitHub workflow and
+the root-owned ``probiga-production-deploy`` broker.  This historical filename
+is kept as an explicit safety fence for old operator habits and shortcuts.
+"""
 
-stdin, stdout, stderr = ssh.exec_command(
-    "ps aux | grep 'sync_stock_market' | grep -v grep | awk '{print $2}' | xargs kill 2>/dev/null; echo 'killed all sync processes'",
-    timeout=10
+from __future__ import annotations
+
+import sys
+
+
+RETIRED_EXIT_CODE = 2
+RETIRED_MESSAGE = (
+    "Legacy mutable-file production maintenance is retired; "
+    "use the audited production deployment workflow."
 )
-stdout.channel.settimeout(10)
-print(stdout.read().decode().strip())
 
-sftp = ssh.open_sftp()
-local_path = os.path.join(os.path.dirname(__file__), '..', 'biz', 'stock_market', 'sync_stock_market.py')
-remote_path = '/opt/ProBigA/biz/stock_market/sync_stock_market.py'
-sftp.put(os.path.abspath(local_path), remote_path)
 
-shell_script = '''#!/bin/bash
-echo "$(date) - Waiting 10 minutes for rate limit cooldown..."
-sleep 600
-echo "$(date) - Starting K-line incremental sync..."
-cd /opt/ProBigA
-source venv/bin/activate
-export PYTHONPATH=/opt/ProBigA:/opt/ProBigA/adata
-export SM_MAX_STOCKS=0
-export SM_MAX_WORKERS=1
-export SM_REQUEST_SLEEP=0.5
-python -m biz.stock_market.sync_stock_market --only stock_kline \\
-    --kline-start 2026-04-28 --kline-end 2026-05-08 \\
-    --kline-incremental
-echo "$(date) - K-line sync done."
-'''
-with sftp.open('/tmp/run_kline_delayed.sh', 'w') as f:
-    f.write(shell_script)
-sftp.close()
+def main() -> int:
+    print(RETIRED_MESSAGE, file=sys.stderr)
+    return RETIRED_EXIT_CODE
 
-chan = ssh.get_transport().open_session()
-chan.settimeout(15)
-chan.exec_command('nohup bash /tmp/run_kline_delayed.sh > /tmp/kline_incremental.log 2>&1 & echo "PID=$!"')
-import time; time.sleep(3)
-out = chan.recv(4096).decode().strip()
-print(out)
-chan.close()
-ssh.close()
-print('Delayed K-line sync scheduled (10 min cooldown)')
+
+if __name__ == "__main__":
+    raise SystemExit(main())

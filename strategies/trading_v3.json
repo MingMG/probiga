@@ -28,7 +28,7 @@
   },
   "account": {
     "initial_cash_cny": 200000.0,
-    "commission_rate": 0.0001,
+    "commission_rate": 0.00025,
     "minimum_commission_cny": 5.0,
     "transfer_fee_rate": 0.00001,
     "sell_stamp_duty_rate": 0.0005,

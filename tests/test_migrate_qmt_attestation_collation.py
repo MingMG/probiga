@@ -363,7 +363,7 @@ def test_frozen_schema_manifest_is_deeply_immutable_and_rechecked_each_audit(
 
 def test_frozen_schema_digest_is_independent_reviewed_literal():
     assert migration.FROZEN_SCHEMA_CONTRACT_SHA256 == (
-        "55d490f291227c940f66271c30fe683f30983faec2dd50a73542d8c0ae57544e"
+        "fac7f2b32602bb677d9f0e5e33be6a833d11fa0c8842a67f0ba6f85b16b1f369"
     )
     migration._assert_frozen_schema_integrity()
 

@@ -16,3 +16,13 @@ TASK = {
     "sort_order": 218,
     "enabled": 1,
 }
+
+
+# Import-time validation freezes the cross-host order: the Windows-owned QMT
+# announcement capture must precede Linux analysis, which must precede this
+# governance close.  Runtime scheduling independently checks today's terminal
+# prerequisite rows before launching either downstream task.
+from tools.qmt_announcement_task_contract import validate_pipeline_order
+
+
+validate_pipeline_order(governance_cron=TASK["cron_time"])

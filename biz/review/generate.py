@@ -32,8 +32,6 @@ from server.common.batch_db import create_batch_engine
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("review")
 
-DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_review_tables.sql"
-
 SECTOR_NAMES = {
     "电力设备": ["电力设备", "光伏", "风电", "储能", "电网"],
     "公用事业": ["电力", "燃气", "水务", "环保"],
@@ -59,19 +57,6 @@ SECTOR_NAMES = {
 
 def get_engine():
     return create_batch_engine()
-
-
-def run_ddl(engine):
-    if DDL_PATH.is_file():
-        sql = DDL_PATH.read_text(encoding="utf-8")
-        for stmt in sql.split(";"):
-            stmt = stmt.strip()
-            if stmt and not stmt.startswith("--"):
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(text(stmt))
-                except Exception as e:
-                    log.debug("DDL: %s", e)
 
 
 # ═══════════════════════════════════════════
@@ -1168,8 +1153,6 @@ def generate_summary(overview: dict, sector: dict, idx_analysis: list) -> str:
 # ═══════════════════════════════════════════
 
 def generate_review(engine, date_str: str) -> dict:
-    run_ddl(engine)
-
     overview = calc_market_overview(engine, date_str)
     sector = calc_sector_analysis(engine, date_str)
     idx_analysis = calc_index_analysis(engine, date_str)

@@ -12,6 +12,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "market_overview_daily",
     "news_daily",
     "public_quote_failover",
+    "qmt_announcement_pit",
     "stock_snapshot_daily",
     "strategy_governance_daily",
     "trading_v2_intraday_activation",

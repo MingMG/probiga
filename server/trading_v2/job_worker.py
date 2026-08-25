@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import uuid
@@ -17,7 +18,11 @@ from .versioning import code_version
 
 
 WORKER_NAME = "trading-v2-job-worker"
-RESEARCH_PROTOCOL_VERSION = "v2_research_protocol_20260725_3"
+RESEARCH_PROTOCOL_VERSION = "v2_research_protocol_20260725_4"
+ETF_MUTABLE_INPUT_BLOCKERS = (
+    "ETF_PIT_CLASSIFICATION_LEDGER_UNAVAILABLE",
+    "ETF_RAW_BAR_REVISION_LEDGER_UNAVAILABLE",
+)
 
 
 def _json(payload: Any) -> str:
@@ -146,10 +151,102 @@ def _stock_backtest(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _etf_research_truth_contract(
+    snapshot_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Quarantine mutable ETF reference inputs from promotion authority."""
+
+    price_rows: list[dict[str, Any]] = []
+    classifications: dict[str, dict[str, Any]] = {}
+    for raw in snapshot_rows:
+        row = dict(raw)
+        code = str(row.get("etf_code") or "")
+        data_version = str(row.get("data_version") or "")
+        if not code or not data_version:
+            raise RuntimeError("ETF native snapshot row is unversioned")
+        raw_adjust_type = row.get("adjust_type")
+        if raw_adjust_type is None or int(raw_adjust_type) != 0:
+            raise RuntimeError("ETF research must use native adjust_type=0 rows")
+        received_at = str(row.get("received_at") or "")
+        if not received_at:
+            raise RuntimeError("ETF native snapshot row lacks received_at")
+        numeric_values: dict[str, float] = {}
+        for field in ("open", "close", "pre_close", "amount"):
+            try:
+                value = float(row.get(field))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"ETF native snapshot row has invalid {field}"
+                ) from exc
+            if not math.isfinite(value) or (
+                field != "amount" and value <= 0
+            ) or (field == "amount" and value < 0):
+                raise RuntimeError(
+                    f"ETF native snapshot row has invalid {field}"
+                )
+            numeric_values[field] = value
+        asset_class = str(row.get("asset_class") or "")
+        classification_updated_at = str(
+            row.get("classification_updated_at") or ""
+        )
+        if not asset_class or not classification_updated_at:
+            raise RuntimeError(
+                "ETF current classification snapshot lacks provenance"
+            )
+        price_rows.append({
+            "etf_code": code,
+            "trade_date": str(row.get("trade_date") or ""),
+            "adjust_type": 0,
+            "data_version": data_version,
+            "validation_status": str(row.get("validation_status") or ""),
+            "quality_status": str(row.get("quality_status") or ""),
+            "received_at": received_at,
+            **numeric_values,
+        })
+        classification = {
+            "etf_code": code,
+            "asset_class": asset_class,
+            "classification_updated_at": classification_updated_at,
+        }
+        previous = classifications.setdefault(code, classification)
+        if previous != classification:
+            raise RuntimeError(
+                "ETF current classification changed within one snapshot"
+            )
+    price_rows.sort(key=lambda item: (item["trade_date"], item["etf_code"]))
+    classification_rows = [
+        classifications[key] for key in sorted(classifications)
+    ]
+    price_hash = canonical_json_hash(price_rows)
+    classification_hash = canonical_json_hash(classification_rows)
+    payload = {
+        "schema": "probiga.etf-research-input-truth.v1",
+        "status": "MUTABLE_INPUTS_QUARANTINED_RESEARCH_ONLY",
+        "native_unadjusted_prices_only": True,
+        "adjusted_history_rows_consumed": False,
+        "derived_price_protocol": (
+            "NATIVE_UNADJUSTED_CLOSE_PRE_CLOSE_RETURN_CHAIN_AND_OPEN_RATIO_V1"
+        ),
+        "native_price_snapshot_hash": price_hash,
+        "native_price_row_count": len(price_rows),
+        "native_price_revision_ledger_available": False,
+        "current_classification_snapshot_hash": classification_hash,
+        "current_classification_count": len(classification_rows),
+        "historical_classification_verified": False,
+        "current_classification_can_authorize_promotion": False,
+        "activation_eligible": False,
+        "promotion_blockers": list(ETF_MUTABLE_INPUT_BLOCKERS),
+    }
+    return {**payload, "contract_hash": canonical_json_hash(payload)}
+
+
 def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
     from decimal import Decimal
 
-    from server.trading_v2.research import evaluate_oos_gate
+    from server.trading_v2.research import (
+        evaluate_oos_gate,
+        nav_records_from_equity,
+    )
     from server.trading_v2.research_replay import (
         annual_trade_metrics,
         fifo_completed_trade_rows,
@@ -181,12 +278,15 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
         snapshot_rows = connection.execute(
             text(
                 """
-                SELECT k.etf_code, k.trade_date, k.data_version,
+                SELECT k.etf_code, k.trade_date, k.adjust_type,
+                       k.data_version, k.received_at,
+                       k.open, k.close, k.pre_close, k.amount,
                        k.validation_status, k.quality_status,
-                       c.asset_class
+                       c.asset_class,
+                       c.updated_at AS classification_updated_at
                 FROM sm_etf_kline k
                 JOIN si_etf_code c ON c.etf_code = k.etf_code
-                WHERE k.adjust_type = 1
+                WHERE k.adjust_type = 0
                   AND k.k_type = 1
                   AND k.validation_status = 'passed'
                   AND k.quality_status = 'validated'
@@ -198,21 +298,10 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
         ).mappings().all()
     if not snapshot_rows:
         raise RuntimeError("ETF data snapshot has no validated source rows")
-    if any(not str(row["data_version"] or "") for row in snapshot_rows):
-        raise RuntimeError("ETF data snapshot contains unversioned rows")
-    data_snapshot_hash = canonical_json_hash(
-        [
-            {
-                "etf_code": str(row["etf_code"]),
-                "trade_date": str(row["trade_date"]),
-                "data_version": str(row["data_version"]),
-                "validation_status": str(row["validation_status"]),
-                "quality_status": str(row["quality_status"]),
-                "asset_class": str(row["asset_class"]),
-            }
-            for row in snapshot_rows
-        ]
+    research_truth = _etf_research_truth_contract(
+        [dict(row) for row in snapshot_rows]
     )
+    data_snapshot_hash = str(research_truth["contract_hash"])
     data, universe_audit = freeze_universe(
         source_data,
         cutoff_date="2020-12-31",
@@ -406,6 +495,10 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
         robustness=robustness,
         future_data_violations=future_violations,
         impossible_fill_profit=Decimal("0"),
+        nav_records=nav_records_from_equity(proposed["equity"]),
+        doubled_cost_nav_records=nav_records_from_equity(
+            doubled_cost["equity"]
+        ),
     )
     proposed_risk_adjusted = (
         float(proposed["performance"]["total_return"])
@@ -463,6 +556,7 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
         promotion_blockers.append("BASELINE_COMPARISON_BLOCKED")
     if confirmed_fee_rows == 0:
         promotion_blockers.append("B-001_ACTUAL_BROKER_FEES")
+    promotion_blockers.extend(ETF_MUTABLE_INPUT_BLOCKERS)
     # The frozen holdout has already been inspected during strategy
     # development, so it cannot honestly be relabelled as a one-shot,
     # untouched test set after the fact.
@@ -479,10 +573,13 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
             "source": "gj_big_qmt_inner",
             "validation_status": "passed",
             "quality_status": "validated",
+            "adjust_type": 0,
+            "stored_adjusted_history_consumed": False,
             "row_identity": (
-                "etf_code+trade_date+data_version+validation+asset_class"
+                "etf_code+trade_date+adjust_type+data_version+received_at"
             ),
         },
+        "research_input_truth": research_truth,
         "account_initial_cash": "200000.00",
         "data_source": "gj_big_qmt_inner",
         "universe_cutoff": "2020-12-31",
@@ -515,6 +612,7 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
             "blockers": promotion_blockers,
             "research_assumption_fees": confirmed_fee_rows == 0,
             "oos_passed": False,
+            "mutable_etf_inputs_quarantined": True,
         },
         "_data_snapshot_hash": data_snapshot_hash,
         "_trade_rows": proposed["trades"],

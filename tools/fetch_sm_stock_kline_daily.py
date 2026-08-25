@@ -3,9 +3,9 @@
 """
 Fetch one trading day's A-share daily K data into sm_stock_kline.
 
-This script is for the daily after-market pipeline. It uses the latest complete
-previous daily-kline universe as the target stock pool, fetches the requested
-date concurrently from Eastmoney, and writes only after coverage passes.
+This script is for the daily after-market pipeline.  Its target universe comes
+only from an independently captured QMT native A-share catalog.  It writes a
+day only when every target member has one bar.
 """
 from __future__ import annotations
 
@@ -37,11 +37,19 @@ from biz.stock_market.stock_kline_akshare import (  # noqa: E402
 )
 from biz.stock_market.sina_kline_fetch import fetch_sina_a_daily_kline  # noqa: E402
 from server.common.config import get_mysql_url  # noqa: E402
+from server.common.batch_db import replace_table_rows_exact_keys  # noqa: E402
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME  # noqa: E402
+from server.common.qmt_attestation_contract import (  # noqa: E402
+    expected_stock_set_contract,
+)
+from server.common.qmt_stock_catalog import (  # noqa: E402
+    load_target_stock_catalog,
+)
 
 _WORKERS = max(1, int(os.environ.get("KLINE_DAILY_WORKERS", "4")))
 _REQUEST_DELAY = float(os.environ.get("KLINE_DAILY_REQUEST_DELAY", "0.3"))
 _REQUEST_JITTER = float(os.environ.get("KLINE_DAILY_REQUEST_JITTER", "0.2"))
-_MIN_COVERAGE = float(os.environ.get("KLINE_DAILY_MIN_COVERAGE", "0.90"))
+_MIN_COVERAGE = 1.0
 _MAX_RETRIES = max(0, int(os.environ.get("KLINE_DAILY_MAX_RETRIES", "2")))
 _SOURCES = [s.strip().lower() for s in os.environ.get("KLINE_DAILY_SOURCES", "sina,east").split(",") if s.strip()]
 _BATCH_PAUSE = float(os.environ.get("KLINE_DAILY_BATCH_PAUSE", "30.0"))
@@ -102,42 +110,24 @@ def _read_short_name_map(engine: Engine) -> dict[str, str]:
     }
 
 
-def _latest_previous_universe_date(engine: Engine, target_date: str) -> str:
-    min_count = int(os.environ.get("KLINE_DAILY_MIN_UNIVERSE", "1000"))
-    with engine.connect() as conn:
-        d = conn.execute(text("""
-            SELECT trade_date
-            FROM sm_stock_kline
-            WHERE trade_date < :d AND k_type = 1 AND adjust_type = 0
-            GROUP BY trade_date
-            HAVING COUNT(DISTINCT stock_code) >= :min_count
-            ORDER BY trade_date DESC
-            LIMIT 1
-        """), {"d": target_date, "min_count": min_count}).scalar()
-    return _fmt_date(d)
-
-
-def _read_stock_codes(engine: Engine, target_date: str) -> tuple[list[str], str]:
-    universe_date = _latest_previous_universe_date(engine, target_date)
-    if universe_date:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT DISTINCT stock_code
-                FROM sm_stock_kline
-                WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
-                ORDER BY stock_code
-            """), {"d": universe_date}).fetchall()
-        return [str(r[0]).strip().zfill(6) for r in rows], f"sm_stock_kline:{universe_date}"
-
-    with engine.connect() as conn:
-        rows = conn.execute(text("""
-            SELECT stock_code
-            FROM si_all_code
-            WHERE stock_code REGEXP '^(0|3|6|4|8)'
-              AND (list_date IS NULL OR list_date <= :d)
-            ORDER BY stock_code
-        """), {"d": target_date}).fetchall()
-    return [str(r[0]).strip().zfill(6) for r in rows], "si_all_code"
+def _read_stock_codes(
+    engine: Engine,
+    target_date: str,
+) -> tuple[list[str], str, dict[str, object]]:
+    catalog, codes = load_target_stock_catalog(
+        engine,
+        target_date=target_date,
+        decision_known_at=datetime.now().replace(microsecond=0),
+    )
+    target_contract = expected_stock_set_contract(target_date, codes)
+    proof: dict[str, object] = {
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_count": catalog.member_count,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        **target_contract,
+    }
+    return codes, f"qmt_stock_catalog:{catalog.batch_id}", proof
 
 
 def _fetch_one(code: str, target_date: str, short_name: str) -> FetchOutcome:
@@ -231,13 +221,14 @@ def _write_daily_kline(engine: Engine, target_date: str, df: pd.DataFrame) -> in
         "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
         "turnover_ratio", "pre_close", "etl_sync_at",
     ]
-    with engine.begin() as conn:
-        conn.execute(text("""
-            DELETE FROM sm_stock_kline
-            WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
-        """), {"d": target_date})
-    full_df[columns].to_sql("sm_stock_kline", engine, if_exists="append", index=False, chunksize=1000, method="multi")
-    return len(full_df)
+    return replace_table_rows_exact_keys(
+        full_df[columns],
+        "sm_stock_kline",
+        engine,
+        key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+        lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        lock_timeout_seconds=max(0, int(os.environ.get("KLINE_DAILY_LOCK_TIMEOUT", "30"))),
+    )
 
 
 def fetch_daily_kline(target_date: str = "", *, min_coverage: float | None = None, dry_run: bool = False) -> int:
@@ -252,15 +243,27 @@ def fetch_daily_kline(target_date: str = "", *, min_coverage: float | None = Non
         print(f"日期格式错误，应为 YYYY-MM-DD，输入: {target_date}")
         return 2
 
-    stock_codes, universe_source = _read_stock_codes(engine, target_date)
+    stock_codes, universe_source, frozen_universe = _read_stock_codes(
+        engine, target_date
+    )
     max_stocks = int(os.environ.get("KLINE_DAILY_MAX_STOCKS", "0"))
     if max_stocks > 0:
-        stock_codes = stock_codes[:max_stocks]
-    min_coverage = _MIN_COVERAGE if min_coverage is None else min_coverage
+        print("KLINE_DAILY_MAX_STOCKS 会破坏权威目标池，生产日K任务已阻断")
+        return 2
+    requested_coverage = _MIN_COVERAGE if min_coverage is None else min_coverage
+    if requested_coverage != 1.0:
+        print("日K写入要求权威目标池 100% 精确覆盖，不能降低覆盖率阈值")
+        return 2
+    min_coverage = 1.0
     short_names = _read_short_name_map(engine)
 
     print(f"开始获取个股日K，目标日期: {target_date}")
     print(f"股票池: {universe_source}, 共 {len(stock_codes)} 只")
+    print(
+        "冻结目标池: "
+        f"count={frozen_universe['stock_count']} "
+        f"hash={frozen_universe['stock_set_hash']}"
+    )
     print(f"数据源链: {' -> '.join(_SOURCES)}, 并发: {_WORKERS}, 最小覆盖率: {min_coverage:.0%}, dry_run={dry_run}")
 
     parts: list[pd.DataFrame] = []
@@ -328,6 +331,10 @@ def fetch_daily_kline(target_date: str = "", *, min_coverage: float | None = Non
     full_df = pd.concat(parts, ignore_index=True)
     full_df = full_df.drop_duplicates(subset=["stock_code", "trade_date", "k_type", "adjust_type"], keep="last")
     coverage = len(full_df) / max(len(stock_codes), 1)
+    observed_codes = sorted(
+        {str(code).strip().zfill(6) for code in full_df["stock_code"].tolist()}
+    )
+    observed_contract = expected_stock_set_contract(target_date, observed_codes)
 
     elapsed_total = time.time() - started
     print("\n===== 汇总 =====")
@@ -343,13 +350,37 @@ def fetch_daily_kline(target_date: str = "", *, min_coverage: float | None = Non
     print(f"  覆盖率: {len(full_df)}/{len(stock_codes)} ({coverage:.1%})")
     print(f"  耗时: {elapsed_total:.0f}s ({elapsed_total/60:.1f}min)")
 
-    if coverage < min_coverage:
-        print(f"覆盖率 {coverage:.1%} 低于阈值 {min_coverage:.0%}，已停止写库")
+    if (
+        coverage != 1.0
+        or observed_codes != stock_codes
+        or observed_contract != {
+            "stock_count": frozen_universe["stock_count"],
+            "stock_set_hash": frozen_universe["stock_set_hash"],
+        }
+    ):
+        print("实际日K集合与冻结 QMT catalog 目标池不完全相等，已停止写库")
         return 3
     if dry_run:
         print("[dry-run] 覆盖率达标，但不写入数据库")
         return 0
 
+    # Re-read the exact selected append-only batch before mutation.  A newer
+    # catalog may appear during the fetch, but it cannot change this run's
+    # frozen batch or target-set hash.
+    current_catalog, current_codes = load_target_stock_catalog(
+        engine,
+        target_date=target_date,
+        decision_known_at=datetime.now().replace(microsecond=0),
+        batch_id=str(frozen_universe["catalog_batch_id"]),
+    )
+    if (
+        current_catalog.manifest_hash
+        != frozen_universe["catalog_manifest_hash"]
+        or expected_stock_set_contract(target_date, current_codes)
+        != observed_contract
+    ):
+        print("冻结 QMT catalog 批次在抓取期间发生变化，已停止写库")
+        return 3
     written = _write_daily_kline(engine, target_date, full_df)
     print(f"写入完成: sm_stock_kline {target_date}, 共 {written} 行")
     return 0
@@ -358,7 +389,7 @@ def fetch_daily_kline(target_date: str = "", *, min_coverage: float | None = Non
 def main() -> int:
     parser = argparse.ArgumentParser(description="获取指定交易日个股日K（并发+覆盖率保护）")
     parser.add_argument("date", nargs="?", default="", help="目标交易日 YYYY-MM-DD；不传则取交易日历最新开市日")
-    parser.add_argument("--min-coverage", type=float, default=None, help="写库前最小覆盖率，默认读 KLINE_DAILY_MIN_COVERAGE 或 0.90")
+    parser.add_argument("--min-coverage", type=float, default=None, help="兼容参数；生产写入固定要求 1.0，不能降低")
     parser.add_argument("--dry-run", action="store_true", help="只抓取并检查覆盖率，不写库")
     args = parser.parse_args()
     return fetch_daily_kline(args.date, min_coverage=args.min_coverage, dry_run=args.dry_run)

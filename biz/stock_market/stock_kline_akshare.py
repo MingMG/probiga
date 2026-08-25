@@ -359,24 +359,10 @@ def delete_kline_range(
     trade_start: str,
     trade_end: str,
 ) -> None:
-    """删除该股在日期区间内、指定 k_type/adjust 的 K 线，便于增量覆盖。"""
-    from sqlalchemy import text
+    """Reject the obsolete deletion-only publication API.
 
-    sql = text(
-        """
-        DELETE FROM sm_stock_kline
-        WHERE stock_code = :code AND k_type = :kt AND adjust_type = :adj
-          AND trade_date >= :d0 AND trade_date <= :d1
-        """
-    )
-    with engine.begin() as conn:
-        conn.execute(
-            sql,
-            {
-                "code": stock_code,
-                "kt": k_type,
-                "adj": adjust_type,
-                "d0": trade_start,
-                "d1": trade_end,
-            },
-        )
+    Callers must publish a fetched frame through the exact-key atomic helper;
+    a range delete cannot distinguish provider failures from authoritative gaps.
+    """
+    del engine, stock_code, k_type, adjust_type, trade_start, trade_end
+    raise RuntimeError("deletion-only K-line range refresh is disabled")

@@ -4,8 +4,9 @@ import logging
 import os
 from pathlib import Path
 import time
+import uuid
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import (
@@ -29,6 +30,13 @@ from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
 from server.engine.strategy_execution_adapters import (
     bootstrap_strategy_execution_adapter_registry,
+)
+from server.api.strategy_evidence_request_limit import (
+    StrategyEvidenceRequestSizeMiddleware,
+    StrategyEvidenceRequestTooLarge,
+    StrategyGovernanceRequestTooLarge,
+    strategy_evidence_too_large_response,
+    strategy_governance_too_large_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,11 +104,15 @@ def _database_error_response(
             "status": "error",
             "error": "database_unavailable",
             "message": "数据库连接暂时不可用，请稍后重试。",
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         }
     return 500, {
         "status": "error",
         "error": "database_operation_failed",
         "message": "数据库操作失败，服务版本或数据结构可能不一致。",
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -118,7 +130,11 @@ def dispose_shared_engines() -> None:
         try:
             dispose()
         except Exception as exc:
-            logger.warning("Dispose %s engine failed: %s", label, exc, exc_info=True)
+            logger.warning(
+                "Engine dispose failed: engine=%s exception_type=%s",
+                label,
+                type(exc).__name__,
+            )
 
 
 @asynccontextmanager
@@ -151,6 +167,21 @@ app = FastAPI(
     description="数据分析平台 API",
     lifespan=lifespan,
 )
+app.add_middleware(StrategyEvidenceRequestSizeMiddleware)
+
+
+@app.exception_handler(StrategyEvidenceRequestTooLarge)
+async def strategy_evidence_request_too_large_handler(
+    _request: Request, _exc: StrategyEvidenceRequestTooLarge,
+):
+    return strategy_evidence_too_large_response()
+
+
+@app.exception_handler(StrategyGovernanceRequestTooLarge)
+async def strategy_governance_request_too_large_handler(
+    _request: Request, _exc: StrategyGovernanceRequestTooLarge,
+):
+    return strategy_governance_too_large_response()
 
 app.include_router(health.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
@@ -239,14 +270,23 @@ async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
 
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled error while handling %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    incident_id = uuid.uuid4().hex
+    logger.error(
+        "Unhandled request error: incident_id=%s exception_type=%s method=%s path=%s",
+        incident_id,
+        type(exc).__name__,
+        request.method,
+        request.url.path,
+    )
     return JSONResponse(
         status_code=500,
         content={
             "status": "error",
             "error": "internal_server_error",
             "message": "服务内部错误，请稍后重试。",
-            "detail": str(exc),
+            "incident_id": incident_id,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         },
     )
 
@@ -294,6 +334,8 @@ def battle_shortcut():
 
 @app.get("/deploy", response_class=HTMLResponse)
 def deploy_console():
+    if not deploy._in_app_deploy_enabled():
+        raise HTTPException(status_code=404, detail="In-app deployment is disabled")
     page_path = static_dir / "deploy.html"
     if page_path.is_file():
         return HTMLResponse(content=page_path.read_text(encoding="utf-8"))

@@ -37,7 +37,7 @@ readonly DEPLOY_PROTOCOL_VERSION=probiga-production-deploy-v4
 readonly RECOVERY_PROTOCOL_VERSION=probiga-database-guard-recovery-v2
 readonly CAPABILITY_SCHEMA=probiga.production-deploy.capabilities.v1
 readonly TRUSTED_ARTIFACT_PROTOCOL=probiga-trusted-artifacts-v2
-readonly BROKER_COMPILED_LOCK_STATUS=BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED
+readonly BROKER_COMPILED_LOCK_STATUS=READY
 readonly TRUSTED_REMOTE=git@github.com:MingMG/probiga.git
 readonly DEPLOY_USER=probiga-deploy
 readonly GITHUB_SSH_KEY=/etc/probiga/github-readonly-ed25519
@@ -770,7 +770,7 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION=2 || \
     fail "trusted production release manifest version differs"
   test "${RELEASE_MANIFEST_LINES[1]}" = \
-    PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_17_x86_64 || \
+    PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_28_x86_64 || \
     fail "trusted production lock target differs"
   case "${RELEASE_MANIFEST_LINES[2]}" in
     PROBIGA_PRODUCTION_LOCK_STATUS=*) \
@@ -837,13 +837,13 @@ if [ "$BROKER_OPERATION" = deploy ]; then
   fi
   grep -Fx 'PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1' \
     "$WHEEL_MANIFEST_FILE" >/dev/null || fail "trusted wheel manifest header differs"
-  grep -Fx 'TARGET=cp314-manylinux_2_17_x86_64' \
+  grep -Fx 'TARGET=cp314-manylinux_2_28_x86_64' \
     "$WHEEL_MANIFEST_FILE" >/dev/null || fail "trusted wheel manifest target differs"
   grep -Fx 'STATUS=READY' "$WHEEL_MANIFEST_FILE" >/dev/null || \
     fail "trusted wheel manifest is not READY"
   grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl$' \
     "$WHEEL_MANIFEST_FILE" || fail "trusted wheel manifest has no exact wheel entries"
-  if grep -Ev '^(PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1|TARGET=cp314-manylinux_2_17_x86_64|STATUS=READY|[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl|#.*|[[:space:]]*)$' \
+  if grep -Ev '^(PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1|TARGET=cp314-manylinux_2_28_x86_64|STATUS=READY|[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl|#.*|[[:space:]]*)$' \
       "$WHEEL_MANIFEST_FILE" >/dev/null; then
     fail "trusted wheel manifest contains malformed entries"
   fi

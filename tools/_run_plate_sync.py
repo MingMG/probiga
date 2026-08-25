@@ -1,24 +1,27 @@
-from remote_support import production_ssh_client, production_ssh_connect_kwargs
-import os
+#!/usr/bin/env python3
+"""Retired mutable-file production maintenance entrypoint.
 
-ssh = production_ssh_client()
-ssh.connect(**production_ssh_connect_kwargs())
-sftp = ssh.open_sftp()
+Production releases are accepted only through the audited GitHub workflow and
+the root-owned ``probiga-production-deploy`` broker.  This historical filename
+is kept as an explicit safety fence for old operator habits and shortcuts.
+"""
 
-sftp.put(os.path.abspath('e:/My Code/ProBigA/tools/_sync_plates_for_fused.py'), '/opt/ProBigA/tools/_sync_plates_for_fused.py')
-print('OK: _sync_plates_for_fused.py uploaded')
-sftp.close()
+from __future__ import annotations
 
-print('--- 运行板块数据同步 ---')
-stdin, stdout, stderr = ssh.exec_command(
-    'cd /opt/ProBigA && /opt/ProBigA/venv/bin/python tools/_sync_plates_for_fused.py',
-    timeout=600
+import sys
+
+
+RETIRED_EXIT_CODE = 2
+RETIRED_MESSAGE = (
+    "Legacy mutable-file production maintenance is retired; "
+    "use the audited production deployment workflow."
 )
-out = stdout.read().decode()
-err = stderr.read().decode()
-print(out)
-if err:
-    print('STDERR:', err[:1000])
 
-ssh.close()
-print('Done!')
+
+def main() -> int:
+    print(RETIRED_MESSAGE, file=sys.stderr)
+    return RETIRED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

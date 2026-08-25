@@ -25,6 +25,8 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 # ── 慢速参数（东财限流极严，必须非常慢）──
 REQUEST_DELAY = 3.0       # 基础间隔 3 秒
@@ -192,11 +194,14 @@ def _backfill_one_day(engine, target_date: str, stock_codes: list[str]):
     df = df.replace({np.nan: None})
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d"), {"d": target_date})
-
-    df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False,
-              chunksize=500, method="multi")
+    replace_table_rows_exact_keys(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=500,
+    )
 
     elapsed = time.time() - t_start
     print(f"  ✅ {target_date} 写入 {len(df)} 条  成功={success}  失败={failed}  无数据={no_data}  耗时 {elapsed:.0f}s ({elapsed/60:.1f}min)")

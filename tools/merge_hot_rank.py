@@ -24,7 +24,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
-from server.common.batch_db import read_frame, write_frame
+from server.common.batch_db import read_frame, replace_table_rows
+from server.common.auxiliary_runtime_schema import (
+    validate_hot_rank_fusion_runtime_schema,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -37,32 +40,6 @@ ensure_adata_import_path(ROOT)
 
 def _warn(message: str, exc: Exception) -> None:
     print(f"[WARN] {message}: {exc}", file=sys.stderr)
-
-
-def _load_sql(file_name: str) -> str:
-    p = ROOT / "tools" / file_name
-    if p.exists():
-        return p.read_text(encoding="utf-8")
-    return ""
-
-
-def run_ddl(engine, file_name: str):
-    sql = _load_sql(file_name)
-    if not sql:
-        print(f"  SQL文件 {file_name} 未找到，跳过自动建表")
-        return
-    with engine.begin() as conn:
-        for stmt in sql.split(";"):
-            s = stmt.strip()
-            if s and not s.startswith("--"):
-                try:
-                    conn.execute(text(s))
-                except Exception as e:
-                    if "already exists" in str(e) or "Duplicate" in str(e):
-                        pass
-                    else:
-                        print(f"  执行SQL警告（可忽略）: {e}")
-    print(f"  已执行建表SQL: {file_name}")
 
 
 def _score_from_rank(rank) -> float:
@@ -335,9 +312,19 @@ def run_single_day(engine, snapshot_date: str, top_n: int, save: bool):
           f"仅东财 {east_only} | 仅同花顺 {ths_only} | 仅雪球 {xq_only} | 仅新浪 {sina_only}")
 
     if save:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM `st_hot_rank_fused` WHERE `snapshot_date` = :d"), {"d": snapshot_date})
-        write_frame(top_df, "st_hot_rank_fused", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        validate_hot_rank_fusion_runtime_schema(
+            engine,
+            tables=("st_hot_rank_fused",),
+        )
+        replace_table_rows(
+            top_df,
+            "st_hot_rank_fused",
+            engine,
+            where_sql="snapshot_date = :snapshot_date",
+            params={"snapshot_date": snapshot_date},
+            chunksize=500,
+            method="multi",
+        )
         print(f"  已写入 st_hot_rank_fused，共 {len(top_df)} 行")
 
 
@@ -514,15 +501,22 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
     print(f"\n  多日统计: 全部{num_days}天均上榜 {full_cover} 只 | 半数以上 {appear_ge_half} 只")
 
     if save:
+        validate_hot_rank_fusion_runtime_schema(
+            engine,
+            tables=("st_hot_rank_multi_day",),
+        )
         top_df["stat_date"] = end_date
         top_df["stat_days"] = num_days
         top_df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM `st_hot_rank_multi_day` WHERE `stat_date` = :d AND `stat_days` = :n"),
-                {"d": end_date, "n": num_days}
-            )
-        write_frame(top_df, "st_hot_rank_multi_day", engine, if_exists="append", index=False, chunksize=500, method="multi")
+        replace_table_rows(
+            top_df,
+            "st_hot_rank_multi_day",
+            engine,
+            where_sql="stat_date = :stat_date AND stat_days = :stat_days",
+            params={"stat_date": end_date, "stat_days": num_days},
+            chunksize=500,
+            method="multi",
+        )
         print(f"  已写入 st_hot_rank_multi_day，共 {len(top_df)} 行")
 
 
@@ -543,7 +537,6 @@ def main():
         return
 
     engine = create_tool_engine(resolve_tool_mysql_url())
-    run_ddl(engine, "02_hot_rank_extra_tables.sql")
 
     if args.days > 1:
         run_multi_day(engine, snapshot_date, args.days, args.top, save=not args.no_save)

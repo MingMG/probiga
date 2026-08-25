@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import uuid
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -624,7 +625,8 @@ def _execution_buy_gate_decision(
     )
     intent_row = connection.execute(
         text(
-            "SELECT decision_run_uid, evidence_json "
+            "SELECT account_id, decision_run_uid, strategy_version, "
+            "stock_code, action, reason_code, evidence_json "
             "FROM st_trade_intent_v2 "
             "WHERE intent_id = :intent_id" + lock_clause
         ),
@@ -636,6 +638,96 @@ def _execution_buy_gate_decision(
             "BUY_GATE_EVIDENCE_MISSING",
             "order intent is missing",
         )
+    if str(intent_row.get("reason_code") or "") == "DYNAMIC_SHADOW_BOOTSTRAP":
+        try:
+            payload = json.loads(str(intent_row.get("evidence_json") or "{}"))
+            if not isinstance(payload, dict):
+                raise ValueError("bootstrap evidence must be an object")
+            authorization = payload.get("dynamic_shadow_bootstrap")
+            risk_binding = payload.get("dynamic_shadow_risk")
+            if not isinstance(authorization, dict) or not isinstance(
+                risk_binding, dict,
+            ):
+                raise ValueError("bootstrap evidence bindings are missing")
+            from server.engine.dynamic_shadow_ledger import (
+                verify_dynamic_shadow_bootstrap_authorization,
+                verify_dynamic_shadow_bootstrap_risk_binding,
+            )
+
+            verified_authorization = (
+                verify_dynamic_shadow_bootstrap_authorization(
+                    connection,
+                    authorization,
+                    require_current_shadow=True,
+                )
+            )
+            verified_risk = verify_dynamic_shadow_bootstrap_risk_binding(
+                connection,
+                risk_binding,
+                intent_id=str(order.get("intent_id") or ""),
+                require_current_shadow=True,
+            )
+            strategy_key = str(verified_authorization["strategy_key"])
+            strategy_version = str(verified_authorization["strategy_version"])
+            expected_ownership_hash = hashlib.sha256(
+                (
+                    f"{verified_authorization['candidate_run_uid']}|"
+                    f"{verified_authorization['shadow_forecast_id']}|"
+                    f"{verified_authorization['stock_code']}|"
+                    f"{strategy_key}|{strategy_version}"
+                ).encode("utf-8")
+            ).hexdigest()
+            if (
+                verified_risk["authorization"]["authorization_hash"]
+                != verified_authorization["authorization_hash"]
+                or str(intent_row.get("account_id") or "")
+                != str(verified_authorization["account_id"])
+                or str(order.get("account_id") or "")
+                != str(verified_authorization["account_id"])
+                or str(intent_row.get("decision_run_uid") or "")
+                != str(verified_authorization["candidate_run_uid"])
+                or str(intent_row.get("strategy_version") or "")
+                != strategy_version
+                or str(order.get("strategy_version") or "")
+                != strategy_version
+                or str(intent_row.get("stock_code") or "")
+                != str(verified_authorization["stock_code"])
+                or str(order.get("stock_code") or "")
+                != str(verified_authorization["stock_code"])
+                or str(intent_row.get("action") or "").upper() != "BUY"
+                or int(order.get("quantity") or 0)
+                != int(verified_risk["risk_decision"]["approved_quantity"] or 0)
+                or str(payload.get("source") or "")
+                != "DYNAMIC_SHADOW_BOOTSTRAP"
+                or str(payload.get("run_uid") or "")
+                != str(verified_authorization["candidate_run_uid"])
+                or str(payload.get("model_version") or "")
+                != strategy_version
+                or str(payload.get("primary_strategy_key") or "")
+                != strategy_key
+                or str(payload.get("primary_strategy_version") or "")
+                != strategy_version
+                or str(payload.get("primary_forecast_id") or "")
+                != str(verified_authorization["shadow_forecast_id"])
+                or str(payload.get("sample_owner_role") or "") != "PRIMARY"
+                or str(payload.get("attribution_status") or "")
+                != "VERIFIED_SNAPSHOT"
+                or str(payload.get("attribution_version") or "")
+                != "V3_PRIMARY_FORECAST_SNAPSHOT_V1"
+                or str(payload.get("ownership_hash") or "")
+                != expected_ownership_hash
+                or payload.get("automatic_real_order_submission") is not False
+                or payload.get("real_order_authority") is not False
+                or payload.get("real_trading_enabled") is not False
+            ):
+                raise ValueError("bootstrap intent/order ownership mismatch")
+        except Exception as exc:
+            return BuyGateDecision(
+                False,
+                "DYNAMIC_SHADOW_BOOTSTRAP_INVALID",
+                str(exc),
+            )
+        return BuyGateDecision(True)
     decision_run_uid = str(intent_row.get("decision_run_uid") or "")
     bound = bound_buy_gate(intent_row.get("evidence_json"))
     current_load = load_current_buy_gate(

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from integrations.qmt.audit import ensure_audit_tables
+from integrations.qmt.audit import validate_audit_schema
 from integrations.qmt.diagnostics import capabilities, core_probe, diagnostics
 from integrations.qmt.raw_store import archive_payload, result_dict
 from server.common.config import get_mysql_url
@@ -32,7 +32,7 @@ def _provenance(diag: dict) -> dict:
 
 def main() -> int:
     engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
-    ensure_audit_tables(engine)
+    validate_audit_schema(engine)
     batch_id = uuid.uuid4().hex
     diag = diagnostics(force=True)
     if diag.get("status") != "ok":

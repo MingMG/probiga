@@ -30,6 +30,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 
 def _engine():
@@ -102,10 +104,13 @@ def main():
 
     # 写入数据库
     print(f"写入 {len(result_df)} 条估算资金流数据...")
-    with eng.begin() as conn:
-        conn.execute(text("DELETE FROM sm_stock_capital_flow_daily"))
-
-    result_df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=1000)
+    replace_table_rows_exact_keys(
+        result_df,
+        "sm_stock_capital_flow_daily",
+        eng,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+    )
 
     # 验证
     with eng.connect() as conn:

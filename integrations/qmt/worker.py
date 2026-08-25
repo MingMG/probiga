@@ -460,6 +460,9 @@ def _minute(payload: dict[str, Any]) -> dict[str, Any]:
     start_date = payload.get("start_date") or trade_date
     end_date = payload.get("end_date") or trade_date
     count = int(payload.get("count") or os.environ.get("QMT_MINUTE_COUNT", "0"))
+    fill_data = payload.get("fill_data", True)
+    if type(fill_data) is not bool:
+        raise ValueError("QMT minute fill_data must be boolean")
     batch_size = int(payload.get("batch_size") or os.environ.get("QMT_MINUTE_BATCH_SIZE", "200"))
 
     rows: list[dict[str, Any]] = []
@@ -472,7 +475,7 @@ def _minute(payload: dict[str, Any]) -> dict[str, Any]:
             period="1m",
             count=count,
             dividend_type="none",
-            fill_data=True,
+            fill_data=fill_data,
         )
         rows.extend(_transform_minute(data, trade_date=trade_date))
         time.sleep(float(os.environ.get("QMT_BATCH_SLEEP_SECONDS", "0.15") or "0.15"))
@@ -604,6 +607,52 @@ def _sector_members_many(payload: dict[str, Any]) -> dict[str, Any]:
     return {"rows": _records(rows), "errors": {}}
 
 
+def _historical_contract_catalog(_: dict[str, Any]) -> dict[str, Any]:
+    downloader = getattr(xtdata, "download_history_contracts", None)
+    if not callable(downloader):
+        raise RuntimeError("QMT download_history_contracts is unavailable")
+    downloader()
+    sector_names = sorted({
+        str(name).strip() for name in (xtdata.get_sector_list() or [])
+        if "过期" in str(name) and str(name).strip()
+    })
+    if not sector_names:
+        raise RuntimeError("QMT historical contract download exposed no expired sectors")
+    rows: list[dict[str, Any]] = []
+    for sector_name in sector_names:
+        members = xtdata.get_stock_list_in_sector(
+            sector_name, real_timetag=-1
+        )
+        if members is None:
+            raise RuntimeError(
+                f"QMT expired sector membership is unavailable: {sector_name}"
+            )
+        for qmt_code in members:
+            code = str(qmt_code or "").strip().upper()
+            stock_code, dot, exchange = code.partition(".")
+            if (
+                dot != "."
+                or exchange not in {"SH", "SZ", "BJ"}
+                or len(stock_code) != 6
+                or not stock_code.isdigit()
+                or stock_code[0] not in {"0", "3", "4", "6", "8", "9"}
+            ):
+                continue
+            rows.append({
+                "sector_name": sector_name,
+                "qmt_code": code,
+                "stock_code": stock_code,
+                "exchange": exchange,
+            })
+    if not rows:
+        raise RuntimeError("QMT expired sectors exposed no historical A-share")
+    return {
+        "expired_sectors": sector_names,
+        "rows": _records(rows),
+        "errors": {},
+    }
+
+
 def _instrument_detail_row(qmt_code: str, detail: dict[str, Any] | None) -> dict[str, Any]:
     detail = detail or {}
     exchange = str(detail.get("ExchangeID") or "").strip().upper()
@@ -618,6 +667,7 @@ def _instrument_detail_row(qmt_code: str, detail: dict[str, Any] | None) -> dict
         "qmt_code": qmt_code,
         "stock_code": qmt_code.split(".", 1)[0].zfill(6),
         "exchange": exchange,
+        "product_type": str(detail.get("ProductType") or "").strip(),
         "short_name": short_name,
         "list_date": open_date,
         "expire_date": expire_date,
@@ -1276,6 +1326,8 @@ def dispatch(payload: dict[str, Any], connection_port: int | None = None) -> dic
         return _sector_members(payload)
     if action == "sector_members_many":
         return _sector_members_many(payload)
+    if action == "historical_contract_catalog":
+        return _historical_contract_catalog(payload)
     if action == "instrument_details":
         return _instrument_details(payload)
     if action == "index_weight":

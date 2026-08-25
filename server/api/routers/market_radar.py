@@ -55,6 +55,12 @@ def radar_status() -> dict[str, Any]:
         "status": "ok",
         "data_source": "qmt_full_tick_5level",
         "l2_available": False,
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "industry_evidence_status": "DATA_BLOCKED",
+        "membership_evidence_status": "LEGACY_UNVERIFIED",
+        "funding_eligible": False,
+        "order_authority": False,
         "quote_fields": ["price", "change_pct", "amount", "amount_delta", "bid/ask five levels"],
         "flow_note": "QMT 当前环境无 VIP/L2；资金强弱使用成交额增量与五档压力代理",
         "latest": rows[0] if rows else {},
@@ -96,7 +102,15 @@ def radar_stocks(
         context="market_radar_stocks",
         stringify_datetime=True,
     )
-    return {"status": "ok", "data_source": "qmt_full_tick_5level", "rows": _json_column(rows, "signal_tags")}
+    return {
+        "status": "ok",
+        "data_source": "qmt_full_tick_5level",
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "funding_eligible": False,
+        "order_authority": False,
+        "rows": _json_column(rows, "signal_tags"),
+    }
 
 
 @router.get("/sectors")
@@ -133,6 +147,12 @@ def radar_sectors(
     return {
         "status": "ok",
         "data_source": "qmt_full_tick_5level+local_membership",
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "industry_evidence_status": "DATA_BLOCKED",
+        "membership_evidence_status": "LEGACY_UNVERIFIED",
+        "funding_eligible": False,
+        "order_authority": False,
         "rows": _json_column(rows, "dragon_json", "core_json", "follower_json"),
     }
 
@@ -154,4 +174,13 @@ def radar_events(limit: int = Query(50, ge=1, le=500)) -> dict[str, Any]:
         context="market_radar_events",
         stringify_datetime=True,
     )
-    return {"status": "ok", "data_source": "qmt_full_tick_5level", "rows": _json_column(rows, "detail_json")}
+    return {
+        "status": "ok",
+        "data_source": "qmt_full_tick_5level",
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "membership_evidence_status": "LEGACY_UNVERIFIED",
+        "funding_eligible": False,
+        "order_authority": False,
+        "rows": _json_column(rows, "detail_json"),
+    }

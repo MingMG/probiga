@@ -41,31 +41,100 @@ def test_workflow_uses_fixed_root_owned_deploy_broker() -> None:
     assert "bash \"$DEPLOY_BOOTSTRAP\"" not in workflow
 
 
-def test_workflow_uses_the_stable_v2_broker_contract() -> None:
-    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
-        encoding="utf-8"
-    )
-    normalized = _normalized_shell(workflow)
-    assert "--capabilities" not in workflow
-    assert "resolved_requirements_b64:" in workflow
-    assert "resolved_requirements_sha256:" in workflow
-    assert (
-        'printf \'%s\\n\' "$RESOLVED_REQUIREMENTS_B64" | '
-        'sudo -n /usr/local/sbin/probiga-production-deploy '
-        '"$EXPECTED_SHA" "$EXPECTED_REQUIREMENTS_SHA256" '
-        '"$EXPECTED_ADATA_SHA" "$EXPECTED_ADATA_TREE_SHA256"'
-        in normalized
-    )
-
-
-def test_v2_deploy_does_not_depend_on_the_blocked_static_wheel_lock() -> None:
+def test_workflow_uses_the_v4_single_sha_broker_contract() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"
     )
     deploy = workflow[workflow.index("\n  deploy:"):]
-    assert "Fail closed unless the complete production artifact lock" not in deploy
-    assert "PROBIGA_PRODUCTION_LOCK_STATUS=READY" not in deploy
-    assert "EXPECTED_REQUIREMENTS_SHA256" in deploy
+    normalized = _normalized_shell(workflow)
+    assert "--capabilities" not in workflow
+    assert 'envs: EXPECTED_SHA' in deploy
+    assert (
+        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
+        in normalized
+    )
+    assert normalized.count(
+        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
+    ) == 1
+    for forbidden in (
+        "RESOLVED_REQUIREMENTS_B64",
+        "EXPECTED_REQUIREMENTS_SHA256",
+        "EXPECTED_ADATA_SHA",
+        "EXPECTED_ADATA_TREE_SHA256",
+        "resolved_requirements_b64:",
+        "resolved_requirements_sha256:",
+    ):
+        assert forbidden not in deploy
+
+
+def test_v4_deploy_uses_a_ready_cp314_manylinux_2_28_static_lock() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    deploy = workflow[workflow.index("\n  deploy:"):]
+    release = (ROOT / "deploy" / "production_release.env").read_text(
+        encoding="utf-8"
+    )
+    requirements_input_path = ROOT / "deploy" / "production_requirements.in"
+    platform_input_path = ROOT / "requirements-platform.txt"
+    requirements_path = ROOT / "deploy" / "production_requirements.lock"
+    requirements = requirements_path.read_text(encoding="utf-8")
+    wheel_manifest_path = ROOT / "deploy" / "production_wheel_manifest.lock"
+    wheel_manifest = wheel_manifest_path.read_text(encoding="utf-8")
+
+    assert "EXPECTED_REQUIREMENTS_SHA256" not in deploy
+    assert "PROBIGA_PRODUCTION_LOCK_STATUS=READY" in release
+    assert (
+        "PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_28_x86_64"
+        in release
+    )
+    assert "STATUS=READY" in requirements
+    assert "TARGET=cp314-manylinux_2_28_x86_64" in requirements
+    assert "STATUS=READY" in wheel_manifest
+    assert "TARGET=cp314-manylinux_2_28_x86_64" in wheel_manifest
+    assert "BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED" not in (
+        release + requirements + wheel_manifest
+    )
+
+    release_fields = dict(
+        line.split("=", 1)
+        for line in release.splitlines()
+        if line and not line.startswith("#") and "=" in line
+    )
+    assert release_fields["INPUT_LOCK_SHA256"] == hashlib.sha256(
+        requirements_path.read_bytes()
+    ).hexdigest()
+    assert release_fields["WHEEL_MANIFEST_SHA256"] == hashlib.sha256(
+        wheel_manifest_path.read_bytes()
+    ).hexdigest()
+    assert (
+        "# REQUIREMENTS_INPUT_SHA256="
+        + hashlib.sha256(requirements_input_path.read_bytes()).hexdigest()
+        in requirements
+    )
+    assert "# PLATFORM_SOURCE=requirements-platform.txt" in requirements
+    assert (
+        "# PLATFORM_REQUIREMENTS_SHA256="
+        + hashlib.sha256(platform_input_path.read_bytes()).hexdigest()
+        in requirements
+    )
+
+
+def test_regressions_install_the_exact_hashed_production_lock() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    install = workflow[
+        workflow.index("      - name: Install regression dependencies") :
+        workflow.index(
+            "      - name: Scan tracked secrets after dependency installation"
+        )
+    ]
+    assert "--require-hashes" in install
+    assert "deploy/production_requirements.lock" in install
+    assert "python -m pip check" in install
+    assert "pip install --upgrade" not in install
+    assert "pip install -r requirements-platform.txt" not in install
 
 
 def test_clean_git_ignores_hostile_environment_and_replace_refs(
@@ -156,16 +225,26 @@ def test_broker_restricts_caller_remote_and_revision() -> None:
     assert "deploy/production_wheel_manifest.lock" in broker
     assert "EXPECTED_ADATA_TREE_SHA256" in broker
     assert "deploy/production_release.env" in broker
+    normalized = _normalized_shell(broker)
+    for trusted_path in (
+        "deploy/production_release.env",
+        "deploy/production_requirements.lock",
+        "deploy/production_wheel_manifest.lock",
+    ):
+        assert f'"${{EXPECTED_SHA}}:{trusted_path}"' in normalized
+    assert "root-derived input lock digest is invalid" in broker
+    assert "trusted input lock digest differs from release manifest" in broker
+    assert "trusted wheel manifest digest differs from release manifest" in broker
 
 
-def test_blocked_broker_fails_before_any_lock_cache_or_network_side_effect() -> None:
+def test_ready_broker_checks_its_compiled_lock_status_before_side_effects() -> None:
     broker = (ROOT / "deploy" / "production_deploy_root.sh").read_text(
         encoding="utf-8"
     )
     release = (ROOT / "deploy" / "production_release.env").read_text(
         encoding="utf-8"
     )
-    status = "BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED"
+    status = "READY"
     assert f"readonly BROKER_COMPILED_LOCK_STATUS={status}" in broker
     assert f"PROBIGA_PRODUCTION_LOCK_STATUS={status}" in release
     blocker = broker.index(
@@ -254,28 +333,33 @@ def test_broker_validates_and_routes_no_receipt_forward_recovery_phases() -> Non
     assert "intermediate forward recovery requires a restore journal" in snapshot_only
 
 
-def test_v2_engine_builds_and_verifies_an_isolated_runtime_wheelhouse() -> None:
+def test_v4_engine_builds_and_verifies_a_hashed_static_wheelhouse() -> None:
     workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
         encoding="utf-8"
     )
     engine = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    assert "Freeze the tested dependency set" in workflow
-    assert "python -m pip install --upgrade pip setuptools" in workflow
-    assert "pip freeze --all --exclude-editable" in workflow
+    deploy = workflow[workflow.index("\n  deploy:"):]
+    assert "Freeze the tested dependency set" not in workflow
+    assert "pip freeze --all --exclude-editable" not in workflow
+    assert "RESOLVED_REQUIREMENTS_B64" not in deploy
+    assert "validate_hashed_requirements_lock" in engine
     assert (
-        "python -m pip wheel --no-deps --no-build-isolation --no-index"
-        in _normalized_shell(workflow)
+        '"$CODE_VALIDATION_ROOT/deploy/production_requirements.in"'
+        in engine
     )
-    assert "validate_ci_resolved_freeze" in engine
-    assert 'if "setuptools" not in normalized:' in engine
-    assert "prepare_ci_resolved_wheelhouse" in engine
-    assert "--only-binary=:all: --no-deps" in engine
-    assert "PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1" in engine
-    assert "SOURCE=ci-resolved-freeze-v1" in engine
-    assert "--no-index --only-binary=:all:" in engine
-    assert 'cmp --silent "$RESOLVED_LOCK"' in engine
+    assert '"$CODE_VALIDATION_ROOT/requirements-platform.txt"' in engine
+    assert "# REQUIREMENTS_INPUT_SHA256=" in engine
+    assert "# PLATFORM_REQUIREMENTS_SHA256=" in engine
+    assert "hashlib.sha256(requirements_input).hexdigest()" in engine
+    assert "hashlib.sha256(platform_input).hexdigest()" in engine
+    assert "prepare_trusted_wheelhouse" in engine
+    assert "--require-hashes --only-binary=:all: --no-deps" in engine
+    assert "PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1" in engine
+    assert "TARGET=cp314-manylinux_2_28_x86_64" in engine
+    assert "STATUS=READY" in engine
+    assert "--require-hashes --no-index --only-binary=:all:" in engine
     assert (
         '"$EXPECTED_BUILD/bin/python" -I -m pip wheel --no-deps '
         "--no-build-isolation --no-index"
@@ -315,13 +399,24 @@ def test_broker_and_engine_use_fd_locks_and_a_versioned_protocol() -> None:
     assert not re.search(r"\b(?:mkdir|rmdir)\b[^\n]*BROKER_LOCK", broker)
 
     assert "REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4" in engine
-    assert "COMPATIBLE_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2" in engine
+    assert "RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2" in engine
+    assert "COMPATIBLE_DEPLOY_PROTOCOL_V2" not in engine
     protocol_guard = engine.index(
         'case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in'
     )
     assert "production deploy broker protocol mismatch" in engine
+    retired_start = engine.index(
+        '"$RETIRED_DEPLOY_PROTOCOL_V2")', protocol_guard
+    )
+    retired_branch = engine[
+        retired_start:engine.index(";;", retired_start)
+    ]
+    assert "DEPLOY_ARTIFACT_MODE=" not in retired_branch
+    assert "exit 2" in retired_branch
+    assert re.search(r"(?is)v2.*(?:retired|unsupported|not supported)", retired_branch)
     assert protocol_guard < engine.index(": \"${EXPECTED_SHA:")
     assert protocol_guard < engine.index("prepare_release() {")
+    assert protocol_guard < engine.index('exec 9>"$DEPLOY_LOCK_FILE"')
     assert protocol_guard < engine.index("systemctl stop")
 
     assert "DEPLOY_LOCK_ROOT=/run/probiga" in engine

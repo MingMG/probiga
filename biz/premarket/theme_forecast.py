@@ -37,6 +37,13 @@ from biz.market_context.external_market import (
     load_latest_external_market_context,
 )
 from server.common.sql_reader import read_sql_rows
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1371,6 +1378,20 @@ def build_theme_forecast_from_records(
     for global_rank, candidate in enumerate(all_candidates, start=1):
         candidate["global_rank"] = global_rank
         candidate["also_matches"] = list(dict.fromkeys(candidate.get("also_matches") or []))
+        candidate["decision_scope"] = "RESEARCH_DISPLAY_ONLY"
+        candidate["news_evidence_status"] = "LEGACY_UNVERIFIED"
+        candidate["membership_evidence_status"] = "LEGACY_UNVERIFIED"
+        candidate["industry_evidence_status"] = "DATA_BLOCKED"
+        candidate["funding_eligible"] = False
+        candidate["order_authority"] = False
+
+    for theme in visible_themes:
+        theme["decision_scope"] = "RESEARCH_DISPLAY_ONLY"
+        theme["news_evidence_status"] = "LEGACY_UNVERIFIED"
+        theme["membership_evidence_status"] = "LEGACY_UNVERIFIED"
+        theme["industry_evidence_status"] = "DATA_BLOCKED"
+        theme["funding_eligible"] = False
+        theme["order_authority"] = False
 
     quality_parts = {
         "news": len(selected_news),
@@ -1409,6 +1430,16 @@ def build_theme_forecast_from_records(
         "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
         "generated_at": datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S"),
         "data_quality": data_quality,
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "news_evidence_status": "LEGACY_UNVERIFIED",
+        "membership_evidence_status": "LEGACY_UNVERIFIED",
+        "industry_evidence_status": "DATA_BLOCKED",
+        "industry_evidence_reason": (
+            "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+        ),
+        "funding_eligible": False,
+        "order_authority": False,
         "quality_counts": {**quality_parts, "flow_quality": flow_quality},
         "flow_quality": flow_quality,
         "summary": f"09:08盘前主线首位：{top_name}；共{len(visible_themes)}个主题、{len(all_candidates)}只候选。",
@@ -1525,18 +1556,12 @@ def _load_forecast_inputs(
         SELECT k.stock_code, k.short_name, k.close, k.change_pct,
                k.turnover_ratio, k.amount,
                k.close * shares.total_shares AS market_cap,
-               industry.industry_name
+               '' AS industry_name
         FROM sm_stock_kline k
         LEFT JOIN (
             SELECT stock_code, MAX(total_shares) AS total_shares
             FROM si_stock_shares GROUP BY stock_code
         ) shares ON shares.stock_code = k.stock_code
-        LEFT JOIN (
-            SELECT stock_code, MAX(industry_name) AS industry_name
-            FROM si_industry_sw
-            WHERE industry_type = '申万一级'
-            GROUP BY stock_code
-        ) industry ON industry.stock_code = k.stock_code
         WHERE k.trade_date = :source_date AND k.k_type = 1 AND k.adjust_type = 0
     """, {"source_date": source_trade_date}, "premarket.kline")
     stock_flow_rows = _safe_rows(engine, """
@@ -1607,7 +1632,7 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_forecast_run (
     UNIQUE KEY uk_premarket_theme_run_uid (run_uid),
     UNIQUE KEY uk_premarket_theme_session_stage (session_date, stage),
     KEY idx_premarket_theme_created (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
 _ITEM_TABLE_DDL = """
@@ -1641,7 +1666,7 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_forecast_item (
     PRIMARY KEY (id),
     UNIQUE KEY uk_premarket_theme_item (run_uid, theme_key),
     KEY idx_premarket_theme_item_rank (run_uid, rank_no)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
 _STOCK_TABLE_DDL = """
@@ -1669,7 +1694,7 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_stock_candidate (
     UNIQUE KEY uk_premarket_theme_stock (run_uid, theme_key, stock_code),
     KEY idx_premarket_theme_stock_rank (run_uid, global_rank),
     KEY idx_premarket_theme_stock_code (stock_code, created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
 
@@ -1689,22 +1714,18 @@ _FORECAST_COLUMN_MIGRATIONS: dict[str, dict[str, str]] = {
 }
 
 
-def _ensure_forecast_columns(connection: Any) -> None:
-    """Apply additive MySQL migrations without touching frozen forecast rows."""
+def _privileged_migrate_forecast_columns(connection: Any) -> None:
+    """Apply known additive migrations only inside the release window."""
 
-    try:
-        rows = connection.execute(text("""
-            SELECT TABLE_NAME, COLUMN_NAME
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE()
-              AND TABLE_NAME IN (
-                  'st_premarket_theme_forecast_item',
-                  'st_premarket_theme_stock_candidate'
-              )
-        """)).mappings().all()
-    except Exception as exc:
-        logger.warning("Premarket forecast column audit skipped: %s", exc)
-        return
+    rows = connection.execute(text("""
+        SELECT TABLE_NAME, COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME IN (
+              'st_premarket_theme_forecast_item',
+              'st_premarket_theme_stock_candidate'
+          )
+    """)).mappings().all()
     existing = {
         (str(row.get("TABLE_NAME") or row.get("table_name") or ""),
          str(row.get("COLUMN_NAME") or row.get("column_name") or ""))
@@ -1719,12 +1740,23 @@ def _ensure_forecast_columns(connection: Any) -> None:
             ))
 
 
-def ensure_premarket_theme_tables(engine: Engine) -> None:
+def privileged_migrate_premarket_theme_tables(engine: Engine) -> None:
+    """Create/upgrade all four premarket tables in a release window."""
+
     with engine.begin() as connection:
         connection.execute(text(_RUN_TABLE_DDL))
         connection.execute(text(_ITEM_TABLE_DDL))
         connection.execute(text(_STOCK_TABLE_DDL))
-        _ensure_forecast_columns(connection)
+        connection.execute(text(_AUCTION_CONFIRMATION_DDL))
+        _privileged_migrate_forecast_columns(connection)
+        privileged_normalize_mysql_storage(connection, _PREMARKET_THEME_SCHEMA)
+        validate_premarket_theme_runtime(engine, connection=connection)
+
+
+def ensure_premarket_theme_tables(engine: Engine) -> None:
+    """Compatibility guard: validate only; never mutate runtime schema."""
+
+    validate_premarket_theme_runtime(engine)
 
 
 def persist_premarket_theme_forecast(engine: Engine, forecast: Mapping[str, Any]) -> dict[str, Any]:
@@ -1863,6 +1895,7 @@ def mark_forecast_delivery(
     delivery_id: str = "",
     error: str = "",
 ) -> None:
+    validate_premarket_theme_runtime(engine)
     with engine.begin() as connection:
         connection.execute(text("""
             UPDATE st_premarket_theme_forecast_run
@@ -1887,6 +1920,7 @@ def load_premarket_theme_forecast(
 ) -> dict[str, Any]:
     requested = str(session_date or "")[:10]
     try:
+        validate_premarket_theme_runtime(engine)
         params: dict[str, Any] = {"stage": stage}
         where = "stage = :stage AND status = 'COMPLETED'"
         if requested:
@@ -1916,6 +1950,13 @@ def load_premarket_theme_forecast(
                 "themes": [],
                 "stock_candidates": [],
                 "total": 0,
+                "decision_scope": "RESEARCH_DISPLAY_ONLY",
+                "actionable_output_allowed": False,
+                "news_evidence_status": "LEGACY_UNVERIFIED",
+                "membership_evidence_status": "LEGACY_UNVERIFIED",
+                "industry_evidence_status": "DATA_BLOCKED",
+                "funding_eligible": False,
+                "order_authority": False,
             }
         run = run_rows[0]
         run_uid = str(run.get("run_uid") or "")
@@ -1970,6 +2011,12 @@ def load_premarket_theme_forecast(
                 "concept_names": concepts,
                 "evidence": evidence,
                 "stock_candidates": [],
+                "decision_scope": "RESEARCH_DISPLAY_ONLY",
+                "news_evidence_status": "LEGACY_UNVERIFIED",
+                "membership_evidence_status": "LEGACY_UNVERIFIED",
+                "industry_evidence_status": "DATA_BLOCKED",
+                "funding_eligible": False,
+                "order_authority": False,
             })
         theme_map = {str(item["theme_key"]): item for item in themes}
         candidates = []
@@ -1999,6 +2046,12 @@ def load_premarket_theme_forecast(
                 "flow_metrics": flow_metrics,
                 "reason": row.get("reason") or "",
                 "evidence": evidence,
+                "decision_scope": "RESEARCH_DISPLAY_ONLY",
+                "news_evidence_status": "LEGACY_UNVERIFIED",
+                "membership_evidence_status": "LEGACY_UNVERIFIED",
+                "industry_evidence_status": "DATA_BLOCKED",
+                "funding_eligible": False,
+                "order_authority": False,
             }
             candidates.append(item)
             if str(item["theme_key"]) in theme_map:
@@ -2022,6 +2075,16 @@ def load_premarket_theme_forecast(
             "stock_candidates": candidates,
             "total": len(candidates),
             "run_uid": run_uid,
+            "decision_scope": "RESEARCH_DISPLAY_ONLY",
+            "actionable_output_allowed": False,
+            "news_evidence_status": "LEGACY_UNVERIFIED",
+            "membership_evidence_status": "LEGACY_UNVERIFIED",
+            "industry_evidence_status": "DATA_BLOCKED",
+            "industry_evidence_reason": (
+                "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+            ),
+            "funding_eligible": False,
+            "order_authority": False,
         }
     except Exception as exc:
         logger.warning("Premarket forecast unavailable: %s", exc)
@@ -2034,6 +2097,13 @@ def load_premarket_theme_forecast(
             "stock_candidates": [],
             "total": 0,
             "error": str(exc),
+            "decision_scope": "RESEARCH_DISPLAY_ONLY",
+            "actionable_output_allowed": False,
+            "news_evidence_status": "LEGACY_UNVERIFIED",
+            "membership_evidence_status": "LEGACY_UNVERIFIED",
+            "industry_evidence_status": "DATA_BLOCKED",
+            "funding_eligible": False,
+            "order_authority": False,
         }
 
 
@@ -2154,8 +2224,144 @@ CREATE TABLE IF NOT EXISTS st_premarket_theme_stock_confirmation (
     PRIMARY KEY (id),
     UNIQUE KEY uk_premarket_theme_confirmation (source_run_uid, stock_code),
     KEY idx_premarket_theme_confirmation_date (session_date, original_rank)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
+
+
+_PREMARKET_THEME_SCHEMA = {
+    "st_premarket_theme_forecast_run": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, auto_increment=True),
+            "run_uid": RuntimeColumn("varchar", False, character_length=64),
+            "session_date": RuntimeColumn("date", False),
+            "source_trade_date": RuntimeColumn("date", False),
+            "cutoff_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "stage": RuntimeColumn("varchar", False, character_length=32),
+            "model_version": RuntimeColumn("varchar", False, character_length=64),
+            "status": RuntimeColumn("varchar", False, character_length=16),
+            "data_quality": RuntimeColumn("varchar", False, character_length=16),
+            "theme_count": RuntimeColumn("int", False),
+            "candidate_count": RuntimeColumn("int", False),
+            "top_theme": RuntimeColumn("varchar", True, character_length=256),
+            "summary": RuntimeColumn("varchar", True, character_length=1000),
+            "quality_json": RuntimeColumn("longtext", True),
+            "delivery_status": RuntimeColumn("varchar", False, character_length=16),
+            "delivery_id": RuntimeColumn("varchar", True, character_length=64),
+            "delivery_error": RuntimeColumn("varchar", True, character_length=512),
+            "created_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "updated_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("run_uid",), unique=True),
+            RuntimeIndex(("session_date", "stage"), unique=True),
+            RuntimeIndex(("created_at",)),
+        ),
+    ),
+    "st_premarket_theme_forecast_item": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, auto_increment=True),
+            "run_uid": RuntimeColumn("varchar", False, character_length=64),
+            "rank_no": RuntimeColumn("int", False),
+            "theme_key": RuntimeColumn("varchar", False, character_length=160),
+            "family_key": RuntimeColumn("varchar", False, character_length=64),
+            "theme_name": RuntimeColumn("varchar", False, character_length=256),
+            "total_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "status": RuntimeColumn("varchar", False, character_length=32),
+            "data_quality": RuntimeColumn("varchar", False, character_length=16),
+            "member_count": RuntimeColumn("int", False),
+            "catalyst_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "flow_breadth_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "flow_positive_ratio": RuntimeColumn("decimal", True, numeric_precision=8, numeric_scale=2),
+            "flow_persistence_ratio": RuntimeColumn("decimal", True, numeric_precision=8, numeric_scale=2),
+            "member_flow_strength_score": RuntimeColumn("decimal", True, numeric_precision=8, numeric_scale=2),
+            "flow_quality_status": RuntimeColumn("varchar", False, character_length=16),
+            "flow_metrics_json": RuntimeColumn("longtext", True),
+            "external_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "technical_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "commodity_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "market_style_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "continuity_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "crowding_penalty": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "concept_names_json": RuntimeColumn("longtext", True),
+            "evidence_json": RuntimeColumn("longtext", True),
+            "created_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("run_uid", "theme_key"), unique=True),
+            RuntimeIndex(("run_uid", "rank_no")),
+        ),
+    ),
+    "st_premarket_theme_stock_candidate": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, auto_increment=True),
+            "run_uid": RuntimeColumn("varchar", False, character_length=64),
+            "global_rank": RuntimeColumn("int", False),
+            "theme_rank": RuntimeColumn("int", False),
+            "stock_rank": RuntimeColumn("int", False),
+            "theme_key": RuntimeColumn("varchar", False, character_length=160),
+            "theme_name": RuntimeColumn("varchar", False, character_length=256),
+            "stock_code": RuntimeColumn("varchar", False, character_length=16),
+            "stock_name": RuntimeColumn("varchar", False, character_length=128),
+            "candidate_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "signal_status": RuntimeColumn("varchar", False, character_length=32),
+            "penalty_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "previous_change_pct": RuntimeColumn("decimal", True, numeric_precision=10, numeric_scale=4),
+            "flow_factor_score": RuntimeColumn("decimal", True, numeric_precision=8, numeric_scale=2),
+            "flow_quality_status": RuntimeColumn("varchar", False, character_length=16),
+            "flow_metrics_json": RuntimeColumn("longtext", True),
+            "reason": RuntimeColumn("varchar", True, character_length=1000),
+            "evidence_json": RuntimeColumn("longtext", True),
+            "created_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("run_uid", "theme_key", "stock_code"), unique=True),
+            RuntimeIndex(("run_uid", "global_rank")),
+            RuntimeIndex(("stock_code", "created_at")),
+        ),
+    ),
+    "st_premarket_theme_stock_confirmation": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, auto_increment=True),
+            "confirmation_uid": RuntimeColumn("varchar", False, character_length=64),
+            "session_date": RuntimeColumn("date", False),
+            "source_run_uid": RuntimeColumn("varchar", False, character_length=64),
+            "cutoff_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "model_version": RuntimeColumn("varchar", False, character_length=64),
+            "original_rank": RuntimeColumn("int", False),
+            "stock_code": RuntimeColumn("varchar", False, character_length=16),
+            "stock_name": RuntimeColumn("varchar", False, character_length=128),
+            "original_score": RuntimeColumn("decimal", False, numeric_precision=8, numeric_scale=2),
+            "quote_price": RuntimeColumn("decimal", True, numeric_precision=18, numeric_scale=4),
+            "quote_change_pct": RuntimeColumn("decimal", True, numeric_precision=10, numeric_scale=4),
+            "quote_snapshot_at": RuntimeColumn("datetime", True, datetime_precision=0),
+            "confirmation_status": RuntimeColumn("varchar", False, character_length=32),
+            "reason": RuntimeColumn("varchar", False, character_length=512),
+            "metrics_json": RuntimeColumn("longtext", True),
+            "created_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("source_run_uid", "stock_code"), unique=True),
+            RuntimeIndex(("session_date", "original_rank")),
+        ),
+    ),
+}
+
+
+def validate_premarket_theme_runtime(
+    engine: Engine, *, connection=None,
+) -> None:
+    """Read-only fail-closed contract for all premarket persistence tables."""
+
+    validate_runtime_tables(
+        engine,
+        _PREMARKET_THEME_SCHEMA,
+        context="premarket_theme",
+        connection=connection,
+    )
 
 
 def build_auction_confirmation_from_records(
@@ -2231,6 +2437,10 @@ def build_auction_confirmation_from_records(
                 "flow_factor_score": candidate.get("flow_factor_score"),
                 "flow_quality_status": candidate.get("flow_quality_status"),
             },
+            "decision_scope": "RESEARCH_DISPLAY_ONLY",
+            "source_forecast_authority": "LEGACY_UNVERIFIED",
+            "funding_eligible": False,
+            "order_authority": False,
         })
     return {
         "confirmation_uid": str(uuid.uuid4()),
@@ -2238,6 +2448,11 @@ def build_auction_confirmation_from_records(
         "source_run_uid": str(forecast.get("run_uid") or ""),
         "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
         "model_version": f"{MODEL_VERSION}_AUCTION_0920",
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "source_forecast_authority": "LEGACY_UNVERIFIED",
+        "funding_eligible": False,
+        "order_authority": False,
         "confirmations": confirmations,
         "counts": dict((status, sum(item["confirmation_status"] == status for item in confirmations)) for status in (
             "CONFIRMED", "WATCH", "REJECT_CHASE", "REJECT_LIMIT", "REJECT_WEAK", "DATA_BLOCKED"
@@ -2252,8 +2467,8 @@ def persist_auction_confirmation(engine: Engine, confirmation: Mapping[str, Any]
     source_run_uid = str(confirmation.get("source_run_uid") or "")
     if not source_run_uid:
         raise ValueError("source_run_uid is required")
+    validate_premarket_theme_runtime(engine)
     with engine.begin() as connection:
-        connection.execute(text(_AUCTION_CONFIRMATION_DDL))
         existing = connection.execute(text("""
             SELECT confirmation_uid, COUNT(*) AS row_count
             FROM st_premarket_theme_stock_confirmation

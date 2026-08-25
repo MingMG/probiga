@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 
@@ -60,12 +62,44 @@ def fetch_flow_efinance(stock_code: str) -> pd.DataFrame | None:
         return None
 
 
+def replace_flow_partitions(engine, df: pd.DataFrame, stock_code: str) -> int:
+    """Atomically replace only fetched code/date partitions."""
+
+    if df is None or df.empty:
+        return 0
+    frame = df.copy()
+    frame["stock_code"] = str(stock_code).strip().zfill(6)
+    frame["trade_date"] = pd.to_datetime(
+        frame["trade_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    frame = frame.dropna(subset=["trade_date"]).drop_duplicates(
+        subset=["stock_code", "trade_date"], keep="last"
+    )
+    if frame.empty:
+        return 0
+    if "etl_sync_at" not in frame.columns:
+        frame["etl_sync_at"] = datetime.now().replace(microsecond=0)
+    return replace_table_rows_exact_keys(
+        frame,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=1000,
+        method="multi",
+    )
+
+
 def main():
     p = argparse.ArgumentParser(description="efinance 同步资金流数据")
     p.add_argument("--limit", type=int, default=0, help="最多处理几只股票（0=全部）")
     p.add_argument("--date", type=str, default="", help="只保留指定日期（YYYY-MM-DD）")
     p.add_argument("--sleep", type=float, default=0.5, help="每只股票间隔秒数")
-    p.add_argument("--skip-truncate", action="store_true", help="不清空表")
+    p.add_argument(
+        "--skip-truncate",
+        action="store_true",
+        help="兼容旧参数；运行时始终按股票/日期安全替换",
+    )
     args = p.parse_args()
 
     eng = _engine()
@@ -80,11 +114,6 @@ def main():
         codes = codes[:args.limit]
 
     print(f"共 {len(codes)} 只股票，开始同步资金流...")
-
-    if not args.skip_truncate:
-        with eng.begin() as conn:
-            conn.execute(text("TRUNCATE TABLE sm_stock_capital_flow_daily"))
-        print("已清空 sm_stock_capital_flow_daily")
 
     total_rows = 0
     success = 0
@@ -101,8 +130,7 @@ def main():
 
             if not df.empty:
                 df["etl_sync_at"] = now_str
-                df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
-                total_rows += len(df)
+                total_rows += replace_flow_partitions(eng, df, code)
                 success += 1
         else:
             fail += 1

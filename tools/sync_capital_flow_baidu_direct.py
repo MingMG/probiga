@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.env_config import create_tool_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 HEADERS = {
     'Host': 'finance.pae.baidu.com',
@@ -124,7 +126,13 @@ def sync_date(engine, target_date):
         df = pd.DataFrame(rows)
         df["data_source"] = "baidu"
         df["etl_sync_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi", chunksize=1000)
+        replace_table_rows_exact_keys(
+            df,
+            "sm_stock_capital_flow_daily",
+            engine,
+            key_columns=("stock_code", "trade_date"),
+            lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        )
         print(f"写入 {len(df)} 条数据")
     else:
         print("无数据可写入")

@@ -26,6 +26,7 @@ from server.common.adata_release import ensure_adata_import_path
 ensure_adata_import_path(ROOT)
 
 from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.hot_rank_schema import validate_hot_rank_runtime_schema
 
 
 def _call_with_retry(fn, *args, retries: int = 3, delay: float = 3.0, **kwargs):
@@ -44,14 +45,7 @@ def _call_with_retry(fn, *args, retries: int = 3, delay: float = 3.0, **kwargs):
 
 
 def _ensure_snapshot_date_column(engine):
-    with engine.connect() as conn:
-        r = conn.execute(
-            text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'st_hot_rank_ths' AND column_name = 'snapshot_date'")
-        ).scalar()
-    if int(r or 0) == 0:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE `st_hot_rank_ths` ADD COLUMN `snapshot_date` DATE NOT NULL COMMENT '快照日期' AFTER `concept_tag`"))
-        print("已为 st_hot_rank_ths 添加 snapshot_date 列")
+    validate_hot_rank_runtime_schema(engine, tables={"st_hot_rank_ths"})
 
 
 def fetch_hot_rank_ths(snapshot_date: str):

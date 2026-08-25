@@ -23,6 +23,13 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from server.common.sql_reader import read_sql_rows
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -769,30 +776,79 @@ def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, A
     }
 
 
-def ensure_external_market_table(engine: Engine) -> None:
-    """Create the append-only external snapshot table when needed."""
+_EXTERNAL_MARKET_DDL = """
+    CREATE TABLE IF NOT EXISTS st_external_market_context (
+        id BIGINT NOT NULL AUTO_INCREMENT,
+        snapshot_id VARCHAR(64) NOT NULL,
+        context_date DATE NOT NULL,
+        captured_at DATETIME NOT NULL,
+        source VARCHAR(64) NOT NULL,
+        symbol VARCHAR(64) NOT NULL,
+        display_name VARCHAR(128) NOT NULL,
+        price DECIMAL(20,6) NULL,
+        change_pct DECIMAL(12,6) NULL,
+        previous_close DECIMAL(20,6) NULL,
+        market_time DATETIME NULL,
+        availability VARCHAR(16) NOT NULL,
+        payload_json LONGTEXT NULL,
+        PRIMARY KEY (id),
+        KEY idx_external_context_capture (context_date, captured_at),
+        KEY idx_external_context_symbol (symbol, captured_at),
+        KEY idx_external_context_snapshot (snapshot_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_EXTERNAL_MARKET_SCHEMA = {
+    "st_external_market_context": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, auto_increment=True),
+            "snapshot_id": RuntimeColumn("varchar", False, character_length=64),
+            "context_date": RuntimeColumn("date", False),
+            "captured_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "source": RuntimeColumn("varchar", False, character_length=64),
+            "symbol": RuntimeColumn("varchar", False, character_length=64),
+            "display_name": RuntimeColumn("varchar", False, character_length=128),
+            "price": RuntimeColumn("decimal", True, numeric_precision=20, numeric_scale=6),
+            "change_pct": RuntimeColumn("decimal", True, numeric_precision=12, numeric_scale=6),
+            "previous_close": RuntimeColumn("decimal", True, numeric_precision=20, numeric_scale=6),
+            "market_time": RuntimeColumn("datetime", True, datetime_precision=0),
+            "availability": RuntimeColumn("varchar", False, character_length=16),
+            "payload_json": RuntimeColumn("longtext", True),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("context_date", "captured_at")),
+            RuntimeIndex(("symbol", "captured_at")),
+            RuntimeIndex(("snapshot_id",)),
+        ),
+    ),
+}
+
+
+def privileged_migrate_external_market_tables(engine: Engine) -> None:
+    """Create/normalize the external snapshot table in a release window."""
+
     with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS st_external_market_context (
-                id BIGINT NOT NULL AUTO_INCREMENT,
-                snapshot_id VARCHAR(64) NOT NULL,
-                context_date DATE NOT NULL,
-                captured_at DATETIME NOT NULL,
-                source VARCHAR(64) NOT NULL,
-                symbol VARCHAR(64) NOT NULL,
-                display_name VARCHAR(128) NOT NULL,
-                price DECIMAL(20,6) NULL,
-                change_pct DECIMAL(12,6) NULL,
-                previous_close DECIMAL(20,6) NULL,
-                market_time DATETIME NULL,
-                availability VARCHAR(16) NOT NULL,
-                payload_json LONGTEXT NULL,
-                PRIMARY KEY (id),
-                KEY idx_external_context_capture (context_date, captured_at),
-                KEY idx_external_context_symbol (symbol, captured_at),
-                KEY idx_external_context_snapshot (snapshot_id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+        conn.execute(text(_EXTERNAL_MARKET_DDL))
+        privileged_normalize_mysql_storage(conn, _EXTERNAL_MARKET_SCHEMA)
+        validate_external_market_runtime(engine, connection=conn)
+
+
+def validate_external_market_runtime(engine: Engine, *, connection=None) -> None:
+    """Read-only fail-closed external market table contract."""
+
+    validate_runtime_tables(
+        engine,
+        _EXTERNAL_MARKET_SCHEMA,
+        context="external_market",
+        connection=connection,
+    )
+
+
+def ensure_external_market_table(engine: Engine) -> None:
+    """Compatibility guard: validate only; never mutate runtime schema."""
+
+    validate_external_market_runtime(engine)
 
 
 def store_external_market_snapshot(engine: Engine, snapshot: dict[str, Any]) -> dict[str, Any]:

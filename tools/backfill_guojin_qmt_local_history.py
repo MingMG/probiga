@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 import time
 import uuid
@@ -13,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import URL
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,14 +24,17 @@ if str(ROOT) not in sys.path:
 from integrations.qmt.local_history import (
     backfill_daily_kline_local,
     backfill_minute_local,
-    ensure_local_history_tables,
     get_local_history_engine,
     load_stock_codes,
     load_trade_dates,
     _normalize_date,
+    privileged_migrate_local_history_schema,
     result_dict,
+    validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
+from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.migrate_qmt_local_history_provenance import (
     WINDOWS_LOCAL_HISTORY_DATABASE,
     WINDOWS_LOCAL_OPTION_FILE,
@@ -38,15 +42,20 @@ from tools.migrate_qmt_local_history_provenance import (
     _create_windows_local_history_engine,
     _validate_windows_local_mysql84_boundary,
 )
+from tools.qmt_operations_task_contract import (
+    QMT_DAILY_BACKFILL_LOCK_PATH,
+    QMT_GAP_REPAIR_LOCK_PATH,
+    QMT_GAP_REPAIR_STATE_ROOT,
+)
 
 
 WINDOWS_LOCAL_PRIMARY_DATABASE = "probiga"
 TARGET_DAILY_TABLE = "sm_stock_kline"
 TARGET_DAILY_QUARANTINE_TABLE = "qmt_target_daily_quarantine"
-TARGET_WINDOW_UNIVERSE_SOURCE = "sm_stock_kline.target_window_exact_union"
-CURRENT_UNIVERSE_SOURCE = "si_all_code.current_snapshot"
+TARGET_WINDOW_UNIVERSE_SOURCE = "qmt_stock_catalog.target_window_exact_union"
+CURRENT_UNIVERSE_SOURCE = "qmt_stock_catalog.current_snapshot"
 EXPLICIT_UNIVERSE_SOURCE = "explicit_codes"
-DAILY_LOCK_PATH = ROOT / "data" / "runtime" / "qmt_local_daily_backfill.lock"
+DAILY_LOCK_PATH = Path(QMT_DAILY_BACKFILL_LOCK_PATH)
 QUARANTINED_LEGACY_PROVIDER = "gj_big_qmt_legacy_unverified"
 QUARANTINED_LEGACY_QUALITY = "QUARANTINED_LEGACY"
 TARGET_INVALID_QUARANTINE_ACTION = "QUARANTINE_INVALID_NO_NATIVE"
@@ -55,7 +64,27 @@ TARGET_SYNTHETIC_QUARANTINE_ACTION = "QUARANTINE_SYNTHETIC_NO_NATIVE"
 TARGET_SYNTHETIC_QUARANTINE_REASON = "SYNTHETIC_ZERO_VOLUME_NO_NATIVE_QMT"
 TARGET_UNATTESTABLE_REASON = "INVALID_OR_SYNTHETIC_NO_NATIVE_QMT"
 TARGET_QUARANTINE_ROW_LIMIT = 200
+TARGET_DAILY_QUARANTINE_COLUMNS = (
+    "id", "run_id", "original_id", "action", "reason", "native_provider",
+    "stock_code", "trade_date", "k_type", "adjust_type", "row_payload",
+    "row_sha256", "quarantined_at", "restored_at", "restore_run_id",
+)
+TARGET_DAILY_QUARANTINE_INDEXES = {
+    "uq_qmt_target_quarantine_original_action": (
+        True,
+        ("original_id", "action"),
+    ),
+    "idx_qmt_target_quarantine_window": (
+        False,
+        ("trade_date", "stock_code", "action"),
+    ),
+    "idx_qmt_target_quarantine_run": (False, ("run_id",)),
+}
 LOCK_INITIALIZATION_GRACE_SECONDS = 5.0
+WINDOWS_GAP_REPAIR_STATE_DIRECTORY_PARTS = (
+    "ProBigA",
+    "qmt-local-gap-repair",
+)
 
 
 def _source_engine():
@@ -145,15 +174,142 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _windows_gap_repair_state_mapping(
+    program_data: str,
+) -> tuple[str, str]:
+    from pathlib import PureWindowsPath
+
+    base = PureWindowsPath(str(program_data or "").strip())
+    if not base.is_absolute() or not base.drive:
+        raise RuntimeError("Windows PROGRAMDATA must be one absolute drive path")
+    root = base.joinpath(*WINDOWS_GAP_REPAIR_STATE_DIRECTORY_PARTS)
+    return str(root), str(root / Path(QMT_GAP_REPAIR_LOCK_PATH).name)
+
+
+def _windows_daily_backfill_state_mapping(
+    program_data: str,
+) -> tuple[str, str]:
+    from pathlib import PureWindowsPath
+
+    root, _ = _windows_gap_repair_state_mapping(program_data)
+    lock = PureWindowsPath(root) / Path(QMT_DAILY_BACKFILL_LOCK_PATH).name
+    return root, str(lock)
+
+
+def _validated_gap_repair_lock_path(
+    *,
+    state_root: str,
+    lock_path: str,
+) -> tuple[Path, Path]:
+    raw = (
+        str(state_root or "").strip(),
+        str(lock_path or "").strip(),
+    )
+    if not all(raw):
+        raise RuntimeError(
+            "from-gaps --apply requires --state-root and --lock-path"
+        )
+    if os.name == "nt" and raw == (
+        QMT_GAP_REPAIR_STATE_ROOT,
+        QMT_GAP_REPAIR_LOCK_PATH,
+    ):
+        raw = _windows_gap_repair_state_mapping(
+            os.environ.get("PROGRAMDATA", "")
+        )
+    root, lock = (Path(item) for item in raw)
+    if not root.is_absolute() or not lock.is_absolute():
+        raise RuntimeError("QMT gap-repair runtime paths must be absolute")
+    if not root.exists() or root.is_symlink() or not root.is_dir():
+        raise RuntimeError(
+            "QMT gap-repair state root must be a pre-created real directory"
+        )
+    resolved_root = root.resolve(strict=True)
+    if resolved_root != root:
+        raise RuntimeError("QMT gap-repair state root contains a path indirection")
+    if _is_relative_to(resolved_root, ROOT.resolve(strict=True)):
+        raise RuntimeError("QMT gap-repair state root cannot be inside the code tree")
+    if lock.parent != root:
+        raise RuntimeError("QMT gap-repair lock must be a direct state-root child")
+    for child in root.iterdir():
+        if child.is_symlink():
+            raise RuntimeError(
+                f"QMT gap-repair state root contains a symlink: {child}"
+            )
+    owner_uid = None if os.name == "nt" else os.geteuid()
+    if os.name != "nt":
+        root_info = root.stat()
+        if root_info.st_uid != owner_uid:
+            raise RuntimeError("QMT gap-repair state root has the wrong owner")
+        if stat.S_IMODE(root_info.st_mode) != 0o700:
+            raise RuntimeError("QMT gap-repair state root must have mode 0700")
+    if not os.access(root, os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError("QMT gap-repair state root is not service-writable")
+    if lock.exists() or lock.is_symlink():
+        if lock.is_symlink():
+            raise RuntimeError("QMT gap-repair lock is a symlink")
+        lock_info = lock.stat()
+        if not stat.S_ISREG(lock_info.st_mode):
+            raise RuntimeError("QMT gap-repair lock is not a regular file")
+        if os.name != "nt" and (
+            lock_info.st_uid != owner_uid
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
+            raise RuntimeError(
+                "QMT gap-repair lock must be service-owned with mode 0600"
+            )
+    return root, lock
+
+
+def _validated_daily_backfill_lock_path(
+    *,
+    state_root: str = "",
+    lock_path: str = "",
+) -> tuple[Path, Path]:
+    if bool(str(state_root or "").strip()) != bool(
+        str(lock_path or "").strip()
+    ):
+        raise RuntimeError(
+            "QMT daily backfill state root and lock path must be paired"
+        )
+    if state_root:
+        raw_root, raw_lock = state_root, lock_path
+    elif os.name == "nt":
+        raw_root, raw_lock = _windows_daily_backfill_state_mapping(
+            os.environ.get("PROGRAMDATA", "")
+        )
+    else:
+        raw_root, raw_lock = (
+            QMT_GAP_REPAIR_STATE_ROOT,
+            QMT_DAILY_BACKFILL_LOCK_PATH,
+        )
+    return _validated_gap_repair_lock_path(
+        state_root=raw_root,
+        lock_path=raw_lock,
+    )
+
+
 def _acquire_lock(lock_path: Path) -> tuple[bool, str]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
     payload = f"{os.getpid()} {datetime.now().isoformat(timespec='seconds')}"
     owner = ""
     for _attempt in range(3):
+        if lock_path.is_symlink():
+            return False, "lock_error:symlink"
         try:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
             descriptor = os.open(
                 lock_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                flags,
+                0o600,
             )
         except FileExistsError:
             before = None
@@ -201,6 +357,7 @@ def _acquire_lock(lock_path: Path) -> tuple[bool, str]:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(payload)
                 stream.flush()
+                os.fsync(stream.fileno())
         except Exception:
             try:
                 os.close(descriptor)
@@ -214,6 +371,8 @@ def _acquire_lock(lock_path: Path) -> tuple[bool, str]:
 
 def _release_lock(lock_path: Path) -> None:
     try:
+        if lock_path.is_symlink():
+            return
         raw = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
         pid = int(raw.split()[0])
         if pid == os.getpid():
@@ -295,70 +454,36 @@ def _target_window_codes(
     start_date: str,
     end_date: str,
 ) -> tuple[list[str], list[str]]:
-    """Load the exact point-in-window A-share union and prove target dates."""
+    """Load the exact independent QMT catalog union for the target window."""
     normalized_start = _normalize_date(start_date)
     normalized_end = _normalize_date(end_date)
     if normalized_start > normalized_end:
         raise RuntimeError("target universe start date is after end date")
-    params = {"start_date": normalized_start, "end_date": normalized_end}
     with source_engine.begin() as connection:
-        calendar_dates = _date_values(
-            connection.execute(
-                text(
-                    "SELECT trade_date FROM si_trade_calendar "
-                    "WHERE trade_status=1 "
-                    "AND trade_date BETWEEN :start_date AND :end_date "
-                    "ORDER BY trade_date"
-                ),
-                params,
-            ).fetchall()
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=datetime.now().replace(microsecond=0),
         )
-        target_dates = _date_values(
-            connection.execute(
-                text(
-                    f"SELECT DISTINCT trade_date FROM {TARGET_DAILY_TABLE} "
-                    "WHERE k_type=1 "
-                    "AND adjust_type=0 "
-                    "AND stock_code REGEXP '^(0|3|6)' "
-                    "AND trade_date BETWEEN :start_date AND :end_date "
-                    "ORDER BY trade_date"
-                ),
-                params,
-            ).fetchall()
+        calendar_receipt = load_trade_calendar_receipt(
+            connection,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            decision_known_at=datetime.now().replace(microsecond=0),
         )
-        rows = connection.execute(
-            text(
-                f"SELECT DISTINCT stock_code FROM {TARGET_DAILY_TABLE} "
-                "WHERE k_type=1 "
-                "AND adjust_type=0 "
-                "AND stock_code REGEXP '^(0|3|6)' "
-                "AND trade_date BETWEEN :start_date AND :end_date "
-                "ORDER BY stock_code"
-            ),
-            params,
-        ).fetchall()
-
-    missing_dates = sorted(set(calendar_dates) - set(target_dates))
-    unexpected_dates = sorted(set(target_dates) - set(calendar_dates))
-    if not calendar_dates or missing_dates or unexpected_dates:
-        raise RuntimeError(
-            "target daily window is incomplete: "
-            f"calendar_dates={len(calendar_dates)}, "
-            f"target_dates={len(target_dates)}, "
-            f"missing_count={len(missing_dates)}, "
-            f"missing_sample={missing_dates[:10]}, "
-            f"unexpected_count={len(unexpected_dates)}, "
-            f"unexpected_sample={unexpected_dates[:10]}"
-        )
-    codes = sorted(
-        {
-            str(row[0]).strip().zfill(6)
-            for row in rows
-            if row[0] is not None and str(row[0]).strip()
-        }
+    target_dates = calendar_receipt.sessions_between(
+        normalized_start, normalized_end
     )
+    if not target_dates:
+        raise RuntimeError("immutable QMT target window has no trade session")
+    expected_by_date = {
+        trade_date: set(catalog.eligible_codes(trade_date))
+        for trade_date in target_dates
+    }
+    if any(not codes for codes in expected_by_date.values()):
+        raise RuntimeError("independent QMT target universe is empty")
+    codes = sorted(set().union(*expected_by_date.values()))
     if not codes:
-        raise RuntimeError("target daily window stock-code union is empty")
+        raise RuntimeError("QMT catalog target window stock-code union is empty")
     return codes, target_dates
 
 
@@ -380,7 +505,7 @@ def _target_window_unattestable_codes(
                 FROM `{WINDOWS_LOCAL_PRIMARY_DATABASE}`.`{TARGET_DAILY_TABLE}`
                 WHERE k_type=1
                   AND adjust_type=0
-                  AND stock_code REGEXP '^(0|3|6)'
+                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
                   AND trade_date BETWEEN :start_date AND :end_date
                 GROUP BY stock_code
                 HAVING SUM(
@@ -464,7 +589,7 @@ def _repair_target_source_only_rows(
         AND s.k_type=1
         AND s.adjust_type=0
         AND s.trade_date BETWEEN :start_date AND :end_date
-        AND s.stock_code REGEXP '^(0|3|6)'
+        AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
         AND BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'
         AND s.pre_close IS NOT NULL AND s.pre_close > 0
         AND s.`open` IS NOT NULL AND s.`open` > 0
@@ -550,7 +675,11 @@ def _repair_target_source_only_rows(
     }
 
 
-def _ensure_target_daily_quarantine_table(source_engine) -> None:
+def _privileged_migrate_target_daily_quarantine_schema(
+    source_engine,
+) -> dict[str, Any]:
+    """Install quarantine storage only during the explicit ``init`` window."""
+
     table_name = (
         f"`{WINDOWS_LOCAL_PRIMARY_DATABASE}`."
         f"`{TARGET_DAILY_QUARANTINE_TABLE}`"
@@ -588,6 +717,68 @@ def _ensure_target_daily_quarantine_table(source_engine) -> None:
                 """
             )
         )
+    validated = _validate_target_daily_quarantine_table(source_engine)
+    return {
+        **validated,
+        "migration_boundary": "privileged_windows_local_release",
+        "ddl_executed": True,
+    }
+
+
+def _validate_target_daily_quarantine_table(source_engine) -> dict[str, Any]:
+    """Read back the quarantine contract; scheduled repair never creates it."""
+
+    inspector = inspect(source_engine)
+    schema = WINDOWS_LOCAL_PRIMARY_DATABASE
+    table = TARGET_DAILY_QUARANTINE_TABLE
+    if not inspector.has_table(table, schema=schema):
+        raise RuntimeError(
+            "QMT target quarantine table is missing; run explicit privileged "
+            "backfill_guojin_qmt_local_history.py init "
+            "--windows-local-option-file first"
+        )
+    columns = tuple(
+        str(row.get("name") or "")
+        for row in inspector.get_columns(table, schema=schema)
+    )
+    primary_key = tuple(
+        str(value)
+        for value in (
+            inspector.get_pk_constraint(table, schema=schema).get(
+                "constrained_columns"
+            )
+            or ()
+        )
+    )
+    indexes = {
+        str(row.get("name") or ""): (
+            bool(row.get("unique")),
+            tuple(str(value) for value in (row.get("column_names") or ())),
+        )
+        for row in inspector.get_indexes(table, schema=schema)
+        if str(row.get("name") or "").upper() != "PRIMARY"
+    }
+    errors = []
+    if columns != TARGET_DAILY_QUARANTINE_COLUMNS:
+        errors.append("column inventory/order differs")
+    if primary_key != ("id",):
+        errors.append("primary key must be exactly id")
+    if indexes != TARGET_DAILY_QUARANTINE_INDEXES:
+        errors.append("secondary index inventory differs")
+    if errors:
+        raise RuntimeError(
+            "QMT target quarantine physical schema differs: "
+            + "; ".join(errors)
+        )
+    return {
+        "schema": schema,
+        "table": table,
+        "columns": list(columns),
+        "primary_key": list(primary_key),
+        "indexes": sorted(indexes),
+        "ready": True,
+        "ddl_executed": False,
+    }
 
 
 def _quarantine_invalid_target_rows_without_native(
@@ -608,7 +799,7 @@ def _quarantine_invalid_target_rows_without_native(
         raise ValueError("target quarantine row limit must be positive")
     normalized_start = _normalize_date(start_date)
     normalized_end = _normalize_date(end_date)
-    _ensure_target_daily_quarantine_table(source_engine)
+    _validate_target_daily_quarantine_table(source_engine)
     history_table = (
         f"`{WINDOWS_LOCAL_HISTORY_DATABASE}`.`qmt_local_stock_kline`"
     )
@@ -629,7 +820,7 @@ def _quarantine_invalid_target_rows_without_native(
         t.k_type=1
         AND t.adjust_type=0
         AND t.trade_date BETWEEN :start_date AND :end_date
-        AND t.stock_code REGEXP '^(0|3|6)'
+        AND t.stock_code REGEXP '^(0|3|4|6|8|9)'
         AND (
             t.pre_close IS NULL OR t.pre_close <= 0
             OR {_synthetic_target_sql('t')}
@@ -1008,7 +1199,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|6)'
+          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
     """
@@ -1037,7 +1228,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|6)'
+          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
         """
@@ -1058,7 +1249,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|6)'
+          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
         """
@@ -1282,13 +1473,13 @@ def main(argv: list[str] | None = None) -> int:
             "the local primary and QMT history schemas."
         ),
     )
-    parser.add_argument("--codes", default="", help="Comma-separated stock codes. Empty means si_all_code universe.")
+    parser.add_argument("--codes", default="", help="Comma-separated stock codes. Empty means the current immutable QMT catalog universe.")
     parser.add_argument(
         "--target-window-universe",
         action="store_true",
         help=(
-            "For daily mode, load the exact distinct 0/3/6 stock-code union "
-            "from sm_stock_kline in --start-date/--end-date."
+            "For daily mode, load the exact target-date stock-code union "
+            "from immutable QMT catalog/calendar receipts."
         ),
     )
     parser.add_argument(
@@ -1340,8 +1531,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--gap-dataset", default="", choices=["", "sm_stock_kline.1d", "sm_stock_minute.1m"])
     parser.add_argument("--apply", action="store_true", help="Actually write rows and update sys_data_gap. Default is dry-run.")
+    parser.add_argument("--state-root", default="")
+    parser.add_argument("--lock-path", default="")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+
+    gap_repair_lock_path: Path | None = None
+    if args.mode == "from-gaps" and args.apply:
+        _, gap_repair_lock_path = _validated_gap_repair_lock_path(
+            state_root=args.state_root,
+            lock_path=args.lock_path,
+        )
+    elif args.state_root or args.lock_path:
+        parser.error(
+            "--state-root/--lock-path are only valid for from-gaps --apply"
+        )
 
     if args.windows_local_option_file and args.local_url:
         parser.error(
@@ -1388,6 +1592,10 @@ def main(argv: list[str] | None = None) -> int:
         if int(args.max_target_quarantine_rows) <= 0:
             parser.error("--max-target-quarantine-rows must be positive")
 
+    daily_lock_path: Path | None = None
+    if args.mode == "daily":
+        _, daily_lock_path = _validated_daily_backfill_lock_path()
+
     if args.windows_local_option_file:
         source_engine, local_engine = _windows_local_engines()
         connection_mode = "fixed_protected_windows_option_file"
@@ -1395,7 +1603,17 @@ def main(argv: list[str] | None = None) -> int:
         source_engine = _source_engine()
         local_engine = get_local_history_engine(args.local_url or None)
         connection_mode = "configured_mysql_urls"
-    ensure_local_history_tables(local_engine)
+    if args.mode == "init":
+        local_schema = privileged_migrate_local_history_schema(local_engine)
+        quarantine_schema = None
+        if args.windows_local_option_file:
+            quarantine_schema = (
+                _privileged_migrate_target_daily_quarantine_schema(
+                    source_engine
+                )
+            )
+    else:
+        validate_local_history_tables(local_engine)
     limits = _resolve_limits(args.mode, limit=args.limit, stock_limit=args.stock_limit, gap_limit=args.gap_limit)
 
     if args.mode == "init":
@@ -1406,6 +1624,8 @@ def main(argv: list[str] | None = None) -> int:
                 "local_database": str(local_engine.url.database or ""),
                 "connection_mode": connection_mode,
                 "tables": ["qmt_local_stock_kline", "qmt_local_stock_minute", "qmt_local_backfill_run"],
+                "local_history_schema": local_schema,
+                "target_quarantine_schema": quarantine_schema,
             },
             as_json=args.json,
         )
@@ -1442,14 +1662,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "daily":
         if not args.start_date or not args.end_date:
             raise RuntimeError("daily mode requires --start-date and --end-date")
-        acquired, owner = _acquire_lock(DAILY_LOCK_PATH)
+        if daily_lock_path is None:
+            raise RuntimeError("QMT daily backfill lock path was not validated")
+        acquired, owner = _acquire_lock(daily_lock_path)
         if not acquired:
+            lock_failed = str(owner).startswith("lock_error:") or owner == (
+                "stale_lock_could_not_be_replaced"
+            )
             _print(
                 {
-                    "status": "already_running",
+                    "status": (
+                        "lock_error" if lock_failed else "already_running"
+                    ),
                     "mode": "daily",
                     "dry_run": dry_run,
-                    "lock_path": str(DAILY_LOCK_PATH),
+                    "lock_path": str(daily_lock_path),
                     "owner": owner,
                     "universe": universe,
                     "connection_mode": connection_mode,
@@ -1521,7 +1748,7 @@ def main(argv: list[str] | None = None) -> int:
                     provider=args.provider,
                 )
         finally:
-            _release_lock(DAILY_LOCK_PATH)
+            _release_lock(daily_lock_path)
         payload = result_dict(result)
         payload["dry_run"] = dry_run
         payload["universe"] = universe
@@ -1566,14 +1793,19 @@ def main(argv: list[str] | None = None) -> int:
         _print(payload, as_json=args.json)
         return 0 if result.status == "SUCCESS" else 2
 
-    lock_path = ROOT / "data" / "runtime" / "qmt_local_gap_repair.lock"
+    lock_path = gap_repair_lock_path
     acquired, owner = (True, "")
     if args.apply:
+        if lock_path is None:
+            raise RuntimeError("QMT gap-repair lock path was not validated")
         acquired, owner = _acquire_lock(lock_path)
     if not acquired:
+        lock_failed = str(owner).startswith("lock_error:") or owner == (
+            "stale_lock_could_not_be_replaced"
+        )
         _print(
             {
-                "status": "already_running",
+                "status": "lock_error" if lock_failed else "already_running",
                 "mode": "from-gaps",
                 "dry_run": dry_run,
                 "lock_path": str(lock_path),
@@ -1581,7 +1813,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             as_json=args.json,
         )
-        return 0
+        return 2
 
     gaps = _gap_rows(source_engine, limit=limits.gap_limit, dataset=args.gap_dataset)
     results: list[dict[str, Any]] = []
@@ -1658,7 +1890,7 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 )
     finally:
-        if args.apply:
+        if args.apply and lock_path is not None:
             _release_lock(lock_path)
 
     failed_count = sum(1 for item in results if item.get("status") == "failed")

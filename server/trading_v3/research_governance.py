@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Iterable, Mapping
 
 
@@ -13,6 +13,9 @@ RESULT_SCHEMA_VERSION = "probiga.trading-v3-governed-result.v1"
 EXPLORATORY = "exploratory"
 CONFIRMATORY = "confirmatory"
 RESEARCH_CLASSIFICATIONS = frozenset({EXPLORATORY, CONFIRMATORY})
+CALLER_DECLARED_UNVERIFIED = "CALLER_DECLARED_UNVERIFIED"
+PROSPECTIVE = "PROSPECTIVE_BEFORE_FIRST_HOLDOUT"
+RETROSPECTIVE = "RETROSPECTIVE_AFTER_HOLDOUT_OPENED"
 
 
 class ResearchGovernanceError(ValueError):
@@ -241,6 +244,21 @@ class CandidatePreregistration:
     def contract_hash(self) -> str:
         return hashlib.sha256(_canonical_json(self.as_dict()).encode("utf-8")).hexdigest()
 
+    @property
+    def timing_status(self) -> str:
+        """Classify timing without trusting the caller-declared timestamp."""
+
+        declared = datetime.fromisoformat(
+            self.created_at.replace("Z", "+00:00")
+        ).astimezone(timezone.utc)
+        first_holdout = min(fold.validation_start for fold in self.outer_folds)
+        holdout_open = datetime.combine(
+            date.fromisoformat(first_holdout),
+            time.min,
+            tzinfo=timezone.utc,
+        )
+        return PROSPECTIVE if declared < holdout_open else RETROSPECTIVE
+
 
 @dataclass(frozen=True, slots=True)
 class HoldoutConsumption:
@@ -347,12 +365,86 @@ def familywise_trial_counts(
     }
 
 
+def familywise_registration_manifest(
+    registrations: Iterable[CandidatePreregistration],
+    *,
+    prior_registration_contract_hashes: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Bind the entire candidate family; counts alone are never authority.
+
+    Historical code accepted a caller-supplied prior trial count.  That count
+    could be reduced after seeing results.  This contract instead requires
+    every prior/current trial to be represented by its immutable contract
+    hash, while duplicate candidate identifiers with different contracts are
+    rejected.
+    """
+
+    unique = _unique_registrations(registrations)
+    if not unique:
+        raise ResearchGovernanceError(
+            "familywise registration manifest must not be empty"
+        )
+    candidate_contracts: dict[str, str] = {}
+    for registration in unique:
+        previous = candidate_contracts.setdefault(
+            registration.candidate_id,
+            registration.contract_hash,
+        )
+        if previous != registration.contract_hash:
+            raise ResearchGovernanceError(
+                "one candidate_id cannot have multiple contracts in a family"
+            )
+    prior_hashes = tuple(sorted({
+        _normalise_hash(value, "prior_registration_contract_hash")
+        for value in prior_registration_contract_hashes
+    }))
+    current_hashes = tuple(sorted(item.contract_hash for item in unique))
+    overlap = sorted(set(prior_hashes).intersection(current_hashes))
+    if overlap:
+        raise ResearchGovernanceError(
+            "prior and current family registrations overlap"
+        )
+    current_rows = [
+        {
+            "candidate_id": item.candidate_id,
+            "family": item.family,
+            "contract_hash": item.contract_hash,
+            "timing_status": item.timing_status,
+        }
+        for item in sorted(unique, key=lambda value: value.contract_hash)
+    ]
+    holdout_report = [
+        item.as_dict() for item in holdout_consumption_report(unique)
+    ]
+    payload = {
+        "schema_version": (
+            "probiga.trading-v3-familywise-registration-manifest.v1"
+        ),
+        "current_registrations": current_rows,
+        "current_candidate_ids": sorted(candidate_contracts),
+        "current_trial_count": len(current_hashes),
+        "prior_registration_contract_hashes": list(prior_hashes),
+        "prior_trial_count": len(prior_hashes),
+        "total_familywise_trial_count": len(prior_hashes) + len(current_hashes),
+        "holdout_consumption": holdout_report,
+        "caller_reported_count_accepted": False,
+    }
+    return {
+        **payload,
+        "manifest_hash": hashlib.sha256(
+            _canonical_json(payload).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def label_research_result(
     preregistration: CandidatePreregistration,
     result: Mapping[str, Any],
     *,
     evaluated_at: datetime | str,
     claimed_classification: str | None = None,
+    family_registrations: Iterable[CandidatePreregistration] | None = None,
+    prior_registration_contract_hashes: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Bind a result to its contract and enforce its maximum evidence class."""
 
@@ -371,10 +463,38 @@ def label_research_result(
         raise ResearchGovernanceError(
             "exploratory preregistration cannot produce a confirmatory result"
         )
+    # CandidatePreregistration is a value supplied by the research caller;
+    # its created_at field is not a trusted clock receipt.  Until an
+    # append-only server registry supplies such a receipt, it can describe
+    # exploratory work only and can never authorize a confirmatory claim.
+    if evidence_classification == CONFIRMATORY:
+        raise ResearchGovernanceError(
+            "confirmatory result requires a persisted authoritative "
+            "preregistration receipt; caller declaration is unverified"
+        )
     normalised_evaluated_at = _normalise_datetime(evaluated_at, "evaluated_at")
     if normalised_evaluated_at < preregistration.created_at:
         raise ResearchGovernanceError("evaluated_at cannot precede created_at")
     payload = _strict_json_copy(result, "result")
+    family_scope_complete = family_registrations is not None
+    family_members = tuple(
+        family_registrations
+        if family_registrations is not None
+        else (preregistration,)
+    )
+    manifest = familywise_registration_manifest(
+        family_members,
+        prior_registration_contract_hashes=(
+            prior_registration_contract_hashes
+        ),
+    )
+    if preregistration.contract_hash not in {
+        item["contract_hash"]
+        for item in manifest["current_registrations"]
+    }:
+        raise ResearchGovernanceError(
+            "result preregistration is missing from the family manifest"
+        )
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
         "candidate_id": preregistration.candidate_id,
@@ -382,7 +502,13 @@ def label_research_result(
         "preregistration_contract_hash": preregistration.contract_hash,
         "preregistered_classification": preregistration.research_classification,
         "evidence_classification": evidence_classification,
-        "confirmatory_claim_allowed": evidence_classification == CONFIRMATORY,
+        "preregistration_timing_status": preregistration.timing_status,
+        "registration_authority": CALLER_DECLARED_UNVERIFIED,
+        "authoritative_preregistration_receipt_verified": False,
+        "family_manifest_scope_complete": family_scope_complete,
+        "familywise_registration_manifest": manifest,
+        "confirmatory_claim_allowed": False,
+        "activation_eligible": False,
         "evaluated_at": normalised_evaluated_at,
         "consumed_holdouts": [
             {
@@ -398,6 +524,8 @@ def label_research_result(
 def assert_result_governance(
     result_envelope: Mapping[str, Any],
     registrations: Iterable[CandidatePreregistration],
+    *,
+    prior_registration_contract_hashes: Iterable[str] = (),
 ) -> None:
     """Reject an unbound, relabelled, or otherwise forged result envelope."""
 
@@ -414,6 +542,12 @@ def assert_result_governance(
         "candidate_id": registration.candidate_id,
         "family": registration.family,
         "preregistered_classification": registration.research_classification,
+        "preregistration_timing_status": registration.timing_status,
+        "registration_authority": CALLER_DECLARED_UNVERIFIED,
+        "authoritative_preregistration_receipt_verified": False,
+        "family_manifest_scope_complete": True,
+        "confirmatory_claim_allowed": False,
+        "activation_eligible": False,
     }
     for field, value in expected.items():
         if result_envelope.get(field) != value:
@@ -422,17 +556,20 @@ def assert_result_governance(
         result_envelope.get("evidence_classification"),
         "evidence_classification",
     )
-    if (
-        evidence_classification == CONFIRMATORY
-        and registration.research_classification != CONFIRMATORY
-    ):
+    if evidence_classification == CONFIRMATORY:
         raise ResearchGovernanceError(
-            "exploratory result cannot be relabelled as confirmatory"
+            "caller-declared result cannot be relabelled as confirmatory"
         )
-    if result_envelope.get("confirmatory_claim_allowed") is not (
-        evidence_classification == CONFIRMATORY
-    ):
-        raise ResearchGovernanceError("confirmatory claim flag is inconsistent")
+    manifest = familywise_registration_manifest(
+        registration_by_hash.values(),
+        prior_registration_contract_hashes=(
+            prior_registration_contract_hashes
+        ),
+    )
+    if result_envelope.get("familywise_registration_manifest") != manifest:
+        raise ResearchGovernanceError(
+            "result familywise manifest is incomplete or has shrunk"
+        )
     evaluated_at = _normalise_datetime(
         result_envelope.get("evaluated_at"),
         "evaluated_at",

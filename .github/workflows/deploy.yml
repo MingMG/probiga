@@ -17,14 +17,9 @@ jobs:
   trading-v4-ci-gate:
     name: Trading V4 Stage 0-3 gate
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-    outputs:
-      resolved_requirements_b64: ${{ steps.dependency_lock.outputs.payload }}
-      resolved_requirements_sha256: ${{ steps.dependency_lock.outputs.sha256 }}
-      adata_release_sha: ${{ steps.adata_release.outputs.git_sha }}
-      adata_tree_sha256: ${{ steps.adata_release.outputs.tree_sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -38,18 +33,314 @@ jobs:
       - name: Scan tracked secrets before dependency installation
         run: python tools/scan_tracked_secrets.py
 
+      - name: Verify the reviewed Python 3.14 static artifact lock
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -Eeuo pipefail
+          readonly LOCK_TARGET=cp314-manylinux_2_28_x86_64
+          readonly RELEASE_MANIFEST=deploy/production_release.env
+          readonly REQUIREMENTS_INPUT=deploy/production_requirements.in
+          readonly PLATFORM_INPUT=requirements-platform.txt
+          readonly REQUIREMENTS_LOCK=deploy/production_requirements.lock
+          readonly WHEEL_MANIFEST=deploy/production_wheel_manifest.lock
+          readonly LOCK_BOOTSTRAP="$RUNNER_TEMP/probiga-lock-bootstrap"
+          readonly LOCK_WHEELHOUSE="$RUNNER_TEMP/probiga-lock-wheelhouse"
+          readonly LOCK_RUNTIME_VENV="$RUNNER_TEMP/probiga-lock-runtime"
+          readonly LOCK_CLEAN_HOME="$RUNNER_TEMP/probiga-lock-home"
+
+          python -I - "$RELEASE_MANIFEST" "$REQUIREMENTS_INPUT" \
+            "$PLATFORM_INPUT" "$REQUIREMENTS_LOCK" "$WHEEL_MANIFEST" \
+            "$LOCK_TARGET" <<'PY'
+          import hashlib
+          import platform
+          import re
+          import sys
+          from pathlib import Path
+
+          (
+              release_path,
+              requirements_input_path,
+              platform_input_path,
+              lock_path,
+              wheel_path,
+          ) = map(Path, sys.argv[1:6])
+          target = sys.argv[6]
+
+          def check(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          def read(path):
+              raw = path.read_bytes()
+              check(b"\r" not in raw and raw.endswith(b"\n"), f"{path}: line endings")
+              lines = raw.decode("utf-8").splitlines()
+              check(lines and all(lines), f"{path}: blank line")
+              return raw, lines
+
+          check(sys.version_info[:2] == (3, 14), "Python 3.14 required")
+          check(
+              platform.system() == "Linux" and platform.machine() == "x86_64",
+              "Linux x86_64 required",
+          )
+          libc, libc_version = platform.libc_ver()
+          libc_tuple = tuple(map(int, libc_version.split(".")[:2]))
+          check(libc == "glibc" and libc_tuple >= (2, 28), "glibc >= 2.28 required")
+
+          _, release = read(release_path)
+          keys = [
+              "PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION",
+              "PROBIGA_PRODUCTION_LOCK_TARGET",
+              "PROBIGA_PRODUCTION_LOCK_STATUS",
+              "INPUT_LOCK_SHA256",
+              "WHEEL_MANIFEST_SHA256",
+              "ADATA_RELEASE_SHA",
+              "ADATA_TREE_SHA256",
+              "TRUSTED_WHEEL_MANIFEST_VERSION",
+              "TRUSTED_ARTIFACT_PROTOCOL",
+              "ADAPTER_REGISTRY_SEAL_SHA256",
+          ]
+          fields = [line.partition("=") for line in release]
+          check(len(fields) == 10, "release manifest must have exactly 10 fields")
+          check(
+              [key for key, separator, value in fields if separator and value] == keys,
+              "release manifest fields/order differ",
+          )
+          values = {key: value for key, _, value in fields}
+          exact = {
+              "PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION": "2",
+              "PROBIGA_PRODUCTION_LOCK_TARGET": target,
+              "PROBIGA_PRODUCTION_LOCK_STATUS": "READY",
+              "TRUSTED_WHEEL_MANIFEST_VERSION": "1",
+              "TRUSTED_ARTIFACT_PROTOCOL": "probiga-trusted-artifacts-v2",
+          }
+          check(all(values[key] == value for key, value in exact.items()), "release state")
+          check(
+              all(
+                  re.fullmatch(r"[0-9a-f]{64}", values[key])
+                  for key in (
+                      "INPUT_LOCK_SHA256",
+                      "WHEEL_MANIFEST_SHA256",
+                      "ADATA_TREE_SHA256",
+                      "ADAPTER_REGISTRY_SEAL_SHA256",
+                  )
+              ),
+              "release SHA-256 field",
+          )
+          check(
+              re.fullmatch(r"[0-9a-f]{40}", values["ADATA_RELEASE_SHA"]),
+              "ADATA Git SHA",
+          )
+
+          requirements_input_raw, requirements_input_lines = read(
+              requirements_input_path
+          )
+          platform_input_raw, _ = read(platform_input_path)
+          lock_raw, lock_lines = read(lock_path)
+          wheel_raw, wheel_lines = read(wheel_path)
+          check(
+              hashlib.sha256(lock_raw).hexdigest() == values["INPUT_LOCK_SHA256"],
+              "requirements lock digest",
+          )
+          check(
+              hashlib.sha256(wheel_raw).hexdigest()
+              == values["WHEEL_MANIFEST_SHA256"],
+              "wheel manifest digest",
+          )
+          requirements_input_sha = hashlib.sha256(
+              requirements_input_raw
+          ).hexdigest()
+          platform_input_sha = hashlib.sha256(platform_input_raw).hexdigest()
+          check(
+              lock_lines[:8]
+              == [
+              "# PROBIGA_PRODUCTION_REQUIREMENTS_LOCK_VERSION=2",
+              "# SOURCE=deploy/production_requirements.in",
+              f"# REQUIREMENTS_INPUT_SHA256={requirements_input_sha}",
+              "# PLATFORM_SOURCE=requirements-platform.txt",
+              f"# PLATFORM_REQUIREMENTS_SHA256={platform_input_sha}",
+              f"# TARGET={target}",
+              "# STATUS=READY",
+              "--only-binary=:all:",
+              ],
+              "requirements lock header",
+          )
+          check(
+              [
+                  line
+                  for line in requirements_input_lines
+                  if line.startswith("-r ")
+              ]
+              == ["-r ../requirements-platform.txt"],
+              "requirements input must reference the reviewed platform input once",
+          )
+          requirement_re = re.compile(
+              r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^ ]+) "
+              r"--hash=sha256:([0-9a-f]{64})"
+          )
+          requirements = [requirement_re.fullmatch(line) for line in lock_lines[8:]]
+          check(len(requirements) == 44 and all(requirements), "44 hashed requirements")
+          requirements = [match.groups() for match in requirements]
+          canonical = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+          requirement_names = [canonical(row[0]) for row in requirements]
+          check(
+              requirement_names == sorted(set(requirement_names))
+              and {"pip", "setuptools"}.issubset(requirement_names),
+              "requirements names",
+          )
+
+          check(
+              wheel_lines[:3]
+              == [
+                  "PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1",
+                  f"TARGET={target}",
+                  "STATUS=READY",
+              ],
+              "wheel manifest header",
+          )
+          wheel_re = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.+-]+[.]whl)")
+          wheels = [wheel_re.fullmatch(line) for line in wheel_lines[3:]]
+          check(len(wheels) == 44 and all(wheels), "44 wheel manifest entries")
+          wheels = [match.groups() for match in wheels]
+          wheel_hashes, wheel_names = map(list, zip(*wheels, strict=True))
+          check(wheel_names == sorted(set(wheel_names)), "wheel filenames")
+          check(len(set(wheel_hashes)) == 44, "wheel hashes")
+          check(
+              set(wheel_hashes) == {row[2] for row in requirements},
+              "lock/manifest hashes",
+          )
+          PY
+
+          mkdir -p "$LOCK_CLEAN_HOME" "$LOCK_WHEELHOUSE"
+          python -I -m venv "$LOCK_BOOTSTRAP"
+          /usr/bin/env -i \
+            PATH="$LOCK_BOOTSTRAP/bin:/usr/bin:/bin" \
+            HOME="$LOCK_CLEAN_HOME" \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            PIP_CONFIG_FILE=/dev/null \
+            PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            PIP_NO_INPUT=1 \
+            PIP_NO_CACHE_DIR=1 \
+            PYTHONNOUSERSITE=1 \
+            "$LOCK_BOOTSTRAP/bin/python" -I -m pip download \
+              --require-hashes --only-binary=:all: --no-deps \
+              --dest "$LOCK_WHEELHOUSE" -r "$REQUIREMENTS_LOCK"
+
+          mapfile -t downloaded_wheels < <(
+            find "$LOCK_WHEELHOUSE" -mindepth 1 -maxdepth 1 -type f \
+              -name '*.whl' -printf '%f\n' | LC_ALL=C sort
+          )
+          test "${#downloaded_wheels[@]}" -eq 44
+          test "$(find "$LOCK_WHEELHOUSE" -mindepth 1 -maxdepth 1 \
+            -printf '%f\n' | wc -l)" -eq 44
+          tail -n +4 "$WHEEL_MANIFEST" | LC_ALL=C sort \
+            > "$RUNNER_TEMP/probiga-expected-wheels.txt"
+          (
+            cd "$LOCK_WHEELHOUSE"
+            sha256sum -- "${downloaded_wheels[@]}" | LC_ALL=C sort
+          ) > "$RUNNER_TEMP/probiga-actual-wheels.txt"
+          cmp --silent "$RUNNER_TEMP/probiga-expected-wheels.txt" \
+            "$RUNNER_TEMP/probiga-actual-wheels.txt"
+
+          python -I -m venv "$LOCK_RUNTIME_VENV"
+          /usr/bin/env -i \
+            PATH="$LOCK_RUNTIME_VENV/bin:/usr/bin:/bin" \
+            HOME="$LOCK_CLEAN_HOME" \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            PIP_CONFIG_FILE=/dev/null \
+            PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            PIP_NO_INPUT=1 \
+            PIP_NO_CACHE_DIR=1 \
+            PYTHONNOUSERSITE=1 \
+            "$LOCK_RUNTIME_VENV/bin/python" -I -m pip install \
+              --require-hashes --no-index --only-binary=:all: \
+              --find-links "$LOCK_WHEELHOUSE" \
+              -r "$REQUIREMENTS_LOCK"
+          /usr/bin/env -i \
+            PATH="$LOCK_RUNTIME_VENV/bin:/usr/bin:/bin" \
+            HOME="$LOCK_CLEAN_HOME" \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+            PIP_CONFIG_FILE=/dev/null \
+            PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            PIP_NO_INPUT=1 \
+            PIP_NO_CACHE_DIR=1 \
+            PYTHONNOUSERSITE=1 \
+            "$LOCK_RUNTIME_VENV/bin/python" -I -m pip check
+          # No fresh-venv package is exempt: pip and setuptools are lock entries.
+          "$LOCK_RUNTIME_VENV/bin/python" -I - "$REQUIREMENTS_LOCK" \
+            "$REQUIREMENTS_INPUT" "$PLATFORM_INPUT" <<'PY'
+          import importlib.metadata
+          import re
+          import sys
+          from pathlib import Path
+          from packaging.requirements import Requirement
+
+          pattern = re.compile(
+              r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^ ]+) "
+              r"--hash=sha256:[0-9a-f]{64}"
+          )
+          canonical = lambda name: re.sub(r"[-_.]+", "-", name).lower()
+          matches = [
+              match
+              for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+              if (match := pattern.fullmatch(line))
+          ]
+          expected = {canonical(match[1]): match[2] for match in matches}
+          pairs = []
+          for distribution in importlib.metadata.distributions():
+              name = distribution.metadata.get("Name")
+              if not name:
+                  raise SystemExit("installed distribution without Name")
+              pairs.append((canonical(name), distribution.version))
+          names = [name for name, _ in pairs]
+          if len(names) != len(set(names)):
+              raise SystemExit("duplicate installed distribution")
+          observed = dict(pairs)
+          if len(expected) != 44 or len(observed) != 44 or observed != expected:
+              raise SystemExit(
+                  "installed set differs: "
+                  f"missing={sorted(expected.keys() - observed.keys())}, "
+                  f"extra={sorted(observed.keys() - expected.keys())}, "
+                  f"version={sorted(name for name in expected.keys() & observed.keys() if expected[name] != observed[name])}"
+              )
+
+          source_path = Path(sys.argv[2])
+          platform_path = Path(sys.argv[3])
+          source_lines = source_path.read_text(encoding="utf-8").splitlines()
+          includes = [line for line in source_lines if line.startswith("-r ")]
+          if includes != ["-r ../requirements-platform.txt"]:
+              raise SystemExit("production requirements input include differs")
+          direct_lines = [
+              line
+              for line in (*source_lines, *platform_path.read_text(
+                  encoding="utf-8"
+              ).splitlines())
+              if line and not line.startswith(("#", "-r "))
+          ]
+          direct = [Requirement(line) for line in direct_lines]
+          for requirement in direct:
+              name = canonical(requirement.name)
+              if name not in observed:
+                  raise SystemExit(f"direct requirement absent from lock: {name}")
+              if observed[name] not in requirement.specifier:
+                  raise SystemExit(
+                      f"locked version violates direct input: "
+                      f"{name}=={observed[name]} {requirement.specifier}"
+                  )
+          PY
+
       - name: Install regression dependencies
         run: |
-          # adata uses setuptools' legacy backend; freeze the exact backend
-          # that both CI and the offline production build will execute.
-          python -m pip install --upgrade pip setuptools
-          python -m pip install -r requirements-platform.txt
+          # Run every regression against the same complete, hashed dependency
+          # set that the offline production release installs.
+          python -m pip install --require-hashes --only-binary=:all: \
+            -r deploy/production_requirements.lock
+          python -m pip check
 
       - name: Scan tracked secrets after dependency installation
         run: python tools/scan_tracked_secrets.py
 
       - name: Build and install the pinned adata release
-        id: adata_release
         shell: bash
         run: |
           set -euo pipefail
@@ -58,7 +349,7 @@ jobs:
           test "${release_manifest[0]}" = \
             PROBIGA_PRODUCTION_RELEASE_MANIFEST_VERSION=2
           test "${release_manifest[1]}" = \
-            PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_17_x86_64
+            PROBIGA_PRODUCTION_LOCK_TARGET=cp314-manylinux_2_28_x86_64
           case "${release_manifest[5]}" in
             ADATA_RELEASE_SHA=*) \
               ADATA_RELEASE_SHA="${release_manifest[5]#ADATA_RELEASE_SHA=}" ;;
@@ -122,22 +413,6 @@ jobs:
           )
           assert Hot and info and StockMarket
           PY
-          echo "git_sha=$ADATA_RELEASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "tree_sha256=$ADATA_TREE_SHA256" >> "$GITHUB_OUTPUT"
-
-      - name: Freeze the tested dependency set
-        id: dependency_lock
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip freeze --all --exclude-editable \
-            | awk 'tolower($0) !~ /^adata([[:space:]]|==|@)/' \
-            | LC_ALL=C sort \
-            > "$RUNNER_TEMP/probiga-resolved-requirements.txt"
-          echo "payload=$(base64 -w0 "$RUNNER_TEMP/probiga-resolved-requirements.txt")" \
-            >> "$GITHUB_OUTPUT"
-          echo "sha256=$(sha256sum "$RUNNER_TEMP/probiga-resolved-requirements.txt" | cut -d' ' -f1)" \
-            >> "$GITHUB_OUTPUT"
 
       - name: Run unified screener and core runtime regressions
         run: >-
@@ -152,22 +427,43 @@ jobs:
           tests/test_intraday_alert_core.py
           tests/test_quant_digest.py
           tests/test_daily_review_quant_api.py
+
+      - name: Run review and delivery regressions
+        run: >-
+          python -m pytest -q
           tests/test_evening_review_generate.py
           tests/test_early_briefing_generate.py
           tests/test_wecom_delivery.py
           tests/test_quality_gate.py
 
-      - name: Validate independent V4 V5 V6 releases
-        shell: bash
-        run: |
-          set -euo pipefail
-          python tools/validate_trading_release.py
-          mapfile -t release_tests < <(cat \
-            versions/trading_v4/releases/trading_v4.1.0-research/tests.txt \
-            versions/trading_v5/releases/trading_v5.0.0-research/tests.txt \
-            versions/trading_v6/releases/trading_v6.0.0-research/tests.txt \
-            | sed '/^[[:space:]]*$/d' | sort -u)
-          python -m pytest -q "${release_tests[@]}"
+      - name: Validate independent V4 V5 V6 release manifests
+        run: python tools/validate_trading_release.py
+
+      - name: Run independent V4 release regressions
+        run: >-
+          python -m pytest -q
+          tests/test_trading_v4_research_kernel.py
+          tests/architecture/test_v4_dependency_boundaries.py
+          tests/architecture/test_v4_artifact_namespace.py
+          tests/test_trading_v4_domain.py
+          tests/test_trading_v4_chase_risk.py
+
+      - name: Run independent V5 release regressions
+        run: >-
+          python -m pytest -q
+          tests/architecture/test_v5_dependency_boundaries.py
+          tests/test_trading_v5_evidence.py
+          tests/test_trading_v5_models.py
+          tests/test_trading_v5_release.py
+
+      - name: Run independent V6 release regressions
+        run: >-
+          python -m pytest -q
+          tests/architecture/test_v6_dependency_boundaries.py
+          tests/test_trading_v6_evidence.py
+          tests/test_trading_v6_models.py
+          tests/test_trading_v6_pit_finance.py
+          tests/test_trading_v6_release.py
 
       - name: Validate fail-closed production boundary
         run: >-
@@ -175,7 +471,7 @@ jobs:
           --require-git-anchor
           --expected-git-sha "${GITHUB_SHA}"
 
-      - name: Run production governance regressions
+      - name: Run production boundary and API regressions
         run: >-
           python -m pytest -q
           tests/test_production_release_boundary.py
@@ -188,7 +484,10 @@ jobs:
           tests/test_api_error_handling.py
           tests/test_health_endpoints.py
           tests/test_scheduler_script_policy.py
-          tests/test_scheduler_runtime.py
+
+      - name: Run production governance and QMT regressions
+        run: >-
+          python -m pytest -q
           tests/test_attest_qmt_daily_kline.py
           tests/test_bigqmt_strategy_pre_close.py
           tests/test_run_guojin_qmt_full_market_history_2024.py
@@ -198,7 +497,75 @@ jobs:
           tests/test_strategy_governance_health.py
           tests/test_strategy_governance_ui.py
           tests/test_trading_v3_forward_evidence_version.py
+
+      - name: Run production MySQL acceptance regressions
+        run: >-
+          python -m pytest -q
           tests/test_trading_v3_mysql_acceptance.py
+
+      - name: Run dynamic strategy governance foundation regressions
+        run: >-
+          python -m pytest -q
+          tests/test_prepare_strategy_governance_schema.py
+          tests/test_strategy_center.py
+          tests/test_strategy_execution_contracts.py
+          tests/test_strategy_governance_roles.py
+          tests/test_sync_strategy_industry_history.py
+          tests/test_trading_v3_truth_risk.py
+          tests/test_dynamic_shadow_ledger.py
+          tests/test_dynamic_shadow_schema_upgrade.py
+          tests/test_strategy_center_membership_history.py
+          tests/test_strategy_challenger_factory.py
+
+      - name: Run dynamic strategy governance funding regressions
+        run: >-
+          python -m pytest -q
+          tests/test_strategy_center_error_log_sanitization.py
+          tests/test_strategy_funding_checkpoint.py
+          tests/test_strategy_funding_checkpoint_mysql84_metadata.py
+          tests/test_strategy_funding_detail_api.py
+          tests/test_strategy_governance_orchestrator.py
+          tests/test_strategy_governance_orchestrator_api.py
+          tests/test_strategy_governance_write_contract.py
+          tests/test_strategy_governance_history_paging.py
+          tests/test_strategy_membership_api_truth.py
+          tests/test_strategy_metric_artifact_paging.py
+
+      - name: Run dynamic strategy governance guard regressions
+        run: >-
+          python -m pytest -q
+          tests/test_strategy_metric_artifact_size_limit.py
+          tests/test_strategy_statistical_guards.py
+          tests/test_production_schema_evidence_validators.py
+          tests/test_api_generic_error_sanitization.py
+          tests/test_trading_v2_error_sanitization.py
+
+      - name: Run QMT and point-in-time truth regressions
+        run: >-
+          python -m pytest -q
+          tests/test_qmt_reference_physical_contract.py
+          tests/test_qmt_stock_catalog_truth.py
+          tests/test_qmt_announcement_pit.py
+          tests/test_qmt_announcement_scheduler_contract.py
+          tests/test_pit_execution_guard.py
+          tests/test_pit_finance_event_facts.py
+          tests/test_pit_strategy_reader_contract.py
+          tests/test_strategy_governance_statistical_integration.py
+          tests/test_backtest_unified_screener.py
+          tests/test_trading_v2_candidate_context_pit.py
+
+      - name: Run Trading V2 and V3 market truth regressions
+        run: >-
+          python -m pytest -q
+          tests/test_trading_v2_etf_research_truth.py
+          tests/test_trading_v2_statistical_admission.py
+          tests/test_trading_v3_backtest_execution_truth.py
+          tests/test_trading_v3_backtest_market_truth.py
+          tests/test_trading_v3_daily_change_pct_truth.py
+          tests/test_trading_v3_industry_pit_fail_closed.py
+          tests/test_trading_v3_old_point_gate_truth.py
+          tests/test_trading_v3_research_governance_truth.py
+          tests/test_trading_v3_validation_execution_truth.py
 
       - name: Run Trading V3 Layer 4 release regressions
         run: >-
@@ -210,6 +577,58 @@ jobs:
           tests/test_trading_v3_shadow_intelligence_runtime.py
           tests/test_trading_v3_production_activation.py
           tests/test_trading_v3_research_api.py
+
+      - name: Run release safety and scheduler surface regressions
+        run: >-
+          python -m pytest -q
+          tests/test_deploy_workflow_test_inventory.py
+          tests/test_ai_execution_safety.py
+          tests/test_datasource_scheduler_launch.py
+          tests/test_hot_data_scheduler_launch.py
+          tests/test_manual_long_task_enqueue.py
+          tests/test_scheduler_runtime_health.py
+          tests/test_scheduler_task_history_schema.py
+          tests/test_scheduler_task_schema_boundary.py
+          tests/test_qmt_host_ownership.py
+          tests/test_qmt_operations_task_contract.py
+
+      - name: Run physical and runtime schema boundary regressions
+        run: >-
+          python -m pytest -q
+          tests/test_ai_output_physical_schema.py
+          tests/test_auth_ai_bridge_runtime_schema.py
+          tests/test_auxiliary_runtime_schema_boundary.py
+          tests/test_hot_rank_runtime_schema_boundary.py
+          tests/test_market_collector_runtime_boundary.py
+          tests/test_production_runtime_schema_bundle.py
+          tests/test_realtime_quote_schema_boundary.py
+          tests/test_runtime_schema_separation.py
+          tests/test_sim_trade_runtime_schema.py
+          tests/test_strategy_center_runtime_schema.py
+
+      - name: Run QMT discovery and ownership regressions
+        run: >-
+          python -m pytest -q
+          tests/test_qmt_control_schema.py
+          tests/test_qmt_edge_release_bootstrap.py
+          tests/test_qmt_historical_contract_discovery.py
+          tests/test_qmt_history_capabilities.py
+          tests/test_qmt_history_coverage.py
+          tests/test_qmt_local_history_runtime_schema_boundary.py
+          tests/test_qmt_reference_index_atomic_publish.py
+          tests/test_concept_map_runtime_boundary.py
+          tests/test_import_gm_minute_runtime_boundary.py
+          tests/test_legacy_table_surface.py
+
+      - name: Run atomic refresh and event truth regressions
+        run: >-
+          python -m pytest -q
+          tests/test_concept_current_snapshot_safety.py
+          tests/test_legacy_market_sync_atomic.py
+          tests/test_notice_event_publication_time.py
+          tests/test_sentiment_atomic_refresh.py
+          tests/test_stock_market_atomic_refresh.py
+          tests/test_sync_stock_info_atomic_refresh.py
 
   deployment-disabled:
     name: Production deployment disabled
@@ -292,23 +711,14 @@ jobs:
         uses: appleboy/ssh-action@029f5b4aeeeb58fdfe1410a5d17f967dacf36262 # v1.0.3
         env:
           EXPECTED_SHA: ${{ github.sha }}
-          RESOLVED_REQUIREMENTS_B64: ${{ needs.trading-v4-ci-gate.outputs.resolved_requirements_b64 }}
-          EXPECTED_REQUIREMENTS_SHA256: ${{ needs.trading-v4-ci-gate.outputs.resolved_requirements_sha256 }}
-          EXPECTED_ADATA_SHA: ${{ needs.trading-v4-ci-gate.outputs.adata_release_sha }}
-          EXPECTED_ADATA_TREE_SHA256: ${{ needs.trading-v4-ci-gate.outputs.adata_tree_sha256 }}
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           fingerprint: ${{ secrets.SERVER_HOST_FINGERPRINT }}
           command_timeout: 150m
-          envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64,EXPECTED_REQUIREMENTS_SHA256,EXPECTED_ADATA_SHA,EXPECTED_ADATA_TREE_SHA256
+          envs: EXPECTED_SHA
           script: |
             set -Eeuo pipefail
             [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-            printf '%s\n' "$RESOLVED_REQUIREMENTS_B64" | \
-              sudo -n /usr/local/sbin/probiga-production-deploy \
-                "$EXPECTED_SHA" \
-                "$EXPECTED_REQUIREMENTS_SHA256" \
-                "$EXPECTED_ADATA_SHA" \
-                "$EXPECTED_ADATA_TREE_SHA256"
+            sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"

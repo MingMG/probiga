@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -17,28 +18,24 @@ from server.api.commentary_utils import (
 )
 from server.api.routers._engine import get_engine
 from server.common.config import get_wecom_webhook
+from server.common.commentary_profile_schema import (
+    COMMENTARY_PROFILE_TABLE,
+    ensure_commentary_profile_table,
+)
+from server.common.manual_scheduler_launch import (
+    launch_registered_scheduler_task,
+    validate_scheduler_launch_surface,
+)
 from server.common.minute_data import minute_source_info
 from server.engine.data_loader import StockDataLoader
+from tools.manual_long_task_contracts import COMMENTARY_WATCH_TASK
 
 router = APIRouter(tags=["commentary"])
 
-PROFILE_TABLE = "st_commentary_profiles"
-SCRIPT_PATH = "tools/run_commentary_watch.py"
-SCHEDULER_COLUMNS = {
-    "task_type": "VARCHAR(50) DEFAULT 'python'",
-    "group_name": "VARCHAR(32) DEFAULT 'system'",
-    "script_args": "VARCHAR(500) DEFAULT ''",
-    "date_param": "VARCHAR(100) DEFAULT ''",
-    "interval_minutes": "INT DEFAULT 0",
-    "sort_order": "INT DEFAULT 0",
-    "last_triggered_at": "DATETIME DEFAULT NULL",
-    "last_run_output": "TEXT DEFAULT NULL",
-    "last_run_duration": "INT DEFAULT 0",
-    "etl_sync_at": "DATETIME DEFAULT NULL",
-    "updated_at": "DATETIME DEFAULT NULL",
-    "description": "VARCHAR(500) DEFAULT ''",
-}
-NOW_COLUMNS = {"created_at", "updated_at", "etl_sync_at"}
+PROFILE_TABLE = COMMENTARY_PROFILE_TABLE
+SCRIPT_PATH = str(COMMENTARY_WATCH_TASK["script_path"])
+TASK_TYPE = str(COMMENTARY_WATCH_TASK["task_type"])
+_ROOT = Path(__file__).resolve().parents[3]
 
 
 class CommentaryAssessRequest(BaseModel):
@@ -54,7 +51,7 @@ class CommentaryProfileBody(BaseModel):
     text: str = Field(..., min_length=1)
     reference_date: str | None = None
     phase: Literal["premarket", "intraday"] = "premarket"
-    cron_time: str = Field(default="08:55", min_length=4, max_length=5)
+    cron_time: str = Field(default="08:55", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     enabled: bool = True
     push_enabled: bool = True
     webhook_kind: Literal["default", "briefing", "news"] = "briefing"
@@ -71,116 +68,13 @@ def _exec_sql(sql: str, params: dict | None = None) -> None:
         conn.execute(text(sql), params or {})
 
 
-def _table_columns(table_name: str) -> set[str]:
-    with get_engine().connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT COLUMN_NAME
-                FROM information_schema.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE()
-                  AND TABLE_NAME = :table_name
-                """
-            ),
-            {"table_name": table_name},
-        ).fetchall()
-    return {str(row[0]) for row in rows}
-
-
 def _ensure_profile_table() -> None:
-    _exec_sql(
-        f"""
-        CREATE TABLE IF NOT EXISTS `{PROFILE_TABLE}` (
-          `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
-          `profile_name` VARCHAR(120) NOT NULL,
-          `commentary_text` MEDIUMTEXT NOT NULL,
-          `reference_date` DATE DEFAULT NULL,
-          `phase` VARCHAR(16) NOT NULL DEFAULT 'premarket',
-          `cron_time` VARCHAR(5) NOT NULL DEFAULT '08:55',
-          `enabled` TINYINT NOT NULL DEFAULT 1,
-          `push_enabled` TINYINT NOT NULL DEFAULT 1,
-          `webhook_kind` VARCHAR(16) NOT NULL DEFAULT 'briefing',
-          `last_run_at` DATETIME DEFAULT NULL,
-          `last_run_status` VARCHAR(32) DEFAULT '',
-          `last_push_at` DATETIME DEFAULT NULL,
-          `last_push_status` VARCHAR(32) DEFAULT '',
-          `created_at` DATETIME DEFAULT NULL,
-          `updated_at` DATETIME DEFAULT NULL
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """
-    )
-
-
-def _ensure_scheduler_columns() -> set[str]:
-    columns = _table_columns("st_scheduled_tasks")
-    if not columns:
-        raise RuntimeError("st_scheduled_tasks does not exist")
-    with get_engine().begin() as conn:
-        for column, ddl in SCHEDULER_COLUMNS.items():
-            if column not in columns:
-                conn.execute(text(f"ALTER TABLE st_scheduled_tasks ADD COLUMN `{column}` {ddl}"))
-                columns.add(column)
-    return columns
+    ensure_commentary_profile_table(get_engine())
 
 
 def _profile_task_type(profile_id: int) -> str:
-    return f"commentary_watch_{int(profile_id)}"
-
-
-def _profile_task_name(profile_name: str) -> str:
-    short = (profile_name or "").strip()[:32] or "未命名股评"
-    return f"股评监控-{short}"
-
-
-def _upsert_scheduler_task(payload: dict[str, Any], *, task_type: str) -> dict[str, Any]:
-    columns = _ensure_scheduler_columns()
-    allowed = {
-        "task_name", "task_type", "group_name", "script_path", "script_args",
-        "cron_time", "interval_minutes", "enabled", "description",
-        "sort_order", "date_param",
-    }
-    compatible = {key: value for key, value in payload.items() if key in allowed and key in columns}
-    if "task_type" in columns:
-        compatible["task_type"] = task_type
-    if not compatible:
-        raise RuntimeError("no compatible scheduler columns found")
-
-    with get_engine().begin() as conn:
-        task_id = conn.execute(
-            text("SELECT id FROM st_scheduled_tasks WHERE task_type = :task_type LIMIT 1"),
-            {"task_type": task_type},
-        ).scalar()
-        if task_id:
-            assignments = ", ".join(f"`{key}` = :{key}" for key in compatible if key != "task_type")
-            if "updated_at" in columns:
-                assignments += ", `updated_at` = NOW()"
-            conn.execute(
-                text(f"UPDATE st_scheduled_tasks SET {assignments} WHERE id = :id"),
-                {**compatible, "id": task_id},
-            )
-            action = "updated"
-        else:
-            insert_payload = dict(compatible)
-            for column in NOW_COLUMNS:
-                if column in columns:
-                    insert_payload[column] = None
-            names = ", ".join(f"`{key}`" for key in insert_payload)
-            values = ", ".join("NOW()" if key in NOW_COLUMNS else f":{key}" for key in insert_payload)
-            bind_payload = {key: value for key, value in insert_payload.items() if key not in NOW_COLUMNS}
-            conn.execute(text(f"INSERT INTO st_scheduled_tasks ({names}) VALUES ({values})"), bind_payload)
-            task_id = conn.execute(text("SELECT LAST_INSERT_ID()")).scalar()
-            action = "inserted"
-    return {"id": int(task_id), "action": action}
-
-
-def _toggle_scheduler_task(task_type: str, enabled: bool) -> None:
-    try:
-        _exec_sql(
-            "UPDATE st_scheduled_tasks SET enabled = :e, updated_at = NOW() WHERE task_type = :t",
-            {"e": 1 if enabled else 0, "t": task_type},
-        )
-    except Exception:
-        pass
+    del profile_id
+    return TASK_TYPE
 
 
 def _latest_trade_date(as_of_date: str | None = None) -> str:
@@ -248,7 +142,16 @@ def _load_news_items(stock_code: str, stock_name: str) -> list[dict]:
     )
     merged = news_rows + notice_rows
     merged.sort(key=lambda row: str(row.get("publish_time") or ""), reverse=True)
-    return merged[:5]
+    return [
+        {
+            **row,
+            "evidence_status": "LEGACY_UNVERIFIED",
+            "strategy_eligible": False,
+            "funding_eligible": False,
+            "order_authority": False,
+        }
+        for row in merged[:5]
+    ]
 
 
 def _assess_one(
@@ -282,7 +185,10 @@ def _assess_one(
         anchor_low=float(anchor_bar.get("low")) if anchor_bar and anchor_bar.get("low") is not None else None,
         anchor_volume=float(anchor_bar.get("volume")) if anchor_bar and anchor_bar.get("volume") is not None else None,
         latest_volume=float(latest_bar.get("volume")) if latest_bar and latest_bar.get("volume") is not None else None,
-        news_count=len(news_items),
+        # The mutable news/notice display caches are useful context for a human
+        # reviewer but have no immutable revision/coverage proof.  They must
+        # not turn a commentary verdict from WATCH into PASS.
+        news_count=0,
     )
     verdict = build_verdict(checks)
 
@@ -321,6 +227,12 @@ def _assess_one(
         },
         "checks": checks,
         "verdict": verdict,
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "news_evidence_status": "LEGACY_UNVERIFIED",
+        "strategy_eligible": False,
+        "funding_eligible": False,
+        "order_authority": False,
     }
 
 
@@ -338,13 +250,16 @@ def _assess_commentary_core(req: CommentaryAssessRequest) -> dict[str, Any]:
         try:
             items.append(_assess_one(item, phase=phase, trade_date=trade_date, loader=loader))
         except Exception as exc:
+            # API payloads expose a stable failure code, never driver/provider
+            # text that may contain credentials or internal paths.
             items.append({
                 "index": item["index"],
                 "stock_code": item["stock_code"],
                 "stock_name": item["stock_name"],
                 "sector": item.get("sector") or "",
                 "description": item.get("description") or "",
-                "error": str(exc),
+                "error": "COMMENTARY_ASSESSMENT_FAILED",
+                "error_type": type(exc).__name__,
             })
 
     return {
@@ -354,6 +269,12 @@ def _assess_commentary_core(req: CommentaryAssessRequest) -> dict[str, Any]:
         "project_feasibility": project_feasibility_summary(minute_source_info()),
         "items": items,
         "total": len(items),
+        "decision_scope": "RESEARCH_DISPLAY_ONLY",
+        "actionable_output_allowed": False,
+        "news_evidence_status": "LEGACY_UNVERIFIED",
+        "strategy_eligible": False,
+        "funding_eligible": False,
+        "order_authority": False,
     }
 
 
@@ -361,6 +282,7 @@ def _format_push_markdown(profile_name: str, result: dict[str, Any]) -> str:
     lines = [
         f"## 股评监控 | {profile_name}",
         f"> 评估模式: {result.get('phase')} | 交易日: {result.get('trade_date')} | 参考日: {result.get('reference_date')}",
+        "> 仅供研究展示；未验证资讯不进入资金或下单决策。",
     ]
     items = result.get("items") or []
     if not items:
@@ -434,23 +356,90 @@ def _profile_to_request(profile: dict[str, Any], *, as_of_date: str | None = Non
     )
 
 
-def _sync_profile_task(profile: dict[str, Any]) -> dict[str, Any]:
-    profile_id = int(profile["id"])
-    task_type = _profile_task_type(profile_id)
-    payload = {
-        "task_name": _profile_task_name(profile.get("profile_name") or ""),
-        "task_type": task_type,
-        "group_name": "资讯公告",
-        "script_path": SCRIPT_PATH,
-        "script_args": f"--profile-id {profile_id} --push",
-        "cron_time": profile.get("cron_time") or "08:55",
-        "interval_minutes": 0,
-        "enabled": 1 if int(profile.get("enabled") or 0) else 0,
-        "description": "按保存的股评文本执行盘前/盘中校验，并可推送企业微信。",
-        "sort_order": 96 + profile_id,
-        "date_param": "",
+def _validated_as_of_date(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="as_of_date must be YYYY-MM-DD") from exc
+
+
+def _build_profile_script_args(
+    profile_id: int,
+    *,
+    push: bool,
+    as_of_date: str | None,
+) -> str:
+    if type(profile_id) is not int or profile_id < 1:
+        raise HTTPException(status_code=422, detail="profile_id must be positive")
+    args = ["--profile-id", str(profile_id)]
+    if push:
+        args.append("--push")
+    normalized_date = _validated_as_of_date(as_of_date)
+    if normalized_date:
+        args.extend(["--as-of-date", normalized_date])
+    args.append("--json")
+    return " ".join(args)
+
+
+def _run_due_profiles(
+    *,
+    push: bool = True,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Task-only executor for profiles due in the current minute."""
+
+    _ensure_profile_table()
+    current = (now or datetime.now()).replace(second=0, microsecond=0)
+    rows = _read_sql(
+        f"""
+        SELECT *
+        FROM `{PROFILE_TABLE}`
+        WHERE enabled = 1
+          AND cron_time = :cron_time
+          AND (
+            last_run_at IS NULL
+            OR last_run_at < :minute_start
+          )
+        ORDER BY id
+        """,
+        {
+            "cron_time": current.strftime("%H:%M"),
+            "minute_start": current.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    )
+    completed: list[dict[str, Any]] = []
+    for profile in rows:
+        profile_id = int(profile["id"])
+        try:
+            result = _run_profile_assessment(
+                profile_id,
+                push=bool(push and int(profile.get("push_enabled") or 0)),
+            )
+            completed.append({
+                "profile_id": profile_id,
+                "status": "success",
+                "push": (result.get("push") or {}).get("success"),
+            })
+        except Exception as exc:
+            _exec_sql(
+                f"UPDATE `{PROFILE_TABLE}` SET last_run_at=NOW(), last_run_status='failed' WHERE id=:id",
+                {"id": profile_id},
+            )
+            completed.append({
+                "profile_id": profile_id,
+                "status": "failed",
+                "error": "COMMENTARY_PROFILE_RUN_FAILED",
+                "error_type": type(exc).__name__,
+            })
+    return {
+        "status": "success",
+        "due_at": current.isoformat(sep=" ", timespec="minutes"),
+        "processed": len(completed),
+        "profiles": completed,
     }
-    return _upsert_scheduler_task(payload, task_type=task_type)
 
 
 def _run_profile_assessment(profile_id: int, *, push: bool = False, as_of_date: str | None = None) -> dict[str, Any]:
@@ -479,10 +468,14 @@ def _run_profile_assessment(profile_id: int, *, push: bool = False, as_of_date: 
                     {"id": profile_id},
                 )
             except WeComWebhookError as exc:
-                push_result = {"success": False, "error": str(exc)}
+                push_result = {
+                    "success": False,
+                    "error": "WECOM_DELIVERY_FAILED",
+                    "error_type": type(exc).__name__,
+                }
                 _exec_sql(
                     f"UPDATE `{PROFILE_TABLE}` SET last_push_at = NOW(), last_push_status = :s WHERE id = :id",
-                    {"id": profile_id, "s": f"failed:{str(exc)[:120]}"},
+                    {"id": profile_id, "s": "failed:WECOM_DELIVERY_FAILED"},
                 )
 
     return {
@@ -501,20 +494,28 @@ def assess_commentary(req: CommentaryAssessRequest):
 def list_commentary_profiles():
     _ensure_profile_table()
     rows = _read_sql(f"SELECT * FROM `{PROFILE_TABLE}` ORDER BY updated_at DESC, id DESC")
-    task_rows = []
+    task: dict[str, Any] = {}
     try:
+        validate_scheduler_launch_surface(get_engine())
         task_rows = _read_sql(
-            "SELECT id, task_type, enabled, cron_time, last_run_status, last_run_at FROM st_scheduled_tasks "
-            "WHERE task_type LIKE 'commentary_watch_%'"
+            "SELECT id, task_type, script_path, enabled, cron_time, last_run_status, last_run_at "
+            "FROM st_scheduled_tasks WHERE task_type=:task_type ORDER BY id LIMIT 2",
+            {"task_type": TASK_TYPE},
         )
+        if len(task_rows) == 1 and str(task_rows[0].get("script_path") or "").replace("\\", "/") == SCRIPT_PATH:
+            task = task_rows[0]
+        elif len(task_rows) > 1:
+            task = {"status": "task_registration_ambiguous", "enabled": False}
+        elif task_rows:
+            task = {"status": "task_contract_mismatch", "enabled": False}
+        else:
+            task = {"status": "task_registration_missing", "enabled": False}
     except Exception:
-        task_rows = []
-    task_map = {row.get("task_type"): row for row in task_rows}
+        task = {"status": "scheduler_registry_unavailable", "enabled": False}
     data = []
     for row in rows:
         item = _serialize_profile(row)
-        task = task_map.get(_profile_task_type(item["id"])) or {}
-        item["task"] = task
+        item["task"] = dict(task)
         data.append(item)
     return {"data": data, "total": len(data)}
 
@@ -576,7 +577,6 @@ def save_commentary_profile(body: CommentaryProfileBody):
         action = "inserted"
 
     profile = _profile_row(profile_id)
-    _toggle_scheduler_task(_profile_task_type(profile_id), bool(int(profile.get("enabled") or 0)))
     return {"success": True, "action": action, "profile": _serialize_profile(profile)}
 
 
@@ -588,15 +588,16 @@ def toggle_commentary_profile(profile_id: int):
         f"UPDATE `{PROFILE_TABLE}` SET enabled = :e, updated_at = NOW() WHERE id = :id",
         {"e": enabled, "id": profile_id},
     )
-    _toggle_scheduler_task(_profile_task_type(profile_id), bool(enabled))
     return {"success": True, "enabled": bool(enabled)}
 
 
 @router.post("/commentary/profiles/{profile_id}/task/ensure")
 def ensure_commentary_profile_task(profile_id: int):
-    profile = _profile_row(profile_id)
-    result = _sync_profile_task(profile)
-    return {"success": True, **result}
+    del profile_id
+    raise HTTPException(
+        status_code=410,
+        detail="运行时任务注册已禁用；请在受控发布窗口注册固定 commentary_watch 任务",
+    )
 
 
 @router.post("/commentary/profiles/{profile_id}/run")
@@ -605,4 +606,21 @@ def run_commentary_profile(
     push: bool = Query(default=False),
     as_of_date: str = Query(default=""),
 ):
-    return _run_profile_assessment(profile_id, push=push, as_of_date=as_of_date or None)
+    _profile_row(profile_id)
+    script_args = _build_profile_script_args(
+        profile_id,
+        push=push,
+        as_of_date=as_of_date,
+    )
+    result = launch_registered_scheduler_task(
+        get_engine(),
+        task_type=TASK_TYPE,
+        expected_script_path=SCRIPT_PATH,
+        script_args=script_args,
+        root=_ROOT,
+    )
+    return {
+        **result,
+        "profile_id": profile_id,
+        "queued": bool(result.get("accepted")),
+    }

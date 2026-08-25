@@ -13,8 +13,9 @@ ensure_adata_import_path(ROOT)
 import pandas as pd
 from sqlalchemy import text
 from env_config import create_tool_engine
-from server.common.batch_db import write_frame
+from server.common.batch_db import replace_table_rows_exact_keys
 from server.common.config import get_kline_mysql_url
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
@@ -57,12 +58,13 @@ def main():
             return
         combined = pd.concat(batch, ignore_index=True)
         combined["etl_sync_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-        with engine.begin() as conn:
-            for _, row in combined.iterrows():
-                conn.execute(text(
-                    "DELETE FROM sm_stock_kline WHERE stock_code = :c AND trade_date >= :s AND trade_date <= :e"
-                ), {"c": row["stock_code"], "s": START_DATE, "e": END_DATE})
-        write_frame(combined, "sm_stock_kline", engine, if_exists="append", index=False)
+        replace_table_rows_exact_keys(
+            combined,
+            "sm_stock_kline",
+            engine,
+            key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+            lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        )
         print(f"  [BATCH] Wrote {len(combined)} rows ({len(batch)} stocks)", flush=True)
         batch = []
 

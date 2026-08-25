@@ -1,0 +1,6 @@
+# Canonical input for the reviewed CPython 3.14 Linux production wheel lock.
+# Application dependencies stay in the shared platform input; the build tools
+# are explicit because adata is built offline with --no-build-isolation.
+-r ../requirements-platform.txt
+pip==26.2.1
+setuptools==84.0.0

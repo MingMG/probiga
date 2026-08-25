@@ -1195,7 +1195,7 @@ SELF_MONITOR_TASK_TYPES = {
 }
 
 LONG_RUNNING_TASK_TYPES = {
-    "qmt_local_history_2026",
+    "qmt_local_history_2024",
 }
 
 

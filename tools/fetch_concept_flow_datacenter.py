@@ -45,7 +45,7 @@ _FIELD_MAP = {
 }
 
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, replace_table_rows
 
 
 def _fetch_page(date_str: str, page: int, page_size: int = 500) -> dict | None:
@@ -182,11 +182,13 @@ def fetch_concept_flow():
 
     df = df[out_cols].replace({np.nan: None, pd.NaT: None})
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_concept_capital_flow_east"))
-
-    df.to_sql("sm_concept_capital_flow_east", engine, if_exists="append", index=False,
-              chunksize=500, method="multi")
+    replace_table_rows(
+        df,
+        "sm_concept_capital_flow_east",
+        engine,
+        chunksize=500,
+        method="multi",
+    )
 
     print(f"写入完成: sm_concept_capital_flow_east, 共 {len(df)} 行")
 

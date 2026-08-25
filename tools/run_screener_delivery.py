@@ -11,7 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.api.routers.screener import ScreenerRunRequest, screener_run
+from server.api.routers.screener import (
+    ScreenerRunRequest,
+    decode_screener_task_request,
+    execute_screener_task,
+)
 from biz.analysis.trading_wecom import (
     notify_screener_failure,
     select_screener_delivery_rows,
@@ -23,15 +27,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset", default="intraday_sector")
     parser.add_argument("--top", type=int, default=100)
     parser.add_argument("--as-of-date", default="")
+    parser.add_argument("--request-token", default="")
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    request = None
     try:
-        result = screener_run(
-            ScreenerRunRequest(
+        request = (
+            decode_screener_task_request(args.request_token)
+            if args.request_token
+            else ScreenerRunRequest(
                 preset=args.preset,
                 as_of_date=args.as_of_date,
                 universe="market",
@@ -40,18 +48,24 @@ def main() -> int:
                 notify=True,
             )
         )
+        result = execute_screener_task(request)
     except Exception as exc:
-        notification = notify_screener_failure(
-            preset=args.preset,
-            reason=str(exc),
-            stage="生成或落库",
+        notification = (
+            notify_screener_failure(
+                preset=args.preset,
+                reason="筛选任务执行失败，请查看调度审计",
+                stage="生成或落库",
+            )
+            if request is None or bool(request.notify)
+            else {"status": "skipped", "reason": "notification_not_requested"}
         )
         print(
             json.dumps(
                 {
                     "status": "error",
                     "preset": args.preset,
-                    "error": str(exc)[:500],
+                    "error": "SCREENER_TASK_FAILED",
+                    "error_type": type(exc).__name__,
                     "notification": notification,
                 },
                 ensure_ascii=False,
@@ -86,7 +100,7 @@ def main() -> int:
         "notification": result.get("notification"),
         "error": result.get("error"),
     }
-    if not result.get("data"):
+    if not result.get("data") and bool(request and request.notify):
         output["notification"] = notify_screener_failure(
             preset=args.preset,
             reason=str(result.get("error") or "本次筛选没有生成任何候选"),

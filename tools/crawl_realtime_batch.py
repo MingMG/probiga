@@ -34,7 +34,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import (
+    create_batch_engine,
+    quote_identifier,
+    replace_table_rows,
+    replace_table_rows_exact_keys,
+    write_frame,
+)
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 from biz.stock_market.realtime_quotes import _ensure_rt_snapshot_table
 
 SESSION = requests.Session()
@@ -128,6 +135,80 @@ def safe_float(val) -> float:
         return 0.0
 
 
+def _code_scope(
+    codes: list[str],
+    *,
+    column: str = "stock_code",
+    prefix: str = "code",
+) -> tuple[str, dict[str, str]]:
+    normalized = sorted({str(code).strip().zfill(6) for code in codes if str(code).strip()})
+    if not normalized:
+        raise ValueError("snapshot replacement code scope must not be empty")
+    params = {f"{prefix}_{index}": code for index, code in enumerate(normalized)}
+    placeholders = ", ".join(f":{name}" for name in params)
+    return f"{quote_identifier(column)} IN ({placeholders})", params
+
+
+def _publish_snapshot_and_archive(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    archive_snapshot: bool,
+) -> int:
+    """Replace observed quote codes and append their archive in one transaction."""
+
+    if frame is None or frame.empty:
+        raise ValueError("realtime quote snapshot must not be empty")
+    predicate, params = _code_scope(frame["stock_code"].astype(str).tolist())
+    if archive_snapshot:
+        _ensure_rt_snapshot_table(engine)
+    archive_cols = [
+        "stock_code",
+        "short_name",
+        "price",
+        "change",
+        "change_pct",
+        "volume",
+        "amount",
+        "snapshot_at",
+    ]
+    with engine.begin() as connection:
+        connection.execute(
+            text(f"DELETE FROM {quote_identifier('sm_stock_current')} WHERE {predicate}"),
+            params,
+        )
+        current_written = write_frame(
+            frame,
+            "sm_stock_current",
+            connection,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
+        if int(current_written) != len(frame):
+            raise RuntimeError(
+                "sm_stock_current write mismatch: "
+                f"expected={len(frame)} actual={current_written}"
+            )
+        if archive_snapshot:
+            archived = write_frame(
+                frame[archive_cols],
+                "sm_rt_quote_snapshot",
+                connection,
+                if_exists="append",
+                index=False,
+                chunksize=1000,
+                method="multi",
+            )
+            if int(archived) != len(frame):
+                raise RuntimeError(
+                    "sm_rt_quote_snapshot write mismatch: "
+                    f"expected={len(frame)} actual={archived}"
+                )
+    return int(len(frame))
+
+
 def fetch_batch(fs: str, fields: str, page_size: int = 100) -> list[dict]:
     """分页获取批量数据"""
     all_items = []
@@ -207,33 +288,12 @@ def refresh_snapshot(
             f"{len(df)}/{expected} ({coverage:.1%}) < {min_coverage:.1%}"
         )
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_stock_current"))
-
     df["etl_sync_at"] = now
-    df.to_sql("sm_stock_current", engine, if_exists="append",
-              index=False, chunksize=1000, method="multi")
-    if archive_snapshot:
-        _ensure_rt_snapshot_table(engine)
-        archive_cols = [
-            "stock_code",
-            "short_name",
-            "price",
-            "change",
-            "change_pct",
-            "volume",
-            "amount",
-            "snapshot_at",
-        ]
-        df[archive_cols].to_sql(
-            "sm_rt_quote_snapshot",
-            engine,
-            if_exists="append",
-            index=False,
-            chunksize=1000,
-            method="multi",
-        )
-    return len(df)
+    return _publish_snapshot_and_archive(
+        engine,
+        df,
+        archive_snapshot=archive_snapshot,
+    )
 
 
 def refresh_flow(
@@ -282,15 +342,16 @@ def refresh_flow(
             f"{len(df)}/{expected} ({coverage:.1%}) < {min_coverage:.1%}"
         )
 
-    with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d"),
-            {"d": today},
-        )
-
     df["etl_sync_at"] = now
-    df.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append",
-              index=False, chunksize=1000, method="multi")
+    replace_table_rows_exact_keys(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=1000,
+        method="multi",
+    )
     return len(df)
 
 
@@ -331,12 +392,14 @@ def refresh_concept_east(engine) -> int:
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["index_code"], keep="last")
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_concept_east_current"))
-
     df["etl_sync_at"] = now
-    df.to_sql("sm_concept_east_current", engine, if_exists="append",
-              index=False, chunksize=500, method="multi")
+    replace_table_rows(
+        df,
+        "sm_concept_east_current",
+        engine,
+        chunksize=500,
+        method="multi",
+    )
     return len(df)
 
 
@@ -378,12 +441,14 @@ def refresh_index(engine) -> int:
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["index_code"], keep="last")
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_index_current"))
-
     df["etl_sync_at"] = now
-    df.to_sql("sm_index_current", engine, if_exists="append",
-              index=False, chunksize=500, method="multi")
+    replace_table_rows(
+        df,
+        "sm_index_current",
+        engine,
+        chunksize=500,
+        method="multi",
+    )
     return len(df)
 
 

@@ -8,6 +8,7 @@ candidate pool.  It deliberately never places orders.
 """
 from __future__ import annotations
 
+import base64
 import json
 import hashlib
 import logging
@@ -15,6 +16,7 @@ import math
 import re
 import uuid
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,16 +24,56 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.manual_scheduler_launch import launch_registered_scheduler_task
+from server.common.pit_facts import (
+    EVENT_REVISION_TABLE,
+    FINANCE_REVISION_TABLE,
+    PIT_AVAILABLE,
+    PIT_DATA_BLOCKED,
+    load_event_facts,
+    load_finance_facts,
+    normalize_decision_at,
+    resolve_common_fact_cutoff,
+)
 from server.common.sql_reader import read_sql_rows
+from server.common.screener_schema import ensure_screener_tables
 from server.engine.production_selector import (
     board_limit_trigger_pct,
     rank_production_candidates,
     selector_contract,
     selector_run_summary,
 )
+from tools.manual_long_task_contracts import SCREENER_TASKS_BY_TYPE
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_ROOT = Path(__file__).resolve().parents[3]
+_SCREENER_SCRIPT_PATH = "tools/run_screener_delivery.py"
+_SCREENER_FILTER_KEYS = frozenset(
+    {
+        "exclude_st",
+        "keyword",
+        "limit_pct",
+        "low_lookback",
+        "ma_slope_min",
+        "max_60d_gain",
+        "max_boards",
+        "max_change",
+        "max_from_low",
+        "min_amount",
+        "min_boards",
+        "min_change",
+        "min_flow",
+        "min_score",
+        "min_turnover",
+        "minimum_active_members",
+        "new_high_pct",
+        "trend_days",
+        "vol_boost",
+        "vol_ratio_max",
+        "vol_ratio_min",
+    }
+)
 
 
 PRESETS: tuple[dict[str, Any], ...] = (
@@ -164,6 +206,85 @@ def _explicit_db_true(value: Any) -> bool:
     return value is True or (type(value) is int and value == 1)
 
 
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    try:
+        decoded = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        decoded = json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _analysis_pit_binding(row: dict[str, Any]) -> tuple[bool, str]:
+    """Prove persisted scores used the same immutable facts selected now."""
+
+    revision_id = str(row.get("finance_revision_id") or "")
+    content_hash = str(row.get("finance_content_hash") or "")
+    flags = {str(item) for item in _json_list(row.get("analysis_data_quality_flags"))}
+    if revision_id and content_hash:
+        if (
+            f"finance_revision_id={revision_id}" not in flags
+            or f"finance_content_hash={content_hash}" not in flags
+        ):
+            return False, "PIT_SCORE_BINDING_FINANCE_REVISION_MISMATCH"
+    else:
+        coverage_id = str(row.get("finance_coverage_id") or "")
+        response_hash = str(row.get("finance_coverage_response_hash") or "")
+        watermark_hash = str(row.get("finance_coverage_watermark_hash") or "")
+        if not (
+            row.get("finance_authoritative_empty") is True
+            and coverage_id
+            and response_hash
+            and watermark_hash
+            and f"finance_coverage_id={coverage_id}" in flags
+            and f"finance_coverage_response_hash={response_hash}" in flags
+            and f"finance_coverage_watermark_hash={watermark_hash}" in flags
+        ):
+            return False, "PIT_SCORE_BINDING_FINANCE_COVERAGE_MISMATCH"
+
+    event_detail = _json_dict(row.get("analysis_event_risk_detail"))
+    stored_ids = [str(value) for value in event_detail.get("event_revision_ids") or []]
+    stored_hashes = [str(value) for value in event_detail.get("event_content_hashes") or []]
+    selected_ids = [str(value) for value in row.get("event_revision_ids") or []]
+    selected_hashes = [str(value) for value in row.get("event_content_hashes") or []]
+    if selected_ids or stored_ids:
+        if (
+            len(stored_ids) != len(stored_hashes)
+            or sorted(zip(stored_ids, stored_hashes))
+            != sorted(zip(selected_ids, selected_hashes))
+        ):
+            return False, "PIT_SCORE_BINDING_EVENT_REVISION_MISMATCH"
+    else:
+        coverage_id = str(row.get("event_coverage_id") or "")
+        response_hash = str(row.get("event_coverage_response_hash") or "")
+        watermark_hash = str(row.get("event_coverage_watermark_hash") or "")
+        if not (
+            row.get("event_authoritative_empty") is True
+            and event_detail.get("event_authoritative_empty") is True
+            and coverage_id
+            and response_hash
+            and watermark_hash
+            and str(event_detail.get("event_coverage_id") or "") == coverage_id
+            and str(event_detail.get("event_coverage_response_hash") or "")
+            == response_hash
+            and str(event_detail.get("event_coverage_watermark_hash") or "")
+            == watermark_hash
+        ):
+            return False, "PIT_SCORE_BINDING_EVENT_COVERAGE_MISMATCH"
+    return True, ""
+
+
 def _candidate_new_buy_action(row: dict[str, Any]) -> tuple[str, bool, str]:
     """Return display action without ever upgrading missing gates to a buy."""
     recommend = str(row.get("recommend_status") or "DATA_BLOCKED").upper()
@@ -235,6 +356,108 @@ def _clean_date(value: Any) -> str:
         return date.fromisoformat(raw).isoformat()
     except ValueError:
         return ""
+
+
+def _validated_screener_task_payload(request: ScreenerRunRequest) -> dict[str, Any]:
+    raw = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+    preset = str(raw.get("preset") or "").strip()
+    if preset not in PRESET_MAP:
+        raise HTTPException(status_code=422, detail="unknown screener preset")
+    as_of_raw = str(raw.get("as_of_date") or "").strip()
+    as_of_date = _clean_date(as_of_raw)
+    if as_of_raw and as_of_date != as_of_raw:
+        raise HTTPException(status_code=422, detail="as_of_date must be YYYY-MM-DD")
+    universe = str(raw.get("universe") or "").strip()
+    if universe not in {"market", "portfolio", "concept"}:
+        raise HTTPException(status_code=422, detail="unknown screener universe")
+    concept_code = str(raw.get("concept_code") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{0,32}", concept_code):
+        raise HTTPException(status_code=422, detail="invalid concept_code")
+    if universe == "concept" and not concept_code:
+        raise HTTPException(status_code=422, detail="concept_code is required")
+
+    filters = dict(raw.get("filters") or {})
+    unknown = sorted(set(filters) - _SCREENER_FILTER_KEYS)
+    if unknown:
+        raise HTTPException(status_code=422, detail="unknown screener filters")
+    normalized_filters: dict[str, Any] = {}
+    for key, value in filters.items():
+        if key == "exclude_st":
+            if type(value) is not bool:
+                raise HTTPException(status_code=422, detail="exclude_st must be boolean")
+            normalized_filters[key] = value
+        elif key == "keyword":
+            keyword = str(value or "").strip()
+            if len(keyword) > 120:
+                raise HTTPException(status_code=422, detail="keyword is too long")
+            normalized_filters[key] = keyword
+        else:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise HTTPException(status_code=422, detail="numeric screener filter required")
+            number = float(value)
+            if not math.isfinite(number) or abs(number) > 1_000_000_000_000:
+                raise HTTPException(status_code=422, detail="screener filter is out of range")
+            normalized_filters[key] = value
+
+    return {
+        "preset": preset,
+        "as_of_date": as_of_date,
+        "universe": universe,
+        "concept_code": concept_code,
+        "top": int(request.top),
+        "filters": normalized_filters,
+        "notify": bool(request.notify),
+    }
+
+
+def _encode_screener_task_request(request: ScreenerRunRequest) -> str:
+    payload = _validated_screener_task_payload(request)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii")
+    if len(encoded) > 450:
+        raise HTTPException(status_code=422, detail="screener request is too large")
+    return encoded
+
+
+def decode_screener_task_request(token: str) -> ScreenerRunRequest:
+    """Task-side strict inverse of the API's URL-safe request token."""
+
+    raw_token = str(token or "").strip()
+    if not raw_token or len(raw_token) > 450 or not re.fullmatch(r"[A-Za-z0-9_=-]+", raw_token):
+        raise ValueError("invalid screener request token")
+    try:
+        decoded = base64.b64decode(raw_token, altchars=b"-_", validate=True)
+        payload = json.loads(decoded.decode("utf-8"))
+    except Exception as exc:
+        raise ValueError("invalid screener request token") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid screener request token")
+    request = (
+        ScreenerRunRequest.model_validate(payload)
+        if hasattr(ScreenerRunRequest, "model_validate")
+        else ScreenerRunRequest.parse_obj(payload)
+    )
+    # Re-run the same semantic allow-list before task execution.
+    normalized = _validated_screener_task_payload(request)
+    return (
+        ScreenerRunRequest.model_validate(normalized)
+        if hasattr(ScreenerRunRequest, "model_validate")
+        else ScreenerRunRequest.parse_obj(normalized)
+    )
+
+
+def _screener_task_type(preset: str) -> str:
+    return (
+        "screener_intraday_delivery"
+        if str(preset) == "intraday_sector"
+        else "screener_premarket_delivery"
+    )
 
 
 def _engine_rows(sql: str, params: dict[str, Any] | None = None, context: str = "screener") -> list[dict]:
@@ -339,89 +562,7 @@ def _runtime_status(now: datetime | None = None) -> dict[str, Any]:
 
 
 def _ensure_tables() -> None:
-    engine = get_engine()
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS st_screener_saved (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(120) NOT NULL,
-                definition_json LONGTEXT NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_st_screener_saved_name (name)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS st_screener_candidate_pool (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                stock_code VARCHAR(12) NOT NULL,
-                stock_name VARCHAR(80) NOT NULL DEFAULT '',
-                source VARCHAR(40) NOT NULL DEFAULT 'screener',
-                screen_name VARCHAR(120) NOT NULL DEFAULT '',
-                score DECIMAL(10,2) NULL,
-                as_of_date DATE NULL,
-                status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
-                reason TEXT NULL,
-                payload_json LONGTEXT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_st_screener_candidate (stock_code, source, as_of_date)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS st_screener_run_history (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                run_uid CHAR(32) NOT NULL,
-                run_key CHAR(64) NOT NULL,
-                preset VARCHAR(64) NOT NULL,
-                requested_date DATE NULL,
-                session_date DATE NULL,
-                data_date DATE NULL,
-                evidence_date DATE NULL,
-                observed_at DATETIME NULL,
-                generated_at DATETIME NOT NULL,
-                freshness VARCHAR(32) NOT NULL DEFAULT '',
-                status VARCHAR(32) NOT NULL DEFAULT '',
-                source VARCHAR(255) NOT NULL DEFAULT '',
-                universe VARCHAR(32) NOT NULL DEFAULT 'market',
-                concept_code VARCHAR(32) NOT NULL DEFAULT '',
-                result_count INT NOT NULL DEFAULT 0,
-                request_json LONGTEXT NOT NULL,
-                summary_json LONGTEXT NULL,
-                selector_json LONGTEXT NULL,
-                push_status VARCHAR(32) NOT NULL DEFAULT 'NOT_REQUESTED',
-                push_error VARCHAR(500) NULL,
-                pushed_at DATETIME NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_st_screener_run_uid (run_uid),
-                UNIQUE KEY uq_st_screener_run_key (run_key),
-                KEY idx_st_screener_run_date (session_date, preset, generated_at),
-                KEY idx_st_screener_data_date (data_date, preset)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS st_screener_run_result (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                run_uid CHAR(32) NOT NULL,
-                rank_no INT NOT NULL,
-                selector_rank INT NULL,
-                stock_code VARCHAR(12) NOT NULL,
-                stock_name VARCHAR(120) NOT NULL DEFAULT '',
-                score DECIMAL(12,4) NULL,
-                ensemble_score DECIMAL(12,4) NULL,
-                candidate_grade VARCHAR(20) NOT NULL DEFAULT '',
-                action_status VARCHAR(40) NOT NULL DEFAULT '',
-                primary_concept VARCHAR(120) NOT NULL DEFAULT '',
-                change_pct DECIMAL(12,4) NULL,
-                price DECIMAL(18,4) NULL,
-                payload_json LONGTEXT NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY uq_st_screener_result_rank (run_uid, rank_no),
-                UNIQUE KEY uq_st_screener_result_stock (run_uid, stock_code),
-                KEY idx_st_screener_result_lookup (stock_code, run_uid)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+    ensure_screener_tables(get_engine())
 
 
 def _number(value: Any, default: float | None = None) -> float | None:
@@ -736,7 +877,12 @@ def _apply_filters(
     }
 
 
-def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
+def _enrich_selector_evidence(
+    rows: list[dict],
+    target_date: str,
+    *,
+    decision_at: datetime | str | None = None,
+) -> list[dict]:
     """Attach same-day analysis/recommendation evidence used by V4/V5/V6.
 
     Legacy preset queries intentionally return a light market row.  The
@@ -753,6 +899,41 @@ def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
     )
     if not codes:
         return [dict(row) for row in rows]
+    if decision_at is None and target_date == date.today().isoformat():
+        decision_at = datetime.now().replace(microsecond=0)
+    try:
+        exact_decision_at = (
+            normalize_decision_at(decision_at)
+            if decision_at is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        # An invalid or date-only decision timestamp is a data-quality failure,
+        # not permission to fall back to a mutable current-state table.
+        exact_decision_at = None
+    common_cutoff: dict[str, Any] = {
+        "status": PIT_DATA_BLOCKED,
+        "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
+        "fact_cutoff_at": "",
+        "receipt_root_hash": "",
+    }
+    if exact_decision_at is not None:
+        common_cutoff = resolve_common_fact_cutoff(
+            get_engine(),
+            codes=codes,
+            decision_at=exact_decision_at,
+            finance_start_date="1900-01-01",
+            finance_end_date=target_date,
+            event_start_date=(date.fromisoformat(target_date) - timedelta(days=14)),
+            event_end_date=target_date,
+            require_qmt_event_batch=True,
+        )
+    pit_reader_decision_at = (
+        exact_decision_at
+        if common_cutoff.get("status") == PIT_AVAILABLE
+        else None
+    )
+    fact_cutoff_at = common_cutoff.get("fact_cutoff_at") or None
     params: dict[str, Any] = {"target_date": target_date}
     placeholders: list[str] = []
     for index, code in enumerate(codes):
@@ -774,6 +955,7 @@ def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
             )
             return []
 
+    market_mood = None
     try:
         market_rows = _safe_selector_rows(
             f"""
@@ -802,7 +984,9 @@ def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
                    technical_score AS entry_score,
                    sentiment_score, event_score, event_risk_level,
                    recommend_status, data_quality_score AS quality_score,
-                   ordinary_buy_eligible, chase_risk_status
+                   ordinary_buy_eligible, chase_risk_status,
+                   data_quality_flags AS analysis_data_quality_flags,
+                   event_risk_detail AS analysis_event_risk_detail
             FROM stock_analysis_result
             WHERE analysis_date = :target_date
               AND stock_code IN ({code_sql})
@@ -850,67 +1034,164 @@ def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
         )
         market_mood = mood_rows[0].get("market_mood_score") if mood_rows else None
 
-        finance_rows = _safe_selector_rows(
-            f"""
-            SELECT f.stock_code, f.report_date AS finance_report_date,
-                   f.notice_date AS finance_notice_date,
-                   f.etl_sync_at AS finance_knowledge_at,
-                   f.net_asset_ps, f.oper_cf_ps, f.total_rev_yoy_gr,
-                   f.net_profit_yoy_gr, f.roe_wtd, f.gross_margin,
-                   f.net_margin, f.cash_flow_ratio, f.asset_liab_ratio
-            FROM si_stock_finance f
-            JOIN (
-                SELECT stock_code, MAX(report_date) AS report_date
-                FROM si_stock_finance
-                WHERE stock_code IN ({code_sql})
-                  AND report_date <= :target_date
-                  AND notice_date <= :target_date
-                  AND notice_date >= report_date
-                  AND etl_sync_at IS NOT NULL
-                  AND etl_sync_at < DATE_ADD(:target_date, INTERVAL 1 DAY)
-                GROUP BY stock_code
-            ) latest
-              ON latest.stock_code = f.stock_code
-             AND latest.report_date = f.report_date
-            WHERE f.stock_code IN ({code_sql})
-              AND f.report_date <= :target_date
-              AND f.notice_date <= :target_date
-              AND f.notice_date >= f.report_date
-              AND f.etl_sync_at IS NOT NULL
-              AND f.etl_sync_at < DATE_ADD(:target_date, INTERVAL 1 DAY)
-            ORDER BY f.stock_code, f.notice_date DESC, f.etl_sync_at DESC, f.id DESC
-            """,
-            params,
-            context="screener_selector_pit_finance",
-        )
-        finance_seen: set[str] = set()
-        for evidence in finance_rows:
-            code = str(evidence.get("stock_code") or "").zfill(6)
-            if code in finance_seen:
-                continue
-            finance_seen.add(code)
-            payload = {
-                key: value
-                for key, value in evidence.items()
-                if key != "stock_code" and value is not None
-            }
-            payload.update(
-                {
-                    "finance_pit_verified": True,
-                    "finance_source": "si_stock_finance",
-                }
+        if pit_reader_decision_at is None:
+            for code in codes:
+                evidence_by_code.setdefault(code, {}).update(
+                    {
+                        "finance_pit_verified": False,
+                        "finance_pit_status": PIT_DATA_BLOCKED,
+                        "finance_pit_reason": (
+                            common_cutoff.get("reason")
+                            or "PIT_FINANCE_EXACT_DECISION_TIME_REQUIRED"
+                        ),
+                        "finance_source": FINANCE_REVISION_TABLE,
+                        "event_pit_verified": False,
+                        "event_pit_status": PIT_DATA_BLOCKED,
+                        "event_pit_reason": (
+                            common_cutoff.get("reason")
+                            or "PIT_EVENT_EXACT_DECISION_TIME_REQUIRED"
+                        ),
+                        "event_source": EVENT_REVISION_TABLE,
+                    }
+                )
+        else:
+            finance_batch = load_finance_facts(
+                get_engine(),
+                codes=codes,
+                decision_at=pit_reader_decision_at,
+                fact_cutoff_at=fact_cutoff_at,
+                as_of_date=target_date,
             )
-            evidence_by_code.setdefault(code, {}).update(payload)
+            for code in codes:
+                raw = dict(finance_batch.facts.get(code) or {})
+                coverage = dict(
+                    finance_batch.coverage_by_code.get(code) or {}
+                )
+                status = finance_batch.status_for(code)
+                payload = {
+                    key: value
+                    for key, value in raw.items()
+                    if value is not None
+                }
+                payload.update(
+                    {
+                        "finance_pit_verified": status == PIT_AVAILABLE,
+                        "finance_pit_status": (
+                            PIT_AVAILABLE
+                            if status == PIT_AVAILABLE
+                            else PIT_DATA_BLOCKED
+                        ),
+                        "finance_pit_reason": (
+                            finance_batch.reason_for(code)
+                            or (
+                                ""
+                                if status == PIT_AVAILABLE
+                                else "PIT_FINANCE_COVERAGE_UNPROVEN"
+                            )
+                        ),
+                        "finance_manifest_hash": finance_batch.manifest_hash,
+                        "finance_source": FINANCE_REVISION_TABLE,
+                        "finance_authoritative_empty": bool(
+                            status == PIT_AVAILABLE and not raw and coverage
+                        ),
+                        "finance_coverage_id": coverage.get("coverage_id"),
+                        "finance_coverage_response_hash": coverage.get(
+                            "coverage_response_hash"
+                        ),
+                        "finance_coverage_watermark_hash": coverage.get(
+                            "coverage_watermark_hash"
+                        ),
+                    }
+                )
+                evidence_by_code.setdefault(code, {}).update(payload)
+            event_batch = load_event_facts(
+                get_engine(),
+                codes=codes,
+                decision_at=pit_reader_decision_at,
+                fact_cutoff_at=fact_cutoff_at,
+                start_date=(
+                    date.fromisoformat(target_date) - timedelta(days=14)
+                ),
+                end_date=target_date,
+                require_qmt_complete_batch=True,
+            )
+            for code in codes:
+                status = event_batch.status_for(code)
+                event_rows = list(event_batch.facts.get(code) or [])
+                coverage = dict(event_batch.coverage_by_code.get(code) or {})
+                evidence_by_code.setdefault(code, {}).update(
+                    {
+                        "event_pit_verified": status == PIT_AVAILABLE,
+                        "event_pit_status": (
+                            PIT_AVAILABLE
+                            if status == PIT_AVAILABLE
+                            else PIT_DATA_BLOCKED
+                        ),
+                        "event_pit_reason": (
+                            event_batch.reason_for(code)
+                            or (
+                                ""
+                                if status == PIT_AVAILABLE
+                                else "PIT_EVENT_COVERAGE_UNPROVEN"
+                            )
+                        ),
+                        "event_manifest_hash": event_batch.manifest_hash,
+                        "event_revision_ids": [
+                            row.get("event_revision_id") for row in event_rows
+                        ],
+                        "event_content_hashes": [
+                            row.get("event_content_hash") for row in event_rows
+                        ],
+                        "event_source": EVENT_REVISION_TABLE,
+                        "event_authoritative_empty": bool(
+                            status == PIT_AVAILABLE
+                            and not event_rows
+                            and coverage
+                        ),
+                        "event_coverage_id": coverage.get("coverage_id"),
+                        "event_coverage_response_hash": coverage.get(
+                            "coverage_response_hash"
+                        ),
+                        "event_coverage_watermark_hash": coverage.get(
+                            "coverage_watermark_hash"
+                        ),
+                    }
+                )
     except Exception as exc:
         logger.warning("selector evidence enrichment failed for %s: %s", target_date, exc)
-        return [dict(row) for row in rows]
+        for code in codes:
+            evidence_by_code.setdefault(code, {}).update(
+                {
+                    "finance_pit_verified": False,
+                    "finance_pit_status": PIT_DATA_BLOCKED,
+                    "finance_pit_reason": (
+                        f"PIT_FINANCE_READER_FAILED:{type(exc).__name__}"
+                    ),
+                    "finance_source": FINANCE_REVISION_TABLE,
+                    "event_pit_verified": False,
+                    "event_pit_status": PIT_DATA_BLOCKED,
+                    "event_pit_reason": (
+                        f"PIT_EVENT_READER_FAILED:{type(exc).__name__}"
+                    ),
+                    "event_source": EVENT_REVISION_TABLE,
+                }
+            )
 
     enriched: list[dict] = []
     for row in rows:
         code = str(row.get("stock_code") or "").zfill(6)
-        item = dict(evidence_by_code.get(code) or {})
-        item.update(row)
+        # Frozen same-day/PIT evidence is authoritative over light preset rows;
+        # otherwise a caller-provided legacy field could spoof verification.
+        item = dict(row)
+        item.update(evidence_by_code.get(code) or {})
         item["stock_code"] = code
+        item["pit_fact_cutoff_at"] = common_cutoff.get("fact_cutoff_at") or ""
+        item["pit_decision_at"] = common_cutoff.get("decision_at") or ""
+        item["pit_common_receipt_root_hash"] = (
+            common_cutoff.get("receipt_root_hash") or ""
+        )
+        item["pit_common_cutoff_status"] = common_cutoff.get("status")
+        item["pit_common_cutoff_reason"] = common_cutoff.get("reason") or ""
         item["data_date"] = target_date
         item["global_market_regime_score"] = market_mood
         close = _number(item.get("close"))
@@ -930,6 +1211,27 @@ def _enrich_selector_evidence(rows: list[dict], target_date: str) -> list[dict]:
         )
         if item.get("market_mood_score") in (None, 0, 0.0, "") and market_mood is not None:
             item["market_mood_score"] = market_mood
+        pit_score_binding, pit_score_binding_reason = _analysis_pit_binding(
+            item
+        )
+        item["pit_score_binding_verified"] = pit_score_binding
+        item["pit_score_binding_reason"] = pit_score_binding_reason
+        pit_ready = bool(
+            item.get("finance_pit_verified") is True
+            and item.get("event_pit_verified") is True
+            and pit_score_binding
+        )
+        item["pit_strategy_status"] = (
+            PIT_AVAILABLE if pit_ready else PIT_DATA_BLOCKED
+        )
+        if not pit_ready:
+            item["ordinary_buy_eligible"] = False
+            item["signal_status"] = "DATA_BLOCKED"
+            item["recommend_status"] = "SUSPENDED"
+            item["pit_strategy_reason"] = (
+                "PIT_DATA_BLOCKED：财务/公告缺少决策时点可验证修订，"
+                "或持久化评分未绑定相同修订证据"
+            )
         enriched.append(item)
     return enriched
 
@@ -1066,7 +1368,15 @@ def _run_preset(request: ScreenerRunRequest, target_date: str) -> dict[str, Any]
         new_high_pct=float(filters.get("new_high_pct", defaults.get("new_high_pct", 0.90))),
     )
     data_date = _clean_date(result.get("data_date") or result.get("date") or target_date)
-    rows = _enrich_selector_evidence(result.get("data") or [], data_date or target_date)
+    rows = _enrich_selector_evidence(
+        result.get("data") or [],
+        data_date or target_date,
+        decision_at=(
+            datetime.now().replace(microsecond=0)
+            if not _clean_date(request.as_of_date)
+            else None
+        ),
+    )
     rows = _attach_correlation_clusters(rows, data_date or target_date)
     for row in rows:
         row.setdefault("data_date", data_date)
@@ -1262,11 +1572,6 @@ def _run_intraday_sector(
             SELECT stock_code, CONCAT('CONCEPT:', concept_code) AS theme_code,
                    name AS theme_name, 'concept' AS theme_source
             FROM si_stock_concept_east
-            UNION
-            SELECT stock_code, CONCAT('INDUSTRY:', sw_code) AS theme_code,
-                   industry_name AS theme_name, 'industry' AS theme_source
-            FROM si_industry_sw
-            WHERE industry_name IS NOT NULL AND industry_name <> ''
         ) m
         JOIN sm_stock_current c ON c.stock_code = m.stock_code
         WHERE {quote_filter_sql}
@@ -1368,11 +1673,6 @@ def _run_intraday_sector(
                 SELECT stock_code, CONCAT('CONCEPT:', concept_code) AS theme_code,
                        name AS theme_name, 'concept' AS theme_source
                 FROM si_stock_concept_east
-                UNION
-                SELECT stock_code, CONCAT('INDUSTRY:', sw_code) AS theme_code,
-                       industry_name AS theme_name, 'industry' AS theme_source
-                FROM si_industry_sw
-                WHERE industry_name IS NOT NULL AND industry_name <> ''
             ) membership
             WHERE theme_code IN ({','.join(placeholders)})
             """,
@@ -1418,6 +1718,14 @@ def _run_intraday_sector(
             "intraday_theme_active_members": int(best.get("active_members") or 0),
             "intraday_theme_positive_breadth": best.get("positive_breadth"),
             "intraday_theme_names": [str(item.get("concept_name") or item.get("concept_code")) for item in themes[:5]],
+            "industry_evidence_status": "DATA_BLOCKED",
+            "industry_evidence_reason": (
+                "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+            ),
+            "legacy_theme_evidence_status": "LEGACY_UNVERIFIED",
+            "strategy_theme_eligible": False,
+            "funding_eligible": False,
+            "order_authority": False,
             "matched_conditions": [
                 f"盘中涨幅{change:.2f}%",
                 f"{best.get('concept_name') or best.get('concept_code')}联动{int(best.get('active_members') or 0)}只",
@@ -1431,7 +1739,11 @@ def _run_intraday_sector(
     # row with gates and buy readiness, but cannot hide an already discovered
     # sector leader merely because its previous-close evidence ranks lower.
     shortlist = _intraday_quota_shortlist(raw, request.top)
-    enriched = _enrich_selector_evidence(shortlist, target_date)
+    enriched = _enrich_selector_evidence(
+        shortlist,
+        target_date,
+        decision_at=observed_at,
+    )
     enriched = _attach_correlation_clusters(enriched, target_date)
     normalized, stats = _apply_filters(
         enriched,
@@ -1448,6 +1760,14 @@ def _run_intraday_sector(
         row["selector_rank"] = row.get("rank")
         row["rank"] = rank
         row["intraday_rank"] = rank
+        row["industry_evidence_status"] = "DATA_BLOCKED"
+        row["industry_evidence_reason"] = (
+            "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+        )
+        row["legacy_theme_evidence_status"] = "LEGACY_UNVERIFIED"
+        row["strategy_theme_eligible"] = False
+        row["funding_eligible"] = False
+        row["order_authority"] = False
     return {
         "status": "ok",
         "preset": preset,
@@ -1460,6 +1780,13 @@ def _run_intraday_sector(
         "source": "sm_stock_current+si_stock_concept_east+previous_close_evidence",
         "decision_scope": "PRODUCTION_SELECTION_ADVISORY",
         "actionable_output_allowed": False,
+        "industry_evidence_status": "DATA_BLOCKED",
+        "industry_evidence_reason": (
+            "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+        ),
+        "legacy_theme_evidence_status": "LEGACY_UNVERIFIED",
+        "funding_eligible": False,
+        "order_authority": False,
         "selector": selector_contract(),
         "stats": {
             **stats,
@@ -1512,8 +1839,9 @@ def screener_status():
     return result
 
 
-@router.post("/screener/run")
-def screener_run(request: ScreenerRunRequest):
+def execute_screener_task(request: ScreenerRunRequest) -> dict[str, Any]:
+    """Generate, persist and optionally deliver from a scheduler task only."""
+
     requested = _clean_date(request.as_of_date)
     target = requested or _latest_date("sm_stock_kline") or date.today().isoformat()
     result = _run_preset(request, target)
@@ -1522,7 +1850,7 @@ def screener_run(request: ScreenerRunRequest):
     result["selector"] = selector_contract()
     result["view_mode"] = "latest"
     run_meta = {
-        "run_type": "sync",
+        "run_type": "scheduler_task",
         "run_id": f"screen-{target}-{request.preset}",
         "generated_at": datetime.now().replace(microsecond=0).isoformat(sep=" "),
         "model_fingerprint": result["selector"]["model_fingerprint"],
@@ -1533,7 +1861,12 @@ def screener_run(request: ScreenerRunRequest):
         run_meta.update(persisted)
     except Exception as exc:  # A database ledger failure must be visible without hiding the ranking.
         logger.exception("Unable to persist screener run: %s", exc)
-        run_meta.update({"persisted": False, "is_new": False, "persistence_error": str(exc)[:300]})
+        run_meta.update({
+            "persisted": False,
+            "is_new": False,
+            "persistence_error": "SCREENER_PERSISTENCE_FAILED",
+            "persistence_error_type": type(exc).__name__,
+        })
     result["run"] = run_meta
     if request.notify:
         if not run_meta.get("persisted"):
@@ -1565,6 +1898,36 @@ def screener_run(request: ScreenerRunRequest):
         ),
     )
     return result
+
+
+@router.post("/screener/run")
+def screener_run(request: ScreenerRunRequest):
+    """Queue one strict registered task; never screen or deliver in the API."""
+
+    token = _encode_screener_task_request(request)
+    task_type = _screener_task_type(request.preset)
+    contract = SCREENER_TASKS_BY_TYPE.get(task_type)
+    if not contract or str(contract.get("script_path") or "") != _SCREENER_SCRIPT_PATH:
+        return {
+            "accepted": False,
+            "queued": False,
+            "status": "task_contract_unavailable",
+            "task_type": task_type,
+            "job_id": "",
+            "error": "生产筛选任务合同不可用，已拒绝执行",
+        }
+    result = launch_registered_scheduler_task(
+        get_engine(),
+        task_type=task_type,
+        expected_script_path=_SCREENER_SCRIPT_PATH,
+        script_args=f"--request-token {token} --json",
+        root=_ROOT,
+    )
+    return {
+        **result,
+        "queued": bool(result.get("accepted")),
+        "preset": request.preset,
+    }
 
 
 @router.get("/screener/history")
@@ -1665,7 +2028,13 @@ def screener_history(
         }
     except Exception as exc:
         logger.exception("Unable to read screener history: %s", exc)
-        return {"status": "error", "data": [], "total": 0, "error": str(exc)[:300], "available_runs": []}
+        return {
+            "status": "error",
+            "data": [],
+            "total": 0,
+            "error": "SCREENER_HISTORY_UNAVAILABLE",
+            "available_runs": [],
+        }
 
 
 @router.get("/screener/saved")
@@ -1684,7 +2053,12 @@ def screener_saved():
         return {"status": "ok", "data": rows, "total": len(rows)}
     except Exception as exc:
         logger.warning("Unable to list saved screens: %s", exc)
-        return {"status": "degraded", "data": [], "total": 0, "error": str(exc)[:300]}
+        return {
+            "status": "degraded",
+            "data": [],
+            "total": 0,
+            "error": "SCREENER_SAVED_LIST_UNAVAILABLE",
+        }
 
 
 @router.post("/screener/saved")
@@ -1732,8 +2106,13 @@ def screener_candidates(status: str = Query(default="ACTIVE"), limit: int = Quer
             row["action"] = "WATCH"
             row["actionable"] = False
         return {"status": "ok", "data": rows, "total": len(rows)}
-    except Exception as exc:
-        return {"status": "degraded", "data": [], "total": 0, "error": str(exc)[:300]}
+    except Exception:
+        return {
+            "status": "degraded",
+            "data": [],
+            "total": 0,
+            "error": "SCREENER_CANDIDATE_LIST_UNAVAILABLE",
+        }
 
 
 @router.post("/screener/candidates")
@@ -1806,7 +2185,7 @@ def screener_candidate_center(trade_date: str = Query(default=""), limit: int = 
         )
     except Exception as exc:
         logger.warning("candidate center recommendation source failed: %s", exc)
-        rec = {"data": [], "error": str(exc)}
+        rec = {"data": [], "error": "RECOMMENDATION_SOURCE_UNAVAILABLE"}
     candidates: list[dict[str, Any]] = []
     for row in (rec.get("data") or []):
         item = dict(row)
@@ -1823,7 +2202,13 @@ def screener_candidate_center(trade_date: str = Query(default=""), limit: int = 
         item["decision_scope"] = "PRODUCTION_SELECTION_ADVISORY"
         item["actionable"] = False
         candidates.append(item)
-    candidates = _enrich_selector_evidence(candidates, target)
+    candidates = _enrich_selector_evidence(
+        candidates,
+        target,
+        decision_at=(
+            datetime.now().replace(microsecond=0) if not trade_date else None
+        ),
+    )
     candidates = _attach_correlation_clusters(candidates, target)
     candidates = rank_production_candidates(candidates)[:limit]
     strategy_counts: dict[str, int] = {}

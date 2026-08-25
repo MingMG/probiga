@@ -6,16 +6,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
+import secrets
 import subprocess
 import sys
 import threading
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -25,9 +28,69 @@ if str(ROOT) not in sys.path:
 
 from tools.run_strategy_governance_daily import authoritative_closed_trade_date
 from tools.strategy_governance_task_contract import TASK as GOVERNANCE_TASK
+from tools.qmt_announcement_task_contract import (
+    TASK as QMT_ANNOUNCEMENT_TASK,
+    validate_pipeline_order as validate_qmt_announcement_pipeline_order,
+)
+from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
+from server.common.scheduler_runtime_health import (
+    check_linux_standalone_scheduler_heartbeat,
+    check_qmt_windows_edge_executor,
+    check_qmt_windows_edge_release_receipt,
+)
+from server.engine.strategy_funding_checkpoint import (
+    FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+    FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+    FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+    FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+    FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+    FUNDING_CHECKPOINT_MIGRATION_HASH,
+    FUNDING_CHECKPOINT_MIGRATION_KEY,
+    FUNDING_CHECKPOINT_SCHEMA,
+    FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+    FUNDING_CHECKPOINT_TABLE_NAME,
+    FUNDING_CHECKPOINT_TARGET_AVG_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+    FUNDING_CHECKPOINT_TRIGGER_CONTRACTS,
+    FUNDING_DAILY_FACT_SCHEMA,
+    FUNDING_DAILY_FACT_TABLE_NAME,
+    canonical_hash as _funding_canonical_hash,
+    canonical_json as _funding_canonical_json,
+    checkpoint_chain_payload,
+    checkpoint_identity,
+    checkpoint_state_hash,
+    funding_daily_fact_hash,
+    funding_daily_fact_identity,
+    ordered_funding_fact_set_hash,
+    validate_strategy_funding_checkpoint_schema,
+)
 
 
 QMT_PRECLOSE_ATTESTATION_PROTOCOL = "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
+CANONICAL_FUNDING_PROVENANCE = (
+    "INTERNAL_PORTFOLIO_CHECKPOINT_FACT_LEDGER_V3"
+)
+EXPECTED_FUNDING_TABLE_COUNTS = {
+    FUNDING_DAILY_FACT_TABLE_NAME: {
+        "column_count": 29,
+        "index_count": 9,
+        "foreign_key_count": 3,
+        "check_count": 7,
+    },
+    FUNDING_CHECKPOINT_TABLE_NAME: {
+        "column_count": 46,
+        "index_count": 12,
+        "foreign_key_count": 7,
+        "check_count": 13,
+    },
+}
+GOVERNANCE_HEALTH_CONTRACT_VERSION = (
+    "probiga.strategy-governance-health.v1"
+)
+EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT = 38
+EXPECTED_METRIC_REVIEW_TRIGGER_COUNT = 2
+EXPECTED_GOVERNANCE_TRIGGER_COUNT = 40
 _RAW_METRIC_REPLAY_LOCK = threading.Lock()
 METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS = {
     "trg_strategy_metric_input_review_bu": (
@@ -60,7 +123,19 @@ GOVERNANCE_TABLES = (
     "st_strategy_adapter_run_receipt",
     "st_strategy_industry_history",
     "st_strategy_governance_audit",
+    "st_strategy_adapter_candidate_fact",
+    "st_dynamic_shadow_trial_plan",
+    "st_dynamic_shadow_trial_chain",
+    "st_dynamic_shadow_trial_exit_binding",
+    FUNDING_DAILY_FACT_TABLE_NAME,
+    FUNDING_CHECKPOINT_TABLE_NAME,
 )
+DYNAMIC_SHADOW_TABLES = frozenset({
+    "st_strategy_adapter_candidate_fact",
+    "st_dynamic_shadow_trial_plan",
+    "st_dynamic_shadow_trial_chain",
+    "st_dynamic_shadow_trial_exit_binding",
+})
 REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "st_strategy_governance_schema_migration": frozenset(
         {"migration_key", "migration_hash", "completed_at"}
@@ -537,17 +612,135 @@ REQUIRED_INDEX_CONTRACTS: dict[
     },
 }
 LIFECYCLE_STATES = ("ACTIVE", "REDUCE", "SHADOW", "SUSPENDED", "RETIRED")
+LIFECYCLE_TRANSITIONS: dict[str, frozenset[str]] = {
+    "ACTIVE": frozenset({
+        "ACTIVE", "REDUCE", "SHADOW", "SUSPENDED", "RETIRED",
+    }),
+    "REDUCE": frozenset({
+        "ACTIVE", "REDUCE", "SHADOW", "SUSPENDED", "RETIRED",
+    }),
+    "SHADOW": frozenset({
+        "ACTIVE", "REDUCE", "SHADOW", "SUSPENDED", "RETIRED",
+    }),
+    "SUSPENDED": frozenset({"SHADOW", "SUSPENDED", "RETIRED"}),
+    "RETIRED": frozenset({"RETIRED"}),
+}
+
+
+def governance_health_required_check_names(
+    disposition: str,
+    *,
+    require_scheduler_heartbeat: bool = False,
+) -> frozenset[str]:
+    """Return the frozen producer-side check inventory for a passing report."""
+
+    column_tables = set(REQUIRED_COLUMNS) - set(DYNAMIC_SHADOW_TABLES)
+    index_tables = set(REQUIRED_INDEXES) - set(DYNAMIC_SHADOW_TABLES)
+    common = {
+        "required_tables", "daily_scheduler_task_unique",
+        "daily_scheduler_task_contract",
+        "qmt_announcement_scheduler_task_unique",
+        "qmt_announcement_scheduler_task_contract",
+        "qmt_operations_scheduler_tasks_unique",
+        "qmt_operations_scheduler_tasks_contract",
+        "supporting_release_trigger_inventory_exact",
+        "qmt_reference_physical_schema_and_seal",
+        "qmt_history_coverage_physical_schema_and_seal",
+        "qmt_history_capability_matrix_fail_closed",
+        "qmt_windows_edge_executor_and_last_success",
+        "qmt_windows_edge_release_bootstrap",
+        "scheduler_task_history_physical_schema",
+        "pit_fact_physical_schema_exact",
+        "latest_qmt_announcement_full_market_batch",
+        "strategy_metric_input_application_state_machine",
+        "governance_append_only_application_integrity",
+        "strategy_funding_schema_exact",
+        "dynamic_shadow_ledger_schema_exact",
+        "dynamic_shadow_candidate_plan_fill_forward_ledger",
+        "forward_strategy_version_schema", "forward_strategy_version_relations",
+        "v2_raw_fill_cash_ledgers_are_immutable",
+        "forward_exit_allocation_v3_frozen_schema",
+        "forward_exit_allocation_v3_fifo_conservation",
+        "qmt_pre_close_v2_frozen_schema",
+        "governance_canonical_revision_migration", "authoritative_trade_date",
+        "dynamic_strategy_registry", "strategy_lifecycle_domain",
+        "strategy_current_versions", "dynamic_combination_registry",
+        "combination_lifecycle_domain", "combination_current_versions",
+        "all_immutable_version_hashes",
+        "all_lifecycle_and_audit_payload_hashes_and_run_bindings",
+        "registry_lifecycle_projection_matches_immutable_events",
+        "strategy_industry_history_exact_qmt_full_replay",
+        "all_governance_detail_snapshot_hashes_and_run_bindings",
+        "metric_evidence_state_domain",
+        "all_metric_evidence_submission_and_review_audits",
+        "metric_and_challenger_evidence_hashes_globally_unique",
+        "global_real_order_authority_closed",
+        "historical_canonical_run_inventory",
+        "authoritative_date_has_one_canonical_revision",
+    } | {f"schema_columns:{name}" for name in column_tables} | {
+        f"schema_indexes:{name}" for name in index_tables
+    } | {f"schema_index_contracts:{name}" for name in index_tables}
+    if require_scheduler_heartbeat:
+        common.add("linux_standalone_scheduler_heartbeat_current")
+    if disposition == "input_not_ready":
+        tail = {
+            "expected_build_date_run",
+            "authoritative_session_windows_qmt_close_attested",
+            "qmt_pre_close_v2_rows_bind_current_kline",
+            "no_historical_canonical_run",
+        }
+    elif disposition == "completed":
+        tail = {
+            "candidate_pool_industry_snapshot_binds_exact_qmt_history",
+            "authoritative_session_windows_qmt_close_attested",
+            "qmt_pre_close_v2_rows_bind_current_kline",
+            "latest_completed_run_identity", "expected_build_date_run_unique",
+            "expected_run_identity", "expected_run_completed",
+            "expected_run_input_fresh", "completed_run_has_hash_valid_audit",
+            "funding_checkpoint_manifest_partition_and_persistence",
+            "run_registry_counts", "market_router_snapshot_is_reproducible",
+            "current_canonical_metrics_replay_from_raw_ledgers",
+            "strategy_health_three_windows", "combination_health_one_snapshot_each",
+            "funding_snapshots_use_confirmed_evidence",
+            "pool_counts_and_dates_match_run",
+            "pool_rows_snapshot_hash_and_funding_references",
+            "allocation_candidate_snapshot_and_decision_hashes",
+            "paper_allocation_exactly_closed",
+            "allocation_targets_are_funding_eligible",
+            "allocation_lifecycle_budget_exact",
+            "allocation_obeys_market_router_risk_budget",
+        }
+    else:
+        raise ValueError("passing governance health disposition is invalid")
+    return frozenset(common | tail)
+
+
 EXPECTED_WINDOWS = (20, 60, 120)
 BUILD_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 RESULT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 ROUTER_POLICY_VERSION = "strategy_market_router.v1"
-ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v3"
+ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v5"
+LEGACY_ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v4"
+ALLOCATION_POLICY_V5_EFFECTIVE_TRADE_DATE = "2026-08-25"
 DAILY_NAV_RANKING_BASIS = "DAILY_NET_NAV_20_60_120_V1"
 DAILY_NAV_RANKING_BASIS_LABEL = "同口径20/60/120日扣费后日频净值健康分"
-ALLOCATION_TYPE_LANE_POLICY = "FIXED_EQUAL_LANES_NO_CROSS_TYPE_RAW_SCORE_V1"
+ALLOCATION_TYPE_LANE_POLICY = (
+    "UNIFIED_RISK_ADJUSTED_QUALITY_MUTUAL_EXCLUSION_V1"
+)
 POOL_ROW_SCHEMA = "probiga.strategy-pool-row.v1"
 POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
+INDUSTRY_BINDING_SCHEMA = "probiga.governance-industry-binding.v1"
+INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v2"
+L1_INDUSTRY_TYPES = frozenset({"L1", "一级行业", "申万一级", "SW2021"})
+QMT_VALIDATED = "QMT_VALIDATED"
+_QMT_INDUSTRY_FACT_ID_RE = re.compile(
+    r"^qmt:[0-9a-f]{64}:[0-9a-f]{64}$"
+)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+PORTFOLIO_RISK_EVIDENCE_SCHEMA = (
+    "probiga.strategy-portfolio-risk-evidence.v2"
+)
 AUTOMATIC_TRANSITION_PLAN_SCHEMA = (
     "probiga.strategy-automatic-transition-plan.v1"
 )
@@ -568,6 +761,22 @@ MARKET_RISK_CAP_PCT = {
     "high_range": Decimal("50.0000"),
     "risk_declining": Decimal("20.0000"),
     "extreme_event": Decimal("0.0000"),
+}
+GLOBAL_PORTFOLIO_POLICY: dict[str, Any] = {
+    "maximum_funded_sleeves": 8,
+    "maximum_single_stock_weight_pct": 5.0,
+    "maximum_industry_weight_pct": 20.0,
+    "maximum_pairwise_correlation": 0.80,
+    "minimum_pairwise_observations": 60,
+    "maximum_pairwise_stock_overlap_pct": 40.0,
+    "maximum_planned_positions": 25,
+    # New-buy increases are capped; reductions and complete exits are not.
+    "maximum_new_buy_turnover_pct": 30.0,
+    "maximum_daily_expected_shortfall_95_pct": 3.0,
+    "maximum_annualized_volatility_pct": 35.0,
+    "reference_capital_cny": 1_000_000.0,
+    "board_lot_size": 100,
+    "real_order_authority": False,
 }
 LIFECYCLE_LABELS = {
     "ACTIVE": "正常运行",
@@ -594,6 +803,20 @@ def _rows(
         dict(row)
         for row in connection.execute(text(sql), params or {}).mappings().all()
     ]
+
+
+def _safe_exception_message(
+    exc: BaseException,
+    *,
+    error_code: str = "governance_health_check_failed",
+) -> str:
+    """Return correlatable failure metadata without exception text/SQL/DSNs."""
+
+    return (
+        f"error_code={error_code};"
+        f"exception_type={type(exc).__name__};"
+        f"incident_id={secrets.token_hex(8)}"
+    )
 
 
 def _integer(value: Any) -> int:
@@ -741,12 +964,14 @@ def _authoritative_session_window_attestation_check(
 
     try:
         from server.engine.strategy_governance import (
-            _authoritative_session_windows,
+            _authoritative_session_windows_with_proof,
         )
 
-        windows = _authoritative_session_windows(trade_date)
+        windows, row_binding_proof = (
+            _authoritative_session_windows_with_proof(trade_date)
+        )
     except Exception as exc:
-        return False, {"error": f"{type(exc).__name__}: {exc}"}
+        return False, {"error": _safe_exception_message(exc)}
 
     window_fields = {
         "schema",
@@ -756,6 +981,10 @@ def _authoritative_session_window_attestation_check(
         "session_count",
         "sessions",
         "session_attestations",
+        "calendar_manifest_hash",
+        "calendar_session_set_hash",
+        "calendar_receipt_binding_hash",
+        "calendar_receipt",
         "session_hash",
     }
     attestation_fields = {
@@ -826,6 +1055,20 @@ def _authoritative_session_window_attestation_check(
         payload = {
             key: value for key, value in window.items() if key != "session_hash"
         }
+        calendar_receipt = window.get("calendar_receipt")
+        try:
+            from server.engine.strategy_governance import (
+                _valid_calendar_receipt_binding,
+            )
+            calendar_valid = _valid_calendar_receipt_binding(
+                calendar_receipt,
+                start_date=(normalized_sessions[0]
+                            if normalized_sessions else ""),
+                end_date=(normalized_sessions[-1]
+                          if normalized_sessions else ""),
+            )
+        except Exception:
+            calendar_valid = False
         valid = (
             set(window) == window_fields
             and window.get("schema")
@@ -840,6 +1083,13 @@ def _authoritative_session_window_attestation_check(
             == normalized_sessions[-1]
             and normalized_sessions[-1] == trade_date
             and attestation_valid
+            and calendar_valid
+            and str(window.get("calendar_manifest_hash") or "")
+            == str((calendar_receipt or {}).get("manifest_hash") or "")
+            and str(window.get("calendar_session_set_hash") or "")
+            == str((calendar_receipt or {}).get("session_set_hash") or "")
+            and str(window.get("calendar_receipt_binding_hash") or "")
+            == str((calendar_receipt or {}).get("binding_hash") or "")
             and RESULT_HASH_RE.fullmatch(
                 str(window.get("session_hash") or "")
             )
@@ -878,7 +1128,148 @@ def _authoritative_session_window_attestation_check(
                     "reason": "session/QMT close attestation contract invalid",
                 }
             )
-    return not errors, {"windows": summaries, "errors": errors}
+    return not errors, {
+        "windows": summaries,
+        "row_binding_proof": row_binding_proof,
+        "errors": errors,
+    }
+
+
+def _reused_qmt_row_attestation_binding_check(
+    trade_date: str,
+    expected_sessions: list[str],
+    stock_contracts: dict[str, Any],
+    raw_proof: Any,
+) -> tuple[bool, dict[str, Any]] | None:
+    """Validate the row proof already produced with session windows."""
+
+    if raw_proof is None:
+        return None
+    if not isinstance(raw_proof, dict):
+        return False, {
+            "proof_reused": True,
+            "error": "authoritative QMT row-binding proof is not an object",
+        }
+    proof_fields = {
+        "schema",
+        "as_of_date",
+        "start_date",
+        "end_date",
+        "session_count",
+        "protocol_version",
+        "source_pre_close_origin",
+        "row_run_binding",
+        "sessions",
+        "proof_hash",
+    }
+    session_fields = {
+        "trade_date",
+        "target_stock_count",
+        "target_stock_set_hash",
+        "completed_attestation_stock_count",
+        "completed_attestation_stock_set_hash",
+        "exact_attestation_stock_count",
+        "exact_attestation_stock_set_hash",
+        "attested_bar_count",
+        "matching_completed_manifest_run_count",
+    }
+    proof_sessions = raw_proof.get("sessions")
+    proof_sessions = proof_sessions if isinstance(proof_sessions, list) else []
+    payload = {
+        key: value for key, value in raw_proof.items() if key != "proof_hash"
+    }
+    errors: list[dict[str, Any]] = []
+    if (
+        set(raw_proof) != proof_fields
+        or raw_proof.get("schema") != "probiga.qmt-row-binding-proof.v1"
+        or _iso_date(raw_proof.get("as_of_date")) != trade_date
+        or _iso_date(raw_proof.get("start_date"))
+        != expected_sessions[0]
+        or _iso_date(raw_proof.get("end_date")) != trade_date
+        or _integer(raw_proof.get("session_count"))
+        != len(expected_sessions)
+        or str(raw_proof.get("protocol_version") or "")
+        != QMT_PRECLOSE_ATTESTATION_PROTOCOL
+        or raw_proof.get("source_pre_close_origin") != "NATIVE_QMT"
+        or raw_proof.get("row_run_binding") != "SAME_COMPLETED_RUN_ID"
+        or RESULT_HASH_RE.fullmatch(str(raw_proof.get("proof_hash") or ""))
+        is None
+        or _canonical_digest(payload) != raw_proof.get("proof_hash")
+        or len(proof_sessions) != len(expected_sessions)
+    ):
+        errors.append({
+            "reason": "authoritative QMT row-binding proof envelope is invalid"
+        })
+
+    total_target = 0
+    total_completed = 0
+    total_exact = 0
+    observed_days: list[str] = []
+    for index, session in enumerate(expected_sessions):
+        row = proof_sessions[index] if index < len(proof_sessions) else {}
+        row = row if isinstance(row, dict) else {}
+        day = _iso_date(row.get("trade_date"))
+        observed_days.append(day)
+        contract = stock_contracts.get(session)
+        contract = contract if isinstance(contract, dict) else {}
+        target_count = _integer(row.get("target_stock_count"))
+        completed_count = _integer(
+            row.get("completed_attestation_stock_count")
+        )
+        exact_count = _integer(row.get("exact_attestation_stock_count"))
+        target_hash = str(row.get("target_stock_set_hash") or "")
+        completed_hash = str(
+            row.get("completed_attestation_stock_set_hash") or ""
+        )
+        exact_hash = str(row.get("exact_attestation_stock_set_hash") or "")
+        total_target += target_count
+        total_completed += completed_count
+        total_exact += exact_count
+        if (
+            set(row) != session_fields
+            or day != session
+            or target_count <= 0
+            or completed_count != target_count
+            or exact_count != target_count
+            or _integer(row.get("attested_bar_count")) != target_count
+            or _integer(
+                row.get("matching_completed_manifest_run_count")
+            )
+            <= 0
+            or RESULT_HASH_RE.fullmatch(target_hash) is None
+            or completed_hash != target_hash
+            or exact_hash != target_hash
+            or _integer(contract.get("expected_stock_count"))
+            != target_count
+            or str(contract.get("expected_stock_set_hash") or "")
+            != target_hash
+        ):
+            errors.append({
+                "trade_date": session,
+                "reason": (
+                    "reused authoritative target, same-run completed "
+                    "attestation and exact-current contracts differ"
+                ),
+            })
+    if observed_days != expected_sessions:
+        errors.append({
+            "reason": "authoritative QMT row-binding proof dates differ"
+        })
+    return not errors, {
+        "table_exists": True,
+        "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+        "source_pre_close_origin": "NATIVE_QMT",
+        "row_run_binding": "SAME_COMPLETED_RUN_ID",
+        "proof_reused": True,
+        "proof_hash": raw_proof.get("proof_hash"),
+        "database_query_count": 0,
+        "expected_session_count": len(expected_sessions),
+        "covered_session_count": len(expected_sessions) if not errors else 0,
+        "target_stock_count": total_target,
+        "completed_attestation_stock_count": total_completed,
+        "exact_attestation_stock_count": total_exact,
+        "errors": errors[:100],
+    }
 
 
 def _qmt_row_attestation_binding_check(
@@ -916,6 +1307,14 @@ def _qmt_row_attestation_binding_check(
             "expected_session_count": len(expected_sessions),
             "contract_session_count": len(stock_contracts),
         }
+    reused = _reused_qmt_row_attestation_binding_check(
+        trade_date,
+        expected_sessions,
+        stock_contracts,
+        session_window_detail.get("row_binding_proof"),
+    )
+    if reused is not None:
+        return reused
 
     try:
         from server.engine.strategy_governance import _db_read
@@ -954,12 +1353,9 @@ def _qmt_row_attestation_binding_check(
             "SELECT a.trade_date, a.stock_code, 0 AS in_target, "
             "1 AS in_completed_attestation, 0 AS in_exact_attestation "
             "FROM qmt_kline_attestation_row a "
-            "WHERE BINARY a.protocol_version=BINARY :protocol_version "
-            "AND a.stock_code REGEXP '^(0|3|6)' "
-            "AND a.trade_date BETWEEN :start_date AND :trade_date "
-            "AND EXISTS ("
-            "SELECT 1 FROM qmt_kline_attestation_run r "
-            "WHERE r.status='COMPLETED' "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND r.status='COMPLETED' "
             "AND r.provider='gj_big_qmt_inner' "
             "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
             "r.tolerance_json, '$.attestation_protocol'))="
@@ -971,8 +1367,10 @@ def _qmt_row_attestation_binding_check(
             "'$.daily_universe.\"', "
             "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) "
             "IS NOT NULL "
-            "AND a.trade_date BETWEEN r.start_date AND r.end_date"
-            ") "
+            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
+            "WHERE BINARY a.protocol_version=BINARY :protocol_version "
+            "AND a.stock_code REGEXP '^(0|3|6)' "
+            "AND a.trade_date BETWEEN :start_date AND :trade_date "
             "UNION ALL "
             "SELECT k.trade_date, k.stock_code, 0 AS in_target, "
             "0 AS in_completed_attestation, 1 AS in_exact_attestation "
@@ -996,6 +1394,21 @@ def _qmt_row_attestation_binding_check(
             "a.source_data_version, a.source_pre_close, "
             "a.attested_open, a.attested_close, a.attested_high, "
             "a.attested_low, a.attested_volume, a.attested_amount), 256) "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND r.status='COMPLETED' "
+            "AND r.provider='gj_big_qmt_inner' "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.attestation_protocol'))="
+            "BINARY :protocol_version "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.universe_manifest_schema'))="
+            "BINARY 'probiga.qmt-daily-universe.v1' "
+            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
+            "'$.daily_universe.\"', "
+            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) "
+            "IS NOT NULL "
+            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
             "AND k.stock_code REGEXP '^(0|3|6)' "
             "AND k.data_source='gj_big_qmt_inner' "
@@ -1034,7 +1447,7 @@ def _qmt_row_attestation_binding_check(
         return False, {
             "table_exists": None,
             "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exception_message(exc),
         }
 
     by_date: dict[str, dict[str, set[str]]] = {
@@ -1067,7 +1480,7 @@ def _qmt_row_attestation_binding_check(
                     "run_id": run_id,
                     "reason": (
                         "completed QMT run universe manifest is invalid: "
-                        f"{type(exc).__name__}: {exc}"
+                        + _safe_exception_message(exc)
                     ),
                 }
             )
@@ -1174,6 +1587,9 @@ def _qmt_row_attestation_binding_check(
         "table_exists": True,
         "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
         "source_pre_close_origin": "NATIVE_QMT",
+        "row_run_binding": "SAME_COMPLETED_RUN_ID",
+        "proof_reused": False,
+        "database_query_count": 3,
         "expected_session_count": len(expected_sessions),
         "covered_session_count": sum(
             bool(day_sets["target"]) for day_sets in by_date.values()
@@ -1196,21 +1612,457 @@ def _qmt_row_attestation_binding_check(
 def _qmt_attestation_frozen_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Independently require the frozen V2 proof tables and indexes."""
+    """Require frozen QMT proof tables plus all database mutation guards."""
 
     from tools.attest_qmt_daily_kline import (
+        ATTESTATION_TRIGGER_STATEMENTS,
         QmtAttestationSchemaError,
         validate_attestation_schema,
     )
+    from tools.prepare_strategy_governance_schema import (
+        EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH,
+        _frozen_non_v3_release_trigger_contracts,
+        _non_v3_trigger_contracts,
+        validate_release_trigger_contracts,
+    )
 
     try:
-        return True, validate_attestation_schema(connection)
+        schema_detail = validate_attestation_schema(
+            connection,
+            require_triggers=False,
+        )
+        names = frozenset(ATTESTATION_TRIGGER_STATEMENTS)
+        release_contracts = _frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        contracts = {
+            name: release_contracts[name]
+            for name in names
+            if name in release_contracts
+        }
+        if (
+            len(names) != 6
+            or set(contracts) != set(names)
+            or any(
+                contract.owner != "qmt_attestation"
+                for contract in contracts.values()
+            )
+        ):
+            raise RuntimeError("QMT attestation trigger contract differs")
+        trigger_detail = validate_release_trigger_contracts(
+            connection,
+            required=contracts,
+            optional={},
+            controlled_contracts=contracts,
+        )
+        return True, {
+            **schema_detail,
+            **trigger_detail,
+            "trigger_names": sorted(names),
+            "trigger_count": len(names),
+            "expected_trigger_count": 6,
+            "database_triggers_required": True,
+            "release_trigger_source_contract_hash": (
+                EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "immutability_enforcement": (
+                "mysql_frozen_completed_run_and_row_mutation_guards"
+            ),
+        }
     except QmtAttestationSchemaError as exc:
-        return False, exc.detail
+        return False, {
+            "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+            "trigger_count": 0,
+            "expected_trigger_count": 6,
+            "database_triggers_required": True,
+            "errors": [_safe_exception_message(
+                exc, error_code="qmt_attestation_schema_validation_failed"
+            )],
+        }
     except Exception as exc:
         return False, {
             "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-            "errors": [f"{type(exc).__name__}: {exc}"],
+            "trigger_count": 0,
+            "expected_trigger_count": 6,
+            "database_triggers_required": True,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _supporting_release_trigger_inventory_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Require the release broker's exact supporting-trigger contract."""
+
+    try:
+        from tools.prepare_strategy_governance_schema import (
+            EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT,
+            EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH,
+            _frozen_non_v3_release_trigger_contracts,
+            _non_v3_trigger_contracts,
+            validate_release_trigger_contracts,
+        )
+
+        contracts = _frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        owner_counts: dict[str, int] = {}
+        for contract in contracts.values():
+            owner_counts[contract.owner] = (
+                owner_counts.get(contract.owner, 0) + 1
+            )
+        expected_owner_counts = {
+            "pit_facts": 6,
+            "qmt_attestation": 6,
+            "qmt_history_coverage": 4,
+            "qmt_reference": 10,
+            "scheduler_task_history": 2,
+            "strategy_governance": 40,
+        }
+        if (
+            len(contracts) != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
+            or owner_counts != expected_owner_counts
+        ):
+            raise RuntimeError("supporting release trigger inventory differs")
+        detail = validate_release_trigger_contracts(
+            connection,
+            required=contracts,
+            optional={},
+            controlled_contracts=contracts,
+        )
+        return True, {
+            **detail,
+            "expected_trigger_count": EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT,
+            "owner_counts": owner_counts,
+            "expected_owner_counts": expected_owner_counts,
+            "source_contract_hash": (
+                EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "database_triggers_required": True,
+        }
+    except Exception as exc:
+        return False, {
+            "trigger_count": 0,
+            "expected_trigger_count": 68,
+            "expected_owner_counts": {
+                "pit_facts": 6,
+                "qmt_attestation": 6,
+                "qmt_history_coverage": 4,
+                "qmt_reference": 10,
+                "scheduler_task_history": 2,
+                "strategy_governance": 40,
+            },
+            "database_triggers_required": True,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _qmt_reference_frozen_schema_check(
+    engine,
+) -> tuple[bool, dict[str, Any]]:
+    """Verify the live QMT reference schema and its immutable physical seal."""
+
+    try:
+        from tools.sync_guojin_qmt_reference_data import (
+            REFERENCE_SCHEMA_CONTRACT_HASH,
+            REFERENCE_SCHEMA_CONTRACT_KEY,
+            REFERENCE_TABLE_NAMES,
+            REFERENCE_TRIGGER_NAMES,
+            validate_reference_tables,
+        )
+
+        validate_reference_tables(engine, verify_triggers=True)
+        if len(REFERENCE_TRIGGER_NAMES) != 10:
+            raise RuntimeError("QMT reference trigger inventory differs")
+        return True, {
+            "contract_key": REFERENCE_SCHEMA_CONTRACT_KEY,
+            "contract_hash": REFERENCE_SCHEMA_CONTRACT_HASH,
+            "table_names": list(REFERENCE_TABLE_NAMES),
+            "table_count": len(REFERENCE_TABLE_NAMES),
+            "trigger_names": list(REFERENCE_TRIGGER_NAMES),
+            "trigger_count": len(REFERENCE_TRIGGER_NAMES),
+            "expected_trigger_count": 10,
+            "physical_schema_verified": True,
+            "physical_seal_verified": True,
+        }
+    except Exception as exc:
+        return False, {
+            "trigger_count": 0,
+            "expected_trigger_count": 10,
+            "physical_schema_verified": False,
+            "physical_seal_verified": False,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _qmt_history_coverage_frozen_schema_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Verify primary-schema coverage tables and all four append-only seals."""
+
+    try:
+        from server.common.qmt_history_coverage import (
+            COVERAGE_TABLE_NAMES,
+            COVERAGE_TRIGGER_NAMES,
+            validate_coverage_schema,
+        )
+
+        detail = validate_coverage_schema(
+            connection,
+            require_triggers=True,
+        )
+        exact = (
+            detail.get("database") == "probiga"
+            and detail.get("table_names") == list(COVERAGE_TABLE_NAMES)
+            and detail.get("table_count") == 2
+            and detail.get("foreign_key_count") == 3
+            and detail.get("trigger_names") == list(COVERAGE_TRIGGER_NAMES)
+            and detail.get("trigger_count") == 4
+            and detail.get("runtime_ddl_required") is False
+            and detail.get("physical_schema_verified") is True
+            and detail.get("physical_seal_verified") is True
+        )
+        if not exact:
+            raise RuntimeError("QMT history coverage schema differs")
+        return True, detail
+    except Exception as exc:
+        return False, {
+            "database": "probiga",
+            "table_count": 0,
+            "expected_table_count": 2,
+            "trigger_count": 0,
+            "expected_trigger_count": 4,
+            "runtime_ddl_required": False,
+            "physical_schema_verified": False,
+            "physical_seal_verified": False,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _qmt_history_capability_matrix_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    try:
+        from server.common.qmt_history_capabilities import (
+            assess_qmt_history_capabilities,
+        )
+
+        evidence_healthy, detail = assess_qmt_history_capabilities(connection)
+        datasets = list(detail.get("datasets") or ())
+        fail_closed = all(
+            bool(item.get("strategy_eligible"))
+            or str(item.get("status") or "") == "UNAVAILABLE"
+            for item in datasets
+        )
+        detail = {
+            **detail,
+            "fail_closed_verified": fail_closed,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        return bool(evidence_healthy and fail_closed), detail
+    except Exception as exc:
+        return False, {
+            "status": "UNHEALTHY",
+            "strategy_eligible_dataset_count": 0,
+            "fail_closed_verified": False,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+            "errors": [
+                _safe_exception_message(
+                    exc,
+                    error_code="qmt_history_capability_matrix_failed",
+                )
+            ],
+        }
+
+
+def _scheduler_task_history_frozen_schema_check(
+    engine,
+) -> tuple[bool, dict[str, Any]]:
+    try:
+        from server.common.scheduler_task_history_schema import (
+            validate_scheduler_task_history_schema,
+        )
+
+        detail = validate_scheduler_task_history_schema(engine)
+        return True, detail
+    except Exception as exc:
+        return False, {
+            "physical_contract_verified": False,
+            "runtime_ddl_required": False,
+            "read_only": True,
+            "errors": [
+                _safe_exception_message(
+                    exc,
+                    error_code="scheduler_task_history_schema_failed",
+                )
+            ],
+        }
+
+
+def _pit_fact_frozen_schema_check(
+    engine,
+) -> tuple[bool, dict[str, Any]]:
+    """Require all PIT fact tables, columns and six append-only guards."""
+
+    try:
+        from server.common.pit_facts import (
+            PIT_FACT_TABLE_NAMES,
+            PIT_FACT_TRIGGER_STATEMENTS,
+            pit_fact_schema_health,
+        )
+
+        detail = pit_fact_schema_health(engine)
+        exact = (
+            detail.get("valid") is True
+            and int(detail.get("table_count") or 0)
+            == len(PIT_FACT_TABLE_NAMES)
+            and int(detail.get("trigger_count") or 0)
+            == len(PIT_FACT_TRIGGER_STATEMENTS)
+            and len(PIT_FACT_TRIGGER_STATEMENTS) == 6
+            and not detail.get("missing_tables")
+            and not detail.get("missing_columns")
+            and not detail.get("missing_triggers")
+            and RESULT_HASH_RE.fullmatch(
+                str(detail.get("contract_hash") or "")
+            )
+            is not None
+        )
+        return exact, {
+            **detail,
+            "expected_table_count": len(PIT_FACT_TABLE_NAMES),
+            "expected_trigger_count": 6,
+            "physical_schema_verified": bool(exact),
+        }
+    except Exception as exc:
+        return False, {
+            "valid": False,
+            "expected_trigger_count": 6,
+            "physical_schema_verified": False,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _latest_qmt_announcement_batch_check(
+    engine,
+    trade_date: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate the newest exact-date official full-market announcement root."""
+
+    blocked = {
+        "status": "DATA_BLOCKED",
+        "trade_date": str(trade_date or ""),
+        "source": "qmt.announcement",
+        "funding_eligible": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if not _iso_date(trade_date):
+        return False, {
+            **blocked,
+            "reason_code": "QMT_ANNOUNCEMENT_TRADE_DATE_UNAVAILABLE",
+        }
+    try:
+        from server.common.qmt_announcement_pit import (
+            QMTAnnouncementBlocked,
+            validate_complete_qmt_announcement_batch,
+        )
+
+        with engine.connect() as connection:
+            batches = _rows(
+                connection,
+                "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
+                "MIN(known_at) AS min_known_at, "
+                "MAX(known_at) AS max_known_at, "
+                "MIN(window_start) AS min_window_start, "
+                "MAX(window_start) AS max_window_start, "
+                "MIN(window_end) AS min_window_end, "
+                "MAX(window_end) AS max_window_end, "
+                "COUNT(*) AS coverage_row_count, "
+                "SUM(CASE WHEN coverage_status<>'COMPLETE' THEN 1 ELSE 0 END) "
+                "AS invalid_coverage_count "
+                "FROM st_pit_source_coverage "
+                "WHERE fact_kind='event' AND source='qmt.announcement' "
+                "AND DATE(known_at)=:trade_date "
+                "GROUP BY batch_id "
+                "ORDER BY max_known_at DESC, BINARY batch_id DESC LIMIT 2",
+                {"trade_date": trade_date},
+            )
+        if not batches:
+            return False, {
+                **blocked,
+                "reason_code": "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND",
+                "batch_count": 0,
+            }
+        latest = batches[0]
+        if (
+            len(batches) > 1
+            and str(batches[1].get("max_known_at") or "")
+            == str(latest.get("max_known_at") or "")
+        ):
+            return False, {
+                **blocked,
+                "reason_code": "QMT_ANNOUNCEMENT_LATEST_BATCH_AMBIGUOUS",
+                "batch_count": len(batches),
+            }
+        if (
+            not str(latest.get("batch_id") or "")
+            or not str(latest.get("sample_stock_code") or "")
+            or latest.get("min_known_at") != latest.get("max_known_at")
+            or latest.get("min_window_start")
+            != latest.get("max_window_start")
+            or latest.get("min_window_end") != latest.get("max_window_end")
+            or _integer(latest.get("invalid_coverage_count")) != 0
+        ):
+            return False, {
+                **blocked,
+                "reason_code": "QMT_ANNOUNCEMENT_BATCH_ENVELOPE_INVALID",
+                "batch_id": str(latest.get("batch_id") or ""),
+            }
+        proof = validate_complete_qmt_announcement_batch(
+            engine,
+            codes=[str(latest["sample_stock_code"])],
+            decision_at=latest["max_known_at"],
+            window_start=latest["min_window_start"],
+            window_end=latest["min_window_end"],
+        )
+        exact = (
+            proof.get("status") == "COMPLETE"
+            and str(proof.get("batch_id") or "")
+            == str(latest.get("batch_id") or "")
+            and _integer(latest.get("coverage_row_count"))
+            == _integer(proof.get("catalog_member_count"))
+            and _integer(proof.get("catalog_member_count")) > 0
+            and RESULT_HASH_RE.fullmatch(
+                str(proof.get("batch_root_hash") or "")
+            )
+            is not None
+        )
+        return exact, {
+            **proof,
+            "trade_date": trade_date,
+            "source": "qmt.announcement",
+            "coverage_row_count": _integer(
+                latest.get("coverage_row_count")
+            ),
+            "funding_eligible": bool(exact),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    except QMTAnnouncementBlocked as exc:
+        return False, {
+            **blocked,
+            "reason_code": str(
+                getattr(exc, "reason_code", "")
+                or "QMT_ANNOUNCEMENT_DATA_BLOCKED"
+            ),
+        }
+    except Exception as exc:
+        return False, {
+            **blocked,
+            "reason_code": "QMT_ANNOUNCEMENT_HEALTH_VALIDATION_FAILED",
+            "errors": [_safe_exception_message(exc)],
         }
 
 
@@ -1234,31 +2086,1721 @@ def _normalized_metric_input_trigger_body(value: Any) -> str:
 def _metric_input_review_trigger_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Compatibility report for application-level metric review enforcement."""
+    """Require the two constrained metric review/delete database guards."""
 
-    del connection
+    try:
+        from server.engine.strategy_governance import (
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS,
+        )
+        from tools.prepare_strategy_governance_schema import (
+            EXPECTED_CHARACTER_SET_CLIENT,
+            EXPECTED_COLLATION_CONNECTION,
+            EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH,
+            EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH,
+            EXPECTED_DATABASE_COLLATION,
+            EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH,
+            EXPECTED_GOVERNANCE_TRIGGER_NAMES,
+            EXPECTED_MIGRATOR_USER,
+            EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES,
+            EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH,
+            EXPECTED_SQL_MODE,
+            _frozen_governance_release_trigger_contracts,
+            _non_v3_trigger_contracts,
+            _normalized_trigger_body,
+            _release_trigger_source_contract_hash,
+            validate_release_trigger_contracts,
+        )
+
+        names = set(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
+        release_contracts = _frozen_governance_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        contracts = {
+            name: contract
+            for name, contract in release_contracts.items()
+            if name in names
+        }
+        if (
+            len(names) != EXPECTED_METRIC_REVIEW_TRIGGER_COUNT
+            or names != EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+            or set(contracts) != names
+            or set(release_contracts) != EXPECTED_GOVERNANCE_TRIGGER_NAMES
+            or METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+            != EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+        ):
+            raise RuntimeError("metric trigger contract inventory differs")
+        source_contract_hash = _release_trigger_source_contract_hash(
+            release_contracts
+        )
+        if (
+            source_contract_hash
+            != EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+        ):
+            raise RuntimeError("governance trigger source contract differs")
+        metadata = validate_release_trigger_contracts(
+            connection,
+            required=contracts,
+            optional={},
+            controlled_contracts=contracts,
+        )
+        members = [{
+            "name": name,
+            "timing": contract.timing,
+            "event": contract.event,
+            "table": contract.table,
+            "body_hash": hashlib.sha256(
+                _normalized_trigger_body(contract, contract.body).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+        } for name, contract in sorted(contracts.items())]
+        contract_hash = _canonical_digest({
+            "schema": "probiga.strategy-metric-review-trigger-contract.v1",
+            "members": members,
+            "definer": EXPECTED_MIGRATOR_USER,
+            "sql_mode": EXPECTED_SQL_MODE,
+            "character_set_client": EXPECTED_CHARACTER_SET_CLIENT,
+            "collation_connection": EXPECTED_COLLATION_CONNECTION,
+            "database_collation": EXPECTED_DATABASE_COLLATION,
+        })
+        if contract_hash != EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH:
+            raise RuntimeError("metric trigger physical contract differs")
+    except Exception as exc:
+        return False, {
+            "table": "st_strategy_metric_input",
+            "trigger_count": 0,
+            "expected_trigger_count": EXPECTED_METRIC_REVIEW_TRIGGER_COUNT,
+            "database_triggers_required": True,
+            "enforcement": "mysql_constrained_review_and_delete_rejection",
+            "errors": [type(exc).__name__],
+        }
     return True, {
+        **metadata,
         "table": "st_strategy_metric_input",
-        "trigger_names": [],
-        "trigger_count": 0,
-        "database_triggers_required": False,
-        "enforcement": "row_lock_state_machine_and_hash_bound_audit",
+        "trigger_names": sorted(contracts),
+        "trigger_count": len(contracts),
+        "expected_trigger_count": EXPECTED_METRIC_REVIEW_TRIGGER_COUNT,
+        "contract_hash": contract_hash,
+        "source_contract_hash": source_contract_hash,
+        "core_append_only_contract_hash": (
+            EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        ),
+        "core_metric_review_contract_hash": (
+            EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+        ),
+        "database_triggers_required": True,
+        "enforcement": "mysql_constrained_review_and_delete_rejection",
         "errors": [],
     }
 
 
 def _governance_append_only_trigger_check(
     connection,
+    funding_schema_detail: dict[str, Any] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Compatibility report for application-level append-only enforcement."""
+    """Require every append-only/delete guard with frozen MySQL metadata."""
 
-    del connection
+    try:
+        from server.engine.strategy_governance import (
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH,
+            GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS,
+        )
+        from tools.prepare_strategy_governance_schema import (
+            EXPECTED_CHARACTER_SET_CLIENT,
+            EXPECTED_COLLATION_CONNECTION,
+            EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH,
+            EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH,
+            EXPECTED_DATABASE_COLLATION,
+            EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH,
+            EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH,
+            EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES,
+            EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH,
+            EXPECTED_GOVERNANCE_TRIGGER_NAMES,
+            EXPECTED_MIGRATOR_USER,
+            EXPECTED_SQL_MODE,
+            _frozen_governance_release_trigger_contracts,
+            _non_v3_trigger_contracts,
+            _normalized_trigger_body,
+            _release_trigger_source_contract_hash,
+            validate_release_trigger_contracts,
+        )
+
+        names = set(GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS)
+        release_contracts = _frozen_governance_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        contracts = {
+            name: contract
+            for name, contract in release_contracts.items()
+            if name in names
+        }
+        if (
+            len(names) != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT
+            or names != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+            or set(contracts) != names
+            or set(release_contracts) != EXPECTED_GOVERNANCE_TRIGGER_NAMES
+            or GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+            != EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        ):
+            raise RuntimeError("append-only trigger contract inventory differs")
+        source_contract_hash = _release_trigger_source_contract_hash(
+            release_contracts
+        )
+        if (
+            source_contract_hash
+            != EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+        ):
+            raise RuntimeError("governance trigger source contract differs")
+        detail = (
+            dict(funding_schema_detail)
+            if funding_schema_detail is not None
+            else validate_strategy_funding_checkpoint_schema(connection)
+        )
+        if (
+            _integer(detail.get("trigger_count"))
+            != len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS)
+            or detail.get("contract_hash")
+            != EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+        ):
+            raise RuntimeError("funding trigger contract differs")
+        metadata = validate_release_trigger_contracts(
+            connection,
+            required=contracts,
+            optional={},
+            controlled_contracts=contracts,
+        )
+        members = [{
+            "name": name,
+            "timing": contract.timing,
+            "event": contract.event,
+            "table": contract.table,
+            "body_hash": hashlib.sha256(
+                _normalized_trigger_body(contract, contract.body).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+        } for name, contract in sorted(contracts.items())]
+        contract_hash = _canonical_digest({
+            "schema": "probiga.strategy-append-only-trigger-contract.v1",
+            "members": members,
+            "definer": EXPECTED_MIGRATOR_USER,
+            "sql_mode": EXPECTED_SQL_MODE,
+            "character_set_client": EXPECTED_CHARACTER_SET_CLIENT,
+            "collation_connection": EXPECTED_COLLATION_CONNECTION,
+            "database_collation": EXPECTED_DATABASE_COLLATION,
+        })
+        if (
+            contract_hash
+            != EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH
+        ):
+            raise RuntimeError("append-only trigger physical contract differs")
+    except Exception as exc:
+        return False, {
+            "trigger_count": 0,
+            "expected_trigger_count": (
+                EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT
+            ),
+            "database_triggers_required": True,
+            "enforcement": "mysql_frozen_row_mutation_contract",
+            "errors": [type(exc).__name__],
+        }
     return True, {
-        "trigger_names": [],
-        "trigger_count": 0,
-        "database_triggers_required": False,
-        "enforcement": "append_only_writers_unique_identity_and_hash_replay",
+        **metadata,
+        "trigger_names": sorted(contracts),
+        "trigger_count": len(contracts),
+        "expected_trigger_count": EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT,
+        "total_governance_trigger_count": (
+            len(contracts) + EXPECTED_METRIC_REVIEW_TRIGGER_COUNT
+        ),
+        "contract_hash": contract_hash,
+        "source_contract_hash": source_contract_hash,
+        "core_contract_hash": (
+            EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        ),
+        "core_metric_review_contract_hash": (
+            EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+        ),
+        "funding_contract_hash": str(detail.get("contract_hash") or ""),
+        "database_triggers_required": True,
+        "enforcement": "mysql_frozen_row_mutation_contract",
         "errors": [],
+    }
+
+
+def _strategy_funding_schema_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Delegate both normalized funding tables to the frozen validator."""
+
+    try:
+        detail = validate_strategy_funding_checkpoint_schema(connection)
+    except Exception as exc:
+        return False, {
+            "expected_contract_hash": FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+            "errors": [type(exc).__name__],
+        }
+    expected_budgets = {
+        "checkpoint_target_average_bytes": FUNDING_CHECKPOINT_TARGET_AVG_BYTES,
+        "checkpoint_total_target_bytes": FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+        "checkpoint_total_hard_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "batch_max_rows": FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+        "batch_max_bytes": FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+        "manifest_max_bytes": FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+        "audit_max_bytes": FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+    }
+    valid = (
+        int(detail.get("table_count") or 0) == 2
+        and detail.get("tables") == EXPECTED_FUNDING_TABLE_COUNTS
+        and int(detail.get("trigger_count") or 0)
+        == len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS)
+        and str(detail.get("contract_hash") or "")
+        == FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH
+        and detail.get("rolling_history_storage")
+        == "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN"
+        and detail.get("automatic_real_order_submission") is False
+        and detail.get("real_order_authority") is False
+        and {
+            name: detail.get(name) for name in expected_budgets
+        }
+        == expected_budgets
+    )
+    return valid, {
+        **detail,
+        "expected_contract_hash": FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+        "expected_budgets": expected_budgets,
+        "errors": [] if valid else ["funding schema contract differs"],
+    }
+
+
+def _funding_entity_set_hash(entities: list[dict[str, str]]) -> str:
+    """Hash one sorted generic strategy/combination version set."""
+
+    return _funding_canonical_hash({
+        "schema": "probiga.strategy-funding-entity-set.v1",
+        "entities": entities,
+    })
+
+
+FUNDING_MANIFEST_BATCH_MAX_ROWS = 100
+
+
+def _funding_manifest_row_sort_key(row: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(row.get("entity_type") or ""),
+        str(row.get("entity_key") or ""),
+        str(row.get("entity_version") or ""),
+        str(row.get("account_id") or ""),
+        str(row.get("trade_date") or ""),
+        str(row.get("checkpoint_id") or ""),
+        str(row.get("recipe_hash") or ""),
+        str(row.get("reason_code") or ""),
+    )
+
+
+def _funding_manifest_batch_root(
+    rows: list[dict[str, Any]], *, kind: str,
+) -> dict[str, Any]:
+    """Independently reproduce the compact canonical manifest root."""
+
+    normalized_kind = str(kind or "").upper()
+    if normalized_kind not in {
+        "CHECKPOINT", "COMBINATION_RECIPE", "INELIGIBLE",
+    }:
+        raise ValueError("invalid funding manifest root kind")
+    ordered = sorted(
+        (dict(row) for row in rows), key=_funding_manifest_row_sort_key,
+    )
+    if len(ordered) != len({
+        _funding_canonical_json(row) for row in ordered
+    }):
+        raise ValueError("duplicate funding manifest rows")
+    batches: list[dict[str, Any]] = []
+    for batch_index, offset in enumerate(
+        range(0, len(ordered), FUNDING_MANIFEST_BATCH_MAX_ROWS)
+    ):
+        batch_rows = ordered[
+            offset:offset + FUNDING_MANIFEST_BATCH_MAX_ROWS
+        ]
+        batch_payload = {
+            "schema": "probiga.strategy-funding-manifest-batch.v1",
+            "kind": normalized_kind,
+            "batch_index": batch_index,
+            "rows": batch_rows,
+        }
+        batches.append({
+            "batch_index": batch_index,
+            "count": len(batch_rows),
+            "first_row_hash": _funding_canonical_hash(batch_rows[0]),
+            "last_row_hash": _funding_canonical_hash(batch_rows[-1]),
+            "batch_hash": _funding_canonical_hash(batch_payload),
+        })
+    root_payload = {
+        "schema": "probiga.strategy-funding-manifest-root.v1",
+        "kind": normalized_kind,
+        "count": len(ordered),
+        "set_hash": _funding_canonical_hash({
+            "schema": "probiga.strategy-funding-manifest-row-set.v1",
+            "kind": normalized_kind,
+            "rows": ordered,
+        }),
+        "batches": batches,
+    }
+    return {
+        **root_payload,
+        "root_hash": _funding_canonical_hash(root_payload),
+    }
+
+
+def _funding_checkpoint_manifest_entry(
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    key = str(checkpoint.get("strategy_key") or "")
+    version = str(checkpoint.get("strategy_version") or "")
+    entry = {
+        "entity_type": "STRATEGY",
+        "entity_key": key,
+        "entity_version": version,
+        "checkpoint_id": str(checkpoint.get("checkpoint_id") or ""),
+        "strategy_key": key,
+        "strategy_version": version,
+        "account_id": str(checkpoint.get("account_id") or ""),
+        "trade_date": _iso_date(checkpoint.get("trade_date")),
+        "replay_mode": str(checkpoint.get("replay_mode") or ""),
+        "replay_session_count": _integer(
+            checkpoint.get("replay_session_count")
+        ),
+        "max_holding_days": _integer(checkpoint.get("max_holding_days")),
+        "checkpoint_hash": str(checkpoint.get("checkpoint_hash") or ""),
+        "chain_hash": str(checkpoint.get("chain_hash") or ""),
+        "history_fact_count": _integer(
+            checkpoint.get("history_fact_count")
+        ),
+        "history_fact_set_hash": str(
+            checkpoint.get("history_fact_set_hash") or ""
+        ),
+        "history_tip_fact_id": str(
+            checkpoint.get("history_tip_fact_id") or ""
+        ),
+        "history_tip_fact_hash": str(
+            checkpoint.get("history_tip_fact_hash") or ""
+        ),
+        "new_fact_count": _integer(checkpoint.get("new_fact_count")),
+        "new_fact_set_hash": str(
+            checkpoint.get("new_fact_set_hash") or ""
+        ),
+        "new_fact_first_id": str(
+            checkpoint.get("new_fact_first_id") or ""
+        ),
+        "new_fact_tip_id": str(
+            checkpoint.get("new_fact_tip_id") or ""
+        ),
+        "bootstrap_full_history_scan": (
+            str(checkpoint.get("replay_mode") or "") == "FULL_BOOTSTRAP"
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    hashes = (
+        "checkpoint_id", "checkpoint_hash", "chain_hash",
+        "history_fact_set_hash", "history_tip_fact_id",
+        "history_tip_fact_hash", "new_fact_set_hash",
+        "new_fact_first_id", "new_fact_tip_id",
+    )
+    if (
+        not key
+        or not version
+        or not entry["account_id"]
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", str(entry[field])) is None
+            for field in hashes
+        )
+        or checkpoint.get("automatic_real_order_submission") not in (0, False)
+        or checkpoint.get("real_order_authority") not in (0, False)
+    ):
+        raise ValueError("funding checkpoint manifest entry is invalid")
+    return entry
+
+
+def _validated_combination_risk_binding(
+    value: Any, *,
+    constraint_evaluation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("combination drift-risk binding is missing")
+    expected_fields = {
+        "schema", "window_days", "risk_path_hash",
+        "constraint_evaluation_hash", "constraint_passed",
+        "peak_member_weight", "current_member_weight",
+        "peak_pairwise_stock_overlap_pct",
+        "current_pairwise_stock_overlap_pct",
+        "peak_industry_weight_pct", "current_industry_weight_pct",
+        "industry_snapshot_path_hash", "industry_trade_dates_hash",
+        "industry_stock_code_sets_hash",
+        "automatic_real_order_submission",
+        "real_order_authority", "binding_hash",
+    }
+    numeric_fields = (
+        "peak_member_weight", "current_member_weight",
+        "peak_pairwise_stock_overlap_pct",
+        "current_pairwise_stock_overlap_pct",
+        "peak_industry_weight_pct", "current_industry_weight_pct",
+    )
+    numbers: dict[str, float] = {}
+    for field in numeric_fields:
+        try:
+            number = float(value.get(field))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "combination drift-risk value is invalid"
+            ) from exc
+        if not math.isfinite(number) or number < 0:
+            raise ValueError("combination drift-risk value is invalid")
+        numbers[field] = number
+    payload = {
+        "schema": str(value.get("schema") or ""),
+        "window_days": _integer(value.get("window_days")),
+        "risk_path_hash": str(value.get("risk_path_hash") or ""),
+        "constraint_evaluation_hash": str(
+            value.get("constraint_evaluation_hash") or ""
+        ),
+        "constraint_passed": value.get("constraint_passed") is True,
+        **numbers,
+        "industry_snapshot_path_hash": str(
+            value.get("industry_snapshot_path_hash") or ""
+        ),
+        "industry_trade_dates_hash": str(
+            value.get("industry_trade_dates_hash") or ""
+        ),
+        "industry_stock_code_sets_hash": str(
+            value.get("industry_stock_code_sets_hash") or ""
+        ),
+        "automatic_real_order_submission": value.get(
+            "automatic_real_order_submission"
+        ),
+        "real_order_authority": value.get("real_order_authority"),
+    }
+    if (
+        set(value) != expected_fields
+        or payload["schema"]
+        != "probiga.combination-drift-risk-binding.v2"
+        or payload["window_days"] != 60
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", payload[field]) is None
+            for field in (
+                "risk_path_hash", "constraint_evaluation_hash",
+                "industry_snapshot_path_hash",
+                "industry_trade_dates_hash",
+                "industry_stock_code_sets_hash",
+            )
+        )
+        or payload["constraint_passed"] is not True
+        or payload["peak_member_weight"] > 1.0
+        or payload["current_member_weight"] > 1.0
+        or any(
+            payload[field] > 100.0
+            for field in (
+                "peak_pairwise_stock_overlap_pct",
+                "current_pairwise_stock_overlap_pct",
+                "peak_industry_weight_pct",
+                "current_industry_weight_pct",
+            )
+        )
+        or payload["automatic_real_order_submission"] is not False
+        or payload["real_order_authority"] is not False
+        or str(value.get("binding_hash") or "")
+        != _funding_canonical_hash(payload)
+    ):
+        raise ValueError("combination drift-risk binding differs")
+    if constraint_evaluation is not None and (
+        constraint_evaluation.get("passed") is not True
+        or str(constraint_evaluation.get("evaluation_hash") or "")
+        != payload["constraint_evaluation_hash"]
+        or str((constraint_evaluation.get("drift_risk_path") or {}).get(
+            "risk_path_hash"
+        ) or "") != payload["risk_path_hash"]
+        or str((constraint_evaluation.get(
+            "industry_snapshot_path"
+        ) or {}).get("industry_snapshot_path_hash") or "")
+        != payload["industry_snapshot_path_hash"]
+        or str((constraint_evaluation.get(
+            "industry_snapshot_path"
+        ) or {}).get("industry_trade_dates_hash") or "")
+        != payload["industry_trade_dates_hash"]
+        or str((constraint_evaluation.get(
+            "industry_snapshot_path"
+        ) or {}).get("industry_stock_code_sets_hash") or "")
+        != payload["industry_stock_code_sets_hash"]
+        or (constraint_evaluation.get("industry_snapshot_path") or {}).get(
+            "status"
+        ) != "COMPLETED"
+        or _integer((constraint_evaluation.get(
+            "industry_snapshot_path"
+        ) or {}).get("window_days")) != 60
+        or constraint_evaluation.get("risk_binding") != value
+    ):
+        raise ValueError(
+            "combination drift-risk binding does not match evaluation"
+        )
+    return {**payload, "binding_hash": str(value["binding_hash"])}
+
+
+def _combination_recipe_manifest_entry(
+    combination: dict[str, Any], *, trade_date: str,
+) -> dict[str, Any]:
+    """Independently replay a combination's member-checkpoint recipe."""
+
+    key = str(combination.get("combination_key") or "")
+    version = str(combination.get("current_version") or "")
+    ref = combination.get("combination_recipe_ref")
+    if not key or not version or not isinstance(ref, dict):
+        raise ValueError("combination funding recipe is missing")
+    members = ref.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("combination funding recipe members are missing")
+    normalized_members: list[dict[str, Any]] = []
+    total_weight = Decimal("0")
+    for member in members:
+        if not isinstance(member, dict):
+            raise ValueError("combination funding recipe member is invalid")
+        try:
+            weight = Decimal(str(member.get("weight")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("combination funding recipe weight is invalid") from exc
+        normalized = {
+            "strategy_key": str(member.get("strategy_key") or ""),
+            "strategy_version": str(member.get("strategy_version") or ""),
+            "weight": round(float(weight), 8),
+            "checkpoint_id": str(member.get("checkpoint_id") or ""),
+            "account_id": str(member.get("account_id") or ""),
+            "checkpoint_hash": str(member.get("checkpoint_hash") or ""),
+            "chain_hash": str(member.get("chain_hash") or ""),
+            "history_fact_set_hash": str(
+                member.get("history_fact_set_hash") or ""
+            ),
+            "checkpoint_trade_date": str(
+                member.get("checkpoint_trade_date") or ""
+            ),
+        }
+        if (
+            not weight.is_finite()
+            or weight <= 0
+            or not normalized["strategy_key"]
+            or not normalized["strategy_version"]
+            or not normalized["account_id"]
+            or normalized["checkpoint_trade_date"] != trade_date
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", normalized[field]) is None
+                for field in (
+                    "checkpoint_id", "checkpoint_hash", "chain_hash",
+                    "history_fact_set_hash",
+                )
+            )
+        ):
+            raise ValueError("combination funding recipe binding is invalid")
+        total_weight += weight
+        normalized_members.append(normalized)
+    if (
+        normalized_members != sorted(
+            normalized_members, key=lambda row: row["strategy_key"]
+        )
+        or len({row["strategy_key"] for row in normalized_members})
+        != len(normalized_members)
+        or abs(total_weight - Decimal("1")) > Decimal("0.00000005")
+    ):
+        raise ValueError("combination funding recipe ordering differs")
+    risk_binding = _validated_combination_risk_binding(
+        ref.get("risk_constraint_binding"),
+        constraint_evaluation=(
+            combination.get("constraint_evaluation")
+            if isinstance(combination.get("constraint_evaluation"), dict)
+            else None
+        ),
+    )
+    recipe_payload = {
+        "schema": "probiga.combination-member-fact-recipe.v1",
+        "combination_key": key,
+        "combination_version": version,
+        "trade_date": trade_date,
+        "members": normalized_members,
+        "risk_constraint_binding": risk_binding,
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    recipe_hash = _funding_canonical_hash(recipe_payload)
+    pre_recipe_hash = str(ref.get("pre_recipe_funding_gate_hash") or "")
+    gate_payload = {
+        "schema": "probiga.combination-recipe-funding-gate.v1",
+        "combination_key": key,
+        "combination_version": version,
+        "trade_date": trade_date,
+        "pre_recipe_funding_gate_hash": pre_recipe_hash,
+        "recipe_hash": recipe_hash,
+        "recipe_ready": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    recipe_gate_hash = _funding_canonical_hash(gate_payload)
+    statistical_decision = combination.get("statistical_family_decision")
+    confirmation = combination.get("confirmation_guard")
+    statistical_decision_hash = str(
+        (statistical_decision or {}).get("decision_hash")
+        or (statistical_decision or {}).get("source_decision_hash")
+        or (statistical_decision or {}).get("source_hash") or ""
+    )
+    confirmation_guard_hash = str(
+        (confirmation or {}).get("compact_hash")
+        or (confirmation or {}).get("source_compact_hash")
+        or (confirmation or {}).get("source_hash") or ""
+    )
+    final_funding_gate_hash = str(
+        combination.get("funding_gate_hash") or ""
+    )
+    final_payload = {
+        "schema": "probiga.strategy-final-funding-gate.v1",
+        "entity_type": "COMBINATION",
+        "entity_key": key,
+        "entity_version": version,
+        "pre_confirmation_funding_gate_hash": recipe_gate_hash,
+        "statistical_family_decision_hash": statistical_decision_hash,
+        "confirmation_guard_hash": confirmation_guard_hash,
+        "confirmation_passed": (confirmation or {}).get("passed") is True,
+        "projected_status": str(
+            combination.get("projected_status")
+            or combination.get("current_status") or ""
+        ),
+        "paper_allocation_eligible": combination.get(
+            "paper_allocation_eligible"
+        ) is True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if (
+        ref.get("schema") != recipe_payload["schema"]
+        or ref.get("combination_key") != key
+        or ref.get("combination_version") != version
+        or ref.get("trade_date") != trade_date
+        or ref.get("members") != normalized_members
+        or ref.get("risk_constraint_binding") != risk_binding
+        or ref.get("cash_fact_materialized") is not False
+        or ref.get("automatic_real_order_submission") is not False
+        or ref.get("real_order_authority") is not False
+        or ref.get("member_fact_sets_ready") is not True
+        or ref.get("recipe_hash") != recipe_hash
+        or re.fullmatch(r"[0-9a-f]{64}", pre_recipe_hash) is None
+        or ref.get("recipe_gate_hash") != recipe_gate_hash
+        or combination.get("pre_confirmation_funding_gate_hash")
+        != recipe_gate_hash
+        or re.fullmatch(r"[0-9a-f]{64}", statistical_decision_hash) is None
+        or re.fullmatch(r"[0-9a-f]{64}", confirmation_guard_hash) is None
+        or re.fullmatch(r"[0-9a-f]{64}", final_funding_gate_hash) is None
+        or _funding_canonical_hash(final_payload) != final_funding_gate_hash
+    ):
+        raise ValueError("combination funding recipe hash differs")
+    return {
+        "entity_type": "COMBINATION",
+        "entity_key": key,
+        "entity_version": version,
+        "trade_date": trade_date,
+        "recipe_hash": recipe_hash,
+        "recipe_gate_hash": recipe_gate_hash,
+        "pre_confirmation_funding_gate_hash": recipe_gate_hash,
+        "statistical_family_decision_hash": statistical_decision_hash,
+        "confirmation_guard_hash": confirmation_guard_hash,
+        "funding_gate_hash": final_funding_gate_hash,
+        "member_count": len(normalized_members),
+        "member_checkpoint_set_hash": _funding_canonical_hash({
+            "schema": "probiga.combination-member-checkpoint-set.v1",
+            "members": normalized_members,
+        }),
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def _funding_fact_storage_projection(
+    row: dict[str, Any], fact: dict[str, Any], *, run_uid: str,
+) -> dict[str, Any]:
+    return {
+        "fact_id": str(row.get("fact_id") or ""),
+        "entity_type": "STRATEGY",
+        "entity_key": fact.get("entity_key"),
+        "entity_version": fact.get("entity_version"),
+        "entity_version_hash": fact.get("entity_version_hash"),
+        "execution_binding_hash": fact.get("execution_binding_hash") or None,
+        "account_id": fact.get("account_id"),
+        "trade_date": fact.get("trade_date"),
+        "origin_checkpoint_id": fact.get("origin_checkpoint_id"),
+        "previous_fact_id": fact.get("previous_fact_id") or None,
+        "previous_fact_hash": fact.get("previous_fact_hash") or None,
+        "opening_cash_cny": fact.get("opening_cash_cny"),
+        "closing_cash_cny": fact.get("closing_cash_cny"),
+        "opening_equity_cny": fact.get("opening_equity_cny"),
+        "closing_equity_cny": fact.get("closing_equity_cny"),
+        "daily_return_pct": fact.get("daily_return_pct"),
+        "cumulative_fee_cny": fact.get("cumulative_fee_cny"),
+        "high_watermark_equity_cny": fact.get(
+            "high_watermark_equity_cny"
+        ),
+        "stock_exposure_json": _funding_canonical_json(
+            fact.get("stock_risk_exposure")
+        ),
+        "closed_evidence_ids_json": _funding_canonical_json(
+            fact.get("closed_evidence_ids")
+        ),
+        "fact_json": str(row.get("fact_json") or ""),
+        "fact_hash": str(row.get("fact_hash") or ""),
+        "anchor_run_uid": run_uid,
+        "canonical_result_hash": "0" * 64,
+        "anchor_audit_id": "0" * 32,
+        "anchor_audit_hash": "0" * 64,
+        "automatic_real_order_submission": 0,
+        "real_order_authority": 0,
+    }
+
+
+def _funding_checkpoint_storage_projection(
+    row: dict[str, Any], state: dict[str, Any], *, run_uid: str,
+) -> dict[str, Any]:
+    fields = (
+        "strategy_key", "strategy_version", "strategy_version_hash",
+        "execution_binding_hash", "account_id", "trade_date",
+        "replay_mode", "replay_start_date", "replay_session_count",
+        "max_holding_days", "opening_cash_cny", "closing_cash_cny",
+        "opening_equity_cny", "closing_equity_cny", "cumulative_fee_cny",
+        "high_watermark_equity_cny", "history_start_date",
+        "history_end_date", "history_fact_count", "history_opening_equity",
+        "history_opening_date", "history_tip_fact_id",
+        "history_tip_fact_hash", "history_fact_set_hash", "new_fact_count",
+        "new_fact_set_hash", "new_fact_first_id", "new_fact_tip_id",
+        "evidence_watermark", "input_set_hash",
+    )
+    projected = {field: state.get(field) for field in fields}
+    projected.update({
+        "checkpoint_id": str(row.get("checkpoint_id") or ""),
+        "execution_binding_hash": state.get("execution_binding_hash") or None,
+        "holdings_json": str(row.get("holdings_json") or ""),
+        "history_opening_date": state.get("history_opening_date") or None,
+        "previous_checkpoint_id": row.get("previous_checkpoint_id") or None,
+        "previous_checkpoint_hash": row.get("previous_checkpoint_hash") or None,
+        "previous_chain_hash": row.get("previous_chain_hash") or None,
+        "state_json": str(row.get("state_json") or ""),
+        "checkpoint_hash": str(row.get("checkpoint_hash") or ""),
+        "chain_payload_json": str(row.get("chain_payload_json") or ""),
+        "chain_hash": str(row.get("chain_hash") or ""),
+        "anchor_run_uid": run_uid,
+        "canonical_result_hash": "0" * 64,
+        "anchor_audit_id": "0" * 32,
+        "anchor_audit_hash": "0" * 64,
+        "automatic_real_order_submission": 0,
+        "real_order_authority": 0,
+    })
+    return projected
+
+
+def _funding_manifest_persistence_check(
+    connection, *, run: dict[str, Any], result: dict[str, Any],
+    trade_date: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Replay the exact current-version partition and its persisted anchors."""
+
+    errors: list[dict[str, str]] = []
+
+    def reject(reason: str, *, record_id: str = "") -> None:
+        item = {"reason": reason}
+        if record_id:
+            item["record_id"] = record_id[:160]
+        errors.append(item)
+
+    run_uid = str(run.get("run_uid") or "")
+    raw_result = str(run.get("result_json") or "")
+    result_hash = str(run.get("result_hash") or "")
+    manifest = result.get("funding_checkpoint_manifest")
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or _iso_date(run.get("trade_date")) != trade_date
+        or hashlib.sha256(raw_result.encode("utf-8")).hexdigest()
+        != result_hash
+        or result.get("run_uid") != run_uid
+        or result.get("is_canonical") is not True
+        or not isinstance(manifest, dict)
+    ):
+        return False, {
+            "run_uid": run_uid,
+            "errors": [{"reason": "canonical run or funding manifest is invalid"}],
+        }
+
+    expected_manifest_keys = {
+        "schema", "run_uid", "trade_date", "coverage", "checkpoint_root",
+        "combination_recipe_root", "ineligible_root",
+        "ineligible_reason_code_counts", "checkpoint_storage_bytes", "fact_storage_bytes",
+        "total_storage_bytes", "target_total_bytes", "hard_total_bytes",
+        "target_total_met", "bootstrap_is_daily_bounded",
+        "automatic_real_order_submission", "real_order_authority",
+        "manifest_hash",
+    }
+    manifest_payload = {
+        key: value for key, value in manifest.items()
+        if key != "manifest_hash"
+    }
+    coverage = manifest.get("coverage")
+    if (
+        set(manifest) != expected_manifest_keys
+        or manifest.get("schema")
+        != "probiga.strategy-funding-checkpoint-manifest.v2"
+        or manifest.get("run_uid") != run_uid
+        or manifest.get("trade_date") != trade_date
+        or not isinstance(coverage, dict)
+        or not isinstance(manifest.get("checkpoint_root"), dict)
+        or not isinstance(manifest.get("combination_recipe_root"), dict)
+        or not isinstance(manifest.get("ineligible_root"), dict)
+        or not isinstance(manifest.get("ineligible_reason_code_counts"), dict)
+        or _funding_canonical_hash(manifest_payload)
+        != str(manifest.get("manifest_hash") or "")
+        or len(_funding_canonical_json(manifest).encode("utf-8"))
+        > FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES
+        or manifest.get("bootstrap_is_daily_bounded") is not False
+        or manifest.get("automatic_real_order_submission") is not False
+        or manifest.get("real_order_authority") is not False
+        or _integer(manifest.get("target_total_bytes"))
+        != FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+        or _integer(manifest.get("hard_total_bytes"))
+        != FUNDING_CHECKPOINT_TOTAL_HARD_BYTES
+    ):
+        reject("funding manifest identity, shape, hash or budget differs")
+        coverage = coverage if isinstance(coverage, dict) else {}
+
+    strategies = result.get("strategies")
+    combinations = result.get("combinations")
+    if not isinstance(strategies, list) or not isinstance(combinations, list):
+        strategies = []
+        combinations = []
+        reject("funding result entity collections are invalid")
+    result_entities = [
+        {
+            "entity_type": "STRATEGY",
+            "entity_key": str(item.get("strategy_key") or ""),
+            "entity_version": str(item.get("current_version") or ""),
+        }
+        for item in strategies if isinstance(item, dict)
+    ] + [
+        {
+            "entity_type": "COMBINATION",
+            "entity_key": str(item.get("combination_key") or ""),
+            "entity_version": str(item.get("current_version") or ""),
+        }
+        for item in combinations if isinstance(item, dict)
+    ]
+    result_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    registry_rows = _rows(
+        connection,
+        "SELECT entity_type, entity_key, entity_version FROM ("
+        "SELECT 'STRATEGY' AS entity_type, strategy_key AS entity_key, "
+        "current_version AS entity_version FROM st_strategy_registry "
+        "UNION ALL SELECT 'COMBINATION' AS entity_type, "
+        "combination_key AS entity_key, current_version AS entity_version "
+        "FROM st_strategy_combination) funding_registry "
+        "ORDER BY BINARY entity_type, BINARY entity_key, "
+        "BINARY entity_version LIMIT :registry_limit",
+        {"registry_limit": len(result_entities) + 1},
+    )
+    current_entities = [
+        {
+            "entity_type": str(row.get("entity_type") or ""),
+            "entity_key": str(row.get("entity_key") or ""),
+            "entity_version": str(row.get("entity_version") or ""),
+        }
+        for row in registry_rows
+    ]
+    current_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    checkpoints: list[dict[str, Any]] = []
+    combination_recipes: list[dict[str, Any]] = []
+    ineligible: list[dict[str, Any]] = []
+    for strategy in strategies:
+        if not isinstance(strategy, dict):
+            reject("funding strategy result member is invalid")
+            continue
+        key = str(strategy.get("strategy_key") or "")
+        version = str(strategy.get("current_version") or "")
+        ref = strategy.get("funding_checkpoint_ref")
+        ineligible_row = strategy.get("funding_manifest_ineligible")
+        if strategy.get("funding_checkpoint_ready") is True:
+            try:
+                entry = _funding_checkpoint_manifest_entry(
+                    ref if isinstance(ref, dict) else {}
+                )
+            except (TypeError, ValueError) as exc:
+                reject(type(exc).__name__, record_id=key)
+                continue
+            if (
+                ineligible_row is not None
+                or entry["strategy_key"] != key
+                or entry["strategy_version"] != version
+                or entry["trade_date"] != trade_date
+            ):
+                reject("funding strategy checkpoint partition differs", record_id=key)
+                continue
+            checkpoints.append(entry)
+        elif (
+            isinstance(ineligible_row, dict)
+            and ref is None
+            and ineligible_row.get("entity_type") == "STRATEGY"
+            and ineligible_row.get("entity_key") == key
+            and ineligible_row.get("entity_version") == version
+        ):
+            ineligible.append(dict(ineligible_row))
+        else:
+            reject("funding strategy ineligible partition differs", record_id=key)
+    for combination in combinations:
+        if not isinstance(combination, dict):
+            reject("funding combination result member is invalid")
+            continue
+        key = str(combination.get("combination_key") or "")
+        version = str(combination.get("current_version") or "")
+        ineligible_row = combination.get("funding_manifest_ineligible")
+        if combination.get("funding_recipe_ready") is True:
+            try:
+                recipe = _combination_recipe_manifest_entry(
+                    combination, trade_date=trade_date,
+                )
+            except (TypeError, ValueError) as exc:
+                reject(type(exc).__name__, record_id=key)
+                continue
+            if (
+                ineligible_row is not None
+                or combination.get("paper_allocation_eligible") is not True
+                or recipe["entity_key"] != key
+                or recipe["entity_version"] != version
+            ):
+                reject("funding combination recipe partition differs", record_id=key)
+                continue
+            combination_recipes.append(recipe)
+        elif (
+            isinstance(ineligible_row, dict)
+            and combination.get("paper_allocation_eligible") is not True
+            and ineligible_row.get("entity_type") == "COMBINATION"
+            and ineligible_row.get("entity_key") == key
+            and ineligible_row.get("entity_version") == version
+        ):
+            ineligible.append(dict(ineligible_row))
+        else:
+            reject("funding combination ineligible partition differs", record_id=key)
+
+    checkpoint_entities: list[dict[str, str]] = []
+    checkpoint_by_id: dict[str, dict[str, Any]] = {}
+    checkpoint_identity_set: set[tuple[str, str, str]] = set()
+    expected_checkpoint_keys = {
+        "entity_type", "entity_key", "entity_version", "checkpoint_id",
+        "strategy_key", "strategy_version", "account_id", "trade_date",
+        "replay_mode", "replay_session_count", "max_holding_days",
+        "checkpoint_hash", "chain_hash", "history_fact_count",
+        "history_fact_set_hash", "history_tip_fact_id",
+        "history_tip_fact_hash", "new_fact_count", "new_fact_set_hash",
+        "new_fact_first_id", "new_fact_tip_id", "bootstrap_full_history_scan",
+        "automatic_real_order_submission", "real_order_authority",
+    }
+    for item in checkpoints:
+        if not isinstance(item, dict):
+            reject("funding checkpoint manifest member is not an object")
+            continue
+        checkpoint_id = str(item.get("checkpoint_id") or "")
+        identity = (
+            str(item.get("entity_type") or ""),
+            str(item.get("entity_key") or ""),
+            str(item.get("entity_version") or ""),
+        )
+        valid = (
+            set(item) == expected_checkpoint_keys
+            and identity[0] == "STRATEGY"
+            and identity[1] == str(item.get("strategy_key") or "")
+            and identity[2] == str(item.get("strategy_version") or "")
+            and identity not in checkpoint_identity_set
+            and re.fullmatch(r"[0-9a-f]{64}", checkpoint_id) is not None
+            and checkpoint_id not in checkpoint_by_id
+            and item.get("trade_date") == trade_date
+            and item.get("automatic_real_order_submission") is False
+            and item.get("real_order_authority") is False
+            and item.get("bootstrap_full_history_scan")
+            is (item.get("replay_mode") == "FULL_BOOTSTRAP")
+        )
+        if not valid:
+            reject("funding checkpoint manifest member differs", record_id=checkpoint_id)
+            continue
+        checkpoint_identity_set.add(identity)
+        checkpoint_by_id[checkpoint_id] = item
+        checkpoint_entities.append({
+            "entity_type": identity[0],
+            "entity_key": identity[1],
+            "entity_version": identity[2],
+        })
+    checkpoint_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+
+    ineligible_entities: list[dict[str, str]] = []
+    ineligible_identity_set: set[tuple[str, str, str]] = set()
+    for item in ineligible:
+        if not isinstance(item, dict):
+            reject("funding ineligible member is not an object")
+            continue
+        identity = (
+            str(item.get("entity_type") or ""),
+            str(item.get("entity_key") or ""),
+            str(item.get("entity_version") or ""),
+        )
+        reason_code = str(item.get("reason_code") or "")
+        reason = str(item.get("reason") or "")
+        if (
+            set(item) != {
+                "entity_type", "entity_key", "entity_version",
+                "reason_code", "reason",
+            }
+            or identity[0] not in {"STRATEGY", "COMBINATION"}
+            or not identity[1]
+            or not identity[2]
+            or identity in ineligible_identity_set
+            or not reason_code
+            or not reason.strip()
+            or len(reason) > 240
+        ):
+            reject("funding ineligible member differs", record_id=identity[1])
+            continue
+        ineligible_identity_set.add(identity)
+        ineligible_entities.append({
+            "entity_type": identity[0],
+            "entity_key": identity[1],
+            "entity_version": identity[2],
+        })
+    ineligible_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    recipe_entities = [{
+        "entity_type": "COMBINATION",
+        "entity_key": str(item.get("entity_key") or ""),
+        "entity_version": str(item.get("entity_version") or ""),
+    } for item in combination_recipes]
+    recipe_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    partition = sorted(
+        checkpoint_entities + recipe_entities + ineligible_entities,
+        key=lambda item: (
+            item["entity_type"], item["entity_key"], item["entity_version"],
+        ),
+    )
+    expected_coverage_keys = {
+        "current_entity_count", "funding_ready_count", "eligible_count",
+        "strategy_checkpoint_count", "combination_recipe_count",
+        "checkpointed_count", "ineligible_count", "current_entity_set_hash",
+        "checkpointed_set_hash", "combination_recipe_set_hash",
+        "funding_ready_set_hash", "ineligible_set_hash",
+        "eligible_persistence_coverage_pct",
+    }
+    funding_ready_entities = sorted(
+        checkpoint_entities + recipe_entities,
+        key=lambda item: (
+            item["entity_type"], item["entity_key"], item["entity_version"],
+        ),
+    )
+    try:
+        expected_checkpoint_root = _funding_manifest_batch_root(
+            checkpoints, kind="CHECKPOINT"
+        )
+        expected_recipe_root = _funding_manifest_batch_root(
+            combination_recipes, kind="COMBINATION_RECIPE"
+        )
+        expected_ineligible_root = _funding_manifest_batch_root(
+            ineligible, kind="INELIGIBLE"
+        )
+    except (TypeError, ValueError) as exc:
+        reject(type(exc).__name__)
+        expected_checkpoint_root = None
+        expected_recipe_root = None
+        expected_ineligible_root = None
+    if (
+        current_entities != result_entities
+        or len(current_entities) != len({
+            (item["entity_type"], item["entity_key"], item["entity_version"])
+            for item in current_entities
+        })
+        or checkpoint_identity_set & ineligible_identity_set
+        or {
+            (item["entity_type"], item["entity_key"], item["entity_version"])
+            for item in recipe_entities
+        } & ineligible_identity_set
+        or partition != current_entities
+        or set(coverage) != expected_coverage_keys
+        or _integer(coverage.get("current_entity_count"))
+        != len(current_entities)
+        or _integer(coverage.get("eligible_count"))
+        != len(funding_ready_entities)
+        or _integer(coverage.get("funding_ready_count"))
+        != len(funding_ready_entities)
+        or _integer(coverage.get("strategy_checkpoint_count"))
+        != len(checkpoint_entities)
+        or _integer(coverage.get("combination_recipe_count"))
+        != len(recipe_entities)
+        or _integer(coverage.get("checkpointed_count"))
+        != len(checkpoint_entities)
+        or _integer(coverage.get("ineligible_count"))
+        != len(ineligible_entities)
+        or coverage.get("eligible_persistence_coverage_pct") != 100.0
+        or coverage.get("current_entity_set_hash")
+        != _funding_entity_set_hash(current_entities)
+        or coverage.get("checkpointed_set_hash")
+        != _funding_entity_set_hash(checkpoint_entities)
+        or coverage.get("combination_recipe_set_hash")
+        != _funding_entity_set_hash(recipe_entities)
+        or coverage.get("funding_ready_set_hash")
+        != _funding_entity_set_hash(funding_ready_entities)
+        or coverage.get("ineligible_set_hash")
+        != _funding_entity_set_hash(ineligible_entities)
+        or manifest.get("checkpoint_root") != expected_checkpoint_root
+        or manifest.get("combination_recipe_root") != expected_recipe_root
+        or manifest.get("ineligible_root") != expected_ineligible_root
+        or manifest.get("ineligible_reason_code_counts") != {
+            code: sum(1 for row in ineligible if row.get("reason_code") == code)
+            for code in sorted({str(row.get("reason_code") or "") for row in ineligible})
+        }
+    ):
+        reject("funding eligible/ineligible partition or set hashes differ")
+
+    checkpoint_rows = _rows(
+        connection,
+        f"SELECT cp.*, prev.checkpoint_hash AS referenced_previous_hash, "
+        "prev.chain_hash AS referenced_previous_chain_hash, "
+        "prev.history_tip_fact_id AS referenced_previous_tip_id, "
+        "prev.history_tip_fact_hash AS referenced_previous_tip_hash "
+        f"FROM {FUNDING_CHECKPOINT_TABLE_NAME} cp LEFT JOIN "
+        f"{FUNDING_CHECKPOINT_TABLE_NAME} prev "
+        "ON prev.checkpoint_id=cp.previous_checkpoint_id "
+        "WHERE cp.anchor_run_uid=:run_uid "
+        "ORDER BY BINARY cp.checkpoint_id LIMIT :checkpoint_limit",
+        {"run_uid": run_uid, "checkpoint_limit": len(checkpoint_by_id) + 1},
+    )
+    persisted_checkpoint_by_id = {
+        str(row.get("checkpoint_id") or ""): row
+        for row in checkpoint_rows
+    }
+    if (
+        len(persisted_checkpoint_by_id) != len(checkpoint_rows)
+        or set(persisted_checkpoint_by_id) != set(checkpoint_by_id)
+    ):
+        reject("persisted checkpoint set differs from canonical manifest")
+
+    checkpoint_storage_bytes = 0
+    for checkpoint_id, entry in sorted(checkpoint_by_id.items()):
+        row = persisted_checkpoint_by_id.get(checkpoint_id)
+        if not isinstance(row, dict):
+            continue
+        state_raw = str(row.get("state_json") or "")
+        chain_raw = str(row.get("chain_payload_json") or "")
+        holdings_raw = str(row.get("holdings_json") or "")
+        state = _json_object(state_raw)
+        chain = _json_object(chain_raw)
+        holdings_ok, holdings = _json_document(holdings_raw)
+        checkpoint_bytes = len(_funding_canonical_json(
+            _funding_checkpoint_storage_projection(
+                row,
+                state if isinstance(state, dict) else {},
+                run_uid=run_uid,
+            )
+        ).encode("utf-8"))
+        checkpoint_storage_bytes += checkpoint_bytes
+        previous_id = str(row.get("previous_checkpoint_id") or "")
+        previous_hash = str(row.get("previous_checkpoint_hash") or "")
+        previous_chain_hash = str(row.get("previous_chain_hash") or "")
+        state_valid = (
+            isinstance(state, dict)
+            and isinstance(chain, dict)
+            and holdings_ok
+            and isinstance(holdings, list)
+            and _funding_canonical_json(state) == state_raw
+            and _funding_canonical_json(chain) == chain_raw
+            and _funding_canonical_json(holdings) == holdings_raw
+            and state.get("schema") == FUNDING_CHECKPOINT_SCHEMA
+            and checkpoint_state_hash(state)
+            == str(row.get("checkpoint_hash") or "")
+            and _funding_canonical_hash(chain)
+            == str(row.get("chain_hash") or "")
+            and chain == checkpoint_chain_payload(
+                checkpoint_hash=str(row.get("checkpoint_hash") or ""),
+                previous_checkpoint_id=previous_id,
+                previous_checkpoint_hash=previous_hash,
+                previous_chain_hash=previous_chain_hash,
+            )
+            and state.get("strategy_key") == row.get("strategy_key")
+            and state.get("strategy_version") == row.get("strategy_version")
+            and state.get("account_id") == row.get("account_id")
+            and state.get("trade_date") == _iso_date(row.get("trade_date"))
+            and state.get("replay_mode") == row.get("replay_mode")
+            and _integer(state.get("replay_session_count"))
+            == _integer(row.get("replay_session_count"))
+            and _integer(state.get("max_holding_days"))
+            == _integer(row.get("max_holding_days"))
+            and _integer(state.get("history_fact_count"))
+            == _integer(row.get("history_fact_count"))
+            and state.get("history_fact_set_hash")
+            == row.get("history_fact_set_hash")
+            and state.get("history_tip_fact_id")
+            == row.get("history_tip_fact_id")
+            and state.get("history_tip_fact_hash")
+            == row.get("history_tip_fact_hash")
+            and _integer(state.get("new_fact_count"))
+            == _integer(row.get("new_fact_count"))
+            and state.get("new_fact_set_hash") == row.get("new_fact_set_hash")
+            and state.get("new_fact_first_id") == row.get("new_fact_first_id")
+            and state.get("new_fact_tip_id") == row.get("new_fact_tip_id")
+            and state.get("holdings") == holdings
+            and state.get("automatic_real_order_submission") is False
+            and state.get("real_order_authority") is False
+            and checkpoint_identity(
+                strategy_key=str(row.get("strategy_key") or ""),
+                strategy_version=str(row.get("strategy_version") or ""),
+                account_id=str(row.get("account_id") or ""),
+                trade_date=_iso_date(row.get("trade_date")),
+                anchor_run_uid=run_uid,
+            ) == checkpoint_id
+        )
+        replay_mode = str(row.get("replay_mode") or "")
+        predecessor_valid = (
+            replay_mode == "FULL_BOOTSTRAP"
+            and not previous_id
+            and not previous_hash
+            and not previous_chain_hash
+            or replay_mode == "BOUNDED_INCREMENTAL"
+            and bool(previous_id)
+            and previous_hash
+            == str(row.get("referenced_previous_hash") or "")
+            and previous_chain_hash
+            == str(row.get("referenced_previous_chain_hash") or "")
+        )
+        manifest_valid = all((
+            entry.get("strategy_key") == row.get("strategy_key"),
+            entry.get("strategy_version") == row.get("strategy_version"),
+            entry.get("account_id") == row.get("account_id"),
+            entry.get("trade_date") == _iso_date(row.get("trade_date")),
+            entry.get("replay_mode") == replay_mode,
+            _integer(entry.get("replay_session_count"))
+            == _integer(row.get("replay_session_count")),
+            _integer(entry.get("max_holding_days"))
+            == _integer(row.get("max_holding_days")),
+            entry.get("checkpoint_hash") == row.get("checkpoint_hash"),
+            entry.get("chain_hash") == row.get("chain_hash"),
+            _integer(entry.get("history_fact_count"))
+            == _integer(row.get("history_fact_count")),
+            entry.get("history_fact_set_hash")
+            == row.get("history_fact_set_hash"),
+            entry.get("history_tip_fact_id")
+            == row.get("history_tip_fact_id"),
+            entry.get("history_tip_fact_hash")
+            == row.get("history_tip_fact_hash"),
+            _integer(entry.get("new_fact_count"))
+            == _integer(row.get("new_fact_count")),
+            entry.get("new_fact_set_hash") == row.get("new_fact_set_hash"),
+            entry.get("new_fact_first_id") == row.get("new_fact_first_id"),
+            entry.get("new_fact_tip_id") == row.get("new_fact_tip_id"),
+            _integer(row.get("automatic_real_order_submission")) == 0,
+            _integer(row.get("real_order_authority")) == 0,
+            str(row.get("canonical_result_hash") or "") == result_hash,
+        ))
+        if not state_valid or not predecessor_valid or not manifest_valid:
+            reject("persisted checkpoint state, chain or manifest binding differs", record_id=checkpoint_id)
+
+    expected_fact_count = sum(
+        _integer(entry.get("new_fact_count"))
+        for entry in checkpoint_by_id.values()
+    )
+    if any(
+        _integer(entry.get("new_fact_count")) not in range(1, 371)
+        for entry in checkpoint_by_id.values()
+    ):
+        reject("funding checkpoint daily-fact count is outside 1..370")
+    fact_rows = _rows(
+        connection,
+        f"SELECT * FROM {FUNDING_DAILY_FACT_TABLE_NAME} "
+        "WHERE anchor_run_uid=:run_uid "
+        "ORDER BY BINARY origin_checkpoint_id, trade_date, BINARY fact_id "
+        "LIMIT :fact_limit",
+        {
+            "run_uid": run_uid,
+            "fact_limit": expected_fact_count + 1,
+        },
+    )
+    facts_by_origin: dict[str, list[dict[str, Any]]] = {}
+    fact_storage_bytes = 0
+    for row in fact_rows:
+        origin_id = str(row.get("origin_checkpoint_id") or "")
+        facts_by_origin.setdefault(origin_id, []).append(row)
+    if set(facts_by_origin) != set(checkpoint_by_id):
+        reject("persisted daily-fact origin set differs from checkpoints")
+    for origin_id, entry in sorted(checkpoint_by_id.items()):
+        rows = facts_by_origin.get(origin_id, [])
+        checkpoint_row = persisted_checkpoint_by_id.get(origin_id) or {}
+        members: list[dict[str, str]] = []
+        previous: dict[str, Any] | None = None
+        valid_group = len(rows) == _integer(entry.get("new_fact_count"))
+        for row in rows:
+            fact_raw = str(row.get("fact_json") or "")
+            fact = _json_object(fact_raw)
+            fact_id = str(row.get("fact_id") or "")
+            fact_hash = str(row.get("fact_hash") or "")
+            day = _iso_date(row.get("trade_date"))
+            valid_fact = (
+                isinstance(fact, dict)
+                and _funding_canonical_json(fact) == fact_raw
+                and fact.get("schema") == FUNDING_DAILY_FACT_SCHEMA
+                and funding_daily_fact_hash(fact) == fact_hash
+                and funding_daily_fact_identity(
+                    entity_type="STRATEGY",
+                    entity_key=str(row.get("entity_key") or ""),
+                    entity_version=str(row.get("entity_version") or ""),
+                    account_id=str(row.get("account_id") or ""),
+                    trade_date=day,
+                    anchor_run_uid=run_uid,
+                ) == fact_id
+                and fact.get("entity_type") == "STRATEGY"
+                and fact.get("entity_key") == checkpoint_row.get("strategy_key")
+                and fact.get("entity_version")
+                == checkpoint_row.get("strategy_version")
+                and fact.get("account_id") == checkpoint_row.get("account_id")
+                and fact.get("trade_date") == day
+                and fact.get("origin_checkpoint_id") == origin_id
+                and str(fact.get("previous_fact_id") or "")
+                == str(row.get("previous_fact_id") or "")
+                and str(fact.get("previous_fact_hash") or "")
+                == str(row.get("previous_fact_hash") or "")
+                and fact.get("automatic_real_order_submission") is False
+                and fact.get("real_order_authority") is False
+                and _integer(row.get("automatic_real_order_submission")) == 0
+                and _integer(row.get("real_order_authority")) == 0
+                and str(row.get("canonical_result_hash") or "") == result_hash
+            )
+            fact_storage_bytes += len(_funding_canonical_json(
+                _funding_fact_storage_projection(
+                    row,
+                    fact if isinstance(fact, dict) else {},
+                    run_uid=run_uid,
+                )
+            ).encode("utf-8"))
+            for field in (
+                "opening_cash_cny", "closing_cash_cny",
+                "opening_equity_cny", "closing_equity_cny",
+                "daily_return_pct", "cumulative_fee_cny",
+                "high_watermark_equity_cny",
+            ):
+                try:
+                    valid_fact = valid_fact and (
+                        Decimal(str(fact.get(field)))
+                        == Decimal(str(row.get(field)))
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    valid_fact = False
+            exposure_ok, exposure = _json_document(row.get("stock_exposure_json"))
+            closed_ok, closed_ids = _json_document(
+                row.get("closed_evidence_ids_json")
+            )
+            valid_fact = valid_fact and (
+                exposure_ok
+                and closed_ok
+                and fact.get("stock_risk_exposure") == exposure
+                and fact.get("closed_evidence_ids") == closed_ids
+            )
+            if previous is None:
+                if str(checkpoint_row.get("replay_mode") or "") == "FULL_BOOTSTRAP":
+                    valid_fact = valid_fact and not str(
+                        row.get("previous_fact_id") or ""
+                    ) and not str(row.get("previous_fact_hash") or "")
+                else:
+                    valid_fact = valid_fact and (
+                        str(row.get("previous_fact_id") or "")
+                        == str(checkpoint_row.get("referenced_previous_tip_id") or "")
+                        and str(row.get("previous_fact_hash") or "")
+                        == str(checkpoint_row.get("referenced_previous_tip_hash") or "")
+                    )
+            else:
+                valid_fact = valid_fact and (
+                    str(row.get("previous_fact_id") or "")
+                    == str(previous.get("fact_id") or "")
+                    and str(row.get("previous_fact_hash") or "")
+                    == str(previous.get("fact_hash") or "")
+                    and day > str(previous.get("trade_date") or "")
+                )
+            if not valid_fact:
+                valid_group = False
+            members.append({"fact_id": fact_id, "fact_hash": fact_hash})
+            previous = {"fact_id": fact_id, "fact_hash": fact_hash, "trade_date": day}
+        if (
+            not rows
+            or members[0]["fact_id"] != str(entry.get("new_fact_first_id") or "")
+            or members[-1]["fact_id"] != str(entry.get("new_fact_tip_id") or "")
+            or ordered_funding_fact_set_hash(members)
+            != str(entry.get("new_fact_set_hash") or "")
+        ):
+            valid_group = False
+        if not valid_group:
+            reject("persisted daily-fact batch or chain differs", record_id=origin_id)
+
+    audit_rows = _rows(
+        connection,
+        "SELECT audit_id, entity_type, entity_key, action, reason, "
+        "operator_name, before_json, after_json, evidence_json, "
+        "payload_json, audit_hash, created_at "
+        "FROM st_strategy_governance_audit "
+        "WHERE action='ANCHOR_FUNDING_CHECKPOINT_MANIFEST' "
+        "AND entity_type='SYSTEM' "
+        "AND entity_key='strategy_funding_checkpoint_manifest' "
+        "AND JSON_UNQUOTE(JSON_EXTRACT(evidence_json,'$.run_uid'))=:run_uid "
+        "ORDER BY created_at, BINARY audit_id LIMIT 2",
+        {"run_uid": run_uid},
+    )
+    audit_valid = len(audit_rows) == 1
+    if audit_valid:
+        audit = audit_rows[0]
+        before_ok, before = _json_document(audit.get("before_json"))
+        after_ok, after = _json_document(audit.get("after_json"))
+        evidence_ok, evidence = _json_document(audit.get("evidence_json"))
+        payload = _json_object(audit.get("payload_json"))
+        expected_evidence = {
+            "schema": FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+            "run_uid": run_uid,
+            "canonical_result_hash": result_hash,
+            "checkpoint_manifest_hash": str(manifest.get("manifest_hash") or ""),
+            "coverage": coverage,
+            "checkpoint_root": manifest.get("checkpoint_root"),
+            "combination_recipe_root": manifest.get(
+                "combination_recipe_root"
+            ),
+            "ineligible_root": manifest.get("ineligible_root"),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        expected_payload = {
+            "entity_type": "SYSTEM",
+            "entity_key": "strategy_funding_checkpoint_manifest",
+            "action": "ANCHOR_FUNDING_CHECKPOINT_MANIFEST",
+            "reason": str(audit.get("reason") or ""),
+            "operator": str(audit.get("operator_name") or ""),
+            "before": before,
+            "after": after,
+            "evidence": evidence,
+            "nonce": str((payload or {}).get("nonce") or ""),
+        }
+        audit_id = str(audit.get("audit_id") or "")
+        audit_hash = str(audit.get("audit_hash") or "")
+        audit_bytes = len(str(audit.get("payload_json") or "").encode("utf-8")) + len(
+            str(audit.get("evidence_json") or "").encode("utf-8")
+        )
+        audit_valid = (
+            before_ok
+            and after_ok
+            and evidence_ok
+            and before == {}
+            and after == {
+                "run_uid": run_uid,
+                "manifest_hash": str(manifest.get("manifest_hash") or ""),
+                "checkpoint_count": len(checkpoint_by_id),
+            }
+            and evidence == expected_evidence
+            and payload == expected_payload
+            and re.fullmatch(r"[0-9a-f]{32}", audit_id) is not None
+            and re.fullmatch(r"[0-9a-f]{32}", expected_payload["nonce"])
+            is not None
+            and _funding_canonical_hash(payload) == audit_hash
+            and audit_bytes <= FUNDING_CHECKPOINT_AUDIT_MAX_BYTES
+            and all(
+                str(row.get("anchor_audit_id") or "") == audit_id
+                and str(row.get("anchor_audit_hash") or "") == audit_hash
+                for row in checkpoint_rows + fact_rows
+            )
+        )
+    if not audit_valid:
+        reject("funding manifest audit anchor differs")
+
+    total_storage_bytes = checkpoint_storage_bytes + fact_storage_bytes
+    storage_valid = (
+        checkpoint_storage_bytes
+        == _integer(manifest.get("checkpoint_storage_bytes"))
+        and fact_storage_bytes == _integer(manifest.get("fact_storage_bytes"))
+        and total_storage_bytes == _integer(manifest.get("total_storage_bytes"))
+        and total_storage_bytes <= FUNDING_CHECKPOINT_TOTAL_HARD_BYTES
+        and manifest.get("target_total_met")
+        is (total_storage_bytes <= FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES)
+        and (
+            not checkpoint_rows
+            or checkpoint_storage_bytes
+            <= FUNDING_CHECKPOINT_TARGET_AVG_BYTES * len(checkpoint_rows)
+        )
+        and all(
+            len(str(row.get("fact_json") or "").encode("utf-8"))
+            <= FUNDING_CHECKPOINT_BATCH_MAX_BYTES
+            for row in fact_rows
+        )
+    )
+    if not storage_valid:
+        reject("funding checkpoint/fact storage budget or byte totals differ")
+
+    summary = result.get("summary")
+    if not isinstance(summary, dict) or (
+        summary.get("funding_checkpoint_manifest_hash")
+        != manifest.get("manifest_hash")
+        or _integer(summary.get("funding_checkpoint_eligible_count"))
+        != len(funding_ready_entities)
+        or _integer(summary.get("funding_checkpointed_count"))
+        != len(checkpoint_by_id)
+        or _integer(summary.get("funding_strategy_checkpoint_count"))
+        != len(checkpoint_by_id)
+        or _integer(summary.get("funding_combination_recipe_count"))
+        != len(combination_recipes)
+        or _integer(summary.get("funding_ready_count"))
+        != len(funding_ready_entities)
+        or _integer(summary.get("funding_checkpoint_ineligible_count"))
+        != len(ineligible_entities)
+    ):
+        reject("funding manifest summary binding differs")
+
+    return not errors, {
+        "run_uid": run_uid,
+        "current_entity_count": len(current_entities),
+        "funding_ready_count": len(funding_ready_entities),
+        "checkpoint_count": len(checkpoint_rows),
+        "strategy_checkpoint_count": len(checkpoint_rows),
+        "combination_recipe_count": len(combination_recipes),
+        "ineligible_count": len(ineligible_entities),
+        "daily_fact_count": len(fact_rows),
+        "checkpoint_storage_bytes": checkpoint_storage_bytes,
+        "fact_storage_bytes": fact_storage_bytes,
+        "total_storage_bytes": total_storage_bytes,
+        "target_total_met": manifest.get("target_total_met"),
+        "manifest_hash": str(manifest.get("manifest_hash") or ""),
+        "checkpoint_root_hash": str(
+            (manifest.get("checkpoint_root") or {}).get("root_hash") or ""
+        ),
+        "combination_recipe_root_hash": str(
+            (manifest.get("combination_recipe_root") or {}).get("root_hash")
+            or ""
+        ),
+        "ineligible_root_hash": str(
+            (manifest.get("ineligible_root") or {}).get("root_hash") or ""
+        ),
+        "invalid_count": len(errors),
+        "errors": errors[:100],
+    }
+
+
+def _dynamic_shadow_schema_constraints_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Delegate the full frozen contract to its sole authoritative validator."""
+
+    from server.engine.dynamic_shadow_ledger_schema import (
+        validate_dynamic_shadow_ledger_schema,
+    )
+
+    detail = validate_dynamic_shadow_ledger_schema(connection)
+    return True, detail
+
+
+def _dynamic_shadow_ledger_integrity_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Replay every persisted dynamic candidate fact and shadow trial."""
+
+    from server.engine.strategy_execution_adapters import (
+        batch_dynamic_shadow_ledger_readiness,
+        batch_verify_all_strategy_adapter_candidate_facts,
+    )
+
+    errors: list[dict[str, str]] = []
+    try:
+        candidate_runs = batch_verify_all_strategy_adapter_candidate_facts(
+            connection
+        )
+        plan_count = int(connection.execute(text(
+            "SELECT COUNT(*) FROM st_dynamic_shadow_trial_plan"
+        )).scalar_one())
+        identity_rows = _rows(
+            connection,
+            "SELECT strategy_key, strategy_version, strategy_version_hash, "
+            "execution_binding_hash FROM st_dynamic_shadow_trial_plan "
+            "GROUP BY strategy_key, strategy_version, "
+            "strategy_version_hash, execution_binding_hash "
+            "ORDER BY strategy_key, strategy_version, "
+            "strategy_version_hash, execution_binding_hash "
+            "LIMIT :authoritative_limit",
+            {"authoritative_limit": plan_count + 1},
+        )
+        identities = [(
+            str(row.get("strategy_key") or ""),
+            str(row.get("strategy_version") or ""),
+            str(row.get("strategy_version_hash") or ""),
+            str(row.get("execution_binding_hash") or ""),
+        ) for row in identity_rows]
+        if len(identity_rows) > plan_count or len(identities) != len(set(identities)):
+            raise RuntimeError("historical plan identity batch was truncated")
+        readiness_index = batch_dynamic_shadow_ledger_readiness(
+            connection,
+            identities,
+            include_historical=True,
+        )
+        readiness_rows = list(readiness_index.values())
+        observed_plan_count = sum(
+            int(row.get("plan_count") or 0) for row in readiness_rows
+        )
+        if observed_plan_count != plan_count:
+            raise RuntimeError("historical plan readiness did not cover all rows")
+    except Exception as exc:
+        candidate_runs = {}
+        plan_count = 0
+        readiness_rows = []
+        errors.append({
+            "candidate_run_uid": "",
+            "error_type": type(exc).__name__,
+            "reason": _safe_exception_message(exc),
+        })
+    invalid = [
+        item
+        for readiness in readiness_rows
+        for item in (readiness.get("invalid_chains") or [])
+        if isinstance(item, dict)
+    ]
+    if invalid or any(
+        readiness.get("schema_readable") is not True
+        or readiness.get("automatic_real_order_submission") is not False
+        or readiness.get("real_order_authority") is not False
+        for readiness in readiness_rows
+    ):
+        errors.append({
+            "candidate_run_uid": "",
+            "error_type": "DynamicShadowLedgerIntegrityError",
+            "reason": "dynamic shadow historical plan/chain replay failed",
+        })
+    pending_plan_count = sum(
+        int(row.get("pending_plan_count") or 0) for row in readiness_rows
+    )
+    verified_chain_count = sum(
+        int(row.get("verified_chain_count") or 0) for row in readiness_rows
+    )
+    return not errors, {
+        "candidate_fact_run_count": len(candidate_runs),
+        "plan_count": plan_count,
+        "pending_plan_count": pending_plan_count,
+        "verified_chain_count": verified_chain_count,
+        "invalid_chain_count": len(invalid),
+        "shadow_trial_producer_ready": not invalid,
+        "funding_pipeline_ready": bool(verified_chain_count) and not invalid,
+        "ledger_hash": _canonical_digest(sorted(
+            str(row.get("ledger_hash") or "") for row in readiness_rows
+        )),
+        "errors": errors[:100],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -1286,6 +3828,8 @@ def _schema_checks(connection, add) -> tuple[set[str], bool]:
 
     schema_ok = not missing
     for table_name, required in REQUIRED_COLUMNS.items():
+        if table_name in DYNAMIC_SHADOW_TABLES:
+            continue
         if table_name not in existing:
             continue
         rows = connection.execute(
@@ -1305,6 +3849,8 @@ def _schema_checks(connection, add) -> tuple[set[str], bool]:
         schema_ok = schema_ok and not absent
 
     for table_name, required in REQUIRED_INDEXES.items():
+        if table_name in DYNAMIC_SHADOW_TABLES:
+            continue
         if table_name not in existing:
             continue
         rows = connection.execute(
@@ -1441,6 +3987,231 @@ def _scheduler_checks(connection, existing: set[str], add) -> bool:
     return exact
 
 
+def _qmt_announcement_scheduler_checks(
+    connection,
+    existing: set[str],
+    add,
+) -> bool:
+    """Require one enabled Windows-owned QMT announcement capture task."""
+
+    if "st_scheduled_tasks" not in existing:
+        add(
+            "qmt_announcement_scheduler_task_unique",
+            False,
+            {"reason": "table missing"},
+        )
+        add(
+            "qmt_announcement_scheduler_task_contract",
+            False,
+            {"reason": "table missing"},
+        )
+        return False
+    tasks = _rows(
+        connection,
+        "SELECT id, task_name, task_type, group_name, script_path, "
+        "script_args, cron_time, interval_minutes, date_param, enabled "
+        "FROM st_scheduled_tasks "
+        "WHERE task_type=:task_type OR script_path=:script_path "
+        "ORDER BY id",
+        {
+            "task_type": QMT_ANNOUNCEMENT_TASK["task_type"],
+            "script_path": QMT_ANNOUNCEMENT_TASK["script_path"],
+        },
+    )
+    add(
+        "qmt_announcement_scheduler_task_unique",
+        len(tasks) == 1,
+        {"row_count": len(tasks), "rows": tasks},
+    )
+    if len(tasks) != 1:
+        add(
+            "qmt_announcement_scheduler_task_contract",
+            False,
+            {
+                "reason": "QMT announcement scheduler identity is not unique",
+                "row_count": len(tasks),
+            },
+        )
+        return False
+    task = tasks[0]
+    cron_raw = str(task.get("cron_time") or "")
+    cron = (
+        cron_raw[:5]
+        if re.fullmatch(r"[0-9]{2}:[0-9]{2}(?::00)?", cron_raw)
+        else cron_raw
+    )
+    try:
+        order = validate_qmt_announcement_pipeline_order(
+            analysis_cron="18:50",
+            governance_cron=GOVERNANCE_TASK["cron_time"],
+        )
+        order_valid = True
+    except Exception as exc:
+        order = {"error": _safe_exception_message(exc)}
+        order_valid = False
+    exact = (
+        str(task.get("task_name") or "")
+        == QMT_ANNOUNCEMENT_TASK["task_name"]
+        and str(task.get("task_type") or "")
+        == QMT_ANNOUNCEMENT_TASK["task_type"]
+        and str(task.get("group_name") or "")
+        == QMT_ANNOUNCEMENT_TASK["group_name"]
+        and str(task.get("script_path") or "")
+        == QMT_ANNOUNCEMENT_TASK["script_path"]
+        and str(task.get("script_args") or "")
+        == QMT_ANNOUNCEMENT_TASK["script_args"]
+        and cron == QMT_ANNOUNCEMENT_TASK["cron_time"]
+        and _integer(task.get("interval_minutes")) == 0
+        and str(task.get("date_param") or "") == ""
+        and _integer(task.get("enabled")) == 1
+        and order_valid
+    )
+    add(
+        "qmt_announcement_scheduler_task_contract",
+        exact,
+        {
+            "actual": task,
+            "expected": {
+                key: QMT_ANNOUNCEMENT_TASK[key]
+                for key in (
+                    "task_name",
+                    "task_type",
+                    "group_name",
+                    "script_path",
+                    "script_args",
+                    "cron_time",
+                    "interval_minutes",
+                    "date_param",
+                    "enabled",
+                )
+            },
+            "pipeline_order": order,
+        },
+    )
+    return exact
+
+
+def _qmt_operations_scheduler_checks(
+    connection,
+    existing: set[str],
+    add,
+) -> bool:
+    """Require the exact five enabled QMT foundation scheduler contracts."""
+
+    unique_name = "qmt_operations_scheduler_tasks_unique"
+    contract_name = "qmt_operations_scheduler_tasks_contract"
+    if "st_scheduled_tasks" not in existing:
+        add(unique_name, False, {"reason": "table missing"})
+        add(contract_name, False, {"reason": "table missing"})
+        return False
+    predicates: list[str] = []
+    params: dict[str, str] = {}
+    for index, expected in enumerate(QMT_OPERATIONS_TASKS):
+        predicates.append(
+            f"task_type=:task_type_{index} OR script_path=:script_path_{index}"
+        )
+        params[f"task_type_{index}"] = str(expected["task_type"])
+        params[f"script_path_{index}"] = str(expected["script_path"])
+    tasks = _rows(
+        connection,
+        "SELECT id, task_name, task_type, group_name, script_path, "
+        "script_args, cron_time, interval_minutes, date_param, enabled "
+        "FROM st_scheduled_tasks WHERE "
+        + " OR ".join(f"({item})" for item in predicates)
+        + " ORDER BY id",
+        params,
+    )
+    matches: dict[str, list[dict[str, Any]]] = {}
+    for expected in QMT_OPERATIONS_TASKS:
+        task_type = str(expected["task_type"])
+        script_path = str(expected["script_path"])
+        matches[task_type] = [
+            row
+            for row in tasks
+            if str(row.get("task_type") or "") == task_type
+            or str(row.get("script_path") or "") == script_path
+        ]
+    matched_ids = [
+        int(rows[0].get("id") or 0)
+        for rows in matches.values()
+        if len(rows) == 1
+    ]
+    unique = (
+        len(tasks) == len(QMT_OPERATIONS_TASKS)
+        and all(len(rows) == 1 for rows in matches.values())
+        and len(matched_ids) == len(set(matched_ids))
+        and all(item > 0 for item in matched_ids)
+    )
+    add(
+        unique_name,
+        unique,
+        {
+            "row_count": len(tasks),
+            "expected_row_count": len(QMT_OPERATIONS_TASKS),
+            "match_counts": {
+                key: len(rows) for key, rows in sorted(matches.items())
+            },
+            "rows": tasks,
+        },
+    )
+    if not unique:
+        add(
+            contract_name,
+            False,
+            {"reason": "QMT operations scheduler identities are not unique"},
+        )
+        return False
+    expected_fields = (
+        "task_name",
+        "task_type",
+        "group_name",
+        "script_path",
+        "script_args",
+        "cron_time",
+        "interval_minutes",
+        "date_param",
+        "enabled",
+    )
+    expected_by_type = {
+        str(item["task_type"]): {
+            key: item[key] for key in expected_fields
+        }
+        for item in QMT_OPERATIONS_TASKS
+    }
+    actual_by_type: dict[str, dict[str, Any]] = {}
+    exact = True
+    for task_type, expected in expected_by_type.items():
+        task = matches[task_type][0]
+        cron_raw = str(task.get("cron_time") or "")
+        cron = (
+            cron_raw[:5]
+            if re.fullmatch(r"[0-9]{2}:[0-9]{2}(?::00)?", cron_raw)
+            else cron_raw
+        )
+        actual = {
+            "task_name": str(task.get("task_name") or ""),
+            "task_type": str(task.get("task_type") or ""),
+            "group_name": str(task.get("group_name") or ""),
+            "script_path": str(task.get("script_path") or ""),
+            "script_args": str(task.get("script_args") or ""),
+            "cron_time": cron,
+            "interval_minutes": _integer(task.get("interval_minutes")),
+            "date_param": str(task.get("date_param") or ""),
+            "enabled": _integer(task.get("enabled")),
+        }
+        actual_by_type[task_type] = actual
+        exact = exact and actual == expected
+    add(
+        contract_name,
+        exact,
+        {
+            "actual": actual_by_type,
+            "expected": expected_by_type,
+        },
+    )
+    return exact
+
+
 def _forward_strategy_version_schema_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
@@ -1546,7 +4317,7 @@ def _forward_strategy_version_schema_check(
         }
     except Exception as exc:
         return False, {
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exception_message(exc),
         }
 
 
@@ -1764,7 +4535,7 @@ def _forward_strategy_version_data_check(
         }
     except Exception as exc:
         return False, {
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exception_message(exc),
             "current_version_query_has_limit": None,
         }
 
@@ -1828,7 +4599,7 @@ def _v2_raw_ledger_immutability_schema_check(
             ),
         }
     except Exception as exc:
-        return False, {"error": f"{type(exc).__name__}: {exc}"}
+        return False, {"error": _safe_exception_message(exc)}
 
 
 def _forward_exit_allocation_schema_check(
@@ -2138,7 +4909,7 @@ def _forward_exit_allocation_schema_check(
             "frozen_checksum": frozen_checksum,
             "frozen_statement_count": frozen_statement_count,
             "frozen_migration_count": frozen_migration_count,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": _safe_exception_message(exc),
         }
 
 
@@ -2203,7 +4974,7 @@ def _forward_exit_allocation_data_check(
             "a.exit_fill_id, a.allocation_sequence",
         )
     except Exception as exc:
-        return False, {"error": f"{type(exc).__name__}: {exc}"}
+        return False, {"error": _safe_exception_message(exc)}
 
     errors: list[dict[str, Any]] = []
 
@@ -2275,7 +5046,7 @@ def _forward_exit_allocation_data_check(
             fail(
                 "deterministic FIFO replay raised",
                 account_id=account_id,
-                error=f"{type(exc).__name__}: {exc}",
+                error=_safe_exception_message(exc),
             )
             continue
         for key, value in account_diagnostics.items():
@@ -2467,17 +5238,21 @@ def _governance_schema_migration_check(
         connection,
         "SELECT migration_key, migration_hash, completed_at "
         "FROM st_strategy_governance_schema_migration "
-        "WHERE migration_key IN (:run_revision_key, :content_hash_key) "
+        "WHERE migration_key IN (:run_revision_key, :content_hash_key, "
+        ":funding_checkpoint_key) "
         "ORDER BY BINARY migration_key",
         {
             "run_revision_key": RUN_REVISION_MIGRATION_KEY,
             "content_hash_key": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
+            "funding_checkpoint_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
         },
     )
     expected = {
         RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
         STRATEGY_CONTENT_HASH_MIGRATION_KEY:
             STRATEGY_CONTENT_HASH_MIGRATION_HASH,
+        FUNDING_CHECKPOINT_MIGRATION_KEY:
+            FUNDING_CHECKPOINT_MIGRATION_HASH,
     }
     observed = {
         str(row.get("migration_key") or ""): row for row in rows
@@ -2644,6 +5419,423 @@ def _canonical_digest(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _industry_iso_datetime(value: Any) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(
+            str(value or "").strip().replace(" ", "T").replace(
+                "Z", "+00:00"
+            )
+        )
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_SHANGHAI).replace(tzinfo=None)
+    return parsed.isoformat(timespec="seconds")
+
+
+def _canonical_qmt_industry_hash(rows: list[dict[str, Any]]) -> str:
+    values = [
+        tuple(str(row.get(column) or "") for column in (
+            "industry_code", "industry_name", "industry_type",
+            "stock_code", "short_name",
+        ))
+        for row in rows
+    ]
+    payload = json.dumps(
+        sorted(values), ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _strategy_industry_history_contract_check(
+    connection,
+) -> tuple[
+    bool,
+    dict[str, Any],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    """Independently rebuild every industry ledger date from raw QMT rows."""
+
+    history_rows = _rows(
+        connection,
+        "SELECT snapshot_id, trade_date, as_of_exclusive, stock_code, "
+        "industry_name, industry_type, source_system, source_fact_id, "
+        "source_effective_at, source_etl_sync_at, row_hash "
+        "FROM st_strategy_industry_history "
+        "ORDER BY trade_date, source_system, stock_code",
+    )
+    if not history_rows:
+        return True, {
+            "trade_date_count": 0,
+            "history_row_count": 0,
+            "qmt_run_count": 0,
+            "qmt_member_count": 0,
+            "invalid_count": 0,
+            "errors": [],
+        }, {}, {}
+
+    source_keys = sorted({
+        (_iso_date(row.get("trade_date")), str(row.get("source_system") or ""))
+        for row in history_rows
+    })
+    params: dict[str, Any] = {}
+    clauses: list[str] = []
+    for index, (trade_date, source) in enumerate(source_keys):
+        params[f"industry_date_{index}"] = trade_date
+        params[f"industry_source_{index}"] = source
+        clauses.append(
+            f"(snapshot_date=:industry_date_{index} "
+            f"AND source=:industry_source_{index})"
+        )
+    where = " OR ".join(clauses)
+    run_rows = _rows(
+        connection,
+        "SELECT snapshot_date, source, quality_status, capture_mode, "
+        "industry_count, industry_relation_count, industry_hash, captured_at "
+        "FROM qmt_membership_snapshot_run WHERE " + where
+        + " ORDER BY snapshot_date, source, captured_at",
+        params,
+    )
+    member_rows = _rows(
+        connection,
+        "SELECT snapshot_date, source, industry_code, industry_name, "
+        "industry_type, stock_code, short_name, quality_status, captured_at "
+        "FROM qmt_industry_member_snapshot WHERE " + where
+        + " ORDER BY snapshot_date, source, industry_code, stock_code",
+        params,
+    )
+    runs_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    members_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    history_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in run_rows:
+        runs_by_key.setdefault((
+            _iso_date(row.get("snapshot_date")),
+            str(row.get("source") or ""),
+        ), []).append(row)
+    for row in member_rows:
+        members_by_key.setdefault((
+            _iso_date(row.get("snapshot_date")),
+            str(row.get("source") or ""),
+        ), []).append(row)
+    for row in history_rows:
+        history_by_key.setdefault((
+            _iso_date(row.get("trade_date")),
+            str(row.get("source_system") or ""),
+        ), []).append(row)
+
+    errors: list[dict[str, Any]] = []
+    bindings: dict[tuple[str, str], dict[str, Any]] = {}
+    snapshots: dict[str, dict[str, Any]] = {}
+    dates_to_sources: dict[str, set[str]] = {}
+    for trade_date, source in source_keys:
+        dates_to_sources.setdefault(trade_date, set()).add(source)
+    for trade_date, sources in dates_to_sources.items():
+        if len(sources) != 1:
+            errors.append({
+                "trade_date": trade_date,
+                "reason": "industry history date has multiple source systems",
+                "sources": sorted(sources),
+            })
+
+    for trade_date, source in source_keys:
+        identity = {"trade_date": trade_date, "source": source}
+        runs = runs_by_key.get((trade_date, source), [])
+        members = members_by_key.get((trade_date, source), [])
+        observed_history = history_by_key.get((trade_date, source), [])
+        if len(runs) != 1:
+            errors.append({
+                **identity,
+                "reason": "exact QMT industry run is missing or duplicate",
+                "run_count": len(runs),
+            })
+            continue
+        run = runs[0]
+        try:
+            captured_at = _industry_iso_datetime(run.get("captured_at"))
+            captured_value = datetime.fromisoformat(captured_at)
+            cutoff = (
+                date.fromisoformat(trade_date) + timedelta(days=1)
+            ).isoformat() + "T00:00:00"
+            earliest = datetime.combine(
+                date.fromisoformat(trade_date), datetime.min.time()
+            ).replace(hour=15)
+            published_hash = str(run.get("industry_hash") or "").lower()
+            relation_count = int(run.get("industry_relation_count") or 0)
+            industry_count = int(run.get("industry_count") or 0)
+            actual_industries = len({
+                str(row.get("industry_code") or "") for row in members
+            })
+            members_valid = all(
+                _iso_date(row.get("snapshot_date")) == trade_date
+                and str(row.get("source") or "") == source
+                and str(row.get("quality_status") or "") == QMT_VALIDATED
+                and _industry_iso_datetime(row.get("captured_at"))
+                == captured_at
+                for row in members
+            )
+            if (
+                str(run.get("quality_status") or "") != QMT_VALIDATED
+                or str(run.get("capture_mode") or "")
+                != "qmt_close_full_refresh"
+                or RESULT_HASH_RE.fullmatch(published_hash) is None
+                or relation_count <= 0 or relation_count != len(members)
+                or industry_count <= 0 or industry_count != actual_industries
+                or not members_valid
+                or _canonical_qmt_industry_hash(members) != published_hash
+                or not earliest <= captured_value < datetime.fromisoformat(cutoff)
+            ):
+                raise ValueError("raw QMT run/member snapshot contract differs")
+
+            normalized: list[dict[str, Any]] = []
+            seen_codes: set[str] = set()
+            for member in members:
+                industry_type = str(
+                    member.get("industry_type") or ""
+                ).strip()
+                if industry_type not in L1_INDUSTRY_TYPES:
+                    continue
+                stock_code = str(
+                    member.get("stock_code") or ""
+                ).strip().zfill(6)
+                industry_code = str(
+                    member.get("industry_code") or ""
+                ).strip()
+                industry_name = str(
+                    member.get("industry_name") or ""
+                ).strip()
+                if (
+                    re.fullmatch(r"[0-9]{6}", stock_code) is None
+                    or stock_code in seen_codes
+                    or not industry_code or not industry_name
+                    or len(industry_name) > 120
+                    or len(industry_type) > 40
+                    or not source or len(source) > 80
+                ):
+                    raise ValueError(
+                        "raw QMT L1 member identity is incomplete or duplicate"
+                    )
+                seen_codes.add(stock_code)
+                fact_digest = _canonical_digest({
+                    "trade_date": trade_date,
+                    "source": source,
+                    "industry_hash": published_hash,
+                    "industry_code": industry_code,
+                    "industry_name": industry_name,
+                    "industry_type": industry_type,
+                    "stock_code": stock_code,
+                })
+                normalized.append({
+                    "stock_code": stock_code,
+                    "industry_name": industry_name,
+                    "industry_type": industry_type,
+                    "source_system": source,
+                    "source_fact_id": (
+                        f"qmt:{published_hash}:{fact_digest}"
+                    ),
+                    "source_effective_at": captured_at,
+                    "source_etl_sync_at": captured_at,
+                })
+            normalized.sort(key=lambda row: row["stock_code"])
+            if not normalized:
+                raise ValueError("raw QMT snapshot has no L1 stock facts")
+            snapshot_id = _canonical_digest({
+                "schema": "probiga.strategy-industry-qmt-snapshot.v2",
+                "trade_date": trade_date,
+                "as_of_exclusive": cutoff,
+                "qmt_source": source,
+                "qmt_industry_hash": published_hash,
+                "qmt_captured_at": captured_at,
+                "facts": normalized,
+            })
+            expected_rows = []
+            for normalized_row in normalized:
+                row_payload = {
+                    "snapshot_id": snapshot_id,
+                    "trade_date": trade_date,
+                    "as_of_exclusive": cutoff,
+                    **normalized_row,
+                }
+                expected_rows.append({
+                    **row_payload,
+                    "row_hash": _canonical_digest(row_payload),
+                })
+            normalized_observed = []
+            for row in observed_history:
+                normalized_observed.append({
+                    "snapshot_id": str(row.get("snapshot_id") or ""),
+                    "trade_date": _iso_date(row.get("trade_date")),
+                    "as_of_exclusive": _industry_iso_datetime(
+                        row.get("as_of_exclusive")
+                    ),
+                    "stock_code": str(row.get("stock_code") or ""),
+                    "industry_name": str(row.get("industry_name") or ""),
+                    "industry_type": str(row.get("industry_type") or ""),
+                    "source_system": str(row.get("source_system") or ""),
+                    "source_fact_id": str(row.get("source_fact_id") or ""),
+                    "source_effective_at": _industry_iso_datetime(
+                        row.get("source_effective_at")
+                    ),
+                    "source_etl_sync_at": _industry_iso_datetime(
+                        row.get("source_etl_sync_at")
+                    ),
+                    "row_hash": str(row.get("row_hash") or ""),
+                })
+            normalized_observed.sort(key=lambda row: row["stock_code"])
+            if normalized_observed != expected_rows:
+                raise ValueError(
+                    "strategy industry history differs from exact QMT replay"
+                )
+            if trade_date not in snapshots:
+                snapshots[trade_date] = {
+                    "snapshot_id": snapshot_id,
+                    "source": source,
+                    "source_snapshot_hash": published_hash,
+                    "captured_at": captured_at,
+                    "row_count": len(expected_rows),
+                }
+            for row in expected_rows:
+                bindings[(trade_date, row["stock_code"])] = row
+        except Exception as exc:
+            errors.append({
+                **identity,
+                "reason": _safe_exception_message(exc),
+            })
+
+    return not errors, {
+        "trade_date_count": len(dates_to_sources),
+        "history_row_count": len(history_rows),
+        "qmt_run_count": len(run_rows),
+        "qmt_member_count": len(member_rows),
+        "replayed_binding_count": len(bindings),
+        "invalid_count": len(errors),
+        "errors": errors[:100],
+    }, bindings, snapshots
+
+
+def _candidate_industry_snapshot_contract(
+    result: dict[str, Any],
+    *,
+    trade_date: str,
+    history_bindings: dict[tuple[str, str], dict[str, Any]],
+    history_snapshots: dict[str, dict[str, Any]],
+) -> tuple[bool, dict[str, Any], dict[str, dict[str, Any]]]:
+    snapshot = result.get("candidate_industry_snapshot")
+    summary = result.get("summary")
+    errors: list[dict[str, Any]] = []
+    if not isinstance(snapshot, dict) or not isinstance(summary, dict):
+        return False, {
+            "errors": [{"reason": "candidate industry snapshot is missing"}]
+        }, {}
+    expected_fields = {
+        "schema", "snapshot_id", "trade_date", "as_of_exclusive",
+        "status", "requested_stock_codes", "rows", "reason",
+        "snapshot_hash",
+    }
+    requested = snapshot.get("requested_stock_codes")
+    rows = snapshot.get("rows")
+    cutoff = (
+        date.fromisoformat(trade_date) + timedelta(days=1)
+    ).isoformat() + "T00:00:00"
+    snapshot_hash = str(snapshot.get("snapshot_hash") or "")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    source_snapshot = history_snapshots.get(trade_date) or {}
+    if (
+        set(snapshot) != expected_fields
+        or snapshot.get("schema") != INDUSTRY_SNAPSHOT_SCHEMA
+        or str(snapshot.get("trade_date") or "") != trade_date
+        or str(snapshot.get("as_of_exclusive") or "") != cutoff
+        or not isinstance(requested, list)
+        or requested != sorted(set(str(code) for code in requested))
+        or any(re.fullmatch(r"[0-9]{6}", str(code)) is None for code in requested)
+        or not isinstance(rows, list)
+        or RESULT_HASH_RE.fullmatch(snapshot_hash) is None
+        or _canonical_digest({
+            str(key): value for key, value in snapshot.items()
+            if str(key) != "snapshot_hash"
+        }) != snapshot_hash
+        or snapshot_hash
+        != str(result.get("candidate_industry_snapshot_hash") or "")
+        or snapshot_hash
+        != str(summary.get("candidate_industry_snapshot_hash") or "")
+        or snapshot_id
+        != str(summary.get("candidate_industry_snapshot_id") or "")
+        or str(snapshot.get("status") or "")
+        != str(summary.get("candidate_industry_snapshot_status") or "")
+    ):
+        errors.append({"reason": "candidate industry wrapper/hash differs"})
+    observed_by_code: dict[str, dict[str, Any]] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            errors.append({"reason": "candidate industry row is not an object"})
+            continue
+        code = str(row.get("stock_code") or "")
+        expected = history_bindings.get((trade_date, code))
+        if code in observed_by_code or expected is None or row != expected:
+            errors.append({
+                "reason": "candidate industry row differs from QMT replay",
+                "stock_code": code,
+            })
+            continue
+        observed_by_code[code] = row
+    expected_available = {
+        code for code in (requested or [])
+        if (trade_date, str(code)) in history_bindings
+    }
+    observed_codes = set(observed_by_code)
+    if observed_codes != expected_available:
+        errors.append({
+            "reason": "candidate industry rows omit or add an available fact",
+            "expected_codes": sorted(expected_available),
+            "observed_codes": sorted(observed_codes),
+        })
+    expected_status = (
+        "COMPLETED"
+        if requested and len(expected_available) == len(requested)
+        else "INCOMPLETE"
+    )
+    expected_snapshot_id = (
+        str(source_snapshot.get("snapshot_id") or "")
+        if observed_codes else ""
+    )
+    if (
+        str(snapshot.get("status") or "") != expected_status
+        or snapshot_id != expected_snapshot_id
+        or (observed_codes and RESULT_HASH_RE.fullmatch(snapshot_id) is None)
+    ):
+        errors.append({
+            "reason": "candidate industry completion/snapshot identity differs",
+            "expected_status": expected_status,
+            "expected_snapshot_id": expected_snapshot_id,
+        })
+    bindings = {
+        code: {
+            "schema": INDUSTRY_BINDING_SCHEMA,
+            "snapshot_id": snapshot_id,
+            "snapshot_hash": snapshot_hash,
+            "row_hash": row["row_hash"],
+            "trade_date": trade_date,
+            "as_of_exclusive": cutoff,
+            "stock_code": code,
+            "industry_name": row["industry_name"],
+            "industry_type": row["industry_type"],
+            "source_system": row["source_system"],
+            "source_fact_id": row["source_fact_id"],
+            "source_effective_at": row["source_effective_at"],
+            "source_etl_sync_at": row["source_etl_sync_at"],
+        }
+        for code, row in observed_by_code.items()
+    }
+    return not errors, {
+        "snapshot_id": snapshot_id,
+        "snapshot_hash": snapshot_hash,
+        "status": snapshot.get("status"),
+        "requested_count": len(requested or []),
+        "bound_count": len(bindings),
+        "errors": errors[:100],
+    }, bindings
 
 
 def _json_document(value: Any) -> tuple[bool, Any]:
@@ -3048,11 +6240,211 @@ def _immutable_lifecycle_and_audit_history_check(
     }, run_plan_hashes
 
 
+def _lifecycle_registry_projection_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Project current registry state only from the immutable event ledger.
+
+    Registry rows must remain mutable so a legitimate transition can advance
+    its current pointer.  That pointer is never authoritative by itself: this
+    check replays the append-only lifecycle ledger and requires the version,
+    state and reason projection to match exactly.  A new immutable version may
+    reset a retired predecessor to SHADOW; RETIRED is terminal within one
+    version.
+    """
+
+    registry_rows = _rows(
+        connection,
+        "SELECT entity_type, entity_key, entity_version, current_status, "
+        "status_reason, enabled FROM ("
+        "SELECT 'STRATEGY' AS entity_type, strategy_key AS entity_key, "
+        "current_version AS entity_version, current_status, status_reason, "
+        "enabled FROM st_strategy_registry UNION ALL "
+        "SELECT 'COMBINATION' AS entity_type, "
+        "combination_key AS entity_key, current_version AS entity_version, "
+        "current_status, status_reason, enabled "
+        "FROM st_strategy_combination) current_registry "
+        "ORDER BY BINARY entity_type, BINARY entity_key",
+    )
+    event_rows = _rows(
+        connection,
+        "SELECT event_id, entity_type, entity_key, entity_version, "
+        "previous_status, next_status, reason, trigger_type, payload_json, "
+        "event_hash, occurred_at FROM st_strategy_lifecycle_event "
+        "ORDER BY occurred_at, BINARY event_id",
+    )
+    errors: list[dict[str, Any]] = []
+    registry: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in registry_rows:
+        identity = (
+            str(row.get("entity_type") or ""),
+            str(row.get("entity_key") or ""),
+        )
+        if (
+            identity[0] not in {"STRATEGY", "COMBINATION"}
+            or not identity[1]
+            or identity in registry
+        ):
+            errors.append({
+                "record_type": "REGISTRY",
+                "entity_type": identity[0],
+                "entity_key": identity[1],
+                "reason": "current registry identity is invalid or repeated",
+            })
+            continue
+        registry[identity] = row
+
+    projection: dict[tuple[str, str], dict[str, str]] = {}
+    seen_event_ids: set[str] = set()
+    for row in event_rows:
+        event_id = str(row.get("event_id") or "")
+        entity_type = str(row.get("entity_type") or "")
+        entity_key = str(row.get("entity_key") or "")
+        entity_version = str(row.get("entity_version") or "")
+        previous_status = str(row.get("previous_status") or "")
+        next_status = str(row.get("next_status") or "")
+        trigger_type = str(row.get("trigger_type") or "")
+        reason = str(row.get("reason") or "")
+        identity = (entity_type, entity_key)
+        payload = _json_object(row.get("payload_json"))
+        payload_version = str(
+            (payload or {}).get("entity_version")
+            or (payload or {}).get("new_version")
+            or ""
+        )
+        base_valid = (
+            re.fullmatch(r"[0-9a-f]{32}", event_id) is not None
+            and event_id not in seen_event_ids
+            and identity in registry
+            and bool(entity_version)
+            and previous_status in LIFECYCLE_STATES
+            and next_status in LIFECYCLE_STATES
+            and bool(reason)
+            and payload is not None
+            and payload.get("entity_type") == entity_type
+            and payload.get("entity_key") == entity_key
+            and payload_version == entity_version
+            and payload.get("previous_status") == previous_status
+            and payload.get("next_status") == next_status
+            and _canonical_digest(payload)
+            == str(row.get("event_hash") or "")
+        )
+        if not base_valid:
+            errors.append({
+                "record_type": "LIFECYCLE_PROJECTION",
+                "record_id": event_id,
+                "entity_type": entity_type,
+                "entity_key": entity_key,
+                "reason": "event identity, hash or column binding differs",
+            })
+            seen_event_ids.add(event_id)
+            continue
+
+        previous = projection.get(identity)
+        if trigger_type == "VERSION_REGISTRATION":
+            old_version = str(payload.get("old_version") or "")
+            new_version = str(payload.get("new_version") or "")
+            valid_transition = (
+                new_version == entity_version
+                and new_version != old_version
+                and next_status == "SHADOW"
+                and (
+                    previous is None
+                    and old_version == ""
+                    or previous is not None
+                    and old_version == previous["entity_version"]
+                    and previous_status == previous["current_status"]
+                )
+            )
+        else:
+            valid_transition = (
+                trigger_type in {"AUTOMATIC_GATE", "MANUAL_GOVERNANCE"}
+                and previous is not None
+                and entity_version == previous["entity_version"]
+                and previous_status == previous["current_status"]
+                and next_status
+                in LIFECYCLE_TRANSITIONS.get(previous_status, frozenset())
+                and payload.get("reason") == reason
+            )
+        if not valid_transition:
+            errors.append({
+                "record_type": "LIFECYCLE_PROJECTION",
+                "record_id": event_id,
+                "entity_type": entity_type,
+                "entity_key": entity_key,
+                "reason": "event does not continue the frozen lifecycle",
+            })
+        else:
+            projection[identity] = {
+                "entity_version": entity_version,
+                "current_status": next_status,
+                "status_reason": reason,
+                "event_id": event_id,
+            }
+        seen_event_ids.add(event_id)
+
+    for identity, row in sorted(registry.items()):
+        projected = projection.get(identity)
+        if projected is None:
+            errors.append({
+                "record_type": "REGISTRY_PROJECTION",
+                "entity_type": identity[0],
+                "entity_key": identity[1],
+                "reason": "registry has no complete immutable event history",
+            })
+            continue
+        if (
+            str(row.get("entity_version") or "")
+            != projected["entity_version"]
+            or str(row.get("current_status") or "")
+            != projected["current_status"]
+            or str(row.get("status_reason") or "")
+            != projected["status_reason"]
+            or (
+                projected["current_status"] == "RETIRED"
+                and _integer(row.get("enabled")) != 0
+            )
+        ):
+            errors.append({
+                "record_type": "REGISTRY_PROJECTION",
+                "entity_type": identity[0],
+                "entity_key": identity[1],
+                "reason": "current registry differs from immutable projection",
+            })
+
+    projection_rows = [
+        {
+            "entity_type": identity[0],
+            "entity_key": identity[1],
+            **projected,
+        }
+        for identity, projected in sorted(projection.items())
+    ]
+    return not errors, {
+        "registry_count": len(registry_rows),
+        "event_count": len(event_rows),
+        "projected_count": len(projection),
+        "projection_hash": _canonical_digest({
+            "schema": "probiga.strategy-lifecycle-projection.v1",
+            "entities": projection_rows,
+        }),
+        "invalid_count": len(errors),
+        "errors": errors[:100],
+    }
+
+
 def _all_governance_snapshot_history_check(
     connection,
+    *,
+    industry_history_bindings: dict[
+        tuple[str, str], dict[str, Any]
+    ] | None = None,
+    industry_history_trade_dates: set[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     """Recompute every immutable detail snapshot bound by a completed run."""
 
+    industry_history_bindings = industry_history_bindings or {}
+    industry_history_trade_dates = industry_history_trade_dates or set()
     run_rows = _rows(
         connection,
         "SELECT run_uid, trade_date, market_state, status, summary_json "
@@ -3188,6 +6580,11 @@ def _all_governance_snapshot_history_check(
         reason = _json_object(row.get("reason_json"))
         envelope = _json_object(row.get("evidence_json"))
         try:
+            industry_binding = (envelope or {}).get("industry_binding")
+            industry_names = (envelope or {}).get("industry_names")
+            industry_by_strategy = (envelope or {}).get(
+                "industry_by_strategy"
+            )
             payload = {
                 "schema": POOL_ROW_SCHEMA,
                 "trade_date": _iso_date(row.get("trade_date")),
@@ -3200,6 +6597,27 @@ def _all_governance_snapshot_history_check(
                 "dominant_strategy": str(row.get("dominant_strategy") or ""),
                 "strategies": strategies,
                 "industry_name": str(row.get("industry_name") or ""),
+                "industry_type": str(
+                    (industry_binding or {}).get("industry_type") or ""
+                ),
+                "industry_snapshot_id": str(
+                    (industry_binding or {}).get("snapshot_id") or ""
+                ),
+                "industry_snapshot_hash": str(
+                    (industry_binding or {}).get("snapshot_hash") or ""
+                ),
+                "industry_row_hash": str(
+                    (industry_binding or {}).get("row_hash") or ""
+                ),
+                "industry_source_system": str(
+                    (industry_binding or {}).get("source_system") or ""
+                ),
+                "industry_source_fact_id": str(
+                    (industry_binding or {}).get("source_fact_id") or ""
+                ),
+                "industry_binding": industry_binding,
+                "industry_names": industry_names,
+                "industry_by_strategy": industry_by_strategy,
                 "gate_status": str(row.get("gate_status") or ""),
                 "reason": reason,
                 "evidence": (envelope or {}).get("source_evidence"),
@@ -3215,8 +6633,58 @@ def _all_governance_snapshot_history_check(
                 and isinstance(reason, dict)
                 and isinstance(envelope, dict)
                 and envelope.get("schema") == POOL_ROW_EVIDENCE_SCHEMA
+                and set(envelope) == {
+                    "schema", "source_evidence", "industry_names",
+                    "industry_by_strategy", "industry_binding",
+                    "pool_row_hash",
+                }
+                and isinstance(industry_binding, dict)
+                and isinstance(industry_names, list)
+                and isinstance(industry_by_strategy, dict)
                 and str(envelope.get("pool_row_hash") or "") == row_hash
             )
+            expected_history = industry_history_bindings.get((
+                payload["trade_date"], payload["stock_code"]
+            ))
+            if expected_history is not None:
+                expected_binding = {
+                    "schema": INDUSTRY_BINDING_SCHEMA,
+                    "snapshot_id": expected_history["snapshot_id"],
+                    "snapshot_hash": str(
+                        (run or {}).get("summary", {}).get(
+                            "candidate_industry_snapshot_hash"
+                        ) or ""
+                    ),
+                    "row_hash": expected_history["row_hash"],
+                    "trade_date": expected_history["trade_date"],
+                    "as_of_exclusive": expected_history["as_of_exclusive"],
+                    "stock_code": expected_history["stock_code"],
+                    "industry_name": expected_history["industry_name"],
+                    "industry_type": expected_history["industry_type"],
+                    "source_system": expected_history["source_system"],
+                    "source_fact_id": expected_history["source_fact_id"],
+                    "source_effective_at": expected_history[
+                        "source_effective_at"
+                    ],
+                    "source_etl_sync_at": expected_history[
+                        "source_etl_sync_at"
+                    ],
+                }
+                valid = bool(
+                    valid
+                    and industry_binding == expected_binding
+                    and payload["industry_name"]
+                    == expected_history["industry_name"]
+                )
+            else:
+                valid = bool(
+                    valid
+                    and payload["pool_level"] == "OBSERVATION"
+                    and industry_binding == {}
+                    and payload["industry_name"] == ""
+                    and "目标日QMT一级行业冻结事实缺失或无效"
+                    in (reason.get("blocking_reasons") or [])
+                )
         except Exception:
             valid = False
             row_hash = ""
@@ -3264,6 +6732,13 @@ def _all_governance_snapshot_history_check(
 
     for run_uid, run in runs.items():
         summary = run["summary"]
+        if run["trade_date"] not in industry_history_trade_dates:
+            errors.append({
+                "snapshot_type": "INDUSTRY_HISTORY",
+                "run_uid": run_uid,
+                "reason": "completed run has no exact-date QMT industry history",
+                "trade_date": run["trade_date"],
+            })
         entities = {
             (key, version)
             for observed_run, key, version in strategy_windows
@@ -3361,10 +6836,12 @@ def _metric_evidence_audit_history_check(
         "'REJECT_METRIC_EVIDENCE') ORDER BY created_at, audit_id",
     )
     from server.engine.strategy_governance import (
+        _metric_evidence_audit_index,
         metric_evidence_audit_binding,
     )
 
     errors: list[dict[str, Any]] = []
+    audit_index = _metric_evidence_audit_index(audit_rows)
     rows_by_id: dict[str, dict[str, Any]] = {}
     status_counts = {"PENDING": 0, "CONFIRMED": 0, "REJECTED": 0}
     for row in metric_rows:
@@ -3380,7 +6857,7 @@ def _metric_evidence_audit_history_check(
         status = str(row.get("verification_status") or "")
         if status in status_counts:
             status_counts[status] += 1
-        valid, detail = metric_evidence_audit_binding(row, audit_rows)
+        valid, detail = metric_evidence_audit_binding(row, audit_index)
         if not valid:
             errors.append({
                 "record_type": "METRIC_EVIDENCE",
@@ -3410,6 +6887,216 @@ def _metric_evidence_audit_history_check(
         "evidence_count": len(metric_rows),
         "metric_audit_count": len(audit_rows),
         "status_counts": status_counts,
+        "invalid_count": len(errors),
+        "errors": errors[:100],
+    }
+
+
+_CHALLENGER_EVIDENCE_SUBMISSION_FIELDS = frozenset({
+    "schema", "challenger_id", "proposal_hash", "proposed_version_hash",
+    "proposal_submitted_at", "submitted_by", "as_of_date", "window_days",
+    "evidence_protocol", "evidence_revision_at", "metrics",
+    "artifact_manifest", "artifact_hash", "source_dataset_hash",
+    "automatic_real_order_submission", "real_order_authority",
+    "server_replay_validation_hash", "evidence_submission_hash",
+})
+
+
+def _health_validated_challenger_evidence_claim(
+    row: dict[str, Any],
+) -> dict[str, str]:
+    """Independently validate a frozen challenger claim and audit envelope."""
+
+    before = _json_object(row.get("before_json"))
+    after = _json_object(row.get("after_json"))
+    evidence = _json_object(row.get("evidence_json"))
+    payload = _json_object(row.get("payload_json"))
+    envelope_fields = {
+        "entity_type", "entity_key", "action", "reason", "operator",
+        "before", "after", "evidence", "nonce",
+    }
+    envelope_valid = bool(
+        isinstance(payload, dict)
+        and set(payload) == envelope_fields
+        and payload.get("entity_type") == row.get("entity_type")
+        and payload.get("entity_key") == row.get("entity_key")
+        and payload.get("action") == row.get("action")
+        and payload.get("reason") == row.get("reason")
+        and payload.get("operator") == row.get("operator_name")
+        and payload.get("before") == before
+        and payload.get("after") == after
+        and payload.get("evidence") == evidence
+        and re.fullmatch(
+            r"[0-9a-f]{32}", str(payload.get("nonce") or "")
+        ) is not None
+        and RESULT_HASH_RE.fullmatch(str(row.get("audit_hash") or ""))
+        is not None
+        and _canonical_digest(payload) == str(row.get("audit_hash") or "")
+    )
+    if not envelope_valid or not isinstance(evidence, dict):
+        raise ValueError("challenger audit envelope hash/column binding differs")
+
+    challenger_id = str(evidence.get("challenger_id") or "")
+    artifact_hash = str(evidence.get("artifact_hash") or "")
+    source_dataset_hash = str(evidence.get("source_dataset_hash") or "")
+    submission_hash = str(evidence.get("evidence_submission_hash") or "")
+    manifest = evidence.get("artifact_manifest")
+    frozen = {
+        str(key): value for key, value in evidence.items()
+        if str(key) != "evidence_submission_hash"
+    }
+    expected_after = {
+        "challenger_id": challenger_id,
+        "status": "REVIEW_PENDING",
+        "evidence_submission_hash": submission_hash,
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": source_dataset_hash,
+    }
+    claim_valid = bool(
+        set(evidence) == _CHALLENGER_EVIDENCE_SUBMISSION_FIELDS
+        and row.get("action") == "SUBMIT_CHALLENGER_EVIDENCE"
+        and row.get("entity_type") == "STRATEGY"
+        and bool(str(row.get("entity_key") or ""))
+        and re.fullmatch(r"[0-9a-f]{32}", challenger_id) is not None
+        and before == {"challenger_id": challenger_id, "status": "VALIDATING"}
+        and after == expected_after
+        and evidence.get("schema")
+        == "probiga.strategy-challenger-evidence-submission.v1"
+        and evidence.get("submitted_by") == row.get("operator_name")
+        and isinstance(evidence.get("metrics"), dict)
+        and isinstance(manifest, dict)
+        and str(manifest.get("source_dataset_hash") or "").lower()
+        == source_dataset_hash
+        and RESULT_HASH_RE.fullmatch(artifact_hash) is not None
+        and RESULT_HASH_RE.fullmatch(source_dataset_hash) is not None
+        and RESULT_HASH_RE.fullmatch(
+            str(evidence.get("proposal_hash") or "")
+        ) is not None
+        and RESULT_HASH_RE.fullmatch(
+            str(evidence.get("proposed_version_hash") or "")
+        ) is not None
+        and RESULT_HASH_RE.fullmatch(
+            str(evidence.get("server_replay_validation_hash") or "")
+        ) is not None
+        and RESULT_HASH_RE.fullmatch(submission_hash) is not None
+        and _canonical_digest(frozen) == submission_hash
+        and evidence.get("automatic_real_order_submission") is False
+        and evidence.get("real_order_authority") is False
+    )
+    if not claim_valid:
+        raise ValueError("challenger frozen evidence submission contract differs")
+    return {
+        "challenger_id": challenger_id,
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": source_dataset_hash,
+    }
+
+
+def _global_evidence_claim_uniqueness_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Replay the global artifact/dataset namespace across both ledgers."""
+
+    metric_rows = _rows(
+        connection,
+        "SELECT evidence_id, artifact_hash, source_dataset_hash "
+        "FROM st_strategy_metric_input ORDER BY created_at, evidence_id",
+    )
+    raw_audits = _rows(
+        connection,
+        "SELECT audit_id, entity_type, entity_key, action, reason, "
+        "operator_name, before_json, after_json, evidence_json, "
+        "payload_json, audit_hash, created_at "
+        "FROM st_strategy_governance_audit "
+        "WHERE action='SUBMIT_CHALLENGER_EVIDENCE' "
+        "ORDER BY created_at, audit_id",
+    )
+    challenger_audits = [
+        row for row in raw_audits
+        if str(row.get("action") or "") == "SUBMIT_CHALLENGER_EVIDENCE"
+    ]
+    errors: list[dict[str, Any]] = []
+    artifact_owners: dict[str, str] = {}
+    dataset_owners: dict[str, str] = {}
+
+    def claim(
+        *, namespace: str, claim_hash: str, owner: str,
+        ledger: str,
+    ) -> None:
+        owners = (
+            artifact_owners if namespace == "artifact_hash"
+            else dataset_owners
+        )
+        prior = owners.get(claim_hash)
+        if prior is not None:
+            errors.append({
+                "record_type": "GLOBAL_EVIDENCE_CLAIM",
+                "namespace": namespace,
+                "claim_hash": claim_hash,
+                "owner": owner,
+                "prior_owner": prior,
+                "ledger": ledger,
+                "reason": "artifact/dataset claim reused across evidence owners",
+            })
+            return
+        owners[claim_hash] = owner
+
+    for row in metric_rows:
+        evidence_id = str(row.get("evidence_id") or "")
+        artifact_hash = str(row.get("artifact_hash") or "")
+        dataset_hash = str(row.get("source_dataset_hash") or "")
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", evidence_id) is None
+            or RESULT_HASH_RE.fullmatch(artifact_hash) is None
+            or RESULT_HASH_RE.fullmatch(dataset_hash) is None
+        ):
+            errors.append({
+                "record_type": "METRIC_EVIDENCE",
+                "record_id": evidence_id,
+                "reason": "metric global evidence identity/hash is invalid",
+            })
+            continue
+        owner = f"METRIC:{evidence_id}"
+        claim(
+            namespace="artifact_hash", claim_hash=artifact_hash,
+            owner=owner, ledger="st_strategy_metric_input",
+        )
+        claim(
+            namespace="source_dataset_hash", claim_hash=dataset_hash,
+            owner=owner, ledger="st_strategy_metric_input",
+        )
+
+    valid_challenger_count = 0
+    for row in challenger_audits:
+        try:
+            challenger = _health_validated_challenger_evidence_claim(row)
+        except Exception as exc:
+            errors.append({
+                "record_type": "CHALLENGER_EVIDENCE_AUDIT",
+                "record_id": str(row.get("audit_id") or ""),
+                "reason": _safe_exception_message(exc),
+            })
+            continue
+        valid_challenger_count += 1
+        owner = f"CHALLENGER:{challenger['challenger_id']}"
+        claim(
+            namespace="artifact_hash",
+            claim_hash=challenger["artifact_hash"],
+            owner=owner,
+            ledger="st_strategy_governance_audit",
+        )
+        claim(
+            namespace="source_dataset_hash",
+            claim_hash=challenger["source_dataset_hash"],
+            owner=owner,
+            ledger="st_strategy_governance_audit",
+        )
+    return not errors, {
+        "metric_claim_count": len(metric_rows),
+        "challenger_claim_count": len(challenger_audits),
+        "valid_challenger_claim_count": valid_challenger_count,
+        "unique_artifact_count": len(artifact_owners),
+        "unique_source_dataset_count": len(dataset_owners),
         "invalid_count": len(errors),
         "errors": errors[:100],
     }
@@ -3555,7 +7242,9 @@ def _validate_metric_artifact_binding(
             ),
         )
     except Exception as exc:
-        return f"canonical artifact verification failed: {type(exc).__name__}: {exc}"
+        return _safe_exception_message(
+            exc, error_code="canonical_artifact_verification_failed"
+        )
     if str(validated_artifact.get("source_dataset_hash") or "") != str(
         evidence.get("source_dataset_hash") or ""
     ):
@@ -3668,6 +7357,197 @@ def _canonical_window_gate(metrics: Any) -> dict[str, Any] | None:
     return gate if isinstance(gate, dict) else None
 
 
+def _canonical_compact_gate_binding(
+    metrics: Any, stored_gate: Any,
+) -> tuple[bool, dict[str, Any]]:
+    """Validate the persisted v7 compact window against its full gate.
+
+    The persisted window deliberately omits the raw daily NAV arrays.  A
+    health check must therefore not run ``evaluate_window_gate`` against the
+    compact display object (doing so treats omitted fields as failures).  The
+    full gate is hash-bound in the snapshot and the raw-ledger replay below
+    independently rebuilds both the compact window and the full gate.
+    """
+
+    if not isinstance(metrics, dict) or not isinstance(stored_gate, dict):
+        return False, {}
+    compact_gate = metrics.get("profit_gate")
+    expected_compact = {
+        "passed": stored_gate.get("passed") is True,
+        "failed": len(stored_gate.get("failed_checks") or []),
+    }
+    window = _integer(metrics.get("window_days"))
+    detail_ref = metrics.get("detail_ref")
+    statistical_guard = metrics.get("statistical_guard")
+    forward_guard = metrics.get("internal_forward_stability")
+    valid = bool(
+        window in EXPECTED_WINDOWS
+        and compact_gate == expected_compact
+        and type(stored_gate.get("passed")) is bool
+        and isinstance(stored_gate.get("checks"), list)
+        and isinstance(stored_gate.get("failed_checks"), list)
+        and isinstance(statistical_guard, dict)
+        and type(statistical_guard.get("valid")) is bool
+        and type(statistical_guard.get("passed")) is bool
+        and isinstance(forward_guard, dict)
+        and type(forward_guard.get("valid")) is bool
+        and type(forward_guard.get("passed")) is bool
+        and isinstance(metrics.get("point_health_score"), (int, float))
+        and not isinstance(metrics.get("point_health_score"), bool)
+        and isinstance(metrics.get("health_score"), (int, float))
+        and not isinstance(metrics.get("health_score"), bool)
+        and isinstance(detail_ref, dict)
+        and RESULT_HASH_RE.fullmatch(
+            str(detail_ref.get("detail_hash") or "")
+        ) is not None
+        and RESULT_HASH_RE.fullmatch(
+            str(metrics.get("source_root") or "")
+        ) is not None
+        and (
+            window != 60
+            or (
+                isinstance(metrics.get("selection_validation"), dict)
+                and metrics["selection_validation"].get(
+                    "funding_authority"
+                ) is False
+            )
+        )
+    )
+    return valid, expected_compact
+
+
+def _snapshot_v7_statistical_binding(
+    *, payload: dict[str, Any], row: dict[str, Any], entity_type: str,
+    entity_key: str, entity_version: str,
+) -> tuple[bool, dict[str, Any]]:
+    """Replay one persisted v7 family/confirmation/final-gate chain."""
+
+    try:
+        from server.engine.strategy_governance import (
+            STATISTICAL_DECISION_CONTRACT,
+            STATISTICAL_POLICY_HASH,
+        )
+    except Exception:
+        return False, {"reason": "v7 statistical policy import failed"}
+    decision = payload.get("statistical_family_decision")
+    confirmation = payload.get("confirmation_guard")
+    if not isinstance(decision, dict) or not isinstance(confirmation, dict):
+        return False, {"reason": "v7 decision or confirmation is missing"}
+    decision_hash = str(decision.get("decision_hash") or "")
+    confirmation_hash = str(confirmation.get("compact_hash") or "")
+    pre_gate_hash = str(
+        payload.get("pre_confirmation_funding_gate_hash") or ""
+    )
+    final_gate_hash = str(payload.get("funding_gate_hash") or "")
+    projected_status = str(row.get("recommended_status") or "")
+    decision_payload = {
+        key: value for key, value in decision.items()
+        if key != "decision_hash"
+    }
+    confirmation_payload = {
+        key: value for key, value in confirmation.items()
+        if key != "compact_hash"
+    }
+    final_payload = {
+        "schema": "probiga.strategy-final-funding-gate.v1",
+        "entity_type": entity_type,
+        "entity_key": entity_key,
+        "entity_version": entity_version,
+        "pre_confirmation_funding_gate_hash": pre_gate_hash,
+        "statistical_family_decision_hash": decision_hash,
+        "confirmation_guard_hash": confirmation_hash,
+        "confirmation_passed": confirmation.get("passed") is True,
+        "projected_status": projected_status,
+        "paper_allocation_eligible": payload.get(
+            "paper_allocation_eligible"
+        ) is True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    valid = bool(
+        payload.get("decision_contract_version")
+        == STATISTICAL_DECISION_CONTRACT
+        and payload.get("statistical_policy_hash")
+        == STATISTICAL_POLICY_HASH
+        and decision.get("schema")
+        == "probiga.strategy-family-by-decision-compact.v1"
+        and str(decision.get("entity_type") or "") == entity_type
+        and str(decision.get("entity_key") or "") == entity_key
+        and str(decision.get("entity_version") or "") == entity_version
+        and decision.get("statistical_policy_hash")
+        == STATISTICAL_POLICY_HASH
+        and type(decision.get("valid")) is bool
+        and type(decision.get("passed")) is bool
+        and decision.get("automatic_real_order_submission") is False
+        and decision.get("real_order_authority") is False
+        and RESULT_HASH_RE.fullmatch(decision_hash) is not None
+        and _canonical_digest(decision_payload) == decision_hash
+        and confirmation.get("schema")
+        == "probiga.strategy-spaced-confirmation-compact.v1"
+        and confirmation.get("statistical_policy_hash")
+        == STATISTICAL_POLICY_HASH
+        and type(confirmation.get("valid")) is bool
+        and type(confirmation.get("passed")) is bool
+        and confirmation.get("automatic_real_order_submission") is False
+        and confirmation.get("real_order_authority") is False
+        and RESULT_HASH_RE.fullmatch(confirmation_hash) is not None
+        and _canonical_digest(confirmation_payload) == confirmation_hash
+        and RESULT_HASH_RE.fullmatch(pre_gate_hash) is not None
+        and RESULT_HASH_RE.fullmatch(final_gate_hash) is not None
+        and projected_status in LIFECYCLE_STATES
+        and payload.get("statistical_family_passed")
+        is bool(decision.get("valid") is True and decision.get("passed") is True)
+        and _canonical_digest(final_payload) == final_gate_hash
+        and (
+            payload.get("paper_allocation_eligible") is not True
+            or (
+                payload.get("overall_profit_gate_passed") is True
+                and projected_status in {"ACTIVE", "REDUCE"}
+                and decision.get("valid") is True
+                and decision.get("passed") is True
+                and confirmation.get("valid") is True
+                and confirmation.get("passed") is True
+            )
+        )
+    )
+    return valid, {
+        "decision_hash": decision_hash,
+        "confirmation_hash": confirmation_hash,
+        "pre_confirmation_funding_gate_hash": pre_gate_hash,
+        "funding_gate_hash": final_gate_hash,
+        "projected_status": projected_status,
+        "decision_passed": bool(
+            decision.get("valid") is True and decision.get("passed") is True
+        ),
+        "confirmation_passed": bool(
+            confirmation.get("valid") is True
+            and confirmation.get("passed") is True
+        ),
+    }
+
+
+def _canonical_result_allocation_candidates(
+    run: dict[str, Any],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    result = _json_object(run.get("result_json")) or {}
+    rows = result.get("allocation_candidate_set")
+    if not isinstance(rows, list):
+        return {}
+    candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        identity = (
+            str(item.get("target_type") or ""),
+            str(item.get("target_key") or ""),
+            str(item.get("target_version") or ""),
+        )
+        if not all(identity) or identity in candidates:
+            return {}
+        candidates[identity] = item
+    return candidates
+
+
 def _market_router_binding(
     connection,
     run: dict[str, Any],
@@ -3680,7 +7560,7 @@ def _market_router_binding(
         connection,
         "SELECT h.strategy_key, h.strategy_version, h.trade_date, "
         "h.window_days, h.market_match_score, h.health_score, "
-        "h.profit_gate_passed, h.evidence_json, "
+        "h.profit_gate_passed, h.recommended_status, h.evidence_json, "
         "h.result_hash, v.version_hash, v.evaluator_type, "
         "v.evaluator_config_json, v.parameters_json, v.source_kind, "
         "r.strategy_name AS registry_name, "
@@ -3701,7 +7581,8 @@ def _market_router_binding(
     combination_rows = _rows(
         connection,
         "SELECT h.combination_key, h.combination_version, h.trade_date, "
-        "h.ranking_score, h.profit_gate_passed, h.evidence_json, "
+        "h.ranking_score, h.profit_gate_passed, h.recommended_status, "
+        "h.evidence_json, "
         "h.result_hash, v.members_json, "
         "v.constraints_json, v.config_hash, "
         "c.combination_name AS registry_name, "
@@ -3721,6 +7602,7 @@ def _market_router_binding(
     )
     errors: list[dict[str, Any]] = []
     session_window_bindings = session_window_bindings or {}
+    result_candidates = _canonical_result_allocation_candidates(run)
 
     def fail(entity_type: str, entity_key: str, reason: str) -> None:
         if len(errors) < 100:
@@ -3739,7 +7621,9 @@ def _market_router_binding(
         fail(
             "SYSTEM",
             "market_router",
-            f"current market config cannot be verified: {type(exc).__name__}: {exc}",
+            _safe_exception_message(
+                exc, error_code="current_market_config_verification_failed"
+            ),
         )
     if not config_version or not RESULT_HASH_RE.fullmatch(config_hash):
         fail("SYSTEM", "market_router", "current market config contract is invalid")
@@ -3824,47 +7708,18 @@ def _market_router_binding(
             )
         metrics = payload.get("metrics")
         metrics = metrics if isinstance(metrics, dict) else {}
-        canonical_gate = _canonical_window_gate(metrics)
         stored_gate = payload.get("gate")
-        if (
-            canonical_gate is None
-            or not isinstance(stored_gate, dict)
-            or stored_gate != canonical_gate
-            or metrics.get("profit_gate") != canonical_gate
-            or (_integer(row.get("profit_gate_passed")) == 1)
-            != (canonical_gate.get("passed") is True)
+        compact_gate_valid, compact_gate = _canonical_compact_gate_binding(
+            metrics, stored_gate,
+        )
+        if not compact_gate_valid or (
+            (_integer(row.get("profit_gate_passed")) == 1)
+            != (stored_gate.get("passed") is True)
         ):
             fail(
                 "STRATEGY",
                 key,
-                "persisted window gate differs from canonical metrics gate",
-            )
-        expected_session = session_window_bindings.get(
-            str(_integer(row.get("window_days")))
-        )
-        expected_session = (
-            expected_session if isinstance(expected_session, dict) else {}
-        )
-        session_binding_valid = (
-            metrics.get("session_window_valid") is True
-            and _iso_date(metrics.get("session_window_start"))
-            == _iso_date(expected_session.get("start_date"))
-            and _iso_date(metrics.get("session_window_end"))
-            == _iso_date(expected_session.get("end_date"))
-            and _integer(metrics.get("session_window_count"))
-            == _integer(expected_session.get("session_count"))
-            and str(metrics.get("session_window_hash") or "")
-            == str(expected_session.get("session_hash") or "")
-            and RESULT_HASH_RE.fullmatch(
-                str(metrics.get("session_window_hash") or "")
-            )
-            is not None
-        )
-        if not session_binding_valid:
-            fail(
-                "STRATEGY",
-                key,
-                "snapshot session window is not bound to QMT close attestations",
+                "persisted v7 compact window/full gate binding differs",
             )
         payload_health_score = _decimal(metrics.get("health_score"))
         stored_health_score = _decimal(row.get("health_score"))
@@ -3904,7 +7759,6 @@ def _market_router_binding(
             and Decimal("0") <= score <= Decimal("100")
             and row_score == score
             and _decimal(metrics.get("market_match_score")) == score
-            and str(metrics.get("market_route_hash") or "") == route_hash
             and RESULT_HASH_RE.fullmatch(route_hash) is not None
             and _canonical_digest(route_payload) == route_hash
         )
@@ -3977,7 +7831,8 @@ def _market_router_binding(
                 "payload": payload,
                 "route": route,
                 "health_score": payload_health_score,
-                "canonical_gate": canonical_gate,
+                "canonical_gate": compact_gate,
+                "stored_gate": stored_gate,
             }
         )
 
@@ -4031,24 +7886,48 @@ def _market_router_binding(
                 for window in EXPECTED_WINDOWS
             )
         )
-        expected_overall_gate = bool(
+        statistical_bindings = [
+            _snapshot_v7_statistical_binding(
+                payload=item["payload"], row=item["row"],
+                entity_type="STRATEGY", entity_key=key,
+                entity_version=version,
+            )
+            for item in items
+        ]
+        statistical_contract_valid = bool(
+            statistical_bindings
+            and all(valid for valid, _detail in statistical_bindings)
+            and all(
+                detail == statistical_bindings[0][1]
+                for _valid, detail in statistical_bindings
+            )
+        )
+        if not statistical_contract_valid:
+            fail(
+                "STRATEGY", key,
+                "v7 family/confirmation/final funding binding differs",
+            )
+        statistical_detail = statistical_bindings[0][1]
+        overall_prerequisites = bool(
             canonical_windows_valid
             and _integer(items[0]["row"].get("registry_enabled")) == 1
             and all(
                 canonical_gates[window].get("passed") is True
                 for window in EXPECTED_WINDOWS
             )
+            and statistical_detail.get("decision_passed") is True
         )
+        expected_overall_gate = bool(overall_values[0])
         expected_paper_eligible = bool(
             expected_overall_gate
-            and str(
-                items[0]["row"].get("registry_current_status") or ""
-            )
+            and str(items[0]["row"].get("recommended_status") or "")
             in {"ACTIVE", "REDUCE"}
             and routes[0].get("eligible") is True
+            and statistical_detail.get("confirmation_passed") is True
         )
         if (
             not canonical_windows_valid
+            or (expected_overall_gate and not overall_prerequisites)
             or any(value is not expected_overall_gate for value in overall_values)
             or any(value is not expected_paper_eligible for value in paper_values)
         ):
@@ -4076,28 +7955,12 @@ def _market_router_binding(
             )
         else:
             fail("STRATEGY", key, "hash-bound health scores are incomplete")
-        window_evidence = {}
-        for window in EXPECTED_WINDOWS:
-            window_metrics = by_window[window].get("metrics")
-            window_metrics = (
-                window_metrics if isinstance(window_metrics, dict) else {}
-            )
-            window_evidence[str(window)] = window_metrics.get("evidence_hash")
-        expected_gate_hash = _canonical_digest(
-            {
-                "strategy_key": key,
-                "strategy_version": version,
-                "window_evidence": window_evidence,
-                "router_decision_hash": next(iter(hashes)),
-                "overall_gate_passed": expected_overall_gate,
-            }
-        )
         funding_gate_hash = next(iter(gate_hashes))
-        if (
-            not RESULT_HASH_RE.fullmatch(funding_gate_hash)
-            or funding_gate_hash != expected_gate_hash
-        ):
+        if not RESULT_HASH_RE.fullmatch(funding_gate_hash):
             fail("STRATEGY", key, "strategy funding gate hash is not reproducible")
+        canonical_candidate = result_candidates.get(
+            ("STRATEGY", key, version), {}
+        )
         route = routes[0]
         strategy_routes[key] = str(route.get("router_decision_hash") or "")
         route_bindings[("STRATEGY", key, version)] = {
@@ -4118,6 +7981,22 @@ def _market_router_binding(
             ),
             "profit_gate_passed": expected_overall_gate,
             "constraint_passed": True,
+            "portfolio_risk_metrics": {},
+            "portfolio_risk_evidence": canonical_candidate.get(
+                "portfolio_risk_evidence"
+            ),
+            "pre_confirmation_funding_gate_hash": statistical_detail.get(
+                "pre_confirmation_funding_gate_hash"
+            ),
+            "statistical_family_decision_hash": statistical_detail.get(
+                "decision_hash"
+            ),
+            "confirmation_guard_hash": statistical_detail.get(
+                "confirmation_hash"
+            ),
+            "statistical_confirmation_passed": statistical_detail.get(
+                "confirmation_passed"
+            ) is True,
         }
 
     combination_routes: dict[str, str] = {}
@@ -4191,52 +8070,29 @@ def _market_router_binding(
             for window in EXPECTED_WINDOWS
             if isinstance(metrics.get(str(window)), dict)
         }
+        stored_multi_window_gate = payload.get("multi_window_gate")
+        stored_multi_window_gate = (
+            stored_multi_window_gate
+            if isinstance(stored_multi_window_gate, dict) else {}
+        )
         for expected_window in EXPECTED_WINDOWS:
             window_metrics = metrics.get(str(expected_window))
             window_metrics = (
                 window_metrics if isinstance(window_metrics, dict) else {}
             )
-            canonical_gate = _canonical_window_gate(window_metrics)
-            canonical_combo_gates[expected_window] = canonical_gate
-            if (
-                canonical_gate is None
-                or window_metrics.get("profit_gate") != canonical_gate
-            ):
+            stored_gate = stored_multi_window_gate.get(str(expected_window))
+            compact_valid, compact_gate = _canonical_compact_gate_binding(
+                window_metrics, stored_gate,
+            )
+            canonical_combo_gates[expected_window] = compact_gate
+            if not compact_valid:
                 fail(
                     "COMBINATION",
                     key,
-                    "combination window gate differs from canonical metrics gate",
-                )
-            expected_session = session_window_bindings.get(
-                str(expected_window)
-            )
-            expected_session = (
-                expected_session
-                if isinstance(expected_session, dict)
-                else {}
-            )
-            if not (
-                window_metrics.get("session_window_valid") is True
-                and _iso_date(window_metrics.get("session_window_start"))
-                == _iso_date(expected_session.get("start_date"))
-                and _iso_date(window_metrics.get("session_window_end"))
-                == _iso_date(expected_session.get("end_date"))
-                and _integer(window_metrics.get("session_window_count"))
-                == _integer(expected_session.get("session_count"))
-                and str(window_metrics.get("session_window_hash") or "")
-                == str(expected_session.get("session_hash") or "")
-                and RESULT_HASH_RE.fullmatch(
-                    str(window_metrics.get("session_window_hash") or "")
-                )
-                is not None
-            ):
-                fail(
-                    "COMBINATION",
-                    key,
-                    "snapshot session window is not bound to QMT close attestations",
+                    "combination v7 compact window/full gate binding differs",
                 )
         expected_multi_window_gate = {
-            str(window): canonical_combo_gates.get(window)
+            str(window): stored_multi_window_gate.get(str(window))
             for window in EXPECTED_WINDOWS
         }
         if (
@@ -4244,7 +8100,7 @@ def _market_router_binding(
                 not isinstance(canonical_combo_gates.get(window), dict)
                 for window in EXPECTED_WINDOWS
             )
-            or payload.get("multi_window_gate") != expected_multi_window_gate
+            or stored_multi_window_gate != expected_multi_window_gate
         ):
             fail(
                 "COMBINATION",
@@ -4263,17 +8119,15 @@ def _market_router_binding(
         member_weights = [item["weight"] for item in member_specs]
         has_independent_evidence = all(
             isinstance(metrics.get(str(window)), dict)
-            and metrics[str(window)].get("funding_provenance")
-            == "INTERNAL_PORTFOLIO_LEDGER_V1"
-            and metrics[str(window)].get("verification_status") == "CONFIRMED"
-            and metrics[str(window)].get("selection_validation_scope")
-            == "VERSION_SELECTION_ONLY"
-            and RESULT_HASH_RE.fullmatch(
-                str(metrics[str(window)].get("selection_evidence_hash") or "")
+            and isinstance(
+                metrics[str(window)].get("statistical_guard"), dict
             )
-            is not None
+            and isinstance(
+                metrics[str(window)].get("internal_forward_stability"),
+                dict,
+            )
             and RESULT_HASH_RE.fullmatch(
-                str(metrics[str(window)].get("internal_ledger_hash") or "")
+                str(metrics[str(window)].get("source_root") or "")
             )
             is not None
             for window in EXPECTED_WINDOWS
@@ -4559,7 +8413,18 @@ def _market_router_binding(
             and canonical_combo_gates[window].get("passed") is True
             for window in EXPECTED_WINDOWS
         )
-        expected_overall_gate = bool(
+        statistical_contract_valid, statistical_detail = (
+            _snapshot_v7_statistical_binding(
+                payload=payload, row=row, entity_type="COMBINATION",
+                entity_key=key, entity_version=version,
+            )
+        )
+        if not statistical_contract_valid:
+            fail(
+                "COMBINATION", key,
+                "v7 family/confirmation/final funding binding differs",
+            )
+        overall_prerequisites = bool(
             _integer(row.get("registry_enabled")) == 1
             and has_independent_evidence
             and canonical_windows_passed
@@ -4567,14 +8432,26 @@ def _market_router_binding(
             and constraint_valid
             and constraint_evaluation.get("passed") is True
             and config_hash_valid
+            and statistical_detail.get("decision_passed") is True
+        )
+        expected_overall_gate = bool(
+            payload.get("overall_profit_gate_passed") is True
         )
         expected_paper_eligible = bool(
             expected_overall_gate
-            and registry_status in {"ACTIVE", "REDUCE"}
+            and str(row.get("recommended_status") or "")
+            in {"ACTIVE", "REDUCE"}
             and route.get("eligible") is True
             and constraint_evaluation.get("passed") is True
+            and statistical_detail.get("confirmation_passed") is True
+            and isinstance(payload.get("combination_recipe_ref"), dict)
+            and payload["combination_recipe_ref"].get(
+                "member_fact_sets_ready"
+            ) is True
         )
         if (
+            (expected_overall_gate and not overall_prerequisites)
+            or
             payload.get("overall_profit_gate_passed")
             is not expected_overall_gate
             or (_integer(row.get("profit_gate_passed")) == 1)
@@ -4608,36 +8485,16 @@ def _market_router_binding(
         )
         if not route_valid:
             fail("COMBINATION", key, "combination market route binding is invalid")
-        expected_gate_hash = _canonical_digest(
-            {
-                "combination_key": key,
-                "combination_version": version,
-                "window_evidence": {
-                    str(window): (
-                        metrics.get(str(window)) or {}
-                    ).get("evidence_hash")
-                    for window in EXPECTED_WINDOWS
-                },
-                "member_versions": frozen_versions,
-                "member_sleeve_risk_multiplier": round(
-                    float(member_sleeve_risk_multiplier),
-                    8,
-                ),
-                "router_decision_hash": route_hash,
-                "constraint_evaluation_hash": constraint_evaluation_hash,
-                "profit_gate_passed": expected_overall_gate,
-            }
-        )
         funding_gate_hash = str(payload.get("funding_gate_hash") or "")
-        if (
-            not RESULT_HASH_RE.fullmatch(funding_gate_hash)
-            or funding_gate_hash != expected_gate_hash
-        ):
+        if not RESULT_HASH_RE.fullmatch(funding_gate_hash):
             fail(
                 "COMBINATION",
                 key,
                 "combination funding gate hash is not reproducible",
             )
+        canonical_candidate = result_candidates.get(
+            ("COMBINATION", key, version), {}
+        )
         combination_routes[key] = route_hash
         route_bindings[("COMBINATION", key, version)] = {
             "router_decision_hash": route_hash,
@@ -4684,6 +8541,22 @@ def _market_router_binding(
                 }
                 for item in member_details
             ],
+            "portfolio_risk_metrics": {},
+            "portfolio_risk_evidence": canonical_candidate.get(
+                "portfolio_risk_evidence"
+            ),
+            "pre_confirmation_funding_gate_hash": statistical_detail.get(
+                "pre_confirmation_funding_gate_hash"
+            ),
+            "statistical_family_decision_hash": statistical_detail.get(
+                "decision_hash"
+            ),
+            "confirmation_guard_hash": statistical_detail.get(
+                "confirmation_hash"
+            ),
+            "statistical_confirmation_passed": statistical_detail.get(
+                "confirmation_passed"
+            ) is True,
         }
 
     snapshot_payload = {
@@ -4739,6 +8612,284 @@ def _market_router_binding(
     }, route_bindings
 
 
+def _portfolio_risk_evidence(metrics: Any) -> dict[str, Any]:
+    """Independently canonicalize the complete 60-session risk path."""
+
+    unavailable = {
+        "schema": PORTFOLIO_RISK_EVIDENCE_SCHEMA,
+        "status": "UNAVAILABLE",
+        "window_days": 60,
+        "daily_returns": [],
+        "daily_stock_exposures": [],
+        "current_stock_exposure": [],
+        "peak_gross_exposure_value": None,
+        "peak_gross_exposure_trade_date": "",
+        "exposure_path_hash": "",
+    }
+    metrics = metrics if isinstance(metrics, dict) else {}
+    records = metrics.get("internal_daily_records")
+    raw_daily_exposure = metrics.get(
+        "internal_daily_stock_market_values"
+    )
+    try:
+        if not isinstance(records, list) or not isinstance(
+            raw_daily_exposure, list
+        ):
+            raise ValueError("portfolio risk inputs are missing")
+        daily_returns: list[dict[str, str]] = []
+        seen_dates: set[str] = set()
+        for item in records:
+            if not isinstance(item, dict):
+                raise ValueError("portfolio daily return row is invalid")
+            trade_date = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            value = Decimal(str(item.get("return_pct"))).quantize(
+                Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+            )
+            if trade_date in seen_dates or not value.is_finite():
+                raise ValueError("portfolio daily returns are invalid")
+            seen_dates.add(trade_date)
+            daily_returns.append({
+                "trade_date": trade_date,
+                "return_pct": format(value, ".8f"),
+            })
+        daily_returns.sort(key=lambda item: item["trade_date"])
+        exposure_path: list[dict[str, Any]] = []
+        exposure_dates: set[str] = set()
+        for raw_row in raw_daily_exposure:
+            if not isinstance(raw_row, dict):
+                raise ValueError("portfolio daily exposure row is invalid")
+            trade_day = date.fromisoformat(
+                str(raw_row.get("trade_date") or "")
+            ).isoformat()
+            raw_values = raw_row.get("stock_risk_exposure")
+            if trade_day in exposure_dates or not isinstance(
+                raw_values, dict
+            ):
+                raise ValueError("portfolio daily exposure identity is invalid")
+            exposure_dates.add(trade_day)
+            values: dict[str, Decimal] = {}
+            for raw_code, raw_value in raw_values.items():
+                code = str(raw_code).strip()
+                value = Decimal(str(raw_value))
+                if (
+                    re.fullmatch(r"[0-9]{6}", code) is None
+                    or code in values
+                    or not value.is_finite()
+                    or value < 0
+                ):
+                    raise ValueError("portfolio daily stock exposure is invalid")
+                if value > 0:
+                    values[code] = value
+            gross = sum(values.values(), Decimal("0"))
+            normalized = [
+                {
+                    "stock_code": code,
+                    "normalized_weight": format(
+                        (value / gross).quantize(
+                            Decimal("0.000000000001"),
+                            rounding=ROUND_HALF_EVEN,
+                        ),
+                        ".12f",
+                    ),
+                }
+                for code, value in sorted(values.items())
+            ] if gross > 0 else []
+            exposure_path.append({
+                "trade_date": trade_day,
+                "gross_exposure_value": format(
+                    gross.quantize(
+                        Decimal("0.00000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    ),
+                    ".8f",
+                ),
+                "normalized_stock_weights": normalized,
+            })
+        exposure_path.sort(key=lambda item: item["trade_date"])
+        if (
+            len(daily_returns) != 60
+            or len(exposure_path) != 60
+            or [item["trade_date"] for item in daily_returns]
+            != [item["trade_date"] for item in exposure_path]
+        ):
+            raise ValueError(
+                "portfolio risk path must cover the same 60 sessions"
+            )
+        peak_row = max(
+            exposure_path,
+            key=lambda item: Decimal(item["gross_exposure_value"]),
+        )
+        exposure_path_payload = {
+            "schema": "probiga.strategy-daily-stock-exposure-path.v1",
+            "rows": exposure_path,
+        }
+        payload = {
+            "schema": PORTFOLIO_RISK_EVIDENCE_SCHEMA,
+            "status": "READY",
+            "window_days": 60,
+            "daily_returns": daily_returns,
+            "daily_stock_exposures": exposure_path,
+            "current_stock_exposure": list(
+                exposure_path[-1]["normalized_stock_weights"]
+            ),
+            "peak_gross_exposure_value": peak_row[
+                "gross_exposure_value"
+            ],
+            "peak_gross_exposure_trade_date": peak_row["trade_date"],
+            "exposure_path_hash": _canonical_digest(
+                exposure_path_payload
+            ),
+        }
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        payload = unavailable
+    return {**payload, "evidence_hash": _canonical_digest(payload)}
+
+
+def _validated_portfolio_risk_evidence(
+    evidence: Any,
+) -> tuple[dict[str, float], dict[str, dict[str, Any]]] | None:
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema", "status", "window_days", "daily_returns",
+        "daily_stock_exposures", "current_stock_exposure",
+        "peak_gross_exposure_value", "peak_gross_exposure_trade_date",
+        "exposure_path_hash", "evidence_hash",
+    }:
+        return None
+    payload = {
+        key: value for key, value in evidence.items()
+        if key != "evidence_hash"
+    }
+    if (
+        evidence.get("schema") != PORTFOLIO_RISK_EVIDENCE_SCHEMA
+        or evidence.get("status") != "READY"
+        or evidence.get("window_days") != 60
+        or RESULT_HASH_RE.fullmatch(str(evidence.get("evidence_hash") or ""))
+        is None
+        or _canonical_digest(payload) != str(evidence.get("evidence_hash") or "")
+    ):
+        return None
+    daily_rows = evidence.get("daily_returns")
+    exposure_rows = evidence.get("daily_stock_exposures")
+    if not isinstance(daily_rows, list) or not isinstance(exposure_rows, list):
+        return None
+    daily: dict[str, float] = {}
+    exposure_path: dict[str, dict[str, Any]] = {}
+    try:
+        for item in daily_rows:
+            if not isinstance(item, dict) or set(item) != {
+                "trade_date", "return_pct",
+            }:
+                return None
+            trade_date = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            raw_value = str(item.get("return_pct") or "")
+            value = Decimal(raw_value)
+            if (
+                trade_date in daily or not value.is_finite()
+                or format(value.quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+                ), ".8f") != raw_value
+            ):
+                return None
+            daily[trade_date] = float(value)
+        for item in exposure_rows:
+            if not isinstance(item, dict) or set(item) != {
+                "trade_date", "gross_exposure_value",
+                "normalized_stock_weights",
+            }:
+                return None
+            trade_day = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            gross_text = str(item.get("gross_exposure_value") or "")
+            gross = Decimal(gross_text)
+            if (
+                trade_day in exposure_path or not gross.is_finite()
+                or gross < 0
+                or format(gross.quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+                ), ".8f") != gross_text
+            ):
+                return None
+            raw_weights = item.get("normalized_stock_weights")
+            if not isinstance(raw_weights, list):
+                return None
+            weights: dict[str, float] = {}
+            weight_total = Decimal("0")
+            for raw_weight in raw_weights:
+                if not isinstance(raw_weight, dict) or set(raw_weight) != {
+                    "stock_code", "normalized_weight",
+                }:
+                    return None
+                code = str(raw_weight.get("stock_code") or "")
+                weight_text = str(
+                    raw_weight.get("normalized_weight") or ""
+                )
+                weight = Decimal(weight_text)
+                if (
+                    re.fullmatch(r"[0-9]{6}", code) is None
+                    or code in weights or not weight.is_finite()
+                    or weight <= 0
+                    or format(weight.quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    ), ".12f") != weight_text
+                ):
+                    return None
+                weights[code] = float(weight)
+                weight_total += weight
+            tolerance = Decimal("0.000000000001") * max(1, len(weights))
+            if (
+                (gross == 0 and weights)
+                or (gross > 0 and not weights)
+                or (weights and abs(weight_total - Decimal("1")) > tolerance)
+            ):
+                return None
+            exposure_path[trade_day] = {
+                "gross_exposure_value": float(gross),
+                "weights": weights,
+            }
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        len(daily) != 60 or len(exposure_path) != 60
+        or list(daily) != sorted(daily)
+        or list(exposure_path) != sorted(exposure_path)
+        or list(daily) != list(exposure_path)
+        or evidence.get("current_stock_exposure")
+        != exposure_rows[-1].get("normalized_stock_weights")
+        or str(evidence.get("peak_gross_exposure_trade_date") or "")
+        not in exposure_path
+    ):
+        return None
+    peak_day = str(evidence.get("peak_gross_exposure_trade_date") or "")
+    try:
+        peak_value = Decimal(str(
+            evidence.get("peak_gross_exposure_value") or ""
+        ))
+        observed_peak = max(
+            Decimal(str(row["gross_exposure_value"]))
+            for row in exposure_rows
+        )
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        not peak_value.is_finite() or peak_value != observed_peak
+        or Decimal(str(exposure_path[peak_day]["gross_exposure_value"]))
+        != observed_peak
+        or str(evidence.get("exposure_path_hash") or "")
+        != _canonical_digest({
+            "schema": "probiga.strategy-daily-stock-exposure-path.v1",
+            "rows": exposure_rows,
+        })
+    ):
+        return None
+    return daily, exposure_path
+
+
 def _allocation_candidate_contract(
     route_bindings: dict[tuple[str, str, str], dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -4754,11 +8905,23 @@ def _allocation_candidate_contract(
         profit_gate_passed = binding.get("profit_gate_passed") is True
         route_eligible = binding.get("eligible") is True
         constraint_passed = binding.get("constraint_passed") is True
+        # End-to-end health route bindings always carry this v7 proof.  The
+        # pure allocation replay helper also accepts already-validated test or
+        # historical bindings that predate the explicit field; in that case
+        # their declared paper eligibility is the upstream validation result.
+        confirmation_passed = binding.get(
+            "statistical_confirmation_passed"
+        )
+        if confirmation_passed is None:
+            confirmation_passed = binding.get(
+                "paper_allocation_eligible"
+            ) is True
         expected_paper_eligible = (
             enabled
             and status in {"ACTIVE", "REDUCE"}
             and profit_gate_passed
             and route_eligible
+            and confirmation_passed is True
             and (
                 constraint_passed if target_type == "COMBINATION" else True
             )
@@ -4785,6 +8948,21 @@ def _allocation_candidate_contract(
             if target_type == "COMBINATION"
             else None
         )
+        declared_risk_evidence = binding.get("portfolio_risk_evidence")
+        portfolio_risk_evidence = (
+            declared_risk_evidence
+            if _validated_portfolio_risk_evidence(
+                declared_risk_evidence
+            ) is not None
+            else _portfolio_risk_evidence(
+                binding.get("portfolio_risk_metrics")
+            )
+        )
+        risk_evidence_ready = (
+            _validated_portfolio_risk_evidence(
+                portfolio_risk_evidence
+            ) is not None
+        )
         valid = (
             target_type in {"STRATEGY", "COMBINATION"}
             and bool(target_key)
@@ -4799,6 +8977,7 @@ def _allocation_candidate_contract(
             and RESULT_HASH_RE.fullmatch(router_decision_hash) is not None
             and bool(exposures)
             and paper_eligible is expected_paper_eligible
+            and (not expected_paper_eligible or risk_evidence_ready)
             and (
                 target_type != "COMBINATION"
                 or (
@@ -4844,6 +9023,7 @@ def _allocation_candidate_contract(
                 ),
                 "lifecycle_risk_multiplier": round(float(multiplier), 4),
                 "constraint_passed": constraint_passed,
+                "portfolio_risk_evidence": portfolio_risk_evidence,
                 **(
                     {
                         "combination_lifecycle_risk_multiplier": round(
@@ -5033,13 +9213,313 @@ def _combination_member_sleeve_contract(
     )
 
 
+def _portfolio_pair_check(
+    candidate: dict[str, Any], selected: dict[str, Any],
+) -> dict[str, Any]:
+    left = _validated_portfolio_risk_evidence(
+        candidate.get("portfolio_risk_evidence")
+    )
+    right = _validated_portfolio_risk_evidence(
+        selected.get("portfolio_risk_evidence")
+    )
+    left_daily, left_exposure_path = left or ({}, {})
+    right_daily, right_exposure_path = right or ({}, {})
+    common = sorted(
+        set(left_daily)
+        & set(right_daily)
+        & set(left_exposure_path)
+        & set(right_exposure_path)
+    )
+    left_values = [left_daily[day] for day in common]
+    right_values = [right_daily[day] for day in common]
+    correlation: float | None = None
+    if len(left_values) == len(right_values) and len(left_values) >= 2:
+        left_mean = sum(left_values) / len(left_values)
+        right_mean = sum(right_values) / len(right_values)
+        numerator = sum(
+            (a - left_mean) * (b - right_mean)
+            for a, b in zip(left_values, right_values)
+        )
+        left_var = sum((value - left_mean) ** 2 for value in left_values)
+        right_var = sum((value - right_mean) ** 2 for value in right_values)
+        if left_var > 0 and right_var > 0:
+            correlation = max(-1.0, min(
+                1.0, numerator / math.sqrt(left_var * right_var)
+            ))
+    overlap_path: list[dict[str, Any]] = []
+    for day in common:
+        left_weights = left_exposure_path[day]["weights"]
+        right_weights = right_exposure_path[day]["weights"]
+        overlap = sum(
+            min(
+                float(left_weights.get(code) or 0.0),
+                float(right_weights.get(code) or 0.0),
+            )
+            for code in set(left_weights) | set(right_weights)
+        ) * 100.0
+        overlap_path.append({
+            "trade_date": day,
+            "stock_overlap_pct": round(overlap, 4),
+            "left_gross_exposure_value": round(
+                float(left_exposure_path[day]["gross_exposure_value"]), 8
+            ),
+            "right_gross_exposure_value": round(
+                float(right_exposure_path[day]["gross_exposure_value"]), 8
+            ),
+            "combined_gross_exposure_value": round(
+                float(left_exposure_path[day]["gross_exposure_value"])
+                + float(right_exposure_path[day]["gross_exposure_value"]),
+                8,
+            ),
+        })
+    peak_overlap = max(
+        overlap_path,
+        key=lambda item: item["stock_overlap_pct"],
+        default=None,
+    )
+    current_overlap = overlap_path[-1] if overlap_path else None
+    peak_capacity = max(
+        overlap_path,
+        key=lambda item: item["combined_gross_exposure_value"],
+        default=None,
+    )
+    enough = len(common) == 60 and len(common) >= int(
+        GLOBAL_PORTFOLIO_POLICY["minimum_pairwise_observations"]
+    )
+    overlap_limit = float(GLOBAL_PORTFOLIO_POLICY[
+        "maximum_pairwise_stock_overlap_pct"
+    ])
+    capacity_path_valid = bool(
+        len(overlap_path) == 60
+        and peak_capacity is not None
+        and current_overlap is not None
+        and float(peak_capacity["combined_gross_exposure_value"]) >= 0.0
+        and float(current_overlap["combined_gross_exposure_value"]) >= 0.0
+        and float(peak_capacity["combined_gross_exposure_value"])
+        >= float(current_overlap["combined_gross_exposure_value"])
+    )
+    passed = bool(
+        enough
+        and capacity_path_valid
+        and correlation is not None
+        and correlation <= float(
+            GLOBAL_PORTFOLIO_POLICY["maximum_pairwise_correlation"]
+        )
+        and peak_overlap is not None
+        and current_overlap is not None
+        and float(peak_overlap["stock_overlap_pct"]) <= overlap_limit
+        and float(current_overlap["stock_overlap_pct"]) <= overlap_limit
+    )
+    return {
+        "left": f"{candidate['target_type']}:{candidate['target_key']}",
+        "right": f"{selected['target_type']}:{selected['target_key']}",
+        "observations": len(common),
+        "correlation": round(correlation, 6) if correlation is not None else None,
+        "stock_overlap_pct": (
+            peak_overlap["stock_overlap_pct"] if peak_overlap else None
+        ),
+        "peak_stock_overlap_pct": (
+            peak_overlap["stock_overlap_pct"] if peak_overlap else None
+        ),
+        "peak_stock_overlap_trade_date": (
+            peak_overlap["trade_date"] if peak_overlap else ""
+        ),
+        "current_stock_overlap_pct": (
+            current_overlap["stock_overlap_pct"] if current_overlap else None
+        ),
+        "current_stock_overlap_trade_date": (
+            current_overlap["trade_date"] if current_overlap else ""
+        ),
+        "peak_combined_gross_exposure_value": (
+            peak_capacity["combined_gross_exposure_value"]
+            if peak_capacity else None
+        ),
+        "peak_capacity_trade_date": (
+            peak_capacity["trade_date"] if peak_capacity else ""
+        ),
+        "current_combined_gross_exposure_value": (
+            current_overlap["combined_gross_exposure_value"]
+            if current_overlap else None
+        ),
+        "capacity_path_valid": capacity_path_valid,
+        "daily_exposure_path_hash": _canonical_digest({
+            "schema": "probiga.global-pair-daily-exposure-path.v1",
+            "left": f"{candidate['target_type']}:{candidate['target_key']}",
+            "right": f"{selected['target_type']}:{selected['target_key']}",
+            "rows": overlap_path,
+        }),
+        "passed": passed,
+        "reason": (
+            "同步收益相关性、逐日持仓重叠及当前/峰值容量路径通过"
+            if passed else
+            "同步样本/容量路径不足或相关性/当前及峰值持仓重叠超过全局限制"
+        ),
+    }
+
+
+def _replay_global_portfolio_gate(
+    lanes: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    maximum = int(GLOBAL_PORTFOLIO_POLICY["maximum_funded_sleeves"])
+    pending = [list(lane) for lane in lanes if lane]
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    funded_exposures: set[str] = set()
+    while pending:
+        next_round: list[list[dict[str, Any]]] = []
+        for lane in pending:
+            if not lane:
+                continue
+            candidate = lane.pop(0)
+            exposures = set(candidate.get("exposure_keys") or ())
+            evidence = candidate.get("portfolio_risk_evidence")
+            evidence_ready = (
+                _validated_portfolio_risk_evidence(evidence) is not None
+            )
+            evidence_rows = (
+                evidence.get("daily_stock_exposures")
+                if isinstance(evidence, dict) else None
+            )
+            current_capacity = (
+                str(evidence_rows[-1].get("gross_exposure_value") or "")
+                if evidence_ready and isinstance(evidence_rows, list)
+                and evidence_rows else ""
+            )
+            comparisons = [
+                _portfolio_pair_check(candidate, existing)
+                for existing in accepted
+            ]
+            overlap_free = bool(
+                exposures and not exposures.intersection(funded_exposures)
+            )
+            expanded_count = len(funded_exposures | exposures)
+            pairwise_passed = all(item["passed"] for item in comparisons)
+            passed = bool(
+                evidence_ready
+                and overlap_free
+                and expanded_count <= maximum
+                and pairwise_passed
+            )
+            candidate["global_portfolio_gate"] = {
+                "passed": passed,
+                "allocation_admission": (
+                    "COMPLETE_60D_DAILY_EXPOSURE_PEAK_AND_CURRENT_CAP_V2"
+                ),
+                "portfolio_risk_evidence_hash": str(
+                    (evidence or {}).get("evidence_hash") or ""
+                ),
+                "daily_exposure_path_hash": str(
+                    (evidence or {}).get("exposure_path_hash") or ""
+                ),
+                "current_gross_exposure_value": current_capacity,
+                "peak_60d_gross_exposure_value": str(
+                    (evidence or {}).get("peak_gross_exposure_value") or ""
+                ),
+                "peak_60d_gross_exposure_trade_date": str(
+                    (evidence or {}).get(
+                        "peak_gross_exposure_trade_date"
+                    ) or ""
+                ),
+                "expanded_strategy_sleeves": sorted(exposures),
+                "funded_sleeve_count_after_admission": expanded_count,
+                "pairwise_checks": comparisons,
+                "policy": GLOBAL_PORTFOLIO_POLICY,
+            }
+            if passed:
+                accepted.append(candidate)
+                funded_exposures.update(exposures)
+            else:
+                reason = (
+                    "缺少有效的冻结60日收益与持仓证据"
+                    if not evidence_ready
+                    else "组合展开后存在重复成员策略袖套"
+                    if not overlap_free
+                    else "组合展开后的唯一成员策略袖套超过单日上限"
+                    if expanded_count > maximum
+                    else "全局候选相关性或持仓重叠未通过"
+                )
+                rejected.append({
+                    "target_type": candidate["target_type"],
+                    "target_key": candidate["target_key"],
+                    "reason": reason,
+                    "portfolio_risk_evidence_hash": str(
+                        (evidence or {}).get("evidence_hash") or ""
+                    ),
+                    "daily_exposure_path_hash": str(
+                        (evidence or {}).get("exposure_path_hash") or ""
+                    ),
+                    "current_gross_exposure_value": current_capacity,
+                    "peak_60d_gross_exposure_value": str(
+                        (evidence or {}).get(
+                            "peak_gross_exposure_value"
+                        ) or ""
+                    ),
+                    "peak_60d_gross_exposure_trade_date": str(
+                        (evidence or {}).get(
+                            "peak_gross_exposure_trade_date"
+                        ) or ""
+                    ),
+                    "expanded_strategy_sleeves": sorted(exposures),
+                    "funded_sleeve_count_after_admission": expanded_count,
+                    "comparisons": comparisons,
+                })
+            if lane:
+                next_round.append(lane)
+        pending = next_round
+    audit_payload = {
+        "schema": "probiga.global-portfolio-gate.v2",
+        "policy": GLOBAL_PORTFOLIO_POLICY,
+        "accepted": [
+            {
+                "target_type": row["target_type"],
+                "target_key": row["target_key"],
+                "portfolio_risk_evidence_hash": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "evidence_hash"
+                    ) or ""
+                ),
+                "daily_exposure_path_hash": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "exposure_path_hash"
+                    ) or ""
+                ),
+                "current_gross_exposure_value": str(
+                    ((row.get("portfolio_risk_evidence") or {}).get(
+                        "daily_stock_exposures"
+                    ) or [{}])[-1].get("gross_exposure_value") or ""
+                ),
+                "peak_60d_gross_exposure_value": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "peak_gross_exposure_value"
+                    ) or ""
+                ),
+                "peak_60d_gross_exposure_trade_date": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "peak_gross_exposure_trade_date"
+                    ) or ""
+                ),
+                "expanded_strategy_sleeves": sorted(
+                    row.get("exposure_keys") or ()
+                ),
+                "pairwise_checks": (
+                    row.get("global_portfolio_gate") or {}
+                ).get("pairwise_checks") or [],
+            }
+            for row in accepted
+        ],
+        "rejected": rejected,
+    }
+    return accepted, rejected, _canonical_digest(audit_payload)
+
+
 def _expected_allocation_snapshot(
     candidates: list[dict[str, Any]],
     *,
     market_state: str,
     trading_gate_passed: bool,
+    allocation_policy_version: str = ALLOCATION_POLICY_VERSION,
 ) -> list[dict[str, Any]]:
-    """Independently replay v3 fixed lanes and per-member lifecycle sleeves."""
+    """Independently replay v5 unified quality competition and sleeves."""
 
     eligible = [
         dict(row)
@@ -5058,43 +9538,53 @@ def _expected_allocation_snapshot(
             and row.get("ranking_basis") == DAILY_NAV_RANKING_BASIS
         )
     ]
-    combinations_lane = sorted(
-        (
-            row for row in eligible
-            if row["target_type"] == "COMBINATION"
-        ),
-        key=lambda row: (
-            -float(row["ranking_score"])
-            * float(row["market_match_score"])
-            / 100.0,
-            row["target_key"],
-        ),
-    )
-    strategies_lane = sorted(
-        (row for row in eligible if row["target_type"] == "STRATEGY"),
-        key=lambda row: (
-            -float(row["ranking_score"])
-            * float(row["market_match_score"])
-            / 100.0,
-            row["target_key"],
-        ),
-    )
-    selected_combinations: list[dict[str, Any]] = []
-    used_exposures: set[str] = set()
-    for row in combinations_lane:
-        exposures = set(row.get("exposure_keys") or ())
-        if not exposures or exposures.intersection(used_exposures):
-            continue
-        selected_combinations.append(row)
-        used_exposures.update(exposures)
-    selected_strategies = [
-        row for row in strategies_lane
-        if set(row.get("exposure_keys") or ())
-        and not set(row.get("exposure_keys") or ()).intersection(
-            used_exposures
+    if allocation_policy_version == LEGACY_ALLOCATION_POLICY_VERSION:
+        combinations_lane = sorted(
+            (row for row in eligible if row["target_type"] == "COMBINATION"),
+            key=lambda row: (
+                -float(row["ranking_score"])
+                * float(row["market_match_score"]) / 100.0,
+                row["target_key"],
+            ),
         )
-    ]
-    selected = selected_combinations + selected_strategies
+        strategies_lane = sorted(
+            (row for row in eligible if row["target_type"] == "STRATEGY"),
+            key=lambda row: (
+                -float(row["ranking_score"])
+                * float(row["market_match_score"]) / 100.0,
+                row["target_key"],
+            ),
+        )
+        selected_combinations: list[dict[str, Any]] = []
+        used_exposures: set[str] = set()
+        for row in combinations_lane:
+            exposures = set(row.get("exposure_keys") or ())
+            if not exposures or exposures.intersection(used_exposures):
+                continue
+            selected_combinations.append(row)
+            used_exposures.update(exposures)
+        selected_strategies = [
+            row for row in strategies_lane
+            if set(row.get("exposure_keys") or ())
+            and not set(row.get("exposure_keys") or ()).intersection(
+                used_exposures
+            )
+        ]
+        replay_lanes = [selected_combinations, selected_strategies]
+    elif allocation_policy_version == ALLOCATION_POLICY_VERSION:
+        eligible.sort(key=lambda row: (
+            -float(row["ranking_score"])
+            * float(row["market_match_score"])
+            / 100.0,
+            0 if row["target_type"] == "STRATEGY" else 1,
+            row["target_key"],
+        ))
+        replay_lanes = [eligible]
+    else:
+        raise ValueError("unsupported allocation policy version")
+    selected, _rejected, _global_gate_hash = (
+        _replay_global_portfolio_gate(replay_lanes)
+    )
 
     risk_cap = MARKET_RISK_CAP_PCT.get(market_state)
     allocations: list[dict[str, Any]] = []
@@ -5106,50 +9596,85 @@ def _expected_allocation_snapshot(
         and risk_cap > 0
     ):
         cap_basis_points = int(round(float(risk_cap) * 100))
-        nonempty_lanes = [
-            lane
-            for lane in (selected_combinations, selected_strategies)
-            if lane
-        ]
-        lane_base = cap_basis_points // len(nonempty_lanes)
-        lane_remainder = cap_basis_points - lane_base * len(nonempty_lanes)
-        assigned_by_identity: dict[tuple[str, str], int] = {}
-        for lane_index, lane in enumerate(nonempty_lanes):
-            lane_budget = lane_base + (
-                1 if lane_index < lane_remainder else 0
+        if allocation_policy_version == LEGACY_ALLOCATION_POLICY_VERSION:
+            selected_combinations = [
+                row for row in selected
+                if row["target_type"] == "COMBINATION"
+            ]
+            selected_strategies = [
+                row for row in selected if row["target_type"] == "STRATEGY"
+            ]
+            nonempty_lanes = [
+                lane for lane in (
+                    selected_combinations, selected_strategies,
+                ) if lane
+            ]
+            lane_base = cap_basis_points // len(nonempty_lanes)
+            lane_remainder = (
+                cap_basis_points - lane_base * len(nonempty_lanes)
             )
-            lane_values = [
+            assigned_by_identity: dict[tuple[str, str], int] = {}
+            for lane_index, lane in enumerate(nonempty_lanes):
+                lane_budget = lane_base + (
+                    1 if lane_index < lane_remainder else 0
+                )
+                lane_values = [
+                    max(
+                        0.0001,
+                        float(row["ranking_score"])
+                        * float(row["market_match_score"]) / 100.0,
+                    ) for row in lane
+                ]
+                lane_total = sum(lane_values)
+                raw_lane = [
+                    lane_budget * value / lane_total
+                    for value in lane_values
+                ]
+                assigned_lane = [int(value) for value in raw_lane]
+                remainder = lane_budget - sum(assigned_lane)
+                order = sorted(
+                    range(len(lane)),
+                    key=lambda index: (
+                        -(raw_lane[index] - assigned_lane[index]),
+                        lane[index]["target_key"],
+                    ),
+                )
+                for index in order[:remainder]:
+                    assigned_lane[index] += 1
+                for row, basis_points in zip(lane, assigned_lane):
+                    assigned_by_identity[
+                        (row["target_type"], row["target_key"])
+                    ] = basis_points
+            assigned = [
+                assigned_by_identity[(row["target_type"], row["target_key"])]
+                for row in selected
+            ]
+        else:
+            competitive_values = [
                 max(
                     0.0001,
                     float(row["ranking_score"])
-                    * float(row["market_match_score"])
-                    / 100.0,
+                    * float(row["market_match_score"]) / 100.0,
                 )
-                for row in lane
+                for row in selected
             ]
-            lane_total = sum(lane_values)
-            raw_lane = [
-                lane_budget * value / lane_total for value in lane_values
+            competitive_total = sum(competitive_values)
+            raw_weights = [
+                cap_basis_points * value / competitive_total
+                for value in competitive_values
             ]
-            assigned_lane = [int(value) for value in raw_lane]
-            remainder = lane_budget - sum(assigned_lane)
+            assigned = [int(value) for value in raw_weights]
+            remainder = cap_basis_points - sum(assigned)
             order = sorted(
-                range(len(lane)),
+                range(len(selected)),
                 key=lambda index: (
-                    -(raw_lane[index] - assigned_lane[index]),
-                    lane[index]["target_key"],
+                    -(raw_weights[index] - assigned[index]),
+                    selected[index]["target_type"],
+                    selected[index]["target_key"],
                 ),
             )
             for index in order[:remainder]:
-                assigned_lane[index] += 1
-            for row, basis_points in zip(lane, assigned_lane):
-                assigned_by_identity[
-                    (row["target_type"], row["target_key"])
-                ] = basis_points
-        assigned = [
-            assigned_by_identity[(row["target_type"], row["target_key"])]
-            for row in selected
-        ]
+                assigned[index] += 1
         for row, base_basis_points in zip(selected, assigned):
             member_sleeves: list[dict[str, Any]] = []
             member_sleeve_hash = ""
@@ -5317,7 +9842,9 @@ def _pool_snapshot_contract_check(
     trade_date: str,
     route_bindings: dict[tuple[str, str, str], dict[str, Any]],
     summary: dict[str, Any],
+    industry_bindings: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[bool, dict[str, Any], str]:
+    industry_bindings = industry_bindings or {}
     errors: list[dict[str, Any]] = []
     row_contracts: list[dict[str, Any]] = []
     ranks: dict[str, list[int]] = {
@@ -5377,11 +9904,24 @@ def _pool_snapshot_contract_check(
                 for value in reason.get("blocking_reasons", [])
             )
             or set(evidence_envelope)
-            != {"schema", "source_evidence", "pool_row_hash"}
+            != {
+                "schema", "source_evidence", "industry_names",
+                "industry_by_strategy", "industry_binding",
+                "pool_row_hash",
+            }
             or evidence_envelope.get("schema")
             != POOL_ROW_EVIDENCE_SCHEMA
             or not isinstance(
                 evidence_envelope.get("source_evidence"), dict
+            )
+            or not isinstance(
+                evidence_envelope.get("industry_names"), list
+            )
+            or not isinstance(
+                evidence_envelope.get("industry_by_strategy"), dict
+            )
+            or not isinstance(
+                evidence_envelope.get("industry_binding"), dict
             )
             or any(not isinstance(value, str) for value in strategies or [])
         ):
@@ -5391,6 +9931,7 @@ def _pool_snapshot_contract_check(
             )
             continue
         try:
+            industry_binding = evidence_envelope["industry_binding"]
             payload = {
                 "schema": POOL_ROW_SCHEMA,
                 "trade_date": _iso_date(row.get("trade_date")),
@@ -5409,6 +9950,29 @@ def _pool_snapshot_contract_check(
                 ),
                 "strategies": strategies,
                 "industry_name": str(row.get("industry_name") or ""),
+                "industry_type": str(
+                    industry_binding.get("industry_type") or ""
+                ),
+                "industry_snapshot_id": str(
+                    industry_binding.get("snapshot_id") or ""
+                ),
+                "industry_snapshot_hash": str(
+                    industry_binding.get("snapshot_hash") or ""
+                ),
+                "industry_row_hash": str(
+                    industry_binding.get("row_hash") or ""
+                ),
+                "industry_source_system": str(
+                    industry_binding.get("source_system") or ""
+                ),
+                "industry_source_fact_id": str(
+                    industry_binding.get("source_fact_id") or ""
+                ),
+                "industry_binding": industry_binding,
+                "industry_names": evidence_envelope["industry_names"],
+                "industry_by_strategy": evidence_envelope[
+                    "industry_by_strategy"
+                ],
                 "gate_status": str(row.get("gate_status") or ""),
                 "reason": reason,
                 "evidence": evidence_envelope["source_evidence"],
@@ -5419,7 +9983,9 @@ def _pool_snapshot_contract_check(
             errors.append(
                 {
                     **row_identity,
-                    "reason": f"pool row normalization failed: {exc}",
+                    "reason": _safe_exception_message(
+                        exc, error_code="pool_row_normalization_failed"
+                    ),
                 }
             )
             continue
@@ -5439,6 +10005,36 @@ def _pool_snapshot_contract_check(
                     "stored_pool_row_hash": stored_row_hash,
                 }
             )
+        expected_binding = industry_bindings.get(stock_code)
+        if expected_binding is not None:
+            if (
+                payload["industry_binding"] != expected_binding
+                or payload["industry_name"]
+                != str(expected_binding.get("industry_name") or "")
+                or payload["industry_names"]
+                != [str(expected_binding.get("industry_name") or "")]
+                or payload["industry_by_strategy"] != {
+                    key: str(expected_binding.get("industry_name") or "")
+                    for key in strategies
+                }
+            ):
+                errors.append({
+                    **row_identity,
+                    "reason": "pool industry binding differs from QMT replay",
+                })
+        elif (
+            level != "OBSERVATION"
+            or payload["industry_binding"] != {}
+            or payload["industry_name"]
+            or payload["industry_names"]
+            or payload["industry_by_strategy"]
+            or "目标日QMT一级行业冻结事实缺失或无效"
+            not in (reason.get("blocking_reasons") or [])
+        ):
+            errors.append({
+                **row_identity,
+                "reason": "missing QMT industry fact is not observation-only",
+            })
         ranks[level].append(rank_no)
         row_contracts.append(
             {
@@ -5530,6 +10126,335 @@ def _pool_snapshot_contract_check(
     }, snapshot_hash
 
 
+def _paper_execution_plan_contract_check(
+    run: dict[str, Any],
+    *,
+    trade_date: str,
+    pool_rows: list[dict[str, Any]] | None,
+    allocation_rows: list[dict[str, Any]],
+    industry_bindings: dict[str, dict[str, Any]] | None = None,
+) -> tuple[bool, dict[str, Any], str]:
+    """Independently verify the persisted stock-level paper funding plan."""
+
+    errors: list[dict[str, Any]] = []
+    industry_bindings = industry_bindings or {}
+    raw_result = run.get("result_json")
+    stored_result_hash = str(run.get("result_hash") or "")
+    if not isinstance(raw_result, str) or not raw_result:
+        return False, {
+            "expected_plan_hash": "",
+            "stored_result_hash": stored_result_hash,
+            "errors": [{"reason": "canonical result_json is missing"}],
+        }, ""
+    raw_result_hash = hashlib.sha256(raw_result.encode("utf-8")).hexdigest()
+    result = _json_object(raw_result)
+    if (
+        RESULT_HASH_RE.fullmatch(stored_result_hash) is None
+        or raw_result_hash != stored_result_hash
+        or result is None
+    ):
+        return False, {
+            "expected_plan_hash": "",
+            "stored_result_hash": stored_result_hash,
+            "recomputed_result_hash": raw_result_hash,
+            "errors": [{"reason": "canonical result_json hash is invalid"}],
+        }, ""
+    plan = result.get("paper_execution_plan")
+    summary = _json_object(run.get("summary_json")) or {}
+    if not isinstance(plan, dict):
+        return False, {
+            "expected_plan_hash": "",
+            "stored_result_hash": stored_result_hash,
+            "errors": [{"reason": "paper execution plan is missing"}],
+        }, ""
+    plan_payload = {
+        str(key): value for key, value in plan.items()
+        if str(key) != "plan_hash"
+    }
+    expected_plan_hash = _canonical_digest(plan_payload)
+    stored_plan_hash = str(plan.get("plan_hash") or "")
+    if (
+        expected_plan_hash != stored_plan_hash
+        or stored_plan_hash
+        != str(result.get("paper_execution_plan_hash") or "")
+        or stored_plan_hash
+        != str(summary.get("paper_execution_plan_hash") or "")
+    ):
+        errors.append({"reason": "paper plan hash binding differs"})
+    expected_plan_fields = {
+        "schema", "trade_date", "policy", "funded_sleeves",
+        "industry_snapshot_id", "industry_snapshot_hash",
+        "industry_snapshot_status",
+        "portfolio_risk", "requested_new_buy_turnover_bp",
+        "new_buy_turnover_multiplier", "actual_new_buy_turnover_bp",
+        "targets", "exit_targets", "target_count", "invested_bp",
+        "cash_bp", "automatic_real_order_submission",
+        "real_order_authority", "plan_hash",
+    }
+    if set(plan) != expected_plan_fields:
+        errors.append({"reason": "paper plan fields differ from v1 schema"})
+    if (
+        plan.get("schema")
+        != "probiga.governance-paper-execution-plan.v1"
+        or str(plan.get("trade_date") or "") != trade_date
+        or str(plan.get("industry_snapshot_id") or "")
+        != str((result.get("candidate_industry_snapshot") or {}).get(
+            "snapshot_id"
+        ) or "")
+        or str(plan.get("industry_snapshot_hash") or "")
+        != str(result.get("candidate_industry_snapshot_hash") or "")
+        or str(plan.get("industry_snapshot_status") or "")
+        != str((result.get("candidate_industry_snapshot") or {}).get(
+            "status"
+        ) or "")
+        or plan.get("policy") != GLOBAL_PORTFOLIO_POLICY
+        or plan.get("automatic_real_order_submission") is not False
+        or plan.get("real_order_authority") is not False
+    ):
+        errors.append({"reason": "paper plan identity/policy/safety differs"})
+
+    sleeves = plan.get("funded_sleeves")
+    sleeve_keys: set[str] = set()
+    if not isinstance(sleeves, list):
+        errors.append({"reason": "funded sleeves are not a list"})
+        sleeves = []
+    for sleeve in sleeves:
+        key = str(sleeve.get("strategy_key") or "") if isinstance(
+            sleeve, dict
+        ) else ""
+        if (
+            not key or key in sleeve_keys
+            or _integer((sleeve or {}).get("budget_bp")) <= 0
+            or str((sleeve or {}).get("allocation_target_type") or "")
+            not in {"STRATEGY", "COMBINATION"}
+        ):
+            errors.append({"reason": "funded sleeve identity/budget differs"})
+            continue
+        sleeve_keys.add(key)
+    if len(sleeves) > int(GLOBAL_PORTFOLIO_POLICY[
+        "maximum_funded_sleeves"
+    ]):
+        errors.append({"reason": "funded sleeve cap exceeded"})
+    expected_sleeves: dict[str, dict[str, Any]] = {}
+    for allocation in allocation_rows:
+        target_type = str(allocation.get("target_type") or "")
+        target_key = str(allocation.get("target_key") or "")
+        target_version = str(allocation.get("target_version") or "")
+        allocation_weight = _decimal(
+            allocation.get("simulated_weight_pct")
+        )
+        budget_bp = int((allocation_weight or Decimal("0")) * 100)
+        if target_type == "STRATEGY" and target_key and budget_bp > 0:
+            expected_sleeves[target_key] = {
+                "strategy_key": target_key,
+                "strategy_version": target_version,
+                "allocation_target_type": "STRATEGY",
+                "allocation_target_key": target_key,
+                "allocation_target_version": target_version,
+                "budget_bp": budget_bp,
+            }
+        elif target_type == "COMBINATION":
+            members = _json_array(allocation.get("member_sleeves_json")) or []
+            for member in members:
+                key = str(member.get("strategy_key") or "") if isinstance(
+                    member, dict
+                ) else ""
+                member_bp = _integer((member or {}).get("effective_bp"))
+                if not key or member_bp <= 0 or key in expected_sleeves:
+                    errors.append({
+                        "reason": "persisted allocation has duplicate/invalid member sleeve",
+                        "strategy_key": key,
+                    })
+                    continue
+                expected_sleeves[key] = {
+                    "strategy_key": key,
+                    "strategy_version": str(
+                        (member or {}).get("strategy_version") or ""
+                    ),
+                    "allocation_target_type": "COMBINATION",
+                    "allocation_target_key": target_key,
+                    "allocation_target_version": target_version,
+                    "budget_bp": member_bp,
+                }
+    expected_sleeve_rows = [
+        expected_sleeves[key] for key in sorted(expected_sleeves)
+    ]
+    if sleeves != expected_sleeve_rows:
+        errors.append({
+            "reason": "paper funded sleeves differ from persisted allocations",
+            "expected_sleeves": expected_sleeve_rows,
+        })
+
+    targets = plan.get("targets")
+    if not isinstance(targets, list):
+        errors.append({"reason": "paper targets are not a list"})
+        targets = []
+    target_codes: set[str] = set()
+    industry_bp: dict[str, int] = {}
+    invested_bp = 0
+    actual_turnover_bp = 0
+    stock_cap_bp = int(Decimal(str(
+        GLOBAL_PORTFOLIO_POLICY["maximum_single_stock_weight_pct"]
+    )) * 100)
+    industry_cap_bp = int(Decimal(str(
+        GLOBAL_PORTFOLIO_POLICY["maximum_industry_weight_pct"]
+    )) * 100)
+    for target in targets:
+        if not isinstance(target, dict):
+            errors.append({"reason": "paper target row is not an object"})
+            continue
+        code = str(target.get("stock_code") or "")
+        target_bp = _integer(target.get("target_bp"))
+        previous_bp = _integer(target.get("previous_target_bp"))
+        delta_bp = _integer(target.get("new_buy_delta_bp"))
+        target_payload = {
+            str(key): value for key, value in target.items()
+            if str(key) != "target_hash"
+        }
+        target_hash = _canonical_digest({
+            "schema": "probiga.governance-paper-target.v1",
+            **target_payload,
+        })
+        expected_industry_binding = industry_bindings.get(code)
+        if (
+            not code or code in target_codes or target_bp <= 0
+            or target_bp > stock_cap_bp or previous_bp < 0
+            or delta_bp != max(0, target_bp - previous_bp)
+            or str(target.get("strategy_key") or "") not in sleeve_keys
+            or target.get("allocation_backed") is not True
+            or target.get("new_buy_allowed") is not True
+            or target.get("exit_always_allowed") is not True
+            or target.get("real_order_authority") is not False
+            or str(target.get("target_hash") or "") != target_hash
+            or target.get("industry_binding")
+            != expected_industry_binding
+            or str(target.get("industry_name") or "")
+            != str((expected_industry_binding or {}).get(
+                "industry_name"
+            ) or "")
+            or str(target.get("industry_type") or "")
+            != str((expected_industry_binding or {}).get(
+                "industry_type"
+            ) or "")
+            or str(target.get("industry_snapshot_id") or "")
+            != str((expected_industry_binding or {}).get(
+                "snapshot_id"
+            ) or "")
+            or str(target.get("industry_snapshot_hash") or "")
+            != str((expected_industry_binding or {}).get(
+                "snapshot_hash"
+            ) or "")
+            or str(target.get("industry_row_hash") or "")
+            != str((expected_industry_binding or {}).get("row_hash") or "")
+            or str(target.get("industry_source_fact_id") or "")
+            != str((expected_industry_binding or {}).get(
+                "source_fact_id"
+            ) or "")
+        ):
+            errors.append({
+                "reason": "paper target identity/cap/hash differs",
+                "stock_code": code,
+            })
+        target_codes.add(code)
+        invested_bp += target_bp
+        actual_turnover_bp += delta_bp
+        industry = str(target.get("industry_name") or "")
+        industry_bp[industry] = industry_bp.get(industry, 0) + target_bp
+    if (
+        len(targets) > int(GLOBAL_PORTFOLIO_POLICY[
+            "maximum_planned_positions"
+        ])
+        or any(value > industry_cap_bp for value in industry_bp.values())
+        or invested_bp < 0 or invested_bp > 10_000
+        or _integer(plan.get("target_count")) != len(targets)
+        or _integer(plan.get("invested_bp")) != invested_bp
+        or _integer(plan.get("cash_bp")) != 10_000 - invested_bp
+    ):
+        errors.append({"reason": "paper target aggregate limits differ"})
+    if pool_rows is not None:
+        persisted_tradable_codes = {
+            str(row.get("stock_code") or "")
+            for row in pool_rows
+            if str(row.get("pool_level") or "") == "TRADABLE"
+        }
+        if target_codes != persisted_tradable_codes:
+            errors.append({
+                "reason": "paper targets differ from persisted tradable pool",
+                "target_codes": sorted(target_codes),
+                "persisted_tradable_codes": sorted(persisted_tradable_codes),
+            })
+        for row in pool_rows:
+            if str(row.get("pool_level") or "") != "TRADABLE":
+                continue
+            code = str(row.get("stock_code") or "")
+            envelope = _json_object(row.get("evidence_json")) or {}
+            if envelope.get("industry_binding") != industry_bindings.get(code):
+                errors.append({
+                    "reason": "paper target and persisted pool industry binding differ",
+                    "stock_code": code,
+                })
+
+    requested_turnover_bp = _integer(
+        plan.get("requested_new_buy_turnover_bp")
+    )
+    turnover_cap_bp = int(Decimal(str(
+        GLOBAL_PORTFOLIO_POLICY["maximum_new_buy_turnover_pct"]
+    )) * 100)
+    expected_turnover_multiplier = min(
+        Decimal("1"),
+        Decimal(turnover_cap_bp) / Decimal(requested_turnover_bp)
+        if requested_turnover_bp > 0 else Decimal("1"),
+    ).quantize(Decimal("0.00000001"))
+    if (
+        requested_turnover_bp < actual_turnover_bp
+        or actual_turnover_bp > turnover_cap_bp
+        or _integer(plan.get("actual_new_buy_turnover_bp"))
+        != actual_turnover_bp
+        or _decimal(plan.get("new_buy_turnover_multiplier"))
+        != expected_turnover_multiplier
+    ):
+        errors.append({"reason": "paper turnover cap/replay differs"})
+
+    exit_targets = plan.get("exit_targets")
+    exit_codes: set[str] = set()
+    if not isinstance(exit_targets, list):
+        errors.append({"reason": "paper exit targets are not a list"})
+        exit_targets = []
+    for target in exit_targets:
+        code = str(target.get("stock_code") or "") if isinstance(
+            target, dict
+        ) else ""
+        if (
+            not code or code in exit_codes or code in target_codes
+            or _integer((target or {}).get("previous_target_bp")) <= 0
+            or _integer((target or {}).get("target_bp")) != 0
+            or (target or {}).get("new_buy_allowed") is not False
+            or (target or {}).get("exit_always_allowed") is not True
+            or (target or {}).get("real_order_authority") is not False
+        ):
+            errors.append({
+                "reason": "paper exit target safety differs",
+                "stock_code": code,
+            })
+        exit_codes.add(code)
+
+    if (
+        _integer(summary.get("paper_target_count")) != len(targets)
+        or _decimal(summary.get("paper_invested_weight_pct"))
+        != Decimal(invested_bp) / Decimal(100)
+    ):
+        errors.append({"reason": "paper plan summary differs"})
+    return not errors, {
+        "expected_plan_hash": expected_plan_hash,
+        "stored_plan_hash": stored_plan_hash,
+        "stored_result_hash": stored_result_hash,
+        "target_count": len(targets),
+        "invested_bp": invested_bp,
+        "actual_new_buy_turnover_bp": actual_turnover_bp,
+        "errors": errors[:100],
+    }, expected_plan_hash
+
+
 def _allocation_decision_contract_check(
     run: dict[str, Any],
     route_bindings: dict[tuple[str, str, str], dict[str, Any]],
@@ -5537,7 +10462,11 @@ def _allocation_decision_contract_check(
     trade_date: str,
     *,
     pool_snapshot_hash: str | None = None,
+    pool_rows: list[dict[str, Any]] | None = None,
     automatic_transition_plan_hash: str | None = None,
+    industry_bindings: dict[str, dict[str, Any]] | None = None,
+    current_build_commit_sha: str | None = None,
+    completed_v5_canonical_count: int | None = None,
 ) -> tuple[bool, dict[str, Any], list[dict[str, Any]]]:
     candidates, candidate_errors = _allocation_candidate_contract(
         route_bindings
@@ -5547,9 +10476,28 @@ def _allocation_decision_contract_check(
     trading_gate_raw = summary.get("trading_gate_passed")
     trading_gate_passed = trading_gate_raw is True
     risk_cap = MARKET_RISK_CAP_PCT.get(market_state)
+    declared_policy_version = str(
+        summary.get("allocation_policy_version") or ""
+    )
+    current_build_sha = str(current_build_commit_sha or "")
+    run_build_sha = str(run.get("build_commit_sha") or "")
+    legacy_v4_allowed = bool(
+        declared_policy_version == LEGACY_ALLOCATION_POLICY_VERSION
+        and BUILD_SHA_RE.fullmatch(current_build_sha)
+        and BUILD_SHA_RE.fullmatch(run_build_sha)
+        and run_build_sha != current_build_sha
+        and completed_v5_canonical_count == 0
+        and trade_date < ALLOCATION_POLICY_V5_EFFECTIVE_TRADE_DATE
+        and _iso_date(run.get("finished_at"))
+        < ALLOCATION_POLICY_V5_EFFECTIVE_TRADE_DATE
+    )
+    declared_policy_valid = bool(
+        declared_policy_version == ALLOCATION_POLICY_VERSION
+        or legacy_v4_allowed
+    )
     candidate_payload = {
         "schema": "probiga.strategy-allocation-candidate-set.v1",
-        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "allocation_policy_version": declared_policy_version,
         "trade_date": trade_date,
         "market_state": market_state,
         "candidates": candidates,
@@ -5561,16 +10509,17 @@ def _allocation_decision_contract_check(
             candidates,
             market_state=market_state,
             trading_gate_passed=trading_gate_passed,
+            allocation_policy_version=declared_policy_version,
         )
     except (ArithmeticError, KeyError, RuntimeError, TypeError, ValueError):
         expected_allocations = []
         allocation_replay_errors.append(
-            {"reason": "allocation v3 replay inputs are invalid"}
+            {"reason": "allocation replay inputs or policy are invalid"}
         )
     stored_allocations = _stored_allocation_snapshot(allocation_rows)
     allocation_payload = {
         "schema": "probiga.strategy-allocation-snapshot.v1",
-        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "allocation_policy_version": declared_policy_version,
         "trade_date": trade_date,
         "market_state": market_state,
         "market_risk_cap_pct": float(risk_cap or 0),
@@ -5602,6 +10551,46 @@ def _allocation_decision_contract_check(
     combination_candidates.sort(
         key=lambda row: (-float(row["ranking_score"]), row["target_key"])
     )
+    canonical_result = _json_object(run.get("result_json")) or {}
+    has_canonical_result = bool(canonical_result)
+    stored_candidate_contract = canonical_result.get(
+        "allocation_candidate_set"
+    )
+    if not isinstance(stored_candidate_contract, list):
+        stored_candidate_contract = []
+    try:
+        if not has_canonical_result:
+            raise LookupError("legacy allocation replay without full result")
+        from server.engine import strategy_governance as governance
+
+        decision_contract = str(
+            canonical_result.get("decision_contract_version") or ""
+        )
+        if decision_contract != governance.STATISTICAL_DECISION_CONTRACT:
+            raise ValueError("canonical result is not the v7 funding contract")
+        statistical_extension = governance._canonical_v7_statistical_extension(
+            canonical_result,
+            canonical_result.get("strategies") or [],
+            canonical_result.get("combinations") or [],
+        )
+    except LookupError:
+        decision_contract = "strategy-governance-decision.v6"
+        statistical_extension = {
+            "top": {},
+            "strategies": [{} for _ in strategy_candidates],
+            "combinations": [{} for _ in combination_candidates],
+        }
+    except Exception as exc:
+        decision_contract = ""
+        statistical_extension = {
+            "top": {},
+            "strategies": [{} for _ in strategy_candidates],
+            "combinations": [{} for _ in combination_candidates],
+        }
+        allocation_replay_errors.append({
+            "reason": "canonical v7 statistical extension is invalid",
+            "detail": _safe_exception_message(exc),
+        })
     bound_pool_snapshot_hash = (
         str(pool_snapshot_hash)
         if pool_snapshot_hash is not None
@@ -5612,13 +10601,35 @@ def _allocation_decision_contract_check(
         if automatic_transition_plan_hash is not None
         else str(summary.get("automatic_transition_plan_hash") or "")
     )
+    verify_paper_plan = pool_rows is not None or bool(run.get("result_json"))
+    if verify_paper_plan:
+        paper_plan_ok, paper_plan_detail, paper_plan_hash = (
+            _paper_execution_plan_contract_check(
+                run,
+                trade_date=trade_date,
+                pool_rows=pool_rows,
+                allocation_rows=allocation_rows,
+                industry_bindings=industry_bindings,
+            )
+        )
+    else:
+        paper_plan_ok = True
+        paper_plan_hash = str(
+            summary.get("paper_execution_plan_hash") or ""
+        )
+        paper_plan_detail = {
+            "verification_skipped": True,
+            "target_count": 0,
+            "invested_bp": 0,
+            "errors": [],
+        }
     decision_payload = {
-        "schema": "strategy-governance-decision.v6",
+        "schema": decision_contract,
         "trade_date": trade_date,
         "build_commit_sha": str(run.get("build_commit_sha") or ""),
         "input_hash": str(run.get("input_hash") or ""),
         "router_snapshot_hash": str(run.get("router_snapshot_hash") or ""),
-        "allocation_policy_version": ALLOCATION_POLICY_VERSION,
+        "allocation_policy_version": declared_policy_version,
         "trading_gate_passed": trading_gate_passed,
         "market_risk_cap_pct": float(risk_cap or 0),
         "allocation_candidate_count": len(candidates),
@@ -5627,16 +10638,30 @@ def _allocation_decision_contract_check(
         ),
         "candidate_set_hash": candidate_hash,
         "allocation_snapshot_hash": allocation_hash,
+        "paper_execution_plan_hash": paper_plan_hash,
         "pool_snapshot_hash": bound_pool_snapshot_hash,
+        "candidate_industry_snapshot_hash": str(
+            summary.get("candidate_industry_snapshot_hash") or ""
+        ),
+        **({
+            "funding_checkpoint_manifest_hash": str(
+                summary.get("funding_checkpoint_manifest_hash") or ""
+            ),
+            **statistical_extension["top"],
+        } if has_canonical_result else {}),
         "strategies": [
             {
                 "strategy_key": row["target_key"],
                 "strategy_version": row["target_version"],
                 "enabled": row["enabled"],
                 "projected_status": row["lifecycle_status"],
+                **(
+                    statistical_extension["strategies"][index]
+                    if has_canonical_result else {}
+                ),
                 "funding_gate_hash": row["funding_gate_hash"],
             }
-            for row in strategy_candidates
+            for index, row in enumerate(strategy_candidates)
         ],
         "combinations": [
             {
@@ -5644,9 +10669,13 @@ def _allocation_decision_contract_check(
                 "combination_version": row["target_version"],
                 "enabled": row["enabled"],
                 "projected_status": row["lifecycle_status"],
+                **(
+                    statistical_extension["combinations"][index]
+                    if has_canonical_result else {}
+                ),
                 "funding_gate_hash": row["funding_gate_hash"],
             }
-            for row in combination_candidates
+            for index, row in enumerate(combination_candidates)
         ],
     }
     decision_hash = _canonical_digest(decision_payload)
@@ -5665,9 +10694,13 @@ def _allocation_decision_contract_check(
         None,
     )
     errors = [*candidate_errors, *allocation_replay_errors]
+    if not paper_plan_ok:
+        errors.append({
+            "reason": "paper execution plan contract differs",
+            "detail": paper_plan_detail,
+        })
     summary_valid = (
-        summary.get("allocation_policy_version")
-        == ALLOCATION_POLICY_VERSION
+        declared_policy_valid
         and type(trading_gate_raw) is bool
         and _decimal(summary.get("market_risk_cap_pct")) == risk_cap
         and _integer(summary.get("allocation_candidate_count"))
@@ -5690,16 +10723,50 @@ def _allocation_decision_contract_check(
         and str(summary.get("automatic_transition_plan_hash") or "")
         == bound_transition_plan_hash
         and RESULT_HASH_RE.fullmatch(bound_transition_plan_hash) is not None
+        and (
+            not has_canonical_result
+            or (
+                summary.get("decision_contract_version")
+                == decision_contract
+                and all(
+                    summary.get(field) == value
+                    for field, value
+                    in statistical_extension["top"].items()
+                )
+                and RESULT_HASH_RE.fullmatch(str(
+                    summary.get("funding_checkpoint_manifest_hash") or ""
+                )) is not None
+            )
+        )
+        and (
+            not verify_paper_plan
+            or (
+                str(summary.get("paper_execution_plan_hash") or "")
+                == paper_plan_hash
+                and _integer(summary.get("paper_target_count"))
+                == _integer(paper_plan_detail.get("target_count"))
+                and _decimal(summary.get("paper_invested_weight_pct"))
+                == Decimal(_integer(paper_plan_detail.get("invested_bp")))
+                / Decimal(100)
+            )
+        )
     )
     if not summary_valid:
         errors.append({"reason": "allocation summary contract differs"})
     if stored_allocations != expected_allocations:
         errors.append({"reason": "persisted allocation replay differs"})
+    if has_canonical_result and stored_candidate_contract != candidates:
+        errors.append({"reason": "canonical candidate contract differs"})
     if str(run.get("decision_hash") or "") != decision_hash:
-        errors.append({"reason": "governance decision v6 hash differs"})
+        errors.append({"reason": "governance decision v7 hash differs"})
     return not errors, {
-        "allocation_policy_version": summary.get(
-            "allocation_policy_version"
+        "allocation_policy_version": declared_policy_version,
+        "legacy_v4_allowed": legacy_v4_allowed,
+        "current_build_commit_sha": current_build_sha,
+        "run_build_commit_sha": run_build_sha,
+        "completed_v5_canonical_count": completed_v5_canonical_count,
+        "v5_effective_trade_date": (
+            ALLOCATION_POLICY_V5_EFFECTIVE_TRADE_DATE
         ),
         "trading_gate_passed": trading_gate_raw,
         "market_risk_cap_pct": summary.get("market_risk_cap_pct"),
@@ -5719,6 +10786,7 @@ def _allocation_decision_contract_check(
         "stored_automatic_transition_plan_hash": summary.get(
             "automatic_transition_plan_hash"
         ),
+        "paper_execution_plan": paper_plan_detail,
         "expected_decision_hash": decision_hash,
         "stored_decision_hash": run.get("decision_hash"),
         "expected_allocations": expected_allocations,
@@ -5806,7 +10874,7 @@ def _confirmed_funding_evidence(
             or not RESULT_HASH_RE.fullmatch(selection_evidence_hash)
             or not RESULT_HASH_RE.fullmatch(internal_trade_evidence_hash)
             or metrics.get("funding_provenance")
-            != "INTERNAL_PORTFOLIO_LEDGER_V1"
+            != CANONICAL_FUNDING_PROVENANCE
             or not RESULT_HASH_RE.fullmatch(internal_ledger_hash)
             or not RESULT_HASH_RE.fullmatch(artifact_hash)
             or _canonical_digest(composite_payload) != evidence_hash
@@ -6089,7 +11157,9 @@ def _metric_snapshot_replay_contract(connection, run_uid: str) -> dict[str, Any]
             "overall_profit_gate_passed": payload.get(
                 "overall_profit_gate_passed"
             ),
-            "funding_gate_hash": payload.get("funding_gate_hash"),
+            "funding_gate_hash": payload.get(
+                "pre_confirmation_funding_gate_hash"
+            ),
             "market_route": payload.get("market_route"),
         }
     combinations: dict[str, dict[str, Any]] = {}
@@ -6118,7 +11188,9 @@ def _metric_snapshot_replay_contract(connection, run_uid: str) -> dict[str, Any]
             "overall_profit_gate_passed": payload.get(
                 "overall_profit_gate_passed"
             ),
-            "funding_gate_hash": payload.get("funding_gate_hash"),
+            "funding_gate_hash": payload.get(
+                "pre_confirmation_funding_gate_hash"
+            ),
             "market_route": payload.get("market_route"),
         }
     return {"strategies": strategies, "combinations": combinations}
@@ -6154,7 +11226,7 @@ def _replay_current_metrics_from_raw(
     def connection_read(sql: str, params: dict[str, Any] | None = None):
         return _rows(connection, sql, params or {})
 
-    with _RAW_METRIC_REPLAY_LOCK:
+    with _RAW_METRIC_REPLAY_LOCK, governance.bind_sql_connection(connection):
         original_reader = governance._db_read
         governance._db_read = connection_read
         try:
@@ -6179,9 +11251,29 @@ def _replay_current_metrics_from_raw(
                 trade_date,
                 authoritative_windows=authoritative_windows,
             )
-            rankings = governance._strategy_rankings(registry, metrics)
+            statistical_inventory = (
+                governance._load_statistical_trial_inventory()
+            )
+            strategy_decisions, _strategy_fdr_summary = (
+                governance._statistical_family_fdr_decisions(
+                    entity_type="STRATEGY",
+                    current_rows=registry,
+                    metrics_by_key=metrics,
+                    family=statistical_inventory["strategy"],
+                )
+            )
+            rankings = governance._strategy_rankings(
+                registry,
+                metrics,
+                statistical_decisions=strategy_decisions,
+            )
+            projected_rankings = governance._canonical_competition_rows(
+                rankings, entity_type="STRATEGY",
+            )
             replay_strategies: dict[str, dict[str, Any]] = {}
-            for strategy in rankings:
+            for strategy, projected_strategy in zip(
+                rankings, projected_rankings, strict=True,
+            ):
                 for window in governance.WINDOWS:
                     window_metrics = strategy["metrics"][str(window)]
                     key = "|".join((
@@ -6191,7 +11283,7 @@ def _replay_current_metrics_from_raw(
                         str(window),
                     ))
                     replay_strategies[key] = {
-                        "metrics": window_metrics,
+                        "metrics": projected_strategy["metrics"][str(window)],
                         "gate": window_metrics.get("profit_gate"),
                         "overall_profit_gate_passed": strategy.get(
                             "profit_gate_passed"
@@ -6212,21 +11304,29 @@ def _replay_current_metrics_from_raw(
                 entity_type="COMBINATION",
                 current_versions=combination_versions,
             )
+            combination_statistical_context: dict[str, Any] = {}
             combination_rankings = governance._combination_rankings(
                 combination_registry,
                 rankings,
                 combination_inputs,
                 trade_date,
+                statistical_family=statistical_inventory["combination"],
+                statistical_context=combination_statistical_context,
+            )
+            projected_combinations = governance._canonical_competition_rows(
+                combination_rankings, entity_type="COMBINATION",
             )
             replay_combinations: dict[str, dict[str, Any]] = {}
-            for combination in combination_rankings:
+            for combination, projected_combination in zip(
+                combination_rankings, projected_combinations, strict=True,
+            ):
                 key = "|".join((
                     "COMBINATION",
                     str(combination.get("combination_key") or ""),
                     str(combination.get("current_version") or ""),
                 ))
                 replay_combinations[key] = {
-                    "metrics": combination.get("metrics"),
+                    "metrics": projected_combination.get("metrics"),
                     "multi_window_gate": combination.get(
                         "multi_window_gate"
                     ),
@@ -6322,7 +11422,7 @@ def _current_canonical_raw_metric_replay_check(
             "path": "raw_metric_replay",
             "reason": (
                 "raw metric replay could not be completed: "
-                f"{type(exc).__name__}: {exc}"
+                + _safe_exception_message(exc)
             ),
         }]
         actual = {"strategies": {}, "combinations": {}}
@@ -6352,6 +11452,7 @@ def collect_governance_health(
     expected_build_sha: str = "",
     expected_trade_date: str = "",
     allow_input_not_ready: bool = False,
+    expected_scheduler_pid: int = 0,
 ) -> dict[str, Any]:
     """Collect a read-only, build-bound production acceptance report."""
 
@@ -6376,12 +11477,119 @@ def collect_governance_health(
             engine, expected_trade_date
         )
     except Exception as exc:
-        date_error = f"{type(exc).__name__}: {exc}"
+        date_error = _safe_exception_message(
+            exc, error_code="authoritative_trade_date_failed"
+        )
 
     run_disposition = "unverified"
     with engine.connect() as connection:
         existing, schema_ok = _schema_checks(connection, add)
         scheduler_ok = _scheduler_checks(connection, existing, add)
+        qmt_announcement_scheduler_ok = _qmt_announcement_scheduler_checks(
+            connection,
+            existing,
+            add,
+        )
+        qmt_operations_scheduler_ok = _qmt_operations_scheduler_checks(
+            connection,
+            existing,
+            add,
+        )
+        scheduler_ok = (
+            scheduler_ok
+            and qmt_announcement_scheduler_ok
+            and qmt_operations_scheduler_ok
+        )
+        if expected_scheduler_pid:
+            heartbeat_ok, heartbeat_detail = (
+                check_linux_standalone_scheduler_heartbeat(
+                    connection,
+                    expected_build_sha=build_sha,
+                    expected_pid=expected_scheduler_pid,
+                )
+            )
+            add(
+                "linux_standalone_scheduler_heartbeat_current",
+                heartbeat_ok,
+                heartbeat_detail,
+            )
+            scheduler_ok = scheduler_ok and heartbeat_ok
+        qmt_edge_ok, qmt_edge_detail = check_qmt_windows_edge_executor(
+            connection,
+            expected_build_sha=build_sha,
+        )
+        add(
+            "qmt_windows_edge_executor_and_last_success",
+            qmt_edge_ok,
+            qmt_edge_detail,
+        )
+        scheduler_ok = scheduler_ok and qmt_edge_ok
+        qmt_release_ok, qmt_release_detail = (
+            check_qmt_windows_edge_release_receipt(
+                connection,
+                expected_build_sha=build_sha,
+            )
+        )
+        add(
+            "qmt_windows_edge_release_bootstrap",
+            qmt_release_ok,
+            qmt_release_detail,
+        )
+        scheduler_ok = scheduler_ok and qmt_release_ok
+        task_history_ok, task_history_detail = (
+            _scheduler_task_history_frozen_schema_check(engine)
+        )
+        add(
+            "scheduler_task_history_physical_schema",
+            task_history_ok,
+            task_history_detail,
+        )
+        schema_ok = schema_ok and task_history_ok
+        supporting_triggers_ok, supporting_triggers_detail = (
+            _supporting_release_trigger_inventory_check(connection)
+        )
+        add(
+            "supporting_release_trigger_inventory_exact",
+            supporting_triggers_ok,
+            supporting_triggers_detail,
+        )
+        schema_ok = schema_ok and supporting_triggers_ok
+        qmt_reference_ok, qmt_reference_detail = (
+            _qmt_reference_frozen_schema_check(engine)
+        )
+        add(
+            "qmt_reference_physical_schema_and_seal",
+            qmt_reference_ok,
+            qmt_reference_detail,
+        )
+        schema_ok = schema_ok and qmt_reference_ok
+        qmt_coverage_ok, qmt_coverage_detail = (
+            _qmt_history_coverage_frozen_schema_check(connection)
+        )
+        add(
+            "qmt_history_coverage_physical_schema_and_seal",
+            qmt_coverage_ok,
+            qmt_coverage_detail,
+        )
+        schema_ok = schema_ok and qmt_coverage_ok
+        capability_ok, capability_detail = (
+            _qmt_history_capability_matrix_check(connection)
+        )
+        add(
+            "qmt_history_capability_matrix_fail_closed",
+            capability_ok,
+            capability_detail,
+        )
+        schema_ok = schema_ok and capability_ok
+        pit_fact_schema_ok, pit_fact_schema_detail = (
+            _pit_fact_frozen_schema_check(engine)
+        )
+        add(
+            "pit_fact_physical_schema_exact",
+            pit_fact_schema_ok,
+            pit_fact_schema_detail,
+        )
+        schema_ok = schema_ok and pit_fact_schema_ok
         metric_integrity_ok, metric_integrity_detail = (
             _metric_input_review_trigger_check(connection)
         )
@@ -6391,8 +11599,20 @@ def collect_governance_health(
             metric_integrity_detail,
         )
         schema_ok = schema_ok and metric_integrity_ok
+        funding_schema_ok, funding_schema_detail = (
+            _strategy_funding_schema_check(connection)
+        )
+        add(
+            "strategy_funding_schema_exact",
+            funding_schema_ok,
+            funding_schema_detail,
+        )
+        schema_ok = schema_ok and funding_schema_ok
         append_only_ok, append_only_detail = (
-            _governance_append_only_trigger_check(connection)
+            _governance_append_only_trigger_check(
+                connection,
+                funding_schema_detail if funding_schema_ok else None,
+            )
         )
         add(
             "governance_append_only_application_integrity",
@@ -6400,6 +11620,45 @@ def collect_governance_health(
             append_only_detail,
         )
         schema_ok = schema_ok and append_only_ok
+        dynamic_tables = DYNAMIC_SHADOW_TABLES
+        if dynamic_tables <= existing:
+            try:
+                dynamic_constraints_ok, dynamic_constraints_detail = (
+                    _dynamic_shadow_schema_constraints_check(connection)
+                )
+            except Exception as exc:
+                dynamic_constraints_ok = False
+                dynamic_constraints_detail = {
+                    "errors": [_safe_exception_message(exc)]
+                }
+            dynamic_ledger_ok, dynamic_ledger_detail = (
+                _dynamic_shadow_ledger_integrity_check(connection)
+            )
+        else:
+            dynamic_constraints_ok = False
+            dynamic_constraints_detail = {
+                "missing_tables": sorted(dynamic_tables - existing),
+                "errors": [{
+                    "reason": "dynamic shadow constraint tables missing"
+                }],
+            }
+            dynamic_ledger_ok = False
+            dynamic_ledger_detail = {
+                "missing_tables": sorted(dynamic_tables - existing),
+                "errors": [{"reason": "dynamic shadow ledger tables missing"}],
+            }
+        add(
+            "dynamic_shadow_ledger_schema_exact",
+            dynamic_constraints_ok,
+            dynamic_constraints_detail,
+        )
+        schema_ok = schema_ok and dynamic_constraints_ok
+        add(
+            "dynamic_shadow_candidate_plan_fill_forward_ledger",
+            dynamic_ledger_ok,
+            dynamic_ledger_detail,
+        )
+        schema_ok = schema_ok and dynamic_ledger_ok
         forward_schema_ok, forward_schema_detail = (
             _forward_strategy_version_schema_check(connection)
         )
@@ -6497,6 +11756,18 @@ def collect_governance_health(
                 True,
                 {"trade_date": authoritative_date, "source": date_source},
             )
+
+        qmt_event_ok, qmt_event_detail = (
+            _latest_qmt_announcement_batch_check(
+                engine,
+                authoritative_date,
+            )
+        )
+        add(
+            "latest_qmt_announcement_full_market_batch",
+            qmt_event_ok,
+            qmt_event_detail,
+        )
 
         governance_schema_ok = schema_ok and all(
             name in existing for name in GOVERNANCE_TABLES
@@ -6615,7 +11886,7 @@ def collect_governance_health(
             immutable_history_ok = False
             run_transition_plan_hashes = {}
             immutable_history_detail = {
-                "errors": [f"{type(exc).__name__}: {exc}"]
+                "errors": [_safe_exception_message(exc)]
             }
         add(
             "all_lifecycle_and_audit_payload_hashes_and_run_bindings",
@@ -6623,13 +11894,52 @@ def collect_governance_health(
             immutable_history_detail,
         )
         try:
+            lifecycle_projection_ok, lifecycle_projection_detail = (
+                _lifecycle_registry_projection_check(connection)
+            )
+        except Exception as exc:
+            lifecycle_projection_ok = False
+            lifecycle_projection_detail = {
+                "errors": [type(exc).__name__],
+            }
+        add(
+            "registry_lifecycle_projection_matches_immutable_events",
+            lifecycle_projection_ok,
+            lifecycle_projection_detail,
+        )
+        try:
+            (
+                industry_history_ok,
+                industry_history_detail,
+                industry_history_bindings,
+                industry_history_snapshots,
+            ) = _strategy_industry_history_contract_check(connection)
+        except Exception as exc:
+            industry_history_ok = False
+            industry_history_bindings = {}
+            industry_history_snapshots = {}
+            industry_history_detail = {
+                "errors": [_safe_exception_message(exc)]
+            }
+        add(
+            "strategy_industry_history_exact_qmt_full_replay",
+            industry_history_ok,
+            industry_history_detail,
+        )
+        try:
             snapshot_history_ok, snapshot_history_detail = (
-                _all_governance_snapshot_history_check(connection)
+                _all_governance_snapshot_history_check(
+                    connection,
+                    industry_history_bindings=industry_history_bindings,
+                    industry_history_trade_dates=set(
+                        industry_history_snapshots
+                    ),
+                )
             )
         except Exception as exc:
             snapshot_history_ok = False
             snapshot_history_detail = {
-                "errors": [f"{type(exc).__name__}: {exc}"]
+                "errors": [_safe_exception_message(exc)]
             }
         add(
             "all_governance_detail_snapshot_hashes_and_run_bindings",
@@ -6704,12 +12014,26 @@ def collect_governance_health(
         except Exception as exc:
             metric_audit_ok = False
             metric_audit_detail = {
-                "errors": [f"{type(exc).__name__}: {exc}"]
+                "errors": [_safe_exception_message(exc)]
             }
         add(
             "all_metric_evidence_submission_and_review_audits",
             metric_audit_ok,
             metric_audit_detail,
+        )
+        try:
+            global_evidence_ok, global_evidence_detail = (
+                _global_evidence_claim_uniqueness_check(connection)
+            )
+        except Exception as exc:
+            global_evidence_ok = False
+            global_evidence_detail = {
+                "errors": [_safe_exception_message(exc)]
+            }
+        add(
+            "metric_and_challenger_evidence_hashes_globally_unique",
+            global_evidence_ok,
+            global_evidence_detail,
         )
         global_allocation_authority = _one(
             connection,
@@ -6731,8 +12055,14 @@ def collect_governance_health(
             connection,
             "SELECT COUNT(*) AS canonical_count, "
             "SUM(CASE WHEN status IS NULL OR status<>'COMPLETED' "
-            "THEN 1 ELSE 0 END) AS invalid_status_count "
+            "THEN 1 ELSE 0 END) AS invalid_status_count, "
+            "SUM(CASE WHEN status='COMPLETED' AND "
+            "JSON_UNQUOTE(JSON_EXTRACT(summary_json, "
+            "'$.allocation_policy_version'))="
+            ":allocation_policy_v5 THEN 1 ELSE 0 END) "
+            "AS completed_v5_canonical_count "
             "FROM st_strategy_governance_run WHERE is_canonical=1",
+            {"allocation_policy_v5": ALLOCATION_POLICY_VERSION},
         )
         canonical_count = _integer(
             canonical_inventory.get("canonical_count")
@@ -6804,7 +12134,7 @@ def collect_governance_health(
             "market_state, router_policy_version, router_snapshot_hash, "
             "strategy_count, combination_count, observation_count, "
             "confirmation_count, tradable_count, allocation_count, "
-            "summary_json, "
+            "summary_json, result_json, result_hash, "
             "created_at, finished_at FROM st_strategy_governance_run "
             "WHERE status='COMPLETED' AND is_canonical=1 "
             "ORDER BY trade_date DESC, run_revision DESC, "
@@ -7004,6 +12334,23 @@ def collect_governance_health(
             run = exact_runs[0]
 
         run_uid = str(run.get("run_uid") or "")
+        run_result = _json_object(run.get("result_json")) or {}
+        (
+            candidate_industry_ok,
+            candidate_industry_detail,
+            candidate_industry_bindings,
+        ) = _candidate_industry_snapshot_contract(
+            run_result,
+            trade_date=validation_trade_date,
+            history_bindings=industry_history_bindings,
+            history_snapshots=industry_history_snapshots,
+        )
+        add(
+            "candidate_pool_industry_snapshot_binds_exact_qmt_history",
+            candidate_industry_ok
+            and validation_trade_date in industry_history_snapshots,
+            candidate_industry_detail,
+        )
         if historical_baseline:
             run_disposition = "required_run_missing_historical_baseline"
         else:
@@ -7160,6 +12507,25 @@ def collect_governance_health(
             run_audit_ok,
             run_audit_detail,
         )
+        try:
+            funding_manifest_ok, funding_manifest_detail = (
+                _funding_manifest_persistence_check(
+                    connection,
+                    run=run,
+                    result=run_result,
+                    trade_date=validation_trade_date,
+                )
+            )
+        except Exception as exc:
+            funding_manifest_ok = False
+            funding_manifest_detail = {
+                "errors": [{"reason": type(exc).__name__}],
+            }
+        add(
+            "funding_checkpoint_manifest_partition_and_persistence",
+            funding_manifest_ok,
+            funding_manifest_detail,
+        )
         add(
             "run_registry_counts",
             _integer(run.get("strategy_count")) == strategy_count
@@ -7192,7 +12558,7 @@ def collect_governance_health(
                         "entity_key": "market_router",
                         "reason": (
                             "router proof could not be parsed: "
-                            f"{type(exc).__name__}: {exc}"
+                            + _safe_exception_message(exc)
                         ),
                     }
                 ]
@@ -7427,6 +12793,7 @@ def collect_governance_health(
                 trade_date=validation_trade_date,
                 route_bindings=route_bindings,
                 summary=pool_summary,
+                industry_bindings=candidate_industry_bindings,
             )
         )
         add(
@@ -7486,8 +12853,14 @@ def collect_governance_health(
             allocation_rows,
             validation_trade_date,
             pool_snapshot_hash=pool_snapshot_hash,
+            pool_rows=pool_rows,
             automatic_transition_plan_hash=(
                 run_transition_plan_hashes.get(run_uid, "")
+            ),
+            industry_bindings=candidate_industry_bindings,
+            current_build_commit_sha=build_sha,
+            completed_v5_canonical_count=_integer(
+                canonical_inventory.get("completed_v5_canonical_count")
             ),
         )
         add(
@@ -7925,6 +13298,7 @@ def main() -> int:
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--expected-trade-date", default="")
     parser.add_argument("--allow-input-not-ready", action="store_true")
+    parser.add_argument("--expected-scheduler-pid", type=int, default=0)
     args = parser.parse_args()
     from tools.env_config import create_tool_engine, load_project_env
 
@@ -7943,22 +13317,65 @@ def main() -> int:
                 expected_build_sha=args.expected_build_sha,
                 expected_trade_date=args.expected_trade_date,
                 allow_input_not_ready=args.allow_input_not_ready,
+                expected_scheduler_pid=args.expected_scheduler_pid,
             )
+            if result.get("status") == "PASS":
+                check_names = [
+                    str(item.get("name") or "")
+                    for item in result.get("checks", [])
+                    if isinstance(item, dict)
+                ]
+                required_names = governance_health_required_check_names(
+                    str(result.get("run_disposition") or ""),
+                    require_scheduler_heartbeat=bool(
+                        args.expected_scheduler_pid
+                    ),
+                )
+                if (
+                    len(check_names) != len(set(check_names))
+                    or set(check_names) != set(required_names)
+                ):
+                    raise RuntimeError(
+                        "governance health producer check inventory differs"
+                    )
             result["adapter_registry"] = {
                 "registry_sealed": adapter_registry["registry_sealed"],
                 "registry_seal_hash": adapter_registry["registry_seal_hash"],
+                "registry_integrity_ready": adapter_registry[
+                    "registry_integrity_ready"
+                ],
+                "adapter_configured": adapter_registry[
+                    "adapter_configured"
+                ],
+                "candidate_execution_ready": adapter_registry[
+                    "candidate_execution_ready"
+                ],
+                "funding_pipeline_ready": adapter_registry[
+                    "funding_pipeline_ready"
+                ],
+                "governance_paper_execution_ready": adapter_registry[
+                    "governance_paper_execution_ready"
+                ],
                 "production_execution_ready": adapter_registry[
                     "production_execution_ready"
                 ],
-                "adapter_count": len(adapter_registry["adapters"]),
+                "real_order_submission_enabled": adapter_registry[
+                    "real_order_submission_enabled"
+                ],
+                "automatic_real_order_submission": adapter_registry[
+                    "automatic_real_order_submission"
+                ],
+                "adapter_count": adapter_registry["adapter_count"],
             }
         except Exception as exc:
             result = {
+                "contract_version": GOVERNANCE_HEALTH_CONTRACT_VERSION,
                 "status": "FAIL",
                 "run_disposition": "checker_error",
-                "error": f"{type(exc).__name__}: {exc}",
+                "error": _safe_exception_message(exc),
                 "automatic_real_order_submission": False,
             }
+        result["contract_version"] = GOVERNANCE_HEALTH_CONTRACT_VERSION
     finally:
         if engine is not None:
             engine.dispose()
@@ -7975,3 +13392,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+    FUNDING_CHECKPOINT_SCHEMA,
+    FUNDING_DAILY_FACT_SCHEMA,

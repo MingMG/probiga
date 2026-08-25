@@ -719,7 +719,9 @@ def run_dataset(
     env.setdefault("CURRENT_MIN_COVERAGE", "0.98")
     env.setdefault("QMT_CURRENT_MIN_COVERAGE", "0.98")
     env.setdefault("QMT_CURRENT_MAX_AGE_SECONDS", "180")
-    env.setdefault("QMT_KLINE_MIN_COVERAGE", "0.90")
+    # Canonical daily bars are funding evidence.  No percentage floor can
+    # waive an independent catalog/source/target set mismatch.
+    env["QMT_KLINE_MIN_COVERAGE"] = "1.0"
     env.setdefault("QMT_MINUTE_MIN_COVERAGE", "0.85")
     env.setdefault("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")
     # Twenty bars for 200 symbols stay comfortably bounded while reducing
@@ -848,7 +850,7 @@ def run_dataset(
     if (
         returncode == 0
         and dataset == "daily_kline"
-        and bigqmt_enabled
+        and source_policy == "bigqmt_primary"
     ):
         target_date = (
             date_str.strip()

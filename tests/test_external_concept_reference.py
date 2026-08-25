@@ -56,3 +56,24 @@ def test_external_concept_reference_fails_fast_without_touching_tables(monkeypat
         assert "preserving previous snapshots" in str(exc)
     else:
         raise AssertionError("systemic concept outage must stop before a destructive replace")
+
+
+def test_external_concept_reference_rejects_one_missing_member_shard(monkeypatch):
+    class PartiallyEmptyInfo(_Info):
+        @staticmethod
+        def concept_constituent_east(*, concept_code: str):
+            if concept_code == "BK002":
+                return pd.DataFrame()
+            return pd.DataFrame([{"stock_code": "000001"}])
+
+    monkeypatch.setattr(sync_stock_info, "load_info", lambda: PartiallyEmptyInfo())
+    monkeypatch.setattr(sync_stock_info, "_sleep", lambda: None)
+
+    try:
+        sync_stock_info._fetch_external_concept_reference()
+    except sync_stock_info.ExternalConceptSourceUnavailable as exc:
+        assert "snapshot is incomplete" in str(exc)
+        assert "successful=1" in str(exc)
+        assert "preserving previous snapshots" in str(exc)
+    else:
+        raise AssertionError("one empty concept shard must block the related full snapshot")

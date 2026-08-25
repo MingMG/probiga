@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """Ensure reliability-focused scheduled tasks exist.
 
-This script is intentionally non-destructive: it only adds missing scheduler
-columns and upserts the quality-gate tasks used to catch stale data before the
-dashboard or paper-trading workflows trust it.
+This script is intentionally non-destructive: it validates the privileged-
+installed scheduler schema and only upserts quality-gate task rows used to
+catch stale data before dashboard or paper-trading workflows trust it.
 """
 from __future__ import annotations
 
@@ -22,6 +22,16 @@ if str(ROOT) not in sys.path:
 
 from server.common.config import get_mysql_url
 from server.common.engine_factory import create_pooled_engine
+from server.common.scheduler_tasks import (
+    ensure_scheduler_columns as validate_scheduler_columns,
+)
+from tools.qmt_announcement_task_contract import TASK as QMT_ANNOUNCEMENT_TASK
+from tools.qmt_host_ownership_contract import (
+    QMT_CATALOG_CAPABILITY_TASK,
+    QMT_INTRADAY_REALTIME_TASK,
+    QMT_MEMBERSHIP_SNAPSHOT_TASK,
+)
+from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 
 
 SCHEDULER_COLUMNS = {
@@ -78,32 +88,8 @@ REVIEW_DELIVERY_RUNTIME_COLUMNS = frozenset(
     }
 )
 TASKS = [
-    {
-        "task_name": "Guojin QMT API catalog capability refresh",
-        "task_type": "qmt_catalog_capability_refresh",
-        "group_name": "Guojin QMT",
-        "script_path": "tools/setup_guojin_qmt_catalog.py",
-        "script_args": "",
-        "cron_time": "01:10",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 86,
-        "date_param": "",
-        "description": "Refresh official QMT API registry and capability ledger every night; unverified sample probes are recorded explicitly.",
-    },
-    {
-        "task_name": "Guojin QMT local history gap repair execute",
-        "task_type": "qmt_local_gap_repair_execute",
-        "group_name": "Guojin QMT",
-        "script_path": "tools/backfill_guojin_qmt_local_history.py",
-        "script_args": "from-gaps --gap-limit 2 --apply --json",
-        "cron_time": "07:05",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 90,
-        "date_param": "",
-        "description": "After the 00:00-07:00 bulk local-history window, repair a small number of registered QMT history gaps into the local history DB and update sys_data_gap status.",
-    },
+    dict(QMT_ANNOUNCEMENT_TASK),
+    dict(QMT_CATALOG_CAPABILITY_TASK),
     {
         "task_name": "盘中实时行情同步",
         "task_type": "intraday_realtime",
@@ -117,19 +103,7 @@ TASKS = [
         "date_param": "",
         "description": "交易时段每分钟刷新 sm_stock_current，并归档到 sm_rt_quote_snapshot；覆盖率不足时失败。",
     },
-    {
-        "task_name": "国金QMT盘中实时行情同步",
-        "task_type": "qmt_intraday_realtime",
-        "group_name": "国金QMT",
-        "script_path": "tools/sync_qmt_realtime.py",
-        "script_args": "--min-coverage 0.60 --no-archive-snapshot --json",
-        "cron_time": "09:25",
-        "interval_minutes": 1,
-        "enabled": 1,
-        "sort_order": 71,
-        "date_param": "",
-        "description": "国金QMT独立实时行情通道；写入 sm_stock_current 使用安全 Upsert，不清空正式表。",
-    },
+    dict(QMT_INTRADAY_REALTIME_TASK),
     {
         "task_name": "盘中分钟K线同步",
         "task_type": "intraday_minute_kline",
@@ -187,13 +161,13 @@ TASKS = [
         "task_type": "sim_trade_signal_prepare",
         "group_name": "盘中交易",
         "script_path": "biz/analysis/sync_sim_trade.py",
-        "script_args": "--prepare-signals --ensure-recommendations --json",
+        "script_args": "--prepare-signals --json",
         "cron_time": "09:20",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 77,
         "date_param": "",
-        "description": "开盘前将上一交易日AI推荐转换为今日模拟交易信号池；若上一交易日推荐缺失则先严格补生成，日期不匹配则禁止自动新开仓。",
+        "description": "开盘前只读校验上一交易日AI推荐并转换为今日模拟交易信号池；推荐缺失或日期不匹配时失败关闭。",
     },
     {
         "task_name": "09:20盘前候选竞价确认",
@@ -260,62 +234,7 @@ TASKS = [
         "date_param": "",
         "description": "盘前只读体检；有 WARN/FAIL 时任务失败，提醒不要信任过期推荐。",
     },
-    {
-        "task_name": "国金QMT凌晨缺口扫描",
-        "task_type": "qmt_nightly_reconciliation",
-        "group_name": "国金QMT",
-        "script_path": "tools/nightly_guojin_qmt_reconciliation.py",
-        "script_args": "--scan-days 20 --json",
-        "cron_time": "01:30",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 87,
-        "date_param": "",
-        "description": "每天凌晨扫描国金QMT待写队列、最近20个交易日覆盖率和质量规则；历史缺口登记到 sys_data_gap 后续补。",
-    },
-    {
-        "task_name": "国金QMT本地历史补数(2026)",
-        "task_type": "qmt_local_history_2026",
-        "group_name": "国金QMT",
-        "script_path": "tools/run_guojin_qmt_full_market_history.py",
-        "script_args": (
-            "--start-date 2026-01-01 --mode all --daily-batch-size 120 "
-            "--minute-batch-size 80 --sleep-seconds 0.2 --stop-at 07:00 "
-            "--log-path data/logs/qmt_full_market_history_2026.jsonl --json"
-        ),
-        "cron_time": "00:00",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 88,
-        "date_param": "",
-        "description": "每天00:00启动国金QMT本地历史补数，只补2026年至最新交易日；07:00自然停止，次日按本地覆盖率续跑。",
-    },
-    {
-        "task_name": "国金QMT基础目录增量同步",
-        "task_type": "qmt_reference_incremental",
-        "group_name": "国金QMT",
-        "script_path": "tools/sync_guojin_qmt_reference_data.py",
-        "script_args": "--skip-refresh --json",
-        "cron_time": "03:20",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 89,
-        "date_param": "",
-        "description": "每天凌晨同步国金QMT板块列表、板块成分、股票/指数基础信息、指数权重；通过安全Upsert只更新新增或变化数据，交易日历不处理。",
-    },
-    {
-        "task_name": "国金QMT历史缺口修复队列",
-        "task_type": "qmt_gap_repair_plan",
-        "group_name": "国金QMT",
-        "script_path": "tools/repair_guojin_qmt_gaps.py",
-        "script_args": "--limit 50 --json",
-        "cron_time": "02:00",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 89,
-        "date_param": "",
-        "description": "每天凌晨列出待修复历史缺口；当前仅计划不自动拉取，避免在QMT历史下载未完全验收前误写。",
-    },
+    *(dict(task) for task in QMT_OPERATIONS_TASKS),
     {
         "task_name": "盘后快速分析推荐",
         "task_type": "analysis_fast",
@@ -334,13 +253,13 @@ TASKS = [
         "task_type": "analysis_morning_strict",
         "group_name": "AI推荐",
         "script_path": "biz/analysis/sync_analysis_fast.py",
-        "script_args": "--strict-prev-trade-day --top-n 80 --min-score 62 --min-kline-coverage 0.80 --auto-repair-missing-kline",
+        "script_args": "--strict-prev-trade-day --top-n 80 --min-score 62 --min-kline-coverage 0.80",
         "cron_time": "08:30",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 91,
         "date_param": "",
-        "description": "每天08:30按执行日上一交易日严格生成AI推荐；上一交易日K线不足时先用国金QMT补目标日，仍不足则失败，不回退更早日期。",
+        "description": "每天08:30按执行日上一交易日严格生成AI推荐；数据不足时失败关闭，不在Linux任务内修复QMT历史，也不回退更早日期。",
     },
     {
         "task_name": "AI推荐09:08盘前主线预判",
@@ -381,19 +300,7 @@ TASKS = [
         "date_param": "",
         "description": "Linux-owned event-driven market, sector, key-stock, style rotation, and broad-index flow alert evaluator.",
     },
-    {
-        "task_name": "QMT industry membership snapshot",
-        "task_type": "qmt_membership_snapshot",
-        "group_name": "Guojin QMT",
-        "script_path": "tools/sync_bigqmt_reference.py",
-        "script_args": "--apply --force-reference-refresh --json",
-        "cron_time": "15:12",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 94,
-        "date_param": "",
-        "description": "Windows QMT bridge-owned daily reference and immutable industry membership snapshot required by the quantitative review gate.",
-    },
+    dict(QMT_MEMBERSHIP_SNAPSHOT_TASK),
     {
         "task_name": "A股早报推送",
         "task_type": "news_daily",
@@ -456,14 +363,11 @@ def _table_columns(engine: Engine, table_name: str) -> set[str]:
 
 
 def ensure_scheduler_columns(engine: Engine) -> None:
-    columns = _table_columns(engine, "st_scheduled_tasks")
-    if not columns:
-        raise RuntimeError("st_scheduled_tasks does not exist")
-
-    with engine.begin() as conn:
-        for column, ddl in SCHEDULER_COLUMNS.items():
-            if column not in columns:
-                conn.execute(text(f"ALTER TABLE st_scheduled_tasks ADD COLUMN `{column}` {ddl}"))
+    validate_scheduler_columns(
+        engine,
+        table_name="st_scheduled_tasks",
+        column_definitions=SCHEDULER_COLUMNS,
+    )
 
 
 def _task_payload(task: dict[str, Any], columns: set[str]) -> dict[str, Any]:

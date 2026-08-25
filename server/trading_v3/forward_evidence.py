@@ -16,6 +16,7 @@ EXIT_ALLOCATION_PROTOCOL = "PAPER_FIFO_EXIT_ALLOCATION_V1"
 INTENT_EPISODE_PROTOCOL = "PAPER_EXECUTED_INTENT_CASH_EPISODE_V1"
 ATTRIBUTION_VERSION = "V3_PRIMARY_FORECAST_SNAPSHOT_V1"
 EXECUTED_INTENT_REASONS = frozenset({
+    "DYNAMIC_SHADOW_BOOTSTRAP",
     "V3_PAPER_DISCOVERY",
     "V3_VALIDATED_POSITIVE",
 })
@@ -124,10 +125,12 @@ def _ownership_hash(
     forecast_id: str,
     stock_code: str,
     strategy_key: str,
+    strategy_version: str,
 ) -> str:
     return hashlib.sha256(
         (
-            f"{run_uid}|{forecast_id}|{stock_code}|{strategy_key}"
+            f"{run_uid}|{forecast_id}|{stock_code}|{strategy_key}|"
+            f"{strategy_version}"
         ).encode("utf-8")
     ).hexdigest()
 
@@ -138,6 +141,62 @@ def _intent_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _runtime_governance_strategy_version(
+    payload: Mapping[str, Any],
+    primary_strategy_key: str,
+) -> tuple[str, str]:
+    bootstrap = payload.get("dynamic_shadow_bootstrap")
+    if isinstance(bootstrap, Mapping):
+        observed = dict(bootstrap)
+        authorization_hash = str(observed.pop("authorization_hash", ""))
+        expected_hash = hashlib.sha256(json.dumps(
+            observed,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        version = str(observed.get("strategy_version") or "")
+        if (
+            observed.get("schema")
+            != "probiga.dynamic-shadow-bootstrap-authorization.v1"
+            or authorization_hash != expected_hash
+            or str(observed.get("strategy_key") or "")
+            != primary_strategy_key
+            or not version
+            or observed.get("real_order_authority") is not False
+        ):
+            return "", "DYNAMIC_SHADOW_BOOTSTRAP_AUTHORIZATION_INVALID"
+        return version, ""
+    receipt = payload.get("strategy_governance")
+    if not isinstance(receipt, Mapping):
+        return "", ""
+    if str(receipt.get("strategy_source_kind") or "") != "runtime_registry":
+        return "", ""
+    observed = dict(receipt)
+    receipt_hash = str(observed.pop("receipt_hash", ""))
+    expected_hash = hashlib.sha256(json.dumps(
+        observed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    version = str(observed.get("strategy_version") or "")
+    if (
+        observed.get("schema")
+        != "probiga.governance-paper-buy-receipt.v1"
+        or receipt_hash != expected_hash
+        or str(observed.get("strategy_key") or "") != primary_strategy_key
+        or not version
+        or observed.get("real_order_authority") is not False
+    ):
+        return "", "RUNTIME_GOVERNANCE_RECEIPT_INVALID"
+    return version, ""
 
 
 def _strategy_keys(row: Mapping[str, Any]) -> tuple[str, ...]:
@@ -200,13 +259,24 @@ def _sample_owner(
         return None, "PRIMARY_STRATEGY_KEY_MISSING"
     if primary_strategy_key not in supporting:
         return None, "PRIMARY_NOT_IN_SUPPORTING_SET"
-    expected_strategy_version = primary_strategy_version(
-        relational_model_version,
-        primary_strategy_key,
+    runtime_strategy_version, governance_rejection = (
+        _runtime_governance_strategy_version(payload, primary_strategy_key)
+    )
+    if governance_rejection:
+        return None, governance_rejection
+    expected_strategy_version = (
+        runtime_strategy_version
+        or primary_strategy_version(
+            relational_model_version,
+            primary_strategy_key,
+        )
     )
     if (
-        frozen_strategy_version
-        and frozen_strategy_version != expected_strategy_version
+        (runtime_strategy_version and not frozen_strategy_version)
+        or (
+            frozen_strategy_version
+            and frozen_strategy_version != expected_strategy_version
+        )
     ):
         return None, "PRIMARY_STRATEGY_VERSION_MISMATCH"
     expected_forecast_id = str(forecast_ids.get(
@@ -226,6 +296,7 @@ def _sample_owner(
         primary_forecast_id,
         stock_code,
         primary_strategy_key,
+        expected_strategy_version,
     )
     if str(payload.get("ownership_hash") or "") != expected_hash:
         return None, "OWNERSHIP_HASH_MISMATCH"
@@ -260,6 +331,7 @@ def reconstruct_executed_forward_records(
     forecast_ids: Mapping[tuple[str, str, str], str] | None = None,
     run_model_versions: Mapping[str, str] | None = None,
     diagnostics: dict[str, int] | None = None,
+    diagnostic_fill_ids: set[str] | None = None,
     allocation_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Rebuild actual V3 paper round trips from the append-only fill ledger.
@@ -271,6 +343,9 @@ def reconstruct_executed_forward_records(
 
     forecast_ids = forecast_ids or {}
     diagnostics = diagnostics if diagnostics is not None else {}
+    diagnostic_fill_ids = (
+        diagnostic_fill_ids if diagnostic_fill_ids is not None else set()
+    )
     fifo: dict[str, deque[dict[str, Any]]] = defaultdict(deque)
     executed: dict[str, dict[str, Any]] = {}
     all_lots: list[dict[str, Any]] = []
@@ -295,6 +370,7 @@ def reconstruct_executed_forward_records(
             )
             if rejection and rejection != "NOT_V3_ENTRY":
                 diagnostics[rejection] = diagnostics.get(rejection, 0) + 1
+                diagnostic_fill_ids.add(str(row.get("fill_id") or ""))
             lot = {
                 "entry_fill_id": str(row.get("fill_id") or ""),
                 "entry_order_id": str(row.get("order_id") or ""),
@@ -338,6 +414,7 @@ def reconstruct_executed_forward_records(
             diagnostics["SELL_FIFO_COVERAGE_GAP"] = (
                 diagnostics.get("SELL_FIFO_COVERAGE_GAP", 0) + 1
             )
+            diagnostic_fill_ids.add(str(row.get("fill_id") or ""))
             continue
         for lot, consumed in fragments:
             lot["remaining_quantity"] -= consumed
@@ -631,6 +708,24 @@ def _assert_persisted_exit_allocations(
     return len(observed)
 
 
+def _require_valid_dynamic_shadow_binding(
+    binding: Mapping[str, Any],
+) -> None:
+    """Fail the scheduled writer when the immutable shadow chain is invalid.
+
+    The forward-evidence rows are idempotent, so surfacing this as a hard task
+    failure is safe to retry and prevents an outer ``status=ok`` from masking a
+    broken candidate-to-fill evidence chain.
+    """
+
+    status = str(binding.get("status") or "")
+    if status != "OK":
+        raise RuntimeError(
+            "dynamic shadow evidence binding failed closed: "
+            f"status={status or 'MISSING'}"
+        )
+
+
 def sync_executed_forward_evidence(
     primary_engine: Engine,
     kline_engine: Engine,
@@ -647,6 +742,7 @@ def sync_executed_forward_evidence(
                        f.side, f.quantity, f.price, f.gross_amount,
                        f.fee_amount, f.filled_at,
                        i.intent_id, i.decision_run_uid,
+                       i.strategy_version AS intent_strategy_version,
                        i.reason_code AS intent_reason_code,
                        i.evidence_json
                 FROM st_fill_v2 f
@@ -665,6 +761,8 @@ def sync_executed_forward_evidence(
     } - {""})
     forecast_ids: dict[tuple[str, str, str], str] = {}
     run_model_versions: dict[str, str] = {}
+    attribution_rejections: dict[str, int] = {}
+    attribution_rejected_fill_ids: set[str] = set()
     if run_uids:
         statement = text(
             """
@@ -688,13 +786,72 @@ def sync_executed_forward_evidence(
                 run_model_versions[str(row["run_uid"])] = str(
                     row["run_model_version"]
                 )
-    attribution_rejections: dict[str, int] = {}
+    bootstrap_rows = [
+        row for row in fills
+        if str(row.get("intent_reason_code") or "")
+        == "DYNAMIC_SHADOW_BOOTSTRAP"
+        and str(row.get("side") or "").upper() == "BUY"
+    ]
+    if bootstrap_rows:
+        from server.engine.dynamic_shadow_ledger import (
+            verify_dynamic_shadow_bootstrap_authorization,
+        )
+
+        with primary_engine.connect() as connection:
+            for row in bootstrap_rows:
+                payload = _intent_evidence(row)
+                authorization = payload.get("dynamic_shadow_bootstrap")
+                try:
+                    verified = verify_dynamic_shadow_bootstrap_authorization(
+                        connection,
+                        authorization,
+                        require_current_shadow=False,
+                    )
+                    if (
+                        str(row.get("decision_run_uid") or "")
+                        != verified["candidate_run_uid"]
+                        or str(row.get("intent_strategy_version") or "")
+                        != verified["strategy_version"]
+                        or str(row.get("stock_code") or "")
+                        != verified["stock_code"]
+                    ):
+                        raise ValueError("bootstrap intent identity mismatch")
+                except Exception:
+                    key = "DYNAMIC_SHADOW_BOOTSTRAP_AUTHORIZATION_INVALID"
+                    attribution_rejections[key] = (
+                        attribution_rejections.get(key, 0) + 1
+                    )
+                    attribution_rejected_fill_ids.add(
+                        str(row.get("fill_id") or "")
+                    )
+                    continue
+                owner_key = (
+                    verified["candidate_run_uid"],
+                    verified["stock_code"],
+                    verified["strategy_key"],
+                )
+                existing = forecast_ids.get(owner_key)
+                if existing and existing != verified["shadow_forecast_id"]:
+                    attribution_rejections[
+                        "DYNAMIC_SHADOW_BOOTSTRAP_OWNER_AMBIGUOUS"
+                    ] = attribution_rejections.get(
+                        "DYNAMIC_SHADOW_BOOTSTRAP_OWNER_AMBIGUOUS", 0,
+                    ) + 1
+                    attribution_rejected_fill_ids.add(
+                        str(row.get("fill_id") or "")
+                    )
+                    continue
+                forecast_ids[owner_key] = verified["shadow_forecast_id"]
+                run_model_versions[verified["candidate_run_uid"]] = (
+                    verified["strategy_version"]
+                )
     exit_allocations: list[dict[str, Any]] = []
     records = reconstruct_executed_forward_records(
         fills,
         forecast_ids=forecast_ids,
         run_model_versions=run_model_versions,
         diagnostics=attribution_rejections,
+        diagnostic_fill_ids=attribution_rejected_fill_ids,
         allocation_rows=exit_allocations,
     )
     if attribution_rejections.get("SELL_FIFO_COVERAGE_GAP", 0):
@@ -803,6 +960,17 @@ def sync_executed_forward_evidence(
             exit_allocations,
             account_id=account_id,
         )
+    # The scheduled evidence producer may only bind facts that the existing
+    # V2/V3 ledgers have already persisted and matured.  The lazy import avoids
+    # a module cycle; this call never creates an intent, order, or fill.
+    from server.engine.dynamic_shadow_ledger import (
+        bind_pending_dynamic_shadow_trials,
+    )
+
+    dynamic_shadow_binding = bind_pending_dynamic_shadow_trials(
+        primary_engine,
+    )
+    _require_valid_dynamic_shadow_binding(dynamic_shadow_binding)
     return {
         "status": "ok",
         "protocol_version": EXECUTED_FORWARD_PROTOCOL,
@@ -811,8 +979,8 @@ def sync_executed_forward_evidence(
         "evidence_count": len(records),
         "exit_allocation_protocol": EXIT_ALLOCATION_PROTOCOL,
         "exit_allocation_count": allocation_count,
-        "unattributed_v3_buy_fill_count": sum(
-            attribution_rejections.values()
+        "unattributed_v3_buy_fill_count": len(
+            attribution_rejected_fill_ids
         ),
         "attribution_rejection_counts": dict(sorted(
             attribution_rejections.items()
@@ -827,4 +995,5 @@ def sync_executed_forward_evidence(
         "matured_count": sum(
             item["evidence_status"] == "MATURED" for item in records
         ),
+        "dynamic_shadow_binding": dynamic_shadow_binding,
     }

@@ -132,18 +132,11 @@ def _is_bad_ths_result(res):
 
 
 def sync_concept_code_ths(engine, info):
-    logger.info("===== 同步同花顺概念列表 (si_concept_code_ths) =====")
-    ts = _now()
-    df = retry_remote(info.all_concept_code_ths)
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        logger.error("获取同花顺概念列表失败或为空！")
-        return pd.DataFrame()
-    df = _clean_object_df(df)
-    df["etl_sync_at"] = ts
-    replace_table_transactionally(engine, df, "si_concept_code_ths")
-    logger.info("概念列表: %d 条", len(df))
-    _sleep()
-    return df
+    """Use the guarded catalog publisher shared with the production collector."""
+
+    from biz.stock_info.sync_stock_info import sync_concept_code_ths as guarded_sync
+
+    return guarded_sync(engine, info)
 
 
 def sync_concept_constituent_ths(engine, info, df_ths):
@@ -207,7 +200,13 @@ def main():
     if _has_fresh_constituents(engine):
         return
 
-    df_ths = sync_concept_code_ths(engine, info)
+    from biz.stock_info.sync_stock_info import PartialSnapshotPublished
+
+    try:
+        df_ths = sync_concept_code_ths(engine, info)
+    except PartialSnapshotPublished as exc:
+        logger.error("%s", exc)
+        return exc.exit_code
     sync_concept_constituent_ths(engine, info, df_ths)
 
     with engine.connect() as conn:
@@ -215,7 +214,8 @@ def main():
         cnt2 = conn.execute(text("SELECT COUNT(*) FROM si_concept_constituent_ths")).scalar()
     logger.info("最终: si_concept_code_ths=%d, si_concept_constituent_ths=%d", cnt1, cnt2)
     logger.info("Done!")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

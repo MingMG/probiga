@@ -6,10 +6,13 @@ from typing import Any
 
 def _number(mapping: dict[str, Any], key: str) -> float | None:
     value = mapping.get(key)
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     number = float(value)
-    return number if math.isfinite(number) or math.isinf(number) else None
+    # Infinity is not an observed metric.  In particular, an all-winning
+    # miniature sample must not bypass profit-factor/payoff gates by exposing
+    # ``inf``.  Every production gate consumes finite measurements only.
+    return number if math.isfinite(number) else None
 
 
 def model_gate_failures(
@@ -22,6 +25,16 @@ def model_gate_failures(
 
     gate = dict(config.get("profit_gate") or {})
     failures: list[str] = []
+    execution_revalidation_required = bool(
+        (config.get("decision_intelligence") or {}).get(
+            "execution_revalidation_required", False
+        )
+    )
+    if execution_revalidation_required:
+        if validation.get("execution_evidence_valid") is not True:
+            failures.append("OOS_EXECUTION_EVIDENCE_INVALID")
+        if portfolio.get("execution_evidence_valid") is not True:
+            failures.append("PORTFOLIO_EXECUTION_EVIDENCE_INVALID")
 
     sample_count = _number(validation, "sample_count")
     if sample_count is None:

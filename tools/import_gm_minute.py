@@ -18,7 +18,6 @@ import argparse
 import csv
 import logging
 import os
-import re
 import sys
 import tempfile
 import time
@@ -37,8 +36,12 @@ logging.basicConfig(
 logger = logging.getLogger("import_gm_minute")
 
 _BEIJING_TZ = timezone(timedelta(hours=8))
-DDL_PATH = ROOT / "biz" / "stock_market" / "sql" / "04_sm_stock_minute_gm.sql"
 _AVRO_MAGIC = b"Obj\x01"
+_REQUIRED_COLUMNS = frozenset({
+    "stock_code", "trade_time", "trade_date", "open", "high", "low",
+    "close", "volume", "amount", "open_interest", "pre_close",
+    "etl_sync_at",
+})
 
 _INSERT_SQL = (
     "INSERT IGNORE INTO `sm_stock_minute_gm` "
@@ -72,13 +75,30 @@ def _now() -> datetime:
     return datetime.now()
 
 
-def _run_ddl(conn) -> None:
-    sql = DDL_PATH.read_text(encoding="utf-8")
-    lines = [l for l in sql.splitlines() if not l.strip().startswith("--")]
-    parts = [p.strip() for p in re.split(r";\s*\n", "\n".join(lines)) if p.strip()]
-    for stmt in parts:
-        conn.execute(stmt)
-    logger.info("DDL 执行完成：%s", DDL_PATH.name)
+def _validate_runtime_table(cursor) -> None:
+    """Fail closed when the fenced migration has not prepared the target."""
+
+    cursor.execute(
+        "SELECT engine FROM information_schema.tables "
+        "WHERE table_schema=DATABASE() AND table_name=%s",
+        ("sm_stock_minute_gm",),
+    )
+    table = cursor.fetchone()
+    if table is None or str(table[0] or "").lower() != "innodb":
+        raise RuntimeError(
+            "sm_stock_minute_gm is not prepared as an InnoDB runtime table"
+        )
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema=DATABASE() AND table_name=%s",
+        ("sm_stock_minute_gm",),
+    )
+    columns = {str(row[0]) for row in cursor.fetchall()}
+    missing = sorted(_REQUIRED_COLUMNS - columns)
+    if missing:
+        raise RuntimeError(
+            f"sm_stock_minute_gm runtime schema is missing columns: {missing}"
+        )
 
 
 def _scan_container_offsets(path: str) -> list[int]:
@@ -163,10 +183,10 @@ def import_gm_minute(
     )
     cur = conn.cursor()
 
-    # DDL
-    if not skip_ddl:
-        _run_ddl(cur)
-        conn.commit()
+    # Persistent DDL is release-owned.  ``skip_ddl`` remains only for CLI/API
+    # compatibility; every import now performs the same read-only guard.
+    _ = skip_ddl
+    _validate_runtime_table(cur)
 
     # 优化写入速度
     cur.execute("SET FOREIGN_KEY_CHECKS=0")
@@ -267,7 +287,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="导入掘金量化 Avro 分钟线到 MySQL")
     parser.add_argument("--data-path", required=True, help="storage.dat 文件路径")
     parser.add_argument("--batch-size", type=int, default=50000, help="每批写入行数（默认 50000）")
-    parser.add_argument("--skip-ddl", action="store_true", help="跳过建表 DDL")
+    parser.add_argument(
+        "--skip-ddl",
+        action="store_true",
+        help="兼容旧命令；运行期始终只校验表结构，不再执行持久 DDL",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只统计不写入")
     args = parser.parse_args()
 

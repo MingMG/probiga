@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shlex
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
@@ -65,49 +67,60 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "qmt_announcement_pit":
+        candidates: list[Mapping[str, Any]] = []
+        for line in str(output or "").splitlines():
+            candidate = line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("schema")
+                == "probiga.qmt-announcement-task-result.v1"
+            ):
+                candidates.append(payload)
+        if len(candidates) != 1 or return_code is None:
+            return "failed"
+        try:
+            from server.common.qmt_announcement_pit import validate_task_result
+
+            disposition = validate_task_result(candidates[0], int(return_code))
+        except (ImportError, TypeError, ValueError, OverflowError):
+            return "failed"
+        return "success" if disposition == "complete" else "blocked"
     if task_type == "strategy_governance_daily":
+        # Use the exact same completed/not-due/blocked contract as the deploy
+        # validator.  A zero process exit alone is not evidence of a safe
+        # governance close: weights, dates and every nested real-order flag
+        # still have to pass the canonical validator.
         nonempty_lines = [
             line.strip()
             for line in str(output or "").splitlines()
             if line.strip()
         ]
         if len(nonempty_lines) != 1:
-            return "failed" if return_code == 2 else None
+            return "failed"
         try:
             payload = json.loads(nonempty_lines[0])
         except (TypeError, ValueError, json.JSONDecodeError):
-            return "failed" if return_code == 2 else None
-        expected_keys = {
-            "status", "reason", "target_trade_date", "input_trade_date",
-            "automatic_real_order_submission",
-        }
-        if not isinstance(payload, Mapping) or set(payload) != expected_keys:
-            return "failed" if return_code == 2 else None
-        if str(payload.get("status") or "").strip().lower() != "blocked":
-            return "failed" if return_code == 2 else None
-        reason = str(payload.get("reason") or "").strip()
-        target_trade_date = str(payload.get("target_trade_date") or "").strip()
-        input_trade_date = str(payload.get("input_trade_date") or "").strip()
-        dates_valid = True
-        for value in (target_trade_date, input_trade_date):
-            if not value:
-                continue
-            try:
-                dates_valid = (
-                    dates_valid
-                    and date.fromisoformat(value).isoformat() == value
-                )
-            except ValueError:
-                dates_valid = False
-        contract_valid = bool(
-            reason
-            and dates_valid
-            and (target_trade_date or not input_trade_date)
-            and payload.get("automatic_real_order_submission") is False
-        )
-        if return_code != 2:
-            return "failed" if contract_valid else None
-        return "blocked" if contract_valid else "failed"
+            return "failed"
+        if return_code is None:
+            return "failed"
+        try:
+            from tools.run_strategy_governance_daily import validate_cli_result
+
+            disposition = validate_cli_result(payload, int(return_code))
+        except (ImportError, TypeError, ValueError, OverflowError):
+            return "failed"
+        if disposition in {"completed", "not_due"}:
+            return "success"
+        if disposition == "not_ready":
+            return "blocked"
+        return "failed"
     if task_type not in {
         "trading_v2_level1_validation",
         "concept_constituent_east",
@@ -443,6 +456,77 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
 }
 
 
+def _analysis_web_manual_profile_is_exact(task: Mapping[str, Any]) -> bool:
+    """Recognize the one fixed no-theme Web recommendation invocation."""
+    if str(task.get("task_type") or "").strip() != "analysis_premarket_external":
+        return False
+    if str(task.get("_trigger_source") or "").strip() != "manual":
+        return False
+    if str(task.get("_validation_profile") or "").strip() != "analysis_web_manual_v1":
+        return False
+    try:
+        tokens = shlex.split(str(task.get("script_args") or ""), posix=True)
+    except ValueError:
+        return False
+    value_flags = {
+        "--date",
+        "--top-n",
+        "--min-score",
+        "--execution-time",
+        "--min-kline-coverage",
+        "--run-uid",
+    }
+    bool_flags = {
+        "--strict-prev-trade-day",
+        "--json",
+    }
+    values: dict[str, str] = {}
+    booleans: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        flag = tokens[index]
+        if flag in value_flags:
+            if flag in values or index + 1 >= len(tokens):
+                return False
+            value = tokens[index + 1]
+            if value.startswith("--"):
+                return False
+            values[flag] = value
+            index += 2
+            continue
+        if flag in bool_flags:
+            if flag in booleans:
+                return False
+            booleans.add(flag)
+            index += 1
+            continue
+        return False
+    if set(values) != value_flags:
+        return False
+    if not {"--strict-prev-trade-day", "--json"}.issubset(booleans):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{32}", values["--run-uid"]):
+        return False
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", values["--date"]):
+        return False
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+        values["--execution-time"],
+    ):
+        return False
+    try:
+        top_n = int(values["--top-n"])
+        min_score = float(values["--min-score"])
+        min_coverage = float(values["--min-kline-coverage"])
+    except (TypeError, ValueError):
+        return False
+    return (
+        20 <= top_n <= 200
+        and 0.0 <= min_score <= 100.0
+        and 0.0 <= min_coverage <= 1.0
+    )
+
+
 def validate_scheduler_task_result(
     task: Mapping[str, Any],
     *,
@@ -452,6 +536,8 @@ def validate_scheduler_task_result(
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
+    if _analysis_web_manual_profile_is_exact(task):
+        requirements = TASK_OUTPUT_REQUIREMENTS["analysis_morning_strict"]
     if not requirements:
         return SchedulerValidationResult(checked=False, ok=True, message="no data validation configured")
 

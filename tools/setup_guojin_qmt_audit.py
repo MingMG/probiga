@@ -11,14 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from integrations.qmt.audit import ensure_audit_tables
+from integrations.qmt.audit import privileged_migrate_audit_schema
 from server.common.config import get_mysql_url
 
 
 def main() -> int:
     engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
-    table_count = ensure_audit_tables(engine)
-    print(json.dumps({"status": "ok", "tables_ensured": table_count}, ensure_ascii=False))
+    result = privileged_migrate_audit_schema(engine)
+    print(json.dumps({"status": "ok", **result}, ensure_ascii=False))
     return 0
 
 

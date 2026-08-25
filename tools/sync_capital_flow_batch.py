@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -118,12 +120,13 @@ def main():
     df["trade_date"] = trade_date
     print(f"获取到 {len(df)} 只股票的资金流数据")
 
-    # 删除当日旧数据
-    with eng.begin() as conn:
-        conn.execute(text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d"), {"d": trade_date})
-
-    # 写入
-    df.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=1000)
+    replace_table_rows_exact_keys(
+        df,
+        "sm_stock_capital_flow_daily",
+        eng,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+    )
     print(f"已写入 {len(df)} 行到 sm_stock_capital_flow_daily")
 
     # 验证

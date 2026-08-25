@@ -16,7 +16,11 @@ from typing import Any, Iterable
 
 ATTESTATION_PROTOCOL_VERSION = "QMT_DAILY_UNADJUSTED_PRECLOSE_V2"
 UNIVERSE_MANIFEST_SCHEMA = "probiga.qmt-daily-universe.v1"
+# The top-level schema remains v1 for compatibility with deployed SQL readers;
+# a catalog-bound run is distinguished by its exact, larger daily-entry shape.
+BOUND_UNIVERSE_MANIFEST_SCHEMA = UNIVERSE_MANIFEST_SCHEMA
 EXPECTED_STOCK_SET_SCHEMA = "probiga.qmt-expected-stock-set.v1"
+CATALOG_BINDING_SCHEMA = "probiga.qmt-daily-catalog-binding.v1"
 QMT_ATTESTATION_COLLATION = "utf8mb4_unicode_ci"
 QMT_ATTESTATION_LEGACY_COLLATION = "utf8mb4_general_ci"
 QMT_ATTESTATION_TRIGGER_DEFINER = "probiga_migrator@127.0.0.1"
@@ -125,6 +129,22 @@ QMT_ATTESTATION_INDEX_SPECS = MappingProxyType({
 
 # Trigger fields are: timing, event, table and normalized ACTION_STATEMENT.
 QMT_ATTESTATION_TRIGGER_SPECS = MappingProxyType({
+    "trg_qmt_kline_attestation_run_completed_bu": (
+        "BEFORE",
+        "UPDATE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run is immutable'; END IF; END",
+    ),
+    "trg_qmt_kline_attestation_run_completed_bd": (
+        "BEFORE",
+        "DELETE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run cannot be deleted'; END IF; END",
+    ),
     "trg_qmt_kline_attestation_row_immutable_bu": (
         "BEFORE",
         "UPDATE",
@@ -175,6 +195,23 @@ QMT_V2_MANIFEST_KEYS = frozenset({
     "daily_universe",
 })
 QMT_V2_DAILY_ENTRY_KEYS = frozenset({"stock_count", "stock_set_hash"})
+QMT_V2_BOUND_DAILY_ENTRY_KEYS = frozenset({
+    *QMT_V2_DAILY_ENTRY_KEYS,
+    "catalog_batch_id",
+    "catalog_member_count",
+    "catalog_member_set_hash",
+    "catalog_manifest_hash",
+    "calendar_batch_id",
+    "calendar_session_set_hash",
+    "calendar_manifest_hash",
+    "calendar_known_at",
+    "target_stock_count",
+    "target_stock_set_hash",
+    "source_stock_count",
+    "source_stock_set_hash",
+    "source_batch_id",
+    "catalog_binding_hash",
+})
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -215,13 +252,126 @@ def expected_stock_set_contract(
     }
 
 
+def daily_market_source_batch_id(
+    *, catalog_manifest_hash: str, calendar_manifest_hash: str,
+) -> str:
+    for name, value in (
+        ("catalog_manifest_hash", catalog_manifest_hash),
+        ("calendar_manifest_hash", calendar_manifest_hash),
+    ):
+        if type(value) is not str or not _LOWER_SHA256_RE.fullmatch(value):
+            raise ValueError(f"{name} is invalid")
+    return canonical_digest({
+        "schema": "probiga.qmt-daily-market-roots.v1",
+        "catalog_manifest_hash": catalog_manifest_hash,
+        "calendar_manifest_hash": calendar_manifest_hash,
+    })
+
+
+def bound_stock_set_contract(
+    trade_date: str,
+    stock_codes: Iterable[str],
+    *,
+    catalog_batch_id: str,
+    catalog_member_count: int,
+    catalog_member_set_hash: str,
+    catalog_manifest_hash: str,
+    source_batch_id: str,
+    calendar_batch_id: str,
+    calendar_session_set_hash: str,
+    calendar_manifest_hash: str,
+    calendar_known_at: str,
+) -> dict[str, Any]:
+    """Bind equal catalog/source/target sets to one independent catalog."""
+
+    stock_contract = expected_stock_set_contract(trade_date, stock_codes)
+    batch_id = str(catalog_batch_id or "").strip()
+    if not batch_id or len(batch_id) > 64:
+        raise ValueError("QMT catalog batch_id is invalid")
+    normalized_source_batch_id = str(source_batch_id or "").strip()
+    if not normalized_source_batch_id or len(normalized_source_batch_id) > 64:
+        raise ValueError("QMT source batch_id is invalid")
+    normalized_calendar_batch_id = str(calendar_batch_id or "").strip()
+    if not normalized_calendar_batch_id or len(normalized_calendar_batch_id) > 64:
+        raise ValueError("QMT calendar batch_id is invalid")
+    normalized_calendar_known_at = str(calendar_known_at or "").strip()
+    try:
+        datetime.strptime(normalized_calendar_known_at, "%Y-%m-%d %H:%M:%S")
+    except ValueError as exc:
+        raise ValueError("QMT calendar known_at is invalid") from exc
+    if type(catalog_member_count) is not int or catalog_member_count <= 0:
+        raise ValueError("QMT catalog member count is invalid")
+    for name, value in (
+        ("catalog_member_set_hash", catalog_member_set_hash),
+        ("catalog_manifest_hash", catalog_manifest_hash),
+        ("calendar_session_set_hash", calendar_session_set_hash),
+        ("calendar_manifest_hash", calendar_manifest_hash),
+    ):
+        if type(value) is not str or not _LOWER_SHA256_RE.fullmatch(value):
+            raise ValueError(f"{name} is invalid")
+    expected_source_batch_id = daily_market_source_batch_id(
+        catalog_manifest_hash=catalog_manifest_hash,
+        calendar_manifest_hash=calendar_manifest_hash,
+    )
+    if normalized_source_batch_id != expected_source_batch_id:
+        raise ValueError("QMT source batch does not bind both market roots")
+    binding = {
+        "schema": CATALOG_BINDING_SCHEMA,
+        "trade_date": trade_date,
+        "catalog_batch_id": batch_id,
+        "catalog_member_count": catalog_member_count,
+        "catalog_member_set_hash": catalog_member_set_hash,
+        "catalog_manifest_hash": catalog_manifest_hash,
+        "calendar_batch_id": normalized_calendar_batch_id,
+        "calendar_session_set_hash": calendar_session_set_hash,
+        "calendar_manifest_hash": calendar_manifest_hash,
+        "calendar_known_at": normalized_calendar_known_at,
+        "stock_count": stock_contract["stock_count"],
+        "stock_set_hash": stock_contract["stock_set_hash"],
+        "target_stock_count": stock_contract["stock_count"],
+        "target_stock_set_hash": stock_contract["stock_set_hash"],
+        "source_stock_count": stock_contract["stock_count"],
+        "source_stock_set_hash": stock_contract["stock_set_hash"],
+        "source_batch_id": normalized_source_batch_id,
+    }
+    return {
+        **stock_contract,
+        "catalog_batch_id": batch_id,
+        "catalog_member_count": catalog_member_count,
+        "catalog_member_set_hash": catalog_member_set_hash,
+        "catalog_manifest_hash": catalog_manifest_hash,
+        "calendar_batch_id": normalized_calendar_batch_id,
+        "calendar_session_set_hash": calendar_session_set_hash,
+        "calendar_manifest_hash": calendar_manifest_hash,
+        "calendar_known_at": normalized_calendar_known_at,
+        "target_stock_count": stock_contract["stock_count"],
+        "target_stock_set_hash": stock_contract["stock_set_hash"],
+        "source_stock_count": stock_contract["stock_count"],
+        "source_stock_set_hash": stock_contract["stock_set_hash"],
+        "source_batch_id": normalized_source_batch_id,
+        "catalog_binding_hash": canonical_digest(binding),
+    }
+
+
 def build_qmt_v2_manifest(
     daily_universe: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    entry_key_sets = {
+        frozenset(entry) for entry in daily_universe.values()
+        if type(entry) is dict
+    }
+    if not daily_universe:
+        manifest_schema = UNIVERSE_MANIFEST_SCHEMA
+    elif entry_key_sets == {QMT_V2_BOUND_DAILY_ENTRY_KEYS}:
+        manifest_schema = UNIVERSE_MANIFEST_SCHEMA
+    elif entry_key_sets == {QMT_V2_DAILY_ENTRY_KEYS}:
+        manifest_schema = UNIVERSE_MANIFEST_SCHEMA
+    else:
+        raise ValueError("QMT daily universe entry fields differ")
     return {
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
         **dict(QMT_V2_TOLERANCE_VALUES),
-        "universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
+        "universe_manifest_schema": manifest_schema,
         "daily_universe": daily_universe,
     }
 
@@ -250,9 +400,10 @@ def validated_universe_manifest(
         or payload["attestation_protocol"] != ATTESTATION_PROTOCOL_VERSION
     ):
         raise ValueError("attestation protocol differs")
+    manifest_schema = payload["universe_manifest_schema"]
     if (
-        type(payload["universe_manifest_schema"]) is not str
-        or payload["universe_manifest_schema"] != UNIVERSE_MANIFEST_SCHEMA
+        type(manifest_schema) is not str
+        or manifest_schema != UNIVERSE_MANIFEST_SCHEMA
     ):
         raise ValueError("universe manifest schema differs")
     for key, expected in QMT_V2_TOLERANCE_VALUES.items():
@@ -263,6 +414,18 @@ def validated_universe_manifest(
     daily = payload["daily_universe"]
     if type(daily) is not dict or not daily:
         raise ValueError("daily universe manifest must be non-empty")
+    daily_entry_key_sets = {
+        frozenset(entry) for entry in daily.values()
+        if type(entry) is dict
+    }
+    if daily_entry_key_sets not in (
+        {QMT_V2_DAILY_ENTRY_KEYS},
+        {QMT_V2_BOUND_DAILY_ENTRY_KEYS},
+    ):
+        raise ValueError("daily universe entry fields differ")
+    is_bound_manifest = (
+        daily_entry_key_sets == {QMT_V2_BOUND_DAILY_ENTRY_KEYS}
+    )
     normalized: dict[str, dict[str, Any]] = {}
     for raw_day, raw_contract in daily.items():
         if type(raw_day) is not str:
@@ -273,7 +436,12 @@ def validated_universe_manifest(
             raise ValueError("daily universe date is invalid") from exc
         if parsed_day != raw_day or not (start_date <= raw_day <= end_date):
             raise ValueError("daily universe date is outside run range")
-        if type(raw_contract) is not dict or set(raw_contract) != QMT_V2_DAILY_ENTRY_KEYS:
+        expected_entry_keys = (
+            QMT_V2_BOUND_DAILY_ENTRY_KEYS
+            if is_bound_manifest
+            else QMT_V2_DAILY_ENTRY_KEYS
+        )
+        if type(raw_contract) is not dict or set(raw_contract) != expected_entry_keys:
             raise ValueError("daily universe entry fields differ")
         stock_count = raw_contract["stock_count"]
         stock_set_hash = raw_contract["stock_set_hash"]
@@ -284,8 +452,98 @@ def validated_universe_manifest(
             or not _LOWER_SHA256_RE.fullmatch(stock_set_hash)
         ):
             raise ValueError("daily universe count/hash is invalid")
-        normalized[raw_day] = {
+        normalized_entry = {
             "stock_count": stock_count,
             "stock_set_hash": stock_set_hash,
         }
+        if is_bound_manifest:
+            catalog_batch_id = raw_contract["catalog_batch_id"]
+            source_batch_id = raw_contract["source_batch_id"]
+            calendar_batch_id = raw_contract["calendar_batch_id"]
+            calendar_known_at = raw_contract["calendar_known_at"]
+            catalog_member_count = raw_contract["catalog_member_count"]
+            if (
+                type(catalog_batch_id) is not str
+                or not catalog_batch_id
+                or len(catalog_batch_id) > 64
+                or type(source_batch_id) is not str
+                or not source_batch_id
+                or len(source_batch_id) > 64
+                or type(calendar_batch_id) is not str
+                or not calendar_batch_id
+                or len(calendar_batch_id) > 64
+                or type(calendar_known_at) is not str
+                or type(catalog_member_count) is not int
+                or catalog_member_count <= 0
+            ):
+                raise ValueError("daily catalog batch binding is invalid")
+            for field in (
+                "catalog_member_set_hash",
+                "catalog_manifest_hash",
+                "calendar_session_set_hash",
+                "calendar_manifest_hash",
+                "target_stock_set_hash",
+                "source_stock_set_hash",
+                "catalog_binding_hash",
+            ):
+                if (
+                    type(raw_contract[field]) is not str
+                    or not _LOWER_SHA256_RE.fullmatch(raw_contract[field])
+                ):
+                    raise ValueError("daily catalog hash binding is invalid")
+            if (
+                type(raw_contract["target_stock_count"]) is not int
+                or type(raw_contract["source_stock_count"]) is not int
+                or raw_contract["target_stock_count"] != stock_count
+                or raw_contract["source_stock_count"] != stock_count
+                or raw_contract["target_stock_set_hash"] != stock_set_hash
+                or raw_contract["source_stock_set_hash"] != stock_set_hash
+            ):
+                raise ValueError("catalog/source/target daily stock sets differ")
+            try:
+                datetime.strptime(calendar_known_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError as exc:
+                raise ValueError("daily calendar known_at is invalid") from exc
+            if source_batch_id != daily_market_source_batch_id(
+                catalog_manifest_hash=raw_contract["catalog_manifest_hash"],
+                calendar_manifest_hash=raw_contract["calendar_manifest_hash"],
+            ):
+                raise ValueError("daily source batch market-root binding differs")
+            binding = {
+                "schema": CATALOG_BINDING_SCHEMA,
+                "trade_date": raw_day,
+                "catalog_batch_id": catalog_batch_id,
+                "catalog_member_count": catalog_member_count,
+                "catalog_member_set_hash": raw_contract[
+                    "catalog_member_set_hash"
+                ],
+                "catalog_manifest_hash": raw_contract["catalog_manifest_hash"],
+                "calendar_batch_id": calendar_batch_id,
+                "calendar_session_set_hash": raw_contract[
+                    "calendar_session_set_hash"
+                ],
+                "calendar_manifest_hash": raw_contract[
+                    "calendar_manifest_hash"
+                ],
+                "calendar_known_at": calendar_known_at,
+                "stock_count": stock_count,
+                "stock_set_hash": stock_set_hash,
+                "target_stock_count": raw_contract["target_stock_count"],
+                "target_stock_set_hash": raw_contract[
+                    "target_stock_set_hash"
+                ],
+                "source_stock_count": raw_contract["source_stock_count"],
+                "source_stock_set_hash": raw_contract[
+                    "source_stock_set_hash"
+                ],
+                "source_batch_id": source_batch_id,
+            }
+            if canonical_digest(binding) != raw_contract["catalog_binding_hash"]:
+                raise ValueError("daily catalog binding hash differs")
+            normalized_entry.update({
+                field: raw_contract[field]
+                for field in QMT_V2_BOUND_DAILY_ENTRY_KEYS
+                if field not in normalized_entry
+            })
+        normalized[raw_day] = normalized_entry
     return dict(sorted(normalized.items()))

@@ -264,10 +264,55 @@ def load_asof_context(
     cutoff_at: datetime | None = None,
     lookback_hours: int = 36,
     theme_aliases: Mapping[str, Iterable[str]] | None = None,
+    allow_legacy_display: bool = False,
 ) -> dict[str, Any]:
-    """Build deterministic, strictly as-of structured news context."""
+    """Build news context, fail-closed for strategy scoring by default.
+
+    ``st_news_flash.first_seen_at`` freezes only the first observed timestamp;
+    the row itself remains updateable and has neither immutable revisions nor
+    source-coverage receipts.  Consequently the legacy calculation below is
+    available only after an explicit display/research opt-in.  Production V3
+    callers receive a neutral, DATA_BLOCKED feature that cannot alter scores.
+    """
     cutoff = cutoff_at or datetime.combine(as_of, time.max)
     start = cutoff - timedelta(hours=lookback_hours)
+    if not allow_legacy_display:
+        blocked_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "probiga.v3-news-context-blocked.v1",
+                    "start": start.isoformat(),
+                    "cutoff": cutoff.isoformat(),
+                    "reason": "PIT_NEWS_REVISION_AND_COVERAGE_REQUIRED",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "policy_support_score": 0.0,
+            "news_risk_score": 0.0,
+            "overseas_risk_score": None,
+            "context_quality_status": "BLOCK",
+            "context_evidence": [
+                "快讯缺少不可变修订与来源覆盖凭证，不进入V3策略评分"
+            ],
+            "context_news_count": 0,
+            "context_unique_event_count": 0,
+            "overseas_news_count": 0,
+            "context_events": [],
+            "context_theme_scores": {},
+            "context_theme_novelty": {},
+            "context_cutoff_at": cutoff.isoformat(sep=" "),
+            "context_hash": blocked_hash,
+            "context_model_version": "structured_context_v3.2.0",
+            "context_evidence_status": "DATA_BLOCKED",
+            "context_knowledge_time_column": "",
+            "context_strategy_eligible": False,
+            "funding_eligible": False,
+            "order_authority": False,
+            "context_reason": "PIT_NEWS_REVISION_AND_COVERAGE_REQUIRED",
+        }
     normalized_theme_aliases = {
         str(cluster_key): tuple(sorted({
             normalized
@@ -318,8 +363,12 @@ def load_asof_context(
             "context_cutoff_at": cutoff.isoformat(sep=" "),
             "context_hash": empty_hash,
             "context_model_version": "structured_context_v3.1.0",
-            "context_evidence_status": "POINT_IN_TIME_VERIFIED",
+            "context_evidence_status": "LEGACY_UNVERIFIED",
             "context_knowledge_time_column": "first_seen_at",
+            "context_strategy_eligible": False,
+            "funding_eligible": False,
+            "order_authority": False,
+            "context_reason": "DISPLAY_ONLY_MUTABLE_NEWS_CACHE",
         }
 
     seen: set[str] = set()
@@ -492,6 +541,10 @@ def load_asof_context(
         "context_cutoff_at": cutoff.isoformat(sep=" "),
         "context_hash": context_hash,
         "context_model_version": "structured_context_v3.1.0",
-        "context_evidence_status": "POINT_IN_TIME_VERIFIED",
+        "context_evidence_status": "LEGACY_UNVERIFIED",
         "context_knowledge_time_column": "first_seen_at",
+        "context_strategy_eligible": False,
+        "funding_eligible": False,
+        "order_authority": False,
+        "context_reason": "DISPLAY_ONLY_MUTABLE_NEWS_CACHE",
     }

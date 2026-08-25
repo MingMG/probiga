@@ -12,7 +12,11 @@ from sqlalchemy.engine import Engine
 
 from .config import canonical_json_hash
 from .jobs import transition_strategy
-from .research import CompletedTrade, trade_metrics
+from .research import (
+    CompletedTrade,
+    trade_metrics,
+    v2_nav_statistical_guard,
+)
 from .domain import decimal_value
 
 
@@ -179,6 +183,7 @@ def _health_state(
     metrics: dict[str, Any],
     *,
     drawdown_limit: Decimal,
+    nav_statistical_guard: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     count = int(metrics.get("completed_trade_count") or 0)
     expectancy = (
@@ -188,10 +193,9 @@ def _health_state(
     )
     pf_raw = metrics.get("profit_factor")
     profit_factor = (
-        Decimal("Infinity")
-        if pf_raw == "INF"
-        else decimal_value(pf_raw)
+        decimal_value(pf_raw)
         if pf_raw is not None
+        and pf_raw != "INF"
         else None
     )
     drawdown = decimal_value(metrics.get("max_drawdown") or 0)
@@ -203,6 +207,8 @@ def _health_state(
         return "RED", "SUSPEND_NEW_ENTRY"
     if (
         count >= 20
+        and isinstance(nav_statistical_guard, dict)
+        and nav_statistical_guard.get("passed") is True
         and profit_factor is not None
         and profit_factor >= Decimal("1.10")
         and expectancy is not None
@@ -254,9 +260,19 @@ def run_strategy_health(
                 end_date=trade_date,
             )
             metrics = trade_metrics(trades, max_drawdown=drawdown)
+            # V2 currently has no immutable per-strategy daily NAV ledger.
+            # Account-wide equity is not a substitute, so health remains
+            # fail-closed (YELLOW) until an exact strategy NAV path is bound.
+            nav_guard = v2_nav_statistical_guard(
+                None,
+                minimum_observations=max(20, window),
+                minimum_effective_sample_size=max(20, window // 2),
+                minimum_profit_factor_lcb=Decimal("1.10"),
+            )
             health_status, action_code = _health_state(
                 metrics,
                 drawdown_limit=drawdown_limit,
+                nav_statistical_guard=nav_guard,
             )
             evidence = {
                 "strategy_id": strategy["strategy_id"],
@@ -266,6 +282,7 @@ def run_strategy_health(
                 "end_date": trade_date.isoformat(),
                 "metrics": metrics,
                 "drawdown_limit": str(drawdown_limit),
+                "nav_statistical_guard": nav_guard,
             }
             result_hash = canonical_json_hash(evidence)
             pf = metrics.get("profit_factor")

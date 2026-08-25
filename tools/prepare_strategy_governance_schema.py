@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -50,6 +51,12 @@ from server.common.mysql_version_policy import (  # noqa: E402
     is_oracle_mysql_distribution,
     isolated_acceptance_version,
 )
+from server.engine.strategy_funding_checkpoint import (  # noqa: E402
+    FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+    FUNDING_CHECKPOINT_TABLE_NAME,
+    FUNDING_DAILY_FACT_TABLE_NAME,
+    validate_strategy_funding_checkpoint_schema,
+)
 from tools.env_config import create_tool_engine, load_project_env  # noqa: E402
 
 
@@ -75,28 +82,123 @@ EXPECTED_ADMIN_GLOBAL_PRIVILEGES = frozenset({
     "SYSTEM_VARIABLES_ADMIN",
     "SHOW_ROUTINE",
 })
+EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES = frozenset({
+    "trg_dynamic_shadow_trial_chain_immutable_bd",
+    "trg_dynamic_shadow_trial_chain_immutable_bu",
+    "trg_dynamic_shadow_trial_exit_binding_immutable_bd",
+    "trg_dynamic_shadow_trial_exit_binding_immutable_bu",
+    "trg_dynamic_shadow_trial_plan_immutable_bd",
+    "trg_dynamic_shadow_trial_plan_immutable_bu",
+    "trg_strategy_adapter_candidate_fact_immutable_bd",
+    "trg_strategy_adapter_candidate_fact_immutable_bu",
+    "trg_strategy_adapter_run_receipt_immutable_bd",
+    "trg_strategy_adapter_run_receipt_immutable_bu",
+    "trg_strategy_allocation_snapshot_immutable_bd",
+    "trg_strategy_allocation_snapshot_immutable_bu",
+    "trg_strategy_combination_health_snapshot_immutable_bd",
+    "trg_strategy_combination_health_snapshot_immutable_bu",
+    "trg_strategy_combination_immutable_bd",
+    "trg_strategy_combination_version_immutable_bd",
+    "trg_strategy_combination_version_immutable_bu",
+    "trg_strategy_funding_checkpoint_immutable_bd",
+    "trg_strategy_funding_checkpoint_immutable_bu",
+    "trg_strategy_funding_daily_fact_immutable_bd",
+    "trg_strategy_funding_daily_fact_immutable_bu",
+    "trg_strategy_governance_audit_immutable_bd",
+    "trg_strategy_governance_audit_immutable_bu",
+    "trg_strategy_governance_run_frozen_bu",
+    "trg_strategy_governance_run_immutable_bd",
+    "trg_strategy_governance_schema_migration_immutable_bd",
+    "trg_strategy_governance_schema_migration_immutable_bu",
+    "trg_strategy_health_snapshot_immutable_bd",
+    "trg_strategy_health_snapshot_immutable_bu",
+    "trg_strategy_industry_history_immutable_bd",
+    "trg_strategy_industry_history_immutable_bu",
+    "trg_strategy_lifecycle_event_immutable_bd",
+    "trg_strategy_lifecycle_event_immutable_bu",
+    "trg_strategy_pool_snapshot_immutable_bd",
+    "trg_strategy_pool_snapshot_immutable_bu",
+    "trg_strategy_registry_immutable_bd",
+    "trg_strategy_version_immutable_bd",
+    "trg_strategy_version_immutable_bu",
+})
+EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES = frozenset({
+    "trg_strategy_metric_input_immutable_bd",
+    "trg_strategy_metric_input_review_bu",
+})
+EXPECTED_GOVERNANCE_TRIGGER_NAMES = frozenset(
+    EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+    | EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+)
+EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH = (
+    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+)
+EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH = (
+    "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
+)
+EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH = (
+    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+)
+EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH = (
+    "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+)
+EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH = (
+    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+)
+EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH = (
+    "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+)
+EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 68
+EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH = (
+    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+)
 ADMIN_IO_TIMEOUT_SECONDS = 60
 MIGRATOR_IO_TIMEOUT_SECONDS = 900
 MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS = 120
-EXPECTED_RUNTIME_SCHEMA_PRIVILEGES = {
+TARGET_RUNTIME_PRIVILEGE_CONTRACT = "TARGET_LEAST_PRIVILEGE"
+LEGACY_RUNTIME_PRIVILEGE_CONTRACT = "LEGACY_DDL_COMPATIBILITY"
+RUNTIME_PERSISTENT_DDL_PRIVILEGES = frozenset({
+    "ALTER",
+    "CREATE",
+    "DROP",
+    "INDEX",
+    "REFERENCES",
+})
+TARGET_RUNTIME_SCHEMA_PRIVILEGES = {
     "BIGA.*": frozenset({"SELECT"}),
+    # Persistent DDL belongs only to the fenced migrator.  Runtime retains the
+    # established application DML surface and session-local temporary tables;
+    # mutations of append-only governance
+    # rows (including both funding ledgers) are denied by the frozen 40-trigger
+    # contract.  With DROP, ALTER and TRIGGER absent, runtime cannot TRUNCATE
+    # protected tables, remove the guards or structurally bypass them.
     "PROBIGA.*": frozenset({
         "SELECT",
         "INSERT",
         "UPDATE",
         "DELETE",
-        "CREATE",
-        "ALTER",
-        "DROP",
-        "INDEX",
-        "REFERENCES",
         "CREATE TEMPORARY TABLES",
     }),
     "PROBIGA_QMT_HISTORY.*": frozenset({"SELECT"}),
 }
+LEGACY_RUNTIME_SCHEMA_PRIVILEGES = {
+    **TARGET_RUNTIME_SCHEMA_PRIVILEGES,
+    "PROBIGA.*": frozenset({
+        *TARGET_RUNTIME_SCHEMA_PRIVILEGES["PROBIGA.*"],
+        *RUNTIME_PERSISTENT_DDL_PRIVILEGES,
+    }),
+}
+# Keep the target name as the canonical end-state contract for callers that
+# publish policy metadata.  Grant validation below deliberately accepts only
+# this target or the one frozen compatibility contract above.
+EXPECTED_RUNTIME_SCHEMA_PRIVILEGES = TARGET_RUNTIME_SCHEMA_PRIVILEGES
 EXPECTED_RUNTIME_SCHEMA_SCOPES = frozenset(
     EXPECTED_RUNTIME_SCHEMA_PRIVILEGES
 )
+RUNTIME_FUNDING_APPEND_ONLY_TABLES = frozenset({
+    FUNDING_DAILY_FACT_TABLE_NAME,
+    FUNDING_CHECKPOINT_TABLE_NAME,
+})
 LEGACY_TRIGGER_REHOME_METADATA = {
     "trg_trade_account_v2_real_disabled_bi": (
         "root@localhost",
@@ -675,7 +777,7 @@ def _validate_migrator_grants(grants: Iterable[str]) -> None:
         )
 
 
-def _validate_runtime_grants(grants: Iterable[str]) -> None:
+def _classify_runtime_grants(grants: Iterable[str]) -> str:
     normalized = _normalized_grants(grants)
     entries = _grant_scope_entries(normalized)
     global_entries = tuple(
@@ -690,7 +792,7 @@ def _validate_runtime_grants(grants: Iterable[str]) -> None:
         1 for _privileges, scope in entries
         if scope in EXPECTED_RUNTIME_SCHEMA_SCOPES
     )
-    if (
+    common_boundary_invalid = (
         any(
             scope not in {"*.*", *EXPECTED_RUNTIME_SCHEMA_SCOPES}
             for _privileges, scope in entries
@@ -699,30 +801,65 @@ def _validate_runtime_grants(grants: Iterable[str]) -> None:
         or global_entries[0] != {"USAGE"}
         or set(schema_entries) != set(EXPECTED_RUNTIME_SCHEMA_SCOPES)
         or schema_entry_count != len(EXPECTED_RUNTIME_SCHEMA_SCOPES)
-        or any(
-            privileges
-            != set(EXPECTED_RUNTIME_SCHEMA_PRIVILEGES[scope])
-            for scope, privileges in schema_entries.items()
-        )
+    )
+    observed_schema = {
+        scope: frozenset(privileges)
+        for scope, privileges in schema_entries.items()
+    }
+    if (
+        not common_boundary_invalid
+        and observed_schema == TARGET_RUNTIME_SCHEMA_PRIVILEGES
     ):
+        return TARGET_RUNTIME_PRIVILEGE_CONTRACT
+    if (
+        not common_boundary_invalid
+        and observed_schema == LEGACY_RUNTIME_SCHEMA_PRIVILEGES
+    ):
+        return LEGACY_RUNTIME_PRIVILEGE_CONTRACT
+    raise PrivilegedSchemaPreparationError(
+        "runtime identity privileges differ from the audited boundary"
+    )
+
+
+def _validate_runtime_grants(grants: Iterable[str]) -> None:
+    try:
+        _classify_runtime_grants(grants)
+    except PrivilegedSchemaPreparationError:
         raise PrivilegedSchemaPreparationError(
             "runtime identity privileges differ from the audited boundary"
-        )
+        ) from None
 
 
 def _runtime_grant_summary(grants: Iterable[str]) -> dict[str, Any]:
     normalized = _normalized_grants(grants)
-    _validate_runtime_grants(normalized)
+    observed_contract = _classify_runtime_grants(normalized)
     entries = _grant_scope_entries(normalized)
+    schema_privileges = {
+        scope: sorted(privileges)
+        for privileges, scope in sorted(entries, key=lambda item: item[1])
+        if scope != "*.*"
+    }
+    persistent_ddl_privileges = sorted(
+        set(schema_privileges["PROBIGA.*"])
+        & RUNTIME_PERSISTENT_DDL_PRIVILEGES
+    )
     return {
+        "observed_contract": observed_contract,
+        "persistent_ddl_privileges": persistent_ddl_privileges,
         "global_privileges": sorted(set().union(*(
             privileges for privileges, scope in entries if scope == "*.*"
         ))),
-        "schema_privileges": {
-            scope: sorted(privileges)
-            for privileges, scope in sorted(entries, key=lambda item: item[1])
-            if scope != "*.*"
-        },
+        "schema_privileges": schema_privileges,
+        "funding_append_only_tables": sorted(
+            RUNTIME_FUNDING_APPEND_ONLY_TABLES
+        ),
+        "funding_append_only_verified": True,
+        "funding_row_mutation_denied_by_triggers": ["DELETE", "UPDATE"],
+        "funding_structural_bypass_privileges": persistent_ddl_privileges,
+        "truncate_denied_by_absent_drop_privilege": (
+            "DROP" not in persistent_ddl_privileges
+        ),
+        "trigger_drop_denied_by_absent_trigger_privilege": True,
         "require_ssl": True,
         "roles": [],
         "grant_option": False,
@@ -840,7 +977,15 @@ def _runtime_least_privilege_evidence(
     finally:
         _close_quietly(admin)
     return {
-        "runtime_least_privilege_verified": True,
+        "runtime_privilege_boundary_verified": True,
+        "runtime_least_privilege_verified": (
+            grant_summary["observed_contract"]
+            == TARGET_RUNTIME_PRIVILEGE_CONTRACT
+        ),
+        "runtime_legacy_ddl_compatibility": (
+            grant_summary["observed_contract"]
+            == LEGACY_RUNTIME_PRIVILEGE_CONTRACT
+        ),
         "runtime_grant_summary": grant_summary,
         **runtime_self,
         **migrator_self,
@@ -1078,11 +1223,21 @@ def _final_v3_trigger_contracts() -> dict[str, TriggerContract]:
 
 
 def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
+    from server.common.pit_facts import PIT_FACT_TRIGGER_STATEMENTS
+    from server.common.qmt_history_coverage import (
+        coverage_trigger_ddl_statements,
+    )
+    from server.common.scheduler_task_history_schema import (
+        scheduler_task_history_trigger_ddl_statements,
+    )
     from server.engine.strategy_governance import (
         GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS,
         METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS,
     )
     from tools.attest_qmt_daily_kline import ATTESTATION_TRIGGER_STATEMENTS
+    from tools.sync_guojin_qmt_reference_data import (
+        reference_trigger_ddl_contracts,
+    )
 
     contracts: dict[str, TriggerContract] = {}
     for statement in ATTESTATION_TRIGGER_STATEMENTS.values():
@@ -1091,6 +1246,69 @@ def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
             normalizer="qmt",
             owner="qmt_attestation",
         )
+        contracts[contract.name] = contract
+    for raw_statement in reference_trigger_ddl_contracts():
+        statement = re.sub(
+            r"^\s*CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
+            "CREATE TRIGGER ",
+            str(raw_statement),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="qmt",
+            owner="qmt_reference",
+        )
+        if contract.name in contracts:
+            raise PrivilegedSchemaPreparationError(
+                "duplicate release trigger name"
+            )
+        contracts[contract.name] = contract
+    for raw_statement in coverage_trigger_ddl_statements():
+        statement = re.sub(
+            r"^\s*CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
+            "CREATE TRIGGER ",
+            str(raw_statement),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="qmt",
+            owner="qmt_history_coverage",
+        )
+        if contract.name in contracts:
+            raise PrivilegedSchemaPreparationError(
+                "duplicate release trigger name"
+            )
+        contracts[contract.name] = contract
+    for raw_statement in scheduler_task_history_trigger_ddl_statements():
+        statement = re.sub(
+            r"^\s*CREATE\s+TRIGGER\s+IF\s+NOT\s+EXISTS\s+",
+            "CREATE TRIGGER ",
+            str(raw_statement),
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="qmt",
+            owner="scheduler_task_history",
+        )
+        if contract.name in contracts:
+            raise PrivilegedSchemaPreparationError(
+                "duplicate release trigger name"
+            )
+        contracts[contract.name] = contract
+    for statement in PIT_FACT_TRIGGER_STATEMENTS.values():
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="governance",
+            owner="pit_facts",
+        )
+        if contract.name in contracts:
+            raise PrivilegedSchemaPreparationError("duplicate release trigger name")
         contracts[contract.name] = contract
     for statement in GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.values():
         contract = _parse_create_trigger(
@@ -1115,6 +1333,213 @@ def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
             raise PrivilegedSchemaPreparationError("duplicate release trigger name")
         contracts[contract.name] = contract
     return contracts
+
+
+def _release_trigger_source_contract_hash(
+    contracts: Mapping[str, TriggerContract],
+) -> str:
+    """Hash the exact parsed source contract before any privileged CREATE."""
+
+    members = [
+        {
+            "name": name,
+            "timing": contract.timing,
+            "event": contract.event,
+            "table": contract.table,
+            "body": _normalized_trigger_body(contract, contract.body),
+            "normalizer": contract.normalizer,
+            "owner": contract.owner,
+        }
+        for name, contract in sorted(contracts.items())
+    ]
+    payload = {
+        "schema": "probiga.release-trigger-source-contract.v1",
+        "members": members,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _release_trigger_owner_counts(
+    contracts: Mapping[str, TriggerContract],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for contract in contracts.values():
+        counts[contract.owner] = counts.get(contract.owner, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _frozen_non_v3_release_trigger_contracts(
+    contracts: Mapping[str, TriggerContract],
+) -> dict[str, TriggerContract]:
+    frozen = dict(contracts)
+    owner_counts = _release_trigger_owner_counts(frozen)
+    if (
+        len(frozen) != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
+        or owner_counts != {
+            "pit_facts": 6,
+            "qmt_attestation": 6,
+            "qmt_history_coverage": 4,
+            "qmt_reference": 10,
+            "scheduler_task_history": 2,
+            "strategy_governance": 40,
+        }
+        or _release_trigger_source_contract_hash(frozen)
+        != EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "non-V3 release trigger source contract differs"
+        )
+    return frozen
+
+
+def _frozen_governance_release_trigger_contracts(
+    release_contracts: Mapping[str, TriggerContract],
+) -> dict[str, TriggerContract]:
+    """Bind core exports to this release's literal 40-trigger contract."""
+
+    from server.engine.strategy_governance import (
+        EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES as core_append_names,
+        EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES as core_metric_names,
+        GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH as core_contract_hash,
+        METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH as core_metric_contract_hash,
+    )
+
+    if (
+        core_append_names != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+        or core_metric_names != EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+        or core_contract_hash
+        != EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        or core_metric_contract_hash
+        != EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+        or FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH
+        != EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "core governance trigger or funding schema contract differs"
+        )
+    selected = {
+        name: release_contracts[name]
+        for name in EXPECTED_GOVERNANCE_TRIGGER_NAMES
+        if name in release_contracts
+    }
+    if (
+        set(selected) != EXPECTED_GOVERNANCE_TRIGGER_NAMES
+        or _release_trigger_source_contract_hash(selected)
+        != EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "release governance trigger source contract differs"
+        )
+    return selected
+
+
+def _ensure_frozen_release_triggers(
+    engine: Engine,
+    contracts: Mapping[str, TriggerContract],
+    *,
+    expected_names: Iterable[str],
+    expected_source_contract_hash: str,
+    trigger_ddl_executor: Callable[[str], None],
+) -> dict[str, Any]:
+    """Create only absent frozen triggers, then require exact metadata.
+
+    This deliberately never drops or replaces an observed trigger.  Any
+    unknown member on a controlled table, wrong body or metadata drift is a
+    hard failure before the narrowly brokered CREATE callback can run.
+    """
+
+    frozen_names = frozenset(str(name) for name in expected_names)
+    source_hash = _release_trigger_source_contract_hash(contracts)
+    if (
+        not callable(trigger_ddl_executor)
+        or not frozen_names
+        or set(contracts) != set(frozen_names)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_source_contract_hash)
+        is None
+        or source_hash != expected_source_contract_hash
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "release trigger source contract differs before creation"
+        )
+    controlled_tables = {contract.table for contract in contracts.values()}
+    with engine.connect() as connection:
+        observed = _trigger_inventory(
+            connection,
+            names=frozen_names,
+            controlled_tables=controlled_tables,
+        )
+        unexpected = set(observed) - set(contracts)
+        if unexpected:
+            raise PrivilegedSchemaPreparationError(
+                "release trigger inventory is incomplete or unexpected"
+            )
+        existing = {
+            name: contracts[name] for name in observed
+        }
+        absent = {
+            name: contracts[name]
+            for name in contracts
+            if name not in observed
+        }
+        validate_release_trigger_contracts(
+            connection,
+            required=existing,
+            optional=absent,
+            controlled_contracts=contracts,
+        )
+
+    created: list[str] = []
+    for name in sorted(absent):
+        contract = absent[name]
+        trigger_ddl_executor(
+            f"CREATE TRIGGER `{name}` {contract.timing} {contract.event} "
+            f"ON `{contract.table}` FOR EACH ROW {contract.body}"
+        )
+        created.append(name)
+
+    with engine.connect() as connection:
+        metadata = validate_release_trigger_contracts(
+            connection,
+            required=contracts,
+            optional={},
+            controlled_contracts=contracts,
+        )
+    release_binding = {}
+    if (
+        frozen_names == EXPECTED_GOVERNANCE_TRIGGER_NAMES
+        and source_hash == EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+    ):
+        release_binding = {
+            "append_only_physical_contract_hash": (
+                EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH
+            ),
+            "metric_review_physical_contract_hash": (
+                EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH
+            ),
+            "core_append_only_contract_hash": (
+                EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+            ),
+            "core_metric_review_contract_hash": (
+                EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+            ),
+            "funding_schema_contract_hash": (
+                EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+            ),
+        }
+    return {
+        **metadata,
+        "source_contract_hash": source_hash,
+        **release_binding,
+        "expected_names": sorted(frozen_names),
+        "created_names": created,
+        "created_count": len(created),
+    }
 
 
 def _normalized_trigger_body(contract: TriggerContract, value: object) -> str:
@@ -1429,11 +1854,84 @@ def _table_inventory(connection: Connection, names: Iterable[str]) -> set[str]:
     }
 
 
+def _prepare_qmt_reference_schema_tables(engine: Engine) -> dict[str, Any]:
+    """Apply only the frozen QMT truth table/migration DDL under the fence.
+
+    Trigger creation is deliberately excluded here.  All ten append-only
+    triggers are installed later through the narrowly allow-listed broker.
+    """
+
+    from tools.sync_guojin_qmt_reference_data import (
+        REFERENCE_SCHEMA_CONTRACT_HASH,
+        REFERENCE_TABLE_NAMES,
+        REFERENCE_TRIGGER_NAMES,
+        reference_migration_ddl_contracts,
+        reference_table_ddl_contracts,
+    )
+
+    table_statements = tuple(reference_table_ddl_contracts())
+    migration_statements = tuple(reference_migration_ddl_contracts())
+    with engine.begin() as connection:
+        for statement in (*table_statements, *migration_statements):
+            connection.execute(text(statement))
+    return {
+        "contract_hash": REFERENCE_SCHEMA_CONTRACT_HASH,
+        "table_names": list(REFERENCE_TABLE_NAMES),
+        "trigger_names": list(REFERENCE_TRIGGER_NAMES),
+        "table_ddl_count": len(table_statements),
+        "migration_ddl_count": len(migration_statements),
+        "runtime_ddl_required": False,
+    }
+
+
+def _prepare_qmt_history_coverage_schema_tables(
+    engine: Engine,
+) -> dict[str, Any]:
+    """Install coverage tables through the fenced privileged migrator only."""
+
+    from server.common.qmt_history_coverage import (
+        COVERAGE_TABLE_NAMES,
+        COVERAGE_TRIGGER_NAMES,
+        coverage_table_ddl_statements,
+    )
+
+    table_statements = tuple(coverage_table_ddl_statements())
+    with engine.begin() as connection:
+        for statement in table_statements:
+            connection.execute(text(statement))
+    return {
+        "database": DATABASE_NAME,
+        "table_names": list(COVERAGE_TABLE_NAMES),
+        "trigger_names": list(COVERAGE_TRIGGER_NAMES),
+        "table_ddl_count": len(table_statements),
+        "trigger_ddl_count": len(COVERAGE_TRIGGER_NAMES),
+        "runtime_ddl_required": False,
+    }
+
+
 def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
     if boundary.migrator_engine is None:
         raise PrivilegedSchemaPreparationError("migration engine is unavailable")
     from server.db.migrations_v3 import run_v3_migrations
     from server.engine.strategy_governance import GOVERNANCE_TABLE_NAMES
+    from server.engine.dynamic_shadow_ledger_schema import (
+        preflight_dynamic_shadow_ledger_schema_upgrade,
+    )
+    from server.common.pit_facts import preflight_pit_fact_schema
+    from server.common.scheduler_runtime_schema import (
+        preflight_scheduler_runtime_heartbeat_schema,
+    )
+    from server.common.scheduler_task_history_schema import (
+        validate_scheduler_task_history_schema,
+    )
+    from server.common.production_runtime_schema_bundle import (
+        preflight_runtime_schema_bundle,
+    )
+    from server.common.qmt_history_coverage import (
+        COVERAGE_TABLE_NAMES,
+        COVERAGE_TRIGGER_NAMES,
+        validate_coverage_schema,
+    )
     from tools.attest_qmt_daily_kline import (
         ATTESTATION_TABLE_NAMES,
         validate_attestation_schema,
@@ -1441,8 +1939,35 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
     from tools.prepare_strategy_governance_qmt_history import (
         plan_legacy_completed_run_binding,
     )
+    from tools.sync_guojin_qmt_reference_data import (
+        preflight_reference_tables,
+    )
 
     runtime_security = _runtime_least_privilege_evidence(boundary)
+    runtime_schema_bundle = preflight_runtime_schema_bundle(
+        boundary.migrator_engine
+    )
+    scheduler_runtime_schema = preflight_scheduler_runtime_heartbeat_schema(
+        boundary.migrator_engine
+    )
+    try:
+        scheduler_task_history_schema = {
+            **validate_scheduler_task_history_schema(
+                boundary.migrator_engine
+            ),
+            "status": "READY",
+        }
+    except Exception as exc:
+        scheduler_task_history_schema = {
+            "table": "st_scheduled_task_history",
+            "status": "MIGRATION_REQUIRED",
+            "runtime_ddl_required": False,
+            "read_only": True,
+            "preflight_error_type": type(exc).__name__,
+        }
+    qmt_reference_preflight = preflight_reference_tables(
+        boundary.migrator_engine
+    )
     plan = run_v3_migrations(boundary.migrator_engine, dry_run=True)
     pending_versions = {
         str(item.version) for item in plan if item.status == "would_apply"
@@ -1452,7 +1977,12 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
             "V3 migration ledger differs from the audited production boundary"
         )
     applied_v3, final_v3 = _v3_trigger_states(plan)
-    non_v3 = _non_v3_trigger_contracts()
+    non_v3 = _frozen_non_v3_release_trigger_contracts(
+        _non_v3_trigger_contracts()
+    )
+    governance_release_contracts = (
+        _frozen_governance_release_trigger_contracts(non_v3)
+    )
     legacy_binding_plan = {
         "legacy_run_count": 0,
         "legacy_binding_plan_hash": "",
@@ -1483,11 +2013,44 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
                 raise PrivilegedSchemaPreparationError(
                     "QMT legacy binding validators disagree"
                 )
+        coverage_tables = _table_inventory(
+            connection,
+            COVERAGE_TABLE_NAMES,
+        )
+        if coverage_tables and coverage_tables != set(COVERAGE_TABLE_NAMES):
+            raise PrivilegedSchemaPreparationError(
+                "QMT history coverage table inventory is partial"
+            )
+        coverage_schema: dict[str, Any] = {
+            "status": "EMPTY",
+            "database": DATABASE_NAME,
+            "table_names": list(COVERAGE_TABLE_NAMES),
+            "table_count": 0,
+            "trigger_names": list(COVERAGE_TRIGGER_NAMES),
+            "expected_trigger_count": len(COVERAGE_TRIGGER_NAMES),
+            "runtime_ddl_required": False,
+            "physical_schema_verified": False,
+            "physical_seal_verified": False,
+            "read_only": True,
+        }
+        if coverage_tables:
+            coverage_schema = {
+                **validate_coverage_schema(
+                    connection,
+                    require_triggers=False,
+                ),
+                "status": "READY_FOR_TRIGGER_CUTOVER",
+                "read_only": True,
+            }
         governance_tables = _table_inventory(connection, GOVERNANCE_TABLE_NAMES)
         if governance_tables and governance_tables != set(GOVERNANCE_TABLE_NAMES):
             raise PrivilegedSchemaPreparationError(
                 "strategy governance table inventory is partial"
             )
+        dynamic_shadow_schema = (
+            preflight_dynamic_shadow_ledger_schema_upgrade(connection)
+        )
+        pit_fact_schema = preflight_pit_fact_schema(connection)
         trigger_detail = validate_release_trigger_contracts(
             connection,
             required=applied_v3,
@@ -1509,11 +2072,48 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "pending_v3_versions": sorted(pending_versions),
         "qmt_table_count": len(qmt_tables),
         "governance_table_count": len(governance_tables),
+        "dynamic_shadow_schema": dynamic_shadow_schema,
+        "pit_fact_schema": pit_fact_schema,
+        "qmt_reference_schema": qmt_reference_preflight,
+        "qmt_history_coverage_schema": coverage_schema,
+        "scheduler_runtime_heartbeat_schema": scheduler_runtime_schema,
+        "scheduler_task_history_schema": scheduler_task_history_schema,
+        "runtime_schema_bundle": runtime_schema_bundle,
         "legacy_binding_plan": {
             key: value for key, value in legacy_binding_plan.items()
             if key != "legacy_bindings"
         },
         "trigger_contract": trigger_detail,
+        "supporting_trigger_source_contract": {
+            "trigger_count": len(non_v3),
+            "trigger_names": sorted(non_v3),
+            "source_contract_hash": (
+                EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "owner_counts": _release_trigger_owner_counts(non_v3),
+        },
+        "governance_trigger_source_contract": {
+            "trigger_count": len(governance_release_contracts),
+            "trigger_names": sorted(governance_release_contracts),
+            "source_contract_hash": (
+                EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "append_only_physical_contract_hash": (
+                EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH
+            ),
+            "metric_review_physical_contract_hash": (
+                EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH
+            ),
+            "core_append_only_contract_hash": (
+                EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+            ),
+            "core_metric_review_contract_hash": (
+                EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+            ),
+            "funding_schema_contract_hash": (
+                EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+            ),
+        },
     }
 
 
@@ -1931,21 +2531,51 @@ def _cutover_schema(
         from server.engine.strategy_governance import (
             ensure_strategy_governance_tables,
         )
+        from server.engine.dynamic_shadow_ledger_schema import (
+            validate_dynamic_shadow_ledger_schema,
+        )
+        from server.common.pit_facts import ensure_pit_fact_schema
+        from server.common.scheduler_runtime_schema import (
+            migrate_scheduler_runtime_heartbeat,
+            validate_scheduler_runtime_heartbeat_schema,
+        )
+        from server.common.scheduler_task_history_schema import (
+            migrate_scheduler_task_history,
+            validate_scheduler_task_history_schema,
+        )
+        from server.common.production_runtime_schema_bundle import (
+            privileged_migrate_runtime_schema_bundle,
+        )
+        from server.common.qmt_history_coverage import (
+            validate_coverage_schema,
+        )
         from tools.attest_qmt_daily_kline import (
-            ensure_attestation_tables,
+            privileged_migrate_attestation_tables,
             validate_attestation_schema,
         )
         from tools.prepare_strategy_governance_qmt_history import (
             apply_legacy_completed_run_binding,
         )
+        from tools.sync_guojin_qmt_reference_data import (
+            attest_prepared_reference_schema,
+            validate_reference_tables,
+        )
 
+        non_v3_contracts = _frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        governance_release_contracts = (
+            _frozen_governance_release_trigger_contracts(
+                non_v3_contracts
+            )
+        )
         final_contracts = {
             **_final_v3_trigger_contracts(),
-            **_non_v3_trigger_contracts(),
+            **non_v3_contracts,
         }
         trigger_create_allowlist = (
             *_all_v3_trigger_contracts(),
-            *_non_v3_trigger_contracts().values(),
+            *non_v3_contracts.values(),
         )
         trigger_ddl_executor = _build_trigger_ddl_executor(
             boundary,
@@ -1975,7 +2605,7 @@ def _cutover_schema(
         _applied_plan, final_v3_plan = _v3_trigger_states(migration_plan)
         planned_final_contracts = {
             **final_v3_plan,
-            **_non_v3_trigger_contracts(),
+            **non_v3_contracts,
         }
         if planned_final_contracts != final_contracts:
             raise PrivilegedSchemaPreparationError(
@@ -1986,10 +2616,41 @@ def _cutover_schema(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
         )
-        ensure_attestation_tables(
+        scheduler_runtime_schema_migration = (
+            migrate_scheduler_runtime_heartbeat(boundary.migrator_engine)
+        )
+        scheduler_runtime_schema_validation = (
+            validate_scheduler_runtime_heartbeat_schema(
+                boundary.migrator_engine
+            )
+        )
+        scheduler_task_history_schema_migration = (
+            migrate_scheduler_task_history(boundary.migrator_engine)
+        )
+        scheduler_task_history_schema_validation = (
+            validate_scheduler_task_history_schema(
+                boundary.migrator_engine
+            )
+        )
+        runtime_schema_bundle = privileged_migrate_runtime_schema_bundle(
+            boundary.migrator_engine
+        )
+        qmt_reference_schema = _prepare_qmt_reference_schema_tables(
+            boundary.migrator_engine
+        )
+        qmt_history_coverage_schema = (
+            _prepare_qmt_history_coverage_schema_tables(
+                boundary.migrator_engine
+            )
+        )
+        privileged_migrate_attestation_tables(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
             allow_legacy_manifest_candidates=True,
+        )
+        pit_fact_schema = ensure_pit_fact_schema(
+            boundary.migrator_engine,
+            trigger_ddl_executor=trigger_ddl_executor,
         )
         legacy_binding = apply_legacy_completed_run_binding(
             boundary.migrator_engine
@@ -1997,7 +2658,49 @@ def _cutover_schema(
         ensure_strategy_governance_tables(
             engine=boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
+            writers_fenced=True,
         )
+        supporting_trigger_source_detail = (
+            _ensure_frozen_release_triggers(
+                boundary.migrator_engine,
+                non_v3_contracts,
+                expected_names=frozenset(non_v3_contracts),
+                expected_source_contract_hash=(
+                    EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                trigger_ddl_executor=trigger_ddl_executor,
+            )
+        )
+        supporting_trigger_source_detail = {
+            **supporting_trigger_source_detail,
+            "owner_counts": _release_trigger_owner_counts(non_v3_contracts),
+        }
+        governance_trigger_source_detail = (
+            _ensure_frozen_release_triggers(
+                boundary.migrator_engine,
+                governance_release_contracts,
+                expected_names=EXPECTED_GOVERNANCE_TRIGGER_NAMES,
+                expected_source_contract_hash=(
+                    EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                trigger_ddl_executor=trigger_ddl_executor,
+            )
+        )
+        qmt_reference_seal = attest_prepared_reference_schema(
+            boundary.migrator_engine
+        )
+        validate_reference_tables(
+            boundary.migrator_engine,
+            verify_triggers=True,
+        )
+        with boundary.migrator_engine.connect() as connection:
+            qmt_history_coverage_seal = validate_coverage_schema(
+                connection,
+                require_triggers=True,
+            )
+            dynamic_shadow_schema = validate_dynamic_shadow_ledger_schema(
+                connection
+            )
         validate_attestation_schema(
             boundary.migrator_engine,
         )
@@ -2009,7 +2712,9 @@ def _cutover_schema(
         )
         if final_contracts != {
             **final_v3,
-            **_non_v3_trigger_contracts(),
+            **_frozen_non_v3_release_trigger_contracts(
+                _non_v3_trigger_contracts()
+            ),
         }:
             raise PrivilegedSchemaPreparationError(
                 "release trigger contract changed during cutover"
@@ -2037,12 +2742,37 @@ def _cutover_schema(
                 for item in migrations
             ],
             "trigger_contract": trigger_detail,
+            "governance_trigger_source_contract": (
+                governance_trigger_source_detail
+            ),
+            "supporting_trigger_source_contract": (
+                supporting_trigger_source_detail
+            ),
             "rehomed_legacy_triggers": list(rehomed),
             "legacy_binding_plan": {
                 key: value for key, value in legacy_binding.items()
                 if key != "legacy_bindings"
             },
             "legacy_trigger_repair": legacy_trigger_repair,
+            "dynamic_shadow_schema": dynamic_shadow_schema,
+            "pit_fact_schema": pit_fact_schema,
+            "qmt_reference_schema": {
+                **qmt_reference_schema,
+                **qmt_reference_seal,
+            },
+            "qmt_history_coverage_schema": {
+                **qmt_history_coverage_schema,
+                **qmt_history_coverage_seal,
+            },
+            "scheduler_runtime_heartbeat_schema": {
+                **scheduler_runtime_schema_migration,
+                "runtime_validation": scheduler_runtime_schema_validation,
+            },
+            "scheduler_task_history_schema": {
+                **scheduler_task_history_schema_migration,
+                "runtime_validation": scheduler_task_history_schema_validation,
+            },
+            "runtime_schema_bundle": runtime_schema_bundle,
             **window_evidence,
         }
     except BaseException as exc:
@@ -2080,31 +2810,145 @@ def _cutover_schema(
         ) from operation_error
 
     from server.api.routers._engine import dispose_engine, get_engine
+    from server.common.pit_facts import pit_fact_schema_health
+    from server.common.qmt_history_coverage import validate_coverage_schema
+    from server.common.scheduler_task_history_schema import (
+        validate_scheduler_task_history_schema,
+    )
+    from server.common.production_runtime_schema_bundle import (
+        validate_runtime_schema_bundle,
+    )
     from server.engine.strategy_governance import (
+        EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES as core_append_names,
+        EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES as core_metric_names,
+        GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH as core_contract_hash,
+        METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH as core_metric_contract_hash,
         seed_governance_registry,
         validate_default_governance_seed_contract,
         validate_governance_append_only_triggers,
         validate_governance_table_schema,
         validate_metric_input_review_triggers,
     )
+    from tools.sync_guojin_qmt_reference_data import (
+        REFERENCE_SCHEMA_CONTRACT_HASH,
+        validate_reference_tables,
+    )
 
     try:
         seed_governance_registry()
         api_engine = get_engine()
+        pit_runtime_schema = pit_fact_schema_health(api_engine)
+        if not bool(pit_runtime_schema.get("valid")):
+            raise PrivilegedSchemaPreparationError(
+                "PIT fact schema runtime validation failed"
+            )
+        validate_reference_tables(api_engine, verify_triggers=True)
+        scheduler_task_history_runtime_schema = (
+            validate_scheduler_task_history_schema(api_engine)
+        )
+        runtime_schema_bundle_validation = validate_runtime_schema_bundle(
+            api_engine
+        )
         with api_engine.connect() as connection:
+            qmt_history_coverage_runtime_schema = validate_coverage_schema(
+                connection,
+                require_triggers=True,
+            )
             metric = validate_metric_input_review_triggers(connection)
             governance_schema = validate_governance_table_schema(connection)
+            funding_schema = validate_strategy_funding_checkpoint_schema(
+                connection
+            )
         append_only = validate_governance_append_only_triggers(api_engine)
         seed_contract = validate_default_governance_seed_contract(
             api_engine,
             require_initial_shadow=True,
         )
+        metric_trigger_count = int(metric.get("trigger_count") or 0)
+        append_only_trigger_count = int(
+            append_only.get("trigger_count") or 0
+        )
+        funding_trigger_count = int(
+            funding_schema.get("trigger_count") or 0
+        )
+        if (
+            metric_trigger_count != 2
+            or append_only_trigger_count != 38
+            or funding_trigger_count != 4
+            or set(metric.get("trigger_names") or ())
+            != EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+            or set(append_only.get("trigger_names") or ())
+            != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+            or core_metric_names
+            != EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+            or core_append_names
+            != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+            or core_contract_hash
+            != EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+            or core_metric_contract_hash
+            != EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+            or str(append_only.get("contract_hash") or "")
+            != EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+            or str(metric.get("contract_hash") or "")
+            != EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+            or str(funding_schema.get("contract_hash") or "")
+            != EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "strategy governance exact 40-trigger contract differs"
+            )
         detail.update(
             {
                 **governance_schema,
                 **seed_contract,
-                "governance_trigger_count": int(metric["trigger_count"])
-                + int(append_only["trigger_count"]),
+                "funding_checkpoint_schema": funding_schema,
+                "funding_checkpoint_contract_hash": str(
+                    funding_schema["contract_hash"]
+                ),
+                "funding_checkpoint_table_count": int(
+                    funding_schema["table_count"]
+                ),
+                "funding_checkpoint_trigger_count": int(
+                    funding_schema["trigger_count"]
+                ),
+                "governance_append_only_trigger_count": (
+                    append_only_trigger_count
+                ),
+                "governance_metric_review_trigger_count": (
+                    metric_trigger_count
+                ),
+                "governance_trigger_count": (
+                    metric_trigger_count + append_only_trigger_count
+                ),
+                "governance_trigger_source_contract_hash": (
+                    EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                "governance_append_only_physical_contract_hash": (
+                    EXPECTED_GOVERNANCE_APPEND_ONLY_PHYSICAL_CONTRACT_HASH
+                ),
+                "governance_metric_review_physical_contract_hash": (
+                    EXPECTED_METRIC_REVIEW_PHYSICAL_CONTRACT_HASH
+                ),
+                "governance_append_only_core_contract_hash": (
+                    EXPECTED_CORE_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+                ),
+                "governance_metric_review_core_contract_hash": (
+                    EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH
+                ),
+                "pit_fact_schema": pit_runtime_schema,
+                "qmt_reference_contract_hash": (
+                    REFERENCE_SCHEMA_CONTRACT_HASH
+                ),
+                "qmt_reference_runtime_valid": True,
+                "qmt_history_coverage_runtime_schema": (
+                    qmt_history_coverage_runtime_schema
+                ),
+                "scheduler_task_history_runtime_schema": (
+                    scheduler_task_history_runtime_schema
+                ),
+                "runtime_schema_bundle_validation": (
+                    runtime_schema_bundle_validation
+                ),
             }
         )
     except BaseException as exc:

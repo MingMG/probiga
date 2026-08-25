@@ -898,15 +898,16 @@ def monitor_positions(
                     }
                 )
                 continue
+            sector_strategy = str(row["strategy_version"]).startswith(
+                "sector_preheat"
+            )
             sector_facts = (
                 _sector_position_facts(
                     connection,
                     theme_code=str(row["theme_code"] or ""),
                     trade_date=trade_date,
                 )
-                if str(row["strategy_version"]).startswith(
-                    "sector_preheat"
-                )
+                if sector_strategy
                 else {
                     "available": False,
                     "strong": False,
@@ -971,8 +972,11 @@ def monitor_positions(
                     trend_strong=(
                         facts["trend_strong"]
                         and (
-                            not sector_facts["available"]
-                            or bool(sector_facts["strong"])
+                            not sector_strategy
+                            or (
+                                bool(sector_facts["available"])
+                                and bool(sector_facts["strong"])
+                            )
                         )
                     ),
                     trend_valid=facts["trend_valid"],

@@ -601,6 +601,7 @@ class DataQualityCheckTest(unittest.TestCase):
 
         self.assertEqual(result.status, "PASS")
         self.assertIn("intraday_minute_kline", captured["task_types"])
+        self.assertNotIn("qmt_local_history_2024", captured["task_types"])
         self.assertNotIn("qmt_local_history_2026", captured["task_types"])
 
     def test_run_checks_stops_when_required_tables_missing(self):

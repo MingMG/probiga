@@ -55,8 +55,8 @@ def test_persist_bigqmt_daily_capture_uses_local_evidence_table(monkeypatch):
     events: list[object] = []
     monkeypatch.setattr(
         local_history,
-        "ensure_local_history_tables",
-        lambda engine: events.append(("ensure", engine)),
+        "validate_local_history_tables",
+        lambda engine, **_kwargs: events.append(("validate", engine)),
     )
     monkeypatch.setattr(
         local_history,
@@ -85,7 +85,7 @@ def test_persist_bigqmt_daily_capture_uses_local_evidence_table(monkeypatch):
     )
 
     assert written == 1
-    assert events[0] == ("ensure", local_engine)
+    assert events[0] == ("validate", local_engine)
     assert events[1][2]["table_name"] == local_history.LOCAL_KLINE_TABLE
     assert events[1][2]["key_columns"] == [
         "provider",
@@ -118,14 +118,14 @@ def test_persist_capture_reuses_authenticated_cross_schema_connection(
     )
     monkeypatch.setattr(
         local_history,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda *_args: (_ for _ in ()).throw(
             AssertionError("cross-schema route must not reconnect")
         ),
     )
     monkeypatch.setattr(
         local_history,
-        "validate_local_history_provenance_schema",
+        "validate_local_history_tables",
         lambda engine, *, database=None: captured.update(
             {
                 "validated_engine": engine,
@@ -189,7 +189,7 @@ def test_cross_schema_capture_validates_before_preparing_or_writing(
 
     monkeypatch.setattr(
         local_history,
-        "validate_local_history_provenance_schema",
+        "validate_local_history_tables",
         blocked_schema,
     )
     monkeypatch.setattr(

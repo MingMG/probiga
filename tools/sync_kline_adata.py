@@ -29,7 +29,8 @@ from server.common.adata_release import ensure_adata_import_path
 
 ensure_adata_import_path(ROOT)
 
-from server.common.batch_db import write_frame
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 
 def _engine():
     return create_tool_engine(resolve_tool_mysql_url())
@@ -93,18 +94,19 @@ def main():
                 df["k_type"] = 1
                 df["adjust_type"] = 1
 
-                # 删除该股票的旧数据
-                with eng.begin() as conn:
-                    conn.execute(text("DELETE FROM sm_stock_kline WHERE stock_code = :c"), {"c": code})
-
-                # 写入
                 cols = ["stock_code", "trade_date", "open", "close", "high", "low",
                         "volume", "amount", "change", "change_pct", "turnover_ratio",
                         "pre_close", "k_type", "adjust_type", "etl_sync_at"]
                 for col in cols:
                     if col not in df.columns:
                         df[col] = None
-                write_frame(df[cols], "sm_stock_kline", eng, if_exists="append", index=False, method="multi")
+                replace_table_rows_exact_keys(
+                    df[cols],
+                    "sm_stock_kline",
+                    eng,
+                    key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+                    lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+                )
                 total_rows += len(df)
                 success += 1
             else:

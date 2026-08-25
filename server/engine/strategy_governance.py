@@ -8,12 +8,14 @@ runtime; strategies without sufficient forward evidence stay in shadow mode.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import os
 import re
 import threading
+import time
 import uuid
 from collections import defaultdict
 from contextlib import nullcontext
@@ -25,6 +27,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from server.api.routers._engine import get_engine
+from server.common.canonical_json import validate_canonical_json
+from server.common.governance_safety import assert_real_order_authority_closed
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
 )
@@ -39,6 +43,7 @@ from server.common.qmt_attestation_contract import (
     expected_stock_set_contract,
     validated_universe_manifest,
 )
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from server.common.versioned_strategy_config import (
     legacy_strategy_merge_map,
     load_market_state_config,
@@ -47,17 +52,66 @@ from server.common.versioned_strategy_config import (
     stock_strategy_catalog,
 )
 from server.trading_v3.config import load_v3_config
+from server.trading_v2.paper_configuration import (
+    PAPER_FEE_PROFILES,
+    PAPER_FEE_PROFILE_VERSION,
+    PAPER_INSTRUMENT_RULE_VERSION,
+)
+from server.trading_v2.policy import load_portfolio_policy
 from server.trading_v3.hypotheses import STRATEGY_LABELS as V3_STRATEGY_LABELS
 from server.trading_v3.forward_evidence import (
     INTENT_EPISODE_PROTOCOL,
     intent_episode_id,
 )
 from server.engine.strategy_execution_adapters import (
+    batch_dynamic_shadow_ledger_readiness,
     normalize_execution_binding,
     strategy_execution_adapter_capabilities,
     strategy_execution_adapter_status,
     validate_strategy_adapter_run_receipt,
     verify_persisted_strategy_adapter_run_receipt,
+)
+from server.engine.dynamic_shadow_ledger_schema import (
+    DYNAMIC_SHADOW_LEDGER_COLUMN_NAMES,
+    DYNAMIC_SHADOW_LEDGER_TABLE_NAMES,
+    ensure_dynamic_shadow_ledger_schema,
+    validate_dynamic_shadow_ledger_schema,
+)
+from server.engine.strategy_funding_checkpoint import (
+    FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+    FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+    FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+    FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+    FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+    FUNDING_CHECKPOINT_MIGRATION_HASH,
+    FUNDING_CHECKPOINT_MIGRATION_KEY,
+    FUNDING_CHECKPOINT_SCHEMA,
+    FUNDING_CHECKPOINT_TABLE_NAME,
+    FUNDING_CHECKPOINT_TARGET_AVG_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+    FUNDING_CHECKPOINT_TRIGGER_CONTRACTS,
+    FUNDING_CHECKPOINT_TRIGGER_STATEMENTS,
+    FUNDING_DAILY_FACT_SCHEMA,
+    FUNDING_DAILY_FACT_TABLE_NAME,
+    FUNDING_INCREMENTAL_MAX_SESSIONS,
+    FUNDING_REPLAY_MAX_SESSIONS,
+    canonical_hash as _checkpoint_canonical_hash,
+    canonical_json as _checkpoint_canonical_json,
+    checkpoint_chain_hash,
+    checkpoint_chain_payload,
+    checkpoint_identity,
+    checkpoint_state_hash,
+    ensure_strategy_funding_checkpoint_schema,
+    funding_daily_fact_hash,
+    funding_daily_fact_identity,
+    ordered_funding_fact_set_hash,
+    validate_strategy_funding_checkpoint_schema,
+)
+from server.engine.strategy_statistical_guards import (
+    benjamini_yekutieli_fdr,
+    newey_west_nav_statistics,
+    spaced_consecutive_gate_confirmations,
 )
 
 
@@ -102,6 +156,22 @@ class GovernanceEvidenceNotReady(RuntimeError):
             "automatic_real_order_submission": False,
         }
 
+
+METRIC_ARTIFACT_MAX_BYTES = 48 * 1024 * 1024
+FUNDING_CANONICAL_RESULT_MAX_BYTES = 4 * 1024 * 1024
+FUNDING_METRICS_STRATEGY_BATCH_SIZE = 25
+FUNDING_REPLAY_BATCH_MAX_SERIALIZED_BYTES = 96 * 1024 * 1024
+FUNDING_BOOTSTRAP_DEFAULT_MAX_STRATEGIES_PER_RUN = 8
+FUNDING_BOOTSTRAP_DEFAULT_TIME_BUDGET_SECONDS = 120
+COMBINATION_RECIPE_READY_REASON = (
+    "已冻结成员权重与事实集合；取得本轮模拟资金资格后可按当前canonical分页复算"
+)
+
+
+class MetricArtifactTooLarge(ValueError):
+    """A validation artifact exceeds the executable storage contract."""
+
+
 EVIDENCE_STATUS_LABELS: dict[str, str] = {
     "PENDING": "等待独立复核",
     "CONFIRMED": "已确认",
@@ -132,6 +202,50 @@ PROFIT_GATE_POLICY: dict[str, Any] = {
     "minimum_consecutive_gate_passes": 3,
     "maximum_evidence_age_days": 7,
 }
+STATISTICAL_GUARD_POLICY: dict[str, Any] = {
+    "schema": "probiga.strategy-statistical-policy.v1",
+    "confidence_level": 0.95,
+    "bandwidth_rule": "FLOOR_SQRT_N",
+    "minimum_positive_days": 2,
+    "minimum_negative_days": 2,
+    "minimum_effective_sample_by_window": {
+        "20": 10.0,
+        "60": 30.0,
+        "120": 60.0,
+    },
+    "window_thresholds": {
+        "20": {
+            "minimum_net_expectancy_lcb_pct_exclusive": 0.0,
+            "minimum_profit_factor_lcb_exclusive": 1.0,
+            "minimum_payoff_ratio_lcb_exclusive": 1.0,
+        },
+        "60": {
+            "minimum_net_expectancy_lcb_pct_exclusive": 0.0,
+            "minimum_profit_factor_lcb_inclusive": 1.30,
+            "minimum_payoff_ratio_lcb_inclusive": 1.10,
+        },
+        "120": {
+            "minimum_net_expectancy_lcb_pct_exclusive": 0.0,
+            "minimum_profit_factor_lcb_inclusive": 1.30,
+            "minimum_payoff_ratio_lcb_inclusive": 1.10,
+        },
+    },
+    "fdr_method": "BENJAMINI_YEKUTIELI_ARBITRARY_DEPENDENCE",
+    "fdr_q": 0.05,
+    "strategy_family_id": "STRATEGY_ALL_TRIALS_V1",
+    "combination_family_id": "COMBINATION_ALL_TRIALS_V1",
+    "candidate_p_value": "MAX_NET_EXPECTANCY_P_60_120",
+    "missing_p_value": 1.0,
+    "minimum_confirmation_sessions": 5,
+    "required_total_confirmations": 3,
+    "automatic_real_order_submission": False,
+    "real_order_authority": False,
+}
+STATISTICAL_POLICY_HASH = _checkpoint_canonical_hash(
+    STATISTICAL_GUARD_POLICY
+)
+STATISTICAL_TRIAL_SCAN_BATCH_SIZE = 100
+STATISTICAL_DECISION_CONTRACT = "strategy-governance-decision.v7"
 DECAY_GATE_20_POLICY: dict[str, Any] = {
     "window_days": 20,
     "minimum_completed_trades": 20,
@@ -154,6 +268,13 @@ HEALTH_SCORE_WEIGHTS = {
 
 DEFAULT_ROUND_TRIP_COST_PCT = 0.25
 WINDOWS = (20, 60, 120)
+CANONICAL_FUNDING_PROVENANCE = (
+    "INTERNAL_PORTFOLIO_CHECKPOINT_FACT_LEDGER_V3"
+)
+LEGACY_FUNDING_PROVENANCE_DISPLAY_ONLY = frozenset({
+    "INTERNAL_PORTFOLIO_LEDGER_V1",
+    "INTERNAL_PORTFOLIO_CHECKPOINT_LEDGER_V2",
+})
 MARKET_REGIME_STATES = (
     "trend_bullish",
     "high_range",
@@ -161,13 +282,42 @@ MARKET_REGIME_STATES = (
     "extreme_event",
 )
 MARKET_ROUTER_POLICY_VERSION = "strategy_market_router.v1"
-ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v3"
+ALLOCATION_POLICY_VERSION = "strategy_capital_competition.v5"
 DAILY_NAV_RANKING_BASIS = "DAILY_NET_NAV_20_60_120_V1"
 DAILY_NAV_RANKING_BASIS_LABEL = "同口径20/60/120日扣费后日频净值健康分"
-ALLOCATION_TYPE_LANE_POLICY = "FIXED_EQUAL_LANES_NO_CROSS_TYPE_RAW_SCORE_V1"
+SIGNAL_VALIDATION_RANKING_BASIS = (
+    "CLIENT_DECLARED_OOS_SELECTION_20_60_120_V2"
+)
+SIGNAL_VALIDATION_RANKING_BASIS_LABEL = (
+    "客户端声明样本外版本选择榜（来源未认证，仅研究，不授予资金）"
+)
+EXTERNAL_SELECTION_SOURCE_AUTHORITY = "CLIENT_DECLARED_UNATTESTED"
+EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL = (
+    "客户端声明数据；仅复核结构与哈希自洽，未与权威行情逐行认证"
+)
+EXECUTION_EVIDENCE_RANKING_BASIS_LABEL = (
+    "成交实证榜（内部模拟成交、实际费用与逐日组合净值）"
+)
+PROVISIONAL_MEMBER_REFERENCE_BASIS = "PROVISIONAL_MEMBER_REFERENCE_ONLY_V1"
+PROVISIONAL_MEMBER_REFERENCE_LABEL = "成员加权参考分（不是组合独立成绩）"
+ALLOCATION_TYPE_LANE_POLICY = (
+    "UNIFIED_RISK_ADJUSTED_QUALITY_MUTUAL_EXCLUSION_V1"
+)
 POOL_ROW_SCHEMA = "probiga.strategy-pool-row.v1"
 POOL_ROW_EVIDENCE_SCHEMA = "probiga.strategy-pool-row-evidence.v1"
 POOL_SNAPSHOT_SCHEMA = "probiga.strategy-pool-snapshot.v1"
+INDUSTRY_BINDING_SCHEMA = "probiga.governance-industry-binding.v1"
+INDUSTRY_SNAPSHOT_SCHEMA = "probiga.governance-industry-snapshot.v2"
+INDUSTRY_SNAPSHOT_PATH_SCHEMA = (
+    "probiga.governance-industry-snapshot-path.v1"
+)
+L1_INDUSTRY_TYPES = frozenset({"L1", "一级行业", "申万一级", "SW2021"})
+_QMT_INDUSTRY_FACT_ID_PATTERN = re.compile(
+    r"^qmt:[0-9a-f]{64}:[0-9a-f]{64}$"
+)
+PORTFOLIO_RISK_EVIDENCE_SCHEMA = (
+    "probiga.strategy-portfolio-risk-evidence.v2"
+)
 AUTOMATIC_TRANSITION_PLAN_SCHEMA = (
     "probiga.strategy-automatic-transition-plan.v1"
 )
@@ -176,6 +326,23 @@ MARKET_RISK_CAP_PCT = {
     "high_range": 50.0,
     "risk_declining": 20.0,
     "extreme_event": 0.0,
+}
+GLOBAL_PORTFOLIO_POLICY: dict[str, Any] = {
+    "maximum_funded_sleeves": 8,
+    "maximum_single_stock_weight_pct": 5.0,
+    "maximum_industry_weight_pct": 20.0,
+    "maximum_pairwise_correlation": 0.80,
+    "minimum_pairwise_observations": 60,
+    "maximum_pairwise_stock_overlap_pct": 40.0,
+    "maximum_planned_positions": 25,
+    # This limit applies only to increases over the prior paper target.
+    # Reductions and complete exits are always permitted.
+    "maximum_new_buy_turnover_pct": 30.0,
+    "maximum_daily_expected_shortfall_95_pct": 3.0,
+    "maximum_annualized_volatility_pct": 35.0,
+    "reference_capital_cny": 1_000_000.0,
+    "board_lot_size": 100,
+    "real_order_authority": False,
 }
 
 # A REDUCE sleeve keeps its competitive rank, but receives only half of the
@@ -215,6 +382,150 @@ _VERIFIED_WALK_FORWARD_PROTOCOLS = frozenset({
     "PURGED_WALK_FORWARD_V2",
     "COMBINATORIAL_PURGED_WALK_FORWARD_V2",
 })
+
+
+def _strict_positive_environment_integer(
+    name: str, default: int, *, maximum: int,
+) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        raise RuntimeError(f"{name} 必须是正整数")
+    value = int(raw)
+    if value > maximum:
+        raise RuntimeError(f"{name} 超出安全上限{maximum}")
+    return value
+
+
+def _funding_bootstrap_budget() -> dict[str, int]:
+    """Return explicit per-run bootstrap limits without capping registry size."""
+
+    maximum_strategies = _strict_positive_environment_integer(
+        "PROBIGA_FUNDING_BOOTSTRAP_MAX_STRATEGIES_PER_RUN",
+        FUNDING_BOOTSTRAP_DEFAULT_MAX_STRATEGIES_PER_RUN,
+        maximum=FUNDING_METRICS_STRATEGY_BATCH_SIZE,
+    )
+    time_budget_seconds = _strict_positive_environment_integer(
+        "PROBIGA_FUNDING_BOOTSTRAP_TIME_BUDGET_SECONDS",
+        FUNDING_BOOTSTRAP_DEFAULT_TIME_BUDGET_SECONDS,
+        maximum=3600,
+    )
+    byte_budget = _strict_positive_environment_integer(
+        "PROBIGA_FUNDING_BOOTSTRAP_MAX_BYTES_PER_RUN",
+        FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+        maximum=FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+    )
+    return {
+        "maximum_strategies": maximum_strategies,
+        "time_budget_seconds": time_budget_seconds,
+        "byte_budget": byte_budget,
+    }
+
+
+def _authoritative_funding_execution_policy() -> dict[str, Any]:
+    """Bind funding economics to the deployed paper execution policy.
+
+    The account hash authority is the existing immutable V2 portfolio policy.
+    Its referenced A-share fee profile and slippage assumptions must agree with
+    the V3 paper executor before any fill can contribute funding evidence.
+    """
+
+    policy = load_portfolio_policy()
+    v3_account = load_v3_config().get("account") or {}
+    share_profiles = [
+        dict(item) for item in PAPER_FEE_PROFILES
+        if str(item.get("security_type") or "") == "A_SHARE"
+    ]
+    if len(share_profiles) != 1:
+        raise RuntimeError("生产A股费用配置不是唯一冻结事实")
+    share = share_profiles[0]
+    fee_fields = {
+        "security_type", "buy_commission_rate", "sell_commission_rate",
+        "minimum_commission", "stamp_tax_sell_rate",
+        "transfer_fee_buy_rate", "transfer_fee_sell_rate", "other_fees",
+    }
+    if (
+        set(share) != fee_fields
+        or type(share.get("other_fees")) is not dict
+        or share["other_fees"]
+    ):
+        # V3 has no independent ``other_fees`` calculator.  A newly introduced
+        # fee must first be represented by both executors; silently ignoring it
+        # would let the funding ledger use different economics from execution.
+        raise RuntimeError("生产A股费用字段与V3执行口径不一致")
+    try:
+        expected = {
+            "commission_rate": Decimal(share["buy_commission_rate"]),
+            "sell_commission_rate": Decimal(share["sell_commission_rate"]),
+            "minimum_commission_cny": Decimal(share["minimum_commission"]),
+            "transfer_fee_rate": Decimal(share["transfer_fee_buy_rate"]),
+            "sell_transfer_fee_rate": Decimal(
+                share["transfer_fee_sell_rate"]
+            ),
+            "sell_stamp_duty_rate": Decimal(
+                share["stamp_tax_sell_rate"]
+            ),
+            "default_slippage_rate": Decimal(
+                policy.paper_snapshot_slippage_rate
+            ),
+        }
+        observed = {
+            key: Decimal(str(v3_account[key])) for key in (
+                "commission_rate", "minimum_commission_cny",
+                "transfer_fee_rate", "sell_stamp_duty_rate",
+                "default_slippage_rate",
+            )
+        }
+    except (InvalidOperation, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("V3生产执行费用/滑点配置不完整") from exc
+    if (
+        expected["commission_rate"] != expected["sell_commission_rate"]
+        or expected["transfer_fee_rate"]
+        != expected["sell_transfer_fee_rate"]
+        or any(not value.is_finite() or value < 0 for value in expected.values())
+        or any(not value.is_finite() or value < 0 for value in observed.values())
+        or any(observed[key] != expected[key] for key in observed)
+        or not _HASH_PATTERN.fullmatch(str(policy.config_hash or ""))
+        or not str(policy.version or "")
+        or not str(policy.fee_profile_version or "")
+        or not str(policy.instrument_rule_version or "")
+        or str(policy.fee_profile_version) != PAPER_FEE_PROFILE_VERSION
+        or str(policy.instrument_rule_version)
+        != PAPER_INSTRUMENT_RULE_VERSION
+    ):
+        raise RuntimeError("V3与V2冻结生产费用/滑点策略不一致")
+    return {
+        "policy_version": str(policy.version),
+        "policy_hash": str(policy.config_hash),
+        "fee_profile_version": str(policy.fee_profile_version),
+        "instrument_rule_version": str(policy.instrument_rule_version),
+        "default_slippage_rate": format(
+            expected["default_slippage_rate"], "f"
+        ),
+        "fee_schedule": {
+            "security_type": str(share["security_type"]),
+            "buy_commission_rate": format(
+                expected["commission_rate"], ".10f"
+            ),
+            "sell_commission_rate": format(
+                expected["sell_commission_rate"], ".10f"
+            ),
+            "minimum_commission": format(
+                expected["minimum_commission_cny"], ".2f"
+            ),
+            "stamp_tax_sell_rate": format(
+                expected["sell_stamp_duty_rate"], ".10f"
+            ),
+            "transfer_fee_buy_rate": format(
+                expected["transfer_fee_rate"], ".10f"
+            ),
+            "transfer_fee_sell_rate": format(
+                expected["sell_transfer_fee_rate"], ".10f"
+            ),
+            "other_fee_json": _json_text(share["other_fees"]),
+        },
+    }
 RUN_REVISION_MIGRATION_KEY = "20260822_001_canonical_run_revision"
 RUN_REVISION_MIGRATION_HASH = hashlib.sha256(
     b"probiga.strategy-governance.canonical-run-revision.v1"
@@ -513,13 +824,15 @@ GOVERNANCE_APPEND_ONLY_TABLES = (
     "st_strategy_governance_run",
 )
 
-# Version, lifecycle, snapshot and audit immutability is enforced by append-only
-# application writers, unique identities and full hash replay.  Emptying these
-# exported plans prevents every setup path (including the legacy privileged
-# migrator) from issuing CREATE TRIGGER on managed RDS.  Existing triggers are
-# intentionally neither queried nor removed.
-GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.clear()
-GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.clear()
+# Funding facts join the governance append-only trigger inventory.  The full
+# inventory is rebuilt from the exact table contracts below so ordinary
+# ON-DUPLICATE no-op writes remain legal while every material mutation fails.
+GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.update(
+    FUNDING_CHECKPOINT_TRIGGER_STATEMENTS
+)
+GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.update(
+    FUNDING_CHECKPOINT_TRIGGER_CONTRACTS
+)
 _LEGACY_MAP = legacy_strategy_merge_map()
 _SEED_LOCK = threading.Lock()
 _SEED_READY = False
@@ -657,6 +970,65 @@ def _db_write(sql: str, params: dict[str, Any] | None = None) -> None:
         return
     with get_engine().begin() as connection:
         connection.execute(text(sql), params or {})
+
+
+def _immutable_calendar_receipt(
+    *, start_date: str, end_date: str, decision_known_at: Any,
+):
+    """Load and validate one append-only QMT calendar receipt.
+
+    All funding/statistical consumers use this helper so a missing receipt,
+    invalid manifest, late receipt, or uncovered range fails closed before a
+    mutable convenience calendar can influence eligibility.
+    """
+
+    connection = current_bound_sql_connection()
+    if connection is not None:
+        return load_trade_calendar_receipt(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            decision_known_at=decision_known_at,
+        )
+    with get_engine().connect() as connection:
+        return load_trade_calendar_receipt(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            decision_known_at=decision_known_at,
+        )
+
+
+def _calendar_receipt_binding(receipt: Any) -> dict[str, Any]:
+    payload = {
+        "schema": "probiga.governance-calendar-receipt-binding.v1",
+        "batch_id": str(receipt.batch_id),
+        "known_at": str(receipt.known_at),
+        "start_date": str(receipt.start_date),
+        "end_date": str(receipt.end_date),
+        "session_count": int(receipt.session_count),
+        "session_set_hash": str(receipt.session_set_hash),
+        "manifest_hash": str(receipt.manifest_hash),
+    }
+    return {**payload, "binding_hash": _digest(payload)}
+
+
+def _valid_calendar_receipt_binding(
+    value: Any, *, start_date: str, end_date: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    payload = {key: item for key, item in value.items() if key != "binding_hash"}
+    return bool(
+        value.get("schema")
+        == "probiga.governance-calendar-receipt-binding.v1"
+        and _digest(payload) == str(value.get("binding_hash") or "")
+        and _HASH_PATTERN.fullmatch(str(value.get("manifest_hash") or ""))
+        and _HASH_PATTERN.fullmatch(str(value.get("session_set_hash") or ""))
+        and str(value.get("start_date") or "") <= start_date <= end_date
+        <= str(value.get("end_date") or "")
+        and _int(value.get("session_count"), 0) > 0
+    )
 
 
 def _table_exists(table_name: str) -> bool:
@@ -894,15 +1266,28 @@ METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS: dict[str, dict[str, str]] = {
         "body": _METRIC_INPUT_DELETE_BODY,
     },
 }
-
-# Managed production MySQL does not grant the deployment account authority to
-# create binary-log protected triggers.  Review transitions are enforced by
-# ``review_metric_input`` under a row lock and are independently replayed from
-# hash-bound audit rows.  Export an empty trigger contract so legacy migration
-# tooling also stops planning these database objects; an already-installed
-# trigger may remain without becoming a deployment prerequisite.
-METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.clear()
-
+METRIC_INPUT_REVIEW_TRIGGER_STATEMENTS = {
+    name: (
+        f"CREATE TRIGGER {name} {contract['timing']} "
+        f"{contract['event']} ON {contract['table']} FOR EACH ROW "
+        f"{contract['body']}"
+    )
+    for name, contract in METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items()
+}
+EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES = frozenset({
+    "trg_strategy_metric_input_review_bu",
+    "trg_strategy_metric_input_immutable_bd",
+})
+METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH = _checkpoint_canonical_hash({
+    "schema": "probiga.strategy-metric-review-trigger-contract.v1",
+    "triggers": [
+        {
+            "name": name,
+            **METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[name],
+        }
+        for name in sorted(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
+    ],
+})
 
 def _normalized_metric_input_trigger_body(value: Any) -> str:
     """Canonicalize information_schema text without weakening the contract."""
@@ -942,22 +1327,43 @@ def _metric_input_trigger_inventory(connection) -> list[dict[str, Any]]:
 
 
 def validate_metric_input_review_triggers(connection) -> dict[str, Any]:
-    """Return the application-level review enforcement contract.
+    """Require the exact two-trigger independent-review state machine."""
 
-    The historical function name is retained for callers during a rolling
-    release, but this validator deliberately performs no trigger inventory
-    query and treats existing database triggers as unmanaged, compatible
-    guards.
-    """
-
-    del connection
+    rows = _metric_input_trigger_inventory(connection)
+    observed = {
+        str(row.get("trigger_name") or ""): dict(row) for row in rows
+    }
+    errors: list[str] = []
+    if set(observed) != EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES:
+        errors.append("strategy metric review trigger name set drift")
+    for name, contract in METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items():
+        row = observed.get(name)
+        if row is None:
+            continue
+        if (
+            str(row.get("action_timing") or "").upper()
+            != contract["timing"]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract["event"]
+            or str(row.get("event_object_table") or "")
+            != contract["table"]
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or _normalized_metric_input_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_metric_input_trigger_body(contract["body"])
+        ):
+            errors.append(f"strategy metric review trigger drift: {name}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
     return {
         "table": "st_strategy_metric_input",
-        "trigger_names": [],
-        "trigger_count": 0,
-        "database_triggers_required": False,
-        "enforcement": "row_lock_state_machine_and_hash_bound_audit",
-        "errors": [],
+        "trigger_names": sorted(observed),
+        "trigger_count": len(observed),
+        "database_triggers_required": True,
+        "metadata_frozen": True,
+        "contract_hash": METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+        "enforcement": "database_review_state_machine_and_hash_bound_audit",
+        "errors": errors,
     }
 
 
@@ -966,11 +1372,42 @@ def _ensure_metric_input_review_triggers(
     *,
     trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> None:
-    """Compatibility shim; governance setup no longer manages triggers."""
+    """Create only missing exact review triggers via the fenced executor."""
 
-    del connection
     if trigger_ddl_executor is not None and not callable(trigger_ddl_executor):
         raise TypeError("trigger_ddl_executor must be callable")
+    rows = _metric_input_trigger_inventory(connection)
+    observed = {
+        str(row.get("trigger_name") or ""): dict(row) for row in rows
+    }
+    observed_names = set(observed)
+    extras = observed_names - EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+    if extras:
+        raise RuntimeError("存在未管理的指标复核触发器：" + ",".join(sorted(extras)))
+    drifted = set()
+    for name, contract in METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS.items():
+        row = observed.get(name)
+        if row is not None and (
+            str(row.get("action_timing") or "").upper()
+            != contract["timing"]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract["event"]
+            or str(row.get("event_object_table") or "")
+            != contract["table"]
+            or _normalized_metric_input_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_metric_input_trigger_body(contract["body"])
+        ):
+            drifted.add(name)
+    if drifted:
+        raise RuntimeError("指标复核触发器已存在但元数据漂移")
+    missing = EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES - observed_names
+    if missing:
+        if trigger_ddl_executor is None:
+            raise RuntimeError("指标复核触发器缺失且没有受控DDL执行器")
+        for name in sorted(missing):
+            trigger_ddl_executor(METRIC_INPUT_REVIEW_TRIGGER_STATEMENTS[name])
+    validate_metric_input_review_triggers(connection)
 
 
 class GovernanceAppendOnlySchemaError(RuntimeError):
@@ -1014,21 +1451,47 @@ def _governance_append_only_trigger_inventory(connection):
         "WHERE TRIGGER_SCHEMA=DATABASE() "
         f"AND EVENT_OBJECT_TABLE IN ({table_names_sql}) "
         "ORDER BY BINARY TRIGGER_NAME"
-    )).mappings().all()
+    ), {}).mappings().all()
 
 
 def _validate_governance_append_only_triggers_connection(
     connection,
 ) -> dict[str, Any]:
-    del connection
-    return {
-        "table_names": list(GOVERNANCE_APPEND_ONLY_TABLES),
-        "trigger_names": [],
-        "trigger_count": 0,
-        "database_triggers_required": False,
-        "enforcement": "append_only_writers_unique_identity_and_hash_replay",
-        "errors": [],
+    rows = _governance_append_only_trigger_inventory(connection)
+    observed = {
+        str(row.get("trigger_name") or ""): dict(row) for row in rows
     }
+    errors: list[str] = []
+    if set(observed) != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES:
+        errors.append("governance append-only trigger name set drift")
+    for name, contract in GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.items():
+        row = observed.get(name)
+        if row is None:
+            continue
+        if (
+            str(row.get("action_timing") or "").upper() != contract[0]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract[1]
+            or str(row.get("event_object_table") or "") != contract[2]
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or _normalized_governance_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_governance_trigger_body(contract[3])
+        ):
+            errors.append(f"governance append-only trigger drift: {name}")
+    detail = {
+        "table_names": list(GOVERNANCE_APPEND_ONLY_TABLES),
+        "trigger_names": sorted(observed),
+        "trigger_count": len(observed),
+        "database_triggers_required": True,
+        "metadata_frozen": not errors,
+        "contract_hash": GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH,
+        "enforcement": "database_append_only_triggers_and_hash_replay",
+        "errors": errors,
+    }
+    if errors:
+        raise GovernanceAppendOnlySchemaError(detail)
+    return detail
 
 
 def _ensure_governance_append_only_triggers(
@@ -1036,15 +1499,46 @@ def _ensure_governance_append_only_triggers(
     *,
     trigger_ddl_executor: Callable[[str], None] | None = None,
 ) -> None:
-    """Compatibility shim; governance setup no longer manages triggers."""
+    """Create only missing exact append-only triggers via a fenced executor."""
 
-    del connection
     if trigger_ddl_executor is not None and not callable(trigger_ddl_executor):
         raise TypeError("trigger_ddl_executor must be callable")
+    rows = _governance_append_only_trigger_inventory(connection)
+    observed = {
+        str(row.get("trigger_name") or ""): dict(row) for row in rows
+    }
+    observed_names = set(observed)
+    extras = observed_names - EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+    if extras:
+        raise RuntimeError("存在未管理的治理不可变触发器：" + ",".join(sorted(extras)))
+    drifted = set()
+    for name, contract in GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.items():
+        row = observed.get(name)
+        if row is not None and (
+            str(row.get("action_timing") or "").upper() != contract[0]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract[1]
+            or str(row.get("event_object_table") or "") != contract[2]
+            or _normalized_governance_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_governance_trigger_body(contract[3])
+        ):
+            drifted.add(name)
+    if drifted:
+        raise RuntimeError("治理不可变触发器已存在但元数据漂移")
+    missing = EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES - observed_names
+    if missing:
+        if trigger_ddl_executor is None:
+            raise RuntimeError("治理不可变触发器缺失且没有受控DDL执行器")
+        for name in sorted(missing):
+            trigger_ddl_executor(
+                GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS[name]
+            )
+    _validate_governance_append_only_triggers_connection(connection)
 
 
 def validate_governance_append_only_triggers(bind) -> dict[str, Any]:
-    """Return the application-level append-only enforcement contract."""
+    """Validate the exact database-enforced append-only contract."""
 
     try:
         if hasattr(bind, "execute"):
@@ -1766,6 +2260,198 @@ def _governance_table_schema_contract() -> dict[str, dict[str, Any]]:
     return contracts
 
 
+EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES = frozenset({
+    "trg_strategy_version_immutable_bu",
+    "trg_strategy_version_immutable_bd",
+    "trg_strategy_combination_version_immutable_bu",
+    "trg_strategy_combination_version_immutable_bd",
+    "trg_strategy_lifecycle_event_immutable_bu",
+    "trg_strategy_lifecycle_event_immutable_bd",
+    "trg_strategy_governance_audit_immutable_bu",
+    "trg_strategy_governance_audit_immutable_bd",
+    "trg_strategy_health_snapshot_immutable_bu",
+    "trg_strategy_health_snapshot_immutable_bd",
+    "trg_strategy_combination_health_snapshot_immutable_bu",
+    "trg_strategy_combination_health_snapshot_immutable_bd",
+    "trg_strategy_pool_snapshot_immutable_bu",
+    "trg_strategy_pool_snapshot_immutable_bd",
+    "trg_strategy_allocation_snapshot_immutable_bu",
+    "trg_strategy_allocation_snapshot_immutable_bd",
+    "trg_strategy_adapter_run_receipt_immutable_bu",
+    "trg_strategy_adapter_run_receipt_immutable_bd",
+    "trg_strategy_industry_history_immutable_bu",
+    "trg_strategy_industry_history_immutable_bd",
+    "trg_strategy_governance_run_frozen_bu",
+    "trg_strategy_governance_run_immutable_bd",
+    "trg_strategy_funding_daily_fact_immutable_bu",
+    "trg_strategy_funding_daily_fact_immutable_bd",
+    "trg_strategy_funding_checkpoint_immutable_bu",
+    "trg_strategy_funding_checkpoint_immutable_bd",
+    "trg_strategy_adapter_candidate_fact_immutable_bu",
+    "trg_strategy_adapter_candidate_fact_immutable_bd",
+    "trg_dynamic_shadow_trial_plan_immutable_bu",
+    "trg_dynamic_shadow_trial_plan_immutable_bd",
+    "trg_dynamic_shadow_trial_chain_immutable_bu",
+    "trg_dynamic_shadow_trial_chain_immutable_bd",
+    "trg_dynamic_shadow_trial_exit_binding_immutable_bu",
+    "trg_dynamic_shadow_trial_exit_binding_immutable_bd",
+    "trg_strategy_governance_schema_migration_immutable_bu",
+    "trg_strategy_governance_schema_migration_immutable_bd",
+    "trg_strategy_registry_immutable_bd",
+    "trg_strategy_combination_immutable_bd",
+})
+
+
+def _initialize_governance_trigger_contracts() -> None:
+    """Build the exact 38-trigger append-only database contract."""
+
+    table_contract = _governance_table_schema_contract()
+    statements: dict[str, str] = {}
+    contracts: dict[str, tuple[str, str, str, str]] = {}
+
+    def add_delete(name: str, table: str, message: str) -> None:
+        body = (
+            "BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+            f"'{message}'; END"
+        )
+        statements[name] = (
+            f"CREATE TRIGGER {name} BEFORE DELETE ON {table} "
+            f"FOR EACH ROW {body}"
+        )
+        contracts[name] = ("BEFORE", "DELETE", table, body)
+
+    def add_noop_update(name: str, table: str, message: str) -> None:
+        predicates = []
+        for column in table_contract[table]["columns"]:
+            field = str(column["name"])
+            base_type = str(column["column_type"]).split("(", 1)[0]
+            if base_type in {
+                "char", "varchar", "text", "mediumtext", "longtext",
+            }:
+                predicates.append(
+                    f"BINARY OLD.{field} <=> BINARY NEW.{field}"
+                )
+            else:
+                predicates.append(f"OLD.{field} <=> NEW.{field}")
+        body = (
+            "BEGIN IF NOT (" + " AND ".join(predicates) + ") THEN "
+            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+            f"'{message}'; END IF; END"
+        )
+        statements[name] = (
+            f"CREATE TRIGGER {name} BEFORE UPDATE ON {table} "
+            f"FOR EACH ROW {body}"
+        )
+        contracts[name] = ("BEFORE", "UPDATE", table, body)
+
+    immutable_tables = {
+        "strategy_version": "st_strategy_version",
+        "strategy_combination_version": "st_strategy_combination_version",
+        "strategy_lifecycle_event": "st_strategy_lifecycle_event",
+        "strategy_governance_audit": "st_strategy_governance_audit",
+        **_GOVERNANCE_SNAPSHOT_TRIGGER_TABLES,
+    }
+    for stem, table in immutable_tables.items():
+        add_noop_update(
+            f"trg_{stem}_immutable_bu", table,
+            f"{stem} is append only",
+        )
+        add_delete(
+            f"trg_{stem}_immutable_bd", table,
+            f"{stem} cannot be deleted",
+        )
+
+    statements["trg_strategy_governance_run_frozen_bu"] = (
+        "CREATE TRIGGER trg_strategy_governance_run_frozen_bu "
+        "BEFORE UPDATE ON st_strategy_governance_run FOR EACH ROW "
+        + _GOVERNANCE_RUN_UPDATE_BODY
+    )
+    contracts["trg_strategy_governance_run_frozen_bu"] = (
+        "BEFORE", "UPDATE", "st_strategy_governance_run",
+        _GOVERNANCE_RUN_UPDATE_BODY,
+    )
+    add_delete(
+        "trg_strategy_governance_run_immutable_bd",
+        "st_strategy_governance_run", "governance run cannot be deleted",
+    )
+
+    statements.update(FUNDING_CHECKPOINT_TRIGGER_STATEMENTS)
+    contracts.update(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS)
+
+    for table, columns in DYNAMIC_SHADOW_LEDGER_COLUMN_NAMES.items():
+        del columns
+        stem = table.removeprefix("st_")
+        name = f"trg_{stem}_immutable_bu"
+        body = (
+            "BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+            f"'{stem} is append only'; END"
+        )
+        statements[name] = (
+            f"CREATE TRIGGER {name} BEFORE UPDATE ON {table} "
+            f"FOR EACH ROW {body}"
+        )
+        contracts[name] = ("BEFORE", "UPDATE", table, body)
+        add_delete(
+            f"trg_{stem}_immutable_bd", table,
+            f"{stem} cannot be deleted",
+        )
+
+    migration_table = "st_strategy_governance_schema_migration"
+    migration_update = "trg_strategy_governance_schema_migration_immutable_bu"
+    migration_body = (
+        "BEGIN SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'strategy governance migration is append only'; END"
+    )
+    statements[migration_update] = (
+        f"CREATE TRIGGER {migration_update} BEFORE UPDATE ON "
+        f"{migration_table} FOR EACH ROW {migration_body}"
+    )
+    contracts[migration_update] = (
+        "BEFORE", "UPDATE", migration_table, migration_body,
+    )
+    add_delete(
+        "trg_strategy_governance_schema_migration_immutable_bd",
+        migration_table, "strategy governance migration cannot be deleted",
+    )
+    add_delete(
+        "trg_strategy_registry_immutable_bd", "st_strategy_registry",
+        "strategy registry cannot be deleted",
+    )
+    add_delete(
+        "trg_strategy_combination_immutable_bd", "st_strategy_combination",
+        "strategy combination cannot be deleted",
+    )
+    if (
+        set(statements) != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+        or set(contracts) != EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+        or len(contracts) != 38
+    ):
+        raise RuntimeError("治理不可变触发器冻结名称集合不完整")
+    GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.clear()
+    GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS.update(statements)
+    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.clear()
+    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.update(contracts)
+    global GOVERNANCE_APPEND_ONLY_TABLES
+    GOVERNANCE_APPEND_ONLY_TABLES = tuple(sorted({
+        contract[2] for contract in contracts.values()
+    }))
+
+
+_initialize_governance_trigger_contracts()
+GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH = _checkpoint_canonical_hash({
+    "schema": "probiga.governance-append-only-trigger-contract.v1",
+    "triggers": [{
+        "name": name,
+        "timing": contract[0],
+        "event": contract[1],
+        "table": contract[2],
+        "body": contract[3],
+    } for name, contract in sorted(
+        GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS.items()
+    )],
+})
+
+
 def _normalized_governance_column_default(
     value: Any,
     column_type: str,
@@ -1934,6 +2620,7 @@ def ensure_strategy_governance_tables(
     *,
     engine: Any | None = None,
     trigger_ddl_executor: Callable[[str], None] | None = None,
+    writers_fenced: bool = False,
 ) -> None:
     """Create governance tables, columns and indexes without trigger DDL.
 
@@ -1948,10 +2635,29 @@ def ensure_strategy_governance_tables(
     ):
         raise TypeError("trigger_ddl_executor must be callable")
     statements = governance_table_ddl_statements()
+    production_mode = (
+        os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+        == "production"
+    )
+    if production_mode and writers_fenced is not True:
+        raise RuntimeError(
+            "生产治理结构准备必须显式证明所有写入器已隔离"
+        )
+    # Local development owns this single preparation process.  Production is
+    # admitted only through the explicit maintenance-lock proof above.
+    effective_writer_fence = writers_fenced is True or not production_mode
     schema_engine = engine or get_engine()
     with schema_engine.begin() as connection:
         for statement in statements:
             connection.execute(text(statement))
+        ensure_dynamic_shadow_ledger_schema(
+            connection,
+            writers_fenced=effective_writer_fence,
+        )
+        ensure_strategy_funding_checkpoint_schema(
+            connection,
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
         metric_entity_type = connection.execute(
             text(
                 "SELECT COUNT(*) FROM information_schema.columns "
@@ -2273,6 +2979,34 @@ def ensure_strategy_governance_tables(
                     f"{index_name} ({columns})"
                 ))
         _ensure_strategy_content_hash_schema(connection)
+        checkpoint_migration = connection.execute(text(
+            "SELECT migration_hash "
+            "FROM st_strategy_governance_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ), {
+            "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+        }).mappings().first()
+        if checkpoint_migration is None:
+            connection.execute(text(
+                "INSERT INTO st_strategy_governance_schema_migration "
+                "(migration_key, migration_hash) "
+                "VALUES (:migration_key, :migration_hash)"
+            ), {
+                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+                "migration_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+            })
+        elif str(checkpoint_migration.get("migration_hash") or "") != (
+            FUNDING_CHECKPOINT_MIGRATION_HASH
+        ):
+            raise RuntimeError("资金检查点迁移标记哈希不一致")
+        _ensure_governance_append_only_triggers(
+            connection,
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
+        _ensure_metric_input_review_triggers(
+            connection,
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
 
 
 def _audit_record(
@@ -2442,6 +3176,10 @@ def seed_manifest_strategies() -> None:
         changed = not existing or (
             not runtime_owned and old_version != strategy_version
         )
+        reason = (
+            "清单版本更新，重新进入影子验证"
+            if existing else "初始策略清单注册为影子观察"
+        )
         params = {
             "key": key,
             "name": catalog_item["name"],
@@ -2455,6 +3193,7 @@ def seed_manifest_strategies() -> None:
             "evaluator": _json_text(evaluator_config),
             "parameters": _json_text(parameters),
             "version_created_at": frozen_at,
+            "reason": reason,
         }
         with get_engine().begin() as connection:
             if not versions:
@@ -2480,7 +3219,7 @@ def seed_manifest_strategies() -> None:
                      recovery_conditions_json)
                     VALUES (:key, :name, :category, :family, :description,
                             'manifest_registry', 'manifest_adapter', 1,
-                            :version, 'SHADOW', '等待独立前向证据', :recovery)
+                            :version, 'SHADOW', :reason, :recovery)
                     """
                 ), params)
             elif not runtime_owned:
@@ -2492,14 +3231,13 @@ def seed_manifest_strategies() -> None:
                         current_status=IF(current_version<>:version,
                                           'SHADOW', current_status),
                         status_reason=IF(current_version<>:version,
-                          '清单版本更新，重新进入影子验证', status_reason),
+                          :reason, status_reason),
                         current_version=:version
                     WHERE strategy_key=:key AND discovery_mode<>'dynamic'
                       AND current_version=:old_version
                     """
                 ), {**params, "old_version": old_version})
             if changed:
-                reason = "清单版本更新，重新进入影子验证" if existing else "初始策略清单注册为影子观察"
                 event_payload = {
                     "entity_type": "STRATEGY", "entity_key": key,
                     "old_version": old_version, "new_version": strategy_version,
@@ -2621,6 +3359,10 @@ def seed_v3_strategies() -> None:
         changed = not existing or (
             not runtime_owned and old_version != strategy_version
         )
+        reason = (
+            "V3版本更新，重新进入影子验证"
+            if existing else "初始V3策略注册为影子观察"
+        )
         params = {
             "key": key,
             "name": V3_STRATEGY_LABELS.get(key, key),
@@ -2632,6 +3374,7 @@ def seed_v3_strategies() -> None:
             "evaluator": _json_text(evaluator_config),
             "parameters": _json_text(sleeve),
             "recovery": _json_text(_recovery_conditions()),
+            "reason": reason,
         }
         with get_engine().begin() as connection:
             if not versions:
@@ -2657,7 +3400,7 @@ def seed_v3_strategies() -> None:
                      recovery_conditions_json)
                     VALUES (:key, :name, 'V3前向策略', :key, :description,
                             'v3_registry', 'v3_sleeve_adapter', 1,
-                            :version, 'SHADOW', '等待版本绑定的真实前向证据',
+                            :version, 'SHADOW', :reason,
                             :recovery)
                     """
                 ), params)
@@ -2670,17 +3413,13 @@ def seed_v3_strategies() -> None:
                         current_status=IF(current_version<>:version,
                                           'SHADOW', current_status),
                         status_reason=IF(current_version<>:version,
-                          'V3版本更新，重新进入影子验证', status_reason),
+                          :reason, status_reason),
                         current_version=:version
                     WHERE strategy_key=:key AND discovery_mode<>'dynamic'
                       AND current_version=:old_version
                     """
                 ), {**params, "old_version": old_version})
             if changed:
-                reason = (
-                    "V3版本更新，重新进入影子验证"
-                    if existing else "初始V3策略注册为影子观察"
-                )
                 event_payload = {
                     "entity_type": "STRATEGY",
                     "entity_key": key,
@@ -2813,12 +3552,17 @@ def seed_default_combinations() -> None:
             if existing else "SHADOW"
         )
         changed = system_owned and (not existing or old_version != version)
+        reason = (
+            "组合成员版本变化，重新进入影子验证"
+            if existing else "系统组合注册为影子观察"
+        )
         params = {
             "key": key, "name": name, "description": description,
             "version": version,
             "members": _json_text(members),
             "constraints": _json_text(constraints),
             "config_hash": config_hash,
+            "reason": reason,
         }
         with get_engine().begin() as connection:
             connection.execute(text(
@@ -2832,10 +3576,6 @@ def seed_default_combinations() -> None:
                 """
             ), params)
             if changed:
-                reason = (
-                    "组合成员版本变化，重新进入影子验证"
-                    if existing else "系统组合注册为影子观察"
-                )
                 event_payload = {
                     "entity_type": "COMBINATION",
                     "entity_key": key,
@@ -2892,7 +3632,7 @@ def seed_default_combinations() -> None:
                 (combination_key, combination_name, description, owner_name,
                  enabled, current_version, current_status, status_reason)
                 VALUES (:key, :name, :description, 'system_seed', 1, :version,
-                        'SHADOW', '等待组合独立验证')
+                        'SHADOW', :reason)
                 ON DUPLICATE KEY UPDATE
                     combination_name=IF(owner_name='system_seed',
                                         VALUES(combination_name),
@@ -2904,7 +3644,7 @@ def seed_default_combinations() -> None:
                                       'SHADOW', current_status),
                     status_reason=IF(owner_name='system_seed'
                                      AND current_version<>VALUES(current_version),
-                                     '组合成员版本变化，重新进入影子验证',
+                                     :reason,
                                      status_reason),
                     current_version=IF(owner_name='system_seed',
                                        VALUES(current_version), current_version)
@@ -3076,7 +3816,12 @@ def validate_default_governance_seed_contract(
     *,
     require_initial_shadow: bool = False,
 ) -> dict[str, Any]:
-    """Read-only proof that every built-in seed has its exact frozen version."""
+    """Read-only proof that every built-in seed's frozen version still exists.
+
+    Registry pointers and lifecycle state are intentionally allowed to advance
+    after the initial seed.  The immutable seed versions remain the release
+    contract and are checked independently from each registry's current version.
+    """
 
     if type(require_initial_shadow) is not bool:
         raise TypeError("require_initial_shadow must be bool")
@@ -3098,96 +3843,224 @@ def validate_default_governance_seed_contract(
     combination_placeholders = ", ".join(
         f":{key}" for key in combination_params
     )
+    strategy_version_params: dict[str, Any] = {}
+    strategy_version_predicates: list[str] = []
+    for index, (key, contract) in enumerate(sorted(strategy_contracts.items())):
+        key_param = f"seed_strategy_key_{index}"
+        version_param = f"seed_strategy_version_{index}"
+        strategy_version_params[key_param] = key
+        strategy_version_params[version_param] = contract["current_version"]
+        strategy_version_predicates.append(
+            f"(v.strategy_key=:{key_param} AND v.version=:{version_param})"
+        )
+    combination_version_params: dict[str, Any] = {}
+    combination_version_predicates: list[str] = []
+    for index, (key, contract) in enumerate(
+        sorted(combination_contracts.items())
+    ):
+        key_param = f"seed_combination_key_{index}"
+        version_param = f"seed_combination_version_{index}"
+        combination_version_params[key_param] = key
+        combination_version_params[version_param] = contract["current_version"]
+        combination_version_predicates.append(
+            f"(v.combination_key=:{key_param} AND v.version=:{version_param})"
+        )
     with runtime_engine.connect() as connection:
-        strategy_rows = connection.execute(text(
-            "SELECT r.strategy_key, r.strategy_name, r.category, "
-            "r.family_key, r.description, r.owner_name, r.discovery_mode, "
-            "r.enabled, r.current_version, r.current_status, "
-            "r.recovery_conditions_json, v.version_hash, v.content_hash, "
-            "v.evaluator_type, v.evaluator_config_json, v.parameters_json, "
-            "v.source_kind, v.created_by FROM st_strategy_registry r "
-            "LEFT JOIN st_strategy_version v ON "
-            "v.strategy_key=r.strategy_key AND v.version=r.current_version "
+        strategy_registry_rows = connection.execute(text(
+            "SELECT r.strategy_key, r.enabled, r.current_version, "
+            "r.current_status, "
+            "(SELECT COUNT(*) FROM st_strategy_version all_versions "
+            " WHERE all_versions.strategy_key=r.strategy_key) AS version_count, "
+            "CASE WHEN EXISTS (SELECT 1 FROM st_strategy_version current_version "
+            " WHERE current_version.strategy_key=r.strategy_key "
+            " AND current_version.version=r.current_version) "
+            "THEN 1 ELSE 0 END AS current_version_exists, "
+            "(SELECT COUNT(*) FROM st_strategy_lifecycle_event lifecycle "
+            " WHERE lifecycle.entity_type='STRATEGY' "
+            " AND lifecycle.entity_key=r.strategy_key "
+            " AND lifecycle.trigger_type<>'VERSION_REGISTRATION') "
+            "AS post_seed_lifecycle_count "
+            "FROM st_strategy_registry r "
             f"WHERE r.strategy_key IN ({strategy_placeholders}) "
             "ORDER BY BINARY r.strategy_key"
         ), strategy_params).mappings().all()
-        combination_rows = connection.execute(text(
-            "SELECT c.combination_key, c.combination_name, c.description, "
-            "c.owner_name, c.enabled, c.current_version, c.current_status, "
-            "v.members_json, v.constraints_json, v.config_hash, v.created_by "
-            "FROM st_strategy_combination c LEFT JOIN "
-            "st_strategy_combination_version v ON "
-            "v.combination_key=c.combination_key "
-            "AND v.version=c.current_version "
+        strategy_version_rows = connection.execute(text(
+            "SELECT v.strategy_key, v.version, v.version_hash, v.content_hash, "
+            "v.evaluator_type, v.evaluator_config_json, v.parameters_json, "
+            "v.source_kind, v.created_by FROM st_strategy_version v WHERE "
+            + " OR ".join(strategy_version_predicates)
+            + " ORDER BY BINARY v.strategy_key, BINARY v.version"
+        ), strategy_version_params).mappings().all()
+        combination_registry_rows = connection.execute(text(
+            "SELECT c.combination_key, c.enabled, c.current_version, "
+            "c.current_status, "
+            "(SELECT COUNT(*) FROM st_strategy_combination_version all_versions "
+            " WHERE all_versions.combination_key=c.combination_key) "
+            "AS version_count, "
+            "CASE WHEN EXISTS (SELECT 1 "
+            " FROM st_strategy_combination_version current_version "
+            " WHERE current_version.combination_key=c.combination_key "
+            " AND current_version.version=c.current_version) "
+            "THEN 1 ELSE 0 END AS current_version_exists, "
+            "(SELECT COUNT(*) FROM st_strategy_lifecycle_event lifecycle "
+            " WHERE lifecycle.entity_type='COMBINATION' "
+            " AND lifecycle.entity_key=c.combination_key "
+            " AND lifecycle.trigger_type<>'VERSION_REGISTRATION') "
+            "AS post_seed_lifecycle_count "
+            "FROM st_strategy_combination c "
             f"WHERE c.combination_key IN ({combination_placeholders}) "
             "ORDER BY BINARY c.combination_key"
         ), combination_params).mappings().all()
-    observed_strategies = {
+        combination_version_rows = connection.execute(text(
+            "SELECT v.combination_key, v.version, v.members_json, "
+            "v.constraints_json, v.config_hash, v.created_by "
+            "FROM st_strategy_combination_version v WHERE "
+            + " OR ".join(combination_version_predicates)
+            + " ORDER BY BINARY v.combination_key, BINARY v.version"
+        ), combination_version_params).mappings().all()
+
+    observed_strategy_registries = {
         str(row.get("strategy_key") or ""): dict(row)
-        for row in strategy_rows
+        for row in strategy_registry_rows
     }
-    if set(observed_strategies) != set(strategy_contracts):
+    if set(observed_strategy_registries) != set(strategy_contracts):
         raise RuntimeError("默认治理策略播种集合不完整")
+    observed_strategy_versions = {
+        (
+            str(row.get("strategy_key") or ""),
+            str(row.get("version") or ""),
+        ): dict(row)
+        for row in strategy_version_rows
+    }
+    expected_strategy_versions = {
+        (key, str(contract["current_version"]))
+        for key, contract in strategy_contracts.items()
+    }
+    if set(observed_strategy_versions) != expected_strategy_versions:
+        raise RuntimeError("默认治理策略冻结版本不完整")
+    initial_strategy_count = 0
     for key, contract in strategy_contracts.items():
-        row = observed_strategies[key]
+        registry = observed_strategy_registries[key]
+        current_version = str(registry.get("current_version") or "")
+        status = str(registry.get("current_status") or "")
+        if (
+            not current_version
+            or int(registry.get("current_version_exists") or 0) != 1
+        ):
+            raise RuntimeError(f"默认治理策略当前版本引用无效：{key}")
+        if status not in LIFECYCLE_LABELS:
+            raise RuntimeError(f"默认治理策略生命周期状态无效：{key}")
+        try:
+            enabled = int(registry.get("enabled"))
+            version_count = int(registry.get("version_count"))
+            post_seed_lifecycle_count = int(
+                registry.get("post_seed_lifecycle_count")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"默认治理策略注册状态损坏：{key}") from exc
+        if enabled not in {0, 1} or version_count < 1:
+            raise RuntimeError(f"默认治理策略注册状态损坏：{key}")
+        initial_seed_state = (
+            current_version == str(contract["current_version"])
+            and version_count == 1
+            and post_seed_lifecycle_count == 0
+        )
+        if initial_seed_state:
+            initial_strategy_count += 1
+            if require_initial_shadow and (status != "SHADOW" or enabled != 1):
+                raise RuntimeError(f"默认治理策略初始播种状态漂移：{key}")
+
+        row = observed_strategy_versions[(key, str(contract["current_version"]))]
         for field in (
-            "strategy_name", "category", "family_key", "description",
-            "owner_name", "discovery_mode", "current_version",
             "version_hash", "content_hash", "evaluator_type",
             "source_kind", "created_by",
         ):
             if str(row.get(field) or "") != str(contract[field]):
-                raise RuntimeError(f"默认治理策略播种漂移：{key}.{field}")
-        status = str(row.get("current_status") or "")
+                raise RuntimeError(f"默认治理策略冻结版本漂移：{key}.{field}")
         if (
-            int(row.get("enabled") or 0) != 1
-            or status not in LIFECYCLE_LABELS
-            or (require_initial_shadow and status != "SHADOW")
-            or _strict_seed_json(
+            _strict_seed_json(
                 row.get("evaluator_config_json"), expected_type=dict
             ) != contract["evaluator_config"]
             or _strict_seed_json(
                 row.get("parameters_json"), expected_type=dict
             ) != contract["parameters"]
-            or _strict_seed_json(
-                row.get("recovery_conditions_json"), expected_type=list
-            ) != _recovery_conditions()
         ):
-            raise RuntimeError(f"默认治理策略播种状态或内容漂移：{key}")
+            raise RuntimeError(f"默认治理策略冻结版本内容漂移：{key}")
 
-    observed_combinations = {
+    observed_combination_registries = {
         str(row.get("combination_key") or ""): dict(row)
-        for row in combination_rows
+        for row in combination_registry_rows
     }
-    if set(observed_combinations) != set(combination_contracts):
+    if set(observed_combination_registries) != set(combination_contracts):
         raise RuntimeError("默认治理组合播种集合不完整")
+    observed_combination_versions = {
+        (
+            str(row.get("combination_key") or ""),
+            str(row.get("version") or ""),
+        ): dict(row)
+        for row in combination_version_rows
+    }
+    expected_combination_versions = {
+        (key, str(contract["current_version"]))
+        for key, contract in combination_contracts.items()
+    }
+    if set(observed_combination_versions) != expected_combination_versions:
+        raise RuntimeError("默认治理组合冻结版本不完整")
+    initial_combination_count = 0
     for key, contract in combination_contracts.items():
-        row = observed_combinations[key]
-        for field in (
-            "combination_name", "description", "owner_name",
-            "current_version", "config_hash", "created_by",
-        ):
-            if str(row.get(field) or "") != str(contract[field]):
-                raise RuntimeError(f"默认治理组合播种漂移：{key}.{field}")
-        status = str(row.get("current_status") or "")
+        registry = observed_combination_registries[key]
+        current_version = str(registry.get("current_version") or "")
+        status = str(registry.get("current_status") or "")
         if (
-            int(row.get("enabled") or 0) != 1
-            or status not in LIFECYCLE_LABELS
-            or (require_initial_shadow and status != "SHADOW")
-            or _strict_seed_json(
+            not current_version
+            or int(registry.get("current_version_exists") or 0) != 1
+        ):
+            raise RuntimeError(f"默认治理组合当前版本引用无效：{key}")
+        if status not in LIFECYCLE_LABELS:
+            raise RuntimeError(f"默认治理组合生命周期状态无效：{key}")
+        try:
+            enabled = int(registry.get("enabled"))
+            version_count = int(registry.get("version_count"))
+            post_seed_lifecycle_count = int(
+                registry.get("post_seed_lifecycle_count")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"默认治理组合注册状态损坏：{key}") from exc
+        if enabled not in {0, 1} or version_count < 1:
+            raise RuntimeError(f"默认治理组合注册状态损坏：{key}")
+        initial_seed_state = (
+            current_version == str(contract["current_version"])
+            and version_count == 1
+            and post_seed_lifecycle_count == 0
+        )
+        if initial_seed_state:
+            initial_combination_count += 1
+            if require_initial_shadow and (status != "SHADOW" or enabled != 1):
+                raise RuntimeError(f"默认治理组合初始播种状态漂移：{key}")
+
+        row = observed_combination_versions[
+            (key, str(contract["current_version"]))
+        ]
+        for field in ("config_hash", "created_by"):
+            if str(row.get(field) or "") != str(contract[field]):
+                raise RuntimeError(f"默认治理组合冻结版本漂移：{key}.{field}")
+        if (
+            _strict_seed_json(
                 row.get("members_json"), expected_type=list
             ) != contract["members"]
             or _strict_seed_json(
                 row.get("constraints_json"), expected_type=dict
             ) != contract["constraints"]
         ):
-            raise RuntimeError(f"默认治理组合播种状态或内容漂移：{key}")
+            raise RuntimeError(f"默认治理组合冻结版本内容漂移：{key}")
     contract_hash = _digest(expected)
     return {
         "seeded_strategy_count": len(strategy_contracts),
         "seeded_combination_count": len(combination_contracts),
         "seed_contract_hash": contract_hash,
         "initial_shadow_required": require_initial_shadow,
+        "initial_strategy_count": initial_strategy_count,
+        "initial_combination_count": initial_combination_count,
     }
 
 
@@ -3215,6 +4088,7 @@ def validate_prepared_governance_runtime(
     expected_migrations = {
         RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
         STRATEGY_CONTENT_HASH_MIGRATION_KEY: STRATEGY_CONTENT_HASH_MIGRATION_HASH,
+        FUNDING_CHECKPOINT_MIGRATION_KEY: FUNDING_CHECKPOINT_MIGRATION_HASH,
     }
     with runtime_engine.connect() as connection:
         observed_tables = {
@@ -3233,11 +4107,13 @@ def validate_prepared_governance_runtime(
             text(
                 "SELECT migration_key, migration_hash "
                 "FROM st_strategy_governance_schema_migration "
-                "WHERE migration_key IN (:run_revision, :content_hash)"
+                "WHERE migration_key IN "
+                "(:run_revision, :content_hash, :funding_checkpoint)"
             ),
             {
                 "run_revision": RUN_REVISION_MIGRATION_KEY,
                 "content_hash": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
+                "funding_checkpoint": FUNDING_CHECKPOINT_MIGRATION_KEY,
             },
         ).mappings().all()
         observed_migrations = {
@@ -3249,21 +4125,84 @@ def validate_prepared_governance_runtime(
         if observed_migrations != expected_migrations:
             raise RuntimeError("生产治理结构迁移标记不完整或已漂移")
         schema_detail = validate_governance_table_schema(connection)
+        dynamic_schema_detail = validate_dynamic_shadow_ledger_schema(
+            connection
+        )
+        funding_checkpoint_schema = (
+            validate_strategy_funding_checkpoint_schema(connection)
+        )
+        append_only_trigger_detail = (
+            _validate_governance_append_only_triggers_connection(connection)
+        )
+        metric_review_trigger_detail = (
+            validate_metric_input_review_triggers(connection)
+        )
     seed_detail = validate_default_governance_seed_contract(runtime_engine)
     return {
         "table_count": int(schema_detail["table_count"]),
         "column_count": int(schema_detail["column_count"]),
         "index_count": int(schema_detail["index_count"]),
+        "dynamic_shadow_schema": dynamic_schema_detail,
+        "dynamic_shadow_table_count": int(
+            dynamic_schema_detail["table_count"]
+        ),
+        "dynamic_shadow_column_count": int(
+            dynamic_schema_detail["column_count"]
+        ),
+        "dynamic_shadow_index_count": int(
+            dynamic_schema_detail["index_count"]
+        ),
+        "dynamic_shadow_foreign_key_count": int(
+            dynamic_schema_detail["foreign_key_count"]
+        ),
+        "dynamic_shadow_check_count": int(
+            dynamic_schema_detail["check_count"]
+        ),
+        "dynamic_shadow_contract_hash": str(
+            dynamic_schema_detail["contract_hash"]
+        ),
+        "funding_checkpoint_schema": funding_checkpoint_schema,
+        "funding_checkpoint_table_count": int(
+            funding_checkpoint_schema["table_count"]
+        ),
+        "funding_checkpoint_column_count": int(
+            funding_checkpoint_schema["column_count"]
+        ),
+        "funding_checkpoint_index_count": int(
+            funding_checkpoint_schema["index_count"]
+        ),
+        "funding_checkpoint_foreign_key_count": int(
+            funding_checkpoint_schema["foreign_key_count"]
+        ),
+        "funding_checkpoint_check_count": int(
+            funding_checkpoint_schema["check_count"]
+        ),
+        "funding_checkpoint_contract_hash": str(
+            funding_checkpoint_schema["contract_hash"]
+        ),
         "migration_count": len(observed_migrations),
         "seeded_strategy_count": int(seed_detail["seeded_strategy_count"]),
         "seeded_combination_count": int(
             seed_detail["seeded_combination_count"]
         ),
         "seed_contract_hash": str(seed_detail["seed_contract_hash"]),
-        "trigger_count": 0,
-        "database_triggers_required": False,
+        "trigger_count": int(append_only_trigger_detail["trigger_count"])
+        + int(metric_review_trigger_detail["trigger_count"]),
+        "database_triggers_required": True,
+        "trigger_metadata_frozen": bool(
+            append_only_trigger_detail["metadata_frozen"]
+            and metric_review_trigger_detail["metadata_frozen"]
+        ),
+        "governance_append_only_triggers": append_only_trigger_detail,
+        "metric_review_triggers": metric_review_trigger_detail,
+        "governance_append_only_trigger_contract_hash": str(
+            append_only_trigger_detail["contract_hash"]
+        ),
+        "metric_review_trigger_contract_hash": str(
+            metric_review_trigger_detail["contract_hash"]
+        ),
         "immutability_enforcement": (
-            "application_state_machine_unique_identity_and_hash_replay"
+            "database_exact_38_append_only_plus_2_metric_review_triggers"
         ),
     }
 
@@ -3288,8 +4227,25 @@ def ensure_and_seed_governance() -> None:
 
 
 def load_registry() -> list[dict[str, Any]]:
+    """Load one complete registry/readiness snapshot on one DB connection."""
+
+    bound_connection = current_bound_sql_connection()
+    if bound_connection is not None:
+        return _load_registry_snapshot(bound_connection)
+    with get_engine().connect() as connection:
+        with bind_sql_connection(connection):
+            return _load_registry_snapshot(connection)
+
+
+def _load_registry_snapshot(connection: Any) -> list[dict[str, Any]]:
     if not _table_exists("st_strategy_registry"):
         return []
+    count_rows = _db_read(
+        "SELECT COUNT(*) AS cnt FROM st_strategy_registry"
+    )
+    registry_count = _int(count_rows[0].get("cnt")) if count_rows else -1
+    if registry_count < 0:
+        raise RuntimeError("策略注册表权威计数不可用")
     rows = _db_read(
         "SELECT r.strategy_key, r.strategy_name, r.category, r.family_key, "
         "r.description, "
@@ -3301,13 +4257,21 @@ def load_registry() -> list[dict[str, Any]]:
         "v.parameters_json, v.source_kind "
         "FROM st_strategy_registry r LEFT JOIN st_strategy_version v "
         "ON v.strategy_key=r.strategy_key AND v.version=r.current_version "
-        "ORDER BY r.created_at, r.strategy_key"
+        "ORDER BY r.created_at, r.strategy_key "
+        "LIMIT :authoritative_registry_scan_limit",
+        {"authoritative_registry_scan_limit": registry_count + 1},
     )
+    if len(rows) != registry_count:
+        raise RuntimeError("策略注册表扫描与权威计数不一致，拒绝截断")
     for row in rows:
         status = str(row.get("current_status") or "SHADOW")
         row["status_label"] = LIFECYCLE_LABELS.get(status, "未知状态")
         row["enabled"] = bool(_int(row.get("enabled")))
-        row["recovery_conditions"] = _json(row.pop("recovery_conditions_json", None), _recovery_conditions(status))
+        # Recovery rules are policy, not stale display data.  Historical rows
+        # may contain the generic registration-time text, so always derive the
+        # current requirements from the authoritative lifecycle state.
+        row.pop("recovery_conditions_json", None)
+        row["recovery_conditions"] = _recovery_conditions(status)
         row["evaluator_config"] = _json(
             row.pop("evaluator_config_json", None), {}
         )
@@ -3335,13 +4299,18 @@ def load_registry() -> list[dict[str, Any]]:
             )
         except (TypeError, ValueError):
             row["version_integrity_valid"] = False
-        adapter_status = strategy_execution_adapter_status(row)
+        # Structure-only first pass.  Every executable runtime identity is then
+        # resolved by one batch ledger scan below; this prevents per-row
+        # connections and repeated whole-ledger scans.
+        adapter_status = strategy_execution_adapter_status(
+            row, ledger_readiness=None,
+        )
         row["execution_adapter"] = adapter_status
         row["execution_adapter_executable"] = (
             adapter_status.get("executable") is True
         )
         row["execution_adapter_reason"] = str(
-            adapter_status.get("reason") or "执行适配器未部署/无效"
+            adapter_status.get("reason") or "执行适配器状态不可用"
         )
         row["execution_binding_hash"] = str(
             adapter_status.get("execution_binding_hash") or ""
@@ -3355,15 +4324,72 @@ def load_registry() -> list[dict[str, Any]]:
         row["funding_pipeline_ready"] = (
             adapter_status.get("funding_pipeline_ready") is True
         )
-        row["funding_pipeline_reason"] = (
-            "动态策略意图、订单、成交和前向证据已完成精确绑定"
-            if row["funding_pipeline_ready"]
-            else "动态策略仅接通影子候选；意图、订单、成交、前向证据的精确绑定闭环尚未部署"
+        row["funding_pipeline_reason"] = str(
+            adapter_status.get("funding_pipeline_reason") or ""
         )
+    runtime_identities: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        adapter_status = row.get("execution_adapter") or {}
+        if (
+            str(row.get("source_kind") or "") == "runtime_registry"
+            and isinstance(adapter_status, dict)
+            and adapter_status.get("executable") is True
+        ):
+            runtime_identities.append((
+                str(row.get("strategy_key") or ""),
+                str(row.get("current_version") or ""),
+                str(row.get("version_hash") or ""),
+                str(adapter_status.get("execution_binding_hash") or ""),
+            ))
+    readiness_index = batch_dynamic_shadow_ledger_readiness(
+        connection, runtime_identities,
+    ) if runtime_identities else {}
+    for row in rows:
+        adapter_status = row.get("execution_adapter") or {}
+        if (
+            str(row.get("source_kind") or "") == "runtime_registry"
+            and isinstance(adapter_status, dict)
+            and adapter_status.get("executable") is True
+        ):
+            identity = (
+                str(row.get("strategy_key") or ""),
+                str(row.get("current_version") or ""),
+                str(row.get("version_hash") or ""),
+                str(adapter_status.get("execution_binding_hash") or ""),
+            )
+            adapter_status = strategy_execution_adapter_status(
+                row,
+                ledger_readiness=readiness_index.get(identity, {}),
+            )
+            row["execution_adapter"] = adapter_status
+            row["execution_adapter_executable"] = (
+                adapter_status.get("executable") is True
+            )
+            row["execution_adapter_reason"] = str(
+                adapter_status.get("reason") or "执行适配器校验失败"
+            )
+            row["execution_binding_hash"] = str(
+                adapter_status.get("execution_binding_hash") or ""
+            )
+            row["adapter_artifact_sha256"] = str(
+                adapter_status.get("artifact_sha256") or ""
+            )
+            row["cost_model_hash"] = str(
+                adapter_status.get("cost_model_hash") or ""
+            )
+            row["funding_pipeline_ready"] = (
+                adapter_status.get("funding_pipeline_ready") is True
+            )
+            row["funding_pipeline_reason"] = str(
+                adapter_status.get("funding_pipeline_reason") or ""
+            )
     return rows
 
 
-def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict[str, Any]:
+def register_strategy(
+    payload: dict[str, Any], *, operator: str = "api",
+    _global_inventory_lock_held: bool = False,
+) -> dict[str, Any]:
     ensure_and_seed_governance()
     key = validate_strategy_key(str(payload.get("strategy_key") or ""))
     name = str(payload.get("strategy_name") or "").strip()
@@ -3373,8 +4399,13 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
     if not version or len(version) > 160:
         raise ValueError("策略版本不能为空且不能超过160字")
     evaluator_type = str(payload.get("evaluator_type") or "external_evidence")[:40]
-    evaluator_config_raw = payload.get("evaluator_config") or {}
-    parameters = payload.get("parameters") or {}
+    canonical_registration = validate_canonical_json({
+        "evaluator_config": payload.get("evaluator_config") or {},
+        "parameters": payload.get("parameters") or {},
+        "execution_binding": payload.get("execution_binding"),
+    }, label="策略评估配置与参数")
+    evaluator_config_raw = canonical_registration["evaluator_config"]
+    parameters = canonical_registration["parameters"]
     if not isinstance(evaluator_config_raw, dict) or not isinstance(parameters, dict):
         raise ValueError("策略评估配置和参数必须是对象")
     parameters = dict(parameters)
@@ -3383,7 +4414,7 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
         parameters
     )
     evaluator_config = dict(evaluator_config_raw)
-    top_level_binding = payload.get("execution_binding")
+    top_level_binding = canonical_registration["execution_binding"]
     nested_binding = evaluator_config.get("execution_adapter")
     if (
         top_level_binding is not None
@@ -3412,6 +4443,12 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
         load_market_state_config()["config_version"]
     )
     evaluator_config["market_state_config_hash"] = market_state_config_hash()
+    finalized_registration = validate_canonical_json({
+        "evaluator_config": evaluator_config,
+        "parameters": parameters,
+    }, label="规范化策略评估配置与参数")
+    evaluator_config = finalized_registration["evaluator_config"]
+    parameters = finalized_registration["parameters"]
     version_hash = _strategy_version_digest(
         strategy_key=key,
         version=version,
@@ -3469,6 +4506,7 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
     }
     previous_status = str(before.get("current_status") or "SHADOW")
     reason = str(payload.get("reason") or "注册策略版本")[:500]
+    params["reason"] = reason
     event_payload = {
         "entity_type": "STRATEGY", "entity_key": key,
         "old_version": parent, "new_version": version,
@@ -3478,9 +4516,11 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
     after_audit = {
         "strategy_key": key, "strategy_name": name,
         "current_version": version, "current_status": "SHADOW",
-        "status_reason": "新版本重新进入影子验证",
+        "status_reason": reason,
     }
     with get_engine().begin() as connection:
+        if not _global_inventory_lock_held:
+            _lock_global_evidence_namespace(connection)
         connection.execute(text(
             """
             INSERT INTO st_strategy_version
@@ -3500,7 +4540,7 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
                     family_key=:family, description=:description,
                     owner_name=:owner, discovery_mode='dynamic', enabled=1,
                     current_version=:version, current_status='SHADOW',
-                    status_reason='新版本重新进入影子验证',
+                    status_reason=:reason,
                     recovery_conditions_json=:recovery
                 WHERE strategy_key=:key AND current_version=:parent
                 """
@@ -3517,7 +4557,7 @@ def register_strategy(payload: dict[str, Any], *, operator: str = "api") -> dict
                  recovery_conditions_json)
                 VALUES (:key, :name, :category, :family, :description,
                         :owner, 'dynamic', 1, :version, 'SHADOW',
-                        '新策略或新版本必须先进行影子验证', :recovery)
+                        :reason, :recovery)
                 """
             ), params)
         connection.execute(text(
@@ -3553,7 +4593,11 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
     key = validate_strategy_key(str(payload.get("combination_key") or ""))
     name = str(payload.get("combination_name") or "").strip()
     version = str(payload.get("version") or "").strip()
-    members = payload.get("members") or []
+    canonical_combination = validate_canonical_json({
+        "members": payload.get("members") or [],
+        "constraints": payload.get("constraints") or {},
+    }, label="策略组合成员与约束")
+    members = canonical_combination["members"]
     if (
         not name or not version or not isinstance(members, list)
         or not 2 <= len(members) <= 50
@@ -3594,7 +4638,7 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
     for item in normalized:
         item["weight"] = round(item["weight"] / total, 8)
     constraints = _validated_combination_constraints(
-        payload.get("constraints")
+        canonical_combination["constraints"]
     )
     if max(item["weight"] for item in normalized) > (
         constraints["maximum_member_weight"] + 0.00000001
@@ -3632,6 +4676,7 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
         "parent": parent, "members": _json_text(normalized),
         "constraints": _json_text(constraints),
         "config_hash": config_hash,
+        "reason": reason,
     }
     event_payload = {
         "entity_type": "COMBINATION", "entity_key": key,
@@ -3642,9 +4687,10 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
     after_audit = {
         "combination_key": key, "combination_name": name,
         "current_version": version, "current_status": "SHADOW",
-        "members": normalized,
+        "status_reason": reason, "members": normalized,
     }
     with get_engine().begin() as connection:
+        _lock_global_evidence_namespace(connection)
         connection.execute(text(
             """
             INSERT INTO st_strategy_combination_version
@@ -3661,7 +4707,7 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
                 SET combination_name=:name, description=:description,
                     owner_name=:operator, enabled=1,
                     current_version=:version, current_status='SHADOW',
-                    status_reason='新版本重新进入影子验证'
+                    status_reason=:reason
                 WHERE combination_key=:key AND current_version=:parent
                 """
             ), params)
@@ -3674,7 +4720,7 @@ def register_combination(payload: dict[str, Any], *, operator: str = "api") -> d
                 (combination_key, combination_name, description, owner_name,
                  enabled, current_version, current_status, status_reason)
                 VALUES (:key, :name, :description, :operator, 1, :version,
-                        'SHADOW', '新组合必须先进行独立影子验证')
+                        'SHADOW', :reason)
                 """
             ), params)
         connection.execute(text(
@@ -3720,6 +4766,7 @@ def load_combinations(only_key: str = "") -> list[dict[str, Any]]:
     for row in rows:
         status = str(row.get("current_status") or "SHADOW")
         row["status_label"] = LIFECYCLE_LABELS.get(status, "未知状态")
+        row["recovery_conditions"] = _recovery_conditions(status)
         row["enabled"] = bool(_int(row.get("enabled")))
         row["members"] = _json(row.pop("members_json", None), [])
         row["constraints"] = _json(row.pop("constraints_json", None), {})
@@ -3730,6 +4777,695 @@ def load_combinations(only_key: str = "") -> list[dict[str, Any]]:
             }) == str(row.get("config_hash") or "")
         )
     return rows
+
+
+def _statistical_query_rows(
+    sql: str, params: dict[str, Any], *, connection=None,
+) -> list[dict[str, Any]]:
+    if connection is None:
+        return _db_read(sql, params)
+    return [
+        dict(row) for row in connection.execute(
+            text(sql), params,
+        ).mappings().all()
+    ]
+
+
+def _paged_statistical_version_rows(
+    *, entity_type: str, connection=None, locking_read: bool = False,
+) -> list[dict[str, Any]]:
+    """Read an unbounded append-only version inventory in bounded pages."""
+
+    normalized = str(entity_type or "").upper()
+    if normalized == "STRATEGY":
+        table = "st_strategy_version"
+        key_column = "strategy_key"
+        select_fields = (
+            "strategy_key AS entity_key, version, version_hash, content_hash, "
+            "evaluator_type, evaluator_config_json, parameters_json, "
+            "source_kind, created_at"
+        )
+    elif normalized == "COMBINATION":
+        table = "st_strategy_combination_version"
+        key_column = "combination_key"
+        select_fields = (
+            "combination_key AS entity_key, version, config_hash, "
+            "members_json, constraints_json, created_at"
+        )
+    else:
+        raise ValueError("统计试验版本对象只能是策略或组合")
+    rows: list[dict[str, Any]] = []
+    last_key = ""
+    last_version = ""
+    lock_clause = " FOR SHARE" if locking_read else ""
+    while True:
+        where = ""
+        params: dict[str, Any] = {
+            "batch_limit": STATISTICAL_TRIAL_SCAN_BATCH_SIZE,
+        }
+        if last_key:
+            where = (
+                f"WHERE ({key_column}>:last_key OR "
+                f"({key_column}=:last_key AND version>:last_version)) "
+            )
+            params.update({
+                "last_key": last_key,
+                "last_version": last_version,
+            })
+        page = _statistical_query_rows(
+            f"SELECT {select_fields} FROM {table} {where}"
+            f"ORDER BY {key_column}, version "
+            f"LIMIT :batch_limit{lock_clause}",
+            params,
+            connection=connection,
+        )
+        if len(page) > STATISTICAL_TRIAL_SCAN_BATCH_SIZE:
+            raise RuntimeError("统计试验版本分页超过服务端批次上限")
+        if not page:
+            break
+        for row in page:
+            identity = (
+                str(row.get("entity_key") or ""),
+                str(row.get("version") or ""),
+            )
+            if not all(identity) or (rows and identity <= (
+                str(rows[-1].get("entity_key") or ""),
+                str(rows[-1].get("version") or ""),
+            )):
+                raise RuntimeError("统计试验版本分页身份重复或非严格递增")
+            rows.append(row)
+        last_key = str(page[-1].get("entity_key") or "")
+        last_version = str(page[-1].get("version") or "")
+        if len(page) < STATISTICAL_TRIAL_SCAN_BATCH_SIZE:
+            break
+    return rows
+
+
+def _paged_challenger_audit_rows(
+    *, connection=None, locking_read: bool = False,
+) -> list[dict[str, Any]]:
+    """Load the complete challenger chain without a caller-controlled cap."""
+
+    rows: list[dict[str, Any]] = []
+    last_key = ""
+    last_created_at = ""
+    last_audit_id = ""
+    lock_clause = " FOR SHARE" if locking_read else ""
+    while True:
+        where = (
+            "WHERE entity_type='STRATEGY' AND action IN "
+            "('REGISTER_CHALLENGER','SUBMIT_CHALLENGER_EVIDENCE',"
+            "'REVIEW_CHALLENGER','PROMOTE_CHALLENGER') "
+        )
+        params: dict[str, Any] = {
+            "batch_limit": STATISTICAL_TRIAL_SCAN_BATCH_SIZE,
+        }
+        if last_key:
+            where += (
+                "AND (entity_key>:last_key OR "
+                "(entity_key=:last_key AND created_at>:last_created_at) OR "
+                "(entity_key=:last_key AND created_at=:last_created_at "
+                "AND audit_id>:last_audit_id)) "
+            )
+            params.update({
+                "last_key": last_key,
+                "last_created_at": last_created_at,
+                "last_audit_id": last_audit_id,
+            })
+        page = _statistical_query_rows(
+            "SELECT audit_id, entity_key, action, operator_name, "
+            "payload_json, audit_hash, created_at "
+            "FROM st_strategy_governance_audit "
+            f"{where}ORDER BY entity_key, created_at, audit_id "
+            f"LIMIT :batch_limit{lock_clause}",
+            params,
+            connection=connection,
+        )
+        if len(page) > STATISTICAL_TRIAL_SCAN_BATCH_SIZE:
+            raise RuntimeError("挑战者审计分页超过服务端批次上限")
+        if not page:
+            break
+        for row in page:
+            identity = (
+                str(row.get("entity_key") or ""),
+                str(row.get("created_at") or ""),
+                str(row.get("audit_id") or ""),
+            )
+            if not all(identity) or (rows and identity <= (
+                str(rows[-1].get("entity_key") or ""),
+                str(rows[-1].get("created_at") or ""),
+                str(rows[-1].get("audit_id") or ""),
+            )):
+                raise RuntimeError("挑战者审计分页身份重复或非严格递增")
+            rows.append(row)
+        last_key = str(page[-1].get("entity_key") or "")
+        last_created_at = str(page[-1].get("created_at") or "")
+        last_audit_id = str(page[-1].get("audit_id") or "")
+        if len(page) < STATISTICAL_TRIAL_SCAN_BATCH_SIZE:
+            break
+    return rows
+
+
+def _statistical_family_result(
+    *, family_id: str, entries: dict[str, dict[str, Any]],
+    valid: bool = True, reason: str = "",
+) -> dict[str, Any]:
+    trial_keys = sorted(entries)
+    inventory_payload = {
+        "schema": "probiga.strategy-trial-inventory.v1",
+        "total_hypotheses": len(trial_keys),
+        "trial_keys": trial_keys,
+    }
+    state_rows = [entries[key] for key in trial_keys]
+    state_payload = {
+        "schema": "probiga.strategy-trial-inventory-state.v1",
+        "family_id": family_id,
+        "trials": state_rows,
+    }
+    payload = {
+        "schema": "probiga.strategy-statistical-family.v1",
+        "family_id": family_id,
+        "valid": bool(valid),
+        "reason": reason or (
+            "服务端完整试验库存有效" if valid else "服务端完整试验库存无效"
+        ),
+        "total_hypotheses": len(trial_keys),
+        "trial_inventory_hash": _digest(inventory_payload),
+        "trial_inventory_state_hash": _digest(state_payload),
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {
+        **payload,
+        "trial_keys": trial_keys,
+        "trial_state_rows": state_rows,
+        "result_hash": _digest(payload),
+    }
+
+
+def _invalid_statistical_family(family_id: str, reason: str) -> dict[str, Any]:
+    return _statistical_family_result(
+        family_id=family_id, entries={}, valid=False, reason=reason[:500],
+    )
+
+
+def _build_statistical_trial_inventory(
+    *, strategy_versions: list[dict[str, Any]],
+    combination_versions: list[dict[str, Any]],
+    challengers: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build the two server-owned global trial families and deduplicate promotion."""
+
+    strategy_entries: dict[str, dict[str, Any]] = {}
+    combination_entries: dict[str, dict[str, Any]] = {}
+    strategy_error = ""
+    combination_error = ""
+    try:
+        for row in strategy_versions:
+            key = validate_strategy_key(str(row.get("entity_key") or ""))
+            version = str(row.get("version") or "")
+            evaluator_config = _json(row.get("evaluator_config_json"), None)
+            parameters = _json(row.get("parameters_json"), None)
+            if not version or not isinstance(evaluator_config, dict) or not isinstance(
+                parameters, dict
+            ):
+                raise RuntimeError("历史策略版本定义无效")
+            expected_version_hash = _strategy_version_digest(
+                strategy_key=key,
+                version=version,
+                evaluator_type=str(row.get("evaluator_type") or ""),
+                evaluator_config=evaluator_config,
+                parameters=parameters,
+                source_kind=str(row.get("source_kind") or ""),
+            )
+            expected_content_hash = _strategy_content_digest(
+                strategy_key=key,
+                evaluator_type=str(row.get("evaluator_type") or ""),
+                evaluator_config=evaluator_config,
+                parameters=parameters,
+                source_kind=str(row.get("source_kind") or ""),
+            )
+            if (
+                expected_version_hash != str(row.get("version_hash") or "")
+                or expected_content_hash != str(row.get("content_hash") or "")
+            ):
+                raise RuntimeError(f"历史策略版本哈希无效：{key}.{version}")
+            trial_key = f"STRATEGY:{key}:{expected_version_hash}"
+            strategy_entries[trial_key] = {
+                "trial_key": trial_key,
+                "entity_key": key,
+                "entity_version": version,
+                "version_hash": expected_version_hash,
+                "max_holding_days": _holding_horizon_from_parameters(
+                    parameters
+                ),
+                "label_horizon_days": _label_horizon_from_parameters(
+                    parameters
+                ),
+                "source_kinds": ["FORMAL_VERSION"],
+                "challenger_statuses": [],
+            }
+        for challenger in challengers:
+            key = validate_strategy_key(str(
+                challenger.get("strategy_key") or ""
+            ))
+            version_hash = str(
+                challenger.get("proposed_version_hash") or ""
+            )
+            challenger_id = str(challenger.get("challenger_id") or "")
+            proposal_hash = str(challenger.get("proposal_hash") or "")
+            status = str(challenger.get("status") or "")
+            registration = challenger.get("registration_payload")
+            challenger_parameters = (
+                registration.get("parameters")
+                if isinstance(registration, dict) else None
+            )
+            if (
+                not _HASH_PATTERN.fullmatch(version_hash)
+                or not _HASH_PATTERN.fullmatch(proposal_hash)
+                or re.fullmatch(r"[0-9a-f]{32}", challenger_id) is None
+                or not isinstance(challenger_parameters, dict)
+                or status not in {
+                    "VALIDATING", "REVIEW_PENDING", "READY",
+                    "REJECTED", "PROMOTED",
+                }
+            ):
+                raise RuntimeError("挑战者试验身份或状态无效")
+            challenger_holding = _holding_horizon_from_parameters(
+                challenger_parameters
+            )
+            challenger_label = _label_horizon_from_parameters(
+                challenger_parameters
+            )
+            trial_key = f"STRATEGY:{key}:{version_hash}"
+            entry = strategy_entries.setdefault(trial_key, {
+                "trial_key": trial_key,
+                "entity_key": key,
+                "entity_version": str(
+                    challenger.get("proposed_version") or ""
+                ),
+                "version_hash": version_hash,
+                "max_holding_days": challenger_holding,
+                "label_horizon_days": challenger_label,
+                "source_kinds": [],
+                "challenger_statuses": [],
+            })
+            if (
+                entry["entity_key"] != key
+                or entry["version_hash"] != version_hash
+                or entry.get("max_holding_days") != challenger_holding
+                or entry.get("label_horizon_days") != challenger_label
+            ):
+                raise RuntimeError("挑战者晋级去重身份冲突")
+            if "CHALLENGER" not in entry["source_kinds"]:
+                entry["source_kinds"].append("CHALLENGER")
+            entry["source_kinds"] = sorted(entry["source_kinds"])
+            entry["challenger_statuses"].append({
+                "challenger_id": challenger_id,
+                "proposal_hash": proposal_hash,
+                "status": status,
+            })
+            entry["challenger_statuses"].sort(
+                key=lambda item: item["challenger_id"]
+            )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        strategy_entries = {}
+        strategy_error = str(exc)
+
+    try:
+        for row in combination_versions:
+            key = validate_strategy_key(str(row.get("entity_key") or ""))
+            version = str(row.get("version") or "")
+            members = _json(row.get("members_json"), None)
+            constraints = _json(row.get("constraints_json"), None)
+            config_hash = str(row.get("config_hash") or "")
+            if (
+                not version or not isinstance(members, list)
+                or not isinstance(constraints, dict)
+                or _digest({"members": members, "constraints": constraints})
+                != config_hash
+            ):
+                raise RuntimeError(f"历史组合版本哈希无效：{key}.{version}")
+            trial_key = f"COMBINATION:{key}:{config_hash}"
+            if trial_key in combination_entries:
+                raise RuntimeError("组合试验身份重复")
+            combination_entries[trial_key] = {
+                "trial_key": trial_key,
+                "entity_key": key,
+                "entity_version": version,
+                "config_hash": config_hash,
+                "source_kinds": ["FORMAL_VERSION"],
+            }
+    except (RuntimeError, TypeError, ValueError) as exc:
+        combination_entries = {}
+        combination_error = str(exc)
+
+    strategy_family = (
+        _invalid_statistical_family(
+            STATISTICAL_GUARD_POLICY["strategy_family_id"], strategy_error,
+        ) if strategy_error else _statistical_family_result(
+            family_id=STATISTICAL_GUARD_POLICY["strategy_family_id"],
+            entries=strategy_entries,
+        )
+    )
+    combination_family = (
+        _invalid_statistical_family(
+            STATISTICAL_GUARD_POLICY["combination_family_id"],
+            combination_error,
+        ) if combination_error else _statistical_family_result(
+            family_id=STATISTICAL_GUARD_POLICY["combination_family_id"],
+            entries=combination_entries,
+        )
+    )
+    payload = {
+        "schema": "probiga.strategy-statistical-inventory.v1",
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "strategy_family_hash": strategy_family["result_hash"],
+        "combination_family_hash": combination_family["result_hash"],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {
+        **payload,
+        "strategy": strategy_family,
+        "combination": combination_family,
+        "result_hash": _digest(payload),
+    }
+
+
+def _load_statistical_trial_inventory(
+    *, connection=None, locking_read: bool = False,
+) -> dict[str, Any]:
+    try:
+        strategy_versions = _paged_statistical_version_rows(
+            entity_type="STRATEGY", connection=connection,
+            locking_read=locking_read,
+        )
+        combination_versions = _paged_statistical_version_rows(
+            entity_type="COMBINATION", connection=connection,
+            locking_read=locking_read,
+        )
+        audit_rows = _paged_challenger_audit_rows(
+            connection=connection, locking_read=locking_read,
+        )
+        from server.engine.strategy_challenger_factory import (
+            _challengers_from_grouped_events,
+        )
+        challengers = _challengers_from_grouped_events(audit_rows)
+        return _build_statistical_trial_inventory(
+            strategy_versions=strategy_versions,
+            combination_versions=combination_versions,
+            challengers=challengers,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        strategy_family = _invalid_statistical_family(
+            STATISTICAL_GUARD_POLICY["strategy_family_id"], str(exc),
+        )
+        combination_family = _invalid_statistical_family(
+            STATISTICAL_GUARD_POLICY["combination_family_id"], str(exc),
+        )
+        payload = {
+            "schema": "probiga.strategy-statistical-inventory.v1",
+            "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+            "strategy_family_hash": strategy_family["result_hash"],
+            "combination_family_hash": combination_family["result_hash"],
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        return {
+            **payload,
+            "strategy": strategy_family,
+            "combination": combination_family,
+            "result_hash": _digest(payload),
+        }
+
+
+def _compact_statistical_inventory(
+    inventory: dict[str, Any],
+) -> dict[str, Any]:
+    families = {}
+    for key in ("strategy", "combination"):
+        family = inventory.get(key) if isinstance(inventory, dict) else None
+        family = family if isinstance(family, dict) else {}
+        families[key] = {
+            field: family.get(field) for field in (
+                "schema", "family_id", "valid", "reason",
+                "total_hypotheses", "trial_inventory_hash",
+                "trial_inventory_state_hash", "statistical_policy_hash",
+                "result_hash", "automatic_real_order_submission",
+                "real_order_authority",
+            )
+        }
+    payload = {
+        "schema": "probiga.strategy-statistical-inventory-compact.v1",
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "strategy": families["strategy"],
+        "combination": families["combination"],
+        "source_inventory_result_hash": str(
+            (inventory or {}).get("result_hash") or ""
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "compact_hash": _digest(payload)}
+
+
+def _require_stable_statistical_inventory(
+    initial: dict[str, Any], locked: dict[str, Any],
+) -> None:
+    """Fail the enclosing transaction if the server trial family drifted."""
+
+    if (
+        locked.get("result_hash") != initial.get("result_hash")
+        or _compact_statistical_inventory(locked)
+        != _compact_statistical_inventory(initial)
+    ):
+        raise RuntimeError(
+            "计算期间服务端完整试验库存已改变，本轮回滚并要求重算"
+        )
+
+
+def _candidate_statistical_p_value(
+    window_metrics: dict[Any, dict[str, Any]],
+) -> float:
+    values: list[float] = []
+    for window in (60, 120):
+        metrics = window_metrics.get(window)
+        if metrics is None:
+            metrics = window_metrics.get(str(window))
+        guard = (
+            metrics.get("statistical_guard")
+            if isinstance(metrics, dict) else None
+        )
+        value = _num(
+            (guard or {}).get("net_expectancy_one_sided_p_value"), None
+        )
+        if (
+            not isinstance(guard, dict)
+            or guard.get("valid") is not True
+            or value is None or not 0 <= value <= 1
+        ):
+            return float(STATISTICAL_GUARD_POLICY["missing_p_value"])
+        values.append(float(value))
+    return max(values) if len(values) == 2 else float(
+        STATISTICAL_GUARD_POLICY["missing_p_value"]
+    )
+
+
+def _invalid_statistical_family_decision(
+    *, entity_type: str, entity_key: str, entity_version: str,
+    trial_key: str, family: dict[str, Any], reason: str,
+) -> dict[str, Any]:
+    payload = {
+        "schema": "probiga.strategy-family-by-decision-compact.v1",
+        "entity_type": entity_type,
+        "entity_key": entity_key,
+        "entity_version": entity_version,
+        "family_id": str(family.get("family_id") or ""),
+        "trial_key": trial_key,
+        "valid": False,
+        "passed": False,
+        "reason": reason[:500],
+        "q": float(STATISTICAL_GUARD_POLICY["fdr_q"]),
+        "total_hypotheses": _int(family.get("total_hypotheses"), 0),
+        "candidate_p_value": 1.0,
+        "rank": 0,
+        "critical_value": 0.0,
+        "trial_inventory_hash": str(
+            family.get("trial_inventory_hash") or ""
+        ),
+        "trial_inventory_state_hash": str(
+            family.get("trial_inventory_state_hash") or ""
+        ),
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "source_by_result_hash": "",
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "decision_hash": _digest(payload)}
+
+
+def _statistical_family_fdr_decisions(
+    *, entity_type: str, current_rows: list[dict[str, Any]],
+    metrics_by_key: dict[str, dict[Any, dict[str, Any]]],
+    family: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    normalized = str(entity_type or "").upper()
+    if normalized == "STRATEGY":
+        key_field = "strategy_key"
+        version_hash_field = "version_hash"
+        version_field = "current_version"
+    elif normalized == "COMBINATION":
+        key_field = "combination_key"
+        version_hash_field = "config_hash"
+        version_field = "current_version"
+    else:
+        raise ValueError("统计家族决策对象只能是策略或组合")
+    prefix = normalized
+    trial_keys = list(family.get("trial_keys") or [])
+    family_valid = bool(
+        family.get("valid") is True
+        and trial_keys == sorted(set(trial_keys))
+        and len(trial_keys) == _int(family.get("total_hypotheses"), -1)
+        and _HASH_PATTERN.fullmatch(str(
+            family.get("trial_inventory_hash") or ""
+        ))
+    )
+    identities: dict[str, tuple[str, str, float]] = {}
+    duplicate = False
+    for row in current_rows:
+        key = str(row.get(key_field) or "")
+        version = str(row.get(version_field) or "")
+        version_hash = str(row.get(version_hash_field) or "")
+        trial_key = f"{prefix}:{key}:{version_hash}"
+        if trial_key in identities:
+            duplicate = True
+        identities[trial_key] = (
+            key, version,
+            _candidate_statistical_p_value(metrics_by_key.get(key) or {}),
+        )
+    if duplicate or any(trial_key not in set(trial_keys) for trial_key in identities):
+        family_valid = False
+    if not family_valid or not identities:
+        reason = str(family.get("reason") or "服务端完整试验库存无效")
+        if duplicate:
+            reason = "当前统计候选试验身份重复"
+        decisions = {
+            key: _invalid_statistical_family_decision(
+                entity_type=normalized,
+                entity_key=key,
+                entity_version=version,
+                trial_key=trial_key,
+                family=family,
+                reason=reason,
+            )
+            for trial_key, (key, version, _p) in identities.items()
+        }
+        summary_payload = {
+            "schema": "probiga.strategy-family-by-summary.v1",
+            "family_id": str(family.get("family_id") or ""),
+            "valid": False,
+            "passed_candidate_count": 0,
+            "current_candidate_count": len(identities),
+            "total_hypotheses": _int(family.get("total_hypotheses"), 0),
+            "trial_inventory_hash": str(
+                family.get("trial_inventory_hash") or ""
+            ),
+            "trial_inventory_state_hash": str(
+                family.get("trial_inventory_state_hash") or ""
+            ),
+            "q": float(STATISTICAL_GUARD_POLICY["fdr_q"]),
+            "source_by_result_hash": "",
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        return decisions, {
+            **summary_payload, "summary_hash": _digest(summary_payload),
+        }
+    # The complete server-owned family participates in every decision.  A
+    # historical, retired, rejected, or otherwise non-current trial has no
+    # current daily-NAV p-value, so bind it explicitly as p=1 instead of
+    # allowing the current candidate set to shrink the tested family.
+    p_values = {trial_key: 1.0 for trial_key in trial_keys}
+    p_values.update({
+        trial_key: p_value
+        for trial_key, (_key, _version, p_value) in identities.items()
+    })
+    full = benjamini_yekutieli_fdr(
+        p_values,
+        total_hypotheses=len(trial_keys),
+        q=float(STATISTICAL_GUARD_POLICY["fdr_q"]),
+        trial_inventory=trial_keys,
+    )
+    full_decisions = {
+        str(item.get("key") or ""): item
+        for item in (full.get("decisions") or [])
+        if isinstance(item, dict)
+    }
+    decisions: dict[str, dict[str, Any]] = {}
+    for trial_key, (key, version, p_value) in identities.items():
+        raw = full_decisions.get(trial_key) or {}
+        valid = bool(
+            full.get("valid") is True
+            and str(full.get("trial_inventory_hash") or "")
+            == str(family.get("trial_inventory_hash") or "")
+            and raw.get("key") == trial_key
+        )
+        payload = {
+            "schema": "probiga.strategy-family-by-decision-compact.v1",
+            "entity_type": normalized,
+            "entity_key": key,
+            "entity_version": version,
+            "family_id": str(family.get("family_id") or ""),
+            "trial_key": trial_key,
+            "valid": valid,
+            "passed": bool(valid and raw.get("passed") is True),
+            "reason": (
+                "通过服务端完整试验族BY多重检验"
+                if valid and raw.get("passed") is True
+                else "未通过服务端完整试验族BY多重检验"
+            ),
+            "q": float(STATISTICAL_GUARD_POLICY["fdr_q"]),
+            "total_hypotheses": len(trial_keys),
+            "candidate_p_value": p_value,
+            "rank": _int(raw.get("rank"), 0),
+            "critical_value": _num(raw.get("critical_value"), 0.0),
+            "trial_inventory_hash": str(
+                family.get("trial_inventory_hash") or ""
+            ),
+            "trial_inventory_state_hash": str(
+                family.get("trial_inventory_state_hash") or ""
+            ),
+            "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+            "source_by_result_hash": str(full.get("result_hash") or ""),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        decisions[key] = {**payload, "decision_hash": _digest(payload)}
+    summary_payload = {
+        "schema": "probiga.strategy-family-by-summary.v1",
+        "family_id": str(family.get("family_id") or ""),
+        "valid": full.get("valid") is True,
+        "passed_candidate_count": sum(
+            item.get("passed") is True for item in decisions.values()
+        ),
+        "current_candidate_count": len(decisions),
+        "total_hypotheses": len(trial_keys),
+        "trial_inventory_hash": str(
+            family.get("trial_inventory_hash") or ""
+        ),
+        "trial_inventory_state_hash": str(
+            family.get("trial_inventory_state_hash") or ""
+        ),
+        "q": float(STATISTICAL_GUARD_POLICY["fdr_q"]),
+        "source_by_result_hash": str(full.get("result_hash") or ""),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return decisions, {
+        **summary_payload, "summary_hash": _digest(summary_payload),
+    }
 
 
 def _holding_horizon_from_parameters(parameters: Any) -> int:
@@ -3845,16 +5581,91 @@ def _version_label_horizon_days(
     return max(horizons)
 
 
-def _trading_sessions_between(start_exclusive: str, end_exclusive: str) -> int:
-    rows = _db_read(
-        "SELECT COUNT(*) AS cnt FROM si_trade_calendar "
-        "WHERE trade_status=1 AND trade_date>:start_date "
-        "AND trade_date<:end_date",
-        {"start_date": start_exclusive, "end_date": end_exclusive},
+def _version_confirmation_gap_sessions(
+    entity_type: str, entity_key: str, entity_version: str, *, connection=None,
+) -> int:
+    """Bind confirmation spacing to the immutable holding and label horizon."""
+
+    return max(
+        int(STATISTICAL_GUARD_POLICY["minimum_confirmation_sessions"]),
+        _version_max_holding_days(
+            entity_type, entity_key, entity_version,
+            connection=connection,
+        ),
+        _version_label_horizon_days(
+            entity_type, entity_key, entity_version,
+            connection=connection,
+        ),
     )
-    if len(rows) != 1:
-        raise ValueError("无法取得权威交易日历用于时序隔离校验")
-    return _int(rows[0].get("cnt"), -1)
+
+
+def _inventory_confirmation_gap_sessions(
+    entity_type: str, row: dict[str, Any],
+    inventory: dict[str, Any],
+) -> int:
+    """Resolve one current entity's gap from the hash-verified full inventory."""
+
+    state_rows = ((inventory.get("strategy") or {}).get(
+        "trial_state_rows"
+    ) or [])
+    horizon_index: dict[tuple[str, str], tuple[int, int]] = {}
+    for state in state_rows:
+        if not isinstance(state, dict):
+            raise ValueError("统计库存策略期限行无效")
+        identity = (
+            str(state.get("entity_key") or ""),
+            str(state.get("entity_version") or ""),
+        )
+        holding = _int(state.get("max_holding_days"), 0)
+        label = _int(state.get("label_horizon_days"), 0)
+        if (
+            not all(identity) or identity in horizon_index
+            or not 1 <= holding <= 250 or not 1 <= label <= 250
+        ):
+            raise ValueError("统计库存策略期限身份重复或越界")
+        horizon_index[identity] = (holding, label)
+
+    normalized = str(entity_type or "").upper()
+    identities: list[tuple[str, str]]
+    if normalized == "STRATEGY":
+        identities = [(
+            str(row.get("strategy_key") or ""),
+            str(row.get("current_version") or ""),
+        )]
+    elif normalized == "COMBINATION":
+        members = row.get("members")
+        if not isinstance(members, list) or not members:
+            raise ValueError("组合版本没有可验证成员期限")
+        identities = [(
+            str(member.get("strategy_key") or ""),
+            str(member.get("strategy_version") or ""),
+        ) for member in members if isinstance(member, dict)]
+        if len(identities) != len(members):
+            raise ValueError("组合成员版本期限身份无效")
+    else:
+        raise ValueError("连续确认期限对象只能是策略或组合")
+    try:
+        horizons = [horizon_index[identity] for identity in identities]
+    except KeyError as exc:
+        raise ValueError("连续确认期限引用的不可变策略版本不在完整库存") from exc
+    return max(
+        int(STATISTICAL_GUARD_POLICY["minimum_confirmation_sessions"]),
+        *(holding for holding, _label in horizons),
+        *(label for _holding, label in horizons),
+    )
+
+
+def _trading_sessions_between(start_exclusive: str, end_exclusive: str) -> int:
+    start = _trade_date(start_exclusive, default_today=False)
+    end = _trade_date(end_exclusive, default_today=False)
+    if start >= end:
+        return 0
+    receipt = _immutable_calendar_receipt(
+        start_date=start,
+        end_date=end,
+        decision_known_at=datetime.now().replace(microsecond=0),
+    )
+    return sum(start < day < end for day in receipt.sessions)
 
 
 def _is_authoritative_trade_session(
@@ -3904,25 +5715,24 @@ def _authoritative_maturity_sessions(
     return result
 
 
-def _authoritative_session_windows(
+def _authoritative_session_windows_with_proof(
     as_of_date: str,
-) -> dict[int, dict[str, Any]]:
-    """Resolve exact closed-session windows from the exchange calendar."""
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    """Resolve windows and one reusable, hash-bound QMT row proof."""
 
-    rows = _db_read(
-        "SELECT trade_date FROM si_trade_calendar "
-        "WHERE trade_status=1 AND trade_date<=:as_of_date "
-        "ORDER BY trade_date DESC LIMIT 120",
-        {"as_of_date": as_of_date},
+    calendar_start = (
+        date.fromisoformat(as_of_date) - timedelta(days=366)
+    ).isoformat()
+    calendar_receipt = _immutable_calendar_receipt(
+        start_date=calendar_start,
+        end_date=as_of_date,
+        decision_known_at=f"{as_of_date} 23:59:59",
     )
-    descending: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        day = _trade_date(row.get("trade_date"), default_today=False)
-        if day in seen:
-            raise ValueError("权威交易日历存在重复开市日")
-        seen.add(day)
-        descending.append(day)
+    calendar_binding = _calendar_receipt_binding(calendar_receipt)
+    descending = sorted(
+        (day for day in calendar_receipt.sessions if day <= as_of_date),
+        reverse=True,
+    )[:max(WINDOWS)]
     if not descending or descending[0] != as_of_date:
         raise ValueError("截止日不是权威交易日历中的已收盘交易日")
     if len(descending) < max(WINDOWS):
@@ -3946,6 +5756,20 @@ def _authoritative_session_windows(
             "SELECT a.trade_date, a.stock_code, 0 AS in_target, "
             "1 AS in_completed_attestation, 0 AS in_exact_attestation "
             "FROM qmt_kline_attestation_row a "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND BINARY r.status=BINARY 'COMPLETED' "
+            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.attestation_protocol'))="
+            "BINARY :protocol_version "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.universe_manifest_schema'))="
+            "BINARY 'probiga.qmt-daily-universe.v1' "
+            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
+            "'$.daily_universe.\"', "
+            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
+            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE BINARY a.protocol_version=BINARY :protocol_version "
             "AND a.stock_code REGEXP '^(0|3|6)' "
             "AND a.trade_date BETWEEN :start_date AND :as_of_date "
@@ -3968,6 +5792,20 @@ def _authoritative_session_windows(
             "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
             "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
             "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND BINARY r.status=BINARY 'COMPLETED' "
+            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.attestation_protocol'))="
+            "BINARY :protocol_version "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.universe_manifest_schema'))="
+            "BINARY 'probiga.qmt-daily-universe.v1' "
+            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
+            "'$.daily_universe.\"', "
+            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
+            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
             "AND k.stock_code REGEXP '^(0|3|6)' "
             "AND k.data_source='gj_big_qmt_inner' "
@@ -4020,6 +5858,20 @@ def _authoritative_session_windows(
             "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
             "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
             "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
+            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
+            "AND BINARY r.run_id=BINARY a.run_id "
+            "AND BINARY r.status=BINARY 'COMPLETED' "
+            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.attestation_protocol'))="
+            "BINARY :protocol_version "
+            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
+            "r.tolerance_json, '$.universe_manifest_schema'))="
+            "BINARY 'probiga.qmt-daily-universe.v1' "
+            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
+            "'$.daily_universe.\"', "
+            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
+            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
             "AND k.data_source='gj_big_qmt_inner' "
             "AND k.quality_status='QMT_ATTESTED' "
@@ -4206,12 +6058,67 @@ def _authoritative_session_windows(
             "session_attestations": [
                 attestations[day] for day in sessions
             ],
+            "calendar_manifest_hash": calendar_receipt.manifest_hash,
+            "calendar_session_set_hash": calendar_receipt.session_set_hash,
+            "calendar_receipt_binding_hash": calendar_binding["binding_hash"],
+            "calendar_receipt": calendar_binding,
         }
         result[window] = {
             **payload,
             "session_hash": _digest(payload),
         }
-    return result
+    proof_sessions: list[dict[str, Any]] = []
+    for day in sorted(expected_days):
+        # Equality of all three concrete sets was established above.  Reuse
+        # the already-computed target contract instead of hashing the same
+        # 120-day stock universe three more times.
+        stock_contract = expected_universes[day]
+        proof_sessions.append({
+            "trade_date": day,
+            "target_stock_count": stock_contract["stock_count"],
+            "target_stock_set_hash": stock_contract["stock_set_hash"],
+            "completed_attestation_stock_count": stock_contract[
+                "stock_count"
+            ],
+            "completed_attestation_stock_set_hash": stock_contract[
+                "stock_set_hash"
+            ],
+            "exact_attestation_stock_count": stock_contract["stock_count"],
+            "exact_attestation_stock_set_hash": stock_contract[
+                "stock_set_hash"
+            ],
+            "attested_bar_count": attestations[day][
+                "attested_bar_count"
+            ],
+            "matching_completed_manifest_run_count": len(
+                matching_manifest_runs[day]
+            ),
+        })
+    proof_payload = {
+        "schema": "probiga.qmt-row-binding-proof.v1",
+        "as_of_date": as_of_date,
+        "start_date": oldest_required,
+        "end_date": as_of_date,
+        "session_count": len(proof_sessions),
+        "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+        "source_pre_close_origin": "NATIVE_QMT",
+        "row_run_binding": "SAME_COMPLETED_RUN_ID",
+        "sessions": proof_sessions,
+        "calendar_receipt": calendar_binding,
+    }
+    return result, {
+        **proof_payload,
+        "proof_hash": _digest(proof_payload),
+    }
+
+
+def _authoritative_session_windows(
+    as_of_date: str,
+) -> dict[int, dict[str, Any]]:
+    """Resolve exact closed-session windows from the exchange calendar."""
+
+    windows, _proof = _authoritative_session_windows_with_proof(as_of_date)
+    return windows
 
 
 def _validated_metric_evidence(raw: Any) -> dict[str, Any]:
@@ -4294,6 +6201,12 @@ def _validate_metric_artifact(
 ) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError("验证产物清单必须是对象")
+    artifact_bytes = len(_json_text(raw).encode("utf-8"))
+    if artifact_bytes > METRIC_ARTIFACT_MAX_BYTES:
+        raise MetricArtifactTooLarge(
+            "验证产物规范JSON不得超过48 MiB；"
+            "请保留现有逐行上限并按新产物分批提交"
+        )
     artifact = dict(raw)
     session_window = _authoritative_session_windows(as_of_date).get(
         window_days
@@ -4813,6 +6726,114 @@ def _assert_global_metric_evidence_unclaimed(
             "不能作为另一条独立资金证据复用"
         )
 
+    challenger_rows = connection.execute(text(
+        "SELECT audit_id, entity_type, entity_key, action, reason, "
+        "operator_name, before_json, after_json, evidence_json, "
+        "payload_json, audit_hash, created_at "
+        "FROM st_strategy_governance_audit "
+        "WHERE action='SUBMIT_CHALLENGER_EVIDENCE' "
+        "ORDER BY created_at, audit_id FOR UPDATE"
+    )).mappings().all()
+    for raw in challenger_rows:
+        claim = _validated_challenger_evidence_claim(dict(raw))
+        if claim["artifact_hash"] == str(
+            evidence_payload.get("artifact_hash") or ""
+        ):
+            raise ValueError("验证产物已经被挑战者证据占用，普通指标不得复用")
+        if claim["source_dataset_hash"] == str(
+            evidence_payload.get("source_dataset_hash") or ""
+        ):
+            raise ValueError("底层样本集已经被挑战者证据占用，普通指标不得复用")
+
+
+_CHALLENGER_EVIDENCE_SUBMISSION_FIELDS = frozenset({
+    "schema", "challenger_id", "proposal_hash", "proposed_version_hash",
+    "proposal_submitted_at", "submitted_by", "as_of_date", "window_days",
+    "evidence_protocol", "evidence_revision_at", "metrics",
+    "artifact_manifest", "artifact_hash", "source_dataset_hash",
+    "automatic_real_order_submission", "real_order_authority",
+    "server_replay_validation_hash", "evidence_submission_hash",
+})
+
+
+def _validated_challenger_evidence_claim(
+    row: dict[str, Any],
+) -> dict[str, str]:
+    """Verify one immutable challenger submission before treating it as owner."""
+
+    envelope = _valid_audit_envelope(row)
+    evidence = (envelope or {}).get("evidence")
+    after = (envelope or {}).get("after")
+    before = (envelope or {}).get("before")
+    if not isinstance(evidence, dict):
+        raise RuntimeError("历史挑战者证据审计哈希或列绑定无效")
+    challenger_id = str(evidence.get("challenger_id") or "")
+    artifact_hash = str(evidence.get("artifact_hash") or "")
+    source_dataset_hash = str(evidence.get("source_dataset_hash") or "")
+    submission_hash = str(evidence.get("evidence_submission_hash") or "")
+    frozen = {
+        str(key): value for key, value in evidence.items()
+        if str(key) != "evidence_submission_hash"
+    }
+    manifest = evidence.get("artifact_manifest")
+    expected_after = {
+        "challenger_id": challenger_id,
+        "status": "REVIEW_PENDING",
+        "evidence_submission_hash": submission_hash,
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": source_dataset_hash,
+    }
+    if (
+        set(evidence) != _CHALLENGER_EVIDENCE_SUBMISSION_FIELDS
+        or row.get("action") != "SUBMIT_CHALLENGER_EVIDENCE"
+        or row.get("entity_type") != "STRATEGY"
+        or re.fullmatch(r"[0-9a-f]{32}", challenger_id) is None
+        or not isinstance(before, dict)
+        or before != {"challenger_id": challenger_id, "status": "VALIDATING"}
+        or after != expected_after
+        or evidence.get("schema")
+        != "probiga.strategy-challenger-evidence-submission.v1"
+        or evidence.get("submitted_by") != row.get("operator_name")
+        or not isinstance(evidence.get("metrics"), dict)
+        or not isinstance(manifest, dict)
+        or str(manifest.get("source_dataset_hash") or "").lower()
+        != source_dataset_hash
+        or _HASH_PATTERN.fullmatch(artifact_hash) is None
+        or _HASH_PATTERN.fullmatch(source_dataset_hash) is None
+        or _HASH_PATTERN.fullmatch(str(
+            evidence.get("proposal_hash") or ""
+        )) is None
+        or _HASH_PATTERN.fullmatch(str(
+            evidence.get("proposed_version_hash") or ""
+        )) is None
+        or _HASH_PATTERN.fullmatch(str(
+            evidence.get("server_replay_validation_hash") or ""
+        )) is None
+        or _HASH_PATTERN.fullmatch(submission_hash) is None
+        or _digest(frozen) != submission_hash
+        or evidence.get("automatic_real_order_submission") is not False
+        or evidence.get("real_order_authority") is not False
+    ):
+        raise RuntimeError("历史挑战者冻结证据审计合同无效")
+    return {
+        "challenger_id": challenger_id,
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": source_dataset_hash,
+        "evidence_submission_hash": submission_hash,
+    }
+
+
+def _lock_global_evidence_namespace(connection) -> None:
+    """Serialize ordinary and challenger claims on the same database row."""
+
+    locked = connection.execute(text(
+        "SELECT migration_key FROM "
+        "st_strategy_governance_schema_migration "
+        "ORDER BY migration_key LIMIT 1 FOR UPDATE"
+    )).mappings().first()
+    if locked is None:
+        raise RuntimeError("策略治理全局证据锁未初始化")
+
 
 _METRIC_EVIDENCE_AUDIT_ACTIONS = frozenset({
     "ADD_METRIC_EVIDENCE",
@@ -4889,8 +6910,31 @@ def _metric_submission_contract(row: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _metric_evidence_audit_index(
+    audit_rows: Iterable[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Index metric audits once without trusting unverified envelope fields."""
+
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for audit_row in audit_rows:
+        if str(audit_row.get("action") or "") not in (
+            _METRIC_EVIDENCE_AUDIT_ACTIONS
+        ):
+            continue
+        raw_evidence = _json(audit_row.get("evidence_json"), None)
+        evidence_id = (
+            str(raw_evidence.get("evidence_id") or "")
+            if isinstance(raw_evidence, dict) else ""
+        )
+        if re.fullmatch(r"[0-9a-f]{32}", evidence_id):
+            result[evidence_id].append(audit_row)
+    return dict(result)
+
+
 def metric_evidence_audit_binding(
-    row: dict[str, Any], audit_rows: list[dict[str, Any]],
+    row: dict[str, Any],
+    audit_rows: list[dict[str, Any]]
+    | dict[str, list[dict[str, Any]]],
 ) -> tuple[bool, dict[str, Any]]:
     """Bind one evidence row to exactly one add and one terminal review audit.
 
@@ -4920,22 +6964,19 @@ def metric_evidence_audit_binding(
         == "EXTERNAL_SUBMITTED"
         and _digest(submission) == str(row.get("evidence_hash") or "")
     )
-    related_raw: list[dict[str, Any]] = []
+    indexed_rows = (
+        audit_rows
+        if isinstance(audit_rows, dict)
+        else _metric_evidence_audit_index(audit_rows)
+    )
+    related_raw: list[dict[str, Any]] = list(
+        indexed_rows.get(evidence_id, [])
+    )
     related_valid: list[dict[str, Any]] = []
-    for audit_row in audit_rows:
-        if str(audit_row.get("action") or "") not in (
-            _METRIC_EVIDENCE_AUDIT_ACTIONS
-        ):
-            continue
-        raw_evidence = _json(audit_row.get("evidence_json"), None)
-        if (
-            isinstance(raw_evidence, dict)
-            and str(raw_evidence.get("evidence_id") or "") == evidence_id
-        ):
-            related_raw.append(audit_row)
-            envelope = _valid_audit_envelope(audit_row)
-            if envelope is not None:
-                related_valid.append(envelope)
+    for audit_row in related_raw:
+        envelope = _valid_audit_envelope(audit_row)
+        if envelope is not None:
+            related_valid.append(envelope)
 
     add_audits = [
         item for item in related_valid
@@ -5050,19 +7091,35 @@ def metric_evidence_audit_binding(
 
 
 def _metric_evidence_audit_rows(
-    entity_type: str, *, connection=None,
+    entity_type: str, *, evidence_ids: Iterable[str], connection=None,
 ) -> list[dict[str, Any]]:
+    selected_ids = sorted({
+        str(value or "").strip().lower() for value in evidence_ids
+        if re.fullmatch(
+            r"[0-9a-f]{32}", str(value or "").strip().lower()
+        )
+    })
+    if not selected_ids:
+        return []
     sql = (
-        "SELECT audit_id, entity_type, entity_key, action, reason, "
-        "operator_name, before_json, after_json, evidence_json, "
-        "payload_json, audit_hash, created_at "
-        "FROM st_strategy_governance_audit "
-        "WHERE entity_type=:entity_type AND action IN "
+        "SELECT audit.audit_id, audit.entity_type, audit.entity_key, "
+        "audit.action, audit.reason, audit.operator_name, "
+        "audit.before_json, audit.after_json, audit.evidence_json, "
+        "audit.payload_json, audit.audit_hash, audit.created_at "
+        "FROM st_strategy_governance_audit audit "
+        "JOIN JSON_TABLE(:evidence_ids, '$[*]' COLUMNS("
+        " evidence_id CHAR(32) PATH '$')) selected "
+        "ON JSON_UNQUOTE(JSON_EXTRACT(audit.evidence_json, "
+        "'$.evidence_id'))=selected.evidence_id "
+        "WHERE audit.entity_type=:entity_type AND audit.action IN "
         "('ADD_METRIC_EVIDENCE','CONFIRM_METRIC_EVIDENCE',"
         "'REJECT_METRIC_EVIDENCE') "
-        "ORDER BY created_at, audit_id"
+        "ORDER BY audit.created_at, audit.audit_id"
     )
-    params = {"entity_type": entity_type}
+    params = {
+        "entity_type": entity_type,
+        "evidence_ids": _json_text(selected_ids),
+    }
     if connection is None:
         return _db_read(sql, params)
     return [
@@ -5152,6 +7209,11 @@ def record_metric_input(payload: dict[str, Any], *, operator: str = "api") -> di
         # Browser/API submissions are useful research evidence, but cannot
         # attest overlapping positions, daily marks and cash movements.
         "funding_provenance": "EXTERNAL_SUBMITTED",
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
     })
     evidence_payload = {
         "strategy_key": key,
@@ -5202,7 +7264,11 @@ def record_metric_input(payload: dict[str, Any], *, operator: str = "api") -> di
         if str(existing.get("evidence_hash") or "") != evidence_hash:
             raise ValueError("同一版本、日期和窗口的指标证据不可覆盖")
         audit_valid, _audit_detail = metric_evidence_audit_binding(
-            existing, _metric_evidence_audit_rows(entity_type),
+            existing,
+            _metric_evidence_audit_rows(
+                entity_type,
+                evidence_ids=[str(existing.get("evidence_id") or "")],
+            ),
         )
         if not audit_valid:
             raise RuntimeError("已有指标证据缺少完整不可变提交/复核审计")
@@ -5211,6 +7277,13 @@ def record_metric_input(payload: dict[str, Any], *, operator: str = "api") -> di
             "evidence_id": existing.get("evidence_id"),
             "verification_status": existing.get("verification_status"),
             "evidence_hash": evidence_hash,
+            "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+            "source_authority_label": (
+                EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL
+            ),
+            "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+            "funding_authority": False,
+            "real_order_authority": False,
             "idempotent_replay": True,
         }
 
@@ -5223,6 +7296,10 @@ def record_metric_input(payload: dict[str, Any], *, operator: str = "api") -> di
     reason = str(payload.get("reason") or "新增验证证据")[:500]
     try:
         with get_engine().begin() as connection:
+            # The challenger path locks this same singleton migration row
+            # before scanning ordinary metrics.  Taking it first here makes
+            # the cross-ledger absence check and insert one serializable claim.
+            _lock_global_evidence_namespace(connection)
             current = connection.execute(text(
                 f"SELECT current_version FROM {table} "
                 f"WHERE {key_column}=:key FOR UPDATE"
@@ -5306,6 +7383,11 @@ def record_metric_input(payload: dict[str, Any], *, operator: str = "api") -> di
         "evidence_id": evidence_id,
         "verification_status": "PENDING",
         "evidence_hash": evidence_hash,
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
         "idempotent_replay": False,
     }
 
@@ -5346,7 +7428,8 @@ def review_metric_input(
         audit_valid, _audit_detail = metric_evidence_audit_binding(
             dict(row),
             _metric_evidence_audit_rows(
-                entity_type, connection=connection,
+                entity_type, evidence_ids=[evidence_key],
+                connection=connection,
             ),
         )
         if current_status != "PENDING":
@@ -5388,6 +7471,9 @@ def review_metric_input(
                 "version_bound_evidence", "evidence_protocol",
                 "artifact_hash", "source_dataset_hash",
                 "evidence_revision_at", "funding_provenance",
+                "source_authority", "source_authority_label",
+                "review_scope", "funding_authority",
+                "real_order_authority",
             ):
                 core_metrics.pop(field, None)
             version_table = (
@@ -5490,99 +7576,577 @@ def review_metric_input(
         "verification_status": target_status,
         "reviewed_by": reviewer,
         "reviewed_at": reviewed_at_text,
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
         "idempotent_replay": False,
     }
 
 
+METRIC_ARTIFACT_PAGE_SECTIONS = frozenset({
+    "trades",
+    "equity_curve",
+    "segments",
+    "segment_train_dataset",
+})
+METRIC_ARTIFACT_PAGE_MAX = 100
+
+
+def _metric_artifact_summary(
+    artifact: Any, *, evidence_id: str, artifact_hash: str,
+) -> dict[str, Any]:
+    manifest = artifact if isinstance(artifact, dict) else {}
+    trades = manifest.get("trades")
+    equity_curve = manifest.get("equity_curve")
+    segments = manifest.get("segments")
+    trades = trades if isinstance(trades, list) else []
+    equity_curve = equity_curve if isinstance(equity_curve, list) else []
+    segments = segments if isinstance(segments, list) else []
+    segment_index = [
+        {
+            **{
+                key: value for key, value in segment.items()
+                if key != "train_dataset"
+            },
+            "train_dataset_count": len(segment.get("train_dataset") or []),
+        }
+        for segment in segments
+        if isinstance(segment, dict)
+    ]
+    training_count = sum(
+        len(segment.get("train_dataset") or [])
+        for segment in segments
+        if isinstance(segment, dict)
+        and isinstance(segment.get("train_dataset"), list)
+    )
+    return {
+        "schema": "probiga.strategy-metric-artifact-summary.v1",
+        "evidence_id": evidence_id,
+        "artifact_hash": artifact_hash,
+        "artifact_schema_version": str(
+            manifest.get("schema_version") or ""
+        ),
+        "source_dataset_hash": str(
+            manifest.get("source_dataset_hash") or ""
+        ),
+        "trade_count": len(trades),
+        "equity_point_count": len(equity_curve),
+        "segment_count": len(segments),
+        "segment_training_observation_count": training_count,
+        "trades_hash": _digest(trades),
+        "equity_curve_hash": _digest(equity_curve),
+        # Each validated segment already carries the bound training-set hash.
+        # Hashing this compact index avoids serializing up to 100 x 100000
+        # training observations again merely to render a summary.
+        "segments_hash": _digest(segment_index),
+        "segments_hash_basis": "VALIDATED_SEGMENT_INDEX_AND_TRAIN_DATASET_HASH",
+        "inline_arrays": False,
+        "page_size_max": METRIC_ARTIFACT_PAGE_MAX,
+        "automatic_real_order_submission": False,
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
+    }
+
+
+def _metric_artifact_cursor(
+    *, evidence_id: str, artifact_hash: str, section: str,
+    segment_index: int | None, total_count: int, limit: int, offset: int,
+) -> str:
+    cursor_hash = _digest({
+        "schema": "probiga.strategy-metric-artifact-cursor.v1",
+        "evidence_id": evidence_id,
+        "artifact_hash": artifact_hash,
+        "section": section,
+        "segment_index": segment_index,
+        "total_count": total_count,
+        "limit": limit,
+        "offset": offset,
+    })[:32]
+    return f"{offset}.{cursor_hash}"
+
+
+def _parse_metric_artifact_cursor(
+    cursor: str, *, evidence_id: str, artifact_hash: str, section: str,
+    segment_index: int | None, total_count: int, limit: int,
+) -> int:
+    if not cursor:
+        return 0
+    raw_offset, separator, supplied_hash = str(cursor).partition(".")
+    if (
+        separator != "."
+        or not raw_offset.isdigit()
+        or len(supplied_hash) != 32
+    ):
+        raise ValueError("指标证据产物游标格式无效")
+    offset = int(raw_offset)
+    if _metric_artifact_cursor(
+        evidence_id=evidence_id,
+        artifact_hash=artifact_hash,
+        section=section,
+        segment_index=segment_index,
+        total_count=total_count,
+        limit=limit,
+        offset=offset,
+    ) != cursor:
+        raise ValueError("指标证据产物游标与规范证据身份不一致")
+    return offset
+
+
+def _metric_artifact_bound_section_hash(
+    *, artifact_hash: str, section: str, total_count: int,
+    segment_index: int | None = None,
+) -> str:
+    return _digest({
+        "schema": "probiga.strategy-metric-artifact-section.v1",
+        "artifact_hash": artifact_hash,
+        "section": section,
+        "segment_index": segment_index,
+        "total_count": total_count,
+    })
+
+
+def _metric_evidence_compact_detail(
+    connection: Any, evidence_key: str,
+) -> dict[str, Any]:
+    """Validate storage identity using DB scalars without selecting artifact_json."""
+
+    row = connection.execute(text("""
+        SELECT evidence_id, entity_type, strategy_key, strategy_version,
+               as_of_date, window_days, metrics_json, source,
+               evidence_protocol, artifact_hash, source_dataset_hash,
+               evidence_revision_at, verification_status,
+               funding_provenance, submitted_by, reviewed_by, reviewed_at,
+               evidence_hash, created_at,
+               OCTET_LENGTH(artifact_json) AS artifact_json_bytes,
+               LOWER(SHA2(artifact_json, 256)) AS artifact_storage_sha256,
+               JSON_VALID(artifact_json) AS artifact_json_valid,
+               JSON_TYPE(JSON_EXTRACT(artifact_json, '$')) AS artifact_type,
+               JSON_UNQUOTE(JSON_EXTRACT(
+                   artifact_json, '$.schema_version'
+               )) AS artifact_schema_version,
+               JSON_UNQUOTE(JSON_EXTRACT(
+                   artifact_json, '$.source_dataset_hash'
+               )) AS artifact_source_dataset_hash,
+               JSON_TYPE(JSON_EXTRACT(
+                   artifact_json, '$.trades'
+               )) AS trades_type,
+               JSON_LENGTH(JSON_EXTRACT(
+                   artifact_json, '$.trades'
+               )) AS trade_count,
+               JSON_TYPE(JSON_EXTRACT(
+                   artifact_json, '$.equity_curve'
+               )) AS equity_curve_type,
+               JSON_LENGTH(JSON_EXTRACT(
+                   artifact_json, '$.equity_curve'
+               )) AS equity_point_count,
+               JSON_TYPE(JSON_EXTRACT(
+                   artifact_json, '$.segments'
+               )) AS segments_type,
+               JSON_LENGTH(JSON_EXTRACT(
+                   artifact_json, '$.segments'
+               )) AS segment_count,
+               (SELECT COALESCE(SUM(JSON_LENGTH(JSON_EXTRACT(
+                    artifact_json, CONCAT(
+                        '$.segments[', segment_row.segment_ordinal - 1,
+                        '].train_dataset'
+                    )
+               ))), 0)
+                FROM JSON_TABLE(
+                    artifact_json, '$.segments[*]'
+                    COLUMNS(segment_ordinal FOR ORDINALITY)
+                ) AS segment_row
+               ) AS segment_training_observation_count
+        FROM st_strategy_metric_input
+        WHERE evidence_id=:evidence_id
+    """), {"evidence_id": evidence_key}).mappings().first()
+    if row is None:
+        raise ValueError("指标证据不存在")
+    compact = dict(row)
+    artifact_hash = str(compact.get("artifact_hash") or "").lower()
+    source_dataset_hash = str(
+        compact.get("source_dataset_hash") or ""
+    ).lower()
+    trade_count = _int(compact.get("trade_count"), -1)
+    equity_count = _int(compact.get("equity_point_count"), -1)
+    segment_count = _int(compact.get("segment_count"), -1)
+    training_count = _int(
+        compact.get("segment_training_observation_count"), -1,
+    )
+    if (
+        _int(compact.get("artifact_json_valid"), 0) != 1
+        or str(compact.get("artifact_type") or "") != "OBJECT"
+        or str(compact.get("artifact_schema_version") or "")
+        != "probiga.strategy-validation-artifact.v3"
+        or not _HASH_PATTERN.fullmatch(artifact_hash)
+        or str(compact.get("artifact_storage_sha256") or "").lower()
+        != artifact_hash
+        or not 0 < _int(compact.get("artifact_json_bytes"), 0)
+        <= METRIC_ARTIFACT_MAX_BYTES
+        or not _HASH_PATTERN.fullmatch(source_dataset_hash)
+        or str(compact.get("artifact_source_dataset_hash") or "").lower()
+        != source_dataset_hash
+        or str(compact.get("trades_type") or "") != "ARRAY"
+        or str(compact.get("equity_curve_type") or "") != "ARRAY"
+        or str(compact.get("segments_type") or "") != "ARRAY"
+        or not 1 <= trade_count <= 100_000
+        or not 2 <= equity_count <= 200_000
+        or not 1 <= segment_count <= 100
+        or training_count < segment_count
+    ):
+        raise ValueError("指标证据产物数据库身份、容量或数组摘要无效")
+    entity_type = str(compact.get("entity_type") or "STRATEGY")
+    if entity_type == "COMBINATION":
+        version_table = "st_strategy_combination_version"
+        version_key_column = "combination_key"
+    elif entity_type == "STRATEGY":
+        version_table = "st_strategy_version"
+        version_key_column = "strategy_key"
+    else:
+        raise ValueError("指标证据对象类型无效")
+    version_exists = connection.execute(text(
+        f"SELECT COUNT(*) FROM {version_table} "
+        f"WHERE {version_key_column}=:entity_key "
+        "AND BINARY version=BINARY :entity_version"
+    ), {
+        "entity_key": str(compact.get("strategy_key") or ""),
+        "entity_version": str(compact.get("strategy_version") or ""),
+    }).scalar()
+    if _int(version_exists, 0) != 1:
+        raise ValueError("证据绑定的不可变版本不存在或不唯一")
+    metrics = _json(compact.pop("metrics_json", None), None)
+    if not isinstance(metrics, dict):
+        raise ValueError("指标证据聚合指标格式无效")
+    for internal_field in (
+        "artifact_storage_sha256", "artifact_json_valid", "artifact_type",
+        "trades_type", "equity_curve_type", "segments_type",
+        "artifact_source_dataset_hash",
+    ):
+        compact.pop(internal_field, None)
+    summary = {
+        "schema": "probiga.strategy-metric-artifact-summary.v1",
+        "evidence_id": evidence_key,
+        "artifact_hash": artifact_hash,
+        "artifact_schema_version": str(
+            compact.get("artifact_schema_version") or ""
+        ),
+        "source_dataset_hash": source_dataset_hash,
+        "artifact_json_bytes": _int(compact.get("artifact_json_bytes")),
+        "trade_count": trade_count,
+        "equity_point_count": equity_count,
+        "segment_count": segment_count,
+        "segment_training_observation_count": training_count,
+        "trades_hash": _metric_artifact_bound_section_hash(
+            artifact_hash=artifact_hash, section="trades",
+            total_count=trade_count,
+        ),
+        "equity_curve_hash": _metric_artifact_bound_section_hash(
+            artifact_hash=artifact_hash, section="equity_curve",
+            total_count=equity_count,
+        ),
+        "segments_hash": _metric_artifact_bound_section_hash(
+            artifact_hash=artifact_hash, section="segments",
+            total_count=segment_count,
+        ),
+        "segments_hash_basis": "ARTIFACT_SHA256_AND_JSON_LENGTH",
+        "inline_arrays": False,
+        "page_size_max": METRIC_ARTIFACT_PAGE_MAX,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {
+        **compact,
+        "verification_status_label": EVIDENCE_STATUS_LABELS.get(
+            str(compact.get("verification_status") or ""), "未知复核状态"
+        ),
+        "validation_status": "VALID",
+        "validation_status_label": "产物存储身份有效",
+        "validation_scope": "COMPACT_STORAGE_IDENTITY",
+        "validation_reason": "数据库SHA-256、容量、版本及数组计数校验通过",
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "metrics": metrics,
+        "artifact_summary": summary,
+        "artifact_detail_ref": {
+            "schema": "probiga.strategy-metric-artifact-detail-ref.v1",
+            "evidence_id": evidence_key,
+            "artifact_hash": artifact_hash,
+            "sections": sorted(METRIC_ARTIFACT_PAGE_SECTIONS),
+            "page_size_max": METRIC_ARTIFACT_PAGE_MAX,
+            "inline_arrays": False,
+        },
+        "automatic_real_order_submission": False,
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
+    }
+
+
 def metric_evidence_detail(evidence_id: str) -> dict[str, Any]:
-    """Return one stored artifact for an authenticated independent reviewer."""
+    """Return compact DB-verified metadata without selecting artifact_json."""
 
     if not _table_exists("st_strategy_metric_input"):
         raise RuntimeError("策略治理表尚未由部署流程创建")
     evidence_key = str(evidence_id or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{32}", evidence_key):
         raise ValueError("证据编号格式无效")
-    rows = _db_read(
-        "SELECT * FROM st_strategy_metric_input WHERE evidence_id=:evidence_id",
-        {"evidence_id": evidence_key},
+    connection = get_engine().connect().execution_options(
+        isolation_level="REPEATABLE READ",
     )
-    if not rows:
-        raise ValueError("指标证据不存在")
-    row = dict(rows[0])
-    metrics = _json(row.pop("metrics_json", None), {})
-    artifact = _json(row.pop("artifact_json", None), None)
-    entity_type = str(row.get("entity_type") or "STRATEGY")
-    entity_key = str(row.get("strategy_key") or "")
-    entity_version = str(row.get("strategy_version") or "")
-    version_table = (
-        "st_strategy_combination_version"
-        if entity_type == "COMBINATION"
-        else "st_strategy_version"
-    )
-    version_key_column = (
-        "combination_key"
-        if entity_type == "COMBINATION"
-        else "strategy_key"
-    )
-    version_rows = _db_read(
-        f"SELECT created_at FROM {version_table} "
-        f"WHERE {version_key_column}=:entity_key AND version=:entity_version",
-        {"entity_key": entity_key, "entity_version": entity_version},
-    )
-    validation_status = "VALID"
-    validation_reason = "逐笔样本、组合权益曲线、窗口、版本和哈希可重算"
     try:
-        if not version_rows:
-            raise ValueError("证据绑定的不可变版本不存在")
-        core_metrics = dict(metrics)
-        for field in (
-            "version_bound_evidence", "evidence_protocol", "artifact_hash",
-            "source_dataset_hash", "evidence_revision_at",
-            "funding_provenance",
-        ):
-            core_metrics.pop(field, None)
-        _validate_metric_artifact(
-            artifact,
-            entity_type=entity_type,
-            entity_key=entity_key,
-            entity_version=entity_version,
-            as_of_date=_trade_date(row.get("as_of_date"), default_today=False),
-            window_days=_int(row.get("window_days")),
-            evidence_protocol=str(row.get("evidence_protocol") or ""),
-            evidence_revision_at=_normalize_evidence_revision(
-                row.get("evidence_revision_at")
-            ),
-            metrics=core_metrics,
-            artifact_hash=str(row.get("artifact_hash") or ""),
-            version_created_at=str(version_rows[0].get("created_at") or ""),
-            expected_max_holding_days=_version_max_holding_days(
-                entity_type, entity_key, entity_version
-            ),
-            expected_label_horizon_days=_version_label_horizon_days(
-                entity_type, entity_key, entity_version
-            ),
-        )
-        if str(row.get("source_dataset_hash") or "") != str(
-            artifact.get("source_dataset_hash") if isinstance(artifact, dict) else ""
-        ):
-            raise ValueError("证据记录与底层样本集哈希不一致")
-    except (TypeError, ValueError) as exc:
-        validation_status = "INVALID"
-        validation_reason = str(exc)[:500]
-    return {
-        **row,
-        "verification_status_label": EVIDENCE_STATUS_LABELS.get(
-            str(row.get("verification_status") or ""), "未知复核状态"
+        with connection.begin():
+            return _metric_evidence_compact_detail(connection, evidence_key)
+    finally:
+        connection.close()
+
+
+def metric_evidence_artifact_page(
+    evidence_id: str, *, section: str, cursor: str = "",
+    limit: int = 50, segment_index: int | None = None,
+) -> dict[str, Any]:
+    """Project one bounded page in MySQL without materializing artifact_json."""
+
+    normalized_section = str(section or "").strip().lower()
+    if normalized_section not in METRIC_ARTIFACT_PAGE_SECTIONS:
+        raise ValueError("指标证据产物分页类型无效")
+    if isinstance(limit, bool) or not 1 <= int(limit) <= METRIC_ARTIFACT_PAGE_MAX:
+        raise ValueError("指标证据产物每页只能读取1至100行")
+    evidence_key = str(evidence_id or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", evidence_key):
+        raise ValueError("证据编号格式无效")
+    normalized_segment_index: int | None = None
+    if normalized_section == "segment_train_dataset":
+        if isinstance(segment_index, bool) or segment_index is None or int(segment_index) < 1:
+            raise ValueError("训练样本分页必须指定从1开始的分段编号")
+        normalized_segment_index = int(segment_index)
+    elif segment_index is not None:
+        raise ValueError("只有训练样本分页可指定分段编号")
+
+    connection = get_engine().connect().execution_options(
+        isolation_level="REPEATABLE READ",
+    )
+    try:
+        with connection.begin():
+            detail = _metric_evidence_compact_detail(connection, evidence_key)
+            artifact_hash = str(detail.get("artifact_hash") or "")
+            summary = detail["artifact_summary"]
+            if normalized_section == "trades":
+                total_count = _int(summary.get("trade_count"), -1)
+                projection_sql = """
+                    SELECT item.item_ordinal, item.evidence_id,
+                           item.trade_date, item.label_available_at,
+                           item.observed_at, item.net_return_pct, item.cost_pct
+                    FROM st_strategy_metric_input evidence
+                    JOIN JSON_TABLE(evidence.artifact_json, '$.trades[*]'
+                        COLUMNS(
+                            item_ordinal FOR ORDINALITY,
+                            evidence_id CHAR(64) PATH '$.evidence_id',
+                            trade_date CHAR(10) PATH '$.trade_date',
+                            label_available_at VARCHAR(32)
+                                PATH '$.label_available_at',
+                            observed_at VARCHAR(32) PATH '$.observed_at',
+                            net_return_pct DOUBLE PATH '$.net_return_pct',
+                            cost_pct DOUBLE PATH '$.cost_pct'
+                        )) AS item ON TRUE
+                    WHERE evidence.evidence_id=:evidence_id
+                      AND item.item_ordinal>:offset
+                      AND item.item_ordinal<=:page_end
+                    ORDER BY item.item_ordinal
+                """
+            elif normalized_section == "equity_curve":
+                total_count = _int(summary.get("equity_point_count"), -1)
+                projection_sql = """
+                    SELECT item.item_ordinal, item.trade_date, item.equity
+                    FROM st_strategy_metric_input evidence
+                    JOIN JSON_TABLE(
+                        evidence.artifact_json, '$.equity_curve[*]'
+                        COLUMNS(
+                            item_ordinal FOR ORDINALITY,
+                            trade_date CHAR(10) PATH '$.trade_date',
+                            equity DOUBLE PATH '$.equity'
+                        )) AS item ON TRUE
+                    WHERE evidence.evidence_id=:evidence_id
+                      AND item.item_ordinal>:offset
+                      AND item.item_ordinal<=:page_end
+                    ORDER BY item.item_ordinal
+                """
+            elif normalized_section == "segments":
+                total_count = _int(summary.get("segment_count"), -1)
+                projection_sql = """
+                    SELECT item.item_ordinal AS segment_index,
+                           item.train_start, item.train_end,
+                           item.test_start, item.test_end,
+                           item.completed_trades, item.net_expectancy_pct,
+                           item.train_dataset_hash, item.test_dataset_hash,
+                           JSON_LENGTH(JSON_EXTRACT(
+                               evidence.artifact_json,
+                               CONCAT('$.segments[',
+                                      item.item_ordinal - 1,
+                                      '].train_dataset')
+                           )) AS train_dataset_count
+                    FROM st_strategy_metric_input evidence
+                    JOIN JSON_TABLE(evidence.artifact_json, '$.segments[*]'
+                        COLUMNS(
+                            item_ordinal FOR ORDINALITY,
+                            train_start CHAR(10) PATH '$.train_start',
+                            train_end CHAR(10) PATH '$.train_end',
+                            test_start CHAR(10) PATH '$.test_start',
+                            test_end CHAR(10) PATH '$.test_end',
+                            completed_trades INT PATH '$.completed_trades',
+                            net_expectancy_pct DOUBLE
+                                PATH '$.net_expectancy_pct',
+                            train_dataset_hash CHAR(64)
+                                PATH '$.train_dataset_hash',
+                            test_dataset_hash CHAR(64)
+                                PATH '$.test_dataset_hash'
+                        )) AS item ON TRUE
+                    WHERE evidence.evidence_id=:evidence_id
+                      AND item.item_ordinal>:offset
+                      AND item.item_ordinal<=:page_end
+                    ORDER BY item.item_ordinal
+                """
+            else:
+                if normalized_segment_index > _int(summary.get("segment_count"), 0):
+                    raise ValueError("训练样本分段编号超出范围")
+                segment_path = (
+                    f"$.segments[{normalized_segment_index - 1}]"
+                )
+                segment_meta = connection.execute(text("""
+                    SELECT JSON_LENGTH(JSON_EXTRACT(
+                               artifact_json,
+                               CONCAT(:segment_path, '.train_dataset')
+                           )) AS section_count,
+                           JSON_UNQUOTE(JSON_EXTRACT(
+                               artifact_json,
+                               CONCAT(:segment_path, '.train_dataset_hash')
+                           )) AS declared_section_hash
+                    FROM st_strategy_metric_input
+                    WHERE evidence_id=:evidence_id
+                """), {
+                    "evidence_id": evidence_key,
+                    "segment_path": segment_path,
+                }).mappings().one()
+                total_count = _int(segment_meta.get("section_count"), -1)
+                declared_hash = str(
+                    segment_meta.get("declared_section_hash") or ""
+                )
+                if total_count < 1 or not _HASH_PATTERN.fullmatch(declared_hash):
+                    raise ValueError("训练样本分段摘要无效")
+                projection_sql = """
+                    SELECT item.item_ordinal, item.observation_id,
+                           item.observed_at, item.label_available_at,
+                           item.feature_snapshot_hash,
+                           item.label_snapshot_hash
+                    FROM st_strategy_metric_input evidence
+                    JOIN JSON_TABLE(
+                        JSON_EXTRACT(
+                            evidence.artifact_json,
+                            CONCAT(:segment_path, '.train_dataset')
+                        ), '$[*]'
+                        COLUMNS(
+                            item_ordinal FOR ORDINALITY,
+                            observation_id CHAR(64) PATH '$.observation_id',
+                            observed_at VARCHAR(32) PATH '$.observed_at',
+                            label_available_at VARCHAR(32)
+                                PATH '$.label_available_at',
+                            feature_snapshot_hash CHAR(64)
+                                PATH '$.feature_snapshot_hash',
+                            label_snapshot_hash CHAR(64)
+                                PATH '$.label_snapshot_hash'
+                        )) AS item ON TRUE
+                    WHERE evidence.evidence_id=:evidence_id
+                      AND item.item_ordinal>:offset
+                      AND item.item_ordinal<=:page_end
+                    ORDER BY item.item_ordinal
+                """
+
+            page_limit = int(limit)
+            offset = _parse_metric_artifact_cursor(
+                cursor, evidence_id=evidence_key,
+                artifact_hash=artifact_hash, section=normalized_section,
+                segment_index=normalized_segment_index,
+                total_count=total_count, limit=page_limit,
+            )
+            if offset > total_count:
+                raise ValueError("指标证据产物游标超出范围")
+            params = {
+                "evidence_id": evidence_key,
+                "offset": offset,
+                "page_end": min(total_count, offset + page_limit),
+            }
+            if normalized_section == "segment_train_dataset":
+                params["segment_path"] = segment_path
+            raw_items = connection.execute(
+                text(projection_sql), params,
+            ).mappings().all()
+            items = []
+            for raw_item in raw_items:
+                item = dict(raw_item)
+                item.pop("item_ordinal", None)
+                if normalized_section == "segments":
+                    item["train_dataset_inline"] = False
+                    item["segment_index_hash"] = _digest(item)
+                items.append(item)
+            expected_count = min(page_limit, max(0, total_count - offset))
+            if len(items) != expected_count:
+                raise ValueError("指标证据产物分页读取发生并发漂移")
+    finally:
+        connection.close()
+
+    next_offset = offset + len(items)
+    previous_offset = max(0, offset - page_limit)
+    section_hash = _metric_artifact_bound_section_hash(
+        artifact_hash=artifact_hash, section=normalized_section,
+        total_count=total_count, segment_index=normalized_segment_index,
+    )
+    page_contract = {
+        "schema": "probiga.strategy-metric-artifact-page.v1",
+        "evidence_id": evidence_key,
+        "evidence_hash": str(detail.get("evidence_hash") or ""),
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": str(detail.get("source_dataset_hash") or ""),
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "section": normalized_section,
+        "segment_index": normalized_segment_index,
+        "section_hash": section_hash,
+        "section_hash_basis": "ARTIFACT_SHA256_AND_JSON_LENGTH",
+        "offset": offset,
+        "limit": page_limit,
+        "total_count": total_count,
+        "items": items,
+        "previous_cursor": (
+            _metric_artifact_cursor(
+                evidence_id=evidence_key, artifact_hash=artifact_hash,
+                section=normalized_section,
+                segment_index=normalized_segment_index,
+                total_count=total_count, limit=page_limit,
+                offset=previous_offset,
+            ) if offset > 0 else None
         ),
-        "validation_status": validation_status,
-        "validation_status_label": (
-            "产物可重算" if validation_status == "VALID" else "产物校验失败"
+        "next_cursor": (
+            _metric_artifact_cursor(
+                evidence_id=evidence_key, artifact_hash=artifact_hash,
+                section=normalized_section,
+                segment_index=normalized_segment_index,
+                total_count=total_count, limit=page_limit,
+                offset=next_offset,
+            ) if next_offset < total_count else None
         ),
-        "validation_reason": validation_reason,
-        "metrics": metrics,
-        "artifact_manifest": artifact,
         "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
+    return {**page_contract, "page_hash": _digest(page_contract)}
 
 
 def _aggregate_forward_intent_episodes(
@@ -5929,6 +8493,435 @@ def calculate_return_metrics(
     }
 
 
+def _statistical_threshold_passed(
+    *, window_days: int, net_lcb: float | None,
+    profit_factor_lcb: float | None, payoff_ratio_lcb: float | None,
+    effective_sample_size: float | None,
+) -> bool:
+    thresholds = STATISTICAL_GUARD_POLICY["window_thresholds"].get(
+        str(window_days)
+    )
+    minimum_ess = STATISTICAL_GUARD_POLICY[
+        "minimum_effective_sample_by_window"
+    ].get(str(window_days))
+    if (
+        not isinstance(thresholds, dict)
+        or any(value is None or not math.isfinite(float(value)) for value in (
+            net_lcb, profit_factor_lcb, payoff_ratio_lcb,
+            effective_sample_size, minimum_ess,
+        ))
+    ):
+        return False
+    if float(net_lcb) <= float(
+        thresholds["minimum_net_expectancy_lcb_pct_exclusive"]
+    ) or float(effective_sample_size) < float(minimum_ess):
+        return False
+    if window_days == 20:
+        return bool(
+            float(profit_factor_lcb)
+            > float(thresholds["minimum_profit_factor_lcb_exclusive"])
+            and float(payoff_ratio_lcb)
+            > float(thresholds["minimum_payoff_ratio_lcb_exclusive"])
+        )
+    return bool(
+        float(profit_factor_lcb)
+        >= float(thresholds["minimum_profit_factor_lcb_inclusive"])
+        and float(payoff_ratio_lcb)
+        >= float(thresholds["minimum_payoff_ratio_lcb_inclusive"])
+    )
+
+
+def _compact_nav_statistical_guard(
+    metrics: dict[str, Any], *, session_window: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Recompute one compact, hash-bound HAC guard from internal daily NAV."""
+
+    window_days = _int(metrics.get("window_days"), -1)
+    records = metrics.get("internal_daily_records")
+    raw_records = records if isinstance(records, list) else []
+    full = newey_west_nav_statistics(
+        raw_records,
+        confidence_level=float(STATISTICAL_GUARD_POLICY["confidence_level"]),
+        bandwidth=None,
+        minimum_positive_days=int(
+            STATISTICAL_GUARD_POLICY["minimum_positive_days"]
+        ),
+        minimum_negative_days=int(
+            STATISTICAL_GUARD_POLICY["minimum_negative_days"]
+        ),
+    )
+    expected_sessions = list((session_window or {}).get("sessions") or [])
+    observed_sessions = [
+        str(item.get("trade_date") or "")
+        for item in raw_records if isinstance(item, dict)
+    ]
+    calendar_binding = (session_window or {}).get("calendar_receipt")
+    session_binding_valid = bool(
+        window_days in WINDOWS
+        and len(expected_sessions) == window_days
+        and expected_sessions == sorted(set(expected_sessions))
+        and observed_sessions == expected_sessions
+        and _int((session_window or {}).get("session_count"), -1)
+        == window_days
+        and _HASH_PATTERN.fullmatch(str(
+            (session_window or {}).get("session_hash") or ""
+        ))
+        and _valid_calendar_receipt_binding(
+            calendar_binding,
+            start_date=expected_sessions[0] if expected_sessions else "",
+            end_date=expected_sessions[-1] if expected_sessions else "",
+        )
+        and str((session_window or {}).get("calendar_manifest_hash") or "")
+        == str((calendar_binding or {}).get("manifest_hash") or "")
+        and str(
+            (session_window or {}).get("calendar_session_set_hash") or ""
+        ) == str((calendar_binding or {}).get("session_set_hash") or "")
+    )
+
+    pf_detail = full.get("profit_factor")
+    payoff_detail = full.get("payoff_ratio")
+    full_valid = bool(
+        full.get("valid") is True
+        and isinstance(pf_detail, dict)
+        and isinstance(payoff_detail, dict)
+    )
+    net_point = _num(full.get("net_expectancy_pct"), None)
+    pf_point = _num((pf_detail or {}).get("estimate"), None)
+    payoff_point = _num((payoff_detail or {}).get("estimate"), None)
+
+    def same_point(left: Any, right: float | None) -> bool:
+        observed = _num(left, None)
+        return bool(
+            observed is not None and right is not None
+            and math.isclose(
+                float(observed), float(right),
+                rel_tol=0.0, abs_tol=0.00011,
+            )
+        )
+
+    point_estimates_valid = bool(
+        full_valid
+        and same_point(metrics.get("net_expectancy_pct"), net_point)
+        and same_point(metrics.get("profit_factor"), pf_point)
+        and same_point(metrics.get("payoff_ratio"), payoff_point)
+    )
+    net_lcb = _num(
+        full.get("net_expectancy_one_sided_95_lcb_pct"), None
+    )
+    net_p = _num(full.get("net_expectancy_one_sided_p_value"), None)
+    pf_lcb = _num((pf_detail or {}).get("one_sided_95_lcb"), None)
+    payoff_lcb = _num(
+        (payoff_detail or {}).get("one_sided_95_lcb"), None
+    )
+    effective_sample_size = _num(full.get("effective_sample_size"), None)
+    threshold_passed = bool(
+        full_valid and session_binding_valid and point_estimates_valid
+        and _statistical_threshold_passed(
+            window_days=window_days,
+            net_lcb=net_lcb,
+            profit_factor_lcb=pf_lcb,
+            payoff_ratio_lcb=payoff_lcb,
+            effective_sample_size=effective_sample_size,
+        )
+    )
+    reason_code = (
+        "HAC_CONFIDENCE_GATE_PASSED" if threshold_passed
+        else "HAC_INTERNAL_NAV_INVALID" if not full_valid
+        else "HAC_SESSION_BINDING_INVALID" if not session_binding_valid
+        else "HAC_POINT_ESTIMATE_MISMATCH" if not point_estimates_valid
+        else "HAC_CONFIDENCE_GATE_FAILED"
+    )
+    parameters = full.get("parameters") if isinstance(
+        full.get("parameters"), dict
+    ) else {}
+    payload = {
+        "schema": "probiga.strategy-nav-hac-guard-compact.v1",
+        "window_days": window_days,
+        "valid": bool(
+            full_valid and session_binding_valid and point_estimates_valid
+        ),
+        "threshold_passed": threshold_passed,
+        "reason_code": reason_code,
+        "observation_count": _int(full.get("observation_count"), 0),
+        "positive_day_count": _int(full.get("positive_day_count"), 0),
+        "negative_day_count": _int(full.get("negative_day_count"), 0),
+        "zero_day_count": _int(full.get("zero_day_count"), 0),
+        "bandwidth": _int(parameters.get("resolved_bandwidth"), -1),
+        "confidence_level": float(
+            STATISTICAL_GUARD_POLICY["confidence_level"]
+        ),
+        "effective_sample_size": effective_sample_size,
+        "minimum_effective_sample_size": _num(
+            STATISTICAL_GUARD_POLICY[
+                "minimum_effective_sample_by_window"
+            ].get(str(window_days)), None,
+        ),
+        "net_expectancy_long_run_variance": _num(
+            full.get("net_expectancy_long_run_variance"), None
+        ),
+        "net_expectancy_one_sided_95_lcb_pct": net_lcb,
+        "net_expectancy_one_sided_p_value": net_p,
+        "profit_factor_one_sided_95_lcb": pf_lcb,
+        "payoff_ratio_one_sided_95_lcb": payoff_lcb,
+        "session_window_hash": str(
+            (session_window or {}).get("session_hash") or ""
+        ),
+        "calendar_receipt_binding_hash": str(
+            (calendar_binding or {}).get("binding_hash") or ""
+        ),
+        "full_input_hash": str(full.get("input_hash") or ""),
+        "full_parameter_hash": str(full.get("parameter_hash") or ""),
+        "full_result_hash": str(full.get("result_hash") or ""),
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "compact_hash": _digest(payload)}
+
+
+def _internal_forward_stability_guard(
+    metrics: dict[str, Any], *, session_window: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Derive non-overlapping time-segment stability from internal daily NAV."""
+
+    segment_target = int(PROFIT_GATE_POLICY["walk_forward_segments"])
+    positive_required = int(
+        PROFIT_GATE_POLICY["minimum_positive_segments"]
+    )
+    window_days = _int(metrics.get("window_days"), -1)
+    raw_records = metrics.get("internal_daily_records")
+    records = raw_records if isinstance(raw_records, list) else []
+    expected_sessions = list((session_window or {}).get("sessions") or [])
+    normalized_records: list[dict[str, str]] = []
+    valid = True
+    try:
+        for item in records:
+            if not isinstance(item, dict):
+                raise ValueError("内部日频NAV分段行无效")
+            trade_day = _trade_date(
+                item.get("trade_date"), default_today=False,
+            )
+            value = Decimal(str(item.get("return_pct")))
+            if not value.is_finite() or value <= Decimal("-100"):
+                raise ValueError("内部日频NAV分段收益无效")
+            normalized_records.append({
+                "trade_date": trade_day,
+                "return_pct": format(
+                    value.quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    ),
+                    ".12f",
+                ),
+            })
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        valid = False
+        normalized_records = []
+    observed_sessions = [
+        item["trade_date"] for item in normalized_records
+    ]
+    calendar_binding = (session_window or {}).get("calendar_receipt")
+    valid = bool(
+        valid
+        and window_days in WINDOWS
+        and len(normalized_records) == window_days
+        and len(expected_sessions) == window_days
+        and observed_sessions == expected_sessions
+        and expected_sessions == sorted(set(expected_sessions))
+        and metrics.get("funding_provenance")
+        == CANONICAL_FUNDING_PROVENANCE
+        and _HASH_PATTERN.fullmatch(str(
+            metrics.get("internal_ledger_hash") or ""
+        ))
+        and _HASH_PATTERN.fullmatch(str(
+            (session_window or {}).get("session_hash") or ""
+        ))
+        and _valid_calendar_receipt_binding(
+            calendar_binding,
+            start_date=expected_sessions[0] if expected_sessions else "",
+            end_date=expected_sessions[-1] if expected_sessions else "",
+        )
+    )
+    segment_rows: list[dict[str, Any]] = []
+    if valid and segment_target > 0 and window_days >= segment_target:
+        for index in range(segment_target):
+            start = index * window_days // segment_target
+            end = (index + 1) * window_days // segment_target
+            equity = Decimal("1")
+            for record in normalized_records[start:end]:
+                equity *= Decimal("1") + (
+                    Decimal(record["return_pct"]) / Decimal("100")
+                )
+            segment_return = (equity - Decimal("1")) * Decimal("100")
+            segment_rows.append({
+                "segment": index + 1,
+                "start_date": normalized_records[start]["trade_date"],
+                "end_date": normalized_records[end - 1]["trade_date"],
+                "observation_count": end - start,
+                "compounded_return_pct": format(
+                    segment_return.quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    ),
+                    ".12f",
+                ),
+                "positive": segment_return > 0,
+            })
+    positive_count = sum(
+        item["positive"] is True for item in segment_rows
+    )
+    passed = bool(
+        valid and len(segment_rows) == segment_target
+        and positive_count >= positive_required
+    )
+    input_payload = {
+        "schema": "probiga.internal-forward-stability-input.v1",
+        "window_days": window_days,
+        "internal_ledger_hash": str(
+            metrics.get("internal_ledger_hash") or ""
+        ),
+        "session_window_hash": str(
+            (session_window or {}).get("session_hash") or ""
+        ),
+        "calendar_receipt_binding_hash": str(
+            (calendar_binding or {}).get("binding_hash") or ""
+        ),
+        "records": normalized_records,
+    }
+    segment_payload = {
+        "schema": "probiga.internal-forward-stability-segments.v1",
+        "segments": segment_rows,
+    }
+    payload = {
+        "schema": "probiga.internal-forward-stability-compact.v1",
+        "valid": valid,
+        "passed": passed,
+        "reason_code": (
+            "INTERNAL_FORWARD_STABILITY_PASSED" if passed
+            else "INTERNAL_FORWARD_STABILITY_INPUT_INVALID" if not valid
+            else "INTERNAL_FORWARD_STABILITY_SEGMENTS_FAILED"
+        ),
+        "method": "NON_OVERLAPPING_COMPOUNDED_DAILY_NAV_SEGMENTS_V1",
+        "window_days": window_days,
+        "segment_count": len(segment_rows),
+        "required_segment_count": segment_target,
+        "positive_segment_count": positive_count,
+        "required_positive_segment_count": positive_required,
+        "full_input_hash": _digest(input_payload),
+        "segment_set_hash": _digest(segment_payload),
+        "internal_ledger_hash": str(
+            metrics.get("internal_ledger_hash") or ""
+        ),
+        "session_window_hash": str(
+            (session_window or {}).get("session_hash") or ""
+        ),
+        "calendar_receipt_binding_hash": str(
+            (calendar_binding or {}).get("binding_hash") or ""
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "compact_hash": _digest(payload)}
+
+
+def _apply_statistical_health(
+    metrics: dict[str, Any], *, session_window: dict[str, Any] | None,
+) -> None:
+    """Attach HAC and replace official health with conservative LCB health."""
+
+    point_health = calculate_health_score(metrics)
+    metrics["calendar_receipt_binding_hash"] = str(
+        (session_window or {}).get("calendar_receipt_binding_hash")
+        or ((session_window or {}).get("calendar_receipt") or {}).get(
+            "binding_hash"
+        )
+        or ""
+    )
+    guard = _compact_nav_statistical_guard(
+        metrics, session_window=session_window,
+    )
+    forward_guard = _internal_forward_stability_guard(
+        metrics, session_window=session_window,
+    )
+    metrics["point_health_score"] = point_health
+    metrics["statistical_guard"] = guard
+    metrics["internal_forward_stability"] = forward_guard
+    # Compatibility columns are now strictly server-derived.  Submitted
+    # VERSION_SELECTION_ONLY artifacts cannot overwrite funding semantics.
+    metrics["walk_forward_verified"] = forward_guard.get("valid") is True
+    metrics["walk_forward_segments"] = _int(
+        forward_guard.get("segment_count"), 0
+    )
+    metrics["positive_segments"] = _int(
+        forward_guard.get("positive_segment_count"), 0
+    )
+    if guard.get("valid") is not True:
+        metrics["statistical_reliability_multiplier"] = 0.0
+        metrics["health_score"] = 0.0
+        return
+    conservative = dict(metrics)
+    conservative["net_expectancy_pct"] = guard[
+        "net_expectancy_one_sided_95_lcb_pct"
+    ]
+    conservative["profit_factor"] = guard[
+        "profit_factor_one_sided_95_lcb"
+    ]
+    conservative["payoff_ratio"] = guard[
+        "payoff_ratio_one_sided_95_lcb"
+    ]
+    effective = float(guard.get("effective_sample_size") or 0.0)
+    window = max(1, _int(metrics.get("window_days"), 1))
+    reliability = min(1.0, max(0.0, effective / window))
+    metrics["statistical_reliability_multiplier"] = round(
+        reliability, 8
+    )
+    metrics["health_score"] = round(
+        calculate_health_score(conservative) * reliability, 2
+    )
+
+
+def _statistical_gate_checks(
+    metrics: dict[str, Any],
+) -> list[tuple[str, bool, str]]:
+    guard = metrics.get("statistical_guard")
+    window = _int(metrics.get("window_days"), -1)
+    minimum_ess = STATISTICAL_GUARD_POLICY[
+        "minimum_effective_sample_by_window"
+    ].get(str(window), 0)
+    valid = isinstance(guard, dict) and guard.get("valid") is True
+    return [
+        (
+            "HAC统计合同",
+            bool(
+                valid
+                and guard.get("statistical_policy_hash")
+                == STATISTICAL_POLICY_HASH
+                and _HASH_PATTERN.fullmatch(str(
+                    guard.get("compact_hash") or ""
+                ))
+                and _HASH_PATTERN.fullmatch(str(
+                    guard.get("full_result_hash") or ""
+                ))
+            ),
+            "必须由内部逐日净值重算并绑定服务端HAC政策和完整结果哈希",
+        ),
+        (
+            "有效日频样本",
+            bool(
+                valid
+                and _num(guard.get("effective_sample_size"), -1.0)
+                >= float(minimum_ess)
+            ),
+            f"{window}日窗口的HAC有效样本数不得低于{minimum_ess:g}",
+        ),
+        (
+            "置信下界",
+            bool(valid and guard.get("threshold_passed") is True),
+            "净期望、利润因子和盈亏比的单侧95%置信下界必须通过对应窗口门槛",
+        ),
+    ]
+
+
 def _gate_result(
     checks: list[tuple[str, bool, str]], *, passed_reason: str,
 ) -> dict[str, Any]:
@@ -5951,13 +8944,9 @@ def _funding_evidence_gate_checks(
     minimum_selection_completed_trades: int,
     minimum_selection_coverage_days: int,
 ) -> list[tuple[str, bool, str]]:
-    evidence_protocol = str(
-        metrics.get("evidence_protocol") or ""
-    ).strip().upper()
-    artifact_hash = str(metrics.get("artifact_hash") or "").strip().lower()
-    source_dataset_hash = str(
-        metrics.get("source_dataset_hash") or ""
-    ).strip().lower()
+    # Retained in the signature for the v6 call surface only.  In v7 external
+    # selection artifacts never satisfy, strengthen, or weaken funding.
+    del minimum_selection_completed_trades, minimum_selection_coverage_days
     internal_ledger_hash = str(
         metrics.get("internal_ledger_hash") or ""
     ).strip().lower()
@@ -5967,21 +8956,40 @@ def _funding_evidence_gate_checks(
     session_window_hash = str(
         metrics.get("session_window_hash") or ""
     ).strip().lower()
+    calendar_receipt_binding_hash = str(
+        metrics.get("calendar_receipt_binding_hash") or ""
+    ).strip().lower()
+    forward_guard = metrics.get("internal_forward_stability")
+    forward_guard_valid = bool(
+        isinstance(forward_guard, dict)
+        and forward_guard.get("valid") is True
+        and forward_guard.get("method")
+        == "NON_OVERLAPPING_COMPOUNDED_DAILY_NAV_SEGMENTS_V1"
+        and forward_guard.get("internal_ledger_hash")
+        == internal_ledger_hash
+        and forward_guard.get("session_window_hash")
+        == session_window_hash
+        and _HASH_PATTERN.fullmatch(calendar_receipt_binding_hash)
+        and forward_guard.get("calendar_receipt_binding_hash")
+        == calendar_receipt_binding_hash
+        and _digest({
+            key: value for key, value in forward_guard.items()
+            if key != "compact_hash"
+        }) == str(forward_guard.get("compact_hash") or "")
+    )
     return [
         ("版本证据绑定", metrics.get("version_bound_evidence") is True, "证据必须绑定当前不可变版本"),
-        ("独立样本外证据", metrics.get("independent_oos") is True, "不得使用回测或训练样本"),
-        ("验证协议", evidence_protocol in _VERIFIED_WALK_FORWARD_PROTOCOLS, "必须使用受支持的时序隔离Walk-Forward协议"),
-        ("验证产物", bool(revision_at) and bool(_HASH_PATTERN.fullmatch(artifact_hash)) and bool(_HASH_PATTERN.fullmatch(source_dataset_hash)), "必须保留可重算产物、底层样本集SHA-256和证据高水位"),
-        ("不可伪造来源", metrics.get("funding_provenance") == "INTERNAL_PORTFOLIO_LEDGER_V1" and bool(_HASH_PATTERN.fullmatch(internal_ledger_hash)), "资金证据必须由内部版本绑定组合账本生成并保留账本哈希；外部上传只用于研究"),
-        ("独立复核", metrics.get("verification_status") == "CONFIRMED" and bool(metrics.get("reviewed_by")) and str(metrics.get("reviewed_by")) != str(metrics.get("submitted_by") or "") and bool(metrics.get("reviewed_at")) and metrics.get("review_audit_valid") is True, "提交者与复核者分离、证据已确认，且复核审计绑定有效"),
+        ("内部前向事实", metrics.get("independent_oos") is True, "资金门槛只接受按时间发生的内部前向账本事实，不接受回测或训练样本"),
+        ("内部时序分段合同", forward_guard_valid, "必须由服务端从版本绑定的内部逐日NAV派生非重叠时序分段并绑定完整输入哈希"),
+        ("不可伪造来源", metrics.get("funding_provenance") == CANONICAL_FUNDING_PROVENANCE and bool(_HASH_PATTERN.fullmatch(internal_ledger_hash)), "资金证据必须由内部版本绑定组合账本生成并保留账本哈希；外部上传或旧版账本只用于历史展示"),
+        ("内部证据高水位", bool(revision_at), "内部逐日账本必须保留可验证证据高水位"),
         ("组合权益回撤", metrics.get("drawdown_basis") == "internal_version_bound_portfolio_equity", "最大回撤必须基于内部逐日盯市、含重叠持仓和现金的版本绑定组合权益"),
         ("成本口径", metrics.get("cost_basis") == "actual_ledger_fees", "资金门槛只接受内部成交账本实际费用"),
-        ("精确交易日窗口", metrics.get("session_window_valid") is True and _int(metrics.get("session_window_count")) == _int(metrics.get("window_days")) and bool(_HASH_PATTERN.fullmatch(session_window_hash)), "20/60/120窗口必须来自权威交易日历的精确已收盘交易日序列并保留哈希"),
+        ("精确交易日窗口", metrics.get("session_window_valid") is True and _int(metrics.get("session_window_count")) == _int(metrics.get("window_days")) and bool(_HASH_PATTERN.fullmatch(session_window_hash)) and bool(_HASH_PATTERN.fullmatch(calendar_receipt_binding_hash)), "20/60/120窗口必须来自不可变QMT交易日历回执的精确已收盘交易日序列并保留回执根与窗口哈希"),
         ("证据新鲜度", metrics.get("evidence_fresh") is True, f"证据日期距治理日不超过{PROFIT_GATE_POLICY['maximum_evidence_age_days']}日"),
-        ("选择验证新鲜度", metrics.get("selection_validation_fresh") is True, f"版本选择Walk-Forward产物距治理日不超过{PROFIT_GATE_POLICY['maximum_evidence_age_days']}日"),
         ("成熟交易", _int(metrics.get("completed_trades")) >= minimum_completed_trades, f"至少{minimum_completed_trades}笔"),
         ("组合净值覆盖", _int(metrics.get("portfolio_coverage_days")) >= minimum_portfolio_coverage_days, f"内部逐日组合净值至少覆盖{minimum_portfolio_coverage_days}个权威交易日；不要求每个交易日都有平仓"),
-        ("Walk-Forward", metrics.get("walk_forward_verified") is True and metrics.get("selection_validation_independent_oos") is True and metrics.get("selection_validation_scope") == "VERSION_SELECTION_ONLY" and _int(metrics.get("selection_validation_completed_trades")) >= minimum_selection_completed_trades and _int(metrics.get("selection_validation_coverage_days")) >= minimum_selection_coverage_days and _int(metrics.get("walk_forward_segments")) >= PROFIT_GATE_POLICY["walk_forward_segments"] and _int(metrics.get("positive_segments")) >= PROFIT_GATE_POLICY["minimum_positive_segments"], f"版本选择经独立时序隔离验证，至少{minimum_selection_completed_trades}笔、覆盖{minimum_selection_coverage_days}个权威交易日，且5段Walk-Forward至少4段为正"),
+        ("内部时序稳健性", forward_guard_valid and forward_guard.get("passed") is True and _int(forward_guard.get("segment_count")) >= PROFIT_GATE_POLICY["walk_forward_segments"] and _int(forward_guard.get("positive_segment_count")) >= PROFIT_GATE_POLICY["minimum_positive_segments"], "服务端内部逐日NAV必须形成5个非重叠分段且至少4段复合收益为正；客户端自报Walk-Forward字段无资金权限"),
     ]
 
 
@@ -6004,13 +9012,14 @@ def evaluate_profit_gate(metrics: dict[str, Any]) -> dict[str, Any]:
             "minimum_coverage_days"
         ],
     )
+    checks.extend(_statistical_gate_checks(metrics))
     checks.extend([
-        ("扣费后净期望", (_num(metrics.get("net_expectancy_pct"), -999.0) or -999.0) > PROFIT_GATE_POLICY["minimum_net_expectancy_pct"] and (_num(metrics.get("gross_expectancy_pct"), -999.0) or -999.0) >= cost * PROFIT_GATE_POLICY["minimum_cost_safety_multiple"], "为正且总期望覆盖3倍成本"),
-        ("盈亏比", (_num(metrics.get("payoff_ratio"), -1.0) or -1.0) >= PROFIT_GATE_POLICY["minimum_payoff_ratio"], f"不低于{PROFIT_GATE_POLICY['minimum_payoff_ratio']:.2f}"),
-        ("利润因子", (_num(metrics.get("profit_factor"), -1.0) or -1.0) >= PROFIT_GATE_POLICY["minimum_profit_factor"], f"不低于{PROFIT_GATE_POLICY['minimum_profit_factor']:.2f}"),
+        ("日均净收益", (_num(metrics.get("net_expectancy_pct"), -999.0) or -999.0) > PROFIT_GATE_POLICY["minimum_net_expectancy_pct"] and (_num(metrics.get("gross_expectancy_pct"), -999.0) or -999.0) >= cost * PROFIT_GATE_POLICY["minimum_cost_safety_multiple"], "为正且日均毛收益覆盖3倍成本"),
+        ("日频盈亏比", (_num(metrics.get("payoff_ratio"), -1.0) or -1.0) >= PROFIT_GATE_POLICY["minimum_payoff_ratio"], f"不低于{PROFIT_GATE_POLICY['minimum_payoff_ratio']:.2f}"),
+        ("日频利润因子", (_num(metrics.get("profit_factor"), -1.0) or -1.0) >= PROFIT_GATE_POLICY["minimum_profit_factor"], f"不低于{PROFIT_GATE_POLICY['minimum_profit_factor']:.2f}"),
         ("最大回撤", max_drawdown is not None and max_drawdown <= PROFIT_GATE_POLICY["maximum_drawdown_pct"], f"不高于{PROFIT_GATE_POLICY['maximum_drawdown_pct']:.0f}%"),
         ("成本压力", (_num(metrics.get("cost_stress_expectancy_pct"), -999.0) or -999.0) > 0, "1.5倍成本仍为正"),
-        ("极端依赖", top5_contribution is not None and top5_contribution <= PROFIT_GATE_POLICY["maximum_top5_profit_contribution_pct"], "最好5笔贡献不超过70%"),
+        ("极端依赖", top5_contribution is not None and top5_contribution <= PROFIT_GATE_POLICY["maximum_top5_profit_contribution_pct"], "最佳5个盈利日贡献不超过70%"),
     ])
     return _gate_result(checks, passed_reason="全部盈利硬门槛通过")
 
@@ -6052,19 +9061,20 @@ def evaluate_decay_gate_20(metrics: dict[str, Any]) -> dict[str, Any]:
                 "minimum_selection_coverage_days"
             ],
         ),
+        *_statistical_gate_checks(metrics),
         (
-            "扣费后净期望",
+            "日均净收益",
             (_num(metrics.get("net_expectancy_pct"), None) is not None)
             and _num(metrics.get("net_expectancy_pct"), None)
             > DECAY_GATE_20_POLICY["minimum_net_expectancy_pct"],
-            "20日扣除真实费用后的净期望必须严格为正",
+            "20日扣除真实费用后的日均净收益必须严格为正",
         ),
         (
-            "利润因子",
+            "日频利润因子",
             (_num(metrics.get("profit_factor"), None) is not None)
             and _num(metrics.get("profit_factor"), None)
             > DECAY_GATE_20_POLICY["minimum_profit_factor_exclusive"],
-            "20日利润因子必须严格大于1.00",
+            "20日日频利润因子必须严格大于1.00",
         ),
         (
             "成本压力",
@@ -6161,28 +9171,49 @@ def _load_metric_inputs(
         raise ValueError("指标证据对象只能是策略或组合")
     rows = _db_read(
         f"""
-        SELECT i.evidence_id, i.entity_type, i.strategy_key,
-               i.strategy_version, i.as_of_date,
-               i.window_days, i.metrics_json, i.source, i.evidence_hash,
-               i.evidence_protocol, i.artifact_hash,
-               i.source_dataset_hash,
-               i.evidence_revision_at, i.verification_status,
-               i.funding_provenance,
-               i.submitted_by, i.reviewed_by, i.reviewed_at, i.created_at
-        FROM st_strategy_metric_input i
-        {current_join}
-        WHERE i.as_of_date <= :as_of_date AND i.entity_type = :entity_type
-          AND i.verification_status='CONFIRMED'
-        ORDER BY i.evidence_revision_at DESC, i.as_of_date DESC,
-                 i.created_at DESC, i.evidence_id DESC
+        WITH ranked_current_evidence AS (
+            SELECT i.evidence_id, i.entity_type, i.strategy_key,
+                   i.strategy_version, i.as_of_date, i.window_days,
+                   i.metrics_json, i.source, i.evidence_hash,
+                   i.evidence_protocol, i.artifact_hash,
+                   i.source_dataset_hash, i.evidence_revision_at,
+                   i.verification_status, i.funding_provenance,
+                   i.submitted_by, i.reviewed_by, i.reviewed_at,
+                   i.created_at,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY i.entity_type, i.strategy_key,
+                                    i.strategy_version, i.window_days
+                       ORDER BY i.evidence_revision_at DESC,
+                                i.as_of_date DESC, i.created_at DESC,
+                                i.evidence_id DESC
+                   ) AS evidence_rank
+            FROM st_strategy_metric_input i
+            {current_join}
+            WHERE i.as_of_date <= :as_of_date
+              AND i.entity_type = :entity_type
+              AND i.verification_status='CONFIRMED'
+        )
+        SELECT evidence_id, entity_type, strategy_key, strategy_version,
+               as_of_date, window_days, metrics_json, source, evidence_hash,
+               evidence_protocol, artifact_hash, source_dataset_hash,
+               evidence_revision_at, verification_status,
+               funding_provenance, submitted_by, reviewed_by, reviewed_at,
+               created_at
+        FROM ranked_current_evidence
+        WHERE evidence_rank=1
+        ORDER BY strategy_key, strategy_version, window_days
         """,
         {"as_of_date": as_of_date, "entity_type": entity_type},
     )
-    audit_rows = _metric_evidence_audit_rows(entity_type)
+    audit_rows = _metric_evidence_audit_rows(
+        entity_type,
+        evidence_ids=[str(row.get("evidence_id") or "") for row in rows],
+    )
+    audit_index = _metric_evidence_audit_index(audit_rows)
     result = {}
     for row in rows:
         review_audit_valid, _audit_detail = metric_evidence_audit_binding(
-            row, audit_rows,
+            row, audit_index,
         )
         if not review_audit_valid:
             continue
@@ -6191,8 +9222,6 @@ def _load_metric_inputs(
         if current_versions is not None and current_versions.get(key) != version:
             continue
         result_key = (key, _int(row.get("window_days")))
-        if result_key in result:
-            continue
         metrics = _json(row.get("metrics_json"), {})
         metrics.update({
             "source": row.get("source"),
@@ -6213,10 +9242,2523 @@ def _load_metric_inputs(
     return result
 
 
+def _verify_funding_checkpoint_anchor_contract(
+    *, checkpoint: dict[str, Any], run: dict[str, Any],
+    audit: dict[str, Any], require_current_canonical: bool,
+) -> dict[str, Any]:
+    """Verify one immutable checkpoint against its exact run/audit manifest."""
+
+    checkpoint_id = str(checkpoint.get("checkpoint_id") or "")
+    checkpoint_hash = str(checkpoint.get("checkpoint_hash") or "")
+    chain_hash = str(checkpoint.get("chain_hash") or "")
+    run_uid = str(checkpoint.get("anchor_run_uid") or "")
+    result_hash = str(checkpoint.get("canonical_result_hash") or "")
+    audit_id = str(checkpoint.get("anchor_audit_id") or "")
+    audit_hash = str(checkpoint.get("anchor_audit_hash") or "")
+    key = str(checkpoint.get("strategy_key") or "")
+    version = str(checkpoint.get("strategy_version") or "")
+    account_id = str(checkpoint.get("account_id") or "")
+    trade_date = _trade_date(
+        checkpoint.get("trade_date"), default_today=False,
+    )
+    if (
+        not _HASH_PATTERN.fullmatch(checkpoint_id)
+        or not _HASH_PATTERN.fullmatch(checkpoint_hash)
+        or not _HASH_PATTERN.fullmatch(chain_hash)
+        or not re.fullmatch(r"[0-9a-f]{32}", run_uid)
+        or not _HASH_PATTERN.fullmatch(result_hash)
+        or not re.fullmatch(r"[0-9a-f]{32}", audit_id)
+        or not _HASH_PATTERN.fullmatch(audit_hash)
+        or checkpoint_identity(
+            strategy_key=key,
+            strategy_version=version,
+            account_id=account_id,
+            trade_date=trade_date,
+            anchor_run_uid=run_uid,
+        ) != checkpoint_id
+    ):
+        raise RuntimeError(f"策略{key}资金检查点锚身份无效")
+    audit_payload_json = str(audit.get("payload_json") or "")
+    audit_payload = _json(audit_payload_json, None)
+    before = _json(audit.get("before_json"), None)
+    after = _json(audit.get("after_json"), None)
+    evidence = _json(audit.get("evidence_json"), None)
+    expected_audit_evidence_keys = {
+        "schema", "run_uid", "canonical_result_hash",
+        "checkpoint_manifest_hash", "coverage", "checkpoint_root",
+        "combination_recipe_root", "ineligible_root",
+        "automatic_real_order_submission", "real_order_authority",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != expected_audit_evidence_keys
+        or evidence.get("schema") != FUNDING_CHECKPOINT_AUDIT_SCHEMA
+        or evidence.get("run_uid") != run_uid
+        or evidence.get("canonical_result_hash") != result_hash
+        or not _HASH_PATTERN.fullmatch(
+            str(evidence.get("checkpoint_manifest_hash") or "")
+        )
+        or not isinstance(evidence.get("coverage"), dict)
+        or evidence.get("automatic_real_order_submission") is not False
+        or evidence.get("real_order_authority") is not False
+    ):
+        raise RuntimeError(f"策略{key}资金检查点审计清单证据无效")
+    manifest = {
+        "manifest_hash": str(evidence["checkpoint_manifest_hash"]),
+        "coverage": evidence["coverage"],
+        "checkpoint_root": evidence["checkpoint_root"],
+        "combination_recipe_root": evidence["combination_recipe_root"],
+        "ineligible_root": evidence["ineligible_root"],
+    }
+    _verify_funding_manifest_root_structure(
+        manifest["checkpoint_root"], kind="CHECKPOINT",
+    )
+    _verify_funding_manifest_root_structure(
+        manifest["combination_recipe_root"], kind="COMBINATION_RECIPE",
+    )
+    _verify_funding_manifest_root_structure(
+        manifest["ineligible_root"], kind="INELIGIBLE",
+    )
+    if (
+        str(run.get("run_uid") or "") != run_uid
+        or str(run.get("status") or "") != "COMPLETED"
+        or (
+            require_current_canonical
+            and _int(run.get("is_canonical"), 0) != 1
+        )
+        or str(run.get("result_hash") or "") != result_hash
+        or _int(run.get("result_json_hash_valid"), 0) != 1
+        or not 0 < _int(run.get("result_json_bytes"), -1)
+        <= FUNDING_CANONICAL_RESULT_MAX_BYTES
+        or str(run.get("result_run_uid") or "") != run_uid
+        or str(run.get("result_status") or "") != "ok"
+        or str(run.get("result_is_canonical") or "").lower() != "true"
+        or str(run.get(
+            "result_automatic_real_order_submission"
+        ) or "").lower() != "false"
+        or str(run.get("result_real_order_authority") or "").lower()
+        != "false"
+        or str(run.get("result_manifest_schema") or "")
+        != "probiga.strategy-funding-checkpoint-manifest.v2"
+        or str(run.get("result_manifest_hash") or "")
+        != manifest["manifest_hash"]
+        or str(run.get("result_manifest_run_uid") or "") != run_uid
+        or str(run.get("result_manifest_trade_date") or "") != trade_date
+        or str(run.get("result_manifest_automatic_real_order_submission")
+               or "").lower() != "false"
+        or str(run.get("result_manifest_real_order_authority") or "").lower()
+        != "false"
+    ):
+        raise RuntimeError(f"策略{key}资金检查点治理运行锚无效")
+    checkpoint_batches = run.get("_funding_checkpoint_batches")
+    checkpoint_batch = (
+        checkpoint_batches.get(checkpoint_id)
+        if isinstance(checkpoint_batches, dict) else None
+    )
+    if not isinstance(checkpoint_batch, dict):
+        raise RuntimeError(f"策略{key}资金检查点缺少同运行批根成员")
+    root_batches = _verify_funding_manifest_root_structure(
+        manifest.get("checkpoint_root"), kind="CHECKPOINT",
+    )
+    if _int(
+        (manifest.get("checkpoint_root") or {}).get("count"), -1,
+    ) != _int(run.get("_funding_checkpoint_total_count"), -2):
+        raise RuntimeError(f"策略{key}资金检查点同运行总数偏离清单")
+    batch_index = _int(checkpoint_batch.get("batch_index"), -1)
+    batch_entries = checkpoint_batch.get("entries")
+    if (
+        not isinstance(batch_entries, list)
+        or not 0 <= batch_index < len(root_batches)
+        or _funding_manifest_batch_summary(
+            batch_entries, kind="CHECKPOINT", batch_index=batch_index,
+        ) != root_batches[batch_index]
+    ):
+        raise RuntimeError(f"策略{key}资金检查点同运行批根成员无效")
+    expected_entry = _funding_checkpoint_manifest_entry(checkpoint)
+    matching = [
+        item for item in batch_entries
+        if isinstance(item, dict) and item == expected_entry
+    ]
+    if len(matching) != 1:
+        raise RuntimeError(f"策略{key}资金检查点未精确进入治理清单")
+    expected_audit_payload = {
+        "entity_type": str(audit.get("entity_type") or ""),
+        "entity_key": str(audit.get("entity_key") or ""),
+        "action": str(audit.get("action") or ""),
+        "reason": str(audit.get("reason") or ""),
+        "operator": str(audit.get("operator_name") or ""),
+        "before": before,
+        "after": after,
+        "evidence": evidence,
+        "nonce": (
+            str(audit_payload.get("nonce") or "")
+            if isinstance(audit_payload, dict) else ""
+        ),
+    }
+    expected_audit_evidence = {
+        "schema": FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+        "run_uid": run_uid,
+        "canonical_result_hash": result_hash,
+        "checkpoint_manifest_hash": manifest["manifest_hash"],
+        "coverage": manifest.get("coverage"),
+        "checkpoint_root": manifest.get("checkpoint_root"),
+        "combination_recipe_root": manifest.get(
+            "combination_recipe_root"
+        ),
+        "ineligible_root": manifest.get("ineligible_root"),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if (
+        str(audit.get("audit_id") or "") != audit_id
+        or str(audit.get("audit_hash") or "") != audit_hash
+        or not isinstance(audit_payload, dict)
+        or not isinstance(before, dict)
+        or not isinstance(after, dict)
+        or not re.fullmatch(
+            r"[0-9a-f]{32}", str(audit_payload.get("nonce") or "")
+        )
+        or audit_payload != expected_audit_payload
+        or _checkpoint_canonical_json(audit_payload) != audit_payload_json
+        or _checkpoint_canonical_hash(audit_payload) != audit_hash
+        or str(audit.get("action") or "")
+        != "ANCHOR_FUNDING_CHECKPOINT_MANIFEST"
+        or evidence != expected_audit_evidence
+    ):
+        raise RuntimeError(f"策略{key}资金检查点审计锚无效")
+    return matching[0]
+
+
+def _verify_funding_daily_fact_chain(
+    *, checkpoint_row: dict[str, Any], state: dict[str, Any],
+    fact_rows: list[dict[str, Any]],
+    origin_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay one exact tip-addressed fact chain into bounded rolling detail."""
+
+    key = str(state.get("strategy_key") or "")
+    version = str(state.get("strategy_version") or "")
+    version_hash = str(state.get("strategy_version_hash") or "")
+    binding_hash = str(state.get("execution_binding_hash") or "")
+    account_id = str(state.get("account_id") or "")
+    expected_count = _int(state.get("history_fact_count"), -1)
+    if (
+        not 1 <= expected_count <= FUNDING_REPLAY_MAX_SESSIONS
+        or len(fact_rows) != expected_count
+    ):
+        raise RuntimeError(f"策略{key}资金日频事实链长度无效")
+    origin_checkpoints = origin_context.get("checkpoints")
+    origin_runs = origin_context.get("runs")
+    origin_audits = origin_context.get("audits")
+    origin_batches = origin_context.get("batch_members")
+    if not all(isinstance(item, dict) for item in (
+        origin_checkpoints, origin_runs, origin_audits, origin_batches,
+    )):
+        raise RuntimeError(f"策略{key}资金日频事实缺少原始锚上下文")
+    represented_origin_ids = sorted({
+        str(row.get("origin_checkpoint_id") or "") for row in fact_rows
+    })
+    if (
+        any(not _HASH_PATTERN.fullmatch(item) for item in represented_origin_ids)
+        or set(represented_origin_ids) != {
+            str(item) for item in origin_checkpoints
+            if str(item) in represented_origin_ids
+        }
+    ):
+        raise RuntimeError(f"策略{key}资金日频事实原始检查点集合无效")
+    anchored_origin_entries: dict[str, dict[str, Any]] = {}
+    total_origin_batch_count = 0
+    for origin_id in represented_origin_ids:
+        origin = origin_checkpoints.get(origin_id)
+        if not isinstance(origin, dict):
+            raise RuntimeError(f"策略{key}资金日频事实原始检查点缺失")
+        run = origin_runs.get(str(origin.get("anchor_run_uid") or ""))
+        audit = origin_audits.get(str(origin.get("anchor_audit_id") or ""))
+        if not isinstance(run, dict) or not isinstance(audit, dict):
+            raise RuntimeError(f"策略{key}资金日频事实原始运行或审计缺失")
+        if (
+            str(origin.get("strategy_key") or "") != key
+            or str(origin.get("strategy_version") or "") != version
+            or str(origin.get("strategy_version_hash") or "") != version_hash
+            or str(origin.get("execution_binding_hash") or "")
+            != binding_hash
+            or str(origin.get("account_id") or "") != account_id
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实原始检查点跨版本或账户")
+        anchored_origin_entries[origin_id] = (
+            _verify_funding_checkpoint_anchor_contract(
+                checkpoint=origin,
+                run=run,
+                audit=audit,
+                require_current_canonical=False,
+            )
+        )
+        total_origin_batch_count += _int(origin.get("new_fact_count"), -1)
+    if total_origin_batch_count > expected_count + 369:
+        raise RuntimeError(f"策略{key}资金原始事实批次扫描边界无效")
+    current_fact_ids = {str(row.get("fact_id") or "") for row in fact_rows}
+    anchored_batch_ids: set[str] = set()
+    for origin_id in represented_origin_ids:
+        origin = origin_checkpoints[origin_id]
+        batch = origin_batches.get(origin_id)
+        count = _int(origin.get("new_fact_count"), -1)
+        if not isinstance(batch, list) or len(batch) != count:
+            raise RuntimeError(f"策略{key}资金原始事实批次长度无效")
+        ordered_batch = sorted(
+            (dict(item) for item in batch),
+            key=lambda item: _int(item.get("chain_depth"), 0),
+            reverse=True,
+        )
+        if [
+            _int(item.get("chain_depth"), 0) for item in ordered_batch
+        ] != list(range(count, 0, -1)):
+            raise RuntimeError(f"策略{key}资金原始事实批次链深度断裂")
+        members: list[dict[str, str]] = []
+        previous: dict[str, Any] | None = None
+        for member in ordered_batch:
+            member_id = str(member.get("fact_id") or "")
+            member_hash = str(member.get("fact_hash") or "")
+            day = _trade_date(member.get("trade_date"), default_today=False)
+            if (
+                not _HASH_PATTERN.fullmatch(member_id)
+                or not _HASH_PATTERN.fullmatch(member_hash)
+                or _int(member.get("fact_hash_valid"), 0) != 1
+                or str(member.get("origin_checkpoint_id") or "") != origin_id
+                or str(member.get("anchor_run_uid") or "")
+                != str(origin.get("anchor_run_uid") or "")
+                or str(member.get("canonical_result_hash") or "")
+                != str(origin.get("canonical_result_hash") or "")
+                or str(member.get("anchor_audit_id") or "")
+                != str(origin.get("anchor_audit_id") or "")
+                or str(member.get("anchor_audit_hash") or "")
+                != str(origin.get("anchor_audit_hash") or "")
+                or str(member.get("entity_key") or "") != key
+                or str(member.get("entity_version") or "") != version
+                or str(member.get("account_id") or "") != account_id
+                or _int(member.get("automatic_real_order_submission"), 1)
+                != 0
+                or _int(member.get("real_order_authority"), 1) != 0
+                or funding_daily_fact_identity(
+                    entity_type="STRATEGY",
+                    entity_key=key,
+                    entity_version=version,
+                    account_id=account_id,
+                    trade_date=day,
+                    anchor_run_uid=str(origin.get("anchor_run_uid") or ""),
+                ) != member_id
+                or previous is not None and (
+                    str(member.get("previous_fact_id") or "")
+                    != str(previous.get("fact_id") or "")
+                    or str(member.get("previous_fact_hash") or "")
+                    != str(previous.get("fact_hash") or "")
+                    or day <= str(previous.get("trade_date") or "")
+                )
+            ):
+                raise RuntimeError(f"策略{key}资金原始事实批次身份或链无效")
+            members.append({"fact_id": member_id, "fact_hash": member_hash})
+            anchored_batch_ids.add(member_id)
+            previous = {**member, "trade_date": day}
+        if (
+            members[0]["fact_id"]
+            != str(origin.get("new_fact_first_id") or "")
+            or members[-1]["fact_id"]
+            != str(origin.get("new_fact_tip_id") or "")
+            or ordered_funding_fact_set_hash(members)
+            != str(origin.get("new_fact_set_hash") or "")
+        ):
+            raise RuntimeError(f"策略{key}资金原始事实批次根无效")
+    if not current_fact_ids.issubset(anchored_batch_ids):
+        raise RuntimeError(f"策略{key}资金日频事实不属于原始锚定批次")
+    chronological = sorted(
+        (dict(item) for item in fact_rows),
+        key=lambda item: _int(item.get("chain_depth"), 0),
+        reverse=True,
+    )
+    if [_int(item.get("chain_depth"), 0) for item in chronological] != list(
+        range(expected_count, 0, -1)
+    ):
+        raise RuntimeError(f"策略{key}资金日频事实链深度断裂")
+    verified: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for raw in chronological:
+        fact_id = str(raw.get("fact_id") or "")
+        fact_hash = str(raw.get("fact_hash") or "")
+        fact_json = str(raw.get("fact_json") or "")
+        fact = _json(fact_json, None)
+        if (
+            not _HASH_PATTERN.fullmatch(fact_id)
+            or not _HASH_PATTERN.fullmatch(fact_hash)
+            or not isinstance(fact, dict)
+            or _checkpoint_canonical_json(fact) != fact_json
+            or funding_daily_fact_hash(fact) != fact_hash
+            or fact.get("schema") != FUNDING_DAILY_FACT_SCHEMA
+            or fact.get("entity_type") != "STRATEGY"
+            or fact.get("entity_key") != key
+            or fact.get("entity_version") != version
+            or fact.get("entity_version_hash") != version_hash
+            or str(fact.get("execution_binding_hash") or "") != binding_hash
+            or fact.get("account_id") != account_id
+            or not _HASH_PATTERN.fullmatch(
+                str(fact.get("origin_checkpoint_id") or "")
+            )
+            or fact.get("automatic_real_order_submission") is not False
+            or fact.get("real_order_authority") is not False
+            or funding_daily_fact_identity(
+                entity_type="STRATEGY",
+                entity_key=key,
+                entity_version=version,
+                account_id=account_id,
+                trade_date=_trade_date(
+                    raw.get("trade_date"), default_today=False,
+                ),
+                anchor_run_uid=str(raw.get("anchor_run_uid") or ""),
+            ) != fact_id
+            or str(raw.get("canonical_result_hash") or "")
+            != str(origin_checkpoints[
+                str(raw.get("origin_checkpoint_id") or "")
+            ].get("canonical_result_hash") or "")
+            or str(raw.get("anchor_audit_id") or "")
+            != str(origin_checkpoints[
+                str(raw.get("origin_checkpoint_id") or "")
+            ].get("anchor_audit_id") or "")
+            or str(raw.get("anchor_audit_hash") or "")
+            != str(origin_checkpoints[
+                str(raw.get("origin_checkpoint_id") or "")
+            ].get("anchor_audit_hash") or "")
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实身份或哈希无效")
+        day = _trade_date(raw.get("trade_date"), default_today=False)
+        materialized = {
+            "trade_date": day,
+            "previous_fact_id": str(raw.get("previous_fact_id") or ""),
+            "previous_fact_hash": str(raw.get("previous_fact_hash") or ""),
+            "origin_checkpoint_id": str(
+                raw.get("origin_checkpoint_id") or ""
+            ),
+        }
+        for field, expected in materialized.items():
+            if str(fact.get(field) or "") != expected:
+                raise RuntimeError(f"策略{key}资金日频事实字段{field}漂移")
+        for field in (
+            "opening_cash_cny", "closing_cash_cny",
+            "opening_equity_cny", "closing_equity_cny",
+            "daily_return_pct", "cumulative_fee_cny",
+            "high_watermark_equity_cny",
+        ):
+            try:
+                fact_value = Decimal(str(fact.get(field)))
+                row_value = Decimal(str(raw.get(field)))
+                if (
+                    not fact_value.is_finite()
+                    or not row_value.is_finite()
+                    or fact_value != row_value
+                ):
+                    raise RuntimeError(
+                        f"策略{key}资金日频事实金额字段{field}漂移"
+                    )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"策略{key}资金日频事实金额字段{field}无效"
+                ) from exc
+        exposure = fact.get("stock_risk_exposure")
+        closed_ids = fact.get("closed_evidence_ids")
+        if (
+            not isinstance(exposure, dict)
+            or not isinstance(closed_ids, list)
+            or _json(str(raw.get("stock_exposure_json") or ""), None)
+            != exposure
+            or _json(str(raw.get("closed_evidence_ids_json") or ""), None)
+            != closed_ids
+            or closed_ids != sorted(set(str(item or "") for item in closed_ids))
+            or any(
+                not re.fullmatch(r"[0-9A-Za-z_.:-]{1,160}", str(item or ""))
+                for item in closed_ids
+            )
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实敞口或平仓集合无效")
+        if previous is not None and (
+            str(raw.get("previous_fact_id") or "")
+            != str(previous.get("fact_id") or "")
+            or str(raw.get("previous_fact_hash") or "")
+            != str(previous.get("fact_hash") or "")
+            or day <= str(previous.get("trade_date") or "")
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实前序分支断裂")
+        try:
+            normalized_open = Decimal(str(
+                fact.get("normalized_opening_equity")
+            ))
+            normalized_close = Decimal(str(
+                fact.get("normalized_closing_equity")
+            ))
+            actual_cost_pct = Decimal(str(fact.get("actual_cost_pct")))
+            normalization_base = Decimal(str(
+                fact.get("normalization_base_equity_cny")
+            ))
+            opening_fee = Decimal(str(
+                fact.get("opening_cumulative_fee_cny")
+            ))
+            daily_fee = Decimal(str(fact.get("daily_fee_cny")))
+            cumulative_fee = Decimal(str(fact.get("cumulative_fee_cny")))
+            opening_cash = Decimal(str(fact.get("opening_cash_cny")))
+            closing_cash = Decimal(str(fact.get("closing_cash_cny")))
+            opening_equity = Decimal(str(fact.get("opening_equity_cny")))
+            closing_equity = Decimal(str(fact.get("closing_equity_cny")))
+            daily_return_pct = Decimal(str(fact.get("daily_return_pct")))
+            high_watermark = Decimal(str(
+                fact.get("high_watermark_equity_cny")
+            ))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"策略{key}资金日频事实标准化净值或费用无效"
+            ) from exc
+        if (
+            not normalized_open.is_finite() or normalized_open <= 0
+            or not normalized_close.is_finite() or normalized_close <= 0
+            or not actual_cost_pct.is_finite() or actual_cost_pct < 0
+            or not normalization_base.is_finite() or normalization_base <= 0
+            or not opening_fee.is_finite() or opening_fee < 0
+            or not daily_fee.is_finite() or daily_fee < 0
+            or not cumulative_fee.is_finite() or cumulative_fee < 0
+            or not opening_cash.is_finite() or opening_cash < 0
+            or not closing_cash.is_finite() or closing_cash < 0
+            or not opening_equity.is_finite() or opening_equity <= 0
+            or not closing_equity.is_finite() or closing_equity <= 0
+            or not daily_return_pct.is_finite()
+            or not high_watermark.is_finite() or high_watermark <= 0
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实标准化净值或费用无效")
+        pct_quantum = Decimal("0.000000000001")
+        expected_return = (
+            (closing_equity / opening_equity - Decimal("1"))
+            * Decimal("100")
+        ).quantize(pct_quantum, rounding=ROUND_HALF_EVEN)
+        expected_cost = (
+            daily_fee / opening_equity * Decimal("100")
+        ).quantize(pct_quantum, rounding=ROUND_HALF_EVEN)
+        expected_normalized_open = (
+            opening_equity / normalization_base * Decimal("100")
+        ).quantize(_EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+        expected_normalized_close = (
+            closing_equity / normalization_base * Decimal("100")
+        ).quantize(_EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+        if (
+            daily_return_pct != expected_return
+            or actual_cost_pct != expected_cost
+            or opening_fee + daily_fee != cumulative_fee
+            or normalized_open != expected_normalized_open
+            or normalized_close != expected_normalized_close
+            or high_watermark < max(opening_equity, closing_equity)
+        ):
+            raise RuntimeError(f"策略{key}资金日频事实经济恒等式无效")
+        previous_fact = (
+            previous.get("_verified_fact")
+            if isinstance(previous, dict) else None
+        )
+        if isinstance(previous_fact, dict):
+            try:
+                prior_closing_cash = Decimal(str(
+                    previous_fact.get("closing_cash_cny")
+                ))
+                prior_closing_equity = Decimal(str(
+                    previous_fact.get("closing_equity_cny")
+                ))
+                prior_cumulative_fee = Decimal(str(
+                    previous_fact.get("cumulative_fee_cny")
+                ))
+                prior_high_watermark = Decimal(str(
+                    previous_fact.get("high_watermark_equity_cny")
+                ))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"策略{key}资金日频事实前序经济字段无效"
+                ) from exc
+            if (
+                opening_cash != prior_closing_cash
+                or opening_equity != prior_closing_equity
+                or opening_fee != prior_cumulative_fee
+                or high_watermark < prior_high_watermark
+            ):
+                raise RuntimeError(f"策略{key}资金日频事实经济连续性断裂")
+        verified.append({
+            "fact_id": fact_id,
+            "fact_hash": fact_hash,
+            "trade_date": day,
+            "fact": fact,
+        })
+        previous = {**raw, "trade_date": day, "_verified_fact": fact}
+    first = verified[0]
+    tip = verified[-1]
+    checkpoint_id = str(checkpoint_row.get("checkpoint_id") or "")
+    authoritative_sessions = (
+        (origin_context.get("authoritative_sessions") or {}).get(
+            checkpoint_id
+        ) or {}
+    )
+    expected_history_sessions = authoritative_sessions.get("HISTORY")
+    try:
+        history_opening = Decimal(str(state.get("history_opening_equity")))
+        first_opening = Decimal(str(
+            first["fact"].get("normalized_opening_equity")
+        ))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RuntimeError(f"策略{key}资金历史期初净值无效") from exc
+    if (
+        str(state.get("history_start_date") or "") != first["trade_date"]
+        or str(state.get("history_end_date") or "") != tip["trade_date"]
+        or str(state.get("history_tip_fact_id") or "") != tip["fact_id"]
+        or str(state.get("history_tip_fact_hash") or "") != tip["fact_hash"]
+        or str(state.get("history_fact_set_hash") or "")
+        != ordered_funding_fact_set_hash(verified)
+        or history_opening != first_opening
+        or tip["trade_date"] != str(state.get("trade_date") or "")
+        or not isinstance(expected_history_sessions, list)
+        or [item["trade_date"] for item in verified]
+        != expected_history_sessions
+    ):
+        raise RuntimeError(f"策略{key}资金检查点与日频事实集合不一致")
+    return {
+        "opening_normalized_equity": str(history_opening),
+        "opening_equity_date": str(state.get("history_opening_date") or ""),
+        "equity_curve": [{
+            "trade_date": item["trade_date"],
+            "equity": str(item["fact"]["normalized_closing_equity"]),
+        } for item in verified],
+        "daily_records": [{
+            "trade_date": item["trade_date"],
+            "return_pct": str(item["fact"]["daily_return_pct"]),
+            "actual_cost_pct": str(
+                item["fact"].get("actual_cost_pct") or "0"
+            ),
+            "is_net_return": True,
+            "evidence_revision_at": f"{item['trade_date']}T15:00:00",
+        } for item in verified],
+        "daily_stock_market_values": [{
+            "trade_date": item["trade_date"],
+            "stock_risk_exposure": item["fact"]["stock_risk_exposure"],
+        } for item in verified],
+        "closed_evidence_by_day": [{
+            "trade_date": item["trade_date"],
+            "evidence_ids": item["fact"]["closed_evidence_ids"],
+        } for item in verified],
+        "fact_members": [{
+            "fact_id": item["fact_id"],
+            "fact_hash": item["fact_hash"],
+            "trade_date": item["trade_date"],
+        } for item in verified],
+    }
+
+
+def _verify_funding_session_contract(
+    *, row: dict[str, Any], state: dict[str, Any],
+    authoritative_sessions: dict[str, Any], key: str,
+) -> list[str]:
+    """Bind replay/history claims to the complete authoritative calendar."""
+
+    checkpoint_day = _trade_date(row.get("trade_date"), default_today=False)
+    replay_mode = str(row.get("replay_mode") or "")
+    replay_sessions = state.get("replay_sessions")
+    replay_session_hash = str(state.get("replay_session_hash") or "")
+    expected_replay_sessions = authoritative_sessions.get("REPLAY")
+    expected_history_sessions = authoritative_sessions.get("HISTORY")
+    if (
+        not isinstance(replay_sessions, list)
+        or not isinstance(expected_replay_sessions, list)
+        or not isinstance(expected_history_sessions, list)
+        or not expected_replay_sessions
+        or not expected_history_sessions
+        or expected_replay_sessions != sorted(set(expected_replay_sessions))
+        or expected_history_sessions != sorted(set(expected_history_sessions))
+        or len(expected_replay_sessions)
+        != _int(row.get("replay_session_count"), -1)
+        or len(expected_history_sessions)
+        != _int(row.get("history_fact_count"), -1)
+        or expected_history_sessions[0]
+        != str(state.get("history_start_date") or "")
+        or expected_history_sessions[-1]
+        != str(state.get("history_end_date") or "")
+        or expected_history_sessions[-1] != checkpoint_day
+        or _digest({
+            "schema": "probiga.strategy-funding-replay-sessions.v1",
+            "sessions": expected_replay_sessions,
+        }) != replay_session_hash
+        or not _HASH_PATTERN.fullmatch(replay_session_hash)
+        or state.get("bootstrap_full_history_scan")
+        is not (replay_mode == "FULL_BOOTSTRAP")
+    ):
+        raise RuntimeError(f"策略{key}资金检查点重放会话合同无效")
+    if replay_mode == "BOUNDED_INCREMENTAL":
+        try:
+            normalized_replay_sessions = [
+                _trade_date(item, default_today=False)
+                for item in replay_sessions
+            ]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"策略{key}资金检查点增量会话日期无效"
+            ) from exc
+        if (
+            normalized_replay_sessions != expected_replay_sessions
+            or normalized_replay_sessions[0]
+            != str(row.get("replay_start_date") or "")[:10]
+            or normalized_replay_sessions[-1] != checkpoint_day
+        ):
+            raise RuntimeError(f"策略{key}资金检查点增量会话集合无效")
+        return normalized_replay_sessions
+    if replay_mode == "FULL_BOOTSTRAP":
+        if replay_sessions:
+            raise RuntimeError(
+                f"策略{key}首次全量重放不应复制全历史会话集合"
+            )
+        if (
+            expected_replay_sessions[0]
+            != str(row.get("replay_start_date") or "")[:10]
+            or expected_replay_sessions[-1] != checkpoint_day
+        ):
+            raise RuntimeError(f"策略{key}首次全量重放权威会话范围无效")
+        return expected_replay_sessions
+    raise RuntimeError(f"策略{key}资金检查点重放模式无效")
+
+
+def _verify_funding_checkpoint_row(
+    row: dict[str, Any], *, registry_row: dict[str, Any], as_of_date: str,
+    fact_rows: list[dict[str, Any]], origin_context: dict[str, Any],
+    require_current_canonical: bool = True,
+) -> dict[str, Any]:
+    """Verify one latest checkpoint, its immediate chain link and anchors."""
+
+    key = str(registry_row.get("strategy_key") or "")
+    version = str(registry_row.get("current_version") or "")
+    version_hash = str(registry_row.get("version_hash") or "")
+    checkpoint_id = str(row.get("checkpoint_id") or "")
+    checkpoint_hash = str(row.get("checkpoint_hash") or "")
+    chain_hash = str(row.get("chain_hash") or "")
+    account_id = str(row.get("account_id") or "")
+    checkpoint_day = _trade_date(
+        row.get("trade_date"), default_today=False,
+    )
+    if (
+        not _HASH_PATTERN.fullmatch(checkpoint_id)
+        or not _HASH_PATTERN.fullmatch(checkpoint_hash)
+        or not _HASH_PATTERN.fullmatch(chain_hash)
+        or str(row.get("strategy_key") or "") != key
+        or str(row.get("strategy_version") or "") != version
+        or str(row.get("strategy_version_hash") or "") != version_hash
+        or not account_id
+        or checkpoint_day >= as_of_date
+        or _int(row.get("latest_day_checkpoint_count"), -1) != 1
+        or _int(row.get("version_account_count"), -1) != 1
+    ):
+        raise RuntimeError(f"策略{key}资金检查点身份、版本、账户或唯一性无效")
+    expected_binding = (
+        str(registry_row.get("execution_binding_hash") or "")
+        if str(registry_row.get("source_kind") or "") == "runtime_registry"
+        else ""
+    )
+    stored_binding = str(row.get("execution_binding_hash") or "")
+    if stored_binding != expected_binding:
+        raise RuntimeError(f"策略{key}资金检查点执行绑定不匹配")
+    max_holding_days = _holding_horizon_from_parameters(
+        registry_row.get("parameters")
+    )
+    if _int(row.get("max_holding_days"), -1) != max_holding_days:
+        raise RuntimeError(f"策略{key}资金检查点最大持有期与当前版本不一致")
+
+    state_json = str(row.get("state_json") or "")
+    chain_json = str(row.get("chain_payload_json") or "")
+    state = _json(state_json, None)
+    chain = _json(chain_json, None)
+    if (
+        not isinstance(state, dict)
+        or not isinstance(chain, dict)
+        or _checkpoint_canonical_json(state) != state_json
+        or _checkpoint_canonical_json(chain) != chain_json
+        or checkpoint_state_hash(state) != checkpoint_hash
+        or _checkpoint_canonical_hash(chain) != chain_hash
+    ):
+        raise RuntimeError(f"策略{key}资金检查点状态或链哈希不可复算")
+    expected_state_columns = {
+        "strategy_key": key,
+        "strategy_version": version,
+        "strategy_version_hash": version_hash,
+        "execution_binding_hash": expected_binding,
+        "account_id": account_id,
+        "trade_date": checkpoint_day,
+        "replay_mode": str(row.get("replay_mode") or ""),
+        "replay_start_date": _trade_date(
+            row.get("replay_start_date"), default_today=False,
+        ),
+        "replay_session_count": _int(row.get("replay_session_count"), -1),
+        "max_holding_days": max_holding_days,
+        "opening_cash_cny": str(row.get("opening_cash_cny")),
+        "closing_cash_cny": str(row.get("closing_cash_cny")),
+        "opening_equity_cny": str(row.get("opening_equity_cny")),
+        "closing_equity_cny": str(row.get("closing_equity_cny")),
+        "cumulative_fee_cny": str(row.get("cumulative_fee_cny")),
+        "high_watermark_equity_cny": str(
+            row.get("high_watermark_equity_cny")
+        ),
+        "history_start_date": _trade_date(
+            row.get("history_start_date"), default_today=False,
+        ),
+        "history_end_date": _trade_date(
+            row.get("history_end_date"), default_today=False,
+        ),
+        "history_fact_count": _int(row.get("history_fact_count"), -1),
+        "history_opening_equity": str(row.get("history_opening_equity")),
+        "history_opening_date": (
+            _trade_date(row.get("history_opening_date"), default_today=False)
+            if row.get("history_opening_date") else ""
+        ),
+        "history_tip_fact_id": str(row.get("history_tip_fact_id") or ""),
+        "history_tip_fact_hash": str(
+            row.get("history_tip_fact_hash") or ""
+        ),
+        "history_fact_set_hash": str(
+            row.get("history_fact_set_hash") or ""
+        ),
+        "new_fact_count": _int(row.get("new_fact_count"), -1),
+        "new_fact_set_hash": str(row.get("new_fact_set_hash") or ""),
+        "new_fact_first_id": str(row.get("new_fact_first_id") or ""),
+        "new_fact_tip_id": str(row.get("new_fact_tip_id") or ""),
+        "evidence_watermark": _normalize_evidence_revision(
+            row.get("evidence_watermark")
+        ),
+        "input_set_hash": str(row.get("input_set_hash") or ""),
+    }
+    for field, expected in expected_state_columns.items():
+        observed = state.get(field)
+        if field.endswith("_cny") or field == "history_opening_equity":
+            try:
+                if Decimal(str(observed)) != Decimal(str(expected)):
+                    raise RuntimeError(
+                        f"策略{key}资金检查点字段{field}与物化列不一致"
+                    )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"策略{key}资金检查点字段{field}无效"
+                ) from exc
+        elif observed != expected:
+            raise RuntimeError(
+                f"策略{key}资金检查点字段{field}与物化列不一致"
+            )
+    holdings = state.get("holdings")
+    history_fields = (
+        "history_start_date", "history_end_date", "history_fact_count",
+        "history_opening_equity", "history_opening_date",
+        "history_tip_fact_id", "history_tip_fact_hash",
+        "history_fact_set_hash",
+        "new_fact_count", "new_fact_set_hash", "new_fact_first_id",
+        "new_fact_tip_id",
+    )
+    if (
+        state.get("schema") != FUNDING_CHECKPOINT_SCHEMA
+        or state.get("automatic_real_order_submission") is not False
+        or state.get("real_order_authority") is not False
+        or not isinstance(holdings, list)
+        or any(field not in state for field in history_fields)
+        or _json(str(row.get("holdings_json") or ""), None) != holdings
+        or not 1 <= _int(state.get("history_fact_count"), -1) <= 120
+        or str(state.get("history_end_date") or "") != checkpoint_day
+        or str(state.get("history_start_date") or "")
+        > str(state.get("history_end_date") or "")
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("history_tip_fact_id") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("history_tip_fact_hash") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("history_fact_set_hash") or "")
+        )
+        or not 1 <= _int(state.get("new_fact_count"), -1) <= 370
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("new_fact_set_hash") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("new_fact_first_id") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("new_fact_tip_id") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(state.get("input_set_hash") or "")
+        )
+    ):
+        raise RuntimeError(f"策略{key}资金检查点状态合同无效")
+    current_account_fact = {
+        "account_id": account_id,
+        "status": str(row.get("current_account_status") or ""),
+        "initial_cash_cny": str(
+            row.get("current_account_initial_cash") or ""
+        ),
+        "policy_version": str(
+            row.get("current_account_policy_version") or ""
+        ),
+        "policy_hash": str(row.get("current_account_policy_hash") or ""),
+        "fee_profile_version": str(
+            row.get("current_account_fee_profile_version") or ""
+        ),
+        "instrument_rule_version": str(
+            row.get("current_account_instrument_rule_version") or ""
+        ),
+        "real_trading_enabled": False,
+        "created_at": str(row.get("current_account_created_at") or ""),
+    }
+    try:
+        configured_initial_cash = Decimal(str(
+            (load_v3_config().get("account") or {}).get(
+                "initial_cash_cny"
+            ) or "0"
+        ))
+        execution_policy = _authoritative_funding_execution_policy()
+        observed_initial_cash = Decimal(
+            current_account_fact["initial_cash_cny"]
+        )
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise RuntimeError(f"策略{key}资金检查点账户资金无效") from exc
+    if (
+        account_id != "paper-main-v2"
+        or current_account_fact["status"] != "ACTIVE"
+        or _int(row.get("current_account_real_enabled"), 1) != 0
+        or current_account_fact["policy_version"]
+        != execution_policy["policy_version"]
+        or current_account_fact["policy_hash"]
+        != execution_policy["policy_hash"]
+        or current_account_fact["fee_profile_version"]
+        != execution_policy["fee_profile_version"]
+        or current_account_fact["instrument_rule_version"]
+        != execution_policy["instrument_rule_version"]
+        or str(state.get("funding_execution_policy_hash") or "")
+        != execution_policy["policy_hash"]
+        or str(state.get("fee_profile_version") or "")
+        != execution_policy["fee_profile_version"]
+        or str(state.get("instrument_rule_version") or "")
+        != execution_policy["instrument_rule_version"]
+        or observed_initial_cash != configured_initial_cash
+        or _digest(current_account_fact)
+        != str(state.get("account_fact_hash") or "")
+    ):
+        raise RuntimeError(f"策略{key}资金检查点账户事实已漂移或不允许")
+    authoritative_sessions = (
+        (origin_context.get("authoritative_sessions") or {}).get(
+            checkpoint_id
+        ) or {}
+    )
+    replay_sessions = _verify_funding_session_contract(
+        row=row,
+        state=state,
+        authoritative_sessions=authoritative_sessions,
+        key=key,
+    )
+    seen_holding_ids: set[str] = set()
+    for holding in holdings:
+        if not isinstance(holding, dict):
+            raise RuntimeError(f"策略{key}资金检查点持仓格式无效")
+        evidence_id = str(holding.get("evidence_id") or "")
+        holding_age = _int(holding.get("holding_session_age"), -1)
+        if (
+            not evidence_id
+            or evidence_id in seen_holding_ids
+            or not re.fullmatch(r"[0-9A-Za-z_.:-]{1,160}", evidence_id)
+            or not re.fullmatch(
+                r"[0-9]{6}", str(holding.get("stock_code") or "")
+            )
+            or _int(holding.get("quantity"), 0) <= 0
+            or not 1 <= holding_age <= max_holding_days
+        ):
+            raise RuntimeError(f"策略{key}资金检查点存在重复或超期持仓")
+        seen_holding_ids.add(evidence_id)
+
+    previous_id = str(row.get("previous_checkpoint_id") or "")
+    previous_hash = str(row.get("previous_checkpoint_hash") or "")
+    previous_chain = str(row.get("previous_chain_hash") or "")
+    expected_chain = checkpoint_chain_payload(
+        checkpoint_hash=checkpoint_hash,
+        previous_checkpoint_id=previous_id,
+        previous_checkpoint_hash=previous_hash,
+        previous_chain_hash=previous_chain,
+    )
+    if chain != expected_chain:
+        raise RuntimeError(f"策略{key}资金检查点链载荷不一致")
+    replay_mode = str(row.get("replay_mode") or "")
+    if replay_mode == "FULL_BOOTSTRAP":
+        if previous_id or previous_hash or previous_chain:
+            raise RuntimeError(f"策略{key}首次资金检查点错误声明前序")
+    elif replay_mode == "BOUNDED_INCREMENTAL":
+        parent_state_json = str(row.get("parent_state_json") or "")
+        parent_chain_json = str(row.get("parent_chain_payload_json") or "")
+        parent_state = _json(parent_state_json, None)
+        parent_chain_payload = _json(parent_chain_json, None)
+        if (
+            str(row.get("parent_checkpoint_id") or "") != previous_id
+            or str(row.get("parent_checkpoint_hash") or "")
+            != previous_hash
+            or str(row.get("parent_chain_hash") or "") != previous_chain
+            or not isinstance(parent_state, dict)
+            or not isinstance(parent_chain_payload, dict)
+            or _checkpoint_canonical_json(parent_state) != parent_state_json
+            or _checkpoint_canonical_json(parent_chain_payload)
+            != parent_chain_json
+            or checkpoint_state_hash(parent_state) != previous_hash
+            or _checkpoint_canonical_hash(parent_chain_payload)
+            != previous_chain
+            or str(row.get("parent_strategy_key") or "") != key
+            or str(row.get("parent_strategy_version") or "") != version
+            or str(row.get("parent_account_id") or "") != account_id
+            or _trade_date(
+                row.get("parent_trade_date"), default_today=False,
+            ) >= checkpoint_day
+        ):
+            raise RuntimeError(f"策略{key}资金检查点前序缺失、断链或跨账户")
+        anchored_parent = (
+            (origin_context.get("checkpoints") or {}).get(previous_id)
+        )
+        anchored_parent_run = (
+            (origin_context.get("runs") or {}).get(
+                str((anchored_parent or {}).get("anchor_run_uid") or "")
+            )
+        )
+        anchored_parent_audit = (
+            (origin_context.get("audits") or {}).get(
+                str((anchored_parent or {}).get("anchor_audit_id") or "")
+            )
+        )
+        parent_expected_chain = checkpoint_chain_payload(
+            checkpoint_hash=previous_hash,
+            previous_checkpoint_id=str(
+                (anchored_parent or {}).get("previous_checkpoint_id") or ""
+            ),
+            previous_checkpoint_hash=str(
+                (anchored_parent or {}).get("previous_checkpoint_hash") or ""
+            ),
+            previous_chain_hash=str(
+                (anchored_parent or {}).get("previous_chain_hash") or ""
+            ),
+        )
+        if (
+            not isinstance(anchored_parent, dict)
+            or not isinstance(anchored_parent_run, dict)
+            or not isinstance(anchored_parent_audit, dict)
+            or str(anchored_parent.get("checkpoint_hash") or "")
+            != previous_hash
+            or str(anchored_parent.get("chain_hash") or "")
+            != previous_chain
+            or parent_state.get("schema") != FUNDING_CHECKPOINT_SCHEMA
+            or parent_state.get("strategy_key") != key
+            or parent_state.get("strategy_version") != version
+            or parent_state.get("strategy_version_hash") != version_hash
+            or str(parent_state.get("execution_binding_hash") or "")
+            != expected_binding
+            or parent_state.get("account_id") != account_id
+            or parent_state.get("trade_date")
+            != _trade_date(
+                anchored_parent.get("trade_date"), default_today=False,
+            )
+            or any(
+                str(parent_state.get(field) or "")
+                != str(anchored_parent.get(field) or "")
+                for field in (
+                    "history_fact_count", "history_fact_set_hash",
+                    "history_tip_fact_id", "history_tip_fact_hash",
+                    "new_fact_count", "new_fact_set_hash",
+                    "new_fact_first_id", "new_fact_tip_id",
+                )
+            )
+            or parent_chain_payload != parent_expected_chain
+            or checkpoint_chain_hash(
+                checkpoint_hash=previous_hash,
+                previous_checkpoint_id=str(
+                    anchored_parent.get("previous_checkpoint_id") or ""
+                ),
+                previous_checkpoint_hash=str(
+                    anchored_parent.get("previous_checkpoint_hash") or ""
+                ),
+                previous_chain_hash=str(
+                    anchored_parent.get("previous_chain_hash") or ""
+                ),
+            ) != previous_chain
+        ):
+            raise RuntimeError(f"策略{key}资金检查点前序完整链不可复算")
+        _verify_funding_checkpoint_anchor_contract(
+            checkpoint=anchored_parent,
+            run=anchored_parent_run,
+            audit=anchored_parent_audit,
+            require_current_canonical=require_current_canonical,
+        )
+        try:
+            parent_closing_cash = Decimal(str(
+                parent_state.get("closing_cash_cny")
+            ))
+            child_opening_cash = Decimal(str(
+                state.get("opening_cash_cny")
+            ))
+            parent_closing_equity = Decimal(str(
+                parent_state.get("closing_equity_cny")
+            ))
+            child_opening_equity = Decimal(str(
+                state.get("opening_equity_cny")
+            ))
+            parent_fee = Decimal(str(
+                parent_state.get("cumulative_fee_cny")
+            ))
+            child_fee = Decimal(str(state.get("cumulative_fee_cny")))
+            parent_peak = Decimal(str(
+                parent_state.get("high_watermark_equity_cny")
+            ))
+            child_peak = Decimal(str(
+                state.get("high_watermark_equity_cny")
+            ))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RuntimeError(f"策略{key}资金检查点经济连续性字段无效") from exc
+        parent_watermark = _normalize_evidence_revision(
+            parent_state.get("evidence_watermark")
+        )
+        child_watermark = _normalize_evidence_revision(
+            state.get("evidence_watermark")
+        )
+        parent_day = _trade_date(
+            parent_state.get("trade_date"), default_today=False,
+        )
+        if (
+            child_opening_cash != parent_closing_cash
+            or child_opening_equity != parent_closing_equity
+            or child_fee < parent_fee
+            or child_peak < parent_peak
+            or not parent_watermark
+            or not child_watermark
+            or child_watermark < parent_watermark
+            or not replay_sessions
+            or replay_sessions[0] <= parent_day
+            or _int(row.get("replay_session_count"), -1)
+            > FUNDING_REPLAY_MAX_SESSIONS + max_holding_days
+        ):
+            raise RuntimeError(f"策略{key}资金检查点经济或会话连续性断裂")
+    else:
+        raise RuntimeError(f"策略{key}资金检查点重放模式无效")
+    if checkpoint_chain_hash(
+        checkpoint_hash=checkpoint_hash,
+        previous_checkpoint_id=previous_id,
+        previous_checkpoint_hash=previous_hash,
+        previous_chain_hash=previous_chain,
+    ) != chain_hash:
+        raise RuntimeError(f"策略{key}资金检查点链哈希无效")
+
+    anchored_checkpoint = (
+        (origin_context.get("checkpoints") or {}).get(checkpoint_id)
+    )
+    anchored_run = (
+        (origin_context.get("runs") or {}).get(
+            str((anchored_checkpoint or {}).get("anchor_run_uid") or "")
+        )
+    )
+    anchored_audit = (
+        (origin_context.get("audits") or {}).get(
+            str((anchored_checkpoint or {}).get("anchor_audit_id") or "")
+        )
+    )
+    if (
+        not isinstance(anchored_checkpoint, dict)
+        or not isinstance(anchored_run, dict)
+        or not isinstance(anchored_audit, dict)
+        or any(
+            str(anchored_checkpoint.get(field) or "")
+            != str(row.get(field) or "")
+            for field in (
+                "checkpoint_id", "strategy_key", "strategy_version",
+                "strategy_version_hash", "execution_binding_hash",
+                "account_id", "trade_date", "replay_mode",
+                "replay_session_count", "max_holding_days",
+                "checkpoint_hash", "chain_hash", "history_fact_count",
+                "history_fact_set_hash", "history_tip_fact_id",
+                "history_tip_fact_hash", "new_fact_count",
+                "new_fact_set_hash", "new_fact_first_id", "new_fact_tip_id",
+                "anchor_run_uid", "canonical_result_hash",
+                "anchor_audit_id", "anchor_audit_hash",
+            )
+        )
+    ):
+        raise RuntimeError(f"策略{key}资金检查点锚物化列不一致")
+    _verify_funding_checkpoint_anchor_contract(
+        checkpoint=anchored_checkpoint,
+        run=anchored_run,
+        audit=anchored_audit,
+        require_current_canonical=require_current_canonical,
+    )
+
+    rolling_history = _verify_funding_daily_fact_chain(
+        checkpoint_row=row,
+        state=state,
+        fact_rows=fact_rows,
+        origin_context=origin_context,
+    )
+    return {
+        "mode": "BOUNDED_INCREMENTAL",
+        "checkpoint": dict(row),
+        "state": state,
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_hash": checkpoint_hash,
+        "chain_hash": chain_hash,
+        "account_id": account_id,
+        "trade_date": checkpoint_day,
+        "max_holding_days": max_holding_days,
+        "rolling_history": rolling_history,
+    }
+
+
+def _load_funding_origin_context(
+    fact_rows: list[dict[str, Any]], *,
+    extra_checkpoint_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Load exact, bounded origin checkpoint/run/audit and fact-batch roots."""
+
+    represented_origin_ids = {
+        str(row.get("origin_checkpoint_id") or "") for row in fact_rows
+    }
+    origin_ids = sorted(represented_origin_ids | {
+        str(item or "") for item in (extra_checkpoint_ids or []) if item
+    })
+    if any(not _HASH_PATTERN.fullmatch(item) for item in origin_ids):
+        raise RuntimeError("资金日频事实包含无效原始检查点身份")
+    checkpoints: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(origin_ids), 500):
+        batch_ids = origin_ids[offset:offset + 500]
+        rows = _db_read(
+            "SELECT cp.checkpoint_id, cp.strategy_key, "
+            "cp.strategy_version, cp.strategy_version_hash, "
+            "cp.execution_binding_hash, cp.account_id, cp.trade_date, "
+            "cp.replay_mode, cp.replay_session_count, cp.max_holding_days, "
+            "cp.checkpoint_hash, cp.chain_hash, cp.history_fact_count, "
+            "cp.history_fact_set_hash, cp.history_tip_fact_id, "
+            "cp.history_tip_fact_hash, cp.new_fact_count, "
+            "cp.new_fact_set_hash, cp.new_fact_first_id, cp.new_fact_tip_id, "
+            "cp.previous_checkpoint_id, cp.previous_checkpoint_hash, "
+            "cp.previous_chain_hash, "
+            "cp.anchor_run_uid, cp.canonical_result_hash, "
+            "cp.anchor_audit_id, cp.anchor_audit_hash, "
+            "cp.automatic_real_order_submission, cp.real_order_authority "
+            f"FROM {FUNDING_CHECKPOINT_TABLE_NAME} cp "
+            "JOIN JSON_TABLE(:origin_ids, '$[*]' COLUMNS("
+            " checkpoint_id CHAR(64) PATH '$')) requested "
+            "ON requested.checkpoint_id=cp.checkpoint_id",
+            {"origin_ids": _json_text(batch_ids)},
+        )
+        for row in rows:
+            checkpoint_id = str(row.get("checkpoint_id") or "")
+            if checkpoint_id in checkpoints:
+                raise RuntimeError("资金原始检查点查询返回重复身份")
+            checkpoints[checkpoint_id] = dict(row)
+    if set(checkpoints) != set(origin_ids):
+        raise RuntimeError("资金日频事实引用的原始检查点缺失")
+    represented_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    history_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    for row in fact_rows:
+        identity = (
+            str(row.get("entity_key") or ""),
+            str(row.get("entity_version") or ""),
+            str(row.get("account_id") or ""),
+        )
+        history_counts[identity] += 1
+    seen_origins_by_identity: dict[
+        tuple[str, str, str], set[str]
+    ] = defaultdict(set)
+    for checkpoint_id, row in checkpoints.items():
+        if checkpoint_id not in represented_origin_ids:
+            continue
+        identity = (
+            str(row.get("strategy_key") or ""),
+            str(row.get("strategy_version") or ""),
+            str(row.get("account_id") or ""),
+        )
+        if checkpoint_id not in seen_origins_by_identity[identity]:
+            seen_origins_by_identity[identity].add(checkpoint_id)
+            represented_counts[identity] += _int(row.get("new_fact_count"), -1)
+    if any(
+        count < 1 or count > history_counts.get(identity, 0) + 369
+        for identity, count in represented_counts.items()
+    ):
+        raise RuntimeError("资金原始事实批次声明超过可证明边界")
+
+    run_uids = sorted({
+        str(row.get("anchor_run_uid") or "") for row in checkpoints.values()
+    })
+    audit_ids = sorted({
+        str(row.get("anchor_audit_id") or "") for row in checkpoints.values()
+    })
+    runs: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(run_uids), 100):
+        rows = _db_read(
+            "SELECT run.run_uid, run.status, run.is_canonical, "
+            "run.result_hash, OCTET_LENGTH(run.result_json) "
+            "AS result_json_bytes, "
+            "(BINARY run.result_hash=BINARY SHA2(run.result_json,256)) "
+            "AS result_json_hash_valid, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,'$.run_uid')) "
+            "AS result_run_uid, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,'$.status')) "
+            "AS result_status, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,'$.is_canonical')) "
+            "AS result_is_canonical, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.automatic_real_order_submission')) "
+            "AS result_automatic_real_order_submission, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.real_order_authority')) AS result_real_order_authority, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.schema')) "
+            "AS result_manifest_schema, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.manifest_hash')) "
+            "AS result_manifest_hash, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.run_uid')) "
+            "AS result_manifest_run_uid, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.trade_date')) "
+            "AS result_manifest_trade_date, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.automatic_real_order_submission')) "
+            "AS result_manifest_automatic_real_order_submission, "
+            "JSON_UNQUOTE(JSON_EXTRACT(run.result_json,"
+            "'$.funding_checkpoint_manifest.real_order_authority')) "
+            "AS result_manifest_real_order_authority "
+            "FROM st_strategy_governance_run run "
+            "JOIN JSON_TABLE(:run_uids, '$[*]' COLUMNS("
+            " run_uid CHAR(32) PATH '$')) requested "
+            "ON requested.run_uid=run.run_uid",
+            {"run_uids": _json_text(run_uids[offset:offset + 100])},
+        )
+        for row in rows:
+            run_uid = str(row.get("run_uid") or "")
+            if run_uid in runs:
+                raise RuntimeError("资金原始治理运行查询返回重复身份")
+            runs[run_uid] = dict(row)
+    if set(runs) != set(run_uids):
+        raise RuntimeError("资金原始检查点治理运行缺失")
+    checkpoint_bindings = [{
+        "checkpoint_id": checkpoint_id,
+        "run_uid": str(row.get("anchor_run_uid") or ""),
+    } for checkpoint_id, row in sorted(checkpoints.items())]
+    ranked_positions: dict[str, tuple[str, int, int]] = {}
+    rank_sql = (
+        "WITH requested AS (SELECT binding.checkpoint_id, binding.run_uid "
+        "FROM JSON_TABLE(:bindings, '$[*]' COLUMNS("
+        " checkpoint_id CHAR(64) PATH '$.checkpoint_id',"
+        " run_uid CHAR(32) PATH '$.run_uid')) binding), "
+        "wanted_runs AS (SELECT DISTINCT run_uid FROM requested), "
+        "ranked AS (SELECT cp.checkpoint_id, cp.anchor_run_uid, "
+        "ROW_NUMBER() OVER (PARTITION BY cp.anchor_run_uid ORDER BY "
+        "BINARY cp.strategy_key, BINARY cp.strategy_version, "
+        "BINARY cp.account_id, cp.trade_date, BINARY cp.checkpoint_id)-1 "
+        "AS manifest_position, COUNT(*) OVER "
+        "(PARTITION BY cp.anchor_run_uid) AS run_checkpoint_count "
+        f"FROM {FUNDING_CHECKPOINT_TABLE_NAME} cp "
+        "JOIN wanted_runs wanted ON wanted.run_uid=cp.anchor_run_uid) "
+        "SELECT ranked.* FROM ranked JOIN requested "
+        "ON requested.checkpoint_id=ranked.checkpoint_id "
+        "AND requested.run_uid=ranked.anchor_run_uid "
+        "ORDER BY ranked.anchor_run_uid, ranked.manifest_position"
+    )
+    for offset in range(0, len(checkpoint_bindings), 100):
+        requested = checkpoint_bindings[offset:offset + 100]
+        rows = _db_read(
+            rank_sql, {"bindings": _json_text(requested)},
+        )
+        if len(rows) != len(requested):
+            raise RuntimeError("资金治理运行检查点批位置缺失")
+        for row in rows:
+            checkpoint_id = str(row.get("checkpoint_id") or "")
+            run_uid = str(row.get("anchor_run_uid") or "")
+            position = _int(row.get("manifest_position"), -1)
+            total_count = _int(row.get("run_checkpoint_count"), -1)
+            if (
+                checkpoint_id in ranked_positions
+                or run_uid not in runs
+                or not 0 <= position < total_count
+            ):
+                raise RuntimeError("资金治理运行检查点批位置重复或无效")
+            ranked_positions[checkpoint_id] = (
+                run_uid, position, total_count,
+            )
+    if set(ranked_positions) != set(checkpoints):
+        raise RuntimeError("资金治理运行检查点批位置集合不完整")
+
+    required_batches = sorted({
+        (run_uid, position // FUNDING_MANIFEST_BATCH_MAX_ROWS, total_count)
+        for run_uid, position, total_count in ranked_positions.values()
+    })
+    run_batches: dict[str, dict[str, Any]] = defaultdict(dict)
+    batch_rows_by_identity: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    batch_sql = (
+        "WITH requested AS (SELECT binding.run_uid, "
+        "binding.batch_index, binding.expected_total, "
+        "binding.batch_start, binding.batch_end "
+        "FROM JSON_TABLE(:batch_requests, '$[*]' COLUMNS("
+        "run_uid CHAR(32) PATH '$.run_uid',"
+        "batch_index INT PATH '$.batch_index',"
+        "expected_total INT PATH '$.expected_total',"
+        "batch_start INT PATH '$.batch_start',"
+        "batch_end INT PATH '$.batch_end')) binding),"
+        "wanted_runs AS (SELECT DISTINCT run_uid FROM requested),"
+        "ranked AS (SELECT cp.checkpoint_id, cp.strategy_key, "
+        "cp.strategy_version, cp.account_id, cp.trade_date, "
+        "cp.replay_mode, cp.replay_session_count, cp.max_holding_days, "
+        "cp.checkpoint_hash, cp.chain_hash, cp.history_fact_count, "
+        "cp.history_fact_set_hash, cp.history_tip_fact_id, "
+        "cp.history_tip_fact_hash, cp.new_fact_count, "
+        "cp.new_fact_set_hash, cp.new_fact_first_id, cp.new_fact_tip_id, "
+        "cp.anchor_run_uid, cp.automatic_real_order_submission, "
+        "cp.real_order_authority, "
+        "ROW_NUMBER() OVER (PARTITION BY cp.anchor_run_uid ORDER BY "
+        "BINARY cp.strategy_key, "
+        "BINARY cp.strategy_version, BINARY cp.account_id, cp.trade_date, "
+        "BINARY cp.checkpoint_id)-1 AS manifest_position, "
+        "COUNT(*) OVER (PARTITION BY cp.anchor_run_uid) "
+        "AS run_checkpoint_count "
+        f"FROM {FUNDING_CHECKPOINT_TABLE_NAME} cp "
+        "JOIN wanted_runs wanted ON wanted.run_uid=cp.anchor_run_uid) "
+        "SELECT ranked.*, requested.batch_index, "
+        "requested.expected_total FROM ranked JOIN requested "
+        "ON requested.run_uid=ranked.anchor_run_uid "
+        "AND ranked.manifest_position>=requested.batch_start "
+        "AND ranked.manifest_position<requested.batch_end "
+        "ORDER BY ranked.anchor_run_uid, requested.batch_index, "
+        "ranked.manifest_position"
+    )
+    batch_requests = []
+    for run_uid, batch_index, expected_total in required_batches:
+        batch_start = batch_index * FUNDING_MANIFEST_BATCH_MAX_ROWS
+        batch_requests.append({
+            "run_uid": run_uid,
+            "batch_index": batch_index,
+            "expected_total": expected_total,
+            "batch_start": batch_start,
+            "batch_end": batch_start + FUNDING_MANIFEST_BATCH_MAX_ROWS,
+        })
+    observed_batch_rows: dict[tuple[str, int], list[dict[str, Any]]] = (
+        defaultdict(list)
+    )
+    for offset in range(0, len(batch_requests), 100):
+        rows = _db_read(batch_sql, {
+            "batch_requests": _json_text(
+                batch_requests[offset:offset + 100]
+            ),
+        })
+        if len(rows) > 100 * FUNDING_MANIFEST_BATCH_MAX_ROWS:
+            raise RuntimeError("资金治理运行检查点批读取超过10000行硬边界")
+        for row in rows:
+            identity = (
+                str(row.get("anchor_run_uid") or ""),
+                _int(row.get("batch_index"), -1),
+            )
+            observed_batch_rows[identity].append(dict(row))
+    for request in batch_requests:
+        run_uid = request["run_uid"]
+        batch_index = request["batch_index"]
+        expected_total = request["expected_total"]
+        batch_start = request["batch_start"]
+        rows = observed_batch_rows.get((run_uid, batch_index), [])
+        expected_batch_count = min(
+            FUNDING_MANIFEST_BATCH_MAX_ROWS, expected_total - batch_start,
+        )
+        if (
+            len(rows) != expected_batch_count
+            or any(
+                _int(row.get("run_checkpoint_count"), -1) != expected_total
+                or _int(row.get("expected_total"), -1) != expected_total
+                or _int(row.get("batch_index"), -1) != batch_index
+                or _int(row.get("manifest_position"), -1)
+                != batch_start + index
+                or str(row.get("anchor_run_uid") or "") != run_uid
+                for index, row in enumerate(rows)
+            )
+        ):
+            raise RuntimeError("资金治理运行检查点批读取发生并发漂移")
+        batch_rows_by_identity[(run_uid, batch_index)] = [
+            _funding_checkpoint_manifest_entry(dict(row)) for row in rows
+        ]
+    for checkpoint_id, (run_uid, position, total_count) in (
+        ranked_positions.items()
+    ):
+        batch_index = position // FUNDING_MANIFEST_BATCH_MAX_ROWS
+        run_batches[run_uid][checkpoint_id] = {
+            "batch_index": batch_index,
+            "entries": batch_rows_by_identity[(run_uid, batch_index)],
+        }
+        existing_total = runs[run_uid].get("_funding_checkpoint_total_count")
+        if existing_total is not None and _int(existing_total, -1) != total_count:
+            raise RuntimeError("资金治理运行检查点总数发生漂移")
+        runs[run_uid]["_funding_checkpoint_total_count"] = total_count
+    for run_uid, run in runs.items():
+        if run_uid not in run_batches:
+            raise RuntimeError("资金治理运行没有可验证的检查点批成员")
+        run["_funding_checkpoint_batches"] = run_batches[run_uid]
+    audits: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(audit_ids), 100):
+        rows = _db_read(
+            "SELECT audit.audit_id, audit.entity_type, audit.entity_key, "
+            "audit.action, audit.reason, audit.operator_name, "
+            "audit.before_json, audit.after_json, audit.evidence_json, "
+            "audit.payload_json, audit.audit_hash "
+            "FROM st_strategy_governance_audit audit "
+            "JOIN JSON_TABLE(:audit_ids, '$[*]' COLUMNS("
+            " audit_id CHAR(32) PATH '$')) requested "
+            "ON requested.audit_id=audit.audit_id",
+            {"audit_ids": _json_text(audit_ids[offset:offset + 100])},
+        )
+        for row in rows:
+            audit_id = str(row.get("audit_id") or "")
+            if audit_id in audits:
+                raise RuntimeError("资金原始审计查询返回重复身份")
+            audits[audit_id] = dict(row)
+    if set(audits) != set(audit_ids):
+        raise RuntimeError("资金原始检查点审计锚缺失")
+
+    batch_members: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    bindings = [{
+        "checkpoint_id": checkpoint_id,
+        "tip_fact_id": str(row.get("new_fact_tip_id") or ""),
+        "fact_count": _int(row.get("new_fact_count"), -1),
+    } for checkpoint_id, row in sorted(checkpoints.items())
+        if checkpoint_id in represented_origin_ids]
+    for offset in range(0, len(bindings), 100):
+        rows = _db_read(
+            "WITH RECURSIVE requested AS ("
+            " SELECT binding.checkpoint_id, binding.tip_fact_id, "
+            " binding.fact_count FROM JSON_TABLE("
+            " :origin_bindings, '$[*]' COLUMNS("
+            " checkpoint_id CHAR(64) PATH '$.checkpoint_id',"
+            " tip_fact_id CHAR(64) PATH '$.tip_fact_id',"
+            " fact_count INT PATH '$.fact_count')) binding"
+            "), origin_batch AS ("
+            " SELECT requested.checkpoint_id, requested.fact_count,"
+            " 1 AS chain_depth, fact.fact_id, fact.fact_hash,"
+            " fact.previous_fact_id, fact.previous_fact_hash,"
+            " fact.origin_checkpoint_id, fact.entity_key,"
+            " fact.entity_version, fact.account_id, fact.trade_date,"
+            " fact.anchor_run_uid, fact.canonical_result_hash,"
+            " fact.anchor_audit_id, fact.anchor_audit_hash,"
+            " fact.automatic_real_order_submission,"
+            " fact.real_order_authority,"
+            " (BINARY fact.fact_hash=BINARY SHA2(fact.fact_json,256))"
+            " AS fact_hash_valid"
+            f" FROM requested JOIN {FUNDING_DAILY_FACT_TABLE_NAME} fact"
+            " ON fact.fact_id=requested.tip_fact_id"
+            " UNION ALL"
+            " SELECT chain.checkpoint_id, chain.fact_count,"
+            " chain.chain_depth+1, parent.fact_id, parent.fact_hash,"
+            " parent.previous_fact_id, parent.previous_fact_hash,"
+            " parent.origin_checkpoint_id, parent.entity_key,"
+            " parent.entity_version, parent.account_id, parent.trade_date,"
+            " parent.anchor_run_uid, parent.canonical_result_hash,"
+            " parent.anchor_audit_id, parent.anchor_audit_hash,"
+            " parent.automatic_real_order_submission,"
+            " parent.real_order_authority,"
+            " (BINARY parent.fact_hash=BINARY SHA2(parent.fact_json,256))"
+            " AS fact_hash_valid"
+            " FROM origin_batch chain"
+            f" JOIN {FUNDING_DAILY_FACT_TABLE_NAME} parent"
+            " ON parent.fact_id=chain.previous_fact_id"
+            " AND BINARY parent.fact_hash=BINARY chain.previous_fact_hash"
+            " WHERE chain.chain_depth<chain.fact_count"
+            ") SELECT * FROM origin_batch"
+            " ORDER BY checkpoint_id, chain_depth DESC",
+            {"origin_bindings": _json_text(
+                bindings[offset:offset + 100]
+            )},
+        )
+        for row in rows:
+            batch_members[str(row.get("checkpoint_id") or "")].append(
+                dict(row)
+            )
+    return {
+        "checkpoints": checkpoints,
+        "runs": runs,
+        "audits": audits,
+        "batch_members": dict(batch_members),
+    }
+
+
+def _load_authoritative_checkpoint_sessions(
+    selected: dict[str, dict[str, Any]],
+    *, decision_known_at: Any | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load exact exchange-session sets for replay and rolling NAV windows."""
+
+    bindings = [{
+        "checkpoint_id": str(row.get("checkpoint_id") or ""),
+        "trade_date": _trade_date(row.get("trade_date"), default_today=False),
+        "replay_mode": str(row.get("replay_mode") or ""),
+        "replay_start_date": _trade_date(
+            row.get("replay_start_date"), default_today=False,
+        ),
+        "parent_trade_date": (
+            _trade_date(row.get("parent_trade_date"), default_today=False)
+            if row.get("parent_trade_date") else ""
+        ),
+        "history_fact_count": _int(row.get("history_fact_count"), -1),
+    } for row in selected.values()]
+    if not bindings:
+        return {}
+    end_date = max(item["trade_date"] for item in bindings)
+    history_floor = (
+        date.fromisoformat(min(item["trade_date"] for item in bindings))
+        - timedelta(days=366)
+    ).isoformat()
+    replay_floors = [
+        item["replay_start_date"] for item in bindings
+        if item["replay_start_date"]
+    ] + [
+        item["parent_trade_date"] for item in bindings
+        if item["parent_trade_date"]
+    ]
+    start_date = min([history_floor, *replay_floors])
+    receipt = _immutable_calendar_receipt(
+        start_date=start_date,
+        end_date=end_date,
+        decision_known_at=(
+            decision_known_at
+            if decision_known_at is not None
+            else datetime.now().replace(microsecond=0)
+        ),
+    )
+    receipt_binding = _calendar_receipt_binding(receipt)
+    result: dict[str, dict[str, Any]] = {}
+    for item in bindings:
+        checkpoint_id = str(item["checkpoint_id"])
+        eligible = [
+            day for day in receipt.sessions
+            if day <= item["trade_date"]
+        ]
+        history = eligible[-int(item["history_fact_count"]):]
+        if item["replay_mode"] == "FULL_BOOTSTRAP":
+            replay = [
+                day for day in eligible
+                if day >= item["replay_start_date"]
+            ]
+        elif item["replay_mode"] == "BOUNDED_INCREMENTAL":
+            replay = [
+                day for day in eligible
+                if day > item["parent_trade_date"]
+            ]
+        else:
+            raise RuntimeError("资金检查点重放模式无效")
+        result[checkpoint_id] = {
+            "HISTORY": history,
+            "REPLAY": replay,
+            "CALENDAR_RECEIPT": receipt_binding,
+        }
+    for checkpoint_id, roles in result.items():
+        for role in ("HISTORY", "REPLAY"):
+            sessions = roles[role]
+            normalized = sorted(set(sessions))
+            if normalized != sessions or not normalized:
+                raise RuntimeError(
+                    f"资金检查点{checkpoint_id}权威{role}交易日集合无效"
+                )
+    return result
+
+
+def _funding_replay_plan_serialized_bytes(plan: dict[str, Any]) -> int:
+    """Count the exact strict-JSON replay seed retained by the metrics worker."""
+
+    payload = {
+        "mode": str(plan.get("mode") or ""),
+        "state": plan.get("state"),
+        "rolling_history": plan.get("rolling_history"),
+        "checkpoint_id": str(plan.get("checkpoint_id") or ""),
+        "checkpoint_hash": str(plan.get("checkpoint_hash") or ""),
+        "chain_hash": str(plan.get("chain_hash") or ""),
+        "account_id": str(plan.get("account_id") or ""),
+        "trade_date": str(plan.get("trade_date") or ""),
+        "max_holding_days": _int(plan.get("max_holding_days"), -1),
+        "bootstrap_full_history_scan": bool(
+            plan.get("bootstrap_full_history_scan")
+        ),
+    }
+    return len(_checkpoint_canonical_json(payload).encode("utf-8"))
+
+
+def _load_funding_replay_plans(
+    as_of_date: str, registry: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Load current-canonical checkpoints and exact tip-addressed fact chains."""
+
+    plans: dict[str, dict[str, Any]] = {}
+    if not _strict_table_exists(FUNDING_CHECKPOINT_TABLE_NAME):
+        raise RuntimeError("资金检查点表尚未迁移；拒绝以每日全表重放代替检查点")
+    if not _strict_table_exists(FUNDING_DAILY_FACT_TABLE_NAME):
+        raise RuntimeError("资金日频事实表尚未迁移；拒绝以内联历史代替事实链")
+    rows = _db_read(
+        "SELECT current_strategy.strategy_key AS registry_strategy_key, "
+        "current_strategy.current_version AS registry_current_version, cp.*, "
+        "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint any_version "
+        " WHERE any_version.strategy_key=current_strategy.strategy_key "
+        " AND BINARY any_version.strategy_version="
+        "BINARY current_strategy.current_version "
+        " AND any_version.trade_date<:as_of_date) "
+        "AS version_checkpoint_count, "
+        "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint same_day "
+        " JOIN st_strategy_governance_run same_day_anchor "
+        " ON same_day_anchor.run_uid=same_day.anchor_run_uid "
+        " WHERE same_day.strategy_key=cp.strategy_key "
+        " AND BINARY same_day.strategy_version=BINARY cp.strategy_version "
+        " AND same_day.account_id=cp.account_id "
+        " AND same_day.trade_date=cp.trade_date "
+        " AND same_day_anchor.status='COMPLETED' "
+        " AND same_day_anchor.is_canonical=1) "
+        " AS latest_day_checkpoint_count, "
+        "(SELECT COUNT(DISTINCT account_scope.account_id) "
+        " FROM st_strategy_funding_checkpoint account_scope "
+        " WHERE account_scope.strategy_key=cp.strategy_key "
+        " AND BINARY account_scope.strategy_version="
+        "BINARY cp.strategy_version "
+        " AND account_scope.trade_date<:as_of_date) "
+        "AS version_account_count, "
+        "account.status AS current_account_status, "
+        "account.initial_cash AS current_account_initial_cash, "
+        "account.policy_version AS current_account_policy_version, "
+        "account.policy_hash AS current_account_policy_hash, "
+        "account.fee_profile_version AS current_account_fee_profile_version, "
+        "account.instrument_rule_version "
+        "AS current_account_instrument_rule_version, "
+        "account.real_trading_enabled AS current_account_real_enabled, "
+        "account.created_at AS current_account_created_at, "
+        "parent.checkpoint_id AS parent_checkpoint_id, "
+        "parent.checkpoint_hash AS parent_checkpoint_hash, "
+        "parent.chain_hash AS parent_chain_hash, "
+        "parent.state_json AS parent_state_json, "
+        "parent.chain_payload_json AS parent_chain_payload_json, "
+        "parent.strategy_key AS parent_strategy_key, "
+        "parent.strategy_version AS parent_strategy_version, "
+        "parent.account_id AS parent_account_id, "
+        "parent.trade_date AS parent_trade_date "
+        "FROM JSON_TABLE(:registry_bindings, '$[*]' COLUMNS("
+        " strategy_key VARCHAR(80) PATH '$.strategy_key',"
+        " strategy_version VARCHAR(160) PATH '$.strategy_version')) requested "
+        "JOIN st_strategy_registry current_strategy "
+        "ON current_strategy.strategy_key=requested.strategy_key "
+        "AND BINARY current_strategy.current_version="
+        "BINARY requested.strategy_version "
+        "LEFT JOIN st_strategy_funding_checkpoint cp "
+        "ON cp.checkpoint_id=("
+        " SELECT latest.checkpoint_id "
+        " FROM st_strategy_funding_checkpoint latest "
+        " JOIN st_strategy_governance_run latest_anchor "
+        " ON latest_anchor.run_uid=latest.anchor_run_uid "
+        " WHERE latest.strategy_key=current_strategy.strategy_key "
+        " AND BINARY latest.strategy_version="
+        "BINARY current_strategy.current_version "
+        " AND latest.trade_date<:as_of_date "
+        " AND latest_anchor.status='COMPLETED' "
+        " AND latest_anchor.is_canonical=1 "
+        " ORDER BY latest.trade_date DESC, latest.created_at DESC, "
+        "latest.checkpoint_id DESC LIMIT 1) "
+        "LEFT JOIN st_trade_account_v2 account "
+        "ON account.account_id=cp.account_id "
+        "LEFT JOIN st_strategy_funding_checkpoint parent "
+        "ON parent.checkpoint_id=cp.previous_checkpoint_id "
+        "ORDER BY current_strategy.strategy_key",
+        {
+            "as_of_date": as_of_date,
+            "registry_bindings": _json_text([{
+                "strategy_key": str(row.get("strategy_key") or ""),
+                "strategy_version": str(row.get("current_version") or ""),
+            } for row in registry]),
+        },
+    )
+    registry_by_key = {
+        str(row["strategy_key"]): row for row in registry
+    }
+    selected: dict[str, dict[str, Any]] = {}
+    for source in rows:
+        key = str(source.get("registry_strategy_key") or "")
+        if key not in registry_by_key:
+            continue
+        if key in selected:
+            raise RuntimeError(f"策略{key}资金检查点选择结果重复")
+        checkpoint_count = _int(source.get("version_checkpoint_count"), -1)
+        if not source.get("checkpoint_id"):
+            if checkpoint_count != 0:
+                raise RuntimeError(
+                    f"策略{key}已有当前版本检查点但没有可用canonical锚；拒绝静默全量重放"
+                )
+            plans[key] = {
+                "mode": "FULL_BOOTSTRAP",
+                "checkpoint": None,
+                "state": None,
+                "rolling_history": None,
+                "checkpoint_id": "",
+                "checkpoint_hash": "",
+                "chain_hash": "",
+                "account_id": "",
+                "trade_date": "",
+                "max_holding_days": _holding_horizon_from_parameters(
+                    registry_by_key[key].get("parameters")
+                ),
+                "bootstrap_full_history_scan": True,
+            }
+            continue
+        if checkpoint_count <= 0:
+            raise RuntimeError(f"策略{key}资金检查点计数与选择结果不一致")
+        selected[key] = dict(source)
+
+    bindings = [{
+        "checkpoint_id": str(row.get("checkpoint_id") or ""),
+        "tip_fact_id": str(row.get("history_tip_fact_id") or ""),
+        "tip_fact_hash": str(row.get("history_tip_fact_hash") or ""),
+        "fact_count": _int(row.get("history_fact_count"), -1),
+    } for row in selected.values()]
+    fact_rows = _db_read(
+        "WITH RECURSIVE requested AS ("
+        " SELECT binding.checkpoint_id, binding.tip_fact_id, "
+        " binding.tip_fact_hash, binding.fact_count "
+        " FROM JSON_TABLE(:checkpoint_bindings, '$[*]' COLUMNS("
+        " checkpoint_id CHAR(64) PATH '$.checkpoint_id', "
+        " tip_fact_id CHAR(64) PATH '$.tip_fact_id', "
+        " tip_fact_hash CHAR(64) PATH '$.tip_fact_hash', "
+        " fact_count INT PATH '$.fact_count')) binding"
+        "), fact_chain AS ("
+        " SELECT requested.checkpoint_id, requested.fact_count, "
+        " 1 AS chain_depth, fact.* "
+        f" FROM requested JOIN {FUNDING_DAILY_FACT_TABLE_NAME} fact "
+        " ON fact.fact_id=requested.tip_fact_id "
+        " AND BINARY fact.fact_hash=BINARY requested.tip_fact_hash "
+        " UNION ALL "
+        " SELECT chain.checkpoint_id, chain.fact_count, "
+        " chain.chain_depth+1, parent.* "
+        " FROM fact_chain chain "
+        f" JOIN {FUNDING_DAILY_FACT_TABLE_NAME} parent "
+        " ON parent.fact_id=chain.previous_fact_id "
+        " AND BINARY parent.fact_hash=BINARY chain.previous_fact_hash "
+        " WHERE chain.chain_depth<chain.fact_count"
+        ") SELECT * FROM fact_chain "
+        "ORDER BY checkpoint_id, chain_depth DESC",
+        {"checkpoint_bindings": _json_text(bindings)},
+    ) if bindings else []
+    facts_by_checkpoint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fact in fact_rows:
+        facts_by_checkpoint[str(fact.get("checkpoint_id") or "")].append(fact)
+    origin_context = _load_funding_origin_context(
+        fact_rows,
+        extra_checkpoint_ids=[
+            str(source.get(field) or "")
+            for source in selected.values()
+            for field in ("checkpoint_id", "previous_checkpoint_id")
+            if source.get(field)
+        ],
+    )
+    origin_context["authoritative_sessions"] = (
+        _load_authoritative_checkpoint_sessions(
+            selected,
+            decision_known_at=f"{as_of_date} 23:59:59",
+        )
+    )
+    for key, source in selected.items():
+        checkpoint_id = str(source.get("checkpoint_id") or "")
+        plans[key] = _verify_funding_checkpoint_row(
+            source,
+            registry_row=registry_by_key[key],
+            as_of_date=as_of_date,
+            fact_rows=facts_by_checkpoint.get(checkpoint_id, []),
+            origin_context=origin_context,
+        )
+    missing = set(registry_by_key) - set(plans)
+    if missing:
+        raise RuntimeError("资金重放计划未覆盖全部当前策略版本：" + ",".join(sorted(missing)))
+    retained_bytes = 0
+    for key in sorted(plans):
+        plan_bytes = _funding_replay_plan_serialized_bytes(plans[key])
+        plans[key]["runtime_serialized_bytes"] = plan_bytes
+        retained_bytes += plan_bytes
+    if retained_bytes > FUNDING_REPLAY_BATCH_MAX_SERIALIZED_BYTES:
+        raise GovernanceEvidenceNotReady(
+            "资金事实重放批次超过96MiB运行内存合同，必须缩小受控批次后重试",
+            blocking_record={
+                "schema": "probiga.strategy-governance-block.v1",
+                "status": "FUNDING_REPLAY_BATCH_MEMORY_EXCEEDED",
+                "strategy_count": len(plans),
+                "serialized_bytes": retained_bytes,
+                "maximum_bytes": FUNDING_REPLAY_BATCH_MAX_SERIALIZED_BYTES,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            },
+        )
+    return plans
+
+
+def _load_funding_replay_index(
+    as_of_date: str, registry: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Load only scheduling metadata; no state/fact JSON crosses this boundary."""
+
+    bindings = [{
+        "strategy_key": str(row.get("strategy_key") or ""),
+        "strategy_version": str(row.get("current_version") or ""),
+    } for row in registry]
+    expected_versions = {
+        item["strategy_key"]: item["strategy_version"] for item in bindings
+    }
+    if (
+        len(expected_versions) != len(bindings)
+        or any(not item["strategy_key"] or not item["strategy_version"]
+               for item in bindings)
+    ):
+        raise RuntimeError("资金重放批处理索引包含空或重复策略身份")
+    if not bindings:
+        return {}
+    rows = _db_read(
+        "WITH requested AS (SELECT binding.strategy_key, "
+        "binding.strategy_version FROM JSON_TABLE("
+        ":registry_bindings, '$[*]' COLUMNS("
+        " strategy_key VARCHAR(80) PATH '$.strategy_key',"
+        " strategy_version VARCHAR(160) PATH '$.strategy_version')) binding) "
+        "SELECT requested.strategy_key, requested.strategy_version, "
+        "latest_cp.checkpoint_id, latest_cp.trade_date, "
+        "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint any_cp "
+        " WHERE any_cp.strategy_key=requested.strategy_key "
+        " AND BINARY any_cp.strategy_version="
+        "BINARY requested.strategy_version "
+        " AND any_cp.trade_date<:as_of_date) AS version_checkpoint_count "
+        "FROM requested LEFT JOIN st_strategy_funding_checkpoint latest_cp "
+        "ON latest_cp.checkpoint_id=("
+        " SELECT cp.checkpoint_id FROM st_strategy_funding_checkpoint cp "
+        " JOIN st_strategy_governance_run anchor "
+        " ON anchor.run_uid=cp.anchor_run_uid "
+        " WHERE cp.strategy_key=requested.strategy_key "
+        " AND BINARY cp.strategy_version=BINARY requested.strategy_version "
+        " AND cp.trade_date<:as_of_date "
+        " AND anchor.status='COMPLETED' AND anchor.is_canonical=1 "
+        " ORDER BY cp.trade_date DESC, cp.created_at DESC, "
+        "cp.checkpoint_id DESC LIMIT 1) "
+        "ORDER BY BINARY requested.strategy_key",
+        {
+            "as_of_date": as_of_date,
+            "registry_bindings": _json_text(bindings),
+        },
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = str(row.get("strategy_key") or "")
+        version = str(row.get("strategy_version") or "")
+        count = _int(row.get("version_checkpoint_count"), -1)
+        checkpoint_id = str(row.get("checkpoint_id") or "")
+        if (
+            key in result
+            or key not in expected_versions
+            or version != expected_versions.get(key)
+            or count < 0
+            or bool(checkpoint_id) != bool(count)
+        ):
+            raise RuntimeError("资金重放批处理索引与当前版本检查点集合不一致")
+        result[key] = {
+            "mode": "BOUNDED_INCREMENTAL" if checkpoint_id else "FULL_BOOTSTRAP",
+            "checkpoint_id": checkpoint_id,
+            "trade_date": (
+                _trade_date(row.get("trade_date"), default_today=False)
+                if checkpoint_id else ""
+            ),
+            "version_checkpoint_count": count,
+        }
+    if set(result) != set(expected_versions):
+        raise RuntimeError("资金重放批处理索引未覆盖全部当前策略版本")
+    return result
+
+
+FUNDING_CHECKPOINT_DETAIL_SOURCE_SCHEMA = (
+    "probiga.verified-funding-checkpoint-detail-source.v1"
+)
+
+
+def _load_verified_funding_checkpoint_sources(
+    checkpoint_refs: list[dict[str, Any]], *,
+    require_current_canonical: bool,
+) -> dict[str, dict[str, Any]]:
+    """Load and verify at most 100 exact checkpoint fact-chain sources.
+
+    The caller must already hold one consistent database snapshot (the public
+    wrapper below establishes it).  This batch form is also used by a
+    combination recipe so up to 50 member sleeves never become an N+1 query
+    path.
+    """
+
+    if not checkpoint_refs or len(checkpoint_refs) > 100:
+        raise ValueError("资金检查点明细批次只能包含1至100个引用")
+    normalized_refs: dict[str, dict[str, Any]] = {}
+    for raw in checkpoint_refs:
+        if not isinstance(raw, dict):
+            raise ValueError("资金检查点明细引用必须是对象")
+        checkpoint_id = str(raw.get("checkpoint_id") or "")
+        key = str(raw.get("strategy_key") or "")
+        version = str(raw.get("strategy_version") or "")
+        account_id = str(raw.get("account_id") or "")
+        trade_day = _trade_date(
+            raw.get("trade_date"), default_today=False,
+        )
+        if (
+            not _HASH_PATTERN.fullmatch(checkpoint_id)
+            or not key
+            or not version
+            or not account_id
+            or not _HASH_PATTERN.fullmatch(
+                str(raw.get("checkpoint_hash") or "")
+            )
+            or not _HASH_PATTERN.fullmatch(
+                str(raw.get("history_fact_set_hash") or "")
+            )
+            or raw.get("automatic_real_order_submission") is not False
+            or raw.get("real_order_authority") is not False
+            or checkpoint_id in normalized_refs
+        ):
+            raise ValueError("资金检查点明细引用身份、哈希或权限合同无效")
+        normalized_refs[checkpoint_id] = {
+            **raw,
+            "checkpoint_id": checkpoint_id,
+            "strategy_key": key,
+            "strategy_version": version,
+            "account_id": account_id,
+            "trade_date": trade_day,
+        }
+
+    rows = _db_read(
+        "WITH requested AS ("
+        " SELECT binding.checkpoint_id FROM JSON_TABLE("
+        " :checkpoint_refs, '$[*]' COLUMNS("
+        " checkpoint_id CHAR(64) PATH '$.checkpoint_id')) binding"
+        ") SELECT cp.*, "
+        "version.version_hash AS frozen_version_hash, "
+        "version.content_hash AS frozen_content_hash, "
+        "version.evaluator_type AS frozen_evaluator_type, "
+        "version.evaluator_config_json AS frozen_evaluator_config_json, "
+        "version.parameters_json AS frozen_parameters_json, "
+        "version.source_kind AS frozen_source_kind, "
+        "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint same_day "
+        " JOIN st_strategy_governance_run same_day_anchor "
+        " ON same_day_anchor.run_uid=same_day.anchor_run_uid "
+        " WHERE same_day.strategy_key=cp.strategy_key "
+        " AND BINARY same_day.strategy_version=BINARY cp.strategy_version "
+        " AND same_day.account_id=cp.account_id "
+        " AND same_day.trade_date=cp.trade_date "
+        " AND same_day_anchor.status='COMPLETED' "
+        " AND same_day_anchor.is_canonical=1) "
+        "AS latest_day_checkpoint_count, "
+        "(SELECT COUNT(DISTINCT account_scope.account_id) "
+        " FROM st_strategy_funding_checkpoint account_scope "
+        " WHERE account_scope.strategy_key=cp.strategy_key "
+        " AND BINARY account_scope.strategy_version="
+        "BINARY cp.strategy_version "
+        " AND account_scope.trade_date<=cp.trade_date) "
+        "AS version_account_count, "
+        "account.status AS current_account_status, "
+        "account.initial_cash AS current_account_initial_cash, "
+        "account.policy_version AS current_account_policy_version, "
+        "account.policy_hash AS current_account_policy_hash, "
+        "account.fee_profile_version AS current_account_fee_profile_version, "
+        "account.instrument_rule_version "
+        "AS current_account_instrument_rule_version, "
+        "account.real_trading_enabled AS current_account_real_enabled, "
+        "account.created_at AS current_account_created_at, "
+        "parent.checkpoint_id AS parent_checkpoint_id, "
+        "parent.checkpoint_hash AS parent_checkpoint_hash, "
+        "parent.chain_hash AS parent_chain_hash, "
+        "parent.state_json AS parent_state_json, "
+        "parent.chain_payload_json AS parent_chain_payload_json, "
+        "parent.strategy_key AS parent_strategy_key, "
+        "parent.strategy_version AS parent_strategy_version, "
+        "parent.account_id AS parent_account_id, "
+        "parent.trade_date AS parent_trade_date "
+        "FROM requested "
+        f"JOIN {FUNDING_CHECKPOINT_TABLE_NAME} cp "
+        "ON cp.checkpoint_id=requested.checkpoint_id "
+        "JOIN st_strategy_version version "
+        "ON version.strategy_key=cp.strategy_key "
+        "AND BINARY version.version=BINARY cp.strategy_version "
+        "JOIN st_trade_account_v2 account "
+        "ON account.account_id=cp.account_id "
+        f"LEFT JOIN {FUNDING_CHECKPOINT_TABLE_NAME} parent "
+        "ON parent.checkpoint_id=cp.previous_checkpoint_id "
+        "ORDER BY cp.checkpoint_id",
+        {"checkpoint_refs": _json_text([
+            {"checkpoint_id": checkpoint_id}
+            for checkpoint_id in sorted(normalized_refs)
+        ])},
+    )
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    registry_by_id: dict[str, dict[str, Any]] = {}
+    for raw_row in rows:
+        row = dict(raw_row)
+        checkpoint_id = str(row.get("checkpoint_id") or "")
+        if checkpoint_id in rows_by_id or checkpoint_id not in normalized_refs:
+            raise RuntimeError("资金检查点明细物化查询返回重复或越界身份")
+        ref = normalized_refs[checkpoint_id]
+        observed_entry = _funding_checkpoint_manifest_entry(row)
+        required_ref_fields = (
+            "checkpoint_id", "strategy_key", "strategy_version",
+            "account_id", "trade_date", "checkpoint_hash",
+            "history_fact_set_hash", "automatic_real_order_submission",
+            "real_order_authority",
+        )
+        if any(
+            str(ref.get(field)) != str(observed_entry.get(field))
+            for field in required_ref_fields
+        ):
+            raise RuntimeError("资金检查点明细引用与物化身份不一致")
+        # A full canonical ref carries most or all manifest fields.  Compare
+        # every supplied one; combination recipes may supply only the stable
+        # subset above and are enriched before entering this batch loader.
+        for field, observed in observed_entry.items():
+            if field in ref and str(ref.get(field)) != str(observed):
+                raise RuntimeError(
+                    f"资金检查点明细引用字段{field}与物化行不一致"
+                )
+        evaluator_config = _json(
+            row.get("frozen_evaluator_config_json"), None,
+        )
+        parameters = _json(row.get("frozen_parameters_json"), None)
+        source_kind = str(row.get("frozen_source_kind") or "")
+        evaluator_type = str(row.get("frozen_evaluator_type") or "")
+        key = str(row.get("strategy_key") or "")
+        version = str(row.get("strategy_version") or "")
+        version_hash = str(row.get("frozen_version_hash") or "")
+        content_hash = str(row.get("frozen_content_hash") or "")
+        if (
+            not isinstance(evaluator_config, dict)
+            or not isinstance(parameters, dict)
+            or not _HASH_PATTERN.fullmatch(version_hash)
+            or not _HASH_PATTERN.fullmatch(content_hash)
+            or _strategy_version_digest(
+                strategy_key=key,
+                version=version,
+                evaluator_type=evaluator_type,
+                evaluator_config=evaluator_config,
+                parameters=parameters,
+                source_kind=source_kind,
+            ) != version_hash
+            or _strategy_content_digest(
+                strategy_key=key,
+                evaluator_type=evaluator_type,
+                evaluator_config=evaluator_config,
+                parameters=parameters,
+                source_kind=source_kind,
+            ) != content_hash
+            or str(row.get("strategy_version_hash") or "") != version_hash
+        ):
+            raise RuntimeError(f"策略{key}资金检查点冻结版本内容不可复算")
+        version_contract = {
+            "strategy_key": key,
+            "current_version": version,
+            "version_hash": version_hash,
+            "content_hash": content_hash,
+            "evaluator_type": evaluator_type,
+            "evaluator_config": evaluator_config,
+            "parameters": parameters,
+            "source_kind": source_kind,
+            "version_integrity_valid": True,
+            "enabled": True,
+            "current_status": "SHADOW",
+        }
+        adapter_status = strategy_execution_adapter_status(
+            version_contract, ledger_readiness=None,
+        )
+        version_contract["execution_binding_hash"] = str(
+            adapter_status.get("execution_binding_hash") or ""
+        )
+        rows_by_id[checkpoint_id] = row
+        registry_by_id[checkpoint_id] = version_contract
+    if set(rows_by_id) != set(normalized_refs):
+        raise RuntimeError("资金检查点明细引用集合没有精确命中物化行")
+
+    bindings = []
+    for checkpoint_id, row in sorted(rows_by_id.items()):
+        fact_count = _int(row.get("history_fact_count"), -1)
+        if not 1 <= fact_count <= FUNDING_REPLAY_MAX_SESSIONS:
+            raise RuntimeError("资金检查点明细事实链长度超过120日硬边界")
+        bindings.append({
+            "checkpoint_id": checkpoint_id,
+            "tip_fact_id": str(row.get("history_tip_fact_id") or ""),
+            "tip_fact_hash": str(row.get("history_tip_fact_hash") or ""),
+            "fact_count": fact_count,
+        })
+    fact_rows = _db_read(
+        "WITH RECURSIVE requested AS ("
+        " SELECT binding.checkpoint_id, binding.tip_fact_id, "
+        " binding.tip_fact_hash, binding.fact_count "
+        " FROM JSON_TABLE(:checkpoint_bindings, '$[*]' COLUMNS("
+        " checkpoint_id CHAR(64) PATH '$.checkpoint_id',"
+        " tip_fact_id CHAR(64) PATH '$.tip_fact_id',"
+        " tip_fact_hash CHAR(64) PATH '$.tip_fact_hash',"
+        " fact_count INT PATH '$.fact_count')) binding"
+        "), fact_chain AS ("
+        " SELECT requested.checkpoint_id, requested.fact_count,"
+        " 1 AS chain_depth, fact.* FROM requested"
+        f" JOIN {FUNDING_DAILY_FACT_TABLE_NAME} fact"
+        " ON fact.fact_id=requested.tip_fact_id"
+        " AND BINARY fact.fact_hash=BINARY requested.tip_fact_hash"
+        " UNION ALL"
+        " SELECT chain.checkpoint_id, chain.fact_count,"
+        " chain.chain_depth+1, parent.* FROM fact_chain chain"
+        f" JOIN {FUNDING_DAILY_FACT_TABLE_NAME} parent"
+        " ON parent.fact_id=chain.previous_fact_id"
+        " AND BINARY parent.fact_hash=BINARY chain.previous_fact_hash"
+        " WHERE chain.chain_depth<chain.fact_count"
+        ") SELECT * FROM fact_chain"
+        " ORDER BY checkpoint_id, chain_depth DESC",
+        {"checkpoint_bindings": _json_text(bindings)},
+    )
+    facts_by_checkpoint: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for fact in fact_rows:
+        checkpoint_id = str(fact.get("checkpoint_id") or "")
+        if checkpoint_id not in rows_by_id:
+            raise RuntimeError("资金检查点明细事实链返回越界身份")
+        facts_by_checkpoint[checkpoint_id].append(dict(fact))
+    origin_context = _load_funding_origin_context(
+        fact_rows,
+        extra_checkpoint_ids=[
+            str(row.get(field) or "")
+            for row in rows_by_id.values()
+            for field in ("checkpoint_id", "previous_checkpoint_id")
+            if row.get(field)
+        ],
+    )
+    origin_context["authoritative_sessions"] = (
+        _load_authoritative_checkpoint_sessions(rows_by_id)
+    )
+    result: dict[str, dict[str, Any]] = {}
+    for checkpoint_id, row in sorted(rows_by_id.items()):
+        checkpoint_day = date.fromisoformat(
+            _trade_date(row.get("trade_date"), default_today=False)
+        )
+        verified_checkpoint = _verify_funding_checkpoint_row(
+            row,
+            registry_row=registry_by_id[checkpoint_id],
+            as_of_date=(checkpoint_day + timedelta(days=1)).isoformat(),
+            fact_rows=facts_by_checkpoint.get(checkpoint_id, []),
+            origin_context=origin_context,
+            require_current_canonical=require_current_canonical,
+        )
+        verified_fact_chain = verified_checkpoint.get("rolling_history")
+        if not isinstance(verified_fact_chain, dict):
+            raise RuntimeError("资金检查点明细缺少已验证事实链")
+        result[checkpoint_id] = {
+            "schema": FUNDING_CHECKPOINT_DETAIL_SOURCE_SCHEMA,
+            "checkpoint_id": checkpoint_id,
+            "strategy_key": str(row.get("strategy_key") or ""),
+            "strategy_version": str(row.get("strategy_version") or ""),
+            "account_id": str(row.get("account_id") or ""),
+            "trade_date": _trade_date(
+                row.get("trade_date"), default_today=False,
+            ),
+            "anchor_run_uid": str(row.get("anchor_run_uid") or ""),
+            "anchor_current_canonical": bool(
+                _int((origin_context.get("runs") or {}).get(
+                    str(row.get("anchor_run_uid") or ""), {}
+                ).get("is_canonical"), 0)
+            ),
+            "verified_checkpoint": verified_checkpoint,
+            "verified_fact_chain": verified_fact_chain,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    return result
+
+
+def load_verified_funding_checkpoint_detail_source(
+    checkpoint_ref: dict[str, Any], *,
+    allow_superseded_revision: bool = False,
+) -> dict[str, Any]:
+    """Resolve one canonical checkpoint ref in a consistent read snapshot."""
+
+    if not isinstance(checkpoint_ref, dict):
+        raise ValueError("资金检查点明细引用必须是对象")
+    bound_connection = current_bound_sql_connection()
+    if bound_connection is not None:
+        return _load_verified_funding_checkpoint_sources(
+            [checkpoint_ref],
+            require_current_canonical=not allow_superseded_revision,
+        )[str(checkpoint_ref.get("checkpoint_id") or "")]
+    with get_engine().connect() as connection:
+        with connection.begin():
+            with bind_sql_connection(connection):
+                return _load_verified_funding_checkpoint_sources(
+                    [checkpoint_ref],
+                    require_current_canonical=(
+                        not allow_superseded_revision
+                    ),
+                )[str(checkpoint_ref.get("checkpoint_id") or "")]
+
+
+FUNDING_COMBINATION_RECIPE_DETAIL_SOURCE_SCHEMA = (
+    "probiga.verified-combination-recipe-detail-source.v1"
+)
+FUNDING_RECIPE_DETAIL_MEMBER_BATCH = 10
+
+
+def _load_verified_combination_recipe_detail_source(
+    *, run_uid: str, recipe_ref: dict[str, Any],
+    require_current_canonical: bool,
+) -> dict[str, Any]:
+    """Verify one recipe root and load member fact chains in bounded batches."""
+
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", str(run_uid or ""))
+        or not isinstance(recipe_ref, dict)
+        or recipe_ref.get("schema")
+        != "probiga.combination-member-fact-recipe.v1"
+        or recipe_ref.get("cash_fact_materialized") is not False
+        or recipe_ref.get("automatic_real_order_submission") is not False
+        or recipe_ref.get("real_order_authority") is not False
+        or recipe_ref.get("member_fact_sets_ready") is not True
+        or not _HASH_PATTERN.fullmatch(
+            str(recipe_ref.get("recipe_hash") or "")
+        )
+        or not _HASH_PATTERN.fullmatch(
+            str(recipe_ref.get("recipe_gate_hash") or "")
+        )
+    ):
+        raise ValueError("组合资金配方明细引用身份、哈希或权限合同无效")
+    key = str(recipe_ref.get("combination_key") or "")
+    version = str(recipe_ref.get("combination_version") or "")
+    trade_day = _trade_date(
+        recipe_ref.get("trade_date"), default_today=False,
+    )
+    members = recipe_ref.get("members")
+    if (
+        not key
+        or not version
+        or not isinstance(members, list)
+        or not 2 <= len(members) <= 50
+    ):
+        raise ValueError("组合资金配方成员数量或版本身份无效")
+    rows = _db_read(
+        "SELECT run_uid, trade_date, status, is_canonical, result_json, "
+        "result_hash FROM st_strategy_governance_run "
+        "WHERE run_uid=:run_uid LIMIT 2",
+        {"run_uid": run_uid},
+    )
+    if len(rows) != 1:
+        raise RuntimeError("组合资金配方治理运行不存在或身份重复")
+    run = dict(rows[0])
+    result_json = str(run.get("result_json") or "")
+    result_hash = str(run.get("result_hash") or "")
+    if len(result_json.encode("utf-8")) > FUNDING_CANONICAL_RESULT_MAX_BYTES:
+        raise RuntimeError("组合资金配方canonical结果超过4MiB读取硬上限")
+    result = _json(result_json, None)
+    if (
+        str(run.get("run_uid") or "") != run_uid
+        or str(run.get("status") or "") != "COMPLETED"
+        or (
+            require_current_canonical
+            and _int(run.get("is_canonical"), 0) != 1
+        )
+        or not _HASH_PATTERN.fullmatch(result_hash)
+        or hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        != result_hash
+        or not isinstance(result, dict)
+        or result.get("run_uid") != run_uid
+        or result.get("trade_date") != trade_day
+        or result.get("is_canonical") is not True
+        or result.get("decision_contract_version")
+        != STATISTICAL_DECISION_CONTRACT
+        or result.get("automatic_real_order_submission") is not False
+        or result.get("real_order_authority") is not False
+    ):
+        raise RuntimeError("组合资金配方治理运行锚无效")
+    manifest = result.get("funding_checkpoint_manifest")
+    combinations = result.get("combinations")
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema")
+        != "probiga.strategy-funding-checkpoint-manifest.v2"
+        or manifest.get("run_uid") != run_uid
+        or manifest.get("trade_date") != trade_day
+        or manifest.get("automatic_real_order_submission") is not False
+        or manifest.get("real_order_authority") is not False
+        or _checkpoint_canonical_hash({
+            field: value for field, value in manifest.items()
+            if field != "manifest_hash"
+        }) != str(manifest.get("manifest_hash") or "")
+        or not isinstance(combinations, list)
+    ):
+        raise RuntimeError("组合资金配方canonical清单无效")
+    matching_combinations = [
+        item for item in combinations
+        if isinstance(item, dict)
+        and str(item.get("combination_key") or "") == key
+        and str(item.get("current_version") or "") == version
+    ]
+    if len(matching_combinations) != 1:
+        raise RuntimeError("组合资金配方在canonical结果中不存在或重复")
+    combination = matching_combinations[0]
+    if (
+        combination.get("funding_recipe_ready") is not True
+        or combination.get("paper_allocation_eligible") is not True
+        or combination.get("combination_recipe_ref") != recipe_ref
+    ):
+        raise RuntimeError("组合资金配方未取得本轮模拟资金资格")
+    recipe_entries = [
+        _combination_recipe_manifest_entry(
+            item, trade_date=trade_day,
+        )
+        for item in combinations
+        if isinstance(item, dict)
+        and item.get("funding_recipe_ready") is True
+    ]
+    _verify_funding_manifest_batch_root(
+        manifest.get("combination_recipe_root"),
+        recipe_entries,
+        kind="COMBINATION_RECIPE",
+    )
+    target_entry = _combination_recipe_manifest_entry(
+        combination, trade_date=trade_day,
+    )
+    if sum(item == target_entry for item in recipe_entries) != 1:
+        raise RuntimeError("组合资金配方未精确进入compact清单根")
+    risk_constraint_binding = _validated_combination_risk_binding(
+        recipe_ref.get("risk_constraint_binding"),
+        constraint_evaluation=(
+            combination.get("constraint_evaluation")
+            if isinstance(combination.get("constraint_evaluation"), dict)
+            else None
+        ),
+    )
+
+    checkpoint_refs: list[dict[str, Any]] = []
+    seen_member_keys: set[str] = set()
+    total_weight = Decimal("0")
+    for member in members:
+        if not isinstance(member, dict):
+            raise RuntimeError("组合资金配方成员引用不是对象")
+        member_key = str(member.get("strategy_key") or "")
+        try:
+            weight = Decimal(str(member.get("weight")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RuntimeError("组合资金配方成员权重无效") from exc
+        if (
+            not member_key
+            or member_key in seen_member_keys
+            or not weight.is_finite()
+            or weight <= 0
+            or str(member.get("checkpoint_trade_date") or "")
+            != trade_day
+        ):
+            raise RuntimeError("组合资金配方成员身份、日期或权重无效")
+        seen_member_keys.add(member_key)
+        total_weight += weight
+        checkpoint_refs.append({
+            "checkpoint_id": str(member.get("checkpoint_id") or ""),
+            "strategy_key": member_key,
+            "strategy_version": str(
+                member.get("strategy_version") or ""
+            ),
+            "account_id": str(member.get("account_id") or ""),
+            "trade_date": trade_day,
+            "checkpoint_hash": str(
+                member.get("checkpoint_hash") or ""
+            ),
+            "chain_hash": str(member.get("chain_hash") or ""),
+            "history_fact_set_hash": str(
+                member.get("history_fact_set_hash") or ""
+            ),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        })
+    if (
+        members != sorted(members, key=lambda item: str(
+            item.get("strategy_key") or ""
+        ))
+        or abs(total_weight - Decimal("1")) > Decimal("0.00000005")
+    ):
+        raise RuntimeError("组合资金配方成员排序或权重不闭合")
+    sources: dict[str, dict[str, Any]] = {}
+    for offset in range(
+        0, len(checkpoint_refs), FUNDING_RECIPE_DETAIL_MEMBER_BATCH,
+    ):
+        batch = checkpoint_refs[
+            offset:offset + FUNDING_RECIPE_DETAIL_MEMBER_BATCH
+        ]
+        batch_sources = _load_verified_funding_checkpoint_sources(
+            batch,
+            require_current_canonical=require_current_canonical,
+        )
+        if set(sources) & set(batch_sources):
+            raise RuntimeError("组合资金配方成员检查点身份重复")
+        sources.update(batch_sources)
+    member_sources = []
+    for member, checkpoint_ref in zip(
+        members, checkpoint_refs, strict=True,
+    ):
+        source = sources.get(checkpoint_ref["checkpoint_id"])
+        if (
+            not isinstance(source, dict)
+            or source.get("anchor_run_uid") != run_uid
+            or source.get("strategy_key") != member["strategy_key"]
+            or source.get("strategy_version") != member["strategy_version"]
+            or source.get("account_id") != member["account_id"]
+            or source.get("trade_date") != trade_day
+        ):
+            raise RuntimeError("组合资金配方成员检查点跨运行、版本或账户")
+        member_sources.append({
+            "strategy_key": member["strategy_key"],
+            "strategy_version": member["strategy_version"],
+            "weight": member["weight"],
+            "checkpoint_id": checkpoint_ref["checkpoint_id"],
+            "source": source,
+        })
+    return {
+        "schema": FUNDING_COMBINATION_RECIPE_DETAIL_SOURCE_SCHEMA,
+        "run_uid": run_uid,
+        "combination_key": key,
+        "combination_version": version,
+        "trade_date": trade_day,
+        "recipe_hash": str(recipe_ref["recipe_hash"]),
+        "recipe_gate_hash": str(recipe_ref["recipe_gate_hash"]),
+        "risk_constraint_binding": risk_constraint_binding,
+        "recipe_entry": target_entry,
+        "member_count": len(member_sources),
+        "member_sources": member_sources,
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def load_verified_combination_recipe_detail_source(
+    *, run_uid: str, recipe_ref: dict[str, Any],
+    allow_superseded_revision: bool = False,
+) -> dict[str, Any]:
+    """Resolve a canonical recipe and all member fact chains atomically."""
+
+    bound_connection = current_bound_sql_connection()
+    if bound_connection is not None:
+        return _load_verified_combination_recipe_detail_source(
+            run_uid=run_uid,
+            recipe_ref=recipe_ref,
+            require_current_canonical=not allow_superseded_revision,
+        )
+    with get_engine().connect() as connection:
+        with connection.begin():
+            with bind_sql_connection(connection):
+                return _load_verified_combination_recipe_detail_source(
+                    run_uid=run_uid,
+                    recipe_ref=recipe_ref,
+                    require_current_canonical=(
+                        not allow_superseded_revision
+                    ),
+                )
+
+
 def _load_forward_records(
     as_of_date: str, registry: list[dict[str, Any]],
+    *, replay_plans: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    effective_replay_plans = (
+        replay_plans
+        if replay_plans is not None
+        else _load_funding_replay_plans(as_of_date, registry)
+    )
+    execution_policy = _authoritative_funding_execution_policy()
+    fee_schedule = execution_policy["fee_schedule"]
     current_versions = {
         str(row["strategy_key"]): str(row["current_version"])
         for row in registry
@@ -6227,6 +11769,39 @@ def _load_forward_records(
         )
         for row in registry
     }
+    replay_plan_bindings = []
+    for registry_row in registry:
+        key = str(registry_row.get("strategy_key") or "")
+        version = str(registry_row.get("current_version") or "")
+        plan = effective_replay_plans.get(key)
+        if not isinstance(plan, dict):
+            raise RuntimeError(f"策略{key}缺少同批已验证资金重放计划")
+        mode = str(plan.get("mode") or "")
+        state = plan.get("state")
+        if mode == "BOUNDED_INCREMENTAL":
+            if not isinstance(state, dict):
+                raise RuntimeError(f"策略{key}增量资金重放缺少检查点状态")
+            replay_plan_bindings.append({
+                "strategy_key": key,
+                "strategy_version": version,
+                "replay_mode": mode,
+                "checkpoint_id": str(plan.get("checkpoint_id") or ""),
+                "account_id": str(plan.get("account_id") or ""),
+                "checkpoint_date": str(plan.get("trade_date") or ""),
+                "holdings": state.get("holdings") or [],
+            })
+        elif mode == "FULL_BOOTSTRAP" and not plan.get("checkpoint_id"):
+            replay_plan_bindings.append({
+                "strategy_key": key,
+                "strategy_version": version,
+                "replay_mode": mode,
+                "checkpoint_id": "",
+                "account_id": "",
+                "checkpoint_date": "",
+                "holdings": [],
+            })
+        else:
+            raise RuntimeError(f"策略{key}资金重放模式或检查点绑定无效")
     if (
         _strict_table_exists("st_forward_trade_evidence_v3")
         and _strict_table_exists("st_forward_exit_allocation_v3")
@@ -6261,6 +11836,206 @@ def _load_forward_records(
         ):
             rows = _db_read(
                 """
+                WITH policy_bound_execution AS (
+                    SELECT execution.*
+                    FROM st_fill_execution_evidence_v2 execution
+                    WHERE BINARY execution.evidence_hash=
+                              BINARY execution.fill_execution_evidence_id
+                      AND BINARY execution.fee_profile_version=
+                              BINARY :funding_fee_profile_version
+                      AND BINARY execution.fee_security_type=
+                              BINARY :funding_fee_security_type
+                      AND JSON_VALID(execution.fee_schedule_json)
+                      AND BINARY execution.fee_schedule_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  execution.fee_schedule_json,
+                                  '}}'
+                              ), 256)
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.fee_profile_version'
+                          ))=BINARY execution.fee_profile_version
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.security_type'
+                          ))=BINARY :funding_fee_security_type
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.buy_commission_rate'
+                          ))=BINARY :funding_buy_commission_rate
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.sell_commission_rate'
+                          ))=BINARY :funding_sell_commission_rate
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.minimum_commission'
+                          ))=BINARY :funding_minimum_commission
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.stamp_tax_sell_rate'
+                          ))=BINARY :funding_stamp_tax_sell_rate
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.transfer_fee_buy_rate'
+                          ))=BINARY :funding_transfer_fee_buy_rate
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.transfer_fee_sell_rate'
+                          ))=BINARY :funding_transfer_fee_sell_rate
+                      AND JSON_TYPE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.other_fee_json'
+                          ))='STRING'
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.fee_schedule_json,
+                              '$.other_fee_json'
+                          ))=BINARY :funding_other_fee_json
+                      AND BINARY execution.instrument_rule_version=
+                              BINARY :funding_instrument_rule_version
+                      AND JSON_VALID(execution.instrument_rule_json)
+                      AND BINARY execution.instrument_rule_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  execution.instrument_rule_json,
+                                  '}}'
+                              ), 256)
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.instrument_rule_json,
+                              '$.rule_version'
+                          ))=BINARY :funding_instrument_rule_version
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.instrument_rule_json,
+                              '$.fee_profile_version'
+                          ))=BINARY :funding_fee_profile_version
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.instrument_rule_json,
+                              '$.stock_code'
+                          ))=BINARY execution.stock_code
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.instrument_rule_json,
+                              '$.security_type'
+                          ))=BINARY :funding_fee_security_type
+                      AND JSON_VALID(execution.accounting_request_json)
+                      AND BINARY execution.accounting_request_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  execution.accounting_request_json,
+                                  '}}'
+                              ), 256)
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.accounting_request_json,
+                              '$.fee_schedule_hash'
+                          ))=BINARY execution.fee_schedule_hash
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.accounting_request_json,
+                              '$.instrument_rule_hash'
+                          ))=BINARY execution.instrument_rule_hash
+                      AND JSON_VALID(execution.settlement_evidence_json)
+                      AND BINARY execution.settlement_evidence_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  execution.settlement_evidence_json,
+                                  '}}'
+                              ), 256)
+                      AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              execution.settlement_evidence_json,
+                              '$.instrument_rule_hash'
+                          ))=BINARY execution.instrument_rule_hash
+                ),
+                replay_plan AS (
+                    SELECT binding.strategy_key,
+                           binding.strategy_version,
+                           binding.replay_mode,
+                           binding.checkpoint_id,
+                           binding.account_id,
+                           binding.checkpoint_date AS trade_date,
+                           binding.holdings_json
+                    FROM JSON_TABLE(
+                        :funding_replay_plans,
+                        '$[*]' COLUMNS(
+                            strategy_key VARCHAR(80)
+                                PATH '$.strategy_key',
+                            strategy_version VARCHAR(160)
+                                PATH '$.strategy_version',
+                            replay_mode VARCHAR(24)
+                                PATH '$.replay_mode',
+                            checkpoint_id CHAR(64)
+                                PATH '$.checkpoint_id',
+                            account_id VARCHAR(64)
+                                PATH '$.account_id',
+                            checkpoint_date DATE
+                                PATH '$.checkpoint_date' NULL ON EMPTY,
+                            holdings_json JSON
+                                PATH '$.holdings'
+                        )
+                    ) binding
+                ),
+                current_checkpoint AS (
+                    SELECT * FROM replay_plan
+                    WHERE replay_mode='BOUNDED_INCREMENTAL'
+                ),
+                checkpoint_holding AS (
+                    SELECT cp.strategy_key, cp.strategy_version,
+                           cp.account_id, held.evidence_id
+                    FROM current_checkpoint cp
+                    JOIN JSON_TABLE(
+                        cp.holdings_json,
+                        '$[*]' COLUMNS(
+                            evidence_id VARCHAR(160)
+                                PATH '$.evidence_id'
+                        )
+                    ) held
+                ),
+                selected_evidence AS (
+                    SELECT e.*
+                    FROM st_forward_trade_evidence_v3 e
+                    JOIN replay_plan cp
+                      ON cp.strategy_key=e.strategy_key
+                     AND BINARY cp.strategy_version=BINARY e.strategy_version
+                    WHERE e.evidence_status IN (
+                        'MATURED', 'OPEN', 'PARTIALLY_CLOSED'
+                    )
+                      AND e.evidence_kind='EXECUTED_PAPER'
+                      AND e.protocol_version='PAPER_EXECUTED_LEDGER_V1'
+                      AND e.sample_owner_role='PRIMARY'
+                      AND e.attribution_status IN (
+                          'VERIFIED_SNAPSHOT',
+                          'LEGACY_VERSION_DERIVED',
+                          'LEGACY_SINGLE_STRATEGY_RESOLVED'
+                      )
+                      AND e.strategy_version<>''
+                      AND DATE(e.entry_at)<=:as_of_date
+                      AND (
+                          cp.replay_mode='FULL_BOOTSTRAP'
+                          OR (
+                              cp.replay_mode='BOUNDED_INCREMENTAL'
+                              AND cp.account_id=e.account_id
+                              AND e.entry_trade_date>cp.trade_date
+                          )
+                      )
+                    UNION ALL
+                    SELECT e.*
+                    FROM checkpoint_holding held
+                    JOIN st_forward_trade_evidence_v3 e
+                      ON e.evidence_id=held.evidence_id
+                     AND e.strategy_key=held.strategy_key
+                     AND BINARY e.strategy_version=
+                         BINARY held.strategy_version
+                     AND e.account_id=held.account_id
+                    WHERE DATE(e.entry_at)<=:as_of_date
+                ),
+                selected_exit_fill AS (
+                    SELECT DISTINCT allocation.exit_fill_id
+                    FROM st_forward_exit_allocation_v3 allocation
+                    JOIN selected_evidence selected_parent
+                      ON selected_parent.evidence_id=allocation.evidence_id
+                )
                 SELECT e.evidence_id, e.account_id, e.stock_code,
                        e.source_run_uid, e.source_forecast_id,
                        e.source_intent_id, e.entry_order_id,
@@ -6271,6 +12046,11 @@ def _load_forward_records(
                        DATE(exit_at) AS trade_date,
                        e.realized_net_return_pct AS return_pct,
                        e.entry_gross_cny, e.entry_fee_cny,
+                       bound_entry_execution.fee_profile_version
+                           AS entry_fee_profile_version,
+                       bound_entry_execution.fee_schedule_hash
+                           AS entry_fee_schedule_hash,
+                       1 AS entry_fee_policy_binding_count,
                        e.exit_gross_cny, e.exit_fee_cny,
                        e.evidence_status,
                        intent_buy.buy_fill_count
@@ -6359,7 +12139,7 @@ def _load_forward_records(
                               IS NOT NULL
                           AND entry_binding.fill_execution_evidence_hash
                               IS NOT NULL
-                         JOIN st_fill_execution_evidence_v2 entry_execution
+                         JOIN policy_bound_execution entry_execution
                            ON entry_execution.fill_execution_evidence_id=
                               entry_binding.fill_execution_evidence_id
                           AND entry_execution.evidence_hash=
@@ -6372,6 +12152,40 @@ def _load_forward_records(
                               entry_fill.stock_code
                           AND entry_execution.executed_at=
                               entry_fill.filled_at
+                          AND entry_execution.history_origin=
+                              'COMPLETE_FROM_DECLARED_ORIGIN'
+                          AND entry_execution.authority_status=
+                              'CONTENT_HASH_ONLY'
+                          AND BINARY entry_execution.fee_profile_version=
+                              BINARY :funding_fee_profile_version
+                          AND JSON_VALID(
+                              entry_execution.fee_schedule_json
+                          )
+                          AND BINARY entry_execution.fee_schedule_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  entry_execution.fee_schedule_json,
+                                  '}}'
+                              ), 256)
+                          AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              entry_execution.fee_schedule_json,
+                              '$.fee_profile_version'
+                          ))=BINARY entry_execution.fee_profile_version
+                          AND JSON_VALID(
+                              entry_execution.accounting_request_json
+                          )
+                          AND BINARY entry_execution.accounting_request_hash=
+                              BINARY SHA2(CONCAT(
+                                  '{"namespace":"trading-v2.canonical-json.v1",',
+                                  '"payload":{"value":',
+                                  entry_execution.accounting_request_json,
+                                  '}}'
+                              ), 256)
+                          AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                              entry_execution.accounting_request_json,
+                              '$.fee_schedule_hash'
+                          ))=BINARY entry_execution.fee_schedule_hash
                           AND JSON_VALID(entry_execution.fill_payload_json)
                           AND BINARY entry_execution.fill_payload_hash=
                               BINARY SHA2(CONCAT(
@@ -6467,6 +12281,9 @@ def _load_forward_records(
                            exit_alloc.exit_allocation_protocol_count, 0
                        ) AS exit_allocation_protocol_count,
                        COALESCE(
+                           exit_alloc.exit_fee_policy_binding_count, 0
+                       ) AS exit_fee_policy_binding_count,
+                       COALESCE(
                            exit_alloc.exit_fill_trade_day_count, 0
                        ) AS exit_fill_trade_day_count,
                        exit_alloc.exit_fill_latest_at,
@@ -6480,7 +12297,7 @@ def _load_forward_records(
                            exit_alloc.exit_fill_fee_sum, 0
                        ) AS exit_fill_fee_sum,
                        e.strategy_version AS bound_strategy_version
-                FROM st_forward_trade_evidence_v3 e
+                FROM selected_evidence e
                 INNER JOIN st_strategy_registry current_strategy
                   ON current_strategy.strategy_key=e.strategy_key
                  AND BINARY current_strategy.current_version=
@@ -6494,6 +12311,60 @@ def _load_forward_records(
                  AND source_intent.reason_code IN (
                      'V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE'
                  )
+                INNER JOIN st_fill_v2 bound_entry_fill
+                  ON bound_entry_fill.fill_id=e.entry_fill_id
+                 AND bound_entry_fill.order_id=e.entry_order_id
+                 AND bound_entry_fill.account_id=e.account_id
+                 AND bound_entry_fill.stock_code=e.stock_code
+                 AND bound_entry_fill.side='BUY'
+                INNER JOIN policy_bound_execution
+                           bound_entry_execution
+                  ON bound_entry_execution.fill_id=
+                     bound_entry_fill.fill_id
+                 AND bound_entry_execution.order_id=
+                     bound_entry_fill.order_id
+                 AND bound_entry_execution.account_id=
+                     bound_entry_fill.account_id
+                 AND bound_entry_execution.stock_code=
+                     bound_entry_fill.stock_code
+                 AND bound_entry_execution.executed_at=
+                     bound_entry_fill.filled_at
+                 AND bound_entry_execution.history_origin=
+                     'COMPLETE_FROM_DECLARED_ORIGIN'
+                 AND bound_entry_execution.authority_status=
+                     'CONTENT_HASH_ONLY'
+                 AND BINARY bound_entry_execution.evidence_hash=
+                     BINARY bound_entry_execution.fill_execution_evidence_id
+                 AND BINARY bound_entry_execution.fee_profile_version=
+                     BINARY :funding_fee_profile_version
+                 AND JSON_VALID(
+                     bound_entry_execution.fee_schedule_json
+                 )
+                 AND BINARY bound_entry_execution.fee_schedule_hash=
+                     BINARY SHA2(CONCAT(
+                         '{"namespace":"trading-v2.canonical-json.v1",',
+                         '"payload":{"value":',
+                         bound_entry_execution.fee_schedule_json,
+                         '}}'
+                     ), 256)
+                 AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                     bound_entry_execution.fee_schedule_json,
+                     '$.fee_profile_version'
+                 ))=BINARY bound_entry_execution.fee_profile_version
+                 AND JSON_VALID(
+                     bound_entry_execution.accounting_request_json
+                 )
+                 AND BINARY bound_entry_execution.accounting_request_hash=
+                     BINARY SHA2(CONCAT(
+                         '{"namespace":"trading-v2.canonical-json.v1",',
+                         '"payload":{"value":',
+                         bound_entry_execution.accounting_request_json,
+                         '}}'
+                     ), 256)
+                 AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                     bound_entry_execution.accounting_request_json,
+                     '$.fee_schedule_hash'
+                 ))=BINARY bound_entry_execution.fee_schedule_hash
                 INNER JOIN (
                     SELECT buy_order.intent_id, raw_buy.account_id,
                            raw_buy.stock_code,
@@ -6507,6 +12378,14 @@ def _load_forward_records(
                      AND buy_order.account_id=raw_buy.account_id
                      AND buy_order.stock_code=raw_buy.stock_code
                      AND buy_order.side='BUY'
+                    JOIN (
+                        SELECT DISTINCT source_intent_id, account_id,
+                                        stock_code
+                        FROM selected_evidence
+                    ) selected_buy
+                      ON selected_buy.source_intent_id=buy_order.intent_id
+                     AND selected_buy.account_id=raw_buy.account_id
+                     AND selected_buy.stock_code=raw_buy.stock_code
                     WHERE raw_buy.side='BUY'
                     GROUP BY buy_order.intent_id, raw_buy.account_id,
                              raw_buy.stock_code
@@ -6541,6 +12420,12 @@ def _load_forward_records(
                                     'PAPER_FIFO_EXIT_ALLOCATION_V1'
                                THEN 1 ELSE 0 END
                            ) AS exit_allocation_protocol_count,
+                           SUM(CASE
+                               WHEN detail.fill_binding_valid=1
+                                AND detail.cash_binding_count=1
+                                AND detail.fee_policy_binding_count=1
+                               THEN 1 ELSE 0 END
+                           ) AS exit_fee_policy_binding_count,
                            COUNT(DISTINCT DATE(detail.exit_filled_at))
                                AS exit_fill_trade_day_count,
                            MAX(detail.exit_filled_at)
@@ -6562,6 +12447,9 @@ def _load_forward_records(
                                allocation.allocation_protocol_version,
                                COALESCE(sell_truth.valid_binding_count, 0)
                                    AS cash_binding_count,
+                               COALESCE(
+                                   sell_truth.fee_policy_binding_count, 0
+                               ) AS fee_policy_binding_count,
                                CASE WHEN
                                    allocation.account_id=parent.account_id
                                    AND allocation.stock_code=parent.stock_code
@@ -6628,7 +12516,7 @@ def _load_forward_records(
                                    THEN 1 ELSE 0
                                END AS global_conservation_valid
                         FROM st_forward_exit_allocation_v3 allocation
-                        JOIN st_forward_trade_evidence_v3 parent
+                        JOIN selected_evidence parent
                           ON parent.evidence_id=allocation.evidence_id
                         LEFT JOIN st_fill_v2 raw_sell
                           ON raw_sell.fill_id=allocation.exit_fill_id
@@ -6737,22 +12625,27 @@ def _load_forward_records(
                                        THEN 1 ELSE 0 END
                                    ) AS valid_row_count
                             FROM (
-                                SELECT exit_fill_id,
+                                SELECT allocation_total.exit_fill_id,
                                        COUNT(*) AS allocation_row_count,
-                                       COUNT(DISTINCT allocation_sequence)
+                                       COUNT(DISTINCT
+                                             allocation_total.allocation_sequence)
                                            AS distinct_sequence_count,
-                                       MIN(allocation_sequence)
+                                       MIN(allocation_total.allocation_sequence)
                                            AS minimum_sequence,
-                                       MAX(allocation_sequence)
+                                       MAX(allocation_total.allocation_sequence)
                                            AS maximum_sequence,
-                                       SUM(allocated_quantity)
+                                       SUM(allocation_total.allocated_quantity)
                                            AS allocated_quantity,
-                                       SUM(allocated_gross_cny)
+                                       SUM(allocation_total.allocated_gross_cny)
                                            AS allocated_gross_cny,
-                                       SUM(allocated_fee_cny)
+                                       SUM(allocation_total.allocated_fee_cny)
                                            AS allocated_fee_cny
                                 FROM st_forward_exit_allocation_v3
-                                GROUP BY exit_fill_id
+                                     allocation_total
+                                JOIN selected_exit_fill scoped_exit
+                                  ON scoped_exit.exit_fill_id=
+                                     allocation_total.exit_fill_id
+                                GROUP BY allocation_total.exit_fill_id
                             ) totals
                             JOIN st_forward_exit_allocation_v3 member
                               ON member.exit_fill_id=totals.exit_fill_id
@@ -6777,8 +12670,12 @@ def _load_forward_records(
                             SELECT sell_cash.account_id,
                                    sell_cash.related_fill_id,
                                    sell_cash.related_order_id,
-                                   COUNT(*) AS valid_binding_count
+                                   COUNT(*) AS valid_binding_count,
+                                   COUNT(*) AS fee_policy_binding_count
                             FROM st_cash_ledger_v2 sell_cash
+                            JOIN selected_exit_fill scoped_sell
+                              ON scoped_sell.exit_fill_id=
+                                 sell_cash.related_fill_id
                             JOIN st_fill_v2 bound_sell_fill
                               ON bound_sell_fill.fill_id=
                                  sell_cash.related_fill_id
@@ -6855,7 +12752,7 @@ def _load_forward_records(
                                  IS NOT NULL
                              AND sell_binding.fill_execution_evidence_hash
                                  IS NOT NULL
-                            JOIN st_fill_execution_evidence_v2 sell_execution
+                            JOIN policy_bound_execution sell_execution
                               ON sell_execution.fill_execution_evidence_id=
                                  sell_binding.fill_execution_evidence_id
                              AND sell_execution.evidence_hash=
@@ -6870,6 +12767,40 @@ def _load_forward_records(
                                  bound_sell_fill.stock_code
                              AND sell_execution.executed_at=
                                  bound_sell_fill.filled_at
+                             AND sell_execution.history_origin=
+                                 'COMPLETE_FROM_DECLARED_ORIGIN'
+                             AND sell_execution.authority_status=
+                                 'CONTENT_HASH_ONLY'
+                             AND BINARY sell_execution.fee_profile_version=
+                                 BINARY :funding_fee_profile_version
+                             AND JSON_VALID(
+                                 sell_execution.fee_schedule_json
+                             )
+                             AND BINARY sell_execution.fee_schedule_hash=
+                                 BINARY SHA2(CONCAT(
+                                     '{"namespace":"trading-v2.canonical-json.v1",',
+                                     '"payload":{"value":',
+                                     sell_execution.fee_schedule_json,
+                                     '}}'
+                                 ), 256)
+                             AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                                 sell_execution.fee_schedule_json,
+                                 '$.fee_profile_version'
+                             ))=BINARY sell_execution.fee_profile_version
+                             AND JSON_VALID(
+                                 sell_execution.accounting_request_json
+                             )
+                             AND BINARY sell_execution.accounting_request_hash=
+                                 BINARY SHA2(CONCAT(
+                                     '{"namespace":"trading-v2.canonical-json.v1",',
+                                     '"payload":{"value":',
+                                     sell_execution.accounting_request_json,
+                                     '}}'
+                                 ), 256)
+                             AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                                 sell_execution.accounting_request_json,
+                                 '$.fee_schedule_hash'
+                             ))=BINARY sell_execution.fee_schedule_hash
                              AND JSON_VALID(
                                  sell_execution.fill_payload_json
                              )
@@ -6963,8 +12894,90 @@ def _load_forward_records(
                 AND DATE(e.entry_at) <= :as_of_date
                 ORDER BY e.entry_at, e.evidence_id
                 """,
-                {"as_of_date": as_of_date},
+                {
+                    "as_of_date": as_of_date,
+                    "funding_fee_profile_version": execution_policy[
+                        "fee_profile_version"
+                    ],
+                    "funding_fee_security_type": fee_schedule[
+                        "security_type"
+                    ],
+                    "funding_buy_commission_rate": fee_schedule[
+                        "buy_commission_rate"
+                    ],
+                    "funding_sell_commission_rate": fee_schedule[
+                        "sell_commission_rate"
+                    ],
+                    "funding_minimum_commission": fee_schedule[
+                        "minimum_commission"
+                    ],
+                    "funding_stamp_tax_sell_rate": fee_schedule[
+                        "stamp_tax_sell_rate"
+                    ],
+                    "funding_transfer_fee_buy_rate": fee_schedule[
+                        "transfer_fee_buy_rate"
+                    ],
+                    "funding_transfer_fee_sell_rate": fee_schedule[
+                        "transfer_fee_sell_rate"
+                    ],
+                    "funding_other_fee_json": fee_schedule[
+                        "other_fee_json"
+                    ],
+                    "funding_instrument_rule_version": execution_policy[
+                        "instrument_rule_version"
+                    ],
+                    "funding_replay_plans": _json_text(
+                        replay_plan_bindings
+                    ),
+                },
             )
+            open_anomalies = _db_read(
+                "WITH replay_plan AS ("
+                " SELECT binding.strategy_key, binding.strategy_version, "
+                " binding.account_id, binding.checkpoint_date, "
+                " binding.holdings_json "
+                " FROM JSON_TABLE(:funding_replay_plans, '$[*]' COLUMNS("
+                " strategy_key VARCHAR(80) PATH '$.strategy_key', "
+                " strategy_version VARCHAR(160) PATH '$.strategy_version', "
+                " replay_mode VARCHAR(24) PATH '$.replay_mode', "
+                " account_id VARCHAR(64) PATH '$.account_id', "
+                " checkpoint_date DATE PATH '$.checkpoint_date' NULL ON EMPTY, "
+                " holdings_json JSON PATH '$.holdings')) binding "
+                " WHERE binding.replay_mode='BOUNDED_INCREMENTAL'"
+                "), checkpoint_holding AS ("
+                " SELECT plan.strategy_key, plan.strategy_version, "
+                " plan.account_id, held.evidence_id "
+                " FROM replay_plan plan JOIN JSON_TABLE("
+                " plan.holdings_json, '$[*]' COLUMNS("
+                " evidence_id VARCHAR(160) PATH '$.evidence_id')) held"
+                ") SELECT plan.strategy_key, COUNT(*) AS anomaly_count, "
+                " MIN(e.evidence_id) AS first_anomaly_id "
+                " FROM replay_plan plan "
+                " JOIN st_forward_trade_evidence_v3 e "
+                " ON e.strategy_key=plan.strategy_key "
+                " AND BINARY e.strategy_version=BINARY plan.strategy_version "
+                " AND e.account_id=plan.account_id "
+                " LEFT JOIN checkpoint_holding held "
+                " ON held.strategy_key=e.strategy_key "
+                " AND BINARY held.strategy_version=BINARY e.strategy_version "
+                " AND held.account_id=e.account_id "
+                " AND held.evidence_id=e.evidence_id "
+                " WHERE e.entry_trade_date<=plan.checkpoint_date "
+                " AND e.evidence_status IN ('OPEN','PARTIALLY_CLOSED') "
+                " AND e.evidence_kind='EXECUTED_PAPER' "
+                " AND e.protocol_version='PAPER_EXECUTED_LEDGER_V1' "
+                " AND e.sample_owner_role='PRIMARY' "
+                " AND held.evidence_id IS NULL "
+                " GROUP BY plan.strategy_key ORDER BY plan.strategy_key",
+                {"funding_replay_plans": _json_text(replay_plan_bindings)},
+            )
+            if open_anomalies:
+                first = open_anomalies[0]
+                raise RuntimeError(
+                    "资金检查点遗漏跨窗未平仓权威证据："
+                    f"{first.get('strategy_key')} / "
+                    f"{first.get('first_anomaly_id')}"
+                )
             for row in rows:
                 key = str(row.get("strategy_key") or "")
                 if (
@@ -6988,6 +13001,11 @@ def _load_forward_records(
                         )
                     records[key].append({
                         **row,
+                        "funding_replay_mode": str(
+                            (effective_replay_plans.get(key) or {}).get(
+                                "mode"
+                            ) or "FULL_BOOTSTRAP"
+                        ),
                         "is_net_return": (
                             str(row.get("evidence_status") or "") == "MATURED"
                         ),
@@ -7008,19 +13026,185 @@ def _load_forward_records(
     return records
 
 
+_LEDGER_PREFETCH_BATCH_SIZE = 500
+
+
+def _prefetch_internal_strategy_ledger_facts(
+    records_by_strategy: dict[str, list[dict[str, Any]]],
+    *, as_of_date: str,
+    replay_plans: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Load shared calendar, account and QMT marks in bounded batches."""
+
+    start_days: list[str] = []
+    stock_codes: set[str] = set()
+    account_ids: set[str] = set()
+    for strategy_key, records in records_by_strategy.items():
+        replay_plan = (replay_plans or {}).get(strategy_key) or {}
+        checkpoint_day = str(replay_plan.get("trade_date") or "")
+        if replay_plan.get("mode") == "BOUNDED_INCREMENTAL":
+            if not checkpoint_day:
+                raise RuntimeError("增量资金重放计划缺少检查点日期")
+            start_days.append(checkpoint_day)
+        for row in records:
+            try:
+                entry_day = _trade_date(
+                    row.get("entry_trade_date") or row.get("entry_at"),
+                    default_today=False,
+                )
+                if replay_plan.get("mode") != "BOUNDED_INCREMENTAL":
+                    start_days.append(entry_day)
+            except (TypeError, ValueError):
+                # The ledger validator below owns the fail-closed diagnostic.
+                pass
+            code = str(row.get("stock_code") or "")
+            if re.fullmatch(r"[0-9]{6}", code):
+                stock_codes.add(code)
+            account_id = str(row.get("account_id") or "")
+            if account_id:
+                account_ids.add(account_id)
+    for strategy_key, replay_plan in (replay_plans or {}).items():
+        if replay_plan.get("mode") != "BOUNDED_INCREMENTAL":
+            continue
+        checkpoint_day = str(replay_plan.get("trade_date") or "")
+        account_id = str(replay_plan.get("account_id") or "")
+        state = replay_plan.get("state")
+        if not checkpoint_day or not account_id or not isinstance(state, dict):
+            raise RuntimeError(
+                f"策略{strategy_key}增量资金重放计划不完整"
+            )
+        start_days.append(checkpoint_day)
+        account_ids.add(account_id)
+        for holding in state.get("holdings") or []:
+            code = str((holding or {}).get("stock_code") or "")
+            if re.fullmatch(r"[0-9]{6}", code):
+                stock_codes.add(code)
+    if not start_days:
+        return {"calendar_rows": [], "price_rows": [], "account_rows": []}
+    earliest = min(start_days)
+    calendar_receipt = _immutable_calendar_receipt(
+        start_date=earliest,
+        end_date=as_of_date,
+        decision_known_at=f"{as_of_date} 23:59:59",
+    )
+    calendar_rows = [
+        {"trade_date": day}
+        for day in calendar_receipt.sessions_between(earliest, as_of_date)
+    ]
+    calendar_binding = _calendar_receipt_binding(calendar_receipt)
+    price_rows: list[dict[str, Any]] = []
+    ordered_codes = sorted(stock_codes)
+    for offset in range(0, len(ordered_codes), _LEDGER_PREFETCH_BATCH_SIZE):
+        batch = ordered_codes[offset: offset + _LEDGER_PREFETCH_BATCH_SIZE]
+        code_params = {
+            f"code_{index}": code for index, code in enumerate(batch)
+        }
+        placeholders = ",".join(f":{key}" for key in code_params)
+        price_rows.extend(_db_read(
+            "SELECT k.stock_code, k.trade_date, k.close, k.pre_close, "
+            "k.data_source, k.quality_status, k.permission_status, "
+            "k.source_time, k.received_at, k.batch_id, k.data_version, "
+            "a.attestation_id, a.protocol_version "
+            "AS pre_close_attestation_protocol, "
+            "a.source_pre_close_origin "
+            "FROM sm_stock_kline k "
+            "JOIN qmt_kline_attestation_row a ON a.target_id=k.id "
+            "AND BINARY a.protocol_version=BINARY :protocol_version "
+            "AND BINARY a.source_data_version=BINARY k.data_version "
+            "AND a.qmt_id>0 AND a.trade_date=k.trade_date "
+            "AND BINARY a.stock_code=BINARY k.stock_code "
+            "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
+            "a.protocol_version, a.target_id, a.qmt_id, "
+            "a.source_data_version, a.source_pre_close, "
+            "a.attested_open, a.attested_close, a.attested_high, "
+            "a.attested_low, a.attested_volume, a.attested_amount), 256) "
+            "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
+            "AND a.source_pre_close=k.pre_close "
+            "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
+            "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
+            "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
+            "WHERE k.k_type=1 AND k.adjust_type=0 "
+            f"AND k.stock_code IN ({placeholders}) "
+            "AND k.trade_date BETWEEN :start_day AND :as_of_date "
+            "ORDER BY k.trade_date, k.stock_code",
+            {
+                **code_params,
+                "start_day": earliest,
+                "as_of_date": as_of_date,
+                "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
+            },
+        ))
+    account_rows: list[dict[str, Any]] = []
+    ordered_accounts = sorted(account_ids)
+    for offset in range(0, len(ordered_accounts), _LEDGER_PREFETCH_BATCH_SIZE):
+        batch = ordered_accounts[offset: offset + _LEDGER_PREFETCH_BATCH_SIZE]
+        account_params = {
+            f"account_{index}": account_id
+            for index, account_id in enumerate(batch)
+        }
+        placeholders = ",".join(f":{key}" for key in account_params)
+        account_rows.extend(_db_read(
+        "SELECT account_id, status, initial_cash, policy_version, "
+        "policy_hash, fee_profile_version, instrument_rule_version, "
+        "real_trading_enabled, created_at "
+            f"FROM st_trade_account_v2 WHERE account_id IN ({placeholders}) "
+            "ORDER BY account_id",
+            account_params,
+        ))
+    return {
+        "calendar_rows": calendar_rows,
+        "price_rows": price_rows,
+        "account_rows": account_rows,
+        "calendar_receipt": calendar_binding,
+        "calendar_slice_hash": _digest({
+            "schema": "probiga.internal-ledger-calendar-slice.v1",
+            "start_date": earliest,
+            "end_date": as_of_date,
+            "sessions": [row["trade_date"] for row in calendar_rows],
+            "calendar_receipt_binding_hash": calendar_binding[
+                "binding_hash"
+            ],
+        }),
+        "start_day": earliest,
+        "as_of_date": as_of_date,
+        "batch_size": _LEDGER_PREFETCH_BATCH_SIZE,
+    }
+
+
 def _internal_strategy_portfolio_ledger(
     records: list[dict[str, Any]], *, as_of_date: str,
     strategy_key: str, strategy_version: str, version_hash: str,
     execution_binding_hash: str | None = None,
+    prefetched_facts: dict[str, Any] | None = None,
+    replay_plan: dict[str, Any] | None = None,
+    candidate_run_uid: str = "",
 ) -> dict[str, Any]:
     """Rebuild a version-bound, unlevered virtual sleeve from internal fills."""
 
-    if not records:
+    effective_replay_plan = dict(replay_plan or {})
+    replay_mode = str(
+        effective_replay_plan.get("mode") or "FULL_BOOTSTRAP"
+    )
+    checkpoint_state = effective_replay_plan.get("state")
+    incremental = replay_mode == "BOUNDED_INCREMENTAL"
+    if incremental and not isinstance(checkpoint_state, dict):
+        return {"valid": False, "reason": "增量资金重放缺少已锚定检查点状态"}
+    if not incremental and replay_mode != "FULL_BOOTSTRAP":
+        return {"valid": False, "reason": "资金重放模式无效"}
+    if not records and not incremental:
         return {"valid": False, "reason": "没有版本绑定的内部成交"}
     try:
         account_ids = {str(row.get("account_id") or "") for row in records}
+        if incremental:
+            checkpoint_account_id = str(
+                checkpoint_state.get("account_id") or ""
+            )
+            if account_ids and account_ids != {checkpoint_account_id}:
+                raise ValueError("增量资金重放混入其他模拟账户")
+            account_ids = {checkpoint_account_id}
         if len(account_ids) != 1 or "" in account_ids:
             raise ValueError("内部组合账本必须绑定唯一模拟账户")
+        execution_policy = _authoritative_funding_execution_policy()
         if not _HASH_PATTERN.fullmatch(str(version_hash or "")):
             raise ValueError("内部组合账本缺少不可变策略版本哈希")
         effective_execution_binding_hash = (
@@ -7033,6 +13217,48 @@ def _internal_strategy_portfolio_ledger(
         ):
             raise ValueError("内部组合账本缺少适配器与成本模型绑定哈希")
         account_id = next(iter(account_ids))
+        checkpoint_day = ""
+        checkpoint_holdings: dict[str, dict[str, Any]] = {}
+        max_holding_days = _int(
+            effective_replay_plan.get("max_holding_days"), 0
+        )
+        if not 1 <= max_holding_days <= 250:
+            raise ValueError("资金重放计划最大持有期无效")
+        if incremental:
+            checkpoint_day = _trade_date(
+                checkpoint_state.get("trade_date"), default_today=False,
+            )
+            if (
+                checkpoint_day >= as_of_date
+                or checkpoint_state.get("schema")
+                != FUNDING_CHECKPOINT_SCHEMA
+                or checkpoint_state.get("strategy_key") != strategy_key
+                or checkpoint_state.get("strategy_version")
+                != strategy_version
+                or checkpoint_state.get("strategy_version_hash")
+                != version_hash
+                or checkpoint_state.get("account_id") != account_id
+                or _int(checkpoint_state.get("max_holding_days"), -1)
+                != max_holding_days
+                or str(
+                    checkpoint_state.get("execution_binding_hash") or ""
+                ) != (effective_execution_binding_hash or "")
+                or str(
+                    checkpoint_state.get("funding_execution_policy_hash")
+                    or ""
+                ) != execution_policy["policy_hash"]
+                or str(checkpoint_state.get("fee_profile_version") or "")
+                != execution_policy["fee_profile_version"]
+                or str(
+                    checkpoint_state.get("instrument_rule_version") or ""
+                ) != execution_policy["instrument_rule_version"]
+            ):
+                raise ValueError("增量资金检查点版本、账户或执行绑定无效")
+            for item in checkpoint_state.get("holdings") or []:
+                evidence_id = str((item or {}).get("evidence_id") or "")
+                if not evidence_id or evidence_id in checkpoint_holdings:
+                    raise ValueError("增量资金检查点持仓身份重复")
+                checkpoint_holdings[evidence_id] = dict(item)
         normalized: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         codes: set[str] = set()
@@ -7049,6 +13275,15 @@ def _internal_strategy_portfolio_ledger(
             status = str(row.get("evidence_status") or "")
             entry_cash_binding_count = _int(
                 row.get("entry_cash_binding_count"), 0
+            )
+            entry_fee_policy_binding_count = _int(
+                row.get("entry_fee_policy_binding_count"), 0
+            )
+            entry_fee_profile_version = str(
+                row.get("entry_fee_profile_version") or ""
+            )
+            entry_fee_schedule_hash = str(
+                row.get("entry_fee_schedule_hash") or ""
             )
             entry_day = _trade_date(
                 row.get("entry_trade_date") or row.get("entry_at"),
@@ -7072,6 +13307,7 @@ def _internal_strategy_portfolio_ledger(
                     "exit_order_binding_count", "exit_cash_binding_count",
                     "exit_global_conservation_count",
                     "exit_allocation_protocol_count",
+                    "exit_fee_policy_binding_count",
                     "exit_fill_trade_day_count", "exit_fill_quantity_sum",
                 ):
                     row[field] = 0
@@ -7093,8 +13329,14 @@ def _internal_strategy_portfolio_ledger(
                 or not re.fullmatch(r"[0-9]{6}", code)
                 or not entry_at or quantity <= 0 or entry_day > as_of_date
                 or entry_cash_binding_count != 1
+                or entry_fee_policy_binding_count != 1
+                or entry_fee_profile_version
+                != execution_policy["fee_profile_version"]
+                or not _HASH_PATTERN.fullmatch(entry_fee_schedule_hash)
             ):
-                raise ValueError("内部成交的编号、证券、数量、日期或买入现金绑定不满足组合账本协议")
+                raise ValueError(
+                    "内部成交的编号、证券、数量、日期、买入现金或冻结费用策略绑定不满足组合账本协议"
+                )
             if status == "PARTIALLY_CLOSED":
                 raise ValueError("聚合证据无法还原部分平仓现金时点，资金证据拒绝该样本")
             if status == "MATURED":
@@ -7137,6 +13379,9 @@ def _internal_strategy_portfolio_ledger(
                     ) != exit_allocation_count
                     or _int(
                         row.get("exit_allocation_protocol_count"), 0
+                    ) != exit_allocation_count
+                    or _int(
+                        row.get("exit_fee_policy_binding_count"), 0
                     ) != exit_allocation_count
                     or _int(row.get("exit_fill_trade_day_count"), 0) != 1
                     or not exit_fill_latest_at
@@ -7206,6 +13451,36 @@ def _internal_strategy_portfolio_ledger(
                 reported = Decimal(str(row.get("return_pct") or "0"))
                 if not reported.is_finite() or abs(reported - realized) > Decimal("0.0001"):
                     raise ValueError("内部成交净收益率无法由现金事实重算")
+            if incremental:
+                prior_holding = checkpoint_holdings.get(evidence_id)
+                if prior_holding is None and entry_day <= checkpoint_day:
+                    raise ValueError("增量资金重放加载了检查点边界前的非持仓成交")
+                if prior_holding is not None:
+                    try:
+                        holding_matches = bool(
+                            prior_holding.get("source_intent_id")
+                            == source_intent_id
+                            and prior_holding.get("stock_code") == code
+                            and _int(prior_holding.get("quantity"), -1)
+                            == quantity
+                            and prior_holding.get("entry_day") == entry_day
+                            and Decimal(str(
+                                prior_holding.get("entry_price") or "0"
+                            )) == numeric["entry_price"]
+                            and Decimal(str(
+                                prior_holding.get("entry_gross_cny") or "0"
+                            )) == numeric["entry_gross_cny"]
+                            and Decimal(str(
+                                prior_holding.get("entry_fee_cny") or "0"
+                            )) == numeric["entry_fee_cny"]
+                            and (
+                                not exit_day or exit_day > checkpoint_day
+                            )
+                        )
+                    except (InvalidOperation, TypeError, ValueError):
+                        holding_matches = False
+                    if not holding_matches:
+                        raise ValueError("增量资金检查点持仓与当前成交事实不一致")
             normalized.append({
                 "evidence_id": evidence_id,
                 "source_intent_id": source_intent_id,
@@ -7217,6 +13492,11 @@ def _internal_strategy_portfolio_ledger(
                 "status": status,
                 "quantity": quantity,
                 "entry_cash_binding_count": entry_cash_binding_count,
+                "entry_fee_policy_binding_count": (
+                    entry_fee_policy_binding_count
+                ),
+                "entry_fee_profile_version": entry_fee_profile_version,
+                "entry_fee_schedule_hash": entry_fee_schedule_hash,
                 "exit_fill_ids_json": str(
                     row.get("exit_fill_ids_json") or "[]"
                 ),
@@ -7251,6 +13531,9 @@ def _internal_strategy_portfolio_ledger(
                 "exit_allocation_protocol_count": _int(
                     row.get("exit_allocation_protocol_count"), 0
                 ),
+                "exit_fee_policy_binding_count": _int(
+                    row.get("exit_fee_policy_binding_count"), 0
+                ),
                 "exit_fill_trade_day_count": _int(
                     row.get("exit_fill_trade_day_count"), 0
                 ),
@@ -7265,20 +13548,114 @@ def _internal_strategy_portfolio_ledger(
                 ),
                 **numeric,
             })
+        if incremental and set(checkpoint_holdings) != {
+            row["evidence_id"]
+            for row in normalized
+            if row["evidence_id"] in checkpoint_holdings
+        }:
+            raise ValueError("增量资金检查点持仓缺少对应权威成交事实")
         normalized.sort(key=lambda row: (row["entry_at"], row["evidence_id"]))
-        start_day = min(row["entry_day"] for row in normalized)
-        calendar_rows = _db_read(
-            "SELECT trade_date FROM si_trade_calendar "
-            "WHERE trade_status=1 AND trade_date BETWEEN :start_day AND :as_of_date "
-            "ORDER BY trade_date",
-            {"start_day": start_day, "as_of_date": as_of_date},
+        start_day = (
+            checkpoint_day
+            if incremental
+            else min(row["entry_day"] for row in normalized)
         )
+        if prefetched_facts is None:
+            calendar_receipt = _immutable_calendar_receipt(
+                start_date=start_day,
+                end_date=as_of_date,
+                decision_known_at=f"{as_of_date} 23:59:59",
+            )
+            calendar_receipt_binding = _calendar_receipt_binding(
+                calendar_receipt
+            )
+            calendar_rows = [
+                {"trade_date": day}
+                for day in calendar_receipt.sessions_between(
+                    start_day, as_of_date,
+                )
+                if not incremental or day > start_day
+            ]
+        else:
+            calendar_receipt_binding = prefetched_facts.get(
+                "calendar_receipt"
+            )
+            if not _valid_calendar_receipt_binding(
+                calendar_receipt_binding,
+                start_date=start_day,
+                end_date=as_of_date,
+            ):
+                # A caller may provide price/account batches without a calendar
+                # proof.  Independently load the immutable receipt and require
+                # its exact session slice; never trust the unbound rows.
+                calendar_receipt = _immutable_calendar_receipt(
+                    start_date=start_day,
+                    end_date=as_of_date,
+                    decision_known_at=f"{as_of_date} 23:59:59",
+                )
+                calendar_receipt_binding = _calendar_receipt_binding(
+                    calendar_receipt
+                )
+                expected_calendar_rows = [
+                    {"trade_date": day}
+                    for day in calendar_receipt.sessions_between(
+                        start_day, as_of_date,
+                    )
+                    if not incremental or day > start_day
+                ]
+                supplied_calendar_days = [
+                    _trade_date(
+                        row.get("trade_date"), default_today=False,
+                    )
+                    for row in prefetched_facts.get("calendar_rows", [])
+                    if (
+                        start_day < str(row.get("trade_date") or "")[:10]
+                        if incremental
+                        else start_day <= str(
+                            row.get("trade_date") or ""
+                        )[:10]
+                    )
+                    and str(row.get("trade_date") or "")[:10] <= as_of_date
+                ]
+                if supplied_calendar_days != [
+                    row["trade_date"] for row in expected_calendar_rows
+                ]:
+                    raise ValueError(
+                        "预取交易日行与不可变QMT交易日历回执不一致"
+                    )
+            calendar_rows = [
+                row for row in prefetched_facts.get("calendar_rows", [])
+                if (
+                    start_day < str(row.get("trade_date") or "")[:10]
+                    if incremental
+                    else start_day <= str(row.get("trade_date") or "")[:10]
+                )
+                and str(row.get("trade_date") or "")[:10] <= as_of_date
+            ]
         calendar = [
             _trade_date(row.get("trade_date"), default_today=False)
             for row in calendar_rows
         ]
-        if not calendar or calendar[0] != start_day or calendar[-1] != as_of_date:
+        if (
+            not calendar
+            or calendar[-1] != as_of_date
+            or (not incremental and calendar[0] != start_day)
+        ):
             raise ValueError("内部组合账本缺少从首笔成交到截止日的完整交易日历")
+        calendar_slice_payload = {
+            "schema": "probiga.internal-ledger-calendar-slice.v1",
+            "start_date": start_day,
+            "end_date": as_of_date,
+            "sessions": calendar,
+            "calendar_receipt_binding_hash": str(
+                calendar_receipt_binding.get("binding_hash") or ""
+            ),
+        }
+        calendar_slice_hash = _digest(calendar_slice_payload)
+        if incremental and len(calendar) > (
+            FUNDING_REPLAY_MAX_SESSIONS + max_holding_days
+        ):
+            raise ValueError("增量资金重放跨度超过120会话与版本持有期缓冲")
         code_params = {
             f"code_{index}": code for index, code in enumerate(sorted(codes))
         }
@@ -7308,7 +13685,9 @@ def _internal_strategy_portfolio_ledger(
             "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
             f"AND k.stock_code IN ({placeholders}) "
-            "AND k.trade_date BETWEEN :start_day AND :as_of_date "
+            "AND k.trade_date "
+            + (">:start_day " if incremental else ">=:start_day ")
+            + "AND k.trade_date<=:as_of_date "
             "ORDER BY k.trade_date, k.stock_code",
             {
                 **code_params,
@@ -7316,7 +13695,16 @@ def _internal_strategy_portfolio_ledger(
                 "as_of_date": as_of_date,
                 "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
             },
-        )
+        ) if prefetched_facts is None and code_params else [
+            row for row in prefetched_facts.get("price_rows", [])
+            if str(row.get("stock_code") or "") in codes
+            and (
+                start_day < str(row.get("trade_date") or "")[:10]
+                if incremental
+                else start_day <= str(row.get("trade_date") or "")[:10]
+            )
+            and str(row.get("trade_date") or "")[:10] <= as_of_date
+        ] if prefetched_facts is not None else []
         prices_by_day: dict[str, dict[str, Decimal]] = defaultdict(dict)
         bar_facts: dict[tuple[str, str], dict[str, Any]] = {}
         for raw_price in price_rows:
@@ -7355,45 +13743,193 @@ def _internal_strategy_portfolio_ledger(
             }
             prices_by_day[day][code] = price
 
-        account_rows = _db_read(
-            "SELECT account_id, status, initial_cash, policy_version, "
-            "policy_hash, real_trading_enabled, created_at "
-            "FROM st_trade_account_v2 WHERE account_id=:account_id LIMIT 1",
-            {"account_id": account_id},
+        account_rows = (
+            _db_read(
+                "SELECT account_id, status, initial_cash, policy_version, "
+                "policy_hash, fee_profile_version, instrument_rule_version, "
+                "real_trading_enabled, created_at "
+                "FROM st_trade_account_v2 WHERE account_id=:account_id LIMIT 1",
+                {"account_id": account_id},
+            )
+            if prefetched_facts is None else [
+                row for row in prefetched_facts.get("account_rows", [])
+                if str(row.get("account_id") or "") == account_id
+            ]
         )
         if len(account_rows) != 1:
             raise ValueError("内部组合账本缺少权威模拟账户初始事实")
         account_fact = account_rows[0]
         initial_cash = Decimal(str(account_fact.get("initial_cash") or "0"))
         policy_hash = str(account_fact.get("policy_hash") or "")
+        fee_profile_version = str(
+            account_fact.get("fee_profile_version") or ""
+        )
+        instrument_rule_version = str(
+            account_fact.get("instrument_rule_version") or ""
+        )
         if (
             not initial_cash.is_finite() or initial_cash <= 0
-            or not _HASH_PATTERN.fullmatch(policy_hash)
+            or str(account_fact.get("policy_version") or "")
+            != execution_policy["policy_version"]
+            or policy_hash != execution_policy["policy_hash"]
+            or fee_profile_version
+            != execution_policy["fee_profile_version"]
+            or instrument_rule_version
+            != execution_policy["instrument_rule_version"]
             or _int(account_fact.get("real_trading_enabled"), 1) != 0
+            or account_id != "paper-main-v2"
+            or str(account_fact.get("status") or "") != "ACTIVE"
         ):
             raise ValueError("权威模拟账户资金、政策哈希或纸面交易边界无效")
         frozen_account = load_v3_config().get("account") or {}
         frozen_initial = Decimal(str(frozen_account.get("initial_cash_cny") or "0"))
         if abs(frozen_initial - initial_cash) > Decimal("0.01"):
             raise ValueError("模拟账户初始资金与部署冻结配置不一致")
+        account_fact_payload = {
+            "account_id": account_id,
+            "status": str(account_fact.get("status") or ""),
+            "initial_cash_cny": str(initial_cash),
+            "policy_version": str(
+                account_fact.get("policy_version") or ""
+            ),
+            "policy_hash": policy_hash,
+            "fee_profile_version": fee_profile_version,
+            "instrument_rule_version": instrument_rule_version,
+            "real_trading_enabled": False,
+            "created_at": str(account_fact.get("created_at") or ""),
+        }
+        if (
+            incremental
+            and str(checkpoint_state.get("account_fact_hash") or "")
+            != _digest(account_fact_payload)
+        ):
+            raise ValueError("增量资金检查点与当前权威账户事实不一致")
 
         entries: dict[str, list[dict[str, Any]]] = defaultdict(list)
         exits: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in normalized:
-            entries[row["entry_day"]].append(row)
+            if row["evidence_id"] not in checkpoint_holdings:
+                entries[row["entry_day"]].append(row)
             if row["status"] == "MATURED":
                 exits[row["exit_day"]].append(row)
         cash = initial_cash
         holdings: dict[str, dict[str, Any]] = {}
+        holding_ages: dict[str, int] = {}
         last_prices: dict[str, Decimal] = {}
         equity_curve: list[dict[str, Any]] = []
         daily_records: list[dict[str, Any]] = []
         price_marks: list[dict[str, str]] = []
         daily_stock_market_values: list[dict[str, Any]] = []
+        rolling_trade_exposures: list[dict[str, Any]] = []
+        closed_evidence_by_day: list[dict[str, Any]] = []
+        daily_fact_economics: list[dict[str, Any]] = []
         corporate_action_checks: list[dict[str, str]] = []
         previous_equity = initial_cash
         peak = _EQUITY_BASE
+        cumulative_fee = Decimal("0")
+        history_opening_equity = _EQUITY_BASE
+        history_opening_equity_date = ""
         maximum_drawdown = Decimal("0")
+        if incremental:
+            rolling = effective_replay_plan.get("rolling_history")
+            if not isinstance(rolling, dict):
+                raise ValueError("资金检查点缺少已验证的日频事实链")
+            equity_curve = [
+                dict(item) for item in (rolling.get("equity_curve") or [])
+            ]
+            daily_records = [
+                dict(item) for item in (rolling.get("daily_records") or [])
+            ]
+            daily_stock_market_values = [
+                dict(item)
+                for item in (
+                    rolling.get("daily_stock_market_values") or []
+                )
+            ]
+            closed_evidence_by_day = [
+                dict(item)
+                for item in (rolling.get("closed_evidence_by_day") or [])
+            ]
+            curve_days = [
+                str(item.get("trade_date") or "") for item in equity_curve
+            ]
+            if (
+                not equity_curve
+                or len(equity_curve) > FUNDING_REPLAY_MAX_SESSIONS
+                or curve_days != sorted(set(curve_days))
+                or curve_days[-1] != checkpoint_day
+                or [
+                    str(item.get("trade_date") or "")
+                    for item in daily_records
+                ] != curve_days
+                or [
+                    str(item.get("trade_date") or "")
+                    for item in daily_stock_market_values
+                ] != curve_days
+                or [
+                    str(item.get("trade_date") or "")
+                    for item in closed_evidence_by_day
+                ] != curve_days
+            ):
+                raise ValueError("资金检查点滚动日频净值或敞口序列无效")
+            cash = Decimal(str(checkpoint_state.get("closing_cash_cny")))
+            previous_equity = Decimal(str(
+                checkpoint_state.get("closing_equity_cny")
+            ))
+            cumulative_fee = Decimal(str(
+                checkpoint_state.get("cumulative_fee_cny")
+            ))
+            high_watermark_cny = Decimal(str(
+                checkpoint_state.get("high_watermark_equity_cny")
+            ))
+            history_opening_equity = Decimal(str(
+                rolling.get("opening_normalized_equity") or "0"
+            ))
+            history_opening_equity_date = str(
+                rolling.get("opening_equity_date") or ""
+            )
+            if (
+                not cash.is_finite() or cash < 0
+                or not previous_equity.is_finite() or previous_equity <= 0
+                or not cumulative_fee.is_finite() or cumulative_fee < 0
+                or not high_watermark_cny.is_finite()
+                or high_watermark_cny < previous_equity
+                or not history_opening_equity.is_finite()
+                or history_opening_equity <= 0
+            ):
+                raise ValueError("资金检查点现金、权益、费用或高水位无效")
+            expected_checkpoint_equity = (
+                previous_equity / initial_cash * Decimal("100")
+            ).quantize(_EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+            if Decimal(str(equity_curve[-1].get("equity") or "0")) != (
+                expected_checkpoint_equity
+            ):
+                raise ValueError("资金检查点期末权益与滚动净值不一致")
+            peak = (
+                high_watermark_cny / initial_cash * Decimal("100")
+            ).quantize(_EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN)
+            normalized_by_id = {
+                row["evidence_id"]: row for row in normalized
+            }
+            for evidence_id, holding_state in checkpoint_holdings.items():
+                holding = normalized_by_id[evidence_id]
+                holdings[evidence_id] = holding
+                mark_price = Decimal(str(
+                    holding_state.get("mark_price") or "0"
+                ))
+                holding_age = _int(
+                    holding_state.get("holding_session_age"), -1
+                )
+                if (
+                    not mark_price.is_finite() or mark_price <= 0
+                    or not 1 <= holding_age <= max_holding_days
+                ):
+                    raise ValueError("资金检查点持仓估值或持有期无效")
+                prior_mark = last_prices.get(holding["stock_code"])
+                if prior_mark is not None and prior_mark != mark_price:
+                    raise ValueError("同一证券检查点持仓存在冲突收盘估值")
+                last_prices[holding["stock_code"]] = mark_price
+                holding_ages[evidence_id] = holding_age
 
         def require_attested_close(
             fact: dict[str, Any] | None, *, trade_day: str,
@@ -7431,7 +13967,11 @@ def _internal_strategy_portfolio_ledger(
                 )
             return fact
 
+        replay_opening_cash = cash
+        replay_opening_equity = previous_equity
         for day in calendar:
+            for evidence_id in list(holding_ages):
+                holding_ages[evidence_id] += 1
             prior_held_codes = {
                 str(holding["stock_code"])
                 for holding in holdings.values()
@@ -7461,6 +14001,9 @@ def _internal_strategy_portfolio_ledger(
                 })
             for code, price in prices_by_day.get(day, {}).items():
                 last_prices[code] = price
+            day_opening_cash = cash
+            day_opening_equity = previous_equity
+            day_opening_cumulative_fee = cumulative_fee
             day_fees = Decimal("0")
             day_trade_gross: dict[str, Decimal] = defaultdict(Decimal)
             events = [
@@ -7480,6 +14023,7 @@ def _internal_strategy_portfolio_ledger(
                         "entry_gross_cny"
                     ]
                     holdings[row["evidence_id"]] = row
+                    holding_ages[row["evidence_id"]] = 1
                 else:
                     if row["evidence_id"] not in holdings:
                         raise ValueError("内部组合账本出现无持仓平仓")
@@ -7489,8 +14033,13 @@ def _internal_strategy_portfolio_ledger(
                         "exit_gross_cny"
                     ]
                     del holdings[row["evidence_id"]]
+                    holding_ages.pop(row["evidence_id"], None)
                 if cash < Decimal("-0.01"):
                     raise ValueError("策略隔离虚拟袖套现金为负，不能证明无杠杆")
+            if any(
+                age > max_holding_days for age in holding_ages.values()
+            ):
+                raise ValueError("策略持仓超过不可变版本最大持有期")
             market_value = Decimal("0")
             day_stock_values: dict[str, Decimal] = defaultdict(Decimal)
             for holding in holdings.values():
@@ -7556,6 +14105,7 @@ def _internal_strategy_portfolio_ledger(
                 (equity / previous_equity - Decimal("1")) * Decimal("100")
             )
             daily_cost = day_fees / previous_equity * Decimal("100")
+            cumulative_fee += day_fees
             peak = max(peak, normalized_equity)
             maximum_drawdown = max(
                 maximum_drawdown,
@@ -7572,6 +14122,40 @@ def _internal_strategy_portfolio_ledger(
                 "is_net_return": True,
                 "evidence_revision_at": f"{day}T15:00:00",
             })
+            closed_evidence_ids = sorted({
+                str(row.get("evidence_id") or "")
+                for row in exits.get(day, [])
+                if str(row.get("evidence_id") or "")
+            })
+            closed_evidence_by_day.append({
+                "trade_date": day,
+                "evidence_ids": closed_evidence_ids,
+            })
+            daily_fact_economics.append({
+                "trade_date": day,
+                "opening_cash_cny": day_opening_cash,
+                "closing_cash_cny": cash,
+                "opening_equity_cny": day_opening_equity,
+                "closing_equity_cny": equity,
+                "normalized_opening_equity": (
+                    day_opening_equity / initial_cash * Decimal("100")
+                ).quantize(_EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN),
+                "normalized_closing_equity": normalized_equity,
+                "normalization_base_equity_cny": initial_cash,
+                "daily_return_pct": daily_return,
+                "actual_cost_pct": daily_cost,
+                "opening_cumulative_fee_cny": day_opening_cumulative_fee,
+                "daily_fee_cny": day_fees,
+                "cumulative_fee_cny": cumulative_fee,
+                "high_watermark_equity_cny": (
+                    peak / Decimal("100") * initial_cash
+                ),
+                "stock_risk_exposure": {
+                    code: str(value)
+                    for code, value in sorted(day_risk_exposure.items())
+                },
+                "closed_evidence_ids": closed_evidence_ids,
+            })
             previous_equity = equity
         funding_evidence_revision_at = (
             f"{as_of_date}T15:00:00"
@@ -7582,36 +14166,456 @@ def _internal_strategy_portfolio_ledger(
                     for row in normalized
                     if row.get("status") == "MATURED"
                 ),
-                default="",
+                default=(
+                    str(checkpoint_state.get("evidence_watermark") or "")
+                    if incremental else ""
+                ),
             )
         )
         if not _normalize_evidence_revision(funding_evidence_revision_at):
             raise ValueError("内部组合账本缺少可验证的经济事实高水位")
-        ledger_payload = {
-            "schema": "probiga.internal-strategy-portfolio-ledger.v1",
+
+        exposure_by_id = {
+            str(item.get("evidence_id") or ""): dict(item)
+            for item in rolling_trade_exposures
+            if str(item.get("evidence_id") or "")
+        }
+        for row in normalized:
+            exposure_by_id[row["evidence_id"]] = {
+                "evidence_id": row["evidence_id"],
+                "trade_date": row["entry_day"],
+                "source_intent_id": row["source_intent_id"],
+                "stock_code": row["stock_code"],
+                "entry_gross_cny": str(row["entry_gross_cny"]),
+                "status": row["status"],
+            }
+        if len(equity_curve) > FUNDING_REPLAY_MAX_SESSIONS:
+            trim_count = len(equity_curve) - FUNDING_REPLAY_MAX_SESSIONS
+            history_opening_equity = Decimal(str(
+                equity_curve[trim_count - 1].get("equity") or "0"
+            ))
+            history_opening_equity_date = str(
+                equity_curve[trim_count - 1].get("trade_date") or ""
+            )
+            equity_curve = equity_curve[trim_count:]
+            daily_records = daily_records[trim_count:]
+            daily_stock_market_values = daily_stock_market_values[
+                trim_count:
+            ]
+            closed_evidence_by_day = closed_evidence_by_day[trim_count:]
+        if (
+            not equity_curve
+            or len(equity_curve) != len(daily_records)
+            or len(equity_curve) != len(daily_stock_market_values)
+            or len(equity_curve) != len(closed_evidence_by_day)
+        ):
+            raise ValueError("资金检查点无法生成完整滚动120日净值")
+        rolling_start = str(equity_curve[0].get("trade_date") or "")
+        rolling_trade_exposures = sorted(
+            (
+                item for item in exposure_by_id.values()
+                if str(item.get("trade_date") or "") >= rolling_start
+                or str(item.get("evidence_id") or "") in holdings
+            ),
+            key=lambda item: (
+                str(item.get("trade_date") or ""),
+                str(item.get("evidence_id") or ""),
+            ),
+        )
+        rolling_history = {
+            "schema": "probiga.strategy-funding-rolling-history.v1",
+            "opening_normalized_equity": str(history_opening_equity),
+            "opening_equity_date": history_opening_equity_date,
+            "daily_records": daily_records,
+            "equity_curve": equity_curve,
+            "daily_stock_market_values": daily_stock_market_values,
+            "closed_evidence_by_day": closed_evidence_by_day,
+            "fact_members": (
+                (effective_replay_plan.get("rolling_history") or {}).get(
+                    "fact_members"
+                ) or []
+            ),
+        }
+        money_quantum = Decimal("0.000001")
+
+        def money(value: Decimal) -> str:
+            if not value.is_finite():
+                raise ValueError("资金检查点金额不是有限数")
+            return str(value.quantize(
+                money_quantum, rounding=ROUND_HALF_EVEN,
+            ))
+
+        checkpoint_holdings_state = []
+        for evidence_id, holding in sorted(holdings.items()):
+            mark_price = last_prices.get(holding["stock_code"])
+            holding_age = holding_ages.get(evidence_id, 0)
+            if (
+                mark_price is None
+                or not mark_price.is_finite()
+                or mark_price <= 0
+                or not 1 <= holding_age <= max_holding_days
+            ):
+                raise ValueError("资金检查点期末持仓缺少估值或持有期无效")
+            checkpoint_holdings_state.append({
+                "evidence_id": evidence_id,
+                "source_intent_id": holding["source_intent_id"],
+                "stock_code": holding["stock_code"],
+                "quantity": holding["quantity"],
+                "entry_day": holding["entry_day"],
+                "entry_at": holding["entry_at"],
+                "entry_price": str(holding["entry_price"]),
+                "entry_gross_cny": str(holding["entry_gross_cny"]),
+                "entry_fee_cny": str(holding["entry_fee_cny"]),
+                "mark_price": str(mark_price),
+                "holding_session_age": holding_age,
+            })
+        previous_input_set_hash = (
+            str(checkpoint_state.get("input_set_hash") or "")
+            if incremental else ""
+        )
+        input_set_payload = {
+            "schema": "probiga.strategy-funding-replay-input-set.v1",
             "strategy_key": strategy_key,
             "strategy_version": strategy_version,
-            "strategy_version_hash": version_hash,
-            "account_fact": {
-                "account_id": account_id,
-                "status": str(account_fact.get("status") or ""),
-                "initial_cash_cny": str(initial_cash),
-                "policy_version": str(account_fact.get("policy_version") or ""),
-                "policy_hash": policy_hash,
-                "real_trading_enabled": False,
-                "created_at": str(account_fact.get("created_at") or ""),
-            },
+            "account_id": account_id,
+            "funding_execution_policy": execution_policy,
+            "account_policy_hash": policy_hash,
+            "fee_profile_version": fee_profile_version,
+            "instrument_rule_version": instrument_rule_version,
             "as_of_date": as_of_date,
-            "funding_evidence_revision_at": funding_evidence_revision_at,
-            "trades": [
+            "previous_input_set_hash": previous_input_set_hash,
+            "evidence_facts": [
                 {
-                    key: (str(value) if isinstance(value, Decimal) else value)
+                    key: (
+                        str(value) if isinstance(value, Decimal) else value
+                    )
                     for key, value in row.items()
                 }
                 for row in normalized
             ],
+            "calendar": calendar,
             "price_marks": price_marks,
-            "daily_stock_market_values": daily_stock_market_values,
+            "corporate_action_checks": corporate_action_checks,
+        }
+        input_set_hash = _digest(input_set_payload)
+        high_watermark_equity_cny = (
+            peak / Decimal("100") * initial_cash
+        )
+        effective_candidate_run_uid = str(candidate_run_uid or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", effective_candidate_run_uid):
+            effective_candidate_run_uid = _digest({
+                "schema": "probiga.strategy-funding-preview-run.v1",
+                "strategy_key": strategy_key,
+                "strategy_version": strategy_version,
+                "account_id": account_id,
+                "as_of_date": as_of_date,
+                "input_set_hash": input_set_hash,
+            })[:32]
+        checkpoint_id = checkpoint_identity(
+            strategy_key=strategy_key,
+            strategy_version=strategy_version,
+            account_id=account_id,
+            trade_date=as_of_date,
+            anchor_run_uid=effective_candidate_run_uid,
+        )
+        previous_fact_members = []
+        if incremental:
+            previous_fact_members = [
+                dict(item) for item in (
+                    (effective_replay_plan.get("rolling_history") or {}).get(
+                        "fact_members"
+                    ) or []
+                )
+            ]
+            if (
+                len(previous_fact_members)
+                != len((effective_replay_plan.get("rolling_history") or {}).get(
+                    "equity_curve"
+                ) or [])
+                or not previous_fact_members
+            ):
+                raise ValueError("增量资金重放缺少前序日频事实成员")
+        fact_source = (
+            daily_fact_economics
+            if incremental
+            else daily_fact_economics[-FUNDING_REPLAY_MAX_SESSIONS:]
+        )
+        prior_fact_id = (
+            str(previous_fact_members[-1].get("fact_id") or "")
+            if previous_fact_members else ""
+        )
+        prior_fact_hash = (
+            str(previous_fact_members[-1].get("fact_hash") or "")
+            if previous_fact_members else ""
+        )
+        daily_fact_candidates: list[dict[str, Any]] = []
+        for economics in fact_source:
+            day = str(economics.get("trade_date") or "")
+            fact_id = funding_daily_fact_identity(
+                entity_type="STRATEGY",
+                entity_key=strategy_key,
+                entity_version=strategy_version,
+                account_id=account_id,
+                trade_date=day,
+                anchor_run_uid=effective_candidate_run_uid,
+            )
+            fact_payload = {
+                "schema": FUNDING_DAILY_FACT_SCHEMA,
+                "entity_type": "STRATEGY",
+                "entity_key": strategy_key,
+                "entity_version": strategy_version,
+                "entity_version_hash": version_hash,
+                "execution_binding_hash": (
+                    effective_execution_binding_hash or ""
+                ),
+                "account_id": account_id,
+                "trade_date": day,
+                "origin_checkpoint_id": checkpoint_id,
+                "previous_fact_id": prior_fact_id,
+                "previous_fact_hash": prior_fact_hash,
+                "opening_cash_cny": money(economics["opening_cash_cny"]),
+                "closing_cash_cny": money(economics["closing_cash_cny"]),
+                "opening_equity_cny": money(
+                    economics["opening_equity_cny"]
+                ),
+                "closing_equity_cny": money(
+                    economics["closing_equity_cny"]
+                ),
+                "normalized_opening_equity": str(
+                    economics["normalized_opening_equity"]
+                ),
+                "normalized_closing_equity": str(
+                    economics["normalized_closing_equity"]
+                ),
+                "normalization_base_equity_cny": money(
+                    economics["normalization_base_equity_cny"]
+                ),
+                "daily_return_pct": str(
+                    Decimal(str(economics["daily_return_pct"])).quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    )
+                ),
+                "actual_cost_pct": str(
+                    Decimal(str(economics["actual_cost_pct"])).quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    )
+                ),
+                "opening_cumulative_fee_cny": money(
+                    economics["opening_cumulative_fee_cny"]
+                ),
+                "daily_fee_cny": money(economics["daily_fee_cny"]),
+                "cumulative_fee_cny": money(
+                    economics["cumulative_fee_cny"]
+                ),
+                "high_watermark_equity_cny": money(
+                    economics["high_watermark_equity_cny"]
+                ),
+                "stock_risk_exposure": economics["stock_risk_exposure"],
+                "closed_evidence_ids": economics["closed_evidence_ids"],
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+            fact_json = _checkpoint_canonical_json(fact_payload)
+            fact_hash = funding_daily_fact_hash(fact_payload)
+            if len(fact_json.encode("utf-8")) > 256 * 1024:
+                raise ValueError("单日日频资金事实超过256KiB安全上限")
+            daily_fact_candidates.append({
+                "fact_id": fact_id,
+                "fact": fact_payload,
+                "fact_json": fact_json,
+                "fact_hash": fact_hash,
+                "previous_fact_id": prior_fact_id,
+                "previous_fact_hash": prior_fact_hash,
+            })
+            prior_fact_id = fact_id
+            prior_fact_hash = fact_hash
+        new_fact_members = [{
+            "fact_id": item["fact_id"],
+            "fact_hash": item["fact_hash"],
+            "trade_date": item["fact"]["trade_date"],
+        } for item in daily_fact_candidates]
+        if not new_fact_members:
+            raise ValueError("资金检查点必须至少生成一个新日频事实")
+        combined_fact_members = (
+            previous_fact_members + new_fact_members
+        )[-FUNDING_REPLAY_MAX_SESSIONS:]
+        curve_days = [str(item.get("trade_date") or "") for item in equity_curve]
+        member_days = [
+            str(item.get("trade_date") or "") for item in combined_fact_members
+        ]
+        if (
+            not combined_fact_members
+            or member_days != curve_days
+            or len(combined_fact_members) > FUNDING_REPLAY_MAX_SESSIONS
+        ):
+            raise ValueError("滚动净值与可寻址日频事实成员不一致")
+        rolling_history["fact_members"] = combined_fact_members
+        checkpoint_state_payload = {
+            "schema": FUNDING_CHECKPOINT_SCHEMA,
+            "strategy_key": strategy_key,
+            "strategy_version": strategy_version,
+            "strategy_version_hash": version_hash,
+            "execution_binding_hash": (
+                effective_execution_binding_hash or ""
+            ),
+            "funding_execution_policy_hash": execution_policy[
+                "policy_hash"
+            ],
+            "fee_profile_version": fee_profile_version,
+            "instrument_rule_version": instrument_rule_version,
+            "account_id": account_id,
+            "trade_date": as_of_date,
+            "replay_mode": replay_mode,
+            "replay_start_date": calendar[0],
+            "replay_session_count": len(calendar),
+            "replay_session_hash": _digest({
+                "schema": "probiga.strategy-funding-replay-sessions.v1",
+                "sessions": calendar,
+            }),
+            "replay_sessions": calendar if incremental else [],
+            "bootstrap_full_history_scan": not incremental,
+            "max_holding_days": max_holding_days,
+            "opening_cash_cny": money(replay_opening_cash),
+            "closing_cash_cny": money(cash),
+            "opening_equity_cny": money(replay_opening_equity),
+            "closing_equity_cny": money(previous_equity),
+            "cumulative_fee_cny": money(cumulative_fee),
+            "high_watermark_equity_cny": money(
+                high_watermark_equity_cny
+            ),
+            "holdings": checkpoint_holdings_state,
+            "history_start_date": member_days[0],
+            "history_end_date": member_days[-1],
+            "history_fact_count": len(combined_fact_members),
+            "history_opening_equity": str(history_opening_equity),
+            "history_opening_date": history_opening_equity_date,
+            "history_tip_fact_id": str(
+                combined_fact_members[-1]["fact_id"]
+            ),
+            "history_tip_fact_hash": str(
+                combined_fact_members[-1]["fact_hash"]
+            ),
+            "history_fact_set_hash": ordered_funding_fact_set_hash(
+                combined_fact_members
+            ),
+            "new_fact_count": len(new_fact_members),
+            "new_fact_set_hash": ordered_funding_fact_set_hash(
+                new_fact_members
+            ),
+            "new_fact_first_id": str(new_fact_members[0]["fact_id"]),
+            "new_fact_tip_id": str(new_fact_members[-1]["fact_id"]),
+            "evidence_watermark": funding_evidence_revision_at,
+            "input_set_hash": input_set_hash,
+            "account_fact_hash": _digest(account_fact_payload),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        candidate_checkpoint_hash = checkpoint_state_hash(
+            checkpoint_state_payload
+        )
+        previous_checkpoint_id = str(
+            effective_replay_plan.get("checkpoint_id") or ""
+        )
+        previous_checkpoint_hash = str(
+            effective_replay_plan.get("checkpoint_hash") or ""
+        )
+        previous_chain_hash = str(
+            effective_replay_plan.get("chain_hash") or ""
+        )
+        candidate_chain_payload = checkpoint_chain_payload(
+            checkpoint_hash=candidate_checkpoint_hash,
+            previous_checkpoint_id=previous_checkpoint_id,
+            previous_checkpoint_hash=previous_checkpoint_hash,
+            previous_chain_hash=previous_chain_hash,
+        )
+        candidate_chain_hash = checkpoint_chain_hash(
+            checkpoint_hash=candidate_checkpoint_hash,
+            previous_checkpoint_id=previous_checkpoint_id,
+            previous_checkpoint_hash=previous_checkpoint_hash,
+            previous_chain_hash=previous_chain_hash,
+        )
+        if incremental:
+            try:
+                parent_cash = Decimal(str(
+                    checkpoint_state.get("closing_cash_cny")
+                ))
+                parent_equity = Decimal(str(
+                    checkpoint_state.get("closing_equity_cny")
+                ))
+                parent_fee = Decimal(str(
+                    checkpoint_state.get("cumulative_fee_cny")
+                ))
+                parent_peak = Decimal(str(
+                    checkpoint_state.get("high_watermark_equity_cny")
+                ))
+                parent_watermark = _normalize_evidence_revision(
+                    checkpoint_state.get("evidence_watermark")
+                )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("前序资金检查点经济连续性字段无效") from exc
+            if (
+                Decimal(checkpoint_state_payload["opening_cash_cny"])
+                != parent_cash
+                or Decimal(checkpoint_state_payload["opening_equity_cny"])
+                != parent_equity
+                or Decimal(checkpoint_state_payload["cumulative_fee_cny"])
+                < parent_fee
+                or Decimal(
+                    checkpoint_state_payload["high_watermark_equity_cny"]
+                ) < parent_peak
+                or not parent_watermark
+                or funding_evidence_revision_at < parent_watermark
+                or calendar[0] <= checkpoint_day
+                or not daily_fact_candidates
+                or daily_fact_candidates[0]["previous_fact_id"]
+                != str(previous_fact_members[-1]["fact_id"])
+                or daily_fact_candidates[0]["previous_fact_hash"]
+                != str(previous_fact_members[-1]["fact_hash"])
+            ):
+                raise ValueError("增量资金检查点经济或日频事实连续性断裂")
+        checkpoint_candidate = {
+            "schema": "probiga.strategy-funding-checkpoint-candidate.v2",
+            "checkpoint_id": checkpoint_id,
+            "anchor_run_uid": effective_candidate_run_uid,
+            "state": checkpoint_state_payload,
+            "state_json": _checkpoint_canonical_json(
+                checkpoint_state_payload
+            ),
+            "checkpoint_hash": candidate_checkpoint_hash,
+            "chain_payload": candidate_chain_payload,
+            "chain_payload_json": _checkpoint_canonical_json(
+                candidate_chain_payload
+            ),
+            "chain_hash": candidate_chain_hash,
+            "previous_checkpoint_id": previous_checkpoint_id,
+            "previous_checkpoint_hash": previous_checkpoint_hash,
+            "previous_chain_hash": previous_chain_hash,
+            "daily_fact_candidates": daily_fact_candidates,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        ledger_payload = {
+            "schema": "probiga.internal-strategy-portfolio-ledger.v3",
+            "strategy_key": strategy_key,
+            "strategy_version": strategy_version,
+            "strategy_version_hash": version_hash,
+            "account_fact": account_fact_payload,
+            "as_of_date": as_of_date,
+            "funding_execution_policy": execution_policy,
+            "funding_evidence_revision_at": funding_evidence_revision_at,
+            "replay_mode": replay_mode,
+            "previous_checkpoint_hash": previous_checkpoint_hash,
+            "previous_chain_hash": previous_chain_hash,
+            "replay_input_set_hash": input_set_hash,
+            "checkpoint_hash": candidate_checkpoint_hash,
+            "checkpoint_chain_hash": candidate_chain_hash,
+            "rolling_fact_set_hash": checkpoint_state_payload[
+                "history_fact_set_hash"
+            ],
+            "calendar_receipt": calendar_receipt_binding,
+            "calendar_slice_hash": calendar_slice_hash,
             "corporate_action_guard": {
                 "method": "PRE_CLOSE_VS_PRIOR_UNADJUSTED_CLOSE",
                 "tolerance_pct": "0.05",
@@ -7626,36 +14630,55 @@ def _internal_strategy_portfolio_ledger(
             )
         return {
             "valid": True,
-            "funding_provenance": "INTERNAL_PORTFOLIO_LEDGER_V1",
+            "funding_provenance": CANONICAL_FUNDING_PROVENANCE,
             "drawdown_basis": "internal_version_bound_portfolio_equity",
             "cost_basis": "actual_ledger_fees",
             "max_drawdown_pct": round(float(maximum_drawdown), 4),
             "portfolio_coverage_days": len(equity_curve),
             "internal_ledger_hash": _digest(ledger_payload),
             "internal_ledger_schema": ledger_payload["schema"],
+            "calendar_receipt_binding_hash": str(
+                calendar_receipt_binding.get("binding_hash") or ""
+            ),
+            "calendar_slice_hash": calendar_slice_hash,
             "execution_binding_hash": (
                 effective_execution_binding_hash or ""
             ),
             "equity_curve": equity_curve,
             "daily_records": daily_records,
-            "trade_exposures": [
-                {
-                    "trade_date": row["entry_day"],
-                    "source_intent_id": row["source_intent_id"],
-                    "stock_code": row["stock_code"],
-                    "entry_gross_cny": str(row["entry_gross_cny"]),
-                    "status": row["status"],
-                }
-                for row in normalized
-            ],
+            "history_opening_equity": float(history_opening_equity),
+            "history_opening_equity_date": history_opening_equity_date,
+            "trade_exposures": rolling_trade_exposures,
+            "closed_evidence_by_day": closed_evidence_by_day,
             "daily_stock_market_values": daily_stock_market_values,
             "completed_trade_count": len({
-                    row["source_intent_id"]
-                    for row in normalized
-                    if row["status"] == "MATURED"
+                str(evidence_id)
+                for item in closed_evidence_by_day
+                for evidence_id in (item.get("evidence_ids") or [])
+                if str(evidence_id)
             }),
             "open_position_count": len(holdings),
             "funding_evidence_revision_at": funding_evidence_revision_at,
+            "funding_checkpoint_candidate": checkpoint_candidate,
+            "funding_checkpoint_ref": {
+                "schema": "probiga.strategy-funding-checkpoint-ref.v1",
+                "checkpoint_id": checkpoint_id,
+                "strategy_key": strategy_key,
+                "strategy_version": strategy_version,
+                "account_id": account_id,
+                "trade_date": as_of_date,
+                "replay_mode": replay_mode,
+                "checkpoint_hash": candidate_checkpoint_hash,
+                "chain_hash": candidate_chain_hash,
+                "replay_session_count": len(calendar),
+                "max_holding_days": max_holding_days,
+                "history_fact_count": len(combined_fact_members),
+                "history_fact_set_hash": checkpoint_state_payload[
+                    "history_fact_set_hash"
+                ],
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            },
         }
     except (ArithmeticError, InvalidOperation, TypeError, ValueError) as exc:
         return {"valid": False, "reason": str(exc)[:500]}
@@ -7694,12 +14717,17 @@ def _slice_internal_ledger(
         opening_equity_source = "PREVIOUS_AUTHORITATIVE_SESSION"
         opening_equity_date = str(prior_points[-1].get("trade_date") or "")
     else:
-        # The full internal ledger is normalized to the immutable account's
-        # initial capital at 100.  This is the only valid baseline before its
-        # first recorded session and ensures a first-day loss is not hidden.
-        opening_equity = Decimal("100")
-        opening_equity_source = "INTERNAL_LEDGER_INITIAL_CAPITAL"
-        opening_equity_date = ""
+        opening_equity = Decimal(str(
+            ledger.get("history_opening_equity") or "0"
+        ))
+        opening_equity_source = (
+            "CHECKPOINT_ROLLING_HISTORY_OPENING_EQUITY"
+            if opening_equity != Decimal("100")
+            else "INTERNAL_LEDGER_INITIAL_CAPITAL"
+        )
+        opening_equity_date = str(
+            ledger.get("history_opening_equity_date") or ""
+        )
     if not opening_equity.is_finite() or opening_equity <= 0:
         return {"valid": False, "reason": "内部组合账本窗口期初净值无效"}
     peak = opening_equity
@@ -7745,11 +14773,11 @@ def _slice_internal_ledger(
         if value > 0
     }
     completed_trades = len({
-        str(item.get("source_intent_id") or "")
-        for item in (ledger.get("trade_exposures") or [])
+        str(evidence_id)
+        for item in (ledger.get("closed_evidence_by_day") or [])
         if start_date <= str(item.get("trade_date") or "") <= as_of_date
-        and item.get("status") == "MATURED"
-        and str(item.get("source_intent_id") or "")
+        for evidence_id in (item.get("evidence_ids") or [])
+        if str(evidence_id)
     })
     parent_hash = str(ledger.get("internal_ledger_hash") or "")
     slice_hash = _digest({
@@ -7865,7 +14893,7 @@ def _strategy_market_route(
     if strategy.get("execution_adapter_executable") is not True:
         reasons.append(str(
             strategy.get("execution_adapter_reason")
-            or "执行适配器未部署/无效"
+            or "执行适配器状态不可用"
         ))
     if not input_ready:
         reasons.append(input_reason)
@@ -7949,7 +14977,7 @@ def _attach_market_routes(
                 strategy["execution_adapter_executable"] = False
                 strategy["execution_adapter_reason"] = str(
                     (runtime or {}).get("reason")
-                    or "执行适配器未部署/无效：本次候选生成缺少版本绑定运行证明"
+                    or "执行适配器运行证明校验失败：本次候选生成缺少版本绑定运行证明"
                 )
                 strategy["candidate_run_receipt_valid"] = False
             else:
@@ -7966,18 +14994,388 @@ def _attach_market_routes(
         strategy["market_route"] = _strategy_market_route(snapshot, strategy)
 
 
+def _selection_validation_summary(
+    evidence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Freeze the independent OOS signal league separately from execution.
+
+    These diagnostics can compare signals that competed for the same paper
+    account without inventing a second fill.  They remain version-selection
+    evidence only and can never satisfy the internal-ledger funding gate.
+    """
+
+    if not isinstance(evidence, dict):
+        return {
+            "status": "UNAVAILABLE",
+            "status_label": "客户端研究声明待补齐",
+            "evidence_ready": False,
+            "ranking_basis": SIGNAL_VALIDATION_RANKING_BASIS,
+            "ranking_basis_label": SIGNAL_VALIDATION_RANKING_BASIS_LABEL,
+            "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+            "source_authority_label": (
+                EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL
+            ),
+            "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+            "funding_authority": False,
+            "real_order_authority": False,
+        }
+    metric_fields = (
+        "window_days", "completed_trades", "coverage_days", "win_rate_pct",
+        "average_win_pct", "average_loss_pct", "payoff_ratio",
+        "gross_expectancy_pct", "estimated_cost_pct", "net_expectancy_pct",
+        "profit_factor", "max_drawdown_pct", "walk_forward_segments",
+        "positive_segments", "cost_stress_expectancy_pct",
+        "top5_profit_contribution_pct", "market_match_score",
+        "independent_oos", "walk_forward_verified", "session_window_valid",
+        "session_window_count", "session_window_hash",
+    )
+    summary = {field: evidence.get(field) for field in metric_fields}
+    protocol = str(evidence.get("evidence_protocol") or "").strip().upper()
+    artifact_hash = str(evidence.get("artifact_hash") or "").strip().lower()
+    dataset_hash = str(
+        evidence.get("source_dataset_hash") or ""
+    ).strip().lower()
+    evidence_ready = bool(
+        evidence.get("independent_oos") is True
+        and evidence.get("walk_forward_verified") is True
+        and protocol in _VERIFIED_WALK_FORWARD_PROTOCOLS
+        and evidence.get("verification_status") == "CONFIRMED"
+        and evidence.get("review_audit_valid") is True
+        and _HASH_PATTERN.fullmatch(artifact_hash)
+        and _HASH_PATTERN.fullmatch(dataset_hash)
+    )
+    summary.update({
+        "status": "COMPARABLE" if evidence_ready else "NOT_COMPARABLE",
+        "status_label": (
+            "客户端样本外声明结构可比（来源未认证）"
+            if evidence_ready else "客户端研究声明未通过结构校验"
+        ),
+        "evidence_ready": evidence_ready,
+        "health_score": calculate_health_score(summary),
+        "evidence_protocol": protocol,
+        "artifact_hash": artifact_hash,
+        "source_dataset_hash": dataset_hash,
+        "evidence_hash": str(evidence.get("evidence_hash") or ""),
+        "evidence_revision_at": str(
+            evidence.get("evidence_revision_at") or ""
+        ),
+        "ranking_basis": SIGNAL_VALIDATION_RANKING_BASIS,
+        "ranking_basis_label": SIGNAL_VALIDATION_RANKING_BASIS_LABEL,
+        "evidence_scope": "VERSION_SELECTION_ONLY",
+        "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+        "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+        "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+        "funding_authority": False,
+        "real_order_authority": False,
+    })
+    return summary
+
+
+def _deferred_funding_metrics(
+    *, row: dict[str, Any], manual: dict[tuple[str, int], dict[str, Any]],
+    session_windows: dict[int, dict[str, Any]], trade_date: str,
+    reason_code: str, reason: str,
+) -> dict[Any, Any]:
+    """Return a complete zero-funding row without loading a deferred fact chain."""
+
+    key = str(row.get("strategy_key") or "")
+    metrics_by_window: dict[Any, Any] = {}
+    for window in WINDOWS:
+        override = manual.get((key, window))
+        metrics = calculate_return_metrics(
+            [], window_days=window,
+            market_match_score=(row.get("market_route") or {}).get(
+                "market_match_score"
+            ),
+            version_bound_evidence=False,
+            independent_oos=False,
+            walk_forward_verified=False,
+        )
+        session_window = session_windows.get(window) or {}
+        metrics.update({
+            "selection_validation": _selection_validation_summary(override),
+            "forward_episode_protocol": INTENT_EPISODE_PROTOCOL,
+            "execution_binding_hash": str(
+                row.get("execution_binding_hash") or ""
+            ),
+            "adapter_artifact_sha256": str(
+                row.get("adapter_artifact_sha256") or ""
+            ),
+            "cost_model_hash": str(row.get("cost_model_hash") or ""),
+            "forward_episode_valid": False,
+            "forward_episode_reason": reason,
+            "forward_fill_fact_count": 0,
+            "forward_intent_episode_count": 0,
+            "funding_provenance": "CHECKPOINT_REPLAY_DEFERRED",
+            "internal_ledger_reason": reason,
+            "session_window_valid": bool(
+                _int(session_window.get("session_count"), -1) == window
+                and str(session_window.get("end_date") or "") == trade_date
+                and _HASH_PATTERN.fullmatch(
+                    str(session_window.get("session_hash") or "")
+                )
+                and _valid_calendar_receipt_binding(
+                    session_window.get("calendar_receipt"),
+                    start_date=str(session_window.get("start_date") or ""),
+                    end_date=str(session_window.get("end_date") or ""),
+                )
+            ),
+            "session_window_start": str(
+                session_window.get("start_date") or ""
+            ),
+            "session_window_end": str(session_window.get("end_date") or ""),
+            "session_window_count": _int(session_window.get("session_count")),
+            "session_window_hash": str(session_window.get("session_hash") or ""),
+            "calendar_receipt_binding_hash": str(
+                session_window.get("calendar_receipt_binding_hash") or ""
+            ),
+            "market_match_score": (row.get("market_route") or {}).get(
+                "market_match_score"
+            ),
+            "market_route_hash": str(
+                (row.get("market_route") or {}).get("router_decision_hash") or ""
+            ),
+            "evidence_age_days": 999999,
+            "evidence_fresh": False,
+            "selection_validation_fresh": False,
+        })
+        if not metrics["session_window_valid"]:
+            metrics["session_window_reason"] = reason
+        _apply_statistical_health(metrics, session_window=session_window)
+        metrics["profit_gate"] = evaluate_window_gate(metrics)
+        metrics_by_window[window] = metrics
+    metrics_by_window["funding_checkpoint_persistence_reason_code"] = reason_code
+    metrics_by_window["funding_checkpoint_persistence_reason"] = reason
+    metrics_by_window["funding_checkpoint_storage_bytes"] = 0
+    return metrics_by_window
+
+
+def _metrics_for_registry_batched(
+    snapshot: dict[str, Any], registry: list[dict[str, Any]], trade_date: str,
+    *, authoritative_windows: dict[int, dict[str, Any]] | None,
+    candidate_run_uid: str,
+    manual: dict[tuple[str, int], dict[str, Any]],
+) -> dict[str, dict[int, dict[str, Any]]]:
+    """Process an unlimited registry under explicit bootstrap run budgets."""
+
+    replay_index = _load_funding_replay_index(trade_date, registry)
+    bootstrap_registry = sorted((
+        item for item in registry
+        if replay_index[str(item.get("strategy_key") or "")]["mode"]
+        == "FULL_BOOTSTRAP"
+    ), key=lambda item: (
+        str(item.get("version_created_at") or ""),
+        0 if str(item.get("current_status") or "") in {"ACTIVE", "REDUCE"}
+        else 1,
+        str(item.get("strategy_key") or ""),
+    ))
+    incremental_registry = sorted((
+        item for item in registry
+        if replay_index[str(item.get("strategy_key") or "")]["mode"]
+        == "BOUNDED_INCREMENTAL"
+    ), key=lambda item: (
+        str(replay_index[str(item.get("strategy_key") or "")].get(
+            "trade_date"
+        ) or "9999-12-31"),
+        0 if str(item.get("current_status") or "") in {"ACTIVE", "REDUCE"}
+        else 1,
+        str(item.get("version_created_at") or ""),
+        str(item.get("strategy_key") or ""),
+    ))
+    session_windows = authoritative_windows or {}
+    result: dict[str, dict[int, dict[str, Any]]] = {}
+    budget = _funding_bootstrap_budget()
+    started_at = time.monotonic()
+    selected_storage_bytes = 0
+    bootstrap_selected_count = 0
+    bootstrap_selected_storage_bytes = 0
+    bootstrap_processed_count = 0
+    batch_count = 0
+    deferred_by_reason: dict[str, int] = defaultdict(int)
+
+    def defer_rows(
+        rows: list[dict[str, Any]], *, reason_code: str, reason: str,
+    ) -> None:
+        deferred_by_reason[reason_code] += len(rows)
+        for row in rows:
+            key = str(row.get("strategy_key") or "")
+            if key in result:
+                raise RuntimeError("资金指标预热延期身份重复")
+            result[key] = _deferred_funding_metrics(
+                row=row, manual=manual, session_windows=session_windows,
+                trade_date=trade_date, reason_code=reason_code,
+                reason=reason,
+            )
+
+    def process_batch(batch: list[dict[str, Any]]) -> None:
+        nonlocal selected_storage_bytes, bootstrap_selected_count
+        nonlocal bootstrap_selected_storage_bytes, batch_count
+        if not batch:
+            return
+        partial = _metrics_for_registry(
+            snapshot, batch, trade_date,
+            authoritative_windows=authoritative_windows,
+            candidate_run_uid=candidate_run_uid,
+            _preloaded_manual=manual,
+            _batching_disabled=True,
+            _initial_selected_storage_bytes=selected_storage_bytes,
+            _bootstrap_selected_count=bootstrap_selected_count,
+            _bootstrap_selection_limit=budget["maximum_strategies"],
+            _bootstrap_selected_storage_bytes=(
+                bootstrap_selected_storage_bytes
+            ),
+            _bootstrap_storage_limit_bytes=budget["byte_budget"],
+        )
+        batch_count += 1
+        persistence = partial.pop("__funding_persistence__", None)
+        if not isinstance(persistence, dict):
+            raise RuntimeError("资金指标批处理缺少持久化装箱摘要")
+        next_storage = _int(persistence.get("selected_storage_bytes"), -1)
+        if (
+            next_storage < selected_storage_bytes
+            or next_storage > FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+        ):
+            raise RuntimeError("资金指标批处理持久化预算不单调或越界")
+        selected_storage_bytes = next_storage
+        next_bootstrap_count = _int(
+            persistence.get("bootstrap_selected_count"), -1
+        )
+        next_bootstrap_storage = _int(
+            persistence.get("bootstrap_selected_storage_bytes"), -1
+        )
+        if (
+            next_bootstrap_count < bootstrap_selected_count
+            or next_bootstrap_count > budget["maximum_strategies"]
+            or next_bootstrap_storage < bootstrap_selected_storage_bytes
+            or next_bootstrap_storage > budget["byte_budget"]
+        ):
+            raise RuntimeError("资金指标首次引导计数或字节预算越界")
+        bootstrap_selected_count = next_bootstrap_count
+        bootstrap_selected_storage_bytes = next_bootstrap_storage
+        expected_keys = {str(row.get("strategy_key") or "") for row in batch}
+        if set(partial) != expected_keys or set(result) & set(partial):
+            raise RuntimeError("资金指标批处理返回身份缺失、重复或越界")
+        for metrics_by_window in partial.values():
+            reason_code = str(
+                metrics_by_window.get(
+                    "funding_checkpoint_persistence_reason_code"
+                ) or ""
+            )
+            if reason_code in {
+                "CHECKPOINT_BOOTSTRAP_COUNT_BUDGET_DEFERRED",
+                "CHECKPOINT_BOOTSTRAP_BYTE_BUDGET_DEFERRED",
+            }:
+                deferred_by_reason[reason_code] += 1
+        result.update(partial)
+
+    deferred_bootstrap: list[dict[str, Any]] = []
+    deferred_code = ""
+    deferred_reason = ""
+    for index, row in enumerate(bootstrap_registry):
+        if bootstrap_processed_count >= budget["maximum_strategies"]:
+            deferred_bootstrap = bootstrap_registry[index:]
+            deferred_code = "CHECKPOINT_BOOTSTRAP_COUNT_BUDGET_DEFERRED"
+            deferred_reason = (
+                "本轮首次引导条数预算已满；策略保持零模拟资金并按版本年龄轮转"
+            )
+            break
+        if time.monotonic() - started_at >= budget["time_budget_seconds"]:
+            deferred_bootstrap = bootstrap_registry[index:]
+            deferred_code = "CHECKPOINT_BOOTSTRAP_TIME_BUDGET_DEFERRED"
+            deferred_reason = (
+                "本轮首次引导时间预算已满；策略保持零模拟资金并等待后续轮转"
+            )
+            break
+        if bootstrap_selected_storage_bytes >= budget["byte_budget"]:
+            deferred_bootstrap = bootstrap_registry[index:]
+            deferred_code = "CHECKPOINT_BOOTSTRAP_BYTE_BUDGET_DEFERRED"
+            deferred_reason = (
+                "本轮首次引导字节预算已满；策略保持零模拟资金并等待后续轮转"
+            )
+            break
+        process_batch([row])
+        bootstrap_processed_count += 1
+    if deferred_bootstrap:
+        defer_rows(
+            deferred_bootstrap,
+            reason_code=deferred_code,
+            reason=deferred_reason,
+        )
+
+    for offset in range(
+        0, len(incremental_registry), FUNDING_METRICS_STRATEGY_BATCH_SIZE,
+    ):
+        process_batch(incremental_registry[
+            offset:offset + FUNDING_METRICS_STRATEGY_BATCH_SIZE
+        ])
+
+    if set(result) != {str(row.get("strategy_key") or "") for row in registry}:
+        raise RuntimeError("资金指标批处理未覆盖全部策略且不得静默截断")
+    result["__funding_persistence__"] = {
+        "selected_storage_bytes": selected_storage_bytes,
+        "target_storage_bytes": FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+        "hard_storage_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "bootstrap_opportunity_reserved": bool(bootstrap_registry),
+        "bootstrap_selected": bootstrap_selected_count > 0,
+        "bootstrap_selected_count": bootstrap_selected_count,
+        "bootstrap_processed_count": bootstrap_processed_count,
+        "bootstrap_selected_storage_bytes": (
+            bootstrap_selected_storage_bytes
+        ),
+        "bootstrap_max_strategies_per_run": budget["maximum_strategies"],
+        "bootstrap_time_budget_seconds": budget["time_budget_seconds"],
+        "bootstrap_byte_budget": budget["byte_budget"],
+        "strategy_batch_size": FUNDING_METRICS_STRATEGY_BATCH_SIZE,
+        "strategy_batch_count": batch_count,
+        "deferred_bootstrap_count": sum(deferred_by_reason.values()),
+        "deferred_bootstrap_by_reason": dict(sorted(
+            deferred_by_reason.items()
+        )),
+    }
+    return result
+
+
 def _metrics_for_registry(
     snapshot: dict[str, Any], registry: list[dict[str, Any]], trade_date: str,
     *, authoritative_windows: dict[int, dict[str, Any]] | None = None,
+    candidate_run_uid: str = "",
+    _preloaded_manual: dict[tuple[str, int], dict[str, Any]] | None = None,
+    _batching_disabled: bool = False,
+    _initial_selected_storage_bytes: int = 0,
+    _bootstrap_selected_count: int = 0,
+    _bootstrap_selection_limit: int | None = None,
+    _bootstrap_selected_storage_bytes: int = 0,
+    _bootstrap_storage_limit_bytes: int | None = None,
 ) -> dict[str, dict[int, dict[str, Any]]]:
     current_versions = {
         row["strategy_key"]: row["current_version"] for row in registry
     }
-    manual = _load_metric_inputs(
-        trade_date, current_versions=current_versions
+    manual = (
+        _preloaded_manual
+        if _preloaded_manual is not None
+        else _load_metric_inputs(trade_date, current_versions=current_versions)
     )
-    records = _load_forward_records(trade_date, registry)
+    if (
+        not _batching_disabled
+        and len(registry) > 1
+    ):
+        return _metrics_for_registry_batched(
+            snapshot, registry, trade_date,
+            authoritative_windows=authoritative_windows,
+            candidate_run_uid=candidate_run_uid,
+            manual=manual,
+        )
+    replay_plans = _load_funding_replay_plans(trade_date, registry)
+    records = _load_forward_records(
+        trade_date, registry, replay_plans=replay_plans,
+    )
+    ledger_facts = _prefetch_internal_strategy_ledger_facts(
+        records,
+        as_of_date=trade_date,
+        replay_plans=replay_plans,
+    )
     result: dict[str, dict[int, dict[str, Any]]] = {}
+    selected_checkpoint_storage_bytes = _initial_selected_storage_bytes
     target = date.fromisoformat(trade_date)
     try:
         session_windows = (
@@ -7989,7 +15387,65 @@ def _metrics_for_registry(
     except (TypeError, ValueError) as exc:
         session_windows = {}
         session_window_error = str(exc)[:500]
-    for row in registry:
+    def replay_mode(item: dict[str, Any]) -> str:
+        return str((replay_plans.get(
+            str(item.get("strategy_key") or "")
+        ) or {}).get("mode") or "")
+
+    # Reserve one deterministic bootstrap opportunity before mature
+    # incrementals consume the daily pack.  Once selected, the version becomes
+    # incremental on the next session, so a finite queue cannot starve.  The
+    # remaining bootstrap candidates are discarded immediately and rotate on
+    # later sessions; they never accumulate large fact arrays in the result.
+    bootstrap_registry = sorted((
+        item for item in registry if replay_mode(item) == "FULL_BOOTSTRAP"
+    ), key=lambda item: (
+        str(item.get("version_created_at") or ""),
+        0 if str(item.get("current_status") or "") in {"ACTIVE", "REDUCE"}
+        else 1,
+        str(item.get("strategy_key") or ""),
+    ))
+    incremental_registry = sorted((
+        item for item in registry
+        if replay_mode(item) == "BOUNDED_INCREMENTAL"
+    ), key=lambda item: (
+        str((replay_plans.get(str(item.get("strategy_key") or "")) or {}).get(
+            "trade_date"
+        ) or "9999-12-31"),
+        0 if str(item.get("current_status") or "") in {"ACTIVE", "REDUCE"}
+        else 1,
+        str(item.get("version_created_at") or ""),
+        str(item.get("strategy_key") or ""),
+    ))
+    unsupported_registry = sorted((
+        item for item in registry
+        if replay_mode(item) not in {
+            "FULL_BOOTSTRAP", "BOUNDED_INCREMENTAL",
+        }
+    ), key=lambda item: str(item.get("strategy_key") or ""))
+    ordered_registry = (
+        bootstrap_registry + incremental_registry + unsupported_registry
+    )
+    bootstrap_budget = _funding_bootstrap_budget()
+    bootstrap_selection_limit = (
+        bootstrap_budget["maximum_strategies"]
+        if _bootstrap_selection_limit is None
+        else _bootstrap_selection_limit
+    )
+    bootstrap_storage_limit_bytes = (
+        bootstrap_budget["byte_budget"]
+        if _bootstrap_storage_limit_bytes is None
+        else _bootstrap_storage_limit_bytes
+    )
+    bootstrap_selected_count = _bootstrap_selected_count
+    bootstrap_selected_storage_bytes = _bootstrap_selected_storage_bytes
+    if (
+        not 0 <= bootstrap_selected_count <= bootstrap_selection_limit
+        or not 0 <= bootstrap_selected_storage_bytes
+        <= bootstrap_storage_limit_bytes
+    ):
+        raise RuntimeError("资金指标首次引导初始预算无效")
+    for row in ordered_registry:
         key = row["strategy_key"]
         result[key] = {}
         strategy_records = records.get(key, [])
@@ -8004,6 +15460,9 @@ def _metrics_for_registry(
                 if str(row.get("source_kind") or "") == "runtime_registry"
                 else None
             ),
+            prefetched_facts=ledger_facts,
+            replay_plan=replay_plans[key],
+            candidate_run_uid=candidate_run_uid,
         )
         try:
             strategy_episodes = _aggregate_forward_intent_episodes(
@@ -8032,8 +15491,8 @@ def _metrics_for_registry(
                     item.get("entry_trade_date") or item.get("entry_at")
                 ) >= start_date
             ]
-            if eligible:
-                metrics = calculate_return_metrics(
+            if eligible or full_internal_ledger.get("valid") is True:
+                trade_episode_metrics = calculate_return_metrics(
                     eligible,
                     window_days=window,
                     market_match_score=(row.get("market_route") or {}).get(
@@ -8046,6 +15505,7 @@ def _metrics_for_registry(
                     # Walk-Forward experiment.
                     walk_forward_verified=False,
                 )
+                metrics = dict(trade_episode_metrics)
                 internal_ledger = _slice_internal_ledger(
                     full_internal_ledger,
                     start_date=start_date,
@@ -8053,7 +15513,28 @@ def _metrics_for_registry(
                     session_window=session_window,
                 )
                 if internal_ledger.get("valid") is True:
+                    # Funding economics must use the capital-weighted daily
+                    # NAV generated by the internal sleeve.  Equal-weighted
+                    # per-intent percentages remain diagnostic only: a tiny
+                    # winner must never offset a much larger CNY loser at the
+                    # funding gate or in the league table.
+                    metrics = calculate_return_metrics(
+                        internal_ledger["daily_records"],
+                        window_days=window,
+                        market_match_score=(
+                            row.get("market_route") or {}
+                        ).get("market_match_score"),
+                        version_bound_evidence=True,
+                        independent_oos=True,
+                        walk_forward_verified=False,
+                    )
                     metrics.update({
+                        "completed_trades": internal_ledger[
+                            "completed_trade_count"
+                        ],
+                        "coverage_days": internal_ledger[
+                            "portfolio_coverage_days"
+                        ],
                         "funding_provenance": internal_ledger["funding_provenance"],
                         "drawdown_basis": internal_ledger["drawdown_basis"],
                         "max_drawdown_pct": internal_ledger["max_drawdown_pct"],
@@ -8079,6 +15560,9 @@ def _metrics_for_registry(
                         "internal_stock_exposure": internal_ledger[
                             "stock_exposure"
                         ],
+                        "internal_daily_stock_market_values": internal_ledger[
+                            "daily_stock_market_values"
+                        ],
                         "internal_stock_exposure_basis": internal_ledger[
                             "exposure_basis"
                         ],
@@ -8088,6 +15572,20 @@ def _metrics_for_registry(
                         "evidence_revision_at": internal_ledger[
                             "funding_evidence_revision_at"
                         ],
+                        "source": "internal_strategy_virtual_nav",
+                        "trade_episode_diagnostics": {
+                            field: trade_episode_metrics.get(field)
+                            for field in (
+                                "completed_trades", "coverage_days",
+                                "win_rate_pct", "average_win_pct",
+                                "average_loss_pct", "payoff_ratio",
+                                "gross_expectancy_pct",
+                                "net_expectancy_pct", "profit_factor",
+                                "cost_stress_expectancy_pct",
+                                "top5_profit_contribution_pct",
+                                "evidence_hash", "source",
+                            )
+                        },
                     })
                 else:
                     metrics["funding_provenance"] = "INTERNAL_LEDGER_INVALID"
@@ -8174,6 +15672,9 @@ def _metrics_for_registry(
                     independent_oos=False,
                     walk_forward_verified=False,
                 )
+            metrics["selection_validation"] = (
+                _selection_validation_summary(override)
+            )
             metrics["forward_episode_protocol"] = INTENT_EPISODE_PROTOCOL
             metrics["execution_binding_hash"] = str(
                 row.get("execution_binding_hash") or ""
@@ -8195,6 +15696,11 @@ def _metrics_for_registry(
                 and _HASH_PATTERN.fullmatch(
                     str(session_window.get("session_hash") or "")
                 )
+                and _valid_calendar_receipt_binding(
+                    session_window.get("calendar_receipt"),
+                    start_date=str(session_window.get("start_date") or ""),
+                    end_date=str(session_window.get("end_date") or ""),
+                )
             )
             metrics["session_window_start"] = str(
                 (session_window or {}).get("start_date") or ""
@@ -8207,6 +15713,11 @@ def _metrics_for_registry(
             )
             metrics["session_window_hash"] = str(
                 (session_window or {}).get("session_hash") or ""
+            )
+            metrics["calendar_receipt_binding_hash"] = str(
+                (session_window or {}).get(
+                    "calendar_receipt_binding_hash"
+                ) or ""
             )
             if not metrics["session_window_valid"]:
                 metrics["session_window_reason"] = (
@@ -8247,9 +15758,111 @@ def _metrics_for_registry(
                 0 <= selection_age
                 <= PROFIT_GATE_POLICY["maximum_evidence_age_days"]
             )
-            metrics["health_score"] = calculate_health_score(metrics)
+            _apply_statistical_health(
+                metrics, session_window=session_window,
+            )
             metrics["profit_gate"] = evaluate_window_gate(metrics)
             result[key][window] = metrics
+        if full_internal_ledger.get("valid") is True:
+            candidate = full_internal_ledger["funding_checkpoint_candidate"]
+            try:
+                probe_manifest, _probe_candidates = (
+                    _build_funding_checkpoint_manifest(
+                        run_uid=str(candidate.get("anchor_run_uid") or ""),
+                        trade_date=trade_date,
+                        strategies=[{
+                            "strategy_key": key,
+                            "current_version": str(row["current_version"]),
+                            "funding_checkpoint_candidate": candidate,
+                            "funding_checkpoint_ref": full_internal_ledger[
+                                "funding_checkpoint_ref"
+                            ],
+                        }],
+                        combinations=[],
+                    )
+                )
+                candidate_storage_bytes = _int(
+                    probe_manifest.get("total_storage_bytes"), -1
+                )
+            except (GovernanceEvidenceNotReady, TypeError, ValueError) as exc:
+                candidate_storage_bytes = -1
+                result[key]["funding_checkpoint_persistence_reason_code"] = (
+                    "CHECKPOINT_CANDIDATE_STORAGE_INVALID"
+                )
+                result[key]["funding_checkpoint_persistence_reason"] = str(
+                    exc
+                )[:240]
+            candidate_mode = str(
+                (candidate.get("state") or {}).get("replay_mode") or ""
+            )
+            bootstrap_count_deferred = bool(
+                candidate_mode == "FULL_BOOTSTRAP"
+                and bootstrap_selected_count >= bootstrap_selection_limit
+            )
+            bootstrap_byte_deferred = bool(
+                candidate_mode == "FULL_BOOTSTRAP"
+                and candidate_storage_bytes >= 0
+                and bootstrap_selected_storage_bytes
+                + candidate_storage_bytes > bootstrap_storage_limit_bytes
+            )
+            if (
+                candidate_storage_bytes >= 0
+                and not bootstrap_count_deferred
+                and not bootstrap_byte_deferred
+                and selected_checkpoint_storage_bytes
+                + candidate_storage_bytes
+                <= FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+            ):
+                selected_checkpoint_storage_bytes += candidate_storage_bytes
+                result[key]["funding_checkpoint_candidate"] = candidate
+                result[key]["funding_checkpoint_ref"] = (
+                    full_internal_ledger["funding_checkpoint_ref"]
+                )
+                result[key]["funding_checkpoint_persistence_reason_code"] = (
+                    "CHECKPOINT_SELECTED"
+                )
+                result[key]["funding_checkpoint_persistence_reason"] = (
+                    "检查点候选已进入本轮8MiB确定性持久化装箱"
+                )
+                result[key]["funding_checkpoint_storage_bytes"] = (
+                    candidate_storage_bytes
+                )
+                if candidate_mode == "FULL_BOOTSTRAP":
+                    bootstrap_selected_count += 1
+                    bootstrap_selected_storage_bytes += (
+                        candidate_storage_bytes
+                    )
+            elif candidate_storage_bytes >= 0:
+                result[key]["funding_checkpoint_persistence_reason_code"] = (
+                    "CHECKPOINT_BOOTSTRAP_COUNT_BUDGET_DEFERRED"
+                    if bootstrap_count_deferred
+                    else "CHECKPOINT_BOOTSTRAP_BYTE_BUDGET_DEFERRED"
+                    if bootstrap_byte_deferred
+                    else "CHECKPOINT_PERSISTENCE_BUDGET_DEFERRED"
+                )
+                result[key]["funding_checkpoint_persistence_reason"] = (
+                    "本轮首次引导条数预算已满；该策略保持零模拟资金并按版本年龄轮转"
+                    if bootstrap_count_deferred
+                    else "本轮首次引导字节预算已满；该策略保持零模拟资金并等待后续轮转"
+                    if bootstrap_byte_deferred
+                    else "本轮8MiB检查点预热预算已满；该策略保持零模拟资金并等待后续轮转"
+                )
+                result[key]["funding_checkpoint_storage_bytes"] = (
+                    candidate_storage_bytes
+                )
+            full_internal_ledger.pop("funding_checkpoint_candidate", None)
+            full_internal_ledger.pop("funding_checkpoint_ref", None)
+    result["__funding_persistence__"] = {
+        "selected_storage_bytes": selected_checkpoint_storage_bytes,
+        "target_storage_bytes": FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+        "hard_storage_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "bootstrap_opportunity_reserved": bool(bootstrap_registry),
+        "bootstrap_selected": bootstrap_selected_count > 0,
+        "bootstrap_selected_count": bootstrap_selected_count,
+        "bootstrap_selected_storage_bytes": (
+            bootstrap_selected_storage_bytes
+        ),
+    }
     return result
 
 
@@ -8262,6 +15875,10 @@ def transition_lifecycle(
 ) -> dict[str, Any]:
     if _connection is None:
         ensure_and_seed_governance()
+    evidence = validate_canonical_json(
+        evidence if evidence is not None else {},
+        label="生命周期证据",
+    )
     next_value = str(next_status or "").upper()
     if next_value not in LIFECYCLE_LABELS:
         raise ValueError("未知生命周期状态")
@@ -8336,6 +15953,25 @@ def transition_lifecycle(
         )
         if updated.rowcount != 1:
             raise RuntimeError("生命周期状态或版本已被并发更新，请重新计算治理结果")
+        if entity_type == "STRATEGY":
+            recovery_updated = connection.execute(
+                text(
+                    "UPDATE st_strategy_registry "
+                    "SET recovery_conditions_json=:recovery "
+                    "WHERE strategy_key=:key AND current_version=:version "
+                    "AND current_status=:status"
+                ),
+                {
+                    "recovery": _json_text(
+                        _recovery_conditions(next_value)
+                    ),
+                    "key": entity_key,
+                    "version": version,
+                    "status": next_value,
+                },
+            )
+            if recovery_updated.rowcount not in (0, 1):
+                raise RuntimeError("生命周期恢复条件未能与新状态原子对齐")
         if entity_type == "STRATEGY" and next_value == "RETIRED":
             center_exists = connection.execute(text(
                 "SELECT COUNT(*) FROM information_schema.tables "
@@ -8540,6 +16176,34 @@ def toggle_strategy_enabled(
         })
         if updated.rowcount != 1:
             raise RuntimeError("策略启停状态已被并发更新")
+        _append_audit_connection(
+            connection,
+            entity_type="STRATEGY",
+            entity_key=key,
+            action="STRATEGY_TOGGLE",
+            reason=transition_reason,
+            operator=str(operator or "api")[:80],
+            before={
+                "strategy_key": key,
+                "strategy_version": str(
+                    rows[0].get("current_version") or ""
+                ),
+                "enabled": current_enabled,
+                "current_status": current_status,
+            },
+            after={
+                "strategy_key": key,
+                "strategy_version": str(
+                    rows[0].get("current_version") or ""
+                ),
+                "enabled": bool(enabled),
+                "current_status": post_transition_status,
+            },
+            evidence={
+                "source": "strategy_toggle",
+                "lifecycle_event_changed": transition.get("changed") is True,
+            },
+        )
         center_exists = connection.execute(text(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_schema=DATABASE() "
@@ -8608,7 +16272,926 @@ def _funding_evidence_revision_at(
     return min(revisions) if revisions else ""
 
 
-def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[int, dict[str, Any]]]) -> list[dict[str, Any]]:
+def _competition_observation_minimums(window_days: int) -> tuple[int, int]:
+    if window_days == 20:
+        return (
+            DECAY_GATE_20_POLICY["minimum_completed_trades"],
+            DECAY_GATE_20_POLICY["minimum_portfolio_coverage_days"],
+        )
+    return (
+        PROFIT_GATE_POLICY["minimum_completed_trades"],
+        PROFIT_GATE_POLICY["minimum_coverage_days"],
+    )
+
+
+def _execution_window_comparable(metrics: dict[str, Any]) -> bool:
+    window = _int(metrics.get("window_days"), -1)
+    minimum_trades, minimum_coverage = _competition_observation_minimums(
+        window
+    )
+    return bool(
+        window in WINDOWS
+        and _int(metrics.get("completed_trades")) >= minimum_trades
+        and _int(metrics.get("portfolio_coverage_days")) >= minimum_coverage
+        and metrics.get("funding_provenance")
+        == CANONICAL_FUNDING_PROVENANCE
+        and metrics.get("drawdown_basis")
+        == "internal_version_bound_portfolio_equity"
+        and metrics.get("cost_basis") == "actual_ledger_fees"
+        and metrics.get("session_window_valid") is True
+        and _int(metrics.get("session_window_count")) == window
+        and _HASH_PATTERN.fullmatch(str(
+            metrics.get("internal_ledger_hash") or ""
+        ))
+    )
+
+
+def _signal_window_comparable(metrics: dict[str, Any]) -> bool:
+    summary = metrics.get("selection_validation")
+    if not isinstance(summary, dict):
+        return False
+    window = _int(summary.get("window_days"), -1)
+    minimum_trades, minimum_coverage = _competition_observation_minimums(
+        window
+    )
+    return bool(
+        window in WINDOWS
+        and summary.get("evidence_ready") is True
+        and summary.get("evidence_scope") == "VERSION_SELECTION_ONLY"
+        and _int(summary.get("completed_trades")) >= minimum_trades
+        and _int(summary.get("coverage_days")) >= minimum_coverage
+        and summary.get("session_window_valid") is True
+        and _int(summary.get("session_window_count")) == window
+        and summary.get("funding_authority") is False
+        and summary.get("real_order_authority") is False
+    )
+
+
+def _weighted_competition_score(values: dict[int, float]) -> float:
+    return round(
+        float(values[20]) * 0.25
+        + float(values[60]) * 0.50
+        + float(values[120]) * 0.25,
+        2,
+    )
+
+
+GOVERNANCE_METRIC_DETAIL_REF_SCHEMA = (
+    "probiga.governance-metric-detail-ref.v1"
+)
+_CANONICAL_METRIC_DETAIL_KEYS = frozenset({
+    "internal_daily_records",
+    "internal_equity_curve",
+    "internal_stock_exposure",
+    "internal_daily_stock_market_values",
+    "funding_checkpoint_candidate",
+})
+_CANONICAL_METRIC_VALUE_KEYS = (
+    "window_days", "completed_trades", "coverage_days", "win_rate_pct",
+    "payoff_ratio", "net_expectancy_pct", "profit_factor",
+    "max_drawdown_pct", "health_score", "point_health_score",
+    "statistical_reliability_multiplier", "market_match_score",
+    "evidence_revision_at",
+)
+
+
+def _canonical_nested_proof_summary(
+    value: Any, *, kind: str,
+) -> dict[str, Any]:
+    """Return the smallest display proof; the window hash binds the fields.
+
+    The source proof hash remains explicit so a detail reader can reconcile the
+    compact value with the immutable snapshot.  Per-proof schema and self-hash
+    strings are intentionally not repeated three times per entity: the v7
+    canonical contract and ``window_proof_hash`` already provide both type and
+    tamper binding.
+    """
+
+    source = value if isinstance(value, dict) else {}
+    if kind == "PROFIT_GATE":
+        payload = {
+            "passed": source.get("passed") is True,
+            "failed": len(source.get("failed_checks") or []),
+        }
+    elif kind == "HAC":
+        payload = {
+            "valid": source.get("valid") is True,
+            "passed": source.get("threshold_passed") is True,
+            "reason": str(source.get("reason_code") or "")[:32],
+            "ess": source.get("effective_sample_size"),
+            "net_lcb_pct": source.get(
+                "net_expectancy_one_sided_95_lcb_pct"
+            ),
+            "p_value": source.get(
+                "net_expectancy_one_sided_p_value"
+            ),
+            "pf_lcb": source.get(
+                "profit_factor_one_sided_95_lcb"
+            ),
+            "payoff_lcb": source.get(
+                "payoff_ratio_one_sided_95_lcb"
+            ),
+        }
+    elif kind == "FORWARD_STABILITY":
+        payload = {
+            "valid": source.get("valid") is True,
+            "passed": source.get("passed") is True,
+            "segments": _int(source.get("segment_count"), 0),
+            "positive_segments": _int(
+                source.get("positive_segment_count"), 0
+            ),
+        }
+    elif kind == "SELECTION":
+        payload = {
+            "status": str(source.get("status") or "UNAVAILABLE")[:40],
+            "ready": source.get("evidence_ready") is True,
+            "health_score": source.get("health_score"),
+            "funding_authority": False,
+        }
+    else:  # pragma: no cover - closed internal dispatch
+        raise ValueError("canonical指标证明摘要类型无效")
+    return payload
+
+
+def _canonical_metric_window_summary(
+    metrics: dict[str, Any],
+    *,
+    entity_type: str,
+    entity_key: str,
+    entity_version: str,
+    window_days: int,
+) -> dict[str, Any]:
+    """Remove bulky replay arrays while retaining an exact detail hash/ref."""
+
+    if not isinstance(metrics, dict):
+        raise TypeError("治理窗口指标必须是对象")
+    summary = {
+        key: metrics.get(key) for key in _CANONICAL_METRIC_VALUE_KEYS
+        if key in metrics
+    }
+    summary["profit_gate"] = _canonical_nested_proof_summary(
+        metrics.get("profit_gate"), kind="PROFIT_GATE",
+    )
+    if isinstance(metrics.get("statistical_guard"), dict):
+        summary["statistical_guard"] = _canonical_nested_proof_summary(
+            metrics.get("statistical_guard"), kind="HAC",
+        )
+    if isinstance(metrics.get("internal_forward_stability"), dict):
+        summary["internal_forward_stability"] = (
+            _canonical_nested_proof_summary(
+                metrics.get("internal_forward_stability"),
+                kind="FORWARD_STABILITY",
+            )
+        )
+    # The primary 60-session view carries the external selection diagnostic.
+    # The other windows remain exactly bound through their detail hash without
+    # tripling a non-funding diagnostic in every canonical entity.
+    if (
+        window_days == 60
+        and isinstance(metrics.get("selection_validation"), dict)
+    ):
+        summary["selection_validation"] = _canonical_nested_proof_summary(
+            metrics.get("selection_validation"), kind="SELECTION",
+        )
+    summarized_keys = set(_CANONICAL_METRIC_VALUE_KEYS) | {
+        "profit_gate", "statistical_guard", "internal_forward_stability",
+    }
+    if window_days == 60:
+        summarized_keys.add("selection_validation")
+    detail = {
+        key: metrics[key] for key in sorted(metrics)
+        if key not in summarized_keys
+    }
+    normalized_type = str(entity_type or "").upper()
+    if normalized_type == "STRATEGY":
+        source_table = "st_strategy_health_snapshot"
+    elif normalized_type == "COMBINATION":
+        source_table = "st_strategy_combination_health_snapshot"
+    else:
+        raise ValueError("治理指标明细引用对象类型无效")
+    detail_payload = {
+        "schema": "probiga.governance-metric-detail.v1",
+        "entity_type": normalized_type,
+        "entity_key": str(entity_key or ""),
+        "entity_version": str(entity_version or ""),
+        "window_days": int(window_days),
+        "detail": detail,
+    }
+    summary["detail_ref"] = {
+        "source_table": source_table,
+        "detail_available": bool(detail),
+        "detail_hash": _digest(detail_payload) if detail else "",
+    }
+    source_binding = {
+        "schema": "probiga.canonical-window-statistical-source.v1",
+        "entity_type": normalized_type,
+        "entity_key": str(entity_key or ""),
+        "entity_version": str(entity_version or ""),
+        "window_days": int(window_days),
+        "profit_gate_hash": _digest(metrics.get("profit_gate") or {}),
+        "statistical_guard_hash": str(
+            (metrics.get("statistical_guard") or {}).get("compact_hash")
+            or ""
+        ),
+        "forward_stability_hash": str(
+            (metrics.get("internal_forward_stability") or {}).get(
+                "compact_hash"
+            ) or ""
+        ),
+        "selection_validation_hash": _digest(
+            metrics.get("selection_validation") or {}
+        ),
+        "detail_hash": str(summary["detail_ref"]["detail_hash"]),
+    }
+    summary["source_root"] = _digest(source_binding)
+    return summary
+
+
+def _canonical_competition_rows(
+    rows: list[dict[str, Any]],
+    *,
+    entity_type: str,
+) -> list[dict[str, Any]]:
+    """Project in-memory competition rows to bounded canonical/API rows."""
+
+    normalized_type = str(entity_type or "").upper()
+    if normalized_type == "STRATEGY":
+        key_field, version_field = "strategy_key", "current_version"
+    elif normalized_type == "COMBINATION":
+        key_field, version_field = "combination_key", "current_version"
+    else:
+        raise ValueError("治理竞技榜投影对象类型无效")
+    projected: list[dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            raise TypeError("治理竞技榜行必须是对象")
+        entity_key = str(raw.get(key_field) or "")
+        entity_version = str(raw.get(version_field) or "")
+        raw_metrics = raw.get("metrics")
+        if not isinstance(raw_metrics, dict):
+            raise ValueError("治理竞技榜行缺少多窗口指标")
+        window_summaries = {
+            str(window): _canonical_metric_window_summary(
+                raw_metrics.get(str(window)) or {},
+                entity_type=normalized_type,
+                entity_key=entity_key,
+                entity_version=entity_version,
+                window_days=window,
+            )
+            for window in WINDOWS
+        }
+        row = {
+            key: value for key, value in raw.items()
+            if key not in {
+                "metrics", "primary_metrics", "funding_checkpoint_candidate",
+            }
+        }
+        statistical_decision = raw.get("statistical_family_decision")
+        if isinstance(statistical_decision, dict):
+            decision_payload = {
+                "valid": statistical_decision.get("valid") is True,
+                "passed": statistical_decision.get("passed") is True,
+                "p_value": statistical_decision.get(
+                    "candidate_p_value"
+                ),
+                "rank": _int(statistical_decision.get("rank"), 0),
+                "critical": statistical_decision.get(
+                    "critical_value"
+                ),
+                "trials": _int(
+                    statistical_decision.get("total_hypotheses"), 0
+                ),
+                "source_hash": str(
+                    statistical_decision.get("decision_hash") or ""
+                ),
+            }
+            row["statistical_family_decision"] = decision_payload
+        confirmation = raw.get("confirmation_guard")
+        if isinstance(confirmation, dict):
+            confirmation_payload = {
+                "valid": confirmation.get("valid") is True,
+                "passed": confirmation.get("passed") is True,
+                "gap_sessions": _int(
+                    confirmation.get("minimum_new_sessions"), 0
+                ),
+                "confirmations": _int(
+                    confirmation.get("total_confirmation_count"), 0
+                ),
+                "continuous_sessions": _int(
+                    confirmation.get("continuous_session_count"), 0
+                ),
+                "source_hash": str(
+                    confirmation.get("compact_hash") or ""
+                ),
+            }
+            row["confirmation_guard"] = confirmation_payload
+        row["metrics"] = window_summaries
+        row["primary_window_days"] = 60
+        row["metric_detail_inline"] = False
+        if normalized_type == "STRATEGY":
+            checkpoint_ref = raw.get("funding_checkpoint_ref")
+            ref_valid = bool(
+                isinstance(checkpoint_ref, dict)
+                and _HASH_PATTERN.fullmatch(str(
+                    checkpoint_ref.get("checkpoint_id") or ""
+                ))
+                and _HASH_PATTERN.fullmatch(str(
+                    checkpoint_ref.get("history_fact_set_hash") or ""
+                ))
+                and checkpoint_ref.get("automatic_real_order_submission")
+                is False
+                and checkpoint_ref.get("real_order_authority") is False
+            )
+            for summary in window_summaries.values():
+                summary["detail_ref"].update({
+                    "detail_available": ref_valid,
+                })
+            row["metric_detail_source_kind"] = (
+                "VERIFIED_NORMALIZED_FUNDING_FACT_CHAIN_V3"
+            )
+            row["funding_checkpoint_id"] = (
+                str(checkpoint_ref.get("checkpoint_id") or "")
+                if ref_valid else ""
+            )
+            row["funding_history_fact_set_hash"] = (
+                str(checkpoint_ref.get("history_fact_set_hash") or "")
+                if ref_valid else ""
+            )
+            row["metric_detail_available"] = ref_valid
+        else:
+            recipe_ref = raw.get("combination_recipe_ref")
+            for summary in window_summaries.values():
+                summary["detail_ref"].update({
+                    "detail_available": False,
+                    "detail_hash": "",
+                })
+            row["metric_detail_source_kind"] = (
+                "COMBINATION_MEMBER_FACT_RECIPE_RESERVED"
+            )
+            row["combination_recipe_hash"] = str(
+                (recipe_ref or {}).get("recipe_hash") or ""
+            ) if isinstance(recipe_ref, dict) else ""
+            row["combination_recipe_gate_hash"] = str(
+                (recipe_ref or {}).get("recipe_gate_hash") or ""
+            ) if isinstance(recipe_ref, dict) else ""
+            row["metric_detail_available"] = False
+        projected.append(row)
+    return projected
+
+
+FUNDING_CHECKPOINT_DETAIL_SERIES = frozenset({
+    "daily_records",
+    "equity_curve",
+    "daily_stock_market_values",
+    "closed_evidence_by_day",
+    "fact_members",
+    "holdings",
+})
+FUNDING_DETAIL_PAGE_MAX_BYTES = 4 * 1024 * 1024 - 4096
+
+
+class FundingDetailItemTooLarge(ValueError):
+    """One verified detail item cannot fit without corrupt truncation."""
+
+
+def _funding_checkpoint_detail_page(
+    verified_checkpoint: dict[str, Any],
+    verified_fact_chain: dict[str, Any],
+    *,
+    series: str,
+    window_days: int,
+    cursor: str,
+    limit: int,
+) -> dict[str, Any]:
+    """Page one verified checkpoint/fact-chain projection without inlining it.
+
+    Loading and canonical-anchor verification intentionally stay outside this
+    pure projection.  Callers must pass the output of both
+    ``_verify_funding_checkpoint_row`` and
+    ``_verify_funding_daily_fact_chain``.  No series is ever read from legacy
+    ``state.rolling_history``; normalized append-only facts are the sole daily
+    source and the state contributes only its hash-bound current holdings.
+    """
+
+    series_name = str(series or "").strip()
+    if series_name not in FUNDING_CHECKPOINT_DETAIL_SERIES:
+        raise ValueError("资金检查点明细序列无效")
+    if int(window_days) not in WINDOWS:
+        raise ValueError("资金检查点明细窗口只能是20、60或120日")
+    if isinstance(limit, bool) or not 1 <= int(limit) <= 50:
+        raise ValueError("资金检查点明细每页只能读取1至50行")
+    state = verified_checkpoint.get("state")
+    if not isinstance(state, dict) or state.get("schema") != FUNDING_CHECKPOINT_SCHEMA:
+        raise ValueError("资金检查点明细缺少已验证状态")
+    if (
+        state.get("automatic_real_order_submission") is not False
+        or state.get("real_order_authority") is not False
+    ):
+        raise ValueError("资金检查点明细越过真实下单边界")
+    checkpoint_hash = str(
+        verified_checkpoint.get("checkpoint_hash") or ""
+    )
+    chain_hash = str(verified_checkpoint.get("chain_hash") or "")
+    if (
+        not _HASH_PATTERN.fullmatch(checkpoint_hash)
+        or not _HASH_PATTERN.fullmatch(chain_hash)
+        or checkpoint_state_hash(state) != checkpoint_hash
+    ):
+        raise ValueError("资金检查点明细哈希无效")
+    if not isinstance(verified_fact_chain, dict):
+        raise ValueError("资金检查点缺少已验证规范化事实链")
+    daily_records = verified_fact_chain.get("daily_records")
+    equity_curve = verified_fact_chain.get("equity_curve")
+    daily_stock_market_values = verified_fact_chain.get(
+        "daily_stock_market_values"
+    )
+    closed_evidence_by_day = verified_fact_chain.get(
+        "closed_evidence_by_day"
+    )
+    fact_members = verified_fact_chain.get("fact_members")
+    if (
+        not isinstance(daily_records, list)
+        or not 1 <= len(daily_records) <= FUNDING_REPLAY_MAX_SESSIONS
+        or any(not isinstance(item, dict) for item in daily_records)
+        or any(
+            not isinstance(items, list)
+            or len(items) != len(daily_records)
+            or any(not isinstance(item, dict) for item in items)
+            for items in (
+                equity_curve,
+                daily_stock_market_values,
+                closed_evidence_by_day,
+                fact_members,
+            )
+        )
+    ):
+        raise ValueError("资金检查点规范化日频事实链无效")
+    daily_dates = [
+        str(item.get("trade_date") or "") for item in daily_records
+    ]
+    related_dates = [
+        [str(item.get("trade_date") or "") for item in items]
+        for items in (
+            equity_curve,
+            daily_stock_market_values,
+            closed_evidence_by_day,
+            fact_members,
+        )
+    ]
+    history_count = _int(state.get("history_fact_count"), -1)
+    history_set_hash = str(state.get("history_fact_set_hash") or "")
+    if (
+        daily_dates != sorted(set(daily_dates))
+        or any(dates != daily_dates for dates in related_dates)
+        or history_count != len(daily_dates)
+        or daily_dates[0] != str(state.get("history_start_date") or "")
+        or daily_dates[-1] != str(state.get("history_end_date") or "")
+        or daily_dates[-1] != str(state.get("trade_date") or "")
+        or not _HASH_PATTERN.fullmatch(history_set_hash)
+        or ordered_funding_fact_set_hash(fact_members) != history_set_hash
+    ):
+        raise ValueError("资金检查点与规范化日频事实集合不一致")
+    allowed_dates = set(daily_dates[-int(window_days):])
+    if series_name == "holdings":
+        source = state.get("holdings")
+    else:
+        source = verified_fact_chain.get(series_name)
+    if not isinstance(source, list) or any(
+        not isinstance(item, dict) for item in source
+    ):
+        raise ValueError("资金检查点明细序列格式无效")
+    if series_name in {
+        "daily_records",
+        "equity_curve",
+        "daily_stock_market_values",
+        "closed_evidence_by_day",
+        "fact_members",
+    }:
+        items = [
+            dict(item) for item in source
+            if str(item.get("trade_date") or "") in allowed_dates
+        ]
+        item_dates = [str(item.get("trade_date") or "") for item in items]
+        if item_dates != sorted(set(item_dates)):
+            raise ValueError("资金检查点逐日明细日期重复或乱序")
+    else:
+        items = sorted(
+            (dict(item) for item in source),
+            key=lambda item: str(item.get("evidence_id") or ""),
+        )
+        holding_ids = [
+            str(item.get("evidence_id") or "") for item in items
+        ]
+        if any(not value for value in holding_ids) or len(holding_ids) != len(
+            set(holding_ids)
+        ):
+            raise ValueError("资金检查点持仓明细标识无效")
+    page_limit = int(limit)
+    checkpoint_id = str(verified_checkpoint.get("checkpoint_id") or "")
+    if not _HASH_PATTERN.fullmatch(checkpoint_id):
+        raise ValueError("资金检查点明细身份无效")
+
+    def page_cursor(offset: int) -> str:
+        cursor_hash = _digest({
+            "schema": "probiga.strategy-funding-detail-cursor.v1",
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_hash": checkpoint_hash,
+            "chain_hash": chain_hash,
+            "history_fact_set_hash": history_set_hash,
+            "series": series_name,
+            "window_days": int(window_days),
+            "limit": page_limit,
+            "offset": offset,
+        })[:32]
+        return f"{offset}.{cursor_hash}"
+
+    if not cursor:
+        offset = 0
+    else:
+        raw_offset, separator, supplied_hash = str(cursor).partition(".")
+        if (
+            separator != "."
+            or not raw_offset.isdigit()
+            or len(supplied_hash) != 32
+        ):
+            raise ValueError("资金检查点明细游标无效")
+        offset = int(raw_offset)
+        if page_cursor(offset) != cursor:
+            raise ValueError("资金检查点明细游标与事实链身份不一致")
+    if offset > len(items):
+        raise ValueError("资金检查点明细游标超出范围")
+    identity = {
+        "checkpoint_id": checkpoint_id,
+        "checkpoint_hash": checkpoint_hash,
+        "chain_hash": chain_hash,
+        "strategy_key": str(state.get("strategy_key") or ""),
+        "strategy_version": str(state.get("strategy_version") or ""),
+        "account_id": str(state.get("account_id") or ""),
+        "trade_date": str(state.get("trade_date") or ""),
+        "replay_mode": str(state.get("replay_mode") or ""),
+        "replay_session_count": _int(state.get("replay_session_count"), -1),
+        "max_holding_days": _int(state.get("max_holding_days"), -1),
+        "history_start_date": daily_dates[0],
+        "history_end_date": daily_dates[-1],
+        "history_fact_count": history_count,
+        "history_fact_set_hash": history_set_hash,
+    }
+    page_items = items[offset:offset + page_limit]
+    while True:
+        next_offset = offset + len(page_items)
+        page_contract = {
+            "schema": "probiga.strategy-funding-checkpoint-detail-page.v2",
+            **identity,
+            "source_kind": "VERIFIED_NORMALIZED_FUNDING_FACT_CHAIN_V3",
+            "series": series_name,
+            "window_days": int(window_days),
+            "offset": offset,
+            "limit": page_limit,
+            "row_count": len(page_items),
+            "total_count": len(items),
+            # Clients keep their own revision-bound cursor stack.  An
+            # approximate offset-page_limit cursor would be wrong once byte
+            # boxing returns fewer than the requested rows.
+            "previous_cursor": None,
+            "next_cursor": (
+                page_cursor(next_offset)
+                if next_offset < len(items) else None
+            ),
+            "items": page_items,
+            "response_byte_boxed": True,
+            "maximum_serialized_page_bytes": FUNDING_DETAIL_PAGE_MAX_BYTES,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        page = {**page_contract, "page_hash": _digest(page_contract)}
+        if len(_json_text(page).encode("utf-8")) <= (
+            FUNDING_DETAIL_PAGE_MAX_BYTES
+        ):
+            return page
+        if len(page_items) <= 1 and offset < len(items):
+            raise FundingDetailItemTooLarge(
+                "单条资金检查点明细超过4MiB响应硬上限，拒绝截断嵌套事实"
+            )
+        page_items = page_items[:-1]
+
+
+def _combination_recipe_detail_page(
+    verified_recipe_source: dict[str, Any], *,
+    series: str, window_days: int, cursor: str, limit: int,
+) -> dict[str, Any]:
+    """Rebuild a frozen combination from member V3 fact chains and page it."""
+
+    if (
+        not isinstance(verified_recipe_source, dict)
+        or verified_recipe_source.get("schema")
+        != FUNDING_COMBINATION_RECIPE_DETAIL_SOURCE_SCHEMA
+        or verified_recipe_source.get("cash_fact_materialized") is not False
+        or verified_recipe_source.get("automatic_real_order_submission")
+        is not False
+        or verified_recipe_source.get("real_order_authority") is not False
+    ):
+        raise ValueError("组合资金配方明细缺少已验证来源")
+    series_name = str(series or "")
+    if series_name not in {"daily_records", "equity_curve", "members"}:
+        raise ValueError("组合资金配方明细序列无效")
+    if int(window_days) not in WINDOWS:
+        raise ValueError("组合资金配方明细窗口只能是20、60或120日")
+    if isinstance(limit, bool) or not 1 <= int(limit) <= 50:
+        raise ValueError("组合资金配方明细每页只能读取1至50行")
+    run_uid = str(verified_recipe_source.get("run_uid") or "")
+    recipe_hash = str(verified_recipe_source.get("recipe_hash") or "")
+    recipe_gate_hash = str(
+        verified_recipe_source.get("recipe_gate_hash") or ""
+    )
+    risk_constraint_binding = _validated_combination_risk_binding(
+        verified_recipe_source.get("risk_constraint_binding")
+    )
+    member_sources = verified_recipe_source.get("member_sources")
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", run_uid)
+        or not _HASH_PATTERN.fullmatch(recipe_hash)
+        or not _HASH_PATTERN.fullmatch(recipe_gate_hash)
+        or not isinstance(member_sources, list)
+        or len(member_sources) != _int(
+            verified_recipe_source.get("member_count"), -1,
+        )
+        or not 2 <= len(member_sources) <= 50
+    ):
+        raise ValueError("组合资金配方明细身份或成员集合无效")
+
+    normalized_members: list[dict[str, Any]] = []
+    common_dates: list[str] | None = None
+    for raw_member in member_sources:
+        if not isinstance(raw_member, dict):
+            raise ValueError("组合资金配方成员来源无效")
+        source = raw_member.get("source")
+        if (
+            not isinstance(source, dict)
+            or source.get("automatic_real_order_submission") is not False
+            or source.get("real_order_authority") is not False
+            or source.get("anchor_run_uid") != run_uid
+        ):
+            raise ValueError("组合成员资金来源跨运行或权限边界")
+        try:
+            weight = Decimal(str(raw_member.get("weight")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("组合成员权重无效") from exc
+        if not weight.is_finite() or weight <= 0:
+            raise ValueError("组合成员权重无效")
+        checkpoint = source.get("verified_checkpoint")
+        facts = source.get("verified_fact_chain")
+        daily_page = _funding_checkpoint_detail_page(
+            checkpoint, facts, series="daily_records",
+            window_days=int(window_days), cursor="", limit=50,
+        )
+        daily_items = list(daily_page["items"])
+        while daily_page.get("next_cursor"):
+            daily_page = _funding_checkpoint_detail_page(
+                checkpoint, facts, series="daily_records",
+                window_days=int(window_days),
+                cursor=str(daily_page["next_cursor"]), limit=50,
+            )
+            daily_items.extend(daily_page["items"])
+        equity_page = _funding_checkpoint_detail_page(
+            checkpoint, facts, series="equity_curve",
+            window_days=int(window_days), cursor="", limit=50,
+        )
+        equity_items = list(equity_page["items"])
+        while equity_page.get("next_cursor"):
+            equity_page = _funding_checkpoint_detail_page(
+                checkpoint, facts, series="equity_curve",
+                window_days=int(window_days),
+                cursor=str(equity_page["next_cursor"]), limit=50,
+            )
+            equity_items.extend(equity_page["items"])
+        daily_by_date = {
+            str(item.get("trade_date") or ""): item
+            for item in daily_items
+        }
+        equity_by_date = {
+            str(item.get("trade_date") or ""): Decimal(
+                str(item.get("equity"))
+            )
+            for item in equity_items
+        }
+        dates = sorted(daily_by_date)
+        if (
+            len(dates) != int(window_days)
+            or set(dates) != set(equity_by_date)
+            or any(
+                not value.is_finite() or value <= 0
+                for value in equity_by_date.values()
+            )
+            or (common_dates is not None and dates != common_dates)
+        ):
+            raise ValueError("组合成员事实链未完整覆盖同一交易日窗口")
+        common_dates = dates
+        state = checkpoint.get("state") if isinstance(checkpoint, dict) else None
+        if not isinstance(state, dict):
+            raise ValueError("组合成员检查点状态无效")
+        normalized_members.append({
+            "strategy_key": str(raw_member.get("strategy_key") or ""),
+            "strategy_version": str(
+                raw_member.get("strategy_version") or ""
+            ),
+            "weight": weight,
+            "checkpoint_id": str(raw_member.get("checkpoint_id") or ""),
+            "checkpoint_hash": str(checkpoint.get("checkpoint_hash") or ""),
+            "chain_hash": str(checkpoint.get("chain_hash") or ""),
+            "history_fact_count": _int(
+                state.get("history_fact_count"), -1,
+            ),
+            "history_fact_set_hash": str(
+                state.get("history_fact_set_hash") or ""
+            ),
+            "daily": daily_by_date,
+            "equity": equity_by_date,
+        })
+    if (
+        common_dates is None
+        or abs(sum(
+            (item["weight"] for item in normalized_members), Decimal("0")
+        ) - Decimal("1")) > Decimal("0.00000005")
+        or len({item["strategy_key"] for item in normalized_members})
+        != len(normalized_members)
+    ):
+        raise ValueError("组合成员权重或身份不闭合")
+
+    sleeves = {
+        item["strategy_key"]: _EQUITY_BASE * item["weight"]
+        for item in normalized_members
+    }
+    daily_records: list[dict[str, Any]] = []
+    equity_curve: list[dict[str, Any]] = []
+    for day_index, day in enumerate(common_dates):
+        prior_equity = sum(sleeves.values(), Decimal("0"))
+        actual_cost_value = Decimal("0")
+        for member in normalized_members:
+            daily = member["daily"][day]
+            try:
+                daily_return = Decimal(str(daily.get("return_pct")))
+                daily_cost = Decimal(str(daily.get("actual_cost_pct")))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise ValueError("组合成员日频收益或成本无效") from exc
+            if (
+                daily.get("is_net_return") is not True
+                or not daily_return.is_finite()
+                or daily_return <= Decimal("-100")
+                or not daily_cost.is_finite()
+                or daily_cost < 0
+            ):
+                raise ValueError("组合成员日频收益或成本无效")
+            if day_index > 0:
+                previous_day = common_dates[day_index - 1]
+                absolute_return = (
+                    member["equity"][day]
+                    / member["equity"][previous_day]
+                    - Decimal("1")
+                ) * Decimal("100")
+                if abs(absolute_return - daily_return) > Decimal("0.0001"):
+                    raise ValueError("组合成员日频收益无法由净值重算")
+            key = member["strategy_key"]
+            prior_sleeve = sleeves[key]
+            actual_cost_value += prior_sleeve * daily_cost / Decimal("100")
+            sleeves[key] = prior_sleeve * (
+                Decimal("1") + daily_return / Decimal("100")
+            )
+        equity = sum(sleeves.values(), Decimal("0")).quantize(
+            _EQUITY_QUANTUM, rounding=ROUND_HALF_EVEN,
+        )
+        if not equity.is_finite() or equity <= 0 or prior_equity <= 0:
+            raise ValueError("组合配方复算净值无效")
+        daily_records.append({
+            "trade_date": day,
+            "return_pct": round(float(
+                (equity / prior_equity - Decimal("1")) * Decimal("100")
+            ), 10),
+            "actual_cost_pct": round(float(
+                actual_cost_value / prior_equity * Decimal("100")
+            ), 10),
+            "is_net_return": True,
+            "evidence_revision_at": f"{day}T15:00:00",
+        })
+        equity_curve.append({"trade_date": day, "equity": float(equity)})
+
+    member_fact_sets = [{
+        key: (
+            float(value) if key == "weight" else value
+        )
+        for key, value in member.items()
+        if key not in {"daily", "equity"}
+    } for member in normalized_members]
+    reconstruction = {
+        "schema": "probiga.combination-recipe-detail-reconstruction.v1",
+        "run_uid": run_uid,
+        "combination_key": str(
+            verified_recipe_source.get("combination_key") or ""
+        ),
+        "combination_version": str(
+            verified_recipe_source.get("combination_version") or ""
+        ),
+        "trade_date": str(verified_recipe_source.get("trade_date") or ""),
+        "recipe_hash": recipe_hash,
+        "recipe_gate_hash": recipe_gate_hash,
+        "risk_constraint_binding": risk_constraint_binding,
+        "window_days": int(window_days),
+        "allocation_semantics": (
+            "WINDOW_OPEN_REBASED_FIXED_SLEEVES_NATURAL_WEIGHT_DRIFT_V3"
+        ),
+        "member_fact_sets": member_fact_sets,
+        "daily_records": daily_records,
+        "equity_curve": equity_curve,
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    reconstruction_hash = _digest(reconstruction)
+    items = {
+        "daily_records": daily_records,
+        "equity_curve": equity_curve,
+        "members": member_fact_sets,
+    }[series_name]
+    page_limit = int(limit)
+
+    def page_cursor(offset: int) -> str:
+        identity = {
+            "schema": "probiga.combination-recipe-detail-cursor.v1",
+            "run_uid": run_uid,
+            "recipe_hash": recipe_hash,
+            "reconstruction_hash": reconstruction_hash,
+            "series": series_name,
+            "window_days": int(window_days),
+            "limit": page_limit,
+            "offset": offset,
+        }
+        return f"{offset}.{_digest(identity)[:32]}"
+
+    if not cursor:
+        offset = 0
+    else:
+        raw_offset, separator, supplied_hash = str(cursor).partition(".")
+        if (
+            separator != "." or not raw_offset.isdigit()
+            or len(supplied_hash) != 32
+        ):
+            raise ValueError("组合资金配方明细游标无效")
+        offset = int(raw_offset)
+        if page_cursor(offset) != cursor:
+            raise ValueError("组合资金配方明细游标与配方修订不一致")
+    if offset > len(items):
+        raise ValueError("组合资金配方明细游标超出范围")
+    page_items = items[offset:offset + page_limit]
+    while True:
+        next_offset = offset + len(page_items)
+        page_contract = {
+            "schema": "probiga.combination-recipe-detail-page.v1",
+            "run_uid": run_uid,
+            "combination_key": reconstruction["combination_key"],
+            "combination_version": reconstruction["combination_version"],
+            "trade_date": reconstruction["trade_date"],
+            "recipe_hash": recipe_hash,
+            "recipe_gate_hash": recipe_gate_hash,
+            "risk_constraint_binding": risk_constraint_binding,
+            "reconstruction_hash": reconstruction_hash,
+            "allocation_semantics": reconstruction["allocation_semantics"],
+            "member_fact_sets": member_fact_sets,
+            "cash_fact_materialized": False,
+            "independent_combination_cash_fact": False,
+            "detail_funding_authority": False,
+            "series": series_name,
+            "window_days": int(window_days),
+            "offset": offset,
+            "limit": page_limit,
+            "row_count": len(page_items),
+            "total_count": len(items),
+            "previous_cursor": None,
+            "next_cursor": (
+                page_cursor(next_offset)
+                if next_offset < len(items) else None
+            ),
+            "items": page_items,
+            "response_byte_boxed": True,
+            "maximum_serialized_page_bytes": FUNDING_DETAIL_PAGE_MAX_BYTES,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        page = {**page_contract, "page_hash": _digest(page_contract)}
+        if len(_json_text(page).encode("utf-8")) <= (
+            FUNDING_DETAIL_PAGE_MAX_BYTES
+        ):
+            return page
+        if len(page_items) <= 1 and offset < len(items):
+            raise FundingDetailItemTooLarge(
+                "单条组合资金配方明细超过4MiB响应硬上限，拒绝截断"
+            )
+        page_items = page_items[:-1]
+
+
+def _strategy_rankings(
+    registry: list[dict[str, Any]],
+    metrics: dict[str, dict[int, dict[str, Any]]],
+    *, statistical_decisions: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     rows = []
     lane_order = {"ACTIVE": 0, "REDUCE": 0, "SHADOW": 1, "SUSPENDED": 2, "RETIRED": 3}
     for item in registry:
@@ -8620,6 +17203,16 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         short = window_metrics[20]
         short_gate = short["profit_gate"]
         short_gate_passed = bool(short_gate["passed"])
+        statistical_decision = (
+            (statistical_decisions or {}).get(item["strategy_key"]) or {}
+        )
+        statistical_family_passed = bool(
+            statistical_decision.get("valid") is True
+            and statistical_decision.get("passed") is True
+            and _HASH_PATTERN.fullmatch(str(
+                statistical_decision.get("decision_hash") or ""
+            ))
+        )
         enabled = bool(item.get("enabled"))
         adapter_executable = item.get("execution_adapter_executable") is True
         runtime_strategy = (
@@ -8628,10 +17221,27 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         funding_pipeline_ready = bool(
             not runtime_strategy or item.get("funding_pipeline_ready") is True
         )
+        checkpoint_candidate = window_metrics.get(
+            "funding_checkpoint_candidate"
+        )
+        checkpoint_ref = window_metrics.get("funding_checkpoint_ref")
+        checkpoint_ready = bool(
+            isinstance(checkpoint_candidate, dict)
+            and checkpoint_candidate.get("schema")
+            == "probiga.strategy-funding-checkpoint-candidate.v2"
+            and isinstance(checkpoint_ref, dict)
+            and checkpoint_ref.get("checkpoint_id")
+            == checkpoint_candidate.get("checkpoint_id")
+            and checkpoint_candidate.get("automatic_real_order_submission")
+            is False
+            and checkpoint_candidate.get("real_order_authority") is False
+        )
         overall_gate_passed = bool(
             enabled and adapter_executable and funding_pipeline_ready
+            and checkpoint_ready
             and short_gate_passed
             and medium_gate["passed"] and long_gate["passed"]
+            and statistical_family_passed
         )
         failed_windows = []
         evidence_block_reasons = list(dict.fromkeys(
@@ -8644,12 +17254,17 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         if not adapter_executable:
             failed_windows.append(
                 str(item.get("execution_adapter_reason")
-                    or "执行适配器未部署/无效")
+                    or "执行适配器状态不可用")
             )
         if not funding_pipeline_ready:
             failed_windows.append(str(
                 item.get("funding_pipeline_reason")
-                or "动态策略资金证据闭环尚未部署，仅允许影子研究"
+                or "模拟链校验失败，当前不授予模拟资金资格"
+            ))
+        if not checkpoint_ready:
+            failed_windows.append(str(
+                window_metrics.get("funding_checkpoint_persistence_reason")
+                or "资金检查点及日频事实候选不可持久化"
             ))
         if not short_gate_passed:
             failed_windows.append(
@@ -8660,26 +17275,72 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
             failed_windows.append("60日盈利硬门槛")
         if not long_gate["passed"]:
             failed_windows.append("120日长期稳定性")
+        if not statistical_family_passed:
+            failed_windows.append("服务端完整试验族BY多重检验")
         overall_reason = (
-            "20日、60日和120日盈利硬门槛全部通过"
+            "20日、60日、120日置信盈利门槛及BY多重检验全部通过"
             if overall_gate_passed
             else "未通过：" + "、".join(failed_windows)
         )
-        ranking_score = round(
-            short["health_score"] * 0.25
-            + primary["health_score"] * 0.50
-            + window_metrics[120]["health_score"] * 0.25,
-            2,
+        ranking_score = _weighted_competition_score({
+            20: short["health_score"],
+            60: primary["health_score"],
+            120: window_metrics[120]["health_score"],
+        })
+        execution_comparable_windows = {
+            window: _execution_window_comparable(window_metrics[window])
+            for window in WINDOWS
+        }
+        signal_comparable_windows = {
+            window: _signal_window_comparable(window_metrics[window])
+            for window in WINDOWS
+        }
+        execution_comparable = all(execution_comparable_windows.values())
+        signal_comparable = all(signal_comparable_windows.values())
+        signal_ranking_score = (
+            _weighted_competition_score({
+                window: float(
+                    window_metrics[window]["selection_validation"].get(
+                        "health_score"
+                    ) or 0.0
+                )
+                for window in WINDOWS
+            })
+            if signal_comparable else None
         )
         funding_gate_hash = _digest({
+            "schema": "probiga.strategy-pre-confirmation-funding-gate.v2",
             "strategy_key": item["strategy_key"],
             "strategy_version": item["current_version"],
             "window_evidence": {
-                str(window): window_metrics[window].get("evidence_hash")
+                str(window): {
+                    "internal_ledger_hash": window_metrics[window].get(
+                        "internal_ledger_hash"
+                    ),
+                    "internal_forward_stability_hash": str(
+                        (window_metrics[window].get(
+                            "internal_forward_stability"
+                        ) or {}).get("compact_hash") or ""
+                    ),
+                    "statistical_guard_hash": str(
+                        (window_metrics[window].get(
+                            "statistical_guard"
+                        ) or {}).get("compact_hash") or ""
+                    ),
+                    "profit_gate_hash": _digest(
+                        window_metrics[window].get("profit_gate") or {}
+                    ),
+                }
                 for window in WINDOWS
             },
+            "statistical_family_decision_hash": str(
+                statistical_decision.get("decision_hash") or ""
+            ),
             "router_decision_hash": market_route.get("router_decision_hash"),
+            "funding_checkpoint_ready": checkpoint_ready,
             "overall_gate_passed": overall_gate_passed,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         })
         funding_evidence_revision_at = _funding_evidence_revision_at(
             window_metrics
@@ -8691,16 +17352,59 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
             "ranking_score": ranking_score,
             "ranking_basis": DAILY_NAV_RANKING_BASIS,
             "ranking_basis_label": DAILY_NAV_RANKING_BASIS_LABEL,
+            "execution_evidence_ranking_basis_label": (
+                EXECUTION_EVIDENCE_RANKING_BASIS_LABEL
+            ),
+            "execution_evidence_comparable": execution_comparable,
+            "execution_evidence_comparable_windows": (
+                execution_comparable_windows
+            ),
+            "execution_evidence_score": (
+                ranking_score if execution_comparable else None
+            ),
+            "execution_evidence_rank": None,
+            "signal_validation_ranking_basis": (
+                SIGNAL_VALIDATION_RANKING_BASIS
+            ),
+            "signal_validation_ranking_basis_label": (
+                SIGNAL_VALIDATION_RANKING_BASIS_LABEL
+            ),
+            "signal_validation_comparable": signal_comparable,
+            "signal_validation_comparable_windows": (
+                signal_comparable_windows
+            ),
+            "signal_validation_score": signal_ranking_score,
+            "signal_validation_rank": None,
+            "competition_disclosure": (
+                "客户端声明信号榜只比较经双人复核且结构可重算的外部提交，"
+                "并未与权威行情逐行认证；成交实证榜只使用内部模拟成交、实际"
+                "费用和逐日净值。两榜不可互相冒充，声明信号成绩不授予模拟资金。"
+            ),
             "profit_gate_passed": overall_gate_passed,
             "profit_gate_reason": overall_reason,
             "execution_adapter_executable": adapter_executable,
             "execution_adapter_reason": str(
                 item.get("execution_adapter_reason")
-                or "执行适配器未部署/无效"
+                or "执行适配器状态不可用"
             ),
             "funding_pipeline_ready": funding_pipeline_ready,
             "funding_pipeline_reason": str(
                 item.get("funding_pipeline_reason") or ""
+            ),
+            "funding_checkpoint_ready": checkpoint_ready,
+            "funding_checkpoint_candidate": checkpoint_candidate,
+            "funding_checkpoint_ref": checkpoint_ref,
+            "funding_checkpoint_persistence_reason_code": str(
+                window_metrics.get(
+                    "funding_checkpoint_persistence_reason_code"
+                ) or "NO_VERIFIED_INTERNAL_LEDGER"
+            ),
+            "funding_checkpoint_persistence_reason": str(
+                window_metrics.get("funding_checkpoint_persistence_reason")
+                or "没有可持久化的内部资金账本"
+            ),
+            "funding_checkpoint_storage_bytes": _int(
+                window_metrics.get("funding_checkpoint_storage_bytes"), 0
             ),
             "evidence_block_reasons": evidence_block_reasons,
             "market_route": market_route,
@@ -8711,6 +17415,9 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
                 "60": medium_gate,
                 "120": long_gate,
             },
+            "statistical_family_decision": statistical_decision,
+            "statistical_family_passed": statistical_family_passed,
+            "pre_confirmation_funding_gate_hash": funding_gate_hash,
             "funding_gate_hash": funding_gate_hash,
             "funding_evidence_revision_at": funding_evidence_revision_at,
             "metrics": {str(window): window_metrics[window] for window in WINDOWS},
@@ -8719,12 +17426,10 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
             "payoff_ratio": primary.get("payoff_ratio"),
             "profit_factor": primary.get("profit_factor"),
             "net_expectancy_pct": primary.get("net_expectancy_pct"),
-            "paper_allocation_eligible": (
-                status in {"ACTIVE", "REDUCE"}
-                and overall_gate_passed
-                and adapter_executable
-                and market_route.get("eligible") is True
-            ),
+            # Spaced confirmation is applied after every current strategy has
+            # been ranked.  Until then no row is funding-eligible.
+            "paper_allocation_eligible": False,
+            "automatic_real_order_submission": False,
             "real_order_authority": False,
         })
     rows.sort(key=lambda row: (lane_order.get(row["current_status"], 9), -float(row["ranking_score"]), row["strategy_key"]))
@@ -8733,7 +17438,52 @@ def _strategy_rankings(registry: list[dict[str, Any]], metrics: dict[str, dict[i
         row["overall_rank"] = index
         lane_ranks[row["lane"]] += 1
         row["lane_rank"] = lane_ranks[row["lane"]]
+    execution_rows = sorted(
+        (
+            row for row in rows
+            if row.get("execution_evidence_comparable") is True
+        ),
+        key=lambda row: (
+            -float(row.get("execution_evidence_score") or 0.0),
+            row["strategy_key"],
+        ),
+    )
+    for rank, row in enumerate(execution_rows, 1):
+        row["execution_evidence_rank"] = rank
+    signal_rows = sorted(
+        (
+            row for row in rows
+            if row.get("signal_validation_comparable") is True
+        ),
+        key=lambda row: (
+            -float(row.get("signal_validation_score") or 0.0),
+            row["strategy_key"],
+        ),
+    )
+    for rank, row in enumerate(signal_rows, 1):
+        row["signal_validation_rank"] = rank
     return rows
+
+
+def _immutable_prior_session_rows(
+    before_date: str, *, limit: int,
+) -> list[dict[str, str]]:
+    count = max(1, int(limit))
+    start_date = (
+        date.fromisoformat(before_date)
+        - timedelta(days=math.ceil(count * 1.65) + 45)
+    ).isoformat()
+    receipt = _immutable_calendar_receipt(
+        start_date=start_date,
+        end_date=before_date,
+        decision_known_at=f"{before_date} 23:59:59",
+    )
+    sessions = sorted((
+        day for day in receipt.sessions if day < before_date
+    ), reverse=True)[:count]
+    if len(sessions) != count:
+        return []
+    return [{"trade_date": day} for day in sessions]
 
 
 def _prior_consecutive_gate_passes(
@@ -8741,10 +17491,12 @@ def _prior_consecutive_gate_passes(
     current_hash: str, current_revision_at: str, limit: int = 2,
     minimum_revision_exclusive: str = "",
     minimum_trade_date_exclusive: str = "",
+    *, history_rows: list[dict[str, Any]] | None = None,
+    expected_session_rows: list[dict[str, Any]] | None = None,
 ) -> int:
-    if not _table_exists("st_strategy_health_snapshot"):
+    if history_rows is None and not _table_exists("st_strategy_health_snapshot"):
         return 0
-    rows = _db_read(
+    rows = history_rows if history_rows is not None else _db_read(
         """
         SELECT h.trade_date, h.profit_gate_passed, h.evidence_json
         FROM st_strategy_health_snapshot h
@@ -8763,11 +17515,10 @@ def _prior_consecutive_gate_passes(
             "limit": max(20, int(limit) * 20),
         },
     )
-    expected_sessions = _db_read(
-        "SELECT trade_date FROM si_trade_calendar "
-        "WHERE trade_status=1 AND trade_date<:before_date "
-        "ORDER BY trade_date DESC LIMIT :limit",
-        {"before_date": before_date, "limit": max(1, int(limit))},
+    expected_sessions = (
+        expected_session_rows
+        if expected_session_rows is not None
+        else _immutable_prior_session_rows(before_date, limit=limit)
     )
     ceiling = _normalize_evidence_revision(current_revision_at)
     if not ceiling:
@@ -8825,12 +17576,17 @@ def _prior_consecutive_combination_gate_passes(
     current_hash: str, current_revision_at: str, limit: int = 2,
     minimum_revision_exclusive: str = "",
     minimum_trade_date_exclusive: str = "",
+    *, history_rows: list[dict[str, Any]] | None = None,
+    expected_session_rows: list[dict[str, Any]] | None = None,
 ) -> int:
     """Count distinct, prior passing combination evidence updates."""
 
-    if not _table_exists("st_strategy_combination_health_snapshot"):
+    if (
+        history_rows is None
+        and not _table_exists("st_strategy_combination_health_snapshot")
+    ):
         return 0
-    rows = _db_read(
+    rows = history_rows if history_rows is not None else _db_read(
         """
         SELECT h.trade_date, h.profit_gate_passed, h.evidence_json
         FROM st_strategy_combination_health_snapshot h
@@ -8849,11 +17605,10 @@ def _prior_consecutive_combination_gate_passes(
             "limit": max(20, int(limit) * 20),
         },
     )
-    expected_sessions = _db_read(
-        "SELECT trade_date FROM si_trade_calendar "
-        "WHERE trade_status=1 AND trade_date<:before_date "
-        "ORDER BY trade_date DESC LIMIT :limit",
-        {"before_date": before_date, "limit": max(1, int(limit))},
+    expected_sessions = (
+        expected_session_rows
+        if expected_session_rows is not None
+        else _immutable_prior_session_rows(before_date, limit=limit)
     )
     ceiling = _normalize_evidence_revision(current_revision_at)
     if not ceiling:
@@ -8998,7 +17753,7 @@ def _internal_combination_portfolio_ledger(
             if (
                 item.get("version_match") is not True
                 or metrics.get("funding_provenance")
-                != "INTERNAL_PORTFOLIO_LEDGER_V1"
+                != CANONICAL_FUNDING_PROVENANCE
                 or not _HASH_PATTERN.fullmatch(
                     str(metrics.get("internal_ledger_hash") or "")
                 )
@@ -9006,11 +17761,17 @@ def _internal_combination_portfolio_ledger(
                 != "TIME_WEIGHTED_DAILY_MAX_CLOSE_OR_TURNOVER_PROXY_V2"
             ):
                 raise ValueError("组合成员缺少相同窗口的内部版本绑定日频净值")
-            daily = {
-                str(row.get("trade_date") or ""): row
-                for row in (metrics.get("internal_daily_records") or [])
-                if str(row.get("trade_date") or "")
-            }
+            raw_daily = metrics.get("internal_daily_records")
+            if not isinstance(raw_daily, list):
+                raise ValueError("组合成员内部日频净值不是列表")
+            daily: dict[str, dict[str, Any]] = {}
+            for raw_row in raw_daily:
+                if not isinstance(raw_row, dict):
+                    raise ValueError("组合成员内部日频净值包含非对象行")
+                day = str(raw_row.get("trade_date") or "")
+                if not day or day in daily:
+                    raise ValueError("组合成员内部日频净值日期为空或重复")
+                daily[day] = raw_row
             if not daily:
                 raise ValueError("组合成员内部日频净值为空")
             equity = {
@@ -9025,6 +17786,38 @@ def _internal_combination_portfolio_ledger(
                 for value in equity.values()
             ):
                 raise ValueError("组合成员日频收益与内部净值无法逐日对应")
+            raw_daily_exposure = metrics.get(
+                "internal_daily_stock_market_values"
+            )
+            if not isinstance(raw_daily_exposure, list):
+                raise ValueError("组合成员缺少逐日真实持仓市值敞口")
+            daily_stock_exposure: dict[str, dict[str, Decimal]] = {}
+            for raw_exposure in raw_daily_exposure:
+                if not isinstance(raw_exposure, dict):
+                    raise ValueError("组合成员逐日持仓市值敞口包含非对象行")
+                exposure_day = str(raw_exposure.get("trade_date") or "")
+                raw_values = raw_exposure.get("stock_risk_exposure")
+                if (
+                    not exposure_day
+                    or exposure_day in daily_stock_exposure
+                    or not isinstance(raw_values, dict)
+                ):
+                    raise ValueError("组合成员逐日持仓市值敞口日期或格式无效")
+                normalized_values: dict[str, Decimal] = {}
+                for raw_code, raw_value in raw_values.items():
+                    code = str(raw_code or "")
+                    value = Decimal(str(raw_value or "0"))
+                    if (
+                        not re.fullmatch(r"[0-9]{6}", code)
+                        or code in normalized_values
+                        or not value.is_finite()
+                        or value < 0
+                    ):
+                        raise ValueError("组合成员逐日持仓市值敞口内容无效")
+                    normalized_values[code] = value
+                daily_stock_exposure[exposure_day] = normalized_values
+            if set(daily_stock_exposure) != set(daily):
+                raise ValueError("组合成员逐日持仓市值敞口未覆盖完整净值窗口")
             member_revision = _normalize_evidence_revision(
                 metrics.get("evidence_revision_at")
             )
@@ -9059,6 +17852,7 @@ def _internal_combination_portfolio_ledger(
                 "metrics": metrics,
                 "daily": daily,
                 "equity": equity,
+                "daily_stock_exposure": daily_stock_exposure,
             })
         ordered_days = sorted(common_days or ())
         if (
@@ -9075,6 +17869,8 @@ def _internal_combination_portfolio_ledger(
         session_window = member_session_windows[0]
         daily_records: list[dict[str, Any]] = []
         equity_curve: list[dict[str, Any]] = []
+        daily_member_weights: list[dict[str, Any]] = []
+        daily_risk_exposures: list[dict[str, Any]] = []
         member_sleeves = {
             item["strategy_key"]: (
                 _EQUITY_BASE * Decimal(str(item["weight"]))
@@ -9146,36 +17942,99 @@ def _internal_combination_portfolio_ledger(
                 "evidence_revision_at": f"{day}T15:00:00",
             })
             equity_curve.append({"trade_date": day, "equity": float(equity)})
-        stock_exposure: dict[str, Decimal] = defaultdict(Decimal)
-        for item in member_payloads:
-            member_exposure = {
-                str(code): Decimal(str(raw_value or "0"))
-                for code, raw_value in (
-                    item["metrics"].get("internal_stock_exposure") or {}
-                ).items()
+            closing_sleeve_total = sum(
+                member_sleeves.values(), Decimal("0")
+            )
+            closing_member_weights = {
+                key: value / closing_sleeve_total
+                for key, value in sorted(member_sleeves.items())
             }
-            if any(
-                not value.is_finite() or value < 0
-                for value in member_exposure.values()
+            if (
+                any(
+                    not value.is_finite() or value < 0
+                    for value in closing_member_weights.values()
+                )
+                or abs(
+                    sum(closing_member_weights.values(), Decimal("0"))
+                    - Decimal("1")
+                ) > Decimal("0.000000000001")
             ):
-                raise ValueError("组合成员真实持仓市值敞口无效")
-            member_total = sum(member_exposure.values(), Decimal("0"))
-            if member_total <= 0:
-                continue
-            for code, value in member_exposure.items():
-                if value.is_finite() and value > 0:
-                    stock_exposure[str(code)] += (
-                        value / member_total * Decimal(str(item["weight"]))
-                    )
+                raise ValueError("组合逐日自然漂移成员权重不闭合")
+            member_stock_weights: dict[str, dict[str, Decimal]] = {}
+            combined_stock_weights: dict[str, Decimal] = defaultdict(Decimal)
+            for item in member_payloads:
+                key = item["strategy_key"]
+                raw_exposure = item["daily_stock_exposure"][day]
+                exposure_total = sum(raw_exposure.values(), Decimal("0"))
+                normalized_exposure = {
+                    code: value / exposure_total
+                    for code, value in sorted(raw_exposure.items())
+                    if value > 0 and exposure_total > 0
+                }
+                member_stock_weights[key] = normalized_exposure
+                effective_weight = closing_member_weights[key]
+                for code, value in normalized_exposure.items():
+                    combined_stock_weights[code] += effective_weight * value
+            daily_member_weights.append({
+                "trade_date": day,
+                "member_weights": {
+                    key: str(value)
+                    for key, value in closing_member_weights.items()
+                },
+            })
+            daily_risk_exposures.append({
+                "trade_date": day,
+                "member_stock_weights": {
+                    key: {
+                        code: str(value)
+                        for code, value in sorted(values.items())
+                    }
+                    for key, values in sorted(member_stock_weights.items())
+                },
+                "combined_stock_weights": {
+                    code: str(value)
+                    for code, value in sorted(combined_stock_weights.items())
+                    if value > 0
+                },
+            })
+        stock_exposure: dict[str, Decimal] = defaultdict(Decimal)
+        for row in daily_risk_exposures:
+            for code, raw_value in row["combined_stock_weights"].items():
+                stock_exposure[code] += Decimal(raw_value) / Decimal(
+                    len(daily_risk_exposures)
+                )
+        peak_member_weight = Decimal("0")
+        peak_member_key = ""
+        peak_member_trade_date = ""
+        for row in daily_member_weights:
+            for key, raw_value in row["member_weights"].items():
+                value = Decimal(raw_value)
+                if value > peak_member_weight:
+                    peak_member_weight = value
+                    peak_member_key = key
+                    peak_member_trade_date = row["trade_date"]
+        current_member_weights = dict(
+            daily_member_weights[-1]["member_weights"]
+        )
+        risk_path_payload = {
+            "schema": "probiga.combination-drift-risk-path.v1",
+            "combination_key": combination["combination_key"],
+            "combination_version": combination["current_version"],
+            "window_days": window,
+            "trade_date": trade_date,
+            "daily_member_weights": daily_member_weights,
+            "daily_risk_exposures": daily_risk_exposures,
+        }
+        risk_path_hash = _digest(risk_path_payload)
         ledger_payload = {
-            "schema": "probiga.internal-combination-portfolio-ledger.v2",
+            "schema": "probiga.internal-combination-portfolio-ledger.v3",
             "combination_key": combination["combination_key"],
             "combination_version": combination["current_version"],
             "combination_config_hash": combination.get("config_hash"),
             "window_days": window,
             "trade_date": trade_date,
             "allocation_semantics": (
-                "WINDOW_OPEN_REBASED_FIXED_SLEEVES_NATURAL_WEIGHT_DRIFT_V2"
+                "WINDOW_OPEN_REBASED_FIXED_SLEEVES_NATURAL_WEIGHT_DRIFT_V3"
             ),
             "funding_evidence_revision_at": min(member_revisions),
             "session_window": session_window,
@@ -9192,8 +18051,15 @@ def _internal_combination_portfolio_ledger(
             ],
             "daily_records": daily_records,
             "equity_curve": equity_curve,
+            "daily_member_weights": daily_member_weights,
+            "daily_risk_exposures": daily_risk_exposures,
+            "risk_path_hash": risk_path_hash,
+            "peak_member_weight": str(peak_member_weight),
+            "peak_member_key": peak_member_key,
+            "peak_member_trade_date": peak_member_trade_date,
+            "current_member_weights": current_member_weights,
             "stock_exposure_basis": (
-                "TIME_WEIGHTED_DAILY_MAX_CLOSE_OR_TURNOVER_PROXY_V2"
+                "DAILY_EFFECTIVE_SLEEVE_WEIGHTED_CLOSE_EXPOSURE_V3"
             ),
             "stock_exposure": {
                 code: str(value)
@@ -9202,11 +18068,15 @@ def _internal_combination_portfolio_ledger(
         }
         return {
             "valid": True,
-            "funding_provenance": "INTERNAL_PORTFOLIO_LEDGER_V1",
+            "funding_provenance": CANONICAL_FUNDING_PROVENANCE,
             "drawdown_basis": "internal_version_bound_portfolio_equity",
             "cost_basis": "actual_ledger_fees",
             "internal_ledger_schema": ledger_payload["schema"],
             "internal_ledger_hash": _digest(ledger_payload),
+            "combination_key": combination["combination_key"],
+            "combination_version": combination["current_version"],
+            "window_days": window,
+            "trade_date": trade_date,
             "allocation_semantics": ledger_payload[
                 "allocation_semantics"
             ],
@@ -9215,6 +18085,16 @@ def _internal_combination_portfolio_ledger(
             "portfolio_coverage_days": len(equity_curve),
             "daily_records": daily_records,
             "equity_curve": equity_curve,
+            "daily_member_weights": daily_member_weights,
+            "daily_risk_exposures": daily_risk_exposures,
+            "risk_path_hash": risk_path_hash,
+            "peak_member_weight": float(peak_member_weight),
+            "peak_member_key": peak_member_key,
+            "peak_member_trade_date": peak_member_trade_date,
+            "current_member_weights": {
+                key: float(Decimal(value))
+                for key, value in current_member_weights.items()
+            },
             "stock_exposure_basis": ledger_payload[
                 "stock_exposure_basis"
             ],
@@ -9247,7 +18127,10 @@ def _frozen_industry_snapshot(
     status = "COMPLETED"
     snapshot_id = ""
     if not codes:
-        status, reason = "INCOMPLETE", "组合没有可冻结的持仓行业暴露"
+        status, reason = (
+            "INCOMPLETE",
+            "当日候选为空，无需行业绑定；模拟资金保持现金",
+        )
     else:
         try:
             table_ready = _strict_table_exists(
@@ -9291,6 +18174,9 @@ def _frozen_industry_snapshot(
         for row in industry_rows:
             code = str(row.get("stock_code") or "").strip().zfill(6)
             name = str(row.get("industry_name") or "").strip()
+            industry_type = str(row.get("industry_type") or "").strip()
+            source_system = str(row.get("source_system") or "").strip()
+            source_fact_id = str(row.get("source_fact_id") or "").strip()
             source_effective_at = _normalize_evidence_revision(
                 row.get("source_effective_at")
             )
@@ -9304,16 +18190,22 @@ def _frozen_industry_snapshot(
                 "as_of_exclusive": cutoff,
                 "stock_code": code,
                 "industry_name": name,
-                "industry_type": str(row.get("industry_type") or ""),
-                "source_system": str(row.get("source_system") or ""),
-                "source_fact_id": str(row.get("source_fact_id") or ""),
+                "industry_type": industry_type,
+                "source_system": source_system,
+                "source_fact_id": source_fact_id,
                 "source_effective_at": source_effective_at,
                 "source_etl_sync_at": source_etl_sync_at,
             }
             if (
                 code not in codes or code in seen or not name
+                or industry_type not in L1_INDUSTRY_TYPES
+                or not source_system
+                or _QMT_INDUSTRY_FACT_ID_PATTERN.fullmatch(source_fact_id)
+                is None
                 or not _HASH_PATTERN.fullmatch(observed_snapshot_id)
                 or not source_effective_at or not source_etl_sync_at
+                or source_effective_at != source_etl_sync_at
+                or source_effective_at < target + "T15:00:00"
                 or source_effective_at >= cutoff
                 or source_etl_sync_at >= cutoff
                 or _digest(row_payload) != str(row.get("row_hash") or "")
@@ -9324,17 +18216,17 @@ def _frozen_industry_snapshot(
             seen.add(code)
             snapshot_ids.add(observed_snapshot_id)
             rows_payload.append({**row_payload, "row_hash": str(row.get("row_hash") or "")})
-        missing = sorted(set(codes) - seen)
-        if missing:
-            status = "INCOMPLETE"
-            reason = "治理交易日前行业快照不完整：" + "、".join(missing)
-        elif len(snapshot_ids) != 1:
+        if len(snapshot_ids) > 1:
             status = "INVALID"
             reason = "行业历史同一治理日存在多个snapshot_id"
-        else:
+        elif len(snapshot_ids) == 1:
             snapshot_id = next(iter(snapshot_ids))
+        missing = sorted(set(codes) - seen)
+        if missing and status != "INVALID":
+            status = "INCOMPLETE"
+            reason = "治理交易日前行业快照不完整：" + "、".join(missing)
     payload = {
-        "schema": "probiga.governance-industry-snapshot.v2",
+        "schema": INDUSTRY_SNAPSHOT_SCHEMA,
         "snapshot_id": snapshot_id,
         "trade_date": target,
         "as_of_exclusive": (
@@ -9348,24 +18240,544 @@ def _frozen_industry_snapshot(
     return {**payload, "snapshot_hash": _digest(payload)}
 
 
+def _industry_snapshot_binding_map(
+    industry_snapshot: dict[str, Any] | None,
+    trade_date: str,
+    *,
+    expected_codes: Iterable[str] | None = None,
+) -> tuple[dict[str, dict[str, Any]], str, bool]:
+    """Validate one frozen wrapper and expose only exact QMT L1 bindings.
+
+    The wrapper can be incomplete so a missing fact blocks only that stock.
+    Any malformed included row, mixed snapshot identity, or wrapper hash drift
+    invalidates every binding because its provenance is then ambiguous.
+    """
+
+    snapshot = industry_snapshot if isinstance(industry_snapshot, dict) else {}
+    target = _trade_date(trade_date, default_today=False)
+    cutoff = (
+        date.fromisoformat(target) + timedelta(days=1)
+    ).isoformat() + "T00:00:00"
+    wrapper_fields = {
+        "schema", "snapshot_id", "trade_date", "as_of_exclusive",
+        "status", "requested_stock_codes", "rows", "reason",
+        "snapshot_hash",
+    }
+    payload = {
+        str(key): value for key, value in snapshot.items()
+        if str(key) != "snapshot_hash"
+    }
+    requested = snapshot.get("requested_stock_codes")
+    rows = snapshot.get("rows")
+    snapshot_id = str(snapshot.get("snapshot_id") or "")
+    snapshot_hash = str(snapshot.get("snapshot_hash") or "")
+    expected = None
+    if expected_codes is not None:
+        expected = sorted({
+            str(code).strip().zfill(6) for code in expected_codes
+            if re.fullmatch(r"[0-9]{1,6}", str(code).strip())
+        })
+    if (
+        set(snapshot) != wrapper_fields
+        or snapshot.get("schema") != INDUSTRY_SNAPSHOT_SCHEMA
+        or str(snapshot.get("trade_date") or "") != target
+        or str(snapshot.get("as_of_exclusive") or "") != cutoff
+        or str(snapshot.get("status") or "")
+        not in {"COMPLETED", "INCOMPLETE", "INVALID", "MISSING"}
+        or not isinstance(requested, list)
+        or requested != sorted(set(str(code) for code in requested))
+        or any(re.fullmatch(r"[0-9]{6}", str(code)) is None for code in requested)
+        or (expected is not None and requested != expected)
+        or not isinstance(rows, list)
+        or _HASH_PATTERN.fullmatch(snapshot_hash) is None
+        or _digest(payload) != snapshot_hash
+        or (rows and _HASH_PATTERN.fullmatch(snapshot_id) is None)
+        or (not rows and snapshot_id)
+    ):
+        return {}, "目标日QMT一级行业冻结快照身份、日期或哈希无效", False
+
+    bindings: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            return {}, "目标日QMT一级行业冻结快照包含非对象行", False
+        row_fields = {
+            "snapshot_id", "trade_date", "as_of_exclusive", "stock_code",
+            "industry_name", "industry_type", "source_system",
+            "source_fact_id", "source_effective_at", "source_etl_sync_at",
+            "row_hash",
+        }
+        row_payload = {
+            str(key): value for key, value in raw.items()
+            if str(key) != "row_hash"
+        }
+        code = str(raw.get("stock_code") or "")
+        industry_name = str(raw.get("industry_name") or "").strip()
+        industry_type = str(raw.get("industry_type") or "").strip()
+        source_system = str(raw.get("source_system") or "").strip()
+        source_fact_id = str(raw.get("source_fact_id") or "").strip()
+        source_effective_at = _normalize_evidence_revision(
+            raw.get("source_effective_at")
+        )
+        source_etl_sync_at = _normalize_evidence_revision(
+            raw.get("source_etl_sync_at")
+        )
+        row_hash = str(raw.get("row_hash") or "")
+        if (
+            set(raw) != row_fields
+            or code not in requested or code in bindings
+            or str(raw.get("snapshot_id") or "") != snapshot_id
+            or str(raw.get("trade_date") or "") != target
+            or str(raw.get("as_of_exclusive") or "") != cutoff
+            or not industry_name or len(industry_name) > 120
+            or industry_type not in L1_INDUSTRY_TYPES
+            or not source_system or len(source_system) > 80
+            or _QMT_INDUSTRY_FACT_ID_PATTERN.fullmatch(source_fact_id) is None
+            or not source_effective_at or not source_etl_sync_at
+            or source_effective_at != source_etl_sync_at
+            or source_effective_at < target + "T15:00:00"
+            or source_effective_at >= cutoff
+            or _HASH_PATTERN.fullmatch(row_hash) is None
+            or _digest(row_payload) != row_hash
+        ):
+            return {}, "目标日QMT一级行业冻结快照包含坏行、非一级行业或混合来源", False
+        bindings[code] = {
+            "schema": INDUSTRY_BINDING_SCHEMA,
+            "snapshot_id": snapshot_id,
+            "snapshot_hash": snapshot_hash,
+            "row_hash": row_hash,
+            "trade_date": target,
+            "as_of_exclusive": cutoff,
+            "stock_code": code,
+            "industry_name": industry_name,
+            "industry_type": industry_type,
+            "source_system": source_system,
+            "source_fact_id": source_fact_id,
+            "source_effective_at": source_effective_at,
+            "source_etl_sync_at": source_etl_sync_at,
+        }
+    if snapshot.get("status") == "COMPLETED" and set(bindings) != set(requested):
+        return {}, "已完成的目标日QMT一级行业快照仍缺少请求证券", False
+    return bindings, str(
+        snapshot.get("reason") or "目标日QMT一级行业冻结事实缺失"
+    ), True
+
+
+def _build_combination_industry_snapshot_path(
+    daily_risk_exposures: list[dict[str, Any]], *,
+    latest_industry_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze an exact-date QMT industry wrapper for every risk-path day.
+
+    A target-day wrapper is only reusable for that same target day.  Earlier
+    sessions are independently loaded from the append-only PIT history so a
+    later industry migration cannot rewrite the 60-session concentration path.
+    """
+
+    rows: list[dict[str, Any]] = []
+    trade_dates: list[str] = []
+    failures: list[str] = []
+    latest = (
+        latest_industry_snapshot
+        if isinstance(latest_industry_snapshot, dict) else {}
+    )
+    for risk_row in daily_risk_exposures:
+        day = date.fromisoformat(
+            str(risk_row.get("trade_date") or "")
+        ).isoformat()
+        raw_weights = risk_row.get("combined_stock_weights")
+        if not isinstance(raw_weights, dict):
+            failures.append(f"{day}:组合个股敞口缺失")
+            codes: list[str] = []
+        else:
+            codes = sorted({
+                str(code)
+                for code, raw_value in raw_weights.items()
+                if Decimal(str(raw_value)) > 0
+            })
+        snapshot = (
+            latest
+            if str(latest.get("trade_date") or "") == day
+            else _frozen_industry_snapshot(day, codes)
+        )
+        bindings, reason, contract_valid = _industry_snapshot_binding_map(
+            snapshot, day, expected_codes=codes,
+        )
+        snapshot_hash = str(
+            snapshot.get("snapshot_hash") or ""
+        ) if isinstance(snapshot, dict) else ""
+        if (
+            not codes
+            or not contract_valid
+            or snapshot.get("status") != "COMPLETED"
+            or set(bindings) != set(codes)
+        ):
+            failures.append(f"{day}:{reason}")
+        rows.append({
+            "trade_date": day,
+            "requested_stock_codes": codes,
+            "snapshot_hash": snapshot_hash,
+            "snapshot": snapshot,
+        })
+        trade_dates.append(day)
+    status = "COMPLETED" if rows and not failures else "INCOMPLETE"
+    payload = {
+        "schema": INDUSTRY_SNAPSHOT_PATH_SCHEMA,
+        "window_days": 60,
+        "trade_dates": trade_dates,
+        "snapshots": rows,
+        "status": status,
+        "reason": (
+            "60日逐日QMT一级行业PIT快照完整"
+            if status == "COMPLETED" else
+            "；".join(failures[:20]) or "60日逐日行业PIT路径缺失"
+        ),
+    }
+    return {**payload, "path_hash": _digest(payload)}
+
+
+def _validated_combination_industry_snapshot_path(
+    industry_snapshot_path: Any,
+    daily_risk_exposures: list[dict[str, Any]],
+) -> tuple[
+    dict[str, dict[str, dict[str, Any]]], dict[str, Any], str, bool,
+]:
+    """Validate the complete 60-session industry path and compact its root."""
+
+    path = industry_snapshot_path if isinstance(
+        industry_snapshot_path, dict
+    ) else {}
+    unavailable = {
+        "schema": INDUSTRY_SNAPSHOT_PATH_SCHEMA,
+        "status": "INVALID",
+        "window_days": 60,
+        "trade_dates": [],
+        "trade_dates_hash": "",
+        "snapshot_hashes": [],
+        "stock_code_sets_hash": "",
+        "path_hash": "",
+        "reason": "60日逐日行业PIT路径缺失或不是对象",
+    }
+    try:
+        expected_days: list[str] = []
+        expected_codes_by_day: dict[str, list[str]] = {}
+        stock_code_sets: list[dict[str, Any]] = []
+        for risk_row in daily_risk_exposures:
+            if not isinstance(risk_row, dict):
+                raise ValueError("60日行业路径对应的风险行不是对象")
+            day = date.fromisoformat(
+                str(risk_row.get("trade_date") or "")
+            ).isoformat()
+            raw_weights = risk_row.get("combined_stock_weights")
+            if not isinstance(raw_weights, dict):
+                raise ValueError("60日行业路径对应的个股敞口缺失")
+            codes = sorted({
+                str(code)
+                for code, raw_value in raw_weights.items()
+                if Decimal(str(raw_value)) > 0
+            })
+            if (
+                not codes
+                or any(re.fullmatch(r"[0-9]{6}", code) is None for code in codes)
+                or day in expected_codes_by_day
+            ):
+                raise ValueError("60日行业路径日期或个股集合无效")
+            expected_days.append(day)
+            expected_codes_by_day[day] = codes
+            stock_code_sets.append({
+                "trade_date": day,
+                "stock_codes": codes,
+            })
+        if (
+            len(expected_days) != 60
+            or expected_days != sorted(set(expected_days))
+        ):
+            raise ValueError("行业PIT路径必须精确覆盖排序后的60个风险交易日")
+        expected_fields = {
+            "schema", "window_days", "trade_dates", "snapshots",
+            "status", "reason", "path_hash",
+        }
+        payload = {
+            str(key): value for key, value in path.items()
+            if str(key) != "path_hash"
+        }
+        snapshots = path.get("snapshots")
+        path_hash = str(path.get("path_hash") or "")
+        if (
+            set(path) != expected_fields
+            or path.get("schema") != INDUSTRY_SNAPSHOT_PATH_SCHEMA
+            or _int(path.get("window_days"), -1) != 60
+            or path.get("trade_dates") != expected_days
+            or path.get("status") != "COMPLETED"
+            or not isinstance(path.get("reason"), str)
+            or not isinstance(snapshots, list)
+            or len(snapshots) != 60
+            or _HASH_PATTERN.fullmatch(path_hash) is None
+            or _digest(payload) != path_hash
+        ):
+            raise ValueError("60日行业PIT路径身份、日期、状态或根哈希无效")
+
+        bindings_by_day: dict[str, dict[str, dict[str, Any]]] = {}
+        snapshot_hashes: list[dict[str, str]] = []
+        for expected_day, raw_row in zip(
+            expected_days, snapshots, strict=True,
+        ):
+            if not isinstance(raw_row, dict) or set(raw_row) != {
+                "trade_date", "requested_stock_codes", "snapshot_hash",
+                "snapshot",
+            }:
+                raise ValueError("逐日行业PIT路径包含非对象或多余字段")
+            codes = expected_codes_by_day[expected_day]
+            snapshot = raw_row.get("snapshot")
+            snapshot_hash = str(raw_row.get("snapshot_hash") or "")
+            if (
+                raw_row.get("trade_date") != expected_day
+                or raw_row.get("requested_stock_codes") != codes
+                or not isinstance(snapshot, dict)
+                or snapshot_hash != str(snapshot.get("snapshot_hash") or "")
+            ):
+                raise ValueError("逐日行业PIT快照日期、证券集或快照哈希不一致")
+            bindings, reason, contract_valid = _industry_snapshot_binding_map(
+                snapshot, expected_day, expected_codes=codes,
+            )
+            if (
+                not contract_valid
+                or snapshot.get("status") != "COMPLETED"
+                or set(bindings) != set(codes)
+            ):
+                raise ValueError(f"{expected_day}:{reason}")
+            bindings_by_day[expected_day] = bindings
+            snapshot_hashes.append({
+                "trade_date": expected_day,
+                "snapshot_hash": snapshot_hash,
+            })
+        compact = {
+            "schema": INDUSTRY_SNAPSHOT_PATH_SCHEMA,
+            "status": "COMPLETED",
+            "window_days": 60,
+            "trade_dates": expected_days,
+            "trade_dates_hash": _digest({
+                "schema": "probiga.governance-industry-trade-dates.v1",
+                "trade_dates": expected_days,
+            }),
+            "snapshot_hashes": snapshot_hashes,
+            "stock_code_sets_hash": _digest({
+                "schema": "probiga.governance-industry-stock-code-sets.v1",
+                "rows": stock_code_sets,
+            }),
+            "path_hash": path_hash,
+            "reason": str(path.get("reason") or ""),
+        }
+        return bindings_by_day, compact, compact["reason"], True
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError) as exc:
+        reason = str(exc)[:500]
+        return {}, {**unavailable, "reason": reason}, reason, False
+
+
 def _combination_constraint_evaluation(
     combination: dict[str, Any], members: list[dict[str, Any]],
     *, trade_date: str | None = None,
     industry_snapshot: dict[str, Any] | None = None,
+    industry_snapshot_path: dict[str, Any] | None = None,
+    internal_combo_ledger: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     constraints = _validated_combination_constraints(
         combination.get("constraints")
     )
+    target_day = (
+        _trade_date(trade_date, default_today=False) if trade_date else ""
+    )
+    expected_member_keys = sorted({
+        str((item.get("strategy") or {}).get("strategy_key") or "")
+        for item in members
+        if str((item.get("strategy") or {}).get("strategy_key") or "")
+    })
+    risk_ledger = (
+        internal_combo_ledger
+        if isinstance(internal_combo_ledger, dict)
+        else _internal_combination_portfolio_ledger(
+            combination, members, window=60, trade_date=target_day,
+        ) if target_day else {
+            "valid": False, "reason": "组合漂移风险路径缺少治理交易日",
+        }
+    )
+    risk_path_valid = False
+    risk_path_reason = str(
+        risk_ledger.get("reason") or "组合漂移风险路径不可用"
+    )
+    daily_member_weights: list[dict[str, Any]] = []
+    daily_risk_exposures: list[dict[str, Any]] = []
+    try:
+        raw_weight_rows = risk_ledger.get("daily_member_weights")
+        raw_exposure_rows = risk_ledger.get("daily_risk_exposures")
+        risk_path_hash = str(risk_ledger.get("risk_path_hash") or "")
+        if (
+            risk_ledger.get("valid") is not True
+            or risk_ledger.get("internal_ledger_schema")
+            != "probiga.internal-combination-portfolio-ledger.v3"
+            or risk_ledger.get("combination_key")
+            != combination.get("combination_key")
+            or risk_ledger.get("combination_version")
+            != combination.get("current_version")
+            or _int(risk_ledger.get("window_days"), -1) != 60
+            or str(risk_ledger.get("trade_date") or "") != target_day
+            or not isinstance(raw_weight_rows, list)
+            or not isinstance(raw_exposure_rows, list)
+            or len(raw_weight_rows) != 60
+            or len(raw_exposure_rows) != 60
+            or len(expected_member_keys) != len(members)
+            or not _HASH_PATTERN.fullmatch(risk_path_hash)
+        ):
+            raise ValueError("组合60日漂移风险路径身份、长度或哈希无效")
+        risk_days: list[str] = []
+        for weight_row, exposure_row in zip(
+            raw_weight_rows, raw_exposure_rows, strict=True,
+        ):
+            if not isinstance(weight_row, dict) or not isinstance(
+                exposure_row, dict
+            ):
+                raise ValueError("组合60日漂移风险路径包含非对象行")
+            day = str(weight_row.get("trade_date") or "")
+            if day != str(exposure_row.get("trade_date") or ""):
+                raise ValueError("组合逐日权重与持仓敞口日期不一致")
+            weights = weight_row.get("member_weights")
+            member_stock = exposure_row.get("member_stock_weights")
+            combined_stock = exposure_row.get("combined_stock_weights")
+            if (
+                not day
+                or not isinstance(weights, dict)
+                or not isinstance(member_stock, dict)
+                or not isinstance(combined_stock, dict)
+                or sorted(weights) != expected_member_keys
+                or sorted(member_stock) != expected_member_keys
+            ):
+                raise ValueError("组合逐日风险路径成员集合不闭合")
+            normalized_weights = {
+                key: Decimal(str(value)) for key, value in weights.items()
+            }
+            if (
+                any(
+                    not value.is_finite() or value < 0
+                    for value in normalized_weights.values()
+                )
+                or abs(
+                    sum(normalized_weights.values(), Decimal("0"))
+                    - Decimal("1")
+                ) > Decimal("0.000000000001")
+            ):
+                raise ValueError("组合逐日自然漂移成员权重不闭合")
+            recomputed_stock: dict[str, Decimal] = defaultdict(Decimal)
+            normalized_member_stock: dict[str, dict[str, Decimal]] = {}
+            for key in expected_member_keys:
+                raw_values = member_stock.get(key)
+                if not isinstance(raw_values, dict):
+                    raise ValueError("组合成员逐日个股敞口不是对象")
+                values: dict[str, Decimal] = {}
+                for raw_code, raw_value in raw_values.items():
+                    code = str(raw_code or "")
+                    value = Decimal(str(raw_value))
+                    if (
+                        not re.fullmatch(r"[0-9]{6}", code)
+                        or code in values
+                        or not value.is_finite()
+                        or value < 0
+                    ):
+                        raise ValueError("组合成员逐日个股敞口内容无效")
+                    values[code] = value
+                if values and abs(
+                    sum(values.values(), Decimal("0")) - Decimal("1")
+                ) > Decimal("0.000000000001"):
+                    raise ValueError("组合成员逐日个股敞口比例不闭合")
+                normalized_member_stock[key] = values
+                for code, value in values.items():
+                    recomputed_stock[code] += normalized_weights[key] * value
+            observed_stock = {
+                str(code): Decimal(str(value))
+                for code, value in combined_stock.items()
+            }
+            if (
+                any(
+                    not re.fullmatch(r"[0-9]{6}", code)
+                    or not value.is_finite()
+                    or value < 0
+                    for code, value in observed_stock.items()
+                )
+                or set(observed_stock) != {
+                    code for code, value in recomputed_stock.items()
+                    if value > 0
+                }
+                or any(
+                    abs(observed_stock[code] - value)
+                    > Decimal("0.000000000001")
+                    for code, value in recomputed_stock.items()
+                    if value > 0
+                )
+            ):
+                raise ValueError("组合逐日汇总个股敞口无法由成员权重重算")
+            risk_days.append(day)
+        if (
+            risk_days != sorted(set(risk_days))
+            or risk_days[-1] != target_day
+            or _digest({
+                "schema": "probiga.combination-drift-risk-path.v1",
+                "combination_key": combination["combination_key"],
+                "combination_version": combination["current_version"],
+                "window_days": 60,
+                "trade_date": target_day,
+                "daily_member_weights": raw_weight_rows,
+                "daily_risk_exposures": raw_exposure_rows,
+            }) != risk_path_hash
+        ):
+            raise ValueError("组合60日漂移风险路径日期或内容哈希无效")
+        daily_member_weights = [dict(row) for row in raw_weight_rows]
+        daily_risk_exposures = [dict(row) for row in raw_exposure_rows]
+        risk_path_valid = True
+        risk_path_reason = "60日逐日自然漂移权重与持仓敞口已重算"
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError) as exc:
+        risk_path_hash = ""
+        risk_path_reason = str(exc)[:500]
+
     checks: list[dict[str, Any]] = []
-    total = sum(item["weight"] for item in members) or 1.0
-    maximum_member = max(
-        (item["weight"] / total for item in members), default=1.0
+    peak_member = Decimal("1")
+    peak_member_key = ""
+    peak_member_day = ""
+    current_member_weights: dict[str, Decimal] = {}
+    if risk_path_valid:
+        peak_member = Decimal("0")
+        for row in daily_member_weights:
+            for key, raw_value in row["member_weights"].items():
+                value = Decimal(str(raw_value))
+                if value > peak_member:
+                    peak_member = value
+                    peak_member_key = key
+                    peak_member_day = str(row["trade_date"])
+        current_member_weights = {
+            key: Decimal(str(value))
+            for key, value in daily_member_weights[-1][
+                "member_weights"
+            ].items()
+        }
+    current_maximum_member = max(
+        current_member_weights.values(), default=Decimal("1")
     )
     checks.append({
         "name": "最大成员权重",
-        "passed": maximum_member <= constraints["maximum_member_weight"] + 1e-9,
-        "actual": round(maximum_member, 6),
+        "passed": bool(
+            risk_path_valid
+            and float(peak_member)
+            <= constraints["maximum_member_weight"] + 1e-9
+        ),
+        "actual": round(float(peak_member), 6),
+        "peak_weight": round(float(peak_member), 6),
+        "peak_member": peak_member_key,
+        "peak_trade_date": peak_member_day,
+        "current_weight": round(float(current_maximum_member), 6),
+        "current_member_weights": {
+            key: round(float(value), 8)
+            for key, value in sorted(current_member_weights.items())
+        },
         "limit": constraints["maximum_member_weight"],
+        "risk_path_valid": risk_path_valid,
+        "risk_path_reason": risk_path_reason,
     })
     pairwise: list[dict[str, Any]] = []
     stock_overlaps: list[dict[str, Any]] = []
@@ -9406,30 +18818,41 @@ def _combination_constraint_evaluation(
                 ),
                 "passed": correlation_passed,
             })
-            left_exposure = {
-                str(code): Decimal(str(value or "0"))
-                for code, value in (
-                    left_metrics.get("internal_stock_exposure") or {}
-                ).items()
-            }
-            right_exposure = {
-                str(code): Decimal(str(value or "0"))
-                for code, value in (
-                    right_metrics.get("internal_stock_exposure") or {}
-                ).items()
-            }
-            left_sum = sum(left_exposure.values(), Decimal("0"))
-            right_sum = sum(right_exposure.values(), Decimal("0"))
-            overlap: Decimal | None = None
-            if left_sum > 0 and right_sum > 0:
-                overlap = sum(
-                    min(
-                        left_exposure.get(code, Decimal("0")) / left_sum,
-                        right_exposure.get(code, Decimal("0")) / right_sum,
-                    )
-                    for code in set(left_exposure) | set(right_exposure)
-                ) * Decimal("100")
-            overlap_value = float(overlap) if overlap is not None else None
+            overlap_path: list[dict[str, Any]] = []
+            if risk_path_valid:
+                left_key = str(left["strategy"]["strategy_key"])
+                right_key = str(right["strategy"]["strategy_key"])
+                for risk_row in daily_risk_exposures:
+                    member_stock = risk_row["member_stock_weights"]
+                    left_exposure = {
+                        str(code): Decimal(str(value))
+                        for code, value in member_stock[left_key].items()
+                    }
+                    right_exposure = {
+                        str(code): Decimal(str(value))
+                        for code, value in member_stock[right_key].items()
+                    }
+                    overlap = sum(
+                        min(
+                            left_exposure.get(code, Decimal("0")),
+                            right_exposure.get(code, Decimal("0")),
+                        )
+                        for code in set(left_exposure) | set(right_exposure)
+                    ) * Decimal("100")
+                    overlap_path.append({
+                        "trade_date": str(risk_row["trade_date"]),
+                        "overlap_pct": overlap,
+                    })
+            peak_overlap_row = max(
+                overlap_path,
+                key=lambda row: row["overlap_pct"],
+                default=None,
+            )
+            current_overlap_row = overlap_path[-1] if overlap_path else None
+            overlap_value = (
+                float(peak_overlap_row["overlap_pct"])
+                if peak_overlap_row is not None else None
+            )
             stock_overlaps.append({
                 "left": left["strategy"]["strategy_key"],
                 "right": right["strategy"]["strategy_key"],
@@ -9437,7 +18860,21 @@ def _combination_constraint_evaluation(
                     round(overlap_value, 4)
                     if overlap_value is not None else None
                 ),
+                "peak_overlap_pct": (
+                    round(overlap_value, 4)
+                    if overlap_value is not None else None
+                ),
+                "peak_trade_date": (
+                    str(peak_overlap_row["trade_date"])
+                    if peak_overlap_row is not None else ""
+                ),
+                "current_overlap_pct": (
+                    round(float(current_overlap_row["overlap_pct"]), 4)
+                    if current_overlap_row is not None else None
+                ),
                 "passed": (
+                    risk_path_valid
+                    and
                     overlap_value is not None
                     and overlap_value <= (
                         constraints["maximum_stock_overlap_pct"] + 1e-9
@@ -9458,167 +18895,260 @@ def _combination_constraint_evaluation(
         "limit_pct": constraints["maximum_stock_overlap_pct"],
     })
 
-    combined_stock: dict[str, Decimal] = defaultdict(Decimal)
-    for item in members:
-        member_weight = Decimal(str(item["weight"] / total))
-        exposures = {
-            str(code): Decimal(str(value or "0"))
-            for code, value in (
-                item["strategy"]["metrics"]["60"].get(
-                    "internal_stock_exposure"
-                ) or {}
-            ).items()
+    stock_concentration_path: list[dict[str, Any]] = []
+    for risk_row in daily_risk_exposures:
+        weights = {
+            str(code): Decimal(str(value))
+            for code, value in risk_row["combined_stock_weights"].items()
         }
-        exposure_sum = sum(exposures.values(), Decimal("0"))
-        if exposure_sum > 0:
-            for code, value in exposures.items():
-                combined_stock[code] += member_weight * value / exposure_sum
-    effective_industry_snapshot = industry_snapshot
-    if effective_industry_snapshot is None and trade_date:
-        effective_industry_snapshot = _frozen_industry_snapshot(
-            trade_date, combined_stock
+        peak_code, peak_value = max(
+            weights.items(), key=lambda item: item[1],
+            default=("", Decimal("0")),
         )
-    effective_industry_snapshot = (
-        effective_industry_snapshot
-        if isinstance(effective_industry_snapshot, dict) else {}
+        stock_concentration_path.append({
+            "trade_date": str(risk_row["trade_date"]),
+            "stock_code": peak_code,
+            "weight_pct": peak_value * Decimal("100"),
+        })
+    peak_stock_row = max(
+        stock_concentration_path,
+        key=lambda row: row["weight_pct"],
+        default={"trade_date": "", "stock_code": "", "weight_pct": Decimal("0")},
     )
-    snapshot_payload = {
-        str(key): value
-        for key, value in effective_industry_snapshot.items()
-        if str(key) != "snapshot_hash"
+    current_stock_row = (
+        stock_concentration_path[-1]
+        if stock_concentration_path else peak_stock_row
+    )
+    effective_industry_path = industry_snapshot_path
+    if effective_industry_path is None and risk_path_valid:
+        effective_industry_path = _build_combination_industry_snapshot_path(
+            daily_risk_exposures,
+            latest_industry_snapshot=industry_snapshot,
+        )
+    (
+        industry_bindings_by_day,
+        compact_industry_path,
+        industry_snapshot_reason,
+        industry_snapshot_path_valid,
+    ) = _validated_combination_industry_snapshot_path(
+        effective_industry_path,
+        daily_risk_exposures,
+    ) if risk_path_valid else (
+        {},
+        {
+            "schema": INDUSTRY_SNAPSHOT_PATH_SCHEMA,
+            "status": "INVALID",
+            "window_days": 60,
+            "trade_dates": [],
+            "trade_dates_hash": "",
+            "snapshot_hashes": [],
+            "stock_code_sets_hash": "",
+            "path_hash": "",
+            "reason": "组合60日漂移风险路径无效，未读取行业PIT路径",
+        },
+        "组合60日漂移风险路径无效，未读取行业PIT路径",
+        False,
+    )
+    daily_industry_weights: list[dict[str, Any]] = []
+    missing_industry: set[str] = set()
+    for risk_row in daily_risk_exposures:
+        day = str(risk_row["trade_date"])
+        bindings = industry_bindings_by_day.get(day, {})
+        weights: dict[str, Decimal] = defaultdict(Decimal)
+        for code, raw_weight in risk_row["combined_stock_weights"].items():
+            industry = str(
+                (bindings.get(str(code)) or {}).get("industry_name") or ""
+            )
+            if industry:
+                weights[industry] += Decimal(str(raw_weight))
+            else:
+                missing_industry.add(f"{day}:{code}")
+        daily_industry_weights.append({
+            "trade_date": day,
+            "industry_weights": dict(weights),
+        })
+    peak_industry_row = {
+        "trade_date": "", "industry": "", "weight": Decimal("0"),
     }
-    expected_industry_codes = sorted(combined_stock)
-    expected_cutoff = (
-        date.fromisoformat(_trade_date(trade_date, default_today=False))
-        + timedelta(days=1)
-    ).isoformat() + "T00:00:00" if trade_date else ""
-    industry_rows = effective_industry_snapshot.get("rows")
-    industry_rows = industry_rows if isinstance(industry_rows, list) else []
-    observed_codes = [
-        str(row.get("stock_code") or "")
-        for row in industry_rows if isinstance(row, dict)
-    ]
-    snapshot_id = str(effective_industry_snapshot.get("snapshot_id") or "")
-    row_contract_valid = bool(industry_rows)
-    for row in industry_rows:
-        if not isinstance(row, dict):
-            row_contract_valid = False
-            break
-        row_hash = str(row.get("row_hash") or "")
-        row_payload = {
-            str(key): value for key, value in row.items()
-            if str(key) != "row_hash"
-        }
-        source_effective = _normalize_evidence_revision(
-            row.get("source_effective_at")
-        )
-        source_sync = _normalize_evidence_revision(
-            row.get("source_etl_sync_at")
-        )
-        if (
-            set(row) != {
-                "snapshot_id", "trade_date", "as_of_exclusive",
-                "stock_code", "industry_name", "industry_type",
-                "source_system", "source_fact_id", "source_effective_at",
-                "source_etl_sync_at", "row_hash",
-            }
-            or str(row.get("snapshot_id") or "") != snapshot_id
-            or str(row.get("trade_date") or "")
-            != _trade_date(trade_date, default_today=False)
-            or str(row.get("as_of_exclusive") or "") != expected_cutoff
-            or not source_effective or not source_sync
-            or source_effective >= expected_cutoff
-            or source_sync >= expected_cutoff
-            or not _HASH_PATTERN.fullmatch(row_hash)
-            or _digest(row_payload) != row_hash
-        ):
-            row_contract_valid = False
-            break
-    industry_snapshot_valid = bool(
-        set(effective_industry_snapshot) == {
-            "schema", "snapshot_id", "trade_date", "as_of_exclusive",
-            "status", "requested_stock_codes", "rows", "reason",
-            "snapshot_hash",
-        }
-        and effective_industry_snapshot.get("schema")
-        == "probiga.governance-industry-snapshot.v2"
-        and
-        effective_industry_snapshot.get("status") == "COMPLETED"
-        and trade_date
-        and str(effective_industry_snapshot.get("trade_date") or "")
-        == _trade_date(trade_date, default_today=False)
-        and _HASH_PATTERN.fullmatch(str(
-            effective_industry_snapshot.get("snapshot_hash") or ""
-        ))
-        and _digest(snapshot_payload)
-        == str(effective_industry_snapshot.get("snapshot_hash") or "")
-        and _HASH_PATTERN.fullmatch(snapshot_id)
-        and str(effective_industry_snapshot.get("as_of_exclusive") or "")
-        == expected_cutoff
-        and effective_industry_snapshot.get("requested_stock_codes")
-        == expected_industry_codes
-        and observed_codes == expected_industry_codes
-        and len(observed_codes) == len(set(observed_codes))
-        and row_contract_valid
+    for row in daily_industry_weights:
+        for industry, weight in row["industry_weights"].items():
+            if weight > peak_industry_row["weight"]:
+                peak_industry_row = {
+                    "trade_date": row["trade_date"],
+                    "industry": industry,
+                    "weight": weight,
+                }
+    current_industry_weights = (
+        daily_industry_weights[-1]["industry_weights"]
+        if daily_industry_weights else {}
     )
-    industry_by_code = {
-        str(row.get("stock_code") or ""): str(
-            row.get("industry_name") or ""
-        )
-        for row in (effective_industry_snapshot.get("rows") or [])
-        if isinstance(row, dict)
-    } if industry_snapshot_valid else {}
-    industry_weights: dict[str, Decimal] = defaultdict(Decimal)
-    missing_industry: list[str] = []
-    for code, weight in combined_stock.items():
-        industry = industry_by_code.get(code)
-        if industry:
-            industry_weights[industry] += weight
-        else:
-            missing_industry.append(code)
-    maximum_industry = max(industry_weights.values(), default=Decimal("0"))
+    current_industry, current_industry_weight = max(
+        current_industry_weights.items(),
+        key=lambda item: item[1],
+        default=("", Decimal("0")),
+    )
     checks.append({
         "name": "单一行业集中度",
         "passed": (
-            industry_snapshot_valid
+            risk_path_valid
             and
-            bool(industry_weights)
+            industry_snapshot_path_valid
+            and
+            bool(daily_industry_weights)
             and not missing_industry
-            and float(maximum_industry * Decimal("100"))
+            and float(peak_industry_row["weight"] * Decimal("100"))
+            <= constraints["maximum_industry_weight_pct"] + 1e-9
+            and float(current_industry_weight * Decimal("100"))
             <= constraints["maximum_industry_weight_pct"] + 1e-9
         ),
-        "actual_pct": round(float(maximum_industry * Decimal("100")), 4),
+        "actual_pct": round(float(
+            peak_industry_row["weight"] * Decimal("100")
+        ), 4),
+        "peak_pct": round(float(
+            peak_industry_row["weight"] * Decimal("100")
+        ), 4),
+        "peak_industry": peak_industry_row["industry"],
+        "peak_trade_date": peak_industry_row["trade_date"],
+        "current_pct": round(float(
+            current_industry_weight * Decimal("100")
+        ), 4),
+        "current_industry": current_industry,
         "limit_pct": constraints["maximum_industry_weight_pct"],
-        "missing_industry_codes": sorted(missing_industry),
-        "industry_snapshot_valid": industry_snapshot_valid,
-        "industry_snapshot_reason": str(
-            effective_industry_snapshot.get("reason")
-            or "缺少治理交易日冻结行业快照"
+        "missing_industry_date_codes": sorted(missing_industry),
+        # Backward-compatible display alias.  It now means the complete
+        # 60-session path is valid, never merely the target-day snapshot.
+        "industry_snapshot_valid": industry_snapshot_path_valid,
+        "industry_snapshot_path_valid": industry_snapshot_path_valid,
+        "industry_snapshot_reason": industry_snapshot_reason,
+        "industry_snapshot_path_hash": str(
+            compact_industry_path.get("path_hash") or ""
         ),
-        "industry_snapshot_hash": str(
-            effective_industry_snapshot.get("snapshot_hash") or ""
+        "industry_snapshot_trade_dates_hash": str(
+            compact_industry_path.get("trade_dates_hash") or ""
         ),
     })
     payload = {
-        "schema": "probiga.combination-constraint-evaluation.v1",
+        "schema": "probiga.combination-constraint-evaluation.v3",
         "combination_key": combination["combination_key"],
         "combination_version": combination["current_version"],
         "constraints": constraints,
         "checks": checks,
         "pairwise_correlations": pairwise,
         "pairwise_stock_overlaps": stock_overlaps,
-        "industry_snapshot": effective_industry_snapshot,
+        "drift_risk_path": {
+            "window_days": 60,
+            "risk_path_valid": risk_path_valid,
+            "risk_path_reason": risk_path_reason,
+            "risk_path_hash": risk_path_hash,
+            "allocation_semantics": (
+                "WINDOW_OPEN_REBASED_FIXED_SLEEVES_NATURAL_WEIGHT_DRIFT_V3"
+            ),
+        },
+        "combined_stock_concentration": {
+            "peak_pct": round(float(peak_stock_row["weight_pct"]), 4),
+            "peak_stock_code": peak_stock_row["stock_code"],
+            "peak_trade_date": peak_stock_row["trade_date"],
+            "current_pct": round(float(current_stock_row["weight_pct"]), 4),
+            "current_stock_code": current_stock_row["stock_code"],
+        },
+        "industry_snapshot_path": compact_industry_path,
         "industry_weights_pct": {
             key: round(float(value * Decimal("100")), 4)
-            for key, value in sorted(industry_weights.items())
+            for key, value in sorted(current_industry_weights.items())
+        },
+        "industry_concentration": {
+            "peak_pct": round(float(
+                peak_industry_row["weight"] * Decimal("100")
+            ), 4),
+            "peak_industry": peak_industry_row["industry"],
+            "peak_trade_date": peak_industry_row["trade_date"],
+            "current_pct": round(float(
+                current_industry_weight * Decimal("100")
+            ), 4),
+            "current_industry": current_industry,
         },
     }
     passed = bool(checks) and all(check["passed"] for check in checks)
+    evaluation_hash = _digest(payload)
+    maximum_peak_overlap = max(
+        (
+            Decimal(str(row["peak_overlap_pct"]))
+            for row in stock_overlaps
+            if row.get("peak_overlap_pct") is not None
+        ),
+        default=Decimal("0"),
+    )
+    maximum_current_overlap = max(
+        (
+            Decimal(str(row["current_overlap_pct"]))
+            for row in stock_overlaps
+            if row.get("current_overlap_pct") is not None
+        ),
+        default=Decimal("0"),
+    )
+    binding_payload = {
+        "schema": "probiga.combination-drift-risk-binding.v2",
+        "window_days": 60,
+        "risk_path_hash": risk_path_hash,
+        "constraint_evaluation_hash": evaluation_hash,
+        "constraint_passed": passed,
+        "peak_member_weight": round(float(peak_member), 8),
+        "current_member_weight": round(float(current_maximum_member), 8),
+        "peak_pairwise_stock_overlap_pct": round(
+            float(maximum_peak_overlap), 4
+        ),
+        "current_pairwise_stock_overlap_pct": round(
+            float(maximum_current_overlap), 4
+        ),
+        "peak_industry_weight_pct": round(float(
+            peak_industry_row["weight"] * Decimal("100")
+        ), 4),
+        "current_industry_weight_pct": round(float(
+            current_industry_weight * Decimal("100")
+        ), 4),
+        "industry_snapshot_path_hash": str(
+            compact_industry_path.get("path_hash") or ""
+        ),
+        "industry_trade_dates_hash": str(
+            compact_industry_path.get("trade_dates_hash") or ""
+        ),
+        "industry_stock_code_sets_hash": str(
+            compact_industry_path.get("stock_code_sets_hash") or ""
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    risk_binding = {
+        **binding_payload,
+        "binding_hash": _digest(binding_payload),
+    }
     return {
         **payload,
         "passed": passed,
-        "evaluation_hash": _digest(payload),
+        "evaluation_hash": evaluation_hash,
+        "risk_binding": risk_binding,
     }
+
+
+def _assign_combination_independent_evidence_ranks(
+    rows: list[dict[str, Any]],
+) -> None:
+    """Rank only combinations whose own daily NAV evidence is comparable."""
+
+    independent_evidence_rows = sorted(
+        (
+            row for row in rows
+            if row.get("has_independent_evidence") is True
+        ),
+        key=lambda row: (
+            -float(row.get("ranking_score_display") or 0.0),
+            row["combination_key"],
+        ),
+    )
+    for row in rows:
+        row["independent_evidence_rank"] = None
+    for rank, row in enumerate(independent_evidence_rows, 1):
+        row["independent_evidence_rank"] = rank
 
 
 def _combination_rankings(
@@ -9626,6 +19156,8 @@ def _combination_rankings(
     strategies: list[dict[str, Any]],
     metric_inputs: dict[tuple[str, int], dict[str, Any]],
     trade_date: str,
+    *, statistical_family: dict[str, Any] | None = None,
+    statistical_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     by_key = {row["strategy_key"]: row for row in strategies}
     target = date.fromisoformat(trade_date)
@@ -9738,6 +19270,15 @@ def _combination_rankings(
                     ],
                     "internal_stock_exposure_basis": internal_ledger[
                         "stock_exposure_basis"
+                    ],
+                    "internal_daily_stock_market_values": [
+                        {
+                            "trade_date": item["trade_date"],
+                            "stock_risk_exposure": dict(
+                                item["combined_stock_weights"]
+                            ),
+                        }
+                        for item in internal_ledger["daily_risk_exposures"]
                     ],
                     "evidence_revision_at": internal_ledger[
                         "funding_evidence_revision_at"
@@ -9872,9 +19413,18 @@ def _combination_rankings(
                 0 <= selection_age
                 <= PROFIT_GATE_POLICY["maximum_evidence_age_days"]
             )
+            metrics["selection_validation"] = (
+                _selection_validation_summary(evidence)
+            )
             metrics["market_match_score"] = market_route["market_match_score"]
             metrics["market_route_hash"] = market_route["router_decision_hash"]
-            metrics["health_score"] = calculate_health_score(metrics)
+            _apply_statistical_health(
+                metrics,
+                session_window=(
+                    internal_ledger.get("session_window")
+                    if isinstance(internal_ledger, dict) else None
+                ),
+            )
             metrics["profit_gate"] = evaluate_window_gate(metrics)
             window_metrics[window] = metrics
         short = window_metrics[20]
@@ -9884,7 +19434,6 @@ def _combination_rankings(
         short_gate_passed = bool(short_gate["passed"])
         has_all_independent_evidence = all(
             internal_combo_ledgers[window].get("valid") is True
-            and metric_inputs.get((combo["combination_key"], window)) is not None
             for window in WINDOWS
         )
         independent_health = round(
@@ -9904,10 +19453,16 @@ def _combination_rankings(
             )
         )
         constraint_evaluation = _combination_constraint_evaluation(
-            combo, members, trade_date=trade_date
+            combo, members, trade_date=trade_date,
+            internal_combo_ledger=internal_combo_ledgers[60],
         )
         concentration_penalty = max(0.0, concentration - 0.5) * 20.0
-        base_score = independent_health if has_all_independent_evidence else score
+        # A weighted average of member scores is useful research context, but
+        # it is not an independently observed combination result.  Keeping it
+        # out of the official score prevents an untested combination from
+        # appearing to beat a strategy that has real forward evidence.
+        provisional_member_reference_score = round(score, 2)
+        base_score = independent_health if has_all_independent_evidence else 0.0
         adjusted_score = max(0.0, base_score - concentration_penalty)
         profit_gate_passed = bool(
             combo.get("enabled")
@@ -9921,10 +19476,28 @@ def _combination_rankings(
         )
         status = combo["current_status"]
         funding_gate_hash = _digest({
+            "schema": "probiga.combination-pre-recipe-funding-gate.v2",
             "combination_key": combo["combination_key"],
             "combination_version": combo["current_version"],
             "window_evidence": {
-                str(window): window_metrics[window].get("evidence_hash")
+                str(window): {
+                    "internal_ledger_hash": window_metrics[window].get(
+                        "internal_ledger_hash"
+                    ),
+                    "internal_forward_stability_hash": str(
+                        (window_metrics[window].get(
+                            "internal_forward_stability"
+                        ) or {}).get("compact_hash") or ""
+                    ),
+                    "statistical_guard_hash": str(
+                        (window_metrics[window].get(
+                            "statistical_guard"
+                        ) or {}).get("compact_hash") or ""
+                    ),
+                    "profit_gate_hash": _digest(
+                        window_metrics[window].get("profit_gate") or {}
+                    ),
+                }
                 for window in WINDOWS
             },
             "member_versions": {
@@ -9951,6 +19524,8 @@ def _combination_rankings(
                 "evaluation_hash"
             ],
             "profit_gate_passed": profit_gate_passed,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         })
         funding_evidence_revision_at = _funding_evidence_revision_at(
             window_metrics
@@ -9991,6 +19566,92 @@ def _combination_rankings(
             if profit_gate_passed
             else recommendation_reason
         )
+        recipe_members = []
+        for item in sorted(
+            members,
+            key=lambda member: str(
+                member["strategy"].get("strategy_key") or ""
+            ),
+        ):
+            checkpoint_ref = item["strategy"].get("funding_checkpoint_ref")
+            recipe_members.append({
+                "strategy_key": str(
+                    item["strategy"].get("strategy_key") or ""
+                ),
+                "strategy_version": str(item.get("frozen_version") or ""),
+                "weight": round(item["weight"] / total, 8),
+                "checkpoint_id": str(
+                    (checkpoint_ref or {}).get("checkpoint_id") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+                "account_id": str(
+                    (checkpoint_ref or {}).get("account_id") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+                "checkpoint_hash": str(
+                    (checkpoint_ref or {}).get("checkpoint_hash") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+                "chain_hash": str(
+                    (checkpoint_ref or {}).get("chain_hash") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+                "history_fact_set_hash": str(
+                    (checkpoint_ref or {}).get("history_fact_set_hash") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+                "checkpoint_trade_date": str(
+                    (checkpoint_ref or {}).get("trade_date") or ""
+                ) if isinstance(checkpoint_ref, dict) else "",
+            })
+        recipe_payload = {
+            "schema": "probiga.combination-member-fact-recipe.v1",
+            "combination_key": combo["combination_key"],
+            "combination_version": combo["current_version"],
+            "trade_date": trade_date,
+            "members": recipe_members,
+            "risk_constraint_binding": constraint_evaluation[
+                "risk_binding"
+            ],
+            "cash_fact_materialized": False,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        recipe_ready = bool(recipe_members) and all(
+            _HASH_PATTERN.fullmatch(member["checkpoint_id"])
+            and member["account_id"]
+            and _HASH_PATTERN.fullmatch(member["checkpoint_hash"])
+            and _HASH_PATTERN.fullmatch(member["chain_hash"])
+            and _HASH_PATTERN.fullmatch(member["history_fact_set_hash"])
+            and member["strategy_version"]
+            and member["checkpoint_trade_date"] == trade_date
+            for member in recipe_members
+        ) and constraint_evaluation.get("passed") is True
+        recipe_hash = _digest(recipe_payload)
+        recipe_gate_payload = {
+            "schema": "probiga.combination-recipe-funding-gate.v1",
+            "combination_key": combo["combination_key"],
+            "combination_version": combo["current_version"],
+            "trade_date": trade_date,
+            "pre_recipe_funding_gate_hash": funding_gate_hash,
+            "recipe_hash": recipe_hash,
+            "recipe_ready": recipe_ready,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        recipe_gate_hash = _digest(recipe_gate_payload)
+        combination_recipe_ref = {
+            **recipe_payload,
+            "recipe_hash": recipe_hash,
+            "pre_recipe_funding_gate_hash": funding_gate_hash,
+            "recipe_gate_hash": recipe_gate_hash,
+            "member_fact_sets_ready": recipe_ready,
+            "detail_available": False,
+            "status": (
+                "MEMBER_FACTS_VERIFIED_RECONSTRUCTION_RESERVED"
+                if recipe_ready else "MEMBER_FACTS_NOT_READY"
+            ),
+            "reason": (
+                COMBINATION_RECIPE_READY_REASON
+                if recipe_ready
+                else "成员事实集合不完整，组合详情不可复算"
+            ),
+        }
         rows.append({
             **combo,
             "lane": (
@@ -10000,8 +19661,23 @@ def _combination_rankings(
                 else "历史档案"
             ),
             "ranking_score": round(adjusted_score, 2),
-            "ranking_basis": DAILY_NAV_RANKING_BASIS,
-            "ranking_basis_label": DAILY_NAV_RANKING_BASIS_LABEL,
+            "ranking_score_display": (
+                round(adjusted_score, 2)
+                if has_all_independent_evidence else None
+            ),
+            "provisional_member_reference_score": (
+                provisional_member_reference_score
+            ),
+            "ranking_basis": (
+                DAILY_NAV_RANKING_BASIS
+                if has_all_independent_evidence
+                else PROVISIONAL_MEMBER_REFERENCE_BASIS
+            ),
+            "ranking_basis_label": (
+                DAILY_NAV_RANKING_BASIS_LABEL
+                if has_all_independent_evidence
+                else PROVISIONAL_MEMBER_REFERENCE_LABEL
+            ),
             "member_sleeve_risk_multiplier": round(
                 member_sleeve_risk_multiplier, 8
             ),
@@ -10009,6 +19685,7 @@ def _combination_rankings(
                 (1.0 - member_sleeve_risk_multiplier) * 100.0, 4
             ),
             "member_details": [{"strategy_key": item["strategy"]["strategy_key"], "strategy_name": item["strategy"]["strategy_name"], "strategy_version": item["frozen_version"], "current_strategy_version": item["strategy"]["current_version"], "version_match": item["version_match"], "weight": round(item["weight"] / total, 8), "status_label": item["strategy"]["status_label"], "lifecycle_status": str(item["strategy"].get("current_status") or ""), "lifecycle_risk_multiplier": LIFECYCLE_RISK_MULTIPLIER.get(str(item["strategy"].get("current_status") or ""), 0.0), "effective_weight_after_lifecycle": round(item["weight"] / total * LIFECYCLE_RISK_MULTIPLIER.get(str(item["strategy"].get("current_status") or ""), 0.0), 6), "contribution_score": round(item["weight"] / total * item["strategy"]["ranking_score"], 2)} for item in members],
+            "combination_recipe_ref": combination_recipe_ref,
             "metrics": {str(window): window_metrics[window] for window in WINDOWS},
             "primary_metrics": window_metrics[60],
             "win_rate_pct": window_metrics[60].get("win_rate_pct"),
@@ -10025,7 +19702,8 @@ def _combination_rankings(
                 "60": independent_gate,
                 "120": long_gate,
             },
-            "funding_gate_hash": funding_gate_hash,
+            "pre_recipe_funding_gate_hash": funding_gate_hash,
+            "funding_gate_hash": recipe_gate_hash,
             "funding_evidence_revision_at": funding_evidence_revision_at,
             "market_route": market_route,
             "market_route_eligible": market_route["eligible"],
@@ -10038,6 +19716,7 @@ def _combination_rankings(
             ),
             "paper_allocation_eligible": (
                 profit_gate_passed
+                and recipe_ready
                 and status in {"ACTIVE", "REDUCE"}
                 and market_route["eligible"]
                 and constraint_evaluation["passed"]
@@ -10050,6 +19729,100 @@ def _combination_rankings(
             "member_version_mismatches": version_mismatches,
             "real_order_authority": False,
         })
+    metrics_by_key = {
+        str(row.get("combination_key") or ""): {
+            int(window): row["metrics"][str(window)] for window in WINDOWS
+        }
+        for row in rows
+    }
+    statistical_decisions, fdr_summary = _statistical_family_fdr_decisions(
+        entity_type="COMBINATION",
+        current_rows=rows,
+        metrics_by_key=metrics_by_key,
+        family=statistical_family or _invalid_statistical_family(
+            STATISTICAL_GUARD_POLICY["combination_family_id"],
+            "组合统计家族库存缺失",
+        ),
+    )
+    if statistical_context is not None:
+        statistical_context["summary"] = fdr_summary
+        statistical_context["decisions"] = statistical_decisions
+    for row in rows:
+        key = str(row.get("combination_key") or "")
+        decision = statistical_decisions.get(key) or {}
+        family_passed = bool(
+            decision.get("valid") is True
+            and decision.get("passed") is True
+            and _HASH_PATTERN.fullmatch(str(
+                decision.get("decision_hash") or ""
+            ))
+        )
+        original_pre_recipe_hash = str(
+            row.get("pre_recipe_funding_gate_hash") or ""
+        )
+        statistical_pre_recipe_hash = _digest({
+            "schema": "probiga.combination-statistical-funding-gate.v1",
+            "combination_key": key,
+            "combination_version": str(row.get("current_version") or ""),
+            "base_funding_gate_hash": original_pre_recipe_hash,
+            "window_statistical_guard_hashes": {
+                str(window): str(
+                    (row["metrics"][str(window)].get(
+                        "statistical_guard"
+                    ) or {}).get("compact_hash") or ""
+                ) for window in WINDOWS
+            },
+            "statistical_family_decision_hash": str(
+                decision.get("decision_hash") or ""
+            ),
+            "family_passed": family_passed,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        })
+        ref = row.get("combination_recipe_ref")
+        if not isinstance(ref, dict):
+            raise RuntimeError(f"组合{key}统计门槛缺少资金事实配方")
+        recipe_ready = ref.get("member_fact_sets_ready") is True
+        recipe_gate_payload = {
+            "schema": "probiga.combination-recipe-funding-gate.v1",
+            "combination_key": key,
+            "combination_version": str(row.get("current_version") or ""),
+            "trade_date": trade_date,
+            "pre_recipe_funding_gate_hash": statistical_pre_recipe_hash,
+            "recipe_hash": str(ref.get("recipe_hash") or ""),
+            "recipe_ready": recipe_ready,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        recipe_gate_hash = _digest(recipe_gate_payload)
+        ref["pre_recipe_funding_gate_hash"] = statistical_pre_recipe_hash
+        ref["recipe_gate_hash"] = recipe_gate_hash
+        row["base_pre_recipe_funding_gate_hash"] = original_pre_recipe_hash
+        row["pre_recipe_funding_gate_hash"] = statistical_pre_recipe_hash
+        row["pre_confirmation_funding_gate_hash"] = recipe_gate_hash
+        row["funding_gate_hash"] = recipe_gate_hash
+        row["statistical_family_decision"] = decision
+        row["statistical_family_passed"] = family_passed
+        row["profit_gate_passed"] = bool(
+            row.get("profit_gate_passed") is True and family_passed
+        )
+        if not family_passed:
+            current_status = str(row.get("current_status") or "SHADOW")
+            row["recommended_status"] = (
+                "RETIRED" if current_status == "RETIRED"
+                else "SUSPENDED" if current_status in {"ACTIVE", "REDUCE"}
+                else "SHADOW"
+            )
+            row["recommended_status_label"] = LIFECYCLE_LABELS[
+                row["recommended_status"]
+            ]
+            row["recommendation_reason"] = (
+                "未通过服务端完整试验族BY多重检验，不授予模拟资金资格"
+            )
+            row["gate_reason"] = row["recommendation_reason"]
+        row["paper_allocation_eligible"] = False
+        row["automatic_real_order_submission"] = False
+
     rows.sort(key=lambda row: (
         lane_order.get(row["current_status"], 9),
         -float(row["ranking_score"]),
@@ -10060,6 +19833,7 @@ def _combination_rankings(
         row["rank"] = index
         lane_ranks[row["lane"]] += 1
         row["lane_rank"] = lane_ranks[row["lane"]]
+    _assign_combination_independent_evidence_ranks(rows)
     return rows
 
 
@@ -10304,13 +20078,55 @@ def _pool_runtime_row_contract(
         ],
     }
     evidence = row.get("evidence") or {}
+    industry_binding = row.get("industry_binding") or {}
+    binding_fields = {
+        "schema", "snapshot_id", "snapshot_hash", "row_hash",
+        "trade_date", "as_of_exclusive", "stock_code", "industry_name",
+        "industry_type", "source_system", "source_fact_id",
+        "source_effective_at", "source_etl_sync_at",
+    }
     if (
         not stock_code
         or rank_no <= 0
         or not isinstance(strategies, list)
         or not isinstance(evidence, dict)
+        or not isinstance(industry_binding, dict)
     ):
         raise ValueError("股票池行身份、排名、策略或证据无效")
+    if industry_binding:
+        if (
+            set(industry_binding) != binding_fields
+            or industry_binding.get("schema") != INDUSTRY_BINDING_SCHEMA
+            or str(industry_binding.get("stock_code") or "") != stock_code
+            or str(industry_binding.get("trade_date") or "")
+            != _trade_date(trade_date, default_today=False)
+            or str(row.get("industry_name") or "")
+            != str(industry_binding.get("industry_name") or "")
+            or str(row.get("industry_type") or "")
+            != str(industry_binding.get("industry_type") or "")
+            or str(row.get("industry_snapshot_id") or "")
+            != str(industry_binding.get("snapshot_id") or "")
+            or str(row.get("industry_snapshot_hash") or "")
+            != str(industry_binding.get("snapshot_hash") or "")
+            or str(row.get("industry_row_hash") or "")
+            != str(industry_binding.get("row_hash") or "")
+            or str(row.get("industry_source_fact_id") or "")
+            != str(industry_binding.get("source_fact_id") or "")
+            or str(row.get("industry_source_system") or "")
+            != str(industry_binding.get("source_system") or "")
+        ):
+            raise ValueError("股票池行与目标日QMT一级行业绑定不一致")
+    elif (
+        level != "OBSERVATION"
+        or any(str(row.get(key) or "") for key in (
+            "industry_name", "industry_type", "industry_snapshot_id",
+            "industry_snapshot_hash", "industry_row_hash",
+            "industry_source_system", "industry_source_fact_id",
+        ))
+        or row.get("industry_names")
+        or row.get("industry_by_strategy")
+    ):
+        raise ValueError("股票池缺失行业绑定时只能作为无行业字段的观察行")
     payload = {
         "schema": POOL_ROW_SCHEMA,
         "trade_date": _trade_date(trade_date, default_today=False),
@@ -10325,6 +20141,19 @@ def _pool_runtime_row_contract(
         "dominant_strategy": str(row.get("dominant_strategy") or ""),
         "strategies": [str(value) for value in strategies],
         "industry_name": str(row.get("industry_name") or ""),
+        "industry_type": str(row.get("industry_type") or ""),
+        "industry_snapshot_id": str(row.get("industry_snapshot_id") or ""),
+        "industry_snapshot_hash": str(
+            row.get("industry_snapshot_hash") or ""
+        ),
+        "industry_row_hash": str(row.get("industry_row_hash") or ""),
+        "industry_source_system": str(
+            row.get("industry_source_system") or ""
+        ),
+        "industry_source_fact_id": str(
+            row.get("industry_source_fact_id") or ""
+        ),
+        "industry_binding": industry_binding,
         "industry_names": sorted({
             str(value) for value in (row.get("industry_names") or [])
             if str(value)
@@ -10455,95 +20284,310 @@ def _automatic_transition_plan_contract(
 
 def _build_pools(
     snapshot: dict[str, Any], strategies: list[dict[str, Any]],
+    *, industry_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     strategy_map = {row["strategy_key"]: row for row in strategies}
     trading_gate = _snapshot_trading_gate(snapshot)
     trading_allowed = trading_gate["trading_allowed"] is True
+    candidate_codes = sorted({
+        str(row.get("stock_code") or "").strip().zfill(6)
+        for row in (snapshot.get("candidates") or [])
+        if re.fullmatch(
+            r"[0-9]{1,6}", str(row.get("stock_code") or "").strip()
+        )
+    })
+    industry_bindings, industry_snapshot_reason, _industry_snapshot_valid = (
+        _industry_snapshot_binding_map(
+            industry_snapshot, snapshot.get("trade_date") or "",
+            expected_codes=candidate_codes,
+        )
+    )
+    industry_block_reason = "目标日QMT一级行业冻结事实缺失或无效"
     observation = []
     confirmation = []
     tradable = []
     for candidate in snapshot.get("candidates") or []:
         raw_keys = [str(key) for key in candidate.get("strategies") or []]
         keys = list(dict.fromkeys(raw_keys))
-        # Candidate-level scores/status/reason may have been aggregated from
-        # every raw contributor.  Silently deleting an ineligible contributor
-        # while retaining those aggregate fields would let a suspended or
-        # forged strategy lend its confidence/payoff to an active strategy.
-        # Without a separately hash-bound per-signal recomputation, the whole
-        # contaminated candidate must therefore stay out of every pool.
-        if not keys or any(
-            key not in strategy_map
-            or strategy_map[key].get("execution_adapter_executable") is not True
-            or strategy_map[key].get("enabled") is not True
-            or str(strategy_map[key].get("current_status") or "")
-            not in {"ACTIVE", "REDUCE", "SHADOW"}
-            for key in keys
-        ):
+        if not keys:
             continue
         member_rows = [strategy_map[key] for key in keys if key in strategy_map]
         dominant_key = str(candidate.get("dominant_strategy") or "")
         if dominant_key not in keys:
             dominant_key = keys[0]
         dominant_row = strategy_map.get(dominant_key)
-        raw_industry_by_strategy = candidate.get("industry_by_strategy")
-        raw_industry_by_strategy = (
-            raw_industry_by_strategy
-            if isinstance(raw_industry_by_strategy, dict) else {}
+        # Candidate-wide confidence/status fields are owned by the dominant
+        # contributor.  Without per-strategy facts they cannot be salvaged
+        # when that contributor explicitly has no executable adapter; showing
+        # the row even in the observation pool would advertise a forged alpha.
+        if (
+            dominant_row is None
+            or (
+                dominant_row.get("execution_adapter_executable") is False
+                and not any(
+                    isinstance(signal, dict)
+                    for signal in (candidate.get("strategy_signals") or [])
+                )
+            )
+        ):
+            continue
+        observation_eligible = bool(
+            dominant_row.get("enabled") is not False
+            and dominant_row.get("execution_adapter_executable") is not False
+            and str(dominant_row.get("current_status") or "ACTIVE")
+            in {"ACTIVE", "REDUCE", "SHADOW"}
         )
-        industry_by_strategy = {
-            key: str(raw_industry_by_strategy.get(key) or "").strip()
-            for key in keys
-            if str(raw_industry_by_strategy.get(key) or "").strip()
-        }
-        fallback_industry = str(
-            candidate.get("industry_name") or candidate.get("industry")
-            or candidate.get("theme_code") or ""
-        ).strip()
-        for key in keys:
-            if key not in industry_by_strategy and fallback_industry:
-                industry_by_strategy[key] = fallback_industry
-        industry_names = sorted(set(industry_by_strategy.values()))
+        observation_keys = [
+            key for key in keys
+            if key in strategy_map
+            and strategy_map[key].get("enabled") is not False
+            and strategy_map[key].get("execution_adapter_executable") is not False
+            and str(strategy_map[key].get("current_status") or "ACTIVE")
+            in {"ACTIVE", "REDUCE", "SHADOW"}
+        ]
+        stock_code = str(candidate.get("stock_code") or "").strip().zfill(6)
+        industry_binding = industry_bindings.get(stock_code) or {}
+        authoritative_industry = str(
+            industry_binding.get("industry_name") or ""
+        )
+        industry_by_strategy = (
+            {key: authoritative_industry for key in observation_keys}
+            if industry_binding else {}
+        )
+        industry_names = [authoritative_industry] if industry_binding else []
         best_health = float(dominant_row["ranking_score"]) if dominant_row else 0.0
         confidence = _num(candidate.get("model_confidence"), 0.0) or 0.0
         risk_reward = _num(candidate.get("risk_reward_ratio"), None)
-        blocking = list(candidate.get("blocking_reasons") or [])
+        blocking = [
+            str(value) for value in (candidate.get("blocking_reasons") or [])
+        ]
+        if not industry_binding and industry_block_reason not in blocking:
+            blocking.append(industry_block_reason)
         final_status = str(candidate.get("final_status") or "INSUFFICIENT_DATA")
         opportunity = round(confidence * 0.7 + best_health * 0.3, 2)
         execution = round((40.0 if not blocking else 0.0) + (30.0 if snapshot.get("source_status") == "fresh" else 10.0) + min(30.0, max(0.0, (risk_reward or 0.0) / 3.0 * 30.0)), 2)
         row = {
-            "stock_code": candidate.get("stock_code"),
+            "stock_code": stock_code,
             "stock_name": candidate.get("stock_name") or "",
-            "strategies": keys,
+            "strategies": observation_keys,
             "dominant_strategy": dominant_key,
             "dominant_strategy_name": (
                 str(dominant_row.get("strategy_name") or dominant_key)
                 if dominant_row else dominant_key
             ),
-            "industry_name": candidate.get("industry_name") or candidate.get("industry") or candidate.get("theme_code") or "",
+            "industry_name": authoritative_industry,
+            "industry_type": str(
+                industry_binding.get("industry_type") or ""
+            ),
+            "industry_snapshot_id": str(
+                industry_binding.get("snapshot_id") or ""
+            ),
+            "industry_snapshot_hash": str(
+                industry_binding.get("snapshot_hash") or ""
+            ),
+            "industry_row_hash": str(
+                industry_binding.get("row_hash") or ""
+            ),
+            "industry_source_system": str(
+                industry_binding.get("source_system") or ""
+            ),
+            "industry_source_fact_id": str(
+                industry_binding.get("source_fact_id") or ""
+            ),
+            "industry_binding": industry_binding,
             "industry_names": industry_names,
             "industry_by_strategy": industry_by_strategy,
             "opportunity_score": opportunity,
             "execution_score": execution,
             "model_confidence": candidate.get("model_confidence"),
             "risk_reward_ratio": risk_reward,
+            "entry_price_low": candidate.get("entry_price_low"),
+            "entry_price_high": candidate.get("entry_price_high"),
+            "stop_loss_price": candidate.get("stop_loss_price"),
+            "take_profit_1": candidate.get("take_profit_1"),
+            "take_profit_2": candidate.get("take_profit_2"),
             "final_status": final_status,
             "blocking_reasons": blocking,
             "reason": candidate.get("today_signal") or candidate.get("conflict_summary") or "等待验证",
-            "evidence": {"data_date": candidate.get("data_date"), "risk_level": candidate.get("risk_level"), "source_status": snapshot.get("source_status"), "trading_gate_status": trading_gate["status"], "market_risk_cap_pct": trading_gate["market_risk_cap_pct"], "candidate_source_hash": trading_gate["candidate_source_hash"]},
+            "evidence": {
+                "data_date": candidate.get("data_date"),
+                "risk_level": candidate.get("risk_level"),
+                "source_status": snapshot.get("source_status"),
+                "trading_gate_status": trading_gate["status"],
+                "market_risk_cap_pct": trading_gate["market_risk_cap_pct"],
+                "candidate_source_hash": trading_gate[
+                    "candidate_source_hash"
+                ],
+                "industry_snapshot_status": str(
+                    (industry_snapshot or {}).get("status") or "MISSING"
+                ),
+                "industry_snapshot_reason": industry_snapshot_reason,
+                "industry_binding": industry_binding,
+                "excluded_observation_contributor_keys": sorted(
+                    set(keys) - set(observation_keys)
+                ),
+            },
             "real_order_authority": False,
         }
-        observation.append(row)
-        if final_status in {"READY", "WATCH"} and confidence >= 60 and not blocking:
+        if observation_eligible:
+            observation.append(row)
+        if (
+            observation_eligible
+            and final_status in {"READY", "WATCH"}
+            and confidence >= 60
+            and not blocking
+        ):
             confirmation.append({**row, "gate_status": "研究确认"})
-        all_signal_strategies_eligible = bool(keys) and len(member_rows) == len(set(keys)) and all(
-            member["paper_allocation_eligible"] for member in member_rows
-        )
-        dominant_eligible = bool(
-            dominant_row and dominant_row["paper_allocation_eligible"]
-        )
-        if trading_allowed and final_status == "READY" and dominant_eligible and all_signal_strategies_eligible and not blocking and risk_reward is not None and risk_reward >= PROFIT_GATE_POLICY["minimum_payoff_ratio"]:
-            tradable.append({
+
+        # Funding is a separate lane.  Re-run conflict resolution only from
+        # ACTIVE/REDUCE signals which independently passed their version-bound
+        # execution and profit gates.  Observation-only or disabled signals
+        # remain visible above, but can neither lend confidence/payoff nor veto
+        # a qualified funding signal on the same stock.
+        funding_keys = {
+            key for key in keys
+            if key in strategy_map
+            and strategy_map[key].get("enabled") is True
+            and strategy_map[key].get("execution_adapter_executable") is True
+            and strategy_map[key].get("paper_allocation_eligible") is True
+            and str(strategy_map[key].get("current_status") or "")
+            in {"ACTIVE", "REDUCE"}
+        }
+        raw_signals = [
+            dict(signal) for signal in (candidate.get("strategy_signals") or [])
+            if isinstance(signal, dict)
+        ]
+
+        def funding_signal_is_bound(signal: dict[str, Any]) -> bool:
+            key = str(signal.get("strategy_key") or "")
+            member = strategy_map.get(key) or {}
+            if key not in funding_keys:
+                return False
+            if str(member.get("source_kind") or "") != "runtime_registry":
+                return True
+            return bool(
+                str(signal.get("strategy_version") or "")
+                == str(member.get("current_version") or "")
+                and str(signal.get("strategy_version_hash") or "")
+                == str(member.get("version_hash") or "")
+                and str(signal.get("execution_binding_hash") or "")
+                == str(member.get("execution_binding_hash") or "")
+                and member.get("candidate_run_receipt_valid") is True
+            )
+
+        funding_signals = [
+            signal for signal in raw_signals
+            if funding_signal_is_bound(signal)
+        ]
+        funding_signal_keys = {
+            str(signal.get("strategy_key") or "")
+            for signal in funding_signals
+            if str(signal.get("strategy_key") or "")
+        }
+        funding_row: dict[str, Any] | None = None
+        if funding_signals:
+            from server.engine.strategy_center import resolve_conflict
+
+            funding_decision = resolve_conflict(
+                funding_signals,
+                str((snapshot.get("market_state") or {}).get("key") or ""),
+            )
+            funding_best = max(
+                funding_signals,
+                key=lambda item: (
+                    _num(item.get("effective_score"), 0.0) or 0.0,
+                    _num(item.get("model_confidence"), 0.0) or 0.0,
+                    str(item.get("strategy_key") or ""),
+                ),
+            )
+            funding_dominant_key = str(
+                funding_decision.get("dominant_strategy")
+                or funding_best.get("strategy_key") or ""
+            )
+            funding_dominant = strategy_map.get(funding_dominant_key)
+            funding_confidence = max(
+                (_num(item.get("model_confidence"), 0.0) or 0.0)
+                for item in funding_signals
+            )
+            funding_risk_reward = _num(
+                funding_best.get("risk_reward_ratio"), None
+            )
+            funding_blocking = [
+                str(value)
+                for value in (funding_decision.get("blocking_reasons") or [])
+            ]
+            if not industry_binding:
+                funding_blocking.append(industry_block_reason)
+            funding_row = {
                 **row,
+                "strategies": sorted(funding_signal_keys),
+                "dominant_strategy": funding_dominant_key,
+                "dominant_strategy_name": (
+                    str(funding_dominant.get("strategy_name") or funding_dominant_key)
+                    if funding_dominant else funding_dominant_key
+                ),
+                "model_confidence": funding_confidence,
+                "risk_reward_ratio": funding_risk_reward,
+                "entry_price_low": funding_best.get("entry_low"),
+                "entry_price_high": funding_best.get("entry_high"),
+                "stop_loss_price": funding_best.get("stop_loss"),
+                "take_profit_1": funding_best.get("take_profit_1"),
+                "take_profit_2": funding_best.get("take_profit_2"),
+                "final_status": str(
+                    funding_decision.get("final_status") or "INSUFFICIENT_DATA"
+                ),
+                "blocking_reasons": funding_blocking,
+                "reason": (
+                    funding_best.get("today_signal")
+                    or funding_decision.get("conflict_summary")
+                    or "等待验证"
+                ),
+                "opportunity_score": round(
+                    funding_confidence * 0.7
+                    + float(funding_dominant.get("ranking_score") or 0.0)
+                    * 0.3
+                    if funding_dominant else funding_confidence * 0.7,
+                    2,
+                ),
+                "evidence": {
+                    **row["evidence"],
+                    "funding_lane_strategy_keys": sorted(funding_signal_keys),
+                    "excluded_contributor_keys": sorted(
+                        set(keys) - funding_signal_keys
+                    ),
+                    "funding_lane_recomputed": True,
+                },
+            }
+            funding_row["execution_score"] = round(
+                (40.0 if not funding_blocking else 0.0)
+                + (30.0 if snapshot.get("source_status") == "fresh" else 10.0)
+                + min(
+                    30.0,
+                    max(0.0, (funding_risk_reward or 0.0) / 3.0 * 30.0),
+                ),
+                2,
+            )
+        elif funding_keys == set(keys) and all(
+            str(strategy_map[key].get("source_kind") or "")
+            != "runtime_registry"
+            for key in funding_keys
+        ):
+            # Backward-compatible snapshots without per-signal details are
+            # admissible only when every contributor is already in the same
+            # qualified funding lane.  Mixed lanes fail closed without details.
+            funding_row = row
+
+        if (
+            funding_row is not None
+            and trading_allowed
+            and funding_row["final_status"] == "READY"
+            and not funding_row["blocking_reasons"]
+            and funding_row["risk_reward_ratio"] is not None
+            and funding_row["risk_reward_ratio"]
+            >= PROFIT_GATE_POLICY["minimum_payoff_ratio"]
+        ):
+            tradable.append({
+                **funding_row,
                 "gate_status": (
                     "降权模拟资金候选"
                     if trading_gate["status"] == "REDUCE_NEW_BUY"
@@ -10657,6 +20701,7 @@ def _allocation_candidate_contract(
                 }
                 for item in (row.get("member_details") or [])
             ],
+            "portfolio_risk_evidence": _portfolio_entity_risk_evidence(row),
         })
     for row in strategies:
         route = row.get("market_route") or {}
@@ -10694,6 +20739,7 @@ def _allocation_candidate_contract(
                 str(row.get("current_status") or ""), 0.0
             ),
             "constraint_passed": True,
+            "portfolio_risk_evidence": _portfolio_entity_risk_evidence(row),
         })
     candidates.sort(key=lambda row: (row["target_type"], row["target_key"]))
     return candidates
@@ -10878,6 +20924,558 @@ def _attach_pool_industry_focus(
         )
 
 
+def _portfolio_entity_risk_evidence(row: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the complete 60-session NAV, exposure and capacity path."""
+
+    unavailable = {
+        "schema": PORTFOLIO_RISK_EVIDENCE_SCHEMA,
+        "status": "UNAVAILABLE",
+        "window_days": 60,
+        "daily_returns": [],
+        "daily_stock_exposures": [],
+        "current_stock_exposure": [],
+        "peak_gross_exposure_value": None,
+        "peak_gross_exposure_trade_date": "",
+        "exposure_path_hash": "",
+    }
+    metrics = (row.get("metrics") or {}).get("60") or row.get(
+        "primary_metrics"
+    ) or {}
+    records = metrics.get("internal_daily_records")
+    raw_daily_exposure = metrics.get("internal_daily_stock_market_values")
+    try:
+        if not isinstance(records, list) or not isinstance(
+            raw_daily_exposure, list
+        ):
+            raise ValueError("portfolio risk inputs are missing")
+        daily_returns: list[dict[str, str]] = []
+        seen_dates: set[str] = set()
+        for item in records:
+            if not isinstance(item, dict):
+                raise ValueError("portfolio daily return row is invalid")
+            trade_date = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            value = Decimal(str(item.get("return_pct"))).quantize(
+                Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+            )
+            if trade_date in seen_dates or not value.is_finite():
+                raise ValueError("portfolio daily returns are invalid")
+            seen_dates.add(trade_date)
+            daily_returns.append({
+                "trade_date": trade_date,
+                "return_pct": format(value, ".8f"),
+            })
+        daily_returns.sort(key=lambda item: item["trade_date"])
+        exposure_path: list[dict[str, Any]] = []
+        exposure_dates: set[str] = set()
+        for raw_row in raw_daily_exposure:
+            if not isinstance(raw_row, dict):
+                raise ValueError("portfolio daily exposure row is invalid")
+            trade_day = date.fromisoformat(
+                str(raw_row.get("trade_date") or "")
+            ).isoformat()
+            raw_values = raw_row.get("stock_risk_exposure")
+            if trade_day in exposure_dates or not isinstance(raw_values, dict):
+                raise ValueError("portfolio daily exposure identity is invalid")
+            exposure_dates.add(trade_day)
+            values: dict[str, Decimal] = {}
+            for raw_code, raw_value in raw_values.items():
+                code = str(raw_code).strip()
+                value = Decimal(str(raw_value))
+                if (
+                    not re.fullmatch(r"[0-9]{6}", code)
+                    or code in values
+                    or not value.is_finite()
+                    or value < 0
+                ):
+                    raise ValueError("portfolio daily stock exposure is invalid")
+                if value > 0:
+                    values[code] = value
+            gross = sum(values.values(), Decimal("0"))
+            normalized = [
+                {
+                    "stock_code": code,
+                    "normalized_weight": format(
+                        (value / gross).quantize(
+                            Decimal("0.000000000001"),
+                            rounding=ROUND_HALF_EVEN,
+                        ),
+                        ".12f",
+                    ),
+                }
+                for code, value in sorted(values.items())
+            ] if gross > 0 else []
+            exposure_path.append({
+                "trade_date": trade_day,
+                "gross_exposure_value": format(
+                    gross.quantize(
+                        Decimal("0.00000001"), rounding=ROUND_HALF_EVEN,
+                    ),
+                    ".8f",
+                ),
+                "normalized_stock_weights": normalized,
+            })
+        exposure_path.sort(key=lambda item: item["trade_date"])
+        return_dates = [item["trade_date"] for item in daily_returns]
+        exposure_days = [item["trade_date"] for item in exposure_path]
+        if (
+            len(daily_returns) != 60
+            or len(exposure_path) != 60
+            or return_dates != exposure_days
+        ):
+            raise ValueError("portfolio risk path must cover the same 60 sessions")
+        if not daily_returns:
+            raise ValueError("portfolio risk evidence is empty")
+        peak_row = max(
+            exposure_path,
+            key=lambda item: Decimal(item["gross_exposure_value"]),
+        )
+        exposure_path_payload = {
+            "schema": "probiga.strategy-daily-stock-exposure-path.v1",
+            "rows": exposure_path,
+        }
+        payload = {
+            "schema": PORTFOLIO_RISK_EVIDENCE_SCHEMA,
+            "status": "READY",
+            "window_days": 60,
+            "daily_returns": daily_returns,
+            "daily_stock_exposures": exposure_path,
+            "current_stock_exposure": list(
+                exposure_path[-1]["normalized_stock_weights"]
+            ),
+            "peak_gross_exposure_value": peak_row["gross_exposure_value"],
+            "peak_gross_exposure_trade_date": peak_row["trade_date"],
+            "exposure_path_hash": _digest(exposure_path_payload),
+        }
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        payload = unavailable
+    return {**payload, "evidence_hash": _digest(payload)}
+
+
+def _validated_portfolio_risk_evidence(
+    evidence: Any,
+) -> tuple[dict[str, float], dict[str, dict[str, Any]]] | None:
+    """Validate the frozen evidence without consulting mutable rank rows."""
+
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema", "status", "window_days", "daily_returns",
+        "daily_stock_exposures", "current_stock_exposure",
+        "peak_gross_exposure_value", "peak_gross_exposure_trade_date",
+        "exposure_path_hash", "evidence_hash",
+    }:
+        return None
+    payload = {
+        key: value for key, value in evidence.items()
+        if key != "evidence_hash"
+    }
+    if (
+        evidence.get("schema") != PORTFOLIO_RISK_EVIDENCE_SCHEMA
+        or evidence.get("status") != "READY"
+        or evidence.get("window_days") != 60
+        or not _HASH_PATTERN.fullmatch(str(evidence.get("evidence_hash") or ""))
+        or _digest(payload) != str(evidence.get("evidence_hash") or "")
+    ):
+        return None
+    daily_rows = evidence.get("daily_returns")
+    exposure_rows = evidence.get("daily_stock_exposures")
+    if not isinstance(daily_rows, list) or not isinstance(exposure_rows, list):
+        return None
+    daily: dict[str, float] = {}
+    exposure_path: dict[str, dict[str, Any]] = {}
+    try:
+        for item in daily_rows:
+            if not isinstance(item, dict) or set(item) != {
+                "trade_date", "return_pct",
+            }:
+                return None
+            trade_date = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            raw_value = str(item.get("return_pct") or "")
+            value = Decimal(raw_value)
+            if (
+                trade_date in daily or not value.is_finite()
+                or format(value.quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+                ), ".8f") != raw_value
+            ):
+                return None
+            daily[trade_date] = float(value)
+        for item in exposure_rows:
+            if not isinstance(item, dict) or set(item) != {
+                "trade_date", "gross_exposure_value",
+                "normalized_stock_weights",
+            }:
+                return None
+            trade_day = date.fromisoformat(
+                str(item.get("trade_date") or "")
+            ).isoformat()
+            gross_text = str(item.get("gross_exposure_value") or "")
+            gross = Decimal(gross_text)
+            if (
+                trade_day in exposure_path or not gross.is_finite()
+                or gross < 0
+                or format(gross.quantize(
+                    Decimal("0.00000001"), rounding=ROUND_HALF_EVEN
+                ), ".8f") != gross_text
+            ):
+                return None
+            raw_weights = item.get("normalized_stock_weights")
+            if not isinstance(raw_weights, list):
+                return None
+            weights: dict[str, float] = {}
+            weight_total = Decimal("0")
+            for raw_weight in raw_weights:
+                if not isinstance(raw_weight, dict) or set(raw_weight) != {
+                    "stock_code", "normalized_weight",
+                }:
+                    return None
+                code = str(raw_weight.get("stock_code") or "")
+                weight_text = str(raw_weight.get("normalized_weight") or "")
+                weight = Decimal(weight_text)
+                if (
+                    not re.fullmatch(r"[0-9]{6}", code)
+                    or code in weights or not weight.is_finite()
+                    or weight <= 0
+                    or format(weight.quantize(
+                        Decimal("0.000000000001"),
+                        rounding=ROUND_HALF_EVEN,
+                    ), ".12f") != weight_text
+                ):
+                    return None
+                weights[code] = float(weight)
+                weight_total += weight
+            tolerance = Decimal("0.000000000001") * max(1, len(weights))
+            if (
+                (gross == 0 and weights)
+                or (gross > 0 and not weights)
+                or (weights and abs(weight_total - Decimal("1")) > tolerance)
+            ):
+                return None
+            exposure_path[trade_day] = {
+                "gross_exposure_value": float(gross),
+                "weights": weights,
+            }
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        return None
+    if (
+        len(daily) != 60 or len(exposure_path) != 60
+        or list(daily) != sorted(daily)
+        or list(exposure_path) != sorted(exposure_path)
+        or list(daily) != list(exposure_path)
+        or evidence.get("current_stock_exposure")
+        != exposure_rows[-1].get("normalized_stock_weights")
+        or str(evidence.get("peak_gross_exposure_trade_date") or "")
+        not in exposure_path
+    ):
+        return None
+    peak_day = str(evidence.get("peak_gross_exposure_trade_date") or "")
+    peak_value = Decimal(str(evidence.get("peak_gross_exposure_value") or ""))
+    observed_peak = max(
+        Decimal(str(row["gross_exposure_value"])) for row in exposure_rows
+    )
+    if (
+        not peak_value.is_finite() or peak_value != observed_peak
+        or Decimal(str(exposure_path[peak_day]["gross_exposure_value"]))
+        != observed_peak
+        or str(evidence.get("exposure_path_hash") or "") != _digest({
+            "schema": "probiga.strategy-daily-stock-exposure-path.v1",
+            "rows": exposure_rows,
+        })
+    ):
+        return None
+    return daily, exposure_path
+
+
+def _portfolio_pair_check(
+    candidate: dict[str, Any], selected: dict[str, Any],
+) -> dict[str, Any]:
+    left = _validated_portfolio_risk_evidence(
+        candidate.get("portfolio_risk_evidence")
+    )
+    right = _validated_portfolio_risk_evidence(
+        selected.get("portfolio_risk_evidence")
+    )
+    left_daily, left_exposure_path = left or ({}, {})
+    right_daily, right_exposure_path = right or ({}, {})
+    common = sorted(
+        set(left_daily)
+        & set(right_daily)
+        & set(left_exposure_path)
+        & set(right_exposure_path)
+    )
+    correlation = _pearson_correlation(
+        [left_daily[day] for day in common],
+        [right_daily[day] for day in common],
+    )
+    overlap_path: list[dict[str, Any]] = []
+    for day in common:
+        left_weights = left_exposure_path[day]["weights"]
+        right_weights = right_exposure_path[day]["weights"]
+        overlap = sum(
+            min(
+                float(left_weights.get(code) or 0.0),
+                float(right_weights.get(code) or 0.0),
+            )
+            for code in set(left_weights) | set(right_weights)
+        ) * 100.0
+        overlap_path.append({
+            "trade_date": day,
+            "stock_overlap_pct": round(overlap, 4),
+            "left_gross_exposure_value": round(
+                float(left_exposure_path[day]["gross_exposure_value"]), 8
+            ),
+            "right_gross_exposure_value": round(
+                float(right_exposure_path[day]["gross_exposure_value"]), 8
+            ),
+            "combined_gross_exposure_value": round(
+                float(left_exposure_path[day]["gross_exposure_value"])
+                + float(right_exposure_path[day]["gross_exposure_value"]),
+                8,
+            ),
+        })
+    peak_overlap = max(
+        overlap_path,
+        key=lambda item: item["stock_overlap_pct"],
+        default=None,
+    )
+    current_overlap = overlap_path[-1] if overlap_path else None
+    peak_capacity = max(
+        overlap_path,
+        key=lambda item: item["combined_gross_exposure_value"],
+        default=None,
+    )
+    enough = len(common) == 60 and len(common) >= int(
+        GLOBAL_PORTFOLIO_POLICY["minimum_pairwise_observations"]
+    )
+    overlap_limit = float(GLOBAL_PORTFOLIO_POLICY[
+        "maximum_pairwise_stock_overlap_pct"
+    ])
+    capacity_path_valid = bool(
+        len(overlap_path) == 60
+        and peak_capacity is not None
+        and current_overlap is not None
+        and float(peak_capacity["combined_gross_exposure_value"]) >= 0.0
+        and float(current_overlap["combined_gross_exposure_value"]) >= 0.0
+        and float(peak_capacity["combined_gross_exposure_value"])
+        >= float(current_overlap["combined_gross_exposure_value"])
+    )
+    passed = bool(
+        enough
+        and capacity_path_valid
+        and correlation is not None
+        and correlation
+        <= float(GLOBAL_PORTFOLIO_POLICY["maximum_pairwise_correlation"])
+        and peak_overlap is not None
+        and current_overlap is not None
+        and float(peak_overlap["stock_overlap_pct"]) <= overlap_limit
+        and float(current_overlap["stock_overlap_pct"]) <= overlap_limit
+    )
+    return {
+        "left": f"{candidate['target_type']}:{candidate['target_key']}",
+        "right": f"{selected['target_type']}:{selected['target_key']}",
+        "observations": len(common),
+        "correlation": round(correlation, 6) if correlation is not None else None,
+        "stock_overlap_pct": (
+            peak_overlap["stock_overlap_pct"] if peak_overlap else None
+        ),
+        "peak_stock_overlap_pct": (
+            peak_overlap["stock_overlap_pct"] if peak_overlap else None
+        ),
+        "peak_stock_overlap_trade_date": (
+            peak_overlap["trade_date"] if peak_overlap else ""
+        ),
+        "current_stock_overlap_pct": (
+            current_overlap["stock_overlap_pct"] if current_overlap else None
+        ),
+        "current_stock_overlap_trade_date": (
+            current_overlap["trade_date"] if current_overlap else ""
+        ),
+        "peak_combined_gross_exposure_value": (
+            peak_capacity["combined_gross_exposure_value"]
+            if peak_capacity else None
+        ),
+        "peak_capacity_trade_date": (
+            peak_capacity["trade_date"] if peak_capacity else ""
+        ),
+        "current_combined_gross_exposure_value": (
+            current_overlap["combined_gross_exposure_value"]
+            if current_overlap else None
+        ),
+        "capacity_path_valid": capacity_path_valid,
+        "daily_exposure_path_hash": _digest({
+            "schema": "probiga.global-pair-daily-exposure-path.v1",
+            "left": f"{candidate['target_type']}:{candidate['target_key']}",
+            "right": f"{selected['target_type']}:{selected['target_key']}",
+            "rows": overlap_path,
+        }),
+        "passed": passed,
+        "reason": (
+            "同步收益相关性、逐日持仓重叠及当前/峰值容量路径通过"
+            if passed else
+            "同步样本/容量路径不足或相关性/当前及峰值持仓重叠超过全局限制"
+        ),
+    }
+
+
+def _select_global_portfolio_candidates(
+    lanes: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Fail closed on frozen pair risk and expanded strategy-sleeve count."""
+
+    maximum = int(GLOBAL_PORTFOLIO_POLICY["maximum_funded_sleeves"])
+    pending = [list(lane) for lane in lanes if lane]
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    funded_exposures: set[str] = set()
+    while pending:
+        next_round: list[list[dict[str, Any]]] = []
+        for lane in pending:
+            if not lane:
+                continue
+            candidate = lane.pop(0)
+            exposures = set(candidate.get("exposure_keys") or ())
+            evidence = candidate.get("portfolio_risk_evidence")
+            evidence_ready = (
+                _validated_portfolio_risk_evidence(evidence) is not None
+            )
+            evidence_rows = (
+                evidence.get("daily_stock_exposures")
+                if isinstance(evidence, dict) else None
+            )
+            current_capacity = (
+                str(evidence_rows[-1].get("gross_exposure_value") or "")
+                if evidence_ready and isinstance(evidence_rows, list)
+                and evidence_rows else ""
+            )
+            comparisons = [
+                _portfolio_pair_check(candidate, existing)
+                for existing in accepted
+            ]
+            overlap_free = bool(
+                exposures and not exposures.intersection(funded_exposures)
+            )
+            expanded_count = len(funded_exposures | exposures)
+            pairwise_passed = all(item["passed"] for item in comparisons)
+            passed = bool(
+                evidence_ready
+                and overlap_free
+                and expanded_count <= maximum
+                and pairwise_passed
+            )
+            candidate["global_portfolio_gate"] = {
+                "passed": passed,
+                "allocation_admission": (
+                    "COMPLETE_60D_DAILY_EXPOSURE_PEAK_AND_CURRENT_CAP_V2"
+                ),
+                "portfolio_risk_evidence_hash": str(
+                    (evidence or {}).get("evidence_hash") or ""
+                ),
+                "daily_exposure_path_hash": str(
+                    (evidence or {}).get("exposure_path_hash") or ""
+                ),
+                "current_gross_exposure_value": current_capacity,
+                "peak_60d_gross_exposure_value": str(
+                    (evidence or {}).get("peak_gross_exposure_value") or ""
+                ),
+                "peak_60d_gross_exposure_trade_date": str(
+                    (evidence or {}).get(
+                        "peak_gross_exposure_trade_date"
+                    ) or ""
+                ),
+                "expanded_strategy_sleeves": sorted(exposures),
+                "funded_sleeve_count_after_admission": expanded_count,
+                "pairwise_checks": comparisons,
+                "policy": GLOBAL_PORTFOLIO_POLICY,
+            }
+            if passed:
+                accepted.append(candidate)
+                funded_exposures.update(exposures)
+            else:
+                reason = (
+                    "缺少有效的冻结60日收益与持仓证据"
+                    if not evidence_ready
+                    else "组合展开后存在重复成员策略袖套"
+                    if not overlap_free
+                    else "组合展开后的唯一成员策略袖套超过单日上限"
+                    if expanded_count > maximum
+                    else "全局候选相关性或持仓重叠未通过"
+                )
+                rejected.append({
+                    "target_type": candidate["target_type"],
+                    "target_key": candidate["target_key"],
+                    "reason": reason,
+                    "portfolio_risk_evidence_hash": str(
+                        (evidence or {}).get("evidence_hash") or ""
+                    ),
+                    "daily_exposure_path_hash": str(
+                        (evidence or {}).get("exposure_path_hash") or ""
+                    ),
+                    "current_gross_exposure_value": current_capacity,
+                    "peak_60d_gross_exposure_value": str(
+                        (evidence or {}).get(
+                            "peak_gross_exposure_value"
+                        ) or ""
+                    ),
+                    "peak_60d_gross_exposure_trade_date": str(
+                        (evidence or {}).get(
+                            "peak_gross_exposure_trade_date"
+                        ) or ""
+                    ),
+                    "expanded_strategy_sleeves": sorted(exposures),
+                    "funded_sleeve_count_after_admission": expanded_count,
+                    "comparisons": comparisons,
+                })
+            if lane:
+                next_round.append(lane)
+        pending = next_round
+    audit_payload = {
+        "schema": "probiga.global-portfolio-gate.v2",
+        "policy": GLOBAL_PORTFOLIO_POLICY,
+        "accepted": [
+            {
+                "target_type": row["target_type"],
+                "target_key": row["target_key"],
+                "portfolio_risk_evidence_hash": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "evidence_hash"
+                    ) or ""
+                ),
+                "daily_exposure_path_hash": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "exposure_path_hash"
+                    ) or ""
+                ),
+                "current_gross_exposure_value": str(
+                    ((row.get("portfolio_risk_evidence") or {}).get(
+                        "daily_stock_exposures"
+                    ) or [{}])[-1].get("gross_exposure_value") or ""
+                ),
+                "peak_60d_gross_exposure_value": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "peak_gross_exposure_value"
+                    ) or ""
+                ),
+                "peak_60d_gross_exposure_trade_date": str(
+                    (row.get("portfolio_risk_evidence") or {}).get(
+                        "peak_gross_exposure_trade_date"
+                    ) or ""
+                ),
+                "expanded_strategy_sleeves": sorted(
+                    row.get("exposure_keys") or ()
+                ),
+                "pairwise_checks": (
+                    row.get("global_portfolio_gate") or {}
+                ).get("pairwise_checks") or [],
+            }
+            for row in accepted
+        ],
+        "rejected": rejected,
+    }
+    return accepted, rejected, _digest(audit_payload)
+
+
 def _allocation(
     strategies: list[dict[str, Any]], combinations: list[dict[str, Any]],
     market_state: str, *, trading_allowed: bool,
@@ -10914,6 +21512,9 @@ def _allocation(
                 "lifecycle_risk_multiplier"
             ],
             "member_sleeves_source": row.get("member_sleeves_source") or [],
+            "portfolio_risk_evidence": row.get(
+                "portfolio_risk_evidence"
+            ) or {},
         }
         for row in contract
         if (
@@ -10933,89 +21534,52 @@ def _allocation(
         row for row in candidates
         if row["ranking_basis"] == DAILY_NAV_RANKING_BASIS
     ]
-    # Strategies and combinations compete only inside their own fixed lane.
-    # This avoids comparing raw scores across different portfolio objects.
-    # A selected combination owns its member exposures by explicit policy;
-    # member strategies are not selected again in the strategy lane.
-    combinations_lane = sorted(
-        (row for row in candidates if row["target_type"] == "COMBINATION"),
-        key=lambda row: (
-            -float(row["score"]) * float(row["market_match_score"]) / 100.0,
-            row["target_key"],
-        ),
+    # Every object has the same capital-weighted daily-NAV score, so strategies
+    # and combinations compete in one quality lane.  Greedy admission over the
+    # expanded member identities makes the stronger object own an overlapping
+    # sleeve; a weak combination can no longer reserve its members merely by
+    # being a combination.
+    candidates.sort(key=lambda row: (
+        -float(row["score"]) * float(row["market_match_score"]) / 100.0,
+        0 if row["target_type"] == "STRATEGY" else 1,
+        row["target_key"],
+    ))
+    candidates, globally_rejected, global_gate_hash = (
+        _select_global_portfolio_candidates(
+            [candidates],
+        )
     )
-    strategies_lane = sorted(
-        (row for row in candidates if row["target_type"] == "STRATEGY"),
-        key=lambda row: (
-            -float(row["score"]) * float(row["market_match_score"]) / 100.0,
-            row["target_key"],
-        ),
-    )
-    selected_combinations: list[dict[str, Any]] = []
-    used_exposures: set[str] = set()
-    for row in combinations_lane:
-        exposures = set(row["exposure_keys"])
-        if not exposures or exposures.intersection(used_exposures):
-            continue
-        selected_combinations.append(row)
-        used_exposures.update(exposures)
-    selected_strategies = [
-        row for row in strategies_lane
-        if set(row["exposure_keys"])
-        and not set(row["exposure_keys"]).intersection(used_exposures)
-    ]
-    candidates = selected_combinations + selected_strategies
     cap = MARKET_RISK_CAP_PCT.get(market_state, 0.0)
     gate_status = str((trading_gate or {}).get("status") or "")
     gate_reason = str((trading_gate or {}).get("reason") or "")
     if not trading_allowed or not candidates or cap <= 0:
-        return [{"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": gate_reason or "没有策略或组合同时通过盈利硬门槛与当前市场状态门槛", "real_order_authority": False}]
+        return [{"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "global_portfolio_gate_hash": global_gate_hash, "global_portfolio_rejections": globally_rejected, "reason": gate_reason or "没有策略或组合同时通过盈利硬门槛、当前市场状态及全局组合门槛", "real_order_authority": False}]
     cap_basis_points = int(round(cap * 100))
-    nonempty_lanes = [
-        lane for lane in (selected_combinations, selected_strategies) if lane
-    ]
-    lane_base = cap_basis_points // len(nonempty_lanes)
-    lane_remainder = cap_basis_points - lane_base * len(nonempty_lanes)
-    assigned_by_identity: dict[tuple[str, str], int] = {}
-    for lane_index, lane in enumerate(nonempty_lanes):
-        lane_budget = lane_base + (1 if lane_index < lane_remainder else 0)
-        lane_total = sum(
-            max(
-                0.0001,
-                float(row["score"])
-                * float(row["market_match_score"]) / 100.0,
-            )
-            for row in lane
+    competitive_values = [
+        max(
+            0.0001,
+            float(row["score"])
+            * float(row["market_match_score"]) / 100.0,
         )
-        raw_lane = [
-            lane_budget
-            * max(
-                0.0001,
-                float(row["score"])
-                * float(row["market_match_score"]) / 100.0,
-            )
-            / lane_total
-            for row in lane
-        ]
-        assigned_lane = [int(value) for value in raw_lane]
-        remainder = lane_budget - sum(assigned_lane)
-        order = sorted(
-            range(len(lane)),
-            key=lambda index: (
-                -(raw_lane[index] - assigned_lane[index]),
-                lane[index]["target_key"],
-            ),
-        )
-        for index in order[:remainder]:
-            assigned_lane[index] += 1
-        for row, basis_points in zip(lane, assigned_lane):
-            assigned_by_identity[(row["target_type"], row["target_key"])] = (
-                basis_points
-            )
-    assigned = [
-        assigned_by_identity[(row["target_type"], row["target_key"])]
         for row in candidates
     ]
+    competitive_total = sum(competitive_values)
+    raw_weights = [
+        cap_basis_points * value / competitive_total
+        for value in competitive_values
+    ]
+    assigned = [int(value) for value in raw_weights]
+    remainder = cap_basis_points - sum(assigned)
+    order = sorted(
+        range(len(candidates)),
+        key=lambda index: (
+            -(raw_weights[index] - assigned[index]),
+            candidates[index]["target_type"],
+            candidates[index]["target_key"],
+        ),
+    )
+    for index in order[:remainder]:
+        assigned[index] += 1
     result = []
     assigned_after_lifecycle = 0
     for row, base_basis_points in zip(candidates, assigned):
@@ -11047,15 +21611,479 @@ def _allocation(
         assigned_after_lifecycle += basis_points
         public_row = {
             key: value for key, value in row.items()
-            if key not in {"exposure_keys", "member_sleeves_source"}
+            if key not in {
+                "exposure_keys", "member_sleeves_source",
+                "portfolio_risk_evidence",
+            }
         }
         lifecycle_reason = (
             "；组合状态或成员袖套处于降权运行，折扣资金留在现金"
             if lifecycle_multiplier < Decimal("1") else ""
         )
-        result.append({**public_row, "allocation_type_lane_policy": ALLOCATION_TYPE_LANE_POLICY, "simulated_weight_pct": basis_points / 100.0, "base_competitive_weight_pct": base_basis_points / 100.0, "member_sleeves": member_sleeves, "member_sleeve_hash": member_sleeve_hash, "cash_discount_bp": cash_discount_bp, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": f"盈利门槛通过且适配{market_state}，在同类型日频净值赛道内按健康分与路由匹配度分配；全局风险上限{cap:.2f}%{lifecycle_reason}", "real_order_authority": False})
-    result.append({"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": (10_000 - assigned_after_lifecycle) / 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": "当前市场风险预算及生命周期降权折扣资金保留", "real_order_authority": False})
+        result.append({**public_row, "allocation_type_lane_policy": ALLOCATION_TYPE_LANE_POLICY, "global_portfolio_gate_hash": global_gate_hash, "simulated_weight_pct": basis_points / 100.0, "base_competitive_weight_pct": base_basis_points / 100.0, "member_sleeves": member_sleeves, "member_sleeve_hash": member_sleeve_hash, "cash_discount_bp": cash_discount_bp, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "reason": f"盈利门槛通过且适配{market_state}，策略与组合按扣费后日频净值健康分及路由匹配度统一竞争，重叠成员仅由更强对象获得资金；袖套数、重复股票、单票/行业、整体波动与预期损失继续由个股级计划统一约束；全局风险上限{cap:.2f}%{lifecycle_reason}", "real_order_authority": False})
+    result.append({"target_type": "CASH", "target_key": "cash", "target_version": "", "funding_gate_hash": "", "market_state": market_state, "market_match_score": 0.0, "router_decision_hash": "", "name": "现金", "simulated_weight_pct": (10_000 - assigned_after_lifecycle) / 100.0, "market_gate_status": gate_status, "market_risk_cap_pct": cap, "global_portfolio_gate_hash": global_gate_hash, "global_portfolio_rejections": globally_rejected, "reason": "当前市场风险预算、生命周期降权及全局组合门槛折扣资金保留", "real_order_authority": False})
     return result
+
+
+def _previous_paper_plan_weights(trade_date: str) -> dict[str, int]:
+    """Read only the last independently validated canonical plan."""
+
+    if not _table_exists("st_strategy_governance_run"):
+        return {}
+    rows = _db_read(
+        "SELECT result_json, result_hash FROM st_strategy_governance_run "
+        "WHERE status='COMPLETED' AND is_canonical=1 "
+        "AND trade_date<:trade_date ORDER BY trade_date DESC, "
+        "run_revision DESC LIMIT 1",
+        {"trade_date": trade_date},
+    )
+    if not rows:
+        return {}
+    raw = rows[0].get("result_json")
+    if (
+        not isinstance(raw, str)
+        or hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        != str(rows[0].get("result_hash") or "")
+    ):
+        return {}
+    previous = _json(raw, None)
+    plan = previous.get("paper_execution_plan") if isinstance(previous, dict) else None
+    if not isinstance(plan, dict):
+        return {}
+    payload = {
+        str(key): value for key, value in plan.items()
+        if str(key) != "plan_hash"
+    }
+    if _digest(payload) != str(plan.get("plan_hash") or ""):
+        return {}
+    return {
+        str(row.get("stock_code") or ""): _int(row.get("target_bp"), 0)
+        for row in (plan.get("targets") or [])
+        if str(row.get("stock_code") or "") and _int(row.get("target_bp"), 0) > 0
+    }
+
+
+def _funded_strategy_sleeves(
+    allocations: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    sleeves: dict[str, dict[str, Any]] = {}
+    for allocation in allocations:
+        target_type = str(allocation.get("target_type") or "")
+        if target_type == "STRATEGY":
+            key = str(allocation.get("target_key") or "")
+            bp = int(round(
+                (_num(allocation.get("simulated_weight_pct"), 0.0) or 0.0)
+                * 100
+            ))
+            if key and bp > 0:
+                sleeves[key] = {
+                    "strategy_key": key,
+                    "strategy_version": str(
+                        allocation.get("target_version") or ""
+                    ),
+                    "allocation_target_type": "STRATEGY",
+                    "allocation_target_key": key,
+                    "allocation_target_version": str(
+                        allocation.get("target_version") or ""
+                    ),
+                    "budget_bp": bp,
+                }
+        elif target_type == "COMBINATION":
+            for member in allocation.get("member_sleeves") or []:
+                key = str(member.get("strategy_key") or "")
+                bp = _int(member.get("effective_bp"), 0)
+                if key and bp > 0:
+                    if key in sleeves:
+                        raise RuntimeError(
+                            "同一策略被多个资金袖套重复授资，拒绝生成个股计划"
+                        )
+                    sleeves[key] = {
+                        "strategy_key": key,
+                        "strategy_version": str(
+                            member.get("strategy_version") or ""
+                        ),
+                        "allocation_target_type": "COMBINATION",
+                        "allocation_target_key": str(
+                            allocation.get("target_key") or ""
+                        ),
+                        "allocation_target_version": str(
+                            allocation.get("target_version") or ""
+                        ),
+                        "budget_bp": bp,
+                    }
+    return sleeves
+
+
+def _paper_plan_portfolio_risk(
+    sleeve_bp: dict[str, int], strategies: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_key = {
+        str(row.get("strategy_key") or ""): row for row in strategies
+    }
+    series = {
+        key: (_portfolio_entity_risk_series(by_key.get(key) or {}).get("daily") or {})
+        for key in sleeve_bp
+    }
+    common: set[str] | None = None
+    for daily in series.values():
+        common = set(daily) if common is None else common & set(daily)
+    days = sorted(common or ())
+    returns = [
+        sum(float(series[key][day]) * bp / 10_000.0
+            for key, bp in sleeve_bp.items())
+        for day in days
+    ]
+    if len(returns) < int(GLOBAL_PORTFOLIO_POLICY[
+        "minimum_pairwise_observations"
+    ]):
+        return {
+            "valid": False,
+            "observations": len(returns),
+            "annualized_volatility_pct": None,
+            "expected_shortfall_95_pct": None,
+            "risk_multiplier": 0.0,
+            "reason": "全局组合风险样本不足，新增模拟买入保持现金",
+        }
+    mean = sum(returns) / len(returns)
+    variance = sum((value - mean) ** 2 for value in returns) / max(
+        1, len(returns) - 1
+    )
+    volatility = math.sqrt(max(0.0, variance)) * math.sqrt(252.0)
+    tail_count = max(1, math.ceil(len(returns) * 0.05))
+    expected_shortfall = abs(sum(sorted(returns)[:tail_count]) / tail_count)
+    volatility_limit = float(
+        GLOBAL_PORTFOLIO_POLICY["maximum_annualized_volatility_pct"]
+    )
+    es_limit = float(
+        GLOBAL_PORTFOLIO_POLICY["maximum_daily_expected_shortfall_95_pct"]
+    )
+    multiplier = min(
+        1.0,
+        volatility_limit / volatility if volatility > 0 else 1.0,
+        es_limit / expected_shortfall if expected_shortfall > 0 else 1.0,
+    )
+    return {
+        "valid": True,
+        "observations": len(returns),
+        "annualized_volatility_pct": round(volatility, 6),
+        "expected_shortfall_95_pct": round(expected_shortfall, 6),
+        "risk_multiplier": round(max(0.0, multiplier), 8),
+        "reason": (
+            "全局波动率和历史预期损失通过"
+            if multiplier >= 1.0
+            else "全局波动率或历史预期损失超限，新增模拟权重按比例降至现金"
+        ),
+    }
+
+
+def _build_allocation_backed_paper_plan(
+    trade_date: str,
+    pools: dict[str, Any],
+    allocations: list[dict[str, Any]],
+    strategies: list[dict[str, Any]],
+    *,
+    industry_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Create a deterministic stock-level paper target plan.
+
+    The plan is intentionally account-independent.  Quantities are shown for
+    a fixed reference capital and are recalculated by the internal paper OMS;
+    broker and real-order authority remain impossible.
+    """
+
+    industry_bindings, industry_snapshot_reason, industry_snapshot_valid = (
+        _industry_snapshot_binding_map(industry_snapshot, trade_date)
+    )
+    industry_snapshot_id = str(
+        (industry_snapshot or {}).get("snapshot_id") or ""
+    )
+    industry_snapshot_hash = str(
+        (industry_snapshot or {}).get("snapshot_hash") or ""
+    )
+    industry_snapshot_status = str(
+        (industry_snapshot or {}).get("status") or "MISSING"
+    )
+    if not industry_snapshot_valid and (pools.get("tradable") or []):
+        raise ValueError(
+            "目标日QMT一级行业冻结快照不可验证，拒绝生成模拟资金计划："
+            + industry_snapshot_reason
+        )
+    sleeves = _funded_strategy_sleeves(allocations)
+    ownership: dict[str, dict[str, Any]] = {}
+    candidate_rows = sorted(
+        (dict(row) for row in (pools.get("tradable") or [])),
+        key=lambda row: (
+            -float(_num(row.get("opportunity_score"), 0.0) or 0.0),
+            -float(_num(row.get("execution_score"), 0.0) or 0.0),
+            str(row.get("stock_code") or ""),
+        ),
+    )
+    for row in candidate_rows:
+        code = str(row.get("stock_code") or "")
+        expected_binding = industry_bindings.get(code)
+        if (
+            expected_binding is None
+            or row.get("industry_binding") != expected_binding
+            or str(row.get("industry_name") or "")
+            != str(expected_binding.get("industry_name") or "")
+            or str(row.get("industry_type") or "")
+            != str(expected_binding.get("industry_type") or "")
+            or str(row.get("industry_snapshot_id") or "")
+            != str(expected_binding.get("snapshot_id") or "")
+            or str(row.get("industry_snapshot_hash") or "")
+            != str(expected_binding.get("snapshot_hash") or "")
+            or str(row.get("industry_row_hash") or "")
+            != str(expected_binding.get("row_hash") or "")
+            or str(row.get("industry_source_fact_id") or "")
+            != str(expected_binding.get("source_fact_id") or "")
+        ):
+            raise ValueError(
+                "可模拟股票缺少与目标日QMT一级行业冻结事实一致的绑定："
+                f"{code or 'UNKNOWN'}；{industry_snapshot_reason}"
+            )
+        eligible = sorted(
+            {
+                str(key) for key in (row.get("strategies") or [])
+                if str(key) in sleeves
+            },
+            key=lambda key: (-_int(sleeves[key].get("budget_bp")), key),
+        )
+        dominant = str(row.get("dominant_strategy") or "")
+        if dominant in eligible:
+            owner = dominant
+        elif eligible:
+            owner = eligible[0]
+        else:
+            continue
+        if code and code not in ownership:
+            ownership[code] = {**row, "owner_strategy_key": owner}
+    maximum_positions = int(
+        GLOBAL_PORTFOLIO_POLICY["maximum_planned_positions"]
+    )
+    owned_rows = list(ownership.values())[:maximum_positions]
+    by_sleeve: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in owned_rows:
+        by_sleeve[row["owner_strategy_key"]].append(row)
+    stock_cap = int(round(
+        float(GLOBAL_PORTFOLIO_POLICY["maximum_single_stock_weight_pct"])
+        * 100
+    ))
+    industry_cap = int(round(
+        float(GLOBAL_PORTFOLIO_POLICY["maximum_industry_weight_pct"])
+        * 100
+    ))
+    allocated_by_code: dict[str, int] = defaultdict(int)
+    industry_allocated: dict[str, int] = defaultdict(int)
+    for key, sleeve in sorted(
+        sleeves.items(), key=lambda item: (-_int(item[1]["budget_bp"]), item[0])
+    ):
+        rows = by_sleeve.get(key) or []
+        remaining = _int(sleeve.get("budget_bp"), 0)
+        while remaining > 0 and rows:
+            eligible_rows = [
+                row for row in rows
+                if allocated_by_code[str(row.get("stock_code") or "")] < stock_cap
+                and industry_allocated[str(row.get("industry_name") or "")]
+                < industry_cap
+            ]
+            if not eligible_rows:
+                break
+            def priority(item: dict[str, Any]) -> tuple[float, float, str]:
+                code = str(item.get("stock_code") or "")
+                score = max(
+                    0.0001,
+                    float(_num(item.get("opportunity_score"), 0.0) or 0.0)
+                    * float(_num(item.get("execution_score"), 0.0) or 0.0),
+                )
+                return (
+                    (allocated_by_code[code] + 1) / score,
+                    -score,
+                    code,
+                )
+            chosen = min(eligible_rows, key=priority)
+            code = str(chosen.get("stock_code") or "")
+            industry = str(chosen.get("industry_name") or "")
+            if not industry:
+                raise ValueError("可模拟股票缺少权威一级行业，拒绝分配")
+            allocated_by_code[code] += 1
+            industry_allocated[industry] += 1
+            remaining -= 1
+    sleeve_actual_bp = defaultdict(int)
+    for code, bp in allocated_by_code.items():
+        if bp > 0:
+            sleeve_actual_bp[str(ownership[code]["owner_strategy_key"])] += bp
+    risk = _paper_plan_portfolio_risk(dict(sleeve_actual_bp), strategies)
+    risk_multiplier = float(risk.get("risk_multiplier") or 0.0)
+    if risk_multiplier < 1.0:
+        allocated_by_code = {
+            code: int(Decimal(bp * risk_multiplier).quantize(
+                Decimal("1"), rounding=ROUND_HALF_EVEN
+            ))
+            for code, bp in allocated_by_code.items()
+        }
+    previous = _previous_paper_plan_weights(trade_date)
+    maximum_buy_turnover_bp = int(round(
+        float(GLOBAL_PORTFOLIO_POLICY["maximum_new_buy_turnover_pct"]) * 100
+    ))
+    buy_increases = {
+        code: max(0, bp - _int(previous.get(code), 0))
+        for code, bp in allocated_by_code.items()
+    }
+    requested_buy_turnover = sum(buy_increases.values())
+    turnover_multiplier = min(
+        1.0,
+        maximum_buy_turnover_bp / requested_buy_turnover
+        if requested_buy_turnover > 0 else 1.0,
+    )
+    if turnover_multiplier < 1.0:
+        for code, bp in list(allocated_by_code.items()):
+            previous_bp = _int(previous.get(code), 0)
+            if bp > previous_bp:
+                allocated_by_code[code] = previous_bp + int(
+                    (bp - previous_bp) * turnover_multiplier
+                )
+    reference_capital = Decimal(str(
+        GLOBAL_PORTFOLIO_POLICY["reference_capital_cny"]
+    ))
+    lot = int(GLOBAL_PORTFOLIO_POLICY["board_lot_size"])
+    targets = []
+    for code, target_bp in sorted(
+        allocated_by_code.items(), key=lambda item: (-item[1], item[0])
+    ):
+        if target_bp <= 0:
+            continue
+        source = ownership[code]
+        owner_key = str(source["owner_strategy_key"])
+        sleeve = sleeves[owner_key]
+        low = _num(source.get("entry_price_low"), None)
+        high = _num(source.get("entry_price_high"), None)
+        reference_price = (
+            (float(low) + float(high)) / 2.0
+            if low is not None and high is not None and low > 0 and high > 0
+            else float(low or high or 0.0)
+        )
+        reference_quantity = 0
+        if reference_price > 0:
+            notional = reference_capital * Decimal(target_bp) / Decimal(10_000)
+            reference_quantity = int(
+                notional / Decimal(str(reference_price)) / Decimal(lot)
+            ) * lot
+        row_payload = {
+            "stock_code": code,
+            "stock_name": str(source.get("stock_name") or ""),
+            "industry_name": str(source.get("industry_name") or ""),
+            "industry_type": str(source.get("industry_type") or ""),
+            "industry_snapshot_id": str(
+                source.get("industry_snapshot_id") or ""
+            ),
+            "industry_snapshot_hash": str(
+                source.get("industry_snapshot_hash") or ""
+            ),
+            "industry_row_hash": str(
+                source.get("industry_row_hash") or ""
+            ),
+            "industry_source_system": str(
+                source.get("industry_source_system") or ""
+            ),
+            "industry_source_fact_id": str(
+                source.get("industry_source_fact_id") or ""
+            ),
+            "industry_binding": dict(source.get("industry_binding") or {}),
+            "strategy_key": owner_key,
+            "strategy_version": str(sleeve.get("strategy_version") or ""),
+            "allocation_target_type": sleeve["allocation_target_type"],
+            "allocation_target_key": sleeve["allocation_target_key"],
+            "allocation_target_version": sleeve["allocation_target_version"],
+            "target_bp": target_bp,
+            "target_weight_pct": target_bp / 100.0,
+            "previous_target_bp": _int(previous.get(code), 0),
+            "new_buy_delta_bp": max(
+                0, target_bp - _int(previous.get(code), 0)
+            ),
+            "reference_capital_cny": float(reference_capital),
+            "reference_price": round(reference_price, 4) if reference_price > 0 else None,
+            "reference_board_lot_quantity": reference_quantity,
+            "quantity_semantics": "REFERENCE_ONLY_INTERNAL_PAPER_OMS_RECALCULATES",
+            "opportunity_score": source.get("opportunity_score"),
+            "execution_score": source.get("execution_score"),
+            "planned_risk_reward_ratio": source.get("risk_reward_ratio"),
+            "stop_loss_price": source.get("stop_loss_price"),
+            "take_profit_1": source.get("take_profit_1"),
+            "take_profit_2": source.get("take_profit_2"),
+            "candidate_source_hash": str(
+                (source.get("evidence") or {}).get("candidate_source_hash") or ""
+            ),
+            "allocation_backed": True,
+            "new_buy_allowed": True,
+            "exit_always_allowed": True,
+            "real_order_authority": False,
+        }
+        targets.append({
+            **row_payload,
+            "target_hash": _digest({
+                "schema": "probiga.governance-paper-target.v1",
+                **row_payload,
+            }),
+        })
+    exits = [
+        {
+            "stock_code": code,
+            "previous_target_bp": bp,
+            "target_bp": 0,
+            "action": "EXIT_OR_REDUCE_ONLY",
+            "new_buy_allowed": False,
+            "exit_always_allowed": True,
+            "real_order_authority": False,
+        }
+        for code, bp in sorted(previous.items())
+        if _int(allocated_by_code.get(code), 0) <= 0
+    ]
+    target_by_code = {row["stock_code"]: row for row in targets}
+    pools["tradable"] = [
+        {
+            **row,
+            "allocation_backed": True,
+            "paper_target": target_by_code[str(row.get("stock_code") or "")],
+            "allocation_target_type": target_by_code[
+                str(row.get("stock_code") or "")
+            ]["allocation_target_type"],
+            "allocation_target_key": target_by_code[
+                str(row.get("stock_code") or "")
+            ]["allocation_target_key"],
+            "target_weight_pct": target_by_code[
+                str(row.get("stock_code") or "")
+            ]["target_weight_pct"],
+        }
+        for row in (pools.get("tradable") or [])
+        if str(row.get("stock_code") or "") in target_by_code
+    ]
+    for index, row in enumerate(pools["tradable"], 1):
+        row["rank"] = index
+    payload = {
+        "schema": "probiga.governance-paper-execution-plan.v1",
+        "trade_date": trade_date,
+        "industry_snapshot_id": industry_snapshot_id,
+        "industry_snapshot_hash": industry_snapshot_hash,
+        "industry_snapshot_status": industry_snapshot_status,
+        "policy": GLOBAL_PORTFOLIO_POLICY,
+        "funded_sleeves": [
+            sleeves[key] for key in sorted(sleeves)
+        ],
+        "portfolio_risk": risk,
+        "requested_new_buy_turnover_bp": requested_buy_turnover,
+        "new_buy_turnover_multiplier": round(turnover_multiplier, 8),
+        "actual_new_buy_turnover_bp": sum(
+            row["new_buy_delta_bp"] for row in targets
+        ),
+        "targets": targets,
+        "exit_targets": exits,
+        "target_count": len(targets),
+        "invested_bp": sum(row["target_bp"] for row in targets),
+        "cash_bp": 10_000 - sum(row["target_bp"] for row in targets),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "plan_hash": _digest(payload)}
 
 
 def _allocation_snapshot_contract(
@@ -11242,48 +22270,1165 @@ def _allocation_snapshot_contract(
     return rows
 
 
-def _persist_health(connection, run_uid: str, trade_date: str, strategies: list[dict[str, Any]]) -> None:
-    for strategy in strategies:
+FUNDING_MANIFEST_BATCH_MAX_ROWS = 100
+
+
+def _funding_checkpoint_manifest_entry(
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    """Project one materialized checkpoint into its compact manifest row."""
+
+    key = str(checkpoint.get("strategy_key") or "")
+    version = str(checkpoint.get("strategy_version") or "")
+    trade_date = _trade_date(
+        checkpoint.get("trade_date"), default_today=False,
+    )
+    entry = {
+        "entity_type": "STRATEGY",
+        "entity_key": key,
+        "entity_version": version,
+        "checkpoint_id": str(checkpoint.get("checkpoint_id") or ""),
+        "strategy_key": key,
+        "strategy_version": version,
+        "account_id": str(checkpoint.get("account_id") or ""),
+        "trade_date": trade_date,
+        "replay_mode": str(checkpoint.get("replay_mode") or ""),
+        "replay_session_count": _int(
+            checkpoint.get("replay_session_count"), -1,
+        ),
+        "max_holding_days": _int(checkpoint.get("max_holding_days"), -1),
+        "checkpoint_hash": str(checkpoint.get("checkpoint_hash") or ""),
+        "chain_hash": str(checkpoint.get("chain_hash") or ""),
+        "history_fact_count": _int(
+            checkpoint.get("history_fact_count"), -1,
+        ),
+        "history_fact_set_hash": str(
+            checkpoint.get("history_fact_set_hash") or ""
+        ),
+        "history_tip_fact_id": str(
+            checkpoint.get("history_tip_fact_id") or ""
+        ),
+        "history_tip_fact_hash": str(
+            checkpoint.get("history_tip_fact_hash") or ""
+        ),
+        "new_fact_count": _int(checkpoint.get("new_fact_count"), -1),
+        "new_fact_set_hash": str(
+            checkpoint.get("new_fact_set_hash") or ""
+        ),
+        "new_fact_first_id": str(
+            checkpoint.get("new_fact_first_id") or ""
+        ),
+        "new_fact_tip_id": str(
+            checkpoint.get("new_fact_tip_id") or ""
+        ),
+        "bootstrap_full_history_scan": (
+            str(checkpoint.get("replay_mode") or "") == "FULL_BOOTSTRAP"
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if (
+        not key
+        or not version
+        or not entry["account_id"]
+        or not _HASH_PATTERN.fullmatch(entry["checkpoint_id"])
+        or not _HASH_PATTERN.fullmatch(entry["checkpoint_hash"])
+        or not _HASH_PATTERN.fullmatch(entry["chain_hash"])
+        or not _HASH_PATTERN.fullmatch(entry["history_fact_set_hash"])
+        or not _HASH_PATTERN.fullmatch(entry["history_tip_fact_id"])
+        or not _HASH_PATTERN.fullmatch(entry["history_tip_fact_hash"])
+        or not _HASH_PATTERN.fullmatch(entry["new_fact_set_hash"])
+        or not _HASH_PATTERN.fullmatch(entry["new_fact_first_id"])
+        or not _HASH_PATTERN.fullmatch(entry["new_fact_tip_id"])
+        or checkpoint.get("automatic_real_order_submission") not in (0, False)
+        or checkpoint.get("real_order_authority") not in (0, False)
+    ):
+        raise RuntimeError(f"策略{key}资金检查点清单物化行无效")
+    return entry
+
+
+def _validated_combination_risk_binding(
+    value: Any, *,
+    constraint_evaluation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate the compact 60-session drift-risk recipe binding."""
+
+    if not isinstance(value, dict):
+        raise RuntimeError("组合资金配方缺少60日漂移风险绑定")
+    expected_fields = {
+        "schema", "window_days", "risk_path_hash",
+        "constraint_evaluation_hash", "constraint_passed",
+        "peak_member_weight", "current_member_weight",
+        "peak_pairwise_stock_overlap_pct",
+        "current_pairwise_stock_overlap_pct",
+        "peak_industry_weight_pct", "current_industry_weight_pct",
+        "industry_snapshot_path_hash", "industry_trade_dates_hash",
+        "industry_stock_code_sets_hash",
+        "automatic_real_order_submission",
+        "real_order_authority", "binding_hash",
+    }
+    numeric_fields = (
+        "peak_member_weight", "current_member_weight",
+        "peak_pairwise_stock_overlap_pct",
+        "current_pairwise_stock_overlap_pct",
+        "peak_industry_weight_pct", "current_industry_weight_pct",
+    )
+    normalized_numbers: dict[str, float] = {}
+    for field in numeric_fields:
+        number = _num(value.get(field), None)
+        if number is None or not math.isfinite(number) or number < 0:
+            raise RuntimeError("组合资金配方漂移风险数值无效")
+        normalized_numbers[field] = float(number)
+    payload = {
+        "schema": str(value.get("schema") or ""),
+        "window_days": _int(value.get("window_days"), -1),
+        "risk_path_hash": str(value.get("risk_path_hash") or ""),
+        "constraint_evaluation_hash": str(
+            value.get("constraint_evaluation_hash") or ""
+        ),
+        "constraint_passed": value.get("constraint_passed") is True,
+        **normalized_numbers,
+        "industry_snapshot_path_hash": str(
+            value.get("industry_snapshot_path_hash") or ""
+        ),
+        "industry_trade_dates_hash": str(
+            value.get("industry_trade_dates_hash") or ""
+        ),
+        "industry_stock_code_sets_hash": str(
+            value.get("industry_stock_code_sets_hash") or ""
+        ),
+        "automatic_real_order_submission": value.get(
+            "automatic_real_order_submission"
+        ),
+        "real_order_authority": value.get("real_order_authority"),
+    }
+    if (
+        set(value) != expected_fields
+        or payload["schema"]
+        != "probiga.combination-drift-risk-binding.v2"
+        or payload["window_days"] != 60
+        or any(
+            not _HASH_PATTERN.fullmatch(payload[field])
+            for field in (
+                "risk_path_hash", "constraint_evaluation_hash",
+                "industry_snapshot_path_hash", "industry_trade_dates_hash",
+                "industry_stock_code_sets_hash",
+            )
+        )
+        or payload["constraint_passed"] is not True
+        or payload["peak_member_weight"] > 1.0
+        or payload["current_member_weight"] > 1.0
+        or any(
+            payload[field] > 100.0
+            for field in (
+                "peak_pairwise_stock_overlap_pct",
+                "current_pairwise_stock_overlap_pct",
+                "peak_industry_weight_pct",
+                "current_industry_weight_pct",
+            )
+        )
+        or payload["automatic_real_order_submission"] is not False
+        or payload["real_order_authority"] is not False
+        or str(value.get("binding_hash") or "") != _digest(payload)
+    ):
+        raise RuntimeError("组合资金配方漂移风险绑定身份或哈希无效")
+    if constraint_evaluation is not None:
+        industry_path = constraint_evaluation.get("industry_snapshot_path")
+        if (
+            constraint_evaluation.get("passed") is not True
+            or str(constraint_evaluation.get("evaluation_hash") or "")
+            != payload["constraint_evaluation_hash"]
+            or str((constraint_evaluation.get("drift_risk_path") or {}).get(
+                "risk_path_hash"
+            ) or "") != payload["risk_path_hash"]
+            or not isinstance(industry_path, dict)
+            or industry_path.get("status") != "COMPLETED"
+            or _int(industry_path.get("window_days"), -1) != 60
+            or str(industry_path.get("path_hash") or "")
+            != payload["industry_snapshot_path_hash"]
+            or str(industry_path.get("trade_dates_hash") or "")
+            != payload["industry_trade_dates_hash"]
+            or str(industry_path.get("stock_code_sets_hash") or "")
+            != payload["industry_stock_code_sets_hash"]
+            or constraint_evaluation.get("risk_binding") != value
+        ):
+            raise RuntimeError("组合资金配方漂移风险绑定与约束评估不一致")
+    return {**payload, "binding_hash": str(value["binding_hash"])}
+
+
+def _combination_recipe_manifest_entry(
+    combination: dict[str, Any], *, trade_date: str,
+) -> dict[str, Any]:
+    """Validate a member-fact recipe and return its compact funding row."""
+
+    key = str(combination.get("combination_key") or "")
+    version = str(combination.get("current_version") or "")
+    ref = combination.get("combination_recipe_ref")
+    if not isinstance(ref, dict):
+        raise RuntimeError(f"组合{key}缺少成员资金事实配方")
+    members = ref.get("members")
+    if not isinstance(members, list) or not members:
+        raise RuntimeError(f"组合{key}成员资金事实配方为空")
+    member_rows: list[dict[str, Any]] = []
+    total_weight = Decimal("0")
+    for member in members:
+        if not isinstance(member, dict):
+            raise RuntimeError(f"组合{key}成员资金事实配方行无效")
+        try:
+            weight = Decimal(str(member.get("weight")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RuntimeError(f"组合{key}成员资金事实配方权重无效") from exc
+        normalized = {
+            "strategy_key": str(member.get("strategy_key") or ""),
+            "strategy_version": str(member.get("strategy_version") or ""),
+            "weight": round(float(weight), 8),
+            "checkpoint_id": str(member.get("checkpoint_id") or ""),
+            "account_id": str(member.get("account_id") or ""),
+            "checkpoint_hash": str(member.get("checkpoint_hash") or ""),
+            "chain_hash": str(member.get("chain_hash") or ""),
+            "history_fact_set_hash": str(
+                member.get("history_fact_set_hash") or ""
+            ),
+            "checkpoint_trade_date": str(
+                member.get("checkpoint_trade_date") or ""
+            ),
+        }
+        if (
+            not weight.is_finite()
+            or weight <= 0
+            or not normalized["strategy_key"]
+            or not normalized["strategy_version"]
+            or not normalized["account_id"]
+            or normalized["checkpoint_trade_date"] != trade_date
+            or any(not _HASH_PATTERN.fullmatch(normalized[field]) for field in (
+                "checkpoint_id", "checkpoint_hash", "chain_hash",
+                "history_fact_set_hash",
+            ))
+        ):
+            raise RuntimeError(f"组合{key}成员资金事实配方绑定无效")
+        total_weight += weight
+        member_rows.append(normalized)
+    if (
+        member_rows != sorted(
+            member_rows, key=lambda item: item["strategy_key"],
+        )
+        or len({item["strategy_key"] for item in member_rows})
+        != len(member_rows)
+        or abs(total_weight - Decimal("1")) > Decimal("0.00000005")
+    ):
+        raise RuntimeError(f"组合{key}成员资金事实配方排序或权重无效")
+    risk_binding = _validated_combination_risk_binding(
+        ref.get("risk_constraint_binding"),
+        constraint_evaluation=(
+            combination.get("constraint_evaluation")
+            if isinstance(combination.get("constraint_evaluation"), dict)
+            else None
+        ),
+    )
+    recipe_payload = {
+        "schema": "probiga.combination-member-fact-recipe.v1",
+        "combination_key": key,
+        "combination_version": version,
+        "trade_date": trade_date,
+        "members": member_rows,
+        "risk_constraint_binding": risk_binding,
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    recipe_hash = _digest(recipe_payload)
+    pre_recipe_hash = str(ref.get("pre_recipe_funding_gate_hash") or "")
+    gate_payload = {
+        "schema": "probiga.combination-recipe-funding-gate.v1",
+        "combination_key": key,
+        "combination_version": version,
+        "trade_date": trade_date,
+        "pre_recipe_funding_gate_hash": pre_recipe_hash,
+        "recipe_hash": recipe_hash,
+        "recipe_ready": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    recipe_gate_hash = _digest(gate_payload)
+    statistical_decision_hash = str(
+        (combination.get("statistical_family_decision") or {}).get(
+            "decision_hash"
+        ) or (combination.get("statistical_family_decision") or {}).get(
+            "source_decision_hash"
+        ) or (combination.get("statistical_family_decision") or {}).get(
+            "source_hash"
+        ) or ""
+    )
+    confirmation_guard_hash = str(
+        (combination.get("confirmation_guard") or {}).get(
+            "compact_hash"
+        ) or (combination.get("confirmation_guard") or {}).get(
+            "source_compact_hash"
+        ) or (combination.get("confirmation_guard") or {}).get(
+            "source_hash"
+        ) or ""
+    )
+    final_funding_gate_hash = str(
+        combination.get("funding_gate_hash") or ""
+    )
+    if (
+        ref.get("schema") != recipe_payload["schema"]
+        or ref.get("combination_key") != key
+        or ref.get("combination_version") != version
+        or ref.get("trade_date") != trade_date
+        or ref.get("members") != member_rows
+        or ref.get("risk_constraint_binding") != risk_binding
+        or ref.get("cash_fact_materialized") is not False
+        or ref.get("automatic_real_order_submission") is not False
+        or ref.get("real_order_authority") is not False
+        or ref.get("member_fact_sets_ready") is not True
+        or ref.get("recipe_hash") != recipe_hash
+        or not _HASH_PATTERN.fullmatch(pre_recipe_hash)
+        or ref.get("recipe_gate_hash") != recipe_gate_hash
+        or combination.get("pre_confirmation_funding_gate_hash")
+        != recipe_gate_hash
+        or not _HASH_PATTERN.fullmatch(statistical_decision_hash)
+        or not _HASH_PATTERN.fullmatch(confirmation_guard_hash)
+        or not _HASH_PATTERN.fullmatch(final_funding_gate_hash)
+        or _finalize_funding_gate_hash(
+            combination, entity_type="COMBINATION",
+        ) != final_funding_gate_hash
+    ):
+        raise RuntimeError(f"组合{key}成员资金事实配方哈希无效")
+    member_set_hash = _digest({
+        "schema": "probiga.combination-member-checkpoint-set.v1",
+        "members": member_rows,
+    })
+    return {
+        "entity_type": "COMBINATION",
+        "entity_key": key,
+        "entity_version": version,
+        "trade_date": trade_date,
+        "recipe_hash": recipe_hash,
+        "recipe_gate_hash": recipe_gate_hash,
+        "pre_confirmation_funding_gate_hash": recipe_gate_hash,
+        "statistical_family_decision_hash": statistical_decision_hash,
+        "confirmation_guard_hash": confirmation_guard_hash,
+        "funding_gate_hash": final_funding_gate_hash,
+        "member_count": len(member_rows),
+        "member_checkpoint_set_hash": member_set_hash,
+        "cash_fact_materialized": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def _funding_entity_set_hash(entities: list[dict[str, Any]]) -> str:
+    return _digest({
+        "schema": "probiga.strategy-funding-entity-set.v1",
+        "entities": entities,
+    })
+
+
+def _funding_manifest_batch_root(
+    rows: list[dict[str, Any]], *, kind: str,
+) -> dict[str, Any]:
+    """Compress arbitrarily many sorted identities into <=100-row roots."""
+
+    normalized_kind = str(kind or "").upper()
+    if normalized_kind not in {
+        "CHECKPOINT", "COMBINATION_RECIPE", "INELIGIBLE",
+    }:
+        raise ValueError("资金清单批根类型无效")
+    ordered = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            str(row.get("entity_type") or ""),
+            str(row.get("entity_key") or ""),
+            str(row.get("entity_version") or ""),
+            str(row.get("account_id") or ""),
+            str(row.get("trade_date") or ""),
+            str(row.get("checkpoint_id") or ""),
+            str(row.get("recipe_hash") or ""),
+            str(row.get("reason_code") or ""),
+        ),
+    )
+    if len(ordered) != len({
+        _checkpoint_canonical_json(row) for row in ordered
+    }):
+        raise ValueError("资金清单批根包含重复行")
+    batches = []
+    for index, offset in enumerate(
+        range(0, len(ordered), FUNDING_MANIFEST_BATCH_MAX_ROWS)
+    ):
+        batch_rows = ordered[offset:offset + FUNDING_MANIFEST_BATCH_MAX_ROWS]
+        batches.append(_funding_manifest_batch_summary(
+            batch_rows, kind=normalized_kind, batch_index=index,
+        ))
+    root_payload = {
+        "schema": "probiga.strategy-funding-manifest-root.v1",
+        "kind": normalized_kind,
+        "count": len(ordered),
+        "set_hash": _checkpoint_canonical_hash({
+            "schema": "probiga.strategy-funding-manifest-row-set.v1",
+            "kind": normalized_kind,
+            "rows": ordered,
+        }),
+        "batches": batches,
+    }
+    return {
+        **root_payload,
+        "root_hash": _checkpoint_canonical_hash(root_payload),
+    }
+
+
+def _funding_manifest_batch_summary(
+    rows: list[dict[str, Any]], *, kind: str, batch_index: int,
+) -> dict[str, Any]:
+    normalized_kind = str(kind or "").upper()
+    if (
+        normalized_kind not in {
+            "CHECKPOINT", "COMBINATION_RECIPE", "INELIGIBLE",
+        }
+        or isinstance(batch_index, bool)
+        or int(batch_index) < 0
+        or not rows
+        or len(rows) > FUNDING_MANIFEST_BATCH_MAX_ROWS
+    ):
+        raise ValueError("资金清单批摘要参数无效")
+    ordered = sorted(
+        (dict(row) for row in rows),
+        key=lambda row: (
+            str(row.get("entity_type") or ""),
+            str(row.get("entity_key") or ""),
+            str(row.get("entity_version") or ""),
+            str(row.get("account_id") or ""),
+            str(row.get("trade_date") or ""),
+            str(row.get("checkpoint_id") or ""),
+            str(row.get("recipe_hash") or ""),
+            str(row.get("reason_code") or ""),
+        ),
+    )
+    if len(ordered) != len({_checkpoint_canonical_json(row) for row in ordered}):
+        raise ValueError("资金清单批摘要包含重复行")
+    payload = {
+        "schema": "probiga.strategy-funding-manifest-batch.v1",
+        "kind": normalized_kind,
+        "batch_index": int(batch_index),
+        "rows": ordered,
+    }
+    return {
+        "batch_index": int(batch_index),
+        "count": len(ordered),
+        "first_row_hash": _checkpoint_canonical_hash(ordered[0]),
+        "last_row_hash": _checkpoint_canonical_hash(ordered[-1]),
+        "batch_hash": _checkpoint_canonical_hash(payload),
+    }
+
+
+def _verify_funding_manifest_root_structure(
+    root: Any, *, kind: str,
+) -> list[dict[str, Any]]:
+    """Validate a compact root without expanding its arbitrarily large set."""
+
+    normalized_kind = str(kind or "").upper()
+    if not isinstance(root, dict):
+        raise RuntimeError(f"资金清单{normalized_kind}根缺失")
+    batches = root.get("batches")
+    count = _int(root.get("count"), -1)
+    root_payload = {
+        field: value for field, value in root.items() if field != "root_hash"
+    }
+    expected_batch_count = (
+        (count + FUNDING_MANIFEST_BATCH_MAX_ROWS - 1)
+        // FUNDING_MANIFEST_BATCH_MAX_ROWS if count else 0
+    )
+    if (
+        normalized_kind not in {
+            "CHECKPOINT", "COMBINATION_RECIPE", "INELIGIBLE",
+        }
+        or root.get("schema")
+        != "probiga.strategy-funding-manifest-root.v1"
+        or root.get("kind") != normalized_kind
+        or count < 0
+        or not _HASH_PATTERN.fullmatch(str(root.get("set_hash") or ""))
+        or not isinstance(batches, list)
+        or len(batches) != expected_batch_count
+        or not _HASH_PATTERN.fullmatch(str(root.get("root_hash") or ""))
+        or _checkpoint_canonical_hash(root_payload)
+        != str(root.get("root_hash") or "")
+    ):
+        raise RuntimeError(f"资金清单{normalized_kind}根结构无效")
+    for index, batch in enumerate(batches):
+        expected_count = min(
+            FUNDING_MANIFEST_BATCH_MAX_ROWS,
+            count - index * FUNDING_MANIFEST_BATCH_MAX_ROWS,
+        )
+        if (
+            not isinstance(batch, dict)
+            or set(batch) != {
+                "batch_index", "count", "first_row_hash",
+                "last_row_hash", "batch_hash",
+            }
+            or _int(batch.get("batch_index"), -1) != index
+            or _int(batch.get("count"), -1) != expected_count
+            or any(not _HASH_PATTERN.fullmatch(str(batch.get(field) or ""))
+                   for field in (
+                       "first_row_hash", "last_row_hash", "batch_hash",
+                   ))
+        ):
+            raise RuntimeError(f"资金清单{normalized_kind}批摘要无效")
+    return [dict(item) for item in batches]
+
+
+def _verify_funding_manifest_batch_root(
+    root: Any, rows: list[dict[str, Any]], *, kind: str,
+) -> None:
+    expected = _funding_manifest_batch_root(rows, kind=kind)
+    if not isinstance(root, dict) or root != expected:
+        raise RuntimeError(f"资金清单{kind}批根不可复算")
+
+
+def _build_funding_checkpoint_manifest(
+    *, run_uid: str, trade_date: str, strategies: list[dict[str, Any]],
+    combinations: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Freeze compact checkpoint/fact roots without result-hash recursion."""
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(run_uid or "")):
+        raise ValueError("资金检查点清单缺少治理运行身份")
+    current_entities: list[dict[str, str]] = []
+    checkpoint_rows: list[dict[str, Any]] = []
+    combination_recipe_rows: list[dict[str, Any]] = []
+    ineligible: list[dict[str, str]] = []
+    candidates: list[dict[str, Any]] = []
+    checkpoint_storage_bytes = 0
+    fact_storage_bytes = 0
+    seen_identities: set[tuple[str, str, str]] = set()
+    for strategy in sorted(
+        strategies, key=lambda item: str(item.get("strategy_key") or ""),
+    ):
+        key = str(strategy.get("strategy_key") or "")
+        version = str(strategy.get("current_version") or "")
+        identity = ("STRATEGY", key, version)
+        if not key or not version or identity in seen_identities:
+            raise ValueError("资金检查点清单当前版本集合重复或为空")
+        seen_identities.add(identity)
+        current_entities.append({
+            "entity_type": "STRATEGY",
+            "entity_key": key,
+            "entity_version": version,
+        })
+        candidate = strategy.get("funding_checkpoint_candidate")
+        if not isinstance(candidate, dict):
+            strategy.pop("funding_checkpoint_ref", None)
+            ineligible_row = {
+                "entity_type": "STRATEGY",
+                "entity_key": key,
+                "entity_version": version,
+                "reason_code": str(strategy.get(
+                    "funding_checkpoint_persistence_reason_code"
+                ) or "NO_VERIFIED_INTERNAL_LEDGER"),
+                "reason": str(
+                    strategy.get("funding_checkpoint_persistence_reason")
+                    or strategy.get("profit_gate_reason")
+                    or "没有可持久化的内部资金账本"
+                )[:240],
+            }
+            ineligible.append(ineligible_row)
+            strategy["funding_manifest_ineligible"] = ineligible_row
+            continue
+        strategy.pop("funding_manifest_ineligible", None)
+        state = candidate.get("state")
+        facts = candidate.get("daily_fact_candidates")
+        state_json = str(candidate.get("state_json") or "")
+        chain_payload = candidate.get("chain_payload")
+        chain_json = str(candidate.get("chain_payload_json") or "")
+        checkpoint_id = str(candidate.get("checkpoint_id") or "")
+        checkpoint_hash = str(candidate.get("checkpoint_hash") or "")
+        chain_hash = str(candidate.get("chain_hash") or "")
+        if (
+            candidate.get("schema")
+            != "probiga.strategy-funding-checkpoint-candidate.v2"
+            or candidate.get("anchor_run_uid") != run_uid
+            or candidate.get("automatic_real_order_submission") is not False
+            or candidate.get("real_order_authority") is not False
+            or not isinstance(state, dict)
+            or not isinstance(chain_payload, dict)
+            or not isinstance(facts, list)
+            or not facts
+            or _checkpoint_canonical_json(state) != state_json
+            or checkpoint_state_hash(state) != checkpoint_hash
+            or _checkpoint_canonical_json(chain_payload) != chain_json
+            or _checkpoint_canonical_hash(chain_payload) != chain_hash
+            or state.get("strategy_key") != key
+            or state.get("strategy_version") != version
+            or state.get("trade_date") != trade_date
+            or checkpoint_identity(
+                strategy_key=key,
+                strategy_version=version,
+                account_id=str(state.get("account_id") or ""),
+                trade_date=trade_date,
+                anchor_run_uid=run_uid,
+            ) != checkpoint_id
+        ):
+            raise ValueError(f"策略{key}资金检查点候选在清单冻结前无效")
+        fact_members: list[dict[str, str]] = []
+        fact_days: list[str] = []
+        previous_fact_id = ""
+        previous_fact_hash = ""
+        for index, fact_candidate in enumerate(facts):
+            fact = (fact_candidate or {}).get("fact")
+            fact_id = str((fact_candidate or {}).get("fact_id") or "")
+            fact_hash = str((fact_candidate or {}).get("fact_hash") or "")
+            fact_json = str((fact_candidate or {}).get("fact_json") or "")
+            if index == 0:
+                previous_fact_id = str(
+                    (fact_candidate or {}).get("previous_fact_id") or ""
+                )
+                previous_fact_hash = str(
+                    (fact_candidate or {}).get("previous_fact_hash") or ""
+                )
+            if (
+                not isinstance(fact, dict)
+                or fact.get("origin_checkpoint_id") != checkpoint_id
+                or fact.get("entity_key") != key
+                or fact.get("entity_version") != version
+                or not re.fullmatch(
+                    r"\d{4}-\d{2}-\d{2}", str(fact.get("trade_date") or "")
+                )
+                or _trade_date(
+                    fact.get("trade_date"), default_today=False,
+                ) != str(fact.get("trade_date") or "")
+                or _checkpoint_canonical_json(fact) != fact_json
+                or funding_daily_fact_hash(fact) != fact_hash
+                or funding_daily_fact_identity(
+                    entity_type="STRATEGY",
+                    entity_key=key,
+                    entity_version=version,
+                    account_id=str(state.get("account_id") or ""),
+                    trade_date=str(fact.get("trade_date") or ""),
+                    anchor_run_uid=run_uid,
+                ) != fact_id
+                or str(fact.get("previous_fact_id") or "")
+                != str((fact_candidate or {}).get("previous_fact_id") or "")
+                or str(fact.get("previous_fact_hash") or "")
+                != str((fact_candidate or {}).get("previous_fact_hash") or "")
+            ):
+                raise ValueError(f"策略{key}日频资金事实候选无效")
+            if index > 0 and (
+                str(fact.get("previous_fact_id") or "")
+                != fact_members[-1]["fact_id"]
+                or str(fact.get("previous_fact_hash") or "")
+                != fact_members[-1]["fact_hash"]
+            ):
+                raise ValueError(f"策略{key}日频资金事实候选链断裂")
+            fact_members.append({
+                "fact_id": fact_id,
+                "fact_hash": fact_hash,
+            })
+            fact_days.append(str(fact["trade_date"]))
+            fact_storage_bytes += len(_checkpoint_canonical_json({
+                "fact_id": fact_id,
+                "entity_type": "STRATEGY",
+                "entity_key": fact["entity_key"],
+                "entity_version": fact["entity_version"],
+                "entity_version_hash": fact["entity_version_hash"],
+                "execution_binding_hash": (
+                    fact.get("execution_binding_hash") or None
+                ),
+                "account_id": fact["account_id"],
+                "trade_date": fact["trade_date"],
+                "origin_checkpoint_id": fact["origin_checkpoint_id"],
+                "previous_fact_id": fact.get("previous_fact_id") or None,
+                "previous_fact_hash": fact.get("previous_fact_hash") or None,
+                "opening_cash_cny": fact["opening_cash_cny"],
+                "closing_cash_cny": fact["closing_cash_cny"],
+                "opening_equity_cny": fact["opening_equity_cny"],
+                "closing_equity_cny": fact["closing_equity_cny"],
+                "daily_return_pct": fact["daily_return_pct"],
+                "cumulative_fee_cny": fact["cumulative_fee_cny"],
+                "high_watermark_equity_cny": fact[
+                    "high_watermark_equity_cny"
+                ],
+                "stock_exposure_json": _checkpoint_canonical_json(
+                    fact["stock_risk_exposure"]
+                ),
+                "closed_evidence_ids_json": _checkpoint_canonical_json(
+                    fact["closed_evidence_ids"]
+                ),
+                "fact_json": fact_json,
+                "fact_hash": fact_hash,
+                "anchor_run_uid": run_uid,
+                "canonical_result_hash": "0" * 64,
+                "anchor_audit_id": "0" * 32,
+                "anchor_audit_hash": "0" * 64,
+                "automatic_real_order_submission": 0,
+                "real_order_authority": 0,
+            }).encode("utf-8"))
+        replay_mode = str(state.get("replay_mode") or "")
+        replay_count = _int(state.get("replay_session_count"), -1)
+        expected_new_count = (
+            min(replay_count, FUNDING_REPLAY_MAX_SESSIONS)
+            if replay_mode == "FULL_BOOTSTRAP" else replay_count
+        )
+        if (
+            fact_days != sorted(set(fact_days))
+            or fact_days[-1] != trade_date
+            or len(fact_days) != expected_new_count
+        ):
+            raise ValueError(f"策略{key}新日频事实日期范围或重放数量无效")
+        new_fact_set_hash = ordered_funding_fact_set_hash(fact_members)
+        if (
+            _int(state.get("new_fact_count"), -1) != len(facts)
+            or str(state.get("new_fact_set_hash") or "")
+            != new_fact_set_hash
+            or str(state.get("new_fact_first_id") or "")
+            != fact_members[0]["fact_id"]
+            or str(state.get("new_fact_tip_id") or "")
+            != fact_members[-1]["fact_id"]
+        ):
+            raise ValueError(f"策略{key}新日频事实根与检查点状态不一致")
+        checkpoint_bytes = len(_checkpoint_canonical_json({
+            **{
+                field: state.get(field) for field in (
+                    "strategy_key", "strategy_version",
+                    "strategy_version_hash", "execution_binding_hash",
+                    "account_id", "trade_date", "replay_mode",
+                    "replay_start_date", "replay_session_count",
+                    "max_holding_days", "opening_cash_cny",
+                    "closing_cash_cny", "opening_equity_cny",
+                    "closing_equity_cny", "cumulative_fee_cny",
+                    "high_watermark_equity_cny", "history_start_date",
+                    "history_end_date", "history_fact_count",
+                    "history_opening_equity", "history_opening_date",
+                    "history_tip_fact_id", "history_tip_fact_hash",
+                    "history_fact_set_hash", "new_fact_count",
+                    "new_fact_set_hash", "new_fact_first_id",
+                    "new_fact_tip_id", "evidence_watermark",
+                    "input_set_hash",
+                )
+            },
+            "checkpoint_id": checkpoint_id,
+            "execution_binding_hash": (
+                state.get("execution_binding_hash") or None
+            ),
+            "holdings_json": _checkpoint_canonical_json(
+                state.get("holdings") or []
+            ),
+            "history_opening_date": (
+                state.get("history_opening_date") or None
+            ),
+            "previous_checkpoint_id": (
+                candidate.get("previous_checkpoint_id") or None
+            ),
+            "previous_checkpoint_hash": (
+                candidate.get("previous_checkpoint_hash") or None
+            ),
+            "previous_chain_hash": candidate.get("previous_chain_hash") or None,
+            "state_json": state_json,
+            "checkpoint_hash": checkpoint_hash,
+            "chain_payload_json": chain_json,
+            "chain_hash": chain_hash,
+            "anchor_run_uid": run_uid,
+            "canonical_result_hash": "0" * 64,
+            "anchor_audit_id": "0" * 32,
+            "anchor_audit_hash": "0" * 64,
+            "automatic_real_order_submission": 0,
+            "real_order_authority": 0,
+        }).encode("utf-8"))
+        checkpoint_storage_bytes += checkpoint_bytes
+        entry = {
+            "entity_type": "STRATEGY",
+            "entity_key": key,
+            "entity_version": version,
+            "checkpoint_id": checkpoint_id,
+            "strategy_key": key,
+            "strategy_version": version,
+            "account_id": str(state.get("account_id") or ""),
+            "trade_date": trade_date,
+            "replay_mode": str(state.get("replay_mode") or ""),
+            "replay_session_count": _int(state.get("replay_session_count"), -1),
+            "max_holding_days": _int(state.get("max_holding_days"), -1),
+            "checkpoint_hash": checkpoint_hash,
+            "chain_hash": chain_hash,
+            "history_fact_count": _int(state.get("history_fact_count"), -1),
+            "history_fact_set_hash": str(
+                state.get("history_fact_set_hash") or ""
+            ),
+            "history_tip_fact_id": str(state.get("history_tip_fact_id") or ""),
+            "history_tip_fact_hash": str(
+                state.get("history_tip_fact_hash") or ""
+            ),
+            "new_fact_count": len(facts),
+            "new_fact_set_hash": new_fact_set_hash,
+            "new_fact_first_id": fact_members[0]["fact_id"],
+            "new_fact_tip_id": fact_members[-1]["fact_id"],
+            "bootstrap_full_history_scan": (
+                state.get("replay_mode") == "FULL_BOOTSTRAP"
+            ),
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        checkpoint_ref = strategy.get("funding_checkpoint_ref")
+        if not isinstance(checkpoint_ref, dict):
+            raise ValueError(f"策略{key}资金检查点候选缺少稳定引用")
+        checkpoint_ref.update({
+            field: entry[field] for field in (
+                "checkpoint_id", "strategy_key", "strategy_version",
+                "account_id", "trade_date", "replay_mode",
+                "replay_session_count", "max_holding_days",
+                "checkpoint_hash", "chain_hash", "history_fact_count",
+                "history_fact_set_hash", "history_tip_fact_id",
+                "history_tip_fact_hash", "new_fact_count",
+                "new_fact_set_hash", "new_fact_first_id", "new_fact_tip_id",
+                "bootstrap_full_history_scan",
+                "automatic_real_order_submission", "real_order_authority",
+            )
+        })
+        checkpoint_ref["checkpoint_storage_bytes"] = checkpoint_bytes
+        checkpoint_rows.append(entry)
+        candidates.append({
+            **candidate,
+            "manifest_entry": entry,
+            "checkpoint_storage_bytes": checkpoint_bytes,
+        })
+    for combination in sorted(
+        combinations,
+        key=lambda item: str(item.get("combination_key") or ""),
+    ):
+        key = str(combination.get("combination_key") or "")
+        version = str(combination.get("current_version") or "")
+        identity = ("COMBINATION", key, version)
+        if not key or not version or identity in seen_identities:
+            raise ValueError("资金检查点清单组合当前版本重复或为空")
+        seen_identities.add(identity)
+        current_entities.append({
+            "entity_type": "COMBINATION",
+            "entity_key": key,
+            "entity_version": version,
+        })
+        recipe_ref = combination.get("combination_recipe_ref")
+        recipe_candidate_ready = bool(
+            isinstance(recipe_ref, dict)
+            and recipe_ref.get("member_fact_sets_ready") is True
+            and combination.get("paper_allocation_eligible") is True
+            and combination.get("profit_gate_passed") is True
+            and (combination.get("constraint_evaluation") or {}).get(
+                "passed"
+            ) is True
+            and combination.get("market_route_eligible") is True
+            and str(combination.get("current_status") or "")
+            in {"ACTIVE", "REDUCE"}
+        )
+        if recipe_candidate_ready:
+            recipe_entry = _combination_recipe_manifest_entry(
+                combination, trade_date=trade_date,
+            )
+            combination_recipe_rows.append(recipe_entry)
+            combination.pop("funding_manifest_ineligible", None)
+            combination["funding_recipe_ready"] = True
+            combination["funding_recipe_reason"] = (
+                "组合配方已绑定本轮全部成员检查点、事实集合与资金门哈希"
+            )
+            continue
+        combination["paper_allocation_eligible"] = False
+        combination["funding_recipe_ready"] = False
+        reason_code = (
+            "COMBINATION_MEMBER_CHECKPOINT_NOT_SELECTED"
+            if not isinstance(recipe_ref, dict)
+            or recipe_ref.get("member_fact_sets_ready") is not True
+            else "COMBINATION_FUNDING_GATE_NOT_READY"
+        )
+        ineligible_row = {
+            "entity_type": "COMBINATION",
+            "entity_key": key,
+            "entity_version": version,
+            "reason_code": reason_code,
+            "reason": (
+                "组合至少一个正权重成员未持久化本轮检查点，不能拆分模拟资金"
+                if reason_code == "COMBINATION_MEMBER_CHECKPOINT_NOT_SELECTED"
+                else "组合成员检查点虽完整，但独立盈利、生命周期、市场或风险门未全部通过"
+            ),
+        }
+        ineligible.append(ineligible_row)
+        combination["funding_manifest_ineligible"] = ineligible_row
+        combination["funding_recipe_reason"] = ineligible_row["reason"]
+    current_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    checkpointed_versions = [{
+        "entity_type": "STRATEGY",
+        "entity_key": row["strategy_key"],
+        "entity_version": row["strategy_version"],
+    } for row in checkpoint_rows]
+    recipe_versions = [{
+        "entity_type": "COMBINATION",
+        "entity_key": row["entity_key"],
+        "entity_version": row["entity_version"],
+    } for row in combination_recipe_rows]
+    ineligible_versions = [{
+        "entity_type": row["entity_type"],
+        "entity_key": row["entity_key"],
+        "entity_version": row["entity_version"],
+    } for row in ineligible]
+    if sorted(
+        checkpointed_versions + recipe_versions + ineligible_versions,
+        key=lambda item: (
+            item["entity_type"], item["entity_key"], item["entity_version"],
+        ),
+    ) != current_entities:
+        raise ValueError("资金检查点覆盖分区不能完整还原当前版本集合")
+    average_checkpoint_bytes = (
+        (checkpoint_storage_bytes + len(checkpoint_rows) - 1)
+        // len(checkpoint_rows) if checkpoint_rows else 0
+    )
+    total_storage_bytes = checkpoint_storage_bytes + fact_storage_bytes
+    if checkpoint_rows and checkpoint_storage_bytes > (
+        FUNDING_CHECKPOINT_TARGET_AVG_BYTES * len(checkpoint_rows)
+    ):
+        raise GovernanceEvidenceNotReady(
+            "资金检查点平均体积超过8KiB门槛；需先压缩持仓状态或预热"
+        )
+    if total_storage_bytes > FUNDING_CHECKPOINT_TOTAL_HARD_BYTES:
+        raise GovernanceEvidenceNotReady(
+            "资金检查点/日频事实本轮超过16MiB硬上限；需分阶段预热，拒绝近似截断"
+        )
+    coverage = {
+        "current_entity_count": len(current_entities),
+        "funding_ready_count": (
+            len(checkpoint_rows) + len(combination_recipe_rows)
+        ),
+        "eligible_count": (
+            len(checkpoint_rows) + len(combination_recipe_rows)
+        ),
+        "strategy_checkpoint_count": len(checkpoint_rows),
+        "combination_recipe_count": len(combination_recipe_rows),
+        "checkpointed_count": len(checkpoint_rows),
+        "ineligible_count": len(ineligible),
+        "current_entity_set_hash": _funding_entity_set_hash(current_entities),
+        "checkpointed_set_hash": _funding_entity_set_hash(
+            checkpointed_versions
+        ),
+        "combination_recipe_set_hash": _funding_entity_set_hash(
+            recipe_versions
+        ),
+        "funding_ready_set_hash": _funding_entity_set_hash(sorted(
+            checkpointed_versions + recipe_versions,
+            key=lambda item: (
+                item["entity_type"], item["entity_key"],
+                item["entity_version"],
+            ),
+        )),
+        "ineligible_set_hash": _funding_entity_set_hash(ineligible_versions),
+        "eligible_persistence_coverage_pct": 100.0,
+    }
+    payload = {
+        "schema": "probiga.strategy-funding-checkpoint-manifest.v2",
+        "run_uid": run_uid,
+        "trade_date": trade_date,
+        "coverage": coverage,
+        "checkpoint_root": _funding_manifest_batch_root(
+            checkpoint_rows, kind="CHECKPOINT"
+        ),
+        "combination_recipe_root": _funding_manifest_batch_root(
+            combination_recipe_rows, kind="COMBINATION_RECIPE"
+        ),
+        "ineligible_root": _funding_manifest_batch_root(
+            ineligible, kind="INELIGIBLE"
+        ),
+        "ineligible_reason_code_counts": {
+            code: sum(1 for row in ineligible if row["reason_code"] == code)
+            for code in sorted({row["reason_code"] for row in ineligible})
+        },
+        "checkpoint_storage_bytes": checkpoint_storage_bytes,
+        "fact_storage_bytes": fact_storage_bytes,
+        "total_storage_bytes": total_storage_bytes,
+        "target_total_bytes": FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+        "hard_total_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "target_total_met": (
+            total_storage_bytes <= FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+        ),
+        "bootstrap_is_daily_bounded": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    manifest = {**payload, "manifest_hash": _checkpoint_canonical_hash(payload)}
+    if len(_checkpoint_canonical_json(manifest).encode("utf-8")) > (
+        FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES
+    ):
+        raise GovernanceEvidenceNotReady("资金检查点canonical清单超过1MiB硬上限")
+    return manifest, candidates
+
+
+_GOVERNANCE_PERSIST_BATCH_MAX_ROWS = 100
+_GOVERNANCE_PERSIST_BATCH_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _execute_governance_parameter_batches(
+    connection, statement, rows: list[dict[str, Any]],
+) -> int:
+    """Use bounded executemany batches for large dynamic registries."""
+
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_bytes = 2
+    for row in rows:
+        row_bytes = len(_json_text(row).encode("utf-8")) + 1
+        if row_bytes > _GOVERNANCE_PERSIST_BATCH_MAX_BYTES:
+            raise GovernanceEvidenceNotReady("单条治理健康摘要超过4MiB硬上限")
+        if current and (
+            len(current) >= _GOVERNANCE_PERSIST_BATCH_MAX_ROWS
+            or current_bytes + row_bytes
+            > _GOVERNANCE_PERSIST_BATCH_MAX_BYTES
+        ):
+            batches.append(current)
+            current = []
+            current_bytes = 2
+        current.append(row)
+        current_bytes += row_bytes
+    if current:
+        batches.append(current)
+    for batch in batches:
+        connection.execute(statement, batch)
+    return len(batches)
+
+
+def _persist_health(
+    connection, run_uid: str, trade_date: str,
+    strategies: list[dict[str, Any]],
+) -> None:
+    projected = _canonical_competition_rows(
+        strategies, entity_type="STRATEGY",
+    )
+    parameters: list[dict[str, Any]] = []
+    for strategy, stored_strategy in zip(strategies, projected, strict=True):
         for window in WINDOWS:
             metrics = strategy["metrics"][str(window)]
+            stored_metrics = stored_strategy["metrics"][str(window)]
             gate = metrics["profit_gate"]
-            payload = {"strategy_key": strategy["strategy_key"], "strategy_version": strategy["current_version"], "trade_date": trade_date, "window_days": window, "metrics": metrics, "gate": gate, "overall_profit_gate_passed": strategy["profit_gate_passed"], "market_route": strategy["market_route"], "paper_allocation_eligible": strategy["paper_allocation_eligible"], "funding_gate_hash": strategy["funding_gate_hash"], "funding_evidence_revision_at": strategy["funding_evidence_revision_at"]}
-            connection.execute(
-                text("""
-                INSERT INTO st_strategy_health_snapshot
-                (run_uid, strategy_key, strategy_version, trade_date, window_days,
-                 completed_trades, coverage_days, win_rate_pct, average_win_pct,
-                 average_loss_pct, payoff_ratio, gross_expectancy_pct,
-                 estimated_cost_pct, net_expectancy_pct, profit_factor,
-                 max_drawdown_pct, walk_forward_segments, positive_segments,
-                 cost_stress_expectancy_pct, top5_profit_contribution_pct,
-                 market_match_score, health_score, profit_gate_passed,
-                 gate_reason, recommended_status, evidence_json, result_hash)
-                VALUES (:run_uid, :strategy_key, :strategy_version, :trade_date,
-                        :window_days, :completed_trades, :coverage_days,
-                        :win_rate_pct, :average_win_pct, :average_loss_pct,
-                        :payoff_ratio, :gross_expectancy_pct, :estimated_cost_pct,
-                        :net_expectancy_pct, :profit_factor, :max_drawdown_pct,
-                        :walk_forward_segments, :positive_segments,
-                        :cost_stress_expectancy_pct, :top5_profit_contribution_pct,
-                        :market_match_score, :health_score, :profit_gate_passed,
-                        :gate_reason, :recommended_status, :evidence_json, :result_hash)
-                """),
-                {
-                    "run_uid": run_uid, "strategy_key": strategy["strategy_key"], "strategy_version": strategy["current_version"], "trade_date": trade_date, "window_days": window,
-                    "completed_trades": _int(metrics.get("completed_trades")), "coverage_days": _int(metrics.get("coverage_days")), "win_rate_pct": metrics.get("win_rate_pct"), "average_win_pct": metrics.get("average_win_pct"), "average_loss_pct": metrics.get("average_loss_pct"), "payoff_ratio": metrics.get("payoff_ratio"), "gross_expectancy_pct": metrics.get("gross_expectancy_pct"), "estimated_cost_pct": metrics.get("estimated_cost_pct"), "net_expectancy_pct": metrics.get("net_expectancy_pct"), "profit_factor": metrics.get("profit_factor"), "max_drawdown_pct": metrics.get("max_drawdown_pct"), "walk_forward_segments": _int(metrics.get("walk_forward_segments")), "positive_segments": _int(metrics.get("positive_segments")), "cost_stress_expectancy_pct": metrics.get("cost_stress_expectancy_pct"), "top5_profit_contribution_pct": metrics.get("top5_profit_contribution_pct"), "market_match_score": metrics.get("market_match_score"), "health_score": metrics.get("health_score") or 0.0, "profit_gate_passed": 1 if gate["passed"] else 0, "gate_reason": gate["reason"][:1000], "recommended_status": strategy["recommended_status"], "evidence_json": _json_text(payload), "result_hash": _digest(payload),
-                },
-            )
+            payload = {
+                "strategy_key": strategy["strategy_key"],
+                "strategy_version": strategy["current_version"],
+                "trade_date": trade_date,
+                "window_days": window,
+                "metrics": stored_metrics,
+                "gate": gate,
+                "overall_profit_gate_passed": strategy[
+                    "profit_gate_passed"
+                ],
+                "decision_contract_version": (
+                    STATISTICAL_DECISION_CONTRACT
+                ),
+                "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+                "statistical_family_decision": strategy.get(
+                    "statistical_family_decision"
+                ) or {},
+                "statistical_family_passed": strategy.get(
+                    "statistical_family_passed"
+                ) is True,
+                "pre_confirmation_funding_gate_hash": strategy.get(
+                    "pre_confirmation_funding_gate_hash"
+                ) or "",
+                "confirmation_guard": strategy.get(
+                    "confirmation_guard"
+                ) or {},
+                "market_route": strategy["market_route"],
+                "paper_allocation_eligible": strategy[
+                    "paper_allocation_eligible"
+                ],
+                "funding_gate_hash": strategy["funding_gate_hash"],
+                "funding_evidence_revision_at": strategy[
+                    "funding_evidence_revision_at"
+                ],
+                "funding_checkpoint_ref": stored_strategy.get(
+                    "funding_checkpoint_ref"
+                ),
+                "metric_detail_inline": False,
+            }
+            parameters.append({
+                "run_uid": run_uid,
+                "strategy_key": strategy["strategy_key"],
+                "strategy_version": strategy["current_version"],
+                "trade_date": trade_date,
+                "window_days": window,
+                "completed_trades": _int(metrics.get("completed_trades")),
+                "coverage_days": _int(metrics.get("coverage_days")),
+                "win_rate_pct": metrics.get("win_rate_pct"),
+                "average_win_pct": metrics.get("average_win_pct"),
+                "average_loss_pct": metrics.get("average_loss_pct"),
+                "payoff_ratio": metrics.get("payoff_ratio"),
+                "gross_expectancy_pct": metrics.get("gross_expectancy_pct"),
+                "estimated_cost_pct": metrics.get("estimated_cost_pct"),
+                "net_expectancy_pct": metrics.get("net_expectancy_pct"),
+                "profit_factor": metrics.get("profit_factor"),
+                "max_drawdown_pct": metrics.get("max_drawdown_pct"),
+                "walk_forward_segments": _int(
+                    metrics.get("walk_forward_segments")
+                ),
+                "positive_segments": _int(metrics.get("positive_segments")),
+                "cost_stress_expectancy_pct": metrics.get(
+                    "cost_stress_expectancy_pct"
+                ),
+                "top5_profit_contribution_pct": metrics.get(
+                    "top5_profit_contribution_pct"
+                ),
+                "market_match_score": metrics.get("market_match_score"),
+                "health_score": metrics.get("health_score") or 0.0,
+                "profit_gate_passed": 1 if gate["passed"] else 0,
+                "gate_reason": gate["reason"][:1000],
+                "recommended_status": strategy["recommended_status"],
+                "evidence_json": _json_text(payload),
+                "result_hash": _digest(payload),
+            })
+    _execute_governance_parameter_batches(
+        connection,
+        text("""
+        INSERT INTO st_strategy_health_snapshot
+        (run_uid, strategy_key, strategy_version, trade_date, window_days,
+         completed_trades, coverage_days, win_rate_pct, average_win_pct,
+         average_loss_pct, payoff_ratio, gross_expectancy_pct,
+         estimated_cost_pct, net_expectancy_pct, profit_factor,
+         max_drawdown_pct, walk_forward_segments, positive_segments,
+         cost_stress_expectancy_pct, top5_profit_contribution_pct,
+         market_match_score, health_score, profit_gate_passed,
+         gate_reason, recommended_status, evidence_json, result_hash)
+        VALUES (:run_uid, :strategy_key, :strategy_version, :trade_date,
+                :window_days, :completed_trades, :coverage_days,
+                :win_rate_pct, :average_win_pct, :average_loss_pct,
+                :payoff_ratio, :gross_expectancy_pct, :estimated_cost_pct,
+                :net_expectancy_pct, :profit_factor, :max_drawdown_pct,
+                :walk_forward_segments, :positive_segments,
+                :cost_stress_expectancy_pct, :top5_profit_contribution_pct,
+                :market_match_score, :health_score, :profit_gate_passed,
+                :gate_reason, :recommended_status, :evidence_json,
+                :result_hash)
+        """),
+        parameters,
+    )
 
 
 def _persist_combinations(connection, payload: dict[str, Any]) -> None:
-    for combo in payload["combinations"]:
+    projected = _canonical_competition_rows(
+        payload["combinations"], entity_type="COMBINATION",
+    )
+    parameters: list[dict[str, Any]] = []
+    for combo, stored_combo in zip(
+        payload["combinations"], projected, strict=True,
+    ):
         evidence = {
             "combination_key": combo["combination_key"],
             "combination_version": combo["current_version"],
             "trade_date": payload["trade_date"],
-            "metrics": combo["metrics"],
+            "metrics": stored_combo["metrics"],
             "multi_window_gate": combo["multi_window_gate"],
+            "decision_contract_version": STATISTICAL_DECISION_CONTRACT,
+            "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+            "statistical_family_decision": combo.get(
+                "statistical_family_decision"
+            ) or {},
+            "statistical_family_passed": combo.get(
+                "statistical_family_passed"
+            ) is True,
+            "pre_confirmation_funding_gate_hash": combo.get(
+                "pre_confirmation_funding_gate_hash"
+            ) or "",
+            "confirmation_guard": combo.get("confirmation_guard") or {},
             "funding_gate_hash": combo["funding_gate_hash"],
             "funding_evidence_revision_at": combo[
                 "funding_evidence_revision_at"
@@ -11293,19 +23438,13 @@ def _persist_combinations(connection, payload: dict[str, Any]) -> None:
             "paper_allocation_eligible": combo["paper_allocation_eligible"],
             "member_details": combo["member_details"],
             "constraint_evaluation": combo.get("constraint_evaluation") or {},
+            "combination_recipe_ref": stored_combo.get(
+                "combination_recipe_ref"
+            ),
+            "metric_detail_inline": False,
+            "combination_cash_fact_materialized": False,
         }
-        connection.execute(text(
-            """
-            INSERT INTO st_strategy_combination_health_snapshot
-            (run_uid, combination_key, combination_version, trade_date,
-             ranking_score, profit_gate_passed, gate_reason,
-             recommended_status, evidence_json, result_hash)
-            VALUES (:run_uid, :combination_key, :combination_version,
-                    :trade_date, :ranking_score, :profit_gate_passed,
-                    :gate_reason, :recommended_status, :evidence_json,
-                    :result_hash)
-            """
-        ), {
+        parameters.append({
             "run_uid": payload["run_uid"],
             "combination_key": combo["combination_key"],
             "combination_version": combo["current_version"],
@@ -11317,9 +23456,507 @@ def _persist_combinations(connection, payload: dict[str, Any]) -> None:
             "evidence_json": _json_text(evidence),
             "result_hash": _digest(evidence),
         })
+    _execute_governance_parameter_batches(
+        connection,
+        text("""
+        INSERT INTO st_strategy_combination_health_snapshot
+        (run_uid, combination_key, combination_version, trade_date,
+         ranking_score, profit_gate_passed, gate_reason,
+         recommended_status, evidence_json, result_hash)
+        VALUES (:run_uid, :combination_key, :combination_version,
+                :trade_date, :ranking_score, :profit_gate_passed,
+                :gate_reason, :recommended_status, :evidence_json,
+                :result_hash)
+        """),
+        parameters,
+    )
 
 
-def _persist_run(connection, payload: dict[str, Any]) -> None:
+_FUNDING_FACT_READBACK_COLUMNS = (
+    "fact_id", "entity_type", "entity_key", "entity_version",
+    "entity_version_hash", "execution_binding_hash", "account_id",
+    "trade_date", "origin_checkpoint_id", "previous_fact_id",
+    "previous_fact_hash", "opening_cash_cny", "closing_cash_cny",
+    "opening_equity_cny", "closing_equity_cny", "daily_return_pct",
+    "cumulative_fee_cny", "high_watermark_equity_cny",
+    "stock_exposure_json", "closed_evidence_ids_json", "fact_json",
+    "fact_hash", "anchor_run_uid", "canonical_result_hash",
+    "anchor_audit_id", "anchor_audit_hash",
+    "automatic_real_order_submission", "real_order_authority",
+)
+_FUNDING_CHECKPOINT_READBACK_COLUMNS = (
+    "checkpoint_id", "strategy_key", "strategy_version",
+    "strategy_version_hash", "execution_binding_hash", "account_id",
+    "trade_date", "replay_mode", "replay_start_date",
+    "replay_session_count", "max_holding_days", "opening_cash_cny",
+    "closing_cash_cny", "opening_equity_cny", "closing_equity_cny",
+    "cumulative_fee_cny", "high_watermark_equity_cny", "holdings_json",
+    "history_start_date", "history_end_date", "history_fact_count",
+    "history_opening_equity", "history_opening_date",
+    "history_tip_fact_id", "history_tip_fact_hash",
+    "history_fact_set_hash", "new_fact_count", "new_fact_set_hash",
+    "new_fact_first_id", "new_fact_tip_id", "evidence_watermark",
+    "input_set_hash", "previous_checkpoint_id",
+    "previous_checkpoint_hash", "previous_chain_hash", "state_json",
+    "checkpoint_hash", "chain_payload_json", "chain_hash",
+    "anchor_run_uid", "canonical_result_hash", "anchor_audit_id",
+    "anchor_audit_hash", "automatic_real_order_submission",
+    "real_order_authority",
+)
+_FUNDING_DECIMAL_READBACK_FIELDS = frozenset({
+    "opening_cash_cny", "closing_cash_cny", "opening_equity_cny",
+    "closing_equity_cny", "daily_return_pct", "cumulative_fee_cny",
+    "high_watermark_equity_cny", "history_opening_equity",
+})
+_FUNDING_INTEGER_READBACK_FIELDS = frozenset({
+    "replay_session_count", "max_holding_days", "history_fact_count",
+    "new_fact_count", "automatic_real_order_submission",
+    "real_order_authority",
+})
+_FUNDING_DATE_READBACK_FIELDS = frozenset({
+    "trade_date", "replay_start_date", "history_start_date",
+    "history_end_date", "history_opening_date",
+})
+
+
+def _funding_readback_projection(
+    row: dict[str, Any], columns: tuple[str, ...],
+) -> dict[str, Any]:
+    projected: dict[str, Any] = {}
+    for field in columns:
+        value = row.get(field)
+        if value is None:
+            projected[field] = None
+        elif field in _FUNDING_DECIMAL_READBACK_FIELDS:
+            try:
+                number = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError("资金持久化回读金额无效") from exc
+            if not number.is_finite():
+                raise RuntimeError("资金持久化回读金额非有限")
+            projected[field] = number
+        elif field in _FUNDING_INTEGER_READBACK_FIELDS:
+            projected[field] = _int(value, -1)
+        elif field in _FUNDING_DATE_READBACK_FIELDS:
+            projected[field] = str(value)[:10]
+        else:
+            projected[field] = str(value)
+    return projected
+
+
+def _funding_persistence_readback(
+    connection, *, manifest: dict[str, Any],
+    fact_params: list[dict[str, Any]],
+    checkpoint_params: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Read back every inserted identity in bounded pages before commit."""
+
+    expected_facts = [{
+        **row,
+        "entity_type": "STRATEGY",
+        "automatic_real_order_submission": 0,
+        "real_order_authority": 0,
+    } for row in fact_params]
+    expected_checkpoints = [{
+        **row,
+        "automatic_real_order_submission": 0,
+        "real_order_authority": 0,
+    } for row in checkpoint_params]
+
+    def exact_rows(
+        *, table: str, id_column: str, columns: tuple[str, ...],
+        expected: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        expected_by_id = {
+            str(row.get(id_column) or ""): row for row in expected
+        }
+        if len(expected_by_id) != len(expected):
+            raise RuntimeError("资金持久化回读请求身份重复")
+        actual_by_id: dict[str, dict[str, Any]] = {}
+        ids = sorted(expected_by_id)
+        column_sql = ", ".join(f"stored.{field}" for field in columns)
+        for offset in range(0, len(ids), FUNDING_CHECKPOINT_BATCH_MAX_ROWS):
+            batch_ids = ids[offset:offset + FUNDING_CHECKPOINT_BATCH_MAX_ROWS]
+            rows = connection.execute(text(
+                f"SELECT {column_sql} FROM {table} stored "
+                "JOIN JSON_TABLE(:ids, '$[*]' COLUMNS("
+                f" row_id CHAR(64) PATH '$')) requested "
+                f"ON requested.row_id=stored.{id_column} "
+                f"ORDER BY stored.{id_column}"
+            ), {"ids": _json_text(batch_ids)}).mappings().all()
+            if len(rows) != len(batch_ids):
+                raise RuntimeError("资金持久化回读行数与请求不一致")
+            for raw in rows:
+                row = dict(raw)
+                row_id = str(row.get(id_column) or "")
+                if row_id in actual_by_id or row_id not in expected_by_id:
+                    raise RuntimeError("资金持久化回读身份重复或越界")
+                actual_by_id[row_id] = row
+        if set(actual_by_id) != set(expected_by_id):
+            raise RuntimeError("资金持久化回读身份集合不完整")
+        for row_id, expected_row in expected_by_id.items():
+            if _funding_readback_projection(
+                actual_by_id[row_id], columns,
+            ) != _funding_readback_projection(expected_row, columns):
+                raise RuntimeError("资金持久化回读物化列与写入参数不一致")
+        return [actual_by_id[row_id] for row_id in ids]
+
+    actual_facts = exact_rows(
+        table=FUNDING_DAILY_FACT_TABLE_NAME,
+        id_column="fact_id",
+        columns=_FUNDING_FACT_READBACK_COLUMNS,
+        expected=expected_facts,
+    )
+    actual_checkpoints = exact_rows(
+        table=FUNDING_CHECKPOINT_TABLE_NAME,
+        id_column="checkpoint_id",
+        columns=_FUNDING_CHECKPOINT_READBACK_COLUMNS,
+        expected=expected_checkpoints,
+    )
+    checkpoint_entries = [
+        _funding_checkpoint_manifest_entry(dict(row))
+        for row in actual_checkpoints
+    ]
+    _verify_funding_manifest_batch_root(
+        manifest.get("checkpoint_root"), checkpoint_entries,
+        kind="CHECKPOINT",
+    )
+    fact_members_by_checkpoint: dict[str, list[dict[str, str]]] = defaultdict(
+        list
+    )
+    for row in sorted(actual_facts, key=lambda item: (
+        str(item.get("origin_checkpoint_id") or ""),
+        str(item.get("trade_date") or ""),
+        str(item.get("fact_id") or ""),
+    )):
+        fact_json = str(row.get("fact_json") or "")
+        fact_hash = str(row.get("fact_hash") or "")
+        if (
+            hashlib.sha256(fact_json.encode("utf-8")).hexdigest()
+            != fact_hash
+        ):
+            raise RuntimeError("资金持久化回读事实哈希无效")
+        fact_members_by_checkpoint[
+            str(row.get("origin_checkpoint_id") or "")
+        ].append({
+            "fact_id": str(row.get("fact_id") or ""),
+            "fact_hash": fact_hash,
+        })
+    checkpoint_by_id = {
+        str(row.get("checkpoint_id") or ""): row
+        for row in actual_checkpoints
+    }
+    for checkpoint_id, row in checkpoint_by_id.items():
+        if (
+            checkpoint_state_hash(_json(row.get("state_json"), None))
+            != str(row.get("checkpoint_hash") or "")
+            or _checkpoint_canonical_hash(_json(
+                row.get("chain_payload_json"), None,
+            )) != str(row.get("chain_hash") or "")
+            or ordered_funding_fact_set_hash(
+                fact_members_by_checkpoint.get(checkpoint_id, [])
+            ) != str(row.get("new_fact_set_hash") or "")
+            or len(fact_members_by_checkpoint.get(checkpoint_id, []))
+            != _int(row.get("new_fact_count"), -1)
+        ):
+            raise RuntimeError("资金持久化回读检查点或新事实根无效")
+    expected_fact_bytes = sum(
+        len(_checkpoint_canonical_json(row).encode("utf-8"))
+        for row in expected_facts
+    )
+    expected_checkpoint_bytes = sum(
+        len(_checkpoint_canonical_json(row).encode("utf-8"))
+        for row in expected_checkpoints
+    )
+    if (
+        expected_fact_bytes != _int(manifest.get("fact_storage_bytes"), -1)
+        or expected_checkpoint_bytes
+        != _int(manifest.get("checkpoint_storage_bytes"), -1)
+        or expected_fact_bytes + expected_checkpoint_bytes
+        != _int(manifest.get("total_storage_bytes"), -1)
+    ):
+        raise RuntimeError("资金持久化回读字节预算与canonical清单不一致")
+    return {
+        "checkpoint_count": len(actual_checkpoints),
+        "daily_fact_count": len(actual_facts),
+        "checkpoint_storage_bytes": expected_checkpoint_bytes,
+        "fact_storage_bytes": expected_fact_bytes,
+        "checkpoint_root_hash": str(
+            (manifest.get("checkpoint_root") or {}).get("root_hash") or ""
+        ),
+    }
+
+
+def _persist_funding_checkpoint_candidates(
+    connection, *, payload: dict[str, Any], canonical_result_hash: str,
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    manifest = payload.get("funding_checkpoint_manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("canonical结果缺少资金检查点清单")
+    manifest_rows = [
+        dict(item.get("manifest_entry") or {}) for item in candidates
+    ]
+    _verify_funding_manifest_batch_root(
+        manifest.get("checkpoint_root"),
+        manifest_rows,
+        kind="CHECKPOINT",
+    )
+    manifest_by_id = {
+        str(row.get("checkpoint_id") or ""): row
+        for row in manifest_rows if isinstance(row, dict)
+    }
+    if (
+        len(manifest_by_id) != len(manifest_rows)
+        or len(candidates) != len(manifest_rows)
+        or _int(
+            (manifest.get("coverage") or {}).get("checkpointed_count"), -1
+        ) != len(candidates)
+        or _int(
+            (manifest.get("coverage") or {}).get(
+                "strategy_checkpoint_count"
+            ), -1,
+        ) != len(candidates)
+    ):
+        raise ValueError("资金检查点候选与canonical覆盖清单不一致")
+    audit_evidence = {
+        "schema": FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+        "run_uid": str(payload.get("run_uid") or ""),
+        "canonical_result_hash": canonical_result_hash,
+        "checkpoint_manifest_hash": str(manifest.get("manifest_hash") or ""),
+        "coverage": manifest.get("coverage"),
+        "checkpoint_root": manifest.get("checkpoint_root"),
+        "combination_recipe_root": manifest.get(
+            "combination_recipe_root"
+        ),
+        "ineligible_root": manifest.get("ineligible_root"),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    audit_sql, audit_params = _audit_record(
+        entity_type="SYSTEM",
+        entity_key="strategy_funding_checkpoint_manifest",
+        action="ANCHOR_FUNDING_CHECKPOINT_MANIFEST",
+        reason=f"锚定{payload['trade_date']}资金检查点与日频事实清单",
+        operator=str(payload.get("operator") or "daily_governance")[:80],
+        before={},
+        after={
+            "run_uid": payload["run_uid"],
+            "manifest_hash": manifest["manifest_hash"],
+            "checkpoint_count": len(candidates),
+        },
+        evidence=audit_evidence,
+    )
+    audit_payload_bytes = len(
+        str(audit_params.get("payload_json") or "").encode("utf-8")
+    ) + len(str(audit_params.get("evidence_json") or "").encode("utf-8"))
+    if audit_payload_bytes > FUNDING_CHECKPOINT_AUDIT_MAX_BYTES:
+        raise GovernanceEvidenceNotReady("资金检查点审计锚超过128KiB硬上限")
+    connection.execute(text(audit_sql), audit_params)
+    audit_id = str(audit_params["audit_id"])
+    audit_hash = str(audit_params["audit_hash"])
+
+    fact_insert_sql = text(f"""
+        INSERT INTO {FUNDING_DAILY_FACT_TABLE_NAME}
+        (fact_id, entity_type, entity_key, entity_version,
+         entity_version_hash, execution_binding_hash, account_id, trade_date,
+         origin_checkpoint_id, previous_fact_id, previous_fact_hash,
+         opening_cash_cny, closing_cash_cny, opening_equity_cny,
+         closing_equity_cny, daily_return_pct, cumulative_fee_cny,
+         high_watermark_equity_cny, stock_exposure_json,
+         closed_evidence_ids_json, fact_json, fact_hash, anchor_run_uid,
+         canonical_result_hash, anchor_audit_id, anchor_audit_hash,
+         automatic_real_order_submission, real_order_authority)
+        VALUES
+        (:fact_id, 'STRATEGY', :entity_key, :entity_version,
+         :entity_version_hash, :execution_binding_hash, :account_id,
+         :trade_date, :origin_checkpoint_id, :previous_fact_id,
+         :previous_fact_hash, :opening_cash_cny, :closing_cash_cny,
+         :opening_equity_cny, :closing_equity_cny, :daily_return_pct,
+         :cumulative_fee_cny, :high_watermark_equity_cny,
+         :stock_exposure_json, :closed_evidence_ids_json, :fact_json,
+         :fact_hash, :anchor_run_uid, :canonical_result_hash,
+         :anchor_audit_id, :anchor_audit_hash, 0, 0)
+    """)
+    fact_params: list[dict[str, Any]] = []
+    checkpoint_params: list[dict[str, Any]] = []
+    for candidate in sorted(
+        candidates, key=lambda item: str(item.get("checkpoint_id") or ""),
+    ):
+        checkpoint_id = str(candidate.get("checkpoint_id") or "")
+        entry = manifest_by_id.get(checkpoint_id)
+        state = candidate.get("state")
+        facts = candidate.get("daily_fact_candidates")
+        if (
+            not isinstance(entry, dict)
+            or candidate.get("manifest_entry") != entry
+            or not isinstance(state, dict)
+            or not isinstance(facts, list)
+            or ordered_funding_fact_set_hash([{
+                "fact_id": str((item or {}).get("fact_id") or ""),
+                "fact_hash": str((item or {}).get("fact_hash") or ""),
+            } for item in facts]) != str(entry.get("new_fact_set_hash") or "")
+        ):
+            raise ValueError("资金检查点候选在写入前偏离canonical清单")
+        for item in facts:
+            fact = item["fact"]
+            fact_params.append({
+                "fact_id": item["fact_id"],
+                "entity_key": fact["entity_key"],
+                "entity_version": fact["entity_version"],
+                "entity_version_hash": fact["entity_version_hash"],
+                "execution_binding_hash": (
+                    fact.get("execution_binding_hash") or None
+                ),
+                "account_id": fact["account_id"],
+                "trade_date": fact["trade_date"],
+                "origin_checkpoint_id": fact["origin_checkpoint_id"],
+                "previous_fact_id": fact.get("previous_fact_id") or None,
+                "previous_fact_hash": fact.get("previous_fact_hash") or None,
+                "opening_cash_cny": fact["opening_cash_cny"],
+                "closing_cash_cny": fact["closing_cash_cny"],
+                "opening_equity_cny": fact["opening_equity_cny"],
+                "closing_equity_cny": fact["closing_equity_cny"],
+                "daily_return_pct": fact["daily_return_pct"],
+                "cumulative_fee_cny": fact["cumulative_fee_cny"],
+                "high_watermark_equity_cny": fact[
+                    "high_watermark_equity_cny"
+                ],
+                "stock_exposure_json": _checkpoint_canonical_json(
+                    fact["stock_risk_exposure"]
+                ),
+                "closed_evidence_ids_json": _checkpoint_canonical_json(
+                    fact["closed_evidence_ids"]
+                ),
+                "fact_json": item["fact_json"],
+                "fact_hash": item["fact_hash"],
+                "anchor_run_uid": payload["run_uid"],
+                "canonical_result_hash": canonical_result_hash,
+                "anchor_audit_id": audit_id,
+                "anchor_audit_hash": audit_hash,
+            })
+        checkpoint_params.append({
+            "checkpoint_id": checkpoint_id,
+            "strategy_key": state["strategy_key"],
+            "strategy_version": state["strategy_version"],
+            "strategy_version_hash": state["strategy_version_hash"],
+            "execution_binding_hash": state.get("execution_binding_hash") or None,
+            "account_id": state["account_id"],
+            "trade_date": state["trade_date"],
+            "replay_mode": state["replay_mode"],
+            "replay_start_date": state["replay_start_date"],
+            "replay_session_count": state["replay_session_count"],
+            "max_holding_days": state["max_holding_days"],
+            "opening_cash_cny": state["opening_cash_cny"],
+            "closing_cash_cny": state["closing_cash_cny"],
+            "opening_equity_cny": state["opening_equity_cny"],
+            "closing_equity_cny": state["closing_equity_cny"],
+            "cumulative_fee_cny": state["cumulative_fee_cny"],
+            "high_watermark_equity_cny": state["high_watermark_equity_cny"],
+            "holdings_json": _checkpoint_canonical_json(state["holdings"]),
+            "history_start_date": state["history_start_date"],
+            "history_end_date": state["history_end_date"],
+            "history_fact_count": state["history_fact_count"],
+            "history_opening_equity": state["history_opening_equity"],
+            "history_opening_date": state.get("history_opening_date") or None,
+            "history_tip_fact_id": state["history_tip_fact_id"],
+            "history_tip_fact_hash": state["history_tip_fact_hash"],
+            "history_fact_set_hash": state["history_fact_set_hash"],
+            "new_fact_count": state["new_fact_count"],
+            "new_fact_set_hash": state["new_fact_set_hash"],
+            "new_fact_first_id": state["new_fact_first_id"],
+            "new_fact_tip_id": state["new_fact_tip_id"],
+            "evidence_watermark": state["evidence_watermark"],
+            "input_set_hash": state["input_set_hash"],
+            "previous_checkpoint_id": (
+                candidate.get("previous_checkpoint_id") or None
+            ),
+            "previous_checkpoint_hash": (
+                candidate.get("previous_checkpoint_hash") or None
+            ),
+            "previous_chain_hash": candidate.get("previous_chain_hash") or None,
+            "state_json": candidate["state_json"],
+            "checkpoint_hash": candidate["checkpoint_hash"],
+            "chain_payload_json": candidate["chain_payload_json"],
+            "chain_hash": candidate["chain_hash"],
+            "anchor_run_uid": payload["run_uid"],
+            "canonical_result_hash": canonical_result_hash,
+            "anchor_audit_id": audit_id,
+            "anchor_audit_hash": audit_hash,
+        })
+    for offset in range(0, len(fact_params), FUNDING_CHECKPOINT_BATCH_MAX_ROWS):
+        batch = fact_params[offset:offset + FUNDING_CHECKPOINT_BATCH_MAX_ROWS]
+        batch_bytes = sum(
+            len(_checkpoint_canonical_json(row).encode("utf-8"))
+            for row in batch
+        )
+        if batch_bytes > FUNDING_CHECKPOINT_BATCH_MAX_BYTES:
+            raise GovernanceEvidenceNotReady("日频资金事实写入批次超过4MiB硬上限")
+        connection.execute(fact_insert_sql, batch)
+    checkpoint_insert_sql = text(f"""
+        INSERT INTO {FUNDING_CHECKPOINT_TABLE_NAME}
+        (checkpoint_id, strategy_key, strategy_version,
+         strategy_version_hash, execution_binding_hash, account_id,
+         trade_date, replay_mode, replay_start_date, replay_session_count,
+         max_holding_days, opening_cash_cny, closing_cash_cny,
+         opening_equity_cny, closing_equity_cny, cumulative_fee_cny,
+         high_watermark_equity_cny, holdings_json, history_start_date,
+         history_end_date, history_fact_count, history_opening_equity,
+         history_opening_date, history_tip_fact_id, history_tip_fact_hash,
+         history_fact_set_hash, new_fact_count, new_fact_set_hash,
+         new_fact_first_id, new_fact_tip_id, evidence_watermark, input_set_hash,
+         previous_checkpoint_id, previous_checkpoint_hash,
+         previous_chain_hash, state_json, checkpoint_hash,
+         chain_payload_json, chain_hash, anchor_run_uid,
+         canonical_result_hash, anchor_audit_id, anchor_audit_hash,
+         automatic_real_order_submission, real_order_authority)
+        VALUES
+        (:checkpoint_id, :strategy_key, :strategy_version,
+         :strategy_version_hash, :execution_binding_hash, :account_id,
+         :trade_date, :replay_mode, :replay_start_date, :replay_session_count,
+         :max_holding_days, :opening_cash_cny, :closing_cash_cny,
+         :opening_equity_cny, :closing_equity_cny, :cumulative_fee_cny,
+         :high_watermark_equity_cny, :holdings_json, :history_start_date,
+         :history_end_date, :history_fact_count, :history_opening_equity,
+         :history_opening_date, :history_tip_fact_id, :history_tip_fact_hash,
+         :history_fact_set_hash, :new_fact_count, :new_fact_set_hash,
+         :new_fact_first_id, :new_fact_tip_id, :evidence_watermark,
+         :input_set_hash,
+         :previous_checkpoint_id, :previous_checkpoint_hash,
+         :previous_chain_hash, :state_json, :checkpoint_hash,
+         :chain_payload_json, :chain_hash, :anchor_run_uid,
+         :canonical_result_hash, :anchor_audit_id, :anchor_audit_hash, 0, 0)
+    """)
+    for offset in range(
+        0, len(checkpoint_params), FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+    ):
+        batch = checkpoint_params[
+            offset:offset + FUNDING_CHECKPOINT_BATCH_MAX_ROWS
+        ]
+        batch_bytes = sum(
+            len(_checkpoint_canonical_json(row).encode("utf-8"))
+            for row in batch
+        )
+        if batch_bytes > FUNDING_CHECKPOINT_BATCH_MAX_BYTES:
+            raise GovernanceEvidenceNotReady("资金检查点写入批次超过4MiB硬上限")
+        connection.execute(checkpoint_insert_sql, batch)
+    readback = _funding_persistence_readback(
+        connection,
+        manifest=manifest,
+        fact_params=fact_params,
+        checkpoint_params=checkpoint_params,
+    )
+    return {
+        "audit_id": audit_id,
+        "audit_hash": audit_hash,
+        **readback,
+    }
+
+
+def _persist_run(
+    connection, payload: dict[str, Any], *,
+    funding_checkpoint_candidates: list[dict[str, Any]] | None = None,
+) -> None:
     run_uid = payload["run_uid"]
     summary = payload["summary"]
     transition_plan = payload.get("automatic_transition_plan")
@@ -11361,6 +23998,12 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
         raise ValueError("股票池快照在持久化前发生变化")
     stored_result = {
         **payload,
+        "strategies": _canonical_competition_rows(
+            payload["strategies"], entity_type="STRATEGY",
+        ),
+        "combinations": _canonical_competition_rows(
+            payload["combinations"], entity_type="COMBINATION",
+        ),
         "result_mode": "CANONICAL_PERSISTED",
         "is_canonical": True,
         "idempotent_replay": False,
@@ -11391,6 +24034,12 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
         """),
         {"run_uid": run_uid, "trade_date": payload["trade_date"], "run_revision": payload["run_revision"], "supersedes_run_uid": payload.get("supersedes_run_uid") or "", "market_state": payload["market_state"].get("key") or "unknown", "source_status": payload["source_status"], "input_hash": payload["input_hash"], "build_commit_sha": payload["build_commit_sha"], "router_policy_version": payload["router_policy_version"], "router_snapshot_hash": payload["router_snapshot_hash"], "decision_hash": payload["decision_hash"], **{key: summary[key] for key in ("strategy_count", "formal_count", "shadow_count", "combination_count", "observation_count", "confirmation_count", "tradable_count", "allocation_count")}, "summary_json": _json_text(summary), "result_json": result_json, "result_hash": result_hash},
     )
+    funding_persistence = _persist_funding_checkpoint_candidates(
+        connection,
+        payload=stored_result,
+        canonical_result_hash=result_hash,
+        candidates=list(funding_checkpoint_candidates or []),
+    )
     levels = (("OBSERVATION", payload["pools"]["observation"]), ("CONFIRMATION", payload["pools"]["confirmation"]), ("TRADABLE", payload["pools"]["tradable"]))
     for level, rows in levels:
         for row in rows:
@@ -11400,6 +24049,11 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
             evidence_envelope = {
                 "schema": POOL_ROW_EVIDENCE_SCHEMA,
                 "source_evidence": source_evidence,
+                "industry_names": row.get("industry_names") or [],
+                "industry_by_strategy": row.get(
+                    "industry_by_strategy"
+                ) or {},
+                "industry_binding": row.get("industry_binding") or {},
                 "pool_row_hash": pool_row_hash,
             }
             connection.execute(
@@ -11461,9 +24115,22 @@ def _persist_run(connection, payload: dict[str, Any]) -> None:
             "build_commit_sha": payload["build_commit_sha"],
             "router_policy_version": payload["router_policy_version"],
             "router_snapshot_hash": payload["router_snapshot_hash"],
+            "funding_checkpoint_manifest_hash": str(
+                (payload.get("funding_checkpoint_manifest") or {}).get(
+                    "manifest_hash"
+                ) or ""
+            ),
+            "funding_checkpoint_count": funding_persistence[
+                "checkpoint_count"
+            ],
+            "funding_daily_fact_count": funding_persistence[
+                "daily_fact_count"
+            ],
             "automatic_real_order_submission": False,
         },
     )
+    payload["strategies"] = stored_result["strategies"]
+    payload["combinations"] = stored_result["combinations"]
 
 
 def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
@@ -11479,7 +24146,7 @@ def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
         return (
             "SUSPENDED" if current in {"ACTIVE", "REDUCE"} else "SHADOW",
             str(row.get("execution_adapter_reason")
-                or "执行适配器未部署/无效"),
+                or "执行适配器状态不可用"),
         )
     if (
         str(row.get("source_kind") or "") == "runtime_registry"
@@ -11489,7 +24156,7 @@ def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
             "SUSPENDED" if current in {"ACTIVE", "REDUCE"} else "SHADOW",
             str(
                 row.get("funding_pipeline_reason")
-                or "动态策略资金证据闭环尚未部署，仅允许影子研究"
+                or "模拟链校验失败，当前不授予模拟资金资格"
             ),
         )
     if not row.get("enabled"):
@@ -11521,9 +24188,103 @@ def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
     return "SHADOW", row["profit_gate_reason"]
 
 
+def _suspension_boundary_from_row(
+    row: dict[str, Any] | None,
+) -> dict[str, str]:
+    if not row:
+        return {}
+    evidence = _json(row.get("evidence_json"), {})
+    occurred_at = _normalize_evidence_revision(row.get("occurred_at"))
+    boundary_revision = _normalize_evidence_revision(
+        evidence.get("funding_evidence_revision_at")
+    ) or occurred_at
+    trade_date = str(evidence.get("trade_date") or occurred_at)[:10]
+    return {
+        "evidence_revision_at": boundary_revision,
+        "trade_date": trade_date,
+        "event_hash": str(row.get("event_hash") or ""),
+        "occurred_at": occurred_at,
+    }
+
+
+def _prefetch_lifecycle_facts(
+    entity_type: str, before_date: str, *, history_limit: int,
+    expected_session_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Fetch lifecycle boundaries and confirmation history in fixed queries."""
+
+    normalized_type = str(entity_type or "").upper()
+    if normalized_type == "STRATEGY":
+        health_table = "st_strategy_health_snapshot"
+        key_column = "strategy_key"
+        version_column = "strategy_version"
+        window_filter = "AND h.window_days=60 "
+    elif normalized_type == "COMBINATION":
+        health_table = "st_strategy_combination_health_snapshot"
+        key_column = "combination_key"
+        version_column = "combination_version"
+        window_filter = ""
+    else:
+        raise ValueError("生命周期批量预取对象只能是策略或组合")
+
+    boundary_index: dict[tuple[str, str], dict[str, str]] = {}
+    if _table_exists("st_strategy_lifecycle_event"):
+        boundary_rows = _db_read(
+            "SELECT entity_key, entity_version, occurred_at, evidence_json, "
+            "event_hash FROM ("
+            "SELECT e.*, ROW_NUMBER() OVER (PARTITION BY entity_key, "
+            "entity_version ORDER BY occurred_at DESC, event_id DESC) AS rn "
+            "FROM st_strategy_lifecycle_event e "
+            "WHERE entity_type=:entity_type AND next_status='SUSPENDED'"
+            ") latest WHERE rn=1",
+            {"entity_type": normalized_type},
+        )
+        for row in boundary_rows:
+            boundary_index[(
+                str(row.get("entity_key") or ""),
+                str(row.get("entity_version") or ""),
+            )] = _suspension_boundary_from_row(row)
+
+    history_index: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    if _table_exists(health_table):
+        scan_limit = max(1, int(history_limit))
+        history_rows = _db_read(
+            f"SELECT entity_key, entity_version, trade_date, "
+            f"profit_gate_passed, evidence_json FROM ("
+            f"SELECT h.{key_column} AS entity_key, "
+            f"h.{version_column} AS entity_version, h.trade_date, "
+            f"h.profit_gate_passed, h.evidence_json, h.created_at, h.run_uid, "
+            f"ROW_NUMBER() OVER (PARTITION BY h.{key_column}, "
+            f"h.{version_column} ORDER BY h.trade_date DESC, "
+            f"h.created_at DESC, h.run_uid DESC) AS rn "
+            f"FROM {health_table} h "
+            "INNER JOIN st_strategy_governance_run r ON r.run_uid=h.run_uid "
+            "WHERE h.trade_date < :before_date "
+            f"{window_filter}"
+            "AND r.status='COMPLETED' AND r.is_canonical=1"
+            ") recent WHERE rn <= :scan_limit "
+            "ORDER BY entity_key, entity_version, trade_date DESC, "
+            "created_at DESC, run_uid DESC",
+            {"before_date": before_date, "scan_limit": scan_limit},
+        )
+        for row in history_rows:
+            history_index[(
+                str(row.get("entity_key") or ""),
+                str(row.get("entity_version") or ""),
+            )].append(row)
+    return {
+        "boundaries": boundary_index,
+        "histories": dict(history_index),
+        "expected_session_rows": expected_session_rows,
+    }
+
+
 def _latest_suspension_boundary(
     entity_type: str, entity_key: str, entity_version: str,
+    *, prefetched_boundaries: dict[tuple[str, str], dict[str, str]] | None = None,
 ) -> dict[str, str]:
+    if prefetched_boundaries is not None:
+        return dict(prefetched_boundaries.get((entity_key, entity_version), {}))
     if not _table_exists("st_strategy_lifecycle_event"):
         return {}
     rows = _db_read(
@@ -11540,19 +24301,7 @@ def _latest_suspension_boundary(
     )
     if not rows:
         return {}
-    row = rows[0]
-    evidence = _json(row.get("evidence_json"), {})
-    occurred_at = _normalize_evidence_revision(row.get("occurred_at"))
-    boundary_revision = _normalize_evidence_revision(
-        evidence.get("funding_evidence_revision_at")
-    ) or occurred_at
-    trade_date = str(evidence.get("trade_date") or occurred_at)[:10]
-    return {
-        "evidence_revision_at": boundary_revision,
-        "trade_date": trade_date,
-        "event_hash": str(row.get("event_hash") or ""),
-        "occurred_at": occurred_at,
-    }
+    return _suspension_boundary_from_row(rows[0])
 
 
 def _apply_suspended_recovery_rule(
@@ -11601,15 +24350,286 @@ def _apply_suspended_recovery_rule(
     return "SHADOW", "暂停后新证据达到初步恢复门槛；先进入影子观察，不能直接取得资金资格"
 
 
+def _authoritative_confirmation_sessions(
+    trade_date: str, *, session_count: int,
+) -> list[str]:
+    sessions, _binding = _authoritative_confirmation_session_bundle(
+        trade_date, session_count=session_count,
+    )
+    return sessions
+
+
+def _authoritative_confirmation_session_bundle(
+    trade_date: str, *, session_count: int,
+) -> tuple[list[str], dict[str, Any]]:
+    maximum = 1 + (
+        int(STATISTICAL_GUARD_POLICY["required_total_confirmations"]) - 1
+    ) * 250
+    if isinstance(session_count, bool) or not 1 <= int(session_count) <= maximum:
+        raise ValueError("连续确认权威会话数量超出不可变期限合同")
+    lookback_days = max(45, math.ceil(int(session_count) * 1.65) + 45)
+    start_date = (
+        date.fromisoformat(trade_date) - timedelta(days=lookback_days)
+    ).isoformat()
+    receipt = _immutable_calendar_receipt(
+        start_date=start_date,
+        end_date=trade_date,
+        decision_known_at=f"{trade_date} 23:59:59",
+    )
+    sessions = sorted((
+        day for day in receipt.sessions if day <= trade_date
+    ), reverse=True)[:int(session_count)]
+    if (
+        len(sessions) != int(session_count) or sessions[0] != trade_date
+        or sessions != sorted(set(sessions), reverse=True)
+    ):
+        raise ValueError("连续确认权威交易日历为空、重复或截止日不一致")
+    return sessions, _calendar_receipt_binding(receipt)
+
+
+def _compact_confirmation_guard(
+    full: dict[str, Any], *, calendar_receipt_binding: dict[str, Any],
+) -> dict[str, Any]:
+    milestones = full.get("milestones")
+    milestone_rows = [
+        {
+            "trade_date": str(item.get("trade_date") or ""),
+            "session_index": _int(item.get("session_index"), -1),
+            "funding_gate_hash": str(
+                item.get("funding_gate_hash") or ""
+            ),
+        }
+        for item in (milestones or []) if isinstance(item, dict)
+    ]
+    parameters = full.get("parameters") if isinstance(
+        full.get("parameters"), dict
+    ) else {}
+    payload = {
+        "schema": "probiga.strategy-spaced-confirmation-compact.v1",
+        "valid": full.get("valid") is True,
+        "passed": full.get("passed") is True,
+        "reason": str(full.get("reason") or "")[:500],
+        "minimum_new_sessions": _int(
+            parameters.get("minimum_new_sessions"), 0
+        ),
+        "required_total_confirmations": _int(
+            parameters.get("required_total_confirmations"), 0
+        ),
+        "prior_confirmation_count": _int(
+            full.get("prior_confirmation_count"), 0
+        ),
+        "total_confirmation_count": _int(
+            full.get("total_confirmation_count"), 0
+        ),
+        "continuous_session_count": _int(
+            full.get("continuous_session_count"), 0
+        ),
+        "milestone_count": len(milestone_rows),
+        "milestone_set_hash": _digest({
+            "schema": "probiga.strategy-spaced-confirmation-milestones.v1",
+            "milestones": milestone_rows,
+        }),
+        "milestone_dates": [
+            item["trade_date"] for item in milestone_rows
+        ],
+        "full_input_hash": str(full.get("input_hash") or ""),
+        "full_parameter_hash": str(full.get("parameter_hash") or ""),
+        "full_result_hash": str(full.get("result_hash") or ""),
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "calendar_manifest_hash": str(
+            calendar_receipt_binding.get("manifest_hash") or ""
+        ),
+        "calendar_session_set_hash": str(
+            calendar_receipt_binding.get("session_set_hash") or ""
+        ),
+        "calendar_receipt_binding_hash": str(
+            calendar_receipt_binding.get("binding_hash") or ""
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "compact_hash": _digest(payload)}
+
+
+def _not_applicable_confirmation_guard(
+    *, minimum_new_sessions: int, reason: str,
+) -> dict[str, Any]:
+    payload = {
+        "schema": "probiga.strategy-spaced-confirmation-compact.v1",
+        "valid": False,
+        "passed": False,
+        "reason": reason[:500],
+        "minimum_new_sessions": int(minimum_new_sessions),
+        "required_total_confirmations": int(
+            STATISTICAL_GUARD_POLICY["required_total_confirmations"]
+        ),
+        "prior_confirmation_count": 0,
+        "total_confirmation_count": 0,
+        "continuous_session_count": 0,
+        "milestone_count": 0,
+        "milestone_set_hash": _digest({
+            "schema": "probiga.strategy-spaced-confirmation-milestones.v1",
+            "milestones": [],
+        }),
+        "milestone_dates": [],
+        "full_input_hash": "",
+        "full_parameter_hash": "",
+        "full_result_hash": "",
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "calendar_manifest_hash": "",
+        "calendar_session_set_hash": "",
+        "calendar_receipt_binding_hash": "",
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**payload, "compact_hash": _digest(payload)}
+
+
+def _spaced_confirmation_guard(
+    *, trade_date: str, pre_confirmation_funding_gate_hash: str,
+    funding_evidence_revision_at: str,
+    history_rows: list[dict[str, Any]],
+    authoritative_sessions_desc: list[str],
+    minimum_new_sessions: int,
+    suspension_boundary: dict[str, str] | None,
+    calendar_receipt_binding: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    boundary = suspension_boundary or {}
+    boundary_day = str(boundary.get("trade_date") or "")[:10]
+    boundary_revision = _normalize_evidence_revision(
+        boundary.get("evidence_revision_at")
+    )
+    sessions = [
+        day for day in authoritative_sessions_desc
+        if not boundary_day or day > boundary_day
+    ]
+    if (
+        not sessions
+        or not _valid_calendar_receipt_binding(
+            calendar_receipt_binding,
+            start_date=sessions[-1],
+            end_date=sessions[0],
+        )
+    ):
+        return _not_applicable_confirmation_guard(
+            minimum_new_sessions=minimum_new_sessions,
+            reason="缺少覆盖连续确认区间的不可变QMT交易日历回执",
+        )
+    current = {
+        "trade_date": trade_date,
+        "passed": True,
+        "funding_gate_hash": pre_confirmation_funding_gate_hash,
+        "evidence_revision_at": funding_evidence_revision_at,
+    }
+    normalized_history: list[dict[str, Any]] = []
+    for row in history_rows:
+        evidence = _json(row.get("evidence_json"), {})
+        day = str(row.get("trade_date") or "")[:10]
+        pre_hash = str(
+            evidence.get("pre_confirmation_funding_gate_hash") or ""
+        )
+        revision = _normalize_evidence_revision(
+            evidence.get("funding_evidence_revision_at")
+        )
+        contract_valid = bool(
+            evidence.get("decision_contract_version")
+            == STATISTICAL_DECISION_CONTRACT
+            and evidence.get("overall_profit_gate_passed") is True
+            and evidence.get("statistical_family_passed") is True
+            and _HASH_PATTERN.fullmatch(pre_hash)
+            and revision
+            and (not boundary_revision or revision > boundary_revision)
+            and (not boundary_day or day > boundary_day)
+        )
+        normalized_history.append({
+            "trade_date": day,
+            "passed": bool(
+                contract_valid and _int(row.get("profit_gate_passed")) == 1
+            ),
+            "funding_gate_hash": pre_hash,
+            "evidence_revision_at": revision,
+        })
+    full = spaced_consecutive_gate_confirmations(
+        current,
+        normalized_history,
+        sessions,
+        minimum_new_sessions=minimum_new_sessions,
+        required_total_confirmations=int(
+            STATISTICAL_GUARD_POLICY["required_total_confirmations"]
+        ),
+    )
+    return _compact_confirmation_guard(
+        full,
+        calendar_receipt_binding=calendar_receipt_binding or {},
+    )
+
+
+def _finalize_funding_gate_hash(
+    row: dict[str, Any], *, entity_type: str,
+) -> str:
+    normalized = str(entity_type or "").upper()
+    key = str(row.get(
+        "strategy_key" if normalized == "STRATEGY" else "combination_key"
+    ) or "")
+    version = str(row.get("current_version") or "")
+    confirmation = row.get("confirmation_guard") or {}
+    payload = {
+        "schema": "probiga.strategy-final-funding-gate.v1",
+        "entity_type": normalized,
+        "entity_key": key,
+        "entity_version": version,
+        "pre_confirmation_funding_gate_hash": str(
+            row.get("pre_confirmation_funding_gate_hash") or ""
+        ),
+        "statistical_family_decision_hash": str(
+            (row.get("statistical_family_decision") or {}).get(
+                "decision_hash"
+            ) or (row.get("statistical_family_decision") or {}).get(
+                "source_decision_hash"
+            ) or (row.get("statistical_family_decision") or {}).get(
+                "source_hash"
+            ) or ""
+        ),
+        "confirmation_guard_hash": str(
+            confirmation.get("compact_hash")
+            or confirmation.get("source_compact_hash")
+            or confirmation.get("source_hash") or ""
+        ),
+        "confirmation_passed": confirmation.get("passed") is True,
+        "projected_status": str(
+            row.get("projected_status") or row.get("current_status") or ""
+        ),
+        "paper_allocation_eligible": row.get(
+            "paper_allocation_eligible"
+        ) is True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return _digest(payload)
+
+
 def _confirmed_funding_status(
     *, entity_type: str, entity_key: str, entity_version: str,
     current_status: str, recommended_status: str, reason: str,
     trade_date: str, funding_gate_hash: str,
     funding_evidence_revision_at: str,
+    minimum_new_sessions: int,
+    authoritative_sessions_desc: list[str],
+    calendar_receipt_binding: dict[str, Any] | None = None,
     suspension_boundary: dict[str, str] | None = None,
-) -> tuple[str, str]:
+    confirmation_history: list[dict[str, Any]] | None = None,
+    expected_session_rows: list[dict[str, Any]] | None = None,
+) -> tuple[str, str, dict[str, Any]]:
+    del expected_session_rows
     if recommended_status not in {"ACTIVE", "REDUCE"}:
-        return recommended_status, reason
+        return (
+            recommended_status,
+            reason,
+            _not_applicable_confirmation_guard(
+                minimum_new_sessions=minimum_new_sessions,
+                reason="当前盈利或生命周期门槛未进入资金确认阶段",
+            ),
+        )
     if current_status == "SUSPENDED":
         boundary_revision = _normalize_evidence_revision(
             (suspension_boundary or {}).get("evidence_revision_at")
@@ -11622,38 +24642,56 @@ def _confirmed_funding_status(
             or not current_revision
             or current_revision <= boundary_revision
         ):
-            return "SUSPENDED", "暂停后的资金门槛仍在使用旧证据，继续暂停"
-        return "SHADOW", "恢复盈利门槛已通过，但按恢复规则先进入影子观察"
+            return (
+                "SUSPENDED",
+                "暂停后的资金门槛仍在使用旧证据，继续暂停",
+                _not_applicable_confirmation_guard(
+                    minimum_new_sessions=minimum_new_sessions,
+                    reason="暂停后尚无严格更新的v7统计证据",
+                ),
+            )
+        return (
+            "SHADOW",
+            "恢复盈利门槛已通过，但按恢复规则先进入影子观察",
+            _not_applicable_confirmation_guard(
+                minimum_new_sessions=minimum_new_sessions,
+                reason="暂停恢复必须先返回影子观察，不能直接恢复资金",
+            ),
+        )
     if not _normalize_evidence_revision(funding_evidence_revision_at):
-        return "SHADOW", "缺少可验证的证据高水位，不授予模拟资金资格"
-    required = int(PROFIT_GATE_POLICY["minimum_consecutive_gate_passes"])
-    boundary = suspension_boundary or {}
-    minimum_revision = _normalize_evidence_revision(
-        boundary.get("evidence_revision_at")
+        return (
+            "SHADOW",
+            "缺少可验证的证据高水位，不授予模拟资金资格",
+            _not_applicable_confirmation_guard(
+                minimum_new_sessions=minimum_new_sessions,
+                reason="缺少可验证证据高水位",
+            ),
+        )
+    guard = _spaced_confirmation_guard(
+        trade_date=trade_date,
+        pre_confirmation_funding_gate_hash=funding_gate_hash,
+        funding_evidence_revision_at=funding_evidence_revision_at,
+        history_rows=confirmation_history or [],
+        authoritative_sessions_desc=authoritative_sessions_desc,
+        minimum_new_sessions=minimum_new_sessions,
+        suspension_boundary=suspension_boundary,
+        calendar_receipt_binding=calendar_receipt_binding,
     )
-    minimum_trade_date = str(boundary.get("trade_date") or "")[:10]
-    if entity_type == "COMBINATION":
-        previous = _prior_consecutive_combination_gate_passes(
-            entity_key, entity_version, trade_date, funding_gate_hash,
-            funding_evidence_revision_at,
-            limit=required - 1,
-            minimum_revision_exclusive=minimum_revision,
-            minimum_trade_date_exclusive=minimum_trade_date,
+    if guard.get("passed") is not True:
+        confirmations = _int(guard.get("total_confirmation_count"), 0)
+        required = int(
+            STATISTICAL_GUARD_POLICY["required_total_confirmations"]
         )
-    else:
-        previous = _prior_consecutive_gate_passes(
-            entity_key, entity_version, trade_date, funding_gate_hash,
-            funding_evidence_revision_at,
-            limit=required - 1,
-            minimum_revision_exclusive=minimum_revision,
-            minimum_trade_date_exclusive=minimum_trade_date,
+        return (
+            "SHADOW",
+            f"v7统计门槛通过，但每次至少新增{minimum_new_sessions}个权威交易会话的连续确认仅{confirmations}/{required}；所有中间交易日也必须持续通过，暂留影子观察",
+            guard,
         )
-    confirmations = previous + 1
-    if current_status == "SHADOW" and confirmations < required:
-        return "SHADOW", f"盈利门槛通过，独立证据更新连续确认{confirmations}/{required}，暂留影子观察"
-    if current_status == "REDUCE" and recommended_status == "ACTIVE" and confirmations < required:
-        return "REDUCE", f"恢复正常权重需连续{required}次独立证据更新，当前{confirmations}/{required}"
-    return recommended_status, reason
+    return (
+        recommended_status,
+        f"{reason}；已完成{guard['total_confirmation_count']}次确认，每次至少新增{minimum_new_sessions}个权威交易会话",
+        guard,
+    )
 
 
 def _latest_completed_governance_date() -> str:
@@ -11668,16 +24706,528 @@ def _latest_completed_governance_date() -> str:
 
 
 def _require_no_real_order_authority(value: Any, *, path: str = "result") -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            name = str(key)
-            if name in {"real_order_authority", "automatic_real_order_submission"}:
-                if item is not False:
-                    raise RuntimeError(f"canonical治理结果包含真实下单权限：{path}.{name}")
-            _require_no_real_order_authority(item, path=f"{path}.{name}")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            _require_no_real_order_authority(item, path=f"{path}[{index}]")
+    assert_real_order_authority_closed(
+        value, path=path, error_type=RuntimeError,
+    )
+
+
+def _canonical_v7_statistical_extension(
+    result: dict[str, Any], strategies: list[dict[str, Any]],
+    combinations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate compact v7 statistical proofs and return decision fields."""
+
+    policy = result.get("statistical_policy")
+    inventory = result.get("statistical_inventory")
+    strategy_summary = result.get("strategy_fdr_summary")
+    combination_summary = result.get("combination_fdr_summary")
+    input_binding = result.get("statistical_input_binding")
+    if (
+        policy != STATISTICAL_GUARD_POLICY
+        or result.get("statistical_policy_hash") != STATISTICAL_POLICY_HASH
+        or result.get("statistical_funding_eligible") is not True
+        or result.get("legacy_statistical_display_only") is not False
+        or not isinstance(inventory, dict)
+        or not isinstance(strategy_summary, dict)
+        or not isinstance(combination_summary, dict)
+        or not isinstance(input_binding, dict)
+    ):
+        raise RuntimeError("canonical治理v7统计政策或紧凑证明缺失")
+    inventory_payload = {
+        key: value for key, value in inventory.items()
+        if key != "compact_hash"
+    }
+    strategy_summary_payload = {
+        key: value for key, value in strategy_summary.items()
+        if key != "summary_hash"
+    }
+    combination_summary_payload = {
+        key: value for key, value in combination_summary.items()
+        if key != "summary_hash"
+    }
+    input_binding_payload = {
+        key: value for key, value in input_binding.items()
+        if key != "binding_hash"
+    }
+    if (
+        inventory.get("schema")
+        != "probiga.strategy-statistical-inventory-compact.v1"
+        or _digest(inventory_payload)
+        != str(inventory.get("compact_hash") or "")
+        or _digest(strategy_summary_payload)
+        != str(strategy_summary.get("summary_hash") or "")
+        or _digest(combination_summary_payload)
+        != str(combination_summary.get("summary_hash") or "")
+        or _digest(input_binding_payload)
+        != str(input_binding.get("binding_hash") or "")
+        or input_binding.get("decision_contract_version")
+        != STATISTICAL_DECISION_CONTRACT
+        or input_binding.get("statistical_policy_hash")
+        != STATISTICAL_POLICY_HASH
+        or input_binding.get("inventory_compact_hash")
+        != inventory.get("compact_hash")
+        or input_binding.get("inventory_result_hash")
+        != inventory.get("source_inventory_result_hash")
+        or input_binding.get("strategy_fdr_summary_hash")
+        != strategy_summary.get("summary_hash")
+        or input_binding.get("combination_fdr_summary_hash")
+        != combination_summary.get("summary_hash")
+        or strategy_summary.get("trial_inventory_hash")
+        != (inventory.get("strategy") or {}).get("trial_inventory_hash")
+        or strategy_summary.get("trial_inventory_state_hash")
+        != (inventory.get("strategy") or {}).get(
+            "trial_inventory_state_hash"
+        )
+        or combination_summary.get("trial_inventory_hash")
+        != (inventory.get("combination") or {}).get(
+            "trial_inventory_hash"
+        )
+        or combination_summary.get("trial_inventory_state_hash")
+        != (inventory.get("combination") or {}).get(
+            "trial_inventory_state_hash"
+        )
+    ):
+        raise RuntimeError("canonical治理v7统计库存、FDR或输入绑定哈希无效")
+
+    def row_fields(item: dict[str, Any], entity_type: str) -> dict[str, Any]:
+        decision = item.get("statistical_family_decision")
+        confirmation = item.get("confirmation_guard")
+        metrics = item.get("metrics")
+        decision_source_hash = str(
+            (decision or {}).get("source_hash") or ""
+        )
+        confirmation_source_hash = str(
+            (confirmation or {}).get("source_hash") or ""
+        )
+        if (
+            not isinstance(decision, dict)
+            or not isinstance(confirmation, dict)
+            or not isinstance(metrics, dict)
+            or not _HASH_PATTERN.fullmatch(decision_source_hash)
+            or not isinstance(decision.get("passed"), bool)
+            or not isinstance(decision.get("valid"), bool)
+            or _num(decision.get("p_value"), None) is None
+            or not 0 <= float(decision.get("p_value")) <= 1
+            or _int(decision.get("trials"), 0) < 1
+            or not _HASH_PATTERN.fullmatch(confirmation_source_hash)
+            or not isinstance(confirmation.get("passed"), bool)
+            or not isinstance(confirmation.get("valid"), bool)
+            or _int(confirmation.get("gap_sessions"), 0)
+            < int(STATISTICAL_GUARD_POLICY[
+                "minimum_confirmation_sessions"
+            ])
+            or not _HASH_PATTERN.fullmatch(str(
+                item.get("pre_confirmation_funding_gate_hash") or ""
+            ))
+            or not _HASH_PATTERN.fullmatch(str(
+                item.get("funding_gate_hash") or ""
+            ))
+        ):
+            raise RuntimeError("canonical治理v7实体统计或确认哈希无效")
+        for window in WINDOWS:
+            window_metrics = metrics.get(str(window))
+            guard = (
+                window_metrics.get("statistical_guard")
+                if isinstance(window_metrics, dict) else None
+            )
+            forward_guard = (
+                window_metrics.get("internal_forward_stability")
+                if isinstance(window_metrics, dict) else None
+            )
+            gate_summary = (
+                window_metrics.get("profit_gate")
+                if isinstance(window_metrics, dict) else None
+            )
+            selection_summary = (
+                window_metrics.get("selection_validation")
+                if window == 60 and isinstance(window_metrics, dict)
+                else None
+            )
+            if (
+                not isinstance(guard, dict)
+                or not isinstance(forward_guard, dict)
+                or not isinstance(gate_summary, dict)
+                or (window == 60 and not isinstance(selection_summary, dict))
+                or not _HASH_PATTERN.fullmatch(str(
+                    window_metrics.get("source_root") or ""
+                ))
+                or (
+                    window == 60 and (
+                        selection_summary.get("funding_authority") is not False
+                    )
+                )
+                or _int(window_metrics.get("window_days"), -1) != window
+                or not isinstance(
+                    window_metrics.get("point_health_score"), (int, float)
+                )
+                or isinstance(
+                    window_metrics.get("point_health_score"), bool
+                )
+            ):
+                raise RuntimeError("canonical治理v7窗口HAC或健康分绑定无效")
+        projected = str(
+            item.get("projected_status")
+            or item.get("current_status") or ""
+        )
+        if entity_type == "STRATEGY":
+            entity_key = str(item.get("strategy_key") or "")
+        else:
+            entity_key = str(item.get("combination_key") or "")
+        final_payload = {
+            "schema": "probiga.strategy-final-funding-gate.v1",
+            "entity_type": entity_type,
+            "entity_key": entity_key,
+            "entity_version": str(item.get("current_version") or ""),
+            "pre_confirmation_funding_gate_hash": str(
+                item.get("pre_confirmation_funding_gate_hash") or ""
+            ),
+            "statistical_family_decision_hash": decision_source_hash,
+            "confirmation_guard_hash": confirmation_source_hash,
+            "confirmation_passed": confirmation.get("passed") is True,
+            "projected_status": projected,
+            "paper_allocation_eligible": item.get(
+                "paper_allocation_eligible"
+            ) is True,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        if _digest(final_payload) != str(item.get("funding_gate_hash") or ""):
+            raise RuntimeError("canonical治理v7最终资金门槛哈希无效")
+        return {
+            "pre_confirmation_funding_gate_hash": str(
+                item.get("pre_confirmation_funding_gate_hash") or ""
+            ),
+            "statistical_family_decision_hash": decision_source_hash,
+            "confirmation_guard_hash": confirmation_source_hash,
+        }
+
+    strategy_fields = [
+        row_fields(item, "STRATEGY") for item in strategies
+    ]
+    combination_fields = [
+        row_fields(item, "COMBINATION") for item in combinations
+    ]
+    return {
+        "top": {
+            "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+            "statistical_inventory_compact_hash": str(
+                inventory.get("compact_hash") or ""
+            ),
+            "strategy_fdr_summary_hash": str(
+                strategy_summary.get("summary_hash") or ""
+            ),
+            "combination_fdr_summary_hash": str(
+                combination_summary.get("summary_hash") or ""
+            ),
+            "statistical_input_binding_hash": str(
+                input_binding.get("binding_hash") or ""
+            ),
+        },
+        "strategies": strategy_fields,
+        "combinations": combination_fields,
+    }
+
+
+def validate_funding_checkpoint_manifest_contract(
+    result: dict[str, Any],
+) -> None:
+    """Replay the one compact funding partition contract used in production.
+
+    This intentionally validates the v2 roots against the persisted strategy
+    and combination projections.  Callers must not invent an older inline
+    ``checkpoints``/``ineligible`` representation at another boundary.
+    """
+
+    if not isinstance(result, dict):
+        raise RuntimeError("canonical资金检查点结果不是对象")
+    trade_date = _trade_date(result.get("trade_date"), default_today=False)
+    summary = result.get("summary")
+    strategies = result.get("strategies")
+    combinations = result.get("combinations")
+    allocations = result.get("allocations")
+    funding_manifest = result.get("funding_checkpoint_manifest")
+    if (
+        not isinstance(summary, dict)
+        or not isinstance(strategies, list)
+        or not isinstance(combinations, list)
+        or not isinstance(allocations, list)
+        or not isinstance(funding_manifest, dict)
+    ):
+        raise RuntimeError("canonical资金检查点清单缺少可复算字段")
+    if (
+        any(not isinstance(item, dict) for item in strategies)
+        or any(not isinstance(item, dict) for item in combinations)
+        or any(not isinstance(item, dict) for item in allocations)
+    ):
+        raise RuntimeError("canonical资金检查点清单成员不是对象")
+    manifest_payload = {
+        key: value for key, value in funding_manifest.items()
+        if key != "manifest_hash"
+    }
+    manifest_coverage = funding_manifest.get("coverage")
+    current_entities = [{
+        "entity_type": "STRATEGY",
+        "entity_key": str(item.get("strategy_key") or ""),
+        "entity_version": str(item.get("current_version") or ""),
+    } for item in sorted(
+        strategies, key=lambda item: str(item.get("strategy_key") or ""),
+    )] + [{
+        "entity_type": "COMBINATION",
+        "entity_key": str(item.get("combination_key") or ""),
+        "entity_version": str(item.get("current_version") or ""),
+    } for item in sorted(
+        combinations,
+        key=lambda item: str(item.get("combination_key") or ""),
+    )]
+    current_entities.sort(key=lambda item: (
+        item["entity_type"], item["entity_key"], item["entity_version"],
+    ))
+    current_identity_set = {
+        (
+            item["entity_type"], item["entity_key"],
+            item["entity_version"],
+        )
+        for item in current_entities
+    }
+    if (
+        any(
+            not item["entity_key"] or not item["entity_version"]
+            for item in current_entities
+        )
+        or len(current_identity_set) != len(current_entities)
+    ):
+        raise RuntimeError("canonical资金检查点当前实体身份为空或重复")
+    if (
+        funding_manifest.get("schema")
+        != "probiga.strategy-funding-checkpoint-manifest.v2"
+        or funding_manifest.get("run_uid") != result.get("run_uid")
+        or funding_manifest.get("trade_date") != trade_date
+        or funding_manifest.get("automatic_real_order_submission") is not False
+        or funding_manifest.get("real_order_authority") is not False
+        or not isinstance(manifest_coverage, dict)
+        or _checkpoint_canonical_hash(manifest_payload)
+        != str(funding_manifest.get("manifest_hash") or "")
+        or len(_checkpoint_canonical_json(funding_manifest).encode("utf-8"))
+        > FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES
+    ):
+        raise RuntimeError("canonical资金检查点清单身份、哈希或体积无效")
+    _verify_funding_manifest_root_structure(
+        funding_manifest.get("checkpoint_root"), kind="CHECKPOINT",
+    )
+    _verify_funding_manifest_root_structure(
+        funding_manifest.get("combination_recipe_root"),
+        kind="COMBINATION_RECIPE",
+    )
+    _verify_funding_manifest_root_structure(
+        funding_manifest.get("ineligible_root"), kind="INELIGIBLE",
+    )
+    manifest_rows: list[dict[str, Any]] = []
+    manifest_recipes: list[dict[str, Any]] = []
+    manifest_ineligible: list[dict[str, Any]] = []
+    for strategy in strategies:
+        key = str(strategy.get("strategy_key") or "")
+        version = str(strategy.get("current_version") or "")
+        ref = strategy.get("funding_checkpoint_ref")
+        ineligible_row = strategy.get("funding_manifest_ineligible")
+        if strategy.get("funding_checkpoint_ready") is True:
+            if not isinstance(ref, dict) or ineligible_row is not None:
+                raise RuntimeError("canonical策略资金检查点分区字段冲突")
+            entry = _funding_checkpoint_manifest_entry(ref)
+            if (
+                entry["strategy_key"] != key
+                or entry["strategy_version"] != version
+                or entry["trade_date"] != trade_date
+            ):
+                raise RuntimeError("canonical策略检查点引用跨版本或日期")
+            manifest_rows.append(entry)
+        else:
+            if (
+                not isinstance(ineligible_row, dict)
+                or ref is not None
+                or ineligible_row.get("entity_type") != "STRATEGY"
+                or ineligible_row.get("entity_key") != key
+                or ineligible_row.get("entity_version") != version
+                or not str(ineligible_row.get("reason_code") or "")
+                or not str(ineligible_row.get("reason") or "")
+            ):
+                raise RuntimeError("canonical策略资金不合格原因不可复算")
+            manifest_ineligible.append(dict(ineligible_row))
+    for combination in combinations:
+        key = str(combination.get("combination_key") or "")
+        version = str(combination.get("current_version") or "")
+        ineligible_row = combination.get("funding_manifest_ineligible")
+        if combination.get("funding_recipe_ready") is True:
+            if (
+                ineligible_row is not None
+                or combination.get("paper_allocation_eligible") is not True
+            ):
+                raise RuntimeError("canonical组合配方资金分区字段冲突")
+            manifest_recipes.append(_combination_recipe_manifest_entry(
+                combination, trade_date=trade_date,
+            ))
+        else:
+            if (
+                not isinstance(ineligible_row, dict)
+                or combination.get("paper_allocation_eligible") is True
+                or ineligible_row.get("entity_type") != "COMBINATION"
+                or ineligible_row.get("entity_key") != key
+                or ineligible_row.get("entity_version") != version
+                or not str(ineligible_row.get("reason_code") or "")
+                or not str(ineligible_row.get("reason") or "")
+            ):
+                raise RuntimeError("canonical组合资金不合格原因不可复算")
+            manifest_ineligible.append(dict(ineligible_row))
+    _verify_funding_manifest_batch_root(
+        funding_manifest.get("checkpoint_root"),
+        manifest_rows,
+        kind="CHECKPOINT",
+    )
+    _verify_funding_manifest_batch_root(
+        funding_manifest.get("combination_recipe_root"),
+        manifest_recipes,
+        kind="COMBINATION_RECIPE",
+    )
+    _verify_funding_manifest_batch_root(
+        funding_manifest.get("ineligible_root"),
+        manifest_ineligible,
+        kind="INELIGIBLE",
+    )
+    checkpointed_versions = [{
+        "entity_type": "STRATEGY",
+        "entity_key": str(item.get("strategy_key") or ""),
+        "entity_version": str(item.get("strategy_version") or ""),
+    } for item in manifest_rows]
+    recipe_versions = [{
+        "entity_type": "COMBINATION",
+        "entity_key": str(item.get("entity_key") or ""),
+        "entity_version": str(item.get("entity_version") or ""),
+    } for item in manifest_recipes]
+    ineligible_versions = [{
+        "entity_type": str(item.get("entity_type") or ""),
+        "entity_key": str(item.get("entity_key") or ""),
+        "entity_version": str(item.get("entity_version") or ""),
+    } for item in manifest_ineligible]
+    partition = sorted(
+        checkpointed_versions + recipe_versions + ineligible_versions,
+        key=lambda item: (
+            item["entity_type"], item["entity_key"], item["entity_version"],
+        ),
+    )
+    if (
+        partition != current_entities
+        or _int(manifest_coverage.get("current_entity_count"), -1)
+        != len(current_entities)
+        or _int(manifest_coverage.get("eligible_count"), -1)
+        != len(checkpointed_versions) + len(recipe_versions)
+        or _int(manifest_coverage.get("funding_ready_count"), -1)
+        != len(checkpointed_versions) + len(recipe_versions)
+        or _int(manifest_coverage.get("strategy_checkpoint_count"), -1)
+        != len(checkpointed_versions)
+        or _int(manifest_coverage.get("combination_recipe_count"), -1)
+        != len(recipe_versions)
+        or _int(manifest_coverage.get("checkpointed_count"), -1)
+        != len(checkpointed_versions)
+        or _int(manifest_coverage.get("ineligible_count"), -1)
+        != len(ineligible_versions)
+        or manifest_coverage.get("eligible_persistence_coverage_pct") != 100.0
+        or manifest_coverage.get("current_entity_set_hash")
+        != _funding_entity_set_hash(current_entities)
+        or manifest_coverage.get("checkpointed_set_hash")
+        != _funding_entity_set_hash(checkpointed_versions)
+        or manifest_coverage.get("combination_recipe_set_hash")
+        != _funding_entity_set_hash(recipe_versions)
+        or manifest_coverage.get("funding_ready_set_hash")
+        != _funding_entity_set_hash(sorted(
+            checkpointed_versions + recipe_versions,
+            key=lambda item: (
+                item["entity_type"], item["entity_key"],
+                item["entity_version"],
+            ),
+        ))
+        or manifest_coverage.get("ineligible_set_hash")
+        != _funding_entity_set_hash(ineligible_versions)
+        or funding_manifest.get("ineligible_reason_code_counts") != {
+            code: sum(
+                1 for row in manifest_ineligible
+                if row.get("reason_code") == code
+            )
+            for code in sorted({
+                str(row.get("reason_code") or "")
+                for row in manifest_ineligible
+            })
+        }
+        or str(summary.get("funding_checkpoint_manifest_hash") or "")
+        != str(funding_manifest.get("manifest_hash") or "")
+        or _int(summary.get("funding_checkpoint_eligible_count"), -1)
+        != len(checkpointed_versions) + len(recipe_versions)
+        or _int(summary.get("funding_checkpointed_count"), -1)
+        != len(checkpointed_versions)
+        or _int(summary.get("funding_strategy_checkpoint_count"), -1)
+        != len(checkpointed_versions)
+        or _int(summary.get("funding_combination_recipe_count"), -1)
+        != len(recipe_versions)
+        or _int(summary.get("funding_ready_count"), -1)
+        != len(checkpointed_versions) + len(recipe_versions)
+        or _int(summary.get("funding_checkpoint_ineligible_count"), -1)
+        != len(ineligible_versions)
+    ):
+        raise RuntimeError("canonical资金检查点覆盖分区或汇总不可复算")
+    funding_ready_identities = {
+        (
+            item["entity_type"], item["entity_key"],
+            item["entity_version"],
+        )
+        for item in checkpointed_versions + recipe_versions
+    }
+    for allocation in allocations:
+        if not isinstance(allocation, dict):
+            raise RuntimeError("canonical模拟资金分配行无效")
+        weight = _num(allocation.get("simulated_weight_pct"), None)
+        if weight is None or not math.isfinite(weight) or weight < 0:
+            raise RuntimeError("canonical模拟资金分配权重无效")
+        target_type = str(allocation.get("target_type") or "").upper()
+        if weight > 0 and target_type != "CASH" and (
+            target_type,
+            str(allocation.get("target_key") or ""),
+            str(allocation.get("target_version") or ""),
+        ) not in funding_ready_identities:
+            raise RuntimeError("未进入本轮资金事实预算的策略或组合获得了模拟资金")
+    storage_fields: dict[str, int] = {}
+    for field in (
+        "checkpoint_storage_bytes", "fact_storage_bytes",
+        "total_storage_bytes", "target_total_bytes", "hard_total_bytes",
+    ):
+        value = funding_manifest.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("canonical资金检查点清单存储边界无效")
+        storage_fields[field] = value
+    if (
+        storage_fields["total_storage_bytes"]
+        != storage_fields["checkpoint_storage_bytes"]
+        + storage_fields["fact_storage_bytes"]
+        or storage_fields["target_total_bytes"]
+        != FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+        or storage_fields["hard_total_bytes"]
+        != FUNDING_CHECKPOINT_TOTAL_HARD_BYTES
+        or storage_fields["total_storage_bytes"]
+        > storage_fields["hard_total_bytes"]
+        or (
+            len(checkpointed_versions) == 0
+            and storage_fields["checkpoint_storage_bytes"] != 0
+        )
+        or (
+            len(checkpointed_versions) > 0
+            and storage_fields["checkpoint_storage_bytes"]
+            > FUNDING_CHECKPOINT_TARGET_AVG_BYTES
+            * len(checkpointed_versions)
+        )
+        or funding_manifest.get("target_total_met") is not (
+            storage_fields["total_storage_bytes"]
+            <= storage_fields["target_total_bytes"]
+        )
+        or funding_manifest.get("bootstrap_is_daily_bounded") is not False
+    ):
+        raise RuntimeError("canonical资金检查点清单存储边界无效")
 
 
 def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
@@ -11691,9 +25241,14 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
     combinations = result.get("combinations")
     pools = result.get("pools")
     allocations = result.get("allocations")
+    paper_plan = result.get("paper_execution_plan")
     candidates = result.get("allocation_candidate_set")
     router_snapshot = result.get("router_snapshot")
     transition_plan = result.get("automatic_transition_plan")
+    candidate_industry_snapshot = result.get(
+        "candidate_industry_snapshot"
+    )
+    funding_manifest = result.get("funding_checkpoint_manifest")
     if (
         result.get("status") != "ok"
         or result.get("input_ready") is not True
@@ -11708,11 +25263,46 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         or not isinstance(combinations, list)
         or not isinstance(pools, dict)
         or not isinstance(allocations, list)
+        or not isinstance(paper_plan, dict)
         or not isinstance(candidates, list)
         or not isinstance(router_snapshot, dict)
         or not isinstance(transition_plan, dict)
+        or not isinstance(candidate_industry_snapshot, dict)
+        or not isinstance(funding_manifest, dict)
     ):
         raise RuntimeError("canonical治理完整结果缺少可复算决策字段")
+    validate_funding_checkpoint_manifest_contract(result)
+    (
+        industry_bindings,
+        industry_snapshot_reason,
+        industry_snapshot_valid,
+    ) = _industry_snapshot_binding_map(
+        candidate_industry_snapshot, trade_date,
+    )
+    industry_snapshot_id = str(
+        candidate_industry_snapshot.get("snapshot_id") or ""
+    )
+    industry_snapshot_hash = str(
+        candidate_industry_snapshot.get("snapshot_hash") or ""
+    )
+    industry_snapshot_status = str(
+        candidate_industry_snapshot.get("status") or ""
+    )
+    if (
+        not industry_snapshot_valid
+        or industry_snapshot_hash
+        != str(result.get("candidate_industry_snapshot_hash") or "")
+        or industry_snapshot_hash
+        != str(summary.get("candidate_industry_snapshot_hash") or "")
+        or industry_snapshot_id
+        != str(summary.get("candidate_industry_snapshot_id") or "")
+        or industry_snapshot_status
+        != str(summary.get("candidate_industry_snapshot_status") or "")
+    ):
+        raise RuntimeError(
+            "canonical治理目标日QMT一级行业冻结快照不可复算："
+            + industry_snapshot_reason
+        )
     market_state = str(market.get("key") or "unknown")
     risk_cap = MARKET_RISK_CAP_PCT.get(market_state, 0.0)
     candidate_payload = {
@@ -11756,13 +25346,259 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         or any(item.get("real_order_authority") is not False for item in allocations)
     ):
         raise RuntimeError("canonical治理资金分配公式、哈希或现金守恒无效")
+    paper_plan_payload = {
+        str(key): value for key, value in paper_plan.items()
+        if str(key) != "plan_hash"
+    }
+    paper_targets = paper_plan.get("targets")
+    if not isinstance(paper_targets, list):
+        raise RuntimeError("canonical治理缺少个股级模拟资金计划")
+    target_codes: set[str] = set()
+    industry_bp: dict[str, int] = defaultdict(int)
+    actual_new_buy_turnover_bp = 0
+    for target_row in paper_targets:
+        if not isinstance(target_row, dict):
+            raise RuntimeError("canonical治理个股计划行无效")
+        code = str(target_row.get("stock_code") or "")
+        target_bp = _int(target_row.get("target_bp"), -1)
+        previous_target_bp = _int(
+            target_row.get("previous_target_bp"), -1
+        )
+        new_buy_delta_bp = _int(target_row.get("new_buy_delta_bp"), -1)
+        target_hash = str(target_row.get("target_hash") or "")
+        row_payload = {
+            str(key): value for key, value in target_row.items()
+            if str(key) != "target_hash"
+        }
+        if (
+            not code or code in target_codes or target_bp <= 0
+            or target_bp > int(round(
+                float(GLOBAL_PORTFOLIO_POLICY[
+                    "maximum_single_stock_weight_pct"
+                ]) * 100
+            ))
+            or target_row.get("allocation_backed") is not True
+            or target_row.get("new_buy_allowed") is not True
+            or target_row.get("exit_always_allowed") is not True
+            or target_row.get("real_order_authority") is not False
+            or previous_target_bp < 0
+            or new_buy_delta_bp
+            != max(0, target_bp - previous_target_bp)
+            or _digest({
+                "schema": "probiga.governance-paper-target.v1",
+                **row_payload,
+            }) != target_hash
+            or target_row.get("industry_binding")
+            != industry_bindings.get(code)
+            or str(target_row.get("industry_name") or "")
+            != str((industry_bindings.get(code) or {}).get(
+                "industry_name"
+            ) or "")
+            or str(target_row.get("industry_type") or "")
+            != str((industry_bindings.get(code) or {}).get(
+                "industry_type"
+            ) or "")
+            or str(target_row.get("industry_snapshot_id") or "")
+            != industry_snapshot_id
+            or str(target_row.get("industry_snapshot_hash") or "")
+            != industry_snapshot_hash
+            or str(target_row.get("industry_row_hash") or "")
+            != str((industry_bindings.get(code) or {}).get("row_hash") or "")
+            or str(target_row.get("industry_source_fact_id") or "")
+            != str((industry_bindings.get(code) or {}).get(
+                "source_fact_id"
+            ) or "")
+        ):
+            raise RuntimeError("canonical治理个股计划身份、上限或哈希无效")
+        target_codes.add(code)
+        actual_new_buy_turnover_bp += new_buy_delta_bp
+        industry_bp[str(target_row.get("industry_name") or "")] += (
+            target_bp
+        )
+    plan_invested_bp = sum(
+        _int(item.get("target_bp"), 0) for item in paper_targets
+    )
+    funded_sleeves = paper_plan.get("funded_sleeves")
+    exit_targets = paper_plan.get("exit_targets")
+    portfolio_risk = paper_plan.get("portfolio_risk")
+    requested_turnover_bp = _int(
+        paper_plan.get("requested_new_buy_turnover_bp"), -1
+    )
+    turnover_cap_bp = int(round(
+        float(GLOBAL_PORTFOLIO_POLICY["maximum_new_buy_turnover_pct"])
+        * 100
+    ))
+    expected_turnover_multiplier = min(
+        1.0,
+        turnover_cap_bp / requested_turnover_bp
+        if requested_turnover_bp > 0 else 1.0,
+    )
+    funded_keys = {
+        str(item.get("strategy_key") or "")
+        for item in (funded_sleeves or [])
+        if isinstance(item, dict)
+    }
+    exits_valid = isinstance(exit_targets, list) and all(
+        isinstance(item, dict)
+        and bool(str(item.get("stock_code") or ""))
+        and _int(item.get("previous_target_bp"), 0) > 0
+        and _int(item.get("target_bp"), -1) == 0
+        and item.get("new_buy_allowed") is False
+        and item.get("exit_always_allowed") is True
+        and item.get("real_order_authority") is False
+        for item in (exit_targets or [])
+    )
+    exit_codes = [
+        str(item.get("stock_code") or "")
+        for item in (exit_targets or [])
+        if isinstance(item, dict)
+    ]
+    exits_valid = bool(
+        exits_valid
+        and len(exit_codes) == len(set(exit_codes))
+        and not (set(exit_codes) & target_codes)
+    )
+    risk_valid = isinstance(portfolio_risk, dict)
+    if risk_valid and paper_targets:
+        risk_observations = _int(portfolio_risk.get("observations"), -1)
+        risk_volatility = _num(
+            portfolio_risk.get("annualized_volatility_pct"), None
+        )
+        risk_expected_shortfall = _num(
+            portfolio_risk.get("expected_shortfall_95_pct"), None
+        )
+        risk_multiplier = _num(
+            portfolio_risk.get("risk_multiplier"), -1.0
+        )
+        expected_risk_multiplier = min(
+            1.0,
+            float(GLOBAL_PORTFOLIO_POLICY[
+                "maximum_annualized_volatility_pct"
+            ]) / risk_volatility
+            if risk_volatility is not None and risk_volatility > 0
+            else 1.0,
+            float(GLOBAL_PORTFOLIO_POLICY[
+                "maximum_daily_expected_shortfall_95_pct"
+            ]) / risk_expected_shortfall
+            if risk_expected_shortfall is not None
+            and risk_expected_shortfall > 0 else 1.0,
+        )
+        risk_valid = bool(
+            portfolio_risk.get("valid") is True
+            and risk_observations >= int(GLOBAL_PORTFOLIO_POLICY[
+                "minimum_pairwise_observations"
+            ])
+            and risk_volatility is not None
+            and risk_volatility >= 0
+            and risk_expected_shortfall is not None
+            and risk_expected_shortfall >= 0
+            and risk_multiplier is not None
+            and abs(risk_multiplier - round(
+                max(0.0, expected_risk_multiplier), 8
+            )) <= 1e-8
+            and risk_volatility * risk_multiplier
+            <= float(GLOBAL_PORTFOLIO_POLICY[
+                "maximum_annualized_volatility_pct"
+            ]) + 1e-6
+            and risk_expected_shortfall * risk_multiplier
+            <= float(GLOBAL_PORTFOLIO_POLICY[
+                "maximum_daily_expected_shortfall_95_pct"
+            ]) + 1e-6
+        )
+    if (
+        paper_plan.get("schema")
+        != "probiga.governance-paper-execution-plan.v1"
+        or paper_plan.get("trade_date") != trade_date
+        or str(paper_plan.get("industry_snapshot_id") or "")
+        != industry_snapshot_id
+        or str(paper_plan.get("industry_snapshot_hash") or "")
+        != industry_snapshot_hash
+        or str(paper_plan.get("industry_snapshot_status") or "")
+        != industry_snapshot_status
+        or paper_plan.get("policy") != GLOBAL_PORTFOLIO_POLICY
+        or paper_plan.get("automatic_real_order_submission") is not False
+        or paper_plan.get("real_order_authority") is not False
+        or not isinstance(funded_sleeves, list)
+        or len(funded_sleeves)
+        > int(GLOBAL_PORTFOLIO_POLICY["maximum_funded_sleeves"])
+        or len(funded_keys) != len(funded_sleeves)
+        or any(
+            str(item.get("strategy_key") or "") not in funded_keys
+            for item in paper_targets
+        )
+        or not exits_valid
+        or not risk_valid
+        or _digest(paper_plan_payload) != str(paper_plan.get("plan_hash") or "")
+        or str(paper_plan.get("plan_hash") or "")
+        != str(result.get("paper_execution_plan_hash") or "")
+        or str(paper_plan.get("plan_hash") or "")
+        != str(summary.get("paper_execution_plan_hash") or "")
+        or _int(paper_plan.get("target_count"), -1) != len(paper_targets)
+        or len(paper_targets)
+        > int(GLOBAL_PORTFOLIO_POLICY["maximum_planned_positions"])
+        or _int(paper_plan.get("invested_bp"), -1) != plan_invested_bp
+        or plan_invested_bp < 0
+        or plan_invested_bp > 10_000
+        or _int(paper_plan.get("cash_bp"), -1) != 10_000 - plan_invested_bp
+        or _int(summary.get("paper_target_count"), -1)
+        != len(paper_targets)
+        or _num(summary.get("paper_invested_weight_pct"), -1.0)
+        != plan_invested_bp / 100.0
+        or requested_turnover_bp < actual_new_buy_turnover_bp
+        or actual_new_buy_turnover_bp > turnover_cap_bp
+        or _int(paper_plan.get("actual_new_buy_turnover_bp"), -1)
+        != actual_new_buy_turnover_bp
+        or abs(float(_num(
+            paper_plan.get("new_buy_turnover_multiplier"), -1.0
+        ) or -1.0) - round(expected_turnover_multiplier, 8)) > 1e-8
+        or any(
+            bp > int(round(
+                float(GLOBAL_PORTFOLIO_POLICY[
+                    "maximum_industry_weight_pct"
+                ]) * 100
+            ))
+            for bp in industry_bp.values()
+        )
+    ):
+        raise RuntimeError("canonical治理个股模拟资金计划不可复算")
     pool_snapshot, pool_hash, _row_hashes = _pool_snapshot_contract(
         trade_date, pools,
     )
+    for pool_name in ("observation", "confirmation", "tradable"):
+        for pool_row in pools.get(pool_name) or []:
+            code = str(pool_row.get("stock_code") or "")
+            expected_binding = industry_bindings.get(code)
+            if expected_binding is not None:
+                if (
+                    pool_row.get("industry_binding") != expected_binding
+                    or str(pool_row.get("industry_name") or "")
+                    != str(expected_binding.get("industry_name") or "")
+                    or str(pool_row.get("industry_type") or "")
+                    != str(expected_binding.get("industry_type") or "")
+                ):
+                    raise RuntimeError(
+                        "canonical治理股票池行业绑定与目标日QMT事实不一致"
+                    )
+            elif (
+                pool_name != "observation"
+                or "目标日QMT一级行业冻结事实缺失或无效"
+                not in (pool_row.get("blocking_reasons") or [])
+            ):
+                raise RuntimeError(
+                    "canonical治理缺失行业事实的证券未被限制在观察池"
+                )
     if (
         pool_snapshot != result.get("pool_snapshot")
         or pool_hash != str(result.get("pool_snapshot_hash") or "")
         or pool_hash != str(summary.get("pool_snapshot_hash") or "")
+        or {
+            str(item.get("stock_code") or "")
+            for item in (pools.get("tradable") or [])
+        } != target_codes
+        or any(
+            item.get("allocation_backed") is not True
+            for item in (pools.get("tradable") or [])
+        )
     ):
         raise RuntimeError("canonical治理股票池快照不可复算")
     expected_strategy_routes = {
@@ -11808,8 +25644,25 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         != str(summary.get("automatic_transition_plan_hash") or "")
     ):
         raise RuntimeError("canonical治理生命周期计划不可复算")
+    decision_contract = str(
+        result.get("decision_contract_version")
+        or "strategy-governance-decision.v6"
+    )
+    if decision_contract not in {
+        "strategy-governance-decision.v6",
+        STATISTICAL_DECISION_CONTRACT,
+    }:
+        raise RuntimeError("canonical治理决策合同版本无效")
+    statistical_extension = (
+        _canonical_v7_statistical_extension(
+            result, strategies, combinations,
+        )
+        if decision_contract == STATISTICAL_DECISION_CONTRACT
+        else {"top": {}, "strategies": [{} for _ in strategies],
+              "combinations": [{} for _ in combinations]}
+    )
     expected_decision = _digest({
-        "schema": "strategy-governance-decision.v6",
+        "schema": decision_contract,
         "trade_date": trade_date,
         "build_commit_sha": str(result.get("build_commit_sha") or ""),
         "input_hash": str(result.get("input_hash") or ""),
@@ -11823,21 +25676,37 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         ),
         "candidate_set_hash": candidate_hash,
         "allocation_snapshot_hash": allocation_hash,
+        "paper_execution_plan_hash": str(
+            result.get("paper_execution_plan_hash") or ""
+        ),
         "pool_snapshot_hash": pool_hash,
+        "candidate_industry_snapshot_hash": industry_snapshot_hash,
+        "funding_checkpoint_manifest_hash": str(
+            funding_manifest.get("manifest_hash") or ""
+        ),
+        **statistical_extension["top"],
         "strategies": [{
             "strategy_key": str(item.get("strategy_key") or ""),
             "strategy_version": str(item.get("current_version") or ""),
             "enabled": bool(item.get("enabled")),
-            "projected_status": str(item.get("current_status") or ""),
+            "projected_status": str(
+                item.get("projected_status")
+                or item.get("current_status") or ""
+            ),
+            **statistical_extension["strategies"][index],
             "funding_gate_hash": str(item.get("funding_gate_hash") or ""),
-        } for item in strategies],
+        } for index, item in enumerate(strategies)],
         "combinations": [{
             "combination_key": str(item.get("combination_key") or ""),
             "combination_version": str(item.get("current_version") or ""),
             "enabled": bool(item.get("enabled")),
-            "projected_status": str(item.get("current_status") or ""),
+            "projected_status": str(
+                item.get("projected_status")
+                or item.get("current_status") or ""
+            ),
+            **statistical_extension["combinations"][index],
             "funding_gate_hash": str(item.get("funding_gate_hash") or ""),
-        } for item in combinations],
+        } for index, item in enumerate(combinations)],
     })
     if (
         expected_decision != str(result.get("decision_hash") or "")
@@ -11845,6 +25714,16 @@ def _validate_canonical_governance_result(result: dict[str, Any]) -> None:
         or _int(summary.get("eligible_candidate_count"), -1)
         != sum(item.get("paper_allocation_eligible") is True for item in candidates)
         or _num(summary.get("market_risk_cap_pct"), -1.0) != risk_cap
+        or (
+            decision_contract == STATISTICAL_DECISION_CONTRACT
+            and any(
+                summary.get(field) != value
+                for field, value in {
+                    "decision_contract_version": decision_contract,
+                    **statistical_extension["top"],
+                }.items()
+            )
+        )
     ):
         raise RuntimeError("canonical治理决策哈希或汇总不可复算")
 
@@ -11876,11 +25755,17 @@ def _canonical_governance_result_from_row(
     ):
         raise RuntimeError("canonical治理完整结果身份与运行账本不一致")
     _validate_canonical_governance_result(result)
+    v7_funding = (
+        result.get("decision_contract_version")
+        == STATISTICAL_DECISION_CONTRACT
+    )
     return {
         **result,
         "canonical_result_hash": expected_hash,
         "result_mode": "CANONICAL_PERSISTED",
         "is_canonical": True,
+        "statistical_funding_eligible": v7_funding,
+        "legacy_statistical_display_only": not v7_funding,
     }
 
 
@@ -11944,10 +25829,14 @@ def _stable_dynamic_input(value: Any) -> Any:
     return value
 
 
-def _governance_source_input_hash(snapshot: dict[str, Any]) -> str:
+def _governance_source_input_hash(
+    snapshot: dict[str, Any],
+    candidate_industry_snapshot: dict[str, Any] | None = None,
+    statistical_input_binding: dict[str, Any] | None = None,
+) -> str:
     """Hash only stable source inputs; exclude run ids and wall-clock fields."""
 
-    return _digest({
+    payload = {
         "schema": "strategy-governance-source-input.v1",
         "trade_date": snapshot.get("trade_date"),
         "data_date": snapshot.get("data_date"),
@@ -11963,10 +25852,14 @@ def _governance_source_input_hash(snapshot: dict[str, Any]) -> str:
         "dynamic_adapter_statuses": _stable_dynamic_input(snapshot.get(
             "dynamic_adapter_statuses"
         ) or []),
+        "candidate_industry_snapshot": candidate_industry_snapshot or {},
         "strategies": snapshot.get("strategies") or [],
         "candidates": _stable_dynamic_input(snapshot.get("candidates") or []),
         "conflicts": snapshot.get("conflicts") or [],
-    })
+    }
+    if statistical_input_binding is not None:
+        payload["statistical_input_binding"] = statistical_input_binding
+    return _digest(payload)
 
 
 def governance_snapshot(
@@ -12021,6 +25914,8 @@ def governance_snapshot(
 
         strategy_snapshot = build_strategy_center_snapshot(
             trade_date,
+            # Compatibility bound for candidate-stock source rows only.
+            # load_registry() below remains complete and unbounded by it.
             limit=max(1, min(500, int(strategy_limit))),
             fresh_market=persist,
         )
@@ -12060,7 +25955,16 @@ def governance_snapshot(
             raise ValueError(
                 f"历史日期{target}早于当前治理日期{latest_completed}，只能回看不能修改当前生命周期"
             )
+    statistical_inventory = _load_statistical_trial_inventory()
+    statistical_inventory_compact = _compact_statistical_inventory(
+        statistical_inventory
+    )
     registry = load_registry()
+    # The immutable run identity is allocated before ledger construction so
+    # addressable daily-fact IDs and their branch chain are deterministic.
+    # Economic fact/state hashes deliberately exclude the later result/audit
+    # anchor hashes, avoiding a manifest/result fixed-point cycle.
+    run_uid = uuid.uuid4().hex
     initial_registry_state = {
         row["strategy_key"]: {
             "current_version": str(row["current_version"]),
@@ -12073,14 +25977,58 @@ def governance_snapshot(
     metrics = _metrics_for_registry(
         strategy_snapshot, registry, target,
         authoritative_windows=authoritative_windows,
+        candidate_run_uid=run_uid,
     )
-    rankings = _strategy_rankings(registry, metrics)
-    run_uid = uuid.uuid4().hex
+    strategy_statistical_decisions, strategy_fdr_summary = (
+        _statistical_family_fdr_decisions(
+            entity_type="STRATEGY",
+            current_rows=registry,
+            metrics_by_key=metrics,
+            family=statistical_inventory["strategy"],
+        )
+    )
+    rankings = _strategy_rankings(
+        registry, metrics,
+        statistical_decisions=strategy_statistical_decisions,
+    )
+    required_confirmations = int(
+        STATISTICAL_GUARD_POLICY["required_total_confirmations"]
+    )
+    strategy_confirmation_gaps = {
+        (row["strategy_key"], row["current_version"]): (
+            _inventory_confirmation_gap_sessions(
+                "STRATEGY", row, statistical_inventory,
+            )
+        )
+        for row in rankings
+    }
+    maximum_strategy_gap = max(
+        strategy_confirmation_gaps.values(),
+        default=int(STATISTICAL_GUARD_POLICY[
+            "minimum_confirmation_sessions"
+        ]),
+    )
+    (
+        strategy_confirmation_sessions,
+        strategy_confirmation_calendar_receipt,
+    ) = _authoritative_confirmation_session_bundle(
+        target,
+        session_count=1 + (required_confirmations - 1) * maximum_strategy_gap,
+    )
+    strategy_expected_confirmation_sessions = [
+        {"trade_date": day} for day in strategy_confirmation_sessions[1:]
+    ]
+    strategy_lifecycle_facts = _prefetch_lifecycle_facts(
+        "STRATEGY", target,
+        history_limit=len(strategy_expected_confirmation_sessions),
+        expected_session_rows=strategy_expected_confirmation_sessions,
+    )
     transition_plans: list[dict[str, Any]] = []
     for row in rankings:
         current_status = row["current_status"]
         suspension_boundary = _latest_suspension_boundary(
-            "STRATEGY", row["strategy_key"], row["current_version"]
+            "STRATEGY", row["strategy_key"], row["current_version"],
+            prefetched_boundaries=strategy_lifecycle_facts["boundaries"],
         )
         row["suspension_boundary"] = suspension_boundary
         recommended, reason = _recommend_strategy_row(row)
@@ -12095,7 +26043,13 @@ def governance_snapshot(
             suspension_boundary=suspension_boundary,
             blockers=[] if row.get("enabled") else ["策略已禁用"],
         )
-        recommended, reason = _confirmed_funding_status(
+        confirmation_gap = strategy_confirmation_gaps[(
+            row["strategy_key"], row["current_version"],
+        )]
+        entity_confirmation_sessions = strategy_confirmation_sessions[
+            :1 + (required_confirmations - 1) * confirmation_gap
+        ]
+        recommended, reason, confirmation_guard = _confirmed_funding_status(
             entity_type="STRATEGY",
             entity_key=row["strategy_key"],
             entity_version=row["current_version"],
@@ -12103,15 +26057,36 @@ def governance_snapshot(
             recommended_status=recommended,
             reason=reason,
             trade_date=target,
-            funding_gate_hash=row["funding_gate_hash"],
+            funding_gate_hash=row["pre_confirmation_funding_gate_hash"],
             funding_evidence_revision_at=row[
                 "funding_evidence_revision_at"
             ],
+            minimum_new_sessions=confirmation_gap,
+            authoritative_sessions_desc=entity_confirmation_sessions,
+            calendar_receipt_binding=(
+                strategy_confirmation_calendar_receipt
+            ),
             suspension_boundary=suspension_boundary,
+            confirmation_history=strategy_lifecycle_facts["histories"].get((
+                row["strategy_key"], row["current_version"],
+            ), []),
+            expected_session_rows=strategy_expected_confirmation_sessions,
         )
         row["recommended_status"] = recommended
+        row["projected_status"] = recommended
         row["recommended_status_label"] = LIFECYCLE_LABELS[recommended]
         row["recommendation_reason"] = reason
+        row["confirmation_guard"] = confirmation_guard
+        row["paper_allocation_eligible"] = bool(
+            recommended in {"ACTIVE", "REDUCE"}
+            and row["profit_gate_passed"]
+            and confirmation_guard.get("passed") is True
+            and row.get("execution_adapter_executable") is True
+            and row.get("market_route_eligible") is True
+        )
+        row["funding_gate_hash"] = _finalize_funding_gate_hash(
+            row, entity_type="STRATEGY",
+        )
         if persist and recommended != current_status:
             transition_plans.append({
                 "entity_type": "STRATEGY",
@@ -12123,7 +26098,20 @@ def governance_snapshot(
                 "evidence": {
                     "run_uid": run_uid, "trade_date": target,
                     "multi_window_gate": row["multi_window_gate"],
+                    "decision_contract_version": (
+                        STATISTICAL_DECISION_CONTRACT
+                    ),
+                    "pre_confirmation_funding_gate_hash": row[
+                        "pre_confirmation_funding_gate_hash"
+                    ],
                     "funding_gate_hash": row["funding_gate_hash"],
+                    "statistical_family_decision": row[
+                        "statistical_family_decision"
+                    ],
+                    "statistical_family_passed": row[
+                        "statistical_family_passed"
+                    ],
+                    "confirmation_guard": confirmation_guard,
                     "funding_evidence_revision_at": row[
                         "funding_evidence_revision_at"
                     ],
@@ -12132,12 +26120,6 @@ def governance_snapshot(
             row["current_status"] = recommended
             row["status_label"] = LIFECYCLE_LABELS[recommended]
             row["status_reason"] = reason
-            row["paper_allocation_eligible"] = (
-                recommended in {"ACTIVE", "REDUCE"}
-                and row["profit_gate_passed"]
-                and row.get("execution_adapter_executable") is True
-                and row.get("market_route_eligible") is True
-            )
             row["lane"] = "正式赛道" if recommended in {"ACTIVE", "REDUCE"} else "观察赛道" if recommended == "SHADOW" else "暂停赛道" if recommended == "SUSPENDED" else "历史档案"
     if persist:
         lane_order = {"ACTIVE": 0, "REDUCE": 0, "SHADOW": 1, "SUSPENDED": 2, "RETIRED": 3}
@@ -12165,13 +26147,53 @@ def governance_snapshot(
         entity_type="COMBINATION",
         current_versions=combination_versions,
     )
+    combination_statistical_context: dict[str, Any] = {}
     combinations = _combination_rankings(
-        combination_registry, rankings, combination_metrics, target
+        combination_registry, rankings, combination_metrics, target,
+        statistical_family=statistical_inventory["combination"],
+        statistical_context=combination_statistical_context,
+    )
+    combination_fdr_summary = combination_statistical_context.get(
+        "summary"
+    ) or {}
+    combination_confirmation_gaps = {
+        (row["combination_key"], row["current_version"]): (
+            _inventory_confirmation_gap_sessions(
+                "COMBINATION", row, statistical_inventory,
+            )
+        )
+        for row in combinations
+    }
+    maximum_combination_gap = max(
+        combination_confirmation_gaps.values(),
+        default=int(STATISTICAL_GUARD_POLICY[
+            "minimum_confirmation_sessions"
+        ]),
+    )
+    (
+        combination_confirmation_sessions,
+        combination_confirmation_calendar_receipt,
+    ) = _authoritative_confirmation_session_bundle(
+        target,
+        session_count=(
+            1 + (required_confirmations - 1)
+            * maximum_combination_gap
+        ),
+    )
+    combination_expected_confirmation_sessions = [
+        {"trade_date": day}
+        for day in combination_confirmation_sessions[1:]
+    ]
+    combination_lifecycle_facts = _prefetch_lifecycle_facts(
+        "COMBINATION", target,
+        history_limit=len(combination_expected_confirmation_sessions),
+        expected_session_rows=combination_expected_confirmation_sessions,
     )
     for row in combinations:
         current_status = row["current_status"]
         suspension_boundary = _latest_suspension_boundary(
-            "COMBINATION", row["combination_key"], row["current_version"]
+            "COMBINATION", row["combination_key"], row["current_version"],
+            prefetched_boundaries=combination_lifecycle_facts["boundaries"],
         )
         row["suspension_boundary"] = suspension_boundary
         recovery_blockers = []
@@ -12194,7 +26216,13 @@ def governance_snapshot(
             suspension_boundary=suspension_boundary,
             blockers=recovery_blockers,
         )
-        recommended, reason = _confirmed_funding_status(
+        confirmation_gap = combination_confirmation_gaps[(
+            row["combination_key"], row["current_version"],
+        )]
+        entity_confirmation_sessions = combination_confirmation_sessions[
+            :1 + (required_confirmations - 1) * confirmation_gap
+        ]
+        recommended, reason, confirmation_guard = _confirmed_funding_status(
             entity_type="COMBINATION",
             entity_key=row["combination_key"],
             entity_version=row["current_version"],
@@ -12202,15 +26230,40 @@ def governance_snapshot(
             recommended_status=recommended,
             reason=reason,
             trade_date=target,
-            funding_gate_hash=row["funding_gate_hash"],
+            funding_gate_hash=row["pre_confirmation_funding_gate_hash"],
             funding_evidence_revision_at=row[
                 "funding_evidence_revision_at"
             ],
+            minimum_new_sessions=confirmation_gap,
+            authoritative_sessions_desc=entity_confirmation_sessions,
+            calendar_receipt_binding=(
+                combination_confirmation_calendar_receipt
+            ),
             suspension_boundary=suspension_boundary,
+            confirmation_history=combination_lifecycle_facts["histories"].get((
+                row["combination_key"], row["current_version"],
+            ), []),
+            expected_session_rows=combination_expected_confirmation_sessions,
         )
         row["recommended_status"] = recommended
+        row["projected_status"] = recommended
         row["recommended_status_label"] = LIFECYCLE_LABELS[recommended]
         row["recommendation_reason"] = reason
+        row["confirmation_guard"] = confirmation_guard
+        row["paper_allocation_eligible"] = bool(
+            recommended in {"ACTIVE", "REDUCE"}
+            and row["profit_gate_passed"]
+            and confirmation_guard.get("passed") is True
+            and (row.get("combination_recipe_ref") or {}).get(
+                "member_fact_sets_ready"
+            ) is True
+            and row.get("market_route_eligible") is True
+            and (row.get("constraint_evaluation") or {}).get("passed")
+            is True
+        )
+        row["funding_gate_hash"] = _finalize_funding_gate_hash(
+            row, entity_type="COMBINATION",
+        )
         if persist and recommended != current_status:
             transition_plans.append({
                 "entity_type": "COMBINATION",
@@ -12222,7 +26275,20 @@ def governance_snapshot(
                 "evidence": {
                     "run_uid": run_uid, "trade_date": target,
                     "multi_window_gate": row["multi_window_gate"],
+                    "decision_contract_version": (
+                        STATISTICAL_DECISION_CONTRACT
+                    ),
+                    "pre_confirmation_funding_gate_hash": row[
+                        "pre_confirmation_funding_gate_hash"
+                    ],
                     "funding_gate_hash": row["funding_gate_hash"],
+                    "statistical_family_decision": row[
+                        "statistical_family_decision"
+                    ],
+                    "statistical_family_passed": row[
+                        "statistical_family_passed"
+                    ],
+                    "confirmation_guard": confirmation_guard,
                     "funding_evidence_revision_at": row[
                         "funding_evidence_revision_at"
                     ],
@@ -12231,13 +26297,6 @@ def governance_snapshot(
             row["current_status"] = recommended
             row["status_label"] = LIFECYCLE_LABELS[recommended]
             row["status_reason"] = reason
-            row["paper_allocation_eligible"] = (
-                recommended in {"ACTIVE", "REDUCE"}
-                and row["profit_gate_passed"]
-                and row.get("market_route_eligible") is True
-                and (row.get("constraint_evaluation") or {}).get("passed")
-                is True
-            )
             row["lane"] = (
                 "正式赛道" if recommended in {"ACTIVE", "REDUCE"}
                 else "观察赛道" if recommended == "SHADOW"
@@ -12259,12 +26318,37 @@ def governance_snapshot(
             row["rank"] = index
             combination_lane_ranks[row["lane"]] += 1
             row["lane_rank"] = combination_lane_ranks[row["lane"]]
-    market_state = strategy_snapshot.get("market_state") or {"key": "unknown", "name": "数据不足"}
-    pools = _build_pools(strategy_snapshot, rankings)
-    _attach_pool_industry_focus(rankings, pools)
-    pool_snapshot, pool_snapshot_hash, _pool_row_hashes = (
-        _pool_snapshot_contract(target, pools)
+    # Freeze the exact persistence set before any pool/allocation decision.
+    # A strategy deferred by the deterministic 8MiB prewarm pack has no
+    # checkpoint candidate in ``rankings`` and therefore cannot receive even
+    # simulated funding.  Combination recipes are bound below; until that
+    # proof exists they are fail-closed as well.
+    funding_checkpoint_manifest, funding_checkpoint_candidates = (
+        _build_funding_checkpoint_manifest(
+            run_uid=run_uid,
+            trade_date=target,
+            strategies=rankings,
+            combinations=combinations,
+        )
     )
+    market_state = strategy_snapshot.get("market_state") or {"key": "unknown", "name": "数据不足"}
+    candidate_stock_codes = sorted({
+        str(row.get("stock_code") or "").strip().zfill(6)
+        for row in (strategy_snapshot.get("candidates") or [])
+        if re.fullmatch(
+            r"[0-9]{1,6}", str(row.get("stock_code") or "").strip()
+        )
+    })
+    # Load one exact-date immutable QMT L1 view before any pool decision.  All
+    # pool levels and the paper plan below consume this same hash-bound object.
+    candidate_industry_snapshot = _frozen_industry_snapshot(
+        target, candidate_stock_codes,
+    )
+    pools = _build_pools(
+        strategy_snapshot, rankings,
+        industry_snapshot=candidate_industry_snapshot,
+    )
+    _attach_pool_industry_focus(rankings, pools)
     trading_gate = _snapshot_trading_gate(strategy_snapshot)
     trading_allowed = trading_gate["trading_allowed"] is True
     allocation_candidates = _allocation_candidate_contract(
@@ -12283,6 +26367,14 @@ def governance_snapshot(
         trading_allowed=trading_allowed,
         candidate_contract=allocation_candidates,
         trading_gate=trading_gate,
+    )
+    paper_execution_plan = _build_allocation_backed_paper_plan(
+        target, pools, allocations, rankings,
+        industry_snapshot=candidate_industry_snapshot,
+    )
+    paper_execution_plan_hash = str(paper_execution_plan["plan_hash"])
+    pool_snapshot, pool_snapshot_hash, _pool_row_hashes = (
+        _pool_snapshot_contract(target, pools)
     )
     allocation_snapshot_rows = _allocation_snapshot_contract(allocations)
     allocation_snapshot_payload = {
@@ -12319,6 +26411,45 @@ def governance_snapshot(
             target, run_uid, transition_plans
         )
     )
+    statistical_input_payload = {
+        "schema": "probiga.strategy-statistical-input-binding.v1",
+        "decision_contract_version": STATISTICAL_DECISION_CONTRACT,
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "inventory_compact_hash": str(
+            statistical_inventory_compact.get("compact_hash") or ""
+        ),
+        "inventory_result_hash": str(
+            statistical_inventory.get("result_hash") or ""
+        ),
+        "strategy_fdr_summary_hash": str(
+            strategy_fdr_summary.get("summary_hash") or ""
+        ),
+        "combination_fdr_summary_hash": str(
+            combination_fdr_summary.get("summary_hash") or ""
+        ),
+        "strategy_confirmation_authority": {
+            "maximum_gap_sessions": maximum_strategy_gap,
+            "session_count": len(strategy_confirmation_sessions),
+            "session_set_hash": _digest({
+                "schema": "probiga.authoritative-confirmation-sessions.v1",
+                "sessions": strategy_confirmation_sessions,
+            }),
+        },
+        "combination_confirmation_authority": {
+            "maximum_gap_sessions": maximum_combination_gap,
+            "session_count": len(combination_confirmation_sessions),
+            "session_set_hash": _digest({
+                "schema": "probiga.authoritative-confirmation-sessions.v1",
+                "sessions": combination_confirmation_sessions,
+            }),
+        },
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    statistical_input_binding = {
+        **statistical_input_payload,
+        "binding_hash": _digest(statistical_input_payload),
+    }
     status_counts = {status: sum(1 for row in rankings if row["current_status"] == status) for status in LIFECYCLE_LABELS}
     summary = {
         "strategy_count": len(rankings),
@@ -12358,15 +26489,71 @@ def governance_snapshot(
         ),
         "candidate_set_hash": candidate_set_hash,
         "allocation_snapshot_hash": allocation_snapshot_hash,
+        "paper_execution_plan_hash": paper_execution_plan_hash,
+        "candidate_industry_snapshot_id": str(
+            candidate_industry_snapshot.get("snapshot_id") or ""
+        ),
+        "candidate_industry_snapshot_hash": str(
+            candidate_industry_snapshot.get("snapshot_hash") or ""
+        ),
+        "candidate_industry_snapshot_status": str(
+            candidate_industry_snapshot.get("status") or "MISSING"
+        ),
+        "paper_target_count": paper_execution_plan["target_count"],
+        "paper_invested_weight_pct": (
+            paper_execution_plan["invested_bp"] / 100.0
+        ),
         "automatic_transition_count": automatic_transition_plan[
             "transition_count"
         ],
         "automatic_transition_plan_hash": automatic_transition_plan_hash,
+        "decision_contract_version": STATISTICAL_DECISION_CONTRACT,
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "statistical_inventory_compact_hash": str(
+            statistical_inventory_compact.get("compact_hash") or ""
+        ),
+        "strategy_fdr_summary_hash": str(
+            strategy_fdr_summary.get("summary_hash") or ""
+        ),
+        "combination_fdr_summary_hash": str(
+            combination_fdr_summary.get("summary_hash") or ""
+        ),
+        "statistical_input_binding_hash": str(
+            statistical_input_binding["binding_hash"]
+        ),
     }
-    input_hash = _governance_source_input_hash(strategy_snapshot)
+    input_hash = _governance_source_input_hash(
+        strategy_snapshot, candidate_industry_snapshot,
+        statistical_input_binding,
+    )
     build_commit_sha = _governance_build_commit_sha()
+    summary["funding_checkpoint_manifest_hash"] = str(
+        funding_checkpoint_manifest["manifest_hash"]
+    )
+    summary["funding_checkpoint_eligible_count"] = _int(
+        funding_checkpoint_manifest["coverage"]["eligible_count"]
+    )
+    summary["funding_checkpointed_count"] = _int(
+        funding_checkpoint_manifest["coverage"]["checkpointed_count"]
+    )
+    summary["funding_strategy_checkpoint_count"] = _int(
+        funding_checkpoint_manifest["coverage"][
+            "strategy_checkpoint_count"
+        ]
+    )
+    summary["funding_combination_recipe_count"] = _int(
+        funding_checkpoint_manifest["coverage"][
+            "combination_recipe_count"
+        ]
+    )
+    summary["funding_ready_count"] = _int(
+        funding_checkpoint_manifest["coverage"]["funding_ready_count"]
+    )
+    summary["funding_checkpoint_ineligible_count"] = _int(
+        funding_checkpoint_manifest["coverage"]["ineligible_count"]
+    )
     decision_hash = _digest({
-        "schema": "strategy-governance-decision.v6",
+        "schema": STATISTICAL_DECISION_CONTRACT,
         "trade_date": target,
         "build_commit_sha": build_commit_sha,
         "input_hash": input_hash,
@@ -12378,13 +26565,47 @@ def governance_snapshot(
         "eligible_candidate_count": summary["eligible_candidate_count"],
         "candidate_set_hash": candidate_set_hash,
         "allocation_snapshot_hash": allocation_snapshot_hash,
+        "paper_execution_plan_hash": paper_execution_plan_hash,
         "pool_snapshot_hash": pool_snapshot_hash,
+        "candidate_industry_snapshot_hash": str(
+            candidate_industry_snapshot.get("snapshot_hash") or ""
+        ),
+        "funding_checkpoint_manifest_hash": str(
+            funding_checkpoint_manifest["manifest_hash"]
+        ),
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "statistical_inventory_compact_hash": str(
+            statistical_inventory_compact.get("compact_hash") or ""
+        ),
+        "strategy_fdr_summary_hash": str(
+            strategy_fdr_summary.get("summary_hash") or ""
+        ),
+        "combination_fdr_summary_hash": str(
+            combination_fdr_summary.get("summary_hash") or ""
+        ),
+        "statistical_input_binding_hash": str(
+            statistical_input_binding["binding_hash"]
+        ),
         "strategies": [
             {
                 "strategy_key": row["strategy_key"],
                 "strategy_version": row["current_version"],
                 "enabled": bool(row.get("enabled")),
-                "projected_status": row["current_status"],
+                "projected_status": row.get("projected_status")
+                or row["current_status"],
+                "pre_confirmation_funding_gate_hash": row[
+                    "pre_confirmation_funding_gate_hash"
+                ],
+                "statistical_family_decision_hash": str(
+                    (row.get("statistical_family_decision") or {}).get(
+                        "decision_hash"
+                    ) or ""
+                ),
+                "confirmation_guard_hash": str(
+                    (row.get("confirmation_guard") or {}).get(
+                        "compact_hash"
+                    ) or ""
+                ),
                 "funding_gate_hash": row["funding_gate_hash"],
             }
             for row in rankings
@@ -12394,7 +26615,21 @@ def governance_snapshot(
                 "combination_key": row["combination_key"],
                 "combination_version": row["current_version"],
                 "enabled": bool(row.get("enabled")),
-                "projected_status": row["current_status"],
+                "projected_status": row.get("projected_status")
+                or row["current_status"],
+                "pre_confirmation_funding_gate_hash": row[
+                    "pre_confirmation_funding_gate_hash"
+                ],
+                "statistical_family_decision_hash": str(
+                    (row.get("statistical_family_decision") or {}).get(
+                        "decision_hash"
+                    ) or ""
+                ),
+                "confirmation_guard_hash": str(
+                    (row.get("confirmation_guard") or {}).get(
+                        "compact_hash"
+                    ) or ""
+                ),
                 "funding_gate_hash": row["funding_gate_hash"],
             }
             for row in combinations
@@ -12414,6 +26649,15 @@ def governance_snapshot(
         "input_reason": input_reason,
         "input_hash": input_hash,
         "build_commit_sha": build_commit_sha,
+        "decision_contract_version": STATISTICAL_DECISION_CONTRACT,
+        "statistical_funding_eligible": True,
+        "legacy_statistical_display_only": False,
+        "statistical_policy": STATISTICAL_GUARD_POLICY,
+        "statistical_policy_hash": STATISTICAL_POLICY_HASH,
+        "statistical_inventory": statistical_inventory_compact,
+        "strategy_fdr_summary": strategy_fdr_summary,
+        "combination_fdr_summary": combination_fdr_summary,
+        "statistical_input_binding": statistical_input_binding,
         "router_policy_version": MARKET_ROUTER_POLICY_VERSION,
         "router_snapshot_hash": router_snapshot_hash,
         "router_snapshot": router_snapshot_payload,
@@ -12421,10 +26665,17 @@ def governance_snapshot(
         "allocation_candidate_set": allocation_candidates,
         "candidate_set_hash": candidate_set_hash,
         "allocation_snapshot_hash": allocation_snapshot_hash,
+        "paper_execution_plan": paper_execution_plan,
+        "paper_execution_plan_hash": paper_execution_plan_hash,
+        "candidate_industry_snapshot": candidate_industry_snapshot,
+        "candidate_industry_snapshot_hash": str(
+            candidate_industry_snapshot.get("snapshot_hash") or ""
+        ),
         "pool_snapshot": pool_snapshot,
         "pool_snapshot_hash": pool_snapshot_hash,
         "automatic_transition_plan": automatic_transition_plan,
         "automatic_transition_plan_hash": automatic_transition_plan_hash,
+        "funding_checkpoint_manifest": funding_checkpoint_manifest,
         "decision_hash": decision_hash,
         "idempotent_replay": False,
         "operator": str(operator or "daily_governance")[:80],
@@ -12433,9 +26684,9 @@ def governance_snapshot(
         "candidate_source": strategy_snapshot.get("candidate_source") or {},
         "market_state": market_state,
         "status_labels": LIFECYCLE_LABELS,
-        "adapter_capabilities": strategy_execution_adapter_capabilities()[
-            "adapters"
-        ],
+        "adapter_capabilities": strategy_execution_adapter_capabilities(
+            registry_rows=registry,
+        )["adapters"],
         "profit_gate_policy": PROFIT_GATE_POLICY,
         "health_score_weights": HEALTH_SCORE_WEIGHTS,
         "summary": summary,
@@ -12445,6 +26696,7 @@ def governance_snapshot(
         "allocations": allocations,
         "lifecycle_transitions": [],
         "automatic_real_order_submission": False,
+        "real_order_authority": False,
         "no_qualified_strategy_policy": "没有合格策略或组合时，模拟资金保持现金，不强制交易",
     }
     if persist:
@@ -12459,6 +26711,15 @@ def governance_snapshot(
                 else connection.begin()
             )
             with transaction_scope:
+                _lock_global_evidence_namespace(connection)
+                locked_statistical_inventory = (
+                    _load_statistical_trial_inventory(
+                        connection=connection, locking_read=True,
+                    )
+                )
+                _require_stable_statistical_inventory(
+                    statistical_inventory, locked_statistical_inventory,
+                )
                 locked_registry_rows = connection.execute(text(
                     "SELECT strategy_key, current_version, current_status, "
                     "enabled FROM st_strategy_registry "
@@ -12572,7 +26833,11 @@ def governance_snapshot(
                 payload["lifecycle_transitions"] = transitions
                 _persist_health(connection, run_uid, target, rankings)
                 _persist_combinations(connection, payload)
-                _persist_run(connection, payload)
+                _persist_run(
+                    connection,
+                    payload,
+                    funding_checkpoint_candidates=funding_checkpoint_candidates,
+                )
         except IntegrityError:
             existing = _db_read(
                 "SELECT run_uid, run_revision, supersedes_run_uid, "
@@ -12594,17 +26859,519 @@ def governance_snapshot(
     return payload
 
 
-def governance_history(limit: int = 100) -> dict[str, Any]:
+GOVERNANCE_HISTORY_SECTION_PAGE_MAX = 100
+GOVERNANCE_HISTORY_SECTION_PAGE_SCHEMA = (
+    "probiga.strategy-governance-history-section-page.v1"
+)
+
+
+def _governance_history_section_cursor(
+    *, section: str, filters_hash: str, limit: int,
+    revision_hash: str, revision_count: int,
+    high_timestamp: str, high_id: str,
+    after_timestamp: str, after_id: str,
+) -> str:
+    payload = {
+        "schema": "probiga.strategy-governance-history-cursor.v1",
+        "section": section,
+        "filters_hash": filters_hash,
+        "limit": limit,
+        "revision_hash": revision_hash,
+        "revision_count": revision_count,
+        "high_timestamp": high_timestamp,
+        "high_id": high_id,
+        "after_timestamp": after_timestamp,
+        "after_id": after_id,
+    }
+    encoded = base64.urlsafe_b64encode(
+        _json_text(payload).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"{encoded}.{_digest(payload)[:32]}"
+
+
+def _parse_governance_history_section_cursor(
+    cursor: str, *, section: str, filters_hash: str, limit: int,
+) -> dict[str, Any]:
+    encoded, separator, supplied_hash = str(cursor or "").partition(".")
+    if separator != "." or not encoded or len(supplied_hash) != 32:
+        raise ValueError("治理历史分页游标格式无效")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(
+            (encoded + padding).encode("ascii")
+        ).decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("治理历史分页游标格式无效") from exc
+    if (
+        not isinstance(payload, dict)
+        or _digest(payload)[:32] != supplied_hash
+        or payload.get("schema")
+        != "probiga.strategy-governance-history-cursor.v1"
+        or payload.get("section") != section
+        or payload.get("filters_hash") != filters_hash
+        or payload.get("limit") != limit
+    ):
+        raise ValueError("治理历史分页游标与筛选或页大小不一致")
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("revision_hash") or ""))
+        or isinstance(payload.get("revision_count"), bool)
+        or not isinstance(payload.get("revision_count"), int)
+        or int(payload["revision_count"]) < 0
+    ):
+        raise ValueError("治理历史分页游标修订身份无效")
+    for field in ("high_timestamp", "after_timestamp"):
+        value = str(payload.get(field) or "")
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("治理历史分页游标时间无效") from exc
+    for field in ("high_id", "after_id"):
+        if not re.fullmatch(r"[0-9a-f]{32}", str(payload.get(field) or "")):
+            raise ValueError("治理历史分页游标稳定标识无效")
+    return payload
+
+
+def governance_history_section_page(
+    section: str, *, limit: int = 80, cursor: str = "",
+    entity_type: str = "", entity_key: str = "", action: str = "",
+    date_from: str = "", date_to: str = "",
+) -> dict[str, Any]:
+    """Page one compact governance ledger without timestamp-tie loss."""
+
+    if not _table_exists("st_strategy_governance_run"):
+        raise RuntimeError("策略治理表尚未由部署流程创建，读取接口不会现场建表")
+    normalized_section = str(section or "").strip().lower()
+    specs = {
+        "lifecycle": {
+            "table": "st_strategy_lifecycle_event",
+            "id": "event_id",
+            "timestamp": "occurred_at",
+            "action": "trigger_type",
+            "entity_type": "entity_type",
+            "entity_key": "entity_key",
+            "select": (
+                "event_id, entity_type, entity_key, entity_version, "
+                "previous_status, next_status, reason, trigger_type, "
+                "event_hash, operator_name, occurred_at, payload_json"
+            ),
+        },
+        "audit": {
+            "table": "st_strategy_governance_audit",
+            "id": "audit_id",
+            "timestamp": "created_at",
+            "action": "action",
+            "entity_type": "entity_type",
+            "entity_key": "entity_key",
+            "select": (
+                "audit_id, entity_type, entity_key, action, reason, "
+                "operator_name, audit_hash, created_at, payload_json"
+            ),
+        },
+        "metric_evidence": {
+            "table": "st_strategy_metric_input",
+            "id": "evidence_id",
+            "timestamp": "created_at",
+            "action": "verification_status",
+            "entity_type": "entity_type",
+            "entity_key": "strategy_key",
+            "select": (
+                "evidence_id, entity_type, strategy_key, strategy_version, "
+                "as_of_date, window_days, metrics_json, source, "
+                "evidence_protocol, artifact_hash, source_dataset_hash, "
+                "evidence_revision_at, verification_status, "
+                "funding_provenance, submitted_by, reviewed_by, reviewed_at, "
+                "evidence_hash, created_at"
+            ),
+        },
+        "adapter_run_receipts": {
+            "table": "st_strategy_adapter_run_receipt",
+            "id": "run_uid",
+            "timestamp": "completed_at",
+            "action": "status",
+            "entity_type": "",
+            "fixed_entity_type": "STRATEGY",
+            "entity_key": "strategy_key",
+            "select": (
+                "run_uid, strategy_key, strategy_version, "
+                "strategy_version_hash, trade_date, completed_at, status, "
+                "execution_binding_hash, adapter_artifact_sha256, "
+                "cost_model_hash, adapter_key, adapter_version, input_hash, "
+                "output_hash, stable_result_hash, candidate_count, "
+                "candidate_identity_json, receipt_json, receipt_hash, "
+                "created_at"
+            ),
+        },
+        "runs": {
+            "table": "st_strategy_governance_run",
+            "id": "run_uid",
+            "timestamp": "created_at",
+            "action": "status",
+            "entity_type": "",
+            "fixed_entity_type": "SYSTEM",
+            "entity_key": "",
+            "select": (
+                "run_uid, trade_date, run_revision, supersedes_run_uid, "
+                "is_canonical, market_state, source_status, input_ready, "
+                "input_hash, build_commit_sha, decision_hash, result_hash, "
+                "status, strategy_count, formal_count, shadow_count, "
+                "combination_count, observation_count, confirmation_count, "
+                "tradable_count, allocation_count, created_at, finished_at"
+            ),
+        },
+    }
+    if normalized_section not in specs:
+        raise ValueError("治理历史分页类型无效")
+    if isinstance(limit, bool) or not 1 <= int(limit) <= (
+        GOVERNANCE_HISTORY_SECTION_PAGE_MAX
+    ):
+        raise ValueError("治理历史每页只能读取1至100行")
+    normalized_type = str(entity_type or "").strip().upper()
+    if normalized_type and normalized_type not in {
+        "STRATEGY", "COMBINATION", "SYSTEM",
+    }:
+        raise ValueError("历史筛选实体类型无效")
+    normalized_key = str(entity_key or "").strip()
+    if len(normalized_key) > 80:
+        raise ValueError("历史筛选实体代码过长")
+    normalized_action = str(action or "").strip().upper()
+    if len(normalized_action) > 40:
+        raise ValueError("历史筛选动作过长")
+    start = _trade_date(date_from, default_today=False) if date_from else ""
+    end = _trade_date(date_to, default_today=False) if date_to else ""
+    if start and end and start > end:
+        raise ValueError("历史筛选起始日期不能晚于结束日期")
+    filters = {
+        "entity_type": normalized_type,
+        "entity_key": normalized_key,
+        "action": normalized_action,
+        "date_from": start,
+        "date_to": end,
+    }
+    filters_hash = _digest({
+        "schema": "probiga.strategy-governance-history-filters.v1",
+        "section": normalized_section,
+        **filters,
+    })
+    page_limit = int(limit)
+    cursor_payload = (
+        _parse_governance_history_section_cursor(
+            cursor,
+            section=normalized_section,
+            filters_hash=filters_hash,
+            limit=page_limit,
+        ) if cursor else None
+    )
+    spec = specs[normalized_section]
+    timestamp_column = spec["timestamp"]
+    id_column = spec["id"]
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+    entity_type_column = str(spec.get("entity_type") or "")
+    fixed_entity_type = str(spec.get("fixed_entity_type") or "")
+    entity_key_column = str(spec.get("entity_key") or "")
+    if normalized_type:
+        if entity_type_column:
+            clauses.append(f"{entity_type_column}=:history_entity_type")
+            params["history_entity_type"] = normalized_type
+        elif fixed_entity_type != normalized_type:
+            clauses.append("1=0")
+    if normalized_key:
+        if not entity_key_column:
+            raise ValueError("该治理历史分区不支持对象代码筛选")
+        clauses.append(f"{entity_key_column}=:history_entity_key")
+        params["history_entity_key"] = normalized_key
+    if normalized_action:
+        clauses.append(f"{spec['action']}=:history_action")
+        params["history_action"] = normalized_action
+    if start:
+        clauses.append(f"DATE({timestamp_column})>=:history_date_from")
+        params["history_date_from"] = start
+    if end:
+        clauses.append(f"DATE({timestamp_column})<=:history_date_to")
+        params["history_date_to"] = end
+    base_where = " WHERE " + " AND ".join(clauses) if clauses else ""
+
+    def revision_anchor() -> dict[str, Any]:
+        # One statement binds the count and top tuple to one database snapshot.
+        # These tables are append-only governance ledgers; the count also catches
+        # a same-timestamp append whose random UUID sorts below the former top row.
+        anchor_rows = _db_read(
+            "SELECT "
+            f"(SELECT COUNT(*) FROM {spec['table']}{base_where}) AS total_count, "
+            f"(SELECT {timestamp_column} FROM {spec['table']}{base_where} "
+            f"ORDER BY {timestamp_column} DESC, {id_column} DESC LIMIT 1) "
+            "AS high_timestamp, "
+            f"(SELECT {id_column} FROM {spec['table']}{base_where} "
+            f"ORDER BY {timestamp_column} DESC, {id_column} DESC LIMIT 1) "
+            "AS high_id",
+            params,
+        )
+        anchor = anchor_rows[0] if anchor_rows else {}
+        total_count = _int(anchor.get("total_count"), 0)
+        high_timestamp = str(anchor.get("high_timestamp") or "")
+        high_id = str(anchor.get("high_id") or "")
+        if total_count > 0:
+            try:
+                datetime.fromisoformat(high_timestamp.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise RuntimeError("治理历史高水位时间无效") from exc
+            if not re.fullmatch(r"[0-9a-f]{32}", high_id):
+                raise RuntimeError("治理历史高水位标识无效")
+        elif high_timestamp or high_id:
+            raise RuntimeError("治理历史空集高水位无效")
+        revision_hash = _digest({
+            "schema": "probiga.strategy-governance-history-revision.v1",
+            "section": normalized_section,
+            "filters_hash": filters_hash,
+            "total_count": total_count,
+            "high_timestamp": high_timestamp,
+            "high_id": high_id,
+        })
+        return {
+            "total_count": total_count,
+            "high_timestamp": high_timestamp,
+            "high_id": high_id,
+            "revision_hash": revision_hash,
+        }
+
+    anchor_before = revision_anchor()
+    if cursor_payload is not None and (
+        str(cursor_payload["revision_hash"]) != anchor_before["revision_hash"]
+        or int(cursor_payload["revision_count"]) != anchor_before["total_count"]
+    ):
+        raise ValueError("治理历史已产生新修订，请从第一页重新读取")
+
+    page_clauses = list(clauses)
+    page_params = dict(params)
+    if cursor_payload is not None:
+        high_timestamp = str(cursor_payload["high_timestamp"])
+        high_id = str(cursor_payload["high_id"])
+        after_timestamp = str(cursor_payload["after_timestamp"])
+        after_id = str(cursor_payload["after_id"])
+        page_clauses.append(
+            f"({timestamp_column}<:history_high_ts OR "
+            f"({timestamp_column}=:history_high_ts AND BINARY {id_column}"
+            "<=BINARY :history_high_id))"
+        )
+        page_clauses.append(
+            f"({timestamp_column}<:history_after_ts OR "
+            f"({timestamp_column}=:history_after_ts AND BINARY {id_column}"
+            "<BINARY :history_after_id))"
+        )
+        page_params.update({
+            "history_high_ts": high_timestamp,
+            "history_high_id": high_id,
+            "history_after_ts": after_timestamp,
+            "history_after_id": after_id,
+        })
+    where = " WHERE " + " AND ".join(page_clauses) if page_clauses else ""
+    page_params["fetch_limit"] = page_limit + 1
+    rows = _db_read(
+        f"SELECT {spec['select']} FROM {spec['table']}{where} "
+        f"ORDER BY {timestamp_column} DESC, {id_column} DESC "
+        "LIMIT :fetch_limit",
+        page_params,
+    )
+    has_more = len(rows) > page_limit
+    rows = rows[:page_limit]
+    for row in rows:
+        if normalized_section in {"lifecycle", "audit"}:
+            payload_value = _json(row.pop("payload_json", None), None)
+            hash_field = (
+                "event_hash" if normalized_section == "lifecycle"
+                else "audit_hash"
+            )
+            row["hash_valid"] = bool(
+                isinstance(payload_value, dict)
+                and _digest(payload_value) == str(row.get(hash_field) or "")
+            )
+        if normalized_section == "lifecycle":
+            row["previous_status_label"] = LIFECYCLE_LABELS.get(
+                str(row.get("previous_status") or ""), "未知状态"
+            )
+            row["next_status_label"] = LIFECYCLE_LABELS.get(
+                str(row.get("next_status") or ""), "未知状态"
+            )
+        elif normalized_section == "metric_evidence":
+            submission = _metric_submission_contract(row)
+            row["hash_valid"] = bool(
+                isinstance(submission, dict)
+                and _digest(submission) == str(row.get("evidence_hash") or "")
+            )
+            metrics = _json(row.pop("metrics_json", None), {})
+            row["verification_status_label"] = EVIDENCE_STATUS_LABELS.get(
+                str(row.get("verification_status") or ""), "未知复核状态"
+            )
+            row["independent_review"] = bool(
+                row.get("reviewed_by")
+                and str(row.get("reviewed_by"))
+                != str(row.get("submitted_by") or "")
+            )
+            row.update({
+                "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+                "source_authority_label": (
+                    EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL
+                ),
+                "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+                "funding_authority": False,
+                "real_order_authority": False,
+            })
+            row["metrics"] = {
+                key: metrics.get(key)
+                for key in (
+                    "completed_trades", "coverage_days",
+                    "net_expectancy_pct", "payoff_ratio", "profit_factor",
+                    "max_drawdown_pct", "cost_stress_expectancy_pct",
+                )
+            }
+        elif normalized_section == "adapter_run_receipts":
+            raw_receipt = _json(row.get("receipt_json"), None)
+            try:
+                verified = verify_persisted_strategy_adapter_run_receipt(
+                    raw_receipt, row,
+                )
+                row["candidate_identity_count"] = len(
+                    verified["candidate_identity"]
+                )
+                row["candidate_identity_hash"] = _digest(
+                    verified["candidate_identity"]
+                )
+                row["hash_valid"] = True
+            except ValueError:
+                row["candidate_identity_count"] = 0
+                row["candidate_identity_hash"] = ""
+                row["hash_valid"] = False
+            row.pop("receipt_json", None)
+            row.pop("candidate_identity_json", None)
+        elif normalized_section == "runs":
+            row["is_canonical"] = bool(_int(row.get("is_canonical")))
+            row["input_ready"] = bool(_int(row.get("input_ready")))
+            row["result_hash_reference_valid"] = bool(
+                _HASH_PATTERN.fullmatch(str(row.get("result_hash") or ""))
+            )
+    anchor_after = revision_anchor()
+    if anchor_after != anchor_before:
+        raise ValueError("治理历史读取期间产生新修订，请重新读取")
+    high_timestamp = str(anchor_before["high_timestamp"])
+    high_id = str(anchor_before["high_id"])
+    revision_hash = str(anchor_before["revision_hash"])
+    next_cursor = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = _governance_history_section_cursor(
+            section=normalized_section,
+            filters_hash=filters_hash,
+            limit=page_limit,
+            revision_hash=revision_hash,
+            revision_count=int(anchor_before["total_count"]),
+            high_timestamp=high_timestamp,
+            high_id=high_id,
+            after_timestamp=str(last.get(timestamp_column) or ""),
+            after_id=str(last.get(id_column) or ""),
+        )
+    page = {
+        "schema": GOVERNANCE_HISTORY_SECTION_PAGE_SCHEMA,
+        "section": normalized_section,
+        "filters": filters,
+        "filters_hash": filters_hash,
+        "history_revision_hash": revision_hash,
+        "total_count": int(anchor_before["total_count"]),
+        "high_watermark": {
+            "timestamp": high_timestamp,
+            "stable_id": high_id,
+        },
+        "limit": page_limit,
+        "row_count": len(rows),
+        "rows": rows,
+        "next_cursor": next_cursor,
+        "raw_payload_inline": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {**page, "page_hash": _digest(page)}
+
+
+def governance_history(
+    limit: int = 100,
+    *,
+    entity_type: str = "",
+    entity_key: str = "",
+    action: str = "",
+    date_from: str = "",
+    date_to: str = "",
+    before: str = "",
+) -> dict[str, Any]:
     if not _table_exists("st_strategy_governance_run"):
         raise RuntimeError("策略治理表尚未由部署流程创建，读取接口不会现场建表")
     limit = max(1, min(500, int(limit)))
+    normalized_type = str(entity_type or "").strip().upper()
+    if normalized_type and normalized_type not in {"STRATEGY", "COMBINATION"}:
+        raise ValueError("历史筛选实体类型无效")
+    normalized_key = str(entity_key or "").strip()
+    normalized_action = str(action or "").strip().upper()
+    start = _trade_date(date_from, default_today=False) if date_from else ""
+    end = _trade_date(date_to, default_today=False) if date_to else ""
+    if start and end and start > end:
+        raise ValueError("历史筛选起始日期不能晚于结束日期")
+    before_value = str(before or "").strip()
+    if before_value:
+        try:
+            datetime.fromisoformat(before_value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("历史游标时间格式无效") from exc
+
+    def filtered_query(
+        base: str,
+        *,
+        timestamp_column: str,
+        order_suffix: str,
+        entity_type_column: str = "",
+        entity_key_column: str = "",
+        action_column: str = "",
+    ) -> tuple[str, dict[str, Any]]:
+        clauses: list[str] = []
+        params: dict[str, Any] = {"limit": limit}
+        if normalized_type and entity_type_column:
+            clauses.append(f"{entity_type_column}=:history_entity_type")
+            params["history_entity_type"] = normalized_type
+        if normalized_key and entity_key_column:
+            clauses.append(f"{entity_key_column}=:history_entity_key")
+            params["history_entity_key"] = normalized_key
+        if normalized_action and action_column:
+            clauses.append(f"{action_column}=:history_action")
+            params["history_action"] = normalized_action
+        if start:
+            clauses.append(f"DATE({timestamp_column})>=:history_date_from")
+            params["history_date_from"] = start
+        if end:
+            clauses.append(f"DATE({timestamp_column})<=:history_date_to")
+            params["history_date_to"] = end
+        if before_value:
+            clauses.append(f"{timestamp_column}<:history_before")
+            params["history_before"] = before_value
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return (
+            f"{base}{where} ORDER BY {timestamp_column} DESC, "
+            f"{order_suffix} DESC LIMIT :limit",
+            params,
+        )
+
+    lifecycle_sql, lifecycle_params = filtered_query(
+        "SELECT event_id, entity_type, entity_key, entity_version, "
+        "previous_status, next_status, reason, trigger_type, event_hash, "
+        "operator_name, occurred_at, payload_json "
+        "FROM st_strategy_lifecycle_event",
+        timestamp_column="occurred_at",
+        order_suffix="event_id",
+        entity_type_column="entity_type",
+        entity_key_column="entity_key",
+        action_column="trigger_type",
+    )
     lifecycle_events = _db_read(
-        "SELECT * FROM st_strategy_lifecycle_event "
-        "ORDER BY occurred_at DESC, event_id DESC LIMIT :limit",
-        {"limit": limit},
+        lifecycle_sql, lifecycle_params,
     )
     for row in lifecycle_events:
-        raw_payload = row.get("payload_json")
+        raw_payload = row.pop("payload_json", None)
         payload_value = _json(raw_payload, None)
         row["hash_valid"] = bool(
             isinstance(payload_value, dict)
@@ -12616,27 +27383,41 @@ def governance_history(limit: int = 100) -> dict[str, Any]:
         row["next_status_label"] = LIFECYCLE_LABELS.get(
             str(row.get("next_status") or ""), "未知状态"
         )
-    audit_events = _db_read(
-        "SELECT * FROM st_strategy_governance_audit "
-        "ORDER BY created_at DESC, audit_id DESC LIMIT :limit",
-        {"limit": limit},
+    audit_sql, audit_params = filtered_query(
+        "SELECT audit_id, entity_type, entity_key, action, reason, "
+        "operator_name, audit_hash, created_at, payload_json "
+        "FROM st_strategy_governance_audit",
+        timestamp_column="created_at",
+        order_suffix="audit_id",
+        entity_type_column="entity_type",
+        entity_key_column="entity_key",
+        action_column="action",
     )
+    audit_events = _db_read(audit_sql, audit_params)
     for row in audit_events:
-        payload_value = _json(row.get("payload_json"), None)
+        payload_value = _json(row.pop("payload_json", None), None)
         row["hash_valid"] = bool(
             isinstance(payload_value, dict)
             and _digest(payload_value) == str(row.get("audit_hash") or "")
         )
-    metric_evidence = _db_read(
+    metric_sql, metric_params = filtered_query(
         "SELECT evidence_id, entity_type, strategy_key, strategy_version, "
         "as_of_date, window_days, metrics_json, source, evidence_protocol, "
         "artifact_hash, source_dataset_hash, evidence_revision_at, "
         "verification_status, funding_provenance, submitted_by, reviewed_by, reviewed_at, "
-        "evidence_hash, created_at FROM st_strategy_metric_input "
-        "ORDER BY created_at DESC, evidence_id DESC LIMIT :limit",
-        {"limit": limit},
+        "evidence_hash, created_at FROM st_strategy_metric_input",
+        timestamp_column="created_at",
+        order_suffix="evidence_id",
+        entity_type_column="entity_type",
+        entity_key_column="strategy_key",
     )
+    metric_evidence = _db_read(metric_sql, metric_params)
     for row in metric_evidence:
+        submission = _metric_submission_contract(row)
+        row["hash_valid"] = bool(
+            isinstance(submission, dict)
+            and _digest(submission) == str(row.get("evidence_hash") or "")
+        )
         metrics = _json(row.pop("metrics_json", None), {})
         row["verification_status_label"] = EVIDENCE_STATUS_LABELS.get(
             str(row.get("verification_status") or ""), "未知复核状态"
@@ -12646,6 +27427,13 @@ def governance_history(limit: int = 100) -> dict[str, Any]:
             and str(row.get("reviewed_by"))
             != str(row.get("submitted_by") or "")
         )
+        row.update({
+            "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
+            "source_authority_label": EXTERNAL_SELECTION_SOURCE_AUTHORITY_LABEL,
+            "review_scope": "STRUCTURE_AND_REPRODUCIBILITY_ONLY",
+            "funding_authority": False,
+            "real_order_authority": False,
+        })
         row["metrics"] = {
             key: metrics.get(key)
             for key in (
@@ -12654,48 +27442,94 @@ def governance_history(limit: int = 100) -> dict[str, Any]:
                 "cost_stress_expectancy_pct",
             )
         }
-    adapter_run_receipts = _db_read(
+    adapter_sql, adapter_params = filtered_query(
         "SELECT run_uid, strategy_key, strategy_version, "
         "strategy_version_hash, trade_date, completed_at, status, "
         "execution_binding_hash, adapter_artifact_sha256, cost_model_hash, "
         "adapter_key, adapter_version, input_hash, output_hash, "
         "stable_result_hash, candidate_count, candidate_identity_json, "
         "receipt_json, receipt_hash, created_at "
-        "FROM st_strategy_adapter_run_receipt "
-        "ORDER BY completed_at DESC, run_uid DESC LIMIT :limit",
-        {"limit": limit},
+        "FROM st_strategy_adapter_run_receipt",
+        timestamp_column="completed_at",
+        order_suffix="run_uid",
+        entity_key_column="strategy_key",
     )
+    adapter_run_receipts = _db_read(adapter_sql, adapter_params)
     for row in adapter_run_receipts:
         raw_receipt = _json(row.get("receipt_json"), None)
         try:
             verified = verify_persisted_strategy_adapter_run_receipt(
                 raw_receipt, row,
             )
-            row["candidate_identity"] = verified["candidate_identity"]
+            row["candidate_identity_count"] = len(
+                verified["candidate_identity"]
+            )
+            row["candidate_identity_hash"] = _digest(
+                verified["candidate_identity"]
+            )
             row["hash_valid"] = True
         except ValueError:
-            row["candidate_identity"] = []
+            row["candidate_identity_count"] = 0
+            row["candidate_identity_hash"] = ""
             row["hash_valid"] = False
         row.pop("receipt_json", None)
         row.pop("candidate_identity_json", None)
+    run_sql, run_params = filtered_query(
+        "SELECT run_uid, trade_date, run_revision, supersedes_run_uid, "
+        "is_canonical, market_state, source_status, "
+        "input_ready, input_hash, build_commit_sha, decision_hash, "
+        "status, strategy_count, formal_count, shadow_count, "
+        "combination_count, observation_count, confirmation_count, "
+        "tradable_count, allocation_count, created_at, finished_at "
+        "FROM st_strategy_governance_run",
+        timestamp_column="created_at",
+        order_suffix="run_uid",
+    )
+    runs = _db_read(run_sql, run_params)
+
+    def next_cursor(rows: list[dict[str, Any]], field: str) -> str:
+        return str(rows[-1].get(field) or "") if len(rows) == limit else ""
+
     return {
         "status": "ok",
+        "filters": {
+            "entity_type": normalized_type,
+            "entity_key": normalized_key,
+            "action": normalized_action,
+            "date_from": start,
+            "date_to": end,
+            "before": before_value,
+            "limit": limit,
+        },
+        "next_cursors": {
+            # Timestamp-only legacy cursors can skip tied rows.  Every ledger
+            # pages only through the stable-id section endpoints below.
+            "metric_evidence": "",
+            "adapter_run_receipts": "",
+            "lifecycle_events": "",
+            "audit_events": "",
+            "runs": "",
+        },
+        "history_section_pages": {
+            "lifecycle": "/api/strategy-center/governance/history/lifecycle",
+            "audit": "/api/strategy-center/governance/history/audit",
+            "metric_evidence": (
+                "/api/strategy-center/governance/history/metric-evidence"
+            ),
+            "adapter_run_receipts": (
+                "/api/strategy-center/governance/history/adapter-run-receipts"
+            ),
+            "runs": "/api/strategy-center/governance/history/runs",
+            "cursor_identity": "timestamp_and_stable_id",
+        },
         "evidence_status_labels": EVIDENCE_STATUS_LABELS,
         "metric_evidence": metric_evidence,
         "adapter_run_receipts": adapter_run_receipts,
         "lifecycle_events": lifecycle_events,
         "audit_events": audit_events,
-        "runs": _db_read(
-            "SELECT run_uid, trade_date, run_revision, supersedes_run_uid, "
-            "is_canonical, market_state, source_status, "
-            "input_ready, input_hash, build_commit_sha, decision_hash, "
-            "status, strategy_count, formal_count, shadow_count, "
-            "combination_count, observation_count, confirmation_count, "
-            "tradable_count, allocation_count, created_at, finished_at "
-            "FROM st_strategy_governance_run "
-            "ORDER BY trade_date DESC, created_at DESC LIMIT :limit",
-            {"limit": limit},
-        ),
+        "runs": runs,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -12704,6 +27538,8 @@ __all__ = [
     "HEALTH_SCORE_WEIGHTS",
     "LIFECYCLE_LABELS",
     "LIFECYCLE_TRANSITIONS",
+    "METRIC_ARTIFACT_MAX_BYTES",
+    "MetricArtifactTooLarge",
     "PROFIT_GATE_POLICY",
     "calculate_health_score",
     "calculate_return_metrics",
@@ -12712,9 +27548,11 @@ __all__ = [
     "evaluate_profit_gate",
     "evaluate_window_gate",
     "governance_history",
+    "governance_history_section_page",
     "governance_input_ready",
     "governance_snapshot",
     "load_canonical_governance_snapshot",
+    "metric_evidence_artifact_page",
     "metric_evidence_detail",
     "record_metric_input",
     "recommend_lifecycle_status",
@@ -12723,5 +27561,6 @@ __all__ = [
     "register_strategy",
     "transition_lifecycle",
     "toggle_strategy_enabled",
+    "validate_funding_checkpoint_manifest_contract",
     "validate_strategy_key",
 ]

@@ -24,6 +24,13 @@ import pandas as pd
 from sqlalchemy import text
 
 from server.common.batch_db import create_batch_engine, read_frame
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
 
 
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
@@ -1613,6 +1620,46 @@ CREATE TABLE IF NOT EXISTS st_quant_review_digest (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_QUANT_DIGEST_SCHEMA = {
+    "st_quant_review_digest": RuntimeTable(
+        columns={
+            "review_date": RuntimeColumn("date", False),
+            "adjust_type": RuntimeColumn("int", False),
+            "publish_status": RuntimeColumn("varchar", False, character_length=16),
+            "compact_review": RuntimeColumn("mediumtext", False),
+            "quality_json": RuntimeColumn("longtext", False),
+            "market_structure_json": RuntimeColumn("longtext", False),
+            "industry_rotation_json": RuntimeColumn("longtext", False),
+            "factor_validation_json": RuntimeColumn("longtext", False),
+            "data_cutoff_at": RuntimeColumn("datetime", True, datetime_precision=6),
+            "generated_at": RuntimeColumn("datetime", False, datetime_precision=6),
+        },
+        indexes=(
+            RuntimeIndex(("review_date", "adjust_type"), unique=True),
+        ),
+    ),
+}
+
+
+def privileged_migrate_quant_digest_tables(engine: Any) -> None:
+    """Create/normalize the quant digest table in a release window."""
+
+    with engine.begin() as connection:
+        connection.execute(text(_DIGEST_DDL))
+        privileged_normalize_mysql_storage(connection, _QUANT_DIGEST_SCHEMA)
+        validate_quant_digest_runtime(engine, connection=connection)
+
+
+def validate_quant_digest_runtime(engine: Any, *, connection=None) -> None:
+    """Read-only fail-closed quant digest table contract."""
+
+    validate_runtime_tables(
+        engine,
+        _QUANT_DIGEST_SCHEMA,
+        context="quant_digest",
+        connection=connection,
+    )
+
 _DIGEST_UPSERT = """
 INSERT INTO st_quant_review_digest (
     review_date, adjust_type, publish_status, compact_review, quality_json,
@@ -1697,6 +1744,7 @@ FOR UPDATE
 def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
     """Idempotently persist one ready or blocked generation receipt."""
 
+    validate_quant_digest_runtime(engine)
     payload = {
         "review_date": result["review_date"],
         "adjust_type": int(result["adjust_type"]),
@@ -1716,7 +1764,6 @@ def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
         ).replace(tzinfo=None),
     }
     with engine.begin() as connection:
-        connection.execute(text(_DIGEST_DDL))
         existing_status = connection.execute(
             text(_DIGEST_EXISTING_STATUS),
             {

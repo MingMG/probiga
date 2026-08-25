@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 warnings.filterwarnings('ignore')
 
 from tools.env_config import create_tool_engine
+from server.common.batch_db import replace_table_rows
 
 # 需要过滤的概念关键词
 FILTER_KEYWORDS = (
@@ -64,11 +65,13 @@ def build_concept_map():
     print(f"  最终数据: {len(result)} 条")
 
     print("[4/4] 写入数据库...")
-    with engine.connect() as conn:
-        conn.execute(text("TRUNCATE TABLE si_stock_concept_map"))
-        conn.commit()
-
-    result.to_sql('si_stock_concept_map', engine, if_exists='append', index=False, chunksize=200)
+    replace_table_rows(
+        result,
+        'si_stock_concept_map',
+        engine,
+        chunksize=200,
+        method='multi',
+    )
 
     stats = pd.read_sql(text("""
         SELECT 

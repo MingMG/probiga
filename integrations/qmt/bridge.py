@@ -67,16 +67,19 @@ def _run_gateway(payload: dict[str, Any], *, timeout: int) -> dict[str, Any] | N
 
 
 def _run(payload: dict[str, Any], *, timeout: int | None = None) -> dict[str, Any]:
+    effective_timeout = timeout or int(os.environ.get("QMT_TIMEOUT", "180"))
+    gateway_result = _run_gateway(payload, timeout=effective_timeout)
+    if gateway_result is not None:
+        return gateway_result
+
+    # The production Linux host can use the authenticated Windows QMT
+    # gateway without carrying a Windows python.exe.  Only the local fallback
+    # requires the bundled QMT interpreter and worker.
     python = python_path()
     if not python.exists():
         raise QmtBridgeError(f"QMT Python runtime not found: {python}")
     if not WORKER.exists():
         raise QmtBridgeError(f"QMT worker not found: {WORKER}")
-
-    effective_timeout = timeout or int(os.environ.get("QMT_TIMEOUT", "180"))
-    gateway_result = _run_gateway(payload, timeout=effective_timeout)
-    if gateway_result is not None:
-        return gateway_result
 
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -167,6 +170,7 @@ def minute(
     start_date: str | None = None,
     end_date: str | None = None,
     count: int = 0,
+    fill_data: bool = True,
     batch_size: int | None = None,
     timeout: int | None = None,
 ) -> pd.DataFrame:
@@ -178,6 +182,7 @@ def minute(
             "start_date": start_date or trade_date,
             "end_date": end_date or trade_date,
             "count": count,
+            "fill_data": fill_data,
             "batch_size": batch_size,
         },
         timeout=timeout,
@@ -302,6 +307,21 @@ def sector_members_many(
         timeout=timeout,
     )
     return pd.DataFrame(result.get("rows") or [])
+
+
+def historical_contract_catalog(
+    *, timeout: int | None = None,
+) -> tuple[list[str], pd.DataFrame]:
+    result = _run({"action": "historical_contract_catalog"}, timeout=timeout)
+    sectors = sorted({
+        str(value or "").strip()
+        for value in (result.get("expired_sectors") or [])
+        if str(value or "").strip()
+    })
+    rows = pd.DataFrame(result.get("rows") or [])
+    if not sectors or rows.empty:
+        raise QmtBridgeError("QMT historical contract catalog is incomplete")
+    return sectors, rows
 
 
 def instrument_details(

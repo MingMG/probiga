@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
+from biz.review import quant_digest as quant_digest_module
 from biz.review.quant_digest import (
     BEIJING_TZ,
     DigestConfig,
@@ -452,33 +453,42 @@ class _Engine:
         return _Begin(self.connection)
 
 
-def test_persistence_stores_quality_receipt_for_blocked_generation_too():
+def test_persistence_stores_quality_receipt_for_blocked_generation_too(monkeypatch):
+    monkeypatch.setattr(
+        quant_digest_module, "validate_quant_digest_runtime", lambda _engine: None,
+    )
     engine = _Engine()
     blocked = _ready_result(target_bars=_bars(TARGET, count=10))
 
     persist_quant_digest(engine, blocked)
 
-    assert len(engine.connection.calls) == 3
-    _, payload = engine.connection.calls[2]
+    assert len(engine.connection.calls) == 2
+    _, payload = engine.connection.calls[1]
     assert payload["publish_status"] == PUBLISH_BLOCKED
     assert payload["compact_review"] == ""
     assert '"status":"blocked"' in payload["quality_json"]
 
 
-def test_blocked_rerun_cannot_overwrite_existing_ready_digest():
+def test_blocked_rerun_cannot_overwrite_existing_ready_digest(monkeypatch):
+    monkeypatch.setattr(
+        quant_digest_module, "validate_quant_digest_runtime", lambda _engine: None,
+    )
     engine = _Engine(existing_status=PUBLISH_READY)
     blocked = _ready_result(target_bars=_bars(TARGET, count=10))
 
     persist_quant_digest(engine, blocked)
 
-    assert len(engine.connection.calls) == 2
-    select_sql, keys = engine.connection.calls[1]
+    assert len(engine.connection.calls) == 1
+    select_sql, keys = engine.connection.calls[0]
     assert "FOR UPDATE" in select_sql
     assert keys == {"review_date": TARGET, "adjust_type": 0}
     assert not any("INSERT INTO st_quant_review_digest" in sql for sql, _ in engine.connection.calls)
 
 
-def test_ready_upsert_guards_against_older_ready_generation_and_cutoff():
+def test_ready_upsert_guards_against_older_ready_generation_and_cutoff(monkeypatch):
+    monkeypatch.setattr(
+        quant_digest_module, "validate_quant_digest_runtime", lambda _engine: None,
+    )
     engine = _Engine(existing_status=PUBLISH_READY)
 
     persist_quant_digest(engine, _ready_result())

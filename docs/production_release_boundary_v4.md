@@ -5,15 +5,19 @@ It is an operational boundary, not authorization to change production.
 
 ## Current readiness
 
-Production deployment is deliberately fail-closed. `deploy/production_release.env`
-has `PROBIGA_PRODUCTION_LOCK_STATUS=BLOCKED_CROSS_PLATFORM_REGEN_REQUIRED`.
-The workflow checks that field before SSH, and the root broker independently checks
-the trusted-main manifest before it touches a production service, database, or
-runtime symlink.
+Production deployment is deliberately fail-closed. The value in
+`deploy/production_release.env` is an input to the release decision, not proof that
+a deployment is ready. CI must resolve the exact reviewed `main` commit, run the
+required validation, freeze the Linux dependency and wheel evidence, verify the
+release manifest, and derive an explicit `READY` decision before it creates any
+production SSH connection. Every non-`READY` value must terminate the workflow
+before SSH; readiness may not be decided after connecting to production. The root
+broker then independently checks the trusted-main manifest before it touches a
+production service, database, or runtime symlink.
 
 The deployment gate may be changed to `READY` only in one reviewed commit that
 contains all of the following for CPython 3.14 on
-`manylinux_2_17_x86_64`:
+`manylinux_2_28_x86_64`:
 
 - a complete, transitively pinned requirements lock with a SHA-256 hash on every
   installable requirement;
@@ -24,6 +28,45 @@ contains all of the following for CPython 3.14 on
 
 A partial direct-dependency lock, a Windows-only resolution, or an unreviewed
 cross-platform download must remain `BLOCKED`.
+
+The database release proof must also bind the exact frozen inventory of 68
+triggers: 40 governance, 6 point-in-time data, 6 completed-run QMT attestation,
+10 immutable QMT reference, 4 QMT historical-coverage certification, and 2
+scheduler-history/release-receipt triggers. Missing, additional, renamed,
+cross-group substituted, or metadata-drifted triggers keep the release `BLOCKED`.
+
+The runtime database grant transition is deliberately staged so an existing
+production account does not deadlock a no-downtime release. Preflight and resume
+accept exactly two contracts, and report which one was observed:
+
+- `TARGET_LEAST_PRIVILEGE`: `biga.* = SELECT`, `probiga.* = SELECT, INSERT,
+  UPDATE, DELETE, CREATE TEMPORARY TABLES`, and
+  `probiga_qmt_history.* = SELECT`;
+- `LEGACY_DDL_COMPATIBILITY`: the same grants plus the frozen five legacy
+  `probiga.*` privileges `CREATE, ALTER, DROP, INDEX, REFERENCES`.
+
+No partial legacy set and no additional privilege is accepted. Evidence includes
+both `observed_contract` and the exact `persistent_ddl_privileges` list; validators
+derive both from the observed schema grants and reject inconsistent labels or an
+empty-list claim for the legacy account. This compatibility state is not a claim
+that least privilege has already been reached. Production runtime code is already
+prohibited from persistent DDL and all persistent schema migration goes through
+the fenced migrator. In a separate reviewed maintenance window, the five legacy
+privileges are revoked; the same release checks then automatically classify the
+account as `TARGET_LEAST_PRIVILEGE` without a deployment-policy edit.
+
+Neither CI `READY` nor a `DEPLOYED` receipt grants trading authority. Strategy
+governance remains simulation-only, with `automatic_real_order_submission=false`
+and `real_order_authority=false`. An empty eligible set is a valid result and must
+remain cash; no release state is a promise of profitability.
+
+Production also fixes `PROBIGA_IN_APP_DEPLOY_ENABLED=0`. The `/deploy` page and
+all `/api/deploy/*` status, run, and detail endpoints must fail closed before any
+Git, thread, or subprocess work starts; hiding a browser button is not sufficient.
+When the desktop-only console is explicitly enabled, its history is stored under
+an absolute protected runtime root outside the code tree. A sealed production
+release must never write deploy history under `runtime/`, `data/`, or another
+tracked directory.
 
 ## External maintenance prerequisites
 

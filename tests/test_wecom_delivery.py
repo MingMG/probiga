@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import inspect as python_inspect
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -77,6 +78,12 @@ def _create_legacy_receipt_table(engine):
         connection.execute(text(delivery._RECEIPT_DDL))
 
 
+def _prepared_engine():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    delivery.privileged_migrate_delivery_receipt_table(engine)
+    return engine
+
+
 def test_http_client_request_logs_are_suppressed_to_protect_webhook_urls():
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
     assert logging.getLogger("httpcore").getEffectiveLevel() >= logging.WARNING
@@ -85,11 +92,20 @@ def test_http_client_request_logs_are_suppressed_to_protect_webhook_urls():
 def test_new_receipt_table_has_started_at_retention_index():
     engine = create_engine("sqlite+pysqlite:///:memory:")
 
-    delivery.ensure_delivery_receipt_table(engine)
+    delivery.privileged_migrate_delivery_receipt_table(engine)
 
     assert _receipt_indexes(engine)[delivery.DELIVERY_RECEIPT_STARTED_AT_INDEX] == (
         "started_at",
     )
+
+
+def test_runtime_receipt_guard_is_read_only_and_fails_before_migration():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with pytest.raises(RuntimeError, match="not prepared"):
+        delivery.ensure_delivery_receipt_table(engine)
+    source = python_inspect.getsource(delivery.ensure_delivery_receipt_table).upper()
+    assert "CREATE TABLE" not in source
+    assert "CREATE INDEX" not in source
 
 
 def test_legacy_receipt_table_gets_started_at_index_idempotently():
@@ -97,8 +113,8 @@ def test_legacy_receipt_table_gets_started_at_index_idempotently():
     _create_legacy_receipt_table(engine)
     assert _receipt_indexes(engine) == {}
 
-    delivery.ensure_delivery_receipt_table(engine)
-    delivery.ensure_delivery_receipt_table(engine)
+    delivery.privileged_migrate_delivery_receipt_table(engine)
+    delivery.privileged_migrate_delivery_receipt_table(engine)
 
     indexes = _receipt_indexes(engine)
     assert indexes == {
@@ -117,7 +133,7 @@ def test_equivalent_legacy_started_at_index_is_not_duplicated():
             )
         )
 
-    delivery.ensure_delivery_receipt_table(engine)
+    delivery.privileged_migrate_delivery_receipt_table(engine)
 
     assert _receipt_indexes(engine) == {
         "custom_receipt_retention": ("started_at",),
@@ -153,7 +169,7 @@ def test_short_message_is_sent_unchanged():
 
 
 def test_successful_delivery_records_a_sanitized_auditable_receipt(monkeypatch):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    engine = _prepared_engine()
     webhook = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=top-secret"
     captured = _install_client(monkeypatch, [_Response()])
 
@@ -179,7 +195,7 @@ def test_successful_delivery_records_a_sanitized_auditable_receipt(monkeypatch):
 
 
 def test_missing_webhook_is_failure_and_is_recorded(monkeypatch):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    engine = _prepared_engine()
     captured = _install_client(monkeypatch, [])
 
     with pytest.raises(delivery.WeComDeliveryError, match="not configured"):
@@ -200,7 +216,7 @@ def test_missing_webhook_is_failure_and_is_recorded(monkeypatch):
 
 
 def test_nonzero_errcode_makes_partial_delivery_fail(monkeypatch):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    engine = _prepared_engine()
     captured = _install_client(
         monkeypatch,
         [
@@ -243,7 +259,7 @@ def test_nonzero_errcode_makes_partial_delivery_fail(monkeypatch):
     ],
 )
 def test_http_and_malformed_responses_fail_closed(monkeypatch, response, expected_code):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    engine = _prepared_engine()
     _install_client(monkeypatch, [response])
 
     with pytest.raises(delivery.WeComDeliveryError):
@@ -262,7 +278,7 @@ def test_http_and_malformed_responses_fail_closed(monkeypatch, response, expecte
 
 
 def test_transport_exception_never_exposes_webhook_or_key(monkeypatch):
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    engine = _prepared_engine()
     webhook = "https://example.invalid/send?key=opaque-value-123"
 
     class _FailingClient(_Client):

@@ -51,7 +51,11 @@ from integrations.bigqmt.bridge import (
 from server.trading_v2.quotes import persist_quote_events
 from integrations.qmt.backend import to_qmt_symbol
 from server.common.batch_db import create_batch_engine, write_frame
+from server.common.auxiliary_runtime_schema import (
+    validate_qmt_realtime_sync_receipt_runtime_schema,
+)
 from server.common.mysql_lock import mysql_named_lock
+from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
     update_scheduler_task,
@@ -68,19 +72,17 @@ ETF_FORWARD_TASK_TYPE = "etf_forward_daily"
 ETF_FORWARD_RETRY_MINUTES = 10
 
 ACTIVE_UNIVERSE_SQL = """
-SELECT DISTINCT code.stock_code, code.short_name
-  FROM si_all_code AS code
-  JOIN sm_stock_kline AS kline
-    ON kline.stock_code = code.stock_code
-   AND kline.k_type = 1
-   AND kline.adjust_type = 0
- WHERE kline.trade_date = (
-       SELECT MAX(latest.trade_date)
-         FROM sm_stock_kline AS latest
-        WHERE latest.k_type = 1
-          AND latest.adjust_type = 0
- )
- ORDER BY code.stock_code
+SELECT member.stock_code, COALESCE(detail.short_name, '') AS short_name
+  FROM qmt_stock_catalog_member AS member
+  JOIN qmt_stock_catalog_batch AS batch
+    ON batch.batch_id=member.batch_id
+   AND batch.status='COMPLETE'
+  LEFT JOIN qmt_instrument_detail AS detail
+    ON detail.qmt_code=member.qmt_code
+ WHERE member.batch_id=:batch_id
+   AND member.list_date <= :target_date
+   AND (member.expire_date IS NULL OR member.expire_date > :target_date)
+ ORDER BY member.stock_code
 """
 
 
@@ -743,8 +745,17 @@ def maybe_sync_membership_snapshot(
 
 
 def _read_universe(engine) -> tuple[list[str], dict[str, str]]:
+    target_date = datetime.now().date().isoformat()
+    catalog, expected_codes = load_target_stock_catalog(
+        engine,
+        target_date=target_date,
+        decision_known_at=datetime.now().replace(microsecond=0),
+    )
     with engine.connect() as conn:
-        rows = conn.execute(text(ACTIVE_UNIVERSE_SQL)).fetchall()
+        rows = conn.execute(
+            text(ACTIVE_UNIVERSE_SQL),
+            {"batch_id": catalog.batch_id, "target_date": target_date},
+        ).fetchall()
     codes: list[str] = []
     names: dict[str, str] = {}
     for raw_code, raw_name in rows:
@@ -753,7 +764,12 @@ def _read_universe(engine) -> tuple[list[str], dict[str, str]]:
             continue
         codes.append(code)
         names[code] = str(raw_name or "").strip()
-    return list(dict.fromkeys(codes)), names
+    codes = list(dict.fromkeys(codes))
+    if codes != expected_codes:
+        raise RuntimeError(
+            "BigQMT active universe differs from frozen independent QMT catalog"
+        )
+    return codes, names
 
 
 def _read_tracked_codes(engine, limit: int) -> list[str]:
@@ -1065,33 +1081,8 @@ def _record_realtime_sync_receipt(
         "full_quote_count": full_payload.get("quote_count"),
         "source_full_file_token": full_file_token,
     }
+    validate_qmt_realtime_sync_receipt_runtime_schema(engine)
     with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS st_qmt_realtime_sync_receipt_v2 (
-                    receipt_id VARCHAR(64) PRIMARY KEY,
-                    source_provider VARCHAR(80) NOT NULL,
-                    source_snapshot_token VARCHAR(128) NOT NULL,
-                    source_full_file_token VARCHAR(160) NOT NULL,
-                    source_generated_at DATETIME NOT NULL,
-                    heartbeat_at DATETIME NOT NULL,
-                    expected_count INT NOT NULL,
-                    observed_count INT NOT NULL,
-                    coverage DECIMAL(18,8) NOT NULL,
-                    published_at DATETIME NOT NULL,
-                    capture_mode VARCHAR(32) NOT NULL,
-                    quality_status VARCHAR(16) NOT NULL,
-                    evidence_json LONGTEXT NOT NULL,
-                    created_at DATETIME NOT NULL,
-                    UNIQUE KEY uk_qmt_realtime_source_snapshot
-                        (source_provider, source_snapshot_token),
-                    KEY idx_qmt_realtime_receipt_latest
-                        (capture_mode, quality_status, published_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-        )
         connection.execute(
             text(
                 """

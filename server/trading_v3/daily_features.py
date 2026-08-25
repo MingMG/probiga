@@ -12,6 +12,14 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from server.common.pit_facts import (
+    PIT_AVAILABLE,
+    PIT_DATA_BLOCKED,
+    load_event_facts,
+    load_finance_facts,
+    resolve_common_fact_cutoff,
+)
+
 from .context import load_asof_context, theme_context_score
 from .theme_history import (
     EvidenceStatus,
@@ -31,11 +39,52 @@ from .theme_features import (
 
 logger = logging.getLogger(__name__)
 
+DERIVED_CHANGE_PCT_PROTOCOL = (
+    "NATIVE_CLOSE_DIV_NATIVE_PRE_CLOSE_MINUS_ONE_X100_V1"
+)
+
 
 def _safe_pct(current: float, base: float) -> float:
     if not base or not math.isfinite(base):
         return 0.0
     return (current / base - 1.0) * 100.0
+
+
+def _optional_finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _derive_change_pct_from_close_pre_close(
+    frame: pd.DataFrame,
+) -> pd.Series:
+    """Never trust the mutable convenience ``change_pct`` column."""
+
+    if not {"close", "pre_close"}.issubset(frame.columns):
+        raise RuntimeError(
+            "QMT native close/pre_close cannot derive finite change_pct"
+        )
+    close = pd.to_numeric(frame.get("close"), errors="coerce")
+    pre_close = pd.to_numeric(frame.get("pre_close"), errors="coerce")
+    invalid = (
+        close.isna()
+        | pre_close.isna()
+        | ~close.map(math.isfinite)
+        | ~pre_close.map(math.isfinite)
+        | (close <= 0)
+        | (pre_close <= 0)
+    )
+    if bool(invalid.any()):
+        raise RuntimeError(
+            "QMT native close/pre_close cannot derive finite change_pct"
+        )
+    result = (close / pre_close - 1.0) * 100.0
+    if not bool(result.map(math.isfinite).all()):
+        raise RuntimeError("derived QMT change_pct is non-finite")
+    return result
 
 
 def _history_session_evidence(
@@ -309,9 +358,10 @@ def _load_bars(
                CASE WHEN trade_date = :latest_date
                     THEN short_name ELSE '' END AS short_name,
                trade_date, open, close, high, low,
-               pre_close, amount, change_pct
+               pre_close, amount
         FROM sm_stock_kline
         WHERE k_type = 1
+          AND adjust_type = 0
           AND trade_date IN :dates
           AND (
               stock_code LIKE '00%%'
@@ -357,13 +407,13 @@ def _load_bars(
         "low",
         "pre_close",
         "amount",
-        "change_pct",
     )
     for column in numeric:
         frame[column] = pd.to_numeric(
             frame[column],
             errors="coerce",
         )
+    frame["change_pct"] = _derive_change_pct_from_close_pre_close(frame)
     frame = frame.loc[
         frame[["open", "close", "high", "low"]]
         .gt(0)
@@ -374,11 +424,6 @@ def _load_bars(
         frame["raw_" + column] = frame[column]
     frame["raw_pre_close"] = frame["pre_close"]
     daily_return = frame["change_pct"] / 100.0
-    fallback = frame["close"] / frame["pre_close"] - 1.0
-    daily_return = daily_return.where(
-        daily_return.notna(),
-        fallback,
-    ).replace([math.inf, -math.inf], math.nan).fillna(0.0)
     frame["_growth"] = (1.0 + daily_return).clip(lower=0.01)
     frame["_adj_close"] = frame.groupby(
         "stock_code",
@@ -422,123 +467,172 @@ def _load_industries(
     codes: list[str],
     *,
     as_of: date | None = None,
-) -> dict[str, tuple[str, str]]:
+    decision_at: datetime | None = None,
+    include_evidence: bool = False,
+) -> (
+    dict[str, tuple[str, str]]
+    | tuple[dict[str, tuple[str, str]], dict[str, Any]]
+):
     if not codes:
-        return {}
-    as_of_exclusive = (
-        datetime.combine(as_of + timedelta(days=1), datetime.min.time())
-        if as_of is not None
-        else None
+        empty_evidence = {
+            "status": PIT_DATA_BLOCKED,
+            "reason": "PIT_INDUSTRY_EMPTY_SCOPE",
+            "snapshot_hash": hashlib.sha256(b"[]").hexdigest(),
+            "status_by_code": {},
+            "reason_by_code": {},
+        }
+        return ({}, empty_evidence) if include_evidence else {}
+    if as_of is None:
+        evidence = {
+            "status": PIT_DATA_BLOCKED,
+            "reason": "PIT_INDUSTRY_EXACT_DATE_REQUIRED",
+            "snapshot_hash": hashlib.sha256(
+                b"PIT_INDUSTRY_EXACT_DATE_REQUIRED"
+            ).hexdigest(),
+            "status_by_code": {code: PIT_DATA_BLOCKED for code in codes},
+            "reason_by_code": {
+                code: "PIT_INDUSTRY_EXACT_DATE_REQUIRED" for code in codes
+            },
+        }
+        return ({}, evidence) if include_evidence else {}
+    cutoff = decision_at or datetime.combine(
+        as_of + timedelta(days=1), datetime.min.time()
     )
-    # The current SW table is refreshed in place, so its ETL timestamp can be
-    # newer than the membership itself.  Historical decisions must prefer the
-    # immutable, validated QMT close snapshot.
-    if as_of is not None:
-        try:
-            with engine.connect() as connection:
-                run = connection.execute(
-                    text(
-                        """
-                        SELECT snapshot_date, source, industry_relation_count
-                        FROM qmt_membership_snapshot_run
-                        WHERE snapshot_date <= :as_of
-                          AND quality_status = 'QMT_VALIDATED'
-                          AND captured_at < :as_of_exclusive
-                        ORDER BY snapshot_date DESC, captured_at DESC, source
-                        LIMIT 1
-                        """
-                    ),
-                    {"as_of": as_of, "as_of_exclusive": as_of_exclusive},
-                ).mappings().first()
-                if run:
-                    actual = int(
-                        connection.execute(
-                            text(
-                                """
-                                SELECT COUNT(*)
-                                FROM qmt_industry_member_snapshot
-                                WHERE snapshot_date = :snapshot_date
-                                  AND source = :source
-                                  AND quality_status = 'QMT_VALIDATED'
-                                  AND captured_at < :as_of_exclusive
-                                """
-                            ),
-                            {
-                                "snapshot_date": run["snapshot_date"],
-                                "source": run["source"],
-                                "as_of_exclusive": as_of_exclusive,
-                            },
-                        ).scalar()
-                        or 0
-                    )
-                    expected = int(run.get("industry_relation_count") or 0)
-                    if expected > 0 and actual == expected:
-                        snapshot_statement = text(
+    result: dict[str, tuple[str, str]] = {}
+    reason = ""
+    run_payload: dict[str, Any] = {}
+    try:
+        with engine.connect() as connection:
+            run = connection.execute(
+                text(
+                    """
+                    SELECT snapshot_date, source, industry_relation_count,
+                           captured_at
+                    FROM qmt_membership_snapshot_run
+                    WHERE snapshot_date = :as_of
+                      AND quality_status = 'QMT_VALIDATED'
+                      AND captured_at <= :decision_at
+                    ORDER BY captured_at DESC, source
+                    LIMIT 1
+                    """
+                ),
+                {"as_of": as_of, "decision_at": cutoff},
+            ).mappings().first()
+            if not run:
+                reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
+            else:
+                actual = int(
+                    connection.execute(
+                        text(
                             """
-                            SELECT stock_code, industry_code, industry_name
+                            SELECT COUNT(*)
                             FROM qmt_industry_member_snapshot
                             WHERE snapshot_date = :snapshot_date
                               AND source = :source
-                              AND stock_code IN :codes
                               AND quality_status = 'QMT_VALIDATED'
-                              AND captured_at < :as_of_exclusive
-                              AND industry_type IN
-                                  ('L1', '一级行业', '申万一级', 'SW2021')
-                            ORDER BY stock_code, industry_code
+                              AND captured_at <= :decision_at
                             """
-                        ).bindparams(bindparam("codes", expanding=True))
-                        result: dict[str, tuple[str, str]] = {}
-                        for row in connection.execute(
-                            snapshot_statement,
-                            {
-                                "snapshot_date": run["snapshot_date"],
-                                "source": run["source"],
-                                "codes": codes,
-                                "as_of_exclusive": as_of_exclusive,
-                            },
-                        ).mappings():
-                            code = str(row["stock_code"])[:6]
-                            result.setdefault(
-                                code,
-                                (
-                                    str(row.get("industry_code") or ""),
-                                    str(row.get("industry_name") or ""),
-                                ),
-                            )
-                        return result
-        except Exception as exc:
-            logger.debug("Immutable industry snapshot lookup skipped: %s", exc)
-    statement = text(
-        """
-        SELECT stock_code, sw_code, industry_name
-        FROM si_industry_sw
-        WHERE stock_code IN :codes
-          AND (
-              :as_of_exclusive IS NULL
-              OR etl_sync_at < :as_of_exclusive
-          )
-          AND industry_type IN ('L1', '一级行业', '申万一级', 'SW2021')
-        ORDER BY stock_code, etl_sync_at DESC, id DESC
-        """
-    ).bindparams(bindparam("codes", expanding=True))
-    result: dict[str, tuple[str, str]] = {}
-    with engine.connect() as connection:
-        for row in connection.execute(
-            statement,
-            {
-                "codes": codes,
-                "as_of_exclusive": as_of_exclusive,
-            },
-        ).mappings():
-            code = str(row["stock_code"])[:6]
-            result.setdefault(
-                code,
-                (
-                    str(row.get("sw_code") or ""),
-                    str(row.get("industry_name") or ""),
-                ),
-            )
-    return result
+                        ),
+                        {
+                            "snapshot_date": run["snapshot_date"],
+                            "source": run["source"],
+                            "decision_at": cutoff,
+                        },
+                    ).scalar()
+                    or 0
+                )
+                expected = int(run.get("industry_relation_count") or 0)
+                run_payload = {
+                    "snapshot_date": str(run.get("snapshot_date") or "")[:10],
+                    "source": str(run.get("source") or ""),
+                    "captured_at": str(run.get("captured_at") or "")[:26],
+                    "expected_relation_count": expected,
+                    "actual_relation_count": actual,
+                }
+                if expected <= 0 or actual != expected:
+                    reason = "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
+                else:
+                    statement = text(
+                        """
+                        SELECT stock_code, industry_code, industry_name
+                        FROM qmt_industry_member_snapshot
+                        WHERE snapshot_date = :snapshot_date
+                          AND source = :source
+                          AND stock_code IN :codes
+                          AND quality_status = 'QMT_VALIDATED'
+                          AND captured_at <= :decision_at
+                          AND industry_type IN
+                              ('L1', '一级行业', '申万一级', 'SW2021')
+                        ORDER BY stock_code, industry_code
+                        """
+                    ).bindparams(bindparam("codes", expanding=True))
+                    for row in connection.execute(
+                        statement,
+                        {
+                            "snapshot_date": run["snapshot_date"],
+                            "source": run["source"],
+                            "codes": codes,
+                            "decision_at": cutoff,
+                        },
+                    ).mappings():
+                        code = str(row["stock_code"])[:6]
+                        result.setdefault(
+                            code,
+                            (
+                                str(row.get("industry_code") or ""),
+                                str(row.get("industry_name") or ""),
+                            ),
+                        )
+    except Exception as exc:
+        reason = f"PIT_INDUSTRY_SCHEMA_OR_CHAIN_INVALID:{type(exc).__name__}"
+        logger.warning("PIT industry exact-date lookup blocked: %s", exc)
+        result = {}
+    status_by_code = {
+        code: PIT_AVAILABLE if code in result else PIT_DATA_BLOCKED
+        for code in codes
+    }
+    reason_by_code = {
+        code: (
+            ""
+            if code in result
+            else (reason or "PIT_INDUSTRY_CODE_NOT_IN_EXACT_SNAPSHOT")
+        )
+        for code in codes
+    }
+    snapshot_payload = {
+        "schema": "probiga.v3-industry-pit-selection.v1",
+        "as_of": as_of.isoformat(),
+        "decision_at": cutoff.isoformat(),
+        "run": run_payload,
+        "memberships": {
+            code: list(result[code]) for code in sorted(result)
+        },
+        "status_by_code": status_by_code,
+        "reason_by_code": reason_by_code,
+    }
+    evidence = {
+        "status": (
+            PIT_AVAILABLE
+            if result and len(result) == len(codes)
+            else PIT_DATA_BLOCKED
+        ),
+        "reason": reason or (
+            "" if len(result) == len(codes)
+            else "PIT_INDUSTRY_PARTIAL_CODE_COVERAGE"
+        ),
+        "snapshot_hash": hashlib.sha256(
+            json.dumps(
+                snapshot_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "status_by_code": status_by_code,
+        "reason_by_code": reason_by_code,
+        **run_payload,
+    }
+    return (result, evidence) if include_evidence else result
 
 
 def _load_theme_memberships(
@@ -738,57 +832,81 @@ def _load_finance(
     *,
     as_of: date,
     codes: list[str],
-) -> dict[str, dict[str, float | None]]:
+    decision_at: datetime | None,
+    fact_cutoff_at: datetime | str | None = None,
+) -> dict[str, dict[str, Any]]:
     if not codes:
         return {}
-    statement = text(
-        """
-        SELECT f.stock_code, f.net_asset_ps, f.oper_cf_ps,
-               f.total_rev_yoy_gr, f.net_profit_yoy_gr,
-               f.roe_wtd, f.gross_margin, f.net_margin,
-               f.cash_flow_ratio, f.asset_liab_ratio
-        FROM si_stock_finance f
-        JOIN (
-            SELECT stock_code, MAX(report_date) AS report_date
-            FROM si_stock_finance
-            WHERE notice_date <= :as_of
-              AND report_date <= :as_of
-              AND notice_date >= report_date
-              AND stock_code IN :codes
-            GROUP BY stock_code
-        ) latest
-          ON latest.stock_code = f.stock_code
-         AND latest.report_date = f.report_date
-        WHERE f.notice_date <= :as_of
-          AND f.report_date <= :as_of
-          AND f.notice_date >= f.report_date
-        ORDER BY f.stock_code, f.notice_date DESC, f.id DESC
-        """
-    ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
-        rows = connection.execute(
-            statement,
-            {"as_of": as_of, "codes": codes},
-        ).mappings().all()
-    result = {}
-    for row in rows:
-        code = str(row["stock_code"])[:6]
-        if code in result:
-            continue
-        result[code] = {
-            key: float(row[key]) if row[key] is not None else None
-            for key in (
-                "net_asset_ps",
-                "oper_cf_ps",
-                "total_rev_yoy_gr",
-                "net_profit_yoy_gr",
-                "roe_wtd",
-                "gross_margin",
-                "net_margin",
-                "cash_flow_ratio",
-                "asset_liab_ratio",
-            )
+    if decision_at is None:
+        return {
+            code: {
+                "finance_pit_status": PIT_DATA_BLOCKED,
+                "finance_pit_reason": "PIT_FINANCE_EXACT_DECISION_TIME_REQUIRED",
+                "finance_manifest_hash": hashlib.sha256(
+                    f"finance:{as_of}:missing-decision-at".encode("utf-8")
+                ).hexdigest(),
+            }
+            for code in codes
         }
+    batch = load_finance_facts(
+        engine,
+        codes=codes,
+        decision_at=decision_at,
+        fact_cutoff_at=fact_cutoff_at,
+        as_of_date=as_of,
+    )
+    result: dict[str, dict[str, Any]] = {}
+    numeric_fields = (
+        "net_asset_ps",
+        "oper_cf_ps",
+        "total_rev_yoy_gr",
+        "net_profit_yoy_gr",
+        "roe_wtd",
+        "gross_margin",
+        "net_margin",
+        "cash_flow_ratio",
+        "asset_liab_ratio",
+    )
+    for code in codes:
+        raw = dict(batch.facts.get(code) or {})
+        coverage = dict(batch.coverage_by_code.get(code) or {})
+        status = batch.status_for(code)
+        item: dict[str, Any] = {
+            key: _optional_finite_float(raw.get(key)) for key in numeric_fields
+        }
+        item.update(
+            {
+                "finance_pit_status": (
+                    PIT_AVAILABLE if status == PIT_AVAILABLE else PIT_DATA_BLOCKED
+                ),
+                "finance_pit_reason": (
+                    batch.reason_for(code)
+                    or (
+                        "" if status == PIT_AVAILABLE
+                        else "PIT_FINANCE_COVERAGE_UNPROVEN"
+                    )
+                ),
+                "finance_manifest_hash": batch.manifest_hash,
+                "finance_revision_id": raw.get("finance_revision_id"),
+                "finance_content_hash": raw.get("finance_content_hash"),
+                "finance_published_at": raw.get("finance_published_at"),
+                "finance_known_at": raw.get("finance_known_at"),
+                "finance_report_date": raw.get("finance_report_date"),
+                "finance_fact_cutoff_at": batch.fact_cutoff_at,
+                "finance_decision_at": batch.decision_at,
+                "finance_authoritative_empty": bool(
+                    status == PIT_AVAILABLE and not raw and coverage
+                ),
+                "finance_coverage_id": coverage.get("coverage_id"),
+                "finance_coverage_response_hash": coverage.get(
+                    "coverage_response_hash"
+                ),
+                "finance_coverage_watermark_hash": coverage.get(
+                    "coverage_watermark_hash"
+                ),
+            }
+        )
+        result[code] = item
     return result
 
 
@@ -797,33 +915,98 @@ def _load_recent_notices(
     *,
     as_of: date,
     codes: list[str],
-) -> dict[str, list[dict[str, Any]]]:
+    decision_at: datetime | None,
+    fact_cutoff_at: datetime | str | None = None,
+    include_evidence: bool = False,
+) -> (
+    dict[str, list[dict[str, Any]]]
+    | tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]
+):
     if not codes:
-        return {}
-    statement = text(
-        """
-        SELECT stock_code, notice_date, title, column_name
-        FROM si_notice_eastmoney
-        WHERE notice_date BETWEEN :start_date AND :as_of
-          AND stock_code IN :codes
-        ORDER BY stock_code, notice_date DESC, id DESC
-        """
-    ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
-        rows = connection.execute(
-            statement,
-            {
-                "start_date": as_of - timedelta(days=20),
-                "as_of": as_of,
-                "codes": codes,
+        empty_evidence = {
+            "status": PIT_DATA_BLOCKED,
+            "reason": "PIT_EVENT_EMPTY_SCOPE",
+            "manifest_hash": hashlib.sha256(b"[]").hexdigest(),
+            "status_by_code": {},
+            "reason_by_code": {},
+        }
+        return ({}, empty_evidence) if include_evidence else {}
+    if decision_at is None:
+        evidence = {
+            "status": PIT_DATA_BLOCKED,
+            "reason": "PIT_EVENT_EXACT_DECISION_TIME_REQUIRED",
+            "manifest_hash": hashlib.sha256(
+                f"event:{as_of}:missing-decision-at".encode("utf-8")
+            ).hexdigest(),
+            "status_by_code": {code: PIT_DATA_BLOCKED for code in codes},
+            "reason_by_code": {
+                code: "PIT_EVENT_EXACT_DECISION_TIME_REQUIRED" for code in codes
             },
-        ).mappings().all()
+        }
+        result: dict[str, list[dict[str, Any]]] = {}
+        return (result, evidence) if include_evidence else result
+    batch = load_event_facts(
+        engine,
+        codes=codes,
+        decision_at=decision_at,
+        fact_cutoff_at=fact_cutoff_at,
+        start_date=as_of - timedelta(days=20),
+        end_date=as_of,
+        require_qmt_complete_batch=True,
+    )
     result: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        code = str(row["stock_code"])[:6]
-        if len(result[code]) < 10:
-            result[code].append(dict(row))
-    return result
+    for code in codes:
+        for raw in batch.facts.get(code) or []:
+            if len(result[code]) >= 10:
+                break
+            row = dict(raw)
+            published_at = str(row.get("event_published_at") or "")
+            try:
+                row["notice_date"] = date.fromisoformat(published_at[:10])
+            except ValueError:
+                row["notice_date"] = None
+            result[code].append(row)
+    status_by_code = {
+        code: (
+            PIT_AVAILABLE
+            if batch.status_for(code) == PIT_AVAILABLE
+            else PIT_DATA_BLOCKED
+        )
+        for code in codes
+    }
+    reason_by_code = {
+        code: (
+            batch.reason_for(code)
+            or (
+                "" if status_by_code[code] == PIT_AVAILABLE
+                else "PIT_EVENT_COVERAGE_UNPROVEN"
+            )
+        )
+        for code in codes
+    }
+    evidence = {
+        "status": (
+            PIT_AVAILABLE
+            if all(value == PIT_AVAILABLE for value in status_by_code.values())
+            else PIT_DATA_BLOCKED
+        ),
+        "reason": (
+            ""
+            if all(value == PIT_AVAILABLE for value in status_by_code.values())
+            else "PIT_EVENT_PARTIAL_OR_UNVERIFIED_COVERAGE"
+        ),
+        "manifest_hash": batch.manifest_hash,
+        "status_by_code": status_by_code,
+        "reason_by_code": reason_by_code,
+        "coverage_by_code": {
+            code: dict(batch.coverage_by_code.get(code) or {})
+            for code in codes
+        },
+        "fact_cutoff_at": batch.fact_cutoff_at,
+        "decision_at": batch.decision_at,
+    }
+    output = dict(result)
+    return (output, evidence) if include_evidence else output
 
 
 def _market_features(
@@ -1028,10 +1211,12 @@ def load_daily_feature_universe(
         for code, count in frame["stock_code"].value_counts().items()
         if int(count) >= 65
     )
-    industries = _load_industries(
+    industries, industry_evidence = _load_industries(
         primary_engine,
         codes,
         as_of=as_of,
+        decision_at=context_cutoff_at,
+        include_evidence=True,
     )
     theme_memberships, concept_snapshot_date = _load_theme_memberships(
         primary_engine,
@@ -1055,6 +1240,23 @@ def load_daily_feature_universe(
             if (membership[0], membership[2]) not in existing_keys:
                 existing.append(membership)
     market = _market_features(frame, dates, industries)
+    change_pct_binding = {
+        "protocol": DERIVED_CHANGE_PCT_PROTOCOL,
+        "source_fields": ["close", "pre_close"],
+        "stored_change_pct_consumed": False,
+    }
+    market["derived_change_pct_binding"] = {
+        **change_pct_binding,
+        "binding_hash": hashlib.sha256(
+            json.dumps(
+                change_pct_binding,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
     market.update(
         _qmt_attestation_evidence(
             kline_engine,
@@ -1072,6 +1274,7 @@ def load_daily_feature_universe(
             as_of=as_of,
             cutoff_at=context_cutoff_at,
             theme_aliases=build_theme_alias_index(theme_memberships),
+            allow_legacy_display=False,
         )
     )
 
@@ -1147,6 +1350,12 @@ def load_daily_feature_universe(
             * 100.0
         )
         industry_code, industry_name = industries.get(code, ("", ""))
+        industry_pit_status = industry_evidence["status_by_code"].get(
+            code, PIT_DATA_BLOCKED
+        )
+        industry_pit_reason = industry_evidence["reason_by_code"].get(
+            code, "PIT_INDUSTRY_CODE_NOT_IN_EXACT_SNAPSHOT"
+        )
         base[code] = {
             "stock_code": code,
             "stock_name": name,
@@ -1164,6 +1373,14 @@ def load_daily_feature_universe(
             "latest_tradable": float(amount.iloc[-1] > 0),
             "theme_code": industry_code,
             "theme_name": industry_name,
+            "industry_pit_status": industry_pit_status,
+            "industry_pit_reason": industry_pit_reason,
+            "industry_snapshot_hash": industry_evidence["snapshot_hash"],
+            "industry_snapshot_date": industry_evidence.get("snapshot_date"),
+            "industry_snapshot_source": industry_evidence.get("source"),
+            "industry_rank_eligible": float(
+                industry_pit_status == PIT_AVAILABLE
+            ),
             **history_evidence,
             "return_2d_pct": ret2,
             "return_1d_pct": float(latest_row["change_pct"] or 0),
@@ -1335,10 +1552,42 @@ def load_daily_feature_universe(
             dict(market.get("context_theme_scores") or {}),
         )
 
+    common_cutoff: dict[str, Any] = {
+        "status": PIT_DATA_BLOCKED,
+        "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
+        "fact_cutoff_at": "",
+        "receipt_root_hash": "",
+    }
+    if context_cutoff_at is not None:
+        common_cutoff = resolve_common_fact_cutoff(
+            primary_engine,
+            codes=list(base),
+            decision_at=context_cutoff_at,
+            finance_start_date="1900-01-01",
+            finance_end_date=as_of,
+            event_start_date=as_of - timedelta(days=20),
+            event_end_date=as_of,
+            require_qmt_event_batch=True,
+        )
+    pit_reader_decision_at = (
+        context_cutoff_at
+        if common_cutoff.get("status") == PIT_AVAILABLE
+        else None
+    )
+    pit_fact_cutoff_at = common_cutoff.get("fact_cutoff_at") or None
+    market["pit_common_cutoff_status"] = common_cutoff.get("status")
+    market["pit_common_cutoff_reason"] = common_cutoff.get("reason") or ""
+    market["pit_fact_cutoff_at"] = common_cutoff.get("fact_cutoff_at") or ""
+    market["pit_decision_at"] = common_cutoff.get("decision_at") or ""
+    market["pit_common_receipt_root_hash"] = (
+        common_cutoff.get("receipt_root_hash") or ""
+    )
     finance = _load_finance(
         primary_engine,
         as_of=as_of,
         codes=list(base),
+        decision_at=pit_reader_decision_at,
+        fact_cutoff_at=pit_fact_cutoff_at,
     )
     quality_raw = {}
     growth_raw = {}
@@ -1348,11 +1597,47 @@ def load_daily_feature_universe(
     momentum_raw = {}
     for code, item in base.items():
         values = finance.get(code)
-        if not values:
+        finance_status = (
+            str((values or {}).get("finance_pit_status") or PIT_DATA_BLOCKED)
+        )
+        item["finance_pit_status"] = finance_status
+        item["finance_pit_reason"] = str(
+            (values or {}).get("finance_pit_reason")
+            or "PIT_FINANCE_COVERAGE_UNPROVEN"
+        )
+        item["finance_manifest_hash"] = (values or {}).get(
+            "finance_manifest_hash"
+        )
+        item["finance_revision_id"] = (values or {}).get(
+            "finance_revision_id"
+        )
+        item["finance_content_hash"] = (values or {}).get(
+            "finance_content_hash"
+        )
+        item["finance_published_at"] = (values or {}).get(
+            "finance_published_at"
+        )
+        item["finance_known_at"] = (values or {}).get("finance_known_at")
+        item["finance_report_date"] = (values or {}).get(
+            "finance_report_date"
+        )
+        item["finance_authoritative_empty"] = bool(
+            (values or {}).get("finance_authoritative_empty")
+        )
+        item["finance_coverage_id"] = (values or {}).get(
+            "finance_coverage_id"
+        )
+        item["finance_coverage_response_hash"] = (values or {}).get(
+            "finance_coverage_response_hash"
+        )
+        item["finance_coverage_watermark_hash"] = (values or {}).get(
+            "finance_coverage_watermark_hash"
+        )
+        if not values or finance_status != PIT_AVAILABLE:
             item["finance_data_complete"] = 0.0
             item["finance_missing_count"] = 9.0
             item["finance_missing_fields"] = [
-                "finance_row_missing"
+                "finance_pit_data_blocked"
             ]
             continue
         missing_fields = [
@@ -1428,16 +1713,86 @@ def load_daily_feature_universe(
     for code in sorted(required_code_set):
         if code in base and code not in ranked_codes:
             ranked_codes.append(code)
-    notices = _load_recent_notices(
+    notices, event_evidence = _load_recent_notices(
         primary_engine,
         as_of=as_of,
         codes=ranked_codes,
+        decision_at=pit_reader_decision_at,
+        fact_cutoff_at=pit_fact_cutoff_at,
+        include_evidence=True,
     )
     selected = []
     for code in ranked_codes:
         item = base[code]
+        item["event_pit_status"] = event_evidence["status_by_code"].get(
+            code, PIT_DATA_BLOCKED
+        )
+        item["event_pit_reason"] = event_evidence["reason_by_code"].get(
+            code, "PIT_EVENT_COVERAGE_UNPROVEN"
+        )
+        item["event_manifest_hash"] = event_evidence["manifest_hash"]
+        item["event_revision_ids"] = [
+            str(row.get("event_revision_id") or "")
+            for row in notices.get(code, [])
+            if row.get("event_revision_id")
+        ]
+        item["event_content_hashes"] = [
+            str(row.get("event_content_hash") or "")
+            for row in notices.get(code, [])
+            if row.get("event_content_hash")
+        ]
+        event_coverage = dict(
+            event_evidence.get("coverage_by_code", {}).get(code) or {}
+        )
+        item["event_authoritative_empty"] = bool(
+            item.get("event_pit_status") == PIT_AVAILABLE
+            and not notices.get(code)
+            and event_coverage
+        )
+        item["event_coverage_id"] = event_coverage.get("coverage_id")
+        item["event_coverage_response_hash"] = event_coverage.get(
+            "coverage_response_hash"
+        )
+        item["event_coverage_watermark_hash"] = event_coverage.get(
+            "coverage_watermark_hash"
+        )
+        pit_strategy_eligible = bool(
+            item.get("finance_pit_status") == PIT_AVAILABLE
+            and item.get("event_pit_status") == PIT_AVAILABLE
+            and item.get("industry_pit_status") == PIT_AVAILABLE
+        )
+        item["pit_strategy_status"] = (
+            PIT_AVAILABLE if pit_strategy_eligible else PIT_DATA_BLOCKED
+        )
+        item["pit_strategy_reason"] = (
+            ""
+            if pit_strategy_eligible
+            else ";".join(
+                value
+                for value in (
+                    str(item.get("finance_pit_reason") or ""),
+                    str(item.get("event_pit_reason") or ""),
+                    str(item.get("industry_pit_reason") or ""),
+                )
+                if value
+            )
+        )
+        if not pit_strategy_eligible:
+            # Positions still remain in ``required_position_monitor`` for exit
+            # risk, but missing PIT facts can never qualify a new entry.
+            item["entry_eligible"] = 0.0
         item["market_news_risk_score"] = float(
             market.get("news_risk_score") or 0.0
+        )
+        item["news_context_evidence_status"] = str(
+            market.get("context_evidence_status") or "DATA_BLOCKED"
+        )
+        item["news_context_strategy_eligible"] = bool(
+            market.get("context_strategy_eligible")
+        )
+        item["news_context_reason"] = str(
+            market.get("context_reason")
+            or "PIT_NEWS_REVISION_AND_COVERAGE_REQUIRED"
         )
         item["overseas_risk_score"] = float(
             market.get("overseas_risk_score") or 0.0
@@ -1478,6 +1833,22 @@ def load_daily_feature_universe(
             if concept_snapshot_date
             else None
         ),
+        "industry_pit": {
+            "status": industry_evidence.get("status"),
+            "reason": industry_evidence.get("reason"),
+            "snapshot_date": industry_evidence.get("snapshot_date"),
+            "source": industry_evidence.get("source"),
+            "captured_at": industry_evidence.get("captured_at"),
+            "snapshot_hash": industry_evidence.get("snapshot_hash"),
+        },
+        "finance_pit_manifest_hashes": sorted(
+            {
+                str(item.get("finance_manifest_hash") or "")
+                for item in selected
+                if item.get("finance_manifest_hash")
+            }
+        ),
+        "event_pit_manifest_hash": event_evidence.get("manifest_hash"),
         "data_quality": {
             key: market.get(key)
             for key in (
@@ -1509,6 +1880,12 @@ def load_daily_feature_universe(
             "context_knowledge_time_column": market.get(
                 "context_knowledge_time_column"
             ),
+            "context_strategy_eligible": market.get(
+                "context_strategy_eligible"
+            ),
+            "context_reason": market.get("context_reason"),
+            "funding_eligible": market.get("funding_eligible"),
+            "order_authority": market.get("order_authority"),
             "policy_support_score": market.get(
                 "policy_support_score"
             ),
@@ -1546,5 +1923,7 @@ def load_daily_feature_universe(
             if concept_snapshot_date
             else None
         ),
+        "industry_pit": snapshot_payload["industry_pit"],
+        "event_pit_manifest_hash": event_evidence.get("manifest_hash"),
         "theme_count": len(theme_statistics),
     }

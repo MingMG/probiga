@@ -12,6 +12,29 @@ from server.api.routers import scheduler as scheduler_router
 from server.common.scheduler_validation import SchedulerValidationResult
 
 
+def _governance_not_ready_payload() -> dict:
+    return {
+        "status": "blocked",
+        "orchestration_status": "NOT_READY",
+        "reason_code": "INPUT_NOT_READY",
+        "error_class": "NOT_READY",
+        "retryable": True,
+        "input_ready": False,
+        "reason": "权威交易日数据尚未就绪",
+        "blocking_stage": "input_readiness",
+        "target_trade_date": "2026-08-21",
+        "requested_trade_date": "",
+        "input_trade_date": "2026-08-20",
+        "allocations": [{
+            "target_type": "CASH",
+            "simulated_weight_pct": 100.0,
+            "real_order_authority": False,
+        }],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 class SchedulerRuntimeTest(unittest.TestCase):
     def tearDown(self):
         scheduler_runtime._scheduler_thread = None
@@ -22,6 +45,11 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._delivery_lane_semaphore = None
         scheduler_runtime._running_procs.clear()
         scheduler_runtime._running_task_ids.clear()
+        scheduler_runtime._running_history_uids.clear()
+        scheduler_runtime._stop_pending_task_ids.clear()
+        scheduler_runtime._stop_requested_task_ids.clear()
+        scheduler_runtime._timeout_pending_task_ids.clear()
+        scheduler_runtime._timeout_requested_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_runtime._delivery_lane_running_task_ids.clear()
@@ -102,6 +130,586 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     "api_mysql_pool_recycle": 1800,
                 },
             )
+
+    def test_linux_scheduler_heartbeat_binds_build_and_executor_role(self):
+        engine = MagicMock()
+        connection = engine.begin.return_value.__enter__.return_value
+        build_sha = "a" * 40
+        with patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 30, "max_concurrent_tasks": 2},
+        ), patch(
+            "server.api.scheduler_runtime.os.name", "posix"
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ",
+            {"PROBIGA_BUILD_COMMIT_SHA": build_sha},
+            clear=False,
+        ):
+            scheduler_runtime._write_scheduler_heartbeat(engine, "standalone")
+
+        sql = str(connection.execute.call_args.args[0])
+        params = connection.execute.call_args.args[1]
+        self.assertIn("build_sha", sql)
+        self.assertIn("executor_role", sql)
+        self.assertEqual(params["build_sha"], build_sha)
+        self.assertEqual(params["executor_role"], "linux_standalone")
+        self.assertNotIn("CREATE TABLE", sql.upper())
+
+    def test_standalone_dispatch_authority_rejects_duplicate_fresh_executors(self):
+        engine = MagicMock()
+        connection = engine.connect.return_value.__enter__.return_value
+        build_sha = "a" * 40
+        common = {
+            "mode": "standalone",
+            "host_name": "scheduler-host",
+            "build_sha": build_sha,
+            "executor_role": "linux_standalone",
+            "started_at": datetime(2026, 8, 25, 9, 0),
+            "heartbeat_at": datetime(2026, 8, 25, 9, 1),
+            "heartbeat_age_seconds": 1,
+            "poll_seconds": 30,
+            "max_concurrent_tasks": 2,
+        }
+        connection.execute.return_value.mappings.return_value = [
+            {
+                **common,
+                "instance_id": "scheduler-host-123",
+                "pid": 123,
+            },
+            {
+                **common,
+                "instance_id": "scheduler-host-456",
+                "pid": 456,
+            },
+        ]
+        with patch(
+            "server.api.scheduler_runtime.os.name", "posix"
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid", return_value=123
+        ), patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="scheduler-host",
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ",
+            {"PROBIGA_BUILD_COMMIT_SHA": build_sha},
+            clear=False,
+        ):
+            passed, detail = scheduler_runtime._standalone_heartbeat_allows_dispatch(
+                engine,
+                "standalone",
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("fresh_heartbeat_not_unique", detail["errors"])
+        self.assertEqual(detail["fresh_row_count"], 2)
+
+    def test_standalone_heartbeat_write_failure_prevents_all_dispatch(self):
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.return_value = True
+        engine = MagicMock()
+        with patch(
+            "server.api.scheduler_runtime._catchup_on_startup"
+        ), patch(
+            "server.api.scheduler_runtime.get_engine", return_value=engine
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
+        ), patch(
+            "server.api.scheduler_runtime._write_scheduler_heartbeat",
+            side_effect=RuntimeError("heartbeat unavailable"),
+        ), patch(
+            "server.api.scheduler_runtime._cleanup_stale_running_tasks"
+        ) as stale_cleanup, patch(
+            "server.api.scheduler_runtime._maybe_cleanup_history"
+        ) as cleanup_history, patch(
+            "server.api.scheduler_runtime._claim_task_run"
+        ) as claim, patch(
+            "server.api.scheduler_runtime.threading.Thread"
+        ) as thread_cls:
+            scheduler_runtime._check_and_run_tasks(
+                mode="standalone",
+                stop_event=stop_event,
+            )
+
+        cleanup_history.assert_not_called()
+        stale_cleanup.assert_not_called()
+        claim.assert_not_called()
+        thread_cls.assert_not_called()
+        engine.connect.assert_not_called()
+
+    def test_standalone_duplicate_identity_prevents_claim_and_worker(self):
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.return_value = True
+        engine = MagicMock()
+        with patch(
+            "server.api.scheduler_runtime._catchup_on_startup"
+        ), patch(
+            "server.api.scheduler_runtime.get_engine", return_value=engine
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
+        ), patch(
+            "server.api.scheduler_runtime._write_scheduler_heartbeat"
+        ), patch(
+            "server.api.scheduler_runtime._standalone_heartbeat_allows_dispatch",
+            return_value=(
+                False,
+                {"errors": ["fresh_heartbeat_not_unique"]},
+            ),
+        ), patch(
+            "server.api.scheduler_runtime._cleanup_stale_running_tasks"
+        ) as stale_cleanup, patch(
+            "server.api.scheduler_runtime._maybe_cleanup_history"
+        ) as cleanup_history, patch(
+            "server.api.scheduler_runtime._claim_task_run"
+        ) as claim, patch(
+            "server.api.scheduler_runtime.threading.Thread"
+        ) as thread_cls:
+            scheduler_runtime._check_and_run_tasks(
+                mode="standalone",
+                stop_event=stop_event,
+            )
+
+        cleanup_history.assert_not_called()
+        stale_cleanup.assert_not_called()
+        claim.assert_not_called()
+        thread_cls.assert_not_called()
+        engine.connect.assert_not_called()
+
+    def test_standalone_authority_rejects_malformed_future_heartbeat(self):
+        engine = MagicMock()
+        connection = engine.connect.return_value.__enter__.return_value
+        build_sha = "a" * 40
+        common = {
+            "mode": "standalone",
+            "host_name": "scheduler-host",
+            "build_sha": build_sha,
+            "executor_role": "linux_standalone",
+            "started_at": datetime(2026, 8, 25, 9, 0),
+            "heartbeat_at": datetime(2026, 8, 25, 9, 1),
+            "poll_seconds": 30,
+            "max_concurrent_tasks": 2,
+        }
+        connection.execute.return_value.mappings.return_value = [
+            {
+                **common,
+                "instance_id": "scheduler-host-123",
+                "pid": 123,
+                "heartbeat_age_seconds": 1,
+            },
+            {
+                **common,
+                "instance_id": "other-host-456",
+                "host_name": "other-host",
+                "pid": 456,
+                "heartbeat_age_seconds": -60,
+                "poll_seconds": None,
+            },
+        ]
+        with patch(
+            "server.api.scheduler_runtime.os.name", "posix"
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid", return_value=123
+        ), patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="scheduler-host",
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 30, "max_concurrent_tasks": 2},
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ",
+            {"PROBIGA_BUILD_COMMIT_SHA": build_sha},
+            clear=False,
+        ):
+            passed, detail = scheduler_runtime._standalone_heartbeat_allows_dispatch(
+                engine,
+                "standalone",
+            )
+
+        self.assertFalse(passed)
+        self.assertIn("future_heartbeat_present", detail["errors"])
+        self.assertEqual(detail["future_row_count"], 1)
+
+    def test_standalone_authority_requires_exact_configured_poll(self):
+        engine = MagicMock()
+        connection = engine.connect.return_value.__enter__.return_value
+        build_sha = "a" * 40
+        row = {
+            "instance_id": "scheduler-host-123",
+            "mode": "standalone",
+            "host_name": "scheduler-host",
+            "pid": 123,
+            "build_sha": build_sha,
+            "executor_role": "linux_standalone",
+            "started_at": datetime(2026, 8, 25, 9, 0),
+            "heartbeat_at": datetime(2026, 8, 25, 9, 1),
+            "heartbeat_age_seconds": 1,
+            "poll_seconds": 30,
+            "max_concurrent_tasks": 2,
+        }
+        connection.execute.return_value.mappings.return_value = [row]
+        with patch(
+            "server.api.scheduler_runtime.os.name", "posix"
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid", return_value=123
+        ), patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="scheduler-host",
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 30, "max_concurrent_tasks": 2},
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ",
+            {"PROBIGA_BUILD_COMMIT_SHA": build_sha},
+            clear=False,
+        ):
+            passed, detail = scheduler_runtime._standalone_heartbeat_allows_dispatch(
+                engine,
+                "standalone",
+            )
+            row["poll_seconds"] = 60
+            rejected, mismatch = (
+                scheduler_runtime._standalone_heartbeat_allows_dispatch(
+                    engine,
+                    "standalone",
+                )
+            )
+
+        self.assertTrue(passed, detail)
+        self.assertFalse(rejected)
+        self.assertIn("poll_seconds_mismatch", mismatch["errors"])
+
+    def test_scheduled_claim_without_audit_row_never_starts_worker(self):
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        stop_event.wait.return_value = True
+        engine = MagicMock()
+        result = MagicMock()
+        result.keys.return_value = [
+            "id",
+            "task_name",
+            "task_type",
+            "script_path",
+            "script_args",
+            "cron_time",
+            "interval_minutes",
+            "enabled",
+            "date_param",
+            "last_run_at",
+            "last_triggered_at",
+            "last_run_status",
+            "last_run_duration",
+        ]
+        result.fetchall.return_value = [
+            (
+                901,
+                "audited task",
+                "analysis_fast",
+                "biz/analysis/sync_analysis_fast.py",
+                "",
+                "00:00",
+                1,
+                1,
+                "",
+                None,
+                None,
+                "",
+                0,
+            )
+        ]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+        with patch(
+            "server.api.scheduler_runtime.get_engine", return_value=engine
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
+        ), patch(
+            "server.api.scheduler_runtime._write_scheduler_heartbeat"
+        ), patch(
+            "server.api.scheduler_runtime._standalone_heartbeat_allows_dispatch",
+            return_value=(True, {"errors": []}),
+        ), patch(
+            "server.api.scheduler_runtime._cleanup_stale_running_tasks"
+        ), patch(
+            "server.api.scheduler_runtime._maybe_cleanup_history"
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._strategy_pipeline_dependencies_ready",
+            return_value=(True, "ready"),
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_non_trading_day",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_outside_intraday_window",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._scheduler_lane_has_capacity",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime._claim_task_run",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value=None,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task, patch(
+            "server.api.scheduler_runtime.threading.Thread"
+        ) as thread_cls:
+            scheduler_runtime._check_and_run_tasks(
+                mode="standalone",
+                stop_event=stop_event,
+            )
+
+        thread_cls.assert_not_called()
+        self.assertEqual(
+            update_task.call_args.args[2]["last_run_status"],
+            "failed",
+        )
+        self.assertNotIn(901, scheduler_runtime._running_task_ids)
+
+    def test_scheduler_heartbeat_never_labels_unconfigured_windows_as_qmt_edge(self):
+        with patch(
+            "server.api.scheduler_runtime.os.name", "nt"
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ", {}, clear=True
+        ):
+            self.assertEqual(
+                scheduler_runtime._scheduler_executor_role("standalone"),
+                "unclassified_scheduler",
+            )
+            self.assertEqual(
+                scheduler_runtime._scheduler_build_commit_sha(), "0" * 40
+            )
+
+    def test_manual_launch_rejects_task_owned_by_other_host_before_claim(self):
+        row = {
+            "id": 801,
+            "task_name": "Windows QMT task",
+            "task_type": "qmt_local_history_2024",
+            "enabled": 1,
+        }
+        with patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime._claim_task_run"
+        ) as claim, patch(
+            "server.api.scheduler_runtime.threading.Thread"
+        ) as thread_cls:
+            result = scheduler_runtime.launch_scheduler_task(
+                row,
+                root=Path("E:/fake"),
+                engine=MagicMock(),
+            )
+
+        self.assertEqual(result["status"], "delegated_to_other_host")
+        self.assertFalse(result["accepted"])
+        claim.assert_not_called()
+        thread_cls.assert_not_called()
+
+    def test_production_manual_launch_requires_release_build_identity(self):
+        row = {
+            "id": 802,
+            "task_name": "Linux task",
+            "task_type": "analysis_fast",
+            "enabled": 1,
+        }
+        with patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ",
+            {"PROBIGA_DEPLOYMENT_MODE": "production"},
+            clear=True,
+        ), patch(
+            "server.api.scheduler_runtime._claim_task_run"
+        ) as claim:
+            result = scheduler_runtime.launch_scheduler_task(
+                row,
+                root=Path("E:/fake"),
+                engine=MagicMock(),
+            )
+
+        self.assertEqual(result["status"], "build_identity_unavailable")
+        self.assertFalse(result["accepted"])
+        claim.assert_not_called()
+
+    def test_scheduler_run_api_uses_claimed_audited_launcher(self):
+        row = {
+            "id": 803,
+            "task_name": "audited task",
+            "task_type": "analysis_fast",
+            "enabled": 1,
+        }
+        expected = {
+            "accepted": True,
+            "status": "running",
+            "task_id": 803,
+        }
+        engine = MagicMock()
+        with patch.object(
+            scheduler_router,
+            "_read_sql",
+            return_value=[row],
+        ), patch.object(
+            scheduler_router,
+            "get_engine",
+            return_value=engine,
+        ), patch.object(
+            scheduler_router,
+            "launch_scheduler_task",
+            return_value=expected,
+        ) as launch:
+            result = scheduler_router.run_task_now(803)
+
+        self.assertEqual(result, expected)
+        self.assertEqual(launch.call_args.args[0], row)
+        self.assertIs(launch.call_args.kwargs["engine"], engine)
+
+    def test_scheduler_stop_api_cannot_mutate_other_host_task(self):
+        row = {
+            "id": 804,
+            "task_name": "Windows QMT task",
+            "task_type": "qmt_local_history_2024",
+            "script_path": "tools/run_guojin_qmt_full_market_history.py",
+            "last_run_status": "running",
+        }
+        with patch.object(
+            scheduler_router,
+            "_read_sql",
+            return_value=[row],
+        ), patch.object(
+            scheduler_router,
+            "scheduler_task_owned_by_current_host",
+            return_value=False,
+        ), patch.object(
+            scheduler_router,
+            "update_scheduler_task",
+        ) as update_task:
+            result = scheduler_router.stop_task(804)
+
+        self.assertEqual(result["status"], "delegated_to_other_host")
+        self.assertFalse(result["process_killed"])
+        update_task.assert_not_called()
+
+    def test_scheduler_stop_api_refuses_same_host_foreign_process(self):
+        row = {
+            "id": 805,
+            "task_name": "standalone-owned task",
+            "task_type": "analysis_fast",
+            "script_path": "tools/run_analysis_fast.py",
+            "last_run_status": "running",
+        }
+        expected = {
+            "accepted": False,
+            "status": "not_owned_by_api_process",
+            "task_id": 805,
+            "process_killed": False,
+        }
+        with patch.object(
+            scheduler_router, "_read_sql", return_value=[row]
+        ), patch.object(
+            scheduler_router,
+            "scheduler_task_owned_by_current_host",
+            return_value=True,
+        ), patch.object(
+            scheduler_router,
+            "request_stop_owned_scheduler_task",
+            return_value=expected,
+        ) as request_stop, patch.object(
+            scheduler_router, "update_scheduler_task"
+        ) as update_task:
+            result = scheduler_router.stop_task(805)
+
+        self.assertEqual(result["status"], "not_owned_by_api_process")
+        self.assertFalse(result["accepted"])
+        request_stop.assert_called_once_with(805)
+        update_task.assert_not_called()
+
+    def test_stop_request_requires_exact_live_api_child_and_audit_uid(self):
+        scheduler_runtime._running_task_ids.add(806)
+
+        result = scheduler_runtime.request_stop_owned_scheduler_task(806)
+
+        self.assertEqual(result["status"], "not_owned_by_api_process")
+        self.assertFalse(result["accepted"])
+        self.assertNotIn(806, scheduler_runtime._stop_requested_task_ids)
+
+    def test_stop_request_kill_failure_keeps_owner_state_and_clears_request(self):
+        task_id = 807
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = "run-807"
+
+        with patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            return_value=False,
+        ):
+            result = scheduler_runtime.request_stop_owned_scheduler_task(task_id)
+
+        self.assertEqual(result["status"], "stop_not_confirmed")
+        self.assertFalse(result["accepted"])
+        self.assertIs(scheduler_runtime._running_procs[task_id], proc)
+        self.assertIn(task_id, scheduler_runtime._running_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._stop_pending_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._stop_requested_task_ids)
+
+    def test_stop_request_confirmed_keeps_worker_as_terminal_state_writer(self):
+        task_id = 808
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = "run-808"
+
+        with patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            return_value=True,
+        ) as terminate:
+            result = scheduler_runtime.request_stop_owned_scheduler_task(task_id)
+
+        self.assertEqual(result["status"], "stop_requested")
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["job_id"], "run-808")
+        self.assertTrue(result["process_killed"])
+        self.assertIn(task_id, scheduler_runtime._stop_requested_task_ids)
+        self.assertIs(scheduler_runtime._running_procs[task_id], proc)
+        terminate.assert_called_once_with(proc, timeout_seconds=5.0)
+
+    def test_stop_confirmation_race_does_not_relabel_natural_completion(self):
+        task_id = 811
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = "run-811"
+
+        def finish_naturally(_proc, *, timeout_seconds):
+            self.assertIs(_proc, proc)
+            self.assertEqual(timeout_seconds, 5.0)
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._running_procs.pop(task_id, None)
+                scheduler_runtime._running_history_uids.pop(task_id, None)
+                scheduler_runtime._running_task_ids.discard(task_id)
+            return True
+
+        with patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            side_effect=finish_naturally,
+        ):
+            result = scheduler_runtime.request_stop_owned_scheduler_task(task_id)
+
+        self.assertEqual(result["status"], "stop_raced_with_terminal_state")
+        self.assertFalse(result["accepted"])
+        self.assertNotIn(task_id, scheduler_runtime._stop_pending_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._stop_requested_task_ids)
 
     def test_sim_trade_uses_dedicated_fast_lane(self):
         self.assertTrue(scheduler_runtime._uses_fast_lane({"task_type": "sim_trade"}))
@@ -202,7 +810,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
-    def test_intraday_capital_flow_fast_is_latency_sensitive_and_windows_owned(self):
+    def test_intraday_capital_flow_fast_is_latency_sensitive_and_linux_owned(self):
         row = {"task_type": "intraday_capital_flow_fast"}
 
         self.assertTrue(scheduler_runtime._uses_fast_lane(row))
@@ -218,7 +826,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
                 datetime(2026, 8, 11, 15, 11),
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             scheduler_runtime._should_delegate_to_windows_qmt_bridge(
                 row,
                 platform_name="posix",
@@ -233,15 +841,13 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
     def test_qmt_desktop_tasks_are_delegated_only_on_non_windows_host(self):
         for task_type in (
-            "etf_forward_daily",
-            "fetch_hot_rank_xq",
-            "index_current",
-            "index_kline",
-            "index_minute",
-            "intraday_minute_kline",
-            "intraday_realtime",
+            "qmt_catalog_capability_refresh",
+            "qmt_intraday_realtime",
             "qmt_membership_snapshot",
-            "stock_kline",
+            "qmt_announcement_pit",
+            "qmt_local_gap_repair_execute",
+            "qmt_local_history_2024",
+            "qmt_reference_incremental",
         ):
             row = {"task_type": task_type}
             self.assertTrue(
@@ -258,14 +864,15 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         self.assertFalse(
             scheduler_runtime._should_delegate_to_windows_qmt_bridge(
-                {"task_type": "trading_v2_level1_validation"},
+                {"task_type": "intraday_realtime"},
                 platform_name="posix",
             )
         )
 
     def test_scheduler_host_ownership_prevents_cross_host_execution(self):
-        qmt_task = {"task_type": "stock_kline"}
+        qmt_task = {"task_type": "qmt_membership_snapshot"}
         linux_task = {"task_type": "analysis_fast"}
+        unfrozen_task = {"task_type": "stock_kline"}
         self.assertTrue(
             scheduler_runtime._should_skip_task_for_host(qmt_task, platform_name="posix")
         )
@@ -277,6 +884,16 @@ class SchedulerRuntimeTest(unittest.TestCase):
         )
         self.assertTrue(
             scheduler_runtime._should_skip_task_for_host(linux_task, platform_name="nt")
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_task_for_host(
+                unfrozen_task, platform_name="posix"
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._should_skip_task_for_host(
+                unfrozen_task, platform_name="nt"
+            )
         )
 
     def test_market_tasks_skip_on_non_trading_day(self):
@@ -522,6 +1139,72 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime.LONG_TASK_TIMEOUT_MINUTES,
         )
 
+    def test_full_qmt_history_timeout_covers_the_seven_hour_window(self):
+        for row in (
+            {
+                "task_type": "qmt_local_history_2024",
+                "script_path": "tools/run_guojin_qmt_full_market_history.py",
+                "interval_minutes": 0,
+            },
+            {
+                "task_type": "legacy_name",
+                "script_path": (
+                    "tools/run_guojin_qmt_full_market_history_2024.py"
+                ),
+                "interval_minutes": 0,
+            },
+        ):
+            self.assertEqual(
+                scheduler_runtime._task_timeout_minutes(row),
+                scheduler_runtime.QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES,
+            )
+
+    def test_detached_job_logs_use_external_protected_runtime_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            code_root = base / "sealed-release"
+            log_root = base / "state" / "jobs"
+            code_root.mkdir()
+            proc = MagicMock(pid=4321)
+            with patch(
+                "server.api.scheduler_runtime.subprocess.Popen",
+                return_value=proc,
+            ) as popen:
+                result = scheduler_runtime.start_detached_python_job(
+                    cmd=["python", "worker.py"],
+                    root=code_root,
+                    env={"PROBIGA_JOB_LOG_ROOT": str(log_root)},
+                    log_name="recommended/queue",
+                )
+
+            self.assertEqual(result["pid"], 4321)
+            self.assertEqual(
+                Path(result["stdout_log"]).resolve(),
+                (log_root / "recommended_queue.out.log").resolve(),
+            )
+            self.assertEqual(
+                Path(result["stderr_log"]).resolve(),
+                (log_root / "recommended_queue.err.log").resolve(),
+            )
+            self.assertFalse((code_root / "data").exists())
+            self.assertTrue(Path(result["stdout_log"]).is_file())
+            self.assertTrue(Path(result["stderr_log"]).is_file())
+            self.assertEqual(popen.call_args.kwargs["cwd"], str(code_root))
+
+    def test_detached_job_log_root_rejects_relative_or_code_tree_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            code_root = Path(temp_dir) / "release"
+            code_root.mkdir()
+            for configured in ("data/jobs", str(code_root / "data" / "jobs")):
+                with self.assertRaises(RuntimeError):
+                    scheduler_runtime.start_detached_python_job(
+                        cmd=["python", "worker.py"],
+                        root=code_root,
+                        env={"PROBIGA_JOB_LOG_ROOT": configured},
+                        log_name="recommended",
+                    )
+            self.assertFalse((code_root / "data").exists())
+
     def test_scheduler_prioritizes_older_interval_task_over_realtime_poll(self):
         now = datetime(2026, 7, 20, 10, 0, 0)
         realtime = {
@@ -567,7 +1250,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(ordered[0]["task_type"], "intraday_minute_kline")
         self.assertEqual(ordered[1]["task_type"], "intraday_realtime")
 
-    def test_cleanup_stale_running_task_after_scheduler_restart(self):
+    def test_cleanup_after_restart_keeps_unknown_process_claimed(self):
         started_at = datetime.now() - timedelta(minutes=2)
         original_started_at = scheduler_runtime._scheduler_started_at
         original_running_procs = scheduler_runtime._running_procs
@@ -622,10 +1305,143 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime._running_procs = original_running_procs
             scheduler_runtime._running_task_ids = original_running_task_ids
 
+        self.assertEqual(cleaned, 0)
+        self.assertEqual(updates, [])
+        self.assertIn(39, remaining_ids)
+
+    def test_cleanup_timeout_kill_failure_keeps_claim_and_owner_state(self):
+        started_at = datetime.now() - timedelta(hours=8)
+        task_id = 40
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_history_uids[task_id] = "run-40"
+
+        engine = MagicMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [{
+            "id": task_id,
+            "task_name": "stale local writer",
+            "task_type": "analysis_fast",
+            "script_path": "biz/analysis/sync_analysis_fast.py",
+            "interval_minutes": 0,
+            "last_run_at": started_at,
+            "last_triggered_at": started_at,
+        }]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+
+        with patch(
+            "server.api.scheduler_runtime._scheduler_started_at",
+            started_at - timedelta(minutes=1),
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            return_value=False,
+        ) as terminate, patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            cleaned = scheduler_runtime._cleanup_stale_running_tasks(engine)
+
+        self.assertEqual(cleaned, 0)
+        terminate.assert_called_once_with(proc)
+        update_task.assert_not_called()
+        self.assertIs(scheduler_runtime._running_procs[task_id], proc)
+        self.assertIn(task_id, scheduler_runtime._running_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._timeout_pending_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._timeout_requested_task_ids)
+
+    def test_cleanup_confirmed_timeout_leaves_terminal_write_to_exact_owner(self):
+        started_at = datetime.now() - timedelta(hours=8)
+        task_id = 41
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_history_uids[task_id] = "run-41"
+
+        engine = MagicMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [{
+            "id": task_id,
+            "task_name": "stale owned writer",
+            "task_type": "analysis_fast",
+            "script_path": "biz/analysis/sync_analysis_fast.py",
+            "interval_minutes": 0,
+            "last_run_at": started_at,
+            "last_triggered_at": started_at,
+        }]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+
+        with patch(
+            "server.api.scheduler_runtime._scheduler_started_at",
+            started_at - timedelta(minutes=1),
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            cleaned = scheduler_runtime._cleanup_stale_running_tasks(engine)
+
         self.assertEqual(cleaned, 1)
-        self.assertEqual(updates[0][2]["last_run_status"], "failed")
-        self.assertIn("服务重启", updates[0][2]["last_run_output"])
-        self.assertNotIn(39, remaining_ids)
+        update_task.assert_not_called()
+        self.assertIn(task_id, scheduler_runtime._timeout_requested_task_ids)
+        self.assertIn(task_id, scheduler_runtime._running_task_ids)
+        self.assertIs(scheduler_runtime._running_procs[task_id], proc)
+
+    def test_cleanup_timeout_confirmation_race_keeps_natural_terminal_state(self):
+        started_at = datetime.now() - timedelta(hours=8)
+        task_id = 43
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_history_uids[task_id] = "run-43"
+        engine = MagicMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [{
+            "id": task_id,
+            "task_name": "naturally completed writer",
+            "task_type": "analysis_fast",
+            "script_path": "biz/analysis/sync_analysis_fast.py",
+            "interval_minutes": 0,
+            "last_run_at": started_at,
+            "last_triggered_at": started_at,
+        }]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+
+        def finish_naturally(_proc):
+            self.assertIs(_proc, proc)
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._running_procs.pop(task_id, None)
+                scheduler_runtime._running_history_uids.pop(task_id, None)
+                scheduler_runtime._running_task_ids.discard(task_id)
+            return True
+
+        with patch(
+            "server.api.scheduler_runtime._scheduler_started_at",
+            started_at - timedelta(minutes=1),
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._terminate_process_and_confirm",
+            side_effect=finish_naturally,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            cleaned = scheduler_runtime._cleanup_stale_running_tasks(engine)
+
+        self.assertEqual(cleaned, 0)
+        update_task.assert_not_called()
+        self.assertNotIn(task_id, scheduler_runtime._timeout_pending_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._timeout_requested_task_ids)
 
     def test_cleanup_does_not_touch_task_owned_by_other_host(self):
         started_at = datetime.now() - timedelta(hours=2)
@@ -1016,6 +1832,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
         row = {"id": 7, "task_name": "missing", "script_path": "tools/missing.py"}
 
         with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="run-missing-7",
+        ), patch(
             "server.api.scheduler_runtime.resolve_scheduler_script",
             return_value=scheduler_runtime.Path(
                 "E:/definitely_missing_probiga_root/tools/missing.py"
@@ -1030,6 +1849,34 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(values["last_run_status"], "failed")
         self.assertEqual(values["last_run_duration"], 0)
         self.assertIn("missing.py", values["last_run_output"])
+
+    def test_run_task_never_executes_without_an_audit_row(self):
+        engine = MagicMock()
+        row = {
+            "id": 69,
+            "task_name": "must be audited",
+            "task_type": "daily_review",
+            "script_path": "biz/review/generate.py",
+        }
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value=None,
+        ), patch(
+            "server.api.scheduler_runtime._run_task_impl"
+        ) as implementation, patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        implementation.assert_not_called()
+        self.assertEqual(
+            update_task.call_args.args[2]["last_run_status"],
+            "failed",
+        )
+        self.assertIn(
+            "audit row unavailable",
+            update_task.call_args.args[2]["last_run_output"],
+        )
 
     def test_run_task_finishes_history_when_script_policy_rejects(self):
         engine = MagicMock()
@@ -1103,84 +1950,43 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(params["task_id"], 74)
         self.assertEqual(params["task_type"], "news_daily")
         self.assertEqual(params["trigger_source"], "scheduled")
+        self.assertIn("build_sha", params)
         self.assertNotIn("script_args", params)
         self.assertNotIn("should-not-be-stored", str(params))
 
-    def test_legacy_history_upgrade_adds_required_indexes(self):
+    def test_runtime_history_schema_check_is_read_only(self):
         engine = MagicMock()
         conn = MagicMock()
-        engine.begin.return_value.__enter__.return_value = conn
-        columns_result = MagicMock()
-        columns_result.fetchall.return_value = [
-            (name,)
-            for name in (
-                "id",
-                "run_uid",
-                "task_id",
-                "task_name",
-                "task_type",
-                "run_at",
-                "finished_at",
-                "status",
-                "duration",
-                "exit_code",
-                "output",
-                "host_name",
-                "scheduler_instance_id",
-                "trigger_source",
-            )
-        ]
-        index_result = MagicMock()
-        index_result.mappings.return_value.all.return_value = [
-            {"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"}
-        ]
-        conn.execute.side_effect = [MagicMock(), columns_result, index_result, MagicMock(), MagicMock()]
-
-        scheduler_runtime._ensure_task_history_table(engine)
-
-        statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-        self.assertTrue(any("ADD UNIQUE INDEX" in sql and "`run_uid`" in sql for sql in statements))
-        self.assertTrue(
-            any("ADD INDEX" in sql and "`task_id`, `run_at`" in sql for sql in statements)
-        )
-
-    def test_history_upgrade_does_not_duplicate_equivalent_indexes(self):
-        engine = MagicMock()
-        conn = MagicMock()
-        engine.begin.return_value.__enter__.return_value = conn
-        columns_result = MagicMock()
-        columns_result.fetchall.return_value = [
-            (name,)
-            for name in (
-                "id",
-                "run_uid",
-                "task_id",
-                "task_name",
-                "task_type",
-                "run_at",
-                "finished_at",
-                "status",
-                "duration",
-                "exit_code",
-                "output",
-                "host_name",
-                "scheduler_instance_id",
-                "trigger_source",
-            )
-        ]
+        engine.connect.return_value.__enter__.return_value = conn
         index_result = MagicMock()
         index_result.mappings.return_value.all.return_value = [
             {"Key_name": "run_uid_custom", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "run_uid"},
             {"Key_name": "task_run_custom", "Non_unique": 1, "Seq_in_index": 1, "Column_name": "task_id"},
             {"Key_name": "task_run_custom", "Non_unique": 1, "Seq_in_index": 2, "Column_name": "run_at"},
         ]
-        conn.execute.side_effect = [MagicMock(), columns_result, index_result]
+        conn.execute.side_effect = [MagicMock(), index_result]
 
         scheduler_runtime._ensure_task_history_table(engine)
 
         statements = [str(call.args[0]) for call in conn.execute.call_args_list]
-        self.assertFalse(any("ADD UNIQUE INDEX" in sql for sql in statements))
-        self.assertFalse(any("ADD INDEX" in sql for sql in statements))
+        self.assertTrue(any("LIMIT 0" in sql for sql in statements))
+        self.assertFalse(any("CREATE " in sql.upper() for sql in statements))
+        self.assertFalse(any("ALTER " in sql.upper() for sql in statements))
+        engine.begin.assert_not_called()
+
+    def test_runtime_history_schema_check_rejects_missing_indexes(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        engine.connect.return_value.__enter__.return_value = conn
+        index_result = MagicMock()
+        index_result.mappings.return_value.all.return_value = [
+            {"Key_name": "PRIMARY", "Non_unique": 0, "Seq_in_index": 1, "Column_name": "id"},
+        ]
+        conn.execute.side_effect = [MagicMock(), index_result]
+
+        with self.assertRaisesRegex(RuntimeError, "unique run_uid"):
+            scheduler_runtime._ensure_task_history_table(engine)
+        engine.begin.assert_not_called()
 
     def test_history_retention_cleanup_is_bounded_and_throttled(self):
         engine = MagicMock()
@@ -1268,7 +2074,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         with patch(
             "server.api.scheduler_runtime._task_history_start",
-            return_value="run-71",
+            return_value="00000000000000000000000000000071",
         ) as history_start, patch(
             "server.api.scheduler_runtime._task_history_finish"
         ) as history_finish, patch(
@@ -1294,10 +2100,111 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         history_start.assert_called_once_with(engine, row, run_uid=None)
         history_finish.assert_called_once()
-        self.assertEqual(history_finish.call_args.args[:2], (engine, "run-71"))
+        self.assertEqual(
+            history_finish.call_args.args[:2],
+            (engine, "00000000000000000000000000000071"),
+        )
         self.assertEqual(history_finish.call_args.kwargs["status"], "success")
         self.assertEqual(history_finish.call_args.kwargs["exit_code"], 0)
         self.assertIn("sent", history_finish.call_args.kwargs["output"])
+
+    def test_confirmed_user_stop_is_persisted_by_owner_with_same_audit_uid(self):
+        engine = MagicMock()
+        row = {
+            "id": 809,
+            "task_name": "manually stopped",
+            "task_type": "news_daily",
+            "script_path": "biz/early_briefing/generate.py",
+            "script_args": "",
+            "date_param": "",
+            "interval_minutes": 0,
+            "_history_run_uid": "00000000000000000000000000000809",
+            "_history_started": True,
+        }
+        fake_proc = MagicMock()
+        fake_proc.communicate.return_value = ("partial", "killed")
+        fake_proc.returncode = -9
+        scheduler_runtime._stop_requested_task_ids.add(809)
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/generate.py"),
+        ), patch.object(
+            Path, "exists", return_value=True
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env", return_value={}
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args", return_value=[]
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen", return_value=fake_proc
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task, patch(
+            "server.api.scheduler_runtime.validate_scheduler_task_result"
+        ) as validate_result:
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        final_values = update_task.call_args_list[-1].args[2]
+        self.assertEqual(final_values["last_run_status"], "stopped")
+        self.assertIn("用户手动停止", final_values["last_run_output"])
+        history_finish.assert_called_once()
+        self.assertEqual(
+            history_finish.call_args.args[:2],
+            (engine, "00000000000000000000000000000809"),
+        )
+        self.assertEqual(history_finish.call_args.kwargs["status"], "stopped")
+        validate_result.assert_not_called()
+
+    def test_confirmed_stale_timeout_is_persisted_by_exact_owner(self):
+        engine = MagicMock()
+        row = {
+            "id": 810,
+            "task_name": "timed out writer",
+            "task_type": "analysis_fast",
+            "script_path": "biz/analysis/sync_analysis_fast.py",
+            "script_args": "",
+            "date_param": "",
+            "interval_minutes": 0,
+            "_history_run_uid": "00000000000000000000000000000810",
+            "_history_started": True,
+        }
+        fake_proc = MagicMock()
+        fake_proc.communicate.return_value = ("partial", "killed")
+        fake_proc.returncode = -9
+        scheduler_runtime._timeout_requested_task_ids.add(810)
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/sync_analysis_fast.py"),
+        ), patch.object(
+            Path, "exists", return_value=True
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env", return_value={}
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args", return_value=[]
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen", return_value=fake_proc
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task, patch(
+            "server.api.scheduler_runtime.validate_scheduler_task_result"
+        ) as validate_result:
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        final_values = update_task.call_args_list[-1].args[2]
+        self.assertEqual(final_values["last_run_status"], "timeout")
+        self.assertIn("子进程已确认退出", final_values["last_run_output"])
+        history_finish.assert_called_once()
+        self.assertEqual(
+            history_finish.call_args.args[:2],
+            (engine, "00000000000000000000000000000810"),
+        )
+        self.assertEqual(history_finish.call_args.kwargs["status"], "timeout")
+        validate_result.assert_not_called()
 
     def test_run_task_finishes_history_before_timeout_return(self):
         engine = MagicMock()
@@ -1319,7 +2226,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         with patch(
             "server.api.scheduler_runtime._task_history_start",
-            return_value="run-72",
+            return_value="00000000000000000000000000000072",
         ), patch(
             "server.api.scheduler_runtime._task_history_finish"
         ) as history_finish, patch(
@@ -1400,7 +2307,10 @@ class SchedulerRuntimeTest(unittest.TestCase):
             script = root / "tools" / "job.py"
             script.parent.mkdir(parents=True)
             script.write_text("print('ok')", encoding="utf-8")
-            with patch("server.api.scheduler_runtime.update_scheduler_task") as update_task, patch(
+            with patch(
+                "server.api.scheduler_runtime._task_history_start",
+                return_value="00000000000000000000000000000007",
+            ), patch("server.api.scheduler_runtime.update_scheduler_task") as update_task, patch(
                 "server.api.scheduler_runtime.resolve_scheduler_script",
                 return_value=script,
             ), patch(
@@ -1447,6 +2357,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
             script.parent.mkdir(parents=True)
             script.write_text("print('BLOCK')", encoding="utf-8")
             with patch(
+                "server.api.scheduler_runtime._task_history_start",
+                return_value="00000000000000000000000000000067",
+            ), patch(
                 "server.api.scheduler_runtime.update_scheduler_task"
             ) as update_task, patch(
                 "server.api.scheduler_runtime.resolve_scheduler_script",
@@ -1485,13 +2398,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_strategy_governance_blocked_output_requires_exact_exit_two_contract(self):
         from server.common.scheduler_validation import scheduler_output_status
 
-        payload = {
-            "status": "blocked",
-            "reason": "权威交易日数据尚未就绪",
-            "target_trade_date": "2026-08-21",
-            "input_trade_date": "2026-08-20",
-            "automatic_real_order_submission": False,
-        }
+        payload = _governance_not_ready_payload()
         task = {"task_type": "strategy_governance_daily"}
         output = json.dumps(payload, ensure_ascii=False)
         self.assertEqual(
@@ -1513,36 +2420,20 @@ class SchedulerRuntimeTest(unittest.TestCase):
         from server.common.scheduler_validation import scheduler_output_status
 
         task = {"task_type": "strategy_governance_daily"}
-        invalid_payloads = [
-            {
-                "status": "blocked",
-                "reason": "",
-                "target_trade_date": "2026-08-21",
-                "input_trade_date": "2026-08-20",
-                "automatic_real_order_submission": False,
-            },
-            {
-                "status": "blocked",
-                "reason": "日历不可用",
-                "target_trade_date": "bad-date",
-                "input_trade_date": "",
-                "automatic_real_order_submission": False,
-            },
-            {
-                "status": "blocked",
-                "reason": "日历不可用",
-                "target_trade_date": "",
-                "input_trade_date": "2026-08-20",
-                "automatic_real_order_submission": False,
-            },
-            {
-                "status": "blocked",
-                "reason": "权威日数据未就绪",
-                "target_trade_date": "2026-08-21",
-                "input_trade_date": "2026-08-20",
-                "automatic_real_order_submission": True,
-            },
-        ]
+        invalid_payloads = []
+        for key, value in (
+            ("reason", ""),
+            ("target_trade_date", "bad-date"),
+            ("automatic_real_order_submission", True),
+            ("real_order_authority", True),
+            ("retryable", False),
+        ):
+            forged = _governance_not_ready_payload()
+            forged[key] = value
+            invalid_payloads.append(forged)
+        forged_weight = _governance_not_ready_payload()
+        forged_weight["allocations"][0]["simulated_weight_pct"] = 99.0
+        invalid_payloads.append(forged_weight)
         for payload in invalid_payloads:
             with self.subTest(payload=payload):
                 self.assertEqual(
@@ -1553,6 +2444,40 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     ),
                     "failed",
                 )
+
+    def test_strategy_governance_completed_output_is_revalidated(self):
+        from server.common.scheduler_validation import scheduler_output_status
+
+        payload = {
+            "status": "ok",
+            "orchestration_status": "COMPLETED",
+            "reason_code": "GOVERNANCE_COMPLETED",
+            "run_uid": "a" * 32,
+            "trade_date": "2026-08-21",
+            "summary": {},
+            "build_commit_sha": "b" * 40,
+            "allocations": [{
+                "target_type": "CASH",
+                "simulated_weight_pct": 100.0,
+                "real_order_authority": False,
+            }],
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        task = {"task_type": "strategy_governance_daily"}
+        self.assertEqual(
+            scheduler_output_status(
+                task, json.dumps(payload), return_code=0
+            ),
+            "success",
+        )
+        payload["automatic_real_order_submission"] = True
+        self.assertEqual(
+            scheduler_output_status(
+                task, json.dumps(payload), return_code=0
+            ),
+            "failed",
+        )
 
     def test_scheduler_quality_uses_cache_unless_forced(self):
         reports = [

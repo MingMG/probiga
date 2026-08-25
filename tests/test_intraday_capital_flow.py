@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import sys
 from contextlib import nullcontext
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -66,6 +67,7 @@ def test_flow_main_uses_minute_engine_and_accepts_scheduler_tuning(monkeypatch):
 def test_flow_coverage_failure_does_not_publish_or_count_old_bars(monkeypatch):
     crawler = _crawler()
     engine = object()
+    stage_connection = object()
     appended = []
     publish = MagicMock(return_value=0)
     drop = MagicMock()
@@ -74,12 +76,16 @@ def test_flow_coverage_failure_does_not_publish_or_count_old_bars(monkeypatch):
         day = "2026-08-11" if code == "000001" else "2026-08-10"
         return [f"{day} 09:31,1,2,3,4,5"]
 
-    def append(_engine, _stage, rows):
+    def append(_connection, _stage, rows):
         appended.extend(rows)
         return len(rows)
 
     monkeypatch.setattr(crawler, "fetch_with_retries", fetch)
-    monkeypatch.setattr(crawler, "_create_flow_stage", lambda _engine: "flow_stage")
+    monkeypatch.setattr(
+        crawler,
+        "_create_flow_stage",
+        lambda _engine: ("flow_stage", stage_connection),
+    )
     monkeypatch.setattr(crawler, "_append_flow_stage", append)
     monkeypatch.setattr(crawler, "_publish_flow_stage", publish)
     monkeypatch.setattr(crawler, "_drop_flow_stage", drop)
@@ -98,12 +104,13 @@ def test_flow_coverage_failure_does_not_publish_or_count_old_bars(monkeypatch):
     assert result["rows"] == 0
     assert [row["stock_code"] for row in appended] == ["000001"]
     publish.assert_not_called()
-    drop.assert_called_once_with(engine, "flow_stage")
+    drop.assert_called_once_with(stage_connection)
 
 
 def test_flow_coverage_success_publishes_staged_day(monkeypatch):
     crawler = _crawler()
     engine = object()
+    stage_connection = object()
     publish = MagicMock(return_value=2)
     drop = MagicMock()
 
@@ -112,8 +119,12 @@ def test_flow_coverage_success_publishes_staged_day(monkeypatch):
         "fetch_with_retries",
         lambda _fetcher, code, _market: [f"2026-08-11 09:31,{code[-1]},2,3,4,5"],
     )
-    monkeypatch.setattr(crawler, "_create_flow_stage", lambda _engine: "flow_stage")
-    monkeypatch.setattr(crawler, "_append_flow_stage", lambda _engine, _stage, rows: len(rows))
+    monkeypatch.setattr(
+        crawler,
+        "_create_flow_stage",
+        lambda _engine: ("flow_stage", stage_connection),
+    )
+    monkeypatch.setattr(crawler, "_append_flow_stage", lambda _connection, _stage, rows: len(rows))
     monkeypatch.setattr(crawler, "_publish_flow_stage", publish)
     monkeypatch.setattr(crawler, "_drop_flow_stage", drop)
     monkeypatch.setattr(crawler.time, "sleep", lambda _seconds: None)
@@ -129,13 +140,19 @@ def test_flow_coverage_success_publishes_staged_day(monkeypatch):
 
     assert result["coverage"] == 1.0
     assert result["rows"] == 2
-    publish.assert_called_once_with(engine, "flow_stage", "2026-08-11")
-    drop.assert_called_once_with(engine, "flow_stage")
+    publish.assert_called_once_with(
+        engine,
+        stage_connection,
+        "flow_stage",
+        "2026-08-11",
+    )
+    drop.assert_called_once_with(stage_connection)
 
 
 def test_flow_cleanup_failure_does_not_mask_collection_failure(monkeypatch):
     crawler = _crawler()
     engine = object()
+    stage_connection = object()
 
     def fail_fetch(*_args):
         raise RuntimeError("source failed")
@@ -143,7 +160,11 @@ def test_flow_cleanup_failure_does_not_mask_collection_failure(monkeypatch):
     def fail_cleanup(*_args):
         raise RuntimeError("cleanup failed")
 
-    monkeypatch.setattr(crawler, "_create_flow_stage", lambda _engine: "flow_stage")
+    monkeypatch.setattr(
+        crawler,
+        "_create_flow_stage",
+        lambda _engine: ("flow_stage", stage_connection),
+    )
     monkeypatch.setattr(crawler, "fetch_with_retries", fail_fetch)
     monkeypatch.setattr(crawler, "_drop_flow_stage", fail_cleanup)
 
@@ -157,20 +178,181 @@ def test_flow_cleanup_failure_does_not_mask_collection_failure(monkeypatch):
         )
 
 
+def test_kline_coverage_failure_keeps_canonical_table_untouched(monkeypatch):
+    crawler = _crawler()
+    engine = object()
+    stage_connection = object()
+    publish = MagicMock(return_value=0)
+    drop = MagicMock()
+
+    monkeypatch.setattr(
+        crawler,
+        "fetch_minute_kline",
+        lambda code, _market: ["bar"] if code == "000001" else None,
+    )
+    monkeypatch.setattr(
+        crawler,
+        "parse_kline",
+        lambda code, _bars: [{
+            "stock_code": code,
+            "trade_time": "2026-08-25 09:31:00",
+            "trade_date": "2026-08-25",
+            "price": 10,
+        }],
+    )
+    monkeypatch.setattr(
+        crawler,
+        "_create_kline_stage",
+        lambda _engine, _table: ("kline_stage", stage_connection),
+    )
+    monkeypatch.setattr(
+        crawler,
+        "_append_kline_stage",
+        lambda _connection, _stage, rows, _table: len(rows),
+    )
+    monkeypatch.setattr(crawler, "_publish_kline_stage", publish)
+    monkeypatch.setattr(crawler, "_drop_kline_stage", drop)
+    monkeypatch.setattr(crawler.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(crawler.random, "uniform", lambda _a, _b: 0.0)
+
+    result = crawler.crawl_kline(
+        engine,
+        [("000001", 0), ("600000", 1)],
+        "sm_stock_minute",
+        "Stock 1-min",
+        0,
+        0.75,
+    )
+
+    assert result["coverage"] == 0.5
+    assert result["rows"] == 0
+    assert result["staged_rows"] == 1
+    publish.assert_not_called()
+    drop.assert_called_once_with(stage_connection)
+
+
+def test_kline_stage_insert_failure_rolls_back_partition_delete(monkeypatch):
+    crawler = _crawler()
+    statements = []
+    transaction = SimpleNamespace(saw_error=False)
+
+    class _Result:
+        def __init__(self, *, scalar_value=None, rows=None, rowcount=0):
+            self._scalar_value = scalar_value
+            self._rows = rows or []
+            self.rowcount = rowcount
+
+        def scalar(self):
+            return self._scalar_value
+
+        def fetchall(self):
+            return self._rows
+
+        def one(self):
+            return self._rows[0]
+
+    class _Transaction:
+        def __enter__(self):
+            return connection
+
+        def __exit__(self, exc_type, _exc, _tb):
+            transaction.saw_error = exc_type is not None
+            return False
+
+    class _Connection:
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            statements.append((sql, params))
+            upper = sql.upper()
+            if "SELECT COUNT(*)" in upper:
+                return _Result(scalar_value=2)
+            if "INFORMATION_SCHEMA.COLUMNS" in upper:
+                return _Result(rows=[("stock_code",), ("trade_date",), ("price",)])
+            if "MIN(TRADE_DATE)" in upper:
+                return _Result(
+                    rows=[
+                        (
+                            datetime(2026, 8, 25, 9, 30),
+                            datetime(2026, 8, 25, 9, 31),
+                        )
+                    ]
+                )
+            if upper.lstrip().startswith("INSERT INTO"):
+                raise RuntimeError("insert failed")
+            return _Result(rowcount=2)
+
+        def commit(self):
+            return None
+
+        def begin(self):
+            return _Transaction()
+
+    connection = _Connection()
+    monkeypatch.setattr(crawler, "mysql_named_lock", lambda *args, **kwargs: nullcontext())
+
+    def _receipt_database_down(*_args, **_kwargs):
+        raise RuntimeError("receipt database unavailable")
+
+    monkeypatch.setattr(
+        crawler,
+        "supersede_overlapping_qmt_minute_forward_receipts",
+        _receipt_database_down,
+    )
+    with pytest.raises(RuntimeError, match="receipt database unavailable"):
+        crawler._publish_kline_stage(
+            object(),
+            connection,
+            "minute_stage",
+            "sm_stock_minute",
+            receipt_engine=object(),
+        )
+    assert not any(
+        sql.upper().lstrip().startswith(("DELETE", "INSERT"))
+        for sql, _ in statements
+    )
+    statements.clear()
+    monkeypatch.setattr(
+        crawler,
+        "supersede_overlapping_qmt_minute_forward_receipts",
+        lambda *args, **kwargs: 1,
+    )
+
+    with pytest.raises(RuntimeError, match="insert failed"):
+        crawler._publish_kline_stage(
+            object(),
+            connection,
+            "minute_stage",
+            "sm_stock_minute",
+            receipt_engine=object(),
+        )
+
+    assert transaction.saw_error is True
+    assert any("DELETE TARGET_ROWS" in sql.upper() for sql, _ in statements)
+    assert any("SELECT DISTINCT" in sql.upper() for sql, _ in statements)
+
+
 def test_publish_flow_stage_replaces_day_in_one_transaction(monkeypatch):
     crawler = _crawler()
     statements = []
 
     class _Connection:
+        def begin(self):
+            return nullcontext(self)
+
         def execute(self, statement, params=None):
             statements.append((str(statement), params))
             return SimpleNamespace(rowcount=7)
 
     connection = _Connection()
-    engine = SimpleNamespace(begin=lambda: nullcontext(connection))
+    engine = object()
     monkeypatch.setattr(crawler, "mysql_named_lock", lambda *args, **kwargs: nullcontext())
 
-    assert crawler._publish_flow_stage(engine, "flow_stage", "2026-08-11") == 7
+    assert crawler._publish_flow_stage(
+        engine,
+        connection,
+        "flow_stage",
+        "2026-08-11",
+    ) == 7
     assert len(statements) == 2
     assert statements[0][0].lstrip().upper().startswith("DELETE FROM")
     assert "TRADE_TIME >=" in statements[0][0].upper()

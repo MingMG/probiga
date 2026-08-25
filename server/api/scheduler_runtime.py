@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -31,6 +32,16 @@ from server.common.scheduler_validation import (
     scheduler_output_status,
     validate_scheduler_task_result,
 )
+from tools.qmt_host_ownership_contract import (
+    LINUX_QMT_TASKS_BY_TYPE,
+    LINUX_QMT_TASK_TYPES,
+    UNFROZEN_PROVIDER_SCRIPT_PATHS,
+    UNFROZEN_PROVIDER_TASK_TYPES,
+    WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE,
+    WINDOWS_NON_QMT_EGRESS_TASK_TYPES,
+    WINDOWS_QMT_EDGE_TASKS_BY_TYPE,
+    WINDOWS_QMT_EDGE_TASK_TYPES,
+)
 
 logger = logging.getLogger("scheduler_daemon")
 if not logger.handlers:
@@ -42,6 +53,7 @@ if not logger.handlers:
 DEFAULT_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_TASK_TIMEOUT_MINUTES", "180"))
 FAST_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_FAST_TASK_TIMEOUT_MINUTES", "20"))
 LONG_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_LONG_TASK_TIMEOUT_MINUTES", "360"))
+QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES = 8 * 60
 CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRON_CATCHUP_WINDOW_SECONDS", "180"))
 CRITICAL_CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRITICAL_CRON_CATCHUP_WINDOW_SECONDS", "10800"))
 CRON_RETRY_INTERVAL_MINUTES = max(1, int(os.environ.get("SCHEDULER_CRON_RETRY_INTERVAL_MINUTES", "15")))
@@ -88,6 +100,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "trading_v3_counterfactual_audit",
         "trading_v3_continuous_calibration",
         "qmt_membership_snapshot",
+        "qmt_announcement_pit",
         "concept_constituent_east",
         "capital_flow",
         "capital_flow_batch_fast",
@@ -112,6 +125,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v3_counterfactual_audit": 8 * 60 * 60,
     "trading_v3_continuous_calibration": 8 * 60 * 60,
     "qmt_membership_snapshot": 8 * 60 * 60,
+    "qmt_announcement_pit": 60 * 60,
     "concept_constituent_east": 8 * 60 * 60,
     # These tables feed the watchlist's current-session market and funds
     # labels.  Missing their exact cron minute must not leave the UI pinned to
@@ -159,6 +173,10 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "quality_check_post",
     "quality_check_pre",
     "qmt_membership_snapshot",
+    "qmt_announcement_pit",
+    "qmt_local_gap_repair_execute",
+    "qmt_local_history_2024",
+    "qmt_reference_incremental",
     "public_quote_failover",
     "sim_trade",
     "sim_trade_signal_prepare",
@@ -185,39 +203,26 @@ NON_TRADING_DAY_SKIP_PATHS = {
     "tools/data_quality_check.py",
     "tools/run_single_table.py",
 }
-# These tasks require the signed-in Guojin desktop QMT process and are owned by
-# the Windows scheduler/bridge.  The production Linux scheduler must leave
-# their database rows visible/enabled, but must never attempt to execute them.
-WINDOWS_QMT_BRIDGE_TASK_TYPES = {
-    "all_code",
-    "all_index_code",
-    "concept_code_east",
-    "concept_constituent_east",
-    "etf_forward_daily",
-    # Xueqiu serves JSON from the operator's Windows egress but returns an
-    # HTML WAF page from the production Linux egress.  Keep this source on the
-    # same Windows-owned scheduler lane so the shared task row cannot be
-    # claimed by the incapable host.
-    "fetch_hot_rank_xq",
-    "index_constituent",
-    "index_current",
-    "index_kline",
-    "index_minute",
-    "intraday_minute_kline",
-    "intraday_capital_flow_fast",
-    "intraday_realtime",
-    "qmt_membership_snapshot",
-    "stock_current",
-    "stock_kline",
-    "stock_relations_qmt",
-}
-WINDOWS_QMT_BRIDGE_SCRIPT_PATHS = {
-    "tools/run_etf_forward_daily.py",
-    "tools/sync_bigqmt_reference.py",
-    "tools/sync_qmt_primary.py",
-}
+# Exact QMT host identity is task-type based.  Script-path matching used to
+# claim unrelated Eastmoney jobs on Windows and allowed provider-generic rows
+# to inherit whichever host happened to see them first.
+WINDOWS_QMT_BRIDGE_TASK_TYPES = WINDOWS_QMT_EDGE_TASK_TYPES
+WINDOWS_QMT_BRIDGE_SCRIPT_PATHS = frozenset(
+    str(task["script_path"]) for task in WINDOWS_QMT_EDGE_TASKS_BY_TYPE.values()
+)
+SCHEDULER_OWNER_LINUX = "linux_standalone"
+SCHEDULER_OWNER_WINDOWS_QMT = "qmt_windows_edge"
+SCHEDULER_OWNER_WINDOWS_EGRESS = "windows_non_qmt_egress"
+SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
 _running_procs: dict[int, subprocess.Popen] = {}
 _running_task_ids: set[int] = set()
+_running_history_uids: dict[int, str] = {}
+# ``*_pending`` means termination is being attempted; workers only treat the
+# corresponding ``*_requested`` set as authoritative after exit confirmation.
+_stop_pending_task_ids: set[int] = set()
+_stop_requested_task_ids: set[int] = set()
+_timeout_pending_task_ids: set[int] = set()
+_timeout_requested_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
@@ -261,7 +266,9 @@ LONG_RUNNING_TASK_TYPES = {
     "index_kline",
     "index_minute",
     "qmt_local_gap_repair_execute",
+    "qmt_local_history_2024",
     "qmt_nightly_reconciliation",
+    "qmt_announcement_pit",
     "stock_kline",
     "stock_minute",
     "stock_minute_flow",
@@ -521,13 +528,62 @@ def _should_skip_outside_intraday_window(row: dict, now: datetime) -> bool:
     return current < start or current > end
 
 
-def _is_windows_qmt_bridge_task(row: dict) -> bool:
+def _contract_path_matches(row: dict, contract: dict) -> bool:
+    script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
+    # Some ownership-only callers intentionally select task_type without the
+    # payload.  A present path, however, must match the frozen identity.
+    return not script_path or script_path == str(contract["script_path"])
+
+
+def scheduler_task_host_owner(row: dict) -> str:
+    """Resolve one exact executor or return ``unavailable`` fail-closed."""
+
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
-    return (
-        task_type in WINDOWS_QMT_BRIDGE_TASK_TYPES
+    group_name = str(row.get("group_name") or "").strip().casefold()
+    if not task_type:
+        return SCHEDULER_OWNER_UNAVAILABLE
+    if task_type in WINDOWS_QMT_EDGE_TASK_TYPES:
+        contract = WINDOWS_QMT_EDGE_TASKS_BY_TYPE[task_type]
+        return (
+            SCHEDULER_OWNER_WINDOWS_QMT
+            if _contract_path_matches(row, contract)
+            else SCHEDULER_OWNER_UNAVAILABLE
+        )
+    if task_type in LINUX_QMT_TASK_TYPES:
+        contract = LINUX_QMT_TASKS_BY_TYPE[task_type]
+        return (
+            SCHEDULER_OWNER_LINUX
+            if _contract_path_matches(row, contract)
+            else SCHEDULER_OWNER_UNAVAILABLE
+        )
+    if task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES:
+        contract = WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE[task_type]
+        return (
+            SCHEDULER_OWNER_WINDOWS_EGRESS
+            if _contract_path_matches(row, contract)
+            else SCHEDULER_OWNER_UNAVAILABLE
+        )
+    if (
+        task_type in UNFROZEN_PROVIDER_TASK_TYPES
+        or script_path in UNFROZEN_PROVIDER_SCRIPT_PATHS
+    ):
+        return SCHEDULER_OWNER_UNAVAILABLE
+    if (
+        task_type.startswith("qmt_")
+        or "qmt" in group_name
+        or "qmt" in script_path.casefold()
         or script_path in WINDOWS_QMT_BRIDGE_SCRIPT_PATHS
-    )
+    ):
+        return SCHEDULER_OWNER_UNAVAILABLE
+    return SCHEDULER_OWNER_LINUX
+
+
+def _is_windows_qmt_bridge_task(row: dict) -> bool:
+    return scheduler_task_host_owner(row) in {
+        SCHEDULER_OWNER_WINDOWS_QMT,
+        SCHEDULER_OWNER_WINDOWS_EGRESS,
+    }
 
 
 def _should_delegate_to_windows_qmt_bridge(
@@ -536,7 +592,7 @@ def _should_delegate_to_windows_qmt_bridge(
     platform_name: str | None = None,
 ) -> bool:
     current_platform = platform_name or os.name
-    return current_platform != "nt" and _is_windows_qmt_bridge_task(row)
+    return current_platform == "posix" and _is_windows_qmt_bridge_task(row)
 
 
 def _should_skip_task_for_host(
@@ -544,10 +600,101 @@ def _should_skip_task_for_host(
     *,
     platform_name: str | None = None,
 ) -> bool:
-    """Run QMT jobs only on Windows and all other jobs only on Linux."""
+    """Run only tasks bound to this host; ambiguous identities never run."""
+
     current_platform = platform_name or os.name
-    is_windows_owned = _is_windows_qmt_bridge_task(row)
-    return (not is_windows_owned) if current_platform == "nt" else is_windows_owned
+    owner = scheduler_task_host_owner(row)
+    if owner == SCHEDULER_OWNER_UNAVAILABLE:
+        return True
+    if current_platform == "nt":
+        return owner not in {
+            SCHEDULER_OWNER_WINDOWS_QMT,
+            SCHEDULER_OWNER_WINDOWS_EGRESS,
+        }
+    if current_platform == "posix":
+        return owner != SCHEDULER_OWNER_LINUX
+    return True
+
+
+def scheduler_task_owned_by_current_host(row: dict) -> bool:
+    """Return whether this host may manually control the task process."""
+
+    return not _should_skip_task_for_host(row)
+
+
+_PIPELINE_TERMINAL_STATUSES = frozenset(
+    {"success", "blocked", "failed", "timeout", "stopped"}
+)
+
+
+def evaluate_strategy_pipeline_dependencies(
+    task_type: str,
+    dependency_rows: list[dict],
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Require today's QMT event capture to finish before downstream work."""
+
+    normalized_type = str(task_type or "").strip()
+    if normalized_type not in {"analysis_fast", "strategy_governance_daily"}:
+        return True, "not_applicable"
+    grouped: dict[str, list[dict]] = {}
+    for row in dependency_rows:
+        grouped.setdefault(str(row.get("task_type") or ""), []).append(row)
+    required = ["qmt_announcement_pit"]
+    if normalized_type == "strategy_governance_daily":
+        required.append("analysis_fast")
+    for dependency in required:
+        rows = grouped.get(dependency, [])
+        if len(rows) != 1:
+            return False, f"{dependency}:missing_or_duplicate"
+        row = rows[0]
+        triggered = _coerce_datetime(row.get("last_triggered_at"))
+        status = str(row.get("last_run_status") or "").strip().lower()
+        if (
+            int(row.get("enabled") or 0) != 1
+            or triggered is None
+            or triggered.date() != now.date()
+            or status not in _PIPELINE_TERMINAL_STATUSES
+        ):
+            return False, f"{dependency}:not_terminal_today"
+    if normalized_type == "strategy_governance_daily":
+        event_time = _coerce_datetime(
+            grouped["qmt_announcement_pit"][0].get("last_triggered_at")
+        )
+        analysis_time = _coerce_datetime(
+            grouped["analysis_fast"][0].get("last_triggered_at")
+        )
+        if event_time is None or analysis_time is None or analysis_time < event_time:
+            return False, "analysis_fast:ran_before_qmt_announcement"
+    return True, "ready"
+
+
+def _strategy_pipeline_dependencies_ready(
+    row: dict, engine, now: datetime
+) -> tuple[bool, str]:
+    task_type = str(row.get("task_type") or "").strip()
+    if task_type not in {"analysis_fast", "strategy_governance_daily"}:
+        return True, "not_applicable"
+    try:
+        with engine.connect() as connection:
+            dependencies = [
+                dict(item)
+                for item in connection.execute(
+                    text(
+                        "SELECT task_type, enabled, last_triggered_at, "
+                        "last_run_status FROM st_scheduled_tasks "
+                        "WHERE task_type IN "
+                        "('qmt_announcement_pit','analysis_fast') "
+                        "ORDER BY task_type, id"
+                    )
+                ).mappings()
+            ]
+    except Exception as exc:
+        return False, f"dependency_query_failed:{type(exc).__name__}"
+    return evaluate_strategy_pipeline_dependencies(
+        task_type, dependencies, now=now
+    )
 
 
 def _task_timeout_minutes(row: dict) -> int:
@@ -555,6 +702,17 @@ def _task_timeout_minutes(row: dict) -> int:
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
 
+    if (
+        task_type == "qmt_local_history_2024"
+        or script_path in {
+            "tools/run_guojin_qmt_full_market_history.py",
+            "tools/run_guojin_qmt_full_market_history_2024.py",
+        }
+    ):
+        return max(
+            LONG_TASK_TIMEOUT_MINUTES,
+            QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES,
+        )
     if interval_minutes > 0:
         return max(FAST_TASK_TIMEOUT_MINUTES, min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3))
     if task_type in LONG_RUNNING_TASK_TYPES or script_path in LONG_RUNNING_PATH_PARTS:
@@ -608,6 +766,121 @@ def _terminate_process(proc: subprocess.Popen | None) -> None:
             logger.warning("failed to terminate process pid=%s: %s", getattr(proc, "pid", None), kill_exc)
 
 
+def _terminate_process_and_confirm(
+    proc: subprocess.Popen | None,
+    *,
+    timeout_seconds: float = 5.0,
+) -> bool:
+    """Terminate one exact child and confirm that it is no longer alive."""
+    if proc is None or proc.poll() is not None:
+        return False
+    _terminate_process(proc)
+    try:
+        proc.wait(timeout=max(0.1, float(timeout_seconds)))
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception as exc:
+        logger.warning(
+            "failed to confirm scheduler child termination pid=%s: %s",
+            getattr(proc, "pid", None),
+            exc,
+        )
+        return False
+    return proc.poll() is not None
+
+
+def _task_stop_requested(task_id: int) -> bool:
+    with _running_lock:
+        return int(task_id) in _stop_requested_task_ids
+
+
+def _task_timeout_requested(task_id: int) -> bool:
+    with _running_lock:
+        return int(task_id) in _timeout_requested_task_ids
+
+
+def request_stop_owned_scheduler_task(
+    task_id: int,
+    *,
+    timeout_seconds: float = 5.0,
+) -> dict[str, object]:
+    """Stop only an exact child owned by this API process, or fail closed.
+
+    The standalone scheduler is another process even when it runs on the same
+    host.  Its child cannot be proven or controlled through this process-local
+    registry.  The owning worker persists ``stopped`` and closes the matching
+    audit row only after termination is confirmed.
+    """
+    task_id = int(task_id)
+    with _running_lock:
+        if task_id in _timeout_pending_task_ids or task_id in _timeout_requested_task_ids:
+            return {
+                "accepted": False,
+                "status": "timeout_in_progress",
+                "task_id": task_id,
+                "process_killed": False,
+            }
+        if task_id in _stop_pending_task_ids or task_id in _stop_requested_task_ids:
+            return {
+                "accepted": False,
+                "status": "stop_in_progress",
+                "task_id": task_id,
+                "process_killed": False,
+            }
+        proc = _running_procs.get(task_id)
+        history_run_uid = str(_running_history_uids.get(task_id) or "").strip()
+        locally_owned = (
+            task_id in _running_task_ids
+            and proc is not None
+            and proc.poll() is None
+            and bool(history_run_uid)
+        )
+        if not locally_owned:
+            return {
+                "accepted": False,
+                "status": "not_owned_by_api_process",
+                "task_id": task_id,
+                "process_killed": False,
+            }
+        _stop_pending_task_ids.add(task_id)
+
+    if not _terminate_process_and_confirm(proc, timeout_seconds=timeout_seconds):
+        with _running_lock:
+            _stop_pending_task_ids.discard(task_id)
+        return {
+            "accepted": False,
+            "status": "stop_not_confirmed",
+            "task_id": task_id,
+            "process_killed": False,
+        }
+
+    with _running_lock:
+        still_exact_owner = (
+            _running_procs.get(task_id) is proc
+            and task_id in _running_task_ids
+            and str(_running_history_uids.get(task_id) or "").strip()
+            == history_run_uid
+        )
+        _stop_pending_task_ids.discard(task_id)
+        if still_exact_owner:
+            _stop_requested_task_ids.add(task_id)
+    if not still_exact_owner:
+        return {
+            "accepted": False,
+            "status": "stop_raced_with_terminal_state",
+            "task_id": task_id,
+            "process_killed": False,
+        }
+
+    return {
+        "accepted": True,
+        "status": "stop_requested",
+        "task_id": task_id,
+        "job_id": history_run_uid,
+        "process_killed": True,
+    }
+
+
 def _cleanup_stale_running_tasks(engine) -> int:
     try:
         with engine.connect() as conn:
@@ -638,41 +911,25 @@ def _cleanup_stale_running_tasks(engine) -> int:
         timeout_minutes = _task_timeout_minutes(data)
         age_minutes = int((now - started_at).total_seconds() / 60)
         task_id = int(data["id"])
-        # A service restart drops the in-memory process registry.  Do not keep
-        # a database row in ``running`` until the normal long-task timeout if
-        # its run started before this scheduler instance; the old child is no
-        # longer owned by this process and would otherwise occupy a slot.
-        interrupted_by_restart = started_at < _scheduler_started_at and task_id not in _running_procs
+        # A service restart drops the process registry but does not prove the
+        # old child died.  Releasing the database claim here could start a
+        # second copy of the same writer while the first one is still alive.
+        # Keep the task claimed and require operator/service-manager evidence
+        # instead of inventing a terminal state.
+        with _running_lock:
+            has_local_process = task_id in _running_procs
+        interrupted_by_restart = (
+            started_at < _scheduler_started_at and not has_local_process
+        )
         if interrupted_by_restart:
             task_name = data.get("task_name") or task_id
-            logger.warning(
-                "服务重启后恢复未完成任务: %s (id=%s, started=%s)",
+            logger.error(
+                "服务重启后发现归属不明的运行任务，保持 running 并禁止重跑: "
+                "%s (id=%s, started=%s)",
                 task_name,
                 task_id,
                 started_at,
             )
-            update_scheduler_task(
-                engine,
-                task_id,
-                {
-                    "last_run_status": "failed",
-                    "last_run_output": "调度服务重启，上一轮任务已中断并释放调度槽",
-                    "last_run_duration": max(0, age_minutes * 60),
-                },
-            )
-            _task_history_mark_interrupted(
-                engine,
-                data,
-                status="failed",
-                duration=max(0, age_minutes * 60),
-                output="scheduler service restarted; prior task run was interrupted",
-            )
-            with _running_lock:
-                _running_task_ids.discard(task_id)
-                _fast_lane_running_task_ids.discard(task_id)
-                _alert_lane_running_task_ids.discard(task_id)
-                _delivery_lane_running_task_ids.discard(task_id)
-            cleaned += 1
             continue
         if age_minutes < timeout_minutes + STALE_RUNNING_GRACE_MINUTES:
             continue
@@ -687,29 +944,58 @@ def _cleanup_stale_running_tasks(engine) -> int:
             age_minutes,
             timeout_minutes,
         )
-        proc = _running_procs.pop(task_id, None)
-        _terminate_process(proc)
-        update_scheduler_task(
-            engine,
-            task_id,
-            {
-                "last_run_status": "timeout",
-                "last_run_output": f"任务超时自动清理(>{timeout_minutes}分钟)",
-                "last_run_duration": age_minutes * 60,
-            },
-        )
-        _task_history_mark_interrupted(
-            engine,
-            data,
-            status="timeout",
-            duration=age_minutes * 60,
-            output=f"stale task exceeded {timeout_minutes} minute timeout",
-        )
         with _running_lock:
-            _running_task_ids.discard(task_id)
-            _fast_lane_running_task_ids.discard(task_id)
-            _alert_lane_running_task_ids.discard(task_id)
-            _delivery_lane_running_task_ids.discard(task_id)
+            proc = _running_procs.get(task_id)
+            history_run_uid = str(_running_history_uids.get(task_id) or "").strip()
+            locally_owned = (
+                task_id in _running_task_ids
+                and proc is not None
+                and proc.poll() is None
+                and bool(history_run_uid)
+                and task_id not in _stop_pending_task_ids
+                and task_id not in _stop_requested_task_ids
+                and task_id not in _timeout_pending_task_ids
+                and task_id not in _timeout_requested_task_ids
+            )
+            if locally_owned:
+                _timeout_pending_task_ids.add(task_id)
+        if not locally_owned:
+            logger.error(
+                "超时任务缺少当前实例的精确进程与审计归属，保持 running: "
+                "%s (id=%s)",
+                task_name,
+                task_id,
+            )
+            continue
+        if not _terminate_process_and_confirm(proc):
+            with _running_lock:
+                _timeout_pending_task_ids.discard(task_id)
+            logger.error(
+                "超时任务终止未确认，保持 running 且不释放抢占: %s (id=%s)",
+                task_name,
+                task_id,
+            )
+            continue
+        with _running_lock:
+            still_exact_owner = (
+                _running_procs.get(task_id) is proc
+                and task_id in _running_task_ids
+                and str(_running_history_uids.get(task_id) or "").strip()
+                == history_run_uid
+            )
+            _timeout_pending_task_ids.discard(task_id)
+            if still_exact_owner:
+                _timeout_requested_task_ids.add(task_id)
+        if not still_exact_owner:
+            logger.info(
+                "超时终止确认时任务已由原执行线程自然收口: %s (id=%s)",
+                task_name,
+                task_id,
+            )
+            continue
+        # The exact owning worker is the sole terminal-state writer.  It will
+        # observe the timeout request after communicate() returns, persist the
+        # timeout against the same audit run, then release all local slots.
         cleaned += 1
     return cleaned
 
@@ -862,6 +1148,94 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
     }
 
 
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _reject_existing_symlink_components(path: Path) -> None:
+    candidate = path
+    while True:
+        if os.path.lexists(candidate) and candidate.is_symlink():
+            raise RuntimeError(f"detached job log path contains symlink: {candidate}")
+        if candidate.parent == candidate:
+            break
+        candidate = candidate.parent
+
+
+def _detached_job_log_root(
+    *, root: Path, env: dict[str, str],
+) -> Path:
+    configured = str(
+        env.get("PROBIGA_JOB_LOG_ROOT")
+        or os.environ.get("PROBIGA_JOB_LOG_ROOT")
+        or ""
+    ).strip()
+    if configured:
+        log_root = Path(configured)
+    elif os.name == "nt":
+        program_data = str(
+            env.get("PROGRAMDATA") or os.environ.get("PROGRAMDATA") or ""
+        ).strip()
+        if not program_data:
+            raise RuntimeError(
+                "PROBIGA_JOB_LOG_ROOT or PROGRAMDATA is required for detached jobs"
+            )
+        log_root = Path(program_data) / "ProBigA" / "jobs"
+    else:
+        log_root = Path("/var/lib/probiga/jobs")
+    if not log_root.is_absolute():
+        raise RuntimeError("detached job log root must be absolute")
+
+    code_root = root.resolve(strict=True)
+    _reject_existing_symlink_components(log_root)
+    prospective = log_root.resolve(strict=False)
+    if _path_is_within(prospective, code_root):
+        raise RuntimeError("detached job logs must not be written inside the code tree")
+    log_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _reject_existing_symlink_components(log_root)
+    resolved = log_root.resolve(strict=True)
+    if _path_is_within(resolved, code_root):
+        raise RuntimeError("detached job logs must not be written inside the code tree")
+    if resolved == Path(resolved.anchor):
+        raise RuntimeError("detached job log root is too broad")
+
+    if os.name != "nt":
+        root_stat = resolved.stat()
+        if root_stat.st_uid != os.geteuid():
+            raise RuntimeError("detached job log root is not owned by the service user")
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
+            raise RuntimeError("detached job log root mode must be 0700")
+    return resolved
+
+
+def _open_detached_job_log(path: Path):
+    if os.path.lexists(path) and path.is_symlink():
+        raise RuntimeError(f"detached job log is a symlink: {path}")
+    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        file_stat = os.fstat(fd)
+        path_stat = os.lstat(path)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_dev != path_stat.st_dev
+            or file_stat.st_ino != path_stat.st_ino
+        ):
+            raise RuntimeError(f"detached job log identity changed: {path}")
+        if os.name != "nt":
+            os.fchmod(fd, 0o600)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def start_detached_python_job(
     *,
     cmd: list[str],
@@ -871,14 +1245,17 @@ def start_detached_python_job(
     nice: int = 10,
 ) -> dict[str, object]:
     """Start a long-running Python job outside the API request lifecycle."""
-    data_dir = root / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    data_dir = _detached_job_log_root(root=root, env=env)
     safe_log_name = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in log_name).strip("_")
     safe_log_name = safe_log_name or "detached_job"
     out_path = data_dir / f"{safe_log_name}.out.log"
     err_path = data_dir / f"{safe_log_name}.err.log"
-    stdout_handle = open(out_path, "a", encoding="utf-8")
-    stderr_handle = open(err_path, "a", encoding="utf-8")
+    stdout_handle = _open_detached_job_log(out_path)
+    try:
+        stderr_handle = _open_detached_job_log(err_path)
+    except Exception:
+        stdout_handle.close()
+        raise
     try:
         popen_kwargs = {
             "cwd": str(root),
@@ -896,35 +1273,35 @@ def start_detached_python_job(
     return {"pid": proc.pid, "stdout_log": str(out_path), "stderr_log": str(err_path)}
 
 
-def _ensure_runtime_table(engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "CREATE TABLE IF NOT EXISTS st_scheduler_runtime ("
-                "instance_id VARCHAR(128) PRIMARY KEY, "
-                "mode VARCHAR(32) NOT NULL, "
-                "host_name VARCHAR(128) NULL, "
-                "pid INT NULL, "
-                "started_at DATETIME NULL, "
-                "heartbeat_at DATETIME NOT NULL, "
-                "poll_seconds INT NULL, "
-                "max_concurrent_tasks INT NULL, "
-                "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
-                ")"
-            )
-        )
+def _scheduler_build_commit_sha() -> str:
+    value = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else "0" * 40
+
+
+def _scheduler_executor_role(mode: str) -> str:
+    configured = str(
+        os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
+    ).strip().lower()
+    if str(mode or "").strip().lower() == "standalone" and os.name != "nt":
+        return "linux_standalone"
+    if os.name == "nt" and configured == "qmt_windows_edge":
+        return configured
+    return "unclassified_scheduler"
 
 
 def _write_scheduler_heartbeat(engine, mode: str) -> None:
     runtime = get_scheduler_runtime_config()
-    _ensure_runtime_table(engine)
     with engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO st_scheduler_runtime "
-                "(instance_id, mode, host_name, pid, started_at, heartbeat_at, poll_seconds, max_concurrent_tasks) "
-                "VALUES (:instance_id, :mode, :host_name, :pid, :started_at, NOW(), :poll_seconds, :max_concurrent_tasks) "
+                "(instance_id, mode, host_name, pid, build_sha, executor_role, "
+                "started_at, heartbeat_at, poll_seconds, max_concurrent_tasks) "
+                "VALUES (:instance_id, :mode, :host_name, :pid, :build_sha, "
+                ":executor_role, :started_at, NOW(), :poll_seconds, "
+                ":max_concurrent_tasks) "
                 "ON DUPLICATE KEY UPDATE mode=VALUES(mode), host_name=VALUES(host_name), pid=VALUES(pid), "
+                "build_sha=VALUES(build_sha), executor_role=VALUES(executor_role), "
                 "started_at=VALUES(started_at), heartbeat_at=NOW(), poll_seconds=VALUES(poll_seconds), "
                 "max_concurrent_tasks=VALUES(max_concurrent_tasks)"
             ),
@@ -933,6 +1310,8 @@ def _write_scheduler_heartbeat(engine, mode: str) -> None:
                 "mode": mode,
                 "host_name": gethostname(),
                 "pid": os.getpid(),
+                "build_sha": _scheduler_build_commit_sha(),
+                "executor_role": _scheduler_executor_role(mode),
                 "started_at": _scheduler_started_at,
                 "poll_seconds": int(runtime["poll_seconds"]),
                 "max_concurrent_tasks": int(runtime["max_concurrent_tasks"]),
@@ -940,14 +1319,161 @@ def _write_scheduler_heartbeat(engine, mode: str) -> None:
         )
 
 
+def _standalone_heartbeat_allows_dispatch(
+    engine,
+    mode: str,
+) -> tuple[bool, dict[str, object]]:
+    """Require this exact standalone executor to be the only fresh owner.
+
+    The heartbeat row is not merely an observability signal: it is the
+    scheduler's authority lease.  Production dispatch therefore fails closed
+    whenever the release SHA is missing, the role is unclassified, a clock is
+    in the future, or more than one executor for the role is fresh.
+    """
+
+    normalized_mode = str(mode or "").strip().lower()
+    if normalized_mode != "standalone":
+        return True, {"mode": normalized_mode, "errors": []}
+
+    role = _scheduler_executor_role(normalized_mode)
+    build_sha = _scheduler_build_commit_sha()
+    host_name = gethostname()
+    pid = os.getpid()
+    expected_instance_id = f"{host_name}-{pid}"
+    errors: list[str] = []
+    if role not in {"linux_standalone", "qmt_windows_edge"}:
+        errors.append("executor_role_unclassified")
+    if not re.fullmatch(r"[0-9a-f]{40}", build_sha) or build_sha == "0" * 40:
+        errors.append("build_sha_invalid")
+    if not host_name or len(host_name) > 128:
+        errors.append("host_name_invalid")
+    if errors:
+        return False, {
+            "mode": normalized_mode,
+            "executor_role": role,
+            "expected_instance_id": expected_instance_id,
+            "expected_build_sha": build_sha,
+            "fresh_row_count": 0,
+            "future_row_count": 0,
+            "errors": errors,
+        }
+
+    try:
+        with engine.connect() as conn:
+            rows = [
+                dict(row)
+                for row in conn.execute(
+                    text(
+                        "SELECT instance_id, mode, host_name, pid, build_sha, "
+                        "executor_role, started_at, heartbeat_at, "
+                        "TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
+                        "AS heartbeat_age_seconds, poll_seconds, "
+                        "max_concurrent_tasks FROM st_scheduler_runtime "
+                        "WHERE executor_role=:executor_role "
+                        "ORDER BY heartbeat_at DESC, instance_id ASC"
+                    ),
+                    {"executor_role": role},
+                ).mappings()
+            ]
+    except Exception:
+        return False, {
+            "mode": normalized_mode,
+            "executor_role": role,
+            "expected_instance_id": expected_instance_id,
+            "expected_build_sha": build_sha,
+            "fresh_row_count": 0,
+            "future_row_count": 0,
+            "errors": ["heartbeat_read_failed"],
+        }
+
+    try:
+        expected_poll_seconds = int(
+            get_scheduler_runtime_config()["poll_seconds"]
+        )
+    except (KeyError, TypeError, ValueError):
+        expected_poll_seconds = 0
+    if expected_poll_seconds < 15:
+        errors.append("expected_poll_seconds_invalid")
+
+    fresh_rows: list[dict[str, object]] = []
+    future_rows: list[dict[str, object]] = []
+    for row in rows:
+        try:
+            age = int(row.get("heartbeat_age_seconds"))
+        except (TypeError, ValueError):
+            errors.append("heartbeat_age_invalid")
+            continue
+        if age < 0:
+            future_rows.append(row)
+        try:
+            poll = int(row.get("poll_seconds"))
+        except (TypeError, ValueError):
+            if 0 <= age <= 2 * max(15, expected_poll_seconds):
+                errors.append("fresh_heartbeat_poll_invalid")
+            continue
+        if (
+            poll < 15
+            and 0 <= age <= 2 * max(15, expected_poll_seconds)
+        ):
+            errors.append("fresh_heartbeat_poll_invalid")
+        if poll >= 15 and 0 <= age <= 2 * poll:
+            fresh_rows.append(row)
+
+    if future_rows:
+        errors.append("future_heartbeat_present")
+    if len(fresh_rows) != 1:
+        errors.append("fresh_heartbeat_not_unique")
+
+    current = fresh_rows[0] if len(fresh_rows) == 1 else None
+    if current is not None:
+        try:
+            current_pid = int(current.get("pid"))
+            current_poll = int(current.get("poll_seconds"))
+            current_concurrency = int(current.get("max_concurrent_tasks"))
+        except (TypeError, ValueError):
+            current_pid = 0
+            current_poll = 0
+            current_concurrency = 0
+        if str(current.get("instance_id") or "") != expected_instance_id:
+            errors.append("instance_id_mismatch")
+        if str(current.get("mode") or "").strip().lower() != normalized_mode:
+            errors.append("mode_mismatch")
+        if str(current.get("host_name") or "") != host_name:
+            errors.append("host_name_mismatch")
+        if current_pid != pid:
+            errors.append("pid_mismatch")
+        if str(current.get("build_sha") or "").strip().lower() != build_sha:
+            errors.append("build_sha_mismatch")
+        if str(current.get("executor_role") or "").strip().lower() != role:
+            errors.append("executor_role_mismatch")
+        if current_poll != expected_poll_seconds:
+            errors.append("poll_seconds_mismatch")
+        if current_concurrency < 1:
+            errors.append("max_concurrent_tasks_invalid")
+        if current.get("started_at") is None:
+            errors.append("started_at_missing")
+        if current.get("heartbeat_at") is None:
+            errors.append("heartbeat_at_missing")
+
+    return not errors, {
+        "mode": normalized_mode,
+        "executor_role": role,
+        "expected_instance_id": expected_instance_id,
+        "expected_build_sha": build_sha,
+        "fresh_row_count": len(fresh_rows),
+        "future_row_count": len(future_rows),
+        "errors": errors,
+    }
+
+
 def read_scheduler_heartbeat() -> dict[str, object] | None:
     try:
         engine = get_engine()
-        _ensure_runtime_table(engine)
         with engine.connect() as conn:
             row = conn.execute(
                 text(
-                    "SELECT instance_id, mode, host_name, pid, started_at, heartbeat_at, "
+                    "SELECT instance_id, mode, host_name, pid, build_sha, "
+                    "executor_role, started_at, heartbeat_at, "
                     "TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) AS heartbeat_age_seconds, "
                     "poll_seconds, max_concurrent_tasks "
                     "FROM st_scheduler_runtime ORDER BY heartbeat_at DESC LIMIT 1"
@@ -966,113 +1492,74 @@ def read_scheduler_heartbeat() -> dict[str, object] | None:
 
 
 def _ensure_task_history_table(engine) -> None:
-    """Create the scheduler audit table while retaining datasource API fields."""
+    """Read-only runtime proof that the privileged audit schema is usable."""
     engine_key = id(engine)
     with _task_history_schema_lock:
         if engine_key in _task_history_ready_engines:
             return
-        with engine.begin() as conn:
+        with engine.connect() as conn:
             conn.execute(
                 text(
-                    "CREATE TABLE IF NOT EXISTS st_scheduled_task_history ("
-                    "id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, "
-                    "run_uid VARCHAR(64) NOT NULL, task_id INT NOT NULL, "
-                    "task_name VARCHAR(255) NULL, task_type VARCHAR(64) NULL, "
-                    "run_at DATETIME NOT NULL, finished_at DATETIME NULL, "
-                    "status VARCHAR(32) NOT NULL, duration INT NOT NULL DEFAULT 0, "
-                    "exit_code INT NULL, output TEXT NULL, host_name VARCHAR(128) NULL, "
-                    "scheduler_instance_id VARCHAR(128) NULL, "
-                    "trigger_source VARCHAR(32) NOT NULL DEFAULT 'scheduled', "
-                    "UNIQUE KEY uk_scheduled_task_history_run_uid (run_uid), "
-                    "KEY idx_scheduled_task_history_task_run (task_id, run_at)"
-                    ")"
+                    "SELECT id, run_uid, task_id, task_name, task_type, "
+                    "run_at, finished_at, status, duration, exit_code, "
+                    "output, host_name, scheduler_instance_id, build_sha, "
+                    "trigger_source FROM st_scheduled_task_history LIMIT 0"
                 )
             )
-            columns = {
-                str(row[0])
-                for row in conn.execute(
-                    text("SHOW COLUMNS FROM st_scheduled_task_history")
-                ).fetchall()
-            }
-            # Older installations may already have only the six legacy
-            # columns read by the datasource API.  Extend that table in place
-            # without changing or deleting prior audit rows.
-            extra_columns = {
-                "run_uid": "VARCHAR(64) NULL",
-                "task_name": "VARCHAR(255) NULL",
-                "task_type": "VARCHAR(64) NULL",
-                "finished_at": "DATETIME NULL",
-                "exit_code": "INT NULL",
-                "host_name": "VARCHAR(128) NULL",
-                "scheduler_instance_id": "VARCHAR(128) NULL",
-                "trigger_source": "VARCHAR(32) NULL DEFAULT 'scheduled'",
-            }
-            for column, ddl in extra_columns.items():
-                if column not in columns:
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE st_scheduled_task_history "
-                            f"ADD COLUMN `{column}` {ddl}"
-                        )
-                    )
             index_rows = conn.execute(
                 text("SHOW INDEX FROM st_scheduled_task_history")
             ).mappings().all()
-            indexes: dict[str, dict[str, object]] = {}
-            for row in index_rows:
-                name = str(row.get("Key_name") or row.get("key_name") or "")
-                if not name:
-                    continue
-                entry = indexes.setdefault(
-                    name,
-                    {"unique": int(row.get("Non_unique") or row.get("non_unique") or 0) == 0, "columns": []},
-                )
-                entry["columns"].append(
-                    (
-                        int(row.get("Seq_in_index") or row.get("seq_in_index") or 0),
-                        str(row.get("Column_name") or row.get("column_name") or ""),
-                    )
-                )
-
-            index_shapes = {
+        indexes: dict[str, dict[str, object]] = {}
+        for row in index_rows:
+            name = str(row.get("Key_name") or row.get("key_name") or "")
+            if not name:
+                continue
+            entry = indexes.setdefault(
+                name,
+                {
+                    "unique": int(
+                        row.get("Non_unique")
+                        if row.get("Non_unique") is not None
+                        else row.get("non_unique") or 0
+                    ) == 0,
+                    "columns": [],
+                },
+            )
+            entry["columns"].append(
                 (
-                    bool(entry["unique"]),
-                    tuple(column for _seq, column in sorted(entry["columns"])),
+                    int(
+                        row.get("Seq_in_index")
+                        or row.get("seq_in_index")
+                        or 0
+                    ),
+                    str(
+                        row.get("Column_name")
+                        or row.get("column_name")
+                        or ""
+                    ),
                 )
-                for entry in indexes.values()
-            }
-            used_names = set(indexes)
-
-            def _available_index_name(preferred: str) -> str:
-                if preferred not in used_names:
-                    used_names.add(preferred)
-                    return preferred
-                suffix = 2
-                while f"{preferred}_{suffix}" in used_names:
-                    suffix += 1
-                name = f"{preferred}_{suffix}"
-                used_names.add(name)
-                return name
-
-            if (True, ("run_uid",)) not in index_shapes:
-                index_name = _available_index_name("uk_scheduled_task_history_run_uid")
-                conn.execute(
-                    text(
-                        "ALTER TABLE st_scheduled_task_history "
-                        f"ADD UNIQUE INDEX `{index_name}` (`run_uid`)"
-                    )
-                )
-            if (False, ("task_id", "run_at")) not in index_shapes and (
-                True,
-                ("task_id", "run_at"),
-            ) not in index_shapes:
-                index_name = _available_index_name("idx_scheduled_task_history_task_run")
-                conn.execute(
-                    text(
-                        "ALTER TABLE st_scheduled_task_history "
-                        f"ADD INDEX `{index_name}` (`task_id`, `run_at`)"
-                    )
-                )
+            )
+        index_shapes = {
+            (
+                bool(entry["unique"]),
+                tuple(
+                    column
+                    for _sequence, column in sorted(entry["columns"])
+                ),
+            )
+            for entry in indexes.values()
+        }
+        if (True, ("run_uid",)) not in index_shapes:
+            raise RuntimeError(
+                "scheduler history unique run_uid index is unavailable"
+            )
+        if not any(
+            columns == ("task_id", "run_at")
+            for _unique, columns in index_shapes
+        ):
+            raise RuntimeError(
+                "scheduler history task/run index is unavailable"
+            )
         _task_history_ready_engines.add(engine_key)
 
 
@@ -1110,10 +1597,18 @@ def _maybe_cleanup_history(engine, *, monotonic_now: float | None = None) -> dic
             table_deleted = 0
             for _batch in range(HISTORY_CLEANUP_MAX_BATCHES):
                 with engine.begin() as conn:
+                    protected_filter = (
+                        " AND task_type NOT IN "
+                        "('qmt_edge_release_request',"
+                        "'qmt_edge_release_bootstrap')"
+                        if table_name == "st_scheduled_task_history"
+                        else ""
+                    )
                     result = conn.execute(
                         text(
                             f"DELETE FROM `{table_name}` "
                             f"WHERE `{date_column}` < NOW() - INTERVAL {HISTORY_RETENTION_DAYS} DAY "
+                            f"{protected_filter} "
                             f"LIMIT {HISTORY_CLEANUP_BATCH_SIZE}"
                         )
                     )
@@ -1145,9 +1640,11 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                 text(
                     "INSERT INTO st_scheduled_task_history "
                     "(run_uid, task_id, task_name, task_type, run_at, status, "
-                    "host_name, scheduler_instance_id, trigger_source) "
+                    "host_name, scheduler_instance_id, build_sha, "
+                    "trigger_source) "
                     "VALUES (:run_uid, :task_id, :task_name, :task_type, NOW(), "
-                    "'running', :host_name, :instance_id, :trigger_source)"
+                    "'running', :host_name, :instance_id, :build_sha, "
+                    ":trigger_source)"
                 ),
                 {
                     "run_uid": run_uid,
@@ -1156,6 +1653,7 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                     "task_type": str(row.get("task_type") or "")[:64],
                     "host_name": gethostname()[:128],
                     "instance_id": _scheduler_instance_id[:128],
+                    "build_sha": _scheduler_build_commit_sha(),
                     "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
                 },
             )
@@ -1196,36 +1694,6 @@ def _task_history_finish(
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
 
 
-def _task_history_mark_interrupted(
-    engine,
-    row: dict,
-    *,
-    status: str,
-    duration: int,
-    output: str,
-) -> None:
-    """Finish the newest orphaned running audit row for a stale task."""
-    try:
-        _ensure_task_history_table(engine)
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
-                    "status=:status, duration=:duration, output=:output "
-                    "WHERE task_id=:task_id AND status='running' "
-                    "ORDER BY run_at DESC LIMIT 1"
-                ),
-                {
-                    "task_id": int(row["id"]),
-                    "status": str(status)[:32],
-                    "duration": max(0, int(duration or 0)),
-                    "output": _redact_history_output(output),
-                },
-            )
-    except Exception as exc:
-        logger.warning("Failed to close stale scheduler history for task %s: %s", row.get("id"), exc)
-
-
 def _run_task(row: dict, root: Path, engine) -> None:
     """Execute one task and leave a terminal audit row on every code path."""
     requested_run_uid = str(row.get("_history_run_uid") or "") or None
@@ -1234,18 +1702,50 @@ def _run_task(row: dict, root: Path, engine) -> None:
         row,
         run_uid=requested_run_uid,
     )
-    started_at = datetime.now()
-    try:
-        _run_task_impl(row, root, engine, history_run_uid=history_run_uid)
-    except Exception as exc:
-        duration = max(0, int((datetime.now() - started_at).total_seconds()))
-        output = f"scheduler task execution failed: {exc}"
+    if not history_run_uid:
         try:
             update_scheduler_task(
                 engine,
                 int(row["id"]),
                 {
                     "last_run_status": "failed",
+                    "last_run_output": (
+                        "scheduler execution rejected: audit row unavailable"
+                    ),
+                    "last_run_duration": 0,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist audit-unavailable state for task %s: %s",
+                row.get("id"),
+                exc,
+            )
+        return
+    started_at = datetime.now()
+    try:
+        _run_task_impl(row, root, engine, history_run_uid=history_run_uid)
+    except Exception as exc:
+        duration = max(0, int((datetime.now() - started_at).total_seconds()))
+        task_id = int(row["id"])
+        stopped_by_user = _task_stop_requested(task_id)
+        timed_out = _task_timeout_requested(task_id)
+        status = "stopped" if stopped_by_user else ("timeout" if timed_out else "failed")
+        output = (
+            f"scheduler task stopped after confirmed termination: {exc}"
+            if stopped_by_user
+            else (
+                f"scheduler task timed out after confirmed termination: {exc}"
+                if timed_out
+                else f"scheduler task execution failed: {exc}"
+            )
+        )
+        try:
+            update_scheduler_task(
+                engine,
+                task_id,
+                {
+                    "last_run_status": status,
                     "last_run_output": output,
                     "last_run_duration": duration,
                 },
@@ -1255,7 +1755,7 @@ def _run_task(row: dict, root: Path, engine) -> None:
         _task_history_finish(
             engine,
             history_run_uid,
-            status="failed",
+            status=status,
             duration=duration,
             exit_code=None,
             output=output,
@@ -1324,6 +1824,21 @@ def _run_task_impl(
     cmd = [sys.executable, str(script)] + args
 
     child_env = build_child_env(root, engine=engine)
+    exact_history_uid = str(history_run_uid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", exact_history_uid):
+        raise RuntimeError(
+            "scheduler child launch requires an exact 32-hex audit identity"
+        )
+    child_env.update(
+        {
+            "PROBIGA_SCHEDULER_HISTORY_RUN_UID": exact_history_uid,
+            "PROBIGA_SCHEDULER_TASK_ID": str(int(task_id)),
+            "PROBIGA_SCHEDULER_TASK_TYPE": str(
+                row.get("task_type") or ""
+            )[:64],
+            "PROBIGA_SCHEDULER_BUILD_SHA": _scheduler_build_commit_sha(),
+        }
+    )
 
     update_scheduler_task(
         engine,
@@ -1349,21 +1864,33 @@ def _run_task_impl(
         else:
             popen_kwargs["preexec_fn"] = os.setsid
         proc = subprocess.Popen(cmd, **popen_kwargs)
-        _running_procs[task_id] = proc
+        with _running_lock:
+            _running_procs[task_id] = proc
         try:
             stdout, stderr = proc.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             _terminate_process(proc)
             stdout, stderr = proc.communicate()
-            _running_procs.pop(task_id, None)
+            with _running_lock:
+                if _running_procs.get(task_id) is proc:
+                    _running_procs.pop(task_id, None)
             duration = int((datetime.now() - start_t).total_seconds())
-            status = "timeout"
-            output = (
-                f"任务执行超过 {_task_timeout_minutes(row)} 分钟，已自动终止。\n"
-                + (stdout or "")[-2500:]
-                + "\n---STDERR---\n"
-                + (stderr or "")[-1500:]
-            )
+            stopped_by_user = _task_stop_requested(int(task_id))
+            status = "stopped" if stopped_by_user else "timeout"
+            if stopped_by_user:
+                output = (
+                    "用户手动停止；子进程已确认退出。\n"
+                    + (stdout or "")[-2500:]
+                    + "\n---STDERR---\n"
+                    + (stderr or "")[-1500:]
+                )
+            else:
+                output = (
+                    f"任务执行超过 {_task_timeout_minutes(row)} 分钟，已自动终止。\n"
+                    + (stdout or "")[-2500:]
+                    + "\n---STDERR---\n"
+                    + (stderr or "")[-1500:]
+                )
             update_scheduler_task(
                 engine,
                 int(task_id),
@@ -1383,18 +1910,34 @@ def _run_task_impl(
                 output=output,
             )
             return
-        _running_procs.pop(task_id, None)
+        with _running_lock:
+            if _running_procs.get(task_id) is proc:
+                _running_procs.pop(task_id, None)
 
         duration = int((datetime.now() - start_t).total_seconds())
-        status = "success" if proc.returncode == 0 else "failed"
+        stopped_by_user = _task_stop_requested(int(task_id))
+        timed_out = _task_timeout_requested(int(task_id))
+        status = "stopped" if stopped_by_user else (
+            "timeout" if timed_out else (
+                "success" if proc.returncode == 0 else "failed"
+            )
+        )
         machine_output = (stdout or "") + "\n" + (stderr or "")
         output = (stdout or "")[-3000:] + "\n---STDERR---\n" + (stderr or "")[-2000:]
         # Preserve the Level-1 validator's explicit BLOCK state even though
         # its CLI exits non-zero.  BLOCK is not an execution failure and must
         # not be retried every fifteen minutes.
-        status = scheduler_output_status(
-            row, machine_output, return_code=proc.returncode
-        ) or status
+        if stopped_by_user:
+            output = "用户手动停止；子进程已确认退出。\n" + output
+        elif timed_out:
+            output = (
+                f"任务执行超过 {_task_timeout_minutes(row)} 分钟；"
+                "子进程已确认退出。\n" + output
+            )
+        else:
+            status = scheduler_output_status(
+                row, machine_output, return_code=proc.returncode
+            ) or status
         if status == "success" and not is_market_closed_skip_output(output):
             validation = validate_scheduler_task_result(row, engine=engine, started_at=start_t)
             if validation.checked:
@@ -1403,10 +1946,24 @@ def _run_task_impl(
                 if not validation.ok:
                     status = "failed"
     except Exception as exc:
-        _running_procs.pop(task_id, None)
-        status = "failed"
+        with _running_lock:
+            if _running_procs.get(task_id) is locals().get("proc"):
+                _running_procs.pop(task_id, None)
+        stopped_by_user = _task_stop_requested(int(task_id))
+        timed_out = _task_timeout_requested(int(task_id))
+        status = "stopped" if stopped_by_user else (
+            "timeout" if timed_out else "failed"
+        )
         duration = 0
-        output = str(exc)
+        output = (
+            f"用户手动停止；子进程已确认退出。\n{exc}"
+            if stopped_by_user
+            else (
+                f"任务超时；子进程已确认退出。\n{exc}"
+                if timed_out
+                else str(exc)
+            )
+        )
 
     update_scheduler_task(
         engine,
@@ -1431,11 +1988,21 @@ def _run_task_impl(
 def _run_task_async(row: dict, root: Path, engine) -> None:
     semaphore = _task_lane_semaphore(row)
     with semaphore:
+        task_id = int(row["id"])
+        history_run_uid = str(row.get("_history_run_uid") or "").strip()
+        with _running_lock:
+            if history_run_uid:
+                _running_history_uids[task_id] = history_run_uid
         try:
             _run_task(row, root, engine)
         finally:
             with _running_lock:
-                task_id = int(row["id"])
+                _running_procs.pop(task_id, None)
+                _running_history_uids.pop(task_id, None)
+                _stop_pending_task_ids.discard(task_id)
+                _stop_requested_task_ids.discard(task_id)
+                _timeout_pending_task_ids.discard(task_id)
+                _timeout_requested_task_ids.discard(task_id)
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
@@ -1458,6 +2025,37 @@ def launch_scheduler_task(
     root = root or Path(__file__).resolve().parents[2]
     task_id = int(row["id"])
     task_name = str(row.get("task_name") or task_id)
+    requested_history_uid = str(
+        row.get("_manual_history_run_uid") or ""
+    ).strip().lower()
+    if requested_history_uid and not re.fullmatch(
+        r"[0-9a-f]{32}", requested_history_uid
+    ):
+        return {
+            "accepted": False,
+            "status": "invalid_history_identity",
+            "task_id": task_id,
+            "task_name": task_name,
+            "job_id": "",
+        }
+    if not scheduler_task_owned_by_current_host(row):
+        return {
+            "accepted": False,
+            "status": "delegated_to_other_host",
+            "task_id": task_id,
+            "task_name": task_name,
+        }
+    if (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+        and _scheduler_build_commit_sha() == "0" * 40
+    ):
+        return {
+            "accepted": False,
+            "status": "build_identity_unavailable",
+            "task_id": task_id,
+            "task_name": task_name,
+        }
     if int(row.get("enabled") or 0) != 1:
         return {
             "accepted": False,
@@ -1512,12 +2110,13 @@ def launch_scheduler_task(
     manual_history_uid = _task_history_start(
         engine,
         manual_row,
-        run_uid=uuid.uuid4().hex,
+        run_uid=requested_history_uid or uuid.uuid4().hex,
     )
     if not manual_history_uid:
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
@@ -1533,6 +2132,38 @@ def launch_scheduler_task(
         return {
             "accepted": False,
             "status": "audit_unavailable",
+            "task_id": task_id,
+            "task_name": task_name,
+            "job_id": "",
+        }
+    if requested_history_uid and manual_history_uid != requested_history_uid:
+        with _running_lock:
+            _running_task_ids.discard(task_id)
+            _fast_lane_running_task_ids.discard(task_id)
+            _alert_lane_running_task_ids.discard(task_id)
+            _delivery_lane_running_task_ids.discard(task_id)
+        update_scheduler_task(
+            engine,
+            task_id,
+            {
+                "last_run_status": "failed",
+                "last_run_output": (
+                    "manual launch rejected: scheduler audit identity mismatch"
+                ),
+                "last_run_duration": 0,
+            },
+        )
+        _task_history_finish(
+            engine,
+            manual_history_uid,
+            status="failed",
+            duration=0,
+            exit_code=None,
+            output="manual launch rejected: scheduler audit identity mismatch",
+        )
+        return {
+            "accepted": False,
+            "status": "audit_identity_mismatch",
             "task_id": task_id,
             "task_name": task_name,
             "job_id": "",
@@ -1596,16 +2227,34 @@ def _catchup_on_startup() -> None:
 def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | None = None) -> None:
     """后台调度线程：每分钟检查一次，到点执行任务"""
     root = Path(__file__).resolve().parents[2]
-    _catchup_on_startup()
     startup_time = datetime.now()
     poll_seconds = int(get_scheduler_runtime_config()["poll_seconds"])
     while not (stop_event and stop_event.is_set()):
         try:
             engine = get_engine()
+            dispatch_authorized = mode != "standalone"
+            heartbeat_detail: dict[str, object] = {}
             try:
                 _write_scheduler_heartbeat(engine, mode)
+                dispatch_authorized, heartbeat_detail = (
+                    _standalone_heartbeat_allows_dispatch(engine, mode)
+                )
             except Exception as exc:
-                logger.warning("写入调度心跳异常: %s", exc)
+                dispatch_authorized = False
+                heartbeat_detail = {"errors": ["heartbeat_write_failed"]}
+                logger.error("写入调度心跳异常，停止本轮任务派发: %s", exc)
+
+            if mode == "standalone" and not dispatch_authorized:
+                logger.error(
+                    "独立调度器身份无法唯一证明，停止本轮任务派发: %s",
+                    heartbeat_detail.get("errors") or ["authority_unknown"],
+                )
+                if stop_event:
+                    if stop_event.wait(poll_seconds):
+                        break
+                else:
+                    time.sleep(poll_seconds)
+                continue
 
             try:
                 _cleanup_stale_running_tasks(engine)
@@ -1638,14 +2287,25 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
 
+                owner = scheduler_task_host_owner(row)
                 if _should_skip_task_for_host(row):
                     skip_key = (int(task_id), now.strftime("%Y-%m-%d"))
                     if skip_key not in _delegated_skip_logged_for:
-                        logger.info(
-                            "Skip task owned by the other scheduler host: %s (type=%s)",
-                            task_name,
-                            row.get("task_type"),
-                        )
+                        if owner == SCHEDULER_OWNER_UNAVAILABLE:
+                            logger.error(
+                                "Skip task with unavailable/unfrozen provider identity: "
+                                "%s (type=%s)",
+                                task_name,
+                                row.get("task_type"),
+                            )
+                        else:
+                            logger.info(
+                                "Skip task owned by the other scheduler host: "
+                                "%s (type=%s owner=%s)",
+                                task_name,
+                                row.get("task_type"),
+                                owner,
+                            )
                         _delegated_skip_logged_for.add(skip_key)
                     continue
 
@@ -1697,6 +2357,17 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 cron_time,
                                 time_str,
                             )
+
+                dependency_ready, dependency_reason = (
+                    _strategy_pipeline_dependencies_ready(row, engine, now)
+                )
+                if not dependency_ready:
+                    logger.warning(
+                        "Defer strategy pipeline task %s until prerequisite: %s",
+                        task_name,
+                        dependency_reason,
+                    )
+                    continue
 
                 non_trading_day_action = _should_skip_non_trading_day(row, engine, now)
                 if non_trading_day_action is None:
@@ -1809,8 +2480,31 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row,
                     run_uid=uuid.uuid4().hex,
                 )
+                if not history_uid:
+                    with _running_lock:
+                        _running_task_ids.discard(int(task_id))
+                        _fast_lane_running_task_ids.discard(int(task_id))
+                        _alert_lane_running_task_ids.discard(int(task_id))
+                        _delivery_lane_running_task_ids.discard(int(task_id))
+                    update_scheduler_task(
+                        engine,
+                        int(task_id),
+                        {
+                            "last_run_status": "failed",
+                            "last_run_output": (
+                                "scheduled execution rejected: "
+                                "audit row unavailable"
+                            ),
+                            "last_run_duration": 0,
+                        },
+                    )
+                    logger.error(
+                        "任务 %s 的审计记录不可用，拒绝启动执行线程",
+                        task_name,
+                    )
+                    continue
                 row["_history_run_uid"] = history_uid
-                row["_history_started"] = bool(history_uid)
+                row["_history_started"] = True
                 worker = threading.Thread(
                     target=_run_task_async,
                     args=(row, root, engine),

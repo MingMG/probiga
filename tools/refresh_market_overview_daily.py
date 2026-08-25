@@ -11,35 +11,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.auxiliary_runtime_schema import (
+    validate_market_overview_daily_runtime_schema,
+)
 from server.common.kline_data import get_kline_engine
 from tools.env_config import load_project_env
 
 
 def _date_list(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
-
-
-def ensure_table(conn) -> None:
-    conn.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS sm_market_overview_daily (
-                trade_date DATE NOT NULL PRIMARY KEY,
-                up_cnt INT NOT NULL DEFAULT 0,
-                down_cnt INT NOT NULL DEFAULT 0,
-                sideline_cnt INT NOT NULL DEFAULT 0,
-                total INT NOT NULL DEFAULT 0,
-                total_amount DECIMAL(50,6) NULL,
-                small_up_cnt INT NOT NULL DEFAULT 0,
-                small_total INT NOT NULL DEFAULT 0,
-                small_avg_chg DECIMAL(20,6) NULL,
-                source_table VARCHAR(64) NOT NULL DEFAULT 'sm_stock_kline',
-                quality_status VARCHAR(32) NULL,
-                updated_at DATETIME NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-    )
 
 
 def resolve_dates(kline_conn, *, dates: list[str], start_date: str, end_date: str) -> list[str]:
@@ -167,8 +147,8 @@ def main() -> int:
     engine = create_batch_engine(future=True)
     kline_engine = get_kline_engine()
     explicit_dates = _date_list(args.dates or args.date_arg)
+    validate_market_overview_daily_runtime_schema(engine)
     with engine.begin() as conn:
-        ensure_table(conn)
         with kline_engine.connect() as kline_conn:
             dates = resolve_dates(kline_conn, dates=explicit_dates, start_date=args.start_date, end_date=args.end_date)
             for trade_date in dates:

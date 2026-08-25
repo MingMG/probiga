@@ -241,7 +241,7 @@ def _persisted_target_row() -> dict:
         "attribution_snapshot_hash": hashlib.sha256(
             (
                 "run-risk-reject|forecast-1|000001|"
-                "right_side_trend"
+                "right_side_trend|dynamic-test-version:right_side_trend"
             ).encode("utf-8")
         ).hexdigest(),
     }
@@ -615,6 +615,17 @@ def test_materializer_persists_rejected_risk_without_creating_order(
         paper_execution,
         "_canonical_v2_buy_receipt",
         lambda *args, **kwargs: ({"receipt": "ok"}, ""),
+    )
+    monkeypatch.setattr(
+        paper_execution,
+        "_canonical_governance_buy_receipt",
+        lambda *args, **kwargs: ({
+            "strategy_key": "right_side_trend",
+            "strategy_version": "dynamic-test-version:right_side_trend",
+            "target_bp": 500,
+            "new_buy_allowed": True,
+            "real_order_authority": False,
+        }, ""),
     )
     real_risk_evaluator = paper_execution._evaluate_cumulative_buy_risk
     captured_risk_inputs = {}

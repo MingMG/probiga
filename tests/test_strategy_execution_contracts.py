@@ -3,11 +3,15 @@ from __future__ import annotations
 import copy
 import hashlib
 from contextlib import nullcontext
+from datetime import date, timedelta
 
 import pytest
 
 from server.engine import strategy_center as center
 from server.engine import strategy_governance as governance
+from server.engine import strategy_execution_adapters as adapter_module
+from server.trading_v3 import paper_execution
+from server.trading_v3.decision_truth import canonical_hash
 from server.engine.strategy_execution_adapters import (
     StrategyExecutionAdapter,
     compute_strategy_execution_adapter_artifact_sha256,
@@ -16,6 +20,7 @@ from server.engine.strategy_execution_adapters import (
     normalize_execution_binding,
     persist_strategy_adapter_run_receipt,
     register_strategy_execution_adapter,
+    strategy_execution_adapter_capabilities,
     strategy_execution_adapter_status,
     unregister_strategy_execution_adapter,
     validate_strategy_adapter_run_receipt,
@@ -122,6 +127,169 @@ def adapter_with_rebindable_helper(strategy, context):
     return _REBINDABLE_ADAPTER_HELPER(strategy, context)
 
 
+def _adapter_helper_with_module(_strategy, _context):
+    return adapter_module.os.getcwd()
+
+
+def adapter_with_module_helper(strategy, context):
+    return _adapter_helper_with_module(strategy, context)
+
+
+def _adapter_helper_with_module_default(
+    _strategy, _context, module=adapter_module.os,
+):
+    return module.getcwd()
+
+
+def adapter_with_module_default_helper(strategy, context):
+    return _adapter_helper_with_module_default(strategy, context)
+
+
+def _make_closure_helper():
+    state = []
+
+    def helper(_strategy, _context):
+        state.append("side-effect")
+        return len(state)
+
+    return helper
+
+
+_ADAPTER_CLOSURE_HELPER = _make_closure_helper()
+
+
+def adapter_with_closure_helper(strategy, context):
+    return _ADAPTER_CLOSURE_HELPER(strategy, context)
+
+
+def adapter_with_direct_framework_globals(_strategy, _context):
+    return create_candidate_batch.__globals__["os"].getcwd()
+
+
+def _adapter_helper_with_indirect_framework_globals(_strategy, _context):
+    return create_candidate_batch.__globals__["os"].getcwd()
+
+
+def adapter_with_indirect_framework_globals(strategy, context):
+    return _adapter_helper_with_indirect_framework_globals(strategy, context)
+
+
+def adapter_with_builtin_getattr_reflection(_strategy, _context):
+    namespace = getattr(create_candidate_batch, "__globals__")
+    return namespace["os"].getcwd()
+
+
+def adapter_with_dunder_type_reflection(_strategy, _context):
+    return ().__class__.__base__.__subclasses__()
+
+
+_ADAPTER_OS_MODULE_ALIAS = adapter_module.os
+
+
+def adapter_with_module_alias(_strategy, _context):
+    return _ADAPTER_OS_MODULE_ALIAS.getcwd()
+
+
+def _make_reflection_closure_helper():
+    target = create_candidate_batch
+
+    def helper(_strategy, _context):
+        return target.__globals__["os"].getcwd()
+
+    return helper
+
+
+_REFLECTION_CLOSURE_HELPER = _make_reflection_closure_helper()
+
+
+def adapter_with_reflection_closure_helper(strategy, context):
+    return _REFLECTION_CLOSURE_HELPER(strategy, context)
+
+
+class _AdapterObjectCapability:
+    def escape(self):
+        return create_candidate_batch.__globals__["os"].getcwd()
+
+
+_ADAPTER_OBJECT_CAPABILITY = _AdapterObjectCapability()
+
+
+def adapter_with_object_capability(_strategy, _context):
+    return _ADAPTER_OBJECT_CAPABILITY.escape()
+
+
+class _AdapterBoundMethodCapability:
+    @classmethod
+    def escape(cls):
+        return create_candidate_batch.__globals__["os"].getcwd()
+
+
+_ADAPTER_BOUND_METHOD_CAPABILITY = _AdapterBoundMethodCapability.escape
+
+
+def adapter_with_bound_method_capability(_strategy, _context):
+    return _ADAPTER_BOUND_METHOD_CAPABILITY()
+
+
+class _AdapterBuiltinReflector:
+    REFLECT = staticmethod(getattr)
+
+
+def adapter_with_class_builtin_getattr(_strategy, _context):
+    namespace = _AdapterBuiltinReflector.REFLECT(
+        create_candidate_batch, "__globals__",
+    )
+    return namespace["os"].getcwd()
+
+
+class _AdapterEscapingMetaclass(type):
+    def __call__(cls):
+        return create_candidate_batch.__globals__["os"].getcwd()
+
+
+class _AdapterMetaclassCarrier(metaclass=_AdapterEscapingMetaclass):
+    pass
+
+
+def adapter_with_metaclass_escape(_strategy, _context):
+    return _AdapterMetaclassCarrier()
+
+
+class _PureAdapterClassHelper:
+    SCALE = 2
+
+    @staticmethod
+    def score(value):
+        return abs(value) * _PureAdapterClassHelper.SCALE
+
+
+def adapter_with_pure_class_helper(_strategy, _context):
+    return _PureAdapterClassHelper.score(-2)
+
+
+class _ModuleBackedAdapterClassHelper:
+    @staticmethod
+    def run():
+        return adapter_module.os.getcwd()
+
+
+def adapter_with_module_backed_class(_strategy, _context):
+    return _ModuleBackedAdapterClassHelper.run()
+
+
+class _MutableStateAdapterClassHelper:
+    STATE = []
+
+    @staticmethod
+    def run():
+        _MutableStateAdapterClassHelper.STATE.append("side-effect")
+        return 1
+
+
+def adapter_with_mutable_class(_strategy, _context):
+    return _MutableStateAdapterClassHelper.run()
+
+
 def mutating_strategy_validator(strategy):
     strategy["source_kind"] = "immutable_manifest"
     return True, "伪造内置来源"
@@ -165,6 +333,93 @@ def _snapshot(state: str, status: str, *, candidates=None) -> dict:
     }
 
 
+def _exact_industry_snapshot(
+    stock_to_industry: dict[str, str],
+    *, trade_date: str = "2026-08-21",
+) -> dict:
+    from server.engine.strategy_industry_history import build_history_rows
+
+    source_hash = governance._digest({
+        "schema": "test.qmt-industry-source.v1",
+        "trade_date": trade_date,
+        "stock_to_industry": stock_to_industry,
+    })
+    _snapshot_id, rows = build_history_rows(
+        [
+            {
+                "industry_code": f"TEST-{index:03d}",
+                "industry_name": industry,
+                "industry_type": "L1",
+                "stock_code": stock_code,
+            }
+            for index, (stock_code, industry) in enumerate(
+                sorted(stock_to_industry.items())
+            )
+        ],
+        trade_date=trade_date,
+        source="QMT_TEST",
+        industry_hash=source_hash,
+        captured_at=f"{trade_date}T15:05:00",
+    )
+    payload = {
+        "schema": governance.INDUSTRY_SNAPSHOT_SCHEMA,
+        "snapshot_id": rows[0]["snapshot_id"],
+        "trade_date": trade_date,
+        "as_of_exclusive": "2026-08-22T00:00:00",
+        "status": "COMPLETED",
+        "requested_stock_codes": sorted(stock_to_industry),
+        "rows": rows,
+        "reason": "测试目标日QMT一级行业冻结事实",
+    }
+    return {**payload, "snapshot_hash": governance._digest(payload)}
+
+
+def _portfolio_risk_evidence(
+    stock_code: str = "600000", *, phase: int = 0,
+) -> dict:
+    patterns = (
+        (0.10, -0.10),
+        (0.10, 0.10, -0.10, -0.10),
+    )
+    pattern = patterns[phase % len(patterns)]
+    start = date(2026, 1, 1)
+    daily_exposures = [
+        {
+            "trade_date": (start + timedelta(days=index)).isoformat(),
+            "gross_exposure_value": "10000.00000000",
+            "normalized_stock_weights": [{
+                "stock_code": stock_code,
+                "normalized_weight": "1.000000000000",
+            }],
+        }
+        for index in range(60)
+    ]
+    payload = {
+        "schema": governance.PORTFOLIO_RISK_EVIDENCE_SCHEMA,
+        "status": "READY",
+        "window_days": 60,
+        "daily_returns": [
+            {
+                "trade_date": (start + timedelta(days=index)).isoformat(),
+                "return_pct": f"{pattern[index % len(pattern)]:.8f}",
+            }
+            for index in range(60)
+        ],
+        "daily_stock_exposures": daily_exposures,
+        "current_stock_exposure": [{
+            "stock_code": stock_code,
+            "normalized_weight": "1.000000000000",
+        }],
+        "peak_gross_exposure_value": "10000.00000000",
+        "peak_gross_exposure_trade_date": daily_exposures[0]["trade_date"],
+        "exposure_path_hash": governance._digest({
+            "schema": "probiga.strategy-daily-stock-exposure-path.v1",
+            "rows": daily_exposures,
+        }),
+    }
+    return {**payload, "evidence_hash": governance._digest(payload)}
+
+
 def _allocation_contract() -> list[dict]:
     return [{
         "target_type": "STRATEGY",
@@ -184,6 +439,7 @@ def _allocation_contract() -> list[dict]:
         "lifecycle_status": "ACTIVE",
         "lifecycle_status_label": "正常运行",
         "lifecycle_risk_multiplier": 1.0,
+        "portfolio_risk_evidence": _portfolio_risk_evidence(),
     }]
 
 
@@ -283,7 +539,7 @@ def test_dynamic_strategy_without_exact_deployed_adapter_stays_shadow():
     }
     status = strategy_execution_adapter_status(strategy)
     assert status["executable"] is False
-    assert "执行适配器未部署/无效" in status["reason"]
+    assert "执行适配器未部署" in status["reason"]
     strategy.update({
         "execution_adapter_executable": False,
         "execution_adapter_reason": status["reason"],
@@ -305,7 +561,157 @@ def test_dynamic_strategy_without_exact_deployed_adapter_stays_shadow():
     assert ranked["paper_allocation_eligible"] is False
     recommended, reason = governance._recommend_strategy_row(ranked)
     assert recommended == "SHADOW"
-    assert "执行适配器未部署/无效" in reason
+    assert "执行适配器未部署" in reason
+
+
+@pytest.mark.parametrize(
+    ("ledger_status", "producer_ready", "funding_ready", "expected_label"),
+    (
+        ("VERIFIED_EMPTY", True, False, "模拟链结构已就绪，证据积累中"),
+        ("VERIFIED_PENDING", True, False, "模拟链结构已就绪，证据积累中"),
+        ("VERIFIED", True, True, "执行适配器与模拟链成熟证据已就绪"),
+        ("INVALID", False, False, "模拟链校验失败"),
+    ),
+)
+def test_dynamic_ledger_display_states_do_not_confuse_accumulation_with_deploy(
+    ledger_status, producer_ready, funding_ready, expected_label,
+):
+    base = {
+        "executable": True,
+        "status": "RESEARCH_READY",
+        "adapter_key": "dynamic.alpha",
+        "adapter_version": "1.0.0",
+    }
+    readiness = {
+        "status": ledger_status,
+        "schema_readable": True,
+        "shadow_trial_producer_ready": producer_ready,
+        "funding_pipeline_ready": funding_ready,
+        "verified_forward_evidence_ready": funding_ready,
+        "verified_chain_count": 1 if funding_ready else 0,
+        "pending_plan_count": 1 if ledger_status == "VERIFIED_PENDING" else 0,
+        "invalid_chain_count": 1 if ledger_status == "INVALID" else 0,
+        "invalid_chains": ([{"reason": "hash mismatch"}]
+                           if ledger_status == "INVALID" else []),
+        "ledger_hash": "a" * 64,
+    }
+    status = adapter_module._with_dynamic_ledger_status(base, readiness)
+    assert status["status_label"] == expected_label
+    assert "资金链尚未部署" not in status["reason"]
+    assert status["funding_pipeline_ready"] is funding_ready
+    assert status["real_order_submission_enabled"] is False
+    assert status["automatic_real_order_submission"] is False
+
+
+def test_builtin_adapter_status_exposes_compatible_funding_fields():
+    status = strategy_execution_adapter_status({
+        "strategy_key": "right_side_trend",
+        "current_version": "manifest-v1",
+        "version_hash": "a" * 64,
+        "source_kind": "immutable_manifest",
+        "evaluator_type": "manifest_score_adapter",
+        "version_integrity_valid": True,
+        "enabled": True,
+        "current_status": "ACTIVE",
+    })
+    assert status["executable"] is True
+    assert status["funding_pipeline_ready"] is True
+    assert status["funding_status"] == "NOT_APPLICABLE_BUILTIN"
+    assert status["funding_evidence_state"] == "BUILTIN_VERSION_BOUND_PATH"
+    assert status["real_order_submission_enabled"] is False
+    assert status["automatic_real_order_submission"] is False
+
+
+def test_adapter_capabilities_do_not_confuse_registry_integrity_with_execution(
+    monkeypatch,
+):
+    artifact_sha256 = compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key="dynamic.capability",
+        adapter_version="1.0.0",
+        evaluator_types=frozenset({"dynamic_score"}),
+        candidate_builder=trusted_zero_candidate_builder,
+    )
+    adapter = StrategyExecutionAdapter(
+        adapter_key="dynamic.capability",
+        adapter_version="1.0.0",
+        artifact_sha256=artifact_sha256,
+        evaluator_types=frozenset({"dynamic_score"}),
+        candidate_builder=trusted_zero_candidate_builder,
+    )
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(adapter_module, "_REGISTRY", {})
+    monkeypatch.setattr(adapter_module, "_REGISTRY_SEALED", False)
+    monkeypatch.setattr(adapter_module, "_REGISTRY_SEAL_HASH", "")
+
+    unsealed = strategy_execution_adapter_capabilities()
+    assert unsealed["registry_integrity_ready"] is False
+    assert unsealed["adapter_configured"] is False
+    assert unsealed["candidate_execution_ready"] is False
+    assert unsealed["funding_pipeline_ready"] is False
+    assert unsealed["governance_paper_execution_ready"] is False
+    assert unsealed["production_execution_ready"] is False
+    assert unsealed["real_order_submission_enabled"] is False
+    assert unsealed["automatic_real_order_submission"] is False
+    assert unsealed["real_order_authority"] is False
+
+    monkeypatch.setattr(adapter_module, "_REGISTRY_SEALED", True)
+    monkeypatch.setattr(adapter_module, "_REGISTRY_SEAL_HASH", "a" * 64)
+    sealed_empty = strategy_execution_adapter_capabilities()
+    assert sealed_empty["registry_integrity_ready"] is True
+    assert sealed_empty["adapter_count"] == 0
+    assert sealed_empty["adapter_configured"] is False
+    assert sealed_empty["candidate_execution_ready"] is False
+    assert sealed_empty["production_execution_ready"] is False
+
+    monkeypatch.setattr(
+        adapter_module,
+        "_REGISTRY",
+        {(adapter.adapter_key, adapter.adapter_version): adapter},
+    )
+    configured = strategy_execution_adapter_capabilities()
+    assert configured["registry_integrity_ready"] is True
+    assert configured["adapter_configured"] is True
+    assert configured["candidate_execution_ready"] is True
+    assert configured["funding_pipeline_ready"] is False
+    assert configured["governance_paper_execution_ready"] is False
+    assert configured["production_execution_ready"] is False
+    assert configured["real_order_submission_enabled"] is False
+    assert configured["automatic_real_order_submission"] is False
+    assert configured["real_order_authority"] is False
+    assert all(
+        row["real_order_submission_enabled"] is False
+        and row["automatic_real_order_submission"] is False
+        and row["real_order_authority"] is False
+        for row in configured["adapters"]
+    )
+
+    dynamic = strategy_execution_adapter_capabilities(registry_rows=[{
+        "strategy_key": "dynamic_capability_strategy",
+        "current_version": "v1",
+        "version_hash": "b" * 64,
+        "source_kind": "runtime_registry",
+        "execution_adapter": {
+            "executable": True,
+            "execution_binding_hash": "c" * 64,
+            "funding_status": "ACCUMULATING",
+            "funding_evidence_state": "PENDING_MATURITY",
+            "paper_chain_structure_ready": True,
+            "funding_pipeline_ready": False,
+            "funding_ledger_hash": "d" * 64,
+            "verified_forward_chain_count": 0,
+            "pending_shadow_plan_count": 1,
+        },
+    }])
+    assert dynamic["dynamic_version_count"] == 1
+    assert dynamic["dynamic_version_readiness"][0][
+        "real_order_submission_enabled"
+    ] is False
+    assert dynamic["dynamic_version_readiness"][0][
+        "automatic_real_order_submission"
+    ] is False
+    assert dynamic["dynamic_version_readiness"][0][
+        "real_order_authority"
+    ] is False
 
 
 def test_dynamic_adapter_registry_is_version_artifact_and_cost_bound():
@@ -400,7 +806,7 @@ def test_dynamic_adapter_registry_is_version_artifact_and_cost_bound():
             "fill_hash", fill["record_hash"],
             evidence_kind="EXECUTED_PAPER",
         )
-        with pytest.raises(RuntimeError, match="资金链尚未部署"):
+        with pytest.raises(RuntimeError, match="不是可信事实"):
             verify_dynamic_shadow_ledger_chain(
                 strategy,
                 candidate_receipt=execution["receipt"],
@@ -410,6 +816,72 @@ def test_dynamic_adapter_registry_is_version_artifact_and_cost_bound():
     finally:
         unregister_strategy_execution_adapter(
             "dynamic.alpha", "1.0.0", explicit_test_mode=True,
+        )
+
+
+def test_candidate_execution_reuses_prebatched_status_without_ledger_query(
+    monkeypatch,
+):
+    from server.engine import dynamic_shadow_ledger
+
+    artifact = compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key="dynamic.batch_ready",
+        adapter_version="1.0.0",
+        evaluator_types={"dynamic_score"},
+        candidate_builder=trusted_zero_candidate_builder,
+    )
+    binding = normalize_execution_binding({
+        "adapter_key": "dynamic.batch_ready",
+        "adapter_version": "1.0.0",
+        "strategy_version": "v1",
+        "artifact_sha256": artifact,
+        "cost_model": {
+            "model_key": "cn.paper.v1", "currency": "CNY",
+            "commission_pct": 0.03, "stamp_tax_pct": 0.05,
+            "slippage_pct": 0.10, "transfer_fee_pct": 0.001,
+        },
+    }, strategy_version="v1")
+    adapter = StrategyExecutionAdapter(
+        adapter_key="dynamic.batch_ready",
+        adapter_version="1.0.0",
+        artifact_sha256=artifact,
+        evaluator_types=frozenset({"dynamic_score"}),
+        candidate_builder=trusted_zero_candidate_builder,
+    )
+    strategy = {
+        "strategy_key": "dynamic_batch_ready",
+        "strategy_name": "批量就绪复用",
+        "current_version": "v1",
+        "version_hash": "b" * 64,
+        "source_kind": "runtime_registry",
+        "evaluator_type": "dynamic_score",
+        "evaluator_config": {"execution_adapter": binding},
+        "version_integrity_valid": True,
+        "enabled": True,
+        "current_status": "SHADOW",
+    }
+    register_strategy_execution_adapter(adapter)
+    try:
+        batch_status = strategy_execution_adapter_status(
+            strategy, ledger_readiness=None,
+        )
+        assert batch_status["executable"] is True
+        monkeypatch.setattr(
+            dynamic_shadow_ledger,
+            "dynamic_shadow_ledger_readiness",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("per-strategy ledger query")
+            ),
+        )
+        execution = execute_dynamic_adapter_candidate_batch(
+            strategy,
+            {"trade_date": "2026-08-24"},
+            adapter_status=batch_status,
+        )
+        assert execution["receipt"]["candidate_count"] == 0
+    finally:
+        unregister_strategy_execution_adapter(
+            "dynamic.batch_ready", "1.0.0", explicit_test_mode=True,
         )
 
 
@@ -809,6 +1281,7 @@ def test_canonical_governance_loader_returns_only_hash_verified_full_result(
         "name": "现金", "simulated_weight_pct": 100.0,
         "market_gate_status": "BLOCK_NEW_BUY", "market_risk_cap_pct": 0.0,
         "reason": "测试保持现金", "real_order_authority": False,
+        "automatic_real_order_submission": False,
     }]
     allocation_rows = governance._allocation_snapshot_contract(allocations)
     allocation_hash = governance._digest({
@@ -831,6 +1304,60 @@ def test_canonical_governance_loader_returns_only_hash_verified_full_result(
         "trade_date": trade_date, "transition_count": 0, "transitions": [],
     }
     transition_hash = governance._digest(transition_plan)
+    funding_manifest, _funding_candidates = (
+        governance._build_funding_checkpoint_manifest(
+            run_uid="1" * 32,
+            trade_date=trade_date,
+            strategies=[],
+            combinations=[],
+        )
+    )
+    funding_coverage = funding_manifest["coverage"]
+    industry_snapshot_payload = {
+        "schema": governance.INDUSTRY_SNAPSHOT_SCHEMA,
+        "snapshot_id": "",
+        "trade_date": trade_date,
+        "as_of_exclusive": "2026-08-22T00:00:00",
+        "status": "INCOMPLETE",
+        "requested_stock_codes": [],
+        "rows": [],
+        "reason": "没有候选证券需要行业冻结",
+    }
+    industry_snapshot = {
+        **industry_snapshot_payload,
+        "snapshot_hash": governance._digest(industry_snapshot_payload),
+    }
+    paper_plan_payload = {
+        "schema": "probiga.governance-paper-execution-plan.v1",
+        "trade_date": trade_date,
+        "industry_snapshot_id": "",
+        "industry_snapshot_hash": industry_snapshot["snapshot_hash"],
+        "industry_snapshot_status": "INCOMPLETE",
+        "policy": governance.GLOBAL_PORTFOLIO_POLICY,
+        "funded_sleeves": [],
+        "portfolio_risk": {
+            "valid": False,
+            "observations": 0,
+            "annualized_volatility_pct": None,
+            "expected_shortfall_95_pct": None,
+            "risk_multiplier": 0.0,
+            "reason": "没有合格策略，保持现金",
+        },
+        "requested_new_buy_turnover_bp": 0,
+        "new_buy_turnover_multiplier": 1.0,
+        "actual_new_buy_turnover_bp": 0,
+        "targets": [],
+        "exit_targets": [],
+        "target_count": 0,
+        "invested_bp": 0,
+        "cash_bp": 10_000,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    paper_plan = {
+        **paper_plan_payload,
+        "plan_hash": governance._digest(paper_plan_payload),
+    }
     input_hash = "a" * 64
     build_commit_sha = "test-build"
     decision_hash = governance._digest({
@@ -842,7 +1369,14 @@ def test_canonical_governance_loader_returns_only_hash_verified_full_result(
         "allocation_candidate_count": 0, "eligible_candidate_count": 0,
         "candidate_set_hash": candidate_hash,
         "allocation_snapshot_hash": allocation_hash,
+        "paper_execution_plan_hash": paper_plan["plan_hash"],
         "pool_snapshot_hash": pool_hash, "strategies": [], "combinations": [],
+        "candidate_industry_snapshot_hash": industry_snapshot[
+            "snapshot_hash"
+        ],
+        "funding_checkpoint_manifest_hash": funding_manifest[
+            "manifest_hash"
+        ],
     })
     result = {
         "status": "ok", "run_uid": "1" * 32,
@@ -856,20 +1390,55 @@ def test_canonical_governance_loader_returns_only_hash_verified_full_result(
         "trading_gate_passed": False,
         "allocation_candidate_set": candidates, "candidate_set_hash": candidate_hash,
         "allocation_snapshot_hash": allocation_hash,
+        "paper_execution_plan": paper_plan,
+        "paper_execution_plan_hash": paper_plan["plan_hash"],
+        "candidate_industry_snapshot": industry_snapshot,
+        "candidate_industry_snapshot_hash": industry_snapshot[
+            "snapshot_hash"
+        ],
         "router_snapshot": router_snapshot, "router_snapshot_hash": router_hash,
         "automatic_transition_plan": transition_plan,
         "automatic_transition_plan_hash": transition_hash,
+        "funding_checkpoint_manifest": funding_manifest,
         "pool_snapshot": pool_snapshot, "pool_snapshot_hash": pool_hash,
         "summary": {
             "candidate_set_hash": candidate_hash,
-            "allocation_snapshot_hash": allocation_hash,
+                "allocation_snapshot_hash": allocation_hash,
+                "paper_execution_plan_hash": paper_plan["plan_hash"],
+                "candidate_industry_snapshot_id": "",
+                "candidate_industry_snapshot_hash": industry_snapshot[
+                    "snapshot_hash"
+                ],
+                "candidate_industry_snapshot_status": "INCOMPLETE",
+            "paper_target_count": 0,
+            "paper_invested_weight_pct": 0.0,
             "pool_snapshot_hash": pool_hash,
             "automatic_transition_plan_hash": transition_hash,
             "allocation_candidate_count": 0, "eligible_candidate_count": 0,
             "market_risk_cap_pct": 0.0,
+            "funding_checkpoint_manifest_hash": funding_manifest[
+                "manifest_hash"
+            ],
+            "funding_checkpoint_eligible_count": funding_coverage[
+                "eligible_count"
+            ],
+            "funding_checkpointed_count": funding_coverage[
+                "checkpointed_count"
+            ],
+            "funding_strategy_checkpoint_count": funding_coverage[
+                "strategy_checkpoint_count"
+            ],
+            "funding_combination_recipe_count": funding_coverage[
+                "combination_recipe_count"
+            ],
+            "funding_ready_count": funding_coverage["funding_ready_count"],
+            "funding_checkpoint_ineligible_count": funding_coverage[
+                "ineligible_count"
+            ],
         },
         "pools": pools, "allocations": allocations,
         "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
     raw = governance._json_text(result)
     row = {
@@ -910,6 +1479,118 @@ def test_canonical_governance_loader_returns_only_hash_verified_full_result(
     monkeypatch.setattr(governance, "_db_read", lambda *_args, **_kwargs: [forged_row])
     with pytest.raises(RuntimeError, match="真实下单权限"):
         governance.load_canonical_governance_snapshot(trade_date)
+
+
+def test_paper_buy_receipt_requires_full_canonical_governance_replay(
+    monkeypatch,
+):
+    target_payload = {
+        "stock_code": "600036",
+        "strategy_key": "right_side_trend",
+        "strategy_version": "v7",
+        "target_bp": 500,
+        "allocation_backed": True,
+        "new_buy_allowed": True,
+        "exit_always_allowed": True,
+        "real_order_authority": False,
+    }
+    target = {
+        **target_payload,
+        "target_hash": canonical_hash({
+            "schema": "probiga.governance-paper-target.v1",
+            **target_payload,
+        }),
+    }
+    plan_payload = {
+        "targets": [target],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    plan = {**plan_payload, "plan_hash": canonical_hash(plan_payload)}
+    canonical_result = {
+        "input_ready": True,
+        "decision_contract_version": (
+            governance.STATISTICAL_DECISION_CONTRACT
+        ),
+        "statistical_funding_eligible": True,
+        "automatic_real_order_submission": False,
+        "paper_execution_plan": plan,
+        "paper_execution_plan_hash": plan["plan_hash"],
+    }
+    ledger = {
+        "run_uid": "1" * 32,
+        "trade_date": date(2026, 8, 21),
+        "input_ready": 1,
+        "build_commit_sha": "test-build",
+        "input_hash": "a" * 64,
+        "decision_hash": "b" * 64,
+        "result_json": "{}",
+        "result_hash": hashlib.sha256(b"{}").hexdigest(),
+    }
+
+    class Result:
+        def __init__(self, *, rows=None, first=None):
+            self._rows = rows or []
+            self._first = first
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+        def first(self):
+            return self._first
+
+    class Connection:
+        def execute(self, statement, _params=None):
+            sql = str(statement)
+            if "FROM st_strategy_governance_run" in sql:
+                assert "input_hash" in sql
+                return Result(rows=[ledger])
+            if "FROM st_strategy_registry" in sql:
+                return Result(first={
+                    "current_version": "v7",
+                    "current_status": "ACTIVE",
+                    "enabled": 1,
+                })
+            raise AssertionError(sql)
+
+    replayed = []
+
+    def replay(row):
+        replayed.append(dict(row))
+        return canonical_result
+
+    monkeypatch.setattr(
+        governance, "_canonical_governance_result_from_row", replay,
+    )
+    receipt, reason = paper_execution._canonical_governance_buy_receipt(
+        Connection(),
+        trade_date=date(2026, 8, 21),
+        stock_code="600036",
+        strategy_keys=["right_side_trend"],
+    )
+    assert reason == ""
+    assert receipt is not None
+    assert receipt["strategy_version"] == "v7"
+    assert replayed == [ledger]
+
+    monkeypatch.setattr(
+        governance,
+        "_canonical_governance_result_from_row",
+        lambda _row: (_ for _ in ()).throw(
+            RuntimeError("self-consistent forged canonical payload")
+        ),
+    )
+    receipt, reason = paper_execution._canonical_governance_buy_receipt(
+        Connection(),
+        trade_date=date(2026, 8, 21),
+        stock_code="600036",
+        strategy_keys=["right_side_trend"],
+    )
+    assert receipt is None
+    assert reason == "GOVERNANCE_CANONICAL_REPLAY_INVALID"
 
 
 def test_adapter_rejects_nested_lambda_bound_default_and_mutable_global():
@@ -969,6 +1650,93 @@ def test_adapter_artifact_rejects_transitive_helper_mutable_global():
             evaluator_types={"dynamic_score"},
             candidate_builder=adapter_with_transitive_mutable_helper,
         )
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    (
+        (adapter_with_module_helper, "模块依赖"),
+        (adapter_with_module_default_helper, "默认值"),
+        (adapter_with_closure_helper, "闭包状态"),
+    ),
+)
+def test_adapter_helper_dependencies_reject_module_default_and_closure(
+    candidate, reason,
+):
+    with pytest.raises(ValueError, match=reason):
+        compute_strategy_execution_adapter_artifact_sha256(
+            adapter_key="dynamic.malicious_helper",
+            adapter_version="1.0.0",
+            evaluator_types={"dynamic_score"},
+            candidate_builder=candidate,
+        )
+
+
+def test_adapter_class_dependencies_are_recursive_and_fail_closed():
+    pure = compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key="dynamic.pure_class",
+        adapter_version="1.0.0",
+        evaluator_types={"dynamic_score"},
+        candidate_builder=adapter_with_pure_class_helper,
+    )
+    assert len(pure) == 64
+
+    for candidate in (
+        adapter_with_module_backed_class,
+        adapter_with_mutable_class,
+    ):
+        with pytest.raises(ValueError, match="模块依赖|可变或不透明类属性"):
+            compute_strategy_execution_adapter_artifact_sha256(
+                adapter_key="dynamic.malicious_class",
+                adapter_version="1.0.0",
+                evaluator_types={"dynamic_score"},
+                candidate_builder=candidate,
+            )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        adapter_with_direct_framework_globals,
+        adapter_with_indirect_framework_globals,
+        adapter_with_builtin_getattr_reflection,
+        adapter_with_dunder_type_reflection,
+        adapter_with_module_alias,
+        adapter_with_reflection_closure_helper,
+        adapter_with_object_capability,
+        adapter_with_bound_method_capability,
+        adapter_with_class_builtin_getattr,
+        adapter_with_metaclass_escape,
+    ),
+)
+def test_adapter_reflection_and_object_capability_escapes_fail_closed(candidate):
+    with pytest.raises(ValueError, match=(
+        "反射|LOAD_GLOBAL|模块|闭包|可变|不透明|绑定方法|描述符"
+    )):
+        compute_strategy_execution_adapter_artifact_sha256(
+            adapter_key="dynamic.reflection_escape",
+            adapter_version="1.0.0",
+            evaluator_types={"dynamic_score"},
+            candidate_builder=candidate,
+        )
+
+
+def test_adapter_reflection_hardening_preserves_pure_helpers():
+    function_helper = compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key="dynamic.pure_function_after_reflection_hardening",
+        adapter_version="1.0.0",
+        evaluator_types={"dynamic_score"},
+        candidate_builder=adapter_with_rebindable_helper,
+    )
+    class_helper = compute_strategy_execution_adapter_artifact_sha256(
+        adapter_key="dynamic.pure_class_after_reflection_hardening",
+        adapter_version="1.0.0",
+        evaluator_types={"dynamic_score"},
+        candidate_builder=adapter_with_pure_class_helper,
+    )
+    assert len(function_helper) == 64
+    assert len(class_helper) == 64
+    assert function_helper != class_helper
 
 
 def test_validator_cannot_mutate_strategy_identity_or_run_after_hard_failure(
@@ -1064,6 +1832,7 @@ def test_combination_cannot_wrap_reduce_member_to_bypass_discount():
     }
     contract = governance._allocation_candidate_contract([], [combination])
     assert contract[0]["lifecycle_risk_multiplier"] == 0.75
+    contract[0]["portfolio_risk_evidence"] = _portfolio_risk_evidence()
     allocations = governance._allocation(
         [], [], "trend_bullish", trading_allowed=True,
         candidate_contract=contract,
@@ -1076,7 +1845,7 @@ def test_combination_cannot_wrap_reduce_member_to_bypass_discount():
     assert allocations[-1]["simulated_weight_pct"] == 36.25
 
 
-def test_strategy_and_combination_use_fixed_type_lanes_not_cross_raw_score():
+def test_strategy_and_combination_share_one_quality_weighted_lane():
     base = _allocation_contract()[0]
     strategy = {**base, "ranking_score": 1.0, "exposure_keys": ["solo"]}
     combo = {
@@ -1093,6 +1862,9 @@ def test_strategy_and_combination_use_fixed_type_lanes_not_cross_raw_score():
             "member_lifecycle_multiplier": 1.0,
         }],
         "constraint_passed": True,
+        "portfolio_risk_evidence": _portfolio_risk_evidence(
+            "600001", phase=1,
+        ),
     }
     allocations = governance._allocation(
         [], [], "trend_bullish", trading_allowed=True,
@@ -1102,7 +1874,13 @@ def test_strategy_and_combination_use_fixed_type_lanes_not_cross_raw_score():
         row["target_type"]: row["base_competitive_weight_pct"]
         for row in allocations if row["target_type"] != "CASH"
     }
-    assert funded == {"COMBINATION": 42.5, "STRATEGY": 42.5}
+    assert funded == {"COMBINATION": 84.15, "STRATEGY": 0.85}
+    assert all(
+        row["allocation_type_lane_policy"]
+        == governance.ALLOCATION_TYPE_LANE_POLICY
+        for row in allocations
+        if row["target_type"] != "CASH"
+    )
 
 
 def test_pool_filters_fake_dynamic_strategy_and_preserves_theme_industry():
@@ -1154,6 +1932,7 @@ def test_pool_filters_fake_dynamic_strategy_and_preserves_theme_industry():
     pools = governance._build_pools(
         _snapshot("high_range", "REDUCE_NEW_BUY", candidates=[valid_candidate]),
         strategies,
+        industry_snapshot=_exact_industry_snapshot({"600036": "银行"}),
     )
     assert pools["tradable"][0]["strategies"] == ["valid_strategy"]
     assert pools["tradable"][0]["industry_name"] == "银行"
@@ -1162,7 +1941,7 @@ def test_pool_filters_fake_dynamic_strategy_and_preserves_theme_industry():
     assert strategies[0]["industry_candidate_count"] == 0
 
 
-def test_pool_industry_focus_preserves_each_signal_industry():
+def test_pool_industry_focus_uses_one_authoritative_qmt_l1_industry():
     candidate = {
         "stock_code": "600000",
         "stock_name": "测试",
@@ -1193,12 +1972,74 @@ def test_pool_industry_focus_preserves_each_signal_industry():
     pools = governance._build_pools(
         _snapshot("high_range", "REDUCE_NEW_BUY", candidates=[candidate]),
         strategies,
+        industry_snapshot=_exact_industry_snapshot({"600000": "银行"}),
     )
-    assert pools["observation"][0]["industry_names"] == ["电子", "银行"]
+    assert pools["observation"][0]["industry_names"] == ["银行"]
     governance._attach_pool_industry_focus(strategies, pools)
     assert {
         row["strategy_key"]: row["primary_industry"] for row in strategies
-    } == {"bank_signal": "银行", "tech_signal": "电子"}
+    } == {"bank_signal": "银行", "tech_signal": "银行"}
+
+
+@pytest.mark.parametrize(
+    "drift_kind", ("tampered", "missing", "wrong_date", "non_l1")
+)
+def test_pool_bad_or_missing_exact_industry_is_observation_only(drift_kind):
+    candidate = {
+        "stock_code": "600036", "stock_name": "招商银行",
+        "strategies": ["valid_strategy"],
+        "dominant_strategy": "valid_strategy",
+        "model_confidence": 88, "risk_reward_ratio": 2.0,
+        "final_status": "READY", "blocking_reasons": [],
+        "data_date": "2026-08-21",
+    }
+    strategy = {
+        "strategy_key": "valid_strategy", "strategy_name": "有效策略",
+        "ranking_score": 80, "execution_adapter_executable": True,
+        "paper_allocation_eligible": True, "enabled": True,
+        "current_status": "ACTIVE",
+    }
+    industry = _exact_industry_snapshot({"600036": "银行"})
+    if drift_kind == "tampered":
+        industry["rows"][0]["industry_name"] = "电子"
+    elif drift_kind == "missing":
+        industry["rows"] = []
+        industry["snapshot_id"] = ""
+        industry["status"] = "INCOMPLETE"
+        industry["snapshot_hash"] = governance._digest({
+            key: value for key, value in industry.items()
+            if key != "snapshot_hash"
+        })
+    elif drift_kind == "wrong_date":
+        industry["trade_date"] = "2026-08-20"
+        industry["snapshot_hash"] = governance._digest({
+            key: value for key, value in industry.items()
+            if key != "snapshot_hash"
+        })
+    else:
+        row = industry["rows"][0]
+        row["industry_type"] = "L2"
+        row["row_hash"] = governance._digest({
+            key: value for key, value in row.items() if key != "row_hash"
+        })
+        industry["snapshot_hash"] = governance._digest({
+            key: value for key, value in industry.items()
+            if key != "snapshot_hash"
+        })
+
+    pools = governance._build_pools(
+        _snapshot("trend_bullish", "ALLOW_NEW_BUY", candidates=[candidate]),
+        [strategy],
+        industry_snapshot=industry,
+    )
+
+    assert len(pools["observation"]) == 1
+    assert pools["confirmation"] == []
+    assert pools["tradable"] == []
+    assert pools["observation"][0]["industry_name"] == ""
+    assert "目标日QMT一级行业冻结事实缺失或无效" in (
+        pools["observation"][0]["blocking_reasons"]
+    )
 
 
 @pytest.mark.parametrize(

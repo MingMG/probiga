@@ -3,8 +3,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
+from server.engine.strategy_statistical_guards import newey_west_nav_statistics
+
+from .config import canonical_json_hash
 from .domain import decimal_value
 
 
@@ -123,6 +126,116 @@ def _metric_decimal(value: Any) -> Decimal | None:
     return decimal_value(value)
 
 
+def nav_records_from_equity(equity: Any) -> list[dict[str, Any]]:
+    """Convert an exact dated equity curve to capital-weighted daily returns."""
+
+    items = list(equity.items()) if hasattr(equity, "items") else []
+    normalized: list[tuple[str, Decimal]] = []
+    for raw_day, raw_value in items:
+        day = getattr(raw_day, "date", lambda: raw_day)()
+        day_text = str(day)[:10]
+        value = decimal_value(raw_value)
+        if not day_text or value <= 0:
+            return []
+        normalized.append((day_text, value))
+    if (
+        len(normalized) < 2
+        or [day for day, _value in normalized]
+        != sorted(set(day for day, _value in normalized))
+    ):
+        return []
+    return [
+        {
+            "trade_date": day,
+            "return_pct": str(
+                (value / previous - Decimal("1")) * Decimal("100")
+            ),
+        }
+        for (day, value), (_prior_day, previous) in zip(
+            normalized[1:], normalized[:-1], strict=True,
+        )
+    ]
+
+
+def v2_nav_statistical_guard(
+    nav_records: Iterable[Mapping[str, Any]] | None,
+    *,
+    minimum_observations: int,
+    minimum_effective_sample_size: int,
+    minimum_profit_factor_lcb: Decimal,
+    minimum_payoff_ratio_lcb: Decimal = Decimal("1"),
+) -> dict[str, Any]:
+    """Build the sole V2 GREEN/research statistical authority from daily NAV."""
+
+    records = [dict(item) for item in (nav_records or [])]
+    full = newey_west_nav_statistics(
+        records,
+        confidence_level=0.95,
+        bandwidth=None,
+        minimum_positive_days=2,
+        minimum_negative_days=2,
+    )
+    profit_detail = full.get("profit_factor")
+    payoff_detail = full.get("payoff_ratio")
+    pf_lcb = (
+        _metric_decimal(profit_detail.get("one_sided_95_lcb"))
+        if isinstance(profit_detail, dict) else None
+    )
+    payoff_lcb = (
+        _metric_decimal(payoff_detail.get("one_sided_95_lcb"))
+        if isinstance(payoff_detail, dict) else None
+    )
+    net_lcb = _metric_decimal(
+        full.get("net_expectancy_one_sided_95_lcb_pct")
+    )
+    ess = _metric_decimal(full.get("effective_sample_size"))
+    observation_count = int(full.get("observation_count") or 0)
+    positive_count = int(full.get("positive_day_count") or 0)
+    negative_count = int(full.get("negative_day_count") or 0)
+    passed = bool(
+        full.get("valid") is True
+        and observation_count >= int(minimum_observations)
+        and ess is not None
+        and ess >= Decimal(int(minimum_effective_sample_size))
+        and positive_count >= 2
+        and negative_count >= 2
+        and net_lcb is not None and net_lcb > 0
+        and pf_lcb is not None and pf_lcb >= minimum_profit_factor_lcb
+        and payoff_lcb is not None
+        and payoff_lcb >= minimum_payoff_ratio_lcb
+    )
+    payload = {
+        "schema": "probiga.trading-v2-nav-hac-admission.v1",
+        "valid": full.get("valid") is True,
+        "passed": passed,
+        "reason": (
+            "NAV_HAC_LCB_PASSED" if passed
+            else "NAV_HAC_LCB_OR_SUPPORT_FAILED"
+        ),
+        "observation_count": observation_count,
+        "minimum_observations": int(minimum_observations),
+        "effective_sample_size": str(ess) if ess is not None else None,
+        "minimum_effective_sample_size": int(minimum_effective_sample_size),
+        "positive_day_count": positive_count,
+        "negative_day_count": negative_count,
+        "net_expectancy_one_sided_95_lcb_pct": (
+            str(net_lcb) if net_lcb is not None else None
+        ),
+        "profit_factor_one_sided_95_lcb": (
+            str(pf_lcb) if pf_lcb is not None else None
+        ),
+        "minimum_profit_factor_lcb": str(minimum_profit_factor_lcb),
+        "payoff_ratio_one_sided_95_lcb": (
+            str(payoff_lcb) if payoff_lcb is not None else None
+        ),
+        "minimum_payoff_ratio_lcb": str(minimum_payoff_ratio_lcb),
+        "full_input_hash": str(full.get("input_hash") or ""),
+        "full_parameter_hash": str(full.get("parameter_hash") or ""),
+        "full_result_hash": str(full.get("result_hash") or ""),
+    }
+    return {**payload, "guard_hash": canonical_json_hash(payload)}
+
+
 def evaluate_oos_gate(
     *,
     security_scope: str,
@@ -134,6 +247,8 @@ def evaluate_oos_gate(
     robustness: dict[str, Any],
     future_data_violations: int,
     impossible_fill_profit: Decimal,
+    nav_records: Iterable[Mapping[str, Any]] | None = None,
+    doubled_cost_nav_records: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     stock_scope = security_scope == "A_SHARE"
     minimum_oos = 120 if stock_scope else 24
@@ -162,6 +277,22 @@ def evaluate_oos_gate(
     contribution = _metric_decimal(
         metrics.get("maximum_single_security_profit_contribution")
     )
+    minimum_hac_observations = max(20, minimum_oos)
+    minimum_hac_ess = max(20, minimum_oos // 2)
+    nav_guard = v2_nav_statistical_guard(
+        nav_records,
+        minimum_observations=minimum_hac_observations,
+        minimum_effective_sample_size=minimum_hac_ess,
+        minimum_profit_factor_lcb=Decimal("1.30"),
+        minimum_payoff_ratio_lcb=Decimal("1.50"),
+    )
+    doubled_nav_guard = v2_nav_statistical_guard(
+        doubled_cost_nav_records,
+        minimum_observations=minimum_hac_observations,
+        minimum_effective_sample_size=minimum_hac_ess,
+        minimum_profit_factor_lcb=Decimal("1.10"),
+        minimum_payoff_ratio_lcb=Decimal("1.00"),
+    )
     add("HISTORY_500_DAYS", trading_days >= 500, trading_days, 500)
     add(
         "OOS_SAMPLE",
@@ -172,11 +303,13 @@ def evaluate_oos_gate(
     add("COMPLETED_TRADES_PRESENT", count > 0, count, ">0")
     add("EXPECTANCY_CNY_POSITIVE", expectancy is not None and expectancy > 0, metrics.get("expectancy_cny"), ">0")
     add("EXPECTANCY_R_POSITIVE", expectancy_r is not None and expectancy_r > 0, metrics.get("expectancy_r"), ">0")
-    add("PROFIT_FACTOR_1_30", metrics.get("profit_factor") == "INF" or (profit_factor is not None and profit_factor >= Decimal("1.30")), metrics.get("profit_factor"), ">=1.30")
-    add("PAYOFF_RATIO_1_50", metrics.get("payoff_ratio") == "INF" or (payoff is not None and payoff >= Decimal("1.50")), metrics.get("payoff_ratio"), ">=1.50")
+    add("PROFIT_FACTOR_1_30", profit_factor is not None and profit_factor >= Decimal("1.30"), metrics.get("profit_factor"), ">=1.30且不得为INF")
+    add("PAYOFF_RATIO_1_50", payoff is not None and payoff >= Decimal("1.50"), metrics.get("payoff_ratio"), ">=1.50且不得为INF")
+    add("NAV_HAC_ESS_LCB", nav_guard["passed"] is True, nav_guard, "完整逐日NAV、HAC有效样本及单侧95%下界全部通过")
     add("MAX_DRAWDOWN_12", drawdown <= Decimal("0.12"), str(drawdown), "<=0.12")
     add("DOUBLED_COST_EXPECTANCY_POSITIVE", doubled_expectancy is not None and doubled_expectancy > 0, doubled_cost_metrics.get("expectancy_cny"), ">0")
-    add("DOUBLED_COST_PF_1_10", doubled_cost_metrics.get("profit_factor") == "INF" or (doubled_pf is not None and doubled_pf >= Decimal("1.10")), doubled_cost_metrics.get("profit_factor"), ">=1.10")
+    add("DOUBLED_COST_PF_1_10", doubled_pf is not None and doubled_pf >= Decimal("1.10"), doubled_cost_metrics.get("profit_factor"), ">=1.10且不得为INF")
+    add("DOUBLED_COST_NAV_HAC_ESS_LCB", doubled_nav_guard["passed"] is True, doubled_nav_guard, "双倍成本逐日NAV的HAC/ESS与单侧95%下界通过")
     add("REMOVE_BEST_THREE_POSITIVE", remove_best_three_net_pnl is not None and remove_best_three_net_pnl > 0, str(remove_best_three_net_pnl) if remove_best_three_net_pnl is not None else None, ">0")
     add("SECURITY_CONTRIBUTION_35", contribution is not None and contribution <= Decimal("0.35"), metrics.get("maximum_single_security_profit_contribution"), "<=0.35")
     add("IMPOSSIBLE_FILL_PROFIT_ZERO", impossible_fill_profit == 0, str(impossible_fill_profit), "0")
@@ -199,6 +332,8 @@ def evaluate_oos_gate(
     return {
         "status": "PASS" if all(item["passed"] for item in checks) else "BLOCK",
         "checks": checks,
+        "nav_statistical_guard": nav_guard,
+        "doubled_cost_nav_statistical_guard": doubled_nav_guard,
     }
 
 

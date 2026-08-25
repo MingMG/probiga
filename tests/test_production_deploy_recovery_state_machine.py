@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -105,6 +107,12 @@ def test_activation_snapshot_fault_is_retryable_and_restores_exact_old_set(
         '"$ACTIVATION_GOVERNANCE_OLD_SHA" 600',
         '"$ACTIVATION_GOVERNANCE_OLD_SHA" "$TEST_SECURE_FILE_MODE"',
     ).replace(
+        '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600',
+        '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" "$TEST_SECURE_FILE_MODE"',
+    ).replace(
+        '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600',
+        '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" "$TEST_SECURE_FILE_MODE"',
+    ).replace(
         '"$ACTIVATION_RELEASE_IDENTITY" 600',
         '"$ACTIVATION_RELEASE_IDENTITY" "$TEST_SECURE_FILE_MODE"',
     ).replace(
@@ -139,10 +147,13 @@ ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
 ACTIVATION_UNIT_SNAPSHOT_STATE_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state.sha256"
 ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-old.json"
 ACTIVATION_GOVERNANCE_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-old.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.json"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.sha256"
 ACTIVATION_RELEASE_IDENTITY="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity"
 ACTIVATION_RELEASE_IDENTITY_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity.sha256"
 DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
 GOVERNANCE_TASK_OLD_SOURCE="$TEST_ROOT/governance-old.json"
+QMT_ANNOUNCEMENT_TASK_OLD_SOURCE="$TEST_ROOT/qmt-announcement-old.json"
 STATIC_RELEASE_LINK="$TEST_ROOT/static"
 UNIT_A="$TEST_ROOT/probiga.service.conf"
 UNIT_B="$TEST_ROOT/probiga-scheduler.service"
@@ -166,6 +177,7 @@ printf 'old-scheduler\n' > "$UNIT_B"
 printf 'new-main\n' > "$PREPARED_MAIN_DROPIN"
 printf 'new-scheduler\n' > "$PREPARED_SCHEDULER_DROPIN"
 printf '[]\n' > "$GOVERNANCE_TASK_OLD_SOURCE"
+printf '{{"rows":[]}}\n' > "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 printf '%s\n' probiga.database-writer-restore.v1 \
   "release=$EXPECTED_SHA" \
   main_unit=loaded,active,enabled \
@@ -175,7 +187,8 @@ printf '%s\n' probiga.database-writer-restore.v1 \
   > "$DATABASE_WRITER_RESTORE_FILE"
 chmod 644 "$UNIT_A" "$UNIT_B"
 chmod 644 "$PREPARED_MAIN_DROPIN" "$PREPARED_SCHEDULER_DROPIN"
-chmod 600 "$DATABASE_WRITER_RESTORE_FILE" "$GOVERNANCE_TASK_OLD_SOURCE"
+chmod 600 "$DATABASE_WRITER_RESTORE_FILE" "$GOVERNANCE_TASK_OLD_SOURCE" \
+  "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 TEST_DIR_MODE="$(stat -c '%a' "$TEST_ROOT")"
 TEST_SECURE_FILE_MODE="$(stat -c '%a' "$DATABASE_WRITER_RESTORE_FILE")"
 test_install() {{
@@ -211,6 +224,8 @@ activation_snapshot_assert_container() {{
     "$(sha256sum "$ACTIVATION_UNIT_SNAPSHOT_STATE" | cut -d' ' -f1)" || return 1
   test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
     "$(sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1)" || return 1
+  test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | cut -d' ' -f1)" || return 1
   test "$(<"$ACTIVATION_RELEASE_IDENTITY_SHA")" = \
     "$(sha256sum "$ACTIVATION_RELEASE_IDENTITY" | cut -d' ' -f1)" || return 1
   return 0
@@ -224,6 +239,8 @@ activation_snapshot_set_phase() {{
 activation_snapshot_create || exit 20
 cmp "$GOVERNANCE_TASK_OLD_SOURCE" "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || \
   exit 31
+cmp "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" \
+  "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" || exit 33
 cp "$ACTIVATION_RELEASE_IDENTITY" "$TEST_ROOT/release-identity.good"
 printf 'tampered\n' >> "$ACTIVATION_RELEASE_IDENTITY"
 if activation_snapshot_validate "$EXPECTED_SHA" >/dev/null 2>&1; then
@@ -467,11 +484,16 @@ def test_governance_snapshot_is_recoverable_without_redundant_checksum(
     )
     snapshot = tmp_path / "governance-task-new.json"
     snapshot_sha = tmp_path / "governance-task-new.sha256"
+    qmt_snapshot = tmp_path / "qmt-announcement-task-new.json"
+    qmt_snapshot_sha = tmp_path / "qmt-announcement-task-new.sha256"
     snapshot.write_text('{"tasks":[]}', encoding="utf-8")
+    qmt_snapshot.write_text('{"rows":[]}', encoding="utf-8")
     harness = f"""
 set -u
 ACTIVATION_GOVERNANCE_NEW_SNAPSHOT={snapshot.as_posix()!r}
 ACTIVATION_GOVERNANCE_NEW_SHA={snapshot_sha.as_posix()!r}
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT={qmt_snapshot.as_posix()!r}
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA={qmt_snapshot_sha.as_posix()!r}
 controlled_guard_assert_file() {{
   test -f "$1" || return 1
   test ! -L "$1" || return 1
@@ -480,6 +502,8 @@ controlled_guard_assert_file() {{
 activation_snapshot_validate_governance_new || exit 20
 sha256sum "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" | cut -d' ' -f1 \
   > "$ACTIVATION_GOVERNANCE_NEW_SHA"
+sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" | cut -d' ' -f1 \
+  > "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA"
 activation_snapshot_validate_governance_new || exit 21
 printf '%064d\n' 0 > "$ACTIVATION_GOVERNANCE_NEW_SHA"
 if activation_snapshot_validate_governance_new; then
@@ -614,6 +638,8 @@ ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
 ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/old.json"
 ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
 ACTIVATION_GOVERNANCE_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-new.json"
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-new.sha256"
 ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.json"
 ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/receipt.sha256"
 DB_STATE="$TEST_ROOT/db-state"
@@ -1907,6 +1933,7 @@ PREVIOUS_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
 PREVIOUS_ADATA_SHA="$EXPECTED_ADATA_SHA"
 PREVIOUS_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
 ADATA_SOURCE="$TEST_ROOT/adata"
+PROBIGA_JOB_LOG_ROOT="$TEST_ROOT/jobs"
 PREVIOUS_ADATA_SOURCE="$ADATA_SOURCE"
 PREPARED_CODE_ROOT="$TEST_ROOT/releases/$EXPECTED_SHA"
 PREVIOUS_CODE_ROOT="$PREPARED_CODE_ROOT"
@@ -2711,11 +2738,397 @@ shift
     trade_date = "2026-08-21"
     adapter = {
         "registry_sealed": True,
-        "production_execution_ready": True,
         "registry_seal_hash": "b" * 64,
+        "registry_integrity_ready": True,
+        "adapter_configured": False,
+        "candidate_execution_ready": False,
+        "funding_pipeline_ready": False,
+        "governance_paper_execution_ready": False,
+        "production_execution_ready": False,
+        "real_order_submission_enabled": False,
+        "automatic_real_order_submission": False,
         "adapter_count": 0,
     }
+    from tools.check_strategy_governance_health import (
+        GOVERNANCE_HEALTH_CONTRACT_VERSION,
+        governance_health_required_check_names,
+    )
+    from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
+
+    qmt_operation_fields = (
+        "task_name",
+        "task_type",
+        "group_name",
+        "script_path",
+        "script_args",
+        "cron_time",
+        "interval_minutes",
+        "date_param",
+        "enabled",
+    )
+    qmt_operations_expected = {
+        str(task["task_type"]): {
+            key: task[key] for key in qmt_operation_fields
+        }
+        for task in QMT_OPERATIONS_TASKS
+    }
+    qmt_operations_rows = [
+        {"id": 300 + index, **payload}
+        for index, payload in enumerate(qmt_operations_expected.values(), 1)
+    ]
+
+    def checks_for(disposition: str) -> list[dict[str, object]]:
+        waived_names = (
+            {
+                "authoritative_date_has_one_canonical_revision",
+                "expected_build_date_run",
+            }
+            if disposition == "input_not_ready"
+            else set()
+        )
+        details: dict[str, dict[str, object]] = {
+            "qmt_operations_scheduler_tasks_unique": {
+                "row_count": len(qmt_operations_rows),
+                "expected_row_count": len(qmt_operations_rows),
+                "match_counts": {
+                    key: 1 for key in qmt_operations_expected
+                },
+                "rows": qmt_operations_rows,
+            },
+            "qmt_operations_scheduler_tasks_contract": {
+                "actual": deepcopy(qmt_operations_expected),
+                "expected": deepcopy(qmt_operations_expected),
+            },
+            "qmt_announcement_scheduler_task_unique": {
+                "row_count": 1,
+                "rows": [{"id": 22, "task_type": "qmt_announcement_pit"}],
+            },
+            "qmt_announcement_scheduler_task_contract": {
+                "actual": {
+                    "id": 22,
+                    "task_name": "国金QMT全市场公告PIT同步",
+                    "task_type": "qmt_announcement_pit",
+                    "group_name": "strategy_governance",
+                    "script_path": "tools/sync_qmt_announcement_pit.py",
+                    "script_args": (
+                        "--window-days 30 --batch-size 100 "
+                        "--checkpoint-dir /var/lib/probiga/"
+                        "qmt-announcement-checkpoints"
+                    ),
+                    "cron_time": "18:20",
+                    "interval_minutes": 0,
+                    "date_param": "",
+                    "enabled": 1,
+                },
+                "expected": {
+                    "task_name": "国金QMT全市场公告PIT同步",
+                    "task_type": "qmt_announcement_pit",
+                    "group_name": "strategy_governance",
+                    "script_path": "tools/sync_qmt_announcement_pit.py",
+                    "script_args": (
+                        "--window-days 30 --batch-size 100 "
+                        "--checkpoint-dir /var/lib/probiga/"
+                        "qmt-announcement-checkpoints"
+                    ),
+                    "cron_time": "18:20",
+                    "interval_minutes": 0,
+                    "date_param": "",
+                    "enabled": 1,
+                },
+                "pipeline_order": {
+                    "qmt_announcement_minutes": 1100,
+                    "analysis_minutes": 1130,
+                    "governance_minutes": 1355,
+                },
+            },
+            "supporting_release_trigger_inventory_exact": {
+                "required_count": 68,
+                "optional_count": 0,
+                "observed_count": 68,
+                "expected_trigger_count": 68,
+                "owner_counts": {
+                    "pit_facts": 6,
+                    "qmt_attestation": 6,
+                    "qmt_history_coverage": 4,
+                    "qmt_reference": 10,
+                    "scheduler_task_history": 2,
+                    "strategy_governance": 40,
+                },
+                "expected_owner_counts": {
+                    "pit_facts": 6,
+                    "qmt_attestation": 6,
+                    "qmt_history_coverage": 4,
+                    "qmt_reference": 10,
+                    "scheduler_task_history": 2,
+                    "strategy_governance": 40,
+                },
+                "source_contract_hash": (
+                    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+                ),
+                "database_triggers_required": True,
+                "metadata_frozen": True,
+                "definer": "probiga_migrator@127.0.0.1",
+            },
+            "qmt_reference_physical_schema_and_seal": {
+                "contract_key": "qmt_reference_truth_v2",
+                "contract_hash": (
+                    "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
+                ),
+                "table_count": 5,
+                "trigger_count": 10,
+                "expected_trigger_count": 10,
+                "physical_schema_verified": True,
+                "physical_seal_verified": True,
+            },
+            "qmt_history_coverage_physical_schema_and_seal": {
+                "database": "probiga",
+                "table_count": 2,
+                "foreign_key_count": 3,
+                "trigger_count": 4,
+                "expected_trigger_count": 4,
+                "runtime_ddl_required": False,
+                "physical_schema_verified": True,
+                "physical_seal_verified": True,
+            },
+            "qmt_history_capability_matrix_fail_closed": {
+                "schema": "probiga.qmt-history-capability-matrix.v1",
+                "status": "HEALTHY",
+                "evidence_healthy": True,
+                "dataset_count": 19,
+                "strategy_eligible_dataset_count": 0,
+                "strategy_ineligible_dataset_count": 19,
+                "required_scope_dataset_count": 0,
+                "fail_closed_verified": True,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+                "errors": [],
+                "datasets": [
+                    {"status": "UNAVAILABLE", "strategy_eligible": False}
+                    for _index in range(19)
+                ],
+            },
+            "qmt_windows_edge_executor_and_last_success": {
+                "status": "AVAILABLE",
+                "strategy_eligible": True,
+                "executor_role": "qmt_windows_edge",
+                "expected_build_sha": expected_sha,
+                "expected_poll_seconds": 60,
+                "role_row_count": 1,
+                "fresh_row_count": 1,
+                "future_row_count": 0,
+                "current": {
+                    "instance_id": "win-edge-9191",
+                    "mode": "standalone",
+                    "host_name": "win-edge",
+                    "pid": 9191,
+                    "build_sha": expected_sha,
+                    "executor_role": "qmt_windows_edge",
+                    "heartbeat_age_seconds": 5,
+                    "poll_seconds": 60,
+                    "max_concurrent_tasks": 2,
+                },
+                "required_task_types": [
+                    "qmt_local_gap_repair_execute",
+                    "qmt_local_history_2024",
+                    "qmt_reference_incremental",
+                ],
+                "task_count": 3,
+                "last_success_count": 3,
+                "success_max_age_seconds": 345600,
+                "tasks": {
+                    task_type: {
+                        "task_id": next(
+                            row["id"] for row in qmt_operations_rows
+                            if row["task_type"] == task_type
+                        ),
+                        "last_run_status": "success",
+                        "last_success_age_seconds": 3600,
+                        "last_success_host": "win-edge",
+                        "last_success_instance_id": "win-edge-8181",
+                    }
+                    for task_type in (
+                        "qmt_local_gap_repair_execute",
+                        "qmt_local_history_2024",
+                        "qmt_reference_incremental",
+                    )
+                },
+                "errors": [],
+            },
+            "qmt_windows_edge_release_bootstrap": {
+                "status": "AVAILABLE",
+                "strategy_eligible": True,
+                "expected_build_sha": expected_sha,
+                "expected_poll_seconds": 60,
+                "receipt_count": 1,
+                "immutable_reference_verified": True,
+                "identity": {
+                    "current": {
+                        "instance_id": "win-edge-9191",
+                        "host_name": "win-edge",
+                        "pid": 9191,
+                        "build_sha": expected_sha,
+                        "executor_role": "qmt_windows_edge",
+                    }
+                },
+                "receipt": {
+                    "build_sha": expected_sha,
+                    "request_run_uid": f"qmt-edge-request-{expected_sha}",
+                    "host_name": "win-edge",
+                    "scheduler_instance_id": "win-edge-9191",
+                    "catalog_batch_id": (
+                        f"qmt_rel_{expected_sha}_20260825120000"
+                    ),
+                    "calendar_batch_id": (
+                        f"qmt_rel_{expected_sha}_20260825120000"
+                    ),
+                    "receipt_hash": "9" * 64,
+                },
+                "errors": [],
+            },
+            "scheduler_task_history_physical_schema": {
+                "table": "st_scheduled_task_history",
+                "required_index_count": 3,
+                "physical_contract_verified": True,
+                "runtime_ddl_required": False,
+                "read_only": True,
+            },
+            "pit_fact_physical_schema_exact": {
+                "schema": "probiga.pit-fact-schema-health.v1",
+                "status": "HEALTHY",
+                "valid": True,
+                "table_count": 3,
+                "expected_table_count": 3,
+                "trigger_count": 6,
+                "expected_trigger_count": 6,
+                "contract_hash": (
+                    "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
+                ),
+                "physical_schema_verified": True,
+            },
+            "latest_qmt_announcement_full_market_batch": {
+                "status": "COMPLETE",
+                "trade_date": trade_date,
+                "source": "qmt.announcement",
+                "funding_eligible": True,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+                "catalog_member_count": 5288,
+                "coverage_row_count": 5288,
+                "batch_root_hash": "e" * 64,
+            },
+            "strategy_funding_schema_exact": {
+                "table_count": 2,
+                "tables": {
+                    "st_strategy_funding_daily_fact": {
+                        "column_count": 29,
+                        "index_count": 9,
+                        "foreign_key_count": 3,
+                        "check_count": 7,
+                    },
+                    "st_strategy_funding_checkpoint": {
+                        "column_count": 46,
+                        "index_count": 12,
+                        "foreign_key_count": 7,
+                        "check_count": 13,
+                    },
+                },
+                "trigger_count": 4,
+                    "contract_hash": (
+                        "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+                    ),
+                "checkpoint_target_average_bytes": 8192,
+                "checkpoint_total_target_bytes": 8388608,
+                "checkpoint_total_hard_bytes": 16777216,
+                "batch_max_rows": 100,
+                "batch_max_bytes": 4194304,
+                "manifest_max_bytes": 1048576,
+                "audit_max_bytes": 131072,
+            },
+            "strategy_metric_input_application_state_machine": {
+                "trigger_count": 2,
+                "expected_trigger_count": 2,
+                "required_count": 2,
+                "observed_count": 2,
+                "database_triggers_required": True,
+                "metadata_frozen": True,
+                "definer": "probiga_migrator@127.0.0.1",
+                    "contract_hash": (
+                        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+                    ),
+                    "source_contract_hash": (
+                        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+                    ),
+                    "core_append_only_contract_hash": (
+                        "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+                    ),
+                    "core_metric_review_contract_hash": (
+                        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+                    ),
+            },
+            "governance_append_only_application_integrity": {
+                "trigger_count": 38,
+                "expected_trigger_count": 38,
+                "total_governance_trigger_count": 40,
+                "required_count": 38,
+                "observed_count": 38,
+                "database_triggers_required": True,
+                "metadata_frozen": True,
+                "definer": "probiga_migrator@127.0.0.1",
+                    "contract_hash": (
+                        "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
+                    ),
+                    "source_contract_hash": (
+                        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+                    ),
+                    "core_contract_hash": (
+                        "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+                    ),
+                    "core_metric_review_contract_hash": (
+                        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+                    ),
+                    "funding_contract_hash": (
+                        "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+                    ),
+            },
+            "registry_lifecycle_projection_matches_immutable_events": {
+                "invalid_count": 0,
+                "registry_count": 2,
+                "projected_count": 2,
+                "projection_hash": "f" * 64,
+            },
+            "funding_checkpoint_manifest_partition_and_persistence": {
+                    "invalid_count": 0,
+                    "current_entity_count": 2,
+                    "funding_ready_count": 1,
+                    "checkpoint_count": 1,
+                    "strategy_checkpoint_count": 1,
+                    "combination_recipe_count": 0,
+                    "ineligible_count": 1,
+                    "daily_fact_count": 1,
+                "checkpoint_storage_bytes": 1024,
+                "fact_storage_bytes": 2048,
+                "total_storage_bytes": 3072,
+                "target_total_met": True,
+                    "manifest_hash": "1" * 64,
+                    "checkpoint_root_hash": "2" * 64,
+                    "combination_recipe_root_hash": "3" * 64,
+                    "ineligible_root_hash": "4" * 64,
+            },
+        }
+        return [
+            {
+                "name": name,
+                "passed": True,
+                "waived": name in waived_names,
+                "detail": deepcopy(details.get(name, {})),
+            }
+            for name in sorted(
+                governance_health_required_check_names(disposition)
+            )
+        ]
+
     completed_health: dict[str, object] = {
+        "contract_version": GOVERNANCE_HEALTH_CONTRACT_VERSION,
         "status": "PASS",
         "run_disposition": "completed",
         "automatic_real_order_submission": False,
@@ -2724,25 +3137,12 @@ shift
             "trade_date": trade_date,
             "trade_date_source": "command_line_verified_against_calendar",
         },
-        "checks": [
-            {"name": "adapter_registry_sealed", "passed": True, "waived": False},
-            {
-                "name": "authoritative_date_has_one_canonical_revision",
-                "passed": True,
-                "waived": False,
-            },
-            {"name": "expected_build_date_run", "passed": True, "waived": False},
-        ],
+        "checks": checks_for("completed"),
         "adapter_registry": adapter,
     }
     input_not_ready_health = clone(completed_health)
     input_not_ready_health["run_disposition"] = "input_not_ready"
-    for check in input_not_ready_health["checks"]:
-        if check["name"] in {
-            "authoritative_date_has_one_canonical_revision",
-            "expected_build_date_run",
-        }:
-            check["waived"] = True
+    input_not_ready_health["checks"] = checks_for("input_not_ready")
 
     completed = run_parser(
         "controlled_guard_parse_governance_health_result",
@@ -2777,12 +3177,71 @@ shift
     ), authoritative.stdout + authoritative.stderr
     assert authoritative.stdout.strip() == trade_date
 
+    scheduler_pid = 4321
+    scheduler_host = socket.gethostname()
+    heartbeat_health = clone(authoritative_health)
+    heartbeat_health["checks"].append(
+        {
+            "name": "linux_standalone_scheduler_heartbeat_current",
+            "passed": True,
+            "waived": False,
+            "detail": {
+                "executor_role": "linux_standalone",
+                "role_row_count": 2,
+                "fresh_row_count": 1,
+                "future_row_count": 0,
+                "expected_host": scheduler_host,
+                    "expected_pid": scheduler_pid,
+                    "expected_build_sha": expected_sha,
+                    "expected_poll_seconds": 60,
+                "current": {
+                    "instance_id": f"{scheduler_host}-{scheduler_pid}",
+                    "mode": "standalone",
+                    "host_name": scheduler_host,
+                    "pid": scheduler_pid,
+                    "build_sha": expected_sha,
+                    "executor_role": "linux_standalone",
+                    "heartbeat_age_seconds": 5,
+                    "poll_seconds": 60,
+                    "max_concurrent_tasks": 2,
+                },
+                "errors": [],
+            },
+        }
+    )
+    heartbeat = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        heartbeat_health,
+        expected_sha,
+        "completed",
+        "",
+        str(scheduler_pid),
+    )
+    assert heartbeat.returncode == 0, heartbeat.stdout + heartbeat.stderr
+    heartbeat_pid_drift = clone(heartbeat_health)
+    next(
+        check for check in heartbeat_pid_drift["checks"]
+        if check["name"] == "linux_standalone_scheduler_heartbeat_current"
+    )["detail"]["current"]["pid"] = 9999
+    rejected_heartbeat = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        heartbeat_pid_drift,
+        expected_sha,
+        "completed",
+        "",
+        str(scheduler_pid),
+    )
+    assert rejected_heartbeat.returncode != 0
+
     invalid_health_payloads: list[tuple[dict[str, object], str, str]] = []
     sha_drift = clone(completed_health)
     sha_drift["expected"]["build_commit_sha"] = "c" * 40
     invalid_health_payloads.append((sha_drift, "completed", trade_date))
     waiver_drift = clone(input_not_ready_health)
-    waiver_drift["checks"][1]["waived"] = False
+    next(
+        check for check in waiver_drift["checks"]
+        if check["name"] == "expected_build_date_run"
+    )["waived"] = False
     invalid_health_payloads.append(
         (waiver_drift, "input_not_ready", trade_date)
     )
@@ -2792,6 +3251,18 @@ shift
     failed_check = clone(completed_health)
     failed_check["checks"][0]["passed"] = False
     invalid_health_payloads.append((failed_check, "completed", trade_date))
+    omitted_required_check = clone(completed_health)
+    omitted_required_check["checks"].pop()
+    invalid_health_payloads.append(
+        (omitted_required_check, "completed", trade_date)
+    )
+    contract_version_drift = clone(completed_health)
+    contract_version_drift["contract_version"] = (
+        "probiga.strategy-governance-health.v0"
+    )
+    invalid_health_payloads.append(
+        (contract_version_drift, "completed", trade_date)
+    )
     unsafe_order_flag = clone(completed_health)
     unsafe_order_flag["automatic_real_order_submission"] = True
     invalid_health_payloads.append((unsafe_order_flag, "completed", trade_date))
@@ -2802,6 +3273,20 @@ shift
     negative_adapter_count["adapter_registry"]["adapter_count"] = -1
     invalid_health_payloads.append(
         (negative_adapter_count, "completed", trade_date)
+    )
+    false_candidate_readiness = clone(completed_health)
+    false_candidate_readiness["adapter_registry"][
+        "candidate_execution_ready"
+    ] = True
+    invalid_health_payloads.append(
+        (false_candidate_readiness, "completed", trade_date)
+    )
+    unsafe_funding_readiness = clone(completed_health)
+    unsafe_funding_readiness["adapter_registry"][
+        "funding_pipeline_ready"
+    ] = True
+    invalid_health_payloads.append(
+        (unsafe_funding_readiness, "completed", trade_date)
     )
     source_drift = clone(completed_health)
     source_drift["expected"]["trade_date_source"] = "unexpected"

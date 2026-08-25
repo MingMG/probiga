@@ -12,6 +12,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 from integrations.bigqmt.reference import PROVIDER_ID
+from server.common.auxiliary_runtime_schema import (
+    privileged_migrate_qmt_membership_snapshot_schema,
+    validate_qmt_membership_snapshot_runtime_schema,
+)
 from server.common.batch_db import write_frame
 
 
@@ -24,69 +28,16 @@ def _canonical_hash(rows: list[tuple[str, ...]]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def ensure_membership_snapshot_tables(engine: Engine) -> None:
-    statements = (
-        """
-        CREATE TABLE IF NOT EXISTS qmt_membership_snapshot_run (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            snapshot_date DATE NOT NULL,
-            source VARCHAR(40) NOT NULL,
-            quality_status VARCHAR(32) NOT NULL,
-            capture_mode VARCHAR(40) NOT NULL,
-            concept_count INT NOT NULL,
-            concept_relation_count INT NOT NULL,
-            industry_count INT NOT NULL,
-            industry_relation_count INT NOT NULL,
-            concept_hash CHAR(64) NOT NULL,
-            industry_hash CHAR(64) NOT NULL,
-            captured_at DATETIME NOT NULL,
-            UNIQUE KEY uk_qmt_membership_snapshot_run (snapshot_date, source),
-            KEY idx_qmt_membership_snapshot_captured (captured_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS qmt_concept_member_snapshot (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            snapshot_date DATE NOT NULL,
-            source VARCHAR(40) NOT NULL,
-            concept_code VARCHAR(80) NOT NULL,
-            concept_name VARCHAR(160) NOT NULL DEFAULT '',
-            stock_code VARCHAR(10) NOT NULL,
-            short_name VARCHAR(80) NOT NULL DEFAULT '',
-            quality_status VARCHAR(32) NOT NULL,
-            captured_at DATETIME NOT NULL,
-            UNIQUE KEY uk_qmt_concept_member_snapshot
-                (snapshot_date, source, concept_code, stock_code),
-            KEY idx_qmt_concept_member_stock
-                (stock_code, snapshot_date),
-            KEY idx_qmt_concept_member_concept
-                (concept_code, snapshot_date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS qmt_industry_member_snapshot (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            snapshot_date DATE NOT NULL,
-            source VARCHAR(40) NOT NULL,
-            industry_code VARCHAR(80) NOT NULL,
-            industry_name VARCHAR(160) NOT NULL DEFAULT '',
-            industry_type VARCHAR(40) NOT NULL DEFAULT '',
-            stock_code VARCHAR(10) NOT NULL,
-            short_name VARCHAR(80) NOT NULL DEFAULT '',
-            quality_status VARCHAR(32) NOT NULL,
-            captured_at DATETIME NOT NULL,
-            UNIQUE KEY uk_qmt_industry_member_snapshot
-                (snapshot_date, source, industry_code, stock_code),
-            KEY idx_qmt_industry_member_stock
-                (stock_code, snapshot_date),
-            KEY idx_qmt_industry_member_industry
-                (industry_code, snapshot_date)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """,
-    )
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
+def ensure_membership_snapshot_tables(engine: Engine) -> dict[str, Any]:
+    """Compatibility alias for the read-only runtime schema guard."""
+
+    return validate_qmt_membership_snapshot_runtime_schema(engine)
+
+
+def privileged_migrate_membership_snapshot_tables(engine: Engine) -> dict[str, Any]:
+    """Create the immutable snapshot tables during a fenced release only."""
+
+    return privileged_migrate_qmt_membership_snapshot_schema(engine)
 
 
 def _concept_snapshot_frame(

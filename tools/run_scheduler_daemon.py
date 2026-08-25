@@ -2,6 +2,8 @@
 """Run the ProBigA scheduler as a standalone process."""
 
 import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +13,60 @@ if str(ROOT) not in sys.path:
 
 
 _WINDOWS_MUTEX_NAME = "Global\\ProBigA.RunSchedulerDaemon"
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_WINDOWS_SCHEDULER_POLL_SECONDS = 60
+
+
+def _bind_windows_state_roots() -> dict[str, str]:
+    raw_program_data = str(os.environ.get("ProgramData") or "").strip()
+    if not raw_program_data:
+        raise RuntimeError("Windows ProgramData is unavailable")
+    program_data = Path(raw_program_data).resolve(strict=True)
+    roots = {
+        "PROBIGA_JOB_LOG_ROOT": program_data / "ProBigA" / "jobs",
+        "PROBIGA_SCHEDULER_STATE_ROOT": (
+            program_data / "ProBigA" / "scheduler"
+        ),
+    }
+    bound: dict[str, str] = {}
+    for name, candidate in roots.items():
+        resolved = candidate.resolve(strict=True)
+        if program_data not in resolved.parents:
+            raise RuntimeError("Windows scheduler state root escapes ProgramData")
+        is_junction = getattr(resolved, "is_junction", lambda: False)
+        if resolved.is_symlink() or is_junction():
+            raise RuntimeError("Windows scheduler state root is a reparse point")
+        bound[name] = str(resolved)
+        os.environ[name] = str(resolved)
+    os.environ["PROBIGA_API_SCHEDULER_POLL_SECONDS"] = str(
+        _WINDOWS_SCHEDULER_POLL_SECONDS
+    )
+    return bound
+
+
+def _bind_windows_build_sha() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    actual = str(completed.stdout or "").strip().lower()
+    if completed.returncode != 0 or _COMMIT_SHA_RE.fullmatch(actual) is None:
+        raise RuntimeError("Windows QMT edge build identity is unavailable")
+    configured = str(
+        os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or os.environ.get("PROBIGA_EXPECTED_GIT_SHA")
+        or ""
+    ).strip().lower()
+    if configured and (
+        _COMMIT_SHA_RE.fullmatch(configured) is None or configured != actual
+    ):
+        raise RuntimeError("Windows QMT edge build identity differs from checkout")
+    os.environ["PROBIGA_BUILD_COMMIT_SHA"] = actual
+    os.environ["PROBIGA_EXPECTED_GIT_SHA"] = actual
+    return actual
 
 
 def _load_windows_runtime_env() -> int:
@@ -26,11 +82,14 @@ def _load_windows_runtime_env() -> int:
         if key and value is not None
     }
     os.environ.update(values)
-    # Launcher-control variables are never business configuration and must not
-    # leak into scheduler task subprocesses.
+    _bind_windows_state_roots()
+    # Clear stale launcher controls, then force the one capability identity
+    # accepted by the shared scheduler/health contract.
     for name in tuple(os.environ):
         if name.startswith("PROBIGA_SCHEDULER_"):
             os.environ.pop(name, None)
+    os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] = "qmt_windows_edge"
+    _bind_windows_build_sha()
     if not (os.environ.get("MYSQL_URL") or os.environ.get("DATABASE_URL")):
         raise RuntimeError("scheduler database URL is unavailable")
     return len(values)

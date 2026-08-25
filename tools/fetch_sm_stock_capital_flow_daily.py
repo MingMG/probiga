@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests as http
-from sqlalchemy import bindparam, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -39,9 +39,9 @@ from server.common.adata_release import ensure_adata_import_path
 
 ensure_adata_import_path(ROOT)
 
-from server.common.batch_db import create_batch_engine, write_frame
+from server.common.batch_db import create_batch_engine, replace_table_rows_exact_keys
 from server.common.kline_data import get_kline_engine
-from server.common.mysql_lock import mysql_named_lock
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME, mysql_named_lock
 from integrations.qmt.backend import to_qmt_symbol
 
 _MAX_RETRIES = int(os.environ.get("FLOW_MAX_RETRIES", "1"))
@@ -256,7 +256,12 @@ def reconcile_daily_flow_from_minute_close(
     fallback = _read_minute_close_fallback(
         engine, target_date, wanted, require_complete=True,
     )
-    with engine.connect() as conn:
+    lock_timeout = max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30")))
+    with mysql_named_lock(
+        engine,
+        CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        timeout_seconds=lock_timeout,
+    ) as conn:
         existing = {
             str(row[0]).strip().zfill(6)
             for row in conn.execute(
@@ -264,40 +269,30 @@ def reconcile_daily_flow_from_minute_close(
                 {"d": target_date},
             ).fetchall()
         }
-    outside = sorted(existing - wanted)
-    missing = wanted - existing
-    fill = fallback[fallback["stock_code"].isin(missing)] if not fallback.empty else fallback
-    if not fill.empty:
-        fill = fill.copy()
-        fill["etl_sync_at"] = datetime.now().replace(microsecond=0)
-    lock_timeout = max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30")))
-    with mysql_named_lock(engine, "probiga:capital_flow_daily", timeout_seconds=lock_timeout):
-        with engine.begin() as conn:
-            if outside:
-                statement = text(
-                    "DELETE FROM sm_stock_capital_flow_daily "
-                    "WHERE trade_date=:d AND stock_code IN :codes"
-                ).bindparams(bindparam("codes", expanding=True))
-                conn.execute(statement, {"d": target_date, "codes": outside})
-            if not fill.empty:
-                write_frame(
-                    fill[[
-                        "stock_code", "trade_date", "main_net_inflow", "max_net_inflow",
-                        "lg_net_inflow", "mid_net_inflow", "sm_net_inflow",
-                        "etl_sync_at", "data_source",
-                    ]],
-                    "sm_stock_capital_flow_daily",
-                    conn,
-                    if_exists="append",
-                    index=False,
-                    chunksize=1000,
-                    method="multi",
-                )
+        missing = wanted - existing
+        fill = fallback[fallback["stock_code"].isin(missing)] if not fallback.empty else fallback
+        if not fill.empty:
+            fill = fill.copy()
+            fill["etl_sync_at"] = datetime.now().replace(microsecond=0)
+            replace_table_rows_exact_keys(
+                fill[[
+                    "stock_code", "trade_date", "main_net_inflow", "max_net_inflow",
+                    "lg_net_inflow", "mid_net_inflow", "sm_net_inflow",
+                    "etl_sync_at", "data_source",
+                ]],
+                "sm_stock_capital_flow_daily",
+                engine,
+                key_columns=("stock_code", "trade_date"),
+                lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+                lock_connection=conn,
+            )
+        else:
+            conn.commit()
     return {
         "target_codes": len(wanted),
         "complete_minute_codes": len(fallback),
         "filled_rows": len(fill),
-        "pruned_rows": len(outside),
+        "pruned_rows": 0,
     }
 
 
@@ -465,20 +460,14 @@ def _write_flow_daily(engine, target_date: str, df: pd.DataFrame) -> None:
 
     full_df["etl_sync_at"] = datetime.now().replace(microsecond=0)
     columns = ["stock_code", "trade_date", *numeric_cols, "etl_sync_at", "data_source"]
-    with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"),
-            {"d": target_date},
-        )
-        write_frame(
-            full_df[columns],
-            "sm_stock_capital_flow_daily",
-            conn,
-            if_exists="append",
-            index=False,
-            chunksize=1000,
-            method="multi",
-        )
+    replace_table_rows_exact_keys(
+        full_df[columns],
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        lock_timeout_seconds=max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30"))),
+    )
 
 
 def _fetch_capital_flow_daily_unlocked(
@@ -629,22 +618,17 @@ def fetch_capital_flow_daily(
     min_coverage: float | None = None,
     dry_run: bool = False,
 ) -> int:
-    """Fetch one day while excluding concurrent daily-flow writers."""
+    """Fetch one day and serialize only the final exact-key publication."""
     engine = create_batch_engine()
     lock_timeout = max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30")))
     try:
-        with mysql_named_lock(
+        return _fetch_capital_flow_daily_unlocked(
             engine,
-            "probiga:capital_flow_daily",
-            timeout_seconds=lock_timeout,
-        ):
-            return _fetch_capital_flow_daily_unlocked(
-                engine,
-                target_date,
-                sources_raw=sources_raw,
-                min_coverage=min_coverage,
-                dry_run=dry_run,
-            )
+            target_date,
+            sources_raw=sources_raw,
+            min_coverage=min_coverage,
+            dry_run=dry_run,
+        )
     except TimeoutError as exc:
         print(f"Capital-flow daily sync skipped: {exc}", file=sys.stderr)
         return 4

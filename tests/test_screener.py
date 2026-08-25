@@ -115,7 +115,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert "style.css?v=44" in index
-    assert "app.js?v=105" in index
+    assert "app.js?v=112" in index
     assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
     assert 'data-trading-view="candidates"' in index
@@ -228,7 +228,11 @@ def test_run_preset_keeps_data_date_and_requested_date(monkeypatch):
         }
 
     monkeypatch.setattr(screener, "_listed_codes", lambda _date: {"600001"})
-    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, _date: rows)
+    monkeypatch.setattr(
+        screener,
+        "_enrich_selector_evidence",
+        lambda rows, _date, **_kwargs: rows,
+    )
     monkeypatch.setattr(screener, "_attach_correlation_clusters", lambda rows, _date: rows)
     monkeypatch.setattr(hot_data, "screen_stocks", fake_screen_stocks)
     request = screener.ScreenerRunRequest(
@@ -288,8 +292,12 @@ def test_enrich_selector_evidence_joins_analysis_recommendation_and_market_mood(
     assert row["final_trade_score"] == 81
     assert row["fundamental"] == 70
     assert row["global_market_regime_score"] == 66
-    assert row["finance_pit_verified"] is True
-    assert row["finance_report_date"] == "2026-06-30"
+    assert row["finance_pit_verified"] is False
+    assert row["finance_pit_status"] == "DATA_BLOCKED"
+    assert row["finance_pit_reason"] == (
+        "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED"
+    )
+    assert "finance_report_date" not in row
     assert row["data_date"] == "2026-08-10"
     assert row["limit_trigger_pct"] == 9.5
     assert row["limit_up_locked"] is False

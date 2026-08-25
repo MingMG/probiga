@@ -16,12 +16,14 @@ import copy
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from integrations.bigqmt.reference import PROVIDER_ID
 from server.api.routers._engine import get_engine
 from server.common.kline_data import get_kline_engine
 from server.common.sql_reader import (
@@ -33,18 +35,39 @@ from server.common.versioned_strategy_config import (
     load_market_state_config,
     load_stock_manifest,
     market_state_config_hash,
-    register_versioned_strategy_configs,
     stock_manifest_hash,
     stock_strategy_catalog,
     strategy_score_field_map,
+    validate_versioned_strategy_runtime,
 )
 from server.engine.market_state_v2 import transition_market_state
 from server.engine.strategy_execution_adapters import (
     execute_dynamic_adapter_candidate_batch,
     persist_strategy_adapter_run_receipt,
 )
+from server.engine.dynamic_shadow_ledger import (
+    create_dynamic_shadow_trial_plans_from_candidate_facts,
+    persist_strategy_adapter_candidate_facts,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_fallback_log(
+    level: int, operation: str, exc: BaseException,
+) -> str:
+    """Record fallback diagnostics without exception text or traceback data."""
+
+    incident_id = uuid.uuid4().hex
+    logger.log(
+        level,
+        "Strategy center fallback: incident_id=%s exception_type=%s "
+        "operation=%s",
+        incident_id,
+        type(exc).__name__,
+        operation,
+    )
+    return incident_id
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _REFERENCE_POOL_DIR = _PROJECT_ROOT / "data" / "strategy_center"
@@ -252,6 +275,70 @@ def _candidate_source_contract(
         # Audit identities remain visible, but do not revise the authoritative
         # candidate-source hash when stable input/output are unchanged.
         "dynamic_adapter_receipts": dynamic_receipts,
+    }
+
+
+def _strategy_discovery_counts(
+    configs: dict[str, dict[str, Any]],
+    dynamic_adapter_statuses: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    """Count unbounded discovered keys without double-counting migrations.
+
+    A runtime-registry entry with the same key supersedes the research-only
+    static enabled flag for the compatibility aggregate. Canonical governance
+    continues to publish its own registry counts independently.
+    """
+
+    static_keys = {
+        str(item.get("key") or "").strip()
+        for item in STRATEGY_CATALOG
+        if str(item.get("key") or "").strip()
+    }
+    enabled_static_keys = {
+        key for key in static_keys
+        if bool((configs.get(key) or {}).get("enabled", True))
+    }
+    runtime_enabled_by_key: dict[str, bool] = {}
+    runtime_discovery_complete = True
+    for raw in dynamic_adapter_statuses:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("strategy_key") or "").strip()
+        if not key:
+            if str(raw.get("status") or "") == "DISCOVERY_UNAVAILABLE":
+                runtime_discovery_complete = False
+            continue
+        enabled = raw.get("enabled") is True
+        runtime_enabled_by_key[key] = (
+            runtime_enabled_by_key.get(key, True) and enabled
+        )
+    runtime_keys = set(runtime_enabled_by_key)
+    enabled_runtime_keys = {
+        key for key, enabled in runtime_enabled_by_key.items() if enabled
+    }
+    discovered_keys = static_keys | runtime_keys
+    enabled_discovered_keys = (
+        (enabled_static_keys - runtime_keys) | enabled_runtime_keys
+    )
+    return {
+        "static_catalog_count": len(static_keys),
+        "enabled_static_catalog_count": len(enabled_static_keys),
+        "runtime_registry_count": len(runtime_keys),
+        "enabled_runtime_count": len(enabled_runtime_keys),
+        "total_discovered_strategy_count": len(discovered_keys),
+        "enabled_discovered_strategy_count": len(enabled_discovered_keys),
+        "runtime_registry_discovery_status": (
+            "COMPLETE" if runtime_discovery_complete else "UNAVAILABLE"
+        ),
+        # Compatibility fields now reflect the complete unique discovery set,
+        # not the fixed static catalog.
+        "strategy_count": len(discovered_keys),
+        "enabled_count": len(enabled_discovered_keys),
+        "strategy_count_semantics": "UNIQUE_DISCOVERED_STRATEGY_KEYS",
+        "enabled_count_semantics": (
+            "RUNTIME_REGISTRY_OVERRIDES_STATIC_ON_KEY_COLLISION"
+        ),
+        "canonical_governance_count_source": "strategy_governance_registry",
     }
 
 
@@ -941,8 +1028,10 @@ def _kline_table_exists(table_name: str) -> bool:
         return False
 
 
-def ensure_strategy_center_tables() -> None:
-    """Create only strategy-center tables; existing recommendation tables are untouched."""
+def privileged_migrate_strategy_center_tables(engine=None) -> None:
+    """Create the six strategy-center tables during a privileged deploy step."""
+
+    engine = engine or get_engine()
     ddl = (
         """
         CREATE TABLE IF NOT EXISTS st_strategy_center_config (
@@ -1057,42 +1146,431 @@ def ensure_strategy_center_tables() -> None:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """,
     )
-    for statement in ddl:
-        _db_write(statement)
-    registration = register_versioned_strategy_configs(get_engine())
+    with engine.begin() as connection:
+        for statement in ddl:
+            connection.execute(text(statement))
+
+
+_STRATEGY_CENTER_TABLE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "st_strategy_center_config": (
+        "strategy_key", "enabled", "base_weight", "config_json", "version",
+        "updated_by", "updated_at",
+    ),
+    "st_strategy_center_run": (
+        "run_uid", "trade_date", "market_state", "state_confidence",
+        "source_status", "model_version", "status", "signal_count",
+        "candidate_count", "conflict_count", "error_message", "created_at",
+        "finished_at",
+    ),
+    "st_strategy_center_signal": (
+        "id", "run_uid", "trade_date", "stock_code", "stock_name",
+        "strategy_key", "market_state", "signal_direction", "signal_status",
+        "raw_score", "effective_score", "model_confidence",
+        "effective_weight", "risk_level", "gate_status", "gate_reason",
+        "entry_low", "entry_high", "stop_loss", "take_profit_1",
+        "take_profit_2", "no_chase_price", "risk_reward_ratio",
+        "today_signal", "trigger_conditions_json", "evidence_chain_json",
+        "data_snapshot_json", "model_version", "created_at",
+    ),
+    "st_strategy_center_conflict": (
+        "id", "run_uid", "trade_date", "stock_code", "stock_name",
+        "market_state", "final_direction", "final_status", "buy_score",
+        "sell_score", "hold_score", "decision_json", "created_at",
+    ),
+    "st_strategy_center_metric": (
+        "id", "as_of_date", "strategy_key", "sample_count",
+        "today_signal_count", "return_pct", "max_drawdown_pct",
+        "win_rate_pct", "profit_factor", "avg_return_pct", "source",
+        "created_at",
+    ),
+    "st_strategy_center_audit": (
+        "id", "strategy_key", "action", "old_value", "new_value", "reason",
+        "operator", "created_at",
+    ),
+}
+
+_STRATEGY_CENTER_COLUMN_CONTRACTS: dict[
+    str, dict[str, tuple[str, bool, int | None, int | None, int | None, bool]]
+] = {
+    "st_strategy_center_config": {
+        "strategy_key": ("varchar", False, 40, None, None, False),
+        "enabled": ("tinyint", False, None, None, None, False),
+        "base_weight": ("decimal", False, None, 8, 4, False),
+        "config_json": ("longtext", True, None, None, None, False),
+        "version": ("int", False, None, None, None, False),
+        "updated_by": ("varchar", False, 80, None, None, False),
+        "updated_at": ("datetime", False, None, None, None, False),
+    },
+    "st_strategy_center_run": {
+        "run_uid": ("varchar", False, 40, None, None, False),
+        "trade_date": ("date", False, None, None, None, False),
+        "market_state": ("varchar", False, 40, None, None, False),
+        "state_confidence": ("decimal", True, None, 6, 2, False),
+        "source_status": ("varchar", False, 20, None, None, False),
+        "model_version": ("varchar", True, 40, None, None, False),
+        "status": ("varchar", False, 20, None, None, False),
+        "signal_count": ("int", False, None, None, None, False),
+        "candidate_count": ("int", False, None, None, None, False),
+        "conflict_count": ("int", False, None, None, None, False),
+        "error_message": ("varchar", True, 500, None, None, False),
+        "created_at": ("datetime", False, None, None, None, False),
+        "finished_at": ("datetime", True, None, None, None, False),
+    },
+    "st_strategy_center_signal": {
+        "id": ("bigint", False, None, None, None, True),
+        "run_uid": ("varchar", False, 40, None, None, False),
+        "trade_date": ("date", False, None, None, None, False),
+        "stock_code": ("varchar", False, 10, None, None, False),
+        "stock_name": ("varchar", True, 80, None, None, False),
+        "strategy_key": ("varchar", False, 40, None, None, False),
+        "market_state": ("varchar", True, 40, None, None, False),
+        "signal_direction": ("varchar", False, 20, None, None, False),
+        "signal_status": ("varchar", False, 30, None, None, False),
+        "raw_score": ("decimal", True, None, 8, 2, False),
+        "effective_score": ("decimal", True, None, 8, 2, False),
+        "model_confidence": ("decimal", True, None, 8, 2, False),
+        "effective_weight": ("decimal", True, None, 8, 4, False),
+        "risk_level": ("varchar", True, 20, None, None, False),
+        "gate_status": ("varchar", True, 20, None, None, False),
+        "gate_reason": ("varchar", True, 500, None, None, False),
+        "entry_low": ("decimal", True, None, 12, 4, False),
+        "entry_high": ("decimal", True, None, 12, 4, False),
+        "stop_loss": ("decimal", True, None, 12, 4, False),
+        "take_profit_1": ("decimal", True, None, 12, 4, False),
+        "take_profit_2": ("decimal", True, None, 12, 4, False),
+        "no_chase_price": ("decimal", True, None, 12, 4, False),
+        "risk_reward_ratio": ("decimal", True, None, 8, 2, False),
+        "today_signal": ("varchar", True, 500, None, None, False),
+        "trigger_conditions_json": ("longtext", True, None, None, None, False),
+        "evidence_chain_json": ("longtext", True, None, None, None, False),
+        "data_snapshot_json": ("longtext", True, None, None, None, False),
+        "model_version": ("varchar", True, 40, None, None, False),
+        "created_at": ("datetime", False, None, None, None, False),
+    },
+    "st_strategy_center_conflict": {
+        "id": ("bigint", False, None, None, None, True),
+        "run_uid": ("varchar", False, 40, None, None, False),
+        "trade_date": ("date", False, None, None, None, False),
+        "stock_code": ("varchar", False, 10, None, None, False),
+        "stock_name": ("varchar", True, 80, None, None, False),
+        "market_state": ("varchar", True, 40, None, None, False),
+        "final_direction": ("varchar", True, 20, None, None, False),
+        "final_status": ("varchar", True, 30, None, None, False),
+        "buy_score": ("decimal", True, None, 10, 2, False),
+        "sell_score": ("decimal", True, None, 10, 2, False),
+        "hold_score": ("decimal", True, None, 10, 2, False),
+        "decision_json": ("longtext", True, None, None, None, False),
+        "created_at": ("datetime", False, None, None, None, False),
+    },
+    "st_strategy_center_metric": {
+        "id": ("bigint", False, None, None, None, True),
+        "as_of_date": ("date", False, None, None, None, False),
+        "strategy_key": ("varchar", False, 40, None, None, False),
+        "sample_count": ("int", False, None, None, None, False),
+        "today_signal_count": ("int", False, None, None, None, False),
+        "return_pct": ("decimal", True, None, 10, 4, False),
+        "max_drawdown_pct": ("decimal", True, None, 10, 4, False),
+        "win_rate_pct": ("decimal", True, None, 10, 4, False),
+        "profit_factor": ("decimal", True, None, 10, 4, False),
+        "avg_return_pct": ("decimal", True, None, 10, 4, False),
+        "source": ("varchar", True, 40, None, None, False),
+        "created_at": ("datetime", False, None, None, None, False),
+    },
+    "st_strategy_center_audit": {
+        "id": ("bigint", False, None, None, None, True),
+        "strategy_key": ("varchar", False, 40, None, None, False),
+        "action": ("varchar", False, 40, None, None, False),
+        "old_value": ("varchar", True, 500, None, None, False),
+        "new_value": ("varchar", True, 500, None, None, False),
+        "reason": ("varchar", True, 500, None, None, False),
+        "operator": ("varchar", True, 80, None, None, False),
+        "created_at": ("datetime", False, None, None, None, False),
+    },
+}
+
+_STRATEGY_CENTER_REQUIRED_INDEXES: dict[
+    str, tuple[tuple[bool, tuple[str, ...]], ...]
+] = {
+    "st_strategy_center_config": ((True, ("strategy_key",)),),
+    "st_strategy_center_run": (
+        (True, ("run_uid",)),
+        (False, ("trade_date", "created_at")),
+    ),
+    "st_strategy_center_signal": (
+        (True, ("id",)),
+        (False, ("trade_date", "strategy_key")),
+        (False, ("trade_date", "stock_code")),
+    ),
+    "st_strategy_center_conflict": (
+        (True, ("id",)),
+        (False, ("trade_date", "stock_code")),
+    ),
+    "st_strategy_center_metric": (
+        (True, ("id",)),
+        (True, ("as_of_date", "strategy_key")),
+    ),
+    "st_strategy_center_audit": (
+        (True, ("id",)),
+        (False, ("strategy_key", "created_at")),
+    ),
+}
+
+
+def _strategy_center_schema_rows(connection, *, kind: str) -> list[dict[str, Any]]:
+    tables = tuple(_STRATEGY_CENTER_TABLE_COLUMNS)
+    placeholders = ", ".join(
+        f":table_{index}" for index in range(len(tables))
+    )
+    if kind == "columns":
+        sql = (
+            "SELECT table_name AS table_name, column_name AS column_name, "
+            "data_type AS data_type, is_nullable AS is_nullable, "
+            "character_maximum_length AS character_maximum_length, "
+            "numeric_precision AS numeric_precision, "
+            "numeric_scale AS numeric_scale, extra AS extra "
+            "FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name IN "
+            f"({placeholders})"
+        )
+    elif kind == "indexes":
+        sql = (
+            "SELECT table_name AS table_name, index_name AS index_name, "
+            "non_unique AS non_unique, seq_in_index AS seq_in_index, "
+            "column_name AS column_name FROM information_schema.statistics "
+            "WHERE table_schema=DATABASE() AND table_name IN "
+            f"({placeholders}) ORDER BY table_name, index_name, seq_in_index"
+        )
+    else:  # pragma: no cover - internal programming error
+        raise ValueError(f"unsupported strategy-center schema kind: {kind}")
+    return [
+        dict(row) for row in connection.execute(
+            text(sql),
+            {f"table_{index}": table for index, table in enumerate(tables)},
+        ).mappings().all()
+    ]
+
+
+def _validate_strategy_center_schema(connection) -> None:
+    columns_by_table: dict[str, dict[str, dict[str, Any]]] = {
+        table: {} for table in _STRATEGY_CENTER_TABLE_COLUMNS
+    }
+    for row in _strategy_center_schema_rows(connection, kind="columns"):
+        table = str(row.get("table_name") or "")
+        if table in columns_by_table:
+            columns_by_table[table][str(row.get("column_name") or "")] = row
+    for table, required in _STRATEGY_CENTER_TABLE_COLUMNS.items():
+        missing = sorted(set(required) - set(columns_by_table[table]))
+        if missing:
+            raise RuntimeError(
+                f"strategy-center runtime schema is not prepared: "
+                f"{table} missing columns {missing}"
+            )
+    for table, contracts in _STRATEGY_CENTER_COLUMN_CONTRACTS.items():
+        for column, expected in contracts.items():
+            row = columns_by_table[table][column]
+            actual = (
+                str(row.get("data_type") or "").lower(),
+                str(row.get("is_nullable") or "").upper() == "YES",
+                (
+                    int(row["character_maximum_length"])
+                    if row.get("character_maximum_length") is not None else None
+                ),
+                (
+                    int(row["numeric_precision"])
+                    if row.get("numeric_precision") is not None else None
+                ),
+                (
+                    int(row["numeric_scale"])
+                    if row.get("numeric_scale") is not None else None
+                ),
+                "auto_increment" in str(row.get("extra") or "").lower(),
+            )
+            comparable_actual = (
+                actual[0], actual[1],
+                actual[2] if expected[2] is not None else None,
+                actual[3] if expected[3] is not None else None,
+                actual[4] if expected[4] is not None else None,
+                actual[5],
+            )
+            if comparable_actual != expected:
+                raise RuntimeError(
+                    f"strategy-center runtime schema type drift: "
+                    f"{table}.{column} expected={expected} "
+                    f"actual={comparable_actual}"
+                )
+
+    index_parts: dict[str, dict[str, list[tuple[int, str]]]] = {
+        table: {} for table in _STRATEGY_CENTER_TABLE_COLUMNS
+    }
+    index_unique: dict[str, dict[str, bool]] = {
+        table: {} for table in _STRATEGY_CENTER_TABLE_COLUMNS
+    }
+    for row in _strategy_center_schema_rows(connection, kind="indexes"):
+        table = str(row.get("table_name") or "")
+        if table not in index_parts:
+            continue
+        name = str(row.get("index_name") or "")
+        index_parts[table].setdefault(name, []).append((
+            int(row.get("seq_in_index") or 0),
+            str(row.get("column_name") or ""),
+        ))
+        index_unique[table][name] = int(row.get("non_unique") or 0) == 0
+    for table, required_indexes in _STRATEGY_CENTER_REQUIRED_INDEXES.items():
+        actual = {
+            (
+                bool(index_unique[table].get(name)),
+                tuple(column for _, column in sorted(parts)),
+            )
+            for name, parts in index_parts[table].items()
+        }
+        missing = [spec for spec in required_indexes if spec not in actual]
+        if missing:
+            raise RuntimeError(
+                f"strategy-center runtime schema is not prepared: "
+                f"{table} missing indexes {missing}"
+            )
+
+
+def _expected_strategy_center_configs(
+    registration: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
     manifest = load_stock_manifest()
     manifest_items = {
         str(item["key"]): item for item in manifest["strategies"]
     }
-    for item in STRATEGY_CATALOG:
-        _db_write("""
-            INSERT INTO st_strategy_center_config (strategy_key, enabled, base_weight, config_json, version, updated_by)
-            VALUES (:strategy_key, 1, :base_weight, :config_json, 2, 'manifest_registry')
-            ON DUPLICATE KEY UPDATE
-                config_json = VALUES(config_json),
-                version = GREATEST(version, VALUES(version)),
-                updated_by = VALUES(updated_by)
-        """, {
-            "strategy_key": item["key"],
+    return {
+        str(item["key"]): {
             "base_weight": float(item["base_weight"]),
-            "config_json": json.dumps(
-                {
-                    **manifest_items[item["key"]],
-                    "manifest_version": registration["stock_manifest_version"],
-                    "config_hash": registration["stock_manifest_hash"],
-                },
-                ensure_ascii=False,
+            "config": {
+                **manifest_items[item["key"]],
+                "manifest_version": registration["stock_manifest_version"],
+                "config_hash": registration["stock_manifest_hash"],
+            },
+        }
+        for item in STRATEGY_CATALOG
+    }
+
+
+def privileged_seed_strategy_center_configs(engine=None) -> dict[str, Any]:
+    """Seed current strategy-center configs after all nine tables are migrated."""
+
+    engine = engine or get_engine()
+    with engine.connect() as connection:
+        _validate_strategy_center_schema(connection)
+        registration = validate_versioned_strategy_runtime(
+            engine, connection=connection,
+        )
+    expected = _expected_strategy_center_configs(registration)
+    with engine.begin() as connection:
+        for strategy_key, identity in expected.items():
+            connection.execute(text("""
+                INSERT INTO st_strategy_center_config
+                (strategy_key, enabled, base_weight, config_json, version, updated_by)
+                VALUES
+                (:strategy_key, 1, :base_weight, :config_json, 2, 'manifest_registry')
+                ON DUPLICATE KEY UPDATE
+                    base_weight = VALUES(base_weight),
+                    config_json = VALUES(config_json),
+                    version = GREATEST(version, VALUES(version)),
+                    updated_by = VALUES(updated_by)
+            """), {
+                "strategy_key": strategy_key,
+                "base_weight": identity["base_weight"],
+                "config_json": json.dumps(
+                    identity["config"], ensure_ascii=False,
+                ),
+            })
+        active_keys = sorted(_STRATEGY_BY_KEY)
+        placeholders = ", ".join(
+            f":active_{index}" for index in range(len(active_keys))
+        )
+        connection.execute(
+            text(f"""
+                UPDATE st_strategy_center_config
+                SET enabled = 0, updated_by = 'legacy_merge_v2'
+                WHERE strategy_key NOT IN ({placeholders})
+            """),
+            {f"active_{index}": key for index, key in enumerate(active_keys)},
+        )
+    validate_strategy_center_runtime(engine)
+    return registration
+
+
+def _validate_strategy_center_config_seed(
+    connection, registration: dict[str, Any],
+) -> None:
+    expected = _expected_strategy_center_configs(registration)
+    keys = tuple(sorted(expected))
+    placeholders = ", ".join(f":key_{index}" for index in range(len(keys)))
+    rows = [
+        dict(row) for row in connection.execute(
+            text(
+                "SELECT strategy_key, enabled, base_weight, config_json, version "
+                "FROM st_strategy_center_config WHERE strategy_key IN "
+                f"({placeholders})"
             ),
-        })
-    active_keys = sorted(_STRATEGY_BY_KEY)
-    placeholders = ", ".join(f":active_{index}" for index in range(len(active_keys)))
-    _db_write(
-        f"""
-        UPDATE st_strategy_center_config
-        SET enabled = 0, updated_by = 'legacy_merge_v2'
-        WHERE strategy_key NOT IN ({placeholders})
-        """,
-        {f"active_{index}": key for index, key in enumerate(active_keys)},
+            {f"key_{index}": key for index, key in enumerate(keys)},
+        ).mappings().all()
+    ]
+    by_key = {str(row.get("strategy_key") or ""): row for row in rows}
+    if len(by_key) != len(rows) or set(by_key) != set(expected):
+        raise RuntimeError(
+            "strategy-center config seed identity drift: current manifest rows missing"
+        )
+    for strategy_key, identity in expected.items():
+        row = by_key[strategy_key]
+        try:
+            config = json.loads(str(row.get("config_json") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"strategy-center config seed identity drift: "
+                f"{strategy_key} config_json invalid"
+            ) from exc
+        try:
+            enabled_valid = int(row.get("enabled")) in {0, 1}
+            version_valid = int(row.get("version") or 0) >= 2
+            weight_valid = abs(
+                float(row.get("base_weight")) - float(identity["base_weight"])
+            ) <= 0.000001
+        except (TypeError, ValueError):
+            enabled_valid = version_valid = weight_valid = False
+        if not (
+            enabled_valid
+            and version_valid
+            and weight_valid
+            and config == identity["config"]
+        ):
+            raise RuntimeError(
+                f"strategy-center config seed identity drift: {strategy_key}"
+            )
+
+
+def validate_strategy_center_runtime(
+    engine=None, *, connection=None,
+) -> dict[str, Any]:
+    """Read-only production guard for all nine tables and current seed identity."""
+
+    engine = engine or get_engine()
+
+    def validate(bound_connection) -> dict[str, Any]:
+        _validate_strategy_center_schema(bound_connection)
+        registration = validate_versioned_strategy_runtime(
+            engine, connection=bound_connection,
+        )
+        _validate_strategy_center_config_seed(bound_connection, registration)
+        return registration
+
+    if connection is not None:
+        return validate(connection)
+    with engine.connect() as bound_connection:
+        return validate(bound_connection)
+
+
+def ensure_strategy_center_tables() -> None:
+    """Compatibility guard: validate only; never create or seed at runtime."""
+
+    validate_strategy_center_runtime(
+        get_engine(), connection=current_bound_sql_connection(),
     )
 
 
@@ -1117,7 +1595,7 @@ def load_strategy_configs() -> dict[str, dict[str, Any]]:
                     "config": _json_value(row.get("config_json"), {}),
                 })
     except Exception as exc:
-        logger.debug("strategy center config fallback: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "configuration", exc)
     return result
 
 
@@ -1138,7 +1616,7 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
             for row in rows:
                 metrics[str(row.get("strategy_key") or "")] = row
         except Exception as exc:
-            logger.debug("strategy center metric fallback: %s", exc)
+            _safe_fallback_log(logging.DEBUG, "metric_snapshot", exc)
 
     # Backfill visible metrics from the existing simulated-trade ledger until
     # the strategy-center metric job has produced its first snapshot. The
@@ -1184,7 +1662,7 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
                     "source": "st_sim_position",
                 }
         except Exception as exc:
-            logger.debug("strategy center simulated metric fallback: %s", exc)
+            _safe_fallback_log(logging.DEBUG, "simulated_metric", exc)
 
     # The recommendation ledger contains historical forward-review labels.
     # Use them only for the four registered strategies; disabled legacy labels
@@ -1240,7 +1718,9 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
                         "metric_note": f"{review_field} 横截面复盘基线，不等同于独立模型回测",
                     }
         except Exception as exc:
-            logger.debug("strategy center recommendation review metric fallback: %s", exc)
+            _safe_fallback_log(
+                logging.DEBUG, "recommendation_review_metric", exc,
+            )
     return metrics
 
 
@@ -1267,7 +1747,7 @@ def load_reference_candidate_pool(trade_date: str) -> dict[str, Any] | None:
         payload["_path"] = str(path.relative_to(_PROJECT_ROOT))
         return payload
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("strategy center reference pool unavailable: %s", exc)
+        _safe_fallback_log(logging.WARNING, "reference_pool_file", exc)
         return None
 
 
@@ -1312,7 +1792,9 @@ def _reference_db_crosscheck(candidates: list[dict[str, Any]], as_of_date: str) 
                 params_with_date,
             )
         except Exception as exc:
-            logger.debug("reference pool database cross-check failed for %s: %s", table_name, exc)
+            _safe_fallback_log(
+                logging.DEBUG, "reference_pool_database_cross_check", exc,
+            )
             continue
         for row in rows:
             code = str(row.get("stock_code") or "").zfill(6)
@@ -1453,11 +1935,7 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
                     """
                     SELECT stock_code, industry_name
                     FROM qmt_industry_member_snapshot
-                    WHERE snapshot_date = (
-                        SELECT MAX(snapshot_date)
-                        FROM qmt_industry_member_snapshot
-                        WHERE snapshot_date <= :trade_date
-                    )
+                    WHERE snapshot_date = :trade_date
                       AND industry_name IS NOT NULL
                       AND industry_name <> ''
                     ORDER BY stock_code, industry_code
@@ -1477,13 +1955,12 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
                             "",
                         )
             except Exception as exc:
-                logger.debug(
-                    "strategy center industry snapshot fallback: %s",
-                    exc,
+                _safe_fallback_log(
+                    logging.DEBUG, "exact_date_industry_membership", exc,
                 )
         return rows
     except Exception as exc:
-        logger.debug("strategy center recommendation fallback: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "recommendation", exc)
         return []
 
 
@@ -1508,7 +1985,7 @@ def _previous_market_state(trade_date: str) -> dict[str, Any] | None:
         )
         return rows[0] if rows else None
     except Exception as exc:
-        logger.debug("market state history fallback: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "market_state_history", exc)
         return None
 
 
@@ -1542,7 +2019,7 @@ def _kline_market_features(trade_date: str) -> dict[str, Any]:
             context="strategy_center_market_features",
         )
     except Exception as exc:
-        logger.debug("strategy center K-line market feature fallback failed: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "kline_market_features", exc)
         return {}
     minimum_count = int(fallback.get("minimum_daily_universe_count") or 1000)
     valid = [
@@ -1893,6 +2370,8 @@ def versioned_strategy_configuration() -> dict[str, Any]:
             "calibration": market.get("calibration") or {},
         },
         "automatic_order_submission": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -1908,6 +2387,8 @@ def load_etf_forward_ledger(limit: int = 100) -> dict[str, Any]:
             "observations": [],
             "observation_count": 0,
             "automatic_order_submission": False,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         }
     strategies = read_sql_rows(
         engine,
@@ -1954,7 +2435,7 @@ def load_etf_forward_ledger(limit: int = 100) -> dict[str, Any]:
         )
         latest_etf_date = str((rows[0] if rows else {}).get("data_date") or "")[:10]
     except Exception as exc:
-        logger.debug("ETF forward latest date unavailable: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "etf_forward_latest_date", exc)
     if observations:
         status = "collecting"
         message = "已产生真实前向观察记录"
@@ -1980,6 +2461,101 @@ def load_etf_forward_ledger(limit: int = 100) -> dict[str, Any]:
         "latest_validated_etf_date": latest_etf_date,
         "backfill": "prohibited",
         "automatic_order_submission": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+_QMT_MEMBERSHIP_QUALITY = "QMT_VALIDATED"
+_QMT_MEMBERSHIP_CAPTURE_MODE = "qmt_close_full_refresh"
+_QMT_MEMBERSHIP_HASH_CHARS = frozenset("0123456789abcdef")
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+_MEMBERSHIP_DATA_CATEGORY = "POINT_IN_TIME_CONSTITUENT_MEMBERSHIP"
+_MEMBERSHIP_EXCLUDED_DATA_CATEGORIES = (
+    "SECTOR_HEAT_HISTORY",
+    "SECTOR_ROTATION_HISTORY",
+)
+
+
+def _membership_truth_boundary(member_type: str) -> dict[str, Any]:
+    scope_label = "概念成分归属历史" if member_type == "concept" else "行业成分归属历史"
+    return {
+        "data_category": _MEMBERSHIP_DATA_CATEGORY,
+        "data_category_label": scope_label,
+        "data_semantics": (
+            "指定交易日收盘后的全量成分归属关系；"
+            "不代表板块热度、资金强弱或轮动信号"
+        ),
+        "excluded_data_categories": list(
+            _MEMBERSHIP_EXCLUDED_DATA_CATEGORIES
+        ),
+    }
+
+
+def _membership_snapshot_hash(
+    rows: Iterable[dict[str, Any]], *, member_type: str,
+) -> str:
+    columns = (
+        ("concept_code", "concept_name", "stock_code", "short_name")
+        if member_type == "concept"
+        else (
+            "industry_code", "industry_name", "industry_type",
+            "stock_code", "short_name",
+        )
+    )
+    payload = json.dumps(
+        sorted(
+            tuple(str(row.get(column) or "") for column in columns)
+            for row in rows
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _membership_snapshot_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value or "").strip().replace(" ", "T")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_SHANGHAI_TZ).replace(tzinfo=None)
+    return parsed
+
+
+def _membership_run_view(row: dict[str, Any]) -> dict[str, Any]:
+    snapshot_date = normalize_trade_date(str(row.get("snapshot_date") or "")[:10])
+    return {
+        "snapshot_date": snapshot_date,
+        "source": str(row.get("source") or ""),
+        "quality_status": str(row.get("quality_status") or ""),
+        "capture_mode": str(row.get("capture_mode") or ""),
+        "concept_count": int(_num(row.get("concept_count"), 0) or 0),
+        "concept_relation_count": int(
+            _num(row.get("concept_relation_count"), 0) or 0
+        ),
+        "industry_count": int(_num(row.get("industry_count"), 0) or 0),
+        "industry_relation_count": int(
+            _num(row.get("industry_relation_count"), 0) or 0
+        ),
+        "concept_hash": str(row.get("concept_hash") or "").lower(),
+        "industry_hash": str(row.get("industry_hash") or "").lower(),
+        "captured_at": str(row.get("captured_at") or ""),
+        "declared_contract_eligible": bool(
+            snapshot_date
+            and str(row.get("source") or "") == PROVIDER_ID
+            and str(row.get("quality_status") or "")
+            == _QMT_MEMBERSHIP_QUALITY
+            and str(row.get("capture_mode") or "")
+            == _QMT_MEMBERSHIP_CAPTURE_MODE
+        ),
     }
 
 
@@ -1991,18 +2567,44 @@ def load_membership_snapshot_history(
     stock_code: str = "",
     limit: int = 200,
 ) -> dict[str, Any]:
-    """Read immutable BigQMT concept/industry membership history."""
+    """Read one fully replayed immutable BigQMT membership snapshot.
+
+    ``limit`` is presentation-only.  The published relation count, group
+    count, row identities, capture time and canonical hash are always checked
+    against the complete exact-date/provider snapshot before any filter is
+    applied.  An explicit date is exact; this function never silently serves
+    an older snapshot for a requested day.
+    """
     member_type = str(member_type or "concept").strip().lower()
     if member_type not in {"concept", "industry"}:
         raise ValueError("member_type must be concept or industry")
+    truth_boundary = _membership_truth_boundary(member_type)
     limit = max(1, min(1000, int(limit)))
-    if not _kline_table_exists("qmt_membership_snapshot_run"):
+    raw_requested = str(snapshot_date or "").strip()
+    requested = normalize_trade_date(raw_requested)
+    if raw_requested and (
+        not requested or raw_requested != requested
+    ):
+        raise ValueError("snapshot_date must be an ISO calendar date")
+    table = (
+        "qmt_concept_member_snapshot"
+        if member_type == "concept"
+        else "qmt_industry_member_snapshot"
+    )
+    if (
+        not _kline_table_exists("qmt_membership_snapshot_run")
+        or not _kline_table_exists(table)
+    ):
         return {
+            **truth_boundary,
             "status": "not_initialized",
+            "status_label": "历史快照表未初始化",
             "snapshot_date": "",
             "member_type": member_type,
             "runs": [],
             "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
         }
     engine = get_kline_engine()
     runs = read_sql_rows(
@@ -2012,71 +2614,296 @@ def load_membership_snapshot_history(
                concept_count, concept_relation_count, industry_count,
                industry_relation_count, concept_hash, industry_hash, captured_at
         FROM qmt_membership_snapshot_run
+        WHERE source = :source
         ORDER BY snapshot_date DESC, id DESC
-        LIMIT 60
+        LIMIT 1000
         """,
+        {"source": PROVIDER_ID},
         context="strategy_center_membership_runs",
         stringify_datetime=True,
     )
-    requested = normalize_trade_date(snapshot_date)
-    available_dates = [
-        normalize_trade_date(str(item.get("snapshot_date") or "")[:10])
-        for item in runs
-    ]
-    available_dates = [item for item in available_dates if item]
-    target = (
-        max((item for item in available_dates if not requested or item <= requested), default="")
-        if available_dates
-        else ""
-    )
+    run_views = [_membership_run_view(dict(row)) for row in runs]
+    available_dates = sorted({
+        str(item.get("snapshot_date") or "")
+        for item in run_views
+        if str(item.get("snapshot_date") or "")
+    })
+    target = requested or (available_dates[-1] if available_dates else "")
+    if requested:
+        selected_runs = read_sql_rows(
+            engine,
+            """
+            SELECT snapshot_date, source, quality_status, capture_mode,
+                   concept_count, concept_relation_count, industry_count,
+                   industry_relation_count, concept_hash, industry_hash,
+                   captured_at
+            FROM qmt_membership_snapshot_run
+            WHERE source = :source AND snapshot_date = :snapshot_date
+            ORDER BY captured_at, id
+            """,
+            {"source": PROVIDER_ID, "snapshot_date": requested},
+            context="strategy_center_membership_exact_run",
+            stringify_datetime=True,
+        )
+        if selected_runs and requested not in available_dates:
+            run_views = [
+                *[_membership_run_view(dict(row)) for row in selected_runs],
+                *run_views,
+            ]
+    else:
+        selected_runs = [
+            dict(row) for row in runs
+            if normalize_trade_date(str(row.get("snapshot_date") or "")[:10])
+            == target
+            and str(row.get("source") or "") == PROVIDER_ID
+        ]
     if not target:
         return {
+            **truth_boundary,
             "status": "empty",
+            "status_label": "暂无历史快照",
+            "reason": "指定QMT提供方尚未发布任何成员快照",
             "snapshot_date": "",
+            "requested_date": requested,
             "member_type": member_type,
-            "runs": runs,
+            "runs": run_views,
             "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
         }
+    if not selected_runs:
+        return {
+            **truth_boundary,
+            "status": "empty",
+            "status_label": "精确日期快照不存在",
+            "reason": f"{target}没有{PROVIDER_ID}精确日期成员快照，不回退旧日数据",
+            "snapshot_date": target,
+            "requested_date": requested,
+            "selection_mode": "EXACT" if requested else "LATEST_DECLARED",
+            "member_type": member_type,
+            "runs": run_views,
+            "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
+        }
+    if len(selected_runs) != 1:
+        return {
+            **truth_boundary,
+            "status": "integrity_error",
+            "status_label": "快照完整性失败",
+            "reason": f"{target}存在重复QMT运行记录",
+            "snapshot_date": target,
+            "requested_date": requested,
+            "member_type": member_type,
+            "runs": run_views,
+            "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
+        }
+    run = selected_runs[0]
+    if str(run.get("source") or "") != PROVIDER_ID:
+        return {
+            **truth_boundary,
+            "status": "integrity_error",
+            "status_label": "快照完整性失败",
+            "reason": f"{target}运行记录来源不是{PROVIDER_ID}",
+            "snapshot_date": target,
+            "requested_date": requested,
+            "member_type": member_type,
+            "runs": run_views,
+            "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
+        }
+    if str(run.get("quality_status") or "") != _QMT_MEMBERSHIP_QUALITY:
+        return {
+            **truth_boundary,
+            "status": "not_ready",
+            "status_label": "快照尚未验真",
+            "reason": f"{target}快照未达到{_QMT_MEMBERSHIP_QUALITY}",
+            "snapshot_date": target,
+            "requested_date": requested,
+            "member_type": member_type,
+            "runs": run_views,
+            "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
+        }
+
     if member_type == "concept":
-        table = "qmt_concept_member_snapshot"
         group_column = "concept_code"
-        select_columns = "concept_code AS group_code, concept_name AS group_name"
-    else:
-        table = "qmt_industry_member_snapshot"
-        group_column = "industry_code"
-        select_columns = (
-            "industry_code AS group_code, industry_name AS group_name, industry_type"
+        group_name_column = "concept_name"
+        snapshot_columns = (
+            "concept_code, concept_name, stock_code, short_name"
         )
-    conditions = ["snapshot_date = :snapshot_date"]
-    params: dict[str, Any] = {"snapshot_date": target}
-    if group_code:
-        conditions.append(f"`{group_column}` = :group_code")
-        params["group_code"] = str(group_code).strip()
-    if stock_code:
-        conditions.append("stock_code = :stock_code")
-        params["stock_code"] = str(stock_code).strip().split(".", 1)[0].zfill(6)
-    rows = read_sql_rows(
+        count_field = "concept_relation_count"
+        group_count_field = "concept_count"
+        hash_field = "concept_hash"
+    else:
+        group_column = "industry_code"
+        group_name_column = "industry_name"
+        snapshot_columns = (
+            "industry_code, industry_name, industry_type, stock_code, short_name"
+        )
+        count_field = "industry_relation_count"
+        group_count_field = "industry_count"
+        hash_field = "industry_hash"
+    raw_rows = read_sql_rows(
         engine,
         f"""
-        SELECT snapshot_date, source, {select_columns},
-               stock_code, short_name, quality_status, captured_at
+        SELECT snapshot_date, source, {snapshot_columns},
+               quality_status, captured_at
         FROM `{table}`
-        WHERE {' AND '.join(conditions)}
+        WHERE snapshot_date = :snapshot_date AND source = :source
         ORDER BY `{group_column}`, stock_code
-        LIMIT {limit}
         """,
-        params,
-        context="strategy_center_membership_history",
+        {"snapshot_date": target, "source": PROVIDER_ID},
+        context="strategy_center_membership_history_full_replay",
         stringify_datetime=True,
     )
+    expected_count = int(_num(run.get(count_field), 0) or 0)
+    expected_group_count = int(_num(run.get(group_count_field), 0) or 0)
+    published_hash = str(run.get(hash_field) or "").lower()
+    run_time = _membership_snapshot_time(run.get("captured_at"))
+    target_day = date.fromisoformat(target)
+    earliest = datetime.combine(target_day, datetime.min.time()).replace(hour=15)
+    latest = datetime.combine(target_day + timedelta(days=1), datetime.min.time())
+    integrity_errors: list[str] = []
+    if str(run.get("source") or "") != PROVIDER_ID:
+        integrity_errors.append("运行记录来源不是指定QMT提供方")
+    if str(run.get("capture_mode") or "") != _QMT_MEMBERSHIP_CAPTURE_MODE:
+        integrity_errors.append("运行记录不是QMT收盘全量冻结模式")
+    if (
+        len(published_hash) != 64
+        or any(char not in _QMT_MEMBERSHIP_HASH_CHARS for char in published_hash)
+    ):
+        integrity_errors.append("运行记录缺少有效发布哈希")
+    if expected_count <= 0 or len(raw_rows) != expected_count:
+        integrity_errors.append(
+            f"发布关系数{expected_count}与完整读取数{len(raw_rows)}不一致"
+        )
+    actual_group_count = len({
+        str(row.get(group_column) or "") for row in raw_rows
+        if str(row.get(group_column) or "")
+    })
+    if expected_group_count <= 0 or actual_group_count != expected_group_count:
+        integrity_errors.append(
+            f"发布分组数{expected_group_count}与重算数{actual_group_count}不一致"
+        )
+    if run_time is None or not earliest <= run_time < latest:
+        integrity_errors.append("快照发布时间不在目标交易日收盘后窗口")
+    for row in raw_rows:
+        row_time = _membership_snapshot_time(row.get("captured_at"))
+        if (
+            normalize_trade_date(str(row.get("snapshot_date") or "")[:10])
+            != target
+            or str(row.get("source") or "") != PROVIDER_ID
+            or str(row.get("quality_status") or "")
+            != _QMT_MEMBERSHIP_QUALITY
+            or row_time is None
+            or run_time is None
+            or row_time != run_time
+        ):
+            integrity_errors.append("成员行的日期、来源、验真状态或发布时间漂移")
+            break
+    actual_hash = _membership_snapshot_hash(
+        [dict(row) for row in raw_rows], member_type=member_type,
+    )
+    if actual_hash != published_hash:
+        integrity_errors.append("完整成员集合canonical hash与发布哈希不一致")
+    if integrity_errors:
+        return {
+            **truth_boundary,
+            "status": "integrity_error",
+            "status_label": "快照完整性失败",
+            "reason": "；".join(integrity_errors),
+            "snapshot_date": target,
+            "requested_date": requested,
+            "selection_mode": "EXACT" if requested else "LATEST_DECLARED",
+            "member_type": member_type,
+            "source": PROVIDER_ID,
+            "runs": run_views,
+            "published_relation_count": expected_count,
+            "verified_relation_count": len(raw_rows),
+            "published_snapshot_hash": published_hash,
+            "replayed_snapshot_hash": actual_hash,
+            "data": [],
+            "snapshot_complete": False,
+            "automatic_real_order_submission": False,
+        }
+
+    normalized_stock = ""
+    if stock_code:
+        normalized_stock = str(stock_code).strip().split(".", 1)[0].zfill(6)
+        if len(normalized_stock) != 6 or not normalized_stock.isdigit():
+            raise ValueError("stock_code must contain a six-digit security code")
+    selected_group = str(group_code or "").strip()
+    filtered = [
+        dict(row) for row in raw_rows
+        if (not selected_group or str(row.get(group_column) or "") == selected_group)
+        and (not normalized_stock or str(row.get("stock_code") or "").zfill(6) == normalized_stock)
+    ]
+    display_rows = []
+    for row in filtered[:limit]:
+        item = {
+            "snapshot_date": target,
+            "source": PROVIDER_ID,
+            "group_code": str(row.get(group_column) or ""),
+            "group_name": str(row.get(group_name_column) or ""),
+            "stock_code": str(row.get("stock_code") or "").zfill(6),
+            "short_name": str(row.get("short_name") or ""),
+            "quality_status": _QMT_MEMBERSHIP_QUALITY,
+            "captured_at": str(row.get("captured_at") or ""),
+        }
+        if member_type == "industry":
+            item["industry_type"] = str(row.get("industry_type") or "")
+        display_rows.append(item)
+    contract = {
+        "schema": "probiga.qmt-membership-history-view.v2",
+        "data_category": truth_boundary["data_category"],
+        "excluded_data_categories": truth_boundary[
+            "excluded_data_categories"
+        ],
+        "snapshot_date": target,
+        "source": PROVIDER_ID,
+        "quality_status": _QMT_MEMBERSHIP_QUALITY,
+        "capture_mode": _QMT_MEMBERSHIP_CAPTURE_MODE,
+        "member_type": member_type,
+        "published_group_count": expected_group_count,
+        "published_relation_count": expected_count,
+        "published_snapshot_hash": published_hash,
+        "captured_at": run_time.isoformat(timespec="seconds") if run_time else "",
+    }
     return {
-        "status": "ok",
+        **truth_boundary,
+        "status": "verified",
+        "status_label": "完整快照已验真",
+        "reason": "完整成员集合的来源、行数、分组数、时间与canonical hash均已重放",
         "snapshot_date": target,
         "requested_date": requested,
+        "selection_mode": "EXACT" if requested else "LATEST_VERIFIED",
         "member_type": member_type,
-        "runs": runs,
-        "total_returned": len(rows),
-        "data": rows,
+        "source": PROVIDER_ID,
+        "quality_status": _QMT_MEMBERSHIP_QUALITY,
+        "capture_mode": _QMT_MEMBERSHIP_CAPTURE_MODE,
+        "captured_at": contract["captured_at"],
+        "runs": run_views,
+        "published_group_count": expected_group_count,
+        "published_relation_count": expected_count,
+        "verified_relation_count": len(raw_rows),
+        "published_snapshot_hash": published_hash,
+        "replayed_snapshot_hash": actual_hash,
+        "snapshot_contract_hash": _canonical_hash(contract),
+        "snapshot_complete": True,
+        "verified_full_snapshot_before_filters": True,
+        "filter_group_code": selected_group,
+        "filter_stock_code": normalized_stock,
+        "filtered_relation_count": len(filtered),
+        "total_returned": len(display_rows),
+        "display_truncated": len(filtered) > len(display_rows),
+        "data": display_rows,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -2089,6 +2916,8 @@ def load_qmt_kline_attestation_status(limit: int = 30) -> dict[str, Any]:
             "message": "旧日K逐行QMT补证尚未在Windows本地数据边界运行",
             "runs": [],
             "mismatches": [],
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         }
     engine = get_kline_engine()
     runs = read_sql_rows(
@@ -2142,6 +2971,8 @@ def load_qmt_kline_attestation_status(limit: int = 30) -> dict[str, Any]:
         "unmatched_rows_are_modified": False,
         "runs": runs,
         "latest_mismatches": mismatches,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -2149,18 +2980,48 @@ def load_persisted_strategy_center_compact(
     trade_date: str = "",
     limit: int = 200,
 ) -> dict[str, Any] | None:
-    """Rebuild the small candidate view from the latest completed persisted run."""
+    """Rebuild the small candidate view from the exact canonical-bound run.
+
+    A strategy-center run is display-authoritative only when the current
+    canonical governance row names its exact ``strategy_center_run_uid``.
+    Selecting the newest standalone ``done`` row would let a legacy/manual
+    writer replace the pool shown by the UI without a canonical governance
+    decision.
+    """
     limit = max(1, min(500, int(limit)))
     requested = normalize_trade_date(trade_date)
     run_where = "AND trade_date = :trade_date" if requested else ""
     params = {"trade_date": requested} if requested else {}
     runs = _db_read(
         f"""
-        SELECT run_uid, trade_date, market_state, state_confidence,
-               source_status, candidate_count, conflict_count, finished_at
-        FROM st_strategy_center_run
-        WHERE status = 'done' {run_where}
-        ORDER BY trade_date DESC, finished_at DESC, created_at DESC
+        SELECT canonical.governance_run_uid,
+               canonical.governance_trade_date,
+               canonical.governance_result_json,
+               canonical.governance_result_hash,
+               canonical.governance_finished_at,
+               center.run_uid, center.trade_date, center.market_state,
+               center.state_confidence, center.source_status,
+               center.candidate_count, center.conflict_count,
+               center.finished_at
+        FROM (
+            SELECT run_uid AS governance_run_uid,
+                   trade_date AS governance_trade_date,
+                   result_json AS governance_result_json,
+                   result_hash AS governance_result_hash,
+                   finished_at AS governance_finished_at
+            FROM st_strategy_governance_run
+            WHERE status = 'COMPLETED' AND is_canonical = 1 {run_where}
+            ORDER BY trade_date DESC, run_revision DESC,
+                     finished_at DESC, created_at DESC, run_uid DESC
+            LIMIT 1
+        ) AS canonical
+        LEFT JOIN st_strategy_center_run AS center
+          ON center.run_uid = JSON_UNQUOTE(JSON_EXTRACT(
+                 canonical.governance_result_json,
+                 '$.strategy_center_run_uid'
+             ))
+         AND center.trade_date = canonical.governance_trade_date
+         AND center.status = 'done'
         LIMIT 1
         """,
         params,
@@ -2168,6 +3029,45 @@ def load_persisted_strategy_center_compact(
     if not runs:
         return None
     run = runs[0]
+    governance_result_json = run.get("governance_result_json")
+    if not isinstance(governance_result_json, str):
+        return None
+    governance_result_hash = str(run.get("governance_result_hash") or "")
+    if (
+        len(governance_result_hash) != 64
+        or any(character not in "0123456789abcdef" for character in governance_result_hash)
+        or hashlib.sha256(governance_result_json.encode("utf-8")).hexdigest()
+        != governance_result_hash
+    ):
+        return None
+    governance_result = _json_value(governance_result_json, None)
+    if not isinstance(governance_result, dict):
+        return None
+    governance_run_uid = str(run.get("governance_run_uid") or "").strip()
+    governance_trade_date = normalize_trade_date(
+        run.get("governance_trade_date")
+    )
+    bound_run_uid = str(
+        governance_result.get("strategy_center_run_uid") or ""
+    ).strip()
+    center_run_uid = str(run.get("run_uid") or "").strip()
+    valid_uid = lambda value: (
+        len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
+    if (
+        not valid_uid(governance_run_uid)
+        or not valid_uid(bound_run_uid)
+        or center_run_uid != bound_run_uid
+        or governance_result.get("is_canonical") is not True
+        or governance_result.get("result_mode") != "CANONICAL_PERSISTED"
+        or str(governance_result.get("run_uid") or "") != governance_run_uid
+        or normalize_trade_date(governance_result.get("trade_date"))
+        != governance_trade_date
+        or normalize_trade_date(run.get("trade_date")) != governance_trade_date
+        or (requested and governance_trade_date != requested)
+    ):
+        return None
     signals = _db_read(
         """
         SELECT stock_code, stock_name, strategy_key, market_state,
@@ -2328,7 +3228,10 @@ def load_persisted_strategy_center_compact(
         ),
         "completed_run_uid": str(run.get("run_uid") or ""),
         "completed_at": str(run.get("finished_at") or ""),
-        "reason": "已完成策略中心运行提供候选源证明",
+        "governance_run_uid": governance_run_uid,
+        "governance_result_hash": governance_result_hash,
+        "canonical_binding_verified": True,
+        "reason": "规范治理结果精确绑定的策略中心运行提供候选源证明",
     }
     return {
         "status": "ok",
@@ -2356,6 +3259,180 @@ def load_persisted_strategy_center_compact(
     }
 
 
+def _dynamic_shadow_trade_session_ordinal(
+    connection: Any, *, trade_date: str,
+) -> int:
+    """Return the exact 1-based open-session ordinal for ``trade_date``.
+
+    A calendar-date hash cannot prove bounded waiting because exchange
+    holidays may skip arbitrary hash positions.  The persisted exchange
+    calendar gives the stable cursor required by the fairness contract.  A
+    missing target session fails closed instead of silently weakening that
+    contract.
+    """
+
+    target = normalize_trade_date(trade_date)
+    if not target:
+        raise ValueError("动态影子轮询缺少有效交易日")
+    row = connection.execute(text("""
+        SELECT COUNT(*) AS trade_session_ordinal,
+               COALESCE(SUM(
+                   CASE WHEN trade_date=:trade_date THEN 1 ELSE 0 END
+               ), 0) AS target_open_session_count
+        FROM si_trade_calendar
+        WHERE trade_status=1 AND trade_date<=:trade_date
+    """), {"trade_date": date.fromisoformat(target)}).mappings().one()
+    target_count = int(row.get("target_open_session_count") or 0)
+    ordinal = int(row.get("trade_session_ordinal") or 0)
+    if target_count != 1 or ordinal < 1:
+        raise RuntimeError(
+            "动态影子公平轮询缺少唯一的权威开市交易日"
+        )
+    return ordinal
+
+
+def _dynamic_shadow_round_robin_plan_ids(
+    plan_groups: Iterable[dict[str, Any]],
+    *,
+    trade_date: str,
+    trade_session_ordinal: int,
+    maximum_paper_orders_per_run: int,
+    maximum_plans_scanned_per_run: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Order shadow plans with a stable, bounded-wait capacity cursor.
+
+    The cursor advances by one full paper-capacity window per authoritative
+    open session.  Therefore, while the eligible strategy set is stable and
+    every strategy supplies a first plan, every first plan reaches the risk
+    scan within ``ceil(strategy_count / capacity)`` consecutive competition
+    runs.  The guarantee is deliberately about scan opportunity, never order
+    acceptance: risk rejection consumes no paper-order capacity.
+    """
+
+    target = normalize_trade_date(trade_date)
+    if not target:
+        raise ValueError("动态影子轮询缺少有效交易日")
+    if (
+        type(trade_session_ordinal) is not int
+        or trade_session_ordinal < 1
+    ):
+        raise ValueError("动态影子轮询缺少有效交易日序号")
+    if (
+        type(maximum_paper_orders_per_run) is not int
+        or maximum_paper_orders_per_run < 1
+    ):
+        raise ValueError("动态影子轮询缺少有效模拟容量")
+    if (
+        type(maximum_plans_scanned_per_run) is not int
+        or maximum_plans_scanned_per_run < maximum_paper_orders_per_run
+    ):
+        raise ValueError("动态影子轮询扫描上限小于模拟容量")
+    normalized: list[dict[str, Any]] = []
+    empty_strategy_keys: list[str] = []
+    seen_strategies: set[str] = set()
+    seen_plans: set[str] = set()
+    for raw in plan_groups:
+        strategy_key = str(raw.get("strategy_key") or "").strip()
+        if not strategy_key or strategy_key in seen_strategies:
+            raise ValueError("动态影子轮询策略身份缺失或重复")
+        seen_strategies.add(strategy_key)
+        plan_ids = [
+            str(value).strip()
+            for value in (raw.get("plan_ids") or ())
+            if str(value).strip()
+        ]
+        if len(plan_ids) != len(set(plan_ids)):
+            raise ValueError("同一动态策略的影子计划身份重复")
+        overlap = seen_plans.intersection(plan_ids)
+        if overlap:
+            raise ValueError("动态影子计划被多个策略重复声明")
+        seen_plans.update(plan_ids)
+        if plan_ids:
+            normalized.append({
+                "strategy_key": strategy_key,
+                "plan_ids": plan_ids,
+            })
+        else:
+            empty_strategy_keys.append(strategy_key)
+    normalized.sort(key=lambda item: item["strategy_key"])
+    empty_strategy_keys.sort()
+    strategy_count = len(normalized)
+    cursor_index = (
+        ((trade_session_ordinal - 1) * maximum_paper_orders_per_run)
+        % strategy_count
+        if strategy_count else 0
+    )
+    normalized = normalized[cursor_index:] + normalized[:cursor_index]
+    ordered_plan_ids: list[str] = []
+    maximum_depth = max(
+        (len(item["plan_ids"]) for item in normalized), default=0
+    )
+    for candidate_index in range(maximum_depth):
+        for item in normalized:
+            if candidate_index < len(item["plan_ids"]):
+                ordered_plan_ids.append(item["plan_ids"][candidate_index])
+    bounded_wait_runs = (
+        math.ceil(strategy_count / maximum_paper_orders_per_run)
+        if strategy_count else 0
+    )
+    stable_strategy_keys = sorted(
+        item["strategy_key"] for item in normalized
+    )
+    fairness_conditions = (
+        "authoritative_open_session_ordinal_increments_by_one",
+        "eligible_strategy_set_hash_remains_stable",
+        "each_eligible_strategy_supplies_at_least_one_plan_per_run",
+        "competition_runs_once_per_open_session",
+        "paper_materializer_continues_scanning_after_risk_rejection",
+        "paper_account_and_risk_controller_remain_available",
+    )
+    payload = {
+        "schema": "probiga.dynamic-shadow-round-robin.v2",
+        "trade_date": target,
+        "trade_session_ordinal": trade_session_ordinal,
+        "selection_policy": (
+            "stable_open_session_capacity_cursor_then_candidate_round_robin"
+        ),
+        "cursor_source": "si_trade_calendar.trade_status=1",
+        "strategy_cursor_index": cursor_index,
+        "cursor_advance_per_session": maximum_paper_orders_per_run,
+        "maximum_paper_orders_per_run": maximum_paper_orders_per_run,
+        "maximum_plans_scanned_per_run": maximum_plans_scanned_per_run,
+        "ordered_strategy_keys": [
+            item["strategy_key"] for item in normalized
+        ],
+        "stable_strategy_set_hash": _canonical_hash(stable_strategy_keys),
+        "strategy_count": strategy_count,
+        "declared_strategy_count": strategy_count + len(empty_strategy_keys),
+        "empty_strategy_count": len(empty_strategy_keys),
+        "empty_strategy_keys_hash": _canonical_hash(empty_strategy_keys),
+        "plan_count": len(ordered_plan_ids),
+        "ordered_plan_ids_hash": _canonical_hash(ordered_plan_ids),
+        "candidate_ordering": "candidate_index_round_robin",
+        "bounded_wait_applies_to": "FIRST_PLAN_RISK_SCAN_OPPORTUNITY",
+        "bounded_wait_maximum_consecutive_competition_runs": (
+            bounded_wait_runs
+        ),
+        "bounded_wait_contract_status": "CONDITIONAL",
+        "bounded_wait_required_conditions": list(fairness_conditions),
+        "current_run_verified_inputs": {
+            "exact_authoritative_open_session_ordinal": True,
+            "participating_strategies_have_first_plan": True,
+            "positive_paper_capacity": True,
+            "scan_limit_covers_paper_capacity": True,
+        },
+        "bounded_wait_guarantees_order_acceptance": False,
+        "risk_rejection_consumes_paper_order_capacity": False,
+        "risk_rejection_counts_as_capacity_underallocation": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return ordered_plan_ids, {
+        **payload,
+        "competition_hash": _canonical_hash(payload),
+    }
+
+
 def _dynamic_execution_signals(
     *,
     trade_date: str,
@@ -2372,7 +3449,7 @@ def _dynamic_execution_signals(
 
         registry = load_registry()
     except Exception as exc:
-        logger.debug("dynamic strategy adapter discovery unavailable: %s", exc)
+        _safe_fallback_log(logging.DEBUG, "dynamic_adapter_discovery", exc)
         return [], [{
             "strategy_key": "",
             "status": "DISCOVERY_UNAVAILABLE",
@@ -2388,6 +3465,12 @@ def _dynamic_execution_signals(
     }
     signals: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
+    shadow_plan_groups: list[dict[str, Any]] = []
+    governance_connection = (
+        current_bound_sql_connection() if persist_receipts else None
+    )
+    if persist_receipts and governance_connection is None:
+        raise RuntimeError("持久化动态适配器回执缺少治理事务连接")
     for strategy in registry:
         if str(strategy.get("source_kind") or "") != "runtime_registry":
             continue
@@ -2447,19 +3530,49 @@ def _dynamic_execution_signals(
             continue
         try:
             execution = execute_dynamic_adapter_candidate_batch(
-                strategy, context
+                strategy, context, adapter_status=adapter,
             )
             receipt = execution["receipt"]
+            shadow_plan_set: dict[str, Any] | None = None
             if persist_receipts:
-                connection = current_bound_sql_connection()
-                if connection is None:
-                    raise RuntimeError("持久化动态适配器回执缺少治理事务连接")
-                persist_strategy_adapter_run_receipt(connection, receipt)
+                persist_strategy_adapter_run_receipt(
+                    governance_connection, receipt
+                )
+                persist_strategy_adapter_candidate_facts(
+                    governance_connection,
+                    candidate_receipt=receipt,
+                    candidates=execution.get("candidate_facts") or (),
+                )
+                if lifecycle == "SHADOW":
+                    shadow_plan_set = (
+                        create_dynamic_shadow_trial_plans_from_candidate_facts(
+                            governance_connection,
+                            strategy=strategy,
+                            candidate_receipt=receipt,
+                            maximum_target_bp=100,
+                        )
+                    )
+                    shadow_plan_groups.append({
+                        "strategy_key": str(
+                            strategy.get("strategy_key") or ""
+                        ),
+                        "strategy_version": str(
+                            strategy.get("current_version") or ""
+                        ),
+                        "plan_ids": tuple(
+                            shadow_plan_set.get("plan_ids") or ()
+                        ),
+                        "status": status,
+                    })
             signals.extend(execution["signals"])
             status.update({
                 "status": "SHADOW_RUN_COMPLETED",
                 "status_label": "影子候选运行完成",
-                "reason": "CandidateBatch输入、输出、身份与运行回执校验通过；未授予资金资格",
+                "reason": (
+                    "CandidateBatch输入、输出、身份与运行回执校验通过；"
+                    "仅current SHADOW且风险复算通过时创建不超过100bp的"
+                    "内部模拟路径，未授予真实下单资格"
+                ),
                 "run_receipt_valid": True,
                 "candidate_receipt_hash": str(
                     receipt.get("receipt_hash") or ""
@@ -2477,6 +3590,25 @@ def _dynamic_execution_signals(
                     receipt.get("completed_at") or ""
                 ),
                 "candidate_run_receipt": dict(receipt),
+                "shadow_trial_plan_count": int(
+                    (shadow_plan_set or {}).get("plan_count") or 0
+                ),
+                "shadow_trial_plan_set_hash": str(
+                    (shadow_plan_set or {}).get("plan_set_hash") or ""
+                ),
+                "shadow_bootstrap_paper_order_count": 0,
+                "shadow_bootstrap_real_order_count": 0,
+                "shadow_bootstrap_result": {
+                    "status": (
+                        "PENDING_GLOBAL_ROUND_ROBIN"
+                        if persist_receipts and lifecycle == "SHADOW"
+                        else "NOT_APPLICABLE_LIFECYCLE"
+                    ),
+                    "paper_order_count": 0,
+                    "real_order_count": 0,
+                    "automatic_real_order_submission": False,
+                    "real_order_authority": False,
+                },
             })
         except Exception as exc:
             if persist_receipts:
@@ -2487,10 +3619,131 @@ def _dynamic_execution_signals(
                 "reason": f"执行适配器候选校验失败：{type(exc).__name__}",
                 "run_receipt_valid": False,
             })
-            logger.warning(
-                "dynamic strategy adapter rejected for %s: %s",
-                strategy.get("strategy_key"), exc,
+            _safe_fallback_log(logging.WARNING, "dynamic_adapter_runtime", exc)
+    if persist_receipts and shadow_plan_groups:
+        from server.trading_v3.paper_execution import (
+            DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN,
+            DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN,
+            materialize_dynamic_shadow_bootstrap_orders,
+        )
+
+        trade_session_ordinal = _dynamic_shadow_trade_session_ordinal(
+            governance_connection,
+            trade_date=trade_date,
+        )
+        ordered_plan_ids, competition = (
+            _dynamic_shadow_round_robin_plan_ids(
+                shadow_plan_groups,
+                trade_date=trade_date,
+                trade_session_ordinal=trade_session_ordinal,
+                maximum_paper_orders_per_run=(
+                    DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
+                ),
+                maximum_plans_scanned_per_run=(
+                    DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN
+                ),
             )
+        )
+        global_bootstrap = materialize_dynamic_shadow_bootstrap_orders(
+            governance_connection,
+            plan_ids=ordered_plan_ids,
+        )
+        priority_rank = {
+            str(strategy_key): index
+            for index, strategy_key in enumerate(
+                competition.get("ordered_strategy_keys") or (), 1
+            )
+        }
+        compact_competition = {
+            key: value for key, value in competition.items()
+            if key != "ordered_strategy_keys"
+        }
+        created_by_plan = {
+            str(item.get("plan_id") or ""): dict(item)
+            for item in (global_bootstrap.get("created") or [])
+            if isinstance(item, dict)
+        }
+        skipped_by_plan = {
+            str(item.get("plan_id") or ""): dict(item)
+            for item in (global_bootstrap.get("skipped") or [])
+            if isinstance(item, dict)
+        }
+        scanned_plan_ids = {
+            str(value) for value in (
+                global_bootstrap.get("scanned_plan_ids") or ()
+            )
+        }
+        for group in shadow_plan_groups:
+            plan_ids = [str(value) for value in group["plan_ids"]]
+            created = [
+                created_by_plan[plan_id]
+                for plan_id in plan_ids if plan_id in created_by_plan
+            ]
+            skipped = [
+                skipped_by_plan[plan_id]
+                for plan_id in plan_ids if plan_id in skipped_by_plan
+            ]
+            scanned_skipped = [
+                item for item in skipped
+                if str(item.get("plan_id") or "") in scanned_plan_ids
+                and not str(item.get("reason") or "").endswith("_DEFERRED")
+            ]
+            capacity_deferred = [
+                item for item in skipped
+                if str(item.get("reason") or "").endswith("_DEFERRED")
+            ]
+            unresolved = [
+                plan_id for plan_id in plan_ids
+                if plan_id not in created_by_plan
+                and plan_id not in skipped_by_plan
+            ]
+            if unresolved:
+                raise RuntimeError("动态影子轮询结果没有覆盖全部持久化计划")
+            per_strategy_result = {
+                "status": str(global_bootstrap.get("status") or "ok"),
+                "created": created,
+                "skipped": skipped,
+                "paper_order_count": len(created),
+                "new_paper_order_count": sum(
+                    item.get("idempotent_replay") is False
+                    for item in created
+                ),
+                "idempotent_paper_order_count": sum(
+                    item.get("idempotent_replay") is True
+                    for item in created
+                ),
+                "scanned_plan_count": sum(
+                    plan_id in scanned_plan_ids for plan_id in plan_ids
+                ),
+                "capacity_opportunity_plan_count": sum(
+                    plan_id in scanned_plan_ids for plan_id in plan_ids
+                ),
+                "risk_or_eligibility_rejected_plan_count": len(
+                    scanned_skipped
+                ),
+                "paper_capacity_consumed_plan_count": len(created),
+                "deferred_plan_count": len(capacity_deferred),
+                "capacity_deferred_plan_count": len(capacity_deferred),
+                "risk_rejection_consumes_paper_order_capacity": False,
+                "risk_rejection_counts_as_capacity_underallocation": False,
+                "maximum_paper_orders_per_run": int(
+                    global_bootstrap.get("maximum_paper_orders_per_run")
+                    or 0
+                ),
+                "strategy_priority_rank": int(
+                    priority_rank.get(str(group["strategy_key"])) or 0
+                ),
+                "global_competition": compact_competition,
+                "real_order_count": 0,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+            group_status = group["status"]
+            group_status.update({
+                "shadow_bootstrap_paper_order_count": len(created),
+                "shadow_bootstrap_real_order_count": 0,
+                "shadow_bootstrap_result": per_strategy_result,
+            })
     return signals, statuses
 
 
@@ -2532,6 +3785,9 @@ def build_strategy_center_snapshot(
         candidates,
         reference_pool=reference_pool,
         dynamic_adapter_statuses=dynamic_adapter_statuses,
+    )
+    strategy_counts = _strategy_discovery_counts(
+        configs, dynamic_adapter_statuses,
     )
     state = market.get("state") or infer_market_state(market)
     gate_status = "ALLOW_NEW_BUY"
@@ -2598,8 +3854,7 @@ def build_strategy_center_snapshot(
         "candidates": candidates,
         "conflicts": conflicts,
         "summary": {
-            "strategy_count": len(STRATEGY_CATALOG),
-            "enabled_count": sum(1 for value in configs.values() if value.get("enabled", True)),
+            **strategy_counts,
             "candidate_count": len(candidates),
             "conflict_count": len(conflicts),
             "buy_count": sum(1 for item in candidates if item.get("final_direction") == "BUY"),

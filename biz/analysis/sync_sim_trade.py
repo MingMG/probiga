@@ -13,6 +13,7 @@
 
 import argparse
 import json
+import os
 import sys
 import logging
 from pathlib import Path as _Path
@@ -25,7 +26,7 @@ if str(_ROOT) not in sys.path:
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
-from server.engine.sim_trade_engine import SimTradeEngine, _is_trade_date, _previous_trade_date
+from server.engine.sim_trade_engine import SimTradeEngine, _previous_trade_date
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,42 +61,17 @@ def ensure_recommendations_for_signal_date(
     min_score: float = 62.0,
     min_kline_coverage: float = 0.80,
 ) -> dict:
-    """Ensure the previous-trading-day AI recommendation exists before signal-pool conversion."""
+    """Read-only prerequisite check; simulation never generates recommendations."""
+    del execution_time, top_n, min_score, min_kline_coverage
     signal_date = (signal_date or "")[:10]
     if not signal_date:
         return {"status": "error", "error": "signal_date is required"}
-    before_count = _recommendation_count(signal_date)
-    if before_count > 0:
-        return {"status": "exists", "signal_date": signal_date, "count": before_count}
-
-    from biz.analysis.sync_analysis_fast import run_batch
-
-    execution_time = execution_time or datetime.now().replace(microsecond=0).isoformat(sep=" ")
-    logger.warning(
-        "AI recommendations missing for %s; running strict recommendation batch before signal preparation",
-        signal_date,
-    )
-    stats = run_batch(
-        engine=get_engine(),
-        trade_date=signal_date,
-        top_n=top_n,
-        min_score=min_score,
-        strict_prev_trade_day=True,
-        execution_time=execution_time,
-        min_kline_coverage=min_kline_coverage,
-        auto_repair_missing_kline=True,
-    )
-    after_count = _recommendation_count(signal_date)
+    count = _recommendation_count(signal_date)
     return {
-        "status": "generated",
+        "status": "exists" if count > 0 else "missing",
         "signal_date": signal_date,
-        "execution_time": execution_time,
-        "before_count": before_count,
-        "after_count": after_count,
-        "analysis_count": stats.analysis_count,
-        "recommendation_count": stats.recommendation_count,
-        "flow_date": stats.flow_date,
-        "hot_date": stats.hot_date,
+        "count": count,
+        "read_only": True,
     }
 
 
@@ -109,26 +85,36 @@ def prepare_signals(
     min_score: float = 62.0,
     min_kline_coverage: float = 0.80,
 ) -> dict:
-    engine = SimTradeEngine()
     trade_date = (trade_date or date.today().isoformat())[:10]
     signal_date = (signal_date or _previous_trade_date(trade_date))[:10]
-    ensure_result = None
-    if ensure_recommendations and _is_trade_date(trade_date) and signal_date:
-        ensure_result = ensure_recommendations_for_signal_date(
-            signal_date,
-            execution_time=execution_time,
-            top_n=top_n,
-            min_score=min_score,
-            min_kline_coverage=min_kline_coverage,
-        )
+    del execution_time, top_n, min_score, min_kline_coverage
+    if ensure_recommendations and (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    ):
+        return {
+            "status": "error",
+            "trade_date": trade_date,
+            "signal_date": signal_date,
+            "error": "--ensure-recommendations is retired in production",
+        }
+    ensure_result = ensure_recommendations_for_signal_date(signal_date)
+    if ensure_result.get("status") != "exists":
+        return {
+            "status": "error",
+            "trade_date": trade_date,
+            "signal_date": signal_date,
+            "error": "上一交易日 AI 推荐不存在，模拟信号池拒绝准备",
+            "recommendation_prerequisite": ensure_result,
+        }
+    engine = SimTradeEngine()
     result = engine.prepare_signal_pool(
         trade_date=trade_date,
         signal_date=signal_date,
         strict=True,
         reset=reset,
     )
-    if ensure_result is not None:
-        result["ensure_recommendations"] = ensure_result
+    result["recommendation_prerequisite"] = ensure_result
     if result.get("status") == "ok":
         logger.info(
             "模拟交易信号池准备完成: trade_date=%s signal_date=%s allowed=%s rejected=%s counts=%s",
@@ -203,6 +189,15 @@ if __name__ == "__main__":
     parser.add_argument("--json", action="store_true", help="JSON 输出")
     parser.add_argument("--skip-outside-intraday", action="store_true", help="非盘中时段直接跳过tick")
     args = parser.parse_args()
+
+    if args.ensure_recommendations and (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    ):
+        raise RuntimeError(
+            "--ensure-recommendations is retired in production; "
+            "the AI recommendation task must complete first"
+        )
 
     trade_date = args.trade_date or (args.date_arg if args.date_arg and args.date_arg.startswith("20") else "")
     if args.prepare_signals:

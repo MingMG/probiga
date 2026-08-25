@@ -1270,57 +1270,49 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["level"], "neutral")
         self.assertTrue(out["label"])
 
-    def test_portfolio_refresh_prices_queues_qmt_without_blocking(self):
-        with patch("server.api.routers.hot_data._read_sql", return_value=[{"stock_code": "000001"}]), \
-             patch("server.api.routers.hot_data._queue_portfolio_qmt_refresh", return_value={
-                 "state": "queued", "refreshed": 0,
-             }) as queue_mock:
+    def test_portfolio_refresh_prices_submits_registered_full_market_task(self):
+        launched = {
+            "accepted": True,
+            "status": "running",
+            "job_id": "a" * 32,
+        }
+        with patch(
+            "server.api.routers.hot_data._launch_registered_scheduler_task",
+            return_value=launched,
+        ) as launch_mock:
             out = hot_data.portfolio_refresh_prices()
 
+        self.assertTrue(out["accepted"])
+        self.assertEqual(out["state"], "running")
+        self.assertIn("已提交后台执行", out["message"])
+        launch_mock.assert_called_once_with(
+            task_type="intraday_realtime",
+            expected_script_path="tools/crawl_realtime_batch.py",
+            script_args_override=(
+                "--only snapshot --min-coverage 0.70 "
+                "--archive-snapshot --skip-closed --json"
+            ),
+        )
+
+    def test_portfolio_refresh_status_uses_scheduler_audit_receipt(self):
+        with patch(
+            "server.api.routers.hot_data._read_sql",
+            side_effect=[
+                [{"id": 17}],
+                [{
+                    "run_uid": "b" * 32,
+                    "status": "running",
+                    "run_at": "2026-08-25 09:31:00",
+                    "finished_at": None,
+                    "output": "",
+                }],
+            ],
+        ):
+            out = hot_data.portfolio_refresh_prices_status()
+
         self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["state"], "queued")
-        self.assertEqual(out["refreshed"], 0)
-        queue_mock.assert_called_once_with(["000001"])
-
-    def test_portfolio_refresh_degraded_state_explains_coverage(self):
-        quotes = {
-            "000001": {"quote_status": "fresh"},
-            "000002": {"quote_status": "stale"},
-        }
-        with hot_data._portfolio_qmt_refresh_lock:
-            hot_data._portfolio_qmt_refresh_thread = None
-            hot_data._portfolio_qmt_refresh_state = {
-                "state": "idle",
-                "started_at": "",
-                "finished_at": "",
-                "requested": 0,
-                "refreshed": 0,
-                "stale": 0,
-                "missing": 0,
-                "error": "",
-            }
-
-        with patch("server.api.routers.hot_data._portfolio_fetch_live_quotes", return_value=quotes) as fetch, \
-             patch("server.api.routers.hot_data._invalidate_portfolio_snapshot_cache"):
-            hot_data._queue_portfolio_qmt_refresh(["000001", "000002", "000003"])
-            hot_data._portfolio_qmt_refresh_thread.join(timeout=1)
-
-        fetch.assert_called_once_with(
-            ["000001", "000002", "000003"],
-            force=True,
-            allow_remote=True,
-        )
-        with hot_data._portfolio_qmt_refresh_lock:
-            state = dict(hot_data._portfolio_qmt_refresh_state)
-        self.assertEqual(state["state"], "degraded")
-        self.assertEqual(state["requested"], 3)
-        self.assertEqual(state["refreshed"], 1)
-        self.assertEqual(state["stale"], 1)
-        self.assertEqual(state["missing"], 1)
-        self.assertEqual(
-            state["error"],
-            "fresh quote coverage 1/3; stale=1; missing=1",
-        )
+        self.assertEqual(out["state"]["state"], "running")
+        self.assertEqual(out["state"]["job_id"], "b" * 32)
 
     def test_portfolio_live_quote_read_does_not_enter_qmt_on_cache_miss(self):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
@@ -1332,7 +1324,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out, {})
         sync_mock.assert_not_called()
 
-    def test_portfolio_live_quote_falls_back_to_sina_when_big_qmt_fails(self):
+    def test_portfolio_force_read_never_calls_remote_market_writers(self):
         fresh_quote = {
             "000001": {
                 "stock_code": "000001",
@@ -1342,26 +1334,13 @@ class HotDataDetailHelperTest(unittest.TestCase):
         }
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set"), \
-             patch("server.api.routers.hot_data._live_quotes_from_current_table", side_effect=[{}, fresh_quote]), \
-             patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=True), \
-             patch("integrations.registry.resolve_source", return_value="bigqmt"), \
-             patch("server.api.routers.hot_data.get_current_engine") as current_engine_mock, \
+             patch("server.api.routers.hot_data._live_quotes_from_current_table", return_value=fresh_quote), \
              patch("tools.run_big_qmt_bridge.sync_big_qmt_realtime", side_effect=RuntimeError("QMT unavailable")) as qmt_mock, \
              patch("tools.sync_market_realtime.sync_market_realtime") as sina_mock:
-            out = hot_data._portfolio_fetch_live_quotes(["000001"], force=True, allow_remote=True)
+            out = hot_data._portfolio_fetch_live_quotes(["000001"], force=True)
 
-        qmt_mock.assert_called_once()
-        current_engine = current_engine_mock.return_value
-        sina_mock.assert_called_once_with(
-            engine=current_engine,
-            codes=["000001"],
-            source="sina",
-            archive_snapshot=False,
-            run_rt_ddl=False,
-            skip_closed=False,
-            min_coverage=0.0,
-            replace_scope="subset",
-        )
+        qmt_mock.assert_not_called()
+        sina_mock.assert_not_called()
         self.assertEqual(out, fresh_quote)
 
     def test_portfolio_live_snapshot_has_positive_intraday_ttl(self):
@@ -2122,7 +2101,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(concept["change_pct"], 3.5)
 
     def test_recommended_progress_uses_long_ttl(self):
-        with patch("server.api.routers.hot_data._recommended_run_history_expire_stale"), \
+        with patch("server.api.routers.hot_data._recommended_run_history_reconcile_scheduler_terminal"), \
              patch("server.api.routers.hot_data._recommended_history_progress", return_value=None), \
              patch("server.api.routers.hot_data._cache_get", return_value={"status": "done"}) as cache_get_mock, \
              patch("server.api.routers.hot_data._job_is_running", return_value=False):
@@ -2140,7 +2119,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "step": "loading",
             "is_running": True,
         }
-        with patch("server.api.routers.hot_data._recommended_run_history_expire_stale"), \
+        with patch("server.api.routers.hot_data._recommended_run_history_reconcile_scheduler_terminal"), \
              patch("server.api.routers.hot_data._cache_get", return_value=cached), \
              patch("server.api.routers.hot_data._recommended_history_progress", return_value=history), \
              patch("server.api.routers.hot_data._job_is_running", return_value=False):
@@ -2150,76 +2129,11 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["percent"], 32)
         self.assertEqual(out["step"], "loading")
 
-    def test_recommended_offline_and_thread_paths_preserve_exact_intraday_cutoff(self):
-        from biz.analysis.sync_analysis_fast import BatchStats
-
-        cutoff = "2026-07-08 10:20:00"
-        with patch(
-            "server.api.routers.hot_data.get_engine", return_value=object()
-        ), patch(
-            "server.api.routers.hot_data.build_child_env", return_value={}
-        ), patch(
-            "server.api.scheduler_runtime.start_detached_python_job",
-            return_value={"pid": 123},
-        ) as start_mock:
-            hot_data._start_recommended_offline_process(
-                run_uid="run-1",
-                trade_date="2026-07-08",
-                min_score=62,
-                top_n=80,
-                strict_prev_trade_day=False,
-                execution_time=cutoff,
-                min_kline_coverage=0.8,
-                auto_repair_missing_kline=False,
-                refresh_realtime=True,
-                use_intraday_current=True,
-            )
-
-        cmd = start_mock.call_args.kwargs["cmd"]
-        self.assertIn("--use-intraday-current", cmd)
-        self.assertEqual(cmd[cmd.index("--execution-time") + 1], cutoff)
-
-        stats = BatchStats("2026-07-08", 1, 1, 50.0, "2026-07-08", "2026-07-08")
-        with patch(
-            "biz.analysis.sync_analysis_fast.run_batch", return_value=stats
-        ) as run_mock:
-            hot_data._run_recommended_batch_in_process(
-                engine=object(),
-                trade_date="2026-07-08",
-                top_n=80,
-                min_score=62,
-                progress_callback=None,
-                strict_prev_trade_day=False,
-                execution_time=cutoff,
-                min_kline_coverage=0.8,
-                auto_repair_missing_kline=False,
-                use_intraday_current=True,
-            )
-
-        self.assertEqual(run_mock.call_args.kwargs["execution_time"], cutoff)
-        self.assertTrue(run_mock.call_args.kwargs["use_intraday_current"])
-
-    def test_recommended_queued_response_autostarts_worker(self):
-        with patch("server.api.routers.hot_data._recommended_run_history_start", return_value="run-1"), \
-             patch("server.api.routers.hot_data._recommended_run_history_update") as update_mock, \
-             patch("server.api.routers.hot_data._web_ai_recommendation_queue_autostart_enabled", return_value=True), \
-             patch("server.api.routers.hot_data._start_recommended_queue_worker", return_value={"pid": 123}) as start_mock, \
-             patch("server.api.routers.hot_data._cache_set") as cache_mock:
-            out = hot_data._queued_recommended_run_response(
-                trade_date="2026-07-06",
-                min_score=50,
-                top_n=80,
-                strict_prev_trade_day=False,
-                execution_time="2026-07-08 08:52:59",
-                refresh_realtime=True,
-            )
-
-        self.assertEqual(out["status"], "queued")
-        self.assertEqual(out["worker"], {"pid": 123})
-        self.assertTrue(out["progress"]["is_running"])
-        start_mock.assert_called_once_with(run_uid="run-1", refresh_realtime=True)
-        update_mock.assert_called()
-        cache_mock.assert_called_once()
+    def test_legacy_recommendation_worker_paths_are_physically_removed(self):
+        self.assertFalse(hasattr(hot_data, "_start_recommended_offline_process"))
+        self.assertFalse(hasattr(hot_data, "_run_recommended_batch_in_process"))
+        self.assertFalse(hasattr(hot_data, "_queued_recommended_run_response"))
+        self.assertFalse(hasattr(hot_data, "_start_recommended_queue_worker"))
 
     def test_recommended_run_context_auto_intraday_uses_current_trade_date(self):
         with patch("server.api.routers.hot_data._market_clock_trade_date_from_calendar", return_value="2026-07-08"), \
@@ -2256,53 +2170,21 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertFalse(out["use_intraday_current"])
         previous_mock.assert_called_once()
 
-    def test_recommended_run_queues_even_when_old_inline_env_enabled(self):
-        run_context = {
-            "trade_date": "2026-07-08",
-            "strict_prev_trade_day": False,
-            "execution_time": "2026-07-08 10:20:00",
-            "refresh_realtime": True,
-            "use_intraday_current": True,
-            "date_policy": "auto",
-            "date_source": "intraday_current",
-        }
-        with patch.dict(os.environ, {"PROBIGA_ALLOW_INLINE_AI_RECOMMENDATION_RUN": "1"}), \
-             patch("server.api.routers.hot_data._resolve_recommended_run_context", return_value=run_context), \
-             patch("server.api.routers.hot_data._recommended_run_history_expire_stale"), \
-             patch("server.api.routers.hot_data._active_recommended_run", return_value=None), \
-             patch("server.api.routers.hot_data._web_ai_recommendation_queue_enabled", return_value=True), \
-             patch("server.api.routers.hot_data._queued_recommended_run_response", return_value={"status": "queued"}) as queue_mock:
+    def test_old_inline_env_cannot_restore_retired_recommendation_paths(self):
+        with patch.dict(
+            os.environ,
+            {"PROBIGA_ALLOW_INLINE_AI_RECOMMENDATION_RUN": "1"},
+        ), patch(
+            "server.api.routers.hot_data._submit_manual_recommended_stocks",
+            return_value={"accepted": False, "status": "strict_gate_blocked"},
+        ) as submit_mock:
             out = hot_data.run_recommended_stocks(
                 trade_date="2026-07-06",
                 execution_time="2026-07-08 10:20:00",
             )
 
-        self.assertEqual(out["status"], "queued")
-        queue_mock.assert_called_once()
-        self.assertEqual(queue_mock.call_args.kwargs["trade_date"], "2026-07-08")
-        self.assertTrue(queue_mock.call_args.kwargs["refresh_realtime"])
-        self.assertEqual(queue_mock.call_args.kwargs["run_context"], run_context)
-
-    def test_queued_recommended_worker_autostart_is_throttled(self):
-        progress = {
-            "status": "queued",
-            "run_uid": "run-1",
-            "trade_date": "2026-07-09",
-            "execution_time": "2026-07-09 10:20:00",
-            "strict_prev_trade_day": False,
-        }
-        with patch("server.api.routers.hot_data._web_ai_recommendation_queue_autostart_enabled", return_value=True), \
-             patch("server.api.routers.hot_data._cache_get", return_value=None) as cache_get_mock, \
-             patch("server.api.routers.hot_data._cache_set") as cache_set_mock, \
-             patch("server.api.routers.hot_data._start_recommended_queue_worker", return_value={"pid": 123}) as start_mock, \
-             patch("server.api.routers.hot_data._recommended_run_history_update") as update_mock:
-            hot_data._maybe_autostart_queued_recommended_worker(progress)
-
-        cache_get_mock.assert_called_once()
-        cache_set_mock.assert_called_once()
-        start_mock.assert_called_once_with(run_uid="run-1", refresh_realtime=True)
-        update_mock.assert_called_once()
-        self.assertEqual(progress["worker"], {"pid": 123})
+        self.assertEqual(out["status"], "strict_gate_blocked")
+        submit_mock.assert_called_once()
 
     def test_recommended_run_history_endpoint_returns_rows(self):
         rows = [{
@@ -2312,7 +2194,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "passed": 12,
             "total": 100,
         }]
-        with patch("server.api.routers.hot_data._ensure_recommended_run_history_table"), \
+        with patch("server.api.routers.hot_data._recommended_run_history_reconcile_scheduler_terminal"), \
+             patch("server.api.routers.hot_data._ensure_recommended_run_history_table"), \
              patch("server.api.routers.hot_data._read_sql", return_value=rows):
             out = hot_data.recommended_stocks_run_history(limit=5)
 
@@ -2320,8 +2203,19 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["data"][0]["run_uid"], "abc")
 
     def test_recommended_run_history_start_and_finish_write_sql(self):
+        build_sha = "c" * 40
+        terminal_row = [{
+            "run_uid": "d" * 32,
+            "status": "done",
+            "scheduler_job_id": None,
+            "build_sha": build_sha,
+            "trigger_source": "scheduled",
+            "finished_at": "2026-06-28 09:01:00",
+        }]
         with patch("server.api.routers.hot_data._ensure_recommended_run_history_table"), \
-             patch("server.api.routers.hot_data._exec_sql") as exec_mock:
+             patch("server.api.routers.hot_data._exec_sql", return_value=1) as exec_mock, \
+             patch("server.api.routers.hot_data._read_sql", return_value=terminal_row), \
+             patch("server.api.routers.hot_data._recommendation_build_sha", return_value=build_sha):
             run_uid = hot_data._recommended_run_history_start(
                 trade_date="2026-06-28",
                 min_score=50,
@@ -2329,6 +2223,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
                 strict_prev_trade_day=True,
                 execution_time="2026-06-28 09:00:00",
                 message="start",
+                run_uid="d" * 32,
             )
             hot_data._recommended_run_history_finish(run_uid, status="done", payload={
                 "total": 100,

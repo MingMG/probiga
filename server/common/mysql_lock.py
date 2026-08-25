@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import logging
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Iterator
 
 from sqlalchemy import text
@@ -18,6 +19,65 @@ from sqlalchemy.engine import Connection, Engine
 
 _LOCK_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 LOGGER = logging.getLogger(__name__)
+
+# Every production writer of ``sm_stock_minute`` must use this one freeze
+# domain.  A table-name-derived lock is unsafe because the QMT receipt barrier,
+# exact-key registry publisher and public minute crawler would otherwise be
+# able to interleave commits while each believed it had exclusive ownership.
+STOCK_MINUTE_FREEZE_LOCK_NAME = "probiga:stock_minute"
+STOCK_KLINE_FREEZE_LOCK_NAME = "probiga:stock_kline"
+CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME = "probiga:capital_flow_daily"
+
+
+def supersede_overlapping_qmt_minute_forward_receipts(
+    engine: Engine,
+    *,
+    first_trade_time: datetime,
+    last_trade_time: datetime,
+    reason: str,
+) -> int:
+    """Revoke authority before a non-QMT writer changes the minute window.
+
+    The authority registry may live on a different MySQL server from the
+    physical minute table, so this transaction deliberately commits before
+    target DML.  A later target failure therefore leaves authority
+    conservatively disabled rather than endorsing stale or mixed rows.
+    Callers must hold ``STOCK_MINUTE_FREEZE_LOCK_NAME`` on the target server
+    for the whole revoke-then-write sequence.
+    """
+
+    if not isinstance(first_trade_time, datetime) or not isinstance(
+        last_trade_time, datetime
+    ):
+        raise TypeError("QMT minute receipt revocation requires datetime bounds")
+    if first_trade_time > last_trade_time:
+        raise ValueError("QMT minute receipt revocation window is invalid")
+    with engine.begin() as connection:
+        result = connection.execute(
+            text(
+                """
+                UPDATE st_qmt_minute_sync_receipt_v2
+                SET forward_eligible=0,
+                    quality_status='SUPERSEDED'
+                WHERE forward_eligible=1
+                  AND quality_status='PASS'
+                  AND first_trade_time<=:last_trade_time
+                  AND last_trade_time>=:first_trade_time
+                """
+            ),
+            {
+                "first_trade_time": first_trade_time,
+                "last_trade_time": last_trade_time,
+            },
+        )
+    revoked = max(0, int(getattr(result, "rowcount", 0) or 0))
+    if revoked:
+        LOGGER.info(
+            "Superseded %s overlapping QMT minute forward receipts before %s",
+            revoked,
+            str(reason or "non-QMT minute publish"),
+        )
+    return revoked
 
 
 @contextmanager

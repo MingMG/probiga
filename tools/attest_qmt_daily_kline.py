@@ -47,14 +47,17 @@ from server.common.qmt_attestation_contract import (
     QMT_ATTESTATION_COLLATION,
     QMT_ATTESTATION_LEGACY_COLLATION,
     QMT_V2_TOLERANCE_VALUES,
-    UNIVERSE_MANIFEST_SCHEMA,
     VOLUME_ABSOLUTE_TOLERANCE,
     VOLUME_REL_TOLERANCE,
     build_qmt_v2_manifest,
+    bound_stock_set_contract,
     canonical_digest,
+    daily_market_source_batch_id,
     expected_stock_set_contract,
     validated_universe_manifest,
 )
+from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.env_config import load_project_env
 
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -237,6 +240,28 @@ _ATTESTATION_INDEX_CONTRACTS: dict[
 }
 
 ATTESTATION_TRIGGER_STATEMENTS = {
+    "trg_qmt_kline_attestation_run_completed_bu": """
+        CREATE TRIGGER trg_qmt_kline_attestation_run_completed_bu
+        BEFORE UPDATE ON qmt_kline_attestation_run
+        FOR EACH ROW
+        BEGIN
+            IF BINARY OLD.status = BINARY 'COMPLETED' THEN
+                SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Completed QMT attestation run is immutable';
+            END IF;
+        END
+    """,
+    "trg_qmt_kline_attestation_run_completed_bd": """
+        CREATE TRIGGER trg_qmt_kline_attestation_run_completed_bd
+        BEFORE DELETE ON qmt_kline_attestation_run
+        FOR EACH ROW
+        BEGIN
+            IF BINARY OLD.status = BINARY 'COMPLETED' THEN
+                SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Completed QMT attestation run cannot be deleted';
+            END IF;
+        END
+    """,
     "trg_qmt_kline_attestation_row_immutable_bu": """
         CREATE TRIGGER trg_qmt_kline_attestation_row_immutable_bu
         BEFORE UPDATE ON qmt_kline_attestation_row
@@ -276,6 +301,22 @@ ATTESTATION_TRIGGER_STATEMENTS = {
 }
 
 _ATTESTATION_TRIGGER_CONTRACTS = {
+    "trg_qmt_kline_attestation_run_completed_bu": (
+        "BEFORE",
+        "UPDATE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run is immutable'; END IF; END",
+    ),
+    "trg_qmt_kline_attestation_run_completed_bd": (
+        "BEFORE",
+        "DELETE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run cannot be deleted'; END IF; END",
+    ),
     "trg_qmt_kline_attestation_row_immutable_bu": (
         "BEFORE",
         "UPDATE",
@@ -306,15 +347,9 @@ _ATTESTATION_TRIGGER_CONTRACTS = {
     ),
 }
 
-# Alibaba Cloud RDS keeps ``log_bin_trust_function_creators`` disabled on the
-# production instance.  QMT evidence integrity is therefore enforced by the
-# application transaction, immutable evidence hashes and the unique source
-# identity below, rather than by database triggers.  Keep these exported
-# mappings empty so older migration tooling also stops planning CREATE TRIGGER
-# statements.  Triggers already installed by an earlier release are unmanaged
-# and may remain in place.
-ATTESTATION_TRIGGER_STATEMENTS.clear()
-_ATTESTATION_TRIGGER_CONTRACTS.clear()
+# Runtime attestation remains DDL-free.  These deterministic statements are
+# consumed by the privileged production trigger broker; the scheduled writer
+# never executes them directly.
 
 
 class QmtAttestationSchemaError(RuntimeError):
@@ -367,10 +402,10 @@ class _SessionLocalDdlConnection:
 @contextmanager
 def _attestation_transaction(engine: Engine, *, schema_prepared: bool):
     with engine.begin() as connection:
-        if schema_prepared:
-            yield _SessionLocalDdlConnection(connection)
-        else:
-            yield connection
+        # Every execution path is runtime code.  ``schema_prepared`` remains
+        # part of the public compatibility contract, but no value may relax
+        # the session-local-only DDL guard.
+        yield _SessionLocalDdlConnection(connection)
 
 
 TOLERANCE_MEDIUMTEXT_MIGRATION_HASH = canonical_digest(
@@ -422,7 +457,7 @@ def _tolerance_json_column_contract(
     )
 
 
-def _ensure_tolerance_json_mediumtext_migration(
+def _privileged_migrate_tolerance_json_mediumtext(
     connection: Connection,
 ) -> None:
     """Apply only the one frozen legacy TEXT -> MEDIUMTEXT upgrade."""
@@ -935,7 +970,7 @@ def _insert_collation_marker(
     )
 
 
-def migrate_legacy_attestation_collation(
+def privileged_migrate_legacy_attestation_collation(
     engine: Engine,
     *,
     writers_fenced: bool,
@@ -1140,27 +1175,23 @@ def migrate_legacy_attestation_collation(
     }
 
 
-def ensure_attestation_tables(
+def migrate_legacy_attestation_collation(
     engine: Engine,
     *,
-    trigger_ddl_executor: Callable[[str], None] | None = None,
-    allow_legacy_manifest_candidates: bool = False,
-) -> None:
-    """Prepare the table, column, index and migration-marker contract.
+    writers_fenced: bool,
+) -> dict[str, Any]:
+    """Compatibility alias for the explicit privileged migration."""
 
-    ``trigger_ddl_executor`` remains as a backward-compatible keyword but is
-    never invoked.  This keeps first-time setup compatible with managed MySQL
-    services that disallow trigger creation while leaving any existing legal
-    triggers untouched.
-    """
+    return privileged_migrate_legacy_attestation_collation(
+        engine,
+        writers_fenced=writers_fenced,
+    )
 
-    if trigger_ddl_executor is not None and not callable(
-        trigger_ddl_executor
-    ):
-        raise TypeError("trigger_ddl_executor must be callable")
-    if type(allow_legacy_manifest_candidates) is not bool:
-        raise TypeError("allow_legacy_manifest_candidates must be bool")
-    table_statements = (
+
+def attestation_table_ddl_statements() -> tuple[str, ...]:
+    """Return the frozen persistent table DDL for the privileged release."""
+
+    return (
         """
         CREATE TABLE IF NOT EXISTS qmt_kline_attestation_run (
             run_id VARCHAR(64) PRIMARY KEY,
@@ -1239,11 +1270,56 @@ def ensure_attestation_tables(
           COLLATE=utf8mb4_unicode_ci
         """,
     )
+
+
+def privileged_migrate_attestation_tables(
+    engine: Engine,
+    *,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+    allow_legacy_manifest_candidates: bool = False,
+) -> dict[str, Any]:
+    """Install the attestation table contract in a fenced release window.
+
+    Attestation triggers remain owned by the production allow-listed broker;
+    the compatibility callback is validated but deliberately not invoked.
+    """
+
+    if trigger_ddl_executor is not None and not callable(
+        trigger_ddl_executor
+    ):
+        raise TypeError("trigger_ddl_executor must be callable")
+    if type(allow_legacy_manifest_candidates) is not bool:
+        raise TypeError("allow_legacy_manifest_candidates must be bool")
     with engine.begin() as connection:
-        for statement in table_statements:
+        for statement in attestation_table_ddl_statements():
             connection.execute(text(statement))
-        _ensure_tolerance_json_mediumtext_migration(connection)
-    validate_attestation_schema(
+        _privileged_migrate_tolerance_json_mediumtext(connection)
+    detail = validate_attestation_schema(
+        engine,
+        require_current_manifests=not allow_legacy_manifest_candidates,
+    )
+    return {
+        **detail,
+        "privileged_migration": True,
+        "runtime_ddl_required": False,
+    }
+
+
+def ensure_attestation_tables(
+    engine: Engine,
+    *,
+    trigger_ddl_executor: Callable[[str], None] | None = None,
+    allow_legacy_manifest_candidates: bool = False,
+) -> dict[str, Any]:
+    """Backward-compatible, read-only runtime schema validation alias."""
+
+    if trigger_ddl_executor is not None and not callable(
+        trigger_ddl_executor
+    ):
+        raise TypeError("trigger_ddl_executor must be callable")
+    if type(allow_legacy_manifest_candidates) is not bool:
+        raise TypeError("allow_legacy_manifest_candidates must be bool")
+    return validate_attestation_schema(
         engine,
         require_current_manifests=not allow_legacy_manifest_candidates,
     )
@@ -1686,11 +1762,7 @@ def attest_range(
 ) -> dict[str, Any]:
     if type(schema_prepared) is not bool:
         raise TypeError("schema_prepared must be bool")
-    if schema_prepared:
-        validate_attestation_schema(engine)
-    else:
-        ensure_attestation_tables(engine)
-        validate_attestation_schema(engine)
+    validate_attestation_schema(engine)
     target_table, source_table = _table_names(
         engine,
         local_history_engine=local_history_engine,
@@ -1730,6 +1802,9 @@ def attest_range(
     match_sql = _match_sql()
     target_temp = "tmp_qmt_attest_target"
     source_temp = "tmp_qmt_attest_source"
+    source_batch_temp = "tmp_qmt_attest_source_batch"
+    calendar_temp = "tmp_qmt_attest_calendar"
+    expected_temp = "tmp_qmt_attest_expected"
     compare_temp = "tmp_qmt_attest_compare"
     try:
         with _attestation_transaction(
@@ -1739,8 +1814,46 @@ def attest_range(
             # two compact temporary tables is substantially faster than
             # repeating random cross-schema lookups for counters, mismatch
             # samples, and the final update.
-            for temporary in (compare_temp, source_temp, target_temp):
+            catalog = load_stock_catalog(
+                connection,
+                decision_known_at=datetime.now().replace(microsecond=0),
+            )
+            calendar_receipt = load_trade_calendar_receipt(
+                connection,
+                start_date=start_date,
+                end_date=end_date,
+                decision_known_at=datetime.now().replace(microsecond=0),
+            )
+            catalog_sessions = calendar_receipt.sessions_between(
+                start_date, end_date
+            )
+            if any(not day for day in catalog_sessions):
+                raise RuntimeError("QMT catalog target session is invalid")
+            catalog_daily_codes = {
+                day: catalog.eligible_codes(day) for day in catalog_sessions
+            }
+            if any(not codes for codes in catalog_daily_codes.values()):
+                raise RuntimeError(
+                    "independent QMT catalog has an empty target-date universe"
+                )
+            for temporary in (
+                compare_temp, source_temp, source_batch_temp, calendar_temp,
+                target_temp, expected_temp,
+            ):
                 connection.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{temporary}`"))
+            connection.execute(text(f"""
+                CREATE TEMPORARY TABLE `{calendar_temp}` (
+                    trade_date DATE NOT NULL PRIMARY KEY
+                ) ENGINE=InnoDB
+            """))
+            if catalog_sessions:
+                connection.execute(text(f"""
+                    INSERT INTO `{calendar_temp}` (trade_date)
+                    VALUES (:trade_date)
+                """), [
+                    {"trade_date": trade_date}
+                    for trade_date in catalog_sessions
+                ])
             connection.execute(
                 text(
                     f"""
@@ -1767,11 +1880,45 @@ def attest_range(
                     FROM {target_table}
                     WHERE trade_date BETWEEN :start_date AND :end_date
                       AND k_type=1 AND adjust_type=0
-                      AND stock_code REGEXP '^(0|3|6)'
+                      AND stock_code REGEXP '^(0|3|4|6|8|9)'
                     """
                 ),
                 params,
             )
+            connection.execute(
+                text(
+                    f"""
+                    CREATE TEMPORARY TABLE `{source_batch_temp}` (
+                        trade_date DATE NOT NULL PRIMARY KEY,
+                        batch_id VARCHAR(64) NOT NULL
+                    ) ENGINE=InnoDB
+                    """
+                )
+            )
+            source_batch_rows = connection.execute(text(f"""
+                SELECT trade_date, batch_id, MAX(received_at) AS latest_received_at
+                FROM {source_table}
+                WHERE trade_date BETWEEN :start_date AND :end_date
+                  AND period='1d' AND k_type=1 AND adjust_type=0
+                  AND provider=:provider
+                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                GROUP BY trade_date, batch_id
+                ORDER BY trade_date, latest_received_at DESC, BINARY batch_id DESC
+            """), params).mappings().all()
+            source_batch_by_date: dict[str, str] = {}
+            for row in source_batch_rows:
+                day = str(row.get("trade_date") or "")[:10]
+                source_batch_id = str(row.get("batch_id") or "").strip()
+                if day and source_batch_id and day not in source_batch_by_date:
+                    source_batch_by_date[day] = source_batch_id
+            if source_batch_by_date:
+                connection.execute(text(f"""
+                    INSERT INTO `{source_batch_temp}` (trade_date, batch_id)
+                    VALUES (:trade_date, :batch_id)
+                """), [
+                    {"trade_date": day, "batch_id": batch_id}
+                    for day, batch_id in sorted(source_batch_by_date.items())
+                ])
             connection.execute(
                 text(
                     f"""
@@ -1799,20 +1946,57 @@ def attest_range(
                         UNIQUE KEY uk_tmp_qmt_attest_source
                             (stock_code, trade_date)
                     ) ENGINE=InnoDB AS
-                    SELECT id AS qmt_id, stock_code, trade_date,
-                           `open`, `close`, `high`, `low`, volume, amount,
-                           pre_close, pre_close_origin,
-                           qmt_code, provider, source_time, received_at,
-                           batch_id, data_version, permission_status
-                    FROM {source_table}
-                    WHERE trade_date BETWEEN :start_date AND :end_date
-                      AND period='1d' AND k_type=1 AND adjust_type=0
-                      AND provider=:provider
-                      AND stock_code REGEXP '^(0|3|6)'
+                    SELECT raw.id AS qmt_id, raw.stock_code, raw.trade_date,
+                           raw.`open`, raw.`close`, raw.`high`, raw.`low`,
+                           raw.volume, raw.amount,
+                           raw.pre_close, raw.pre_close_origin,
+                           raw.qmt_code, raw.provider, raw.source_time,
+                           raw.received_at, raw.batch_id, raw.data_version,
+                           raw.permission_status
+                    FROM {source_table} AS raw
+                    JOIN `{source_batch_temp}` AS selected_batch
+                      ON selected_batch.trade_date=raw.trade_date
+                     AND BINARY selected_batch.batch_id=BINARY raw.batch_id
+                    WHERE raw.trade_date BETWEEN :start_date AND :end_date
+                      AND raw.period='1d' AND raw.k_type=1
+                      AND raw.adjust_type=0
+                      AND raw.provider=:provider
+                      AND raw.stock_code REGEXP '^(0|3|4|6|8|9)'
                     """
                 ),
                 params,
             )
+            connection.execute(text(f"""
+                CREATE TEMPORARY TABLE `{expected_temp}` (
+                    trade_date DATE NOT NULL,
+                    stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                        COLLATE utf8mb4_unicode_ci NOT NULL,
+                    PRIMARY KEY (trade_date, stock_code)
+                ) ENGINE=InnoDB AS
+                SELECT calendar.trade_date, member.stock_code
+                FROM `{calendar_temp}` AS calendar
+                JOIN qmt_stock_catalog_member AS member
+                  ON member.batch_id=:catalog_batch_id
+                 AND member.list_date <= calendar.trade_date
+                 AND (
+                     member.expire_date IS NULL
+                     OR member.expire_date > calendar.trade_date
+                 )
+                WHERE calendar.trade_date BETWEEN :start_date AND :end_date
+            """), {
+                **params,
+                "catalog_batch_id": catalog.batch_id,
+            })
+            expected_rows = int(connection.execute(
+                text(f"SELECT COUNT(*) FROM `{expected_temp}`")
+            ).scalar() or 0)
+            expected_contract_rows = sum(
+                len(codes) for codes in catalog_daily_codes.values()
+            )
+            if expected_rows != expected_contract_rows:
+                raise RuntimeError(
+                    "QMT catalog SQL/Python target-set proof differs"
+                )
             qmt_rows = int(
                 connection.execute(
                     text(f"SELECT COUNT(*) FROM `{source_temp}`")
@@ -1832,6 +2016,44 @@ def attest_range(
                 )).scalar()
                 or 0
             )
+            catalog_missing_target_rows = int(connection.execute(text(f"""
+                SELECT COUNT(*)
+                FROM `{expected_temp}` expected
+                LEFT JOIN `{target_temp}` target
+                  ON target.trade_date=expected.trade_date
+                 AND target.stock_code=expected.stock_code
+                WHERE target.target_id IS NULL
+            """)).scalar() or 0)
+            target_not_catalog_rows = int(connection.execute(text(f"""
+                SELECT COUNT(*)
+                FROM `{target_temp}` target
+                LEFT JOIN `{expected_temp}` expected
+                  ON expected.trade_date=target.trade_date
+                 AND expected.stock_code=target.stock_code
+                WHERE expected.stock_code IS NULL
+            """)).scalar() or 0)
+            catalog_missing_source_rows = int(connection.execute(text(f"""
+                SELECT COUNT(*)
+                FROM `{expected_temp}` expected
+                LEFT JOIN `{source_temp}` source
+                  ON source.trade_date=expected.trade_date
+                 AND source.stock_code=expected.stock_code
+                WHERE source.qmt_id IS NULL
+            """)).scalar() or 0)
+            source_not_catalog_rows = int(connection.execute(text(f"""
+                SELECT COUNT(*)
+                FROM `{source_temp}` source
+                LEFT JOIN `{expected_temp}` expected
+                  ON expected.trade_date=source.trade_date
+                 AND expected.stock_code=source.stock_code
+                WHERE expected.stock_code IS NULL
+            """)).scalar() or 0)
+            universe_gap_rows = sum((
+                catalog_missing_target_rows,
+                target_not_catalog_rows,
+                catalog_missing_source_rows,
+                source_not_catalog_rows,
+            ))
             connection.execute(
                 text(
                     f"""
@@ -1877,14 +2099,7 @@ def attest_range(
             # defensive 30-second DB read timeout even when every row is
             # valid; chunking changes only execution shape, not the snapshot
             # or the final all-or-nothing transaction.
-            compare_session_rows = connection.execute(text(
-                f"SELECT DISTINCT trade_date FROM `{target_temp}` "
-                "ORDER BY trade_date"
-            )).mappings().all()
-            compare_sessions = [
-                str(row.get("trade_date") or "")[:10]
-                for row in compare_session_rows
-            ]
+            compare_sessions = list(catalog_sessions)
             if any(not value for value in compare_sessions):
                 raise RuntimeError("QMT attestation target session is invalid")
             for offset in range(
@@ -1976,7 +2191,8 @@ def attest_range(
             joined_rows = int(aggregate["joined_rows"] or 0)
             mismatched_rows = max(
                 0,
-                joined_rows - matched_rows + source_only_rows,
+                joined_rows - matched_rows + source_only_rows
+                + universe_gap_rows,
             )
             already_attested_rows = int(aggregate["already_attested_rows"] or 0)
             sample_limit = max(0, min(50000, int(mismatch_sample_limit)))
@@ -2055,26 +2271,47 @@ def attest_range(
                             for row in source_only_samples
                         ],
                     )
-            manifest_source_rows = connection.execute(
-                text(
-                    f"SELECT trade_date, stock_code "
-                    f"FROM `{compare_temp}` "
-                    "ORDER BY trade_date, stock_code"
-                )
-            ).mappings().all()
-            daily_stock_codes: dict[str, set[str]] = {}
-            for row in manifest_source_rows:
-                day = str(row.get("trade_date") or "")[:10]
-                stock_code = str(row.get("stock_code") or "").strip()
-                if not day or not stock_code:
-                    raise RuntimeError(
-                        "QMT attestation universe manifest source is invalid"
+            universe_sets_exact = bool(
+                catalog_sessions
+                and set(source_batch_by_date) == set(catalog_sessions)
+                and all(
+                    source_batch_by_date[day]
+                    == daily_market_source_batch_id(
+                        catalog_manifest_hash=catalog.manifest_hash,
+                        calendar_manifest_hash=calendar_receipt.manifest_hash,
                     )
-                daily_stock_codes.setdefault(day, set()).add(stock_code)
-            daily_universe = {
-                day: expected_stock_set_contract(day, stock_codes)
-                for day, stock_codes in sorted(daily_stock_codes.items())
-            }
+                    for day in catalog_sessions
+                )
+                and universe_gap_rows == 0
+                and target_rows == expected_rows
+                and qmt_rows == expected_rows
+            )
+            if universe_sets_exact:
+                daily_universe = {
+                    day: bound_stock_set_contract(
+                        day,
+                        codes,
+                        catalog_batch_id=catalog.batch_id,
+                        catalog_member_count=catalog.member_count,
+                        catalog_member_set_hash=catalog.member_set_hash,
+                        catalog_manifest_hash=catalog.manifest_hash,
+                        source_batch_id=source_batch_by_date[day],
+                        calendar_batch_id=calendar_receipt.batch_id,
+                        calendar_session_set_hash=(
+                            calendar_receipt.session_set_hash
+                        ),
+                        calendar_manifest_hash=calendar_receipt.manifest_hash,
+                        calendar_known_at=calendar_receipt.known_at,
+                    )
+                    for day, codes in sorted(catalog_daily_codes.items())
+                }
+            else:
+                # A failed/partial run records only its planned catalog set.
+                # It must never claim catalog/source/target equality.
+                daily_universe = {
+                    day: expected_stock_set_contract(day, codes)
+                    for day, codes in sorted(catalog_daily_codes.items())
+                }
             run_tolerances = build_qmt_v2_manifest(daily_universe)
             manifest_row_count = sum(
                 int(contract["stock_count"])
@@ -2083,6 +2320,7 @@ def attest_range(
             manifest_complete = bool(
                 daily_universe
                 and manifest_row_count == target_rows
+                and universe_sets_exact
                 and validated_universe_manifest(
                     run_tolerances,
                     start_date=start_date,
@@ -2094,6 +2332,7 @@ def attest_range(
                 target_rows > 0
                 and matched_rows == target_rows
                 and source_only_rows == 0
+                and universe_sets_exact
                 and manifest_complete
             )
             updated_rows = 0
@@ -2265,7 +2504,10 @@ def attest_range(
                     ),
                 },
             )
-            for temporary in (compare_temp, source_temp, target_temp):
+            for temporary in (
+                compare_temp, source_temp, source_batch_temp, calendar_temp,
+                target_temp, expected_temp,
+            ):
                 connection.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{temporary}`"))
         return {
             "run_id": run_id,
@@ -2279,12 +2521,27 @@ def attest_range(
             "matched_rows": matched_rows,
             "missing_qmt_rows": missing_qmt_rows,
             "source_only_rows": source_only_rows,
+            "catalog_batch_id": catalog.batch_id,
+            "catalog_manifest_hash": catalog.manifest_hash,
+            "catalog_member_count": catalog.member_count,
+            "catalog_member_set_hash": catalog.member_set_hash,
+            "source_batch_by_date": dict(sorted(source_batch_by_date.items())),
+            "calendar_batch_id": calendar_receipt.batch_id,
+            "calendar_session_set_hash": calendar_receipt.session_set_hash,
+            "calendar_manifest_hash": calendar_receipt.manifest_hash,
+            "calendar_known_at": calendar_receipt.known_at,
+            "catalog_missing_target_rows": catalog_missing_target_rows,
+            "target_not_catalog_rows": target_not_catalog_rows,
+            "catalog_missing_source_rows": catalog_missing_source_rows,
+            "source_not_catalog_rows": source_not_catalog_rows,
             "mismatched_rows": mismatched_rows,
             "already_attested_rows": already_attested_rows,
             "updated_rows": updated_rows,
             "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
             "tolerances": run_tolerances,
-            "universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
+            "universe_manifest_schema": run_tolerances[
+                "universe_manifest_schema"
+            ],
             "daily_universe": daily_universe,
         }
     except Exception as exc:

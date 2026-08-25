@@ -283,6 +283,7 @@ class QualityGateTaskTest(unittest.TestCase):
                         group_name TEXT,
                         script_path TEXT,
                         script_args TEXT,
+                        date_param_desc TEXT,
                         cron_time TEXT,
                         interval_minutes INTEGER,
                         enabled INTEGER,
@@ -294,7 +295,9 @@ class QualityGateTaskTest(unittest.TestCase):
                         etl_sync_at DATETIME,
                         last_triggered_at DATETIME,
                         last_run_output TEXT,
-                        last_run_duration INTEGER
+                        last_run_duration INTEGER,
+                        last_run_status TEXT,
+                        last_run_at DATETIME
                     )
                     """
                 )

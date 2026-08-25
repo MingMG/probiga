@@ -1,0 +1,819 @@
+from __future__ import annotations
+
+import inspect
+import json
+from datetime import datetime
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine, text
+
+from server.common.qmt_attestation_contract import (
+    bound_stock_set_contract,
+    build_qmt_v2_manifest,
+    canonical_digest,
+    daily_market_source_batch_id,
+    validated_universe_manifest,
+)
+from server.common.qmt_stock_catalog import (
+    CATALOG_STATUS_COMPLETE,
+    NATIVE_A_SHARE_SECTORS,
+    build_catalog_discovery,
+    build_catalog_manifest,
+    load_stock_catalog,
+    privileged_migrate_stock_catalog_schema,
+    ensure_stock_catalog_tables,
+    validate_catalog_manifest,
+)
+from server.common.qmt_trade_calendar import (
+    CALENDAR_STATUS_COMPLETE,
+    build_calendar_manifest,
+    calendar_source_batch_id,
+    load_trade_calendar_receipt,
+    privileged_migrate_trade_calendar_schema,
+    ensure_trade_calendar_tables,
+    validate_calendar_manifest,
+)
+from tools import attest_qmt_daily_kline as attester
+from tools import fetch_sm_stock_kline_daily as daily_fetch
+from tools import sync_guojin_qmt_reference_data as reference_sync
+from tools import prepare_strategy_governance_qmt_history as history_preparation
+from biz.stock_market import sync_stock_market
+
+
+def _members():
+    return [
+        {
+            "qmt_code": "000001.SZ",
+            "stock_code": "000001",
+            "list_date": "1991-04-03",
+            "expire_date": None,
+            "instrument_batch_id": "instrument-batch-1",
+            "instrument_type": "STOCK",
+        },
+        {
+            "qmt_code": "301999.SZ",
+            "stock_code": "301999",
+            "list_date": "2026-08-24",
+            "expire_date": None,
+            "instrument_batch_id": "instrument-batch-1",
+            "instrument_type": "STOCK",
+        },
+        {
+            "qmt_code": "600001.SH",
+            "stock_code": "600001",
+            "list_date": "1990-12-19",
+            "expire_date": "2026-08-24",
+            "instrument_batch_id": "instrument-batch-1",
+            "instrument_type": "STOCK",
+        },
+    ]
+
+
+def _discovery(members):
+    sector_by_exchange = {
+        "SH": "上证A股",
+        "SZ": "深证A股",
+        "BJ": "京市A股",
+    }
+    return build_catalog_discovery(
+        current_sectors=("上证A股", "深证A股", "京市A股", "沪深A股"),
+        expired_sectors=(),
+        sector_members=[
+            {
+                "sector_name": sector_by_exchange[
+                    str(member["qmt_code"]).split(".", 1)[1]
+                ],
+                "qmt_code": member["qmt_code"],
+            }
+            for member in members
+        ],
+    )
+
+
+def _catalog_row(manifest):
+    return {
+        "batch_id": manifest["batch_id"],
+        "captured_at": manifest["captured_at"],
+        "history_complete_from": manifest["history_complete_from"],
+        "status": CATALOG_STATUS_COMPLETE,
+        "member_count": manifest["member_count"],
+        "member_set_hash": manifest["member_set_hash"],
+        "manifest_hash": canonical_digest(manifest),
+    }
+
+
+def _calendar_row(manifest):
+    return {
+        "batch_id": manifest["batch_id"],
+        "source_batch_id": manifest["source_batch_id"],
+        "known_at": manifest["known_at"],
+        "start_date": manifest["start_date"],
+        "end_date": manifest["end_date"],
+        "status": CALENDAR_STATUS_COMPLETE,
+        "session_count": manifest["session_count"],
+        "session_set_hash": manifest["session_set_hash"],
+        "manifest_hash": canonical_digest(manifest),
+    }
+
+
+def test_qmt_calendar_receipt_freezes_sessions_known_at_and_source_batch():
+    source_batch_id = calendar_source_batch_id(
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        sessions=["2026-08-21", "2026-08-24"],
+    )
+    manifest, sessions = build_calendar_manifest(
+        batch_id="calendar-batch-1",
+        source_batch_id=source_batch_id,
+        known_at="2026-08-24 03:20:00",
+        start_date="2026-08-01",
+        end_date="2026-08-31",
+        sessions=["2026-08-21", "2026-08-24"],
+    )
+    receipt = validate_calendar_manifest(
+        manifest, row=_calendar_row(manifest), sessions=sessions
+    )
+
+    assert receipt.sessions_between("2026-08-22", "2026-08-24") == [
+        "2026-08-24"
+    ]
+    assert receipt.source_batch_id == source_batch_id
+    assert receipt.known_at == "2026-08-24 03:20:00"
+
+    tampered = {**manifest, "session_count": 1}
+    with pytest.raises(ValueError, match="manifest content differs"):
+        validate_calendar_manifest(
+            tampered, row=_calendar_row(manifest), sessions=sessions
+        )
+
+    with pytest.raises(ValueError, match="payload-bound"):
+        build_calendar_manifest(
+            batch_id="calendar-batch-2",
+            source_batch_id="f" * 64,
+            known_at="2026-08-24 03:20:00",
+            start_date="2026-08-01",
+            end_date="2026-08-31",
+            sessions=sessions,
+        )
+
+
+class _CalendarDdlConnection:
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+
+        class _Result:
+            def mappings(self):
+                return self
+
+            def all(self):
+                return [
+                    {
+                        "TRIGGER_NAME": name,
+                        "EVENT_MANIPULATION": event,
+                        "ACTION_TIMING": "BEFORE",
+                        "ACTION_STATEMENT": (
+                            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
+                            "'append-only'"
+                        ),
+                        "EVENT_OBJECT_TABLE": table_name,
+                    }
+                    for name, table_name, event in (
+                        ("trg_qmt_calendar_batch_no_update", "qmt_trade_calendar_batch", "UPDATE"),
+                        ("trg_qmt_calendar_batch_no_delete", "qmt_trade_calendar_batch", "DELETE"),
+                        ("trg_qmt_calendar_session_no_update", "qmt_trade_calendar_session", "UPDATE"),
+                        ("trg_qmt_calendar_session_no_delete", "qmt_trade_calendar_session", "DELETE"),
+                    )
+                ]
+
+        return _Result()
+
+
+class _CalendarDdlEngine:
+    def __init__(self):
+        self.connection = _CalendarDdlConnection()
+
+    def begin(self):
+        connection = self.connection
+
+        class _Scope:
+            def __enter__(self):
+                return connection
+
+            def __exit__(self, *_args):
+                return False
+
+        return _Scope()
+
+    def connect(self):
+        return self.begin()
+
+
+def test_qmt_calendar_schema_installs_database_append_only_guards():
+    engine = _CalendarDdlEngine()
+    privileged_migrate_trade_calendar_schema(engine)
+    ddl = "\n".join(engine.connection.statements)
+
+    assert ddl.index("CREATE TABLE IF NOT EXISTS qmt_trade_calendar_session") < (
+        ddl.index("trg_qmt_calendar_session_no_update")
+    )
+    assert ddl.count("BEFORE UPDATE ON qmt_trade_calendar_") == 2
+    assert ddl.count("BEFORE DELETE ON qmt_trade_calendar_") == 2
+    assert ddl.count("SIGNAL SQLSTATE '45000'") == 4
+
+
+def test_qmt_calendar_loader_hides_receipts_unknown_at_decision_time():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    start_date = "2026-08-01"
+    end_date = "2026-08-31"
+    receipts = []
+    for batch_id, known_at, sessions in (
+        ("known-batch", "2026-08-24 10:00:00", ["2026-08-21"]),
+        (
+            "future-batch",
+            "2026-08-25 10:00:00",
+            ["2026-08-21", "2026-08-24"],
+        ),
+    ):
+        source_id = calendar_source_batch_id(
+            start_date=start_date,
+            end_date=end_date,
+            sessions=sessions,
+        )
+        manifest, normalized = build_calendar_manifest(
+            batch_id=batch_id,
+            source_batch_id=source_id,
+            known_at=known_at,
+            start_date=start_date,
+            end_date=end_date,
+            sessions=sessions,
+        )
+        receipts.append((manifest, normalized))
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_trade_calendar_batch (
+                batch_id TEXT PRIMARY KEY, source_batch_id TEXT,
+                known_at TEXT, start_date TEXT, end_date TEXT, status TEXT,
+                session_count INTEGER, session_set_hash TEXT,
+                manifest_json TEXT, manifest_hash TEXT
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_trade_calendar_session (
+                batch_id TEXT, trade_date TEXT
+            )
+        """))
+        for manifest, sessions in receipts:
+            connection.execute(text("""
+                INSERT INTO qmt_trade_calendar_batch
+                VALUES (:batch_id, :source_batch_id, :known_at, :start_date,
+                        :end_date, 'COMPLETE', :session_count,
+                        :session_set_hash, :manifest_json, :manifest_hash)
+            """), {
+                **manifest,
+                "manifest_json": json.dumps(
+                    manifest, sort_keys=True, separators=(",", ":")
+                ),
+                "manifest_hash": canonical_digest(manifest),
+            })
+            connection.execute(text("""
+                INSERT INTO qmt_trade_calendar_session
+                (batch_id, trade_date) VALUES (:batch_id, :trade_date)
+            """), [
+                {"batch_id": manifest["batch_id"], "trade_date": day}
+                for day in sessions
+            ])
+
+    with engine.connect() as connection:
+        receipt = load_trade_calendar_receipt(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            decision_known_at="2026-08-24 12:00:00",
+        )
+
+    assert receipt.batch_id == "known-batch"
+    assert receipt.sessions == ("2026-08-21",)
+
+
+def test_governance_history_window_cannot_drift_with_mutable_calendar():
+    source = inspect.getsource(history_preparation)
+    session_source = inspect.getsource(
+        history_preparation._latest_closed_sessions
+    )
+    close_source = inspect.getsource(
+        history_preparation.authoritative_closed_trade_date
+    )
+
+    assert "si_trade_calendar" not in source
+    assert "load_trade_calendar_receipt" in session_source
+    assert "decision_known_at=" in session_source
+    assert "load_trade_calendar_receipt" in close_source
+    assert "decision_known_at=" in close_source
+
+
+def test_target_date_catalog_adds_new_ipo_and_excludes_expired_member():
+    manifest, members = build_catalog_manifest(
+        batch_id="catalog-batch-1",
+        captured_at="2026-08-24 18:00:00",
+        history_complete_from="1990-01-01",
+        members=_members(),
+        discovery=_discovery(_members()),
+    )
+    catalog = validate_catalog_manifest(
+        json.dumps(manifest), row=_catalog_row(manifest), members=members
+    )
+
+    assert catalog.eligible_codes("2026-08-23") == ["000001", "600001"]
+    assert catalog.eligible_codes("2026-08-24") == ["000001", "301999"]
+    with pytest.raises(RuntimeError, match="does not prove"):
+        catalog.eligible_codes("1989-12-31")
+
+
+def test_expired_code_collision_rejects_index_as_equity():
+    index_member = {
+        "qmt_code": "000001.SH",
+        "stock_code": "000001",
+        "list_date": "1991-07-15",
+        "expire_date": "2026-08-24",
+        "instrument_batch_id": "qmt-history-contracts",
+        "instrument_type": "INDEX",
+    }
+    with pytest.raises(ValueError, match="not proven as equity"):
+        build_catalog_manifest(
+            batch_id="collision-batch",
+            captured_at="2026-08-24 18:00:00",
+            history_complete_from="1991-07-15",
+            members=[index_member],
+            discovery=build_catalog_discovery(
+                current_sectors=NATIVE_A_SHARE_SECTORS,
+                expired_sectors=["过期指数"],
+                sector_members=[{
+                    "sector_name": "过期指数",
+                    "qmt_code": "000001.SH",
+                }],
+            ),
+        )
+
+
+class _CatalogDdlConnection:
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+
+        class _Result:
+            def mappings(self):
+                return self
+
+            def all(self):
+                return [
+                    {
+                        "TRIGGER_NAME": name,
+                        "EVENT_MANIPULATION": event,
+                        "ACTION_TIMING": "BEFORE",
+                        "ACTION_STATEMENT": (
+                            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
+                            "'append-only'"
+                        ),
+                        "EVENT_OBJECT_TABLE": table_name,
+                    }
+                    for name, table_name, event in (
+                        ("trg_qmt_stock_catalog_batch_no_update", "qmt_stock_catalog_batch", "UPDATE"),
+                        ("trg_qmt_stock_catalog_batch_no_delete", "qmt_stock_catalog_batch", "DELETE"),
+                        ("trg_qmt_stock_catalog_member_no_update", "qmt_stock_catalog_member", "UPDATE"),
+                        ("trg_qmt_stock_catalog_member_no_delete", "qmt_stock_catalog_member", "DELETE"),
+                    )
+                ]
+
+        return _Result()
+
+
+class _CatalogDdlEngine:
+    def __init__(self):
+        self.connection = _CatalogDdlConnection()
+
+    def begin(self):
+        connection = self.connection
+
+        class _Scope:
+            def __enter__(self):
+                return connection
+
+            def __exit__(self, *_args):
+                return False
+
+        return _Scope()
+
+    def connect(self):
+        return self.begin()
+
+
+def test_qmt_stock_catalog_schema_installs_database_append_only_guards():
+    engine = _CatalogDdlEngine()
+    privileged_migrate_stock_catalog_schema(engine)
+    ddl = "\n".join(engine.connection.statements)
+
+    assert ddl.index("CREATE TABLE IF NOT EXISTS qmt_stock_catalog_member") < (
+        ddl.index("trg_qmt_stock_catalog_member_no_update")
+    )
+    assert ddl.count("BEFORE UPDATE ON qmt_stock_catalog_") == 2
+    assert ddl.count("BEFORE DELETE ON qmt_stock_catalog_") == 2
+    assert ddl.count("SIGNAL SQLSTATE '45000'") == 4
+
+
+def test_qmt_stock_catalog_loader_hides_future_metadata():
+    engine = create_engine("sqlite:///:memory:", future=True)
+    batches = []
+    for batch_id, captured_at, history_from in (
+        ("known-catalog", "2026-08-24 10:00:00", "2026-08-01"),
+        ("future-catalog", "2026-08-25 10:00:00", "1990-01-01"),
+    ):
+        manifest, members = build_catalog_manifest(
+            batch_id=batch_id,
+            captured_at=captured_at,
+            history_complete_from=history_from,
+            members=_members(),
+            discovery=_discovery(_members()),
+        )
+        batches.append((manifest, members))
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_stock_catalog_batch (
+                batch_id TEXT PRIMARY KEY, captured_at TEXT,
+                history_complete_from TEXT, status TEXT, member_count INTEGER,
+                member_set_hash TEXT, manifest_json TEXT, manifest_hash TEXT
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_stock_catalog_member (
+                batch_id TEXT, qmt_code TEXT, stock_code TEXT, list_date TEXT,
+                expire_date TEXT, instrument_batch_id TEXT,
+                instrument_type TEXT
+            )
+        """))
+        for manifest, members in batches:
+            connection.execute(text("""
+                INSERT INTO qmt_stock_catalog_batch VALUES
+                (:batch_id, :captured_at, :history_complete_from, 'COMPLETE',
+                 :member_count, :member_set_hash, :manifest_json, :manifest_hash)
+            """), {
+                **manifest,
+                "manifest_json": json.dumps(manifest),
+                "manifest_hash": canonical_digest(manifest),
+            })
+            connection.execute(text("""
+                    INSERT INTO qmt_stock_catalog_member VALUES
+                    (:batch_id, :qmt_code, :stock_code, :list_date, :expire_date,
+                     :instrument_batch_id, :instrument_type)
+            """), [{"batch_id": manifest["batch_id"], **member}
+                      for member in members])
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at="2026-08-24 12:00:00",
+        )
+
+    assert catalog.batch_id == "known-catalog"
+    assert catalog.history_complete_from == "2026-08-01"
+
+
+def test_historical_archive_imports_expired_instrument_and_rejects_tamper(
+    tmp_path,
+):
+    raw_member = {
+        "qmt_code": "600001.SH",
+        "stock_code": "600001",
+        "list_date": "1990-12-19",
+        "expire_date": "2026-08-24",
+        "instrument_type": "STOCK",
+    }
+    unsigned = {
+        "schema": reference_sync.HISTORICAL_INSTRUMENT_ARCHIVE_SCHEMA,
+        "source_export_id": "native-qmt-export-20260824",
+        "history_complete_from": "1990-12-19",
+        "members": [raw_member],
+    }
+    payload = {**unsigned, "payload_hash": canonical_digest(unsigned)}
+    archive_path = tmp_path / "qmt-instrument-archive.json"
+    archive_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    history_from, members = reference_sync._load_historical_instrument_archive(
+        str(archive_path)
+    )
+    assert history_from == "1990-12-19"
+    assert members[0]["expire_date"] == "2026-08-24"
+    assert members[0]["instrument_batch_id"] == payload["payload_hash"]
+
+    payload["members"][0]["expire_date"] = None
+    archive_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="root differs"):
+        reference_sync._load_historical_instrument_archive(str(archive_path))
+
+
+def test_scheduled_reference_capture_is_ddl_free_and_schema_is_privileged():
+    runtime_source = inspect.getsource(reference_sync.sync_reference_data)
+    prepare_source = inspect.getsource(reference_sync.prepare_reference_tables)
+    migration_source = inspect.getsource(
+        reference_sync.privileged_migrate_reference_schema
+    )
+    validate_source = inspect.getsource(reference_sync.validate_reference_tables)
+
+    assert "validate_reference_tables(engine)" in runtime_source
+    assert "prepare_reference_tables(engine)" not in runtime_source
+    assert "CREATE TABLE" not in runtime_source
+    assert "CREATE TRIGGER" not in runtime_source
+    assert "CREATE TABLE" not in prepare_source
+    assert "ALTER TABLE" not in prepare_source
+    assert "validate_reference_tables(engine)" in prepare_source
+    assert "privileged_migrate_stock_catalog_schema" in migration_source
+    assert "privileged_migrate_trade_calendar_schema" in migration_source
+    assert "qmt_reference_schema_contract" in validate_source
+    assert "REFERENCE_SCHEMA_CONTRACT_HASH" in validate_source
+    assert "information_schema.TRIGGERS" not in validate_source
+
+
+def test_legacy_ensure_aliases_are_read_only_runtime_validators():
+    for function in (
+        ensure_stock_catalog_tables,
+        ensure_trade_calendar_tables,
+    ):
+        source = inspect.getsource(function).upper()
+        assert "CREATE TABLE" not in source
+        assert "ALTER TABLE" not in source
+        assert "CREATE TRIGGER" not in source
+        assert "VALIDATE_" in source
+
+
+def test_privileged_reference_migration_can_defer_triggers_to_release_broker(
+    monkeypatch,
+):
+    class _Connection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, _params=None):
+            self.statements.append(str(statement))
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            connection = self.connection
+
+            class _Scope:
+                def __enter__(self):
+                    return connection
+
+                def __exit__(self, *_args):
+                    return False
+
+            return _Scope()
+
+    engine = _Engine()
+    monkeypatch.setattr(reference_sync, "_table_columns", lambda *_args: set())
+
+    result = reference_sync.privileged_migrate_reference_schema(
+        engine,
+        install_triggers=False,
+        attest_schema=False,
+    )
+
+    sql = "\n".join(engine.connection.statements).upper()
+    assert "CREATE TABLE" in sql
+    assert "ALTER TABLE" in sql
+    assert "CREATE TRIGGER" not in sql
+    assert result["privileged_migration"] is True
+    assert result["triggers_installed"] is False
+    assert result["schema_attested"] is False
+
+
+def test_missing_bar_never_removes_member_from_next_target_universe():
+    manifest, members = build_catalog_manifest(
+        batch_id="catalog-batch-1",
+        captured_at="2026-08-24 18:00:00",
+        history_complete_from="1990-01-01",
+        members=_members(),
+        discovery=_discovery(_members()),
+    )
+    catalog = validate_catalog_manifest(
+        manifest, row=_catalog_row(manifest), members=members
+    )
+    prior_day_bar_codes = {"000001"}
+
+    assert "301999" not in prior_day_bar_codes
+    assert "301999" in catalog.eligible_codes("2026-08-25")
+    source = inspect.getsource(daily_fetch._read_stock_codes)
+    assert "load_target_stock_catalog" in source
+    assert "sm_stock_kline" not in source
+
+
+def test_native_qmt_sector_discovery_includes_code_absent_from_si_all_code(
+    monkeypatch,
+):
+    rows = []
+    for sector_name, code in (
+        ("上证A股", "600000.SH"),
+        ("深证A股", "000001.SZ"),
+        ("京市A股", "830001.BJ"),
+        ("沪深A股", "301999.SZ"),
+    ):
+        rows.append({
+            "sector_name": sector_name,
+            "qmt_code": code,
+            "stock_code": code[:6],
+        })
+    monkeypatch.setattr(
+        reference_sync.bridge,
+        "sector_members_many",
+        lambda *_args, **_kwargs: pd.DataFrame(rows),
+    )
+
+    assert reference_sync._discover_native_stock_qmt_codes() == [
+        "000001.SZ",
+        "301999.SZ",
+        "600000.SH",
+        "830001.BJ",
+    ]
+    assert "si_all_code" not in inspect.getsource(
+        reference_sync._discover_native_stock_qmt_codes
+    )
+
+
+def test_ninety_percent_threshold_cannot_authorize_a_daily_write(
+    monkeypatch, capsys,
+):
+    monkeypatch.delenv("KLINE_DAILY_MAX_STOCKS", raising=False)
+    monkeypatch.setattr(daily_fetch, "_mysql_url", lambda: "mysql://test")
+    monkeypatch.setattr(daily_fetch, "create_engine", lambda *_a, **_k: object())
+    monkeypatch.setattr(
+        daily_fetch,
+        "_read_stock_codes",
+        lambda *_a, **_k: (
+            ["000001"],
+            "qmt_stock_catalog:batch",
+            {
+                "catalog_batch_id": "batch",
+                "catalog_manifest_hash": "a" * 64,
+                "catalog_member_count": 1,
+                "catalog_member_set_hash": "b" * 64,
+                "stock_count": 1,
+                "stock_set_hash": "c" * 64,
+            },
+        ),
+    )
+
+    assert daily_fetch.fetch_daily_kline(
+        "2026-08-24", min_coverage=0.90
+    ) == 2
+    assert "100%" in capsys.readouterr().out
+
+
+def test_source_target_same_missing_member_is_rejected_by_catalog_gap_gate():
+    source = inspect.getsource(attester.attest_range)
+
+    assert "catalog_missing_target_rows" in source
+    assert "catalog_missing_source_rows" in source
+    assert "target_not_catalog_rows" in source
+    assert "source_not_catalog_rows" in source
+    assert "universe_gap_rows == 0" in source
+    assert "and universe_sets_exact" in source
+    assert "bound_stock_set_contract" in source
+    assert "source_batch_by_date" in source
+    assert "BINARY selected_batch.batch_id=BINARY raw.batch_id" in source
+
+
+def test_canonical_qmt_daily_writer_requires_exact_sets_and_atomic_replace():
+    source = inspect.getsource(sync_stock_market._step_stock_kline_qmt)
+
+    assert "load_stock_catalog" in source
+    assert "member_by_code" in source
+    assert "observed != expected" in source
+    assert "_create_temporary_stage(" in source
+    assert "_publish_temporary_stage(" in source
+    assert "persist_daily_kline_capture(" in source
+    assert "load_trade_calendar_receipt" in source
+    assert "capture_batch_id = daily_market_source_batch_id(" in source
+    assert "coverage <" not in source
+    assert "_upsert_qmt_kline_frame" not in source
+
+    attestation_source = inspect.getsource(attester.attest_range)
+    assert "daily_market_source_batch_id(" in (
+        attestation_source
+    )
+
+
+def test_catalog_manifest_and_bound_attestation_tampering_fail_closed():
+    manifest, members = build_catalog_manifest(
+        batch_id="catalog-batch-1",
+        captured_at="2026-08-24 18:00:00",
+        history_complete_from="1990-01-01",
+        members=_members(),
+        discovery=_discovery(_members()),
+    )
+    tampered_catalog = {**manifest, "member_count": manifest["member_count"] - 1}
+    with pytest.raises(ValueError, match="manifest content differs"):
+        validate_catalog_manifest(
+            tampered_catalog,
+            row=_catalog_row(manifest),
+            members=members,
+        )
+
+    daily = bound_stock_set_contract(
+        "2026-08-24",
+        ["000001", "301999"],
+        catalog_batch_id=manifest["batch_id"],
+        catalog_member_count=manifest["member_count"],
+        catalog_member_set_hash=manifest["member_set_hash"],
+        catalog_manifest_hash=canonical_digest(manifest),
+        source_batch_id=daily_market_source_batch_id(
+            catalog_manifest_hash=canonical_digest(manifest),
+            calendar_manifest_hash="e" * 64,
+        ),
+        calendar_batch_id="calendar-batch-1",
+        calendar_session_set_hash="d" * 64,
+        calendar_manifest_hash="e" * 64,
+        calendar_known_at="2026-08-24 18:00:00",
+    )
+    bound_manifest = build_qmt_v2_manifest({"2026-08-24": daily})
+    bound_manifest["daily_universe"]["2026-08-24"][
+        "source_stock_count"
+    ] -= 1
+    with pytest.raises(ValueError, match="catalog/source/target"):
+        validated_universe_manifest(
+            bound_manifest,
+            start_date="2026-08-24",
+            end_date="2026-08-24",
+        )
+
+
+class _AtomicConnection:
+    def __init__(self):
+        self.statements = []
+
+    def execute(self, statement, params=None):
+        self.statements.append((str(statement), params))
+
+
+class _AtomicTransaction:
+    def __init__(self, connection):
+        self.connection = connection
+        self.rolled_back = False
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, exc_type, _exc, _tb):
+        self.rolled_back = exc_type is not None
+        return False
+
+
+class _AtomicEngine:
+    def __init__(self):
+        self.connection = _AtomicConnection()
+        self.transaction = _AtomicTransaction(self.connection)
+
+    def begin(self):
+        return self.transaction
+
+
+def test_daily_kline_delegates_exact_business_keys_to_atomic_helper(monkeypatch):
+    engine = _AtomicEngine()
+    frame = pd.DataFrame([{
+        "stock_code": "000001",
+        "short_name": "平安银行",
+        "trade_time": datetime(2026, 8, 24, 15, 0),
+        "trade_date": "2026-08-24",
+        "k_type": 1,
+        "adjust_type": 0,
+        "open": 10.0,
+        "close": 10.1,
+        "high": 10.2,
+        "low": 9.9,
+        "volume": 1000.0,
+        "amount": 10000.0,
+        "change": 0.1,
+        "change_pct": 1.0,
+        "turnover_ratio": 0.1,
+        "pre_close": 10.0,
+    }])
+
+    def fail_write(_frame, table_name, target_engine, **kwargs):
+        assert target_engine is engine
+        assert table_name == "sm_stock_kline"
+        assert kwargs["key_columns"] == (
+            "stock_code", "trade_date", "k_type", "adjust_type",
+        )
+        assert kwargs["lock_name"] == "probiga:stock_kline"
+        raise RuntimeError("insert failed")
+
+    monkeypatch.setattr(daily_fetch, "replace_table_rows_exact_keys", fail_write)
+    with pytest.raises(RuntimeError, match="insert failed"):
+        daily_fetch._write_daily_kline(engine, "2026-08-24", frame)

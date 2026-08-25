@@ -8,7 +8,10 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 
-from server.ai_bridge.schema import reset_ai_bridge_schema_cache
+from server.ai_bridge.schema import (
+    privileged_migrate_ai_bridge_schema,
+    reset_ai_bridge_schema_cache,
+)
 from server.api.admin_auth import is_admin_protected_path
 from server.api.routers import ai_bridge as ai_bridge_router
 from server.common.config import get_settings
@@ -22,6 +25,7 @@ def _client(monkeypatch, tmp_path) -> tuple[TestClient, object]:
         connect_args={"check_same_thread": False},
     )
     reset_ai_bridge_schema_cache(engine)
+    privileged_migrate_ai_bridge_schema(engine)
     monkeypatch.setenv("PROBIGA_AI_BRIDGE_TOKEN", "bridge-secret")
     get_settings.cache_clear()
     monkeypatch.setattr(ai_bridge_router, "get_engine", lambda: engine)

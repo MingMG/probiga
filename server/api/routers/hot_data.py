@@ -8,6 +8,7 @@ import time as _time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from socket import gethostname
 
 import pandas as pd
 from fastapi import APIRouter, Query
@@ -15,6 +16,10 @@ from fastapi.responses import HTMLResponse, Response
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.api.scheduler_runtime import (
+    launch_scheduler_task,
+    request_stop_owned_scheduler_task,
+)
 from server.common.current_data import get_current_engine, should_use_current_engine
 from server.common.kline_data import get_kline_engine, should_use_kline_engine
 from server.common.minute_data import (
@@ -23,10 +28,16 @@ from server.common.minute_data import (
     minute_source_info,
     should_use_capital_flow_engine,
 )
-from server.common.process_env import build_child_env
 from server.common.adata_release import ensure_adata_import_path
 from server.common.config import get_api_cache_config, get_settings
 from server.common.batch_db import quote_identifier, write_frame
+from server.common.recommended_run_history_schema import (
+    validate_recommended_run_history_schema,
+)
+from server.common.portfolio_schema import validate_portfolio_runtime_schema
+from server.common.manual_scheduler_launch import (
+    launch_registered_scheduler_task as launch_registered_manual_task,
+)
 from server.common.sql_reader import read_sql_rows
 from server.common.tech_risk import (
     build_tech_risk_signal,
@@ -93,24 +104,14 @@ _job_running: dict[str, bool] = {
     "recommended_stocks": False,
     "market_refresh": False,
 }
-_portfolio_qmt_refresh_lock = _threading.Lock()
 _portfolio_snapshot_build_lock = _threading.Lock()
 _portfolio_snapshot_generation = 0
 _portfolio_completed_force_requests: OrderedDict[str, tuple[int, float]] = OrderedDict()
-_portfolio_qmt_refresh_thread: _threading.Thread | None = None
-_portfolio_qmt_refresh_state: dict[str, object] = {
-    "state": "idle",
-    "started_at": "",
-    "finished_at": "",
-    "requested": 0,
-    "refreshed": 0,
-    "stale": 0,
-    "missing": 0,
-    "error": "",
-}
 _fallback_lock = _threading.Lock()
 _fallback_events: OrderedDict[str, dict[str, object]] = OrderedDict()
 MAX_FALLBACK_EVENTS = 200
+_recommended_history_schema_lock = _threading.Lock()
+_recommended_history_schema_ready_engines: set[int] = set()
 
 
 def _record_fallback(context: str, exc: BaseException | None = None) -> None:
@@ -369,6 +370,98 @@ def _read_sql(sql: str, params: dict = None) -> list[dict]:
     else:
         engine = get_kline_engine() if should_use_kline_engine(sql) else get_engine()
     return read_sql_rows(engine, sql, params, context="hot_data")
+
+
+def _launch_registered_scheduler_task(
+    *,
+    task_type: str,
+    expected_script_path: str,
+    run_date: str = "",
+    script_args_override: str | None = None,
+    validation_profile: str = "",
+    scheduler_history_uid: str = "",
+) -> dict:
+    """Launch one uniquely registered task without mutating its persisted row."""
+    normalized_date = (
+        datetime.strptime(str(run_date), "%Y-%m-%d").date().isoformat()
+        if run_date
+        else ""
+    )
+    rows = _read_sql(
+        "SELECT * FROM st_scheduled_tasks "
+        "WHERE task_type = :task_type ORDER BY id LIMIT 2",
+        {"task_type": task_type},
+    )
+    if not rows:
+        return {
+            "accepted": False,
+            "status": "task_registration_missing",
+            "task_type": task_type,
+            "job_id": "",
+            "error": f"生产任务未注册: {task_type}",
+        }
+    if len(rows) != 1:
+        return {
+            "accepted": False,
+            "status": "task_registration_ambiguous",
+            "task_type": task_type,
+            "job_id": "",
+            "error": f"生产任务注册不唯一: {task_type}",
+        }
+
+    task = dict(rows[0])
+    if str(task.get("script_path") or "") != expected_script_path:
+        return {
+            "accepted": False,
+            "status": "task_contract_mismatch",
+            "task_type": task_type,
+            "job_id": "",
+            "error": f"生产任务脚本合同不匹配: {task_type}",
+        }
+    task["date_param"] = normalized_date
+    if script_args_override is not None:
+        task["script_args"] = script_args_override
+    if validation_profile:
+        if not (
+            task_type == "analysis_premarket_external"
+            and validation_profile == "analysis_web_manual_v1"
+        ):
+            raise ValueError("scheduler validation profile is not allowed")
+        task["_validation_profile"] = validation_profile
+    if scheduler_history_uid:
+        if not (
+            task_type == "analysis_premarket_external"
+            and validation_profile == "analysis_web_manual_v1"
+            and re.fullmatch(r"[0-9a-f]{32}", scheduler_history_uid)
+        ):
+            raise ValueError("scheduler history identity override is not allowed")
+        task["_manual_history_run_uid"] = scheduler_history_uid
+    result = dict(
+        launch_scheduler_task(
+            task,
+            root=_ROOT,
+            engine=get_engine(),
+        )
+    )
+    result.setdefault("accepted", False)
+    result.setdefault("job_id", "")
+    result.setdefault("task_type", task_type)
+    return result
+
+
+_REALTIME_REFRESH_TASK_CONTRACTS = {
+    "snapshot": {
+        "task_type": "intraday_realtime",
+        "script_args": (
+            "--only snapshot --min-coverage 0.70 "
+            "--archive-snapshot --skip-closed --json"
+        ),
+    },
+    "flow": {
+        "task_type": "capital_flow_batch_fast",
+        "script_args": "--only flow --min-coverage 0.70 --json",
+    },
+}
 
 
 def _table_columns(table_name: str) -> set[str]:
@@ -2014,78 +2107,54 @@ IMPORTANT_KEYWORDS = [
 ]
 
 
-def _merge_and_dedup(all_items: list) -> list:
-    def _title_key(t: str) -> str:
-        import re as _re
-        t = _re.sub(r"[【】\s\u3000]+", "", t)
-        return t[:40]
-    groups: dict[str, list] = {}
-    for it in all_items:
-        key = _title_key(it.get("title") or it.get("content") or "")
-        if not key:
-            key = f"_unique_{it['source']}_{it['source_id']}"
-        groups.setdefault(key, []).append(it)
-    merged = []
-    for key, group in groups.items():
-        if len(group) == 1:
-            item = group[0].copy()
-            item["sources"] = [group[0]["source"]]
-        else:
-            best = max(group, key=lambda x: _calc_importance(x))
-            item = best.copy()
-            item["sources"] = list(dict.fromkeys(g["source"] for g in group))
-            all_stocks = []
-            seen_codes = set()
-            for g in group:
-                for s in (g.get("stocks") or []):
-                    c = s.get("code", "")
-                    if c and c not in seen_codes:
-                        seen_codes.add(c)
-                        all_stocks.append(s)
-            item["stocks"] = all_stocks
-            best_content = max((g.get("content") or "" for g in group), key=len)
-            item["content"] = best_content
-        item["importance_score"] = _calc_importance(item)
-        merged.append(item)
-    merged.sort(key=lambda x: (x.get("publish_time") or datetime.min), reverse=True)
-    return merged
+_NEWS_SOURCES = frozenset({"all", "cls", "eastmoney", "sina"})
 
 
-def _save_news_to_db(engine, items: list):
-    from datetime import datetime as _dt
-    import json as _json
-    etl = _dt.now().replace(microsecond=0)
-    upsert = text(
-        "INSERT INTO st_news_flash (source, source_id, title, content, publish_time, first_seen_at, level, stocks, subjects, reading_num, is_top, jpush, extra, etl_sync_at) "
-        "VALUES (:source, :source_id, :title, :content, :publish_time, :etl_sync_at, :level, :stocks, :subjects, :reading_num, :is_top, :jpush, :extra, :etl_sync_at) "
-        "ON DUPLICATE KEY UPDATE title=VALUES(title), content=VALUES(content), level=VALUES(level), etl_sync_at=VALUES(etl_sync_at)"
-    )
-    saved = 0
+def _decode_news_collection(value) -> list:
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
     try:
-        with engine.begin() as conn:
-            for it in items:
-                try:
-                    conn.execute(upsert, {
-                        "source": it["source"],
-                        "source_id": it["source_id"],
-                        "title": (it.get("title") or "")[:512],
-                        "content": it.get("content") or "",
-                        "publish_time": it.get("publish_time"),
-                        "level": it.get("level") or "C",
-                        "stocks": _json.dumps(it.get("stocks") or [], ensure_ascii=False),
-                        "subjects": _json.dumps(it.get("subjects") or [], ensure_ascii=False),
-                        "reading_num": it.get("reading_num") or 0,
-                        "is_top": 1 if it.get("is_top") else 0,
-                        "jpush": 1 if it.get("jpush") else 0,
-                        "extra": None,
-                        "etl_sync_at": etl,
-                    })
-                    saved += 1
-                except Exception as exc:
-                    _record_fallback('_save_news_to_db:1870', exc)
-    except Exception as exc:
-        _record_fallback('_save_news_to_db:1872', exc)
-    return saved
+        decoded = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    return decoded if isinstance(decoded, list) else []
+
+
+def _persisted_news_rows(source: str, limit: int) -> list[dict]:
+    """Read news already published by the scheduler; never crawl or write."""
+
+    normalized_source = str(source or "all").strip().lower()
+    if normalized_source not in _NEWS_SOURCES:
+        raise ValueError("unsupported news source")
+    safe_limit = min(max(1, int(limit)), 500)
+    params = {"limit": safe_limit}
+    source_clause = ""
+    if normalized_source != "all":
+        source_clause = " WHERE source=:source"
+        params["source"] = normalized_source
+    rows = _read_sql(
+        "SELECT source, source_id, title, content, publish_time, level, "
+        "stocks, subjects, reading_num, is_top, jpush "
+        f"FROM st_news_flash{source_clause} "
+        "ORDER BY publish_time DESC, id DESC LIMIT :limit",
+        params,
+    )
+    result: list[dict] = []
+    for persisted in rows:
+        item = dict(persisted)
+        item["stocks"] = _decode_news_collection(item.get("stocks"))
+        item["subjects"] = _decode_news_collection(item.get("subjects"))
+        item["sources"] = [str(item.get("source") or "")]
+        published_at = item.pop("publish_time", None)
+        item["time"] = str(published_at or "")[:19]
+        item["is_top"] = bool(item.get("is_top"))
+        item["jpush"] = bool(item.get("jpush"))
+        item["bold"] = False
+        item["importance_score"] = _calc_importance(item)
+        result.append(item)
+    return result
 
 
 @router.get("/hot-data/news-flash")
@@ -2094,73 +2163,49 @@ def news_flash(
     pages: int = Query(default=3, ge=1, le=5),
     source: str = Query(default="all"),
 ):
-    """多源快讯聚合: cls/eastmoney/sina/all"""
+    """只读返回调度器已落库的多源快讯。"""
     try:
-        import httpx
-        all_items = []
-        with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA"}, timeout=10.0) as client:
-            if source in ("all", "cls"):
-                try:
-                    all_items.extend(_fetch_cls_news(client, pages))
-                except Exception as exc:
-                    _record_fallback('news_flash:1891', exc)
-            if source in ("all", "eastmoney"):
-                try:
-                    all_items.extend(_fetch_eastmoney_news(client, max(1, pages // 2)))
-                except Exception as exc:
-                    _record_fallback('news_flash:1896', exc)
-            if source in ("all", "sina"):
-                try:
-                    all_items.extend(_fetch_sina_news(client, max(1, pages // 2)))
-                except Exception as exc:
-                    _record_fallback('news_flash:1901', exc)
-
-        if source == "all":
-            merged = _merge_and_dedup(all_items)
-        else:
-            for it in all_items:
-                it["sources"] = [it["source"]]
-                it["importance_score"] = _calc_importance(it)
-            merged = sorted(all_items, key=lambda x: (x.get("publish_time") or datetime.min), reverse=True)
-
-        saved = _save_news_to_db(get_engine(), all_items)
-
-        result = []
-        for it in merged[:rn]:
-            it.pop("publish_time", None)
-            result.append(it)
-        return {"data": result, "total": len(result), "saved": saved}
+        safe_source = source if isinstance(source, str) else "all"
+        safe_limit = rn if isinstance(rn, int) else 200
+        result = _persisted_news_rows(safe_source, safe_limit)
+        return {"data": result, "total": len(result), "read_only": True}
     except Exception as e:
         return {"data": [], "total": 0, "error": str(e)}
 
 
 @router.get("/hot-data/news-important")
 def news_important(pages: int = Query(default=2, ge=1, le=5)):
-    """多源重要快讯"""
+    """只读返回调度器已落库的重要快讯。"""
     try:
-        import httpx
-        all_items = []
-        with httpx.Client(headers={"User-Agent": "Mozilla/5.0 ProBigA"}, timeout=10.0) as client:
-            try:
-                all_items.extend(_fetch_cls_news(client, pages))
-            except Exception as exc:
-                _record_fallback('news_important:1932', exc)
-            try:
-                all_items.extend(_fetch_eastmoney_news(client, max(1, pages // 2)))
-            except Exception as exc:
-                _record_fallback('news_important:1936', exc)
-            try:
-                all_items.extend(_fetch_sina_news(client, max(1, pages // 2)))
-            except Exception as exc:
-                _record_fallback('news_important:1940', exc)
-
-        merged = _merge_and_dedup(all_items)
-        important = [it for it in merged if it.get("importance_score", 0) >= 2]
-        for it in important:
-            it.pop("publish_time", None)
+        important = [
+            item
+            for item in _persisted_news_rows("all", 500)
+            if int(item.get("importance_score") or 0) >= 2
+        ]
         return {"data": important, "total": len(important)}
     except Exception as e:
         return {"data": [], "total": 0, "error": str(e)}
+
+
+@router.post("/hot-data/news-flash/refresh")
+def refresh_news_flash():
+    """Queue the fixed realtime news task; the API process never crawls."""
+
+    result = launch_registered_manual_task(
+        get_engine(),
+        task_type="news_sync",
+        expected_script_path="biz/news/sync_news.py",
+        script_args="--pages 2 --mode realtime",
+        root=_ROOT,
+    )
+    return {
+        **result,
+        "message": (
+            "资讯同步任务已提交后台执行"
+            if result.get("accepted")
+            else str(result.get("error") or result.get("status") or "提交失败")
+        ),
+    }
 
 
 @router.get("/hot-data/news-history")
@@ -4371,18 +4416,36 @@ def daily_review_dates():
 
 @router.post("/hot-data/daily-review/generate")
 def generate_daily_review(review_date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """生成复盘数据"""
+    """通过生产调度器异步生成复盘数据。"""
     try:
-        import subprocess
-        import sys
-        root = _Path(__file__).resolve().parents[3]
-        cmd = [sys.executable, "-m", "biz.review.generate", review_date]
-        child_env = build_child_env(root)
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=str(root), env=child_env)
-        return {"date": review_date, "status": "success" if r.returncode == 0 else "failed",
-                "output": (r.stdout or "")[-500:] + (r.stderr or "")[-500:]}
+        result = _launch_registered_scheduler_task(
+            task_type="daily_review",
+            expected_script_path="biz/review/generate.py",
+            run_date=review_date,
+        )
+        launch_status = str(result.get("status") or "error")
+        accepted = bool(result.get("accepted"))
+        return {
+            **result,
+            "date": review_date,
+            "status": launch_status,
+            "launch_status": launch_status,
+            "duration": 0,
+            "output": (
+                "复盘生成任务已提交后台执行"
+                if accepted
+                else str(result.get("error") or launch_status)
+            ),
+        }
     except Exception as e:
-        return {"date": review_date, "status": "error", "output": str(e)}
+        return {
+            "accepted": False,
+            "date": review_date,
+            "status": "error",
+            "launch_status": "error",
+            "job_id": "",
+            "output": str(e),
+        }
 
 
 @router.get("/hot-data/daily-review/print")
@@ -4787,58 +4850,15 @@ class PortfolioTransact(BaseModel):
 
 
 def _ensure_portfolio_trans_log_table():
-    try:
-        _exec_sql("""
-            CREATE TABLE IF NOT EXISTS `st_portfolio_trans_log` (
-              `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
-              `stock_code` VARCHAR(16) NOT NULL,
-              `trans_type` VARCHAR(8) NOT NULL,
-              `price` DECIMAL(12,4) NOT NULL DEFAULT 0,
-              `shares` INT NOT NULL DEFAULT 0,
-              `trans_date` DATE NOT NULL,
-              `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              KEY `idx_code_date` (`stock_code`, `trans_date`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """)
-        _portfolio_ensure_column("st_portfolio_trans_log", "source", "ALTER TABLE `st_portfolio_trans_log` ADD COLUMN `source` VARCHAR(16) DEFAULT 'trade' COMMENT '来源：trade/position_add' AFTER `shares`")
-    except Exception as exc:
-        _record_fallback('_ensure_portfolio_trans_log_table:4273', exc)
+    """Compatibility boundary: validate the prepared schema without DDL."""
 
-
-def _portfolio_ensure_column(table: str, column: str, ddl: str) -> None:
-    try:
-        rows = _read_sql("""
-            SELECT COUNT(*) AS cnt
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c
-        """, {"t": table, "c": column})
-        if not rows or int(rows[0].get("cnt") or 0) == 0:
-            _exec_sql(ddl)
-    except Exception as exc:
-        _record_fallback('_portfolio_ensure_column:4286', exc)
+    validate_portfolio_runtime_schema(get_engine())
 
 
 def _ensure_portfolio_position_columns() -> None:
-    _portfolio_ensure_column("st_user_portfolio", "position_source", "ALTER TABLE `st_user_portfolio` ADD COLUMN `position_source` VARCHAR(16) DEFAULT 'manual' COMMENT '持仓来源：manual/today_buy' AFTER `shares`")
-    _portfolio_ensure_column("st_user_portfolio", "position_date", "ALTER TABLE `st_user_portfolio` ADD COLUMN `position_date` DATE DEFAULT NULL COMMENT '持仓来源日期' AFTER `position_source`")
-    _portfolio_ensure_cost_price_precision()
+    """Compatibility boundary: validate the prepared schema without DDL."""
 
-
-def _portfolio_ensure_cost_price_precision() -> None:
-    try:
-        rows = _read_sql("""
-            SELECT numeric_precision, numeric_scale
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE() AND table_name = 'st_user_portfolio' AND column_name = 'cost_price'
-        """)
-        if not rows:
-            return
-        precision = int(rows[0].get("numeric_precision") or 0)
-        scale = int(rows[0].get("numeric_scale") or 0)
-        if precision < 12 or scale < 4:
-            _exec_sql("ALTER TABLE `st_user_portfolio` MODIFY COLUMN `cost_price` DECIMAL(12,4) NOT NULL DEFAULT 0 COMMENT '成本价'")
-    except Exception as exc:
-        _record_fallback('_portfolio_ensure_cost_price_precision:4309', exc)
+    validate_portfolio_runtime_schema(get_engine())
 
 
 def _portfolio_log_trans(
@@ -6775,14 +6795,8 @@ def _portfolio_fetch_live_quotes(
     codes: list[str],
     *,
     force: bool = False,
-    allow_remote: bool = False,
 ) -> dict[str, dict]:
-    """Read persisted quotes, optionally refreshing the selected quote source.
-
-    Normal portfolio reads remain independent of any remote quote process.
-    Explicit refresh actions run in a background thread.
-    """
-    _log = logging.getLogger("portfolio.live_quotes")
+    """Read persisted quotes only; API workers never refresh market storage."""
 
     clean = _safe_portfolio_stock_codes(codes)
     if not clean:
@@ -6794,47 +6808,6 @@ def _portfolio_fetch_live_quotes(
     if cached is not None:
         return cached
     out = {} if force else _live_quotes_from_current_table(clean, max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS)
-    missing_codes = clean if force else [code for code in clean if code not in out]
-    if allow_remote and missing_codes and (_is_monitor_trading_time() or force):
-        try:
-            from integrations.registry import resolve_source
-            from tools.sync_market_realtime import sync_market_realtime
-
-            if resolve_source("current") == "bigqmt":
-                from tools.run_big_qmt_bridge import sync_big_qmt_realtime
-
-                try:
-                    sync_big_qmt_realtime(engine=get_current_engine(), codes=missing_codes)
-                except Exception as qmt_exc:
-                    _log.warning(
-                        "Selected Big QMT quote refresh failed for %s codes; falling back to Sina: %s",
-                        len(missing_codes),
-                        qmt_exc,
-                    )
-                    sync_market_realtime(
-                        engine=get_current_engine(),
-                        codes=missing_codes,
-                        source="sina",
-                        archive_snapshot=False,
-                        run_rt_ddl=False,
-                        skip_closed=False,
-                        min_coverage=0.0,
-                        replace_scope="subset",
-                    )
-            else:
-                sync_market_realtime(
-                    engine=get_current_engine(),
-                    codes=missing_codes,
-                    source="sina",
-                    archive_snapshot=False,
-                    run_rt_ddl=False,
-                    skip_closed=False,
-                    min_coverage=0.0,
-                    replace_scope="subset",
-                )
-            out.update(_live_quotes_from_current_table(missing_codes, max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS))
-        except Exception as exc:
-            _log.warning("Selected live quote refresh failed for %s codes: %s", len(missing_codes), exc)
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
@@ -6847,79 +6820,6 @@ def _portfolio_fetch_live_quotes(
         )
     _cache_set(_cache_key, out)
     return out
-
-
-def _queue_portfolio_qmt_refresh(codes: list[str]) -> dict[str, object]:
-    """Queue a public-source refresh without holding an API worker open."""
-    global _portfolio_qmt_refresh_thread, _portfolio_qmt_refresh_state
-
-    clean = _safe_portfolio_stock_codes(codes)
-    if not clean:
-        return {"state": "idle", "requested": 0, "refreshed": 0, "stale": 0, "missing": 0}
-
-    with _portfolio_qmt_refresh_lock:
-        if _portfolio_qmt_refresh_thread is not None and _portfolio_qmt_refresh_thread.is_alive():
-            return dict(_portfolio_qmt_refresh_state)
-
-        started_at = datetime.now().isoformat(timespec="seconds")
-        _portfolio_qmt_refresh_state = {
-            "state": "queued",
-            "started_at": started_at,
-            "finished_at": "",
-            "requested": len(clean),
-            "refreshed": 0,
-            "stale": 0,
-            "missing": len(clean),
-            "error": "",
-        }
-
-        def _run() -> None:
-            global _portfolio_qmt_refresh_state
-            try:
-                quotes = _portfolio_fetch_live_quotes(clean, force=True, allow_remote=True)
-                fresh_count = sum(
-                    1 for item in quotes.values() if str(item.get("quote_status") or "") == "fresh"
-                )
-                stale_count = sum(
-                    1 for item in quotes.values() if str(item.get("quote_status") or "") == "stale"
-                )
-                missing_count = max(0, len(clean) - fresh_count - stale_count)
-                complete = fresh_count == len(clean)
-                coverage_error = "" if complete else (
-                    f"fresh quote coverage {fresh_count}/{len(clean)}; "
-                    f"stale={stale_count}; missing={missing_count}"
-                )
-                _invalidate_portfolio_snapshot_cache()
-                with _portfolio_qmt_refresh_lock:
-                    _portfolio_qmt_refresh_state = {
-                        **_portfolio_qmt_refresh_state,
-                        "state": "success" if complete else "degraded",
-                        "finished_at": datetime.now().isoformat(timespec="seconds"),
-                        "requested": len(clean),
-                        "refreshed": fresh_count,
-                        "stale": stale_count,
-                        "missing": missing_count,
-                        "error": coverage_error,
-                    }
-            except Exception as exc:
-                logging.getLogger("portfolio.refresh_prices").warning(
-                    "background public quote refresh failed for %s codes: %s", len(clean), exc
-                )
-                with _portfolio_qmt_refresh_lock:
-                    _portfolio_qmt_refresh_state = {
-                        **_portfolio_qmt_refresh_state,
-                        "state": "failed",
-                        "finished_at": datetime.now().isoformat(timespec="seconds"),
-                        "error": str(exc)[:200],
-                    }
-
-        _portfolio_qmt_refresh_thread = _threading.Thread(
-            target=_run,
-            name="portfolio-public-quote-refresh",
-            daemon=True,
-        )
-        _portfolio_qmt_refresh_thread.start()
-        return dict(_portfolio_qmt_refresh_state)
 
 
 @router.get("/portfolio/live")
@@ -7074,37 +6974,81 @@ def portfolio_holding_strategy(
 
 @router.post("/portfolio/refresh-prices")
 def portfolio_refresh_prices():
-    """异步刷新自选股实时行情：拉取最新价写入 sm_stock_current"""
-    _log = logging.getLogger("portfolio.refresh_prices")
+    """Submit the one full-market quote task; never write from the API."""
     try:
-        pf_rows = _read_sql("SELECT stock_code FROM st_user_portfolio ORDER BY sort_order")
-        codes = [r["stock_code"] for r in pf_rows] if pf_rows else []
-        _log.info("刷新行情: %d 只自选股, codes=%s", len(codes), codes[:5])
-        if not codes:
-            return {"status": "ok", "refreshed": 0, "message": "无自选股"}
-        state = _queue_portfolio_qmt_refresh(codes)
+        contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
+        result = _launch_registered_scheduler_task(
+            task_type=str(contract["task_type"]),
+            expected_script_path="tools/crawl_realtime_batch.py",
+            script_args_override=str(contract["script_args"]),
+        )
         return {
-            "status": "ok",
-            "state": state.get("state", "queued"),
-            "requested": int(state.get("requested") or len(codes)),
-            "refreshed": int(state.get("refreshed") or 0),
-            "stale": int(state.get("stale") or 0),
-            "missing": int(state.get("missing") or 0),
-            "message": "行情同步已转后台执行，页面将继续使用已落库行情。",
+            **result,
+            "accepted": bool(result.get("accepted")),
+            "state": str(result.get("status") or "error"),
+            "message": (
+                f"全市场行情任务已提交后台执行（{result.get('job_id')}）"
+                if result.get("accepted")
+                else str(result.get("error") or result.get("status") or "error")
+            ),
         }
-    except ImportError:
-        _log.error("ImportError: adata 模块不可用")
-        return {"status": "error", "error": "adata 模块不可用，无法获取实时行情"}
     except Exception as e:
-        _log.error("刷新行情异常: %s", e, exc_info=True)
-        return {"status": "error", "error": str(e)[:200]}
+        logger.error("刷新行情任务提交异常: %s", e, exc_info=True)
+        return {
+            "accepted": False,
+            "status": "error",
+            "state": "error",
+            "job_id": "",
+            "error": str(e)[:200],
+        }
 
 
 @router.get("/portfolio/refresh-prices/status")
 def portfolio_refresh_prices_status():
-    """Return the state of the asynchronous portfolio quote refresh."""
-    with _portfolio_qmt_refresh_lock:
-        return {"status": "ok", "state": dict(_portfolio_qmt_refresh_state)}
+    """Read the latest exact scheduler audit receipt for quote refresh."""
+    try:
+        tasks = _read_sql(
+            "SELECT id FROM st_scheduled_tasks "
+            "WHERE task_type='intraday_realtime' ORDER BY id LIMIT 2"
+        )
+        if len(tasks) != 1:
+            return {
+                "status": "task_registration_missing"
+                if not tasks
+                else "task_registration_ambiguous",
+                "state": {"state": "unavailable", "job_id": ""},
+            }
+        rows = _read_sql("""
+            SELECT run_uid, status, run_at, finished_at, output
+            FROM st_scheduled_task_history
+            WHERE task_id=:task_id
+            ORDER BY run_at DESC, id DESC
+            LIMIT 1
+        """, {"task_id": int(tasks[0]["id"])})
+        if not rows:
+            return {"status": "ok", "state": {"state": "idle", "job_id": ""}}
+        row = rows[0]
+        return {
+            "status": "ok",
+            "state": {
+                "state": str(row.get("status") or "unknown"),
+                "job_id": str(row.get("run_uid") or ""),
+                "started_at": str(row.get("run_at") or "")[:19],
+                "finished_at": str(row.get("finished_at") or "")[:19],
+                "error": (
+                    str(row.get("output") or "")[-500:]
+                    if str(row.get("status") or "")
+                    in {"failed", "timeout", "stopped"}
+                    else ""
+                ),
+            },
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "state": {"state": "unavailable", "job_id": ""},
+            "error": str(exc)[:200],
+        }
 
 
 @router.get("/portfolio/analyze/{stock_code}")
@@ -7648,39 +7592,40 @@ def sector_heat_upload(payload: list[dict]):
 
 @router.post("/hot-data/sector-heat-matrix/sync-today")
 def sync_sector_heat_today(date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """触发东财板块热度同步（plate_type=3/4）"""
-    import subprocess
-    import sys as _sys
-    import os as _os
-    import re as _re
-    _ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))
-    cmd = [_sys.executable, str(_ROOT + "/tools/fetch_sector_heat_east_daily.py"), date]
-    child_env = build_child_env(
-        _ROOT,
-        engine=get_engine(),
-        override_mysql_url=False,
-    )
+    """通过生产调度器异步触发东财板块热度同步。"""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=_ROOT, env=child_env)
-        output = ((r.stdout or "") + ("\n" + r.stderr if r.stderr else "")).strip()
-        synced = 0
-        m = _re.search(r"SYNCED=(\d+)", output)
-        if m:
-            synced = int(m.group(1))
-        actual_date = date
-        dm = _re.search(r"DATE=(\d{4}-\d{2}-\d{2})", output)
-        if dm:
-            actual_date = dm.group(1)
+        result = _launch_registered_scheduler_task(
+            task_type="sector_heat_east",
+            expected_script_path="tools/fetch_sector_heat_east_daily.py",
+            run_date=date,
+        )
+        launch_status = str(result.get("status") or "error")
+        accepted = bool(result.get("accepted"))
         return {
-            "status": "success" if r.returncode == 0 else "failed",
-            "date": actual_date,
+            **result,
+            "status": launch_status,
+            "launch_status": launch_status,
+            "date": date,
             "requested_date": date,
-            "synced": synced,
-            "output": output[:1000],
-            "error": (r.stderr or "").strip()[:500] if r.returncode != 0 else "",
+            "synced": None,
+            "output": (
+                "板块热度同步任务已提交后台执行"
+                if accepted
+                else str(result.get("error") or launch_status)
+            ),
+            "error": "" if accepted else str(result.get("error") or launch_status),
         }
     except Exception as e:
-        return {"status": "error", "date": date, "error": str(e)}
+        return {
+            "accepted": False,
+            "status": "error",
+            "launch_status": "error",
+            "date": date,
+            "requested_date": date,
+            "job_id": "",
+            "synced": None,
+            "error": str(e),
+        }
 
 
 @router.get("/hot-data/market-sentiment")
@@ -7872,7 +7817,8 @@ def _exec_sql(sql: str, params: dict = None):
     from server.api.routers._engine import get_engine as _ge
     e = _ge()
     with e.begin() as c:
-        c.execute(text(sql), params)
+        result = c.execute(text(sql), params)
+    return int(getattr(result, "rowcount", 0) or 0)
 
 
 def _read_dotenv_key():
@@ -9013,54 +8959,33 @@ def strategy_picks_data(
 
 @router.post("/monitor/sync-realtime")
 def sync_realtime_data():
-    """盘中同步实时行情数据到数据库"""
-    if not _job_begin("market_refresh"):
-        return {"success": False, "busy": True, "error": "market_refresh_running"}
+    """Compatibility endpoint for the one scheduler-owned quote task."""
     try:
-        from integrations.bigqmt.spool import PROVIDER_ID, resolve_big_qmt_home
-
-        # The production API can run on Linux while the standard QMT terminal
-        # and consumer run on the operator's Windows host.  In that topology
-        # the database is already refreshed continuously; a web request must
-        # never wait for or attempt to launch a desktop terminal remotely.
-        if resolve_big_qmt_home(required=False) is None:
-            latest = _read_sql(
-                "SELECT COUNT(*) AS rows_count, MAX(snapshot_at) AS snapshot_at "
-                "FROM sm_stock_current WHERE data_source = :source",
-                {"source": PROVIDER_ID},
-            )
-            row = latest[0] if latest else {}
-            return {
-                "success": True,
-                "source": PROVIDER_ID,
-                "status": "managed_by_external_big_qmt_bridge",
-                "synced": 0,
-                "available_rows": int(row.get("rows_count") or 0),
-                "snapshot_at": row.get("snapshot_at"),
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-        from tools.run_big_qmt_bridge import sync_big_qmt_realtime
-
-        # Current quotes are owned by the local QMT/public quote collector.
-        # Even an explicit refresh must use the dedicated current-data route;
-        # never write a live snapshot into production's primary database.
-        engine = get_current_engine()
-        result = sync_big_qmt_realtime(engine=engine)
-        total_synced = int(result.get("full_rows") or 0) + int(result.get("tracked_rows") or 0)
-        _invalidate_market_runtime_caches()
+        contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
+        result = _launch_registered_scheduler_task(
+            task_type=str(contract["task_type"]),
+            expected_script_path="tools/crawl_realtime_batch.py",
+            script_args_override=str(contract["script_args"]),
+        )
         return {
-            "success": True,
-            "source": result.get("source"),
-            "status": result.get("status"),
-            "synced": total_synced,
+            **result,
+            "success": bool(result.get("accepted")),
+            "synced": None,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "message": (
+                f"全市场行情任务已提交后台执行（{result.get('job_id')}）"
+                if result.get("accepted")
+                else str(result.get("error") or result.get("status") or "error")
+            ),
         }
     except Exception as e:
-        import traceback
-        return {"error": str(e), "trace": traceback.format_exc()}
-    finally:
-        _job_end("market_refresh")
+        return {
+            "accepted": False,
+            "success": False,
+            "status": "error",
+            "job_id": "",
+            "error": str(e)[:200],
+        }
 
 
 # ═══════════════════════════════════════════
@@ -10030,59 +9955,24 @@ def _set_recommendation_progress(**payload) -> None:
 
 
 def _ensure_recommended_run_history_table() -> None:
-    _exec_sql("""
-        CREATE TABLE IF NOT EXISTS `st_recommended_run_history` (
-            `id` BIGINT NOT NULL AUTO_INCREMENT,
-            `run_uid` VARCHAR(40) NOT NULL,
-            `trade_date` DATE NULL,
-            `status` VARCHAR(20) NOT NULL DEFAULT 'running',
-            `min_score` DECIMAL(8,2) NULL,
-            `top_n` INT NULL,
-            `strict_prev_trade_day` TINYINT(1) NOT NULL DEFAULT 0,
-            `execution_time` DATETIME NULL,
-            `started_at` DATETIME NULL,
-            `finished_at` DATETIME NULL,
-            `duration_seconds` INT NULL,
-            `progress_percent` INT NULL,
-            `done_count` INT NULL,
-            `total` INT NULL,
-            `passed` INT NULL,
-            `flow_date` VARCHAR(20) NULL,
-            `hot_date` VARCHAR(20) NULL,
-            `market_mood_score` DECIMAL(8,2) NULL,
-            `message` VARCHAR(500) NULL,
-            `error` VARCHAR(500) NULL,
-            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (`id`),
-            UNIQUE KEY `uk_rec_run_uid` (`run_uid`),
-            KEY `idx_rec_run_date` (`trade_date`, `started_at`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """, {})
-    _recommended_history_ensure_column(
-        "progress_percent",
-        "ALTER TABLE `st_recommended_run_history` ADD COLUMN `progress_percent` INT NULL AFTER `duration_seconds`",
-    )
-    _recommended_history_ensure_column(
-        "done_count",
-        "ALTER TABLE `st_recommended_run_history` ADD COLUMN `done_count` INT NULL AFTER `progress_percent`",
-    )
+    """Read-only runtime proof; release migration owns every DDL operation."""
+    engine = get_engine()
+    engine_key = id(engine)
+    with _recommended_history_schema_lock:
+        if engine_key in _recommended_history_schema_ready_engines:
+            return
+        validate_recommended_run_history_schema(engine)
+        _recommended_history_schema_ready_engines.add(engine_key)
 
 
-def _recommended_history_ensure_column(column: str, ddl: str) -> None:
-    try:
-        rows = _read_sql("""
-            SELECT COUNT(*) AS cnt
-            FROM information_schema.columns
-            WHERE table_schema = DATABASE()
-              AND table_name = 'st_recommended_run_history'
-              AND column_name = :column
-        """, {"column": column})
-        if not rows or int(rows[0].get("cnt") or 0) == 0:
-            _exec_sql(ddl)
-            _cache_drop("table_columns_st_recommended_run_history")
-    except Exception as exc:
-        _record_fallback(f'_recommended_history_ensure_column:{column}', exc)
+def _recommendation_build_sha() -> str | None:
+    value = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or os.environ.get("PROBIGA_EXPECTED_GIT_SHA")
+        or ""
+    ).strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else None
 
 
 def _recommended_run_history_start(
@@ -10094,41 +9984,100 @@ def _recommended_run_history_start(
     execution_time: str,
     message: str = "",
     status: str = "running",
+    run_uid: str | None = None,
+    trigger_source: str = "scheduled",
+    scheduler_job_id: str = "",
 ) -> str:
     import uuid
 
-    run_uid = uuid.uuid4().hex
-    try:
-        _ensure_recommended_run_history_table()
-        _exec_sql("""
-            INSERT INTO st_recommended_run_history
-            (run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
-             execution_time, started_at, progress_percent, done_count, message)
-            VALUES (:uid, :trade_date, :status, :min_score, :top_n, :strict_prev,
-                    :execution_time, NOW(), :progress_percent, 0, :message)
-        """, {
-            "uid": run_uid,
-            "status": status[:20] if status else "running",
-            "trade_date": trade_date,
-            "min_score": float(min_score),
-            "top_n": int(top_n),
-            "strict_prev": 1 if strict_prev_trade_day else 0,
-            "execution_time": execution_time[:19] if execution_time else None,
-            "progress_percent": 5 if status == "queued" else 0,
-            "message": message[:500] if message else "",
-        })
-    except Exception as exc:
-        _record_fallback('_recommended_run_history_start:8297', exc)
+    run_uid = str(run_uid or uuid.uuid4().hex).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", run_uid):
+        raise ValueError("recommendation run_uid must be 32 lowercase hex characters")
+    scheduler_job_id = str(scheduler_job_id or "").strip().lower()
+    if scheduler_job_id and (
+        not re.fullmatch(r"[0-9a-f]{32}", scheduler_job_id)
+        or scheduler_job_id != run_uid
+    ):
+        raise ValueError(
+            "recommendation scheduler_job_id must equal the 32-hex run_uid"
+        )
+    trigger_source = str(trigger_source or "scheduled").strip().lower()
+    if trigger_source not in {"scheduled", "manual"}:
+        raise ValueError("recommendation trigger_source is invalid")
+    build_sha = _recommendation_build_sha()
+    scheduler_env_uid = str(
+        os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
+    ).strip().lower()
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    if production or scheduler_env_uid:
+        if (
+            scheduler_env_uid
+            and (
+                not re.fullmatch(r"[0-9a-f]{32}", scheduler_env_uid)
+                or scheduler_env_uid != run_uid
+            )
+        ):
+            raise RuntimeError(
+                "recommendation start scheduler environment identity differs"
+            )
+        if scheduler_job_id != run_uid:
+            raise RuntimeError(
+                "recommendation start requires the scheduler audit identity"
+            )
+        if not build_sha:
+            raise RuntimeError(
+                "recommendation start requires the production build identity"
+            )
+    _ensure_recommended_run_history_table()
+    affected = _exec_sql("""
+        INSERT INTO st_recommended_run_history
+        (run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
+         execution_time, started_at, progress_percent, done_count, message,
+         trigger_source, scheduler_job_id, host_name, build_sha)
+        VALUES (:uid, :trade_date, :status, :min_score, :top_n, :strict_prev,
+                :execution_time, NOW(), :progress_percent, 0, :message,
+                :trigger_source, :scheduler_job_id, :host_name, :build_sha)
+    """, {
+        "uid": run_uid,
+        "status": status[:20] if status else "running",
+        "trade_date": trade_date,
+        "min_score": float(min_score),
+        "top_n": int(top_n),
+        "strict_prev": 1 if strict_prev_trade_day else 0,
+        "execution_time": (
+            execution_time[:19].replace("T", " ")
+            if execution_time
+            else None
+        ),
+        "progress_percent": 5 if status in {"queued", "submitted"} else 0,
+        "message": message[:500] if message else "",
+        "trigger_source": trigger_source,
+        "scheduler_job_id": scheduler_job_id or None,
+        "host_name": gethostname()[:128],
+        "build_sha": build_sha,
+    })
+    if affected != 1:
+        raise RuntimeError(
+            "recommendation history start was not persisted exactly once"
+        )
     return run_uid
 
 
-def _recommended_run_history_update(run_uid: str, *, status: str = "running", payload: dict | None = None) -> None:
+def _recommended_run_history_update(
+    run_uid: str,
+    *,
+    status: str = "running",
+    payload: dict | None = None,
+) -> bool:
     if not run_uid:
-        return
+        return False
     payload = payload or {}
     try:
         _ensure_recommended_run_history_table()
-        _exec_sql("""
+        affected = _exec_sql("""
             UPDATE st_recommended_run_history
             SET status = COALESCE(:status, status),
                 progress_percent = COALESCE(:progress_percent, progress_percent),
@@ -10139,7 +10088,8 @@ def _recommended_run_history_update(run_uid: str, *, status: str = "running", pa
                 hot_date = COALESCE(:hot_date, hot_date),
                 market_mood_score = COALESCE(:market_mood_score, market_mood_score),
                 message = COALESCE(:message, message),
-                error = COALESCE(:error, error)
+                error = COALESCE(:error, error),
+                scheduler_job_id = COALESCE(:scheduler_job_id, scheduler_job_id)
             WHERE run_uid = :uid
         """, {
             "uid": run_uid,
@@ -10153,14 +10103,29 @@ def _recommended_run_history_update(run_uid: str, *, status: str = "running", pa
             "market_mood_score": payload.get("market_mood_score"),
             "message": str(payload.get("message") or "")[:500] if "message" in payload else None,
             "error": str(payload.get("error") or "")[:500] if "error" in payload else None,
+            "scheduler_job_id": (
+                str(payload.get("scheduler_job_id") or "")[:64]
+                if "scheduler_job_id" in payload
+                else None
+            ),
         })
+        return affected == 1
     except Exception as exc:
         _record_fallback('_recommended_run_history_update', exc)
+        return False
 
 
-def _recommended_run_history_finish(run_uid: str, *, status: str, payload: dict | None = None) -> None:
-    if not run_uid:
-        return
+def _recommended_run_history_finish(
+    run_uid: str,
+    *,
+    status: str,
+    payload: dict | None = None,
+) -> dict:
+    run_uid = str(run_uid or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{32}", run_uid):
+        raise ValueError("recommendation terminal run_uid is invalid")
+    if status not in {"done", "error", "cancelled"}:
+        raise ValueError("recommendation terminal status is invalid")
     payload = payload or {}
     progress_percent = payload.get("progress_percent")
     if progress_percent is None and status == "done":
@@ -10168,245 +10133,131 @@ def _recommended_run_history_finish(run_uid: str, *, status: str, payload: dict 
     done_count = payload.get("done_count")
     if done_count is None and status == "done":
         done_count = payload.get("total")
-    try:
-        _ensure_recommended_run_history_table()
-        _exec_sql("""
-            UPDATE st_recommended_run_history
-            SET status = :status,
-                trade_date = COALESCE(:trade_date, trade_date),
-                finished_at = NOW(),
-                duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
-                progress_percent = :progress_percent,
-                done_count = :done_count,
-                total = :total,
-                passed = :passed,
-                flow_date = :flow_date,
-                hot_date = :hot_date,
-                market_mood_score = :market_mood_score,
-                message = :message,
-                error = :error
-            WHERE run_uid = :uid
-        """, {
-            "uid": run_uid,
-            "status": status,
-            "trade_date": payload.get("trade_date"),
-            "progress_percent": progress_percent,
-            "done_count": done_count,
-            "total": payload.get("total"),
-            "passed": payload.get("passed"),
-            "flow_date": str(payload.get("flow_date") or "")[:20],
-            "hot_date": str(payload.get("hot_date") or "")[:20],
-            "market_mood_score": payload.get("market_mood_score"),
-            "message": str(payload.get("message") or "")[:500],
-            "error": str(payload.get("error") or "")[:500],
-        })
-    except Exception as exc:
-        _record_fallback('_recommended_run_history_finish:8334', exc)
+    _ensure_recommended_run_history_table()
+    affected = _exec_sql("""
+        UPDATE st_recommended_run_history
+        SET status = :status,
+            trade_date = COALESCE(:trade_date, trade_date),
+            finished_at = NOW(),
+            duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
+            progress_percent = :progress_percent,
+            done_count = :done_count,
+            total = :total,
+            passed = :passed,
+            flow_date = :flow_date,
+            hot_date = :hot_date,
+            market_mood_score = :market_mood_score,
+            message = :message,
+            error = :error
+        WHERE run_uid = :uid
+    """, {
+        "uid": run_uid,
+        "status": status,
+        "trade_date": payload.get("trade_date"),
+        "progress_percent": progress_percent,
+        "done_count": done_count,
+        "total": payload.get("total"),
+        "passed": payload.get("passed"),
+        "flow_date": str(payload.get("flow_date") or "")[:20],
+        "hot_date": str(payload.get("hot_date") or "")[:20],
+        "market_mood_score": payload.get("market_mood_score"),
+        "message": str(payload.get("message") or "")[:500],
+        "error": str(payload.get("error") or "")[:500],
+    })
+    if affected != 1:
+        raise RuntimeError(
+            "recommendation terminal state was not updated exactly once"
+        )
+    rows = _read_sql("""
+        SELECT run_uid, status, scheduler_job_id, build_sha,
+               trigger_source, finished_at
+        FROM st_recommended_run_history
+        WHERE run_uid=:run_uid
+        LIMIT 2
+    """, {"run_uid": run_uid})
+    if len(rows) != 1:
+        raise RuntimeError(
+            "recommendation terminal state could not be read back exactly once"
+        )
+    row = rows[0]
+    scheduler_job_id = str(row.get("scheduler_job_id") or "").strip().lower()
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    scheduler_env_uid = str(
+        os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
+    ).strip().lower()
+    if scheduler_env_uid and (
+        not re.fullmatch(r"[0-9a-f]{32}", scheduler_env_uid)
+        or scheduler_env_uid != run_uid
+    ):
+        raise RuntimeError(
+            "recommendation terminal scheduler environment identity differs"
+        )
+    if scheduler_job_id != run_uid and (production or scheduler_env_uid):
+        raise RuntimeError(
+            "recommendation terminal scheduler identity differs"
+        )
+    build_sha = _recommendation_build_sha()
+    row_build_sha = str(row.get("build_sha") or "").strip().lower()
+    if production and not build_sha:
+        raise RuntimeError("recommendation terminal build identity unavailable")
+    if build_sha and row_build_sha != build_sha:
+        raise RuntimeError("recommendation terminal build identity differs")
+    if (
+        str(row.get("run_uid") or "").strip().lower() != run_uid
+        or str(row.get("status") or "") != status
+        or row.get("finished_at") is None
+    ):
+        raise RuntimeError("recommendation terminal receipt differs")
+    return dict(row)
 
 
-def _recommended_run_history_expire_stale(max_age_minutes: int = 180) -> None:
-    try:
-        minutes = max(5, min(1440, int(max_age_minutes)))
-    except (TypeError, ValueError):
-        minutes = 180
+def _recommended_run_history_reconcile_scheduler_terminal() -> None:
+    """Close rows only from the exact scheduler audit terminal receipt."""
     try:
         _ensure_recommended_run_history_table()
-        _exec_sql(f"""
-            UPDATE st_recommended_run_history
-            SET status = 'error',
-                finished_at = NOW(),
-                duration_seconds = TIMESTAMPDIFF(SECOND, started_at, NOW()),
-                progress_percent = 0,
-                message = '任务已中断或超时，已自动清理，避免生产卡死',
-                error = 'stale running recommendation job expired'
-            WHERE status = 'running'
-              AND started_at < DATE_SUB(NOW(), INTERVAL {minutes} MINUTE)
+        rows = _read_sql("""
+            SELECT r.run_uid, r.scheduler_job_id,
+                   h.status AS scheduler_status,
+                   h.finished_at AS scheduler_finished_at,
+                   h.output AS scheduler_output
+            FROM st_recommended_run_history r
+            JOIN st_scheduled_task_history h
+              ON h.run_uid = r.scheduler_job_id
+             AND h.run_uid = r.run_uid
+            WHERE r.status IN ('running', 'submitted')
+              AND h.finished_at IS NOT NULL
+              AND h.status IN ('success', 'failed', 'timeout', 'stopped', 'blocked')
+            ORDER BY h.finished_at ASC
+            LIMIT 20
         """, {})
     except Exception as exc:
-        _record_fallback('_recommended_run_history_expire_stale', exc)
-
-
-def _web_ai_recommendation_run_enabled() -> bool:
-    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_RUN", "").strip() == "1"
-
-
-def _web_ai_recommendation_queue_enabled() -> bool:
-    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_QUEUE", "1").strip() != "0"
-
-
-def _web_ai_recommendation_queue_autostart_enabled() -> bool:
-    return os.environ.get("PROBIGA_ENABLE_WEB_AI_RECOMMENDATION_QUEUE_AUTOSTART", "1").strip() != "0"
-
-
-def _web_ai_recommendation_queue_worker_allow_intraday() -> bool:
-    return os.environ.get("PROBIGA_AI_RECOMMEND_QUEUE_WORKER_ALLOW_INTRADAY", "1").strip() != "0"
-
-
-def _start_recommended_queue_worker(*, run_uid: str, refresh_realtime: bool) -> dict:
-    from server.api.scheduler_runtime import start_detached_python_job
-
-    cmd = [
-        sys.executable,
-        str(_ROOT / "tools" / "run_ai_recommendation_worker.py"),
-        "--once",
-        "--force",
-    ]
-    if refresh_realtime:
-        cmd.append("--refresh-realtime")
-    if _web_ai_recommendation_queue_worker_allow_intraday():
-        cmd.append("--allow-intraday")
-    cmd.extend([
-        "--max-load",
-        os.environ.get(
-            "PROBIGA_AI_RECOMMEND_QUEUE_WORKER_MAX_LOAD",
-            os.environ.get("PROBIGA_AI_WORKER_MAX_LOAD", "8.00"),
-        ),
-        "--min-memory-mb",
-        os.environ.get(
-            "PROBIGA_AI_RECOMMEND_QUEUE_WORKER_MIN_MEMORY_MB",
-            os.environ.get("PROBIGA_AI_WORKER_MIN_MEMORY_MB", "700"),
-        ),
-    ])
-
-    env = build_child_env(_ROOT, engine=get_engine())
-    env.update({
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-        "PROBIGA_AI_RECOMMEND_WORKER_ENABLED": "1",
-    })
-    return start_detached_python_job(
-        cmd=cmd,
-        root=_ROOT,
-        env=env,
-        log_name=f"recommended_queue_worker_{run_uid}",
-        nice=10,
-    )
-
-
-def _protected_recommended_run_response(
-    *,
-    trade_date: str,
-    min_score: float,
-    top_n: int,
-    strict_prev_trade_day: bool,
-    execution_time: str,
-    run_context: dict | None = None,
-) -> dict:
-    message = "生产保护模式：Web 端全市场 AI 推荐已暂停，避免 2核4G 服务器再次卡死；请改用独立 worker 或低峰手工任务生成。"
-    progress = {
-        "status": "protected",
-        "percent": 0,
-        "step": message,
-        "total": 0,
-        "done": 0,
-        "passed": 0,
-        "trade_date": trade_date,
-        "min_score": float(min_score),
-        "top_n": int(top_n),
-        "strict_prev_trade_day": bool(strict_prev_trade_day),
-        "execution_time": execution_time,
-        "run_context": run_context or {},
-        "is_running": False,
-    }
-    _cache_set("rec_screen_progress", progress)
-    return {
-        "status": "protected",
-        "date": trade_date,
-        "min_score": float(min_score),
-        "top_n": int(top_n),
-        "strict_prev_trade_day": bool(strict_prev_trade_day),
-        "execution_time": execution_time,
-        "run_context": run_context or {},
-        "progress": progress,
-        "note": message,
-    }
-
-
-def _queued_recommended_run_response(
-    *,
-    trade_date: str,
-    min_score: float,
-    top_n: int,
-    strict_prev_trade_day: bool,
-    execution_time: str,
-    refresh_realtime: bool = True,
-    run_context: dict | None = None,
-) -> dict:
-    message = "AI 推荐任务已入队；将由独立低优先级 worker 后台执行，避免生产 API 卡死。"
-    run_uid = _recommended_run_history_start(
-        trade_date=trade_date,
-        min_score=min_score,
-        top_n=top_n,
-        strict_prev_trade_day=strict_prev_trade_day,
-        execution_time=execution_time,
-        message=message,
-        status="queued",
-    )
-    worker_info = None
-    worker_error = ""
-    if run_uid and _web_ai_recommendation_queue_autostart_enabled():
-        try:
-            worker_info = _start_recommended_queue_worker(
-                run_uid=run_uid,
-                refresh_realtime=bool(refresh_realtime),
-            )
-            message = "AI 推荐任务已入队，worker 已自动启动；正在等待后台领取任务。"
-            _recommended_run_history_update(run_uid, status="queued", payload={
-                "progress_percent": 5,
-                "done_count": 0,
-                "message": message,
-                "error": "",
-            })
-        except Exception as exc:
-            worker_error = str(exc)[:500]
-            message = "AI 推荐任务已入队，但自动启动 worker 失败；请检查后台 worker。"
-            _recommended_run_history_update(run_uid, status="queued", payload={
-                "progress_percent": 5,
-                "done_count": 0,
-                "message": message,
-                "error": worker_error,
-            })
-    progress = {
-        "status": "queued",
-        "percent": 5,
-        "step": message,
-        "total": 0,
-        "done": 0,
-        "passed": 0,
-        "trade_date": trade_date,
-        "min_score": float(min_score),
-        "top_n": int(top_n),
-        "strict_prev_trade_day": bool(strict_prev_trade_day),
-        "execution_time": execution_time,
-        "refresh_realtime": bool(refresh_realtime),
-        "use_intraday_current": bool((run_context or {}).get("use_intraday_current")),
-        "run_context": run_context or {},
-        "run_uid": run_uid,
-        "is_running": True,
-    }
-    if worker_info:
-        progress["worker"] = worker_info
-    if worker_error:
-        progress["worker_error"] = worker_error
-    _cache_set("rec_screen_progress", progress)
-    return {
-        "status": "queued",
-        "date": trade_date,
-        "min_score": float(min_score),
-        "top_n": int(top_n),
-        "strict_prev_trade_day": bool(strict_prev_trade_day),
-        "execution_time": execution_time,
-        "refresh_realtime": bool(refresh_realtime),
-        "use_intraday_current": bool((run_context or {}).get("use_intraday_current")),
-        "run_context": run_context or {},
-        "run_uid": run_uid,
-        "progress": progress,
-        "worker": worker_info,
-        "worker_error": worker_error,
-        "note": message,
-    }
+        _record_fallback(
+            '_recommended_run_history_reconcile_scheduler_terminal',
+            exc,
+        )
+        return
+    for row in rows:
+        scheduler_status = str(row.get("scheduler_status") or "")
+        if scheduler_status == "success":
+            status = "done"
+            message = "生产调度任务已完成（由调度审计回执收口）"
+            error = ""
+        elif scheduler_status == "stopped":
+            status = "cancelled"
+            message = "生产调度任务已停止"
+            error = str(row.get("scheduler_output") or "")[-500:]
+        else:
+            status = "error"
+            message = f"生产调度任务终态：{scheduler_status}"
+            error = str(row.get("scheduler_output") or "")[-500:]
+        _recommended_run_history_finish(
+            str(row.get("run_uid") or ""),
+            status=status,
+            payload={"message": message, "error": error},
+        )
 
 
 def _recommended_history_progress(run_uid: str = "") -> dict | None:
@@ -10417,7 +10268,8 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
                 SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
                         execution_time, started_at, finished_at, duration_seconds,
                         progress_percent, done_count, total, passed,
-                        flow_date, hot_date, market_mood_score, message, error
+                        flow_date, hot_date, market_mood_score, message, error,
+                        trigger_source, scheduler_job_id, host_name, build_sha
                 FROM st_recommended_run_history
                 WHERE run_uid = :run_uid
                 LIMIT 1
@@ -10427,7 +10279,8 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
                 SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
                         execution_time, started_at, finished_at, duration_seconds,
                         progress_percent, done_count, total, passed,
-                        flow_date, hot_date, market_mood_score, message, error
+                        flow_date, hot_date, market_mood_score, message, error,
+                        trigger_source, scheduler_job_id, host_name, build_sha
                 FROM st_recommended_run_history
                 ORDER BY started_at DESC, id DESC
                 LIMIT 1
@@ -10435,18 +10288,24 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
         if not rows:
             return None
         row = rows[0]
-        status = str(row.get("status") or "idle")
-        is_running = status == "running"
-        is_active = status in {"running", "queued"}
-        fallback_percent = 20 if is_running else (5 if status == "queued" else (100 if status == "done" else 0))
+        stored_status = str(row.get("status") or "idle")
+        legacy_queued = stored_status == "queued"
+        status = "cancelled" if legacy_queued else stored_status
+        is_running = status in {"running", "submitted"}
+        is_active = is_running
+        fallback_percent = 20 if status == "running" else (1 if status == "submitted" else (100 if status == "done" else 0))
         try:
             percent = int(row.get("progress_percent") if row.get("progress_percent") is not None else fallback_percent)
         except (TypeError, ValueError):
             percent = fallback_percent
         percent = max(0, min(100, percent))
-        step = str(row.get("message") or row.get("error") or "")
+        step = (
+            "旧版推荐队列已停用；该任务不会自动恢复，请重新提交"
+            if legacy_queued
+            else str(row.get("message") or row.get("error") or "")
+        )
         if not step:
-            step = "离线推荐任务运行中" if is_running else ("离线推荐任务排队中" if status == "queued" else status)
+            step = "生产调度推荐任务运行中" if is_running else status
         done_count = row.get("done_count")
         if done_count is None and status == "done":
             done_count = row.get("total")
@@ -10470,6 +10329,10 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
             "finished_at": str(row.get("finished_at") or "")[:19],
             "duration_seconds": row.get("duration_seconds"),
             "error": str(row.get("error") or ""),
+            "trigger_source": str(row.get("trigger_source") or ""),
+            "scheduler_job_id": str(row.get("scheduler_job_id") or ""),
+            "host_name": str(row.get("host_name") or ""),
+            "build_sha": str(row.get("build_sha") or ""),
             "is_running": is_active,
             "is_active": is_active,
         }
@@ -10478,55 +10341,10 @@ def _recommended_history_progress(run_uid: str = "") -> dict | None:
         return None
 
 
-def _queued_recommended_refresh_realtime(progress: dict) -> bool:
-    if bool(progress.get("strict_prev_trade_day")):
-        return False
-    trade_date = str(progress.get("trade_date") or "")[:10]
-    execution_time = str(progress.get("execution_time") or "")[:19]
-    if not trade_date or not execution_time:
-        return False
-    dt = _parse_recommendation_execution_time(execution_time)
-    if trade_date != dt.date().isoformat():
-        return False
-    hhmm = dt.hour * 100 + dt.minute
-    return 925 <= hhmm <= 1505
-
-
-def _maybe_autostart_queued_recommended_worker(progress: dict | None) -> None:
-    if not progress or str(progress.get("status") or "") != "queued":
-        return
-    if not _web_ai_recommendation_queue_autostart_enabled():
-        return
-    run_uid = str(progress.get("run_uid") or "")
-    if not run_uid:
-        return
-    cache_key = f"rec_queue_worker_autostart_{run_uid}"
-    if _cache_get(cache_key, ttl_seconds=60):
-        return
-    _cache_set(cache_key, True)
-    refresh_realtime = _queued_recommended_refresh_realtime(progress)
-    try:
-        worker_info = _start_recommended_queue_worker(
-            run_uid=run_uid,
-            refresh_realtime=refresh_realtime,
-        )
-        _recommended_run_history_update(run_uid, status="queued", payload={
-            "progress_percent": 5,
-            "message": "queued AI recommendation worker auto-retried",
-            "error": "",
-        })
-        progress["worker"] = worker_info
-    except Exception as exc:
-        _recommended_run_history_update(run_uid, status="queued", payload={
-            "message": "queued AI recommendation worker auto-retry failed",
-            "error": str(exc)[:500],
-        })
-
-
 @router.get("/hot-data/recommended-stocks/progress")
 def recommended_stocks_progress():
     """查询 AI 推荐筛选进度"""
-    _recommended_run_history_expire_stale()
+    _recommended_run_history_reconcile_scheduler_terminal()
     cached = _cache_get("rec_screen_progress", ttl_seconds=7200)
     if cached is not None:
         if isinstance(cached, dict) and str(cached.get("status") or "") == "protected":
@@ -10547,9 +10365,6 @@ def recommended_stocks_progress():
             history_percent = int(history.get("percent") or 0)
             if history_status in {"done", "error", "protected"}:
                 return history
-            if history_status == "queued":
-                _maybe_autostart_queued_recommended_worker(history)
-                return history
             if cached_status != history_status:
                 return history
             if history_status == "running" and history_percent >= cached_percent:
@@ -10559,13 +10374,10 @@ def recommended_stocks_progress():
             "is_running": (
                 _job_is_running("recommended_stocks")
                 or bool(history and history.get("is_running"))
-                or (isinstance(cached, dict) and str(cached.get("status") or "") == "queued")
             ),
         }
     history = _recommended_history_progress()
-    if history and (history.get("is_running") or history.get("status") in {"queued", "protected"}):
-        if str(history.get("status") or "") == "queued":
-            _maybe_autostart_queued_recommended_worker(history)
+    if history and (history.get("is_running") or history.get("status") == "protected"):
         return history
     return {"status": "idle", "percent": 0, "step": "未启动", "is_running": False}
 
@@ -10574,12 +10386,13 @@ def recommended_stocks_progress():
 def recommended_stocks_run_history(limit: int = Query(default=10, ge=1, le=50)):
     """查询 AI 推荐筛选执行历史"""
     try:
-        _recommended_run_history_expire_stale()
+        _recommended_run_history_reconcile_scheduler_terminal()
         _ensure_recommended_run_history_table()
         rows = _read_sql("""
             SELECT id, run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
                    execution_time, started_at, finished_at, duration_seconds,
-                   total, passed, flow_date, hot_date, market_mood_score, message, error
+                   total, passed, flow_date, hot_date, market_mood_score, message, error,
+                   trigger_source, scheduler_job_id, host_name, build_sha
             FROM st_recommended_run_history
             ORDER BY started_at DESC, id DESC
             LIMIT :limit
@@ -10591,13 +10404,13 @@ def recommended_stocks_run_history(limit: int = Query(default=10, ge=1, le=50)):
 
 def _active_recommended_run() -> dict | None:
     try:
-        _recommended_run_history_expire_stale()
+        _recommended_run_history_reconcile_scheduler_terminal()
         _ensure_recommended_run_history_table()
         rows = _read_sql("""
             SELECT run_uid, trade_date, status, min_score, top_n, strict_prev_trade_day,
                    execution_time, started_at, message
             FROM st_recommended_run_history
-            WHERE status IN ('running', 'queued')
+            WHERE status IN ('running', 'submitted')
               AND started_at >= DATE_SUB(NOW(), INTERVAL 12 HOUR)
             ORDER BY started_at DESC, id DESC
             LIMIT 1
@@ -10608,92 +10421,262 @@ def _active_recommended_run() -> dict | None:
         return None
 
 
-def _start_recommended_offline_process(
+def _manual_recommendation_script_args(
     *,
-    run_uid: str,
     trade_date: str,
     min_score: float,
     top_n: int,
-    strict_prev_trade_day: bool,
     execution_time: str,
     min_kline_coverage: float,
-    auto_repair_missing_kline: bool,
-    refresh_realtime: bool,
-    use_intraday_current: bool = False,
-) -> dict:
-    from server.api.scheduler_runtime import start_detached_python_job
-
-    cmd = [
-        sys.executable,
-        str(_ROOT / "tools" / "run_ai_recommendation_premarket.py"),
+    run_uid: str,
+) -> str:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", trade_date):
+        raise ValueError("resolved recommendation trade date is invalid")
+    if not re.fullmatch(r"[0-9a-f]{32}", run_uid):
+        raise ValueError("recommendation run_uid is invalid")
+    execution_token = execution_time
+    tokens = [
         "--date",
         trade_date,
         "--top-n",
-        str(int(top_n)),
+        str(max(20, min(200, int(top_n)))),
         "--min-score",
-        str(float(min_score)),
+        format(max(0.0, min(100.0, float(min_score))), ".6g"),
+        "--strict-prev-trade-day",
         "--execution-time",
-        execution_time,
+        execution_token,
         "--min-kline-coverage",
-        str(float(min_kline_coverage)),
+        format(max(0.0, min(1.0, float(min_kline_coverage))), ".6g"),
         "--run-uid",
         run_uid,
         "--json",
     ]
-    if strict_prev_trade_day:
-        cmd.append("--strict-prev-trade-day")
-    if auto_repair_missing_kline:
-        cmd.append("--auto-repair-missing-kline")
-        cmd.append("--auto-repair-missing-data")
-    if refresh_realtime:
-        cmd.append("--refresh-realtime")
-    if use_intraday_current:
-        cmd.append("--use-intraday-current")
-
-    env = build_child_env(_ROOT, engine=get_engine())
-    env.update({
-        "OMP_NUM_THREADS": "1",
-        "OPENBLAS_NUM_THREADS": "1",
-        "MKL_NUM_THREADS": "1",
-        "NUMEXPR_NUM_THREADS": "1",
-    })
-    return start_detached_python_job(
-        cmd=cmd,
-        root=_ROOT,
-        env=env,
-        log_name=f"recommended_stocks_{run_uid}",
-        nice=10,
-    )
+    return " ".join(tokens)
 
 
-def _run_recommended_batch_in_process(
+def _manual_recommendation_execution_time(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return datetime.now().replace(microsecond=0).isoformat(timespec="seconds")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("execution_time must be an ISO local timestamp") from exc
+    if parsed.tzinfo is not None:
+        raise ValueError("execution_time must not contain a timezone offset")
+    return parsed.replace(microsecond=0).isoformat(timespec="seconds")
+
+
+def _submit_manual_recommended_stocks(
     *,
-    engine,
     trade_date: str,
-    top_n: int,
     min_score: float,
-    progress_callback,
-    strict_prev_trade_day: bool,
+    top_n: int,
     execution_time: str,
     min_kline_coverage: float,
     auto_repair_missing_kline: bool,
-    use_intraday_current: bool,
-):
-    """Thread fallback that preserves the caller's one exact run cutoff."""
-    from biz.analysis.sync_analysis_fast import run_batch
+    strict_prev_trade_day: bool,
+    refresh_realtime: bool,
+    date_policy: str,
+) -> dict:
+    """Submit one strict previous-day run through the production scheduler."""
+    import uuid
 
-    return run_batch(
-        engine=engine,
-        trade_date=trade_date,
+    try:
+        execution_iso = _manual_recommendation_execution_time(execution_time)
+    except ValueError as exc:
+        return {
+            "accepted": False,
+            "status": "invalid_request",
+            "job_id": "",
+            "run_uid": "",
+            "error": str(exc),
+        }
+    try:
+        gate = _recommendation_gate_status(
+            execution_time=execution_iso,
+            min_kline_coverage=min_kline_coverage,
+            target_trade_date="",
+            check_readiness=True,
+        )
+    except Exception as exc:
+        return {
+            "accepted": False,
+            "status": "strict_gate_unavailable",
+            "job_id": "",
+            "run_uid": "",
+            "error": str(exc),
+        }
+    resolved_trade_date = str(gate.get("expected_trade_date") or "")[:10]
+    if not gate.get("ready"):
+        return {
+            "accepted": False,
+            "status": "strict_gate_blocked",
+            "date": resolved_trade_date,
+            "job_id": "",
+            "run_uid": "",
+            "strict_prev_trade_day": True,
+            "refresh_realtime": False,
+            "use_intraday_current": False,
+            "gate": gate,
+            "error": str(
+                gate.get("error")
+                or "上一完整交易日数据未通过严格就绪检查"
+            ),
+        }
+
+    run_uid = uuid.uuid4().hex
+    script_args = _manual_recommendation_script_args(
+        trade_date=resolved_trade_date,
+        min_score=min_score,
         top_n=top_n,
-        min_score=float(min_score),
-        progress_callback=progress_callback,
-        strict_prev_trade_day=bool(strict_prev_trade_day),
-        execution_time=execution_time or None,
-        min_kline_coverage=float(min_kline_coverage),
-        auto_repair_missing_kline=bool(auto_repair_missing_kline),
-        use_intraday_current=bool(use_intraday_current),
+        execution_time=execution_iso,
+        min_kline_coverage=min_kline_coverage,
+        run_uid=run_uid,
     )
+    try:
+        _recommended_run_history_start(
+            run_uid=run_uid,
+            trade_date=resolved_trade_date,
+            min_score=min_score,
+            top_n=top_n,
+            strict_prev_trade_day=True,
+            execution_time=execution_iso,
+            message="AI 推荐任务待生产调度器接管",
+            status="submitted",
+            trigger_source="manual",
+            scheduler_job_id=run_uid,
+        )
+    except Exception as exc:
+        return {
+            "accepted": False,
+            "status": "recommendation_audit_unavailable",
+            "date": resolved_trade_date,
+            "job_id": "",
+            "run_uid": run_uid,
+            "strict_prev_trade_day": True,
+            "refresh_realtime": False,
+            "use_intraday_current": False,
+            "error": str(exc),
+        }
+
+    try:
+        launch = _launch_registered_scheduler_task(
+            task_type="analysis_premarket_external",
+            expected_script_path="tools/run_ai_recommendation_premarket.py",
+            script_args_override=script_args,
+            validation_profile="analysis_web_manual_v1",
+            scheduler_history_uid=run_uid,
+        )
+    except Exception as exc:
+        launch = {
+            "accepted": False,
+            "status": "scheduler_launch_error",
+            "job_id": "",
+            "error": str(exc),
+        }
+    if not launch.get("accepted"):
+        _recommended_run_history_finish(
+            run_uid,
+            status="error",
+            payload={
+                "trade_date": resolved_trade_date,
+                "message": "生产调度器拒绝 AI 推荐任务",
+                "error": str(
+                    launch.get("error")
+                    or launch.get("status")
+                    or "scheduler rejected launch"
+                ),
+            },
+        )
+        return {
+            **launch,
+            "accepted": False,
+            "date": resolved_trade_date,
+            "run_uid": run_uid,
+            "strict_prev_trade_day": True,
+            "refresh_realtime": False,
+            "use_intraday_current": False,
+            "gate": gate,
+        }
+
+    scheduler_job_id = str(launch.get("job_id") or "")
+    if scheduler_job_id != run_uid:
+        task_id = launch.get("task_id")
+        stop_result: dict = {
+            "accepted": False,
+            "status": "invalid_task_identity",
+            "process_killed": False,
+        }
+        try:
+            if task_id is not None:
+                stop_result = dict(
+                    request_stop_owned_scheduler_task(int(task_id))
+                )
+        except Exception as exc:
+            stop_result = {
+                "accepted": False,
+                "status": "stop_failed",
+                "process_killed": False,
+                "error": str(exc),
+            }
+        _recommended_run_history_finish(
+            run_uid,
+            status="error",
+            payload={
+                "trade_date": resolved_trade_date,
+                "message": "生产调度器返回了不同的审计任务编号",
+                "error": (
+                    f"expected={run_uid}; returned={scheduler_job_id or '<empty>'}; "
+                    f"stop_status={stop_result.get('status') or 'unknown'}"
+                ),
+            },
+        )
+        stopped_exact_job = bool(
+            stop_result.get("accepted")
+            and stop_result.get("process_killed")
+            and str(stop_result.get("job_id") or "") == scheduler_job_id
+        )
+        if not stopped_exact_job:
+            raise RuntimeError(
+                "scheduler returned a different pre-bound audit identity and "
+                "the exact child termination was not confirmed"
+            )
+        return {
+            **launch,
+            "accepted": False,
+            "status": "audit_identity_mismatch",
+            "date": resolved_trade_date,
+            "run_uid": run_uid,
+            "scheduler_job_id": scheduler_job_id,
+            "stop": stop_result,
+            "error": "scheduler returned a different pre-bound audit identity",
+        }
+    response = {
+        **launch,
+        "accepted": True,
+        "status": "running",
+        "date": resolved_trade_date,
+        "run_uid": run_uid,
+        "scheduler_job_id": scheduler_job_id,
+        "audit_linked": True,
+        "strict_prev_trade_day": True,
+        "refresh_realtime": False,
+        "use_intraday_current": False,
+        "gate": gate,
+        "ignored_request": {
+            "trade_date": str(trade_date or "")[:10],
+            "strict_prev_trade_day": bool(strict_prev_trade_day),
+            "refresh_realtime": bool(refresh_realtime),
+            "date_policy": str(date_policy or ""),
+            "auto_repair_missing_kline": bool(auto_repair_missing_kline),
+        },
+        "note": (
+            "已提交生产调度器；仅使用上一完整交易日数据，"
+            f"任务编号 {scheduler_job_id}"
+        ),
+    }
+    return response
 
 
 @router.post("/hot-data/recommended-stocks/run")
@@ -10708,541 +10691,19 @@ def run_recommended_stocks(
     refresh_realtime: bool = Query(default=True),
     date_policy: str = Query(default="auto"),
 ):
-    """触发 AI 推荐股票筛选（使用统一分析引擎）"""
-    try:
-        run_context = _resolve_recommended_run_context(
-            trade_date=trade_date,
-            strict_prev_trade_day=bool(strict_prev_trade_day),
-            execution_time=execution_time,
-            refresh_realtime=bool(refresh_realtime),
-            date_policy=date_policy,
-        )
-    except Exception as exc:
-        return {
-            "status": "error",
-            "date": str(trade_date or "")[:10],
-            "min_score": min_score,
-            "top_n": top_n,
-            "strict_prev_trade_day": bool(strict_prev_trade_day),
-            "error": str(exc),
-        }
-
-    trade_date = str(run_context.get("trade_date") or "")[:10]
-    strict_prev_trade_day = bool(run_context.get("strict_prev_trade_day"))
-    execution_time = str(run_context.get("execution_time") or "")
-    refresh_realtime = bool(run_context.get("refresh_realtime"))
-    use_intraday_current = bool(run_context.get("use_intraday_current"))
-
-    _recommended_run_history_expire_stale()
-    active = _active_recommended_run()
-    if active:
-        progress = _recommended_history_progress(str(active.get("run_uid") or "")) or recommended_stocks_progress()
-        active_status = str(active.get("status") or progress.get("status") or "running")
-        process_info = None
-        worker_error = ""
-        if active_status == "queued" and _web_ai_recommendation_queue_autostart_enabled():
-            try:
-                process_info = _start_recommended_queue_worker(
-                    run_uid=str(active.get("run_uid") or ""),
-                    refresh_realtime=bool(refresh_realtime),
-                )
-                _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
-                    "progress_percent": 5,
-                    "message": "queued AI recommendation worker restarted",
-                    "error": "",
-                })
-                progress = _recommended_history_progress(str(active.get("run_uid") or "")) or progress
-            except Exception as exc:
-                worker_error = str(exc)[:500]
-                _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
-                    "message": "queued AI recommendation worker restart failed",
-                    "error": worker_error,
-                })
-        return {
-            "status": active_status,
-            "date": str(active.get("trade_date") or "")[:10],
-            "min_score": float(active.get("min_score") or min_score),
-            "top_n": int(active.get("top_n") or top_n),
-            "strict_prev_trade_day": bool(active.get("strict_prev_trade_day")),
-            "run_uid": str(active.get("run_uid") or ""),
-            "progress": progress,
-            "process": process_info,
-            "worker_error": worker_error,
-            "run_context": run_context,
-            "note": "已有 AI 推荐任务在队列或后台运行",
-        }
-
-    strict_gate = None
-    if strict_prev_trade_day and not auto_repair_missing_kline:
-        try:
-            strict_gate = _recommendation_gate_status(
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-                target_trade_date=trade_date,
-            )
-            if not strict_gate.get("ready"):
-                gate_error = strict_gate.get("error") or "target trade date data is not ready"
-                return {
-                    "status": "error",
-                    "date": trade_date,
-                    "min_score": min_score,
-                    "top_n": top_n,
-                    "strict_prev_trade_day": True,
-                    "gate": strict_gate,
-                    "run_context": run_context,
-                    "error": gate_error,
-                }
-        except Exception as exc:
-            return {
-                "status": "error",
-                "date": trade_date,
-                "min_score": min_score,
-                "top_n": top_n,
-                "strict_prev_trade_day": True,
-                "run_context": run_context,
-                "error": str(exc),
-            }
-
-    if _web_ai_recommendation_queue_enabled():
-        return _queued_recommended_run_response(
-            trade_date=trade_date,
-            min_score=min_score,
-            top_n=top_n,
-            strict_prev_trade_day=strict_prev_trade_day,
-            execution_time=execution_time,
-            refresh_realtime=refresh_realtime,
-            run_context=run_context,
-        )
-    return _protected_recommended_run_response(
+    """通过唯一生产调度任务运行上一完整交易日 AI 推荐。"""
+    return _submit_manual_recommended_stocks(
         trade_date=trade_date,
         min_score=min_score,
         top_n=top_n,
-        strict_prev_trade_day=strict_prev_trade_day,
-        execution_time=execution_time,
-        run_context=run_context,
-    )
-
-    import threading
-
-    if os.environ.get("PROBIGA_ALLOW_INLINE_AI_RECOMMENDATION_RUN", "").strip() != "1":
-        _recommended_run_history_expire_stale()
-        active = _active_recommended_run()
-        if active:
-            progress = _recommended_history_progress(str(active.get("run_uid") or "")) or recommended_stocks_progress()
-            active_status = str(active.get("status") or progress.get("status") or "running")
-            process_info = None
-            worker_error = ""
-            if active_status == "queued" and _web_ai_recommendation_queue_autostart_enabled():
-                try:
-                    process_info = _start_recommended_queue_worker(
-                        run_uid=str(active.get("run_uid") or ""),
-                        refresh_realtime=bool(refresh_realtime),
-                    )
-                    _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
-                        "progress_percent": 5,
-                        "message": "已有 AI 推荐任务在排队，worker 已重新唤起。",
-                        "error": "",
-                    })
-                    progress = _recommended_history_progress(str(active.get("run_uid") or "")) or progress
-                except Exception as exc:
-                    worker_error = str(exc)[:500]
-                    _recommended_run_history_update(str(active.get("run_uid") or ""), status="queued", payload={
-                        "message": "已有 AI 推荐任务在排队，但自动唤起 worker 失败。",
-                        "error": worker_error,
-                    })
-            return {
-                "status": active_status,
-                "date": str(active.get("trade_date") or "")[:10],
-                "min_score": float(active.get("min_score") or min_score),
-                "top_n": int(active.get("top_n") or top_n),
-                "strict_prev_trade_day": bool(active.get("strict_prev_trade_day")),
-                "run_uid": str(active.get("run_uid") or ""),
-                "progress": progress,
-                "process": process_info,
-                "worker_error": worker_error,
-                "note": "已有 AI 推荐任务在排队" if active_status == "queued" else "已有离线 AI 推荐任务在运行",
-            }
-
-        strict_gate = None
-        if strict_prev_trade_day:
-            try:
-                strict_gate = _recommendation_gate_status(
-                    execution_time=execution_time,
-                    min_kline_coverage=min_kline_coverage,
-                )
-                trade_date = strict_gate["expected_trade_date"]
-                execution_time = strict_gate["execution_time"]
-                if not strict_gate.get("ready") and not auto_repair_missing_kline:
-                    gate_error = strict_gate.get("error") or "目标日基础数据未就绪"
-                    return {
-                        "status": "error",
-                        "date": trade_date,
-                        "min_score": min_score,
-                        "top_n": top_n,
-                        "strict_prev_trade_day": True,
-                        "gate": strict_gate,
-                        "error": gate_error,
-                    }
-            except Exception as exc:
-                return {
-                    "status": "error",
-                    "date": str(trade_date or "")[:10],
-                    "min_score": min_score,
-                    "top_n": top_n,
-                    "strict_prev_trade_day": True,
-                    "error": str(exc),
-                }
-        elif not trade_date:
-            trade_date = _smart_trade_date()
-        trade_date = str(trade_date or "")[:10]
-        execution_time = execution_time or datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-        if not _web_ai_recommendation_run_enabled():
-            if _web_ai_recommendation_queue_enabled():
-                return _queued_recommended_run_response(
-                    trade_date=trade_date,
-                    min_score=min_score,
-                    top_n=top_n,
-                    strict_prev_trade_day=strict_prev_trade_day,
-                    execution_time=execution_time,
-                    refresh_realtime=refresh_realtime,
-                )
-            return _protected_recommended_run_response(
-                trade_date=trade_date,
-                min_score=min_score,
-                top_n=top_n,
-                strict_prev_trade_day=strict_prev_trade_day,
-                execution_time=execution_time,
-            )
-        run_uid = _recommended_run_history_start(
-            trade_date=trade_date,
-            min_score=min_score,
-            top_n=top_n,
-            strict_prev_trade_day=strict_prev_trade_day,
-            execution_time=execution_time,
-            message="离线 AI 推荐任务已启动；先刷新点击时实时数据",
-        )
-        _set_recommendation_progress(
-            status="running",
-            percent=0,
-            step="离线 AI 推荐任务已启动；正在刷新点击时实时数据",
-            total=0,
-            done=0,
-            passed=0,
-            trade_date=trade_date,
-            min_score=min_score,
-            top_n=top_n,
-            strict_prev_trade_day=strict_prev_trade_day,
-            execution_time=execution_time,
-            min_kline_coverage=min_kline_coverage,
-            auto_repair_missing_kline=auto_repair_missing_kline,
-            refresh_realtime=refresh_realtime,
-            gate=strict_gate,
-            run_uid=run_uid,
-            started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        )
-        try:
-            process_info = _start_recommended_offline_process(
-                run_uid=run_uid,
-                trade_date=trade_date,
-                min_score=min_score,
-                top_n=top_n,
-                strict_prev_trade_day=strict_prev_trade_day,
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-                auto_repair_missing_kline=auto_repair_missing_kline,
-                refresh_realtime=refresh_realtime,
-                use_intraday_current=use_intraday_current,
-            )
-        except Exception as exc:
-            _recommended_run_history_finish(run_uid, status="error", payload={
-                "trade_date": trade_date,
-                "message": "离线 AI 推荐任务启动失败",
-                "error": str(exc)[:500],
-            })
-            _set_recommendation_progress(
-                status="error",
-                percent=0,
-                step=f"离线任务启动失败: {str(exc)[:80]}",
-                trade_date=trade_date,
-                run_uid=run_uid,
-                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            return {
-                "status": "error",
-                "date": trade_date,
-                "min_score": min_score,
-                "top_n": top_n,
-                "strict_prev_trade_day": strict_prev_trade_day,
-                "run_uid": run_uid,
-                "error": str(exc),
-            }
-        return {
-            "status": "started",
-            "date": trade_date,
-            "min_score": min_score,
-            "top_n": top_n,
-            "strict_prev_trade_day": strict_prev_trade_day,
-            "execution_time": execution_time,
-            "min_kline_coverage": min_kline_coverage,
-            "auto_repair_missing_kline": auto_repair_missing_kline,
-            "refresh_realtime": refresh_realtime,
-            "gate": strict_gate,
-            "run_uid": run_uid,
-            "process": process_info,
-            "progress": recommended_stocks_progress(),
-            "note": "离线 AI 推荐任务已启动，完成后页面会读取今天的新结果",
-        }
-
-    strict_gate = None
-    if strict_prev_trade_day:
-        try:
-            strict_gate = _recommendation_gate_status(
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-            )
-            trade_date = strict_gate["expected_trade_date"]
-            execution_time = strict_gate["execution_time"]
-            if not strict_gate.get("ready") and not auto_repair_missing_kline:
-                gate_error = strict_gate.get("error") or "目标日基础数据未就绪"
-                run_uid = _recommended_run_history_start(
-                    trade_date=trade_date,
-                    min_score=min_score,
-                    top_n=top_n,
-                    strict_prev_trade_day=True,
-                    execution_time=execution_time,
-                    message="严格门禁未通过",
-                )
-                _recommended_run_history_finish(run_uid, status="error", payload={
-                    "message": "严格门禁未通过",
-                    "error": gate_error,
-                })
-                _set_recommendation_progress(
-                    status="error",
-                    percent=0,
-                    step=f"严格门禁未通过：{gate_error}",
-                    total=0,
-                    done=0,
-                    passed=0,
-                    trade_date=trade_date,
-                    min_score=min_score,
-                    top_n=top_n,
-                    strict_prev_trade_day=True,
-                    auto_repair_missing_kline=False,
-                    gate=strict_gate,
-                    run_uid=run_uid,
-                    finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                )
-                return {
-                    "status": "error",
-                    "date": trade_date,
-                    "min_score": min_score,
-                    "top_n": top_n,
-                    "strict_prev_trade_day": True,
-                    "auto_repair_missing_kline": False,
-                    "gate": strict_gate,
-                    "run_uid": run_uid,
-                    "error": gate_error,
-                }
-        except Exception as exc:
-            return {
-                "status": "error",
-                "date": trade_date,
-                "min_score": min_score,
-                "top_n": top_n,
-                "strict_prev_trade_day": True,
-                "error": str(exc),
-            }
-    elif not trade_date:
-        trade_date = _smart_trade_date()
-    trade_date = str(trade_date)[:10]
-
-    if not _job_begin("recommended_stocks"):
-        return {
-            "status": "running",
-            "date": trade_date,
-            "min_score": min_score,
-            "top_n": top_n,
-            "strict_prev_trade_day": strict_prev_trade_day,
-            "auto_repair_missing_kline": auto_repair_missing_kline,
-            "gate": strict_gate,
-            "progress": recommended_stocks_progress(),
-            "note": "已有推荐筛选任务在运行",
-        }
-
-    initial_step = "正在初始化..."
-    if strict_prev_trade_day and strict_gate and not strict_gate.get("ready") and auto_repair_missing_kline:
-        initial_step = f"目标日 {trade_date} 数据未就绪，后台先用国金QMT补K线..."
-    run_uid = _recommended_run_history_start(
-        trade_date=trade_date,
-        min_score=min_score,
-        top_n=top_n,
-        strict_prev_trade_day=strict_prev_trade_day,
-        execution_time=execution_time,
-        message=initial_step,
-    )
-
-    _set_recommendation_progress(
-        status="running",
-        percent=0,
-        step=initial_step,
-        total=0,
-        done=0,
-        passed=0,
-        trade_date=trade_date,
-        min_score=min_score,
-        top_n=top_n,
-        strict_prev_trade_day=strict_prev_trade_day,
         execution_time=execution_time,
         min_kline_coverage=min_kline_coverage,
         auto_repair_missing_kline=auto_repair_missing_kline,
-        gate=strict_gate,
-        run_uid=run_uid,
-        started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        strict_prev_trade_day=strict_prev_trade_day,
+        refresh_realtime=refresh_realtime,
+        date_policy=date_policy,
     )
 
-    def _run_screen():
-        try:
-            engine = get_engine()
-
-            def _progress_callback(event: dict):
-                stage = str(event.get("stage") or "")
-                if stage == "done":
-                    _set_recommendation_progress(
-                        status="done",
-                        percent=100,
-                        step=f"V3筛选完成，通过 {int(event.get('recommendation_count') or 0)} 只",
-                        total=int(event.get("analysis_count") or 0),
-                        done=int(event.get("analysis_count") or 0),
-                        passed=int(event.get("recommendation_count") or 0),
-                        trade_date=trade_date,
-                        min_score=min_score,
-                        top_n=top_n,
-                        strict_prev_trade_day=strict_prev_trade_day,
-                        execution_time=execution_time,
-                        min_kline_coverage=min_kline_coverage,
-                        auto_repair_missing_kline=auto_repair_missing_kline,
-                        gate=strict_gate,
-                        run_uid=run_uid,
-                        flow_date=event.get("flow_date") or "",
-                        hot_date=event.get("hot_date") or "",
-                        market_mood_score=event.get("market_mood_score"),
-                        finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    )
-                    return
-                _set_recommendation_progress(
-                    status="running",
-                    percent=int(event.get("percent") or 0),
-                    step=str(event.get("step") or "运行中..."),
-                    total=int(event.get("analysis_count") or 0),
-                    done=int(event.get("done") or 0),
-                    passed=int(event.get("recommendation_count") or 0),
-                    trade_date=trade_date,
-                    min_score=min_score,
-                    top_n=top_n,
-                    strict_prev_trade_day=strict_prev_trade_day,
-                    execution_time=execution_time,
-                    min_kline_coverage=min_kline_coverage,
-                    auto_repair_missing_kline=auto_repair_missing_kline,
-                    run_uid=run_uid,
-                    )
-
-            stats = _run_recommended_batch_in_process(
-                engine=engine,
-                trade_date=trade_date,
-                top_n=top_n,
-                min_score=min_score,
-                progress_callback=_progress_callback,
-                strict_prev_trade_day=strict_prev_trade_day,
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-                auto_repair_missing_kline=auto_repair_missing_kline,
-                use_intraday_current=use_intraday_current,
-            )
-            _set_recommendation_progress(
-                status="done",
-                percent=100,
-                step=f"V3筛选完成，通过 {stats.recommendation_count} 只",
-                total=stats.analysis_count,
-                done=stats.analysis_count,
-                passed=stats.recommendation_count,
-                trade_date=trade_date,
-                min_score=min_score,
-                top_n=top_n,
-                strict_prev_trade_day=strict_prev_trade_day,
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-                auto_repair_missing_kline=auto_repair_missing_kline,
-                gate=strict_gate,
-                run_uid=run_uid,
-                flow_date=stats.flow_date,
-                hot_date=stats.hot_date,
-                market_mood_score=stats.market_mood_score,
-                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            _recommended_run_history_finish(run_uid, status="done", payload={
-                "trade_date": stats.trade_date,
-                "total": stats.analysis_count,
-                "passed": stats.recommendation_count,
-                "flow_date": stats.flow_date,
-                "hot_date": stats.hot_date,
-                "market_mood_score": stats.market_mood_score,
-                "message": f"V3筛选完成，通过 {stats.recommendation_count} 只",
-            })
-            try:
-                _invalidate_recommended_stocks_cache()
-                default_result = _recommended_stocks_v2(trade_date, "", "")
-                _cache_set(f"recommended_stocks_{trade_date}_all_all", default_result)
-                _cache_set("recommended_stocks_latest_all_all", default_result)
-            except Exception as exc:
-                _record_fallback('_run_screen:8578', exc)
-        except Exception as ex:
-            import logging
-            logging.getLogger(__name__).error(f"recommended-stocks error: {ex}", exc_info=True)
-            _set_recommendation_progress(
-                status="error",
-                percent=0,
-                step=f"筛选失败: {str(ex)[:80]}",
-                total=0,
-                done=0,
-                passed=0,
-                trade_date=trade_date,
-                min_score=min_score,
-                top_n=top_n,
-                strict_prev_trade_day=strict_prev_trade_day,
-                execution_time=execution_time,
-                min_kline_coverage=min_kline_coverage,
-                auto_repair_missing_kline=auto_repair_missing_kline,
-                gate=strict_gate,
-                run_uid=run_uid,
-                finished_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            )
-            _recommended_run_history_finish(run_uid, status="error", payload={
-                "message": "筛选失败",
-                "error": str(ex)[:500],
-            })
-        finally:
-            _job_end("recommended_stocks")
-
-    t = threading.Thread(target=_run_screen, daemon=True)
-    t.start()
-    return {
-        "status": "started",
-        "date": trade_date,
-        "min_score": min_score,
-        "top_n": top_n,
-        "strict_prev_trade_day": strict_prev_trade_day,
-        "execution_time": execution_time,
-        "min_kline_coverage": min_kline_coverage,
-        "auto_repair_missing_kline": auto_repair_missing_kline,
-        "gate": strict_gate,
-        "run_uid": run_uid,
-        "note": "筛选已启动，完成后刷新页面查看结果",
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  主力行为分析 (建仓 / 洗盘 / 出货)
-# ──────────────────────────────────────────────────────────────────────
 
 def _compute_mainforce_behavior_fast(stock_code: str, trade_date: str = None) -> dict:
     """Fast mainforce view based on snapshot + recent capital flow.
@@ -12457,41 +11918,39 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
 # ── 盘中实时数据刷新 ──
 @router.post("/realtime/refresh")
 def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow|concept|index)$")):
-    """手动刷新盘中数据（行情快照、资金流向、概念行情、指数行情）"""
-    import subprocess as _sp
-    if not _job_begin("market_refresh"):
-        return {"success": False, "busy": True, "error": "market_refresh_running"}
-    script = str(_ROOT / "tools" / "crawl_realtime_batch.py")
-    cmd = [
-        sys.executable,
-        script,
-        "--only",
-        only,
-        "--json",
-        "--min-coverage",
-        "0.70",
-    ]
-    if only in ("snapshot", "all"):
-        cmd.append("--archive-snapshot")
-    if only in ("snapshot", "all", "concept", "index"):
-        cmd.append("--skip-closed")
-    env = build_child_env(_ROOT, engine=get_engine())
-    try:
-        result = _sp.run(
-            cmd,
-            capture_output=True, text=True, timeout=120, env=env,
-            cwd=str(_ROOT),
-        )
-        if result.returncode == 0:
-            _invalidate_market_runtime_caches()
+    """通过唯一生产任务异步刷新一个明确归属的数据域。"""
+    contract = _REALTIME_REFRESH_TASK_CONTRACTS.get(str(only or ""))
+    if contract is None:
         return {
-            "success": result.returncode == 0,
-            "output": result.stdout[-500:] if result.stdout else "",
-            "error": result.stderr[-500:] if result.stderr else "",
+            "accepted": False,
+            "success": False,
+            "status": "operation_not_registered",
+            "operation": only,
+            "job_id": "",
+            "error": "该刷新范围没有唯一生产任务，已拒绝执行",
         }
-    except _sp.TimeoutExpired:
-        return {"success": False, "error": "timeout"}
+    try:
+        result = _launch_registered_scheduler_task(
+            task_type=str(contract["task_type"]),
+            expected_script_path="tools/crawl_realtime_batch.py",
+            script_args_override=str(contract["script_args"]),
+        )
+        return {
+            **result,
+            "success": bool(result.get("accepted")),
+            "operation": only,
+            "output": (
+                "实时数据刷新任务已提交后台执行"
+                if result.get("accepted")
+                else str(result.get("error") or result.get("status") or "error")
+            ),
+        }
     except Exception as e:
-        return {"success": False, "error": str(e)}
-    finally:
-        _job_end("market_refresh")
+        return {
+            "accepted": False,
+            "success": False,
+            "status": "error",
+            "operation": only,
+            "job_id": "",
+            "error": str(e),
+        }

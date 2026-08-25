@@ -268,13 +268,27 @@ def test_null_zero_or_negative_market_values_never_match(
     assert values_match(target, source) is False
 
 
-def test_attestation_setup_never_manages_database_triggers():
+def test_attestation_runtime_is_ddl_free_but_exports_broker_trigger_contracts():
     source = inspect.getsource(attester.ensure_attestation_tables).upper()
+    assert "CREATE TABLE" not in source
+    assert "ALTER TABLE" not in source
     assert "CREATE TRIGGER" not in source
     assert "DROP TRIGGER" not in source
     assert "INFORMATION_SCHEMA.TRIGGERS" not in source
-    assert attester.ATTESTATION_TRIGGER_STATEMENTS == {}
-    assert attester._ATTESTATION_TRIGGER_CONTRACTS == {}
+    assert set(attester.ATTESTATION_TRIGGER_STATEMENTS) == set(
+        attester._ATTESTATION_TRIGGER_CONTRACTS
+    )
+    assert len(attester.ATTESTATION_TRIGGER_STATEMENTS) == 6
+    completed_update = attester.ATTESTATION_TRIGGER_STATEMENTS[
+        "trg_qmt_kline_attestation_run_completed_bu"
+    ]
+    completed_delete = attester.ATTESTATION_TRIGGER_STATEMENTS[
+        "trg_qmt_kline_attestation_run_completed_bd"
+    ]
+    assert "OLD.status = BINARY 'COMPLETED'" in completed_update
+    assert "BEFORE UPDATE ON qmt_kline_attestation_run" in completed_update
+    assert "OLD.status = BINARY 'COMPLETED'" in completed_delete
+    assert "BEFORE DELETE ON qmt_kline_attestation_run" in completed_delete
 
 
 class _SchemaResult:
@@ -832,8 +846,8 @@ class _MigrationConnection:
 def test_exact_legacy_text_schema_is_upgraded_once_and_hash_registered():
     connection = _MigrationConnection()
 
-    attester._ensure_tolerance_json_mediumtext_migration(connection)
-    attester._ensure_tolerance_json_mediumtext_migration(connection)
+    attester._privileged_migrate_tolerance_json_mediumtext(connection)
+    attester._privileged_migrate_tolerance_json_mediumtext(connection)
 
     assert connection.data_type == "mediumtext"
     assert connection.marker_hash == (
@@ -848,7 +862,7 @@ def test_exact_legacy_text_schema_is_upgraded_once_and_hash_registered():
 def test_fresh_mediumtext_schema_registers_without_alter():
     connection = _MigrationConnection(data_type="mediumtext")
 
-    attester._ensure_tolerance_json_mediumtext_migration(connection)
+    attester._privileged_migrate_tolerance_json_mediumtext(connection)
 
     assert connection.marker_hash == (
         attester.TOLERANCE_MEDIUMTEXT_MIGRATION_HASH
@@ -872,7 +886,7 @@ def test_mediumtext_migration_fails_closed_on_drift(
     )
 
     with pytest.raises(attester.QmtAttestationSchemaError):
-        attester._ensure_tolerance_json_mediumtext_migration(connection)
+        attester._privileged_migrate_tolerance_json_mediumtext(connection)
 
     assert not any(
         "ALTER TABLE" in sql for sql, _params in connection.statements
@@ -880,7 +894,7 @@ def test_mediumtext_migration_fails_closed_on_drift(
 
 
 def test_v2_attested_market_values_are_frozen_not_null():
-    source = inspect.getsource(attester.ensure_attestation_tables).upper()
+    source = "\n".join(attester.attestation_table_ddl_statements()).upper()
     for column in (
         "ATTESTED_OPEN",
         "ATTESTED_CLOSE",
@@ -919,7 +933,9 @@ def test_full_window_attestation_bounds_database_statements_to_ten_sessions():
     source = inspect.getsource(attester.attest_range)
 
     assert attester.ATTESTATION_SESSION_CHUNK_SIZE == 10
-    assert "SELECT DISTINCT trade_date" in source
+    assert "load_trade_calendar_receipt" in source
+    assert "calendar_temp" in source
+    assert "catalog_sessions" in source
     assert source.count("ATTESTATION_SESSION_CHUNK_SIZE") >= 2
     assert source.count("q.trade_date BETWEEN :chunk_start_date") >= 3
     assert "t.trade_date BETWEEN :chunk_start_date" in source
@@ -1088,7 +1104,7 @@ def test_relaxed_legacy_gate_still_rejects_json_hash_fields_and_counters(
 
 
 def test_run_manifest_capacity_is_frozen_as_mediumtext():
-    source = inspect.getsource(attester.ensure_attestation_tables).upper()
+    source = "\n".join(attester.attestation_table_ddl_statements()).upper()
     assert "TOLERANCE_JSON MEDIUMTEXT NOT NULL" in source
     contract = dict(
         (row[0], row)
@@ -1102,7 +1118,7 @@ def test_run_manifest_capacity_is_frozen_as_mediumtext():
 def test_completed_status_persists_daily_manifest_in_same_transaction():
     source = inspect.getsource(attester.attest_range)
     assert "daily_universe =" in source
-    assert '"universe_manifest_schema": UNIVERSE_MANIFEST_SCHEMA' in source
+    assert '"universe_manifest_schema": run_tolerances[' in source
     assert "manifest_complete" in source
     assert "and manifest_complete" in source
     assert "tolerance_json=:tolerance_json" in source
@@ -1153,12 +1169,12 @@ def test_legacy_text_upgrade_and_frozen_rows_on_mysql57():
             with engine.begin() as connection:
                 connection.execute(text(statement))
 
-        attester.ensure_attestation_tables(
+        attester.privileged_migrate_attestation_tables(
             engine,
             trigger_ddl_executor=trigger_executor,
         )
         first = attester.validate_attestation_schema(engine)
-        attester.ensure_attestation_tables(
+        attester.privileged_migrate_attestation_tables(
             engine,
             trigger_ddl_executor=trigger_executor,
         )

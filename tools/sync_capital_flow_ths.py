@@ -26,6 +26,8 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 from sqlalchemy import text
 from server.api.routers._engine import get_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME, mysql_named_lock
 
 
 def _parse_amount(val):
@@ -113,39 +115,42 @@ def main():
 
     # 写入数据库
     engine = get_engine()
+    df['stock_code'] = df['stock_code'].astype(str).str.strip().str.zfill(6)
     target_date = df['trade_date'].iloc[0]
 
-    # 只删除 THS 来源的旧数据，保留东财等其他来源的数据
-    with engine.begin() as conn:
-        deleted = conn.execute(
-            text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d AND data_source = 'ths'"),
-            {"d": target_date}
-        ).rowcount
-        if deleted > 0:
-            print(f"\n已删除 {target_date} 的旧 THS 数据 {deleted} 条")
-
-    # 获取已有东财数据的股票列表，THS 不覆盖
-    with engine.connect() as conn:
+    # THS is a fallback.  Keep precedence read/filter/publication under the
+    # same advisory lock so a concurrent primary writer cannot be overwritten.
+    with mysql_named_lock(
+        engine,
+        CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        timeout_seconds=30,
+    ) as conn:
         existing = conn.execute(
             text("SELECT stock_code FROM sm_stock_capital_flow_daily WHERE trade_date = :d AND data_source != 'ths'"),
             {"d": target_date}
         ).fetchall()
-        existing_codes = {r[0] for r in existing}
+        existing_codes = {str(r[0]).strip().zfill(6) for r in existing}
+        if existing_codes:
+            before_count = len(df)
+            df = df[~df['stock_code'].isin(existing_codes)]
+            print(f"跳过已有东财数据的股票: {before_count - len(df)} 只")
 
-    if existing_codes:
-        before_count = len(df)
-        df = df[~df['stock_code'].isin(existing_codes)]
-        print(f"跳过已有东财数据的股票: {before_count - len(df)} 只")
+        if df.empty:
+            conn.commit()
+            print("无需写入（所有股票已有东财数据）")
+            return
 
-    if df.empty:
-        print("无需写入（所有股票已有东财数据）")
-        return
-
-    # 写入新数据
-    df['data_source'] = 'ths'
-    df['etl_sync_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    df.to_sql('sm_stock_capital_flow_daily', engine, if_exists='append', index=False,
-              chunksize=500, method='multi')
+        df['data_source'] = 'ths'
+        df['etl_sync_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        replace_table_rows_exact_keys(
+            df,
+            "sm_stock_capital_flow_daily",
+            engine,
+            key_columns=("stock_code", "trade_date"),
+            lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+            lock_connection=conn,
+            chunksize=500,
+        )
 
     print(f"写入完成: {len(df)} 条")
 

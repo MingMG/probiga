@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import pandas as pd
 from sqlalchemy import text
@@ -208,6 +208,96 @@ def replace_table_rows(
             chunksize=chunksize,
             method=method,
         )
+
+
+def replace_table_rows_exact_keys(
+    frame: pd.DataFrame,
+    table_name: str,
+    engine: Engine,
+    *,
+    key_columns: Sequence[str],
+    lock_name: str,
+    lock_timeout_seconds: int = 30,
+    lock_connection: Connection | None = None,
+    delete_chunk_size: int = 500,
+    chunksize: int | None = 1000,
+    method: str | None = "multi",
+) -> int:
+    """Atomically replace only the complete business identities in ``frame``.
+
+    This is intentionally narrower than a date/range refresh: missing provider
+    rows are not deleted.  The table-wide advisory lock also keeps independent
+    legacy writers from interleaving otherwise individually atomic commits.
+    """
+    from server.common.mysql_lock import mysql_named_lock
+
+    if frame is None or frame.empty:
+        raise ValueError(f"replacement frame for {table_name!r} must not be empty")
+    table_sql = quote_identifier(table_name)
+    keys = tuple(str(column).strip() for column in key_columns)
+    if not keys or len(set(keys)) != len(keys):
+        raise ValueError("key_columns must contain unique column names")
+    for column in keys:
+        quote_identifier(column)
+        if column not in frame.columns:
+            raise ValueError(f"replacement frame is missing business key {column!r}")
+    key_frame = frame.loc[:, list(keys)]
+    if key_frame.isna().any(axis=None):
+        raise ValueError("replacement frame contains a null business identity")
+    invalid_text_identities = key_frame.apply(
+        lambda column: column.map(
+            lambda value: isinstance(value, str)
+            and value.strip().casefold() in {"", "nan", "nat", "none", "null", "<na>"}
+        )
+    )
+    if invalid_text_identities.any(axis=None):
+        raise ValueError("replacement frame contains an empty or nan-like business identity")
+    if key_frame.duplicated(keep=False).any():
+        raise ValueError("replacement frame contains duplicate business identities")
+    if delete_chunk_size < 1:
+        raise ValueError("delete_chunk_size must be positive")
+
+    replacement = frame.copy()
+    identities = replacement.loc[:, list(keys)].to_dict(orient="records")
+    def _replace(connection: Connection) -> int:
+        # GET_LOCK and any caller-side precedence reads start SQLAlchemy's
+        # autobegin transaction.  End that read transaction while retaining
+        # the session-owned advisory lock, then bind DELETE+INSERT to one new
+        # transaction on the exact same physical connection.
+        if connection.in_transaction():
+            connection.commit()
+        with connection.begin():
+            for offset in range(0, len(identities), delete_chunk_size):
+                predicates: list[str] = []
+                params: dict[str, Any] = {}
+                for row_index, identity in enumerate(
+                    identities[offset : offset + delete_chunk_size]
+                ):
+                    terms: list[str] = []
+                    for column_index, column in enumerate(keys):
+                        param_name = f"key_{row_index}_{column_index}"
+                        terms.append(f"{quote_identifier(column)} = :{param_name}")
+                        params[param_name] = identity[column]
+                    predicates.append("(" + " AND ".join(terms) + ")")
+                connection.execute(
+                    text(f"DELETE FROM {table_sql} WHERE " + " OR ".join(predicates)),
+                    params,
+                )
+            return write_frame(
+                replacement,
+                table_name,
+                connection,
+                if_exists="append",
+                index=False,
+                chunksize=chunksize,
+                method=method,
+            )
+
+    if lock_connection is not None:
+        return _replace(lock_connection)
+    timeout = max(0, int(lock_timeout_seconds))
+    with mysql_named_lock(engine, lock_name, timeout_seconds=timeout) as connection:
+        return _replace(connection)
 
 
 def records_from_frame(df: pd.DataFrame) -> list[dict]:

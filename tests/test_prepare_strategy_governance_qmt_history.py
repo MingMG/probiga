@@ -72,8 +72,8 @@ def test_schema_preparation_creates_trigger_free_tables_then_validates(monkeypat
     calls = []
     monkeypatch.setattr(
         preparation,
-        "ensure_attestation_tables",
-        lambda engine: calls.append(("ensure", engine)),
+        "privileged_migrate_attestation_tables",
+        lambda engine: calls.append(("migrate", engine)),
     )
     monkeypatch.setattr(
         preparation,
@@ -87,7 +87,7 @@ def test_schema_preparation_creates_trigger_free_tables_then_validates(monkeypat
 
     result = preparation.prepare_attestation_schema("engine")
 
-    assert calls == [("ensure", "engine"), ("validate", "engine")]
+    assert calls == [("migrate", "engine"), ("validate", "engine")]
     assert result == {
         "status": "ok",
         "mode": "schema-only",
@@ -714,17 +714,9 @@ def test_windows_option_file_is_rejected_outside_readiness(capsys):
     assert "only valid with --readiness-only" in capsys.readouterr().err
 
 
-def test_latest_closed_sessions_requires_exact_count_and_high_watermark():
-    class Result:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def mappings(self):
-            return self
-
-        def all(self):
-            return self._rows
-
+def test_latest_closed_sessions_requires_exact_count_and_high_watermark(
+    monkeypatch,
+):
     class Connection:
         def __init__(self, rows):
             self.rows = rows
@@ -735,15 +727,30 @@ def test_latest_closed_sessions_requires_exact_count_and_high_watermark():
         def __exit__(self, *_args):
             return False
 
-        def execute(self, *_args, **_kwargs):
-            return Result(self.rows)
-
     class Engine:
         def __init__(self, rows):
             self.rows = rows
 
         def connect(self):
             return Connection(self.rows)
+
+    class Receipt:
+        def __init__(self, rows):
+            self.sessions = sorted(
+                str(row["trade_date"]) for row in rows
+            )
+
+        def sessions_between(self, start_date, end_date):
+            return [
+                day for day in self.sessions
+                if start_date <= day <= end_date
+            ]
+
+    monkeypatch.setattr(
+        preparation,
+        "load_trade_calendar_receipt",
+        lambda connection, **_kwargs: Receipt(connection.rows),
+    )
 
     sessions = _sessions()
     engine = Engine([{"trade_date": day} for day in reversed(sessions)])

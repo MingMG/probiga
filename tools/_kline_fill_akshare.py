@@ -6,6 +6,8 @@ import akshare as ak
 from sqlalchemy import text
 
 from tools.env_config import create_tool_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 START_DATE = "2026-04-28"
 END_DATE = "2026-05-08"
 
@@ -55,11 +57,13 @@ for i, code in enumerate(missing):
                     "open", "close", "high", "low", "volume", "amount", "change", "change_pct",
                     "turnover_ratio", "pre_close"]
             df = df[cols]
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "DELETE FROM sm_stock_kline WHERE stock_code = :c AND trade_date >= :s AND trade_date <= :e"
-                ), {"c": symbol, "s": START_DATE, "e": END_DATE})
-            df.to_sql("sm_stock_kline", engine, if_exists="append", index=False, method="multi")
+            replace_table_rows_exact_keys(
+                df,
+                "sm_stock_kline",
+                engine,
+                key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+                lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+            )
             success += 1
         else:
             failed += 1

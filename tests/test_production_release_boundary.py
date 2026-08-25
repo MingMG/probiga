@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,56 @@ from tools import validate_production_release_boundary as boundary
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_scheduler_heartbeat_schema_ddl_uses_only_privileged_fenced_migrator():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    schema_tool = (
+        ROOT / "tools/prepare_strategy_governance_schema.py"
+    ).read_text(encoding="utf-8")
+
+    assert "migrate_scheduler_runtime_heartbeat.py" not in deploy
+    assert "migrate_scheduler_runtime_heartbeat(boundary.migrator_engine)" in (
+        schema_tool
+    )
+    assert "preflight_scheduler_runtime_heartbeat_schema(\n        boundary.migrator_engine" in schema_tool
+    assert "validate_scheduler_runtime_heartbeat_schema(\n                boundary.migrator_engine" in schema_tool
+
+
+def test_qmt_and_detached_job_state_roots_are_external_and_service_owned():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy)
+    bodies = _shell_function_bodies(deploy)
+    expected = {
+        "prepare_qmt_full_market_history_state_root": (
+            "/var/lib/probiga/qmt-full-market-history"
+        ),
+        "prepare_qmt_local_gap_repair_state_root": (
+            "/var/lib/probiga/qmt-local-gap-repair"
+        ),
+        "prepare_probiga_job_log_root": "/var/lib/probiga/jobs",
+    }
+
+    for function_name, state_root in expected.items():
+        assert state_root in deploy
+        body = _normalized_shell(bodies[function_name])
+        assert 'install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700' in body
+        assert "readlink -f" in body
+        assert "stat -c '%U:%G'" in body
+        assert "stat -c '%a'" in body
+        assert "-perm /7177" in body
+        assert function_name in normalized
+
+    job_body = bodies["prepare_probiga_job_log_root"]
+    assert "O_EXCL" in job_body
+    assert "O_NOFOLLOW" in job_body
+    assert "os.fsync" in job_body
+    assert "probe.unlink()" in job_body
+    assert "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" in deploy
 
 
 def _bash() -> str | None:
@@ -27,6 +78,31 @@ def _normalized_shell(source: str) -> str:
     """Join shell continuations without changing command ordering."""
 
     return re.sub(r"[ \t]*\\\r?\n[ \t]*", " ", source)
+
+
+def test_deploy_revalidates_release_identity_after_all_pruning() -> None:
+    deploy_script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    prune_end = deploy_script.rindex("if ! prune_release_temp_files; then")
+    post_prune_identity = deploy_script.rindex(
+        "CUTOVER_STEP=verify_post_prune_release_identity"
+    )
+    post_prune_health = deploy_script.rindex("CUTOVER_STEP=verify_post_prune_health")
+    persist_receipt = deploy_script.rindex(
+        "CUTOVER_STEP=persist_deployed_receipt_pending"
+    )
+    deploy_succeeded = deploy_script.rindex("DEPLOY_SUCCEEDED=1")
+    journal_cleanup = deploy_script.rindex(
+        "CUTOVER_STEP=remove_finalized_activation_journal"
+    )
+
+    assert prune_end < post_prune_identity < post_prune_health < persist_receipt
+    assert persist_receipt < deploy_succeeded < journal_cleanup
+    final_validation = deploy_script[post_prune_identity:persist_receipt]
+    assert 'release_identity_check 1 "$PREPARED_CODE_ROOT"' in final_validation
+    assert "http://127.0.0.1/api/health" in final_validation
+    assert "http://127.0.0.1/api/health/runtime" in final_validation
 
 
 def _shell_function_bodies(source: str) -> dict[str, str]:
@@ -182,16 +258,23 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
         encoding="utf-8"
     )
     workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
+    deploy_job = workflow_source[workflow_source.index("\n  deploy:"):]
 
-    assert len(workflow_source) < 27_000
-    assert "resolved_requirements_b64:" in workflow_source
-    assert "resolved_requirements_sha256:" in workflow_source
+    assert len(workflow_source) < 32_000
+    assert "envs: EXPECTED_SHA" in deploy_job
     assert (
-        "envs: EXPECTED_SHA,RESOLVED_REQUIREMENTS_B64,"
-        "EXPECTED_REQUIREMENTS_SHA256,EXPECTED_ADATA_SHA,"
-        "EXPECTED_ADATA_TREE_SHA256" in workflow_source
+        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
+        in _normalized_shell(deploy_job)
     )
-    assert "RESOLVED_REQUIREMENTS_B64" in workflow_source
+    for forbidden in (
+        "RESOLVED_REQUIREMENTS_B64",
+        "EXPECTED_REQUIREMENTS_SHA256",
+        "EXPECTED_ADATA_SHA",
+        "EXPECTED_ADATA_TREE_SHA256",
+        "resolved_requirements_b64:",
+        "resolved_requirements_sha256:",
+    ):
+        assert forbidden not in deploy_job
     assert "${{" not in deploy_script
     assert "actions/checkout@v4" not in workflow
     assert "actions/setup-python@v5" not in workflow
@@ -222,8 +305,8 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     )
     assert 'exec 9>"$DEPLOY_LOCK_FILE"' in deploy_script
     assert "flock -n 9" in deploy_script
-    assert "validate_ci_resolved_freeze" in deploy_script
-    assert "prepare_ci_resolved_wheelhouse" in deploy_script
+    assert "validate_hashed_requirements_lock" in deploy_script
+    assert "prepare_trusted_wheelhouse" in deploy_script
     assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in deploy_script
     assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in deploy_script
     assert not re.search(
@@ -243,12 +326,18 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
         'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"'
         in deploy_script
     )
-    assert "Warning: release venv cleanup failed after activation" in deploy_script
     assert (
-        "Warning: immutable code release cleanup failed after activation"
+        "Warning: release venv cleanup failed before final verification"
         in deploy_script
     )
-    assert "Warning: release temp cleanup failed after activation" in deploy_script
+    assert (
+        "Warning: immutable code release cleanup failed before final verification"
+        in deploy_script
+    )
+    assert (
+        "Warning: release temp cleanup failed before final verification"
+        in deploy_script
+    )
     assert "prune_code_releases" in deploy_script
     assert "prune_release_temp_files" in deploy_script
     assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
@@ -440,14 +529,12 @@ def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
         assert rejected.returncode == 2, (argv, rejected.stdout, rejected.stderr)
 
 
-def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
+def test_v4_workflow_cannot_request_privileged_guard_recovery() -> None:
     workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
         encoding="utf-8"
     )
-    engine = (ROOT / "deploy/production_deploy.sh").read_text(
-        encoding="utf-8"
-    )
     normalized = _normalized_shell(workflow)
+    deploy_job = workflow[workflow.index("\n  deploy:"):]
 
     assert "workflow_dispatch:" not in workflow
     assert "recover_database_guard:" not in workflow
@@ -455,7 +542,11 @@ def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
     assert "timeout-minutes: 165" in workflow
     assert "command_timeout: 150m" in workflow
     assert "--recover-database-guard" not in normalized
-    assert "v2 production deploy broker cannot authorize recovery" in engine
+    assert (
+        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
+        in normalized
+    )
+    assert "envs: EXPECTED_SHA" in deploy_job
     assert workflow.count("python tools/scan_tracked_secrets.py") == 2
     before_scan = workflow.index(
         "Scan tracked secrets before dependency installation"
@@ -467,41 +558,109 @@ def test_stable_v2_workflow_cannot_request_privileged_guard_recovery() -> None:
     assert before_scan < dependency_install < after_scan
 
 
-def test_v2_rds_safe_cutover_never_invokes_the_privileged_migrator() -> None:
+def test_dynamic_governance_completion_regression_inventory_is_frozen() -> None:
+    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+        encoding="utf-8"
+    )
+    start = workflow.index(
+        "- name: Run dynamic strategy governance foundation regressions"
+    )
+    end = workflow.index(
+        "- name: Run QMT and point-in-time truth regressions", start
+    )
+    steps = workflow[start:end]
+    expected = [
+        "tests/test_prepare_strategy_governance_schema.py",
+        "tests/test_strategy_center.py",
+        "tests/test_strategy_execution_contracts.py",
+        "tests/test_strategy_governance_roles.py",
+        "tests/test_sync_strategy_industry_history.py",
+        "tests/test_trading_v3_truth_risk.py",
+        "tests/test_dynamic_shadow_ledger.py",
+        "tests/test_dynamic_shadow_schema_upgrade.py",
+        "tests/test_strategy_center_membership_history.py",
+        "tests/test_strategy_challenger_factory.py",
+        "tests/test_strategy_center_error_log_sanitization.py",
+        "tests/test_strategy_funding_checkpoint.py",
+        "tests/test_strategy_funding_checkpoint_mysql84_metadata.py",
+        "tests/test_strategy_funding_detail_api.py",
+        "tests/test_strategy_governance_orchestrator.py",
+        "tests/test_strategy_governance_orchestrator_api.py",
+        "tests/test_strategy_governance_write_contract.py",
+        "tests/test_strategy_governance_history_paging.py",
+        "tests/test_strategy_membership_api_truth.py",
+        "tests/test_strategy_metric_artifact_paging.py",
+        "tests/test_strategy_metric_artifact_size_limit.py",
+        "tests/test_strategy_statistical_guards.py",
+        "tests/test_production_schema_evidence_validators.py",
+        "tests/test_api_generic_error_sanitization.py",
+        "tests/test_trading_v2_error_sanitization.py",
+    ]
+    observed = re.findall(
+        r"(?m)^\s+(tests/[A-Za-z0-9_./-]+\.py)\s*$",
+        steps,
+    )
+
+    assert observed == expected
+
+
+def test_production_health_parser_freezes_compact_funding_and_exact40() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = deploy[
+        deploy.index("controlled_guard_parse_governance_health_result() {"):
+        deploy.index("controlled_guard_parse_governance_cutover_result() {")
+    ]
+
+    for required in (
+        'manifest_detail.get("strategy_checkpoint_count")',
+        'manifest_detail.get("combination_recipe_count")',
+        'manifest_detail.get("funding_ready_count")',
+        '"checkpoint_root_hash"',
+        '"combination_recipe_root_hash"',
+        '"ineligible_root_hash"',
+        'metric_trigger_detail.get("core_metric_review_contract_hash")',
+        'append_trigger_detail.get("core_metric_review_contract_hash")',
+    ):
+        assert required in body
+    for frozen_hash in (
+        "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde",
+        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f",
+        "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8",
+        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
+        "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
+        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
+    ):
+        assert frozen_hash in body
+
+
+def test_retired_v2_protocol_fails_before_lock_or_cutover_side_effects() -> None:
     engine = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
     )
-
-    prepare_database = engine.index("# PREPARE DATABASE:")
-    v4_preflight = engine.index(
-        'if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then',
-        prepare_database,
+    protocol_guard = engine.index(
+        'case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in'
     )
-    v4_preflight_end = engine.index("\nfi", v4_preflight)
-    assert "prepare_strategy_governance_schema.py" in engine[
-        v4_preflight:v4_preflight_end
-    ]
-    assert "--phase preflight" in engine[v4_preflight:v4_preflight_end]
-
-    writer_fence = engine.index("CUTOVER_STEP=writer_fence")
-    v2_cutover = engine.index(
-        'if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then',
-        writer_fence,
+    assert "RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2" in engine
+    assert "COMPATIBLE_DEPLOY_PROTOCOL_V2" not in engine
+    retired_start = engine.index(
+        '"$RETIRED_DEPLOY_PROTOCOL_V2")', protocol_guard
     )
-    v4_cutover = engine.index("\nelse\n", v2_cutover)
-    qmt_history = engine.index(
-        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", v4_cutover
-    )
-    v2_branch = engine[v2_cutover:v4_cutover]
-    v4_branch = engine[v4_cutover:qmt_history]
+    retired_end = engine.index(";;", retired_start)
+    retired_branch = engine[retired_start:retired_end]
 
-    assert "prepare_strategy_governance_rds_safe_schema" in v2_branch
-    assert "add_strategy_governance_task.py" in v2_branch
-    assert "--disabled --writers-fenced-schema-preparation; then" in v2_branch
-    assert "run_prepared_database_migration_tool" not in v2_branch
-    assert "prepare_strategy_governance_schema.py" not in v2_branch
-    assert "--phase cutover --writers-fenced" in v4_branch
-    assert "--phase recover" in v4_branch
+    assert "DEPLOY_ARTIFACT_MODE=" not in retired_branch
+    assert "exit 2" in retired_branch
+    assert re.search(
+        r"(?is)v2.*(?:retired|unsupported|not supported)", retired_branch
+    )
+    for first_side_effect in (
+        'install -d -o root -g root -m 0700 "$DEPLOY_LOCK_ROOT"',
+        'exec 9>"$DEPLOY_LOCK_FILE"',
+        "flock -n 9",
+    ):
+        assert retired_end < engine.index(first_side_effect)
 
 
 def test_production_deploy_publishes_an_immutable_code_release() -> None:
@@ -656,8 +815,9 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     pre_cutover = _normalized_shell(
         deploy_script[schema_prepare:cutover_fence]
     )
-    assert pre_cutover.count("prepare_strategy_governance_qmt_history.py") == 1
-    assert "--readiness-only" in pre_cutover
+    assert "prepare_strategy_governance_qmt_history.py" not in pre_cutover
+    assert "sync_guojin_qmt_reference_data.py" not in pre_cutover
+    assert "sync_qmt_announcement_pit.py" not in pre_cutover
     assert "--apply" not in pre_cutover
     assert "--schema-only" not in deploy_script[schema_prepare:cutover_fence]
     assert "DATABASE_FORWARD_MIGRATION_STARTED=1" not in deploy_script[
@@ -789,8 +949,28 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert python_cutover_commands == [
         expected_writer_fence_command,
         'if ! run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
-        '--disabled --writers-fenced-schema-preparation; then',
+        '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" '
+        '--disabled; then',
+        'if ! run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py" '
+        '--disabled; then',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" '
+        '--check-via-primary',
+        'QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" '
+        '--request --expected-build-sha "$EXPECTED_SHA" --compact)"',
+        'if QMT_EDGE_IDENTITY_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" '
+        '--identity-only --expected-build-sha "$EXPECTED_SHA" '
+        '--expected-poll-seconds 60 --compact)"; then',
+        'if QMT_EDGE_BOOTSTRAP_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" '
+        '--release-bootstrap-only --expected-build-sha "$EXPECTED_SHA" '
+        '--expected-poll-seconds 60 --compact)"; then',
+        'QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" '
+        '--readiness-only)"',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" '
         '--expected-target-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE" '
@@ -798,19 +978,37 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '--expected-end-date "$QMT_HISTORY_END_DATE" '
         '--expected-session-window-sha256 '
         '"$QMT_HISTORY_SESSION_WINDOW_SHA256"',
+        'if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" '
+        '--window-days 30 --batch-size 100 '
+        '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")"; then',
+        "printf '%s' \"$QMT_ANNOUNCEMENT_RUN_OUTPUT\" | "
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" '
+        '--validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"',
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--disabled --schema-prepared; then',
         'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py")"; then',
+        '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" '
+        '--expected-build-sha "$EXPECTED_SHA")"; then',
         'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"',
+        '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
+        '--schema-prepared',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"',
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py"',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--capture-snapshot "$GOVERNANCE_TASK_NEW_SOURCE"',
         'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" '
-        '"${GOVERNANCE_HEALTH_ARGS[@]}"',
+        '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" '
+        '--capture-snapshot "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"',
+            'if ! run_prepared_python_tool '
+            '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" '
+            '"${GOVERNANCE_HEALTH_ARGS[@]}" '
+            '> "$GOVERNANCE_HEALTH_RESULT_FILE"; then',
         '/usr/bin/python3.14 -I - "$ACTIVATION_RECEIPT_PENDING" '
         '"$expected_release" <<\'PY\'',
     ]
@@ -886,12 +1084,38 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         'case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in'
         in governance_activation
     )
-    assert "0:ok)" in governance_activation
-    assert "2:blocked)" in governance_activation
-    assert 'blocked_keys={"status","reason","target_trade_date",' in governance_activation
-    assert '"input_trade_date","automatic_real_order_submission"}' in governance_activation
-    assert "GOVERNANCE_INPUT_NOT_READY=1" in governance_activation
-    assert "GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)" in normalized
+    assert "0:completed|0:not_due)" in governance_activation
+    assert "2:not_ready)" in governance_activation
+    assert "3:integrity_error)" in governance_activation
+    assert "4:program_error)" in governance_activation
+    assert '--validate-result-exit "$GOVERNANCE_RUN_STATUS"' in (
+        governance_activation
+    )
+    assert governance_activation.count(
+        '--expected-build-sha "$EXPECTED_SHA"'
+    ) == 3
+    assert governance_activation.index(
+        "tools/run_strategy_governance_daily.py"
+    ) < governance_activation.index(
+        '--expected-build-sha "$EXPECTED_SHA"'
+    ) < governance_activation.index(
+        '--validate-result-exit "$GOVERNANCE_RUN_STATUS"'
+    ) < governance_activation.rindex(
+        '--expected-build-sha "$EXPECTED_SHA"'
+    )
+    assert "GOVERNANCE_HEALTH_DISPOSITION=completed" in governance_activation
+    not_ready_branch = governance_activation[
+        governance_activation.index("2:not_ready)"):
+        governance_activation.index("3:integrity_error)")
+    ]
+    assert "refusing READY deployment" in not_ready_branch
+    assert "false" in not_ready_branch
+    assert "GOVERNANCE_HEALTH_DISPOSITION=input_not_ready" not in (
+        governance_activation
+    )
+    assert "GOVERNANCE_INPUT_NOT_READY" not in normalized
+    assert "--allow-input-not-ready" not in governance_activation
+    assert normalized.count("--allow-input-not-ready") == 2
     assert '--expected-build-sha "$EXPECTED_SHA"' in normalized
 
     assert 'install_prepared_dropins' in downtime
@@ -932,8 +1156,22 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     premarket_task = normalized.index(
         "--task-type analysis_premarket_external", premarket_probe
     )
+    code_cleanup = normalized.index(
+        'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"',
+        premarket_task,
+    )
+    post_prune_identity = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_release_identity", code_cleanup,
+    )
+    post_prune_health = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_health", post_prune_identity,
+    )
+    governance_smoke = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+        post_prune_health,
+    )
     receipt_pending = normalized.index(
-        "persist_deployed_receipt_pending", premarket_task
+        "persist_deployed_receipt_pending", governance_smoke
     )
     deployed_receipt = normalized.index(
         "publish_deployed_receipt_pending", receipt_pending
@@ -945,10 +1183,6 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     )
     journal_remove = normalized.index(
         "activation_snapshot_remove_finalized", deployed_receipt
-    )
-    code_cleanup = normalized.index(
-        'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"',
-        journal_remove,
     )
     assert (
         service_start
@@ -962,15 +1196,18 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert (
         premarket_probe
         < premarket_task
+        < code_cleanup
+        < post_prune_identity
+        < post_prune_health
+        < governance_smoke
         < receipt_pending
         < journal_finalize
         < deployed_receipt
         < journal_remove
-        < code_cleanup
     )
 
 
-def test_normal_activation_runs_one_prestart_governance_health_check() -> None:
+def test_normal_activation_rechecks_governance_after_fresh_scheduler_heartbeat() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -988,10 +1225,119 @@ def test_normal_activation_runs_one_prestart_governance_health_check() -> None:
     )
     api_start = activation.index("CUTOVER_STEP=start_api", guard_removal)
 
-    assert activation.count(governance_health) == 1
-    assert activation.index(governance_health) < guard_removal < api_start
-    assert governance_health not in activation[api_start:]
-    assert "CUTOVER_STEP=verify_strategy_governance_after_start" not in activation
+    first_health = activation.index(governance_health)
+    second_health = activation.index(governance_health, first_health + 1)
+    heartbeat_wait = activation.index(
+        "CUTOVER_STEP=wait_for_first_scheduler_heartbeat"
+    )
+    strict_recheck = activation.index(
+        "CUTOVER_STEP=verify_strategy_governance_with_scheduler_heartbeat"
+    )
+
+    assert activation.count(governance_health) == 2
+    assert first_health < guard_removal < api_start
+    assert api_start < heartbeat_wait < strict_recheck < second_health
+    assert '--expected-scheduler-pid "$SCHEDULER_MAIN_PID"' in activation[
+        strict_recheck:
+    ]
+    assert 'GOVERNANCE_TRADE_DATE="$(' in activation[strict_recheck:]
+
+
+def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    smoke = deploy_script[
+        deploy_script.index(
+            "verify_strategy_governance_api_and_page_smoke() {"
+        ):
+        deploy_script.index("release_identity_check() {")
+    ]
+
+    for required in (
+        "/api/strategy-center/governance?trade_date=$expected_trade_date",
+        'payload.get("build_commit_sha") == expected_sha',
+        'payload.get("result_mode") == "CANONICAL_PERSISTED"',
+        'payload.get("is_canonical") is True',
+        'run_uid = str(payload.get("run_uid") or "")',
+        'result_hash = str(payload.get("canonical_result_hash") or "")',
+        'set(pools) != {"observation", "confirmation", "tradable"}',
+        'set(rankings) != {"strategy", "combination"}',
+        'metadata.get("run_uid") == run_uid',
+        'metadata.get("canonical_result_hash") == result_hash',
+        'sum(weights) != Decimal("100")',
+        "verify_authority(payload)",
+        '"real_order_submission"',
+        '"real_orders_allowed"',
+        '"real_order_allowed"',
+        '"automatic_real_order_authority"',
+        'data-tab="strategy-center"',
+        'id="tab-strategy-center"',
+        "动态策略竞技场",
+        "/api/strategy-center/governance",
+        "真实下单权限：关闭",
+    ):
+        assert required in smoke
+    assert "|| true" not in smoke
+    post_prune_health = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_health"
+    )
+    smoke_call = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+        post_prune_health,
+    )
+    receipt = normalized.index(
+        "CUTOVER_STEP=persist_deployed_receipt_pending", smoke_call,
+    )
+    assert post_prune_health < smoke_call < receipt
+
+
+def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    bodies = _shell_function_bodies(deploy_script)
+    state_root = "/var/lib/probiga/qmt-announcement-checkpoints"
+
+    assert f"QMT_ANNOUNCEMENT_CHECKPOINT_ROOT={state_root}" in deploy_script
+    prepare_root = _normalized_shell(
+        bodies["prepare_qmt_announcement_checkpoint_root"]
+    )
+    for required in (
+        'install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700',
+        'test ! -L "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"',
+        'readlink -f -- "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"',
+        "stat -c '%U:%G'",
+        "stat -c '%a'",
+        'find -P "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" -mindepth 1 -type l',
+        'sudo -u "$SERVICE_USER" test -w',
+    ):
+        assert required in prepare_root
+    service_user = normalized.index('test "$SERVICE_USER" != root')
+    prepare_call = normalized.index(
+        "prepare_qmt_announcement_checkpoint_root", service_user
+    )
+    first_capture = normalized.index(
+        "CUTOVER_STEP=capture_qmt_announcement_full_market_batch",
+        prepare_call,
+    )
+    assert service_user < prepare_call < first_capture
+    assert (
+        'QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"'
+        in bodies["run_prepared_python_tool"]
+    )
+    for name in ("write_dropin", "write_scheduler_dropin"):
+        assert "QMT_ANNOUNCEMENT_CHECKPOINT_DIR=" in bodies[name]
+    capture = normalized[first_capture:]
+    assert (
+        '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"' in capture
+    )
+    assert (
+        "--checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints"
+        in deploy_script
+    )
 
 
 def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
@@ -1035,44 +1381,78 @@ def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
     assert "set -Eeuo pipefail" in normalized
 
 
-def test_qmt_history_provenance_schema_is_checked_before_cutover() -> None:
+def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
     normalized = _normalized_shell(deploy_script)
-    provenance_preflight = normalized.index(
-        "CUTOVER_STEP=preflight_qmt_local_history_provenance_schema"
+    schema_recover = normalized.index(
+        "CUTOVER_STEP=recover_strategy_governance_database_trust"
     )
-    governance_snapshot = normalized.index(
-        "CUTOVER_STEP=capture_strategy_governance_task_before_cutover",
-        provenance_preflight,
+    provenance_check = normalized.index(
+        "CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover",
+        schema_recover,
     )
-    cutover_started = normalized.index("CUTOVER_STARTED=1", governance_snapshot)
-    preflight_body = normalized[provenance_preflight:governance_snapshot]
-    readiness = preflight_body.index(
-        "CUTOVER_STEP=preflight_strategy_governance_qmt_history_readiness"
+    release_request = normalized.index(
+        "CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap",
+        provenance_check,
     )
+    edge_identity = normalized.index(
+        "CUTOVER_STEP=wait_for_qmt_windows_edge_identity", release_request
+    )
+    edge_bootstrap = normalized.index(
+        "CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap",
+        edge_identity,
+    )
+    readiness = normalized.index(
+        "CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema",
+        edge_bootstrap,
+    )
+    history_apply = normalized.index(
+        "CUTOVER_STEP=prepare_strategy_governance_qmt_history", readiness
+    )
+    announcement_batch = normalized.index(
+        "CUTOVER_STEP=capture_qmt_announcement_full_market_batch",
+        history_apply,
+    )
+    governance_run = normalized.index(
+        "CUTOVER_STEP=run_strategy_governance", announcement_batch
+    )
+    body = normalized[provenance_check:history_apply]
 
-    assert provenance_preflight < governance_snapshot < cutover_started
-    assert preflight_body.count(
+    assert (
+        schema_recover
+        < provenance_check
+        < release_request
+        < edge_identity
+        < edge_bootstrap
+        < readiness
+        < history_apply
+        < announcement_batch
+        < governance_run
+    )
+    assert body.count(
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/'
         'migrate_qmt_local_history_provenance.py" --check-via-primary'
     ) == 1
-    assert 'QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool' in preflight_body
-    assert '"$BOOTSTRAP_PYTHON" -I -c' in preflight_body
-    assert "json.load(sys.stdin)" in preflight_body
-    assert "session_window_sha256" in preflight_body
-    assert "readonly QMT_HISTORY_TARGET_TRADE_DATE" in preflight_body
-    window_binding = preflight_body[
-        readiness:preflight_body.index("GOVERNANCE_TASK_OLD_SOURCE=", readiness)
-    ]
-    assert "mktemp" not in window_binding
-    assert "if run_prepared_python_tool" not in preflight_body
-    assert "|| true" not in preflight_body
-    assert "--apply" not in preflight_body
-    assert preflight_body.index("--check-via-primary") < readiness
-    assert preflight_body.count(
+    announcement_body = normalized[announcement_batch:governance_run]
+    assert "--window-days 30 --batch-size 100" in announcement_body
+    assert '--validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"' in (
+        announcement_body
+    )
+    assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' in announcement_body
+    assert "sync_guojin_qmt_reference_data.py" not in body
+    assert "run_qmt_windows_edge_release_bootstrap.py" in body
+    assert "--request --expected-build-sha \"$EXPECTED_SHA\"" in body
+    assert "--identity-only --expected-build-sha \"$EXPECTED_SHA\"" in body
+    assert "--release-bootstrap-only" in body
+    assert body.count("--expected-poll-seconds 60 --compact") == 2
+    assert 'QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool' in body
+    assert "session_window_sha256" in body
+    assert "readonly QMT_HISTORY_TARGET_TRADE_DATE" in body
+    assert "|| true" not in body
+    assert body.count(
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/'
         'prepare_strategy_governance_qmt_history.py" --readiness-only'
@@ -1115,7 +1495,7 @@ def test_rollback_restores_previous_immutable_runtime_without_checkout() -> None
     )
     assert "restore previous probiga drop-in" in rollback
     assert "restore previous AI recommendation worker drop-in" in rollback
-    assert "restore previous strategy governance task" in rollback
+    assert "restore previous scheduler task set" in rollback
     assert "prepared_restore_and_verify_governance_snapshot" in rollback
     assert "controlled_guard_restore_and_verify_governance_snapshot" not in rollback
     assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in rollback
@@ -1175,8 +1555,14 @@ def test_previous_code_fallback_and_code_retention_keep_two_generations() -> Non
         'point_static_release_to_checkout "$PREPARED_CODE_ROOT"',
         service_start,
     )
+    post_prune_identity = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_release_identity", static_switch
+    )
+    post_prune_health = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_health", post_prune_identity
+    )
     receipt_pending = normalized.index(
-        "persist_deployed_receipt_pending", static_switch
+        "persist_deployed_receipt_pending", post_prune_health
     )
     journal_finalize = normalized.rindex(
         "controlled_guard_finalize_successful_activation",
@@ -1190,11 +1576,13 @@ def test_previous_code_fallback_and_code_retention_keep_two_generations() -> Non
     assert (
         service_start
         < static_switch
+        < prune_position
+        < post_prune_identity
+        < post_prune_health
         < receipt_pending
         < journal_finalize
         < receipt
         < journal_remove
-        < prune_position
     )
 
 
@@ -1778,7 +2166,8 @@ def test_production_dependency_lock_respects_server_mirror_ceiling() -> None:
 
     assert "charset-normalizer==3.5.0" in requirements
     assert "idna==3.18" in requirements
-    assert "uvicorn[standard]==0.52.3" in requirements
+    assert "uvicorn==0.52.3" in requirements
+    assert "uvicorn[standard]" not in requirements
 
 
 def test_sector_heat_runtime_cache_is_outside_tracked_data() -> None:
@@ -2051,13 +2440,23 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
         in schema_tool
     )
     for exact_runtime_policy in (
+        'TARGET_RUNTIME_PRIVILEGE_CONTRACT = "TARGET_LEAST_PRIVILEGE"',
+        'LEGACY_RUNTIME_PRIVILEGE_CONTRACT = "LEGACY_DDL_COMPATIBILITY"',
         '"BIGA.*": frozenset({"SELECT"})',
         '"PROBIGA.*": frozenset({',
         '"PROBIGA_QMT_HISTORY.*": frozenset({"SELECT"})',
         '"CREATE TEMPORARY TABLES"',
+        '"ALTER"',
+        '"CREATE"',
+        '"DROP"',
+        '"INDEX"',
+        '"REFERENCES"',
         "len(global_entries) != 1",
         'global_entries[0] != {"USAGE"}',
-        "privileges\n            != set(EXPECTED_RUNTIME_SCHEMA_PRIVILEGES[scope])",
+        "observed_schema == TARGET_RUNTIME_SCHEMA_PRIVILEGES",
+        "observed_schema == LEGACY_RUNTIME_SCHEMA_PRIVILEGES",
+        '"observed_contract": observed_contract',
+        '"persistent_ddl_privileges": persistent_ddl_privileges',
         '"require_ssl": True',
         '"roles": []',
         '"grant_option": False',
@@ -2158,8 +2557,18 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert "--phase cutover --writers-fenced" in cutover_command
     assert "prepare_strategy_governance_schema.py" in recover_command
     assert "--phase recover" in recover_command
-    assert "prepare_strategy_governance_qmt_history.py" in preflight_command
-    assert "--readiness-only" in preflight_command
+    assert "prepare_strategy_governance_qmt_history.py" not in preflight_command
+    assert "sync_guojin_qmt_reference_data.py" not in preflight_command
+    assert "--readiness-only" in recover_command
+    assert "sync_guojin_qmt_reference_data.py" not in recover_command
+    assert "run_qmt_windows_edge_release_bootstrap.py" in recover_command
+    assert "--request --expected-build-sha \"$EXPECTED_SHA\"" in (
+        recover_command
+    )
+    assert "--identity-only --expected-build-sha \"$EXPECTED_SHA\"" in (
+        recover_command
+    )
+    assert "--release-bootstrap-only" in recover_command
     assert "--apply" not in preflight_command
     assert "--schema-only" not in preflight_command
     assert "ensure_attestation_tables(" not in production_history
@@ -2848,30 +3257,57 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     ):
         assert required_recovery_evidence in recover_validator
     for required_resume_evidence in (
-        'p.get("phase")=="resume"',
-        'p.get("runtime_least_privilege_verified") is True',
-        'security.get("global_privileges")==["USAGE"]',
-        'security.get("schema_privileges")==expected_schema',
+        'p.get("phase") == "resume"',
+        'p.get("runtime_privilege_boundary_verified") is True',
+        'p.get("runtime_least_privilege_verified")',
+        'p.get("runtime_legacy_ddl_compatibility")',
+        'security.get("observed_contract") == observed_contract',
+        'security.get("persistent_ddl_privileges") == expected_persistent_ddl',
+        'security.get("global_privileges") == ["USAGE"]',
+        'security.get("schema_privileges") == observed_schema',
+        'security.get("funding_append_only_tables") == expected_funding_tables',
+        'security.get("funding_append_only_verified") is True',
+        'security.get("funding_structural_bypass_privileges")',
+        '== expected_persistent_ddl',
+        'security.get("truncate_denied_by_absent_drop_privilege")',
+        'is (observed_contract == target_contract)',
+        'security.get("trigger_drop_denied_by_absent_trigger_privilege") is True',
         'security.get("require_ssl") is True',
-        'security.get("roles")==[]',
+        'security.get("roles") == []',
         'security.get("grant_option") is False',
-        'p.get("runtime_definer_routine_count")==0',
+        'p.get("runtime_definer_routine_count") == 0',
         'p.get("runtime_definer_routine_inventory_verified") is True',
         'binding.get("legacy_binding_pending") is False',
-        'binding.get("legacy_binding_marker_present") is bool(binding['
-        '"legacy_run_count"])',
+        'binding.get("legacy_binding_marker_present")',
+        'is bool(binding["legacy_run_count"])',
         'p.get("trust_restoration_verified") is True',
         'p.get("restore_primary_verified") is True',
         'p.get("restore_secondary_verified") is True',
         'p.get("runtime_trust_off_verified") is True',
-        'x.get("status") in {"applied","exists"}',
+        'x.get("status") in {"applied", "exists"}',
         'repair.get("post_validation_verified") is True',
-        'candidates==sorted(set(candidates))',
-        'repaired==candidates',
-        'set(candidates)<=allowed',
-        'p.get("trigger_trust_window_count")==len(windows)',
-        'p["seeded_strategy_count"]>0',
-        'p["governance_trigger_count"]>0',
+        'candidates == sorted(set(candidates))',
+        'repaired == candidates',
+        'set(candidates) <= allowed',
+        'p.get("trigger_trust_window_count") == len(windows)',
+        'p["seeded_strategy_count"] > 0',
+        'p.get("funding_checkpoint_table_count") == 2',
+        'p.get("funding_checkpoint_trigger_count") == 4',
+        'p.get("governance_append_only_trigger_count") == 38',
+        'p.get("governance_metric_review_trigger_count") == 2',
+        'p["governance_trigger_count"] == 40',
+        'p.get("governance_trigger_source_contract_hash")',
+        'p.get("governance_append_only_physical_contract_hash")',
+        'p.get("governance_metric_review_physical_contract_hash")',
+        'p.get("governance_append_only_core_contract_hash")',
+        'p.get("governance_metric_review_core_contract_hash")',
+        'governance_names_hash == expected_trigger_names_hash',
+        'funding.get("batch_max_rows") == 100',
+        'funding.get("batch_max_bytes") == 4194304',
+        'funding.get("manifest_max_bytes") == 1048576',
+        'funding.get("audit_max_bytes") == 131072',
+        'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
+        'runtime_bundle_runtime.get("contract_hash")',
     ):
         assert required_resume_evidence in resume_validator
     for required_writer_fence_evidence in (
@@ -2884,33 +3320,67 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     ):
         assert required_writer_fence_evidence in writer_fence_validator
     for required_preflight_evidence in (
-        'p.get("runtime_least_privilege_verified") is True',
-        'security.get("global_privileges")==["USAGE"]',
-        'security.get("schema_privileges")==expected_schema',
+        'p.get("runtime_privilege_boundary_verified") is True',
+        'p.get("runtime_least_privilege_verified")',
+        'p.get("runtime_legacy_ddl_compatibility")',
+        'security.get("observed_contract") == observed_contract',
+        'security.get("persistent_ddl_privileges") == expected_persistent_ddl',
+        'security.get("global_privileges") == ["USAGE"]',
+        'security.get("schema_privileges") == observed_schema',
+        'security.get("funding_append_only_tables") == expected_funding_tables',
+        'security.get("funding_append_only_verified") is True',
+        'security.get("funding_structural_bypass_privileges")',
+        '== expected_persistent_ddl',
+        'security.get("truncate_denied_by_absent_drop_privilege")',
+        'is (observed_contract == target_contract)',
+        'security.get("trigger_drop_denied_by_absent_trigger_privilege") is True',
         'security.get("require_ssl") is True',
-        'security.get("roles")==[]',
+        'security.get("roles") == []',
         'security.get("grant_option") is False',
-        'p.get("runtime_definer_routine_count")==0',
+        'p.get("runtime_definer_routine_count") == 0',
         'p.get("runtime_definer_routine_inventory_verified") is True',
         'binding.get("legacy_binding_pending") is False',
-        'binding.get("legacy_binding_marker_present") is bool(binding['
-        '"legacy_run_count"])',
-        'p.get("pending_v3_versions")==[]',
-        'x.get("status")=="exists"',
+        'binding.get("legacy_binding_marker_present")',
+        'is bool(binding["legacy_run_count"])',
+        'p.get("pending_v3_versions") == []',
+        'x.get("status") == "exists"',
         'trigger.get("metadata_frozen") is True',
-        'trigger.get("legacy_rehome_names")==[]',
-        'p["qmt_table_count"]>0',
-        'p["governance_table_count"]>0',
+        'trigger.get("legacy_rehome_names") == []',
+            'p.get("qmt_table_count") == 4',
+            'p.get("governance_table_count") == 15',
+        'governance_source.get("source_contract_hash")',
+        'governance_source.get("core_append_only_contract_hash")',
+        'governance_source.get("core_metric_review_contract_hash")',
+        'governance_names_hash == expected_trigger_names_hash',
+        'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
+        'runtime_bundle.get("migration_required")',
     ):
         assert required_preflight_evidence in preflight_validator
     for exact_runtime_grant in (
-        '"BIGA.*":["SELECT"]',
-        '"PROBIGA.*":["ALTER","CREATE","CREATE TEMPORARY TABLES",'
-        '"DELETE","DROP","INDEX","INSERT","REFERENCES","SELECT","UPDATE"]',
-        '"PROBIGA_QMT_HISTORY.*":["SELECT"]',
+        '"BIGA.*": ["SELECT"]',
+        '"PROBIGA.*": [',
+        '"CREATE TEMPORARY TABLES", "DELETE"',
+        '"INSERT", "SELECT", "UPDATE"',
+        '"ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP"',
+        '"INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE"',
+        '"PROBIGA_QMT_HISTORY.*": ["SELECT"]',
+        'target_contract = "TARGET_LEAST_PRIVILEGE"',
+        'legacy_contract = "LEGACY_DDL_COMPATIBILITY"',
     ):
         assert exact_runtime_grant in resume_validator
         assert exact_runtime_grant in preflight_validator
+    for frozen_contract_literal in (
+        "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde",
+        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f",
+        "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13",
+        "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8",
+        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
+        "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
+        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
+        "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff",
+    ):
+        assert frozen_contract_literal in resume_validator
+        assert frozen_contract_literal in preflight_validator
 
     assert cleanup.count("controlled_guard_restore_after_cleanup_failure") >= 2
     assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' in cleanup
@@ -3406,7 +3876,14 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert ') > "$output_file" || gate_status=$?' in capture_deadline
     assert "completed|input_not_ready)" in health_result_parser
     assert "registry_sealed" in health_result_parser
+    assert "registry_integrity_ready" in health_result_parser
+    assert "adapter_configured" in health_result_parser
+    assert "candidate_execution_ready" in health_result_parser
+    assert "funding_pipeline_ready" in health_result_parser
+    assert "governance_paper_execution_ready" in health_result_parser
     assert "production_execution_ready" in health_result_parser
+    assert "real_order_submission_enabled" in health_result_parser
+    assert "automatic_real_order_submission" in health_result_parser
     assert "trade_date_source" in health_result_parser
     assert "safe_before_epoch" in cutover_result_parser
     assert "cutoff - safe_before == reserve" in cutover_result_parser
@@ -3954,6 +4431,21 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     assert snapshot_handoff.index(
         'controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600'
     ) < deadline_handoff
+    qmt_snapshot_handoff = bodies[
+        "controlled_guard_qmt_announcement_snapshot"
+    ]
+    assert '"$code_root/tools/add_qmt_announcement_task.py"' in (
+        qmt_snapshot_handoff
+    )
+    assert '"--${action}-snapshot" - < "$snapshot"' in (
+        qmt_snapshot_handoff
+    )
+    assert "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" in (
+        qmt_snapshot_handoff
+    )
+    assert "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" in (
+        qmt_snapshot_handoff
+    )
 
     restore_and_verify = bodies[
         "controlled_guard_restore_and_verify_governance_snapshot"
@@ -3971,6 +4463,9 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     )
     assert initial_verify < restore < final_verify
     assert "return 0" in restore_and_verify[initial_verify:restore]
+    assert restore_and_verify.count(
+        "controlled_guard_qmt_announcement_snapshot"
+    ) >= 3
 
     prepared_handoff = bodies["prepared_governance_snapshot"]
     assert "restore|verify" in prepared_handoff
@@ -3985,6 +4480,15 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     assert 'test ! -w "$entrypoint"' in prepared_handoff
     assert '"--${action}-snapshot" - < "$snapshot"' in prepared_handoff
     assert 'run_prepared_python_tool "$entrypoint"' in prepared_handoff
+    prepared_qmt_handoff = bodies["prepared_qmt_announcement_snapshot"]
+    assert "add_qmt_announcement_task.py" in prepared_qmt_handoff
+    assert "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" in prepared_qmt_handoff
+    assert "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" in (
+        prepared_qmt_handoff
+    )
+    assert "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" in (
+        prepared_qmt_handoff
+    )
     prepared_restore = bodies[
         "prepared_restore_and_verify_governance_snapshot"
     ]
@@ -4005,6 +4509,7 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     assert "return 0" in prepared_restore[
         initial_prepared_verify:prepared_restore_call
     ]
+    assert prepared_restore.count("prepared_qmt_announcement_snapshot") >= 3
 
     recovery = bodies["controlled_activation_snapshot_only_recovery"]
     old_branch = recovery[: recovery.index("activation_snapshot_restore_new_set")]
@@ -4158,6 +4663,7 @@ CODE_RELEASE_ROOT="$sandbox/releases"
 RELEASE_VENV_ROOT="$sandbox/venvs"
 ADATA_RUNTIME_ROOT="$sandbox/adata"
 ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$sandbox/governance-new.json"
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT="$sandbox/qmt-announcement-new.json"
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL="$controlled_tool"
 runner_trace="$sandbox/runner-trace"
 
@@ -4174,6 +4680,7 @@ chmod 0444 "$controlled_tool"
 CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256="$(sha256sum "$controlled_tool" | cut -d' ' -f1)"
 
 activation_snapshot_validate_governance_new() { return 0; }
+controlled_guard_qmt_announcement_snapshot() { return 0; }
 controlled_guard_assert_governance_restore_runtime() { return 0; }
 controlled_guard_assert_file() { test -f "$1"; }
 systemctl() { printf '%s\n' probiga; }
@@ -4428,3 +4935,73 @@ def test_schema_preflight_is_read_only_and_global_trust_isolated() -> None:
     assert 'fenced_phases = {"cutover", "resume"}' in prepare
     assert "if phase in fenced_phases and not writers_fenced:" in prepare
     assert "_recover_trust(_open_recovery_boundary())" in prepare
+
+
+def test_all_legacy_mutable_production_entrypoints_are_retired() -> None:
+    retired_entrypoints = (
+        "deploy/deploy.sh",
+        "deploy/deploy.ps1",
+        "deploy/deploy_today.py",
+        "deploy/migrate_to_cloud.ps1",
+        "deploy/publish_to_cloud.bat",
+        "deploy/upload_and_restart.ps1",
+        "deploy/upload_and_restart.bat",
+        "deploy/upload_capital_flow_fixes.py",
+        "deploy/upload_portfolio_profit_fix.ps1",
+        "deploy/upload_portfolio_profit_fix.bat",
+        "tools/_kill_and_restart.py",
+        "tools/_restart_probiga.py",
+        "tools/_run_akshare_fill.py",
+        "tools/_run_kline_incremental.py",
+        "tools/_run_plate_sync.py",
+        "tools/_upload_sync_sm.py",
+    )
+    for relative in retired_entrypoints:
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        assert "retired" in source.casefold(), relative
+
+    python_fences = (
+        "deploy/deploy_today.py",
+        "tools/_kill_and_restart.py",
+        "tools/_restart_probiga.py",
+        "tools/_run_akshare_fill.py",
+        "tools/_run_kline_incremental.py",
+        "tools/_run_plate_sync.py",
+        "tools/_upload_sync_sm.py",
+    )
+    forbidden_tokens = (
+        "production_ssh_client",
+        "production_ssh_connect_kwargs",
+        "paramiko",
+        ".connect(",
+        "open_sftp",
+        "sftp",
+        "exec_command",
+        "open_session",
+        "invoke_shell",
+        "subprocess",
+        "os.system",
+        "pip install",
+        "systemctl",
+        "restart",
+        "nohup",
+    )
+    for relative in python_fences:
+        source = (ROOT / relative).read_text(encoding="utf-8")
+        folded = source.casefold()
+        assert "RETIRED_EXIT_CODE = 2" in source, relative
+        assert "return RETIRED_EXIT_CODE" in source, relative
+        assert "raise SystemExit(main())" in source, relative
+        for forbidden in forbidden_tokens:
+            assert forbidden not in folded, (relative, forbidden)
+
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / relative)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert completed.returncode == 2, relative
+        assert completed.stdout == "", relative
+        assert "retired" in completed.stderr.casefold(), relative

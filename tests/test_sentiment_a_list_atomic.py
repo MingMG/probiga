@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+from types import SimpleNamespace
 
 from biz.sentiment import sync_sentiment
 
@@ -61,3 +62,83 @@ def test_replace_a_list_dates_rejects_unscoped_frame():
         assert "trade_date" in str(exc)
     else:
         raise AssertionError("unscoped replacement must be rejected")
+
+
+def test_a_list_info_empty_code_keeps_old_partition(monkeypatch):
+    captured = {}
+
+    def get_info(*, stock_code, report_date):
+        if stock_code == "000002":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [{"trade_date": report_date, "stock_code": stock_code, "reason": "ok"}]
+        )
+
+    provider = SimpleNamespace(hot=SimpleNamespace(get_a_list_info=get_info))
+    monkeypatch.setenv("SE_A_LIST_INFO", "1")
+    monkeypatch.setenv("SE_A_LIST_INFO_MAX", "0")
+    monkeypatch.delenv("SE_A_LIST_DATE", raising=False)
+    monkeypatch.setattr(sync_sentiment, "_sleep", lambda: None)
+    monkeypatch.setattr(
+        sync_sentiment,
+        "retry_remote",
+        lambda function, *args, **kwargs: function(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        sync_sentiment,
+        "replace_table_rows",
+        lambda frame, table, engine, **kwargs: captured.update(
+            frame=frame,
+            table=table,
+            engine=engine,
+            kwargs=kwargs,
+        ),
+    )
+    daily = pd.DataFrame(
+        {
+            "trade_date": ["2026-08-25", "2026-08-25"],
+            "stock_code": ["000001", "000002"],
+        }
+    )
+
+    sync_sentiment.step_a_list_info(object(), provider, daily)
+
+    assert captured["table"] == "st_a_list_info"
+    assert captured["frame"]["stock_code"].unique().tolist() == ["000001"]
+    assert "stock_code = :stock_code_0" in captured["kwargs"]["where_sql"]
+    assert captured["kwargs"]["params"] == {
+        "trade_date_0": "2026-08-25",
+        "stock_code_0": "000001",
+    }
+
+
+def test_a_list_date_response_for_wrong_date_is_not_published(monkeypatch):
+    writes: list[object] = []
+    provider = SimpleNamespace(
+        hot=SimpleNamespace(
+            list_a_list_daily=lambda report_date: pd.DataFrame(
+                [{"trade_date": "2026-08-24", "stock_code": "000001"}]
+            )
+        )
+    )
+    monkeypatch.setattr(sync_sentiment, "_a_list_report_dates", lambda _engine: ["2026-08-25"])
+    monkeypatch.setattr(sync_sentiment, "_sleep", lambda: None)
+    monkeypatch.setattr(
+        sync_sentiment,
+        "retry_remote",
+        lambda function, *args, **kwargs: function(*args, **kwargs),
+    )
+    monkeypatch.setattr(
+        sync_sentiment,
+        "replace_table_rows",
+        lambda *_args, **_kwargs: writes.append(True),
+    )
+
+    try:
+        sync_sentiment.step_a_list_daily(object(), provider)
+    except RuntimeError as exc:
+        assert "no a-list daily rows" in str(exc)
+    else:
+        raise AssertionError("wrong-date response must not replace the requested date")
+
+    assert writes == []

@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
-from remote_support import production_ssh_client, production_ssh_connect_kwargs
+"""Retired mutable-file production maintenance entrypoint.
 
-ssh = production_ssh_client()
-ssh.connect(**production_ssh_connect_kwargs())
+Production releases are accepted only through the audited GitHub workflow and
+the root-owned ``probiga-production-deploy`` broker.  This historical filename
+is kept as an explicit safety fence for old operator habits and shortcuts.
+"""
 
-stdin, stdout, stderr = ssh.exec_command('systemctl restart probiga && sleep 2 && systemctl status probiga | head -10', timeout=15)
-print(stdout.read().decode())
-err = stderr.read().decode()
-if err:
-    print('ERR:', err[:500])
-ssh.close()
+from __future__ import annotations
+
+import sys
+
+
+RETIRED_EXIT_CODE = 2
+RETIRED_MESSAGE = (
+    "Legacy mutable-file production maintenance is retired; "
+    "use the audited production deployment workflow."
+)
+
+
+def main() -> int:
+    print(RETIRED_MESSAGE, file=sys.stderr)
+    return RETIRED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

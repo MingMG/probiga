@@ -9,9 +9,11 @@ from typing import Any, Iterable, Sequence
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from integrations.qmt.audit import ensure_audit_tables
+from integrations.qmt.audit import validate_audit_schema
 from integrations.qmt.diagnostics import PROVIDER_ID
 from integrations.qmt.pending_write import replay_pending_writes, result_dict as pending_result_dict
+from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 
 CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -94,60 +96,53 @@ def _table_columns(conn, table_name: str) -> set[str]:
 
 def _previous_trade_dates(engine: Engine, *, scan_days: int, today: date | None = None) -> list[date]:
     today_value = today or _now().date()
+    lookback_start = today_value - timedelta(days=max(60, scan_days * 4))
     with engine.begin() as conn:
-        if _table_exists(conn, "si_trade_calendar"):
-            rows = conn.execute(
-                text(
-                    """
-                    SELECT trade_date
-                    FROM si_trade_calendar
-                    WHERE trade_status = 1
-                      AND trade_date < :today
-                    ORDER BY trade_date DESC
-                    LIMIT :limit
-                    """
-                ),
-                {"today": today_value, "limit": scan_days},
-            ).fetchall()
-            if rows:
-                return [row[0] for row in rows]
-
-        rows = conn.execute(
-            text(
-                """
-                SELECT DISTINCT trade_date
-                FROM sm_stock_kline
-                WHERE trade_date < :today
-                ORDER BY trade_date DESC
-                LIMIT :limit
-                """
-            ),
-            {"today": today_value, "limit": scan_days},
-        ).fetchall()
-    return [row[0] for row in rows]
+        receipt = load_trade_calendar_receipt(
+            conn,
+            start_date=lookback_start.isoformat(),
+            end_date=today_value.isoformat(),
+            decision_known_at=_now().replace(tzinfo=None, microsecond=0),
+        )
+    sessions = [
+        datetime.strptime(day, "%Y-%m-%d").date()
+        for day in receipt.sessions_between(
+            lookback_start.isoformat(), today_value.isoformat()
+        )
+        if day < today_value.isoformat()
+    ]
+    if len(sessions) < max(1, int(scan_days)):
+        raise RuntimeError("immutable QMT calendar receipt has too few sessions")
+    return list(reversed(sessions[-max(1, int(scan_days)):]))
 
 
-def _expected_stock_counts(engine: Engine, dates: Sequence[date]) -> dict[date, int]:
+def _expected_stock_sets(
+    engine: Engine, dates: Sequence[date],
+) -> tuple[Any, Any, dict[date, set[str]]]:
     if not dates:
-        return {}
-    result: dict[date, int] = {}
+        raise RuntimeError("QMT reconciliation requires target sessions")
     with engine.begin() as conn:
-        for trade_date in dates:
-            result[trade_date] = int(
-                conn.execute(
-                    text(
-                        """
-                        SELECT COUNT(*)
-                        FROM si_all_code
-                        WHERE stock_code REGEXP '^(0|3|4|6|8|9)'
-                          AND (list_date IS NULL OR list_date <= :trade_date)
-                        """
-                    ),
-                    {"trade_date": trade_date},
-                ).scalar()
-                or 0
-            )
-    return result
+        catalog = load_stock_catalog(
+            conn,
+            decision_known_at=_now().replace(tzinfo=None, microsecond=0),
+        )
+        calendar_receipt = load_trade_calendar_receipt(
+            conn,
+            start_date=min(dates).isoformat(),
+            end_date=max(dates).isoformat(),
+            decision_known_at=_now().replace(tzinfo=None, microsecond=0),
+        )
+    expected = {
+        trade_date: set(catalog.eligible_codes(trade_date.isoformat()))
+        for trade_date in dates
+    }
+    if any(not codes for codes in expected.values()):
+        raise RuntimeError("independent QMT reconciliation universe is empty")
+    if set(calendar_receipt.sessions_between(
+        min(dates).isoformat(), max(dates).isoformat()
+    )) != {trade_date.isoformat() for trade_date in dates}:
+        raise RuntimeError("QMT reconciliation dates differ from calendar root")
+    return catalog, calendar_receipt, expected
 
 
 def _group_counts_for_dates(engine: Engine, table_name: str, dates: Sequence[date]) -> dict[date, int]:
@@ -170,6 +165,35 @@ def _group_counts_for_dates(engine: Engine, table_name: str, dates: Sequence[dat
             params,
         ).fetchall()
     return {row[0]: int(row[1] or 0) for row in rows}
+
+
+def _group_stock_sets_for_dates(
+    engine: Engine, table_name: str, dates: Sequence[date],
+) -> dict[date, set[str]]:
+    if not dates:
+        return {}
+    placeholders = ", ".join(f":d{idx}" for idx, _ in enumerate(dates))
+    params = {f"d{idx}": item for idx, item in enumerate(dates)}
+    filters = ""
+    if table_name == "sm_stock_kline":
+        filters = " AND k_type=1 AND adjust_type=0"
+    with engine.begin() as conn:
+        if not _table_exists(conn, table_name):
+            return {}
+        rows = conn.execute(text(f"""
+            SELECT DISTINCT trade_date, stock_code
+            FROM `{table_name}`
+            WHERE trade_date IN ({placeholders})
+              AND stock_code REGEXP '^(0|3|4|6|8|9)'
+              {filters}
+            ORDER BY trade_date, stock_code
+        """), params).fetchall()
+    result: dict[date, set[str]] = {}
+    for trade_date, stock_code in rows:
+        result.setdefault(trade_date, set()).add(
+            str(stock_code).strip().zfill(6)
+        )
+    return result
 
 
 def _coverage_status(ratio: float, *, warn_threshold: float, pass_threshold: float) -> str:
@@ -203,20 +227,31 @@ def _missing_quality_result(dataset: str, rule_name: str, reason: str) -> Qualit
 
 def build_coverage_results(engine: Engine, *, scan_days: int) -> list[CoverageResult]:
     dates = _previous_trade_dates(engine, scan_days=scan_days)
-    expected = _expected_stock_counts(engine, dates)
-    daily_counts = _group_counts_for_dates(engine, "sm_stock_kline", dates)
-    minute_counts = _group_counts_for_dates(engine, "sm_stock_minute", dates)
+    catalog, calendar_receipt, expected = _expected_stock_sets(engine, dates)
+    daily_sets = _group_stock_sets_for_dates(engine, "sm_stock_kline", dates)
+    minute_sets = _group_stock_sets_for_dates(engine, "sm_stock_minute", dates)
 
     results: list[CoverageResult] = []
     for trade_date in dates:
-        expected_count = int(expected.get(trade_date) or 0)
-        for dataset, counts, warn, passed in (
-            ("sm_stock_kline.1d", daily_counts, 0.80, 0.95),
-            ("sm_stock_minute.1m", minute_counts, 0.50, 0.80),
+        expected_set = expected.get(trade_date) or set()
+        expected_count = len(expected_set)
+        for dataset, actual_sets, warn, passed in (
+            ("sm_stock_kline.1d", daily_sets, 1.0, 1.0),
+            ("sm_stock_minute.1m", minute_sets, 0.50, 0.80),
         ):
-            actual_count = int(counts.get(trade_date) or 0)
-            missing_count = max(expected_count - actual_count, 0)
-            ratio = (actual_count / expected_count) if expected_count else 0.0
+            actual_set = actual_sets.get(trade_date) or set()
+            missing = sorted(expected_set - actual_set)
+            unexpected = sorted(actual_set - expected_set)
+            actual_count = len(actual_set)
+            missing_count = len(missing)
+            matched_count = len(expected_set & actual_set)
+            ratio = (matched_count / expected_count) if expected_count else 0.0
+            if dataset == "sm_stock_kline.1d":
+                status = "PASS" if not missing and not unexpected else "FAIL"
+            else:
+                status = _coverage_status(
+                    ratio, warn_threshold=warn, pass_threshold=passed
+                )
             results.append(
                 CoverageResult(
                     dataset=dataset,
@@ -225,8 +260,26 @@ def build_coverage_results(engine: Engine, *, scan_days: int) -> list[CoverageRe
                     actual_count=actual_count,
                     missing_count=missing_count,
                     coverage_ratio=round(ratio, 8),
-                    status=_coverage_status(ratio, warn_threshold=warn, pass_threshold=passed),
-                    details={"warn_threshold": warn, "pass_threshold": passed, "history_backfill": "deferred_queue"},
+                    status=status,
+                    details={
+                        "warn_threshold": warn,
+                        "pass_threshold": passed,
+                        "exact_set_required": dataset == "sm_stock_kline.1d",
+                        "missing_count": len(missing),
+                        "missing_sample": missing[:20],
+                        "unexpected_count": len(unexpected),
+                        "unexpected_sample": unexpected[:20],
+                        "catalog_batch_id": catalog.batch_id,
+                        "catalog_member_set_hash": catalog.member_set_hash,
+                        "catalog_manifest_hash": catalog.manifest_hash,
+                        "calendar_batch_id": calendar_receipt.batch_id,
+                        "calendar_session_set_hash": (
+                            calendar_receipt.session_set_hash
+                        ),
+                        "calendar_manifest_hash": calendar_receipt.manifest_hash,
+                        "calendar_known_at": calendar_receipt.known_at,
+                        "history_backfill": "deferred_queue",
+                    },
                 )
             )
     return results
@@ -751,7 +804,7 @@ def _save_quality(conn, *, run_id: str, quality: Iterable[QualityResult], checke
 
 
 def run_nightly_reconciliation(engine: Engine, *, scan_days: int = 20) -> NightlyReconciliationResult:
-    ensure_audit_tables(engine)
+    validate_audit_schema(engine)
     run_id = f"qmt_nightly_{_now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     started_at = _now()
     coverage: list[CoverageResult] = []

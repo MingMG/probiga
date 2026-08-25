@@ -238,6 +238,15 @@ def main() -> int:
             "writers-fenced schema preparation requires --disabled and cannot "
             "be combined with --schema-prepared"
         )
+    if (
+        os.environ.get("PROBIGA_DEPLOYMENT_MODE") == "production"
+        and not any(read_or_restore_modes)
+        and not args.schema_prepared
+    ):
+        parser.error(
+            "production task installation requires --schema-prepared; "
+            "persistent DDL belongs to the fenced migration account"
+        )
     load_project_env()
     engine = create_tool_engine()
     try:
@@ -370,8 +379,12 @@ def main() -> int:
                     if not args.schema_prepared
                     else None
                 ),
-                "governance_trigger_count": 0,
-                "database_triggers_required": False,
+                "governance_trigger_count": int(
+                    governance_schema["trigger_count"]
+                ),
+                "database_triggers_required": bool(
+                    governance_schema["database_triggers_required"]
+                ),
                 "governance_schema": governance_schema,
                 "schema_prepared": bool(args.schema_prepared),
                 "result": result,

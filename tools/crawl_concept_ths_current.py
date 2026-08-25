@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.batch_db import replace_table_rows
 from tools.env_config import create_tool_engine
 
 DELAY = 0.6
@@ -120,11 +121,43 @@ def fetch_concept(session: requests.Session, index_code: str) -> dict | None:
     }
 
 
-def save_to_db(engine, rows: list[dict]):
+def save_to_db(
+    engine,
+    rows: list[dict],
+    *,
+    expected_codes: list[str],
+    attempted_codes: list[str],
+    failed_codes: list[str],
+):
+    """Publish a full snapshot, or safely replace only proven code partitions."""
+
     if not rows:
-        return
+        raise ValueError("empty THS concept snapshot cannot be published")
 
     df = pd.DataFrame(rows)
+    required = {"index_code", "trade_date"}
+    if not required.issubset(df.columns):
+        raise ValueError("THS concept rows omit code/date coverage evidence")
+    df["index_code"] = df["index_code"].astype(str).str.strip()
+    df["trade_date"] = df["trade_date"].astype(str).str.slice(0, 10)
+    expected = {str(code).strip() for code in expected_codes if str(code).strip()}
+    attempted = {str(code).strip() for code in attempted_codes if str(code).strip()}
+    failed = {str(code).strip() for code in failed_codes if str(code).strip()}
+    observed = set(df["index_code"].dropna().unique())
+    observed_dates = set(df["trade_date"].dropna().unique())
+    if len(observed_dates) != 1:
+        raise ValueError(
+            f"THS concept snapshot has mixed or missing trade dates: {sorted(observed_dates)}"
+        )
+    if not attempted.issubset(expected):
+        raise ValueError("THS concept attempted codes are outside the catalog")
+    if observed & failed or observed | failed != attempted:
+        raise ValueError(
+            "THS concept shard evidence mismatch: "
+            f"attempted={len(attempted)} observed={len(observed)} failed={len(failed)}"
+        )
+    if not observed.issubset(expected):
+        raise ValueError("THS concept response contains codes outside the catalog")
     df = df.replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["index_code"], keep="last")
 
@@ -132,9 +165,6 @@ def save_to_db(engine, rows: list[dict]):
     df["trade_time"] = now
     df["snapshot_at"] = now
     df["etl_sync_at"] = now
-
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_concept_ths_current"))
 
     cols = [
         "index_code", "trade_time", "trade_date",
@@ -144,11 +174,19 @@ def save_to_db(engine, rows: list[dict]):
     ]
     df = df[[c for c in cols if c in df.columns]]
 
-    df.to_sql(
-        "sm_concept_ths_current", engine,
-        if_exists="append", index=False,
-        chunksize=500, method="multi",
-    )
+    complete = not failed and attempted == expected and observed == expected
+    kwargs = {"chunksize": 500, "method": "multi"}
+    if not complete:
+        params = {
+            f"index_code_{index}": code
+            for index, code in enumerate(sorted(observed))
+        }
+        kwargs["where_sql"] = "index_code IN (" + ", ".join(
+            f":{key}" for key in params
+        ) + ")"
+        kwargs["params"] = params
+    replace_table_rows(df, "sm_concept_ths_current", engine, **kwargs)
+    return "full" if complete else "partitions"
 
 
 def main():
@@ -159,7 +197,8 @@ def main():
     args = parser.parse_args()
 
     engine = create_tool_engine()
-    concepts = get_concept_codes(engine)
+    all_concepts = get_concept_codes(engine)
+    concepts = all_concepts
 
     if args.limit > 0:
         concepts = concepts[: args.limit]
@@ -174,6 +213,7 @@ def main():
 
     session = make_session()
     rows = []
+    failed_codes: list[str] = []
     ok = fail = 0
     t0 = time.time()
 
@@ -189,11 +229,12 @@ def main():
                 if attempt == 0:
                     time.sleep(2)
 
-        if result:
+        if result and str(result.get("index_code", "")).strip() == str(code).strip():
             rows.append(result)
             ok += 1
         else:
             fail += 1
+            failed_codes.append(str(code))
 
         time.sleep(DELAY + random.uniform(0, JITTER))
 
@@ -209,9 +250,19 @@ def main():
         if (i + 1) % BATCH_EVERY == 0:
             time.sleep(BATCH_PAUSE + random.uniform(0, 5))
 
-    if rows:
-        print(f"\n  Saving {len(rows)} rows...", flush=True)
-        save_to_db(engine, rows)
+    if not rows:
+        raise RuntimeError(
+            "THS concept source returned no successful code partitions; preserving previous rows"
+        )
+    print(f"\n  Saving {len(rows)} rows...", flush=True)
+    mode = save_to_db(
+        engine,
+        rows,
+        expected_codes=[item["index_code"] for item in all_concepts],
+        attempted_codes=[item["index_code"] for item in concepts],
+        failed_codes=failed_codes,
+    )
+    print(f"  Publication mode: {mode}", flush=True)
 
     elapsed = time.time() - t0
     print(f"\n  Done! OK={ok} Fail={fail} Time={elapsed/60:.1f}min\n")

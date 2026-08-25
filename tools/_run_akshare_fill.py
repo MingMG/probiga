@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-from remote_support import production_ssh_client, production_ssh_connect_kwargs
-import os
+"""Retired mutable-file production maintenance entrypoint.
 
-ssh = production_ssh_client()
-ssh.connect(**production_ssh_connect_kwargs())
+Production releases are accepted only through the audited GitHub workflow and
+the root-owned ``probiga-production-deploy`` broker.  This historical filename
+is kept as an explicit safety fence for old operator habits and shortcuts.
+"""
 
-sftp = ssh.open_sftp()
-local = os.path.join(os.path.dirname(__file__), '_kline_fill_akshare.py')
-sftp.put(os.path.abspath(local), '/tmp/kline_fill_akshare.py')
-sftp.close()
+from __future__ import annotations
 
-chan = ssh.get_transport().open_session()
-chan.settimeout(15)
-chan.exec_command('nohup bash -c "cd /opt/ProBigA && source venv/bin/activate && python /tmp/kline_fill_akshare.py" > /tmp/kline_akshare.log 2>&1 & echo "PID=$!"')
-import time; time.sleep(3)
-out = chan.recv(4096).decode().strip()
-print(out)
-chan.close()
-ssh.close()
-print('K-line akshare fill started.')
+import sys
+
+
+RETIRED_EXIT_CODE = 2
+RETIRED_MESSAGE = (
+    "Legacy mutable-file production maintenance is retired; "
+    "use the audited production deployment workflow."
+)
+
+
+def main() -> int:
+    print(RETIRED_MESSAGE, file=sys.stderr)
+    return RETIRED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

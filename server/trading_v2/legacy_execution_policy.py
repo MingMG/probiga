@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from .domain import OrderSide, WaitingReason, decimal_value
@@ -55,44 +54,12 @@ class LegacySectorPreheatExecutionPolicy:
 
         if not self.applies(strategy_version=strategy_version, side=side):
             return ""
-        theme = str(theme_code or "").strip()
-        if not theme:
-            return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        try:
-            row = connection.execute(
-                text(
-                    """
-                    SELECT snapshot_at, direction, score, breadth_pct
-                    FROM sm_market_radar_sector
-                    WHERE sector_code = :theme_code
-                    LIMIT 1
-                    """
-                ),
-                {"theme_code": theme},
-            ).mappings().first()
-        except Exception:
-            row = None
-        if not row or not row.get("snapshot_at"):
-            return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        snapshot_at = row["snapshot_at"]
-        if isinstance(snapshot_at, str):
-            try:
-                snapshot_at = datetime.fromisoformat(snapshot_at)
-            except ValueError:
-                return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        try:
-            age = (now - snapshot_at).total_seconds()
-        except (TypeError, ValueError):
-            return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        if age < 0 or age > self.confirmation_max_age_seconds:
-            return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        if (
-            str(row.get("direction") or "").upper() != "UP"
-            or decimal_value(row.get("score")) < Decimal("20")
-            or decimal_value(row.get("breadth_pct")) < Decimal("10")
-        ):
-            return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
-        return ""
+        # ``sm_market_radar_sector`` is an overwrite-in-place advisory cache
+        # whose concept memberships have no immutable received-time revision
+        # or coverage receipt.  It cannot authorize a new funded entry.  Keep
+        # the legacy strategy fail-closed until the radar publishes a PIT-bound
+        # membership/evidence contract.
+        return WaitingReason.WAIT_SECTOR_CONFIRMATION.value
 
     def entry_trend_wait_reason(
         self,

@@ -970,10 +970,17 @@ class TradingV3Repository:
                     "target owner forecast missing from decision run: "
                     f"{code}/{primary_strategy_key}"
                 )
+            primary_strategy_version = (
+                f"{model_version}:{primary_strategy_key}"
+            )
+            if len(primary_strategy_version) > 160:
+                raise RuntimeError(
+                    "target owner strategy version exceeds 160 characters"
+                )
             ownership_hash = hashlib.sha256(
                 (
                     f"{run_uid}|{primary_forecast_id}|{code}|"
-                    f"{primary_strategy_key}"
+                    f"{primary_strategy_key}|{primary_strategy_version}"
                 ).encode("utf-8")
             ).hexdigest()
             target_ownership[code] = {

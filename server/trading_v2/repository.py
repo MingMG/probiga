@@ -890,7 +890,7 @@ class TradingV2ReadRepository:
                        END
                    ) AS validated_rows
             FROM sm_etf_kline
-            WHERE adjust_type = 1 AND k_type = 1
+            WHERE adjust_type = 0 AND k_type = 1
             """
         ) or {}
         task = self._one(

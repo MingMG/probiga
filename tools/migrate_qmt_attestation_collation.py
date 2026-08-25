@@ -126,6 +126,22 @@ QMT_ATTESTATION_INDEX_SPECS = {
     },
 }
 QMT_ATTESTATION_TRIGGER_SPECS = {
+    "trg_qmt_kline_attestation_run_completed_bu": (
+        "BEFORE",
+        "UPDATE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run is immutable'; END IF; END",
+    ),
+    "trg_qmt_kline_attestation_run_completed_bd": (
+        "BEFORE",
+        "DELETE",
+        "qmt_kline_attestation_run",
+        "BEGIN IF BINARY OLD.status = BINARY 'COMPLETED' THEN "
+        "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = "
+        "'Completed QMT attestation run cannot be deleted'; END IF; END",
+    ),
     "trg_qmt_kline_attestation_row_immutable_bu": (
         "BEFORE",
         "UPDATE",
@@ -463,13 +479,13 @@ FROZEN_SCHEMA_MANIFESTS = _deep_freeze({
 # Independent reviewed digest of the literal contract above.  Never derive
 # this expected value from FROZEN_SCHEMA_MANIFESTS at runtime.
 FROZEN_SCHEMA_CONTRACT_SHA256 = (
-    "55d490f291227c940f66271c30fe683f30983faec2dd50a73542d8c0ae57544e"
+    "fac7f2b32602bb677d9f0e5e33be6a833d11fa0c8842a67f0ba6f85b16b1f369"
 )
 
 
 def _assert_frozen_schema_integrity() -> None:
     reviewed_digest = (
-        "55d490f291227c940f66271c30fe683f30983faec2dd50a73542d8c0ae57544e"
+        "fac7f2b32602bb677d9f0e5e33be6a833d11fa0c8842a67f0ba6f85b16b1f369"
     )
     if (
         FROZEN_SCHEMA_CONTRACT_SHA256 != reviewed_digest

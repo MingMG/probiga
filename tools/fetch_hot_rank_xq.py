@@ -28,6 +28,7 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.hot_rank_schema import validate_hot_rank_runtime_schema
 
 _SESSION = http.Session()
 _SESSION.trust_env = False
@@ -39,14 +40,7 @@ _SESSION.headers.update({
 
 
 def _ensure_snapshot_date_column(engine):
-    with engine.connect() as conn:
-        r = conn.execute(
-            text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'st_hot_rank_xq' AND column_name = 'snapshot_date'")
-        ).scalar()
-    if int(r or 0) == 0:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE `st_hot_rank_xq` ADD COLUMN `snapshot_date` DATE NOT NULL COMMENT '快照日期' AFTER `diff`"))
-        print("已为 st_hot_rank_xq 添加 snapshot_date 列")
+    validate_hot_rank_runtime_schema(engine, tables={"st_hot_rank_xq"})
 
 
 def _init_cookie():
@@ -116,40 +110,7 @@ def fetch_hot_rank_xq(snapshot_date: str):
     print(f"开始获取雪球热股TOP100，快照日期: {snapshot_date}")
 
     engine = create_batch_engine()
-
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'st_hot_rank_xq'")
-        ).scalar()
-    if int(exists or 0) == 0:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE `st_hot_rank_xq` (
-                    `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                    `snapshot_date` DATE NOT NULL COMMENT '快照日期',
-                    `rank` INT DEFAULT NULL COMMENT '排名',
-                    `stock_code` VARCHAR(10) DEFAULT NULL COMMENT '股票代码',
-                    `short_name` VARCHAR(50) DEFAULT NULL COMMENT '股票简称',
-                    `current` DECIMAL(12,4) DEFAULT NULL COMMENT '当前价',
-                    `percent` DECIMAL(8,4) DEFAULT NULL COMMENT '涨跌幅(%)',
-                    `chg` DECIMAL(12,4) DEFAULT NULL COMMENT '涨跌额',
-                    `amount` DECIMAL(20,2) DEFAULT NULL COMMENT '成交额',
-                    `market_capital` DECIMAL(20,2) DEFAULT NULL COMMENT '市值',
-                    `followers` INT DEFAULT NULL COMMENT '关注人数',
-                    `sector` VARCHAR(50) DEFAULT NULL COMMENT '所属行业',
-                    `exchange` VARCHAR(10) DEFAULT NULL COMMENT '交易所(SH/SZ)',
-                    `increment` INT DEFAULT NULL COMMENT '新增关注',
-                    `diff` INT DEFAULT NULL COMMENT '排名变化',
-                    `etl_sync_at` DATETIME DEFAULT NULL COMMENT '同步时间',
-                    PRIMARY KEY (`id`),
-                    KEY `idx_snapshot_date` (`snapshot_date`),
-                    KEY `idx_stock_code` (`stock_code`),
-                    KEY `idx_snapshot_stock` (`snapshot_date`, `stock_code`)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='雪球热股TOP100'
-            """))
-        print("已创建 st_hot_rank_xq 表")
-    else:
-        _ensure_snapshot_date_column(engine)
+    _ensure_snapshot_date_column(engine)
 
     _init_cookie()
 

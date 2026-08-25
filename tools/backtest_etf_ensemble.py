@@ -2,8 +2,10 @@
 """Point-in-time backtest for a mature cross-asset ETF strategy ensemble.
 
 Signals are formed at month-end close and executed at the next trading day's
-open. The implementation uses only validated forward-adjusted Guojin QMT bars,
-models one-way ETF costs, and keeps unused risk budget in a cash-management ETF.
+open. The implementation reads validated native/unadjusted Guojin QMT bars and
+derives a continuous research price path from close/pre_close.  It never reads
+the mutable adjusted-history rows.  Unused risk budget is kept in a
+cash-management ETF.
 """
 from __future__ import annotations
 
@@ -29,6 +31,9 @@ CASH_CODE = "511880"
 TARGET_ANNUAL_VOL = 0.10
 MIN_AVG_AMOUNT_20 = 5_000_000.0
 EQUITY_CLASSES = {"A股宽基", "A股红利", "港股权益", "海外权益"}
+DERIVED_ETF_PRICE_PROTOCOL = (
+    "NATIVE_UNADJUSTED_CLOSE_PRE_CLOSE_RETURN_CHAIN_AND_OPEN_RATIO_V1"
+)
 
 
 @dataclass
@@ -49,10 +54,10 @@ class MarketData:
 def load_market_data(engine: Any, start_date: str, end_date: str) -> MarketData:
     sql = """
         SELECT k.etf_code, k.short_name, k.trade_date,
-               k.open, k.close, k.amount, c.asset_class
+               k.open, k.close, k.pre_close, k.amount, c.asset_class
           FROM sm_etf_kline k
           JOIN si_etf_code c ON c.etf_code = k.etf_code
-         WHERE k.adjust_type = 1
+         WHERE k.adjust_type = 0
            AND k.k_type = 1
            AND k.validation_status = 'passed'
            AND k.quality_status = 'validated'
@@ -70,8 +75,49 @@ def load_market_data(engine: Any, start_date: str, end_date: str) -> MarketData:
     if frame.empty:
         raise RuntimeError("validated ETF K-line table is empty")
     frame["trade_date"] = pd.to_datetime(frame["trade_date"])
-    for column in ("open", "close", "amount"):
+    for column in ("open", "close", "pre_close", "amount"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    finite_prices = np.isfinite(
+        frame[["open", "close", "pre_close"]].to_numpy(dtype=float)
+    ).all(axis=1)
+    valid = (
+        finite_prices
+        & frame[["open", "close", "pre_close"]].gt(0).all(axis=1)
+        & frame["amount"].notna()
+        & np.isfinite(frame["amount"].to_numpy(dtype=float))
+        & frame["amount"].ge(0)
+    )
+    if not bool(valid.all()):
+        raise RuntimeError(
+            "validated native ETF rows contain invalid open/close/pre_close/amount"
+        )
+    # Rebuild a continuous path from native daily returns.  This makes the
+    # result independent of a provider rewriting all historical adjusted rows
+    # after a distribution.  The first observation is anchored to its native
+    # close; every later close has exactly close/pre_close daily growth.
+    frame.sort_values(["etf_code", "trade_date"], inplace=True)
+    growth = frame["close"] / frame["pre_close"]
+    chained = growth.groupby(frame["etf_code"], sort=False).cumprod()
+    first_chain = chained.groupby(frame["etf_code"], sort=False).transform(
+        "first"
+    )
+    first_native_close = frame["close"].groupby(
+        frame["etf_code"], sort=False
+    ).transform("first")
+    adjusted_close = chained / first_chain * first_native_close
+    previous_adjusted_close = adjusted_close.groupby(
+        frame["etf_code"], sort=False
+    ).shift(1)
+    adjusted_open = previous_adjusted_close * (
+        frame["open"] / frame["pre_close"]
+    )
+    first_row_open = adjusted_close * (frame["open"] / frame["close"])
+    frame["open"] = adjusted_open.where(
+        previous_adjusted_close.notna(), first_row_open
+    )
+    frame["close"] = adjusted_close
+    if not bool(np.isfinite(frame[["open", "close"]]).all().all()):
+        raise RuntimeError("derived ETF continuous price path is non-finite")
     names = (
         frame[["etf_code", "short_name"]]
         .drop_duplicates("etf_code", keep="last")

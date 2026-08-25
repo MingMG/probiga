@@ -23,7 +23,8 @@ ensure_adata_import_path(ROOT)
 
 import pandas as pd
 from sqlalchemy import text
-from server.common.batch_db import create_batch_engine, read_frame, write_frame
+from server.common.batch_db import create_batch_engine, read_frame, replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 
 def get_engine():
@@ -71,15 +72,13 @@ def sync_single_stock(engine, stock_code: str, start_date: str = None, end_date:
         # 添加 etl_sync_at 字段
         df["etl_sync_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 删除旧数据
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM sm_stock_capital_flow_daily WHERE stock_code = :code AND trade_date >= :start AND trade_date <= :end"),
-                {"code": stock_code, "start": df["trade_date"].min(), "end": df["trade_date"].max()}
-            )
-
-        # 写入新数据（不包含 id 列，让它自增）
-        write_frame(df, "sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
+        replace_table_rows_exact_keys(
+            df,
+            "sm_stock_capital_flow_daily",
+            engine,
+            key_columns=("stock_code", "trade_date"),
+            lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        )
 
         print(f"  {stock_code}: 同步 {len(df)} 条数据")
         return len(df)

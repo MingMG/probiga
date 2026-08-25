@@ -194,19 +194,26 @@ class TradingV3Engine:
                 features=signal.features,
             )
         gates = self.config["profit_gate"]
-        pf = bucket.profit_factor
-        payoff = bucket.payoff_ratio
+        pf = (
+            float(bucket.profit_factor)
+            if bucket.profit_factor is not None
+            and math.isfinite(float(bucket.profit_factor))
+            else None
+        )
+        payoff = (
+            float(bucket.payoff_ratio)
+            if bucket.payoff_ratio is not None
+            and math.isfinite(float(bucket.payoff_ratio))
+            else None
+        )
         positive = (
             bucket.sample_count >= int(gates["minimum_oos_samples"])
             and bucket.expected_return_net_pct
             > float(gates["minimum_expected_return_net_pct"])
             and pf is not None
-            and (math.isinf(pf) or pf >= float(gates["minimum_profit_factor"]))
+            and pf >= float(gates["minimum_profit_factor"])
             and payoff is not None
-            and (
-                math.isinf(payoff)
-                or payoff >= float(gates["minimum_payoff_ratio"])
-            )
+            and payoff >= float(gates["minimum_payoff_ratio"])
         )
         confidence = min(
             1.0,

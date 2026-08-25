@@ -30,6 +30,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.config import get_mysql_url
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -147,14 +149,16 @@ def main():
     df_today["trade_date"] = trade_date
     print(f"获取到 {len(df_today)} 只股票的当日资金流")
 
-    # 删除当日旧数据
-    with eng.begin() as conn:
-        conn.execute(text("DELETE FROM sm_stock_capital_flow_daily WHERE trade_date = :d"), {"d": trade_date})
-
-    # 写入当日数据
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df_today["etl_sync_at"] = now_str
-    df_today.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi", chunksize=2000)
+    replace_table_rows_exact_keys(
+        df_today,
+        "sm_stock_capital_flow_daily",
+        eng,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=2000,
+    )
     print(f"已写入 {len(df_today)} 条当日数据")
 
     # 第二步：获取历史数据（可选）
@@ -168,12 +172,13 @@ def main():
             hist = fetch_history_single(code)
             if hist is not None and not hist.empty:
                 hist["etl_sync_at"] = now_str
-                # 删除该股票的旧历史数据（保留当日）
-                with eng.begin() as conn:
-                    conn.execute(text(
-                        "DELETE FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date != :d"
-                    ), {"c": code, "d": trade_date})
-                hist.to_sql("sm_stock_capital_flow_daily", eng, if_exists="append", index=False, method="multi")
+                replace_table_rows_exact_keys(
+                    hist,
+                    "sm_stock_capital_flow_daily",
+                    eng,
+                    key_columns=("stock_code", "trade_date"),
+                    lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+                )
                 total_hist += len(hist)
             if (i + 1) % 100 == 0:
                 print(f"  进度: {i+1}/{len(codes)} | 写入: {total_hist} 条历史")

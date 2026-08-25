@@ -41,7 +41,8 @@ def test_daily_bar_loader_streams_rows_into_frame() -> None:
                 """
                 CREATE TABLE sm_stock_kline (
                     stock_code TEXT, short_name TEXT, trade_date DATE,
-                    k_type INTEGER, open REAL, close REAL, high REAL,
+                    k_type INTEGER, adjust_type INTEGER,
+                    open REAL, close REAL, high REAL,
                     low REAL, pre_close REAL, amount REAL,
                     change_pct REAL
                 )
@@ -52,9 +53,9 @@ def test_daily_bar_loader_streams_rows_into_frame() -> None:
             text(
                 """
                 INSERT INTO sm_stock_kline VALUES
-                ('002240', '盛新锂能', '2026-08-10', 1,
+                ('002240', '盛新锂能', '2026-08-10', 1, 0,
                  10, 10.2, 10.3, 9.9, 10, 100000000, 2),
-                ('002240', '盛新锂能', '2026-08-11', 1,
+                ('002240', '盛新锂能', '2026-08-11', 1, 0,
                  10.2, 10.5, 10.6, 10.1, 10.2, 120000000, 2.94)
                 """
             )

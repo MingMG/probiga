@@ -94,13 +94,195 @@ RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
 RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
+QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/var/lib/probiga/qmt-announcement-checkpoints
+QMT_FULL_MARKET_HISTORY_STATE_ROOT=/var/lib/probiga/qmt-full-market-history
+QMT_LOCAL_GAP_REPAIR_STATE_ROOT=/var/lib/probiga/qmt-local-gap-repair
+PROBIGA_JOB_LOG_ROOT=/var/lib/probiga/jobs
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 DEPLOY_LOCK_ROOT=/run/probiga
 DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
-COMPATIBLE_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
+RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
 DEPLOY_ARTIFACT_MODE=""
+prepare_qmt_announcement_checkpoint_root() {
+  local parent_root=/var/lib/probiga
+  local unsafe_link
+  if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
+    test -d "$parent_root" || return 2
+    test ! -L "$parent_root" || return 2
+  fi
+  install -d -o root -g root -m 0755 "$parent_root" || return 2
+  test "$(readlink -f -- "$parent_root")" = "$parent_root" || return 2
+  if [ -e "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" ] || \
+    [ -L "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" ]; then
+    test -d "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || return 2
+    test ! -L "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || return 2
+  fi
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 \
+    "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || return 2
+  test ! -L "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || return 2
+  test "$(readlink -f -- "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")" = \
+    "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || return 2
+  test "$(stat -c '%U:%G' -- "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 2
+  test "$(stat -c '%a' -- "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")" = 700 || \
+    return 2
+  unsafe_link="$(find -P "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" -mindepth 1 \
+    -type l -print -quit)" || return 2
+  if [ -n "$unsafe_link" ]; then
+    echo "QMT announcement checkpoint tree contains a symlink: $unsafe_link" >&2
+    return 2
+  fi
+  sudo -u "$SERVICE_USER" test -r "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -w "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -x "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" || \
+    return 2
+  return 0
+}
+prepare_qmt_full_market_history_state_root() {
+  local parent_root=/var/lib/probiga
+  local unsafe_entry
+  if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
+    test -d "$parent_root" || return 2
+    test ! -L "$parent_root" || return 2
+  fi
+  install -d -o root -g root -m 0755 "$parent_root" || return 2
+  test "$(readlink -f -- "$parent_root")" = "$parent_root" || return 2
+  if [ -e "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" ] || \
+    [ -L "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" ]; then
+    test -d "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || return 2
+    test ! -L "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || return 2
+    test "$(stat -c '%U:%G' -- "$QMT_FULL_MARKET_HISTORY_STATE_ROOT")" = \
+      "$SERVICE_USER:$SERVICE_USER" || return 2
+    test "$(stat -c '%a' -- "$QMT_FULL_MARKET_HISTORY_STATE_ROOT")" = 700 || \
+      return 2
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 \
+      "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || return 2
+  fi
+  test ! -L "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || return 2
+  test "$(readlink -f -- "$QMT_FULL_MARKET_HISTORY_STATE_ROOT")" = \
+    "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || return 2
+  test "$(stat -c '%U:%G' -- "$QMT_FULL_MARKET_HISTORY_STATE_ROOT")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 2
+  test "$(stat -c '%a' -- "$QMT_FULL_MARKET_HISTORY_STATE_ROOT")" = 700 || \
+    return 2
+  unsafe_entry="$(find -P "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" \
+    -mindepth 1 -maxdepth 1 \
+    \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
+       -o ! -perm 0600 -o -perm /7177 \) -print -quit)" || return 2
+  if [ -n "$unsafe_entry" ]; then
+    echo "QMT full-market history state entry is unsafe: $unsafe_entry" >&2
+    return 2
+  fi
+  sudo -u "$SERVICE_USER" test -r "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -w "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -x "$QMT_FULL_MARKET_HISTORY_STATE_ROOT" || \
+    return 2
+  return 0
+}
+prepare_qmt_local_gap_repair_state_root() {
+  local parent_root=/var/lib/probiga
+  local unsafe_entry
+  if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
+    test -d "$parent_root" || return 2
+    test ! -L "$parent_root" || return 2
+  fi
+  install -d -o root -g root -m 0755 "$parent_root" || return 2
+  test "$(readlink -f -- "$parent_root")" = "$parent_root" || return 2
+  if [ -e "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" ] || \
+    [ -L "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" ]; then
+    test -d "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || return 2
+    test ! -L "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || return 2
+    test "$(stat -c '%U:%G' -- "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT")" = \
+      "$SERVICE_USER:$SERVICE_USER" || return 2
+    test "$(stat -c '%a' -- "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT")" = 700 || \
+      return 2
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 \
+      "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || return 2
+  fi
+  test ! -L "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || return 2
+  test "$(readlink -f -- "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT")" = \
+    "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || return 2
+  test "$(stat -c '%U:%G' -- "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 2
+  test "$(stat -c '%a' -- "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT")" = 700 || \
+    return 2
+  unsafe_entry="$(find -P "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" \
+    -mindepth 1 -maxdepth 1 \
+    \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
+       -o ! -perm 0600 -o -perm /7177 \) -print -quit)" || return 2
+  if [ -n "$unsafe_entry" ]; then
+    echo "QMT local gap-repair state entry is unsafe: $unsafe_entry" >&2
+    return 2
+  fi
+  sudo -u "$SERVICE_USER" test -r "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -w "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || \
+    return 2
+  sudo -u "$SERVICE_USER" test -x "$QMT_LOCAL_GAP_REPAIR_STATE_ROOT" || \
+    return 2
+  return 0
+}
+prepare_probiga_job_log_root() {
+  local parent_root=/var/lib/probiga
+  local unsafe_entry
+  if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
+    test -d "$parent_root" || return 2
+    test ! -L "$parent_root" || return 2
+  fi
+  install -d -o root -g root -m 0755 "$parent_root" || return 2
+  test "$(readlink -f -- "$parent_root")" = "$parent_root" || return 2
+  if [ -e "$PROBIGA_JOB_LOG_ROOT" ] || [ -L "$PROBIGA_JOB_LOG_ROOT" ]; then
+    test -d "$PROBIGA_JOB_LOG_ROOT" || return 2
+    test ! -L "$PROBIGA_JOB_LOG_ROOT" || return 2
+    test "$(stat -c '%U:%G' -- "$PROBIGA_JOB_LOG_ROOT")" = \
+      "$SERVICE_USER:$SERVICE_USER" || return 2
+    test "$(stat -c '%a' -- "$PROBIGA_JOB_LOG_ROOT")" = 700 || return 2
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 \
+      "$PROBIGA_JOB_LOG_ROOT" || return 2
+  fi
+  test ! -L "$PROBIGA_JOB_LOG_ROOT" || return 2
+  test "$(readlink -f -- "$PROBIGA_JOB_LOG_ROOT")" = \
+    "$PROBIGA_JOB_LOG_ROOT" || return 2
+  test "$(stat -c '%U:%G' -- "$PROBIGA_JOB_LOG_ROOT")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 2
+  test "$(stat -c '%a' -- "$PROBIGA_JOB_LOG_ROOT")" = 700 || return 2
+  unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
+    \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
+       -o ! -perm 0600 -o -perm /7177 \) -print -quit)" || return 2
+  if [ -n "$unsafe_entry" ]; then
+    echo "detached job log entry is unsafe: $unsafe_entry" >&2
+    return 2
+  fi
+  sudo -u "$SERVICE_USER" /usr/bin/python3.14 -I - \
+    "$PROBIGA_JOB_LOG_ROOT" <<'PY' || return 2
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+probe = root / ".probiga-deploy-write-probe"
+flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(probe, flags, 0o600)
+try:
+    os.write(descriptor, b"writable\n")
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+    probe.unlink()
+PY
+  return 0
+}
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "production deploy engine must run through the root broker" >&2
   exit 2
@@ -114,13 +296,9 @@ case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in
       exit 2
     fi
     ;;
-  "$COMPATIBLE_DEPLOY_PROTOCOL_V2")
-    DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
-    if [ -n "${PROBIGA_RECOVERY_PROTOCOL_VERSION:-}" ] || \
-      [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ]; then
-      echo "v2 production deploy broker cannot authorize recovery" >&2
-      exit 2
-    fi
+  "$RETIRED_DEPLOY_PROTOCOL_V2")
+    echo "v2 production deploy protocol is retired and unsupported" >&2
+    exit 2
     ;;
   *)
     echo "production deploy broker protocol mismatch" >&2
@@ -186,6 +364,10 @@ ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-tas
 ACTIVATION_GOVERNANCE_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-old.sha256"
 ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-new.json"
 ACTIVATION_GOVERNANCE_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-new.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.json"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-new.json"
+ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-new.sha256"
 ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pending.json"
 ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pending.sha256"
 V2_FORWARD_FINALIZED_SHA=""
@@ -256,6 +438,10 @@ activation_snapshot_assert_container() {
   controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
     return 1
   controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || return 1
+  controlled_guard_assert_file "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || \
+    return 1
   controlled_guard_assert_file "$ACTIVATION_RELEASE_IDENTITY" 600 || return 1
   controlled_guard_assert_file "$ACTIVATION_RELEASE_IDENTITY_SHA" 600 || \
     return 1
@@ -263,6 +449,9 @@ activation_snapshot_assert_container() {
     "$(sha256sum "$ACTIVATION_UNIT_SNAPSHOT_STATE" | cut -d' ' -f1)" || return 1
   test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
     "$(sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
+    return 1
+  test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
     return 1
   test "$(<"$ACTIVATION_RELEASE_IDENTITY_SHA")" = \
     "$(sha256sum "$ACTIVATION_RELEASE_IDENTITY" | cut -d' ' -f1)" || \
@@ -311,33 +500,46 @@ activation_snapshot_old_release() {
   printf '%s\n' "${lines[2]#old_release=}"
 }
 activation_snapshot_validate_governance_new() {
-  controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" 600 || \
-    return 1
-  if [ -e "$ACTIVATION_GOVERNANCE_NEW_SHA" ] || \
-    [ -L "$ACTIVATION_GOVERNANCE_NEW_SHA" ]; then
-    controlled_guard_assert_file "$ACTIVATION_GOVERNANCE_NEW_SHA" 600 || \
-      return 1
-    test "$(<"$ACTIVATION_GOVERNANCE_NEW_SHA")" = \
-      "$(sha256sum "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" | cut -d' ' -f1)" || \
-      return 1
-  else
-    # The canonical snapshot is fsynced and atomically renamed before its
-    # redundant checksum, so a crash in between remains safely recoverable.
-    test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
-    test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
-  fi
+  local sha
+  local snapshot
+  for snapshot in "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; do
+    case "$snapshot" in
+      "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
+        sha="$ACTIVATION_GOVERNANCE_NEW_SHA"
+        ;;
+      "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
+        sha="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA"
+        ;;
+      *) return 1 ;;
+    esac
+    controlled_guard_assert_file "$snapshot" 600 || return 1
+    if [ -e "$sha" ] || [ -L "$sha" ]; then
+      controlled_guard_assert_file "$sha" 600 || return 1
+      test "$(<"$sha")" = "$(sha256sum "$snapshot" | cut -d' ' -f1)" || \
+        return 1
+    else
+      # The canonical snapshot is fsynced and atomically renamed before its
+      # redundant checksum, so a crash in between remains safely recoverable.
+      test ! -e "$sha" || return 1
+      test ! -L "$sha" || return 1
+    fi
+  done
   return 0
 }
-activation_snapshot_install_governance_new() {
+activation_snapshot_install_task_new() {
   local source="$1"
+  local target_snapshot="$2"
+  local target_sha="$3"
+  local temporary_prefix="$4"
   local snapshot_tmp
   local sha_tmp
   activation_snapshot_validate "$EXPECTED_SHA" >/dev/null || return 1
   test -f "$source" || return 1
   test ! -L "$source" || return 1
-  snapshot_tmp="$(mktemp "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-new.XXXXXX")" || \
+  snapshot_tmp="$(mktemp "$ACTIVATION_UNIT_SNAPSHOT_DIR/.${temporary_prefix}-new.XXXXXX")" || \
     return 1
-  sha_tmp="$(mktemp "$ACTIVATION_UNIT_SNAPSHOT_DIR/.governance-new-sha.XXXXXX")" || {
+  sha_tmp="$(mktemp "$ACTIVATION_UNIT_SNAPSHOT_DIR/.${temporary_prefix}-new-sha.XXXXXX")" || {
     rm -f -- "$snapshot_tmp"
     return 1
   }
@@ -345,12 +547,27 @@ activation_snapshot_install_governance_new() {
     ! printf '%s\n' "$(sha256sum "$snapshot_tmp" | cut -d' ' -f1)" \
       > "$sha_tmp" || ! chown root:root "$sha_tmp" || ! chmod 0600 "$sha_tmp" || \
     ! sync -f "$snapshot_tmp" || ! sync -f "$sha_tmp" || \
-    ! mv -fT "$snapshot_tmp" "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || \
-    ! mv -fT "$sha_tmp" "$ACTIVATION_GOVERNANCE_NEW_SHA" || \
+    ! mv -fT "$snapshot_tmp" "$target_snapshot" || \
+    ! mv -fT "$sha_tmp" "$target_sha" || \
     ! sync -f "$ACTIVATION_UNIT_SNAPSHOT_DIR"; then
     rm -f -- "$snapshot_tmp" "$sha_tmp"
     return 1
   fi
+  controlled_guard_assert_file "$target_snapshot" 600 || return 1
+  controlled_guard_assert_file "$target_sha" 600 || return 1
+  test "$(<"$target_sha")" = \
+    "$(sha256sum "$target_snapshot" | cut -d' ' -f1)" || return 1
+  return 0
+}
+activation_snapshot_install_governance_new() {
+  activation_snapshot_install_task_new "$1" \
+    "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" \
+    "$ACTIVATION_GOVERNANCE_NEW_SHA" governance
+}
+activation_snapshot_install_qmt_announcement_new() {
+  activation_snapshot_install_task_new "$1" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA" qmt-announcement || return 1
   activation_snapshot_validate_governance_new || return 1
   return 0
 }
@@ -371,6 +588,7 @@ activation_snapshot_validate_receipt_pending() {
   fi
   /usr/bin/python3.14 -I - "$ACTIVATION_RECEIPT_PENDING" \
     "$expected_release" <<'PY'
+import hashlib
 import json
 import re
 import sys
@@ -1087,6 +1305,23 @@ activation_snapshot_create() {
       rm -rf -- "$build_dir"
       return 1
     }
+  test -n "${QMT_ANNOUNCEMENT_TASK_OLD_SOURCE:-}" || {
+    rm -rf -- "$build_dir"
+    return 1
+  }
+  test -f "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" || {
+    rm -rf -- "$build_dir"
+    return 1
+  }
+  test ! -L "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" || {
+    rm -rf -- "$build_dir"
+    return 1
+  }
+  install -o root -g root -m 0600 "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" \
+    "$build_dir/qmt-announcement-task-old.json" || {
+      rm -rf -- "$build_dir"
+      return 1
+    }
   release_identity_tmp="$build_dir/release-identity"
   printf '%s\n' \
     probiga.activation-release-identity.v1 \
@@ -1103,19 +1338,29 @@ activation_snapshot_create() {
       rm -rf -- "$build_dir"
       return 1
     }
+  printf '%s\n' \
+    "$(sha256sum "$build_dir/qmt-announcement-task-old.json" | cut -d' ' -f1)" \
+    > "$build_dir/qmt-announcement-task-old.sha256" || {
+      rm -rf -- "$build_dir"
+      return 1
+    }
   printf '%s\n' "$(sha256sum "$release_identity_tmp" | cut -d' ' -f1)" \
     > "$build_dir/release-identity.sha256" || {
       rm -rf -- "$build_dir"
       return 1
     }
   chown root:root "$build_dir/writer-state.sha256" \
-    "$build_dir/governance-task-old.sha256" "$release_identity_tmp" \
+    "$build_dir/governance-task-old.sha256" \
+    "$build_dir/qmt-announcement-task-old.json" \
+    "$build_dir/qmt-announcement-task-old.sha256" "$release_identity_tmp" \
     "$build_dir/release-identity.sha256" || {
       rm -rf -- "$build_dir"
       return 1
     }
   chmod 0600 "$build_dir/writer-state.sha256" \
-    "$build_dir/governance-task-old.sha256" "$release_identity_tmp" \
+    "$build_dir/governance-task-old.sha256" \
+    "$build_dir/qmt-announcement-task-old.json" \
+    "$build_dir/qmt-announcement-task-old.sha256" "$release_identity_tmp" \
     "$build_dir/release-identity.sha256" || {
       rm -rf -- "$build_dir"
       return 1
@@ -1137,6 +1382,14 @@ activation_snapshot_create() {
     return 1
   }
   sync -f "$build_dir/governance-task-old.sha256" || {
+    rm -rf -- "$build_dir"
+    return 1
+  }
+  sync -f "$build_dir/qmt-announcement-task-old.json" || {
+    rm -rf -- "$build_dir"
+    return 1
+  }
+  sync -f "$build_dir/qmt-announcement-task-old.sha256" || {
     rm -rf -- "$build_dir"
     return 1
   }
@@ -2001,22 +2254,31 @@ controlled_guard_parse_governance_health_result() {
   local expected_sha="$2"
   local expected_disposition="$3"
   local expected_trade_date="${4:-}"
+  local expected_scheduler_pid="${5:-}"
   controlled_guard_assert_file "$result_file" 600 || return 1
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   case "$expected_disposition" in
     completed|input_not_ready) ;;
     *) return 1 ;;
   esac
+  case "$expected_scheduler_pid" in
+    ''|[1-9][0-9]*) ;;
+    *) return 1 ;;
+  esac
   /usr/bin/python3.14 -I - "$result_file" "$expected_sha" \
-    "$expected_disposition" "$expected_trade_date" <<'PY'
+    "$expected_disposition" "$expected_trade_date" \
+    "$expected_scheduler_pid" <<'PY'
 import json
 import re
+import socket
 import sys
 from datetime import date
 from pathlib import Path
 
 path = Path(sys.argv[1])
-expected_sha, expected_disposition, expected_date = sys.argv[2:]
+expected_sha, expected_disposition, expected_date, expected_scheduler_pid = (
+    sys.argv[2:]
+)
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -2035,6 +2297,7 @@ if not isinstance(payload, dict):
 expected = payload.get("expected")
 checks = payload.get("checks")
 adapter = payload.get("adapter_registry")
+contract_version = "probiga.strategy-governance-health.v1"
 expected_source = (
     "command_line_verified_against_calendar"
     if expected_date
@@ -2043,6 +2306,7 @@ expected_source = (
 valid = (
     set(payload)
     == {
+        "contract_version",
         "status",
         "run_disposition",
         "expected",
@@ -2050,6 +2314,7 @@ valid = (
         "automatic_real_order_submission",
         "adapter_registry",
     }
+    and payload.get("contract_version") == contract_version
     and payload.get("status") == "PASS"
     and payload.get("run_disposition") == expected_disposition
     and payload.get("automatic_real_order_submission") is False
@@ -2065,17 +2330,45 @@ valid = (
     == {
         "registry_sealed",
         "registry_seal_hash",
+        "registry_integrity_ready",
+        "adapter_configured",
+        "candidate_execution_ready",
+        "funding_pipeline_ready",
+        "governance_paper_execution_ready",
         "production_execution_ready",
+        "real_order_submission_enabled",
+        "automatic_real_order_submission",
         "adapter_count",
     }
     and adapter.get("registry_sealed") is True
-    and adapter.get("production_execution_ready") is True
+    and adapter.get("registry_integrity_ready") is True
     and re.fullmatch(
         r"[0-9a-f]{64}", str(adapter.get("registry_seal_hash") or "")
     ) is not None
     and isinstance(adapter.get("adapter_count"), int)
     and not isinstance(adapter.get("adapter_count"), bool)
     and adapter.get("adapter_count") >= 0
+    and adapter.get("adapter_configured")
+    is (adapter.get("adapter_count") > 0)
+    and adapter.get("candidate_execution_ready")
+    is (
+        adapter.get("registry_integrity_ready") is True
+        and adapter.get("adapter_configured") is True
+    )
+    and isinstance(adapter.get("funding_pipeline_ready"), bool)
+    and (
+        adapter.get("funding_pipeline_ready") is False
+        or adapter.get("candidate_execution_ready") is True
+    )
+    and adapter.get("governance_paper_execution_ready")
+    is (
+        adapter.get("candidate_execution_ready") is True
+        and adapter.get("funding_pipeline_ready") is True
+    )
+    and adapter.get("production_execution_ready")
+    is adapter.get("governance_paper_execution_ready")
+    and adapter.get("real_order_submission_enabled") is False
+    and adapter.get("automatic_real_order_submission") is False
 )
 trade_date = str(expected.get("trade_date") or "") if isinstance(expected, dict) else ""
 try:
@@ -2086,9 +2379,14 @@ if expected_date:
     valid = valid and trade_date == expected_date
 names = []
 waived = []
+check_details = {}
 if isinstance(checks, list):
     for check in checks:
-        if not isinstance(check, dict) or check.get("passed") is not True:
+        if (
+            not isinstance(check, dict)
+            or set(check) != {"name", "passed", "waived", "detail"}
+            or check.get("passed") is not True
+        ):
             valid = False
             continue
         name = check.get("name")
@@ -2096,12 +2394,686 @@ if isinstance(checks, list):
             valid = False
             continue
         names.append(name)
+        check_details[name] = check.get("detail")
         if check.get("waived") is True:
             waived.append(name)
         elif check.get("waived") not in (False, None):
             valid = False
 if len(names) != len(set(names)):
     valid = False
+column_tables = {
+    "st_strategy_governance_schema_migration",
+    "st_strategy_registry",
+    "st_strategy_version",
+    "st_strategy_lifecycle_event",
+    "st_strategy_metric_input",
+    "st_strategy_health_snapshot",
+    "st_strategy_combination",
+    "st_strategy_combination_version",
+    "st_strategy_combination_health_snapshot",
+    "st_strategy_governance_run",
+    "st_strategy_pool_snapshot",
+    "st_strategy_allocation_snapshot",
+    "st_strategy_adapter_run_receipt",
+    "st_strategy_industry_history",
+    "st_strategy_governance_audit",
+    "st_strategy_adapter_candidate_fact",
+    "st_dynamic_shadow_trial_plan",
+    "st_dynamic_shadow_trial_chain",
+    "st_dynamic_shadow_trial_exit_binding",
+    "st_scheduled_tasks",
+    }
+column_tables -= {
+    "st_strategy_adapter_candidate_fact",
+    "st_dynamic_shadow_trial_plan",
+    "st_dynamic_shadow_trial_chain",
+    "st_dynamic_shadow_trial_exit_binding",
+    }
+index_tables = column_tables - {"st_scheduled_tasks"}
+common_required_names = {
+    "required_tables",
+    "daily_scheduler_task_unique",
+    "daily_scheduler_task_contract",
+    "qmt_announcement_scheduler_task_unique",
+    "qmt_announcement_scheduler_task_contract",
+    "qmt_operations_scheduler_tasks_unique",
+    "qmt_operations_scheduler_tasks_contract",
+    "supporting_release_trigger_inventory_exact",
+    "qmt_reference_physical_schema_and_seal",
+    "qmt_history_coverage_physical_schema_and_seal",
+    "qmt_history_capability_matrix_fail_closed",
+    "qmt_windows_edge_executor_and_last_success",
+    "qmt_windows_edge_release_bootstrap",
+    "scheduler_task_history_physical_schema",
+    "pit_fact_physical_schema_exact",
+    "latest_qmt_announcement_full_market_batch",
+    "strategy_metric_input_application_state_machine",
+    "governance_append_only_application_integrity",
+    "strategy_funding_schema_exact",
+    "dynamic_shadow_ledger_schema_exact",
+    "dynamic_shadow_candidate_plan_fill_forward_ledger",
+    "forward_strategy_version_schema",
+    "forward_strategy_version_relations",
+    "v2_raw_fill_cash_ledgers_are_immutable",
+    "forward_exit_allocation_v3_frozen_schema",
+    "forward_exit_allocation_v3_fifo_conservation",
+    "qmt_pre_close_v2_frozen_schema",
+    "governance_canonical_revision_migration",
+    "authoritative_trade_date",
+    "dynamic_strategy_registry",
+    "strategy_lifecycle_domain",
+    "strategy_current_versions",
+    "dynamic_combination_registry",
+    "combination_lifecycle_domain",
+    "combination_current_versions",
+    "all_immutable_version_hashes",
+    "all_lifecycle_and_audit_payload_hashes_and_run_bindings",
+    "registry_lifecycle_projection_matches_immutable_events",
+    "strategy_industry_history_exact_qmt_full_replay",
+    "all_governance_detail_snapshot_hashes_and_run_bindings",
+    "metric_evidence_state_domain",
+    "all_metric_evidence_submission_and_review_audits",
+    "metric_and_challenger_evidence_hashes_globally_unique",
+    "global_real_order_authority_closed",
+    "historical_canonical_run_inventory",
+    "authoritative_date_has_one_canonical_revision",
+    } | {f"schema_columns:{name}" for name in column_tables} | {
+    f"schema_indexes:{name}" for name in index_tables
+    } | {f"schema_index_contracts:{name}" for name in index_tables}
+if expected_scheduler_pid:
+    common_required_names.add(
+        "linux_standalone_scheduler_heartbeat_current"
+    )
+if expected_disposition == "input_not_ready":
+    required_names = common_required_names | {
+        "expected_build_date_run",
+        "authoritative_session_windows_qmt_close_attested",
+        "qmt_pre_close_v2_rows_bind_current_kline",
+        "no_historical_canonical_run",
+    }
+else:
+    required_names = common_required_names | {
+        "candidate_pool_industry_snapshot_binds_exact_qmt_history",
+        "authoritative_session_windows_qmt_close_attested",
+        "qmt_pre_close_v2_rows_bind_current_kline",
+        "latest_completed_run_identity",
+        "expected_build_date_run_unique",
+        "expected_run_identity",
+        "expected_run_completed",
+        "expected_run_input_fresh",
+        "completed_run_has_hash_valid_audit",
+        "funding_checkpoint_manifest_partition_and_persistence",
+        "run_registry_counts",
+        "market_router_snapshot_is_reproducible",
+        "current_canonical_metrics_replay_from_raw_ledgers",
+        "strategy_health_three_windows",
+        "combination_health_one_snapshot_each",
+        "funding_snapshots_use_confirmed_evidence",
+        "pool_counts_and_dates_match_run",
+        "pool_rows_snapshot_hash_and_funding_references",
+        "allocation_candidate_snapshot_and_decision_hashes",
+        "paper_allocation_exactly_closed",
+        "allocation_targets_are_funding_eligible",
+        "allocation_lifecycle_budget_exact",
+        "allocation_obeys_market_router_risk_budget",
+    }
+funding_schema_detail = check_details.get("strategy_funding_schema_exact")
+metric_trigger_detail = check_details.get(
+    "strategy_metric_input_application_state_machine"
+)
+append_trigger_detail = check_details.get(
+    "governance_append_only_application_integrity"
+)
+projection_detail = check_details.get(
+    "registry_lifecycle_projection_matches_immutable_events"
+)
+qmt_task_unique_detail = check_details.get(
+    "qmt_announcement_scheduler_task_unique"
+)
+qmt_task_contract_detail = check_details.get(
+    "qmt_announcement_scheduler_task_contract"
+)
+qmt_operations_unique_detail = check_details.get(
+    "qmt_operations_scheduler_tasks_unique"
+)
+qmt_operations_contract_detail = check_details.get(
+    "qmt_operations_scheduler_tasks_contract"
+)
+scheduler_heartbeat_detail = check_details.get(
+    "linux_standalone_scheduler_heartbeat_current"
+)
+supporting_trigger_detail = check_details.get(
+    "supporting_release_trigger_inventory_exact"
+)
+qmt_reference_detail = check_details.get(
+    "qmt_reference_physical_schema_and_seal"
+)
+qmt_coverage_detail = check_details.get(
+    "qmt_history_coverage_physical_schema_and_seal"
+)
+qmt_capability_detail = check_details.get(
+    "qmt_history_capability_matrix_fail_closed"
+)
+qmt_edge_detail = check_details.get(
+    "qmt_windows_edge_executor_and_last_success"
+)
+qmt_edge_release_detail = check_details.get(
+    "qmt_windows_edge_release_bootstrap"
+)
+scheduler_task_history_detail = check_details.get(
+    "scheduler_task_history_physical_schema"
+)
+pit_fact_detail = check_details.get("pit_fact_physical_schema_exact")
+qmt_announcement_detail = check_details.get(
+    "latest_qmt_announcement_full_market_batch"
+)
+expected_funding_table_counts = {
+    "st_strategy_funding_daily_fact": {
+        "column_count": 29, "index_count": 9,
+        "foreign_key_count": 3, "check_count": 7,
+    },
+    "st_strategy_funding_checkpoint": {
+        "column_count": 46, "index_count": 12,
+        "foreign_key_count": 7, "check_count": 13,
+    },
+    }
+expected_funding_contract_hash = (
+    "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+)
+expected_append_physical_hash = (
+    "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
+)
+expected_metric_physical_hash = (
+    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+)
+expected_core_append_hash = (
+    "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+)
+expected_core_metric_hash = (
+    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+)
+expected_trigger_source_hash = (
+    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+)
+expected_supporting_trigger_source_hash = (
+    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+)
+expected_qmt_reference_contract_hash = (
+    "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
+)
+expected_pit_fact_contract_hash = (
+    "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
+)
+expected_supporting_owner_counts = {
+    "pit_facts": 6,
+    "qmt_attestation": 6,
+    "qmt_history_coverage": 4,
+    "qmt_reference": 10,
+    "scheduler_task_history": 2,
+    "strategy_governance": 40,
+    }
+expected_qmt_task = {
+    "task_name": "国金QMT全市场公告PIT同步",
+    "task_type": "qmt_announcement_pit",
+    "group_name": "strategy_governance",
+    "script_path": "tools/sync_qmt_announcement_pit.py",
+    "script_args": "--window-days 30 --batch-size 100 --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
+    "cron_time": "18:20",
+    "interval_minutes": 0,
+    "date_param": "",
+    "enabled": 1,
+    }
+expected_qmt_operations_tasks = {
+    "qmt_local_gap_repair_execute": {
+        "task_name": "Guojin QMT local history gap repair execute",
+        "task_type": "qmt_local_gap_repair_execute",
+        "group_name": "Guojin QMT",
+        "script_path": "tools/backfill_guojin_qmt_local_history.py",
+        "script_args": "from-gaps --gap-limit 2 --apply --state-root /var/lib/probiga/qmt-local-gap-repair --lock-path /var/lib/probiga/qmt-local-gap-repair/qmt-local-gap-repair.lock --json",
+        "cron_time": "07:05",
+        "interval_minutes": 0,
+        "date_param": "",
+        "enabled": 1,
+    },
+    "qmt_nightly_reconciliation": {
+        "task_name": "国金QMT凌晨缺口扫描",
+        "task_type": "qmt_nightly_reconciliation",
+        "group_name": "国金QMT",
+        "script_path": "tools/nightly_guojin_qmt_reconciliation.py",
+        "script_args": "--scan-days 20 --json",
+        "cron_time": "01:30",
+        "interval_minutes": 0,
+        "date_param": "",
+        "enabled": 1,
+    },
+    "qmt_local_history_2024": {
+        "task_name": "国金QMT本地历史补数(2024起)",
+        "task_type": "qmt_local_history_2024",
+        "group_name": "国金QMT",
+        "script_path": "tools/run_guojin_qmt_full_market_history.py",
+        "script_args": "--start-date 2024-01-01 --mode all --daily-batch-size 120 --minute-batch-size 80 --sleep-seconds 0.2 --stop-at 07:00 --state-root /var/lib/probiga/qmt-full-market-history --lock-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history.lock --log-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history-2024.jsonl --json",
+        "cron_time": "00:00",
+        "interval_minutes": 0,
+        "date_param": "",
+        "enabled": 1,
+    },
+    "qmt_reference_incremental": {
+        "task_name": "国金QMT基础目录增量同步",
+        "task_type": "qmt_reference_incremental",
+        "group_name": "国金QMT",
+        "script_path": "tools/sync_guojin_qmt_reference_data.py",
+        "script_args": "--skip-refresh --include-calendar --json",
+        "cron_time": "03:20",
+        "interval_minutes": 0,
+        "date_param": "",
+        "enabled": 1,
+    },
+    "qmt_gap_repair_plan": {
+        "task_name": "国金QMT历史缺口修复队列",
+        "task_type": "qmt_gap_repair_plan",
+        "group_name": "国金QMT",
+        "script_path": "tools/repair_guojin_qmt_gaps.py",
+        "script_args": "--limit 50 --json",
+        "cron_time": "02:00",
+        "interval_minutes": 0,
+        "date_param": "",
+        "enabled": 1,
+    },
+    }
+qmt_edge_current = (
+    qmt_edge_detail.get("current")
+    if isinstance(qmt_edge_detail, dict)
+    else None
+)
+qmt_edge_tasks = (
+    qmt_edge_detail.get("tasks")
+    if isinstance(qmt_edge_detail, dict)
+    else None
+)
+qmt_edge_task_types = {
+    "qmt_local_gap_repair_execute",
+    "qmt_local_history_2024",
+    "qmt_reference_incremental",
+    }
+qmt_edge_valid = (
+    isinstance(qmt_edge_detail, dict)
+    and qmt_edge_detail.get("status") == "AVAILABLE"
+    and qmt_edge_detail.get("strategy_eligible") is True
+    and qmt_edge_detail.get("executor_role") == "qmt_windows_edge"
+    and qmt_edge_detail.get("expected_build_sha") == expected_sha
+    and qmt_edge_detail.get("expected_poll_seconds") == 60
+    and isinstance(qmt_edge_detail.get("role_row_count"), int)
+    and qmt_edge_detail.get("role_row_count") >= 1
+    and qmt_edge_detail.get("fresh_row_count") == 1
+    and qmt_edge_detail.get("future_row_count") == 0
+    and qmt_edge_detail.get("required_task_types")
+    == [
+        "qmt_local_gap_repair_execute",
+        "qmt_local_history_2024",
+        "qmt_reference_incremental",
+    ]
+    and qmt_edge_detail.get("task_count") == 3
+    and qmt_edge_detail.get("last_success_count") == 3
+    and qmt_edge_detail.get("success_max_age_seconds") == 345600
+    and qmt_edge_detail.get("errors") == []
+    and isinstance(qmt_edge_current, dict)
+    and qmt_edge_current.get("mode") == "standalone"
+    and qmt_edge_current.get("executor_role") == "qmt_windows_edge"
+    and qmt_edge_current.get("build_sha") == expected_sha
+    and qmt_edge_current.get("poll_seconds") == 60
+    and isinstance(qmt_edge_current.get("heartbeat_age_seconds"), int)
+    and not isinstance(qmt_edge_current.get("heartbeat_age_seconds"), bool)
+    and 0 <= qmt_edge_current.get("heartbeat_age_seconds") <= 120
+    and isinstance(qmt_edge_current.get("host_name"), str)
+    and 0 < len(qmt_edge_current.get("host_name")) <= 128
+    and isinstance(qmt_edge_current.get("pid"), int)
+    and not isinstance(qmt_edge_current.get("pid"), bool)
+    and qmt_edge_current.get("pid") > 0
+    and qmt_edge_current.get("instance_id")
+    == f"{qmt_edge_current.get('host_name')}-{qmt_edge_current.get('pid')}"
+    and isinstance(qmt_edge_tasks, dict)
+    and set(qmt_edge_tasks) == qmt_edge_task_types
+    and all(
+        isinstance(item, dict)
+        and isinstance(item.get("task_id"), int)
+        and not isinstance(item.get("task_id"), bool)
+        and item.get("task_id") > 0
+        and item.get("last_run_status") in {"success", "running"}
+        and isinstance(item.get("last_success_age_seconds"), int)
+        and not isinstance(item.get("last_success_age_seconds"), bool)
+        and 0 <= item.get("last_success_age_seconds") <= 345600
+        and item.get("last_success_host")
+        == qmt_edge_current.get("host_name")
+        and isinstance(item.get("last_success_instance_id"), str)
+        and item.get("last_success_instance_id").startswith(
+            f"{qmt_edge_current.get('host_name')}-"
+        )
+        for item in qmt_edge_tasks.values()
+    )
+)
+qmt_edge_release_receipt = (
+    qmt_edge_release_detail.get("receipt")
+    if isinstance(qmt_edge_release_detail, dict) else None
+)
+qmt_edge_release_identity = (
+    qmt_edge_release_detail.get("identity")
+    if isinstance(qmt_edge_release_detail, dict) else None
+)
+qmt_edge_release_current = (
+    qmt_edge_release_identity.get("current")
+    if isinstance(qmt_edge_release_identity, dict) else None
+)
+qmt_edge_release_valid = (
+    isinstance(qmt_edge_release_detail, dict)
+    and qmt_edge_release_detail.get("status") == "AVAILABLE"
+    and qmt_edge_release_detail.get("strategy_eligible") is True
+    and qmt_edge_release_detail.get("expected_build_sha") == expected_sha
+    and qmt_edge_release_detail.get("expected_poll_seconds") == 60
+    and qmt_edge_release_detail.get("receipt_count") == 1
+    and qmt_edge_release_detail.get("immutable_reference_verified") is True
+    and qmt_edge_release_detail.get("errors") == []
+    and isinstance(qmt_edge_release_current, dict)
+    and qmt_edge_release_current.get("build_sha") == expected_sha
+    and qmt_edge_release_current.get("executor_role") == "qmt_windows_edge"
+    and isinstance(qmt_edge_release_receipt, dict)
+    and qmt_edge_release_receipt.get("build_sha") == expected_sha
+    and qmt_edge_release_receipt.get("request_run_uid")
+    == f"qmt-edge-request-{expected_sha}"
+    and qmt_edge_release_receipt.get("host_name")
+    == qmt_edge_release_current.get("host_name")
+    and qmt_edge_release_receipt.get("scheduler_instance_id")
+    == qmt_edge_release_current.get("instance_id")
+    and str(qmt_edge_release_receipt.get("catalog_batch_id") or "").startswith(
+        f"qmt_rel_{expected_sha}_"
+    )
+    and qmt_edge_release_receipt.get("catalog_batch_id")
+    == qmt_edge_release_receipt.get("calendar_batch_id")
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(qmt_edge_release_receipt.get("receipt_hash") or ""),
+    ) is not None
+)
+valid = valid and (
+    isinstance(funding_schema_detail, dict)
+    and funding_schema_detail.get("table_count") == 2
+    and funding_schema_detail.get("tables") == expected_funding_table_counts
+    and funding_schema_detail.get("trigger_count") == 4
+    and funding_schema_detail.get("contract_hash")
+    == expected_funding_contract_hash
+    and funding_schema_detail.get("checkpoint_target_average_bytes") == 8192
+    and funding_schema_detail.get("checkpoint_total_target_bytes") == 8388608
+    and funding_schema_detail.get("checkpoint_total_hard_bytes") == 16777216
+    and funding_schema_detail.get("batch_max_rows") == 100
+    and funding_schema_detail.get("batch_max_bytes") == 4194304
+    and funding_schema_detail.get("manifest_max_bytes") == 1048576
+    and funding_schema_detail.get("audit_max_bytes") == 131072
+    and isinstance(metric_trigger_detail, dict)
+    and metric_trigger_detail.get("trigger_count") == 2
+    and metric_trigger_detail.get("expected_trigger_count") == 2
+    and metric_trigger_detail.get("required_count") == 2
+    and metric_trigger_detail.get("observed_count") == 2
+    and metric_trigger_detail.get("database_triggers_required") is True
+    and metric_trigger_detail.get("metadata_frozen") is True
+    and metric_trigger_detail.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and metric_trigger_detail.get("contract_hash")
+    == expected_metric_physical_hash
+    and metric_trigger_detail.get("source_contract_hash")
+    == expected_trigger_source_hash
+    and metric_trigger_detail.get("core_append_only_contract_hash")
+    == expected_core_append_hash
+    and metric_trigger_detail.get("core_metric_review_contract_hash")
+    == expected_core_metric_hash
+    and isinstance(append_trigger_detail, dict)
+    and append_trigger_detail.get("trigger_count") == 38
+    and append_trigger_detail.get("expected_trigger_count") == 38
+    and append_trigger_detail.get("total_governance_trigger_count") == 40
+    and append_trigger_detail.get("required_count") == 38
+    and append_trigger_detail.get("observed_count") == 38
+    and append_trigger_detail.get("database_triggers_required") is True
+    and append_trigger_detail.get("metadata_frozen") is True
+    and append_trigger_detail.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and append_trigger_detail.get("contract_hash")
+    == expected_append_physical_hash
+    and append_trigger_detail.get("source_contract_hash")
+    == expected_trigger_source_hash
+    and append_trigger_detail.get("core_contract_hash")
+    == expected_core_append_hash
+    and append_trigger_detail.get("core_metric_review_contract_hash")
+    == expected_core_metric_hash
+    and append_trigger_detail.get("funding_contract_hash")
+    == expected_funding_contract_hash
+    and isinstance(projection_detail, dict)
+    and projection_detail.get("invalid_count") == 0
+    and projection_detail.get("registry_count")
+    == projection_detail.get("projected_count")
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(projection_detail.get("projection_hash") or ""),
+    ) is not None
+    and isinstance(qmt_task_unique_detail, dict)
+    and qmt_task_unique_detail.get("row_count") == 1
+    and isinstance(qmt_task_unique_detail.get("rows"), list)
+    and len(qmt_task_unique_detail.get("rows")) == 1
+    and isinstance(qmt_task_contract_detail, dict)
+    and qmt_task_contract_detail.get("expected") == expected_qmt_task
+    and all(
+        qmt_task_contract_detail.get("actual", {}).get(key) == value
+        for key, value in expected_qmt_task.items()
+    )
+    and qmt_task_contract_detail.get("pipeline_order") == {
+        "qmt_announcement_minutes": 1100,
+        "analysis_minutes": 1130,
+        "governance_minutes": 1355,
+    }
+    and isinstance(qmt_operations_unique_detail, dict)
+    and qmt_operations_unique_detail.get("row_count") == 5
+    and qmt_operations_unique_detail.get("expected_row_count") == 5
+    and qmt_operations_unique_detail.get("match_counts")
+    == {key: 1 for key in expected_qmt_operations_tasks}
+    and isinstance(qmt_operations_unique_detail.get("rows"), list)
+    and len(qmt_operations_unique_detail.get("rows")) == 5
+    and isinstance(qmt_operations_contract_detail, dict)
+    and qmt_operations_contract_detail.get("expected")
+    == expected_qmt_operations_tasks
+    and qmt_operations_contract_detail.get("actual")
+    == expected_qmt_operations_tasks
+    and isinstance(supporting_trigger_detail, dict)
+    and supporting_trigger_detail.get("required_count") == 68
+    and supporting_trigger_detail.get("optional_count") == 0
+    and supporting_trigger_detail.get("observed_count") == 68
+    and supporting_trigger_detail.get("expected_trigger_count") == 68
+    and supporting_trigger_detail.get("owner_counts")
+    == expected_supporting_owner_counts
+    and supporting_trigger_detail.get("expected_owner_counts")
+    == expected_supporting_owner_counts
+    and supporting_trigger_detail.get("source_contract_hash")
+    == expected_supporting_trigger_source_hash
+    and supporting_trigger_detail.get("database_triggers_required") is True
+    and supporting_trigger_detail.get("metadata_frozen") is True
+    and supporting_trigger_detail.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and isinstance(qmt_reference_detail, dict)
+    and qmt_reference_detail.get("contract_key") == "qmt_reference_truth_v2"
+    and qmt_reference_detail.get("contract_hash")
+    == expected_qmt_reference_contract_hash
+    and qmt_reference_detail.get("table_count") == 5
+    and qmt_reference_detail.get("trigger_count") == 10
+    and qmt_reference_detail.get("expected_trigger_count") == 10
+    and qmt_reference_detail.get("physical_schema_verified") is True
+    and qmt_reference_detail.get("physical_seal_verified") is True
+    and isinstance(qmt_coverage_detail, dict)
+    and qmt_coverage_detail.get("database") == "probiga"
+    and qmt_coverage_detail.get("table_count") == 2
+    and qmt_coverage_detail.get("foreign_key_count") == 3
+    and qmt_coverage_detail.get("trigger_count") == 4
+    and qmt_coverage_detail.get("expected_trigger_count") == 4
+    and qmt_coverage_detail.get("runtime_ddl_required") is False
+    and qmt_coverage_detail.get("physical_schema_verified") is True
+    and qmt_coverage_detail.get("physical_seal_verified") is True
+    and isinstance(qmt_capability_detail, dict)
+    and qmt_capability_detail.get("schema")
+    == "probiga.qmt-history-capability-matrix.v1"
+    and qmt_capability_detail.get("status") == "HEALTHY"
+    and qmt_capability_detail.get("evidence_healthy") is True
+    and qmt_capability_detail.get("dataset_count") == 19
+    and qmt_capability_detail.get("strategy_eligible_dataset_count") == 0
+    and qmt_capability_detail.get("strategy_ineligible_dataset_count") == 19
+    and qmt_capability_detail.get("required_scope_dataset_count") == 0
+    and qmt_capability_detail.get("fail_closed_verified") is True
+    and qmt_capability_detail.get("automatic_real_order_submission") is False
+    and qmt_capability_detail.get("real_order_authority") is False
+    and qmt_capability_detail.get("errors") == []
+    and isinstance(qmt_capability_detail.get("datasets"), list)
+    and len(qmt_capability_detail.get("datasets")) == 19
+    and all(
+        isinstance(item, dict)
+        and item.get("status") == "UNAVAILABLE"
+        and item.get("strategy_eligible") is False
+        for item in qmt_capability_detail.get("datasets")
+    )
+    and isinstance(scheduler_task_history_detail, dict)
+    and scheduler_task_history_detail.get("table")
+    == "st_scheduled_task_history"
+    and scheduler_task_history_detail.get("required_index_count") == 3
+    and scheduler_task_history_detail.get("physical_contract_verified") is True
+    and scheduler_task_history_detail.get("runtime_ddl_required") is False
+    and scheduler_task_history_detail.get("read_only") is True
+    and qmt_edge_valid
+    and qmt_edge_release_valid
+    and isinstance(pit_fact_detail, dict)
+    and pit_fact_detail.get("schema")
+    == "probiga.pit-fact-schema-health.v1"
+    and pit_fact_detail.get("status") == "HEALTHY"
+    and pit_fact_detail.get("valid") is True
+    and pit_fact_detail.get("table_count") == 3
+    and pit_fact_detail.get("expected_table_count") == 3
+    and pit_fact_detail.get("trigger_count") == 6
+    and pit_fact_detail.get("expected_trigger_count") == 6
+    and pit_fact_detail.get("contract_hash") == expected_pit_fact_contract_hash
+    and pit_fact_detail.get("physical_schema_verified") is True
+    and isinstance(qmt_announcement_detail, dict)
+    and qmt_announcement_detail.get("status") == "COMPLETE"
+    and qmt_announcement_detail.get("trade_date") == trade_date
+    and qmt_announcement_detail.get("source") == "qmt.announcement"
+    and qmt_announcement_detail.get("funding_eligible") is True
+    and qmt_announcement_detail.get("automatic_real_order_submission") is False
+    and qmt_announcement_detail.get("real_order_authority") is False
+    and isinstance(qmt_announcement_detail.get("catalog_member_count"), int)
+    and qmt_announcement_detail.get("catalog_member_count") > 0
+    and qmt_announcement_detail.get("coverage_row_count")
+    == qmt_announcement_detail.get("catalog_member_count")
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(qmt_announcement_detail.get("batch_root_hash") or ""),
+    ) is not None
+)
+if expected_scheduler_pid:
+    expected_pid = int(expected_scheduler_pid)
+    expected_host = socket.gethostname()
+    current = (
+        scheduler_heartbeat_detail.get("current")
+        if isinstance(scheduler_heartbeat_detail, dict)
+        else None
+    )
+    poll_seconds = (
+        current.get("poll_seconds") if isinstance(current, dict) else None
+    )
+    heartbeat_age = (
+        current.get("heartbeat_age_seconds")
+        if isinstance(current, dict)
+        else None
+    )
+    valid = valid and (
+        isinstance(scheduler_heartbeat_detail, dict)
+        and set(scheduler_heartbeat_detail) == {
+            "executor_role", "role_row_count", "fresh_row_count",
+            "future_row_count", "expected_host", "expected_pid",
+            "expected_build_sha", "expected_poll_seconds", "current",
+            "errors",
+        }
+        and scheduler_heartbeat_detail.get("executor_role")
+        == "linux_standalone"
+        and isinstance(scheduler_heartbeat_detail.get("role_row_count"), int)
+        and scheduler_heartbeat_detail.get("role_row_count") >= 1
+        and scheduler_heartbeat_detail.get("fresh_row_count") == 1
+        and scheduler_heartbeat_detail.get("future_row_count") == 0
+        and scheduler_heartbeat_detail.get("expected_host") == expected_host
+        and scheduler_heartbeat_detail.get("expected_pid") == expected_pid
+        and scheduler_heartbeat_detail.get("expected_build_sha") == expected_sha
+        and scheduler_heartbeat_detail.get("expected_poll_seconds") == 60
+        and scheduler_heartbeat_detail.get("errors") == []
+        and isinstance(current, dict)
+        and set(current) == {
+            "instance_id", "mode", "host_name", "pid", "build_sha",
+            "executor_role", "heartbeat_age_seconds", "poll_seconds",
+            "max_concurrent_tasks",
+        }
+        and current.get("instance_id") == f"{expected_host}-{expected_pid}"
+        and current.get("mode") == "standalone"
+        and current.get("host_name") == expected_host
+        and current.get("pid") == expected_pid
+        and current.get("build_sha") == expected_sha
+        and current.get("executor_role") == "linux_standalone"
+        and isinstance(poll_seconds, int)
+        and not isinstance(poll_seconds, bool)
+        and poll_seconds == 60
+        and isinstance(heartbeat_age, int)
+        and not isinstance(heartbeat_age, bool)
+        and 0 <= heartbeat_age <= 2 * poll_seconds
+        and isinstance(current.get("max_concurrent_tasks"), int)
+        and not isinstance(current.get("max_concurrent_tasks"), bool)
+        and current.get("max_concurrent_tasks") >= 1
+    )
+if expected_disposition != "input_not_ready":
+    manifest_detail = check_details.get(
+        "funding_checkpoint_manifest_partition_and_persistence"
+    )
+    valid = valid and (
+        isinstance(manifest_detail, dict)
+        and manifest_detail.get("invalid_count") == 0
+        and isinstance(manifest_detail.get("current_entity_count"), int)
+        and not isinstance(manifest_detail.get("current_entity_count"), bool)
+        and manifest_detail.get("current_entity_count") >= 0
+        and isinstance(manifest_detail.get("strategy_checkpoint_count"), int)
+        and isinstance(manifest_detail.get("combination_recipe_count"), int)
+        and isinstance(manifest_detail.get("ineligible_count"), int)
+        and manifest_detail.get("current_entity_count")
+        == manifest_detail.get("strategy_checkpoint_count")
+        + manifest_detail.get("combination_recipe_count")
+        + manifest_detail.get("ineligible_count")
+        and manifest_detail.get("checkpoint_count")
+        == manifest_detail.get("strategy_checkpoint_count")
+        and manifest_detail.get("funding_ready_count")
+        == manifest_detail.get("strategy_checkpoint_count")
+        + manifest_detail.get("combination_recipe_count")
+        and isinstance(manifest_detail.get("daily_fact_count"), int)
+        and not isinstance(manifest_detail.get("daily_fact_count"), bool)
+        and 0 <= manifest_detail.get("daily_fact_count")
+        <= manifest_detail.get("current_entity_count") * 370
+        and manifest_detail.get("total_storage_bytes")
+        == manifest_detail.get("checkpoint_storage_bytes")
+        + manifest_detail.get("fact_storage_bytes")
+        and manifest_detail.get("total_storage_bytes") <= 16777216
+        and isinstance(manifest_detail.get("target_total_met"), bool)
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(manifest_detail.get("manifest_hash") or ""),
+        ) is not None
+        and all(
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(manifest_detail.get(field) or ""),
+            ) is not None
+            for field in (
+                "checkpoint_root_hash",
+                "combination_recipe_root_hash",
+                "ineligible_root_hash",
+            )
+        )
+    )
+valid = valid and set(names) == required_names and len(names) == len(required_names)
 expected_waived = (
     {
         "authoritative_date_has_one_canonical_revision",
@@ -2908,6 +3880,65 @@ controlled_guard_governance_snapshot() {
     "--${action}-snapshot" - < "$snapshot" || return 1
   return 0
 }
+controlled_guard_qmt_announcement_snapshot() {
+  local action="$1"
+  local guarded_sha="$2"
+  local snapshot="$3"
+  local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
+  local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
+  local service_user adata_sha adata_tree_sha adata_source
+  local release_tree_sha adapter_registry_seal_sha
+  case "$snapshot" in
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")
+      controlled_guard_assert_file \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || return 1
+      test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+        "$(sha256sum "$snapshot" | cut -d' ' -f1)" || return 1
+      ;;
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
+      activation_snapshot_validate_governance_new || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  case "$action" in restore|verify) ;; *) return 1 ;; esac
+  test -d "$code_root" || return 1
+  test ! -L "$code_root" || return 1
+  test -L "$release_venv" || return 1
+  test -x "$release_venv/bin/python" || return 1
+  adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
+  adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
+  release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
+  adapter_registry_seal_sha="$(/usr/bin/cat -- \
+    "$release_venv/.adapter-registry-seal.sha256")" || return 1
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  test -d "$adata_source" || return 1
+  test ! -L "$adata_source" || return 1
+  service_user="$(systemctl show -p User --value probiga)" || return 1
+  test -n "$service_user" || return 1
+  test "$service_user" != root || return 1
+  controlled_guard_run_service_gate_with_deadline "$service_user" \
+    /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+    PROBIGA_CODE_ROOT="$code_root" \
+    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+    PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
+    PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
+    PYTHONPATH="$adata_source:$code_root" \
+    "$release_venv/bin/python" -P \
+    "$code_root/tools/add_qmt_announcement_task.py" \
+    "--${action}-snapshot" - < "$snapshot" || return 1
+  return 0
+}
 materialize_controlled_governance_contract_tool() {
   local source_digest
   local source_sha="$1"
@@ -3065,6 +4096,11 @@ controlled_guard_governance_contract_snapshot() {
         "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" < "$snapshot"
     ) 2>&1
   )"; then
+    if ! controlled_guard_qmt_announcement_snapshot "$action" "$guarded_sha" \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; then
+      GOVERNANCE_CONTRACT_FAILURE_CODE=qmt-announcement-task
+      return 1
+    fi
     return 0
   fi
   case "$gate_output" in
@@ -3098,12 +4134,24 @@ controlled_guard_restore_and_verify_governance_snapshot() {
   # Most rollback attempts fail before the scheduler row is changed.  Prove
   # that case first and avoid unnecessary database writes.  A mismatch falls
   # through to the exact restore, whose own failure remains visible.
+  local qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
+  if [ "$2" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
+    qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
+  elif [ "$2" != "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
+    return 1
+  fi
   if controlled_guard_governance_snapshot verify "$1" "$2" \
-      >/dev/null 2>&1; then
+      >/dev/null 2>&1 && \
+    controlled_guard_qmt_announcement_snapshot verify "$1" \
+      "$qmt_snapshot" >/dev/null 2>&1; then
     return 0
   fi
   controlled_guard_governance_snapshot restore "$1" "$2" || return 1
   controlled_guard_governance_snapshot verify "$1" "$2" || return 1
+  controlled_guard_qmt_announcement_snapshot restore "$1" \
+    "$qmt_snapshot" || return 1
+  controlled_guard_qmt_announcement_snapshot verify "$1" \
+    "$qmt_snapshot" || return 1
   return 0
 }
 controlled_guard_assert_immutable_venv_tree() {
@@ -3218,6 +4266,8 @@ controlled_guard_assert_governance_restore_runtime() {
     status --porcelain=v1 --untracked-files=all)" || return 1
   controlled_guard_assert_file \
     "$code_root/tools/add_strategy_governance_task.py" 444 || return 1
+  controlled_guard_assert_file \
+    "$code_root/tools/add_qmt_announcement_task.py" 444 || return 1
   test -L "$release_venv" || return 1
   test -x "$release_venv/bin/python" || return 1
   test "$(<"$release_venv/.probiga.gitsha")" = "$guarded_sha" || return 1
@@ -3271,6 +4321,7 @@ controlled_guard_capture_current_governance_snapshot() {
   local runtime_adapter_registry_seal_sha
   local capture_root=/tmp
   local current_snapshot
+  local qmt_current_snapshot
   local capture_valid=1
   local -a release_identity_lines=()
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -3407,6 +4458,50 @@ controlled_guard_capture_current_governance_snapshot() {
     return 1
   fi
   test "$capture_valid" -eq 0 || return 1
+  capture_valid=1
+  qmt_current_snapshot="$(mktemp \
+    "$capture_root/.probiga-qmt-announcement-capture.XXXXXX")" || return 1
+  case "$qmt_current_snapshot" in
+    "$capture_root"/.probiga-qmt-announcement-capture.*) ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_file "$qmt_current_snapshot" 600 || return 1
+  if chown "$service_user:$service_user" "$qmt_current_snapshot" && \
+    chmod 0600 "$qmt_current_snapshot" && \
+    controlled_guard_run_service_gate_with_deadline "$service_user" \
+      /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+      PROBIGA_CODE_ROOT="$code_root" \
+      PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+      PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+      PROBIGA_RELEASE_TREE_SHA256="$release_tree_sha" \
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
+      PYTHONPATH="$adata_source:$code_root" \
+      "$release_venv/bin/python" -P \
+      "$code_root/tools/add_qmt_announcement_task.py" \
+      --capture-snapshot "$qmt_current_snapshot" && \
+    test -f "$qmt_current_snapshot" && \
+    test ! -L "$qmt_current_snapshot" && \
+    test "$(stat -c '%U:%G' "$qmt_current_snapshot")" = \
+      "$service_user:$service_user" && \
+    test "$(stat -c '%a' "$qmt_current_snapshot")" = 600 && \
+    chown root:root "$qmt_current_snapshot" && \
+    chmod 0600 "$qmt_current_snapshot" && \
+    controlled_guard_assert_file "$qmt_current_snapshot" 600 && \
+    cmp --silent "$qmt_current_snapshot" \
+      "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"; then
+    capture_valid=0
+  fi
+  if ! rm -f -- "$qmt_current_snapshot" || \
+    [ -e "$qmt_current_snapshot" ] || [ -L "$qmt_current_snapshot" ]; then
+    return 1
+  fi
+  test "$capture_valid" -eq 0 || return 1
   return 0
 }
 controlled_guard_restore_and_finalize() {
@@ -3446,6 +4541,8 @@ controlled_guard_restore_and_finalize() {
         # any drift must re-fence rather than trigger another database write.
         prepared_governance_snapshot verify \
           "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+        prepared_qmt_announcement_snapshot verify \
+          "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" || return 1
         ;;
     esac
   fi
@@ -3940,6 +5037,10 @@ controlled_v2_rollback_only_recovery() {
       test ! -L "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
       test ! -e "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
       test ! -L "$ACTIVATION_GOVERNANCE_NEW_SHA" || return 1
+      test ! -e "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" || return 1
+      test ! -L "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT" || return 1
+      test ! -e "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA" || return 1
+      test ! -L "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SHA" || return 1
       ;;
   esac
   activation_snapshot_validate_rollback_receipt_state \
@@ -4070,7 +5171,9 @@ controlled_v2_rollback_only_recovery() {
   if [ "$restore_forward_governance" -eq 1 ]; then
     V2_RECOVERY_STEP=rollback-probe-old-governance
     if controlled_guard_governance_snapshot verify "$guarded_sha" \
-        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" >/dev/null 2>&1; then
+        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" >/dev/null 2>&1 && \
+      controlled_guard_qmt_announcement_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" >/dev/null 2>&1; then
       :
     else
       V2_RECOVERY_STEP=rollback-restore-old-governance
@@ -4419,7 +5522,7 @@ controlled_guard_run_writer_fence() {
       "$code_root/tools/add_trading_v3_tasks.py" \
       --writer-fence \
       --require-no-live-scheduler-writers \
-      --writer-drain-timeout-seconds 150 \
+      --writer-drain-timeout-seconds 660 \
       --writer-drain-poll-seconds 5
   )
 }
@@ -4436,12 +5539,859 @@ controlled_guard_validate_recover_json() {
 controlled_guard_validate_resume_json() {
   local python_bin="$1"
   "$python_bin" -I -c \
-    'import json,sys; p=json.load(sys.stdin); migrations=p.get("v3_migrations") if isinstance(p,dict) else None; trigger=p.get("trigger_contract") if isinstance(p,dict) else None; repair=p.get("legacy_trigger_repair") if isinstance(p,dict) else None; candidates=repair.get("candidate_names") if isinstance(repair,dict) else None; repaired=repair.get("repaired_names") if isinstance(repair,dict) else None; windows=p.get("trigger_trust_window_names") if isinstance(p,dict) else None; security=p.get("runtime_grant_summary") if isinstance(p,dict) else None; binding=p.get("legacy_binding_plan") if isinstance(p,dict) else None; expected_schema={"BIGA.*":["SELECT"],"PROBIGA.*":["ALTER","CREATE","CREATE TEMPORARY TABLES","DELETE","DROP","INDEX","INSERT","REFERENCES","SELECT","UPDATE"],"PROBIGA_QMT_HISTORY.*":["SELECT"]}; allowed={"trg_trade_account_v2_real_disabled_bi","trg_trade_account_v2_real_disabled_bu"}; least=isinstance(security,dict) and security.get("global_privileges")==["USAGE"] and security.get("schema_privileges")==expected_schema and security.get("require_ssl") is True and security.get("roles")==[] and security.get("grant_option") is False and p.get("runtime_definer_routine_count")==0 and p.get("runtime_definer_routine_inventory_verified") is True; legacy=isinstance(binding,dict) and isinstance(binding.get("legacy_run_count"),int) and binding["legacy_run_count"]>=0 and isinstance(binding.get("legacy_binding_plan_hash"),str) and bool(binding["legacy_binding_plan_hash"]) and binding.get("legacy_binding_pending") is False and binding.get("legacy_binding_marker_present") is bool(binding["legacy_run_count"]); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("phase")=="resume" and p.get("runtime_least_privilege_verified") is True and least and legacy and p.get("trust_restoration_verified") is True and p.get("restore_primary_verified") is True and p.get("restore_secondary_verified") is True and p.get("runtime_trust_off_verified") is True and isinstance(repair,dict) and repair.get("post_validation_verified") is True and isinstance(candidates,list) and candidates==sorted(set(candidates)) and set(candidates)<=allowed and repaired==candidates and isinstance(windows,list) and all(isinstance(x,str) for x in windows) and windows==list(dict.fromkeys(windows)) and p.get("trigger_trust_window_count")==len(windows) and p.get("global_trust_changed") is bool(windows) and isinstance(migrations,list) and bool(migrations) and all(isinstance(x,dict) and x.get("status") in {"applied","exists"} for x in migrations) and isinstance(trigger,dict) and trigger.get("metadata_frozen") is True and trigger.get("legacy_rehome_names")==[] and trigger.get("definer")=="probiga_migrator@127.0.0.1" and trigger.get("observed_count")==trigger.get("required_count",-1)+trigger.get("optional_count",-1) and isinstance(p.get("seeded_strategy_count"),int) and p["seeded_strategy_count"]>0 and isinstance(p.get("governance_trigger_count"),int) and p["governance_trigger_count"]>0 and p.get("automatic_real_order_submission") is False; raise SystemExit(0 if ok else 2)'
+    '
+import hashlib
+import json
+import re
+import sys
+
+p = json.load(sys.stdin)
+migrations = p.get("v3_migrations") if isinstance(p, dict) else None
+trigger = p.get("trigger_contract") if isinstance(p, dict) else None
+repair = p.get("legacy_trigger_repair") if isinstance(p, dict) else None
+candidates = repair.get("candidate_names") if isinstance(repair, dict) else None
+repaired = repair.get("repaired_names") if isinstance(repair, dict) else None
+windows = p.get("trigger_trust_window_names") if isinstance(p, dict) else None
+security = p.get("runtime_grant_summary") if isinstance(p, dict) else None
+binding = p.get("legacy_binding_plan") if isinstance(p, dict) else None
+funding = p.get("funding_checkpoint_schema") if isinstance(p, dict) else None
+governance_source = (
+    p.get("governance_trigger_source_contract")
+    if isinstance(p, dict) else None
+)
+supporting_source = (
+    p.get("supporting_trigger_source_contract")
+    if isinstance(p, dict) else None
+)
+pit_schema = p.get("pit_fact_schema") if isinstance(p, dict) else None
+qmt_reference = (
+    p.get("qmt_reference_schema") if isinstance(p, dict) else None
+)
+qmt_coverage = (
+    p.get("qmt_history_coverage_schema") if isinstance(p, dict) else None
+)
+qmt_coverage_runtime = (
+    p.get("qmt_history_coverage_runtime_schema")
+    if isinstance(p, dict) else None
+)
+scheduler_history = (
+    p.get("scheduler_task_history_schema") if isinstance(p, dict) else None
+)
+scheduler_history_runtime = (
+    p.get("scheduler_task_history_runtime_schema")
+    if isinstance(p, dict) else None
+)
+runtime_bundle = (
+    p.get("runtime_schema_bundle") if isinstance(p, dict) else None
+)
+runtime_bundle_runtime = (
+    p.get("runtime_schema_bundle_validation")
+    if isinstance(p, dict) else None
+)
+expected_runtime_bundle_hash = (
+    "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff"
+)
+expected_funding_contract_hash = (
+    "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+)
+expected_trigger_source_hash = (
+    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+)
+expected_trigger_names_hash = (
+    "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
+)
+expected_supporting_source_hash = (
+    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+)
+expected_supporting_names_hash = (
+    "b9afbb35a8adc7fdcf6f53fe014139069add38e6711742607daf050e1127d0be"
+)
+expected_supporting_owner_counts = {
+    "pit_facts": 6,
+    "qmt_attestation": 6,
+    "qmt_history_coverage": 4,
+    "qmt_reference": 10,
+    "scheduler_task_history": 2,
+    "strategy_governance": 40,
+}  # expected_supporting_owner_counts
+expected_pit_contract_hash = (
+    "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
+)
+expected_qmt_reference_contract_hash = (
+    "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
+)
+expected_qmt_tables = [
+    "qmt_stock_catalog_batch",
+    "qmt_stock_catalog_member",
+    "qmt_trade_calendar_batch",
+    "qmt_trade_calendar_session",
+    "qmt_reference_schema_contract",
+]
+expected_qmt_triggers = [
+    "trg_qmt_calendar_batch_no_delete",
+    "trg_qmt_calendar_batch_no_update",
+    "trg_qmt_calendar_session_no_delete",
+    "trg_qmt_calendar_session_no_update",
+    "trg_qmt_reference_contract_no_delete",
+    "trg_qmt_reference_contract_no_update",
+    "trg_qmt_stock_catalog_batch_no_delete",
+    "trg_qmt_stock_catalog_batch_no_update",
+    "trg_qmt_stock_catalog_member_no_delete",
+    "trg_qmt_stock_catalog_member_no_update",
+]
+expected_append_physical_hash = (
+    "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
+)
+expected_metric_physical_hash = (
+    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+)
+expected_core_append_hash = (
+    "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+)
+expected_core_metric_hash = (
+    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+)
+target_schema = {
+    "BIGA.*": ["SELECT"],
+    "PROBIGA.*": [
+        "CREATE TEMPORARY TABLES", "DELETE",
+        "INSERT", "SELECT", "UPDATE",
+    ],
+    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
+}  # target_schema
+legacy_schema = {
+    "BIGA.*": ["SELECT"],
+    "PROBIGA.*": [
+        "ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP",
+        "INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE",
+    ],
+    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
+}  # legacy_schema
+target_contract = "TARGET_LEAST_PRIVILEGE"
+legacy_contract = "LEGACY_DDL_COMPATIBILITY"
+observed_schema = security.get("schema_privileges") if isinstance(security, dict) else None
+observed_contract = (
+    target_contract if observed_schema == target_schema
+    else legacy_contract if observed_schema == legacy_schema
+    else None
+)
+expected_persistent_ddl = (
+    [] if observed_contract == target_contract
+    else ["ALTER", "CREATE", "DROP", "INDEX", "REFERENCES"]
+    if observed_contract == legacy_contract
+    else None
+)
+expected_security_keys = {
+    "observed_contract", "persistent_ddl_privileges",
+    "global_privileges", "schema_privileges",
+    "funding_append_only_tables", "funding_append_only_verified",
+    "funding_row_mutation_denied_by_triggers",
+    "funding_structural_bypass_privileges",
+    "truncate_denied_by_absent_drop_privilege",
+    "trigger_drop_denied_by_absent_trigger_privilege",
+    "require_ssl", "roles", "grant_option",
+}  # expected_security_keys
+expected_funding_tables = [
+    "st_strategy_funding_checkpoint",
+    "st_strategy_funding_daily_fact",
+]
+expected_funding_table_counts = {
+    "st_strategy_funding_daily_fact": {
+        "column_count": 29, "index_count": 9,
+        "foreign_key_count": 3, "check_count": 7,
+    },
+    "st_strategy_funding_checkpoint": {
+        "column_count": 46, "index_count": 12,
+        "foreign_key_count": 7, "check_count": 13,
+    },
+}  # expected_funding_table_counts
+least = (
+    isinstance(security, dict)
+    and set(security) == expected_security_keys
+    and observed_contract is not None
+    and security.get("observed_contract") == observed_contract
+    and security.get("persistent_ddl_privileges") == expected_persistent_ddl
+    and security.get("global_privileges") == ["USAGE"]
+    and security.get("schema_privileges") == observed_schema
+    and security.get("funding_append_only_tables") == expected_funding_tables
+    and security.get("funding_append_only_verified") is True
+    and security.get("funding_row_mutation_denied_by_triggers")
+    == ["DELETE", "UPDATE"]
+    and security.get("funding_structural_bypass_privileges")
+    == expected_persistent_ddl
+    and security.get("truncate_denied_by_absent_drop_privilege")
+    is (observed_contract == target_contract)
+    and security.get("trigger_drop_denied_by_absent_trigger_privilege") is True
+    and security.get("require_ssl") is True
+    and security.get("roles") == []
+    and security.get("grant_option") is False
+    and p.get("runtime_definer_routine_count") == 0
+    and p.get("runtime_definer_routine_inventory_verified") is True
+)
+legacy = (
+    isinstance(binding, dict)
+    and isinstance(binding.get("legacy_run_count"), int)
+    and binding["legacy_run_count"] >= 0
+    and isinstance(binding.get("legacy_binding_plan_hash"), str)
+    and bool(binding["legacy_binding_plan_hash"])
+    and binding.get("legacy_binding_pending") is False
+    and binding.get("legacy_binding_marker_present")
+    is bool(binding["legacy_run_count"])
+)
+funding_hash = (
+    str(funding.get("contract_hash") or "")
+    if isinstance(funding, dict)
+    else ""
+)
+funding_exact = (
+    isinstance(funding, dict)
+    and funding.get("table_count") == 2
+    and funding.get("tables") == expected_funding_table_counts
+    and funding.get("trigger_count") == 4
+    and funding_hash == expected_funding_contract_hash
+    and re.fullmatch(
+        r"[0-9a-f]{64}", str(funding.get("trigger_contract_hash") or "")
+    ) is not None
+    and p.get("funding_checkpoint_contract_hash") == funding_hash
+    and p.get("funding_checkpoint_table_count") == 2
+    and p.get("funding_checkpoint_trigger_count") == 4
+    and p.get("governance_append_only_trigger_count") == 38
+    and p.get("governance_metric_review_trigger_count") == 2
+    and isinstance(p.get("governance_trigger_count"), int)
+    and p["governance_trigger_count"] == 40
+    and p.get("governance_trigger_source_contract_hash")
+    == expected_trigger_source_hash
+    and p.get("governance_append_only_physical_contract_hash")
+    == expected_append_physical_hash
+    and p.get("governance_metric_review_physical_contract_hash")
+    == expected_metric_physical_hash
+    and p.get("governance_append_only_core_contract_hash")
+    == expected_core_append_hash
+    and p.get("governance_metric_review_core_contract_hash")
+    == expected_core_metric_hash
+    and funding.get("daily_path_base_authoritative_sessions") == 120
+    and funding.get("daily_path_max_incremental_replay_sessions") == 370
+    and funding.get("maximum_holding_buffer_sessions") == 250
+    and funding.get("bootstrap_mode")
+    == "EXPLICIT_FULL_HISTORY_ONCE_PER_VERSION_ACCOUNT"
+    and funding.get("bootstrap_is_bounded") is False
+    and funding.get("rolling_history_storage")
+    == "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN"
+    and funding.get("checkpoint_target_average_bytes") == 8192
+    and funding.get("checkpoint_total_target_bytes") == 8388608
+    and funding.get("checkpoint_total_hard_bytes") == 16777216
+    and funding.get("batch_max_rows") == 100
+    and funding.get("batch_max_bytes") == 4194304
+    and funding.get("manifest_max_bytes") == 1048576
+    and funding.get("audit_max_bytes") == 131072
+    and funding.get("automatic_real_order_submission") is False
+    and funding.get("real_order_authority") is False
+)
+governance_names = (
+    governance_source.get("expected_names")
+    if isinstance(governance_source, dict) else None
+)
+governance_names_hash = (
+    hashlib.sha256(
+        json.dumps(
+            governance_names, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(governance_names, list) else ""
+)
+governance_source_exact = (
+    isinstance(governance_source, dict)
+    and governance_source.get("source_contract_hash")
+    == expected_trigger_source_hash
+    and governance_source.get("append_only_physical_contract_hash")
+    == expected_append_physical_hash
+    and governance_source.get("metric_review_physical_contract_hash")
+    == expected_metric_physical_hash
+    and governance_source.get("core_append_only_contract_hash")
+    == expected_core_append_hash
+    and governance_source.get("core_metric_review_contract_hash")
+    == expected_core_metric_hash
+    and governance_source.get("funding_schema_contract_hash")
+    == expected_funding_contract_hash
+    and governance_source.get("observed_count") == 40
+    and governance_source.get("required_count") == 40
+    and isinstance(governance_source.get("created_count"), int)
+    and not isinstance(governance_source.get("created_count"), bool)
+    and governance_source.get("created_count") >= 0
+    and governance_source.get("created_names")
+    == sorted(set(governance_source.get("created_names") or []))
+    and len(governance_source.get("created_names") or [])
+    == governance_source.get("created_count")
+    and governance_names == sorted(set(governance_names or []))
+    and len(governance_names or []) == 40
+    and governance_names_hash == expected_trigger_names_hash
+)
+supporting_names = (
+    supporting_source.get("expected_names")
+    if isinstance(supporting_source, dict) else None
+)
+supporting_names_hash = (
+    hashlib.sha256(
+        json.dumps(
+            supporting_names, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(supporting_names, list) else ""
+)
+supporting_source_exact = (
+    isinstance(supporting_source, dict)
+    and supporting_source.get("source_contract_hash")
+    == expected_supporting_source_hash
+    and supporting_source.get("owner_counts")
+    == expected_supporting_owner_counts
+    and supporting_source.get("required_count") == 68
+    and supporting_source.get("optional_count") == 0
+    and supporting_source.get("observed_count") == 68
+    and supporting_source.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and supporting_source.get("metadata_frozen") is True
+    and supporting_source.get("legacy_rehome_names") == []
+    and isinstance(supporting_source.get("created_count"), int)
+    and not isinstance(supporting_source.get("created_count"), bool)
+    and supporting_source.get("created_count") >= 0
+    and supporting_source.get("created_names")
+    == sorted(set(supporting_source.get("created_names") or []))
+    and len(supporting_source.get("created_names") or [])
+    == supporting_source.get("created_count")
+    and set(supporting_source.get("created_names") or [])
+    <= set(supporting_names or [])
+    and supporting_names == sorted(set(supporting_names or []))
+    and len(supporting_names or []) == 68
+    and supporting_names_hash == expected_supporting_names_hash
+)
+pit_schema_exact = (
+    isinstance(pit_schema, dict)
+    and pit_schema.get("schema") == "probiga.pit-fact-schema-health.v1"
+    and pit_schema.get("status") == "HEALTHY"
+    and pit_schema.get("valid") is True
+    and pit_schema.get("table_count") == 3
+    and pit_schema.get("trigger_count") == 6
+    and pit_schema.get("missing_tables") == []
+    and pit_schema.get("missing_columns") == {}
+    and pit_schema.get("missing_triggers") == []
+    and pit_schema.get("contract_hash") == expected_pit_contract_hash
+)
+qmt_reference_exact = (
+    isinstance(qmt_reference, dict)
+    and qmt_reference.get("contract_key") == "qmt_reference_truth_v2"
+    and qmt_reference.get("contract_hash")
+    == expected_qmt_reference_contract_hash
+    and qmt_reference.get("table_names") == expected_qmt_tables
+    and qmt_reference.get("trigger_names") == expected_qmt_triggers
+    and qmt_reference.get("table_ddl_count") == 5
+    and qmt_reference.get("migration_ddl_count") == 14
+    and qmt_reference.get("runtime_ddl_required") is False
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(qmt_reference.get("table_contract_hash") or ""),
+    ) is not None
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(qmt_reference.get("trigger_contract_hash") or ""),
+    ) is not None
+)
+qmt_coverage_exact = (
+    isinstance(qmt_coverage, dict)
+    and qmt_coverage.get("database") == "probiga"
+    and qmt_coverage.get("table_count") == 2
+    and qmt_coverage.get("foreign_key_count") == 3
+    and qmt_coverage.get("trigger_count") == 4
+    and qmt_coverage.get("runtime_ddl_required") is False
+    and qmt_coverage.get("physical_schema_verified") is True
+    and qmt_coverage.get("physical_seal_verified") is True
+    and isinstance(qmt_coverage_runtime, dict)
+    and qmt_coverage_runtime.get("database") == "probiga"
+    and qmt_coverage_runtime.get("table_count") == 2
+    and qmt_coverage_runtime.get("trigger_count") == 4
+    and qmt_coverage_runtime.get("physical_schema_verified") is True
+    and qmt_coverage_runtime.get("physical_seal_verified") is True
+)
+scheduler_history_exact = (
+    isinstance(scheduler_history, dict)
+    and scheduler_history.get("table") == "st_scheduled_task_history"
+    and scheduler_history.get("status") == "ok"
+    and scheduler_history.get("required_index_count") == 3
+    and scheduler_history.get("physical_contract_verified") is True
+    and scheduler_history.get("runtime_ddl_required") is False
+    and isinstance(scheduler_history.get("runtime_validation"), dict)
+    and scheduler_history["runtime_validation"].get(
+        "physical_contract_verified"
+    ) is True
+    and isinstance(scheduler_history_runtime, dict)
+    and scheduler_history_runtime.get("table")
+    == "st_scheduled_task_history"
+    and scheduler_history_runtime.get("required_index_count") == 3
+    and scheduler_history_runtime.get("physical_contract_verified") is True
+    and scheduler_history_runtime.get("runtime_ddl_required") is False
+    and scheduler_history_runtime.get("read_only") is True
+)
+runtime_bundle_exact = (
+    isinstance(runtime_bundle, dict)
+    and runtime_bundle.get("schema")
+    == "probiga.production-runtime-schema-bundle.v1"
+    and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
+    and runtime_bundle.get("migration_count") == 24
+    and runtime_bundle.get("seed_count") == 3
+    and runtime_bundle.get("validator_count") == 27
+    and isinstance(runtime_bundle.get("migration_names"), list)
+    and isinstance(runtime_bundle.get("seed_names"), list)
+    and isinstance(runtime_bundle.get("validator_names"), list)
+    and isinstance(runtime_bundle.get("migrations"), dict)
+    and set(runtime_bundle["migrations"])
+    == set(runtime_bundle["migration_names"])
+    and isinstance(runtime_bundle.get("seeds"), dict)
+    and set(runtime_bundle["seeds"]) == set(runtime_bundle["seed_names"])
+    and runtime_bundle.get("runtime_ddl_required") is False
+    and runtime_bundle.get("privileged_migration") is True
+    and isinstance(runtime_bundle.get("runtime_validation"), dict)
+    and runtime_bundle["runtime_validation"].get("contract_hash")
+    == expected_runtime_bundle_hash
+    and runtime_bundle["runtime_validation"].get(
+        "required_surface_verified"
+    ) is True
+    and runtime_bundle["runtime_validation"].get("read_only") is True
+    and isinstance(runtime_bundle["runtime_validation"].get("contracts"), dict)
+    and set(runtime_bundle["runtime_validation"]["contracts"])
+    == set(runtime_bundle["validator_names"])
+    and isinstance(runtime_bundle_runtime, dict)
+    and runtime_bundle_runtime.get("contract_hash")
+    == expected_runtime_bundle_hash
+    and runtime_bundle_runtime.get("required_surface_verified") is True
+    and runtime_bundle_runtime.get("read_only") is True
+    and isinstance(runtime_bundle_runtime.get("contracts"), dict)
+    and set(runtime_bundle_runtime["contracts"])
+    == set(runtime_bundle_runtime.get("validator_names") or [])
+)
+allowed = {
+    "trg_trade_account_v2_real_disabled_bi",
+    "trg_trade_account_v2_real_disabled_bu",
+}  # allowed
+ok = (
+    isinstance(p, dict)
+    and p.get("status") == "ok"
+    and p.get("phase") == "resume"
+    and p.get("runtime_privilege_boundary_verified") is True
+    and p.get("runtime_least_privilege_verified")
+    is (observed_contract == target_contract)
+    and p.get("runtime_legacy_ddl_compatibility")
+    is (observed_contract == legacy_contract)
+    and least
+    and legacy
+    and funding_exact
+    and governance_source_exact
+    and supporting_source_exact
+    and pit_schema_exact
+    and qmt_reference_exact
+    and qmt_coverage_exact
+    and scheduler_history_exact
+    and runtime_bundle_exact
+    and p.get("trust_restoration_verified") is True
+    and p.get("restore_primary_verified") is True
+    and p.get("restore_secondary_verified") is True
+    and p.get("runtime_trust_off_verified") is True
+    and isinstance(repair, dict)
+    and repair.get("post_validation_verified") is True
+    and isinstance(candidates, list)
+    and candidates == sorted(set(candidates))
+    and set(candidates) <= allowed
+    and repaired == candidates
+    and isinstance(windows, list)
+    and all(isinstance(x, str) for x in windows)
+    and windows == list(dict.fromkeys(windows))
+    and p.get("trigger_trust_window_count") == len(windows)
+    and p.get("global_trust_changed") is bool(windows)
+    and isinstance(migrations, list)
+    and bool(migrations)
+    and all(
+        isinstance(x, dict) and x.get("status") in {"applied", "exists"}
+        for x in migrations
+    )
+    and isinstance(trigger, dict)
+    and trigger.get("metadata_frozen") is True
+    and trigger.get("legacy_rehome_names") == []
+    and trigger.get("definer") == "probiga_migrator@127.0.0.1"
+    and trigger.get("required_count") == 88
+    and trigger.get("optional_count") == 0
+    and trigger.get("observed_count") == 88
+    and isinstance(p.get("seeded_strategy_count"), int)
+    and p["seeded_strategy_count"] > 0
+    and p.get("automatic_real_order_submission") is False
+)
+raise SystemExit(0 if ok else 2)
+'
 }
 controlled_guard_validate_preflight_json() {
   local python_bin="$1"
   "$python_bin" -I -c \
-    'import json,sys; p=json.load(sys.stdin); migrations=p.get("v3_migrations") if isinstance(p,dict) else None; trigger=p.get("trigger_contract") if isinstance(p,dict) else None; security=p.get("runtime_grant_summary") if isinstance(p,dict) else None; binding=p.get("legacy_binding_plan") if isinstance(p,dict) else None; expected_schema={"BIGA.*":["SELECT"],"PROBIGA.*":["ALTER","CREATE","CREATE TEMPORARY TABLES","DELETE","DROP","INDEX","INSERT","REFERENCES","SELECT","UPDATE"],"PROBIGA_QMT_HISTORY.*":["SELECT"]}; least=isinstance(security,dict) and security.get("global_privileges")==["USAGE"] and security.get("schema_privileges")==expected_schema and security.get("require_ssl") is True and security.get("roles")==[] and security.get("grant_option") is False and p.get("runtime_definer_routine_count")==0 and p.get("runtime_definer_routine_inventory_verified") is True; legacy=isinstance(binding,dict) and isinstance(binding.get("legacy_run_count"),int) and binding["legacy_run_count"]>=0 and isinstance(binding.get("legacy_binding_plan_hash"),str) and bool(binding["legacy_binding_plan_hash"]) and binding.get("legacy_binding_pending") is False and binding.get("legacy_binding_marker_present") is bool(binding["legacy_run_count"]); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("phase")=="preflight" and p.get("runtime_least_privilege_verified") is True and least and legacy and p.get("global_trust_changed") is False and p.get("trust_restoration_verified") is True and p.get("pending_v3_versions")==[] and isinstance(migrations,list) and bool(migrations) and all(isinstance(x,dict) and x.get("status")=="exists" for x in migrations) and isinstance(trigger,dict) and trigger.get("metadata_frozen") is True and trigger.get("legacy_rehome_names")==[] and trigger.get("definer")=="probiga_migrator@127.0.0.1" and trigger.get("observed_count")==trigger.get("required_count",-1)+trigger.get("optional_count",-1) and isinstance(p.get("qmt_table_count"),int) and p["qmt_table_count"]>0 and isinstance(p.get("governance_table_count"),int) and p["governance_table_count"]>0 and p.get("automatic_real_order_submission") is False; raise SystemExit(0 if ok else 2)'
+    '
+import hashlib
+import json
+import sys
+
+p = json.load(sys.stdin)
+migrations = p.get("v3_migrations") if isinstance(p, dict) else None
+trigger = p.get("trigger_contract") if isinstance(p, dict) else None
+security = p.get("runtime_grant_summary") if isinstance(p, dict) else None
+binding = p.get("legacy_binding_plan") if isinstance(p, dict) else None
+governance_source = (
+    p.get("governance_trigger_source_contract")
+    if isinstance(p, dict) else None
+)
+supporting_source = (
+    p.get("supporting_trigger_source_contract")
+    if isinstance(p, dict) else None
+)
+pit_schema = p.get("pit_fact_schema") if isinstance(p, dict) else None
+qmt_reference = (
+    p.get("qmt_reference_schema") if isinstance(p, dict) else None
+)
+qmt_coverage = (
+    p.get("qmt_history_coverage_schema") if isinstance(p, dict) else None
+)
+scheduler_history = (
+    p.get("scheduler_task_history_schema") if isinstance(p, dict) else None
+)
+runtime_bundle = (
+    p.get("runtime_schema_bundle") if isinstance(p, dict) else None
+)
+expected_runtime_bundle_hash = (
+    "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff"
+)
+expected_funding_contract_hash = (
+    "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+)
+expected_trigger_source_hash = (
+    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+)
+expected_trigger_names_hash = (
+    "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
+)
+expected_supporting_source_hash = (
+    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+)
+expected_supporting_names_hash = (
+    "b9afbb35a8adc7fdcf6f53fe014139069add38e6711742607daf050e1127d0be"
+)
+expected_supporting_owner_counts = {
+    "pit_facts": 6,
+    "qmt_attestation": 6,
+    "qmt_history_coverage": 4,
+    "qmt_reference": 10,
+    "scheduler_task_history": 2,
+    "strategy_governance": 40,
+}  # expected_supporting_owner_counts
+expected_pit_contract_hash = (
+    "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
+)
+expected_qmt_reference_contract_hash = (
+    "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
+)
+expected_qmt_tables = [
+    "qmt_stock_catalog_batch",
+    "qmt_stock_catalog_member",
+    "qmt_trade_calendar_batch",
+    "qmt_trade_calendar_session",
+    "qmt_reference_schema_contract",
+]
+expected_qmt_triggers = [
+    "trg_qmt_calendar_batch_no_delete",
+    "trg_qmt_calendar_batch_no_update",
+    "trg_qmt_calendar_session_no_delete",
+    "trg_qmt_calendar_session_no_update",
+    "trg_qmt_reference_contract_no_delete",
+    "trg_qmt_reference_contract_no_update",
+    "trg_qmt_stock_catalog_batch_no_delete",
+    "trg_qmt_stock_catalog_batch_no_update",
+    "trg_qmt_stock_catalog_member_no_delete",
+    "trg_qmt_stock_catalog_member_no_update",
+]
+expected_append_physical_hash = (
+    "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
+)
+expected_metric_physical_hash = (
+    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+)
+expected_core_append_hash = (
+    "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+)
+expected_core_metric_hash = (
+    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+)
+target_schema = {
+    "BIGA.*": ["SELECT"],
+    "PROBIGA.*": [
+        "CREATE TEMPORARY TABLES", "DELETE",
+        "INSERT", "SELECT", "UPDATE",
+    ],
+    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
+}  # target_schema
+legacy_schema = {
+    "BIGA.*": ["SELECT"],
+    "PROBIGA.*": [
+        "ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP",
+        "INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE",
+    ],
+    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
+}  # legacy_schema
+target_contract = "TARGET_LEAST_PRIVILEGE"
+legacy_contract = "LEGACY_DDL_COMPATIBILITY"
+observed_schema = security.get("schema_privileges") if isinstance(security, dict) else None
+observed_contract = (
+    target_contract if observed_schema == target_schema
+    else legacy_contract if observed_schema == legacy_schema
+    else None
+)
+expected_persistent_ddl = (
+    [] if observed_contract == target_contract
+    else ["ALTER", "CREATE", "DROP", "INDEX", "REFERENCES"]
+    if observed_contract == legacy_contract
+    else None
+)
+expected_security_keys = {
+    "observed_contract", "persistent_ddl_privileges",
+    "global_privileges", "schema_privileges",
+    "funding_append_only_tables", "funding_append_only_verified",
+    "funding_row_mutation_denied_by_triggers",
+    "funding_structural_bypass_privileges",
+    "truncate_denied_by_absent_drop_privilege",
+    "trigger_drop_denied_by_absent_trigger_privilege",
+    "require_ssl", "roles", "grant_option",
+}  # expected_security_keys
+expected_funding_tables = [
+    "st_strategy_funding_checkpoint",
+    "st_strategy_funding_daily_fact",
+]
+least = (
+    isinstance(security, dict)
+    and set(security) == expected_security_keys
+    and observed_contract is not None
+    and security.get("observed_contract") == observed_contract
+    and security.get("persistent_ddl_privileges") == expected_persistent_ddl
+    and security.get("global_privileges") == ["USAGE"]
+    and security.get("schema_privileges") == observed_schema
+    and security.get("funding_append_only_tables") == expected_funding_tables
+    and security.get("funding_append_only_verified") is True
+    and security.get("funding_row_mutation_denied_by_triggers")
+    == ["DELETE", "UPDATE"]
+    and security.get("funding_structural_bypass_privileges")
+    == expected_persistent_ddl
+    and security.get("truncate_denied_by_absent_drop_privilege")
+    is (observed_contract == target_contract)
+    and security.get("trigger_drop_denied_by_absent_trigger_privilege") is True
+    and security.get("require_ssl") is True
+    and security.get("roles") == []
+    and security.get("grant_option") is False
+    and p.get("runtime_definer_routine_count") == 0
+    and p.get("runtime_definer_routine_inventory_verified") is True
+)
+legacy = (
+    isinstance(binding, dict)
+    and isinstance(binding.get("legacy_run_count"), int)
+    and binding["legacy_run_count"] >= 0
+    and isinstance(binding.get("legacy_binding_plan_hash"), str)
+    and bool(binding["legacy_binding_plan_hash"])
+    and binding.get("legacy_binding_pending") is False
+    and binding.get("legacy_binding_marker_present")
+    is bool(binding["legacy_run_count"])
+)
+governance_names = (
+    governance_source.get("trigger_names")
+    if isinstance(governance_source, dict) else None
+)
+governance_names_hash = (
+    hashlib.sha256(
+        json.dumps(
+            governance_names, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(governance_names, list) else ""
+)
+governance_source_exact = (
+    isinstance(governance_source, dict)
+    and governance_source.get("trigger_count") == 40
+    and governance_source.get("source_contract_hash")
+    == expected_trigger_source_hash
+    and governance_source.get("append_only_physical_contract_hash")
+    == expected_append_physical_hash
+    and governance_source.get("metric_review_physical_contract_hash")
+    == expected_metric_physical_hash
+    and governance_source.get("core_append_only_contract_hash")
+    == expected_core_append_hash
+    and governance_source.get("core_metric_review_contract_hash")
+    == expected_core_metric_hash
+    and governance_source.get("funding_schema_contract_hash")
+    == expected_funding_contract_hash
+    and governance_names == sorted(set(governance_names or []))
+    and len(governance_names or []) == 40
+    and governance_names_hash == expected_trigger_names_hash
+)
+supporting_names = (
+    supporting_source.get("trigger_names")
+    if isinstance(supporting_source, dict) else None
+)
+supporting_names_hash = (
+    hashlib.sha256(
+        json.dumps(
+            supporting_names, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(supporting_names, list) else ""
+)
+supporting_source_exact = (
+    isinstance(supporting_source, dict)
+    and supporting_source.get("trigger_count") == 68
+    and supporting_source.get("source_contract_hash")
+    == expected_supporting_source_hash
+    and supporting_source.get("owner_counts")
+    == expected_supporting_owner_counts
+    and supporting_names == sorted(set(supporting_names or []))
+    and len(supporting_names or []) == 68
+    and supporting_names_hash == expected_supporting_names_hash
+)
+pit_schema_exact = (
+    isinstance(pit_schema, dict)
+    and pit_schema.get("schema") == "probiga.pit-fact-schema-health.v1"
+    and pit_schema.get("status") == "HEALTHY"
+    and pit_schema.get("valid") is True
+    and pit_schema.get("table_count") == 3
+    and pit_schema.get("trigger_count") == 6
+    and pit_schema.get("missing_tables") == []
+    and pit_schema.get("missing_columns") == {}
+    and pit_schema.get("missing_triggers") == []
+    and pit_schema.get("contract_hash") == expected_pit_contract_hash
+)
+qmt_reference_exact = (
+    isinstance(qmt_reference, dict)
+    and qmt_reference.get("status")
+    == "READY_FOR_PHYSICAL_ATTESTATION"
+    and qmt_reference.get("read_only") is True
+    and qmt_reference.get("contract_key") == "qmt_reference_truth_v2"
+    and qmt_reference.get("contract_hash")
+    == expected_qmt_reference_contract_hash
+    and qmt_reference.get("table_names") == expected_qmt_tables
+    and qmt_reference.get("trigger_names") == expected_qmt_triggers
+    and qmt_reference.get("present_tables") == expected_qmt_tables
+    and qmt_reference.get("absent_tables") == []
+    and qmt_reference.get("missing_columns") == {}
+    and qmt_reference.get("table_ddl_count") == 5
+    and qmt_reference.get("migration_ddl_count") == 14
+    and qmt_reference.get("trigger_ddl_count") == 10
+)
+qmt_coverage_exact = (
+    isinstance(qmt_coverage, dict)
+    and qmt_coverage.get("status")
+    in {"EMPTY", "READY_FOR_TRIGGER_CUTOVER"}
+    and qmt_coverage.get("database") == "probiga"
+    and qmt_coverage.get("table_names") == [
+        "qmt_history_coverage_manifest",
+        "qmt_history_coverage_entity",
+    ]
+    and qmt_coverage.get("trigger_names") == [
+        "trg_qmt_history_coverage_no_update",
+        "trg_qmt_history_coverage_no_delete",
+        "trg_qmt_history_coverage_entity_no_update",
+        "trg_qmt_history_coverage_entity_no_delete",
+    ]
+    and qmt_coverage.get("runtime_ddl_required") is False
+    and qmt_coverage.get("read_only") is True
+    and (
+        (
+            qmt_coverage.get("status") == "EMPTY"
+            and qmt_coverage.get("table_count") == 0
+            and qmt_coverage.get("physical_schema_verified") is False
+        )
+        or (
+            qmt_coverage.get("status") == "READY_FOR_TRIGGER_CUTOVER"
+            and qmt_coverage.get("table_count") == 2
+            and qmt_coverage.get("foreign_key_count") == 3
+            and qmt_coverage.get("physical_schema_verified") is True
+        )
+    )
+)
+scheduler_history_exact = (
+    isinstance(scheduler_history, dict)
+    and scheduler_history.get("table") == "st_scheduled_task_history"
+    and scheduler_history.get("status") in {"READY", "MIGRATION_REQUIRED"}
+    and scheduler_history.get("runtime_ddl_required") is False
+    and scheduler_history.get("read_only") is True
+    and (
+        scheduler_history.get("status") == "MIGRATION_REQUIRED"
+        or (
+            scheduler_history.get("required_index_count") == 3
+            and scheduler_history.get("physical_contract_verified") is True
+        )
+    )
+)
+runtime_bundle_exact = (
+    isinstance(runtime_bundle, dict)
+    and runtime_bundle.get("schema")
+    == "probiga.production-runtime-schema-bundle.v1"
+    and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
+    and runtime_bundle.get("migration_count") == 24
+    and runtime_bundle.get("seed_count") == 3
+    and runtime_bundle.get("validator_count") == 27
+    and isinstance(runtime_bundle.get("validator_names"), list)
+    and isinstance(runtime_bundle.get("contracts"), dict)
+    and set(runtime_bundle["contracts"])
+    == set(runtime_bundle["validator_names"])
+    and all(
+        isinstance(item, dict)
+        and item.get("status") in {"READY", "MIGRATION_REQUIRED"}
+        and item.get("read_only") is True
+        for item in runtime_bundle["contracts"].values()
+    )
+    and runtime_bundle.get("migration_required")
+    is any(
+        item.get("status") != "READY"
+        for item in runtime_bundle["contracts"].values()
+    )
+    and runtime_bundle.get("read_only") is True
+)
+ok = (
+    isinstance(p, dict)
+    and p.get("status") == "ok"
+    and p.get("phase") == "preflight"
+    and p.get("runtime_privilege_boundary_verified") is True
+    and p.get("runtime_least_privilege_verified")
+    is (observed_contract == target_contract)
+    and p.get("runtime_legacy_ddl_compatibility")
+    is (observed_contract == legacy_contract)
+    and least
+    and legacy
+    and governance_source_exact
+    and supporting_source_exact
+    and pit_schema_exact
+    and qmt_reference_exact
+    and qmt_coverage_exact
+    and scheduler_history_exact
+    and runtime_bundle_exact
+    and p.get("global_trust_changed") is False
+    and p.get("trust_restoration_verified") is True
+    and p.get("pending_v3_versions") == []
+    and isinstance(migrations, list)
+    and bool(migrations)
+    and all(
+        isinstance(x, dict) and x.get("status") == "exists"
+        for x in migrations
+    )
+    and isinstance(trigger, dict)
+    and trigger.get("metadata_frozen") is True
+    and trigger.get("legacy_rehome_names") == []
+    and trigger.get("definer") == "probiga_migrator@127.0.0.1"
+    and trigger.get("required_count") == 20
+    and trigger.get("optional_count") == 68
+    and trigger.get("observed_count") == 88
+    and p.get("qmt_table_count") == 4
+    and p.get("governance_table_count") == 15
+    and p.get("automatic_real_order_submission") is False
+)
+raise SystemExit(0 if ok else 2)
+'
 }
 controlled_database_guard_recovery() {
   local adata_sha
@@ -4986,6 +6936,10 @@ MAIN_SERVICE=probiga
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
+prepare_qmt_announcement_checkpoint_root
+prepare_qmt_full_market_history_state_root
+prepare_qmt_local_gap_repair_state_root
+prepare_probiga_job_log_root
 materialize_controlled_governance_contract_tool "$EXPECTED_SHA"
 if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
   [ -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
@@ -5600,11 +7554,13 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
+    "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
+    "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
@@ -5639,11 +7595,14 @@ write_scheduler_dropin() {
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
+    "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
@@ -5676,11 +7635,12 @@ write_ai_worker_dropin() {
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_ai_recommendation_worker.py --once" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_ai_recommendation_worker.py --once" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
     "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
@@ -6057,6 +8017,209 @@ assert_nginx_static_matches_checkout() {
   done
   return 0
 }
+verify_strategy_governance_api_and_page_smoke() {
+  local expected_sha="$1"
+  local expected_trade_date="$2"
+  local governance_response index_response app_response
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$expected_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  governance_response="$(mktemp)" || return 1
+  index_response="$(mktemp)" || {
+    rm -f -- "$governance_response"
+    return 1
+  }
+  app_response="$(mktemp)" || {
+    rm -f -- "$governance_response" "$index_response"
+    return 1
+  }
+  chmod 0600 "$governance_response" "$index_response" "$app_response" || {
+    rm -f -- "$governance_response" "$index_response" "$app_response"
+    return 1
+  }
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$governance_response" \
+      "http://127.0.0.1/api/strategy-center/governance?trade_date=$expected_trade_date"; then
+    cat "$governance_response" >&2
+    rm -f -- "$governance_response" "$index_response" "$app_response"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$governance_response" \
+      "$expected_sha" "$expected_trade_date" <<'PY'
+import json
+import re
+import sys
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_sha, expected_trade_date = sys.argv[2:]
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+def fail(message):
+    print(f"strategy_governance_api_smoke invalid={message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def require_hash(value, length):
+    return re.fullmatch(rf"[0-9a-f]{{{length}}}", str(value or "")) is not None
+
+try:
+    if path.stat().st_size > 8 * 1024 * 1024:
+        fail("response_too_large")
+    payload = json.loads(
+        path.read_text(encoding="utf-8"), object_pairs_hook=unique_object,
+    )
+except Exception as exc:
+    fail(f"json:{type(exc).__name__}")
+if not isinstance(payload, dict):
+    fail("payload_type")
+run_uid = str(payload.get("run_uid") or "")
+result_hash = str(payload.get("canonical_result_hash") or "")
+if not (
+    payload.get("status") == "ok"
+    and payload.get("result_mode") == "CANONICAL_PERSISTED"
+    and payload.get("is_canonical") is True
+    and payload.get("ranking_response_bounded") is True
+    and payload.get("trade_date") == expected_trade_date
+    and payload.get("build_commit_sha") == expected_sha
+    and payload.get("decision_contract_version")
+    == "strategy-governance-decision.v7"
+    and require_hash(run_uid, 32)
+    and require_hash(result_hash, 64)
+    and require_hash(payload.get("decision_hash"), 64)
+):
+    fail("canonical_identity")
+
+authority_fields = {
+    "automatic_real_order_submission",
+    "real_order_authority",
+    "real_order_submission_enabled",
+    "real_order_submission",
+    "real_orders_allowed",
+    "real_order_allowed",
+    "automatic_real_order_authority",
+    "real_trading_enabled",
+    "order_authority",
+}
+def is_authority_field(key):
+    return key in authority_fields or key.endswith(
+        ("_automatic_real_order_submission", "_real_order_authority")
+    )
+def verify_authority(value, location="$"):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if is_authority_field(key) and item is not False:
+                fail(f"authority:{location}.{key}")
+            verify_authority(item, f"{location}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            verify_authority(item, f"{location}[{index}]")
+verify_authority(payload)
+
+summary = payload.get("summary")
+pools = payload.get("pools")
+if not isinstance(summary, dict) or not isinstance(pools, dict):
+    fail("summary_or_pools_type")
+if set(pools) != {"observation", "confirmation", "tradable"}:
+    fail("pool_names")
+for name in ("observation", "confirmation", "tradable"):
+    rows = pools.get(name)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        fail(f"pool_rows:{name}")
+    if summary.get(f"{name}_count") != len(rows):
+        fail(f"pool_count:{name}")
+
+rankings = payload.get("ranking_pages")
+if not isinstance(rankings, dict) or set(rankings) != {"strategy", "combination"}:
+    fail("ranking_pages")
+for name, entity_type, collection_key, summary_key in (
+    ("strategy", "STRATEGY", "strategies", "strategy_count"),
+    ("combination", "COMBINATION", "combinations", "combination_count"),
+):
+    metadata = rankings.get(name)
+    rows = payload.get(collection_key)
+    total = summary.get(summary_key)
+    if not (
+        isinstance(metadata, dict)
+        and isinstance(rows, list)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and metadata.get("schema") == "probiga.governance-ranking-page.v1"
+        and metadata.get("run_uid") == run_uid
+        and metadata.get("canonical_result_hash") == result_hash
+        and metadata.get("trade_date") == expected_trade_date
+        and metadata.get("entity_type") == entity_type
+        and metadata.get("total_count") == total
+        and metadata.get("unfiltered_total_count") == total
+        and metadata.get("offset") == 0
+        and metadata.get("limit") == 50
+        and len(rows) == min(50, total)
+        and require_hash(metadata.get("page_hash"), 64)
+    ):
+        fail(f"ranking_identity:{name}")
+
+allocations = payload.get("allocations")
+if not isinstance(allocations, list) or not allocations:
+    fail("allocations")
+weights = []
+try:
+    for row in allocations:
+        if not isinstance(row, dict):
+            fail("allocation_row")
+        raw = row.get("simulated_weight_pct")
+        if isinstance(raw, bool):
+            fail("allocation_bool")
+        weight = Decimal(str(raw))
+        if not weight.is_finite() or weight < 0:
+            fail("allocation_weight")
+        weights.append(weight)
+except (InvalidOperation, TypeError, ValueError):
+    fail("allocation_weight")
+cash_count = sum(row.get("target_type") == "CASH" for row in allocations)
+non_cash_count = sum(row.get("target_type") != "CASH" for row in allocations)
+if sum(weights) != Decimal("100") or cash_count != 1:
+    fail("allocation_conservation")
+if summary.get("allocation_count") != non_cash_count:
+    fail("allocation_count")
+print(
+    "strategy_governance_api_smoke status=PASS "
+    f"trade_date={expected_trade_date} run_uid={run_uid} "
+    f"canonical_result_hash={result_hash}"
+)
+PY
+  then
+    rm -f -- "$governance_response" "$index_response" "$app_response"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$index_response" http://127.0.0.1/ || \
+    ! grep -F -- 'data-tab="strategy-center"' "$index_response" >/dev/null || \
+    ! grep -F -- 'id="tab-strategy-center"' "$index_response" >/dev/null || \
+    ! grep -F -- '动态策略竞技场' "$index_response" >/dev/null; then
+    echo "Strategy governance page entry smoke failed" >&2
+    rm -f -- "$governance_response" "$index_response" "$app_response"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$app_response" http://127.0.0.1/static/js/app.js || \
+    ! grep -F -- '/api/strategy-center/governance' "$app_response" >/dev/null || \
+    ! grep -F -- '真实下单权限：关闭' "$app_response" >/dev/null; then
+    echo "Strategy governance page application smoke failed" >&2
+    rm -f -- "$governance_response" "$index_response" "$app_response"
+    return 1
+  fi
+  rm -f -- "$governance_response" "$index_response" "$app_response"
+  echo "Strategy governance API and page smoke passed"
+}
 release_identity_check() {
   local require_clean="$1"
   local checkout_root="${2:-$REPOSITORY_ROOT}"
@@ -6119,8 +8282,11 @@ PREVIOUS_AI_WORKER_DROPIN=""
 PREVIOUS_LOCK_SNAPSHOT=""
 GOVERNANCE_TASK_OLD_SOURCE=""
 GOVERNANCE_TASK_NEW_SOURCE=""
+QMT_ANNOUNCEMENT_TASK_OLD_SOURCE=""
+QMT_ANNOUNCEMENT_TASK_NEW_SOURCE=""
 GOVERNANCE_TASK_TOUCHED=0
-GOVERNANCE_INPUT_NOT_READY=0
+QMT_ANNOUNCEMENT_TASK_TOUCHED=0
+GOVERNANCE_TRADE_DATE=""
 QMT_HISTORY_PREFLIGHT_OUTPUT=""
 QMT_HISTORY_WINDOW=""
 DATABASE_FORWARD_MIGRATION_STARTED=0
@@ -6139,6 +8305,10 @@ cleanup_prepare_artifacts() {
     rm -f -- "$GOVERNANCE_TASK_OLD_SOURCE"
   [ -z "$GOVERNANCE_TASK_NEW_SOURCE" ] || \
     rm -f -- "$GOVERNANCE_TASK_NEW_SOURCE"
+  [ -z "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" ] || \
+    rm -f -- "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+  [ -z "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE" ] || \
+    rm -f -- "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
@@ -6592,6 +8762,10 @@ cleanup_prepare_artifacts() {
     rm -f -- "$GOVERNANCE_TASK_OLD_SOURCE"
   [ -z "$GOVERNANCE_TASK_NEW_SOURCE" ] || \
     rm -f -- "$GOVERNANCE_TASK_NEW_SOURCE"
+  [ -z "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" ] || \
+    rm -f -- "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+  [ -z "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE" ] || \
+    rm -f -- "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
@@ -6671,13 +8845,54 @@ clean_root_pip() {
 
 validate_hashed_requirements_lock() {
   local lock_file="$1"
-  "$BOOTSTRAP_PYTHON" -I - "$lock_file" <<'PY'
+  local requirements_input="$CODE_VALIDATION_ROOT/deploy/production_requirements.in"
+  local platform_input="$CODE_VALIDATION_ROOT/requirements-platform.txt"
+  test -f "$requirements_input" || return 1
+  test ! -L "$requirements_input" || return 1
+  test -f "$platform_input" || return 1
+  test ! -L "$platform_input" || return 1
+  "$BOOTSTRAP_PYTHON" -I - "$lock_file" "$requirements_input" \
+    "$platform_input" <<'PY'
+import hashlib
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
+requirements_input_path = Path(sys.argv[2])
+platform_input_path = Path(sys.argv[3])
 text = path.read_text(encoding="utf-8")
+requirements_input = requirements_input_path.read_bytes()
+platform_input = platform_input_path.read_bytes()
+if "\r" in text or not text.endswith("\n"):
+    raise SystemExit(2)
+requirements_input_text = requirements_input.decode("utf-8")
+platform_input.decode("utf-8")
+if b"\r" in requirements_input or not requirements_input.endswith(b"\n"):
+    raise SystemExit(2)
+if b"\r" in platform_input or not platform_input.endswith(b"\n"):
+    raise SystemExit(2)
+lines = text.splitlines()
+expected_header = [
+    "# PROBIGA_PRODUCTION_REQUIREMENTS_LOCK_VERSION=2",
+    "# SOURCE=deploy/production_requirements.in",
+    "# REQUIREMENTS_INPUT_SHA256="
+    + hashlib.sha256(requirements_input).hexdigest(),
+    "# PLATFORM_SOURCE=requirements-platform.txt",
+    "# PLATFORM_REQUIREMENTS_SHA256="
+    + hashlib.sha256(platform_input).hexdigest(),
+    "# TARGET=cp314-manylinux_2_28_x86_64",
+    "# STATUS=READY",
+    "--only-binary=:all:",
+]
+if lines[:8] != expected_header:
+    raise SystemExit(2)
+if [
+    line
+    for line in requirements_input_text.splitlines()
+    if line.startswith("-r ")
+] != ["-r ../requirements-platform.txt"]:
+    raise SystemExit(2)
 logical = []
 pending = ""
 for raw in text.splitlines():
@@ -6828,7 +9043,7 @@ prepare_ci_resolved_wheelhouse() {
   }
   printf '%s\n' \
     PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1 \
-    TARGET=cp314-manylinux_2_17_x86_64 \
+    TARGET=cp314-manylinux_2_28_x86_64 \
     SOURCE=ci-resolved-freeze-v1 > "$TRUSTED_WHEEL_MANIFEST" || {
       rm -f -- "$actual_files"
       return 1
@@ -6980,7 +9195,7 @@ prepare_release_venv() {
       "$EXPECTED_WHEEL_MANIFEST_SHA256"
     grep -Fx PROBIGA_TRUSTED_WHEEL_MANIFEST_VERSION=1 \
       "$TRUSTED_WHEEL_MANIFEST" >/dev/null
-    grep -Fx TARGET=cp314-manylinux_2_17_x86_64 \
+    grep -Fx TARGET=cp314-manylinux_2_28_x86_64 \
       "$TRUSTED_WHEEL_MANIFEST" >/dev/null
     grep -Fx STATUS=READY "$TRUSTED_WHEEL_MANIFEST" >/dev/null
     prepare_trusted_wheelhouse
@@ -7205,6 +9420,8 @@ prepare_release() {
     "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
     "$PREPARED_MAIN_DROPIN" >/dev/null
+  grep -Fx "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
+    "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_RELEASE_TREE_SHA256=$EXPECTED_RELEASE_TREE_SHA256" \
     "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx \
@@ -7224,9 +9441,13 @@ prepare_release() {
   chmod 0600 "$PREPARED_SCHEDULER_DROPIN"
   grep -Fx 'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
+  grep -Fx 'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+    "$PREPARED_SCHEDULER_DROPIN" >/dev/null
+  grep -Fx "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_RELEASE_TREE_SHA256=$EXPECTED_RELEASE_TREE_SHA256" \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
@@ -7247,6 +9468,8 @@ prepare_release() {
       "$PREPARED_AI_WORKER_DROPIN"
     chmod 0600 "$PREPARED_AI_WORKER_DROPIN"
     grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+      "$PREPARED_AI_WORKER_DROPIN" >/dev/null
+    grep -Fx "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
       "$PREPARED_AI_WORKER_DROPIN" >/dev/null
     grep -Fx "Environment=PROBIGA_RELEASE_TREE_SHA256=$EXPECTED_RELEASE_TREE_SHA256" \
       "$PREPARED_AI_WORKER_DROPIN" >/dev/null
@@ -7291,6 +9514,7 @@ prepared_request_is_already_active() {
     "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA"
     "PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA"
     "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT"
+    "PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT"
     "PROBIGA_EXPECTED_ADATA_SHA=$EXPECTED_ADATA_SHA"
     "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$EXPECTED_ADATA_TREE_SHA256"
     "PROBIGA_ADATA_SOURCE_DIR=$ADATA_SOURCE"
@@ -7377,6 +9601,8 @@ prepared_request_is_already_active() {
     grep -zFx -- "$expected_value" "/proc/$scheduler_pid/environ" \
       >/dev/null || return 1
   done
+  grep -zFx -- 'PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    "/proc/$scheduler_pid/environ" >/dev/null || return 1
   grep -zFx -- "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
     "/proc/$main_pid/environ" >/dev/null || return 1
   mapfile -d '' -t main_cmdline < "/proc/$main_pid/cmdline" || return 1
@@ -7420,7 +9646,8 @@ prepared_request_is_already_active() {
   fi
   run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-    --compact --expected-build-sha "$EXPECTED_SHA" || return 1
+    --compact --expected-build-sha "$EXPECTED_SHA" \
+    --expected-scheduler-pid "$scheduler_pid" || return 1
   assert_scheduler_triggers_quiescent || return 1
   assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || return 1
   assert_prepared_runtime_units_still_current || return 1
@@ -7473,6 +9700,7 @@ run_prepared_python_tool() {
       PYTHONDONTWRITEBYTECODE=1 \
       PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
+      QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
       PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
@@ -7559,14 +9787,64 @@ prepared_governance_snapshot() {
   fi
   return 0
 }
+prepared_qmt_announcement_snapshot() {
+  local action="$1"
+  local entrypoint="$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"
+  local snapshot="$2"
+  case "$action" in restore|verify) ;;
+    *) echo "prepared_qmt_announcement_snapshot invalid_action" >&2; return 1 ;;
+  esac
+  if [ "$PREPARED_CODE_ROOT" != "$CODE_RELEASE_ROOT/$EXPECTED_SHA" ] || \
+    [ ! -d "$PREPARED_CODE_ROOT" ] || [ -L "$PREPARED_CODE_ROOT" ]; then
+    echo "prepared_qmt_announcement_snapshot invalid_code_root" >&2
+    return 1
+  fi
+  if [ ! -f "$entrypoint" ] || [ -L "$entrypoint" ] || \
+    [ "$(stat -c '%U:%G' "$entrypoint")" != root:root ] || \
+    ! sudo -u "$SERVICE_USER" test ! -w "$entrypoint"; then
+    echo "prepared_qmt_announcement_snapshot invalid_entrypoint" >&2
+    return 1
+  fi
+  case "$snapshot" in
+    "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE")
+      test "$action" = verify || return 1
+      ;;
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")
+      controlled_guard_assert_file \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || return 1
+      test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+        "$(sha256sum "$snapshot" | cut -d' ' -f1)" || return 1
+      ;;
+    "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT")
+      test "$action" = verify || return 1
+      activation_snapshot_validate_governance_new || return 1
+      ;;
+    *) echo "prepared_qmt_announcement_snapshot invalid_snapshot" >&2; return 1 ;;
+  esac
+  controlled_guard_assert_file "$snapshot" 600 || return 1
+  test -s "$snapshot" || return 1
+  run_prepared_python_tool "$entrypoint" \
+    "--${action}-snapshot" - < "$snapshot" || return 1
+  return 0
+}
 prepared_restore_and_verify_governance_snapshot() {
   # The scheduler row is normally unchanged.  Verify first so rollback avoids
   # an unnecessary write, then restore the exact sealed state only on mismatch.
-  if prepared_governance_snapshot verify "$1" >/dev/null 2>&1; then
+  local qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
+  if [ "$1" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
+    qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
+  elif [ "$1" != "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
+    return 1
+  fi
+  if prepared_governance_snapshot verify "$1" >/dev/null 2>&1 && \
+    prepared_qmt_announcement_snapshot verify "$qmt_snapshot" \
+      >/dev/null 2>&1; then
     return 0
   fi
   prepared_governance_snapshot restore "$1" || return 1
   prepared_governance_snapshot verify "$1" || return 1
+  prepared_qmt_announcement_snapshot restore "$qmt_snapshot" || return 1
+  prepared_qmt_announcement_snapshot verify "$qmt_snapshot" || return 1
   return 0
 }
 prepared_v2_rollback_release_database_guard() {
@@ -7597,6 +9875,8 @@ prepared_v2_rollback_release_database_guard() {
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   prepared_governance_snapshot verify \
     "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  prepared_qmt_announcement_snapshot verify \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" || return 1
   controlled_guard_capture_current_governance_snapshot "$EXPECTED_SHA" \
     "$old_runtime_sha" || return 1
   assert_scheduler_triggers_quiescent || return 1
@@ -7784,13 +10064,15 @@ rollback() {
     esac
   fi
   if [ "$services_quiescent" -eq 1 ]; then
-    if [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ]; then
-      if [ ! -s "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
-        rollback_failure "strategy governance task snapshot is missing"
+    if [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ] || \
+      [ "$QMT_ANNOUNCEMENT_TASK_TOUCHED" -eq 1 ]; then
+      if [ ! -s "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ] || \
+        [ ! -s "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" ]; then
+        rollback_failure "scheduler task snapshots are missing"
         restoration_ready=0
       elif ! prepared_restore_and_verify_governance_snapshot \
         "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
-        rollback_failure "restore previous strategy governance task"
+        rollback_failure "restore previous scheduler task set"
         restoration_ready=0
       fi
     fi
@@ -8170,25 +10452,6 @@ if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
     "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
     --phase preflight
 fi
-CUTOVER_STEP=preflight_qmt_local_history_provenance_schema
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
-  --check-via-primary
-CUTOVER_STEP=preflight_strategy_governance_qmt_history_readiness
-QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
-  --readiness-only)"
-printf '%s\n' "$QMT_HISTORY_PREFLIGHT_OUTPUT"
-QMT_HISTORY_WINDOW="$(
-  printf '%s' "$QMT_HISTORY_PREFLIGHT_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,re,sys; from datetime import date; p=json.load(sys.stdin); keys={"status","mode","target_trade_date","session_count","start_date","end_date","session_window_sha256","target_rows","native_qmt_rows","exact_matched_rows","database_writes","automatic_real_order_submission"}; values=[p.get(k) for k in ("target_trade_date","start_date","end_date")]; canonical=isinstance(p,dict) and all(isinstance(x,str) and date.fromisoformat(x).isoformat()==x for x in values); counts=type(p.get("target_rows")) is int and p["target_rows"]>0 and p.get("native_qmt_rows")==p["target_rows"] and p.get("exact_matched_rows")==p["target_rows"]; ok=set(p)==keys and p.get("status")=="ok" and p.get("mode")=="readiness-only" and p.get("session_count")==120 and canonical and values[0]==values[2] and values[1]<=values[2] and isinstance(p.get("session_window_sha256"),str) and re.fullmatch(r"[0-9a-f]{64}",p["session_window_sha256"]) and counts and p.get("database_writes") is False and p.get("automatic_real_order_submission") is False; print(*values,p.get("session_window_sha256","")) if ok else None; raise SystemExit(0 if ok else 2)'
-)"
-read -r QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
-  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256 \
-  QMT_HISTORY_WINDOW_EXTRA <<< "$QMT_HISTORY_WINDOW"
-test -z "$QMT_HISTORY_WINDOW_EXTRA"
-readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
-  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
@@ -8202,6 +10465,20 @@ chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
 controlled_guard_assert_file "$GOVERNANCE_TASK_OLD_SOURCE" 600
 CUTOVER_STEP=preflight_strategy_governance_rollback_channel
 prepared_governance_snapshot verify "$GOVERNANCE_TASK_OLD_SOURCE"
+QMT_ANNOUNCEMENT_TASK_OLD_SOURCE="$(mktemp)"
+chown "$SERVICE_USER:$SERVICE_USER" "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+chmod 0600 "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+CUTOVER_STEP=capture_qmt_announcement_task_before_cutover
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" \
+  --capture-snapshot "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+test -s "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+chown root:root "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+chmod 0600 "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
+controlled_guard_assert_file "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE" 600
+CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
+prepared_qmt_announcement_snapshot verify \
+  "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
 # CUTOVER: persist the exact pre-cutover activation journal before the first
 # stop/disable.  A completed journal is always present before any writer state
@@ -8282,32 +10559,99 @@ fi
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   assert_ai_worker_writer_fence
 fi
-if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
-  # Alibaba Cloud RDS keeps binary logging enabled and does not expose
-  # log_bin_trust_function_creators/SUPER to tenants.  The v2 release path
-  # therefore applies the RDS-safe additive schema through the runtime account
-  # only after every writer is fenced.  The task stays disabled until the same
-  # schema is revalidated by the normal installation step below.
-  CUTOVER_STEP=prepare_strategy_governance_rds_safe_schema
-  DATABASE_FORWARD_MIGRATION_STARTED=1
-  if ! run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
-    --disabled --writers-fenced-schema-preparation; then
-    GOVERNANCE_TASK_TOUCHED=1
-    false
-  fi
-  GOVERNANCE_TASK_TOUCHED=1
-else
-  CUTOVER_STEP=prepare_strategy_governance_database_schema
-  DATABASE_FORWARD_MIGRATION_STARTED=1
-  run_prepared_database_migration_tool \
-    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-    --phase cutover --writers-fenced
-  CUTOVER_STEP=recover_strategy_governance_database_trust
-  run_prepared_database_migration_tool \
-    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-    --phase recover
+CUTOVER_STEP=prepare_strategy_governance_database_schema
+DATABASE_FORWARD_MIGRATION_STARTED=1
+run_prepared_database_migration_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+  --phase cutover --writers-fenced
+CUTOVER_STEP=recover_strategy_governance_database_trust
+run_prepared_database_migration_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+  --phase recover
+CUTOVER_STEP=install_qmt_announcement_task_disabled
+if ! run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" --disabled; then
+  QMT_ANNOUNCEMENT_TASK_TOUCHED=1
+  false
 fi
+QMT_ANNOUNCEMENT_TASK_TOUCHED=1
+CUTOVER_STEP=install_qmt_operations_tasks_disabled
+if ! run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py" --disabled; then
+  QMT_ANNOUNCEMENT_TASK_TOUCHED=1
+  false
+fi
+QMT_ANNOUNCEMENT_TASK_TOUCHED=1
+# The immutable QMT reference and attestation tables do not exist on a first
+# deployment until the privileged schema cutover above has completed.  Keep
+# all reads and captures of those tables after the cutover validation.
+CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
+  --check-via-primary
+CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap
+QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
+  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
+printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
+printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,re,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("status") in {"inserted","idempotent"} and p.get("build_sha")==sys.argv[1] and p.get("database_writes") is True and re.fullmatch(r"qmt-edge-request-[0-9a-f]{40}",str(p.get("request_run_uid") or "")); raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+
+# The Windows updater stops the old edge before this schema cutover, consumes
+# only the post-schema request above, starts the new-SHA daemon, and performs
+# the native QMT capture.  Linux only polls read-only proofs; it never imports
+# or invokes the Windows QMT runtime.
+CUTOVER_STEP=wait_for_qmt_windows_edge_identity
+QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
+QMT_EDGE_IDENTITY_OUTPUT=""
+while [ "$SECONDS" -lt "$QMT_EDGE_WAIT_DEADLINE" ]; do
+  if QMT_EDGE_IDENTITY_OUTPUT="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" \
+    --identity-only --expected-build-sha "$EXPECTED_SHA" \
+    --expected-poll-seconds 60 --compact)"; then
+    break
+  fi
+  sleep 5
+done
+test -n "$QMT_EDGE_IDENTITY_OUTPUT"
+printf '%s\n' "$QMT_EDGE_IDENTITY_OUTPUT"
+printf '%s' "$QMT_EDGE_IDENTITY_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; c=d.get("current") if isinstance(d,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="identity" and p.get("strategy_eligible") is True and p.get("database_writes") is False and isinstance(c,dict) and c.get("build_sha")==sys.argv[1] and c.get("executor_role")=="qmt_windows_edge" and c.get("instance_id")==f"{c.get('"'"'host_name'"'"')}-{c.get('"'"'pid'"'"')}" and d.get("expected_poll_seconds")==60 and d.get("errors")==[]; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+
+CUTOVER_STEP=wait_for_qmt_windows_edge_release_bootstrap
+QMT_EDGE_BOOTSTRAP_DEADLINE=$((SECONDS + 2700))
+QMT_EDGE_BOOTSTRAP_OUTPUT=""
+while [ "$SECONDS" -lt "$QMT_EDGE_BOOTSTRAP_DEADLINE" ]; do
+  if QMT_EDGE_BOOTSTRAP_OUTPUT="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/check_qmt_windows_edge.py" \
+    --release-bootstrap-only --expected-build-sha "$EXPECTED_SHA" \
+    --expected-poll-seconds 60 --compact)"; then
+    break
+  fi
+  sleep 10
+done
+test -n "$QMT_EDGE_BOOTSTRAP_OUTPUT"
+printf '%s\n' "$QMT_EDGE_BOOTSTRAP_OUTPUT"
+printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,re,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; r=d.get("receipt") if isinstance(d,dict) else None; i=d.get("identity") if isinstance(d,dict) else None; c=i.get("current") if isinstance(i,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="release-bootstrap" and p.get("strategy_eligible") is True and p.get("database_writes") is False and d.get("immutable_reference_verified") is True and d.get("receipt_count")==1 and d.get("errors")==[] and isinstance(r,dict) and r.get("build_sha")==sys.argv[1] and r.get("request_run_uid")==f"qmt-edge-request-{sys.argv[1]}" and r.get("scheduler_instance_id")==c.get("instance_id") and str(r.get("catalog_batch_id") or "").startswith(f"qmt_rel_{sys.argv[1]}_") and r.get("catalog_batch_id")==r.get("calendar_batch_id") and re.fullmatch(r"[0-9a-f]{64}",str(r.get("receipt_hash") or "")); raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
+QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
+  --readiness-only)"
+printf '%s\n' "$QMT_HISTORY_PREFLIGHT_OUTPUT"
+QMT_HISTORY_WINDOW="$(
+  printf '%s' "$QMT_HISTORY_PREFLIGHT_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,re,sys; from datetime import date; p=json.load(sys.stdin); keys={"status","mode","target_trade_date","session_count","start_date","end_date","session_window_sha256","target_rows","native_qmt_rows","exact_matched_rows","database_writes","automatic_real_order_submission"}; values=[p.get(k) for k in ("target_trade_date","start_date","end_date")]; canonical=isinstance(p,dict) and all(isinstance(x,str) and date.fromisoformat(x).isoformat()==x for x in values); counts=type(p.get("target_rows")) is int and p["target_rows"]>0 and p.get("native_qmt_rows")==p["target_rows"] and p.get("exact_matched_rows")==p["target_rows"]; ok=set(p)==keys and p.get("status")=="ok" and p.get("mode")=="readiness-only" and p.get("session_count")==120 and canonical and values[0]==values[2] and values[1]<=values[2] and isinstance(p.get("session_window_sha256"),str) and re.fullmatch(r"[0-9a-f]{64}",p["session_window_sha256"]) and counts and p.get("database_writes") is False and p.get("automatic_real_order_submission") is False; print(*values,p.get("session_window_sha256","")) if ok else None; raise SystemExit(0 if ok else 2)'
+)"
+read -r QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
+  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256 \
+  QMT_HISTORY_WINDOW_EXTRA <<< "$QMT_HISTORY_WINDOW"
+test -z "$QMT_HISTORY_WINDOW_EXTRA"
+readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
+  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
 CUTOVER_STEP=prepare_strategy_governance_qmt_history
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
@@ -8316,6 +10660,22 @@ run_prepared_python_tool \
   --expected-end-date "$QMT_HISTORY_END_DATE" \
   --expected-session-window-sha256 \
     "$QMT_HISTORY_SESSION_WINDOW_SHA256"
+CUTOVER_STEP=capture_qmt_announcement_full_market_batch
+QMT_ANNOUNCEMENT_RUN_OUTPUT=""
+QMT_ANNOUNCEMENT_RUN_STATUS=0
+if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
+  --window-days 30 --batch-size 100 \
+  --checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")"; then
+  QMT_ANNOUNCEMENT_RUN_STATUS=0
+else
+  QMT_ANNOUNCEMENT_RUN_STATUS=$?
+fi
+printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
+printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
+  --validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"
+test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
 CUTOVER_STEP=verify_installed_runtime_units
@@ -8349,22 +10709,39 @@ GOVERNANCE_TASK_TOUCHED=1
 CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0
+GOVERNANCE_HEALTH_DISPOSITION=completed
 if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py")"; then
+  "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
+  --expected-build-sha "$EXPECTED_SHA")"; then
   GOVERNANCE_RUN_STATUS=0
 else
   GOVERNANCE_RUN_STATUS=$?
 fi
 printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
-GOVERNANCE_JSON_STATUS="$(
-  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,sys; from datetime import date; payload=json.load(sys.stdin); status=payload.get("status") if isinstance(payload,dict) else None; blocked_keys={"status","reason","target_trade_date","input_trade_date","automatic_real_order_submission"}; target=payload.get("target_trade_date") if isinstance(payload,dict) else None; input_day=payload.get("input_trade_date") if isinstance(payload,dict) else None; dates_valid=isinstance(target,str) and isinstance(input_day,str) and all(not value or date.fromisoformat(value).isoformat()==value for value in (target,input_day)); blocked=status=="blocked" and set(payload)==blocked_keys and isinstance(payload.get("reason"),str) and bool(payload["reason"].strip()) and dates_valid and bool(target or not input_day) and payload.get("automatic_real_order_submission") is False; ok=status=="ok" and payload.get("automatic_real_order_submission") is False; normalized="blocked" if blocked else "ok" if ok else ""; print(normalized); raise SystemExit(0 if normalized else 2)'
-)"
+GOVERNANCE_JSON_STATUS=""
+if ! GOVERNANCE_JSON_STATUS="$(
+  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I \
+    "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
+    --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
+    --expected-build-sha "$EXPECTED_SHA"
+)"; then
+  printf 'strategy_governance invalid_result exit=%s\n' \
+    "$GOVERNANCE_RUN_STATUS" >&2
+  false
+fi
 case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
-  0:ok) ;;
-  2:blocked)
-    GOVERNANCE_INPUT_NOT_READY=1
-    echo "Strategy governance input is not ready; schema and task checks remain mandatory" >&2
+  0:completed|0:not_due) ;;
+  2:not_ready)
+    echo "Strategy governance input is not ready; refusing READY deployment" >&2
+    false
+    ;;
+  3:integrity_error)
+    echo "Strategy governance integrity check failed; refusing deployment" >&2
+    false
+    ;;
+  4:program_error)
+    echo "Strategy governance program failed; refusing deployment" >&2
+    false
     ;;
   *)
     printf 'strategy_governance invalid_result exit=%s json_status=%q\n' \
@@ -8374,7 +10751,14 @@ case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
 esac
 CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"
+  "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+  --schema-prepared
+CUTOVER_STEP=enable_qmt_announcement_task
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"
+CUTOVER_STEP=enable_qmt_operations_tasks
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py"
 GOVERNANCE_TASK_NEW_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_NEW_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_NEW_SOURCE"
@@ -8383,18 +10767,45 @@ run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
   --capture-snapshot "$GOVERNANCE_TASK_NEW_SOURCE"
 activation_snapshot_install_governance_new "$GOVERNANCE_TASK_NEW_SOURCE"
+QMT_ANNOUNCEMENT_TASK_NEW_SOURCE="$(mktemp)"
+chown "$SERVICE_USER:$SERVICE_USER" "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
+chmod 0600 "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
+CUTOVER_STEP=capture_qmt_announcement_task_after_enable
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" \
+  --capture-snapshot "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
+activation_snapshot_install_qmt_announcement_new \
+  "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
 prepared_governance_snapshot verify "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+prepared_qmt_announcement_snapshot verify \
+  "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
 declare -a GOVERNANCE_HEALTH_ARGS=(
   --compact
   --expected-build-sha "$EXPECTED_SHA"
 )
-if [ "$GOVERNANCE_INPUT_NOT_READY" -eq 1 ]; then
-  GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)
-fi
 CUTOVER_STEP=verify_strategy_governance_before_start
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-  "${GOVERNANCE_HEALTH_ARGS[@]}"
+GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
+chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
+if ! run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+    "${GOVERNANCE_HEALTH_ARGS[@]}" \
+    > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
+  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+  GOVERNANCE_HEALTH_RESULT_FILE=""
+  false
+fi
+if ! controlled_guard_parse_governance_health_result \
+    "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
+    "$GOVERNANCE_HEALTH_DISPOSITION" >/dev/null; then
+  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+  GOVERNANCE_HEALTH_RESULT_FILE=""
+  false
+fi
+cat "$GOVERNANCE_HEALTH_RESULT_FILE"
+rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+GOVERNANCE_HEALTH_RESULT_FILE=""
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
@@ -8474,6 +10885,8 @@ grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
+  "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$EXPECTED_ADATA_SHA" \
   "/proc/$SERVICE_MAIN_PID/environ" >/dev/null
 grep -zFx -- \
@@ -8515,11 +10928,15 @@ case "$SCHEDULER_MAIN_PID" in
 esac
 grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- 'PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- "PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$EXPECTED_ADATA_SHA" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
@@ -8552,6 +10969,47 @@ esac
 test "${SCHEDULER_CMDLINE[1]}" = -P
 test "${SCHEDULER_CMDLINE[2]}" = \
   "$PREPARED_CODE_ROOT/tools/run_scheduler_daemon.py"
+CUTOVER_STEP=wait_for_first_scheduler_heartbeat
+SCHEDULER_HEARTBEAT_READY=0
+for _heartbeat_attempt in $(seq 1 30); do
+  if run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/check_scheduler_runtime_heartbeat.py" \
+      --expected-build-sha "$EXPECTED_SHA" \
+      --expected-scheduler-pid "$SCHEDULER_MAIN_PID" >/dev/null; then
+    SCHEDULER_HEARTBEAT_READY=1
+    break
+  fi
+  if [ "$_heartbeat_attempt" -lt 30 ]; then
+    sleep 2
+  fi
+done
+test "$SCHEDULER_HEARTBEAT_READY" -eq 1
+CUTOVER_STEP=verify_strategy_governance_with_scheduler_heartbeat
+GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
+chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
+if ! run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+    "${GOVERNANCE_HEALTH_ARGS[@]}" \
+    --expected-scheduler-pid "$SCHEDULER_MAIN_PID" \
+    > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
+  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+  GOVERNANCE_HEALTH_RESULT_FILE=""
+  false
+fi
+if ! GOVERNANCE_TRADE_DATE="$(
+    controlled_guard_parse_governance_health_result \
+      "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
+      "$GOVERNANCE_HEALTH_DISPOSITION" "" "$SCHEDULER_MAIN_PID"
+  )"; then
+  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+  GOVERNANCE_HEALTH_RESULT_FILE=""
+  false
+fi
+cat "$GOVERNANCE_HEALTH_RESULT_FILE"
+rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+GOVERNANCE_HEALTH_RESULT_FILE=""
 CUTOVER_STEP=verify_health
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
@@ -8599,6 +11057,36 @@ sudo -u "$SERVICE_USER" /usr/bin/env -i \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
   "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
   --task-type analysis_premarket_external
+if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
+  echo "Warning: release venv cleanup failed before final verification" >&2
+fi
+if ! prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"; then
+  echo "Warning: immutable code release cleanup failed before final verification" >&2
+fi
+if ! prune_release_temp_files; then
+  echo "Warning: release temp cleanup failed before final verification" >&2
+fi
+CUTOVER_STEP=verify_post_prune_release_identity
+release_identity_check 1 "$PREPARED_CODE_ROOT"
+CUTOVER_STEP=verify_post_prune_health
+HEALTH_RESPONSE="$(mktemp)"
+if ! curl --fail-with-body --silent --show-error --retry 15 \
+  --retry-all-errors --retry-delay 2 --retry-connrefused \
+  --output "$HEALTH_RESPONSE" http://127.0.0.1/api/health; then
+  cat "$HEALTH_RESPONSE" >&2
+  rm -f "$HEALTH_RESPONSE"
+  HEALTH_RESPONSE=""
+  false
+fi
+cat "$HEALTH_RESPONSE"
+rm -f "$HEALTH_RESPONSE"
+HEALTH_RESPONSE=""
+curl --fail-with-body --silent --show-error --retry 15 \
+  --retry-all-errors --retry-delay 2 --retry-connrefused \
+  http://127.0.0.1/api/health/runtime >/dev/null
+CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
+verify_strategy_governance_api_and_page_smoke \
+  "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
 ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
 ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
@@ -8616,13 +11104,4 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
-if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
-  echo "Warning: release venv cleanup failed after activation" >&2
-fi
-if ! prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"; then
-  echo "Warning: immutable code release cleanup failed after activation" >&2
-fi
-if ! prune_release_temp_files; then
-  echo "Warning: release temp cleanup failed after activation" >&2
-fi
 df -h / >&2

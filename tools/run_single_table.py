@@ -277,7 +277,7 @@ def _sub_run_kline_daily(date_str: str = "") -> int:
     env.setdefault("KLINE_DAILY_WORKERS", "2")
     env.setdefault("KLINE_DAILY_REQUEST_DELAY", "0.25")
     env.setdefault("KLINE_DAILY_REQUEST_JITTER", "0.1")
-    env.setdefault("KLINE_DAILY_MIN_COVERAGE", "0.90")
+    env["KLINE_DAILY_MIN_COVERAGE"] = "1.0"
     cmd = [sys.executable, "tools/fetch_sm_stock_kline_daily.py"]
     if date_str.strip():
         cmd.append(date_str.strip())
@@ -364,11 +364,17 @@ def _si_engine_info():
 @_with_si_env(_si_index_extra_env)
 def run_si_all_index_code() -> int:
     # 东财 push2 常不可用：默认先只拉新浪；若要仍试东财再设 SI_INDEX_TRY_EAST_FIRST=1
-    from biz.stock_info.sync_stock_info import sync_all_index_code
+    from biz.stock_info.sync_stock_info import (
+        PartialSnapshotPublished,
+        sync_all_index_code,
+    )
 
     eng, info = _si_engine_info()
     try:
         df = sync_all_index_code(eng, info)
+    except PartialSnapshotPublished as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return exc.exit_code
     except Exception as exc:
         source = _first_env(os.environ, "SI_ALL_INDEX_CODE_SOURCE", "DATA_SOURCE_INDEX_LIST").lower()
         if source not in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:
@@ -389,11 +395,14 @@ def run_si_all_index_code() -> int:
 
 @_with_si_env()
 def run_si_all_code() -> int:
-    from biz.stock_info.sync_stock_info import sync_all_code
+    from biz.stock_info.sync_stock_info import PartialSnapshotPublished, sync_all_code
 
     eng, info = _si_engine_info()
     try:
         df = sync_all_code(eng, info)
+    except PartialSnapshotPublished as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return exc.exit_code
     except Exception as exc:
         source = _first_env(os.environ, "SI_ALL_CODE_SOURCE", "DATA_SOURCE_CODE_LIST").lower()
         if source not in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:

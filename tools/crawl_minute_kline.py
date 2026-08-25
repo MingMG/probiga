@@ -28,6 +28,7 @@ import pandas as pd
 import requests
 import urllib3
 from sqlalchemy import text
+from sqlalchemy.engine import Connection
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -38,7 +39,11 @@ if str(ROOT) not in sys.path:
 from server.common.batch_db import create_batch_engine, quote_identifier, write_frame
 from server.common.kline_data import get_kline_engine
 from server.common.minute_data import get_minute_engine
-from server.common.mysql_lock import mysql_named_lock
+from server.common.mysql_lock import (
+    STOCK_MINUTE_FREEZE_LOCK_NAME,
+    mysql_named_lock,
+    supersede_overlapping_qmt_minute_forward_receipts,
+)
 
 
 def _is_trade_day(engine, day: datetime | None = None) -> bool:
@@ -295,51 +300,206 @@ def _minute_code_column(table: str) -> str:
     return "index_code" if table in ("sm_index_minute", "sm_concept_east_minute") else "stock_code"
 
 
-def save_kline(engine, rows: list[dict], table: str) -> int:
+def _prepare_kline_frame(rows: list[dict], table: str) -> pd.DataFrame:
     if not rows:
-        return 0
+        return pd.DataFrame()
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
-
-    code_col = _minute_code_column(table)
-    date_codes = df[["stock_code", "trade_date"]].drop_duplicates().to_dict("records")
-    with engine.begin() as conn:
-        for item in date_codes:
-            conn.execute(
-                text(f"DELETE FROM {table} WHERE {code_col} = :code AND trade_date = :d"),
-                {"code": item["stock_code"], "d": item["trade_date"]},
-            )
-
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
     # sm_index_minute / sm_concept_east_minute 用 index_code 列，有 snapshot_at
     if table in ("sm_index_minute", "sm_concept_east_minute"):
         df = df.rename(columns={"stock_code": "index_code"})
         df["snapshot_at"] = datetime.now().replace(microsecond=0)
-
-    df.to_sql(table, engine, if_exists="append", index=False, chunksize=1000, method="multi")
-    return len(df)
+    return df
 
 
-def _create_flow_stage(engine) -> str:
-    stage = f"{FLOW_TABLE}_stage_{uuid.uuid4().hex[:12]}"
-    with engine.begin() as conn:
-        conn.execute(
+def _create_kline_stage(engine, table: str) -> tuple[str, Connection]:
+    stage = f"{table}_stage_{uuid.uuid4().hex[:12]}"
+    connection = engine.connect()
+    try:
+        connection.execute(
             text(
-                f"CREATE TABLE {quote_identifier(stage)} "
+                f"CREATE TEMPORARY TABLE {quote_identifier(stage)} "
+                f"LIKE {quote_identifier(table)}"
+            )
+        )
+        connection.commit()
+        return stage, connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _append_kline_stage(
+    connection: Connection,
+    stage: str,
+    rows: list[dict],
+    table: str,
+) -> int:
+    df = _prepare_kline_frame(rows, table)
+    if df.empty:
+        return 0
+    with connection.begin():
+        write_frame(
+            df,
+            stage,
+            connection,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
+    return int(len(df))
+
+
+def _publish_kline_stage(
+    engine,
+    connection: Connection,
+    stage: str,
+    table: str,
+    *,
+    receipt_engine=None,
+) -> int:
+    """Publish only code/date partitions proven present in a complete stage."""
+
+    target = quote_identifier(table)
+    staged = quote_identifier(stage)
+    code_col = quote_identifier(_minute_code_column(table))
+    staged_rows = int(
+        connection.execute(text(f"SELECT COUNT(*) FROM {staged}")).scalar() or 0
+    )
+    column_rows = connection.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name "
+            "AND EXTRA NOT LIKE '%GENERATED%' AND COLUMN_NAME <> 'id' "
+            "ORDER BY ORDINAL_POSITION"
+        ),
+        {"table_name": table},
+    ).fetchall()
+    revoke_window = None
+    if table == "sm_stock_minute":
+        if receipt_engine is None:
+            raise RuntimeError(
+                "sm_stock_minute crawler publish requires the authority receipt engine"
+            )
+        revoke_window = connection.execute(
+            text(f"SELECT MIN(trade_date), MAX(trade_date) FROM {staged}")
+        ).one()
+        if revoke_window[0] is None or revoke_window[1] is None:
+            raise RuntimeError(
+                "sm_stock_minute crawler stage has no receipt revocation window"
+            )
+    connection.commit()
+    if staged_rows <= 0:
+        raise RuntimeError(f"{table} minute stage is empty; preserving previous rows")
+    columns = [quote_identifier(str(row[0])) for row in column_rows]
+    if not columns:
+        raise RuntimeError(f"{table} has no publishable columns")
+    column_list = ", ".join(columns)
+
+    with mysql_named_lock(
+        engine,
+        (
+            STOCK_MINUTE_FREEZE_LOCK_NAME
+            if table == "sm_stock_minute"
+            else f"probiga:{table}"
+        ),
+        timeout_seconds=max(0, _env_int("MINUTE_PUBLISH_LOCK_TIMEOUT", "0")),
+        connection=connection,
+    ):
+        connection.commit()
+        if revoke_window is not None:
+            supersede_overlapping_qmt_minute_forward_receipts(
+                receipt_engine,
+                first_trade_time=(
+                    pd.Timestamp(revoke_window[0]).normalize().to_pydatetime()
+                ),
+                last_trade_time=(
+                    pd.Timestamp(revoke_window[1]).normalize()
+                    + pd.Timedelta(days=1)
+                    - pd.Timedelta(microseconds=1)
+                ).to_pydatetime(),
+                reason="public stock-minute crawler publish",
+            )
+        with connection.begin():
+            connection.execute(
+                text(
+                    f"DELETE target_rows FROM {target} AS target_rows "
+                    f"INNER JOIN (SELECT DISTINCT {code_col}, trade_date FROM {staged}) AS scope_rows "
+                    f"ON target_rows.{code_col} = scope_rows.{code_col} "
+                    "AND target_rows.trade_date = scope_rows.trade_date"
+                )
+            )
+            result = connection.execute(
+                text(
+                    f"INSERT INTO {target} ({column_list}) "
+                    f"SELECT {column_list} FROM {staged}"
+                )
+            )
+            if (
+                result.rowcount is not None
+                and result.rowcount >= 0
+                and int(result.rowcount) != staged_rows
+            ):
+                raise RuntimeError(
+                    f"{table} minute publish mismatch: "
+                    f"expected={staged_rows} actual={result.rowcount}"
+                )
+    return staged_rows
+
+
+def _drop_kline_stage(connection: Connection) -> None:
+    connection.close()
+
+
+def save_kline(
+    engine,
+    rows: list[dict],
+    table: str,
+    *,
+    receipt_engine=None,
+) -> int:
+    """Atomically replace the exact code/date partitions represented by rows."""
+
+    if not rows:
+        return 0
+    stage, connection = _create_kline_stage(engine, table)
+    try:
+        _append_kline_stage(connection, stage, rows, table)
+        return _publish_kline_stage(
+            engine,
+            connection,
+            stage,
+            table,
+            receipt_engine=receipt_engine,
+        )
+    finally:
+        _drop_kline_stage(connection)
+
+
+def _create_flow_stage(engine) -> tuple[str, Connection]:
+    stage = f"{FLOW_TABLE}_stage_{uuid.uuid4().hex[:12]}"
+    connection = engine.connect()
+    try:
+        connection.execute(
+            text(
+                f"CREATE TEMPORARY TABLE {quote_identifier(stage)} "
                 f"LIKE {quote_identifier(FLOW_TABLE)}"
             )
         )
-    return stage
+        connection.commit()
+        return stage, connection
+    except BaseException:
+        connection.close()
+        raise
 
 
-def _drop_flow_stage(engine, stage: str) -> None:
-    if not stage:
-        return
-    with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage)}"))
+def _drop_flow_stage(connection: Connection) -> None:
+    connection.close()
 
 
-def _append_flow_stage(engine, stage: str, rows: list[dict]) -> int:
+def _append_flow_stage(connection: Connection, stage: str, rows: list[dict]) -> int:
     if not rows:
         return 0
     df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
@@ -347,19 +507,25 @@ def _append_flow_stage(engine, stage: str, rows: list[dict]) -> int:
     now = datetime.now().replace(microsecond=0)
     df["snapshot_at"] = now
     df["etl_sync_at"] = now
-    write_frame(
-        df[list(FLOW_WRITE_COLUMNS)],
-        stage,
-        engine,
-        if_exists="append",
-        index=False,
-        chunksize=1000,
-        method="multi",
-    )
+    with connection.begin():
+        write_frame(
+            df[list(FLOW_WRITE_COLUMNS)],
+            stage,
+            connection,
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
     return len(df)
 
 
-def _publish_flow_stage(engine, stage: str, trade_date: str) -> int:
+def _publish_flow_stage(
+    engine,
+    stage_connection: Connection,
+    stage: str,
+    trade_date: str,
+) -> int:
     """Replace today's minute-flow slice only after the staged run is complete."""
     columns = ", ".join(quote_identifier(column) for column in FLOW_WRITE_COLUMNS)
     lock_timeout = max(0, _env_int("FLOW_MINUTE_LOCK_TIMEOUT", "0"))
@@ -368,8 +534,8 @@ def _publish_flow_stage(engine, stage: str, trade_date: str) -> int:
         "probiga:capital_flow_minute",
         timeout_seconds=lock_timeout,
     ):
-        with engine.begin() as conn:
-            conn.execute(
+        with stage_connection.begin():
+            stage_connection.execute(
                 text(
                     f"DELETE FROM {quote_identifier(FLOW_TABLE)} "
                     "WHERE trade_time >= :trade_date "
@@ -377,7 +543,7 @@ def _publish_flow_stage(engine, stage: str, trade_date: str) -> int:
                 ),
                 {"trade_date": trade_date},
             )
-            result = conn.execute(
+            result = stage_connection.execute(
                 text(
                     f"INSERT INTO {quote_identifier(FLOW_TABLE)} ({columns}) "
                     f"SELECT {columns} FROM {quote_identifier(stage)}"
@@ -386,7 +552,16 @@ def _publish_flow_stage(engine, stage: str, trade_date: str) -> int:
     return int(result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0)
 
 
-def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, limit: int) -> dict:
+def crawl_kline(
+    engine,
+    codes: list[tuple[str, int]],
+    table: str,
+    label: str,
+    limit: int,
+    min_coverage: float,
+    *,
+    receipt_engine=None,
+) -> dict:
     if limit > 0:
         codes = codes[:limit]
     total = len(codes)
@@ -394,47 +569,66 @@ def crawl_kline(engine, codes: list[tuple[str, int]], table: str, label: str, li
 
     buffer = []
     ok = fail = 0
-    written_rows = 0
+    staged_rows = 0
+    published_rows = 0
     t0 = time.time()
+    stage, stage_connection = _create_kline_stage(engine, table)
+    try:
+        for i, (code, market) in enumerate(codes):
+            klines = fetch_minute_kline(code, market)
+            rows = parse_kline(code, klines or []) if klines else []
+            if rows:
+                buffer.extend(rows)
+                ok += 1
+            else:
+                fail += 1
 
-    for i, (code, market) in enumerate(codes):
-        klines = fetch_minute_kline(code, market)
-        rows = parse_kline(code, klines or []) if klines else []
-        if rows:
-            buffer.extend(rows)
-            ok += 1
-        else:
-            fail += 1
+            time.sleep(DELAY + random.uniform(0, JITTER))
 
-        time.sleep(DELAY + random.uniform(0, JITTER))
+            if (i + 1) % 200 == 0:
+                elapsed = time.time() - t0
+                eta = (total - i - 1) / (i + 1) * elapsed
+                print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
 
-        if (i + 1) % 200 == 0:
-            elapsed = time.time() - t0
-            eta = (total - i - 1) / (i + 1) * elapsed
-            print(f"    [{i+1}/{total}] OK={ok} Fail={fail} Buf={len(buffer)} ETA={eta/60:.0f}min", flush=True)
+            if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
+                time.sleep(BATCH_PAUSE + random.uniform(0, 5))
 
-        if BATCH_EVERY > 0 and (i + 1) % BATCH_EVERY == 0:
-            time.sleep(BATCH_PAUSE + random.uniform(0, 5))
+            if len(buffer) >= 5000:
+                print(f"    Staging {len(buffer)} rows...", flush=True)
+                staged_rows += _append_kline_stage(
+                    stage_connection, stage, buffer, table
+                )
+                buffer.clear()
 
-        if len(buffer) >= 5000:
-            print(f"    Writing {len(buffer)} rows...", flush=True)
-            written_rows += save_kline(engine, buffer, table)
-            buffer.clear()
+        if buffer:
+            print(f"    Staging {len(buffer)} rows...", flush=True)
+            staged_rows += _append_kline_stage(
+                stage_connection, stage, buffer, table
+            )
 
-    if buffer:
-        print(f"    Writing {len(buffer)} rows...", flush=True)
-        written_rows += save_kline(engine, buffer, table)
+        coverage = ok / total if total else 0
+        if total > 0 and coverage >= min_coverage:
+            published_rows = _publish_kline_stage(
+                engine,
+                stage_connection,
+                stage,
+                table,
+                receipt_engine=receipt_engine,
+            )
+    finally:
+        _drop_kline_stage(stage_connection)
 
     elapsed = time.time() - t0
     coverage = ok / total if total else 0
-    print(f"    Done! OK={ok} Fail={fail} Rows={written_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
+    print(f"    Done! OK={ok} Fail={fail} Rows={published_rows} Coverage={coverage:.1%} Time={elapsed/60:.1f}min", flush=True)
     return {
         "label": label,
         "table": table,
         "total": total,
         "ok": ok,
         "fail": fail,
-        "rows": written_rows,
+        "rows": published_rows,
+        "staged_rows": staged_rows,
         "coverage": round(coverage, 4),
     }
 
@@ -457,7 +651,7 @@ def crawl_flow(
     staged_rows = 0
     published_rows = 0
     t0 = time.time()
-    stage = _create_flow_stage(engine)
+    stage, stage_connection = _create_flow_stage(engine)
     try:
         for i, (code, market) in enumerate(codes):
             klines = fetch_with_retries(fetch_minute_flow, code, market)
@@ -484,25 +678,30 @@ def crawl_flow(
 
             if len(buffer) >= 5000:
                 print(f"    Staging {len(buffer)} rows...", flush=True)
-                staged_rows += _append_flow_stage(engine, stage, buffer)
+                staged_rows += _append_flow_stage(stage_connection, stage, buffer)
                 buffer.clear()
 
         if buffer:
             print(f"    Staging {len(buffer)} rows...", flush=True)
-            staged_rows += _append_flow_stage(engine, stage, buffer)
+            staged_rows += _append_flow_stage(stage_connection, stage, buffer)
 
         coverage = ok / total if total else 0
         if total > 0 and coverage >= min_coverage:
-            published_rows = _publish_flow_stage(engine, stage, trade_date)
+            published_rows = _publish_flow_stage(
+                engine,
+                stage_connection,
+                stage,
+                trade_date,
+            )
     except BaseException:
         # Preserve the collection/publish failure if cleanup also fails.
         try:
-            _drop_flow_stage(engine, stage)
+            _drop_flow_stage(stage_connection)
         except Exception:
             pass
         raise
     else:
-        _drop_flow_stage(engine, stage)
+        _drop_flow_stage(stage_connection)
 
     elapsed = time.time() - t0
     coverage = ok / total if total else 0
@@ -570,18 +769,32 @@ def main():
     summaries: list[dict] = []
 
     if args.type in ("stock", "all"):
-        codes = get_latest_kline_stock_codes(engine)
-        summaries.append(crawl_kline(engine, codes, "sm_stock_minute", "Stock 1-min", args.limit))
+        stock_minute_engine = get_kline_engine()
+        codes = get_latest_kline_stock_codes(
+            stock_minute_engine,
+            fallback_engine=engine,
+        )
+        summaries.append(
+            crawl_kline(
+                stock_minute_engine,
+                codes,
+                "sm_stock_minute",
+                "Stock 1-min",
+                args.limit,
+                args.min_coverage,
+                receipt_engine=engine,
+            )
+        )
 
     if args.type in ("index", "all"):
         codes = get_codes(engine, "si_all_index_code", "index_code")
-        summaries.append(crawl_kline(engine, codes, "sm_index_minute", "Index 1-min", args.limit))
+        summaries.append(crawl_kline(engine, codes, "sm_index_minute", "Index 1-min", args.limit, args.min_coverage))
 
     if args.type in ("concept", "all"):
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT index_code FROM si_concept_code_east ORDER BY index_code")).fetchall()
         codes = [(str(r[0]), 90) for r in rows]
-        summaries.append(crawl_kline(engine, codes, "sm_concept_east_minute", "Concept 1-min", args.limit))
+        summaries.append(crawl_kline(engine, codes, "sm_concept_east_minute", "Concept 1-min", args.limit, args.min_coverage))
 
     if args.type in ("flow", "all"):
         kline_engine = get_kline_engine()

@@ -21,6 +21,14 @@ import httpx
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
+
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +60,35 @@ CREATE TABLE IF NOT EXISTS {DELIVERY_RECEIPT_TABLE} (
     updated_at DATETIME NOT NULL
 )
 """
+_MYSQL_RECEIPT_DDL = (
+    _RECEIPT_DDL.rstrip()
+    + " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
+)
+
+_DELIVERY_RECEIPT_CONTRACT = {
+    DELIVERY_RECEIPT_TABLE: RuntimeTable(
+        columns={
+            "delivery_id": RuntimeColumn("varchar", False, character_length=36),
+            "delivery_kind": RuntimeColumn("varchar", False, character_length=64),
+            "webhook_kind": RuntimeColumn("varchar", False, character_length=32),
+            "content_sha256": RuntimeColumn("char", False, character_length=64),
+            "content_bytes": RuntimeColumn("bigint", False, numeric_precision=19, numeric_scale=0),
+            "segment_count": RuntimeColumn("int", False, numeric_precision=10, numeric_scale=0),
+            "delivered_count": RuntimeColumn("int", False, numeric_precision=10, numeric_scale=0),
+            "status": RuntimeColumn("varchar", False, character_length=16),
+            "error_code": RuntimeColumn("varchar", True, character_length=64),
+            "error_message": RuntimeColumn("varchar", True, character_length=512),
+            "segments_json": RuntimeColumn("text", False, character_length=65535),
+            "started_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "finished_at": RuntimeColumn("datetime", True, datetime_precision=0),
+            "updated_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("delivery_id",), unique=True),
+            RuntimeIndex(("started_at",), unique=False),
+        ),
+    )
+}
 
 
 @dataclass(frozen=True)
@@ -212,31 +249,86 @@ def build_markdown_segments(
     return segments
 
 
-def ensure_delivery_receipt_table(engine: Engine) -> None:
-    """Create/upgrade the portable receipt table and its retention index."""
+def _validate_sqlite_delivery_receipt(engine: Engine) -> None:
+    inspector = inspect(engine)
+    if DELIVERY_RECEIPT_TABLE not in set(inspector.get_table_names()):
+        raise RuntimeError("WeCom delivery receipt schema is not prepared")
+    columns = {str(item["name"]) for item in inspector.get_columns(DELIVERY_RECEIPT_TABLE)}
+    if columns != set(_DELIVERY_RECEIPT_CONTRACT[DELIVERY_RECEIPT_TABLE].columns):
+        raise RuntimeError("WeCom delivery receipt columns differ")
+    shapes = {
+        tuple(str(column) for column in (item.get("column_names") or ()))
+        for item in inspector.get_indexes(DELIVERY_RECEIPT_TABLE)
+    }
+    primary = tuple(
+        str(column)
+        for column in (
+            inspector.get_pk_constraint(DELIVERY_RECEIPT_TABLE).get("constrained_columns")
+            or ()
+        )
+    )
+    if primary != ("delivery_id",) or ("started_at",) not in shapes:
+        raise RuntimeError("WeCom delivery receipt indexes differ")
+
+
+def validate_delivery_receipt_runtime(engine: Engine) -> dict[str, Any]:
+    """Read-only validation used by every delivery attempt."""
+    if engine.dialect.name == "mysql":
+        validate_runtime_tables(
+            engine,
+            _DELIVERY_RECEIPT_CONTRACT,
+            context="WeCom delivery receipt",
+        )
+    else:
+        _validate_sqlite_delivery_receipt(engine)
+    return {
+        "schema": "probiga.wecom-delivery-receipt.v1",
+        "status": "HEALTHY",
+        "table_count": 1,
+        "physical_schema_verified": True,
+        "runtime_ddl_required": False,
+        "read_only": True,
+    }
+
+
+def privileged_migrate_delivery_receipt_table(engine: Engine) -> dict[str, Any]:
+    """Create/upgrade the receipt table only in the fenced release window."""
 
     with engine.begin() as connection:
-        connection.execute(text(_RECEIPT_DDL))
+        connection.execute(text(
+            _MYSQL_RECEIPT_DDL
+            if engine.dialect.name == "mysql"
+            else _RECEIPT_DDL
+        ))
         indexes = inspect(connection).get_indexes(DELIVERY_RECEIPT_TABLE)
         index_shapes = {
             tuple(str(column) for column in (item.get("column_names") or ()))
             for item in indexes
         }
-        if ("started_at",) in index_shapes:
-            return
-
-        used_names = {str(item.get("name") or "") for item in indexes}
-        index_name = DELIVERY_RECEIPT_STARTED_AT_INDEX
-        suffix = 2
-        while index_name in used_names:
-            index_name = f"{DELIVERY_RECEIPT_STARTED_AT_INDEX}_{suffix}"
-            suffix += 1
-        connection.execute(
-            text(
-                f"CREATE INDEX `{index_name}` "
-                f"ON `{DELIVERY_RECEIPT_TABLE}` (`started_at`)"
+        if ("started_at",) not in index_shapes:
+            used_names = {str(item.get("name") or "") for item in indexes}
+            index_name = DELIVERY_RECEIPT_STARTED_AT_INDEX
+            suffix = 2
+            while index_name in used_names:
+                index_name = f"{DELIVERY_RECEIPT_STARTED_AT_INDEX}_{suffix}"
+                suffix += 1
+            connection.execute(
+                text(
+                    f"CREATE INDEX `{index_name}` "
+                    f"ON `{DELIVERY_RECEIPT_TABLE}` (`started_at`)"
+                )
             )
-        )
+        if engine.dialect.name == "mysql":
+            privileged_normalize_mysql_storage(
+                connection,
+                _DELIVERY_RECEIPT_CONTRACT,
+            )
+    return validate_delivery_receipt_runtime(engine)
+
+
+def ensure_delivery_receipt_table(engine: Engine) -> None:
+    """Compatibility runtime guard; never performs persistent DDL."""
+    validate_delivery_receipt_runtime(engine)
 
 
 def _insert_receipt(

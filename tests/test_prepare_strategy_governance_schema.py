@@ -25,11 +25,19 @@ RUNTIME_GRANTS = (
     "GRANT USAGE ON *.* TO `probiga_runtime`@`127.0.0.1` REQUIRE SSL",
     "GRANT SELECT ON `biga`.* TO "
     "`probiga_runtime`@`127.0.0.1`",
-    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, "
-    "REFERENCES, CREATE TEMPORARY TABLES ON `probiga`.* TO "
+    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES "
+    "ON `probiga`.* TO "
     "`probiga_runtime`@`127.0.0.1`",
     "GRANT SELECT ON `probiga_qmt_history`.* TO "
     "`probiga_runtime`@`127.0.0.1`",
+)
+LEGACY_RUNTIME_GRANTS = (
+    RUNTIME_GRANTS[0],
+    RUNTIME_GRANTS[1],
+    "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, "
+    "REFERENCES, CREATE TEMPORARY TABLES ON `probiga`.* TO "
+    "`probiga_runtime`@`127.0.0.1`",
+    RUNTIME_GRANTS[3],
 )
 
 
@@ -404,33 +412,85 @@ def test_all_three_database_identity_grant_boundaries_accept_exact_grants():
     schema._validate_admin_grants(ADMIN_GRANTS)
     schema._validate_migrator_grants(MIGRATOR_GRANTS)
     schema._validate_runtime_grants(RUNTIME_GRANTS)
+    schema._validate_runtime_grants(LEGACY_RUNTIME_GRANTS)
 
 
 def test_runtime_grant_summary_is_exact_and_safe_to_publish():
     detail = schema._runtime_grant_summary(RUNTIME_GRANTS)
 
     assert detail == {
+        "observed_contract": "TARGET_LEAST_PRIVILEGE",
+        "persistent_ddl_privileges": [],
         "global_privileges": ["USAGE"],
         "schema_privileges": {
             "BIGA.*": ["SELECT"],
             "PROBIGA.*": [
-                "ALTER",
-                "CREATE",
                 "CREATE TEMPORARY TABLES",
                 "DELETE",
-                "DROP",
-                "INDEX",
                 "INSERT",
-                "REFERENCES",
                 "SELECT",
                 "UPDATE",
             ],
             "PROBIGA_QMT_HISTORY.*": ["SELECT"],
         },
+        "funding_append_only_tables": [
+            "st_strategy_funding_checkpoint",
+            "st_strategy_funding_daily_fact",
+        ],
+        "funding_append_only_verified": True,
+        "funding_row_mutation_denied_by_triggers": ["DELETE", "UPDATE"],
+        "funding_structural_bypass_privileges": [],
+        "truncate_denied_by_absent_drop_privilege": True,
+        "trigger_drop_denied_by_absent_trigger_privilege": True,
         "require_ssl": True,
         "roles": [],
         "grant_option": False,
     }
+
+
+def test_runtime_grant_summary_reports_legacy_ddl_compatibility_truthfully():
+    detail = schema._runtime_grant_summary(LEGACY_RUNTIME_GRANTS)
+
+    assert detail["observed_contract"] == "LEGACY_DDL_COMPATIBILITY"
+    assert detail["persistent_ddl_privileges"] == [
+        "ALTER",
+        "CREATE",
+        "DROP",
+        "INDEX",
+        "REFERENCES",
+    ]
+    assert detail["funding_structural_bypass_privileges"] == detail[
+        "persistent_ddl_privileges"
+    ]
+    assert detail["truncate_denied_by_absent_drop_privilege"] is False
+    assert detail["trigger_drop_denied_by_absent_trigger_privilege"] is True
+
+
+@pytest.mark.parametrize(
+    "probiga_privileges",
+    (
+        # A partial legacy grant is neither the target nor the frozen legacy
+        # compatibility contract.
+        "SELECT, INSERT, UPDATE, DELETE, CREATE, CREATE TEMPORARY TABLES",
+        # No capability beyond either exact contract is tolerated.
+        "SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES, TRIGGER",
+        "SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, "
+        "REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES",
+    ),
+)
+def test_runtime_grants_accept_only_target_or_exact_legacy_contract(
+    probiga_privileges,
+):
+    forged = (
+        RUNTIME_GRANTS[0],
+        RUNTIME_GRANTS[1],
+        f"GRANT {probiga_privileges} ON `probiga`.* TO "
+        "`probiga_runtime`@`127.0.0.1`",
+        RUNTIME_GRANTS[3],
+    )
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_runtime_grants(forged)
 
 
 @pytest.mark.parametrize(
@@ -464,6 +524,18 @@ def test_runtime_grants_reject_all_trust_window_capabilities(forged_grant):
 
     with pytest.raises(schema.PrivilegedSchemaPreparationError):
         schema._validate_runtime_grants(forged)
+
+
+def test_runtime_grants_deny_every_funding_structural_bypass_privilege():
+    detail = schema._runtime_grant_summary(RUNTIME_GRANTS)
+
+    probiga = set(detail["schema_privileges"]["PROBIGA.*"])
+    assert {"DROP", "ALTER", "INDEX", "REFERENCES", "TRIGGER"}.isdisjoint(
+        probiga
+    )
+    assert detail["truncate_denied_by_absent_drop_privilege"] is True
+    assert detail["trigger_drop_denied_by_absent_trigger_privilege"] is True
+    assert detail["persistent_ddl_privileges"] == []
 
 
 class _RoutineInventoryResult:
@@ -824,6 +896,119 @@ def test_trigger_inventory_allows_required_and_optional_absence(monkeypatch):
         statement.lstrip().startswith("SELECT ")
         for statement in connection.statements
     )
+
+
+class _FrozenTriggerConnection:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def execute(self, statement, _params=None):
+        self.engine.statements.append(str(statement))
+        return _InventoryResult(self.engine.rows)
+
+
+class _FrozenTriggerEngine:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.statements: list[str] = []
+
+    def connect(self):
+        return nullcontext(_FrozenTriggerConnection(self))
+
+
+def test_frozen_release_trigger_ensure_is_no_delta_without_trust_window():
+    contracts = {
+        contract.name: contract
+        for contract in (
+            _contract("trg_exact_a"),
+            _contract("trg_exact_b", table="controlled_audit"),
+        )
+    }
+    engine = _FrozenTriggerEngine([
+        _trigger_row(contract) for contract in contracts.values()
+    ])
+
+    detail = schema._ensure_frozen_release_triggers(
+        engine,
+        contracts,
+        expected_names=contracts,
+        expected_source_contract_hash=(
+            schema._release_trigger_source_contract_hash(contracts)
+        ),
+        trigger_ddl_executor=lambda _statement: pytest.fail(
+            "no-delta inventory opened a trigger trust window"
+        ),
+    )
+
+    assert detail["created_names"] == []
+    assert detail["created_count"] == 0
+    assert detail["observed_count"] == 2
+    assert detail["metadata_frozen"] is True
+
+
+def test_frozen_release_trigger_ensure_creates_only_missing_then_reads_back():
+    contracts = {
+        contract.name: contract
+        for contract in (
+            _contract("trg_exact_a"),
+            _contract("trg_exact_b", table="controlled_audit"),
+        )
+    }
+    engine = _FrozenTriggerEngine([
+        _trigger_row(contracts["trg_exact_a"])
+    ])
+    created: list[str] = []
+
+    def create(statement):
+        contract = schema._parse_create_trigger(
+            statement,
+            normalizer="governance",
+            owner="test",
+        )
+        created.append(contract.name)
+        engine.rows.append(_trigger_row(contracts[contract.name]))
+
+    detail = schema._ensure_frozen_release_triggers(
+        engine,
+        contracts,
+        expected_names=contracts,
+        expected_source_contract_hash=(
+            schema._release_trigger_source_contract_hash(contracts)
+        ),
+        trigger_ddl_executor=create,
+    )
+
+    assert created == ["trg_exact_b"]
+    assert detail["created_names"] == created
+    assert detail["created_count"] == 1
+    assert detail["observed_count"] == 2
+    assert detail["metadata_frozen"] is True
+
+
+@pytest.mark.parametrize("drift", ("source_hash", "name_set", "metadata"))
+def test_frozen_release_trigger_ensure_fails_before_create_on_drift(drift):
+    contracts = {"trg_exact_a": _contract("trg_exact_a")}
+    rows = [_trigger_row(contracts["trg_exact_a"])]
+    expected_names = set(contracts)
+    expected_hash = schema._release_trigger_source_contract_hash(contracts)
+    if drift == "source_hash":
+        expected_hash = "0" * 64
+    elif drift == "name_set":
+        expected_names.add("trg_unfrozen")
+    else:
+        rows[0]["definer"] = "runtime@127.0.0.1"
+    engine = _FrozenTriggerEngine(rows)
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._ensure_frozen_release_triggers(
+            engine,
+            contracts,
+            expected_names=expected_names,
+            expected_source_contract_hash=expected_hash,
+            trigger_ddl_executor=lambda _statement: pytest.fail(
+                "drifted inventory attempted privileged CREATE"
+            ),
+        )
 
 
 @pytest.mark.parametrize("case", ("missing", "forbidden", "unexpected"))
@@ -1263,10 +1448,17 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch,
 ):
     from server.api.routers import _engine as api_engine_module
+    from server.common import pit_facts
+    from server.common import production_runtime_schema_bundle
+    from server.common import qmt_history_coverage
+    from server.common import scheduler_runtime_schema
+    from server.common import scheduler_task_history_schema
     from server.db import migrations_v3
+    from server.engine import dynamic_shadow_ledger_schema
     from server.engine import strategy_governance
     from tools import attest_qmt_daily_kline
     from tools import prepare_strategy_governance_qmt_history as qmt_history
+    from tools import sync_guojin_qmt_reference_data as qmt_reference
 
     boundary = _boundary(trust=0)
     boundary.migrator_engine = _NoDeltaEngine()
@@ -1286,6 +1478,57 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
     monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
     monkeypatch.setattr(
+        scheduler_runtime_schema,
+        "migrate_scheduler_runtime_heartbeat",
+        lambda _engine: calls.append("scheduler-runtime-migration-off") or {
+            "status": "ok",
+            "physical_contract_verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        scheduler_runtime_schema,
+        "validate_scheduler_runtime_heartbeat_schema",
+        lambda _engine: calls.append("scheduler-runtime-validate") or {
+            "physical_contract_verified": True,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        scheduler_task_history_schema,
+        "migrate_scheduler_task_history",
+        lambda _engine: calls.append("scheduler-history-migration-off") or {
+            "status": "ok",
+            "physical_contract_verified": True,
+        },
+    )
+    monkeypatch.setattr(
+        scheduler_task_history_schema,
+        "validate_scheduler_task_history_schema",
+        lambda _engine: calls.append("scheduler-history-validate") or {
+            "physical_contract_verified": True,
+            "runtime_ddl_required": False,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        production_runtime_schema_bundle,
+        "privileged_migrate_runtime_schema_bundle",
+        lambda _engine: calls.append("runtime-schema-bundle-off") or {
+            "migrations": {},
+            "seeds": {},
+            "runtime_ddl_required": False,
+        },
+    )
+    monkeypatch.setattr(
+        production_runtime_schema_bundle,
+        "validate_runtime_schema_bundle",
+        lambda _engine: calls.append("runtime-schema-bundle-validate") or {
+            "contracts": {},
+            "runtime_ddl_required": False,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
         schema,
         "_set_trust",
         lambda *_args, **_kwargs: pytest.fail("no-delta cutover enabled trust"),
@@ -1293,6 +1536,31 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(schema, "_all_v3_trigger_contracts", lambda: ())
     monkeypatch.setattr(schema, "_final_v3_trigger_contracts", lambda: {})
     monkeypatch.setattr(schema, "_non_v3_trigger_contracts", lambda: {})
+    monkeypatch.setattr(
+        schema,
+        "_frozen_non_v3_release_trigger_contracts",
+        lambda _contracts: {},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_frozen_governance_release_trigger_contracts",
+        lambda _contracts: {},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_ensure_frozen_release_triggers",
+        lambda *_args, **_kwargs: {
+            "required_count": 0,
+            "observed_count": 0,
+            "metadata_frozen": True,
+            "source_contract_hash": (
+                schema.EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "expected_names": [],
+            "created_names": [],
+            "created_count": 0,
+        },
+    )
     monkeypatch.setattr(schema, "_v3_trigger_states", lambda _plan: ({}, {}))
     monkeypatch.setattr(
         schema,
@@ -1329,8 +1597,47 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
 
     monkeypatch.setattr(migrations_v3, "run_v3_migrations", fake_migrations)
     monkeypatch.setattr(
+        schema,
+        "_prepare_qmt_reference_schema_tables",
+        lambda _engine: calls.append("qmt-reference-schema-off") or {
+            "contract_hash": qmt_reference.REFERENCE_SCHEMA_CONTRACT_HASH,
+            "table_names": list(qmt_reference.REFERENCE_TABLE_NAMES),
+            "trigger_names": list(qmt_reference.REFERENCE_TRIGGER_NAMES),
+            "table_ddl_count": 5,
+            "migration_ddl_count": 9,
+            "runtime_ddl_required": False,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_prepare_qmt_history_coverage_schema_tables",
+        lambda _engine: calls.append("qmt-coverage-schema-off") or {
+            "database": "probiga",
+            "table_names": list(
+                qmt_history_coverage.COVERAGE_TABLE_NAMES
+            ),
+            "trigger_names": list(
+                qmt_history_coverage.COVERAGE_TRIGGER_NAMES
+            ),
+            "table_ddl_count": 2,
+            "trigger_ddl_count": 4,
+            "runtime_ddl_required": False,
+        },
+    )
+    monkeypatch.setattr(
+        qmt_history_coverage,
+        "validate_coverage_schema",
+        lambda *_args, **_kwargs: {
+            "database": "probiga",
+            "table_count": 2,
+            "trigger_count": 4,
+            "physical_schema_verified": True,
+            "physical_seal_verified": True,
+        },
+    )
+    monkeypatch.setattr(
         attest_qmt_daily_kline,
-        "ensure_attestation_tables",
+        "privileged_migrate_attestation_tables",
         lambda _engine, **kwargs: (
             calls.append("qmt-schema-off"),
             assert_callable(kwargs.get("trigger_ddl_executor")),
@@ -1347,12 +1654,57 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         lambda _engine: {"legacy_run_count": 0},
     )
     monkeypatch.setattr(
+        pit_facts,
+        "ensure_pit_fact_schema",
+        lambda _engine, **kwargs: (
+            calls.append("pit-schema-off")
+            or {
+                "status": "READY",
+                "trigger_ddl_executor": callable(
+                    kwargs.get("trigger_ddl_executor")
+                ),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        pit_facts,
+        "pit_fact_schema_health",
+        lambda _engine: {"valid": True},
+    )
+    monkeypatch.setattr(
+        qmt_reference,
+        "attest_prepared_reference_schema",
+        lambda _engine: {
+            "contract_key": qmt_reference.REFERENCE_SCHEMA_CONTRACT_KEY,
+            "contract_hash": qmt_reference.REFERENCE_SCHEMA_CONTRACT_HASH,
+            "table_contract_hash": "a" * 64,
+            "trigger_contract_hash": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        qmt_reference,
+        "validate_reference_tables",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
         strategy_governance,
         "ensure_strategy_governance_tables",
         lambda **kwargs: (
             calls.append("governance-schema-off"),
             assert_callable(kwargs.get("trigger_ddl_executor")),
         ),
+    )
+    monkeypatch.setattr(
+        dynamic_shadow_ledger_schema,
+        "validate_dynamic_shadow_ledger_schema",
+        lambda _connection: {
+            "table_count": 4,
+            "column_count": 57,
+            "index_count": 22,
+            "foreign_key_count": 15,
+            "check_count": 10,
+            "contract_hash": "d" * 64,
+        },
     )
     monkeypatch.setattr(
         strategy_governance,
@@ -1362,7 +1714,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         strategy_governance,
         "validate_metric_input_review_triggers",
-        lambda _connection: {"trigger_count": 0},
+        lambda _connection: {
+            "trigger_count": 2,
+            "trigger_names": sorted(
+                strategy_governance.EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+            ),
+            "contract_hash": (
+                strategy_governance.METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+            ),
+        },
     )
     monkeypatch.setattr(
         strategy_governance,
@@ -1376,7 +1736,38 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         strategy_governance,
         "validate_governance_append_only_triggers",
-        lambda _engine: {"trigger_count": 0},
+        lambda _engine: {
+            "trigger_count": 38,
+            "trigger_names": sorted(
+                strategy_governance.EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+            ),
+            "contract_hash": (
+                strategy_governance.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_strategy_funding_checkpoint_schema",
+        lambda _connection: {
+            "table_count": 2,
+            "tables": {
+                "st_strategy_funding_daily_fact": {
+                    "column_count": 29,
+                    "index_count": 9,
+                    "foreign_key_count": 3,
+                    "check_count": 7,
+                },
+                "st_strategy_funding_checkpoint": {
+                    "column_count": 46,
+                    "index_count": 12,
+                    "foreign_key_count": 7,
+                    "check_count": 13,
+                },
+            },
+            "trigger_count": 4,
+                "contract_hash": schema.EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH,
+        },
     )
     monkeypatch.setattr(
         strategy_governance,
@@ -1399,8 +1790,14 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert detail["trigger_trust_window_count"] == 0
     assert detail["trigger_trust_window_names"] == []
     assert detail["global_trust_changed"] is False
+    assert detail["governance_trigger_count"] == 40
+    assert detail["governance_append_only_trigger_count"] == 38
+    assert detail["governance_metric_review_trigger_count"] == 2
+    assert detail["funding_checkpoint_trigger_count"] == 4
     assert detail["trust_restoration_verified"] is True
     assert detail["runtime_least_privilege_verified"] is True
+    assert calls.count("scheduler-runtime-migration-off") == 1
+    assert calls.count("scheduler-runtime-validate") == 1
     assert calls.count("triple-off") == 1
 
 
@@ -1675,6 +2072,9 @@ def test_recover_forces_admin_off_before_broken_project_environment(
 
 
 class _ReadOnlyResult:
+    def mappings(self):
+        return self
+
     def __iter__(self):
         return iter(())
 
@@ -1700,9 +2100,12 @@ class _ReadOnlyEngine:
 
 
 def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
+    from server.common import pit_facts
     from server.db import migrations_v3
+    from server.engine import dynamic_shadow_ledger_schema
     from server.engine import strategy_governance
     from tools import attest_qmt_daily_kline
+    from tools import sync_guojin_qmt_reference_data as qmt_reference
 
     engine = _ReadOnlyEngine()
     dry_run_calls: list[bool] = []
@@ -1715,6 +2118,16 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
     monkeypatch.setattr(migrations_v3, "run_v3_migrations", dry_run_only)
     monkeypatch.setattr(schema, "_v3_trigger_states", lambda _plan: ({}, {}))
     monkeypatch.setattr(schema, "_non_v3_trigger_contracts", lambda: {})
+    monkeypatch.setattr(
+        schema,
+        "_frozen_non_v3_release_trigger_contracts",
+        lambda _contracts: {},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_frozen_governance_release_trigger_contracts",
+        lambda _contracts: {},
+    )
     monkeypatch.setattr(
         schema,
         "_runtime_least_privilege_evidence",
@@ -1730,6 +2143,31 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
         "ensure_strategy_governance_tables",
         lambda *_args, **_kwargs: pytest.fail("preflight called governance DDL"),
     )
+    monkeypatch.setattr(
+        dynamic_shadow_ledger_schema,
+        "preflight_dynamic_shadow_ledger_schema_upgrade",
+        lambda _connection: {
+            "status": "ABSENT_CREATE_ALLOWED",
+            "expected_table_count": 4,
+            "real_order_authority": False,
+        },
+    )
+    monkeypatch.setattr(
+        pit_facts,
+        "preflight_pit_fact_schema",
+        lambda _connection: {"status": "ABSENT_CREATE_ALLOWED"},
+    )
+    monkeypatch.setattr(
+        qmt_reference,
+        "preflight_reference_tables",
+        lambda observed_engine: {
+            "status": "EMPTY",
+            "read_only": True,
+            "contract_hash": qmt_reference.REFERENCE_SCHEMA_CONTRACT_HASH,
+        }
+        if observed_engine is engine
+        else pytest.fail("wrong QMT reference preflight engine"),
+    )
     boundary = SimpleNamespace(migrator_engine=engine)
 
     detail = schema._preflight_schema(boundary)
@@ -1737,11 +2175,68 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
     assert dry_run_calls == [True]
     assert detail["qmt_table_count"] == 0
     assert detail["governance_table_count"] == 0
+    assert detail["dynamic_shadow_schema"]["status"] == (
+        "ABSENT_CREATE_ALLOWED"
+    )
+    assert detail["qmt_reference_schema"]["status"] == "EMPTY"
     assert engine.connection.statements
     assert all(
-        statement.upper().startswith("SELECT ")
+        statement.upper().startswith(("SELECT ", "SHOW "))
         for statement in engine.connection.statements
     )
+
+
+def test_non_v3_release_contract_freezes_all_truth_guards():
+    from tools.sync_guojin_qmt_reference_data import REFERENCE_TRIGGER_NAMES
+
+    contracts = schema._frozen_non_v3_release_trigger_contracts(
+        schema._non_v3_trigger_contracts()
+    )
+
+    assert len(contracts) == schema.EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
+    assert schema._release_trigger_source_contract_hash(contracts) == (
+        schema.EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+    )
+    assert set(REFERENCE_TRIGGER_NAMES) <= set(contracts)
+    assert {
+        "trg_qmt_kline_attestation_run_completed_bu",
+        "trg_qmt_kline_attestation_run_completed_bd",
+        "trg_pit_source_coverage_immutable_bu",
+        "trg_pit_source_coverage_immutable_bd",
+    } <= set(contracts)
+
+
+def test_qmt_reference_table_preparation_never_creates_triggers():
+    from tools.sync_guojin_qmt_reference_data import (
+        REFERENCE_SCHEMA_CONTRACT_HASH,
+        REFERENCE_TABLE_NAMES,
+        REFERENCE_TRIGGER_NAMES,
+        reference_migration_ddl_contracts,
+        reference_table_ddl_contracts,
+    )
+
+    statements: list[str] = []
+
+    class _Connection:
+        def execute(self, statement, _params=None):
+            statements.append(str(statement).strip())
+            return _ReadOnlyResult()
+
+    class _Engine:
+        def begin(self):
+            return nullcontext(_Connection())
+
+    detail = schema._prepare_qmt_reference_schema_tables(_Engine())
+
+    assert detail["contract_hash"] == REFERENCE_SCHEMA_CONTRACT_HASH
+    assert detail["table_names"] == list(REFERENCE_TABLE_NAMES)
+    assert detail["trigger_names"] == list(REFERENCE_TRIGGER_NAMES)
+    assert len(statements) == (
+        len(reference_table_ddl_contracts())
+        + len(reference_migration_ddl_contracts())
+    )
+    assert not any("CREATE TRIGGER" in statement.upper() for statement in statements)
+    assert detail["runtime_ddl_required"] is False
 
 
 @pytest.mark.parametrize(

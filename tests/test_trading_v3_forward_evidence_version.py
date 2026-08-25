@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from decimal import Decimal
@@ -12,6 +13,7 @@ from server.trading_v3.forward_evidence import (
     INTENT_EPISODE_PROTOCOL,
     _assert_persisted_exit_allocations,
     _ownership_hash,
+    _require_valid_dynamic_shadow_binding,
     _sample_owner,
     intent_episode_id,
     primary_strategy_version,
@@ -46,6 +48,7 @@ def _buy_row(*, evidence_overrides: dict[str, object] | None = None):
             FORECAST_ID,
             STOCK_CODE,
             STRATEGY_KEY,
+            STRATEGY_VERSION,
         ),
     }
     payload.update(evidence_overrides or {})
@@ -118,6 +121,56 @@ def test_forward_owner_binds_relational_run_model_and_strategy_version():
     )
     assert missing_owner is None
     assert missing_rejection == "SOURCE_INTENT_ID_MISSING"
+
+
+def test_runtime_registry_owner_uses_hash_verified_governance_version():
+    receipt_payload = {
+        "schema": "probiga.governance-paper-buy-receipt.v1",
+        "strategy_key": STRATEGY_KEY,
+        "strategy_version": "registry-v7",
+        "strategy_version_hash": "1" * 64,
+        "strategy_source_kind": "runtime_registry",
+        "real_order_authority": False,
+    }
+    receipt = {
+        **receipt_payload,
+        "receipt_hash": hashlib.sha256(json.dumps(
+            receipt_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest(),
+    }
+    owner, rejection = _sample_owner(
+        _buy_row(evidence_overrides={
+            "primary_strategy_version": "registry-v7",
+            "ownership_hash": _ownership_hash(
+                RUN_UID,
+                FORECAST_ID,
+                STOCK_CODE,
+                STRATEGY_KEY,
+                "registry-v7",
+            ),
+            "strategy_governance": receipt,
+        }),
+        _forecast_ids(),
+        {RUN_UID: MODEL_VERSION},
+    )
+    assert rejection == ""
+    assert owner is not None
+    assert owner["strategy_version"] == "registry-v7"
+
+    forged = {**receipt, "strategy_version": "registry-v8"}
+    forged_owner, forged_rejection = _sample_owner(
+        _buy_row(evidence_overrides={
+            "primary_strategy_version": "registry-v8",
+            "strategy_governance": forged,
+        }),
+        _forecast_ids(),
+        {RUN_UID: MODEL_VERSION},
+    )
+    assert forged_owner is None
+    assert forged_rejection == "RUNTIME_GOVERNANCE_RECEIPT_INVALID"
 
 
 @pytest.mark.parametrize(
@@ -474,3 +527,50 @@ def test_persisted_allocation_replay_rejects_missing_or_tampered_rows():
             allocations,
             account_id="paper-main-v2",
         )
+
+
+def test_unattributed_fill_identity_is_distinct_across_rejection_reasons():
+    invalid = _buy_row(evidence_overrides={"primary_strategy_key": ""})
+    diagnostics = {"DYNAMIC_SHADOW_BOOTSTRAP_AUTHORIZATION_INVALID": 1}
+    rejected_fill_ids = {str(invalid["fill_id"])}
+
+    records = reconstruct_executed_forward_records(
+        (invalid,),
+        forecast_ids=_forecast_ids(),
+        run_model_versions={RUN_UID: MODEL_VERSION},
+        diagnostics=diagnostics,
+        diagnostic_fill_ids=rejected_fill_ids,
+    )
+
+    assert records == []
+    assert sum(diagnostics.values()) == 2
+    assert rejected_fill_ids == {"buy-fill-1"}
+
+
+@pytest.mark.parametrize("status", ["INVALID", "UNAVAILABLE_OR_INVALID", ""])
+def test_dynamic_shadow_binding_failure_cannot_be_reported_as_success(status):
+    with pytest.raises(RuntimeError, match="failed closed"):
+        _require_valid_dynamic_shadow_binding({"status": status})
+
+
+def test_counterfactual_worker_stops_before_writes_on_forward_integrity_failure(
+    monkeypatch,
+):
+    from server.trading_v3 import counterfactual_worker as worker
+
+    pending_called = False
+
+    def _failed_sync(*_args, **_kwargs):
+        raise RuntimeError("dynamic shadow evidence binding failed closed")
+
+    def _pending(*_args, **_kwargs):
+        nonlocal pending_called
+        pending_called = True
+        return []
+
+    monkeypatch.setattr(worker, "sync_executed_forward_evidence", _failed_sync)
+    monkeypatch.setattr(worker, "_pending_forecasts", _pending)
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        worker.run_counterfactual_audit(object(), object())
+    assert pending_called is False

@@ -167,6 +167,7 @@ class AuthorityClaim:
     trade_date: date
     event_at: datetime | None = None
     received_at: datetime | None = None
+    stock_code: str | None = None
     claim_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -198,24 +199,35 @@ class AuthorityClaim:
                     raise AuthorityVerificationError(
                         f"{name} cannot follow available_at"
                     )
+        stock_code = self.stock_code
+        if stock_code is not None:
+            stock_code = _identity_text(stock_code, "stock_code", maximum=16)
+        object.__setattr__(self, "stock_code", stock_code)
+        claim_payload = {
+            "evidence_type": self.evidence_type,
+            "evidence_id": self.evidence_id,
+            "source_provider": self.source_provider,
+            "source_payload_hash": self.source_payload_hash,
+            "receipt_type": self.receipt_type,
+            "receipt_id": self.receipt_id,
+            "receipt_hash": self.receipt_hash,
+            "available_at": self.available_at,
+            "trade_date": self.trade_date,
+            "event_at": self.event_at,
+            "received_at": self.received_at,
+        }
+        if stock_code is not None:
+            claim_payload["stock_code"] = stock_code
         object.__setattr__(
             self,
             "claim_hash",
             _digest(
-                "trading-v2.authority-claim.v1",
-                {
-                    "evidence_type": self.evidence_type,
-                    "evidence_id": self.evidence_id,
-                    "source_provider": self.source_provider,
-                    "source_payload_hash": self.source_payload_hash,
-                    "receipt_type": self.receipt_type,
-                    "receipt_id": self.receipt_id,
-                    "receipt_hash": self.receipt_hash,
-                    "available_at": self.available_at,
-                    "trade_date": self.trade_date,
-                    "event_at": self.event_at,
-                    "received_at": self.received_at,
-                },
+                (
+                    "trading-v2.authority-claim.v2"
+                    if stock_code is not None
+                    else "trading-v2.authority-claim.v1"
+                ),
+                claim_payload,
             ),
         )
 
@@ -939,8 +951,27 @@ class MySQLRegistryBackedAuthorityVerifier:
             return self._denied(claim, "TRUST_KEY_REVOKED", now)
         return record
 
+    def _source_receipt_decision(
+        self,
+        connection: Any,
+        claim: AuthorityClaim,
+        now: datetime,
+    ) -> AuthorityDecision | None:
+        if claim.receipt_type != QuoteReceiptType.QMT_MINUTE.value:
+            return None
+        return MySQLReceiptRegistryAuthorityVerifier(
+            clock=lambda: now
+        ).verify(connection, claim)
+
     def verify(self, connection: Any, claim: AuthorityClaim) -> AuthorityDecision:
         now = _aware(self._clock(), "verifier clock")
+        source_receipt = self._source_receipt_decision(
+            connection,
+            claim,
+            now,
+        )
+        if source_receipt is not None and not source_receipt.verified:
+            return self._denied(claim, source_receipt.reason_code, now)
         loaded = self._record(connection, claim, now)
         if type(loaded) is AuthorityDecision:
             return loaded
@@ -959,6 +990,16 @@ class MySQLRegistryBackedAuthorityVerifier:
         """Lock and recheck a registered claim without re-expiring old proof."""
 
         now = _aware(self._clock(), "verifier clock")
+        source_receipt = self._source_receipt_decision(
+            connection,
+            claim,
+            now,
+        )
+        if source_receipt is not None and not source_receipt.verified:
+            raise AuthorityVerificationError(
+                "stored QMT minute authority no longer proves the exact stock: "
+                f"{source_receipt.reason_code}"
+            )
         loaded = self._record(connection, claim, now)
         if type(loaded) is AuthorityDecision:
             raise AuthorityVerificationError(
@@ -1262,7 +1303,7 @@ class MySQLReceiptRegistryAuthorityVerifier:
     """Verify registered quote receipts on the caller-owned connection."""
 
     verifier_id = "mysql-v2-receipt-registry"
-    verifier_version = "v1"
+    verifier_version = "v2"
 
     def __init__(
         self,
@@ -1273,7 +1314,7 @@ class MySQLReceiptRegistryAuthorityVerifier:
 
     _STATEMENTS = {
         QuoteReceiptType.QMT_MINUTE.value: """
-            SELECT COUNT(*)
+            SELECT r.expected_count, r.observed_count, r.evidence_json
             FROM st_qmt_minute_sync_receipt_v2 r
             WHERE r.receipt_id = :receipt_id
               AND r.trade_date = :trade_date
@@ -1282,6 +1323,9 @@ class MySQLReceiptRegistryAuthorityVerifier:
               AND r.created_at <= :available_at
               AND r.quality_status = 'PASS'
               AND r.forward_eligible = 1
+              AND r.expected_count > 0
+              AND r.observed_count = r.expected_count
+              AND r.coverage = 1
             FOR UPDATE
         """,
         QuoteReceiptType.QMT_REALTIME.value: """
@@ -1316,27 +1360,36 @@ class MySQLReceiptRegistryAuthorityVerifier:
         statement = self._STATEMENTS.get(claim.receipt_type)
         if statement is None or claim.event_at is None:
             return self._decision(claim, False, "UNSUPPORTED_RECEIPT_TYPE")
-        result = connection.execute(
-            text(statement),
-            {
-                "receipt_id": claim.receipt_id,
-                "trade_date": claim.trade_date,
-                "source_provider": claim.source_provider,
-                "event_at": claim.event_at.astimezone(MARKET_ZONE).replace(
+        if (
+            claim.receipt_type == QuoteReceiptType.QMT_MINUTE.value
+            and claim.stock_code is None
+        ):
+            return self._decision(claim, False, "STOCK_CODE_NOT_BOUND")
+        params = {
+            "receipt_id": claim.receipt_id,
+            "trade_date": claim.trade_date,
+            "source_provider": claim.source_provider,
+            "event_at": claim.event_at.astimezone(MARKET_ZONE).replace(
+                tzinfo=None
+            ),
+            "received_at": (
+                None
+                if claim.received_at is None
+                else claim.received_at.astimezone(MARKET_ZONE).replace(
                     tzinfo=None
-                ),
-                "received_at": (
-                    None
-                    if claim.received_at is None
-                    else claim.received_at.astimezone(MARKET_ZONE).replace(
-                        tzinfo=None
-                    )
-                ),
-                "available_at": claim.available_at.astimezone(
-                    MARKET_ZONE
-                ).replace(tzinfo=None),
-            },
-        ).scalar()
+                )
+            ),
+            "available_at": claim.available_at.astimezone(
+                MARKET_ZONE
+            ).replace(tzinfo=None),
+        }
+        query_result = connection.execute(
+            text(statement),
+            params,
+        )
+        if claim.receipt_type == QuoteReceiptType.QMT_MINUTE.value:
+            return self._verify_qmt_minute_result(query_result, claim)
+        result = query_result.scalar()
         if type(result) is not int:
             raise AuthorityVerificationError(
                 "authority registry count must be exactly int"
@@ -1346,6 +1399,128 @@ class MySQLReceiptRegistryAuthorityVerifier:
             result == 1,
             "VERIFIED" if result == 1 else "RECEIPT_REGISTRY_MISMATCH",
         )
+
+    def _verify_qmt_minute_result(
+        self,
+        result: Any,
+        claim: AuthorityClaim,
+    ) -> AuthorityDecision:
+        if claim.stock_code is None:
+            return self._decision(claim, False, "STOCK_CODE_NOT_BOUND")
+        try:
+            rows = result.mappings().all()
+        except Exception as exc:
+            raise AuthorityVerificationError(
+                "QMT minute authority registry returned invalid rows"
+            ) from exc
+        if len(rows) != 1 or not isinstance(rows[0], Mapping):
+            return self._decision(claim, False, "RECEIPT_REGISTRY_MISMATCH")
+        row = dict(rows[0])
+        if set(row) != {"expected_count", "observed_count", "evidence_json"}:
+            raise AuthorityVerificationError(
+                "QMT minute authority registry columns differ"
+            )
+        if (
+            type(row["expected_count"]) is not int
+            or type(row["observed_count"]) is not int
+            or row["expected_count"] <= 0
+            or row["observed_count"] != row["expected_count"]
+        ):
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+        evidence = row["evidence_json"]
+        if type(evidence) is str:
+            try:
+                evidence = json.loads(evidence)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                evidence = None
+        elif isinstance(evidence, Mapping):
+            evidence = dict(evidence)
+        if type(evidence) is not dict:
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+        required = {
+            "stock_code_set_schema",
+            "requested_stock_code_count",
+            "requested_stock_codes_sha256",
+            "responded_stock_code_count",
+            "responded_stock_codes_sha256",
+            "responded_stock_codes",
+            "published_stock_code_count",
+            "published_stock_codes_sha256",
+            "published_stock_codes",
+            "full_requested_response_coverage",
+        }
+        if not required.issubset(evidence):
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+        responded_codes = evidence["responded_stock_codes"]
+        published_codes = evidence["published_stock_codes"]
+        if (
+            evidence["stock_code_set_schema"]
+            != "probiga.sorted-stock-code-set.v1"
+            or type(evidence["requested_stock_code_count"]) is not int
+            or type(evidence["responded_stock_code_count"]) is not int
+            or type(evidence["published_stock_code_count"]) is not int
+            or evidence["full_requested_response_coverage"] is not True
+            or type(responded_codes) is not list
+            or any(
+                type(code) is not str or len(code) != 6 or not code.isdigit()
+                for code in responded_codes
+            )
+            or responded_codes != sorted(set(responded_codes))
+            or type(published_codes) is not list
+            or not published_codes
+            or any(
+                type(code) is not str or len(code) != 6 or not code.isdigit()
+                for code in published_codes
+            )
+            or published_codes != sorted(set(published_codes))
+            or not set(published_codes).issubset(responded_codes)
+            or evidence["requested_stock_code_count"] != row["expected_count"]
+            or evidence["responded_stock_code_count"] != row["observed_count"]
+            or evidence["published_stock_code_count"] != len(published_codes)
+            or len(responded_codes) != row["observed_count"]
+        ):
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+
+        responded_hash = hashlib.sha256(
+            json.dumps(
+                responded_codes,
+                ensure_ascii=True,
+                sort_keys=False,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        published_hash = hashlib.sha256(
+            json.dumps(
+                published_codes,
+                ensure_ascii=True,
+                sort_keys=False,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        try:
+            requested_hash = _sha256(
+                evidence["requested_stock_codes_sha256"],
+                "requested_stock_codes_sha256",
+            )
+            frozen_responded_hash = _sha256(
+                evidence["responded_stock_codes_sha256"],
+                "responded_stock_codes_sha256",
+            )
+            frozen_published_hash = _sha256(
+                evidence["published_stock_codes_sha256"],
+                "published_stock_codes_sha256",
+            )
+        except AuthorityVerificationError:
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+        if (
+            requested_hash != frozen_responded_hash
+            or frozen_responded_hash != responded_hash
+            or frozen_published_hash != published_hash
+        ):
+            return self._decision(claim, False, "QMT_MINUTE_UNIVERSE_MISMATCH")
+        if claim.stock_code not in published_codes:
+            return self._decision(claim, False, "QMT_MINUTE_CODE_NOT_PUBLISHED")
+        return self._decision(claim, True, "VERIFIED")
 
     def _decision(
         self,
@@ -1403,6 +1578,11 @@ def build_authority_claim(evidence: object) -> AuthorityClaim:
             trade_date=evidence.trade_date,
             event_at=evidence.quote_at,
             received_at=evidence.received_at,
+            stock_code=(
+                evidence.stock_code
+                if evidence.receipt_type is QuoteReceiptType.QMT_MINUTE
+                else None
+            ),
         )
     raise AuthorityVerificationError(
         f"unsupported authoritative evidence type: {type(evidence).__name__}"

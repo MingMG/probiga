@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,7 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.authoritative_market_clock import (
-    authoritative_closed_trade_date,
+    DAILY_CLOSE_READY_HOUR,
+    PRODUCTION_TIMEZONE,
 )
 from server.common.batch_db import create_batch_engine
 from server.common.qmt_attestation_contract import (
@@ -38,6 +39,7 @@ from server.common.qmt_attestation_contract import (
     VOLUME_REL_TOLERANCE,
     validated_universe_manifest,
 )
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.attest_qmt_daily_kline import (
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH,
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT,
@@ -47,7 +49,7 @@ from tools.attest_qmt_daily_kline import (
     _match_sql,
     _table_names,
     attest_range,
-    ensure_attestation_tables,
+    privileged_migrate_attestation_tables,
     legacy_completed_run_binding_plan,
     validate_legacy_completed_run_release_contract,
     validate_attestation_schema,
@@ -206,7 +208,7 @@ def apply_legacy_completed_run_binding(
 def prepare_attestation_schema(engine) -> dict[str, Any]:
     """Create and validate the trigger-free QMT V2 table/index schema."""
 
-    ensure_attestation_tables(engine)
+    privileged_migrate_attestation_tables(engine)
     detail = validate_attestation_schema(engine)
     return {
         "status": "ok",
@@ -220,6 +222,48 @@ def prepare_attestation_schema(engine) -> dict[str, Any]:
     }
 
 
+def _calendar_decision_time(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(PRODUCTION_TIMEZONE)
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    return current.replace(microsecond=0)
+
+
+def authoritative_closed_trade_date(
+    engine,
+    now: datetime | None = None,
+) -> str:
+    """Resolve the closed market day only from a known immutable QMT root."""
+
+    decision_time = _calendar_decision_time(now)
+    today = decision_time.date()
+    start_date = (today - timedelta(days=550)).isoformat()
+    try:
+        with engine.connect() as connection:
+            receipt = load_trade_calendar_receipt(
+                connection,
+                start_date=start_date,
+                end_date=today.isoformat(),
+                decision_known_at=decision_time,
+            )
+    except Exception as exc:
+        raise GovernanceQmtHistoryNotReady(
+            "没有在决策时点已知且覆盖治理窗口的不可变QMT交易日历"
+        ) from exc
+    inclusive = (
+        decision_time.hour,
+        decision_time.minute,
+        decision_time.second,
+    ) >= (DAILY_CLOSE_READY_HOUR, 0, 0)
+    candidates = [
+        session
+        for session in receipt.sessions_between(start_date, today.isoformat())
+        if session < today.isoformat()
+        or (inclusive and session == today.isoformat())
+    ]
+    return candidates[-1] if candidates else ""
+
+
 def _latest_closed_sessions(
     engine,
     *,
@@ -228,16 +272,29 @@ def _latest_closed_sessions(
 ) -> list[str]:
     if required_sessions != REQUIRED_GOVERNANCE_SESSIONS:
         raise ValueError("策略治理历史窗口固定为120个权威交易日")
-    with engine.connect() as connection:
-        rows = connection.execute(
-            text(
-                "SELECT trade_date FROM si_trade_calendar "
-                "WHERE trade_status=1 AND trade_date<=:target_trade_date "
-                "ORDER BY trade_date DESC LIMIT 120"
-            ),
-            {"target_trade_date": target_trade_date},
-        ).mappings().all()
-    sessions = sorted(str(row.get("trade_date") or "")[:10] for row in rows)
+    try:
+        target = date.fromisoformat(target_trade_date)
+    except (TypeError, ValueError) as exc:
+        raise GovernanceQmtHistoryNotReady(
+            "QMT治理目标交易日无效"
+        ) from exc
+    start_date = (target - timedelta(days=550)).isoformat()
+    try:
+        with engine.connect() as connection:
+            receipt = load_trade_calendar_receipt(
+                connection,
+                start_date=start_date,
+                end_date=target_trade_date,
+                decision_known_at=_calendar_decision_time(),
+            )
+        eligible_sessions = receipt.sessions_between(
+            start_date, target_trade_date
+        )
+    except Exception as exc:
+        raise GovernanceQmtHistoryNotReady(
+            "不可变QMT交易日历未覆盖120会话治理窗口"
+        ) from exc
+    sessions = eligible_sessions[-required_sessions:]
     if (
         len(sessions) != required_sessions
         or len(set(sessions)) != required_sessions
@@ -304,7 +361,7 @@ def preflight_governance_qmt_history_readiness(
                 FROM {target_table}
                 WHERE trade_date BETWEEN :start_date AND :end_date
                   AND k_type=1 AND adjust_type=0
-                  AND stock_code REGEXP '^(0|3|6)'
+                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
                 GROUP BY trade_date
                 ORDER BY trade_date
                 """
@@ -325,7 +382,7 @@ def preflight_governance_qmt_history_readiness(
                 WHERE trade_date BETWEEN :start_date AND :end_date
                   AND period='1d' AND k_type=1 AND adjust_type=0
                   AND provider=:provider
-                  AND stock_code REGEXP '^(0|3|6)'
+                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
                 GROUP BY trade_date
                 ORDER BY trade_date
                 """
@@ -358,8 +415,8 @@ def preflight_governance_qmt_history_readiness(
                      AND q.provider=:provider
                     WHERE t.trade_date BETWEEN :start_date AND :end_date
                       AND t.k_type=1 AND t.adjust_type=0
-                      AND t.stock_code REGEXP '^(0|3|6)'
-                      AND q.stock_code REGEXP '^(0|3|6)'
+                      AND t.stock_code REGEXP '^(0|3|4|6|8|9)'
+                      AND q.stock_code REGEXP '^(0|3|4|6|8|9)'
                 ) exact_match_rows
                 GROUP BY trade_date
                 ORDER BY trade_date

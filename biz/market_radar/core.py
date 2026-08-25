@@ -25,6 +25,13 @@ from sqlalchemy import text
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt import bridge
 from server.common.config import get_market_radar_runtime_config, get_wecom_webhook
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
 
 logger = logging.getLogger("market_radar")
 
@@ -32,6 +39,92 @@ logger = logging.getLogger("market_radar")
 STOCK_TABLE = "sm_market_radar_stock"
 SECTOR_TABLE = "sm_market_radar_sector"
 EVENT_TABLE = "sm_market_radar_event"
+
+
+_RADAR_SCHEMA = {
+    STOCK_TABLE: RuntimeTable(
+        columns={
+            "stock_code": RuntimeColumn("varchar", False, character_length=16),
+            "short_name": RuntimeColumn("varchar", True, character_length=128),
+            "snapshot_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "qmt_timetag": RuntimeColumn("varchar", True, character_length=40),
+            **{
+                column: RuntimeColumn("double", True)
+                for column in (
+                    "price", "pre_close", "change_pct", "volume", "amount",
+                    "amount_delta", "price_speed", "five_bid_value",
+                    "five_ask_value", "five_pressure", "amount_score",
+                    "price_score", "pressure_score", "score",
+                )
+            },
+            "direction": RuntimeColumn("varchar", True, character_length=16),
+            "stale": RuntimeColumn("tinyint", False),
+            **{
+                column: RuntimeColumn("text", True)
+                for column in (
+                    "signal_tags", "bid_price_json", "bid_vol_json",
+                    "ask_price_json", "ask_vol_json",
+                )
+            },
+            "data_source": RuntimeColumn("varchar", False, character_length=64),
+            "updated_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("stock_code",), unique=True),
+            RuntimeIndex(("score",)),
+            RuntimeIndex(("snapshot_at",)),
+        ),
+    ),
+    SECTOR_TABLE: RuntimeTable(
+        columns={
+            "sector_code": RuntimeColumn("varchar", False, character_length=160),
+            "sector_name": RuntimeColumn("varchar", False, character_length=192),
+            "sector_type": RuntimeColumn("varchar", False, character_length=32),
+            "snapshot_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "member_count": RuntimeColumn("int", False),
+            "positive_count": RuntimeColumn("int", False),
+            "negative_count": RuntimeColumn("int", False),
+            **{
+                column: RuntimeColumn("double", True)
+                for column in (
+                    "breadth_pct", "avg_change_pct", "amount_delta", "score",
+                )
+            },
+            "direction": RuntimeColumn("varchar", True, character_length=16),
+            "dragon_json": RuntimeColumn("text", True),
+            "core_json": RuntimeColumn("text", True),
+            "follower_json": RuntimeColumn("text", True),
+            "data_source": RuntimeColumn("varchar", False, character_length=64),
+            "updated_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("sector_code",), unique=True),
+            RuntimeIndex(("score",)),
+            RuntimeIndex(("snapshot_at",)),
+        ),
+    ),
+    EVENT_TABLE: RuntimeTable(
+        columns={
+            "event_id": RuntimeColumn("bigint", False, auto_increment=True),
+            "event_key": RuntimeColumn("varchar", False, character_length=160),
+            "event_type": RuntimeColumn("varchar", False, character_length=32),
+            "direction": RuntimeColumn("varchar", False, character_length=16),
+            "sector_code": RuntimeColumn("varchar", True, character_length=160),
+            "sector_name": RuntimeColumn("varchar", True, character_length=192),
+            "stock_code": RuntimeColumn("varchar", True, character_length=16),
+            "snapshot_at": RuntimeColumn("datetime", False, datetime_precision=0),
+            "score": RuntimeColumn("double", True),
+            "detail_json": RuntimeColumn("text", True),
+            "data_source": RuntimeColumn("varchar", False, character_length=64),
+            "created_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("event_id",), unique=True),
+            RuntimeIndex(("snapshot_at",)),
+            RuntimeIndex(("event_key",)),
+        ),
+    ),
+}
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -133,8 +226,8 @@ def market_phase(now: datetime | None = None) -> str:
     return "closed"
 
 
-def ensure_radar_tables(engine) -> None:
-    """Create the small latest-state/event tables used by the radar."""
+def privileged_migrate_radar_tables(engine) -> None:
+    """Create/upgrade radar tables only during a privileged release window."""
     ddl = (
         f"""
         CREATE TABLE IF NOT EXISTS {STOCK_TABLE} (
@@ -168,7 +261,7 @@ def ensure_radar_tables(engine) -> None:
             PRIMARY KEY (stock_code),
             KEY idx_radar_stock_score (score),
             KEY idx_radar_stock_snapshot (snapshot_at)
-        )
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         f"""
         CREATE TABLE IF NOT EXISTS {SECTOR_TABLE} (
@@ -192,7 +285,7 @@ def ensure_radar_tables(engine) -> None:
             PRIMARY KEY (sector_code),
             KEY idx_radar_sector_score (score),
             KEY idx_radar_sector_snapshot (snapshot_at)
-        )
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
         f"""
         CREATE TABLE IF NOT EXISTS {EVENT_TABLE} (
@@ -211,7 +304,7 @@ def ensure_radar_tables(engine) -> None:
             PRIMARY KEY (event_id),
             KEY idx_radar_event_time (snapshot_at),
             KEY idx_radar_event_key (event_key)
-        )
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """,
     )
     with engine.begin() as conn:
@@ -225,6 +318,22 @@ def ensure_radar_tables(engine) -> None:
                 conn.execute(text(f"ALTER TABLE {table} MODIFY data_source VARCHAR(64) NOT NULL"))
             except Exception:
                 logger.debug("radar table data_source alter skipped: %s", table, exc_info=True)
+        privileged_normalize_mysql_storage(conn, _RADAR_SCHEMA)
+        validate_radar_runtime(engine, connection=conn)
+
+
+def validate_radar_runtime(engine, *, connection=None) -> None:
+    """Read-only fail-closed radar table contract."""
+
+    validate_runtime_tables(
+        engine, _RADAR_SCHEMA, context="market_radar", connection=connection,
+    )
+
+
+def ensure_radar_tables(engine) -> None:
+    """Compatibility guard: validate only; never mutate runtime schema."""
+
+    validate_radar_runtime(engine)
 
 
 def _upsert_sql(table: str, columns: list[str], key: str) -> str:
@@ -292,31 +401,11 @@ class MarketRadarEngine:
         codes = set(self._universe)
         sectors: dict[str, dict[str, Any]] = {}
 
-        try:
-            industry_rows = _read_rows(
-                self.engine,
-                """
-                SELECT stock_code, industry_name
-                FROM si_industry_sw
-                WHERE industry_name IS NOT NULL AND industry_name <> ''
-                  AND (industry_type = '申万一级' OR industry_type LIKE '%一级%')
-                """,
-                context="market_radar_industry_members",
-            )
-        except Exception:
-            industry_rows = []
-        for row in industry_rows:
-            code = _text(row.get("stock_code")).zfill(6)
-            name = _text(row.get("industry_name"))
-            if code not in codes or not name:
-                continue
-            sector_code = f"SW1:{name}"
-            item = sectors.setdefault(
-                sector_code,
-                {"sector_code": sector_code, "sector_name": name, "sector_type": "industry", "members": set()},
-            )
-            item["members"].add(code)
-
+        # Mutable ``si_industry_sw`` is intentionally excluded here.  A live
+        # radar may display current concept groupings, but it must not turn a
+        # current industry map into historical/strategy-authoritative sector
+        # evidence.  Exact-date QMT industry facts are consumed by the strategy
+        # feature pipeline, not this advisory radar.
         try:
             concept_rows = _read_rows(
                 self.engine,
@@ -491,6 +580,14 @@ class MarketRadarEngine:
                     "core": core_row,
                     "followers": followers,
                     "data_source": "qmt_full_tick_5level+local_membership",
+                    "industry_evidence_status": "DATA_BLOCKED",
+                    "industry_evidence_reason": (
+                        "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+                    ),
+                    "membership_evidence_status": "LEGACY_UNVERIFIED",
+                    "strategy_eligible": False,
+                    "funding_eligible": False,
+                    "order_authority": False,
                 }
             )
         result.sort(key=lambda item: abs(item["score"]), reverse=True)
@@ -641,6 +738,11 @@ class MarketRadarEngine:
                 result = {
                     "status": "degraded", "error": "stock_universe_empty", "phase": phase,
                     "data_source": "qmt_full_tick_5level", "l2_available": False,
+                    "decision_scope": "RESEARCH_DISPLAY_ONLY",
+                    "industry_evidence_status": "DATA_BLOCKED",
+                    "membership_evidence_status": "LEGACY_UNVERIFIED",
+                    "funding_eligible": False,
+                    "order_authority": False,
                 }
                 self.last_result = result
                 return result
@@ -663,6 +765,15 @@ class MarketRadarEngine:
                 "status": "ok", "phase": phase, "snapshot_at": _dt_string(now), "quote_rows": len(quotes),
                 "sector_rows": len(sectors), "event_rows": len(events), "data_source": "qmt_full_tick_5level",
                 "l2_available": False,
+                "decision_scope": "RESEARCH_DISPLAY_ONLY",
+                "actionable_output_allowed": False,
+                "industry_evidence_status": "DATA_BLOCKED",
+                "industry_evidence_reason": (
+                    "PIT_EXACT_DATE_OR_VALID_INTERVAL_INDUSTRY_REQUIRED"
+                ),
+                "membership_evidence_status": "LEGACY_UNVERIFIED",
+                "funding_eligible": False,
+                "order_authority": False,
                 "method": "成交额增量/横截面异常 + 涨跌强度 + QMT五档压力 + 板块宽度",
                 "events": [
                     {"event_type": event["event_type"], "direction": event["direction"], "stock_code": event["stock_code"],

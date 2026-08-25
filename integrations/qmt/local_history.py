@@ -18,6 +18,8 @@ from integrations.qmt import bridge
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.diagnostics import PROVIDER_ID as LEGACY_PROVIDER_ID
 from server.common.config import get_mysql_url, get_qmt_history_mysql_url
+from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 
 CHINA_STANDARD_TIME = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -73,6 +75,71 @@ _IDENTITY_QUERY_KEYS = frozenset(
 
 class LocalHistoryProvenanceSchemaError(RuntimeError):
     """The QMT source table cannot satisfy the frozen provenance contract."""
+
+
+class LocalHistorySchemaError(LocalHistoryProvenanceSchemaError):
+    """The local QMT history schema is absent or physically incompatible."""
+
+
+_LOCAL_HISTORY_TABLE_CONTRACTS: dict[str, dict[str, Any]] = {
+    LOCAL_KLINE_TABLE: {
+        "columns": (
+            "id", "provider", "qmt_code", "stock_code", "short_name",
+            "period", "trade_time", "trade_date", "k_type", "adjust_type",
+            "open", "close", "high", "low", "volume", "amount", "change",
+            "change_pct", "turnover_ratio", "pre_close",
+            "pre_close_origin", "source_time", "received_at", "batch_id",
+            "data_version", "quality_status", "permission_status",
+            "created_at", "updated_at",
+        ),
+        "indexes": {
+            "uk_qmt_local_kline": (
+                True,
+                ("provider", "stock_code", "period", "trade_date", "adjust_type"),
+            ),
+            "idx_qmt_local_kline_date": (False, ("trade_date",)),
+            "idx_qmt_local_kline_code_time": (
+                False,
+                ("stock_code", "trade_time"),
+            ),
+        },
+    },
+    LOCAL_MINUTE_TABLE: {
+        "columns": (
+            "id", "provider", "qmt_code", "stock_code", "short_name",
+            "period", "trade_time", "trade_date", "price", "avg_price",
+            "change", "change_pct", "volume", "amount", "pre_close",
+            "source_time", "received_at", "batch_id", "data_version",
+            "quality_status", "permission_status", "created_at", "updated_at",
+        ),
+        "indexes": {
+            "uk_qmt_local_minute": (
+                True,
+                ("provider", "stock_code", "period", "trade_time"),
+            ),
+            "idx_qmt_local_minute_date": (False, ("trade_date",)),
+            "idx_qmt_local_minute_code_time": (
+                False,
+                ("stock_code", "trade_time"),
+            ),
+        },
+    },
+    LOCAL_RUN_TABLE: {
+        "columns": (
+            "id", "run_id", "provider", "dataset", "period", "start_date",
+            "end_date", "status", "requested_codes", "fetched_rows",
+            "written_rows", "error_message", "started_at", "finished_at",
+            "extra_json", "created_at",
+        ),
+        "indexes": {
+            "uk_qmt_local_run": (True, ("run_id",)),
+            "idx_qmt_local_run_dataset": (
+                False,
+                ("dataset", "period", "status"),
+            ),
+        },
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -443,15 +510,144 @@ def migrate_local_history_provenance_schema(
     return {**validated, "status": "applied", "applied": True}
 
 
-def ensure_local_history_tables(engine: Engine) -> None:
+def local_history_schema_snapshot(
+    bind: Any,
+    *,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Read the complete local-history table shape without issuing DDL."""
+
+    database_name = _bind_database_name(bind, database)
+    inspector = inspect(bind)
+    tables: dict[str, Any] = {}
+    errors: list[str] = []
+    for table_name, contract in _LOCAL_HISTORY_TABLE_CONTRACTS.items():
+        table_errors: list[str] = []
+        exists = bool(inspector.has_table(table_name, schema=database_name))
+        actual_columns: tuple[str, ...] = ()
+        actual_indexes: dict[str, tuple[bool, tuple[str, ...]]] = {}
+        primary_key: tuple[str, ...] = ()
+        if exists:
+            actual_columns = tuple(
+                str(row.get("name") or "")
+                for row in inspector.get_columns(
+                    table_name,
+                    schema=database_name,
+                )
+            )
+            primary_key = tuple(
+                str(value)
+                for value in (
+                    inspector.get_pk_constraint(
+                        table_name,
+                        schema=database_name,
+                    ).get("constrained_columns")
+                    or ()
+                )
+            )
+            for row in inspector.get_indexes(
+                table_name,
+                schema=database_name,
+            ):
+                index_name = str(row.get("name") or "")
+                if not index_name or index_name.upper() == "PRIMARY":
+                    continue
+                actual_indexes[index_name] = (
+                    bool(row.get("unique")),
+                    tuple(str(value) for value in (row.get("column_names") or ())),
+                )
+        else:
+            table_errors.append("table is missing")
+        expected_columns = tuple(contract["columns"])
+        expected_indexes = dict(contract["indexes"])
+        if exists and actual_columns != expected_columns:
+            table_errors.append("column inventory/order differs")
+        if exists and primary_key != ("id",):
+            table_errors.append("primary key must be exactly id")
+        if exists and actual_indexes != expected_indexes:
+            table_errors.append("secondary index inventory differs")
+        if table_errors:
+            errors.extend(
+                f"{table_name}: {message}" for message in table_errors
+            )
+        tables[table_name] = {
+            "exists": exists,
+            "columns": list(actual_columns),
+            "expected_columns": list(expected_columns),
+            "primary_key": list(primary_key),
+            "indexes": {
+                key: {"unique": value[0], "columns": list(value[1])}
+                for key, value in sorted(actual_indexes.items())
+            },
+            "expected_indexes": {
+                key: {"unique": value[0], "columns": list(value[1])}
+                for key, value in sorted(expected_indexes.items())
+            },
+            "ready": not table_errors,
+            "errors": table_errors,
+        }
+    return {
+        "database": database_name,
+        "table_count": sum(
+            1 for detail in tables.values() if detail["exists"]
+        ),
+        "expected_table_count": len(_LOCAL_HISTORY_TABLE_CONTRACTS),
+        "tables": tables,
+        "ready": not errors,
+        "errors": errors,
+        "ddl_executed": False,
+    }
+
+
+def validate_local_history_tables(
+    bind: Any,
+    *,
+    database: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless scheduled DML can use the frozen physical schema."""
+
+    snapshot = local_history_schema_snapshot(bind, database=database)
+    if not snapshot["ready"]:
+        raise LocalHistorySchemaError(
+            "QMT 本地历史库物理契约未准备: "
+            + "; ".join(snapshot["errors"])
+            + "; 常规定时任务禁止 CREATE/ALTER，请由特权账号显式运行 "
+            "tools/backfill_guojin_qmt_local_history.py init"
+        )
+    validate_local_history_provenance_schema(
+        bind,
+        database=snapshot["database"],
+    )
+    return snapshot
+
+
+def privileged_migrate_local_history_schema(engine: Engine) -> dict[str, Any]:
+    """Install the frozen local-history schema inside a privileged window.
+
+    Scheduled capture and backfill callers must use
+    :func:`validate_local_history_tables` instead.  The only supported
+    additive upgrade for an existing database is the provenance column whose
+    legacy-safe value is frozen by ``migrate_local_history_provenance_schema``.
+    """
+
     database_name = _bind_database_name(engine, None)
     if inspect(engine).has_table(LOCAL_KLINE_TABLE, schema=database_name):
-        # Existing tables must be migrated explicitly.  Never smuggle a DDL
-        # upgrade into a capture/backfill path that is about to write evidence.
-        validate_local_history_provenance_schema(
+        provenance = local_history_provenance_schema_snapshot(
             engine,
             database=database_name,
         )
+        missing = set(provenance["missing_columns"])
+        if missing == {LOCAL_KLINE_PROVENANCE_COLUMN}:
+            migrate_local_history_provenance_schema(
+                engine,
+                apply=True,
+                database=database_name,
+            )
+        elif missing or provenance["errors"]:
+            validate_local_history_provenance_schema(
+                engine,
+                database=database_name,
+            )
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -555,10 +751,15 @@ def ensure_local_history_tables(engine: Engine) -> None:
                 """
             )
         )
-    validate_local_history_provenance_schema(
+    validated = validate_local_history_tables(
         engine,
         database=database_name,
     )
+    return {
+        **validated,
+        "migration_boundary": "privileged_local_history_release",
+        "ddl_executed": True,
+    }
 
 
 def load_stock_codes(source_engine: Engine, *, codes: Sequence[str] | None = None, limit: int = 0) -> list[str]:
@@ -570,51 +771,32 @@ def load_stock_codes(source_engine: Engine, *, codes: Sequence[str] | None = Non
                 continue
             result.append(text_value.split(".", 1)[0].zfill(6))
         return sorted(set(result))
-    sql = "SELECT stock_code FROM si_all_code WHERE stock_code REGEXP '^(0|3|4|6|8|9)' ORDER BY stock_code"
-    params: dict[str, Any] = {}
-    if limit > 0:
-        sql += " LIMIT :limit"
-        params["limit"] = limit
     with source_engine.begin() as conn:
-        rows = conn.execute(text(sql), params).fetchall()
-    return [str(row[0]).strip().zfill(6) for row in rows]
+        catalog = load_stock_catalog(
+            conn,
+            decision_known_at=datetime.now(CHINA_STANDARD_TIME).replace(
+                tzinfo=None, microsecond=0
+            ),
+        )
+    result = catalog.eligible_codes(date.today().isoformat())
+    return result[:limit] if limit > 0 else result
 
 
 def load_trade_dates(source_engine: Engine, *, start_date: str, end_date: str, limit: int = 0) -> list[str]:
-    params = {"start": _normalize_date(start_date), "end": _normalize_date(end_date)}
-    calendar_sql = """
-        SELECT trade_date
-        FROM si_trade_calendar
-        WHERE trade_status = 1
-          AND trade_date >= :start
-          AND trade_date <= :end
-        ORDER BY trade_date
-    """
-    if limit > 0:
-        calendar_sql += " LIMIT :limit"
-        params["limit"] = limit
-    rows = []
-    try:
-        with source_engine.begin() as conn:
-            rows = conn.execute(text(calendar_sql), params).fetchall()
-    except Exception:
-        rows = []
-    if rows:
-        return [str(row[0])[:10] for row in rows]
-
-    fallback_sql = """
-        SELECT DISTINCT trade_date
-        FROM sm_stock_kline
-        WHERE k_type = 1
-          AND trade_date >= :start
-          AND trade_date <= :end
-        ORDER BY trade_date
-    """
-    if limit > 0:
-        fallback_sql += " LIMIT :limit"
+    normalized_start = _normalize_date(start_date)
+    normalized_end = _normalize_date(end_date)
+    decision_time = datetime.now(CHINA_STANDARD_TIME).replace(
+        tzinfo=None, microsecond=0
+    )
     with source_engine.begin() as conn:
-        rows = conn.execute(text(fallback_sql), params).fetchall()
-    return [str(row[0])[:10] for row in rows]
+        receipt = load_trade_calendar_receipt(
+            conn,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            decision_known_at=decision_time,
+        )
+    result = receipt.sessions_between(normalized_start, normalized_end)
+    return result[:limit] if limit > 0 else result
 
 
 def _chunked(items: Sequence[str], size: int) -> Iterable[list[str]]:
@@ -776,12 +958,12 @@ def persist_daily_kline_capture(
             raise RuntimeError("QMT history database name is required")
         target_engine = source_engine
         table_name = f"{history_database}.{LOCAL_KLINE_TABLE}"
-        validate_local_history_provenance_schema(
+        validate_local_history_tables(
             target_engine,
             database=history_database,
         )
     else:
-        ensure_local_history_tables(target_engine)
+        validate_local_history_tables(target_engine)
     rows = _prepare_kline_rows(
         frame,
         source_engine=source_engine,
@@ -887,6 +1069,7 @@ def backfill_daily_kline_local(
     provider: str = BIGQMT_PROVIDER_ID,
     dry_run: bool = False,
     allowed_missing_stock_codes: Sequence[str] = (),
+    source_batch_id: str = "",
 ) -> LocalBackfillResult:
     if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
         raise ValueError("daily QMT history provider is not supported")
@@ -910,8 +1093,14 @@ def backfill_daily_kline_local(
             "allowed missing stock codes must be included in the requested universe: "
             f"count={len(unknown_allowed_codes)}, sample={unknown_allowed_codes[:10]}"
         )
-    ensure_local_history_tables(local_engine)
+    validate_local_history_tables(local_engine)
     run_id = f"qmt_hist_kline_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    normalized_source_batch_id = str(source_batch_id or "").strip()
+    if normalized_source_batch_id and (
+        len(normalized_source_batch_id) != 64
+        or any(ch not in "0123456789abcdef" for ch in normalized_source_batch_id)
+    ):
+        raise ValueError("daily QMT source batch root must be lower SHA-256")
     batches: list[LocalBackfillBatchResult] = []
     fetched_total = 0
     written_total = 0
@@ -931,6 +1120,7 @@ def backfill_daily_kline_local(
             "provider": provider,
             "allowed_missing_stock_codes": sorted(allowed_missing_codes),
             "allowed_missing_stock_code_count": len(allowed_missing_codes),
+            "source_batch_id": normalized_source_batch_id,
         },
     )
     status = "SUCCESS"
@@ -970,7 +1160,7 @@ def backfill_daily_kline_local(
                 frame,
                 source_engine=source_engine,
                 period="1d",
-                batch_id=run_id,
+                batch_id=normalized_source_batch_id or run_id,
                 provider=provider,
             )
             fetched_codes = {
@@ -1059,7 +1249,7 @@ def backfill_minute_local(
     batch_size: int = 50,
     dry_run: bool = False,
 ) -> LocalBackfillResult:
-    ensure_local_history_tables(local_engine)
+    validate_local_history_tables(local_engine)
     start_date = trade_dates[0] if trade_dates else ""
     end_date = trade_dates[-1] if trade_dates else ""
     run_id = f"qmt_hist_minute_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -1089,10 +1279,16 @@ def backfill_minute_local(
                     trade_date=trade_date,
                     start_date=trade_date,
                     end_date=trade_date,
+                    fill_data=False,
                     batch_size=batch_size,
                     timeout=900,
                 )
                 rows = _prepare_minute_rows(frame, source_engine=source_engine, period="1m", batch_id=run_id)
+                if not rows:
+                    raise RuntimeError(
+                        "QMT minute history returned no native rows: "
+                        f"trade_date={trade_date}, requested_codes={len(qmt_codes)}"
+                    )
                 fetched_total += len(rows)
                 written = 0 if dry_run else _upsert_rows(
                     local_engine,

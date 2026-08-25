@@ -46,6 +46,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.env_config import create_tool_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 # ── 核心配置：通过 push2delay IP 访问 push2his ──
 PROXY_IP = "61.129.129.48"       # push2delay 的 IP
@@ -178,31 +180,15 @@ def save_to_db(engine, rows: list[dict]):
     df = df.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
 
     # 按股票代码分组删除已有数据（避免误删其他股票）
-    codes = sorted(df["stock_code"].unique())
-    dates = sorted(df["trade_date"].unique())
-    with engine.begin() as conn:
-        for code in codes:
-            conn.execute(
-                text(
-                    "DELETE FROM `sm_stock_capital_flow_daily` "
-                    "WHERE `stock_code` = :c AND `trade_date` IN :dates"
-                ),
-                {"c": code, "dates": tuple(dates)},
-            )
-
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-
-    chunk_size = 2000
-    for start in range(0, len(df), chunk_size):
-        chunk = df.iloc[start : start + chunk_size]
-        chunk.to_sql(
-            "sm_stock_capital_flow_daily",
-            engine,
-            if_exists="append",
-            index=False,
-            chunksize=500,
-            method="multi",
-        )
+    replace_table_rows_exact_keys(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=500,
+    )
 
 
 def main():

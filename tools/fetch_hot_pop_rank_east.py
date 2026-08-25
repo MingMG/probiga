@@ -19,18 +19,12 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.hot_rank_schema import validate_hot_rank_runtime_schema
 
 
 def _ensure_snapshot_date_column(engine):
-    with engine.connect() as conn:
-        r = conn.execute(
-            text("SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'st_hot_pop_rank_east' AND column_name = 'snapshot_date'")
-        ).scalar()
-    if int(r or 0) == 0:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE `st_hot_pop_rank_east` ADD COLUMN `snapshot_date` DATE NOT NULL COMMENT '快照日期' AFTER `change_pct`"))
-        print("已为 st_hot_pop_rank_east 添加 snapshot_date 列")
+    validate_hot_rank_runtime_schema(engine, tables={"st_hot_pop_rank_east"})
 
 
 def fetch_hot_pop_rank_east(snapshot_date: str):
@@ -178,9 +172,15 @@ def fetch_hot_pop_rank_east(snapshot_date: str):
     df = df[["snapshot_date", "rank", "stock_code", "short_name", "rank_change", "his_rank", "price", "price_change", "change_pct", "hot_value", "pop_tag", "concept_tag", "etl_sync_at"]]
     df = df.replace({np.nan: None, pd.NaT: None})
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM st_hot_pop_rank_east WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_pop_rank_east", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    replace_table_rows(
+        df,
+        "st_hot_pop_rank_east",
+        engine,
+        where_sql="snapshot_date = :d",
+        params={"d": snapshot_date},
+        chunksize=500,
+        method="multi",
+    )
 
     print(f"写入完成: st_hot_pop_rank_east, 共 {len(df)} 行, 快照日期: {snapshot_date}")
     top10 = ", ".join([f"{r['rank']}.{r['short_name']}" for _, r in df.head(10).iterrows()])

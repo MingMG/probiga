@@ -35,6 +35,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tools.env_config import create_tool_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 
 PROXY_IP = "61.129.129.48"
 TARGET_HOST = "push2his.eastmoney.com"
@@ -155,22 +157,13 @@ def save_to_db(engine, rows: list[dict]):
     out = pd.DataFrame(result).replace({np.nan: None, pd.NaT: None})
     out["etl_sync_at"] = datetime.now().replace(microsecond=0)
 
-    codes = sorted(out["stock_code"].unique())
-    dates = sorted(out["trade_date"].unique())
-    with engine.begin() as conn:
-        for c in codes:
-            conn.execute(
-                text(
-                    "DELETE FROM sm_stock_kline "
-                    "WHERE stock_code=:c AND k_type=1 AND adjust_type=0 "
-                    "AND trade_date IN :d"
-                ),
-                {"c": c, "d": tuple(dates)},
-            )
-
-    out.to_sql(
-        "sm_stock_kline", engine, if_exists="append",
-        index=False, chunksize=500, method="multi",
+    replace_table_rows_exact_keys(
+        out,
+        "sm_stock_kline",
+        engine,
+        key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+        lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        chunksize=500,
     )
 
 

@@ -16,24 +16,12 @@ _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.hot_rank_schema import validate_hot_rank_runtime_schema
 
 
 def _run_ddl(engine):
-    sql_file = ROOT / "tools" / "02_hot_rank_sina.sql"
-    if not sql_file.exists():
-        print("  DDL文件 02_hot_rank_sina.sql 未找到，跳过")
-        return
-    with engine.begin() as conn:
-        for stmt in sql_file.read_text(encoding="utf-8").split(";"):
-            s = stmt.strip()
-            if s and not s.startswith("--"):
-                try:
-                    conn.execute(text(s))
-                except Exception as e:
-                    if "already exists" not in str(e):
-                        print(f"  DDL警告: {e}")
-    print("  已确保 st_hot_rank_sina 表存在")
+    validate_hot_rank_runtime_schema(engine, tables={"st_hot_rank_sina"})
 
 
 def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
@@ -103,9 +91,15 @@ def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
     df = df.replace({np.nan: None, pd.NaT: None})
 
-    with engine.begin() as conn:
-        conn.execute(text("DELETE FROM st_hot_rank_sina WHERE snapshot_date = :d"), {"d": snapshot_date})
-    df.to_sql("st_hot_rank_sina", engine, if_exists="append", index=False, chunksize=500, method="multi")
+    replace_table_rows(
+        df,
+        "st_hot_rank_sina",
+        engine,
+        where_sql="snapshot_date = :d",
+        params={"d": snapshot_date},
+        chunksize=500,
+        method="multi",
+    )
 
     print(f"写入完成: st_hot_rank_sina, 共 {len(df)} 行")
     print(f"  TOP5: {', '.join(df.head(5)['short_name'].tolist())}")

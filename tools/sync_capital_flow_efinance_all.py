@@ -25,6 +25,8 @@ if str(ROOT) not in sys.path:
 import pandas as pd
 from sqlalchemy import text
 from server.api.routers._engine import get_engine
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 
 def fetch_flow(stock_code: str) -> pd.DataFrame | None:
@@ -51,6 +53,34 @@ def fetch_flow(stock_code: str) -> pd.DataFrame | None:
         return None
 
 
+def replace_flow_partitions(engine, df: pd.DataFrame, stock_code: str) -> int:
+    """Atomically replace only fetched code/date partitions."""
+
+    if df is None or df.empty:
+        return 0
+    frame = df.copy()
+    frame["stock_code"] = str(stock_code).strip().zfill(6)
+    frame["trade_date"] = pd.to_datetime(
+        frame["trade_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    frame = frame.dropna(subset=["trade_date"]).drop_duplicates(
+        subset=["stock_code", "trade_date"], keep="last"
+    )
+    if frame.empty:
+        return 0
+    if "etl_sync_at" not in frame.columns:
+        frame["etl_sync_at"] = datetime.now().replace(microsecond=0)
+    return replace_table_rows_exact_keys(
+        frame,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=1000,
+        method="multi",
+    )
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
@@ -59,7 +89,11 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="最多处理几只股票（0=全部，调试用）")
     parser.add_argument("--batch-size", type=int, default=100, help="每批写入DB的股票数")
     parser.add_argument("--sleep", type=float, default=0.3, help="每只股票间隔秒数（防限流）")
-    parser.add_argument("--skip-truncate", action="store_true", help="不清空表，追加模式")
+    parser.add_argument(
+        "--skip-truncate",
+        action="store_true",
+        help="兼容旧参数；运行时始终按股票/日期安全替换",
+    )
     args = parser.parse_args()
 
     engine = get_engine()
@@ -76,12 +110,6 @@ def main():
 
     total_stocks = len(codes)
     print(f"共 {total_stocks} 只A股待同步")
-
-    # 清空表（除非指定追加模式）
-    if not args.skip_truncate:
-        with engine.begin() as conn:
-            conn.execute(text("TRUNCATE TABLE sm_stock_capital_flow_daily"))
-        print("已清空 sm_stock_capital_flow_daily")
 
     # 按板块统计
     boards = {}
@@ -114,9 +142,11 @@ def main():
         # 批量写入
         if len(batch_data) >= args.batch_size or (i + 1) == total_stocks:
             if batch_data:
-                combined = pd.concat(batch_data, ignore_index=True)
-                combined.to_sql("sm_stock_capital_flow_daily", engine, if_exists="append", index=False, method="multi")
-                total_rows += len(combined)
+                for frame in batch_data:
+                    code_value = str(frame["stock_code"].iloc[0]).strip().zfill(6)
+                    total_rows += replace_flow_partitions(
+                        engine, frame, code_value
+                    )
                 batch_data = []
 
         if (i + 1) % 100 == 0 or (i + 1) == total_stocks:

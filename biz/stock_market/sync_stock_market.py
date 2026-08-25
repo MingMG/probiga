@@ -17,8 +17,7 @@
 
 环境变量（常用）：
   MYSQL_URL                 必填，MySQL 连接串；也可写入项目根目录 ``.env``
-  SM_SKIP_DDL               1=跳过 DDL
-  SM_SKIP_GLOBAL_TRUNCATE   1=跳过全量 TRUNCATE（单步内仍会清理目标表）
+  运行账号只验证已迁移表面，不执行持久 DDL，也不允许全局/单表预清空。
   SM_REQUEST_SLEEP          请求后休眠秒数，默认 0.2
   SM_HTTP_RETRIES / SM_HTTP_BACKOFF  重试参数，默认 8 / 3.0
   SM_MAX_STOCKS             个股类接口股票数量上限；默认 200。设为 0 表示不限制（同步 si_all_code 全部）
@@ -34,7 +33,7 @@
                              写入 sm_stock_kline 时会带 short_name（简称），来自表 si_all_code，请先同步 STOCK-INFO 全码表。
   SM_STOCK_KLINE_ENGINE     仅 akshare 日 K 引擎：sina（默认，需 Node + vendor 解密脚本）| east / em / eastmoney（东财 push2his）
   SM_NODE_BIN               新浪日 K 解密用：node.exe 绝对路径（未加入 PATH 时填写，如 C:\\Program Files\\nodejs\\node.exe）
-  SM_STOCK_KLINE_AKSHARE_TRUNCATE  1=akshare 模式启动时仍 TRUNCATE 全表；0（默认）=按股票+日期区间 DELETE 后追加
+  SM_STOCK_KLINE_AKSHARE_TRUNCATE  已废弃；设为 1 会失败关闭，仅允许股票+日期分区原子替换
   SM_STOCK_KLINE_AKSHARE_ADJUST     akshare 复权：空/qfq/hfq，默认空（与 --kline-adjust 二选一，CLI 优先）
   SM_STOCK_KLINE_AKSHARE_SLEEP      仅 akshare 个股 K：每只股票请求后的休眠秒数；未设置则沿用 SM_REQUEST_SLEEP。
                                     东财接口亦可能限流，求稳可设 0.5~2；不建议为提速低于 0.15 或并发多请求。
@@ -72,7 +71,7 @@ import pandas as pd
 import requests
 from requests.exceptions import ChunkedEncodingError, ConnectionError, Timeout
 from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.engine.url import make_url
 
 try:
@@ -102,15 +101,20 @@ from tools.env_config import load_project_env
 
 load_project_env()
 
-from server.common.batch_db import create_batch_engine, quote_identifier, read_frame, read_frame_direct, replace_table_rows, write_frame
+from server.common.batch_db import create_batch_engine, quote_identifier, read_frame, read_frame_direct, replace_table_rows, replace_table_rows_exact_keys, write_frame
 from server.common.kline_data import get_kline_engine
-from server.common.mysql_lock import mysql_named_lock
+from server.common.legacy_table_surface import validate_required_table_surface
+from server.common.mysql_lock import (
+    CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+    STOCK_KLINE_FREEZE_LOCK_NAME,
+    STOCK_MINUTE_FREEZE_LOCK_NAME,
+    mysql_named_lock,
+    supersede_overlapping_qmt_minute_forward_receipts,
+)
 from server.common.process_env import temporary_env
 from integrations.qmt.safe_upsert import safe_upsert_rows
 
-DDL_PATH = Path(__file__).resolve().parent / "sql" / "02_sm_stock_market_tables.sql"
-
-TABLES_TRUNCATE_ORDER = [
+RUNTIME_TABLE_ORDER = [
     "sm_index_current",
     "sm_index_minute",
     "sm_index_kline",
@@ -232,6 +236,7 @@ def _concurrent_run(
     *,
     label: str = "",
     log_every: int = 200,
+    fail_on_error: bool = False,
 ) -> list[pd.DataFrame]:
     """线程池并发执行 per-code API 调用，收集非空 DataFrame。"""
     if not codes:
@@ -241,6 +246,7 @@ def _concurrent_run(
     done_count = 0
     total = len(codes)
     lock = threading.Lock()
+    failures: list[tuple[str, BaseException]] = []
 
     def _worker(code: str) -> pd.DataFrame | None:
         df = fn(code)
@@ -259,9 +265,523 @@ def _concurrent_run(
                         parts.append(df)
             except Exception as e:
                 logger.warning("%s %s 失败：%s", label, code, e)
+                failures.append((code, e))
             if done_count % log_every == 0 or done_count == total:
                 logger.info("%s：进度 %d/%d（并发 %d）", label, done_count, total, workers)
+    if fail_on_error and failures:
+        samples = ", ".join(f"{code}: {error}" for code, error in failures[:3])
+        raise RuntimeError(
+            f"{label or 'remote collection'} failed for {len(failures)}/{total} "
+            f"requested codes; preserving previous data; samples={samples}"
+        )
     return parts
+
+
+def _minimum_coverage(env_name: str, default: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(os.environ.get(env_name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _validated_code_snapshot(
+    frame: pd.DataFrame,
+    requested_codes: list[str],
+    *,
+    code_column: str,
+    label: str,
+    coverage_env: str,
+    default_coverage: float,
+) -> tuple[pd.DataFrame, list[str], float]:
+    """Validate a fetched code-scoped snapshot before any canonical DML."""
+
+    requested = {
+        str(code).strip().zfill(6)
+        for code in requested_codes
+        if str(code).strip()
+    }
+    if not requested:
+        raise RuntimeError(f"{label} has no requested code universe")
+    if frame is None or frame.empty or code_column not in frame.columns:
+        raise RuntimeError(f"{label} returned no rows; preserving previous data")
+    complete = frame.copy()
+    complete[code_column] = complete[code_column].astype(str).str.strip().str.zfill(6)
+    received = set(complete[code_column].tolist())
+    outside = received - requested
+    if outside:
+        raise RuntimeError(
+            f"{label} returned {len(outside)} codes outside the requested universe"
+        )
+    coverage = len(received) / len(requested)
+    minimum = _minimum_coverage(coverage_env, default_coverage)
+    if coverage < minimum:
+        raise RuntimeError(
+            f"{label} coverage below threshold: {len(received)}/{len(requested)} "
+            f"({coverage:.1%}) < {minimum:.1%}; preserving previous data"
+        )
+    # Only codes proven present in the replacement may be deleted.  A source
+    # may legitimately omit halted/new symbols even after passing the global
+    # coverage gate; their previous rows must remain intact.
+    return complete, sorted(received), coverage
+
+
+def _code_scope_predicate(
+    codes: list[str],
+    *,
+    column: str,
+    prefix: str = "scope_code",
+) -> tuple[str, dict[str, Any]]:
+    normalized = sorted({str(code).strip().zfill(6) for code in codes if str(code).strip()})
+    if not normalized:
+        raise RuntimeError("replacement code scope must not be empty")
+    placeholders = ", ".join(f":{prefix}_{idx}" for idx in range(len(normalized)))
+    return (
+        f"{quote_identifier(column)} IN ({placeholders})",
+        {f"{prefix}_{idx}": code for idx, code in enumerate(normalized)},
+    )
+
+
+def _replace_validated_code_snapshot(
+    engine: Engine,
+    frame: pd.DataFrame,
+    *,
+    table_name: str,
+    requested_codes: list[str],
+    code_column: str,
+    label: str,
+    coverage_env: str,
+    default_coverage: float,
+) -> int:
+    complete, scope_codes, coverage = _validated_code_snapshot(
+        frame,
+        requested_codes,
+        code_column=code_column,
+        label=label,
+        coverage_env=coverage_env,
+        default_coverage=default_coverage,
+    )
+    predicate, params = _code_scope_predicate(scope_codes, column=code_column)
+    written = replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        table_name,
+        engine,
+        where_sql=predicate,
+        params=params,
+    )
+    logger.info(
+        "%s: atomically replaced %d rows for %d requested codes (coverage=%.2f%%)",
+        label,
+        written,
+        len(scope_codes),
+        coverage * 100,
+    )
+    return written
+
+
+def _replace_validated_code_date_frame(
+    engine: Engine,
+    frame: pd.DataFrame,
+    *,
+    table_name: str,
+    requested_codes: list[str],
+    code_column: str,
+    date_column: str,
+    label: str,
+    coverage_env: str,
+    default_coverage: float,
+    day_partition: bool = False,
+    identity_columns: tuple[str, ...] | None = None,
+    extra_where: str = "",
+    extra_params: dict[str, Any] | None = None,
+    receipt_engine: Engine | None = None,
+) -> int:
+    complete, scope_codes, coverage = _validated_code_snapshot(
+        frame,
+        requested_codes,
+        code_column=code_column,
+        label=label,
+        coverage_env=coverage_env,
+        default_coverage=default_coverage,
+    )
+    parsed_dates = pd.to_datetime(complete[date_column], errors="coerce")
+    complete = complete.loc[parsed_dates.notna()].copy()
+    parsed_dates = parsed_dates.loc[parsed_dates.notna()]
+    if complete.empty:
+        raise RuntimeError(
+            f"{label} has no valid target dates; preserving previous data"
+        )
+    # Re-run coverage after date validation.  A symbol represented only by
+    # malformed dates must not enter the DELETE scope.
+    complete, scope_codes, coverage = _validated_code_snapshot(
+        complete,
+        requested_codes,
+        code_column=code_column,
+        label=label,
+        coverage_env=coverage_env,
+        default_coverage=default_coverage,
+    )
+    parsed_dates = pd.to_datetime(complete[date_column], errors="coerce")
+    start_value = parsed_dates.min()
+    end_value = parsed_dates.max()
+    complete[date_column] = (
+        parsed_dates
+        if day_partition
+        else parsed_dates.dt.strftime("%Y-%m-%d")
+    )
+    identities = tuple(identity_columns or (code_column, date_column))
+    if (
+        not identities
+        or code_column not in identities
+        or date_column not in identities
+        or len(set(identities)) != len(identities)
+        or any(column not in complete.columns for column in identities)
+    ):
+        raise RuntimeError(f"{label} exact replacement identity is invalid")
+    for column in identities:
+        series = complete[column]
+        if series.isna().any() or series.astype(str).str.strip().eq("").any():
+            raise RuntimeError(
+                f"{label} exact replacement identity {column} is incomplete"
+            )
+    if complete.duplicated(subset=list(identities), keep=False).any():
+        raise RuntimeError(
+            f"{label} returned duplicate exact identities; preserving previous data"
+        )
+    # Legacy callers supplied the former broad DELETE predicate for K-line
+    # dimensions.  Keep validating those frozen values, but never use the
+    # predicate to delete an entire date range.
+    for column, parameter in re.findall(
+        r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*=\s*:([A-Za-z_][A-Za-z0-9_]*)",
+        extra_where or "",
+    ):
+        if (
+            column not in identities
+            or column not in complete.columns
+            or parameter not in (extra_params or {})
+            or not complete[column].eq((extra_params or {})[parameter]).all()
+        ):
+            raise RuntimeError(
+                f"{label} frozen identity predicate is not bound to staged rows"
+            )
+    stage_connection, stage_table = _create_temporary_stage(
+        engine,
+        target_table=table_name,
+        prefix=f"tmp_exact_{table_name}",
+    )
+    try:
+        staged = _append_temporary_stage(
+            stage_connection,
+            stage_table,
+            complete,
+        )
+        if staged != len(complete):
+            raise RuntimeError(
+                f"{label} exact stage row mismatch; preserving previous data"
+            )
+        written = _publish_temporary_stage_exact_keys(
+            engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table=table_name,
+            identity_columns=identities,
+            lock_name=(
+                STOCK_MINUTE_FREEZE_LOCK_NAME
+                if table_name == "sm_stock_minute"
+                else STOCK_KLINE_FREEZE_LOCK_NAME
+                if table_name == "sm_stock_kline"
+                else CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
+                if table_name == "sm_stock_capital_flow_daily"
+                else f"probiga:exact:{table_name}"[:64]
+            ),
+            receipt_engine=receipt_engine,
+        )
+    finally:
+        stage_connection.close()
+    logger.info(
+        "%s: atomically merged %d exact rows in %s..%s for %d codes "
+        "(coverage=%.2f%%); missing dates/timestamps were preserved",
+        label,
+        written,
+        start_value,
+        end_value,
+        len(scope_codes),
+        coverage * 100,
+    )
+    return written
+
+
+def _temporary_stage_name(prefix: str) -> str:
+    safe_prefix = re.sub(r"[^a-z0-9_]", "_", str(prefix).strip().lower())[:30]
+    return f"{safe_prefix}_{os.getpid()}_{time.time_ns()}"[:63]
+
+
+def _create_temporary_stage(
+    engine: Engine,
+    *,
+    target_table: str,
+    prefix: str,
+) -> tuple[Connection, str]:
+    """Create a session-local LIKE stage that disappears when closed."""
+
+    target = quote_identifier(target_table)
+    stage_table = _temporary_stage_name(prefix)
+    stage = quote_identifier(stage_table)
+    connection = engine.connect()
+    try:
+        connection.execute(text(f"CREATE TEMPORARY TABLE {stage} LIKE {target}"))
+        connection.commit()
+        return connection, stage_table
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _append_temporary_stage(
+    connection: Connection,
+    stage_table: str,
+    frame: pd.DataFrame,
+    *,
+    chunksize: int = 1000,
+) -> int:
+    if frame is None or frame.empty:
+        return 0
+    with connection.begin():
+        return write_frame(
+            _clean_df(_with_etl(frame)),
+            stage_table,
+            connection,
+            if_exists="append",
+            index=False,
+            chunksize=max(100, int(chunksize)),
+            method="multi",
+        )
+
+
+def _publish_temporary_stage(
+    engine: Engine,
+    connection: Connection,
+    *,
+    stage_table: str,
+    target_table: str,
+    where_sql: str,
+    params: dict[str, Any],
+    lock_name: str,
+    receipt_engine: Engine | None = None,
+) -> int:
+    """Publish a complete stage with DELETE/INSERT in one target transaction."""
+
+    target = quote_identifier(target_table)
+    stage = quote_identifier(stage_table)
+    staged_rows = int(
+        connection.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar() or 0
+    )
+    column_rows = connection.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name "
+            "AND EXTRA NOT LIKE '%GENERATED%' AND COLUMN_NAME <> 'id' "
+            "ORDER BY ORDINAL_POSITION"
+        ),
+        {"table_name": target_table},
+    ).fetchall()
+    revoke_window: tuple[datetime, datetime] | None = None
+    if target_table == "sm_stock_minute":
+        if receipt_engine is None:
+            raise RuntimeError(
+                "sm_stock_minute publish requires the authority receipt engine"
+            )
+        window = connection.execute(
+            text(f"SELECT MIN(trade_date), MAX(trade_date) FROM {stage}")
+        ).one()
+        if window[0] is None or window[1] is None:
+            raise RuntimeError(
+                "sm_stock_minute stage has no receipt revocation window"
+            )
+        revoke_window = (
+            pd.Timestamp(window[0]).normalize().to_pydatetime(),
+            (
+                pd.Timestamp(window[1]).normalize()
+                + pd.Timedelta(days=1)
+                - pd.Timedelta(microseconds=1)
+            ).to_pydatetime(),
+        )
+    connection.commit()
+    if staged_rows <= 0:
+        raise RuntimeError(
+            f"temporary replacement stage for {target_table} is empty; "
+            "preserving previous data"
+        )
+    columns = [quote_identifier(str(row[0])) for row in column_rows]
+    if not columns:
+        raise RuntimeError(f"{target_table} has no publishable columns")
+    column_list = ", ".join(columns)
+    with mysql_named_lock(
+        engine,
+        lock_name,
+        timeout_seconds=max(0, int(os.environ.get("SM_REFRESH_LOCK_TIMEOUT", "0"))),
+        connection=connection,
+    ):
+        connection.commit()
+        if revoke_window is not None:
+            supersede_overlapping_qmt_minute_forward_receipts(
+                receipt_engine,
+                first_trade_time=revoke_window[0],
+                last_trade_time=revoke_window[1],
+                reason=f"{target_table} staged partition publish",
+            )
+        with connection.begin():
+            connection.execute(
+                text(f"DELETE FROM {target} WHERE {where_sql}"),
+                params,
+            )
+            result = connection.execute(
+                text(
+                    f"INSERT INTO {target} ({column_list}) "
+                    f"SELECT {column_list} FROM {stage}"
+                )
+            )
+            inserted = (
+                int(result.rowcount)
+                if result.rowcount is not None and result.rowcount >= 0
+                else staged_rows
+            )
+            if inserted != staged_rows:
+                raise RuntimeError(
+                    f"{target_table} staged publish row mismatch: "
+                    f"expected={staged_rows} actual={inserted}"
+                )
+    return staged_rows
+
+
+def _publish_temporary_stage_exact_keys(
+    engine: Engine,
+    connection: Connection,
+    *,
+    stage_table: str,
+    target_table: str,
+    identity_columns: tuple[str, ...],
+    lock_name: str,
+    receipt_engine: Engine | None = None,
+) -> int:
+    """Replace only identities actually present in a complete temporary stage.
+
+    Date-range replacement is unsafe for independently fetched symbols: a
+    response can contain the global first/last timestamp while one symbol is
+    missing dates or intraday bars in between.  Joining the target to the stage
+    on the complete business identity preserves every absent old row, while
+    DELETE and INSERT still commit as one transaction.
+    """
+
+    target = quote_identifier(target_table)
+    stage = quote_identifier(stage_table)
+    identities = tuple(str(column) for column in identity_columns)
+    if not identities or len(set(identities)) != len(identities):
+        raise ValueError("exact stage identity columns are invalid")
+    identity_sql = [quote_identifier(column) for column in identities]
+    staged_rows = int(
+        connection.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar() or 0
+    )
+    if staged_rows <= 0:
+        connection.rollback()
+        raise RuntimeError(
+            f"temporary exact stage for {target_table} is empty; "
+            "preserving previous data"
+        )
+    null_predicate = " OR ".join(
+        f"{column} IS NULL" for column in identity_sql
+    )
+    null_count = int(
+        connection.execute(
+            text(f"SELECT COUNT(*) FROM {stage} WHERE {null_predicate}")
+        ).scalar()
+        or 0
+    )
+    grouped = ", ".join(identity_sql)
+    duplicate = connection.execute(
+        text(
+            f"SELECT 1 FROM {stage} GROUP BY {grouped} "
+            "HAVING COUNT(*) > 1 LIMIT 1"
+        )
+    ).first()
+    column_rows = connection.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name "
+            "AND EXTRA NOT LIKE '%GENERATED%' AND COLUMN_NAME <> 'id' "
+            "ORDER BY ORDINAL_POSITION"
+        ),
+        {"table_name": target_table},
+    ).fetchall()
+    revoke_window: tuple[datetime, datetime] | None = None
+    if target_table == "sm_stock_minute":
+        if receipt_engine is None:
+            raise RuntimeError(
+                "sm_stock_minute exact publish requires the authority receipt engine"
+            )
+        window = connection.execute(
+            text(f"SELECT MIN(trade_time), MAX(trade_time) FROM {stage}")
+        ).one()
+        if window[0] is None or window[1] is None:
+            raise RuntimeError(
+                "sm_stock_minute exact stage has no receipt revocation window"
+            )
+        revoke_window = (
+            pd.Timestamp(window[0]).to_pydatetime(),
+            pd.Timestamp(window[1]).to_pydatetime(),
+        )
+    connection.commit()
+    if null_count or duplicate is not None:
+        raise RuntimeError(
+            f"temporary exact stage for {target_table} has null/duplicate "
+            "business identities; preserving previous data"
+        )
+    columns = [quote_identifier(str(row[0])) for row in column_rows]
+    if not columns or any(column not in columns for column in identity_sql):
+        raise RuntimeError(
+            f"{target_table} does not expose the staged business identity"
+        )
+    column_list = ", ".join(columns)
+    join_sql = " AND ".join(
+        f"target.{column}=staged.{column}" for column in identity_sql
+    )
+    with mysql_named_lock(
+        engine,
+        lock_name,
+        timeout_seconds=max(0, int(os.environ.get("SM_REFRESH_LOCK_TIMEOUT", "0"))),
+        connection=connection,
+    ):
+        connection.commit()
+        if revoke_window is not None:
+            supersede_overlapping_qmt_minute_forward_receipts(
+                receipt_engine,
+                first_trade_time=revoke_window[0],
+                last_trade_time=revoke_window[1],
+                reason=f"{target_table} exact-key publish",
+            )
+        with connection.begin():
+            connection.execute(
+                text(
+                    f"DELETE target FROM {target} AS target "
+                    f"INNER JOIN {stage} AS staged ON {join_sql}"
+                )
+            )
+            result = connection.execute(
+                text(
+                    f"INSERT INTO {target} ({column_list}) "
+                    f"SELECT {column_list} FROM {stage}"
+                )
+            )
+            inserted = (
+                int(result.rowcount)
+                if result.rowcount is not None and result.rowcount >= 0
+                else staged_rows
+            )
+            if inserted != staged_rows:
+                raise RuntimeError(
+                    f"{target_table} exact publish row mismatch: "
+                    f"expected={staged_rows} actual={inserted}"
+                )
+    return staged_rows
 
 
 def _load_stock_short_name_map(engine: Engine) -> dict[str, str]:
@@ -455,22 +975,12 @@ def _records_without_nan(df: pd.DataFrame) -> list[dict[str, Any]]:
     return df.astype(object).where(pd.notna(df), None).to_dict(orient="records")
 
 
-def _upsert_qmt_kline_frame(engine: Engine, df: pd.DataFrame) -> int:
-    """Upsert a validated QMT K-line batch without deleting the last good data."""
-    stamped = _with_etl(df)
-    result = safe_upsert_rows(
-        engine,
-        table_name="sm_stock_kline",
-        rows=_records_without_nan(stamped),
-        key_columns=["stock_code", "trade_date", "k_type", "adjust_type"],
-        batch_id=f"qmt_kline_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-        permission_status="SUPPORTED",
-        quality_status="VERIFIED",
-    )
-    return int(result.accepted_rows)
-
-
-def _replace_qmt_minute_window(engine: Engine, df: pd.DataFrame) -> int:
+def _replace_qmt_minute_window(
+    engine: Engine,
+    df: pd.DataFrame,
+    *,
+    receipt_engine: Engine | None = None,
+) -> int:
     """Atomically replace only the fetched time window for a small stock batch."""
     if df is None or df.empty:
         return 0
@@ -480,6 +990,10 @@ def _replace_qmt_minute_window(engine: Engine, df: pd.DataFrame) -> int:
     stamped = stamped.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
     if stamped.empty:
         return 0
+    if receipt_engine is None:
+        raise RuntimeError(
+            "sm_stock_minute window publish requires the authority receipt engine"
+        )
     stamped["stock_code"] = stamped["stock_code"].astype(str).str.zfill(6)
     stamped = stamped.drop_duplicates(subset=["stock_code", "trade_time"], keep="last")
     codes = sorted(stamped["stock_code"].unique().tolist())
@@ -489,19 +1003,79 @@ def _replace_qmt_minute_window(engine: Engine, df: pd.DataFrame) -> int:
     params["end_time_exclusive"] = (
         stamped["trade_time"].max() + pd.Timedelta(seconds=1)
     ).to_pydatetime()
-    with engine.begin() as conn:
-        conn.execute(
+    conn = engine.connect()
+    try:
+        with mysql_named_lock(
+            engine,
+            STOCK_MINUTE_FREEZE_LOCK_NAME,
+            timeout_seconds=0,
+            connection=conn,
+        ):
+            conn.commit()
+            supersede_overlapping_qmt_minute_forward_receipts(
+                receipt_engine,
+                first_trade_time=params["start_time"],
+                last_trade_time=params["end_time_exclusive"],
+                reason="legacy QMT minute window publish",
+            )
+            with conn.begin():
+                conn.execute(
+                    text(
+                        "DELETE FROM `sm_stock_minute` "
+                        f"WHERE stock_code IN ({placeholders}) "
+                        "AND trade_time >= :start_time "
+                        "AND trade_time < :end_time_exclusive"
+                    ),
+                    params,
+                )
+                write_frame(
+                    _clean_df(stamped),
+                    "sm_stock_minute",
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    chunksize=max(
+                        500,
+                        int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000")),
+                    ),
+                    method="multi",
+                )
+    finally:
+        conn.close()
+    return int(len(stamped))
+
+
+def _create_qmt_minute_stage(engine: Engine, stage_table: str) -> Connection:
+    """Open a session-local stage; no persistent schema object is created."""
+
+    connection = engine.connect()
+    try:
+        connection.execute(
             text(
-                "DELETE FROM `sm_stock_minute` "
-                f"WHERE stock_code IN ({placeholders}) "
-                "AND trade_time >= :start_time AND trade_time < :end_time_exclusive"
-            ),
-            params,
+                f"CREATE TEMPORARY TABLE {quote_identifier(stage_table)} "
+                "LIKE `sm_stock_minute`"
+            )
         )
+        connection.commit()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _append_qmt_minute_stage(
+    connection: Connection,
+    stage_table: str,
+    df: pd.DataFrame,
+) -> int:
+    if df is None or df.empty:
+        return 0
+    stamped = _with_etl(df).copy()
+    with connection.begin():
         write_frame(
             _clean_df(stamped),
-            "sm_stock_minute",
-            conn,
+            stage_table,
+            connection,
             if_exists="append",
             index=False,
             chunksize=max(500, int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000"))),
@@ -510,35 +1084,9 @@ def _replace_qmt_minute_window(engine: Engine, df: pd.DataFrame) -> int:
     return int(len(stamped))
 
 
-def _create_qmt_minute_stage(engine: Engine, stage_table: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage_table)}"))
-        conn.execute(
-            text(
-                f"CREATE TABLE {quote_identifier(stage_table)} "
-                "LIKE `sm_stock_minute`"
-            )
-        )
-
-
-def _append_qmt_minute_stage(engine: Engine, stage_table: str, df: pd.DataFrame) -> int:
-    if df is None or df.empty:
-        return 0
-    stamped = _with_etl(df).copy()
-    write_frame(
-        _clean_df(stamped),
-        stage_table,
-        engine,
-        if_exists="append",
-        index=False,
-        chunksize=max(500, int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000"))),
-        method="multi",
-    )
-    return int(len(stamped))
-
-
 def _commit_qmt_minute_stage(
     engine: Engine,
+    stage_connection: Connection,
     stage_table: str,
     *,
     first_trade_time: datetime,
@@ -559,78 +1107,91 @@ def _commit_qmt_minute_stage(
         1,
         min(100, int(os.environ.get("QMT_MINUTE_PUBLISH_CODE_BATCH_SIZE", "10"))),
     )
-    with mysql_named_lock(engine, "probiga:stock_minute", timeout_seconds=0):
-        with engine.connect() as conn:
-            staged_rows = int(conn.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar() or 0)
-            if staged_rows <= 0:
-                return 0
-            codes = [
-                str(row[0]).zfill(6)
-                for row in conn.execute(
-                    text(f"SELECT DISTINCT stock_code FROM {stage} ORDER BY stock_code")
-                ).fetchall()
-                if row[0] is not None
-            ]
-            column_rows = conn.execute(
-                text(
-                    "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sm_stock_minute' "
-                    "AND COLUMN_NAME <> 'id' ORDER BY ORDINAL_POSITION"
-                ),
-            ).fetchall()
-        if not codes:
-            return 0
-        columns = [quote_identifier(str(row[0])) for row in column_rows]
-        if not columns:
-            raise RuntimeError("sm_stock_minute has no publishable columns")
-        column_list = ", ".join(columns)
-        inserted_rows = 0
-        total_batches = (len(codes) + batch_size - 1) // batch_size
-        for offset in range(0, len(codes), batch_size):
-            batch = codes[offset : offset + batch_size]
-            placeholders = ", ".join(f":code_{idx}" for idx in range(len(batch)))
-            params: dict[str, Any] = {
-                f"code_{idx}": code for idx, code in enumerate(batch)
+    lock_owner = stage_connection.execute(
+        text(
+            "SELECT IS_USED_LOCK(:lock_name), CONNECTION_ID()"
+        ),
+        {"lock_name": STOCK_MINUTE_FREEZE_LOCK_NAME},
+    ).one()
+    if int(lock_owner[0] or 0) != int(lock_owner[1] or -1):
+        stage_connection.rollback()
+        raise RuntimeError("QMT minute publish requires the owned generation lock")
+    staged_rows = int(
+        stage_connection.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar()
+        or 0
+    )
+    if staged_rows <= 0:
+        stage_connection.rollback()
+        return 0
+    codes = [
+        str(row[0]).zfill(6)
+        for row in stage_connection.execute(
+            text(f"SELECT DISTINCT stock_code FROM {stage} ORDER BY stock_code")
+        ).fetchall()
+        if row[0] is not None
+    ]
+    column_rows = stage_connection.execute(
+        text(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sm_stock_minute' "
+            "AND COLUMN_NAME <> 'id' ORDER BY ORDINAL_POSITION"
+        ),
+    ).fetchall()
+    stage_connection.commit()
+    if not codes:
+        return 0
+    columns = [quote_identifier(str(row[0])) for row in column_rows]
+    if not columns:
+        raise RuntimeError("sm_stock_minute has no publishable columns")
+    column_list = ", ".join(columns)
+    inserted_rows = 0
+    total_batches = (len(codes) + batch_size - 1) // batch_size
+    for offset in range(0, len(codes), batch_size):
+        batch = codes[offset : offset + batch_size]
+        placeholders = ", ".join(f":code_{idx}" for idx in range(len(batch)))
+        params: dict[str, Any] = {
+            f"code_{idx}": code for idx, code in enumerate(batch)
+        }
+        params.update(
+            {
+                "first_trade_time": first_trade_time,
+                "last_trade_time": last_trade_time,
             }
-            params.update(
-                {
-                    "first_trade_time": first_trade_time,
-                    "last_trade_time": last_trade_time,
-                }
+        )
+        with stage_connection.begin():
+            stage_connection.execute(
+                text(
+                    f"DELETE FROM {target} WHERE stock_code IN ({placeholders}) "
+                    "AND trade_time >= :first_trade_time "
+                    "AND trade_time <= :last_trade_time"
+                ),
+                params,
             )
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        f"DELETE FROM {target} WHERE stock_code IN ({placeholders}) "
-                        "AND trade_time >= :first_trade_time "
-                        "AND trade_time <= :last_trade_time"
-                    ),
-                    params,
-                )
-                result = conn.execute(
-                    text(
-                        f"INSERT INTO {target} ({column_list}) "
-                        f"SELECT {column_list} FROM {stage} "
-                        f"WHERE stock_code IN ({placeholders})"
-                    ),
-                    params,
-                )
-                if result.rowcount is not None and result.rowcount >= 0:
-                    inserted_rows += int(result.rowcount)
-            batch_number = offset // batch_size + 1
-            if batch_number == total_batches or batch_number % 25 == 0:
-                logger.info(
-                    "QMT minute publish batch %s/%s: inserted=%s",
-                    batch_number,
-                    total_batches,
-                    inserted_rows,
-                )
-        return inserted_rows or staged_rows
+            result = stage_connection.execute(
+                text(
+                    f"INSERT INTO {target} ({column_list}) "
+                    f"SELECT {column_list} FROM {stage} "
+                    f"WHERE stock_code IN ({placeholders})"
+                ),
+                params,
+            )
+            if result.rowcount is not None and result.rowcount >= 0:
+                inserted_rows += int(result.rowcount)
+        batch_number = offset // batch_size + 1
+        if batch_number == total_batches or batch_number % 25 == 0:
+            logger.info(
+                "QMT minute publish batch %s/%s: inserted=%s",
+                batch_number,
+                total_batches,
+                inserted_rows,
+            )
+    return inserted_rows or staged_rows
 
 
-def _drop_qmt_minute_stage(engine: Engine, stage_table: str) -> None:
-    with engine.begin() as conn:
-        conn.execute(text(f"DROP TABLE IF EXISTS {quote_identifier(stage_table)}"))
+def _drop_qmt_minute_stage(connection: Connection, _stage_table: str) -> None:
+    """Closing the owning session destroys its temporary stage."""
+
+    connection.close()
 
 
 def _record_qmt_minute_receipt(
@@ -646,6 +1207,7 @@ def _record_qmt_minute_receipt(
     capture_mode: str,
     forward_eligible: bool,
     evidence: dict[str, Any],
+    quality_status: str = "PASS",
 ) -> None:
     """Attest which provider produced a published minute window.
 
@@ -653,6 +1215,28 @@ def _record_qmt_minute_receipt(
     makes the source and coverage independently verifiable before an
     intraday paper order can trust that window.
     """
+    status = str(quality_status or "").strip().upper()
+    if status not in {"PUBLISHING", "PASS", "PARTIAL", "FAILED"}:
+        raise ValueError("QMT minute receipt quality status is invalid")
+    if status != "PASS" and forward_eligible:
+        raise ValueError("unfinished QMT minute publication cannot be forward eligible")
+    if forward_eligible and (
+        expected_count <= 0
+        or observed_count != expected_count
+        or row_count <= 0
+    ):
+        raise ValueError(
+            "forward-eligible QMT minute receipt requires exact requested coverage "
+            "and published rows"
+        )
+    if forward_eligible and not _qmt_minute_evidence_proves_full_coverage(
+        evidence,
+        expected_count=expected_count,
+        observed_count=observed_count,
+    ):
+        raise ValueError(
+            "forward-eligible QMT minute receipt requires frozen universe evidence"
+        )
     payload = {
         "trade_date": trade_date,
         "first_trade_time": first_trade_time.isoformat(),
@@ -663,6 +1247,7 @@ def _record_qmt_minute_receipt(
         "source_provider": source_provider,
         "capture_mode": capture_mode,
         "forward_eligible": bool(forward_eligible),
+        "quality_status": status,
         "evidence": evidence,
     }
     receipt_id = hashlib.sha256(
@@ -675,118 +1260,49 @@ def _record_qmt_minute_receipt(
         ).encode("utf-8")
     ).hexdigest()[:32]
     coverage = observed_count / max(expected_count, 1)
+    validate_required_table_surface(
+        engine,
+        {"st_qmt_minute_sync_receipt_v2"},
+        context="QMT minute receipt writer",
+        required_columns={
+            "st_qmt_minute_sync_receipt_v2": {
+                "receipt_id",
+                "trade_date",
+                "first_trade_time",
+                "last_trade_time",
+                "expected_count",
+                "observed_count",
+                "coverage",
+                "row_count",
+                "source_provider",
+                "capture_mode",
+                "forward_eligible",
+                "quality_status",
+                "evidence_json",
+                "created_at",
+            },
+        },
+    )
     with engine.begin() as conn:
-        # Minute bars can live in the Windows data-plane database while V2
-        # business tables live on production. Keep the receipt beside the
-        # bars so both travel through the same configured minute-data route.
         conn.execute(
             text(
                 """
-                CREATE TABLE IF NOT EXISTS st_qmt_minute_sync_receipt_v2 (
-                    receipt_id VARCHAR(64) PRIMARY KEY,
-                    trade_date DATE NOT NULL,
-                    first_trade_time DATETIME NOT NULL,
-                    last_trade_time DATETIME NOT NULL,
-                    expected_count INT NOT NULL,
-                    observed_count INT NOT NULL,
-                    coverage DECIMAL(18,8) NOT NULL,
-                    row_count BIGINT NOT NULL,
-                    source_provider VARCHAR(80) NOT NULL,
-                    capture_mode VARCHAR(32) NOT NULL,
-                    forward_eligible TINYINT(1) NOT NULL DEFAULT 0,
-                    quality_status VARCHAR(16) NOT NULL,
-                    evidence_json LONGTEXT NOT NULL,
-                    created_at DATETIME NOT NULL,
-                    UNIQUE KEY uk_qmt_minute_receipt_window
-                        (trade_date, first_trade_time, last_trade_time,
-                         source_provider, capture_mode),
-                    KEY idx_qmt_minute_receipt_latest
-                        (trade_date, last_trade_time)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                UPDATE st_qmt_minute_sync_receipt_v2
+                SET forward_eligible=0,
+                    quality_status='SUPERSEDED'
+                WHERE trade_date=:trade_date
+                  AND first_trade_time<=:last_trade_time
+                  AND last_trade_time>=:first_trade_time
+                  AND receipt_id<>:receipt_id
                 """
-            )
+            ),
+            {
+                "trade_date": trade_date,
+                "first_trade_time": first_trade_time,
+                "last_trade_time": last_trade_time,
+                "receipt_id": receipt_id,
+            },
         )
-        columns = {
-            str(row[0])
-            for row in conn.execute(
-                text(
-                    """
-                    SELECT COLUMN_NAME
-                    FROM information_schema.COLUMNS
-                    WHERE TABLE_SCHEMA = DATABASE()
-                      AND TABLE_NAME =
-                          'st_qmt_minute_sync_receipt_v2'
-                    """
-                )
-            ).fetchall()
-        }
-        if "capture_mode" not in columns:
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE st_qmt_minute_sync_receipt_v2
-                    ADD COLUMN capture_mode VARCHAR(32) NOT NULL
-                        DEFAULT 'LEGACY_UNCLASSIFIED'
-                        AFTER source_provider
-                    """
-                )
-            )
-        if "forward_eligible" not in columns:
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE st_qmt_minute_sync_receipt_v2
-                    ADD COLUMN forward_eligible TINYINT(1) NOT NULL
-                        DEFAULT 0
-                        AFTER capture_mode
-                    """
-                )
-            )
-        receipt_index_columns = tuple(
-            str(row[0])
-            for row in conn.execute(
-                text(
-                    """
-                    SELECT COLUMN_NAME
-                    FROM information_schema.STATISTICS
-                    WHERE TABLE_SCHEMA = DATABASE()
-                      AND TABLE_NAME =
-                          'st_qmt_minute_sync_receipt_v2'
-                      AND INDEX_NAME =
-                          'uk_qmt_minute_receipt_window'
-                    ORDER BY SEQ_IN_INDEX
-                    """
-                )
-            ).fetchall()
-        )
-        expected_index_columns = (
-            "trade_date",
-            "first_trade_time",
-            "last_trade_time",
-            "source_provider",
-            "capture_mode",
-        )
-        if receipt_index_columns != expected_index_columns:
-            if receipt_index_columns:
-                conn.execute(
-                    text(
-                        """
-                        ALTER TABLE st_qmt_minute_sync_receipt_v2
-                        DROP INDEX uk_qmt_minute_receipt_window
-                        """
-                    )
-                )
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE st_qmt_minute_sync_receipt_v2
-                    ADD UNIQUE KEY uk_qmt_minute_receipt_window (
-                        trade_date, first_trade_time, last_trade_time,
-                        source_provider, capture_mode
-                    )
-                    """
-                )
-            )
         conn.execute(
             text(
                 """
@@ -799,8 +1315,9 @@ def _record_qmt_minute_receipt(
                 (:receipt_id, :trade_date, :first_trade_time,
                  :last_trade_time, :expected_count, :observed_count,
                  :coverage, :row_count, :source_provider, :capture_mode,
-                 :forward_eligible, 'PASS', :evidence_json, :created_at)
+                 :forward_eligible, :quality_status, :evidence_json, :created_at)
                 ON DUPLICATE KEY UPDATE
+                    receipt_id=VALUES(receipt_id),
                     expected_count=VALUES(expected_count),
                     observed_count=VALUES(observed_count),
                     coverage=VALUES(coverage),
@@ -823,6 +1340,7 @@ def _record_qmt_minute_receipt(
                 "source_provider": source_provider,
                 "capture_mode": capture_mode,
                 "forward_eligible": int(bool(forward_eligible)),
+                "quality_status": status,
                 "evidence_json": json.dumps(
                     evidence,
                     ensure_ascii=False,
@@ -858,6 +1376,135 @@ def _classify_qmt_minute_capture(
         live_forward,
         lag_seconds,
     )
+
+
+def _qmt_minute_code_set_sha256(codes: list[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            codes,
+            ensure_ascii=True,
+            sort_keys=False,
+            separators=(",", ":"),
+        ).encode("ascii")
+    ).hexdigest()
+
+
+def _qmt_minute_universe_evidence(
+    requested_codes: list[str],
+    responded_codes: set[str] | list[str],
+    published_codes: set[str] | list[str],
+) -> dict[str, Any]:
+    """Freeze requested, validated-response and physically published sets."""
+
+    requested = sorted(
+        {str(code).strip().zfill(6) for code in requested_codes if str(code).strip()}
+    )
+    responded = sorted(
+        {str(code).strip().zfill(6) for code in responded_codes if str(code).strip()}
+    )
+    published = sorted(
+        {str(code).strip().zfill(6) for code in published_codes if str(code).strip()}
+    )
+
+    return {
+        "stock_code_set_schema": "probiga.sorted-stock-code-set.v1",
+        "requested_stock_code_count": len(requested),
+        "requested_stock_codes_sha256": _qmt_minute_code_set_sha256(requested),
+        "responded_stock_code_count": len(responded),
+        "responded_stock_codes_sha256": _qmt_minute_code_set_sha256(responded),
+        "responded_stock_codes": responded,
+        "published_stock_code_count": len(published),
+        "published_stock_codes_sha256": _qmt_minute_code_set_sha256(published),
+        "published_stock_codes": published,
+        "full_requested_response_coverage": responded == requested,
+    }
+
+
+def _qmt_minute_evidence_proves_full_coverage(
+    evidence: dict[str, Any],
+    *,
+    expected_count: int,
+    observed_count: int,
+) -> bool:
+    if type(evidence) is not dict:
+        return False
+    responded_codes = evidence.get("responded_stock_codes")
+    published_codes = evidence.get("published_stock_codes")
+    if (
+        evidence.get("stock_code_set_schema")
+        != "probiga.sorted-stock-code-set.v1"
+        or evidence.get("full_requested_response_coverage") is not True
+        or type(responded_codes) is not list
+        or any(
+            type(code) is not str or len(code) != 6 or not code.isdigit()
+            for code in responded_codes
+        )
+        or responded_codes != sorted(set(responded_codes))
+        or type(published_codes) is not list
+        or not published_codes
+        or any(
+            type(code) is not str or len(code) != 6 or not code.isdigit()
+            for code in published_codes
+        )
+        or published_codes != sorted(set(published_codes))
+        or not set(published_codes).issubset(responded_codes)
+        or type(evidence.get("requested_stock_code_count")) is not int
+        or type(evidence.get("responded_stock_code_count")) is not int
+        or type(evidence.get("published_stock_code_count")) is not int
+        or evidence["requested_stock_code_count"] != expected_count
+        or evidence["responded_stock_code_count"] != observed_count
+        or evidence["published_stock_code_count"] != len(published_codes)
+        or len(responded_codes) != observed_count
+    ):
+        return False
+    responded_hash = _qmt_minute_code_set_sha256(responded_codes)
+    published_hash = _qmt_minute_code_set_sha256(published_codes)
+    return bool(
+        evidence.get("requested_stock_codes_sha256") == responded_hash
+        and evidence.get("responded_stock_codes_sha256") == responded_hash
+        and evidence.get("published_stock_codes_sha256") == published_hash
+    )
+
+
+def _qmt_minute_receipt_disposition(
+    requested_codes: list[str],
+    responded_codes: set[str] | list[str],
+    published_codes: set[str] | list[str],
+    *,
+    live_forward_capture: bool,
+) -> tuple[dict[str, Any], str, bool]:
+    """Return evidence/status/authority; partial coverage always fails closed."""
+
+    evidence = _qmt_minute_universe_evidence(
+        requested_codes,
+        responded_codes,
+        published_codes,
+    )
+    full_coverage = evidence["full_requested_response_coverage"] is True
+    has_published_rows = bool(evidence["published_stock_code_count"])
+    return (
+        evidence,
+        "PASS" if full_coverage else "PARTIAL",
+        bool(live_forward_capture and full_coverage and has_published_rows),
+    )
+
+
+def _qmt_minute_validated_code_sets(
+    frame: pd.DataFrame,
+) -> tuple[set[str], set[str]]:
+    """Separate explicit valid responses from rows eligible for publication."""
+
+    if frame is None or frame.empty:
+        return set(), set()
+    responded = set(frame["stock_code"].astype(str))
+    published = set(
+        frame.groupby("stock_code")[["volume", "amount"]]
+        .sum(min_count=1)
+        .query("volume > 0 or amount > 0")
+        .index.astype(str)
+        .tolist()
+    )
+    return responded, published
 
 
 def _is_complete_stock_universe(engine: Engine, stock_codes: list[str]) -> bool:
@@ -901,54 +1548,11 @@ def _prune_snapshot_codes(
     target_date: str,
     keep_codes: set[str],
 ) -> int:
-    """Delete stale symbols from one validated daily snapshot.
-
-    This function is deliberately called only after a complete-universe fetch
-    passes its coverage gate.  It computes the small stale set first, avoiding
-    a huge ``NOT IN`` predicate and keeping every deletion bounded.
-    """
-    table = quote_identifier(table_name)
-    code_col = quote_identifier(code_column)
-    date_col = quote_identifier(date_column)
-    existing = read_frame_direct(
-        text(f"SELECT DISTINCT {code_col} AS code FROM {table} WHERE {date_col} = :target_date"),
-        engine,
-        params={"target_date": target_date},
+    del engine, table_name, code_column, date_column, target_date, keep_codes
+    raise RuntimeError(
+        "post-publish snapshot pruning is disabled; replacement scope must be "
+        "decided before the atomic publish"
     )
-    if existing is None or existing.empty:
-        return 0
-    existing_codes = {
-        str(code).zfill(6)
-        for code in existing["code"].dropna().astype(str).tolist()
-        if str(code).strip()
-    }
-    normalized_keep = {str(code).zfill(6) for code in keep_codes if str(code).strip()}
-    stale_codes = sorted(existing_codes - normalized_keep)
-    if not stale_codes:
-        return 0
-
-    deleted = 0
-    with engine.begin() as conn:
-        for stale_batch in _chunked(stale_codes, 500):
-            placeholders = ", ".join(f":stale_{idx}" for idx in range(len(stale_batch)))
-            params: dict[str, Any] = {f"stale_{idx}": code for idx, code in enumerate(stale_batch)}
-            params["target_date"] = target_date
-            result = conn.execute(
-                text(
-                    f"DELETE FROM {table} WHERE {date_col} = :target_date "
-                    f"AND {code_col} IN ({placeholders})"
-                ),
-                params,
-            )
-            deleted += max(0, int(result.rowcount or 0))
-    logger.info(
-        "%s: pruned %d stale rows (%d codes) for %s",
-        table_name,
-        deleted,
-        len(stale_codes),
-        target_date,
-    )
-    return deleted
 
 
 def _prune_snapshot_time_bounds(
@@ -961,33 +1565,11 @@ def _prune_snapshot_time_bounds(
     first_time: datetime,
     last_time: datetime,
 ) -> int:
-    """Remove leftover bars outside a complete provider snapshot's time range."""
-    table = quote_identifier(table_name)
-    date_col = quote_identifier(date_column)
-    time_col = quote_identifier(time_column)
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(
-                f"DELETE FROM {table} WHERE {date_col} = :target_date "
-                f"AND ({time_col} < :first_time OR {time_col} > :last_time)"
-            ),
-            {
-                "target_date": target_date,
-                "first_time": first_time,
-                "last_time": last_time,
-            },
-        )
-    deleted = max(0, int(result.rowcount or 0))
-    if deleted:
-        logger.info(
-            "%s: pruned %d rows outside %s..%s for %s",
-            table_name,
-            deleted,
-            first_time,
-            last_time,
-            target_date,
-        )
-    return deleted
+    del engine, table_name, date_column, time_column, target_date, first_time, last_time
+    raise RuntimeError(
+        "post-publish time pruning is disabled; replacement scope must be "
+        "decided before the atomic publish"
+    )
 
 
 def _replace_qmt_index_window(
@@ -1082,154 +1664,130 @@ def _sm_column_exists(conn: Any, table: str, column: str) -> bool:
 
 
 def _ensure_sm_stock_kline_short_name(engine: Engine) -> None:
-    """旧库补列：sm_stock_kline.short_name；新建表由 DDL 已含该列。"""
-    try:
-        with engine.begin() as conn:
-            if _sm_column_exists(conn, "sm_stock_kline", "short_name"):
-                return
+    """Read-only guard for the release-migrated K-line name column."""
+
+    validate_required_table_surface(
+        engine,
+        {"sm_stock_kline"},
+        context="stock kline short-name",
+        required_columns={
+            "sm_stock_kline": {"stock_code", "short_name", "trade_date"},
+        },
+    )
+
+
+def privileged_migrate_sm_stock_kline_short_name(engine: Engine) -> dict[str, Any]:
+    """Release-only additive migration for the legacy short-name column."""
+
+    added = False
+    with engine.begin() as conn:
+        if not _sm_column_exists(conn, "sm_stock_kline", "short_name"):
             conn.execute(
                 text(
-                    "ALTER TABLE `sm_stock_kline` ADD COLUMN `short_name` VARCHAR(128) NOT NULL DEFAULT '' "
-                    "COMMENT '股票简称（来自 si_all_code）' AFTER `stock_code`"
+                    "ALTER TABLE `sm_stock_kline` ADD COLUMN `short_name` "
+                    "VARCHAR(128) NOT NULL DEFAULT '' AFTER `stock_code`"
                 )
             )
-        logger.info("sm_stock_kline：已为旧表增加列 short_name。")
-        try:
-            with engine.begin() as conn:
-                conn.execute(
-                    text(
-                        """
-                        UPDATE `sm_stock_kline` k
-                        INNER JOIN `si_all_code` s ON k.stock_code = s.stock_code
-                        SET k.short_name = s.short_name
-                        """
-                    )
-                )
-            logger.info("sm_stock_kline：已从 si_all_code 回填 short_name。")
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning("sm_stock_kline short_name 回填失败（请先同步 si_all_code）：%s", e)
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning("sm_stock_kline 补列 short_name 失败：%s", e)
+            added = True
+        conn.execute(
+            text(
+                "UPDATE `sm_stock_kline` k "
+                "INNER JOIN `si_all_code` s ON k.stock_code=s.stock_code "
+                "SET k.short_name=s.short_name "
+                "WHERE (k.short_name IS NULL OR k.short_name='') "
+                "AND s.short_name IS NOT NULL"
+            )
+        )
+    _ensure_sm_stock_kline_short_name(engine)
+    return {"table": "sm_stock_kline", "column_added": added, "validated": True}
+
+
+def validate_stock_market_runtime_schema(engine: Engine) -> dict[str, Any]:
+    return validate_required_table_surface(
+        engine,
+        RUNTIME_TABLE_ORDER,
+        context="stock market collector",
+        required_columns={
+            "sm_stock_current": {"stock_code", "price", "snapshot_at", "etl_sync_at"},
+            "sm_stock_kline": {"stock_code", "short_name", "trade_date", "close"},
+            "sm_stock_minute": {"stock_code", "trade_time", "trade_date", "price"},
+        },
+    )
 
 
 def run_ddl(engine: Engine) -> None:
-    if os.environ.get("SM_SKIP_DDL") == "1":
-        logger.info("已设置 SM_SKIP_DDL=1，跳过 DDL。")
-        return
-    sql = DDL_PATH.read_text(encoding="utf-8")
-    lines = []
-    for line in sql.splitlines():
-        if line.strip().startswith("--"):
-            continue
-        lines.append(line)
-    cleaned = "\n".join(lines)
-    parts = [p.strip() for p in re.split(r";\s*\n", cleaned) if p.strip()]
-    with engine.begin() as conn:
-        for stmt in parts:
-            conn.execute(text(stmt))
-    logger.info("DDL 执行完成：%s", DDL_PATH)
+    """Legacy entrypoint retained as a read-only prepared-schema guard."""
+
+    validate_stock_market_runtime_schema(engine)
 
 
 def truncate_all(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
-        for t in TABLES_TRUNCATE_ORDER:
-            if t == "sm_stock_minute" and os.environ.get("SM_ALLOW_STOCK_MINUTE_TRUNCATE") != "1":
-                logger.warning("Skip TRUNCATE sm_stock_minute; set SM_ALLOW_STOCK_MINUTE_TRUNCATE=1 to allow.")
-                continue
-            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
-    logger.info("已 TRUNCATE 共 %s 张 STOCK-MARKET 表。", len(TABLES_TRUNCATE_ORDER))
+    del engine
+    raise RuntimeError(
+        "stock-market global preclear is disabled; use a validated atomic "
+        "table/partition replacement"
+    )
 
 
 def truncate_only(engine: Engine, *tables: str) -> None:
-    if not tables:
-        return
-    with engine.begin() as conn:
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=0"))
-        for t in tables:
-            if t == "sm_stock_minute" and os.environ.get("SM_ALLOW_STOCK_MINUTE_TRUNCATE") != "1":
-                logger.warning("Skip TRUNCATE sm_stock_minute; set SM_ALLOW_STOCK_MINUTE_TRUNCATE=1 to allow.")
-                continue
-            conn.execute(text(f"TRUNCATE TABLE {quote_identifier(t)}"))
-        conn.execute(text("SET FOREIGN_KEY_CHECKS=1"))
-    logger.info("已 TRUNCATE 表：%s", ", ".join(tables))
+    del engine, tables
+    raise RuntimeError(
+        "stock-market table preclear is disabled; use a validated atomic "
+        "table/partition replacement"
+    )
 
 
 def delete_stock_minute_dates(engine: Engine, dates: list[str]) -> None:
-    clean_dates = sorted({str(d)[:10] for d in dates if str(d or "").strip()})
-    if not clean_dates:
-        return
-    with engine.begin() as conn:
-        for trade_date in clean_dates:
-            conn.execute(
-                text("DELETE FROM `sm_stock_minute` WHERE trade_date = :trade_date"),
-                {"trade_date": trade_date},
-            )
-    logger.info("sm_stock_minute: deleted existing rows for dates: %s", ", ".join(clean_dates))
+    del engine, dates
+    raise RuntimeError(
+        "stock-minute preclear is disabled; publish a validated temporary stage atomically"
+    )
 
 
 def df_to_table(engine: Engine, df: pd.DataFrame, table: str) -> None:
-    if df is None or df.empty:
-        logger.info("表 %s：无数据，跳过写入。", table)
-        return
-    cleaned = _clean_df(df)
-    with engine.begin() as conn:
-        write_frame(cleaned, table, conn, if_exists="append", index=False, chunksize=1000, method="multi")
-    logger.info("表 %s：写入 %s 行。", table, len(df))
+    del engine, df, table
+    raise RuntimeError(
+        "unscoped append is disabled for stock-market refreshes; use an atomic "
+        "validated table/partition replacement"
+    )
 
 
 def replace_stock_current_snapshot(engine: Engine, df: pd.DataFrame) -> int:
-    """Write a complete quote batch to staging, then atomically swap it in."""
+    """Replace only the validated quote codes in one DML transaction."""
     if df is None or df.empty:
         raise ValueError("sm_stock_current snapshot must not be empty")
 
     cleaned = _clean_df(df)
-    stage_table = "sm_stock_current_stage"
-    backup_table = "sm_stock_current_backup"
+    if "stock_code" not in cleaned.columns:
+        raise ValueError("sm_stock_current snapshot has no stock_code column")
+    cleaned = cleaned.copy()
+    cleaned["stock_code"] = cleaned["stock_code"].astype(str).str.strip().str.zfill(6)
+    cleaned = cleaned.drop_duplicates(subset=["stock_code"], keep="last")
+    predicate, params = _code_scope_predicate(
+        cleaned["stock_code"].tolist(),
+        column="stock_code",
+        prefix="current_code",
+    )
     lock_timeout = max(0, int(os.environ.get("CURRENT_SNAPSHOT_LOCK_TIMEOUT", "0")))
     with mysql_named_lock(
         engine,
         "probiga:stock_current",
         timeout_seconds=lock_timeout,
     ):
-        with engine.begin() as conn:
-            conn.execute(text(f"DROP TABLE IF EXISTS {stage_table}"))
-            conn.execute(text(f"CREATE TABLE {stage_table} LIKE sm_stock_current"))
-
-        try:
-            write_frame(
-                cleaned,
-                stage_table,
-                engine,
-                if_exists="append",
-                index=False,
-                chunksize=1000,
-                method="multi",
+        written = replace_table_rows(
+            cleaned,
+            "sm_stock_current",
+            engine,
+            where_sql=predicate,
+            params=params,
+            chunksize=1000,
+            method="multi",
+        )
+        if written != len(cleaned):
+            raise RuntimeError(
+                "sm_stock_current replacement row mismatch: "
+                f"expected={len(cleaned)} actual={written}"
             )
-            with engine.connect() as conn:
-                staged_count = int(
-                    conn.execute(text(f"SELECT COUNT(*) FROM {stage_table}")).scalar() or 0
-                )
-            if staged_count != len(cleaned):
-                raise RuntimeError(
-                    f"sm_stock_current staging row mismatch: expected={len(cleaned)} actual={staged_count}"
-                )
-
-            with engine.begin() as conn:
-                conn.execute(text(f"DROP TABLE IF EXISTS {backup_table}"))
-                conn.execute(
-                    text(
-                        f"RENAME TABLE sm_stock_current TO {backup_table}, "
-                        f"{stage_table} TO sm_stock_current"
-                    )
-                )
-            with engine.begin() as conn:
-                conn.execute(text(f"DROP TABLE IF EXISTS {backup_table}"))
-        except Exception:
-            with engine.begin() as conn:
-                conn.execute(text(f"DROP TABLE IF EXISTS {stage_table}"))
-            raise
     logger.info("sm_stock_current: atomically replaced %s rows", len(cleaned))
     return int(len(cleaned))
 
@@ -1392,7 +1950,9 @@ def _chunked(items: list[str], size: int) -> list[list[str]]:
 def step_dividend(engine: Engine, stock_codes: list[str]) -> None:
     from adata.stock.market.stock_dividend import StockDividend
 
-    truncate_only(engine, "sm_dividend")
+    if not stock_codes:
+        logger.warning("dividend: empty stock universe; preserving previous data")
+        return
     div = StockDividend()
 
     def _fetch_dividend(code: str) -> pd.DataFrame | None:
@@ -1405,9 +1965,32 @@ def step_dividend(engine: Engine, stock_codes: list[str]) -> None:
             return df[["stock_code", "report_date", "dividend_plan", "ex_dividend_date"]]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_dividend, label="分红", log_every=500)
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_dividend")
+    parts = _concurrent_run(
+        stock_codes,
+        _fetch_dividend,
+        label="分红",
+        log_every=500,
+        fail_on_error=True,
+    )
+    if not parts:
+        raise RuntimeError("dividend returned no rows; preserving previous data")
+    complete = pd.concat(parts, ignore_index=True)
+    complete, scope_codes, _coverage = _validated_code_snapshot(
+        complete,
+        stock_codes,
+        code_column="stock_code",
+        label="dividend",
+        coverage_env="SM_DIVIDEND_MIN_COVERAGE",
+        default_coverage=0.20,
+    )
+    predicate, params = _code_scope_predicate(scope_codes, column="stock_code")
+    replace_table_rows(
+        _clean_df(_with_etl(complete)),
+        "sm_dividend",
+        engine,
+        where_sql=predicate,
+        params=params,
+    )
 
 
 def _step_stock_kline_adata(
@@ -1422,17 +2005,18 @@ def _step_stock_kline_adata(
 ) -> None:
     from adata.stock.market.stock_market.stock_market import StockMarket
 
-    if incremental:
-        with engine.begin() as conn:
-            deleted = conn.execute(
-                text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s"),
-                {"s": start},
-            ).rowcount
-        logger.info("增量模式：已删除 %d 条 trade_date >= %s 的旧数据", deleted, start)
-    else:
-        truncate_only(engine, "sm_stock_kline")
     mk = StockMarket()
-    logger.info("个股K线(adata)：%d 只，区间 %s ~ %s，k_type=%s，adjust_type=%s", len(stock_codes), start, end or "至今", k_type, adjust_type)
+    end_value = end or datetime.now().strftime("%Y-%m-%d")
+    logger.info(
+        "个股K线(adata)：%d 只，区间 %s ~ %s，k_type=%s，adjust_type=%s，"
+        "mode=%s staged-atomic",
+        len(stock_codes),
+        start,
+        end_value,
+        k_type,
+        adjust_type,
+        "incremental" if incremental else "refresh",
+    )
     name_map = _load_stock_short_name_map(engine)
     kline_cols = [
         "stock_code", "short_name", "trade_time", "trade_date", "k_type", "adjust_type",
@@ -1458,33 +2042,105 @@ def _step_stock_kline_adata(
         return None
 
     workers = _max_workers()
-    batch_size = max(500, workers * 100)
+    fetch_batch_size = max(
+        workers,
+        int(os.environ.get("ADATA_KLINE_FETCH_CODE_BATCH_SIZE", str(workers * 8))),
+    )
     batch: list[pd.DataFrame] = []
     done_count = 0
     total = len(stock_codes)
+    failed_codes: list[str] = []
+    received_codes: set[str] = set()
+    staged_rows = 0
+    stage_connection, stage_table = _create_temporary_stage(
+        engine,
+        target_table="sm_stock_kline",
+        prefix="sm_stock_kline_adata_stage",
+    )
 
     def _flush() -> None:
-        nonlocal batch
+        nonlocal batch, staged_rows
         if batch:
-            df_to_table(engine, _with_etl(pd.concat(batch, ignore_index=True)), "sm_stock_kline")
-            logger.info("K线 分批写入 %d 只，累计 %d/%d", len(batch), done_count, total)
+            complete_batch = pd.concat(batch, ignore_index=True)
+            complete_batch["stock_code"] = (
+                complete_batch["stock_code"].astype(str).str.strip().str.zfill(6)
+            )
+            complete_batch = complete_batch.drop_duplicates(
+                subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+                keep="last",
+            )
+            staged_rows += _append_temporary_stage(
+                stage_connection,
+                stage_table,
+                complete_batch,
+                chunksize=1000,
+            )
+            received_codes.update(complete_batch["stock_code"].unique().tolist())
+            logger.info("K线 分批写入临时区 %d 只，累计 %d/%d", len(batch), done_count, total)
             batch = []
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_fetch_kline, c): c for c in stock_codes}
-        for future in as_completed(futures):
-            done_count += 1
-            try:
-                df = future.result()
-                if df is not None:
-                    batch.append(df)
-            except Exception as e:
-                logger.warning("stock_kline %s 失败：%s", futures[future], e)
-            if done_count % batch_size == 0:
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for request_batch in _chunked(stock_codes, fetch_batch_size):
+                futures = {
+                    pool.submit(_fetch_kline, code): code for code in request_batch
+                }
+                for future in as_completed(futures):
+                    done_count += 1
+                    try:
+                        df = future.result()
+                        if df is not None:
+                            batch.append(df)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        failed_codes.append(futures[future])
+                        logger.warning("stock_kline %s 失败：%s", futures[future], exc)
+                    if done_count % 500 == 0:
+                        logger.info("K线 进度 %d/%d（并发 %d）", done_count, total, workers)
+                # Release this bounded future/result set before requesting the
+                # next group; multi-year per-symbol frames can be large.
                 _flush()
-            elif done_count % 500 == 0:
-                logger.info("K线 进度 %d/%d（并发 %d）", done_count, total, workers)
-    _flush()
+        _flush()
+        coverage = len(received_codes) / max(total, 1)
+        minimum = _minimum_coverage("ADATA_KLINE_MIN_COVERAGE", 0.90)
+        if staged_rows <= 0 or coverage < minimum:
+            raise RuntimeError(
+                "adata K-line coverage below threshold: "
+                f"{len(received_codes)}/{total} ({coverage:.1%}) < {minimum:.1%}; "
+                f"failed={failed_codes[:10]}; preserving previous data"
+            )
+        code_where, params = _code_scope_predicate(
+            sorted(received_codes),
+            column="stock_code",
+            prefix="kline_code",
+        )
+        params.update(
+            {
+                "start_date": start,
+                "end_date": end_value,
+                "k_type": k_type,
+                "adjust_type": adjust_type,
+            }
+        )
+        published = _publish_temporary_stage(
+            engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table="sm_stock_kline",
+            where_sql=(
+                f"{code_where} AND trade_date >= :start_date "
+                "AND trade_date <= :end_date AND k_type=:k_type "
+                "AND adjust_type=:adjust_type"
+            ),
+            params=params,
+            lock_name="probiga:stock_kline",
+        )
+        logger.info(
+            "adata K-line published %d staged rows, coverage=%.2f%%",
+            published,
+            coverage * 100,
+        )
+    finally:
+        stage_connection.close()
 
 
 def _step_stock_kline_akshare(
@@ -1500,7 +2156,6 @@ def _step_stock_kline_akshare(
     from biz.stock_market.stock_kline_akshare import (
         ADJUST_TO_INT,
         akshare_daily_to_sm_kline,
-        delete_kline_range,
         em_code_to_sina_symbol,
         fetch_stock_daily_kline,
         _to_yyyymmdd,
@@ -1524,11 +2179,14 @@ def _step_stock_kline_akshare(
 
     do_truncate = os.environ.get("SM_STOCK_KLINE_AKSHARE_TRUNCATE") == "1"
     if do_truncate:
-        truncate_only(engine, "sm_stock_kline")
+        raise RuntimeError(
+            "SM_STOCK_KLINE_AKSHARE_TRUNCATE=1 is no longer supported; "
+            "use safe code/date-partition replacement"
+        )
     pf = (progress_file or "").strip()
     use_flush = bool(pf) and not skip_progress
     logger.info(
-        "个股K线(akshare)：%d 只，区间 %s ~ %s（API %s~%s），复权=%s，全表TRUNCATE=%s，"
+        "个股K线(akshare)：%d 只，区间 %s ~ %s（API %s~%s），复权=%s，安全分区替换=%s，"
         "断点进度文件(--progress-file 且未 --skip-progress)=%s",
         len(stock_codes),
         start_sql,
@@ -1536,7 +2194,7 @@ def _step_stock_kline_akshare(
         start_api,
         end_api,
         adjust or "不复权",
-        do_truncate,
+        True,
         use_flush,
     )
     if not use_flush:
@@ -1547,6 +2205,7 @@ def _step_stock_kline_akshare(
 
     written_flush = 0
     written_stocks = 0
+    failed_codes: list[str] = []
     total_n = len(stock_codes)
     name_map = _load_stock_short_name_map(engine)
     log_every = max(1, int(os.environ.get("SM_STOCK_KLINE_PROGRESS_LOG_EVERY", "25")))
@@ -1559,9 +2218,6 @@ def _step_stock_kline_akshare(
                 logger.warning("AkShare K线：无法映射新浪代码，跳过 %s", code)
                 _sleep_stock_kline_akshare()
                 continue
-            if not do_truncate:
-                delete_kline_range(engine, code, 1, adjust_type, start_sql, end_sql)
-
             def _pull() -> pd.DataFrame | None:
                 return fetch_stock_daily_kline(code, start_api, end_api, adjust)
 
@@ -1584,12 +2240,23 @@ def _step_stock_kline_akshare(
                     ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"],
                 )
                 etl = _with_etl(sm_df)
-                df_to_table(engine, etl, "sm_stock_kline")
+                exact_frame = _clean_df(etl).drop_duplicates(
+                    subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+                    keep="last",
+                )
+                replace_table_rows_exact_keys(
+                    exact_frame,
+                    "sm_stock_kline",
+                    engine,
+                    key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+                    lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+                )
                 if use_flush:
                     _kline_append_progress(pf, code)
                     written_flush += 1
                 written_stocks += 1
         except Exception as e:  # pylint: disable=broad-except
+            failed_codes.append(str(code).strip().zfill(6))
             logger.warning("AkShare stock_kline %s 失败：%s", code, e, exc_info=True)
         _sleep_stock_kline_akshare()
 
@@ -1610,6 +2277,14 @@ def _step_stock_kline_akshare(
             "个股K线(akshare)：共 %d 只均未写入（逐只入库+进度文件模式）。示例代码：%s",
             len(stock_codes),
             stock_codes[0],
+        )
+    coverage = written_stocks / max(total_n, 1)
+    minimum = _minimum_coverage("AKSHARE_KLINE_MIN_COVERAGE", 0.90)
+    if coverage < minimum:
+        raise RuntimeError(
+            "AkShare K-line coverage below threshold: "
+            f"{written_stocks}/{total_n} ({coverage:.1%}) < {minimum:.1%}; "
+            f"failed={failed_codes[:10]}; missing partitions retained"
         )
     elif use_flush and written_flush:
         logger.info("个股K线(akshare)：逐只入库完成 %s 只，进度已写入 %s", written_flush, pf)
@@ -1684,60 +2359,96 @@ def _step_stock_kline_myquant(
 
     start = kline_start or os.environ.get("SM_MARKET_START", "2020-01-01")
     end = kline_end or os.environ.get("SM_MARKET_END") or datetime.now().strftime("%Y-%m-%d")
-    if incremental:
-        with engine.begin() as conn:
-            deleted = conn.execute(
-                text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1 AND `adjust_type` = 0"),
-                {"s": start},
-            ).rowcount
-        logger.info("MyQuant K-line incremental: deleted %d rows from %s", deleted, start)
-    else:
-        truncate_only(engine, "sm_stock_kline")
 
     supported = [c for c in stock_codes if to_gm_symbol(c)]
     skipped = len(stock_codes) - len(supported)
     logger.info(
-        "Stock K-line (MyQuant): %d supported stocks, %d skipped, range %s ~ %s, adjust_type=0",
+        "Stock K-line (MyQuant): %d supported stocks, %d skipped, range %s ~ %s, "
+        "adjust_type=0, mode=%s staged-atomic",
         len(supported),
         skipped,
         start,
         end,
+        "incremental" if incremental else "refresh",
     )
+    if not supported:
+        raise RuntimeError("MyQuant stock K-line has no supported stock symbols")
 
     name_map = _load_stock_short_name_map(engine)
     batch_size = _myquant_batch_size("kline", 80)
     fields = "symbol,eob,open,high,low,close,pre_close,volume,amount"
     written_rows = 0
     written_stocks: set[str] = set()
-    for i, batch in enumerate(_chunked(supported, batch_size), start=1):
-        raw = history(
-            batch,
-            frequency="1d",
-            start_time=start,
-            end_time=end,
-            fields=fields,
-            adjust=None,
-            timeout=_myquant_timeout(300),
-        )
-        sm_df = _myquant_daily_to_sm_kline(raw, name_map)
-        if sm_df is not None and not sm_df.empty:
-            sm_df = _to_numeric(
-                sm_df,
-                ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"],
+    stage_connection, stage_table = _create_temporary_stage(
+        engine,
+        target_table="sm_stock_kline",
+        prefix="sm_stock_kline_myquant_stage",
+    )
+    try:
+        for i, batch in enumerate(_chunked(supported, batch_size), start=1):
+            raw = history(
+                batch,
+                frequency="1d",
+                start_time=start,
+                end_time=end,
+                fields=fields,
+                adjust=None,
+                timeout=_myquant_timeout(300),
             )
-            df_to_table(engine, _with_etl(sm_df), "sm_stock_kline")
-            written_rows += len(sm_df)
-            written_stocks.update(sm_df["stock_code"].astype(str).unique().tolist())
-        logger.info(
-            "Stock K-line (MyQuant): batch %d/%d, rows=%d, stocks=%d",
-            i,
-            (len(supported) + batch_size - 1) // batch_size,
-            written_rows,
-            len(written_stocks),
+            sm_df = _myquant_daily_to_sm_kline(raw, name_map)
+            if sm_df is not None and not sm_df.empty:
+                sm_df = _to_numeric(
+                    sm_df,
+                    ["open", "close", "high", "low", "volume", "amount", "change", "change_pct", "turnover_ratio", "pre_close"],
+                )
+                sm_df["stock_code"] = sm_df["stock_code"].astype(str).str.zfill(6)
+                sm_df = sm_df.drop_duplicates(
+                    subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+                    keep="last",
+                )
+                written_rows += _append_temporary_stage(
+                    stage_connection,
+                    stage_table,
+                    sm_df,
+                    chunksize=1000,
+                )
+                written_stocks.update(sm_df["stock_code"].unique().tolist())
+            logger.info(
+                "Stock K-line (MyQuant): stage batch %d/%d, rows=%d, stocks=%d",
+                i,
+                (len(supported) + batch_size - 1) // batch_size,
+                written_rows,
+                len(written_stocks),
+            )
+            _sleep()
+        coverage = len(written_stocks) / len(supported)
+        minimum = _minimum_coverage("MYQUANT_KLINE_MIN_COVERAGE", 0.90)
+        if written_rows <= 0 or coverage < minimum:
+            raise RuntimeError(
+                "MyQuant stock K-line coverage below threshold: "
+                f"{len(written_stocks)}/{len(supported)} ({coverage:.1%}) "
+                f"< {minimum:.1%}; preserving previous data"
+            )
+        code_where, params = _code_scope_predicate(
+            sorted(written_stocks),
+            column="stock_code",
+            prefix="kline_code",
         )
-        _sleep()
-    if supported and not written_rows:
-        raise RuntimeError("MyQuant stock K-line returned no rows")
+        params.update({"start_date": start, "end_date": end})
+        _publish_temporary_stage(
+            engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table="sm_stock_kline",
+            where_sql=(
+                f"{code_where} AND trade_date >= :start_date "
+                "AND trade_date <= :end_date AND k_type=1 AND adjust_type=0"
+            ),
+            params=params,
+            lock_name="probiga:stock_kline",
+        )
+    finally:
+        stage_connection.close()
 
 
 def _step_stock_kline_qmt(
@@ -1748,109 +2459,196 @@ def _step_stock_kline_qmt(
     end: str,
     short_name_map: dict[str, str],
 ) -> None:
-    """Fetch and upsert QMT daily bars in bounded batches.
+    """Replace an exact catalog-bound QMT daily window atomically."""
+    from server.common.qmt_attestation_contract import (
+        daily_market_source_batch_id,
+    )
+    from server.common.qmt_stock_catalog import load_stock_catalog
+    from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
-    A failed/empty batch never deletes canonical rows.  This is important when
-    the Windows terminal or reverse tunnel reconnects during a scheduled run.
-    """
     batch_size = max(20, int(os.environ.get("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")))
     history_engine = get_kline_engine()
-    min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_KLINE_MIN_COVERAGE", "0.90"))))
-    written = 0
-    received_codes: set[str] = set()
-    received_codes_by_date: dict[str, set[str]] = {}
     normalized_start = pd.to_datetime(start, errors="coerce")
     normalized_end = pd.to_datetime(end, errors="coerce")
-    total_batches = (len(stock_codes) + batch_size - 1) // batch_size
-    for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
-        frame = backend.fetch_kline(
-            batch,
-            start,
-            end,
-            short_name_map=short_name_map,
-            dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
-        )
-        if frame is None or frame.empty:
-            logger.warning("QMT daily K-line batch %d/%d returned no rows", batch_no, total_batches)
-            continue
-        frame = frame.copy()
-        frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        if pd.notna(normalized_start):
-            frame = frame[frame["trade_date"] >= normalized_start.strftime("%Y-%m-%d")]
-        if pd.notna(normalized_end):
-            frame = frame[frame["trade_date"] <= normalized_end.strftime("%Y-%m-%d")]
-        for column in ("open", "close", "high", "low", "volume", "amount"):
-            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-        frame = frame.dropna(subset=["stock_code", "trade_date", "open", "close", "high", "low"])
-        frame = frame[
-            (frame["open"] > 0)
-            & (frame["close"] > 0)
-            & (frame["high"] >= frame[["open", "close"]].max(axis=1))
-            & (frame["low"] <= frame[["open", "close"]].min(axis=1))
-            & (frame["volume"] >= 0)
-            & (frame["amount"] >= 0)
-        ]
-        if frame.empty:
-            logger.warning("QMT daily K-line batch %d/%d failed business validation", batch_no, total_batches)
-            continue
-        frame = frame.drop_duplicates(
-            subset=["stock_code", "trade_date", "k_type", "adjust_type"],
-            keep="last",
-        )
-        if str(getattr(backend, "name", "")).lower() == "bigqmt":
-            from integrations.qmt.local_history import (
-                persist_daily_kline_capture,
-            )
-
-            captured = persist_daily_kline_capture(
-                frame,
-                source_engine=engine,
-                batch_id=(
-                    f"canonical_bigqmt_kline_"
-                    f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-                ),
-            )
-            if captured != len(frame):
-                raise RuntimeError(
-                    "BigQMT raw daily capture mismatch: "
-                    f"{captured}/{len(frame)}"
-                )
-        written += _upsert_qmt_kline_frame(history_engine, frame)
-        received_codes.update(frame["stock_code"].astype(str).str.zfill(6).unique().tolist())
-        for trade_date, date_frame in frame.groupby("trade_date"):
-            received_codes_by_date.setdefault(str(trade_date), set()).update(
-                date_frame["stock_code"].astype(str).str.zfill(6).unique().tolist()
-            )
-        logger.info(
-            "QMT daily K-line batch %d/%d: rows=%d cumulative_codes=%d",
-            batch_no,
-            total_batches,
-            len(frame),
-            len(received_codes),
-        )
-
-    coverage = len(received_codes) / max(len(stock_codes), 1)
-    if written <= 0 or coverage < min_coverage:
-        raise RuntimeError(
-            f"QMT daily K-line coverage below threshold: {len(received_codes)}/{len(stock_codes)} "
-            f"({coverage:.1%}) < {min_coverage:.1%}"
-        )
     if (
-        pd.notna(normalized_start)
-        and pd.notna(normalized_end)
-        and normalized_start.normalize() == normalized_end.normalize()
-        and _is_complete_stock_universe(engine, stock_codes)
+        pd.isna(normalized_start)
+        or pd.isna(normalized_end)
+        or normalized_start > normalized_end
     ):
-        target_date = normalized_start.strftime("%Y-%m-%d")
-        _prune_snapshot_codes(
-            history_engine,
-            table_name="sm_stock_kline",
-            code_column="stock_code",
-            date_column="trade_date",
-            target_date=target_date,
-            keep_codes=received_codes_by_date.get(target_date, set()),
+        raise RuntimeError("QMT daily K-line target range is invalid")
+    normalized_start_text = normalized_start.strftime("%Y-%m-%d")
+    normalized_end_text = normalized_end.strftime("%Y-%m-%d")
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=datetime.now().replace(microsecond=0),
         )
-    logger.info("QMT daily K-line complete: rows=%d coverage=%.2f%%", written, coverage * 100)
+        calendar_receipt = load_trade_calendar_receipt(
+            connection,
+            start_date=normalized_start_text,
+            end_date=normalized_end_text,
+            decision_known_at=datetime.now().replace(microsecond=0),
+        )
+    sessions = calendar_receipt.sessions_between(
+        normalized_start_text, normalized_end_text
+    )
+    if not sessions:
+        raise RuntimeError("QMT daily K-line range has no authoritative session")
+    member_by_code = {
+        str(member["stock_code"]).zfill(6): member for member in catalog.members
+    }
+    stock_codes = sorted(
+        code
+        for code, member in member_by_code.items()
+        if str(member["list_date"]) <= normalized_end_text
+        and (
+            member.get("expire_date") in (None, "")
+            or normalized_start_text < str(member["expire_date"])
+        )
+    )
+    if not stock_codes:
+        raise RuntimeError("QMT catalog target-range stock universe is empty")
+    # Bind the raw source batch to both independent roots.  A catalog or
+    # calendar change during the fetch is therefore detected by attestation.
+    capture_batch_id = daily_market_source_batch_id(
+        catalog_manifest_hash=catalog.manifest_hash,
+        calendar_manifest_hash=calendar_receipt.manifest_hash,
+    )
+    stage_connection, stage_table = _create_temporary_stage(
+        history_engine,
+        target_table="sm_stock_kline",
+        prefix="sm_stock_kline_qmt_stage",
+    )
+    staged_rows = 0
+    total_batches = (len(stock_codes) + batch_size - 1) // batch_size
+    try:
+        for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
+            frame = backend.fetch_kline(
+                batch,
+                start,
+                end,
+                short_name_map=short_name_map,
+                dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+            )
+            if frame is None or frame.empty:
+                raise RuntimeError(
+                    f"QMT daily K-line batch {batch_no}/{total_batches} returned no rows; "
+                    "preserving previous data"
+                )
+            frame = frame.copy()
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            frame = frame[
+                (frame["trade_date"] >= normalized_start_text)
+                & (frame["trade_date"] <= normalized_end_text)
+            ]
+            for column in ("open", "close", "high", "low", "volume", "amount"):
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame = frame.dropna(
+                subset=["stock_code", "trade_date", "open", "close", "high", "low"]
+            )
+            frame = frame[
+                (frame["open"] > 0)
+                & (frame["close"] > 0)
+                & (frame["high"] >= frame[["open", "close"]].max(axis=1))
+                & (frame["low"] <= frame[["open", "close"]].min(axis=1))
+                & (frame["volume"] >= 0)
+                & (frame["amount"] >= 0)
+            ]
+            frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+            frame = frame[
+                frame["stock_code"].isin(batch)
+                & (pd.to_numeric(frame["k_type"], errors="coerce") == 1)
+                & (pd.to_numeric(frame["adjust_type"], errors="coerce") == 0)
+            ]
+            frame = frame.drop_duplicates(
+                subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+                keep="last",
+            )
+            observed_by_date = {
+                str(trade_date): set(group["stock_code"].astype(str))
+                for trade_date, group in frame.groupby("trade_date")
+            }
+            for trade_date in sessions:
+                expected = {
+                    code
+                    for code in batch
+                    if str(member_by_code[code]["list_date"]) <= trade_date
+                    and (
+                        member_by_code[code].get("expire_date") in (None, "")
+                        or trade_date < str(member_by_code[code]["expire_date"])
+                    )
+                }
+                observed = observed_by_date.get(trade_date, set())
+                if observed != expected:
+                    missing = sorted(expected - observed)
+                    extra = sorted(observed - expected)
+                    raise RuntimeError(
+                        "QMT daily K-line does not exactly equal the frozen catalog: "
+                        f"batch={batch_no}, date={trade_date}, "
+                        f"missing={missing[:10]}, extra={extra[:10]}"
+                    )
+            extra_sessions = set(observed_by_date) - set(sessions)
+            if extra_sessions:
+                raise RuntimeError(
+                    "QMT daily K-line returned sessions outside the frozen calendar: "
+                    f"{sorted(extra_sessions)[:10]}"
+                )
+            if frame.empty:
+                raise RuntimeError(
+                    f"QMT daily K-line batch {batch_no}/{total_batches} failed validation"
+                )
+            if str(getattr(backend, "name", "")).lower() == "bigqmt":
+                from integrations.qmt.local_history import persist_daily_kline_capture
+
+                captured = persist_daily_kline_capture(
+                    frame,
+                    source_engine=engine,
+                    batch_id=capture_batch_id,
+                )
+                if captured != len(frame):
+                    raise RuntimeError(
+                        "BigQMT raw daily capture mismatch: "
+                        f"{captured}/{len(frame)}"
+                    )
+            staged_rows += _append_temporary_stage(
+                stage_connection,
+                stage_table,
+                frame,
+                chunksize=1000,
+            )
+            logger.info(
+                "QMT daily K-line stage batch %d/%d: rows=%d staged=%d",
+                batch_no,
+                total_batches,
+                len(frame),
+                staged_rows,
+            )
+        written = _publish_temporary_stage(
+            history_engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table="sm_stock_kline",
+            where_sql=(
+                "trade_date BETWEEN :start_date AND :end_date "
+                "AND k_type=1 AND adjust_type=0"
+            ),
+            params={
+                "start_date": normalized_start_text,
+                "end_date": normalized_end_text,
+            },
+            lock_name="probiga:stock_kline",
+        )
+        logger.info(
+            "QMT daily K-line complete: rows=%d coverage=100.00%% "
+            "catalog_batch=%s source_batch=%s",
+            written,
+            catalog.batch_id,
+            capture_batch_id,
+        )
+    finally:
+        stage_connection.close()
 
 
 def _try_step_stock_kline_registry(
@@ -1866,8 +2664,11 @@ def _try_step_stock_kline_registry(
 
         backend = get_backend("kline")
     except Exception as exc:
-        logger.error("Data-source registry error: %s", exc)
-        return True
+        logger.warning(
+            "Data-source registry error; falling back to the explicit K-line source: %s",
+            exc,
+        )
+        return False
     if backend is None:
         return False
 
@@ -1878,15 +2679,6 @@ def _try_step_stock_kline_registry(
     if backend.name in {"qmt", "bigqmt"}:
         _step_stock_kline_qmt(engine, backend, stock_codes, start, end, short_name_map)
         return True
-    if incremental:
-        with engine.begin() as conn:
-            deleted = conn.execute(
-                text("DELETE FROM `sm_stock_kline` WHERE `trade_date` >= :s AND `k_type` = 1"),
-                {"s": start},
-            ).rowcount
-        logger.info("Stock K-line incremental: deleted %d existing rows from %s", deleted, start)
-    else:
-        truncate_only(engine, "sm_stock_kline")
     df = backend.fetch_kline(stock_codes, start, end, short_name_map=short_name_map)
     if df is not None and not df.empty:
         kline_cols = [
@@ -1909,7 +2701,12 @@ def _try_step_stock_kline_registry(
         ]
         for col in kline_cols:
             if col not in df.columns:
-                df[col] = None
+                if col == "k_type":
+                    df[col] = int(os.environ.get("SM_STOCK_K_TYPE", "1"))
+                elif col == "adjust_type":
+                    df[col] = 0
+                else:
+                    df[col] = None
         df = _to_numeric(
             df,
             [
@@ -1925,10 +2722,45 @@ def _try_step_stock_kline_registry(
                 "pre_close",
             ],
         )
-        df_to_table(engine, _with_etl(df), "sm_stock_kline")
-        logger.info("Stock K-line (%s): wrote %d rows", backend.name, len(df))
+        df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df = df[(df["trade_date"] >= start) & (df["trade_date"] <= end)].copy()
+        type_pairs = df[["k_type", "adjust_type"]].dropna().drop_duplicates()
+        if len(type_pairs) != 1:
+            raise RuntimeError(
+                f"Stock K-line ({backend.name}) returned ambiguous k_type/adjust_type pairs; "
+                "preserving previous data"
+            )
+        k_type = int(type_pairs.iloc[0]["k_type"])
+        adjust_type = int(type_pairs.iloc[0]["adjust_type"])
+        written = _replace_validated_code_date_frame(
+            get_kline_engine(),
+            df,
+            table_name="sm_stock_kline",
+            requested_codes=stock_codes,
+            code_column="stock_code",
+            date_column="trade_date",
+            label=f"Stock K-line ({backend.name})",
+            coverage_env="REGISTRY_KLINE_MIN_COVERAGE",
+            default_coverage=0.90,
+            identity_columns=(
+                "stock_code", "trade_date", "k_type", "adjust_type",
+            ),
+            extra_where="k_type=:scope_k_type AND adjust_type=:scope_adjust_type",
+            extra_params={
+                "scope_k_type": k_type,
+                "scope_adjust_type": adjust_type,
+            },
+        )
+        logger.info(
+            "Stock K-line (%s): atomically wrote %d rows, mode=%s",
+            backend.name,
+            written,
+            "incremental" if incremental else "refresh",
+        )
     else:
-        logger.warning("Stock K-line (%s): no data returned", backend.name)
+        raise RuntimeError(
+            f"Stock K-line ({backend.name}) returned no data; preserving previous data"
+        )
     return True
 
 
@@ -1945,7 +2777,7 @@ def step_stock_kline(
     incremental: bool = False,
 ) -> None:
     if not stock_codes:
-        logger.warning("个股K线：si_all_code 未读到代码，跳过 truncate 与写入。请先执行 sync_stock_info 写入 si_all_code。")
+        logger.warning("个股K线：si_all_code 未读到代码，保留旧数据并跳过写入。请先执行 sync_stock_info 写入 si_all_code。")
         return
 
     source_override = {"SM_STOCK_KLINE_SOURCE": kline_source} if kline_source else {}
@@ -1995,6 +2827,12 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     This avoids materializing roughly 1.3 million rows in one JSON response and
     prevents a failed QMT call from clearing the canonical trading day.
     """
+    stock_codes = sorted(
+        {str(code).strip().zfill(6) for code in stock_codes if str(code).strip()}
+    )
+    if not stock_codes:
+        raise RuntimeError("QMT minute requested stock universe is empty")
+    requested_code_set = set(stock_codes)
     trade_date = _default_myquant_minute_date(engine)
     history_engine = get_kline_engine()
     batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40")))
@@ -2002,11 +2840,12 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_MINUTE_MIN_COVERAGE", "0.85"))))
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
     written = 0
-    received_codes: set[str] = set()
+    responded_codes: set[str] = set()
+    published_codes: set[str] = set()
     first_trade_time: pd.Timestamp | None = None
     last_trade_time: pd.Timestamp | None = None
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
-    _create_qmt_minute_stage(history_engine, stage_table)
+    stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
     try:
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
             frame = backend.fetch_minute(
@@ -2026,6 +2865,13 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 continue
             frame = frame.copy()
             frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+            returned_codes = set(frame["stock_code"].astype(str))
+            outside_batch = returned_codes - set(batch)
+            if outside_batch:
+                raise RuntimeError(
+                    "QMT minute returned codes outside the requested batch: "
+                    f"{sorted(outside_batch)[:10]}"
+                )
             frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
             frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
             frame = frame[frame["trade_date"] == trade_date]
@@ -2033,104 +2879,181 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
             frame = frame.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
             frame = frame[(frame["price"] > 0) & (frame["volume"] >= 0) & (frame["amount"] >= 0)]
+            (
+                validated_response_codes,
+                active_codes,
+            ) = _qmt_minute_validated_code_sets(frame)
+            responded_codes.update(validated_response_codes)
             # Match canonical semantics: a zero-volume suspended symbol has no
-            # minute transaction rows for that day.
-            active_codes = set(
-                frame.groupby("stock_code")[["volume", "amount"]]
-                .sum(min_count=1)
-                .query("volume > 0 or amount > 0")
-                .index.astype(str)
-                .tolist()
-            )
+            # minute transaction rows for that day.  Its validated response
+            # still proves request coverage, but it must never enter the
+            # published-code authority membership set.
             frame = frame[frame["stock_code"].isin(active_codes)]
             if frame.empty:
+                logger.info(
+                    "QMT minute batch %d/%d: validated=%d published=0",
+                    batch_no,
+                    total_batches,
+                    len(validated_response_codes),
+                )
                 continue
             batch_first = frame["trade_time"].min()
             batch_last = frame["trade_time"].max()
             first_trade_time = batch_first if first_trade_time is None else min(first_trade_time, batch_first)
             last_trade_time = batch_last if last_trade_time is None else max(last_trade_time, batch_last)
-            batch_written = _append_qmt_minute_stage(history_engine, stage_table, frame)
+            batch_written = _append_qmt_minute_stage(
+                stage_connection,
+                stage_table,
+                frame,
+            )
             written += batch_written
-            received_codes.update(active_codes)
+            published_codes.update(active_codes)
             logger.info(
-                "QMT minute batch %d/%d: rows=%d cumulative_codes=%d",
+                "QMT minute batch %d/%d: rows=%d responded=%d published=%d",
                 batch_no,
                 total_batches,
                 batch_written,
-                len(received_codes),
+                len(responded_codes),
+                len(published_codes),
             )
 
-        coverage = len(received_codes) / max(len(stock_codes), 1)
+        coverage = len(responded_codes) / max(len(stock_codes), 1)
         if written <= 0 or coverage < min_coverage:
             raise RuntimeError(
-                f"QMT minute coverage below threshold: {len(received_codes)}/{len(stock_codes)} "
+                f"QMT minute coverage below threshold: {len(responded_codes)}/{len(stock_codes)} "
                 f"({coverage:.1%}) < {min_coverage:.1%}"
             )
         if first_trade_time is None or last_trade_time is None:
             raise RuntimeError("QMT minute source returned no valid trade-time window")
-
-        _commit_qmt_minute_stage(
-            history_engine,
-            stage_table,
-            first_trade_time=first_trade_time.to_pydatetime(),
-            last_trade_time=last_trade_time.to_pydatetime(),
-        )
         captured_at = datetime.now().replace(microsecond=0)
         (
             capture_mode,
-            forward_eligible,
+            live_forward_capture,
             capture_lag_seconds,
         ) = _classify_qmt_minute_capture(
             trade_date=trade_date,
             last_trade_time=last_trade_time.to_pydatetime(),
             captured_at=captured_at,
         )
-        _record_qmt_minute_receipt(
-            engine,
-            trade_date=trade_date,
-            first_trade_time=first_trade_time.to_pydatetime(),
-            last_trade_time=last_trade_time.to_pydatetime(),
-            expected_count=len(stock_codes),
-            observed_count=len(received_codes),
-            row_count=written,
-            source_provider=(
-                "gj_big_qmt_inner"
-                if str(getattr(backend, "name", "")).lower() == "bigqmt"
-                else "guojin_miniqmt_gateway"
-            ),
-            capture_mode=capture_mode,
-            forward_eligible=forward_eligible,
-            evidence={
-                "backend": str(getattr(backend, "name", "")),
-                "batch_size": batch_size,
-                "minute_count": count,
-                "coverage_threshold": min_coverage,
-                "capture_mode": capture_mode,
-                "captured_at": captured_at.isoformat(sep=" "),
-                "capture_lag_seconds": capture_lag_seconds,
-            },
+        source_provider = (
+            "gj_big_qmt_inner"
+            if str(getattr(backend, "name", "")).lower() == "bigqmt"
+            else "guojin_miniqmt_gateway"
         )
-        if count == 0 and _is_complete_stock_universe(engine, stock_codes):
-            _prune_snapshot_codes(
-                history_engine,
-                table_name="sm_stock_minute",
-                code_column="stock_code",
-                date_column="trade_date",
-                target_date=trade_date,
-                keep_codes=received_codes,
+        (
+            universe_evidence,
+            final_quality_status,
+            forward_eligible,
+        ) = _qmt_minute_receipt_disposition(
+            stock_codes,
+            responded_codes,
+            published_codes,
+            live_forward_capture=live_forward_capture,
+        )
+        full_requested_response_coverage = bool(
+            universe_evidence["full_requested_response_coverage"]
+            and responded_codes == requested_code_set
+        )
+        if not full_requested_response_coverage:
+            final_quality_status = "PARTIAL"
+            forward_eligible = False
+        receipt_evidence = {
+            "backend": str(getattr(backend, "name", "")),
+            "batch_size": batch_size,
+            "minute_count": count,
+            "coverage_threshold": min_coverage,
+            "capture_mode": capture_mode,
+            "captured_at": captured_at.isoformat(sep=" "),
+            "capture_lag_seconds": capture_lag_seconds,
+            **universe_evidence,
+        }
+        # Publication intentionally uses bounded per-code transactions to
+        # avoid MySQL lock-table exhaustion.  The generation lock spans the
+        # receipt barrier, every target batch and the final PASS receipt, so a
+        # concurrent refresh cannot re-enable an older receipt mid-publish.
+        with mysql_named_lock(
+            history_engine,
+            STOCK_MINUTE_FREEZE_LOCK_NAME,
+            timeout_seconds=0,
+            connection=stage_connection,
+        ):
+            # Revoke every overlapping prior receipt before the first target
+            # batch.  A crash leaves PUBLISHING/FAILED and therefore no
+            # forward consumer can accept the mixed physical window.
+            _record_qmt_minute_receipt(
+                engine,
+                trade_date=trade_date,
+                first_trade_time=first_trade_time.to_pydatetime(),
+                last_trade_time=last_trade_time.to_pydatetime(),
+                expected_count=len(stock_codes),
+                observed_count=len(responded_codes),
+                row_count=0,
+                source_provider=source_provider,
+                capture_mode=capture_mode,
+                forward_eligible=False,
+                quality_status="PUBLISHING",
+                evidence={
+                    **receipt_evidence,
+                    "publication_state": "PUBLISHING",
+                },
             )
-            _prune_snapshot_time_bounds(
-                history_engine,
-                table_name="sm_stock_minute",
-                date_column="trade_date",
-                time_column="trade_time",
-                target_date=trade_date,
-                first_time=first_trade_time.to_pydatetime(),
-                last_time=last_trade_time.to_pydatetime(),
+            try:
+                published_rows = _commit_qmt_minute_stage(
+                    history_engine,
+                    stage_connection,
+                    stage_table,
+                    first_trade_time=first_trade_time.to_pydatetime(),
+                    last_trade_time=last_trade_time.to_pydatetime(),
+                )
+                if published_rows != written:
+                    raise RuntimeError(
+                        "QMT minute target/receipt row mismatch: "
+                        f"published={published_rows} staged={written}"
+                    )
+            except BaseException:
+                try:
+                    _record_qmt_minute_receipt(
+                        engine,
+                        trade_date=trade_date,
+                        first_trade_time=first_trade_time.to_pydatetime(),
+                        last_trade_time=last_trade_time.to_pydatetime(),
+                        expected_count=len(stock_codes),
+                        observed_count=len(responded_codes),
+                        row_count=0,
+                        source_provider=source_provider,
+                        capture_mode=capture_mode,
+                        forward_eligible=False,
+                        quality_status="FAILED",
+                        evidence={
+                            **receipt_evidence,
+                            "publication_state": "FAILED",
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Unable to mark failed QMT minute publication receipt"
+                    )
+                raise
+            _record_qmt_minute_receipt(
+                engine,
+                trade_date=trade_date,
+                first_trade_time=first_trade_time.to_pydatetime(),
+                last_trade_time=last_trade_time.to_pydatetime(),
+                expected_count=len(stock_codes),
+                observed_count=len(responded_codes),
+                row_count=written,
+                source_provider=source_provider,
+                capture_mode=capture_mode,
+                forward_eligible=forward_eligible,
+                quality_status=final_quality_status,
+                evidence={
+                    **receipt_evidence,
+                    "publication_state": final_quality_status,
+                },
             )
         logger.info("QMT minute complete: rows=%d coverage=%.2f%%", written, coverage * 100)
     finally:
-        _drop_qmt_minute_stage(history_engine, stage_table)
+        _drop_qmt_minute_stage(stage_connection, stage_table)
 
 
 def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
@@ -2139,15 +3062,14 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
         from integrations.registry import get_backend
         backend = get_backend("minute")
     except Exception as exc:
-        logger.error("数据源 registry 错误: %s", exc)
-        return
+        logger.warning("数据源 registry 错误，改用显式分钟数据源: %s", exc)
+        backend = None
     if backend is not None:
         logger.info("分钟K线: 使用 registry backend '%s'", backend.name)
         if backend.name in {"qmt", "bigqmt"}:
             _step_stock_minute_qmt(engine, backend, stock_codes)
             return
         trade_date = _default_myquant_minute_date(engine)
-        delete_stock_minute_dates(engine, [trade_date])
         df = backend.fetch_minute(stock_codes, trade_date)
         if df is not None and not df.empty:
             minute_cols = ["stock_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount"]
@@ -2155,10 +3077,24 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
                 if col not in df.columns:
                     df[col] = None
             df = _to_numeric(df, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
-            df_to_table(engine, _with_etl(df), "sm_stock_minute")
-            logger.info("分钟K线(%s): 写入 %d 行", backend.name, len(df))
+            written = _replace_validated_code_date_frame(
+                get_kline_engine(),
+                df,
+                table_name="sm_stock_minute",
+                requested_codes=stock_codes,
+                code_column="stock_code",
+                date_column="trade_time",
+                label=f"stock minute ({backend.name})",
+                coverage_env="REGISTRY_MINUTE_MIN_COVERAGE",
+                default_coverage=0.80,
+                day_partition=True,
+                receipt_engine=engine,
+            )
+            logger.info("分钟K线(%s): 原子写入 %d 行", backend.name, written)
         else:
-            logger.warning("分钟K线(%s): 未获取到数据", backend.name)
+            raise RuntimeError(
+                f"分钟K线({backend.name}): 未获取到数据，保留旧分区"
+            )
         return
     # --- end registry ---
 
@@ -2181,11 +3117,122 @@ def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
             return df[minute_cols]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_minute, label="个股分钟", log_every=500)
-    if parts:
-        out = pd.concat(parts, ignore_index=True)
-        delete_stock_minute_dates(engine, out["trade_date"].dropna().astype(str).tolist())
-        df_to_table(engine, _with_etl(out), "sm_stock_minute")
+    history_engine = get_kline_engine()
+    stage_connection, stage_table = _create_temporary_stage(
+        history_engine,
+        target_table="sm_stock_minute",
+        prefix="sm_stock_minute_adata_stage",
+    )
+    workers = _max_workers()
+    received_codes: set[str] = set()
+    failed_codes: list[str] = []
+    staged_rows = 0
+    first_date: str | None = None
+    last_date: str | None = None
+    pending_frames: list[pd.DataFrame] = []
+    stage_batch_size = max(
+        5, int(os.environ.get("ADATA_MINUTE_STAGE_CODE_BATCH_SIZE", "25"))
+    )
+    fetch_batch_size = max(
+        workers,
+        int(os.environ.get("ADATA_MINUTE_FETCH_CODE_BATCH_SIZE", str(workers * 16))),
+    )
+
+    def _flush_minute_stage() -> None:
+        nonlocal pending_frames, staged_rows
+        if not pending_frames:
+            return
+        staged_rows += _append_temporary_stage(
+            stage_connection,
+            stage_table,
+            pd.concat(pending_frames, ignore_index=True),
+            chunksize=1000,
+        )
+        pending_frames = []
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            done_count = 0
+            for request_batch in _chunked(stock_codes, fetch_batch_size):
+                futures = {
+                    pool.submit(_fetch_minute, code): code for code in request_batch
+                }
+                for future in as_completed(futures):
+                    done_count += 1
+                    code = futures[future]
+                    try:
+                        frame = future.result()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        failed_codes.append(code)
+                        logger.warning("个股分钟 %s 失败：%s", code, exc)
+                        continue
+                    if frame is None or frame.empty:
+                        continue
+                    frame = frame.copy()
+                    frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+                    frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+                    frame["trade_date"] = pd.to_datetime(
+                        frame["trade_date"], errors="coerce"
+                    ).dt.strftime("%Y-%m-%d")
+                    frame = frame.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
+                    frame = frame[pd.to_numeric(frame["price"], errors="coerce") > 0]
+                    frame = frame.drop_duplicates(
+                        subset=["stock_code", "trade_time"], keep="last"
+                    )
+                    if frame.empty:
+                        continue
+                    received_codes.update(frame["stock_code"].unique().tolist())
+                    dates = frame["trade_date"].astype(str)
+                    batch_first = dates.min()
+                    batch_last = dates.max()
+                    first_date = batch_first if first_date is None else min(first_date, batch_first)
+                    last_date = batch_last if last_date is None else max(last_date, batch_last)
+                    pending_frames.append(frame)
+                    if len(pending_frames) >= stage_batch_size:
+                        _flush_minute_stage()
+                    if done_count % 200 == 0:
+                        logger.info(
+                            "个股分钟临时区进度 %d/%d，rows=%d",
+                            done_count,
+                            len(stock_codes),
+                            staged_rows,
+                        )
+                _flush_minute_stage()
+        _flush_minute_stage()
+        coverage = len(received_codes) / max(len(stock_codes), 1)
+        minimum = _minimum_coverage("ADATA_MINUTE_MIN_COVERAGE", 0.80)
+        if (
+            staged_rows <= 0
+            or first_date is None
+            or last_date is None
+            or coverage < minimum
+        ):
+            raise RuntimeError(
+                "adata stock minute coverage below threshold: "
+                f"{len(received_codes)}/{len(stock_codes)} ({coverage:.1%}) "
+                f"< {minimum:.1%}; failed={failed_codes[:10]}; preserving previous data"
+            )
+        code_where, params = _code_scope_predicate(
+            sorted(received_codes),
+            column="stock_code",
+            prefix="minute_code",
+        )
+        params.update({"first_date": first_date, "last_date": last_date})
+        _publish_temporary_stage(
+            history_engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table="sm_stock_minute",
+            where_sql=(
+                f"{code_where} AND trade_date >= :first_date "
+                "AND trade_date <= :last_date"
+            ),
+            params=params,
+            lock_name=STOCK_MINUTE_FREEZE_LOCK_NAME,
+            receipt_engine=engine,
+        )
+    finally:
+        stage_connection.close()
 
 
 def _default_myquant_minute_date(engine: Engine) -> str:
@@ -2236,7 +3283,8 @@ def _step_stock_minute_myquant(engine: Engine, stock_codes: list[str]) -> None:
     frequency = os.environ.get("MYQUANT_MINUTE_FREQUENCY", "60s").strip() or "60s"
 
     supported = [c for c in stock_codes if to_gm_symbol(c)]
-    delete_stock_minute_dates(engine, [trade_date])
+    if not supported:
+        raise RuntimeError("MyQuant stock minute has no supported stock symbols")
     logger.info(
         "Stock minute (MyQuant): %d supported stocks, date=%s, frequency=%s",
         len(supported),
@@ -2246,32 +3294,73 @@ def _step_stock_minute_myquant(engine: Engine, stock_codes: list[str]) -> None:
     batch_size = _myquant_batch_size("minute", 50)
     fields = "symbol,eob,open,high,low,close,volume,amount"
     written_rows = 0
-    for i, batch in enumerate(_chunked(supported, batch_size), start=1):
-        raw = history(
-            batch,
-            frequency=frequency,
-            start_time=start,
-            end_time=end,
-            fields=fields,
-            timeout=_myquant_timeout(300),
+    written_stocks: set[str] = set()
+    history_engine = get_kline_engine()
+    stage_connection, stage_table = _create_temporary_stage(
+        history_engine,
+        target_table="sm_stock_minute",
+        prefix="sm_stock_minute_myquant_stage",
+    )
+    try:
+        for i, batch in enumerate(_chunked(supported, batch_size), start=1):
+            raw = history(
+                batch,
+                frequency=frequency,
+                start_time=start,
+                end_time=end,
+                fields=fields,
+                timeout=_myquant_timeout(300),
+            )
+            sm_df = _myquant_minute_to_sm(raw)
+            if sm_df is not None and not sm_df.empty:
+                sm_df = _to_numeric(sm_df, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
+                sm_df["stock_code"] = sm_df["stock_code"].astype(str).str.zfill(6)
+                sm_df = sm_df.drop_duplicates(
+                    subset=["stock_code", "trade_time"], keep="last"
+                )
+                written_rows += _append_temporary_stage(
+                    stage_connection,
+                    stage_table,
+                    sm_df,
+                    chunksize=1000,
+                )
+                written_stocks.update(sm_df["stock_code"].unique().tolist())
+            logger.info(
+                "Stock minute (MyQuant): stage batch %d/%d, rows=%d",
+                i,
+                (len(supported) + batch_size - 1) // batch_size,
+                written_rows,
+            )
+            _sleep()
+        coverage = len(written_stocks) / len(supported)
+        minimum = _minimum_coverage("MYQUANT_MINUTE_MIN_COVERAGE", 0.80)
+        if written_rows <= 0 or coverage < minimum:
+            raise RuntimeError(
+                "MyQuant stock minute coverage below threshold: "
+                f"{len(written_stocks)}/{len(supported)} ({coverage:.1%}) "
+                f"< {minimum:.1%}; preserving previous data"
+            )
+        code_where, params = _code_scope_predicate(
+            sorted(written_stocks),
+            column="stock_code",
+            prefix="minute_code",
         )
-        sm_df = _myquant_minute_to_sm(raw)
-        if sm_df is not None and not sm_df.empty:
-            sm_df = _to_numeric(sm_df, ["price", "avg_price", "change", "change_pct", "volume", "amount"])
-            df_to_table(engine, _with_etl(sm_df), "sm_stock_minute")
-            written_rows += len(sm_df)
-        logger.info(
-            "Stock minute (MyQuant): batch %d/%d, rows=%d",
-            i,
-            (len(supported) + batch_size - 1) // batch_size,
-            written_rows,
+        params.update({"trade_date": trade_date})
+        _publish_temporary_stage(
+            history_engine,
+            stage_connection,
+            stage_table=stage_table,
+            target_table="sm_stock_minute",
+            where_sql=f"{code_where} AND trade_date=:trade_date",
+            params=params,
+            lock_name=STOCK_MINUTE_FREEZE_LOCK_NAME,
+            receipt_engine=engine,
         )
-        _sleep()
-    if supported and not written_rows:
-        raise RuntimeError("MyQuant stock minute returned no rows")
+    finally:
+        stage_connection.close()
 
 
-def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
+def _legacy_step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
     backend = None
     # --- registry 统一数据源入口 ---
     try:
@@ -2542,7 +3631,6 @@ def step_stock_current(engine: Engine, stock_codes: list[str]) -> None:
 def step_stock_five(engine: Engine, stock_codes: list[str]) -> None:
     from adata.stock.market.stock_market.stock_market import StockMarket
 
-    truncate_only(engine, "sm_stock_five_level")
     mk = StockMarket()
     now = _now()
     numeric_cols = [
@@ -2557,15 +3645,29 @@ def step_stock_five(engine: Engine, stock_codes: list[str]) -> None:
             return df[["stock_code","short_name"] + numeric_cols + ["snapshot_at"]]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_five, label="五档盘口", log_every=500)
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_five_level")
+    parts = _concurrent_run(
+        stock_codes,
+        _fetch_five,
+        label="五档盘口",
+        log_every=500,
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_snapshot(
+        engine,
+        frame,
+        table_name="sm_stock_five_level",
+        requested_codes=stock_codes,
+        code_column="stock_code",
+        label="stock five-level snapshot",
+        coverage_env="SM_STOCK_FIVE_MIN_COVERAGE",
+        default_coverage=0.80,
+    )
 
 
 def step_stock_bar(engine: Engine, stock_codes: list[str]) -> None:
     from adata.stock.market.stock_market.stock_market import StockMarket
 
-    truncate_only(engine, "sm_stock_bar")
     mk = StockMarket()
     now = _now()
 
@@ -2577,9 +3679,24 @@ def step_stock_bar(engine: Engine, stock_codes: list[str]) -> None:
             return df[["stock_code", "trade_time", "price", "volume", "bs_type", "snapshot_at"]]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_bar, label="逐笔成交", log_every=500)
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_bar")
+    parts = _concurrent_run(
+        stock_codes,
+        _fetch_bar,
+        label="逐笔成交",
+        log_every=500,
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_snapshot(
+        engine,
+        frame,
+        table_name="sm_stock_bar",
+        requested_codes=stock_codes,
+        code_column="stock_code",
+        label="stock trade-tick snapshot",
+        coverage_env="SM_STOCK_BAR_MIN_COVERAGE",
+        default_coverage=0.50,
+    )
 
 
 def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
@@ -2601,14 +3718,24 @@ def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
                 timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
             )
             if df is not None and not df.empty:
-                truncate_only(engine, "sm_stock_capital_flow_min")
                 out = df.copy()
                 out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
                 out["trade_time"] = pd.to_datetime(out["trade_time"], errors="coerce")
                 out["snapshot_at"] = _now()
                 cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
                 out = _to_numeric(out, cols)
-                df_to_table(engine, _with_etl(out[["stock_code", "trade_time"] + cols + ["snapshot_at"]]), "sm_stock_capital_flow_min")
+                _replace_validated_code_date_frame(
+                    engine,
+                    out[["stock_code", "trade_time"] + cols + ["snapshot_at"]],
+                    table_name="sm_stock_capital_flow_min",
+                    requested_codes=stock_codes,
+                    code_column="stock_code",
+                    date_column="trade_time",
+                    label="QMT stock minute capital flow",
+                    coverage_env="QMT_FLOW_MIN_MIN_COVERAGE",
+                    default_coverage=0.80,
+                    day_partition=True,
+                )
                 return
             raise RuntimeError(
                 "QMT stock flow minute returned no rows from transactioncount1m; "
@@ -2617,7 +3744,6 @@ def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
 
     from adata.stock.market.capital_flow.stock_capital_flow import StockCapitalFlow
 
-    truncate_only(engine, "sm_stock_capital_flow_min")
     cf = StockCapitalFlow()
     now = _now()
     cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
@@ -2630,9 +3756,26 @@ def step_stock_flow_min(engine: Engine, stock_codes: list[str]) -> None:
             return df[["stock_code", "trade_time"] + cols + ["snapshot_at"]]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_flow_min, label="分钟资金", log_every=500)
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_capital_flow_min")
+    parts = _concurrent_run(
+        stock_codes,
+        _fetch_flow_min,
+        label="分钟资金",
+        log_every=500,
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_stock_capital_flow_min",
+        requested_codes=stock_codes,
+        code_column="stock_code",
+        date_column="trade_time",
+        label="stock minute capital flow",
+        coverage_env="SM_FLOW_MIN_MIN_COVERAGE",
+        default_coverage=0.50,
+        day_partition=True,
+    )
 
 
 def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str = "") -> None:
@@ -2655,11 +3798,6 @@ def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str
                 timeout=int(os.environ.get("QMT_TIMEOUT", "300")),
             )
             if df is not None and not df.empty:
-                if target_date:
-                    with engine.begin() as conn:
-                        conn.execute(text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"), {"d": target_date[:10]})
-                else:
-                    truncate_only(engine, "sm_stock_capital_flow_daily")
                 out = df.copy()
                 out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
                 out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
@@ -2668,7 +3806,17 @@ def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str
                 cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
                 out = _to_numeric(out, cols)
                 out = out.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
-                df_to_table(engine, _with_etl(out[["stock_code", "trade_date"] + cols]), "sm_stock_capital_flow_daily")
+                _replace_validated_code_date_frame(
+                    engine,
+                    out[["stock_code", "trade_date"] + cols],
+                    table_name="sm_stock_capital_flow_daily",
+                    requested_codes=stock_codes,
+                    code_column="stock_code",
+                    date_column="trade_date",
+                    label="QMT stock daily capital flow",
+                    coverage_env="QMT_FLOW_DAILY_MIN_COVERAGE",
+                    default_coverage=0.80,
+                )
                 return
             raise RuntimeError(
                 "QMT stock flow daily returned no rows from transactioncount1d; "
@@ -2678,14 +3826,7 @@ def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str
     from adata.stock.market.capital_flow.stock_capital_flow import StockCapitalFlow
 
     if flow_date:
-        print(f"日度资金流向：指定日期 {flow_date}，增量模式（删除该日旧数据后写入）")
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"),
-                {"d": flow_date[:10]}
-            )
-    else:
-        truncate_only(engine, "sm_stock_capital_flow_daily")
+        logger.info("日度资金流向：指定日期 %s，将在验证后原子替换该日分区", flow_date)
     cf = StockCapitalFlow()
     cols = ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]
     _fd = flow_date
@@ -2705,9 +3846,25 @@ def step_stock_flow_daily(engine: Engine, stock_codes: list[str], flow_date: str
                 return df[["stock_code", "trade_date"] + cols]
         return None
 
-    parts = _concurrent_run(stock_codes, _fetch_flow_daily, label="日度资金", log_every=500)
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_stock_capital_flow_daily")
+    parts = _concurrent_run(
+        stock_codes,
+        _fetch_flow_daily,
+        label="日度资金",
+        log_every=500,
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_stock_capital_flow_daily",
+        requested_codes=stock_codes,
+        code_column="stock_code",
+        date_column="trade_date",
+        label="stock daily capital flow",
+        coverage_env="SM_FLOW_DAILY_MIN_COVERAGE",
+        default_coverage=0.50,
+    )
 
 
 def _concept_ths_instance():
@@ -2725,7 +3882,6 @@ def _concept_east_instance():
 def step_concept_ths_kline(
     engine: Engine, concept_codes: list[str], kline_start: str | None = None, kline_end: str | None = None
 ) -> None:
-    truncate_only(engine, "sm_concept_ths_kline")
     ins = _concept_ths_instance()
     k_type = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
     start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
@@ -2747,9 +3903,27 @@ def step_concept_ths_kline(
             return df[cols]
         return None
 
-    parts = _concurrent_run(concept_codes, _fetch, label="THS概念K线")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_ths_kline")
+    parts = _concurrent_run(
+        concept_codes,
+        _fetch,
+        label="THS概念K线",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_concept_ths_kline",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        date_column="trade_date",
+        label="THS concept K-line",
+        coverage_env="THS_CONCEPT_KLINE_MIN_COVERAGE",
+        default_coverage=0.80,
+        identity_columns=("index_code", "trade_date", "k_type"),
+        extra_where="k_type = :scope_k_type",
+        extra_params={"scope_k_type": k_type},
+    )
 
 
 def step_concept_ths_minute(engine: Engine, concept_codes: list[str]) -> None:
@@ -2767,12 +3941,25 @@ def step_concept_ths_minute(engine: Engine, concept_codes: list[str]) -> None:
             return df[cols]
         return None
 
-    parts = _concurrent_run(concept_codes, _fetch, label="THS概念分钟")
-    if parts:
-        truncate_only(engine, "sm_concept_ths_minute")
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_ths_minute")
-    else:
-        raise RuntimeError("no THS concept minute rows fetched")
+    parts = _concurrent_run(
+        concept_codes,
+        _fetch,
+        label="THS概念分钟",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_concept_ths_minute",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        date_column="trade_time",
+        label="THS concept minute",
+        coverage_env="THS_CONCEPT_MINUTE_MIN_COVERAGE",
+        default_coverage=0.80,
+        day_partition=True,
+    )
 
 
 def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
@@ -2809,10 +3996,15 @@ def step_concept_ths_current(engine: Engine, concept_codes: list[str]) -> None:
             f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
             f"< {min_coverage:.1%}; preserving previous snapshot"
         )
-    replace_table_rows(
-        _clean_df(_with_etl(complete)),
-        "sm_concept_ths_current",
+    _replace_validated_code_snapshot(
         engine,
+        complete,
+        table_name="sm_concept_ths_current",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        label="THS concept current",
+        coverage_env="THS_CONCEPT_CURRENT_MIN_COVERAGE",
+        default_coverage=0.80,
     )
 
 
@@ -2824,11 +4016,9 @@ def step_concept_east_kline(
         from integrations.qmt.aggregate import aggregate_concept_kline
         from integrations.qmt.info import to_qmt_stock_symbols
 
-        truncate_only(engine, "sm_concept_east_kline")
         members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
-            logger.warning("QMT 概念K线: no concept members")
-            return
+            raise RuntimeError("QMT concept K-line has no concept members")
         start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
         end = kline_end or os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
         qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
@@ -2845,10 +4035,22 @@ def step_concept_east_kline(
         out = aggregate_concept_kline(members, df)
         if out.empty:
             raise RuntimeError("QMT concept kline aggregation returned no rows")
-        df_to_table(engine, _with_etl(out), "sm_concept_east_kline")
+        _replace_validated_code_date_frame(
+            engine,
+            out,
+            table_name="sm_concept_east_kline",
+            requested_codes=concept_codes,
+            code_column="index_code",
+            date_column="trade_date",
+            label="QMT Eastmoney concept K-line",
+            coverage_env="QMT_CONCEPT_KLINE_MIN_COVERAGE",
+            default_coverage=0.80,
+            identity_columns=("index_code", "trade_date", "k_type"),
+            extra_where="k_type = :scope_k_type",
+            extra_params={"scope_k_type": int(os.environ.get("SM_INDEX_K_TYPE", "1"))},
+        )
         return
 
-    truncate_only(engine, "sm_concept_east_kline")
     ins = _concept_east_instance()
     k_type = int(os.environ.get("SM_INDEX_K_TYPE", "1"))
     start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
@@ -2868,9 +4070,27 @@ def step_concept_east_kline(
             return df[cols]
         return None
 
-    parts = _concurrent_run(concept_codes, _fetch, label="东财概念K线")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_east_kline")
+    parts = _concurrent_run(
+        concept_codes,
+        _fetch,
+        label="东财概念K线",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_concept_east_kline",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        date_column="trade_date",
+        label="Eastmoney concept K-line",
+        coverage_env="EAST_CONCEPT_KLINE_MIN_COVERAGE",
+        default_coverage=0.80,
+        identity_columns=("index_code", "trade_date", "k_type"),
+        extra_where="k_type = :scope_k_type",
+        extra_params={"scope_k_type": k_type},
+    )
 
 
 def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
@@ -2879,11 +4099,9 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
         from integrations.qmt.aggregate import aggregate_concept_minute
         from integrations.qmt.info import to_qmt_stock_symbols
 
-        truncate_only(engine, "sm_concept_east_minute")
         members, _name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
-            logger.warning("QMT 概念分钟: no concept members")
-            return
+            raise RuntimeError("QMT concept minute has no concept members")
         trade_date = datetime.now().strftime("%Y-%m-%d")
         qmt_codes = to_qmt_stock_symbols(members["stock_code"].astype(str).tolist())
         df = bridge.minute(
@@ -2900,10 +4118,20 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
         out = aggregate_concept_minute(members, df, snapshot_at=pd.Timestamp(_now()))
         if out.empty:
             raise RuntimeError("QMT concept minute aggregation returned no rows")
-        df_to_table(engine, _with_etl(out), "sm_concept_east_minute")
+        _replace_validated_code_date_frame(
+            engine,
+            out,
+            table_name="sm_concept_east_minute",
+            requested_codes=concept_codes,
+            code_column="index_code",
+            date_column="trade_time",
+            label="QMT Eastmoney concept minute",
+            coverage_env="QMT_CONCEPT_MINUTE_MIN_COVERAGE",
+            default_coverage=0.80,
+            day_partition=True,
+        )
         return
 
-    truncate_only(engine, "sm_concept_east_minute")
     ins = _concept_east_instance()
     now = _now()
     cols = ["index_code", "trade_time", "trade_date", "price", "avg_price", "change", "change_pct", "volume", "amount", "snapshot_at"]
@@ -2916,9 +4144,25 @@ def step_concept_east_minute(engine: Engine, concept_codes: list[str]) -> None:
             return df[cols]
         return None
 
-    parts = _concurrent_run(concept_codes, _fetch, label="东财概念分钟")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_east_minute")
+    parts = _concurrent_run(
+        concept_codes,
+        _fetch,
+        label="东财概念分钟",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        engine,
+        frame,
+        table_name="sm_concept_east_minute",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        date_column="trade_time",
+        label="Eastmoney concept minute",
+        coverage_env="EAST_CONCEPT_MINUTE_MIN_COVERAGE",
+        default_coverage=0.80,
+        day_partition=True,
+    )
 
 
 def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
@@ -2960,10 +4204,15 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
                 f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
                 f"< {min_coverage:.1%}; preserving previous snapshot"
             )
-        replace_table_rows(
-            _clean_df(_with_etl(out)),
-            "sm_concept_east_current",
+        _replace_validated_code_snapshot(
             engine,
+            out,
+            table_name="sm_concept_east_current",
+            requested_codes=concept_codes,
+            code_column="index_code",
+            label="QMT Eastmoney concept current",
+            coverage_env="QMT_CONCEPT_CURRENT_MIN_COVERAGE",
+            default_coverage=0.80,
         )
         return
 
@@ -3002,10 +4251,15 @@ def step_concept_east_current(engine: Engine, concept_codes: list[str]) -> None:
             f"{len(received & requested)}/{len(requested)} ({coverage:.1%}) "
             f"< {min_coverage:.1%}; preserving previous snapshot"
         )
-    replace_table_rows(
-        _clean_df(_with_etl(complete)),
-        "sm_concept_east_current",
+    _replace_validated_code_snapshot(
         engine,
+        complete,
+        table_name="sm_concept_east_current",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        label="Eastmoney concept current",
+        coverage_env="EAST_CONCEPT_CURRENT_MIN_COVERAGE",
+        default_coverage=0.80,
     )
 
 
@@ -3016,11 +4270,9 @@ def step_concept_flow_east(engine: Engine) -> None:
         from integrations.qmt.info import to_qmt_stock_symbols
 
         concept_codes = read_concept_east_codes(engine)
-        truncate_only(engine, "sm_concept_capital_flow_east")
         members, name_map = _read_qmt_concept_meta(engine, concept_codes)
         if members.empty:
-            logger.warning("QMT 概念资金流: no concept members")
-            return
+            raise RuntimeError("QMT concept flow has no concept members")
 
         unique_stock_codes = members["stock_code"].astype(str).str.zfill(6).drop_duplicates().tolist()
         qmt_codes = to_qmt_stock_symbols(unique_stock_codes)
@@ -3131,14 +4383,21 @@ def step_concept_flow_east(engine: Engine) -> None:
                 )
 
         if not rows:
-            logger.warning("QMT concept flow aggregation returned no rows")
-            return
-        df_to_table(engine, _with_etl(pd.DataFrame(rows)), "sm_concept_capital_flow_east")
+            raise RuntimeError("QMT concept flow aggregation returned no rows")
+        _replace_validated_code_snapshot(
+            engine,
+            pd.DataFrame(rows),
+            table_name="sm_concept_capital_flow_east",
+            requested_codes=concept_codes,
+            code_column="index_code",
+            label="QMT Eastmoney concept capital-flow snapshot",
+            coverage_env="QMT_CONCEPT_FLOW_MIN_COVERAGE",
+            default_coverage=0.80,
+        )
         return
 
     from adata.stock.market.concept_capital_flow.capital_flow_east import CapitalFlowEast
 
-    truncate_only(engine, "sm_concept_capital_flow_east")
     ins = CapitalFlowEast()
     now = _now()
     parts: list[pd.DataFrame] = []
@@ -3163,8 +4422,22 @@ def step_concept_flow_east(engine: Engine) -> None:
                 ]
             )
         _sleep()
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_concept_capital_flow_east")
+    if len(parts) != 3:
+        raise RuntimeError(
+            "Eastmoney concept capital flow did not return all 1/5/10-day snapshots; "
+            "preserving previous data"
+        )
+    concept_codes = read_concept_east_codes(engine)
+    _replace_validated_code_snapshot(
+        engine,
+        pd.concat(parts, ignore_index=True),
+        table_name="sm_concept_capital_flow_east",
+        requested_codes=concept_codes,
+        code_column="index_code",
+        label="Eastmoney concept capital-flow snapshot",
+        coverage_env="EAST_CONCEPT_FLOW_MIN_COVERAGE",
+        default_coverage=0.80,
+    )
 
 
 def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start: str | None = None, kline_end: str | None = None) -> None:
@@ -3176,7 +4449,6 @@ def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start
             from integrations.qmt import bridge
         from integrations.qmt.info import to_qmt_index_symbols
 
-        truncate_only(engine, "sm_index_kline")
         start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
         end = kline_end or os.environ.get("SM_INDEX_END") or datetime.now().strftime("%Y-%m-%d")
         qmt_codes = to_qmt_index_symbols(index_codes)
@@ -3206,12 +4478,24 @@ def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start
         out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
         out["change"] = pd.to_numeric(df.get("change"), errors="coerce")
         out["change_pct"] = pd.to_numeric(df.get("change_pct"), errors="coerce")
-        df_to_table(engine, _with_etl(out), "sm_index_kline")
+        _replace_validated_code_date_frame(
+            get_kline_engine(),
+            out,
+            table_name="sm_index_kline",
+            requested_codes=index_codes,
+            code_column="index_code",
+            date_column="trade_date",
+            label="legacy QMT index K-line",
+            coverage_env="QMT_INDEX_KLINE_MIN_COVERAGE",
+            default_coverage=0.80,
+            identity_columns=("index_code", "trade_date", "k_type"),
+            extra_where="k_type=:scope_k_type",
+            extra_params={"scope_k_type": int(os.environ.get("SM_INDEX_K_TYPE", "1"))},
+        )
         return
 
     from adata.stock.market.index_market.market_index import StockMarketIndex
 
-    truncate_only(engine, "sm_index_kline")
     ins = StockMarketIndex()
     start = kline_start or os.environ.get("SM_INDEX_START", "2020-01-01")
     end = kline_end or os.environ.get("SM_INDEX_END")
@@ -3229,9 +4513,27 @@ def _legacy_step_index_kline(engine: Engine, index_codes: list[str], kline_start
             return df[cols]
         return None
 
-    parts = _concurrent_run(index_codes, _fetch, label="指数K线")
-    if parts:
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_index_kline")
+    parts = _concurrent_run(
+        index_codes,
+        _fetch,
+        label="指数K线",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        get_kline_engine(),
+        frame,
+        table_name="sm_index_kline",
+        requested_codes=index_codes,
+        code_column="index_code",
+        date_column="trade_date",
+        label="legacy index K-line",
+        coverage_env="INDEX_KLINE_MIN_COVERAGE",
+        default_coverage=0.80,
+        identity_columns=("index_code", "trade_date", "k_type"),
+        extra_where="k_type=:scope_k_type",
+        extra_params={"scope_k_type": k_type},
+    )
 
 
 def _legacy_step_index_minute(engine: Engine, index_codes: list[str]) -> None:
@@ -3270,8 +4572,18 @@ def _legacy_step_index_minute(engine: Engine, index_codes: list[str]) -> None:
         out["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
         out["amount"] = pd.to_numeric(df.get("amount"), errors="coerce")
         out["snapshot_at"] = _now()
-        truncate_only(engine, "sm_index_minute")
-        df_to_table(engine, _with_etl(out), "sm_index_minute")
+        _replace_validated_code_date_frame(
+            get_kline_engine(),
+            out,
+            table_name="sm_index_minute",
+            requested_codes=index_codes,
+            code_column="index_code",
+            date_column="trade_time",
+            label="legacy QMT index minute",
+            coverage_env="QMT_INDEX_MINUTE_MIN_COVERAGE",
+            default_coverage=0.80,
+            day_partition=True,
+        )
         return
 
     from adata.stock.market.index_market.market_index import StockMarketIndex
@@ -3288,10 +4600,25 @@ def _legacy_step_index_minute(engine: Engine, index_codes: list[str]) -> None:
             return df[cols]
         return None
 
-    parts = _concurrent_run(index_codes, _fetch, label="指数分钟")
-    if parts:
-        truncate_only(engine, "sm_index_minute")
-        df_to_table(engine, _with_etl(pd.concat(parts, ignore_index=True)), "sm_index_minute")
+    parts = _concurrent_run(
+        index_codes,
+        _fetch,
+        label="指数分钟",
+        fail_on_error=True,
+    )
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        get_kline_engine(),
+        frame,
+        table_name="sm_index_minute",
+        requested_codes=index_codes,
+        code_column="index_code",
+        date_column="trade_time",
+        label="legacy index minute",
+        coverage_env="INDEX_MINUTE_MIN_COVERAGE",
+        default_coverage=0.80,
+        day_partition=True,
+    )
 
 
 def _normalize_index_kline_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -3857,7 +5184,7 @@ def step_index_kline(
         min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_INDEX_KLINE_MIN_COVERAGE", "0.50"))))
         total_batches = (len(qmt_codes) + batch_size - 1) // batch_size
         received_codes: set[str] = set()
-        written = 0
+        staged_parts: list[pd.DataFrame] = []
         for batch_no, batch in enumerate(_chunked(qmt_codes, batch_size), start=1):
             raw = bridge.kline(
                 batch,
@@ -3871,27 +5198,38 @@ def step_index_kline(
             if out.empty:
                 logger.warning("QMT index K batch %d/%d returned no valid rows", batch_no, total_batches)
                 continue
-            batch_written = _replace_qmt_index_window(
-                history_engine,
-                out,
-                table_name="sm_index_kline",
-                time_column="trade_date",
-            )
-            written += batch_written
+            staged_parts.append(out)
             received_codes.update(out["index_code"].astype(str).unique().tolist())
             logger.info(
-                "QMT index K batch %d/%d: rows=%d cumulative_codes=%d",
+                "QMT index K staged batch %d/%d: rows=%d cumulative_codes=%d",
                 batch_no,
                 total_batches,
-                batch_written,
+                len(out),
                 len(received_codes),
             )
         coverage = len(received_codes) / max(len(qmt_codes), 1)
-        if written <= 0 or coverage < min_coverage:
+        if not staged_parts or coverage < min_coverage:
             raise RuntimeError(
                 f"QMT index kline coverage below threshold: {len(received_codes)}/{len(qmt_codes)} "
                 f"({coverage:.1%}) < {min_coverage:.1%}"
             )
+        complete = pd.concat(staged_parts, ignore_index=True)
+        written = _replace_validated_code_date_frame(
+            history_engine,
+            complete,
+            table_name="sm_index_kline",
+            requested_codes=index_codes,
+            code_column="index_code",
+            date_column="trade_date",
+            label="QMT index K-line",
+            coverage_env="QMT_INDEX_KLINE_MIN_COVERAGE",
+            default_coverage=0.50,
+            identity_columns=("index_code", "trade_date", "k_type"),
+            extra_where="k_type=:scope_k_type",
+            extra_params={
+                "scope_k_type": int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+            },
+        )
         logger.info("QMT index K complete: rows=%d coverage=%.2f%%", written, coverage * 100)
         return
 
@@ -3956,19 +5294,26 @@ def step_index_kline(
                 f"{len(received_codes)}/{len(requested_codes)} ({coverage:.1%}) < {min_coverage:.1%}; "
                 f"errors={errors[:3]}"
             )
-        normalized = _with_etl(complete)
-        predicate = "trade_date >= :start_date AND trade_date <= :end_date"
-        replace_table_rows(
-            _clean_df(normalized),
-            "sm_index_kline",
+        written = _replace_validated_code_date_frame(
             history_engine,
-            where_sql=predicate,
-            params={"start_date": start, "end_date": end},
+            complete,
+            table_name="sm_index_kline",
+            requested_codes=index_codes,
+            code_column="index_code",
+            date_column="trade_date",
+            label="verified external index K-line",
+            coverage_env="TENCENT_INDEX_KLINE_MIN_COVERAGE",
+            default_coverage=0.978,
+            identity_columns=("index_code", "trade_date", "k_type"),
+            extra_where="k_type=:scope_k_type",
+            extra_params={
+                "scope_k_type": int(os.environ.get("SM_INDEX_K_TYPE", "1"))
+            },
         )
         logger.info(
             "Verified external index K complete: rows=%d coverage=%d/%d (%.2f%%), "
             "range=%s..%s, sources=%s, errors=%d",
-            len(normalized),
+            written,
             len(received_codes),
             len(requested_codes),
             coverage * 100,
@@ -3995,13 +5340,27 @@ def step_index_kline(
         frame["k_type"] = k_type
         return frame[cols]
 
-    parts = _concurrent_run(index_codes, _fetch, label="index K-line")
-    if not parts:
-        raise RuntimeError("external index K-line returned no rows")
-    complete = _with_etl(pd.concat(parts, ignore_index=True))
-    predicate = "trade_date >= :start_date AND trade_date <= :end_date" if end else "trade_date >= :start_date"
-    params = {"start_date": start, **({"end_date": end} if end else {})}
-    replace_table_rows(_clean_df(complete), "sm_index_kline", history_engine, where_sql=predicate, params=params)
+    parts = _concurrent_run(
+        index_codes,
+        _fetch,
+        label="index K-line",
+        fail_on_error=True,
+    )
+    complete = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        history_engine,
+        complete,
+        table_name="sm_index_kline",
+        requested_codes=index_codes,
+        code_column="index_code",
+        date_column="trade_date",
+        label="external index K-line",
+        coverage_env="INDEX_KLINE_MIN_COVERAGE",
+        default_coverage=0.80,
+        identity_columns=("index_code", "trade_date", "k_type"),
+        extra_where="k_type=:scope_k_type",
+        extra_params={"scope_k_type": k_type},
+    )
 
 
 def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
@@ -4025,9 +5384,7 @@ def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
         min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_INDEX_MINUTE_MIN_COVERAGE", "0.50"))))
         total_batches = (len(qmt_codes) + batch_size - 1) // batch_size
         received_codes: set[str] = set()
-        written = 0
-        first_trade_time: pd.Timestamp | None = None
-        last_trade_time: pd.Timestamp | None = None
+        staged_parts: list[pd.DataFrame] = []
         for batch_no, batch in enumerate(_chunked(qmt_codes, batch_size), start=1):
             raw = bridge.minute(
                 batch,
@@ -4043,51 +5400,42 @@ def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
             if out.empty:
                 logger.warning("QMT index minute batch %d/%d returned no valid rows", batch_no, total_batches)
                 continue
-            batch_first = out["trade_time"].min()
-            batch_last = out["trade_time"].max()
-            first_trade_time = batch_first if first_trade_time is None else min(first_trade_time, batch_first)
-            last_trade_time = batch_last if last_trade_time is None else max(last_trade_time, batch_last)
-            batch_written = _replace_qmt_index_window(
-                history_engine,
-                out,
-                table_name="sm_index_minute",
-                time_column="trade_time",
-                replace_date=trade_date if count == 0 else None,
-            )
-            written += batch_written
+            staged_parts.append(out)
             received_codes.update(out["index_code"].astype(str).unique().tolist())
             logger.info(
-                "QMT index minute batch %d/%d: rows=%d cumulative_codes=%d",
+                "QMT index minute staged batch %d/%d: rows=%d cumulative_codes=%d",
                 batch_no,
                 total_batches,
-                batch_written,
+                len(out),
                 len(received_codes),
             )
         coverage = len(received_codes) / max(len(qmt_codes), 1)
-        if written <= 0 or coverage < min_coverage:
+        if not staged_parts or coverage < min_coverage:
             raise RuntimeError(
                 f"QMT index minute coverage below threshold: {len(received_codes)}/{len(qmt_codes)} "
                 f"({coverage:.1%}) < {min_coverage:.1%}"
             )
-        if count == 0 and _is_complete_index_universe(engine, index_codes):
-            _prune_snapshot_codes(
+        complete = pd.concat(staged_parts, ignore_index=True)
+        if count == 0:
+            written = _replace_validated_code_date_frame(
                 history_engine,
+                complete,
                 table_name="sm_index_minute",
+                requested_codes=index_codes,
                 code_column="index_code",
-                date_column="trade_date",
-                target_date=trade_date,
-                keep_codes=received_codes,
+                date_column="trade_time",
+                label="QMT index minute",
+                coverage_env="QMT_INDEX_MINUTE_MIN_COVERAGE",
+                default_coverage=0.50,
+                day_partition=True,
             )
-            if first_trade_time is not None and last_trade_time is not None:
-                _prune_snapshot_time_bounds(
-                    history_engine,
-                    table_name="sm_index_minute",
-                    date_column="trade_date",
-                    time_column="trade_time",
-                    target_date=trade_date,
-                    first_time=first_trade_time.to_pydatetime(),
-                    last_time=last_trade_time.to_pydatetime(),
-                )
+        else:
+            written = _replace_qmt_index_window(
+                history_engine,
+                complete,
+                table_name="sm_index_minute",
+                time_column="trade_time",
+            )
         logger.info("QMT index minute complete: rows=%d coverage=%.2f%%", written, coverage * 100)
         return
 
@@ -4105,11 +5453,25 @@ def step_index_minute(engine: Engine, index_codes: list[str]) -> None:
         frame["snapshot_at"] = now
         return frame[cols]
 
-    parts = _concurrent_run(index_codes, _fetch, label="index minute")
-    if not parts:
-        raise RuntimeError("external index minute returned no rows")
-    complete = pd.concat(parts, ignore_index=True)
-    _replace_qmt_index_window(history_engine, complete, table_name="sm_index_minute", time_column="trade_time")
+    parts = _concurrent_run(
+        index_codes,
+        _fetch,
+        label="index minute",
+        fail_on_error=True,
+    )
+    complete = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    _replace_validated_code_date_frame(
+        history_engine,
+        complete,
+        table_name="sm_index_minute",
+        requested_codes=index_codes,
+        code_column="index_code",
+        date_column="trade_time",
+        label="external index minute",
+        coverage_env="INDEX_MINUTE_MIN_COVERAGE",
+        default_coverage=0.80,
+        day_partition=True,
+    )
 
 
 def _sina_index_symbol(index_code: str) -> str | None:
@@ -4343,10 +5705,17 @@ def _replace_index_current_snapshot(
             f"{source} index current coverage below threshold: "
             f"{len(received_codes)}/{len(expected_codes)} ({coverage:.1%}) < {min_coverage:.1%}"
         )
+    predicate, params = _code_scope_predicate(
+        sorted(received_codes),
+        column="index_code",
+        prefix="index_current_code",
+    )
     written = replace_table_rows(
         _clean_df(_with_etl(out)),
         "sm_index_current",
         engine,
+        where_sql=predicate,
+        params=params,
         chunksize=max(100, int(os.environ.get("QMT_INDEX_DB_CHUNK_SIZE", "1000"))),
         method="multi",
     )
@@ -4433,7 +5802,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kline-start", type=str, default="", help="K线起始日期（YYYY-MM-DD），覆盖 SM_MARKET_START/SM_INDEX_START")
     parser.add_argument("--kline-end", type=str, default="", help="K线结束日期（YYYY-MM-DD），覆盖 SM_MARKET_END/SM_INDEX_END")
     parser.add_argument("--kline-today", action="store_true", help="K线仅同步当天（收盘后常用）")
-    parser.add_argument("--kline-incremental", action="store_true", help="K线增量模式：不TRUNCATE全表，只删除start之后的数据后追加")
+    parser.add_argument(
+        "--kline-incremental",
+        action="store_true",
+        help="K线增量模式：先抓取/验证，再原子替换目标代码的日期分区",
+    )
     parser.add_argument(
         "--kline-source",
         type=str,
@@ -4482,7 +5855,7 @@ def _parse_args() -> argparse.Namespace:
         help="akshare 模式断点续跑进度文件（每行一码）；空字符串表示不写进度、不逐只入库",
     )
     parser.add_argument("--skip-progress", action="store_true", help="忽略进度文件（不过滤、不追加进度）")
-    parser.add_argument("--flow-date", type=str, default="", help="资金流向指定日期（YYYY-MM-DD），仅拉取该日数据，不 truncate 全表")
+    parser.add_argument("--flow-date", type=str, default="", help="资金流向指定日期（YYYY-MM-DD），仅拉取并原子替换该日分区")
     return parser.parse_args()
 
 
@@ -4535,8 +5908,6 @@ def main() -> None:
     _log_mysql_target(str(engine.url))
     run_ddl(engine)
     _ensure_sm_stock_kline_short_name(engine)
-    if not only_set and os.environ.get("SM_SKIP_GLOBAL_TRUNCATE") != "1":
-        truncate_all(engine)
 
     stock_steps = {
         "dividend",

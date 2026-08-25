@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.batch_db import create_batch_engine
+from server.common.batch_db import create_batch_engine, replace_table_rows
 
 
 def get_engine():
@@ -149,7 +149,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
 
 
 def write_snapshot(engine, df: pd.DataFrame) -> None:
-    """TRUNCATE + INSERT 写入快照表"""
+    """在同一事务内替换完整快照。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df["etl_sync_at"] = now
 
@@ -168,14 +168,10 @@ def write_snapshot(engine, df: pd.DataFrame) -> None:
     df["sort_order"] = df["stock_code"].map(order_map)
     df["is_holding"] = df["stock_code"].isin(holding_codes).astype(int)
 
-    with engine.begin() as conn:
-        conn.execute(text("TRUNCATE TABLE sm_stock_snapshot"))
-
-    df.to_sql(
+    replace_table_rows(
+        df,
         "sm_stock_snapshot",
         engine,
-        if_exists="append",
-        index=False,
         chunksize=1000,
         method="multi",
     )

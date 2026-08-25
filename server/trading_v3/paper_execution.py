@@ -4,8 +4,8 @@ import hashlib
 import json
 import uuid
 from datetime import date, datetime, time
-from decimal import Decimal
-from typing import Any
+from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -28,7 +28,7 @@ from .decision_truth import (
     canonical_target_ledger,
     decision_result_hash,
 )
-from .forward_evidence import primary_strategy_version
+from .forward_evidence import ATTRIBUTION_VERSION, primary_strategy_version
 
 
 ACTIVE_ORDER_STATES = (
@@ -37,6 +37,8 @@ ACTIVE_ORDER_STATES = (
     "QUEUED",
     "PARTIALLY_FILLED",
 )
+DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN = 20
+DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN = 1000
 
 
 def _canonical_v2_buy_receipt(
@@ -70,6 +72,156 @@ def _canonical_v2_buy_receipt(
     if not decision.allowed:
         return None, decision.reason_code or "BUY_GATE_DATA_BLOCKED"
     return loaded.binding, ""
+
+
+def _canonical_governance_buy_receipt(
+    connection,
+    *,
+    trade_date: date,
+    stock_code: str,
+    strategy_keys: list[str],
+) -> tuple[dict[str, Any] | None, str]:
+    """Require exact canonical governance allocation for every new BUY.
+
+    Governance suspension never blocks an exit.  This receipt is requested
+    only in the BUY path and binds the V3 sample owner to the immutable
+    stock-level paper plan plus the live lifecycle registry.
+    """
+
+    try:
+        rows = connection.execute(
+            text(
+                """
+                SELECT run_uid, trade_date, input_ready, build_commit_sha,
+                       input_hash, decision_hash, result_json, result_hash
+                FROM st_strategy_governance_run
+                WHERE trade_date = :trade_date
+                  AND status = 'COMPLETED'
+                  AND is_canonical = 1
+                ORDER BY run_revision DESC, created_at DESC
+                LIMIT 2
+                """
+            ),
+            {"trade_date": trade_date},
+        ).mappings().all()
+    except Exception:
+        return None, "GOVERNANCE_CANONICAL_LEDGER_UNAVAILABLE"
+    if len(rows) != 1 or int(rows[0].get("input_ready") or 0) != 1:
+        return None, "GOVERNANCE_CANONICAL_RUN_NOT_READY"
+    ledger = dict(rows[0])
+    try:
+        # Import lazily to keep the trading runtime's module graph acyclic.  A
+        # raw result hash and self-consistent nested hashes are not sufficient:
+        # the governance validator independently replays the candidate set,
+        # allocation, stock plan, pools, market routes and decision hash before
+        # a BUY may consume the row.
+        from server.engine.strategy_governance import (
+            STATISTICAL_DECISION_CONTRACT,
+            _canonical_governance_result_from_row,
+        )
+
+        result = _canonical_governance_result_from_row(ledger)
+    except (RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+        return None, "GOVERNANCE_CANONICAL_REPLAY_INVALID"
+    if (
+        result.get("input_ready") is not True
+        or result.get("automatic_real_order_submission") is not False
+        or result.get("decision_contract_version")
+        != STATISTICAL_DECISION_CONTRACT
+        or result.get("statistical_funding_eligible") is not True
+    ):
+        return None, "GOVERNANCE_CANONICAL_IDENTITY_INVALID"
+    plan = result.get("paper_execution_plan")
+    if not isinstance(plan, dict):
+        return None, "GOVERNANCE_PAPER_PLAN_MISSING"
+    plan_payload = {
+        str(key): value for key, value in plan.items()
+        if str(key) != "plan_hash"
+    }
+    plan_hash = str(plan.get("plan_hash") or "")
+    if (
+        canonical_hash(plan_payload) != plan_hash
+        or plan_hash != str(result.get("paper_execution_plan_hash") or "")
+        or plan.get("automatic_real_order_submission") is not False
+        or plan.get("real_order_authority") is not False
+    ):
+        return None, "GOVERNANCE_PAPER_PLAN_HASH_INVALID"
+    targets = [
+        item for item in (plan.get("targets") or [])
+        if isinstance(item, dict)
+        and str(item.get("stock_code") or "") == stock_code
+    ]
+    if len(targets) != 1:
+        return None, "GOVERNANCE_STOCK_NOT_ALLOCATION_BACKED"
+    target = targets[0]
+    target_payload = {
+        str(key): value for key, value in target.items()
+        if str(key) != "target_hash"
+    }
+    owner = str(target.get("strategy_key") or "")
+    version = str(target.get("strategy_version") or "")
+    normalized_keys = sorted({str(key) for key in strategy_keys if str(key)})
+    if (
+        canonical_hash({
+            "schema": "probiga.governance-paper-target.v1",
+            **target_payload,
+        }) != str(target.get("target_hash") or "")
+        or target.get("allocation_backed") is not True
+        or target.get("new_buy_allowed") is not True
+        or target.get("real_order_authority") is not False
+        or int(target.get("target_bp") or 0) <= 0
+        or not owner
+        or owner not in normalized_keys
+        or not version
+    ):
+        return None, "GOVERNANCE_STOCK_TARGET_BINDING_INVALID"
+    try:
+        live = connection.execute(
+            text(
+                """
+                SELECT r.current_version, r.current_status, r.enabled,
+                       v.source_kind, v.version_hash
+                FROM st_strategy_registry r
+                JOIN st_strategy_version v
+                  ON v.strategy_key=r.strategy_key
+                 AND v.version=r.current_version
+                WHERE r.strategy_key = :strategy_key
+                LIMIT 1
+                """
+            ),
+            {"strategy_key": owner},
+        ).mappings().first()
+    except Exception:
+        return None, "GOVERNANCE_LIFECYCLE_REGISTRY_UNAVAILABLE"
+    if (
+        live is None
+        or int(live.get("enabled") or 0) != 1
+        or str(live.get("current_status") or "") not in {"ACTIVE", "REDUCE"}
+        or str(live.get("current_version") or "") != version
+    ):
+        return None, "GOVERNANCE_LIFECYCLE_BLOCKED"
+    receipt_payload = {
+        "schema": "probiga.governance-paper-buy-receipt.v1",
+        "governance_run_uid": str(ledger.get("run_uid") or ""),
+        "trade_date": str(trade_date),
+        "build_commit_sha": str(ledger.get("build_commit_sha") or ""),
+        "decision_hash": str(ledger.get("decision_hash") or ""),
+        "paper_plan_hash": plan_hash,
+        "target_hash": str(target.get("target_hash") or ""),
+        "stock_code": stock_code,
+        "strategy_key": owner,
+        "strategy_version": version,
+        "strategy_version_hash": str(live.get("version_hash") or ""),
+        "strategy_source_kind": str(live.get("source_kind") or ""),
+        "target_bp": int(target.get("target_bp") or 0),
+        "new_buy_allowed": True,
+        "exit_always_allowed": True,
+        "real_order_authority": False,
+    }
+    return {
+        **receipt_payload,
+        "receipt_hash": canonical_hash(receipt_payload),
+    }, ""
 
 
 def _cancel_superseded_v3_buys(
@@ -228,10 +380,12 @@ def _ownership_hash(
     forecast_id: str,
     stock_code: str,
     strategy_key: str,
+    strategy_version: str,
 ) -> str:
     return hashlib.sha256(
         (
-            f"{run_uid}|{forecast_id}|{stock_code}|{strategy_key}"
+            f"{run_uid}|{forecast_id}|{stock_code}|{strategy_key}|"
+            f"{strategy_version}"
         ).encode("utf-8")
     ).hexdigest()
 
@@ -639,6 +793,819 @@ def _evaluate_cumulative_buy_risk(
         "reserved_notional": notional,
         "cash_reservation": cash_reservation,
         "estimated_buy_fee": estimated_buy_fee,
+    }
+
+
+def _bootstrap_hash(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _bootstrap_db_number(value: Any, places: int) -> float:
+    quantum = Decimal("1").scaleb(-places)
+    return float(Decimal(str(value or 0)).quantize(
+        quantum, rounding=ROUND_HALF_UP,
+    ))
+
+
+def _bootstrap_exact_price(
+    connection: Any,
+    *,
+    trade_date: date,
+    stock_code: str,
+) -> float:
+    rows = connection.execute(text("""
+        SELECT close
+        FROM sm_stock_kline
+        WHERE trade_date=:trade_date AND stock_code=:stock_code
+          AND k_type=1 AND adjust_type=0
+        ORDER BY stock_code
+    """), {
+        "trade_date": trade_date,
+        "stock_code": stock_code,
+    }).all()
+    if len(rows) != 1 or float(rows[0][0] or 0) <= 0:
+        raise RuntimeError("DYNAMIC_SHADOW_EXACT_DAILY_PRICE_UNAVAILABLE")
+    return float(rows[0][0])
+
+
+def _bootstrap_exact_industry(
+    connection: Any,
+    *,
+    trade_date: date,
+    stock_code: str,
+) -> str:
+    from server.engine.dynamic_shadow_ledger import (
+        verify_dynamic_shadow_industry_fact,
+    )
+
+    try:
+        fact = verify_dynamic_shadow_industry_fact(
+            connection,
+            trade_date=trade_date.isoformat(),
+            stock_code=stock_code,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "DYNAMIC_SHADOW_EXACT_INDUSTRY_UNAVAILABLE"
+        ) from exc
+    return str(fact["industry_name"])
+
+
+def _bootstrap_portfolio_state(
+    connection: Any,
+    *,
+    account_id: str,
+    trade_date: date,
+    execution_date: date,
+    commission_rate: float,
+    minimum_commission_cny: float,
+    transfer_fee_rate: float,
+) -> dict[str, Any]:
+    """Load aggregate risk only inside the trusted system controller."""
+
+    positions = [dict(row) for row in connection.execute(text("""
+        SELECT stock_code, remaining_quantity, protective_stop
+        FROM st_position_lot_v2
+        WHERE account_id=:account_id AND remaining_quantity>0
+        ORDER BY stock_code, lot_id
+    """), {"account_id": account_id}).mappings().all()]
+    reservations = [dict(row) for row in connection.execute(text("""
+        SELECT o.stock_code, o.quantity, o.filled_quantity,
+               o.limit_price, i.worst_price, i.protective_stop
+        FROM st_order_v2 o
+        JOIN st_trade_intent_v2 i ON i.intent_id=o.intent_id
+        WHERE o.account_id=:account_id AND o.side='BUY'
+          AND o.status IN ('CREATED','RISK_APPROVED','QUEUED','PARTIALLY_FILLED')
+        ORDER BY o.stock_code, o.order_id
+    """), {"account_id": account_id}).mappings().all()]
+    codes = sorted({
+        str(row.get("stock_code") or "")
+        for row in (*positions, *reservations)
+        if str(row.get("stock_code") or "")
+    })
+    prices = {
+        code: _bootstrap_exact_price(
+            connection, trade_date=trade_date, stock_code=code,
+        )
+        for code in codes
+    }
+    industries = {
+        code: _bootstrap_exact_industry(
+            connection, trade_date=trade_date, stock_code=code,
+        )
+        for code in codes
+    }
+    code_values: dict[str, float] = {}
+    industry_values: dict[str, float] = {}
+    total_value = 0.0
+    open_risk = 0.0
+    turnover = float(connection.execute(text("""
+        SELECT COALESCE(SUM(ABS(gross_amount)), 0)
+        FROM st_fill_v2
+        WHERE account_id=:account_id AND side='BUY'
+          AND DATE(filled_at)=:execution_date
+    """), {
+        "account_id": account_id,
+        "execution_date": execution_date,
+    }).scalar() or 0)
+    reserved_cash = 0.0
+    live_codes: set[str] = set()
+    for row in positions:
+        code = str(row.get("stock_code") or "")
+        quantity = int(row.get("remaining_quantity") or 0)
+        price = prices[code]
+        value = quantity * price
+        industry = industries[code]
+        code_values[code] = code_values.get(code, 0.0) + value
+        industry_values[industry] = industry_values.get(industry, 0.0) + value
+        total_value += value
+        stop = float(row.get("protective_stop") or 0)
+        open_risk += quantity * (
+            max(0.0, price - stop) if stop > 0 else price * 0.08
+        )
+        live_codes.add(code)
+    for row in reservations:
+        code = str(row.get("stock_code") or "")
+        remaining = max(
+            0,
+            int(row.get("quantity") or 0)
+            - int(row.get("filled_quantity") or 0),
+        )
+        price = max(
+            float(row.get("worst_price") or 0),
+            float(row.get("limit_price") or 0),
+        )
+        value = remaining * price
+        industry = industries[code]
+        code_values[code] = code_values.get(code, 0.0) + value
+        industry_values[industry] = industry_values.get(industry, 0.0) + value
+        total_value += value
+        turnover += value
+        reserved_cash += value + (
+            max(minimum_commission_cny, value * commission_rate)
+            + value * transfer_fee_rate
+            if value > 0 else 0.0
+        )
+        stop = float(row.get("protective_stop") or 0)
+        open_risk += remaining * (
+            max(0.0, price - stop) if stop > 0 else price * 0.08
+        )
+        live_codes.add(code)
+    return {
+        "position_codes": {
+            str(row.get("stock_code") or "") for row in positions
+        },
+        "reservation_codes": {
+            str(row.get("stock_code") or "") for row in reservations
+        },
+        "live_codes": live_codes,
+        "code_values": code_values,
+        "industry_values": industry_values,
+        "total_value": total_value,
+        "open_risk_cny": open_risk,
+        "daily_buy_turnover_cny": turnover,
+        "reserved_cash_cny": reserved_cash,
+    }
+
+
+def materialize_dynamic_shadow_bootstrap_orders(
+    connection: Any,
+    *,
+    plan_ids: Iterable[str],
+    account_id: str = "paper-main-v2",
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Create a bounded V2/V3 internal-paper BUY from exact shadow plans.
+
+    This is an intentionally separate bootstrap lane.  It does not consume a
+    canonical portfolio target, never grants broker authority, and cannot be
+    called with caller-enriched signal data.  The trusted controller may read
+    other positions/orders solely to fail closed on aggregate risk; no such
+    state is exposed to the strategy adapter.
+    """
+
+    from server.engine.dynamic_shadow_ledger import (
+        BOOTSTRAP_REASON_CODE,
+        DynamicShadowLedgerError,
+        build_dynamic_shadow_bootstrap_authorization,
+        verify_dynamic_shadow_bootstrap_risk_binding,
+    )
+
+    require_legacy_strategy_account(
+        account_id,
+        entrypoint="trading_v3.materialize_dynamic_shadow_bootstrap_orders",
+    )
+    all_plan_ids = list(dict.fromkeys(
+        str(value) for value in plan_ids if str(value)
+    ))
+    if not all_plan_ids:
+        return {
+            "status": "ok",
+            "created": [],
+            "skipped": [],
+            "paper_order_count": 0,
+            "new_paper_order_count": 0,
+            "idempotent_paper_order_count": 0,
+            "scanned_plan_count": 0,
+            "scanned_plan_ids": [],
+            "deferred_plan_count": 0,
+            "maximum_paper_orders_per_run": (
+                DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
+            ),
+            "real_order_count": 0,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    observed_at = (now or datetime.now()).replace(microsecond=0)
+    lock_clause = (
+        " FOR UPDATE"
+        if str(getattr(connection.dialect, "name", "")).casefold()
+        in {"mysql", "mariadb"}
+        else ""
+    )
+    account = connection.execute(text(
+        "SELECT account_id, status, cash_balance, real_trading_enabled "
+        "FROM st_trade_account_v2 WHERE account_id=:account_id"
+        + lock_clause
+    ), {"account_id": account_id}).mappings().first()
+    normalized_plan_ids = all_plan_ids[
+        :DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN
+    ]
+    deferred_plan_ids = all_plan_ids[
+        DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN:
+    ]
+    if not account:
+        return {
+            "status": "BLOCKED",
+            "created": [],
+            "skipped": [
+                {"plan_id": plan_id, "reason": "PAPER_ACCOUNT_MISSING"}
+                for plan_id in all_plan_ids
+            ],
+            "paper_order_count": 0,
+            "new_paper_order_count": 0,
+            "idempotent_paper_order_count": 0,
+            "scanned_plan_count": 0,
+            "scanned_plan_ids": [],
+            "deferred_plan_count": 0,
+            "maximum_paper_orders_per_run": (
+                DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
+            ),
+            "real_order_count": 0,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    if (
+        str(account.get("status") or "") != "ACTIVE"
+        or int(account.get("real_trading_enabled") or 0) != 0
+    ):
+        raise RuntimeError("dynamic shadow bootstrap requires active paper-only account")
+    config = load_v3_config()
+    portfolio_policy = dict(config.get("portfolio") or {})
+    execution_policy = dict(config.get("paper_execution") or {})
+    account_policy = dict(config.get("account") or {})
+    maximum_live_positions = min(
+        50,
+        max(1, int(execution_policy.get("maximum_live_positions", 12))),
+    )
+    maximum_single_weight = min(
+        0.01,
+        float(portfolio_policy.get("maximum_single_position_weight", 0.12)),
+    )
+    maximum_total_weight = 0.20
+    maximum_industry_weight = min(
+        0.10,
+        float(portfolio_policy.get("maximum_theme_weight", 0.25)),
+    )
+    maximum_open_risk_weight = min(
+        0.02,
+        float(portfolio_policy.get("maximum_open_risk", 0.02)),
+    )
+    maximum_daily_buy_turnover_weight = max(0.0, min(
+        0.30,
+        float(portfolio_policy.get("maximum_daily_turnover", 0.30)),
+    ))
+    commission_rate = float(account_policy.get("commission_rate", 0.0))
+    minimum_commission_cny = float(
+        account_policy.get("minimum_commission_cny", 0.0)
+    )
+    transfer_fee_rate = float(account_policy.get("transfer_fee_rate", 0.0))
+    limit_premium = max(0.0, min(
+        0.05,
+        float(execution_policy.get("maximum_entry_premium_pct", 0.5))
+        / 100.0,
+    ))
+    worst_premium = max(limit_premium, max(0.0, min(
+        0.10,
+        float(execution_policy.get("worst_price_premium_pct", 1.0))
+        / 100.0,
+    )))
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = [
+        {
+            "plan_id": plan_id,
+            "reason": "DYNAMIC_SHADOW_BOOTSTRAP_SCAN_LIMIT_DEFERRED",
+        }
+        for plan_id in deferred_plan_ids
+    ]
+    scanned_plan_count = 0
+    for plan_index, plan_id in enumerate(normalized_plan_ids):
+        if (
+            len(created)
+            >= DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
+        ):
+            skipped.extend({
+                "plan_id": deferred_id,
+                "reason": "DYNAMIC_SHADOW_BOOTSTRAP_ORDER_CAPACITY_DEFERRED",
+            } for deferred_id in normalized_plan_ids[plan_index:])
+            break
+        scanned_plan_count += 1
+        mutation_started = False
+        try:
+            authorization = build_dynamic_shadow_bootstrap_authorization(
+                connection, plan_id=plan_id,
+            )
+            if str(authorization["account_id"]) != account_id:
+                raise DynamicShadowLedgerError("bootstrap计划账户不一致")
+            version = str(authorization["strategy_version"])
+            if len(version) > 80:
+                raise DynamicShadowLedgerError("bootstrap策略版本超过V2冻结列上限")
+            if len(str(authorization["strategy_key"])) > 64:
+                raise DynamicShadowLedgerError("bootstrap策略键超过V3证据列上限")
+            intent_id = _bootstrap_hash({
+                "schema": "probiga.dynamic-shadow-bootstrap-intent-id.v1",
+                "plan_id": plan_id,
+                "plan_hash": authorization["plan_hash"],
+                "account_id": account_id,
+            })[:32]
+            existing = connection.execute(text("""
+                SELECT intent_id, evidence_json
+                FROM st_trade_intent_v2 WHERE intent_id=:intent_id
+            """), {"intent_id": intent_id}).mappings().first()
+            if existing:
+                evidence = json.loads(str(existing.get("evidence_json") or "{}"))
+                risk_binding = evidence.get("dynamic_shadow_risk")
+                if not isinstance(risk_binding, Mapping):
+                    raise DynamicShadowLedgerError("bootstrap幂等意图风险绑定缺失")
+                verify_dynamic_shadow_bootstrap_risk_binding(
+                    connection,
+                    risk_binding,
+                    intent_id=intent_id,
+                    require_current_shadow=True,
+                )
+                order = connection.execute(text("""
+                    SELECT order_id, quantity, status
+                    FROM st_order_v2 WHERE intent_id=:intent_id
+                    ORDER BY order_id
+                """), {"intent_id": intent_id}).mappings().first()
+                if order:
+                    created.append({
+                        "plan_id": plan_id,
+                        "intent_id": intent_id,
+                        "order_id": str(order["order_id"]),
+                        "stock_code": authorization["stock_code"],
+                        "quantity": int(order["quantity"]),
+                        "status": str(order["status"]),
+                        "idempotent_replay": True,
+                    })
+                else:
+                    skipped.append({
+                        "plan_id": plan_id,
+                        "reason": "BOOTSTRAP_RISK_REJECTED_PREVIOUSLY",
+                    })
+                continue
+            trade_date = date.fromisoformat(str(authorization["trade_date"])[:10])
+            equity_rows = connection.execute(text("""
+                SELECT total_equity
+                FROM st_equity_daily_v2
+                WHERE account_id=:account_id AND trade_date=:trade_date
+            """), {
+                "account_id": account_id,
+                "trade_date": trade_date,
+            }).all()
+            if len(equity_rows) != 1 or float(equity_rows[0][0] or 0) <= 0:
+                raise RuntimeError("DYNAMIC_SHADOW_EXACT_EQUITY_UNAVAILABLE")
+            equity_cny = float(equity_rows[0][0])
+            reconciliation = connection.execute(text("""
+                SELECT status
+                FROM st_reconciliation_v2
+                WHERE account_id=:account_id AND trade_date=:trade_date
+                ORDER BY version DESC LIMIT 1
+            """), {
+                "account_id": account_id,
+                "trade_date": trade_date,
+            }).scalar()
+            if str(reconciliation or "") != "PASS":
+                raise RuntimeError("DYNAMIC_SHADOW_RECONCILIATION_NOT_PASS")
+            execution_date = _next_trade_date(connection, trade_date)
+            state = _bootstrap_portfolio_state(
+                connection,
+                account_id=account_id,
+                trade_date=trade_date,
+                execution_date=execution_date,
+                commission_rate=commission_rate,
+                minimum_commission_cny=minimum_commission_cny,
+                transfer_fee_rate=transfer_fee_rate,
+            )
+            code = str(authorization["stock_code"])
+            if (
+                code in state["position_codes"]
+                or code in state["reservation_codes"]
+            ):
+                raise RuntimeError("DYNAMIC_SHADOW_SINGLE_STOCK_ALREADY_EXPOSED")
+            reference_price = _bootstrap_exact_price(
+                connection, trade_date=trade_date, stock_code=code,
+            )
+            limit_price = round(reference_price * (1.0 + limit_premium), 3)
+            worst_price = round(reference_price * (1.0 + worst_premium), 3)
+            maximum_target_bp = min(
+                100,
+                int(authorization["maximum_target_bp"]),
+            )
+            maximum_notional = (
+                equity_cny * maximum_target_bp / 10000.0
+            )
+            requested_quantity = int(maximum_notional / worst_price / 100) * 100
+            if requested_quantity < 100:
+                raise RuntimeError("DYNAMIC_SHADOW_100BP_BELOW_BOARD_LOT")
+            initial_stop = round(reference_price * 0.92, 3)
+            industry = str(authorization["industry_name"])
+            if len(industry) > 80:
+                raise DynamicShadowLedgerError("bootstrap行业名超过V2冻结列上限")
+            available_cash = (
+                float(account["cash_balance"])
+                - float(state["reserved_cash_cny"])
+            )
+            limits = {
+                "maximum_live_positions": maximum_live_positions,
+                "maximum_single_weight": maximum_single_weight,
+                "maximum_total_weight": maximum_total_weight,
+                "maximum_industry_weight": maximum_industry_weight,
+                "maximum_open_risk_weight": maximum_open_risk_weight,
+                "maximum_daily_buy_turnover_weight": (
+                    maximum_daily_buy_turnover_weight
+                ),
+            }
+            risk = _evaluate_cumulative_buy_risk(
+                requested_quantity=requested_quantity,
+                worst_price=worst_price,
+                initial_stop=initial_stop,
+                current_code_value=float(state["code_values"].get(code, 0.0)),
+                current_total_value=float(state["total_value"]),
+                current_theme_value=float(
+                    state["industry_values"].get(industry, 0.0)
+                ),
+                current_open_risk_cny=float(state["open_risk_cny"]),
+                available_cash_cny=available_cash,
+                current_turnover_cny=float(state["daily_buy_turnover_cny"]),
+                equity_cny=equity_cny,
+                creates_new_position=True,
+                live_position_count=len(state["live_codes"]),
+                maximum_live_positions=maximum_live_positions,
+                maximum_single_weight=maximum_single_weight,
+                maximum_total_weight=maximum_total_weight,
+                maximum_theme_weight=maximum_industry_weight,
+                maximum_open_risk_weight=maximum_open_risk_weight,
+                maximum_daily_turnover_weight=(
+                    maximum_daily_buy_turnover_weight
+                ),
+                commission_rate=commission_rate,
+                minimum_commission_cny=minimum_commission_cny,
+                transfer_fee_rate=transfer_fee_rate,
+            )
+            frozen_risk = {
+                "trade_risk": _bootstrap_db_number(risk["trade_risk"], 2),
+                "post_single_weight": _bootstrap_db_number(
+                    risk["post_single_weight"], 8,
+                ),
+                "post_total_weight": _bootstrap_db_number(
+                    risk["post_total_weight"], 8,
+                ),
+                "post_theme_weight": _bootstrap_db_number(
+                    risk["post_theme_weight"], 8,
+                ),
+                "post_open_risk_cny": _bootstrap_db_number(
+                    risk["post_open_risk_cny"], 2,
+                ),
+                "post_cash": _bootstrap_db_number(risk["post_cash"], 2),
+                "post_turnover_weight": _bootstrap_db_number(
+                    risk["post_turnover_weight"], 8,
+                ),
+            }
+            risk_decision_payload = {
+                "schema": "probiga.dynamic-shadow-bootstrap-risk-decision.v1",
+                "plan_id": plan_id,
+                "authorization_hash": authorization["authorization_hash"],
+                "authorization": authorization,
+                "intent_id": intent_id,
+                "account_id": account_id,
+                "strategy_key": authorization["strategy_key"],
+                "strategy_version": version,
+                "trade_date": trade_date.isoformat(),
+                "execution_date": execution_date.isoformat(),
+                "stock_code": code,
+                "industry_snapshot_id": authorization["industry_snapshot_id"],
+                "industry_row_hash": authorization["industry_row_hash"],
+                "industry_name": industry,
+                "equity_cny": _bootstrap_db_number(equity_cny, 2),
+                "reference_price": reference_price,
+                "worst_price": worst_price,
+                "initial_stop": initial_stop,
+                "maximum_target_bp": maximum_target_bp,
+                "requested_quantity": requested_quantity,
+                "approved_quantity": int(risk["approved_quantity"]),
+                "current_code_value": _bootstrap_db_number(
+                    state["code_values"].get(code, 0.0), 2,
+                ),
+                "current_total_value": _bootstrap_db_number(
+                    state["total_value"], 2,
+                ),
+                "current_industry_value": _bootstrap_db_number(
+                    state["industry_values"].get(industry, 0.0), 2,
+                ),
+                "current_open_risk_cny": _bootstrap_db_number(
+                    state["open_risk_cny"], 2,
+                ),
+                "current_daily_buy_turnover_cny": _bootstrap_db_number(
+                    state["daily_buy_turnover_cny"], 2,
+                ),
+                "available_cash_cny": _bootstrap_db_number(available_cash, 2),
+                "live_position_count": len(state["live_codes"]),
+                "limits": limits,
+                "decision_status": risk["decision_status"],
+                "checks": dict(risk["checks"]),
+                "first_failure": risk["first_failure"],
+                **frozen_risk,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+            decision_hash = _bootstrap_hash(risk_decision_payload)
+            risk_binding_payload = {
+                "schema": "probiga.dynamic-shadow-bootstrap-risk.v1",
+                "decision_payload": risk_decision_payload,
+                "decision_hash": decision_hash,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+            risk_binding = {
+                **risk_binding_payload,
+                "binding_hash": _bootstrap_hash(risk_binding_payload),
+            }
+            ownership_hash = _ownership_hash(
+                authorization["candidate_run_uid"],
+                authorization["shadow_forecast_id"],
+                code,
+                authorization["strategy_key"],
+                version,
+            )
+            evidence = {
+                "source": BOOTSTRAP_REASON_CODE,
+                "run_uid": authorization["candidate_run_uid"],
+                "model_version": version,
+                "signal_strategy_keys": [authorization["strategy_key"]],
+                "supporting_strategy_keys": [authorization["strategy_key"]],
+                "primary_strategy_key": authorization["strategy_key"],
+                "primary_strategy_version": version,
+                "primary_forecast_id": authorization["shadow_forecast_id"],
+                "sample_owner_role": "PRIMARY",
+                "attribution_status": "VERIFIED_SNAPSHOT",
+                "attribution_version": ATTRIBUTION_VERSION,
+                "ownership_hash": ownership_hash,
+                "dynamic_shadow_bootstrap": authorization,
+                "dynamic_shadow_risk": risk_binding,
+                "positive_expectancy_validated": False,
+                "real_trading_enabled": False,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+            earliest_at = datetime.combine(execution_date, time(9, 30))
+            expires_at = datetime.combine(execution_date, time(14, 45))
+            intent_key = _bootstrap_hash({
+                "schema": "probiga.dynamic-shadow-bootstrap-intent-key.v1",
+                "intent_id": intent_id,
+                "plan_id": plan_id,
+                "risk_decision_hash": decision_hash,
+            })
+            mutation_started = True
+            connection.execute(text("""
+                INSERT INTO st_trade_intent_v2 (
+                    intent_id, account_id, decision_run_uid,
+                    strategy_version, stock_code, theme_code, action,
+                    current_quantity, target_quantity, target_weight,
+                    earliest_at, expires_at, limit_price, worst_price,
+                    initial_stop, protective_stop, invalidation_condition,
+                    reason_code, evidence_json, intent_version,
+                    idempotency_key, created_at
+                ) VALUES (
+                    :intent_id, :account_id, :decision_run_uid,
+                    :strategy_version, :stock_code, :theme_code, 'BUY',
+                    0, :target_quantity, :target_weight,
+                    :earliest_at, :expires_at, :limit_price, :worst_price,
+                    :initial_stop, :protective_stop, :invalidation_condition,
+                    :reason_code, :evidence_json, 1,
+                    :idempotency_key, :created_at
+                )
+            """), {
+                "intent_id": intent_id,
+                "account_id": account_id,
+                "decision_run_uid": authorization["candidate_run_uid"],
+                "strategy_version": version,
+                "stock_code": code,
+                "theme_code": industry,
+                "target_quantity": requested_quantity,
+                "target_weight": frozen_risk["post_single_weight"],
+                "earliest_at": earliest_at,
+                "expires_at": expires_at,
+                "limit_price": limit_price,
+                "worst_price": worst_price,
+                "initial_stop": initial_stop,
+                "protective_stop": initial_stop,
+                "invalidation_condition": (
+                    "动态SHADOW bootstrap固定风险退出；SELL永不受准入门阻断"
+                ),
+                "reason_code": BOOTSTRAP_REASON_CODE,
+                "evidence_json": json.dumps(
+                    evidence, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False,
+                ),
+                "idempotency_key": intent_key,
+                "created_at": observed_at,
+            })
+            connection.execute(text("""
+                INSERT INTO st_risk_decision_v2 (
+                    intent_id, decision_status, requested_quantity,
+                    approved_quantity, trade_risk, post_single_weight,
+                    post_total_weight, post_theme_weight, post_open_risk,
+                    post_cash, checks_json, first_failure, decision_hash,
+                    created_at
+                ) VALUES (
+                    :intent_id, :decision_status, :requested_quantity,
+                    :approved_quantity, :trade_risk, :post_single_weight,
+                    :post_total_weight, :post_theme_weight, :post_open_risk,
+                    :post_cash, :checks_json, :first_failure,
+                    :decision_hash, :created_at
+                )
+            """), {
+                "intent_id": intent_id,
+                "decision_status": risk["decision_status"],
+                "requested_quantity": requested_quantity,
+                "approved_quantity": int(risk["approved_quantity"]),
+                "trade_risk": frozen_risk["trade_risk"],
+                "post_single_weight": frozen_risk["post_single_weight"],
+                "post_total_weight": frozen_risk["post_total_weight"],
+                "post_theme_weight": frozen_risk["post_theme_weight"],
+                "post_open_risk": frozen_risk["post_open_risk_cny"],
+                "post_cash": frozen_risk["post_cash"],
+                "checks_json": json.dumps(
+                    risk["checks"], sort_keys=True, separators=(",", ":"),
+                ),
+                "first_failure": risk["first_failure"],
+                "decision_hash": decision_hash,
+                "created_at": observed_at,
+            })
+            if risk["decision_status"] != "APPROVED":
+                skipped.append({
+                    "plan_id": plan_id,
+                    "stock_code": code,
+                    "reason": str(risk["first_failure"] or "RISK_REJECTED"),
+                })
+                continue
+            verify_dynamic_shadow_bootstrap_risk_binding(
+                connection,
+                risk_binding,
+                intent_id=intent_id,
+                require_current_shadow=True,
+            )
+            order_id = _bootstrap_hash({
+                "schema": "probiga.dynamic-shadow-bootstrap-order-id.v1",
+                "intent_id": intent_id,
+                "decision_hash": decision_hash,
+            })[:32]
+            order_key = order_idempotency_key(
+                account_id=account_id,
+                decision_run_uid=authorization["candidate_run_uid"],
+                intent_id=intent_id,
+                stock_code=code,
+                side="BUY",
+                target_quantity=requested_quantity,
+                intent_version=1,
+            )
+            connection.execute(text("""
+                INSERT INTO st_order_v2 (
+                    order_id, account_id, intent_id, stock_code, side,
+                    order_type, limit_price, quantity, filled_quantity,
+                    status, waiting_reason, earliest_at, expires_at,
+                    idempotency_key, created_at, updated_at
+                ) VALUES (
+                    :order_id, :account_id, :intent_id, :stock_code, 'BUY',
+                    'LIMIT', :limit_price, :quantity, 0, 'QUEUED',
+                    'DYNAMIC_SHADOW_NEXT_SESSION', :earliest_at, :expires_at,
+                    :idempotency_key, :created_at, :updated_at
+                )
+            """), {
+                "order_id": order_id,
+                "account_id": account_id,
+                "intent_id": intent_id,
+                "stock_code": code,
+                "limit_price": limit_price,
+                "quantity": requested_quantity,
+                "earliest_at": earliest_at,
+                "expires_at": expires_at,
+                "idempotency_key": order_key,
+                "created_at": observed_at,
+                "updated_at": observed_at,
+            })
+            execution_plan_id = _bootstrap_hash({
+                "schema": "probiga.dynamic-shadow-bootstrap-execution-plan-id.v1",
+                "plan_id": plan_id,
+                "order_id": order_id,
+            })[:32]
+            connection.execute(text("""
+                INSERT INTO st_execution_plan_v3 (
+                    execution_plan_id, run_uid, account_id, trade_date,
+                    stock_code, side, quantity, limit_price, state,
+                    reason_code, source, real_order_allowed,
+                    idempotency_key, created_at, updated_at
+                ) VALUES (
+                    :execution_plan_id, :run_uid, :account_id, :trade_date,
+                    :stock_code, 'BUY', :quantity, :limit_price,
+                    'PAPER_QUEUED', :reason_code, :source, 0,
+                    :idempotency_key, :created_at, :updated_at
+                )
+            """), {
+                "execution_plan_id": execution_plan_id,
+                "run_uid": authorization["candidate_run_uid"],
+                "account_id": account_id,
+                "trade_date": execution_date,
+                "stock_code": code,
+                "quantity": requested_quantity,
+                "limit_price": limit_price,
+                "reason_code": BOOTSTRAP_REASON_CODE,
+                "source": BOOTSTRAP_REASON_CODE,
+                "idempotency_key": _bootstrap_hash({
+                    "plan_id": plan_id,
+                    "order_id": order_id,
+                    "real_order_allowed": False,
+                }),
+                "created_at": observed_at,
+                "updated_at": observed_at,
+            })
+            created.append({
+                "plan_id": plan_id,
+                "intent_id": intent_id,
+                "order_id": order_id,
+                "execution_plan_id": execution_plan_id,
+                "stock_code": code,
+                "strategy_key": authorization["strategy_key"],
+                "strategy_version": version,
+                "quantity": requested_quantity,
+                "maximum_target_bp": maximum_target_bp,
+                "industry_snapshot_id": authorization["industry_snapshot_id"],
+                "industry_row_hash": authorization["industry_row_hash"],
+                "execution_date": execution_date.isoformat(),
+                "real_order_allowed": False,
+                "real_order_authority": False,
+                "idempotent_replay": False,
+            })
+        except (DynamicShadowLedgerError, RuntimeError, ValueError) as exc:
+            if mutation_started:
+                # Do not commit an approved V2 intent/order without its exact
+                # V3 paper plan.  The caller owns the surrounding transaction,
+                # so propagation atomically rolls back every partial write.
+                raise
+            skipped.append({
+                "plan_id": plan_id,
+                "reason": str(exc),
+            })
+    return {
+        "status": "ok",
+        "created": created,
+        "skipped": skipped,
+        "paper_order_count": len(created),
+        "new_paper_order_count": sum(
+            item.get("idempotent_replay") is False for item in created
+        ),
+        "idempotent_paper_order_count": sum(
+            item.get("idempotent_replay") is True for item in created
+        ),
+        "scanned_plan_count": scanned_plan_count,
+        "scanned_plan_ids": normalized_plan_ids[:scanned_plan_count],
+        "deferred_plan_count": sum(
+            str(item.get("reason") or "").endswith("_DEFERRED")
+            for item in skipped
+        ),
+        "maximum_paper_orders_per_run": (
+            DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
+        ),
+        "real_order_count": 0,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -1309,6 +2276,37 @@ def materialize_internal_paper_orders(
                     "reason": "V3_SAMPLE_OWNER_AMBIGUOUS",
                 })
                 continue
+            governance_receipt, governance_reason = (
+                _canonical_governance_buy_receipt(
+                    connection,
+                    trade_date=(
+                        source_date
+                        if isinstance(source_date, date)
+                        else date.fromisoformat(str(source_date))
+                    ),
+                    stock_code=code,
+                    strategy_keys=target_strategy_keys,
+                )
+            )
+            if governance_receipt is None:
+                skipped.append({
+                    "stock_code": code,
+                    "side": "BUY",
+                    "status": "BLOCKED",
+                    "reason": governance_reason
+                    or "GOVERNANCE_PAPER_BUY_NOT_AUTHORIZED",
+                })
+                continue
+            if str(governance_receipt.get("strategy_key") or "") != (
+                primary_strategy_key
+            ):
+                skipped.append({
+                    "stock_code": code,
+                    "side": "BUY",
+                    "status": "BLOCKED",
+                    "reason": "GOVERNANCE_PRIMARY_OWNER_MISMATCH",
+                })
+                continue
             primary_forecast_id = str(
                 target.get("primary_forecast_id") or ""
             )
@@ -1339,24 +2337,42 @@ def materialize_internal_paper_orders(
                     "reason": "V3_SAMPLE_OWNER_FORECAST_MISSING",
                 })
                 continue
-            ownership_hash = _ownership_hash(
+            target_snapshot_strategy_version = primary_strategy_version(
+                run["model_version"],
+                primary_strategy_key,
+            )
+            target_snapshot_ownership_hash = _ownership_hash(
                 run_uid,
                 primary_forecast_id,
                 code,
                 primary_strategy_key,
+                target_snapshot_strategy_version,
             )
             stored_ownership_hash = str(
                 target.get("attribution_snapshot_hash") or ""
             )
             if (
                 stored_ownership_hash
-                and stored_ownership_hash != ownership_hash
+                and stored_ownership_hash != target_snapshot_ownership_hash
             ):
                 skipped.append({
                     "stock_code": code,
                     "reason": "V3_SAMPLE_OWNER_HASH_MISMATCH",
                 })
                 continue
+            frozen_primary_strategy_version = (
+                str(governance_receipt.get("strategy_version") or "")
+                if str(governance_receipt.get("strategy_source_kind") or "")
+                == "runtime_registry"
+                else target_snapshot_strategy_version
+            )
+            ownership_hash = _ownership_hash(
+                run_uid,
+                primary_forecast_id,
+                code,
+                primary_strategy_key,
+                frozen_primary_strategy_version,
+            )
             buy_gate_receipt, buy_gate_reason = _canonical_v2_buy_receipt(
                 connection,
                 decision_run_uid=run_uid,
@@ -1398,17 +2414,13 @@ def materialize_internal_paper_orders(
                 ),
                 "signal_strategy_keys": sorted(target_strategy_keys),
                 "primary_strategy_key": primary_strategy_key,
-                "primary_strategy_version": primary_strategy_version(
-                    run["model_version"],
-                    primary_strategy_key,
-                ),
+                "primary_strategy_version": frozen_primary_strategy_version,
                 "primary_forecast_id": primary_forecast_id,
                 "supporting_strategy_keys": target_strategy_keys,
                 "sample_owner_role": "PRIMARY",
-                "attribution_version": (
-                    "V3_PRIMARY_FORECAST_SNAPSHOT_V1"
-                ),
+                "attribution_version": ATTRIBUTION_VERSION,
                 "ownership_hash": ownership_hash,
+                "strategy_governance": governance_receipt,
                 # Keep V3 attribution as a mapping while exposing the exact
                 # canonical receipt shape consumed again by the V2 executor.
                 GATE_MODULE: buy_gate_receipt,

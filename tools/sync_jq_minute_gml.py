@@ -28,6 +28,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.config import get_mysql_url
+from server.common.jq_minute_schema import (
+    JQ_MINUTE_DDL,
+    JQ_MINUTE_TABLE,
+    privileged_migrate_jq_minute_tables,
+    validate_jq_minute_runtime,
+)
 from tools.jq_config import get_jq_client, jq_auth, jq_normalize_code
 
 
@@ -56,29 +62,9 @@ def _get_jq_client():
     return jq
 
 
-DDL_PATH = ROOT / "biz" / "stock_market" / "sql" / "05_sm_stock_minute_gml.sql"
-TABLE_NAME = "sm_stock_minute_gml"
+TABLE_NAME = JQ_MINUTE_TABLE
 BAR_FIELDS = ("date", "open", "high", "low", "close", "volume", "money")
-DDL_SQL = """
-CREATE TABLE IF NOT EXISTS `sm_stock_minute_gml` (
-  `stock_code` VARCHAR(16) NOT NULL COMMENT '6-digit stock code',
-  `jq_code` VARCHAR(24) NOT NULL DEFAULT '' COMMENT 'JoinQuant security code',
-  `trade_time` DATETIME NOT NULL COMMENT 'minute bar time',
-  `trade_date` DATE NOT NULL COMMENT 'trade date',
-  `open` DECIMAL(12,4) DEFAULT NULL COMMENT 'open price',
-  `high` DECIMAL(12,4) DEFAULT NULL COMMENT 'high price',
-  `low` DECIMAL(12,4) DEFAULT NULL COMMENT 'low price',
-  `close` DECIMAL(12,4) DEFAULT NULL COMMENT 'close price',
-  `volume` BIGINT DEFAULT NULL COMMENT 'volume',
-  `amount` DECIMAL(20,4) DEFAULT NULL COMMENT 'turnover amount',
-  `pre_close` DECIMAL(12,4) DEFAULT NULL COMMENT 'previous close, if available',
-  `is_current_bar` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 when this row is the latest include_now bar in the sync batch',
-  `etl_sync_at` DATETIME NOT NULL COMMENT 'sync time',
-  PRIMARY KEY (`stock_code`, `trade_time`, `trade_date`),
-  KEY `idx_gml_date_time` (`trade_date`, `trade_time`),
-  KEY `idx_gml_sync` (`etl_sync_at`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='JoinQuant live 1-minute stock bars'
-"""
+DDL_SQL = JQ_MINUTE_DDL
 
 UPSERT_SQL = text(
     """
@@ -106,12 +92,9 @@ UPSERT_SQL = text(
 
 
 def _run_ddl(engine: Engine) -> None:
-    sql = DDL_PATH.read_text(encoding="utf-8") if DDL_PATH.exists() else DDL_SQL
-    lines = [line for line in sql.splitlines() if not line.strip().startswith("--")]
-    parts = [part.strip() for part in re.split(r";\s*\n", "\n".join(lines)) if part.strip()]
-    with engine.begin() as conn:
-        for stmt in parts:
-            conn.execute(text(stmt))
+    """Compatibility name: runtime validation only; never execute DDL."""
+
+    validate_jq_minute_runtime(engine)
 
 
 def _is_trade_day(engine: Engine, day: date | None = None) -> bool:
@@ -372,8 +355,10 @@ def sync_jq_minute_gml(
     skip_ddl: bool = False,
     pause_seconds: float = 0.0,
 ) -> dict[str, Any]:
-    if not skip_ddl and not dry_run:
-        _run_ddl(engine)
+    # ``skip_ddl`` is retained as a CLI compatibility option only.  Runtime
+    # execution always proves the release-prepared schema and never creates it.
+    del skip_ddl
+    _run_ddl(engine)
 
     now = datetime.now().replace(microsecond=0)
     if skip_closed and not is_trading_time(engine, now):

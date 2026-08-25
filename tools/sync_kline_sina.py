@@ -29,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import STOCK_KLINE_FREEZE_LOCK_NAME
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -82,12 +84,43 @@ def fetch_kline_sina(stock_code: str, days: int = 30) -> pd.DataFrame | None:
         return None
 
 
+def replace_kline_partitions(engine, df: pd.DataFrame, stock_code: str) -> int:
+    """Replace only fetched code/date/type partitions in one transaction."""
+
+    if df is None or df.empty:
+        return 0
+    frame = df.copy()
+    frame["stock_code"] = str(stock_code).strip().zfill(6)
+    frame["trade_date"] = pd.to_datetime(
+        frame["trade_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    frame = frame.dropna(subset=["trade_date"]).drop_duplicates(
+        subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+        keep="last",
+    )
+    if frame.empty:
+        return 0
+    return replace_table_rows_exact_keys(
+        frame,
+        "sm_stock_kline",
+        engine,
+        key_columns=("stock_code", "trade_date", "k_type", "adjust_type"),
+        lock_name=STOCK_KLINE_FREEZE_LOCK_NAME,
+        chunksize=1000,
+        method="multi",
+    )
+
+
 def main():
     p = argparse.ArgumentParser(description="新浪K线批量同步")
     p.add_argument("--days", type=int, default=30, help="每只股票获取最近N天（默认30）")
     p.add_argument("--limit", type=int, default=0, help="最多处理几只（0=全部）")
     p.add_argument("--sleep", type=float, default=0.2, help="每只间隔秒数")
-    p.add_argument("--skip-truncate", action="store_true", help="不清空表，增量写入")
+    p.add_argument(
+        "--skip-truncate",
+        action="store_true",
+        help="兼容旧参数；运行时始终按股票/日期安全替换",
+    )
     args = p.parse_args()
 
     eng = _engine()
@@ -103,12 +136,6 @@ def main():
 
     print(f"共 {len(codes)} 只股票，获取最近 {args.days} 天K线...")
 
-    # 清空表
-    if not args.skip_truncate:
-        with eng.begin() as conn:
-            conn.execute(text("TRUNCATE TABLE sm_stock_kline"))
-        print("已清空 sm_stock_kline")
-
     total_rows = 0
     success = 0
     fail = 0
@@ -120,12 +147,7 @@ def main():
 
         if df is not None and not df.empty:
             df["etl_sync_at"] = now_str
-            # 删除该股票的旧数据
-            if args.skip_truncate:
-                with eng.begin() as conn:
-                    conn.execute(text("DELETE FROM sm_stock_kline WHERE stock_code = :c"), {"c": code})
-            df.to_sql("sm_stock_kline", eng, if_exists="append", index=False, method="multi")
-            total_rows += len(df)
+            total_rows += replace_kline_partitions(eng, df, code)
             success += 1
         else:
             fail += 1

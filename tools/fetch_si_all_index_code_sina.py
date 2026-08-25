@@ -32,27 +32,26 @@ def main() -> int:
     os.environ.setdefault("SI_SYNC_SKIP_ALL_CODE", "1")
     os.environ.setdefault("SI_INDEX_PRIMARY", "sina")
 
-    from sqlalchemy import create_engine
-
     from biz.stock_info.sync_stock_info import (
-        _clean_object_df,
-        _mysql_url,
-        df_to_table,
-        fetch_all_index_code_sina,
-        run_ddl,
-        truncate_only,
-        _now,
+        PartialSnapshotPublished,
+        sync_all_index_code,
+    )
+    from server.common.batch_db import create_batch_engine
+    from server.common.auxiliary_runtime_schema import (
+        validate_si_all_index_code_runtime_schema,
     )
 
-    eng = create_engine(_mysql_url(), pool_pre_ping=True)
-    run_ddl(eng)
-    ts = _now()
-    df = fetch_all_index_code_sina()
-    df = _clean_object_df(df)
-    df["etl_sync_at"] = ts
-    truncate_only(eng, "si_all_index_code")
-    df_to_table(eng, df, "si_all_index_code")
-    print(f"已写入 si_all_index_code：{len(df)} 条（来源：新浪财经）", flush=True)
+    eng = create_batch_engine()
+    validate_si_all_index_code_runtime_schema(eng)
+    try:
+        df = sync_all_index_code(eng, object())
+    except PartialSnapshotPublished as exc:
+        print(str(exc), file=sys.stderr, flush=True)
+        return exc.exit_code
+    print(
+        f"status=complete exit_code=0 si_all_index_code={len(df)} source=新浪财经",
+        flush=True,
+    )
     return 0
 
 

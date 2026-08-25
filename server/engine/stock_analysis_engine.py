@@ -13,7 +13,15 @@
 """
 
 import logging
+from datetime import date, datetime, timedelta
 from typing import List, Optional
+
+from server.api.routers._engine import get_engine
+from server.common.pit_facts import (
+    PIT_AVAILABLE,
+    normalize_decision_at,
+    resolve_common_fact_cutoff,
+)
 
 from .data_loader import StockDataLoader
 from .date_context import coerce_date
@@ -40,7 +48,14 @@ class StockAnalysisEngine:
         self.event_risk = EventRiskEngine()
         self.gate = RecommendationGate()
 
-    def analyze(self, stock_code: str, full_data: bool = True, trade_date: str | None = None) -> StockAnalysisResult:
+    def analyze(
+        self,
+        stock_code: str,
+        full_data: bool = True,
+        trade_date: str | None = None,
+        *,
+        decision_at: datetime | str | None = None,
+    ) -> StockAnalysisResult:
         """
         统一分析入口
 
@@ -53,10 +68,64 @@ class StockAnalysisEngine:
             StockAnalysisResult: 统一分析结果
         """
         # 1. 加载数据
+        if trade_date is None and decision_at is None:
+            decision_at = datetime.now().replace(microsecond=0)
+        normalized_decision = (
+            normalize_decision_at(decision_at)
+            if decision_at is not None
+            else None
+        )
+        coverage_end = (
+            date.fromisoformat(str(trade_date)[:10])
+            if trade_date is not None
+            else (
+                normalized_decision.date()
+                if normalized_decision is not None
+                else date.today()
+            )
+        )
+        common_cutoff = {
+            "status": "DATA_BLOCKED",
+            "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
+            "fact_cutoff_at": "",
+            "receipt_root_hash": "",
+        }
+        if normalized_decision is not None:
+            common_cutoff = resolve_common_fact_cutoff(
+                get_engine(),
+                codes=[stock_code],
+                decision_at=normalized_decision,
+                finance_start_date="1900-01-01",
+                finance_end_date=coverage_end,
+                event_start_date=normalized_decision.date() - timedelta(days=14),
+                event_end_date=normalized_decision.date(),
+                require_qmt_event_batch=True,
+            )
+        reader_decision = (
+            normalized_decision
+            if common_cutoff.get("status") == PIT_AVAILABLE
+            else None
+        )
+        fact_cutoff_at = common_cutoff.get("fact_cutoff_at") or None
         if full_data:
-            data = self.data_loader.load_full_data(stock_code, trade_date, use_realtime=trade_date is None)
+            data = self.data_loader.load_full_data(
+                stock_code,
+                trade_date,
+                use_realtime=trade_date is None,
+                strategy_context=True,
+                decision_at=reader_decision,
+                fact_cutoff_at=fact_cutoff_at,
+            )
         else:
-            data = self.data_loader.load_light_data(stock_code, trade_date, use_realtime=trade_date is None)
+            data = self.data_loader.load_light_data(
+                stock_code,
+                trade_date,
+                use_realtime=trade_date is None,
+                strategy_context=True,
+                decision_at=reader_decision,
+                fact_cutoff_at=fact_cutoff_at,
+            )
+        data["pit_common_cutoff"] = common_cutoff
 
         # 2. 长线分析
         long_term_result = self.long_term.analyze(data)
@@ -72,6 +141,31 @@ class StockAnalysisEngine:
         recommend_result = self.gate.evaluate(
             long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
         )
+        finance_status = str(
+            (data.get("finance") or {}).get("pit_status") or "DATA_BLOCKED"
+        )
+        event_status = str(
+            (data.get("news") or {}).get("event_pit_status")
+            or "DATA_BLOCKED"
+        )
+        reference_status = str(
+            (data.get("strategy_reference_evidence") or {}).get("status")
+            or PIT_AVAILABLE
+        )
+        if (
+            finance_status != PIT_AVAILABLE
+            or event_status != PIT_AVAILABLE
+            or common_cutoff.get("status") != PIT_AVAILABLE
+            or reference_status != PIT_AVAILABLE
+        ):
+            recommend_result = {
+                **recommend_result,
+                "status": "SUSPENDED",
+                "reason": (
+                    "PIT_DATA_BLOCKED：财务、公告或策略参考数据缺少"
+                    "同一事实截止时点的不可变证据，禁止进入策略推荐"
+                ),
+            }
 
         # 6. 生成文本结论
         summary = self.gate.generate_summary(
@@ -131,7 +225,14 @@ class StockAnalysisEngine:
             risks=risks,
         )
 
-    def analyze_batch(self, stock_codes: List[str], full_data: bool = True, trade_date: str | None = None) -> List[StockAnalysisResult]:
+    def analyze_batch(
+        self,
+        stock_codes: List[str],
+        full_data: bool = True,
+        trade_date: str | None = None,
+        *,
+        decision_at: datetime | str | None = None,
+    ) -> List[StockAnalysisResult]:
         """
         批量分析（用于AI推荐筛选）
 
@@ -145,7 +246,12 @@ class StockAnalysisEngine:
         results = []
         for code in stock_codes:
             try:
-                result = self.analyze(code, full_data=full_data, trade_date=trade_date)
+                result = self.analyze(
+                    code,
+                    full_data=full_data,
+                    trade_date=trade_date,
+                    decision_at=decision_at,
+                )
                 results.append(result)
             except Exception as e:
                 logger.error(f"分析 {code} 失败: {e}")
@@ -181,6 +287,22 @@ class StockAnalysisEngine:
         recommend_result = self.gate.evaluate(
             long_term_result, short_term_result, event_risk_result, analysis_date=analysis_date
         )
+        finance_status = str(
+            (data.get("finance") or {}).get("pit_status") or "DATA_BLOCKED"
+        )
+        event_status = str(
+            (data.get("news") or {}).get("event_pit_status")
+            or "DATA_BLOCKED"
+        )
+        if finance_status != PIT_AVAILABLE or event_status != PIT_AVAILABLE:
+            recommend_result = {
+                **recommend_result,
+                "status": "SUSPENDED",
+                "reason": (
+                    "PIT_DATA_BLOCKED：缓存数据没有决策时点可验证的"
+                    "财务与公告修订，禁止进入策略推荐"
+                ),
+            }
 
         # 生成文本结论
         summary = self.gate.generate_summary(

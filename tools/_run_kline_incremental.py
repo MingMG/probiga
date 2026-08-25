@@ -1,38 +1,27 @@
 #!/usr/bin/env python3
-from remote_support import production_ssh_client, production_ssh_connect_kwargs
-import os
-import time
+"""Retired mutable-file production maintenance entrypoint.
 
-ssh = production_ssh_client()
-ssh.connect(**production_ssh_connect_kwargs())
+Production releases are accepted only through the audited GitHub workflow and
+the root-owned ``probiga-production-deploy`` broker.  This historical filename
+is kept as an explicit safety fence for old operator habits and shortcuts.
+"""
 
-sftp = ssh.open_sftp()
-local_path = os.path.join(os.path.dirname(__file__), '..', 'biz', 'stock_market', 'sync_stock_market.py')
-remote_path = '/opt/ProBigA/biz/stock_market/sync_stock_market.py'
-sftp.put(os.path.abspath(local_path), remote_path)
+from __future__ import annotations
 
-shell_script = '''#!/bin/bash
-cd /opt/ProBigA
-source venv/bin/activate
-export PYTHONPATH=/opt/ProBigA:/opt/ProBigA/adata
-export SM_MAX_STOCKS=0
-export SM_MAX_WORKERS=1
-export SM_REQUEST_SLEEP=0.2
-nohup python -m biz.stock_market.sync_stock_market --only stock_kline \
-    --kline-start 2026-04-28 --kline-end 2026-05-08 \
-    --kline-incremental > /tmp/kline_incremental.log 2>&1 &
-echo "KLINE_PID=$!"
-'''
-with sftp.open('/tmp/run_kline.sh', 'w') as f:
-    f.write(shell_script)
-sftp.close()
+import sys
 
-chan = ssh.get_transport().open_session()
-chan.settimeout(15)
-chan.exec_command('bash /tmp/run_kline.sh')
-time.sleep(5)
-out = chan.recv(4096).decode().strip()
-print(out)
-chan.close()
-ssh.close()
-print('K-line incremental sync launched with SM_MAX_WORKERS=1')
+
+RETIRED_EXIT_CODE = 2
+RETIRED_MESSAGE = (
+    "Legacy mutable-file production maintenance is retired; "
+    "use the audited production deployment workflow."
+)
+
+
+def main() -> int:
+    print(RETIRED_MESSAGE, file=sys.stderr)
+    return RETIRED_EXIT_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

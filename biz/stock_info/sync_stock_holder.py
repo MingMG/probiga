@@ -30,6 +30,7 @@ from server.common.adata_release import ensure_adata_import_path
 ensure_adata_import_path(ROOT)
 
 from server.common.batch_db import create_batch_engine, read_frame
+from server.common.legacy_table_surface import validate_required_table_surface
 
 log = logging.getLogger(__name__)
 
@@ -39,14 +40,25 @@ def _engine():
 
 
 def run_ddl(engine):
-    """建表（如不存在）"""
-    sql_path = Path(__file__).parent / "sql" / "01_si_stock_info_tables.sql"
-    ddl = sql_path.read_text(encoding="utf-8")
-    stmts = [s.strip() for s in ddl.split(";\n") if s.strip() and not s.strip().startswith("--")]
-    with engine.begin() as conn:
-        for stmt in stmts:
-            if "si_stock_holder" in stmt:
-                conn.execute(text(stmt))
+    """Legacy entrypoint retained as a read-only prepared-schema guard."""
+
+    validate_required_table_surface(
+        engine,
+        {"si_stock_holder"},
+        context="stock holder collector",
+        required_columns={
+            "si_stock_holder": {
+                "stock_code",
+                "report_date",
+                "holder_num",
+                "holder_num_change",
+                "pre_holder_num",
+                "holder_num_ratio",
+                "avg_free_shares",
+                "etl_sync_at",
+            },
+        },
+    )
 
 
 UPSERT_SQL = text("""

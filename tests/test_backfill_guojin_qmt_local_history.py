@@ -16,6 +16,39 @@ from integrations.qmt.local_history import (
 from tools import backfill_guojin_qmt_local_history as backfill_tool
 
 
+TEST_DAILY_LOCK = backfill_tool.Path(
+    r"C:\ProgramData\ProBigA\qmt-local-gap-repair\qmt-local-daily-backfill.lock"
+)
+
+
+@pytest.fixture(autouse=True)
+def _ready_target_quarantine_schema(monkeypatch):
+    def validate(engine):
+        with engine.begin() as connection:
+            connection.execute(backfill_tool.text(
+                "SELECT id, run_id, original_id, action, reason, "
+                "native_provider, stock_code, trade_date, k_type, "
+                "adjust_type, row_payload, row_sha256, quarantined_at, "
+                "restored_at, restore_run_id "
+                "FROM `probiga`.`qmt_target_daily_quarantine` WHERE 1=0"
+            ))
+        return {"ready": True, "ddl_executed": False}
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_target_daily_quarantine_table",
+        validate,
+    )
+
+
+def _patch_daily_lock_path(monkeypatch):
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validated_daily_backfill_lock_path",
+        lambda: (TEST_DAILY_LOCK.parent, TEST_DAILY_LOCK),
+    )
+
+
 class _Rows:
     def __init__(self, rows):
         self._rows = list(rows)
@@ -78,13 +111,29 @@ def _result(*, code_count=2, fetched_rows=2, written_rows=0):
     )
 
 
-def test_target_window_universe_uses_exact_a_share_union_and_dates():
-    engine = _SequenceEngine(
-        [
-            [("2026-08-18",), ("2026-08-19",)],
-            [("2026-08-18",), ("2026-08-19",)],
-            [("600000",), ("000001",), ("000001",), ("300001",)],
-        ]
+def test_target_window_universe_uses_exact_a_share_union_and_dates(
+    monkeypatch,
+):
+    engine = _SequenceEngine([])
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_stock_catalog",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            eligible_codes=lambda day: (
+                ["000001", "600000"]
+                if day == "2026-08-18"
+                else ["000001", "300001"]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_trade_calendar_receipt",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            sessions_between=lambda _start, _end: [
+                "2026-08-18", "2026-08-19"
+            ]
+        ),
     )
 
     codes, trade_dates = backfill_tool._target_window_codes(
@@ -95,32 +144,31 @@ def test_target_window_universe_uses_exact_a_share_union_and_dates():
 
     assert codes == ["000001", "300001", "600000"]
     assert trade_dates == ["2026-08-18", "2026-08-19"]
-    assert len(engine.connection.statements) == 3
-    assert all(
-        params == {
-            "start_date": "2026-08-18",
-            "end_date": "2026-08-19",
-        }
-        for _sql, params in engine.connection.statements
-    )
-    target_sql = " ".join(
-        sql for sql, _params in engine.connection.statements[1:]
-    )
-    assert "adjust_type=0" in target_sql
-    assert "stock_code REGEXP '^(0|3|6)'" in target_sql
-    assert "SELECT DISTINCT stock_code" in target_sql
+    assert engine.connection.statements == []
 
 
-def test_target_window_universe_rejects_missing_target_trade_date():
-    engine = _SequenceEngine(
-        [
-            [("2026-08-18",), ("2026-08-19",)],
-            [("2026-08-18",)],
-            [("000001",)],
-        ]
+def test_target_window_universe_rejects_empty_catalog_day(monkeypatch):
+    engine = _SequenceEngine([])
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_stock_catalog",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            eligible_codes=lambda day: (
+                ["000001"] if day == "2026-08-18" else []
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_trade_calendar_receipt",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            sessions_between=lambda _start, _end: [
+                "2026-08-18", "2026-08-19"
+            ]
+        ),
     )
 
-    with pytest.raises(RuntimeError, match="target daily window is incomplete"):
+    with pytest.raises(RuntimeError, match="target universe is empty"):
         backfill_tool._target_window_codes(
             engine,
             start_date="2026-08-18",
@@ -411,8 +459,9 @@ def test_invalid_target_quarantine_preserves_full_rows_before_delete():
 
     statements = [sql for sql, _params in engine.connection.statements]
     combined = "\n".join(statements)
-    assert "CREATE TABLE IF NOT EXISTS" in statements[0]
-    assert "row_payload LONGTEXT NOT NULL" in statements[0]
+    assert "WHERE 1=0" in statements[0]
+    assert "CREATE TABLE" not in combined
+    assert "ALTER TABLE" not in combined
     assert "FOR UPDATE" in combined
     assert "NOT EXISTS" in combined
     assert "BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'" in combined
@@ -874,6 +923,7 @@ def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
     source_engine = object()
     local_engine = _DisposableEngine("probiga_qmt_history")
     events = []
+    _patch_daily_lock_path(monkeypatch)
     monkeypatch.setattr(
         backfill_tool,
         "_windows_local_engines",
@@ -881,7 +931,7 @@ def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
     )
     monkeypatch.setattr(
         backfill_tool,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda engine: events.append(("ensure", engine)),
     )
     monkeypatch.setattr(
@@ -926,12 +976,12 @@ def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
     assert payload["status"] == "SUCCESS"
     assert payload["connection_mode"] == "fixed_protected_windows_option_file"
     assert payload["universe"]["source"] == (
-        "sm_stock_kline.target_window_exact_union"
+        "qmt_stock_catalog.target_window_exact_union"
     )
     assert payload["universe"]["stock_count"] == 2
     assert payload["universe"]["target_trade_date_count"] == 1
-    assert events[1] == ("acquire", backfill_tool.DAILY_LOCK_PATH)
-    assert events[-1] == ("release", backfill_tool.DAILY_LOCK_PATH)
+    assert events[1] == ("acquire", TEST_DAILY_LOCK)
+    assert events[-1] == ("release", TEST_DAILY_LOCK)
 
 
 def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
@@ -941,6 +991,7 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     source_engine = object()
     local_engine = _DisposableEngine("probiga_qmt_history")
     events = []
+    _patch_daily_lock_path(monkeypatch)
     monkeypatch.setattr(
         backfill_tool,
         "_windows_local_engines",
@@ -948,7 +999,7 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     )
     monkeypatch.setattr(
         backfill_tool,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda _engine: None,
     )
     monkeypatch.setattr(
@@ -1048,6 +1099,7 @@ def test_daily_main_lock_contention_is_nonzero_and_does_not_fetch(
     monkeypatch,
     capsys,
 ):
+    _patch_daily_lock_path(monkeypatch)
     monkeypatch.setattr(backfill_tool, "_source_engine", lambda: object())
     monkeypatch.setattr(
         backfill_tool,
@@ -1056,7 +1108,7 @@ def test_daily_main_lock_contention_is_nonzero_and_does_not_fetch(
     )
     monkeypatch.setattr(
         backfill_tool,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda _engine: None,
     )
     monkeypatch.setattr(
@@ -1121,10 +1173,157 @@ def test_atomic_daily_lock_never_unlinks_a_fresh_initializing_owner(tmp_path):
     assert lock_path.exists()
 
 
+def _patch_gap_repair_main_dependencies(monkeypatch):
+    monkeypatch.setattr(backfill_tool, "_source_engine", lambda: object())
+    monkeypatch.setattr(
+        backfill_tool,
+        "get_local_history_engine",
+        lambda _url=None: _DisposableEngine("probiga_qmt_history"),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "validate_local_history_tables",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_codes_from_arg",
+        lambda _engine, _codes, *, limit: ["000001"],
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_gap_rows",
+        lambda *_args, **_kwargs: [],
+    )
+
+
+def test_gap_repair_apply_lock_io_error_is_not_false_already_running(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    state_root = tmp_path / "gap-state"
+    state_root.mkdir(mode=0o700)
+    _patch_gap_repair_main_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        backfill_tool,
+        "_acquire_lock",
+        lambda _path: (False, "lock_error:PermissionError"),
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "from-gaps",
+            "--gap-limit",
+            "2",
+            "--apply",
+            "--state-root",
+            str(state_root),
+            "--lock-path",
+            str(state_root / "gap.lock"),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "lock_error"
+    assert payload["owner"] == "lock_error:PermissionError"
+
+
+def test_gap_repair_true_active_lock_is_distinct_and_nonzero(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    state_root = tmp_path / "gap-state"
+    state_root.mkdir(mode=0o700)
+    _patch_gap_repair_main_dependencies(monkeypatch)
+    monkeypatch.setattr(
+        backfill_tool,
+        "_acquire_lock",
+        lambda _path: (False, "1234 2026-08-25T07:05:00"),
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "from-gaps",
+            "--apply",
+            "--state-root",
+            str(state_root),
+            "--lock-path",
+            str(state_root / "gap.lock"),
+            "--json",
+        ]
+    )
+
+    assert exit_code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "already_running"
+
+
+def test_gap_repair_state_root_is_outside_sealed_code_tree(
+    monkeypatch,
+    tmp_path,
+):
+    code_root = tmp_path / "sealed-code"
+    code_root.mkdir(mode=0o700)
+    state_root = tmp_path / "service-state"
+    state_root.mkdir(mode=0o700)
+    code_root.chmod(0o555)
+    monkeypatch.setattr(backfill_tool, "ROOT", code_root)
+
+    root, lock = backfill_tool._validated_gap_repair_lock_path(
+        state_root=str(state_root),
+        lock_path=str(state_root / "gap.lock"),
+    )
+
+    assert root == state_root
+    assert lock == state_root / "gap.lock"
+    code_root.chmod(0o700)
+
+
+def test_gap_repair_windows_mapping_is_fixed_under_programdata():
+    root, lock = backfill_tool._windows_gap_repair_state_mapping(
+        r"C:\ProgramData"
+    )
+
+    assert root == r"C:\ProgramData\ProBigA\qmt-local-gap-repair"
+    assert lock == root + r"\qmt-local-gap-repair.lock"
+    with pytest.raises(RuntimeError, match="absolute drive path"):
+        backfill_tool._windows_gap_repair_state_mapping("relative")
+
+    daily_root, daily_lock = (
+        backfill_tool._windows_daily_backfill_state_mapping(
+            r"C:\ProgramData"
+        )
+    )
+    assert daily_root == root
+    assert daily_lock == root + r"\qmt-local-daily-backfill.lock"
+
+
+def test_daily_backfill_lock_reuses_protected_gap_state_root(tmp_path):
+    state_root = tmp_path / "qmt-state"
+    state_root.mkdir(mode=0o700)
+
+    root, lock = backfill_tool._validated_daily_backfill_lock_path(
+        state_root=str(state_root),
+        lock_path=str(state_root / "qmt-local-daily-backfill.lock"),
+    )
+
+    assert root == state_root
+    assert lock.parent == state_root
+    assert lock.name == "qmt-local-daily-backfill.lock"
+    assert not backfill_tool._is_relative_to(
+        root.resolve(),
+        backfill_tool.ROOT.resolve(),
+    )
+
+
 def _patch_daily_dependencies(monkeypatch, prepared_rows):
     monkeypatch.setattr(
         local_history,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda _engine: None,
     )
     run_events = []
@@ -1248,7 +1447,7 @@ def test_daily_backfill_rejects_allowed_code_outside_requested_universe(
 ):
     monkeypatch.setattr(
         local_history,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda _engine: (_ for _ in ()).throw(
             AssertionError("invalid allow-list must fail before schema access")
         ),
@@ -1270,7 +1469,7 @@ def test_daily_backfill_rejects_empty_requested_universe_before_run(
 ):
     monkeypatch.setattr(
         local_history,
-        "ensure_local_history_tables",
+        "validate_local_history_tables",
         lambda _engine: (_ for _ in ()).throw(
             AssertionError("empty universe must fail before schema access")
         ),

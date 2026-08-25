@@ -192,7 +192,7 @@ WHERE ml.object_schema = 'probiga'
 ORDER BY ml.lock_status, ml.object_name;
 ```
 
-`innodb_trx` 必须为空，目标表不得有 `PENDING` metadata lock，且不得有不可解释的 transaction-duration `GRANTED` lock。运行 migration 的账号还必须在 `probiga.*` 上具有 `SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, REFERENCES, TRIGGER`；当前 `probiga_runtime` 的 `GRANT ALL PRIVILEGES ON probiga.*` 满足 DDL 集合，但它不能代替上述 DBA 的全局活跃事务/MDL 审计。
+`innodb_trx` 必须为空，目标表不得有 `PENDING` metadata lock，且不得有不可解释的 transaction-duration `GRANTED` lock。运行 migration 的独立 `probiga_migrator` 账号必须在 `probiga.*` 上具有所需迁移权限。运行账号发布门禁只接受两个精确合同：`TARGET_LEAST_PRIVILEGE` 仅有 `SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES`；无停机过渡期的 `LEGACY_DDL_COMPATIBILITY` 只能额外完整包含 `CREATE, ALTER, DROP, INDEX, REFERENCES`。回执必须如实展示合同名和持久 DDL 列表，不能把兼容态称为已经收紧；运行代码无论处于哪个合同都不得执行持久 DDL。五项旧权限在后续独立维护窗撤销后会自动归类为目标合同。`probiga_runtime` 也不能代替上述 DBA 的全局活跃事务/MDL 审计。
 
 ## 4. 经批准后的正向执行
 

@@ -9,10 +9,15 @@ from fastapi import APIRouter, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
-from server.common.scheduler_runner import run_scheduler_task_sync
 from server.common.scheduler_tasks import update_scheduler_task
 from server.common.sql_reader import read_sql_rows
-from server.api.scheduler_runtime import read_scheduler_heartbeat, scheduler_runtime_info
+from server.api.scheduler_runtime import (
+    launch_scheduler_task,
+    read_scheduler_heartbeat,
+    request_stop_owned_scheduler_task,
+    scheduler_task_owned_by_current_host,
+    scheduler_runtime_info,
+)
 
 router = APIRouter(tags=["scheduler"])
 _QUALITY_CACHE_TTL_SECONDS = 300
@@ -395,41 +400,26 @@ def run_task_now(task_id: int):
     if not row:
         return {"error": "任务不存在"}
     root = Path(__file__).resolve().parents[3]
-    return run_scheduler_task_sync(row[0], root=root, engine=get_engine())
+    return launch_scheduler_task(row[0], root=root, engine=get_engine())
 
 
 @router.post("/scheduler/tasks/{task_id}/stop")
 def stop_task(task_id: int):
-    import os
-    import signal
-    from server.api.scheduler_runtime import _running_lock, _running_procs, _running_task_ids
-
-    row = _read_sql("SELECT id, task_name, last_run_status FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
+    row = _read_sql(
+        "SELECT id, task_name, task_type, script_path, last_run_status "
+        "FROM st_scheduled_tasks WHERE id = :id",
+        {"id": task_id},
+    )
     if not row:
         return {"error": "任务不存在"}
     task = row[0]
+    if not scheduler_task_owned_by_current_host(task):
+        return {
+            "id": task_id,
+            "status": "delegated_to_other_host",
+            "process_killed": False,
+        }
     if task["last_run_status"] != "running":
         return {"message": f"任务当前状态: {task['last_run_status']}，无需停止"}
-
-    proc = _running_procs.pop(task_id, None)
-    if proc and proc.poll() is None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            killed = True
-        except Exception:
-            try:
-                proc.kill()
-                killed = True
-            except Exception:
-                killed = False
-    else:
-        killed = False
-
-    update_scheduler_task(
-        get_engine(),
-        task_id,
-        {"last_run_status": "stopped", "last_run_output": "用户手动停止"},
-    )
-    with _running_lock:
-        _running_task_ids.discard(int(task_id))
-    return {"id": task_id, "status": "stopped", "process_killed": killed}
+    result = request_stop_owned_scheduler_task(task_id)
+    return {"id": task_id, **result}

@@ -546,13 +546,8 @@ def test_bigqmt_daily_kline_requires_same_day_attestation():
     assert attest.call_args.kwargs["apply"] is True
 
 
-def test_enabled_bigqmt_fallback_stays_failed_until_daily_attestation_completes():
+def test_external_fallback_cannot_reuse_old_bigqmt_rows_for_attestation():
     completed = SimpleNamespace(returncode=0)
-    empty_attestation = {
-        "status": "EMPTY_TARGET",
-        "start_date": "2026-08-19",
-        "end_date": "2026-08-19",
-    }
     with patch(
         "tools.sync_qmt_primary.build_child_env",
         return_value={"BIG_QMT_BRIDGE_ENABLED": "true"},
@@ -567,19 +562,18 @@ def test_enabled_bigqmt_fallback_stays_failed_until_daily_attestation_completes(
         return_value=object(),
     ), patch(
         "tools.attest_qmt_daily_kline.attest_range",
-        return_value=empty_attestation,
     ) as attest:
         result = sync_qmt_primary.run_dataset(
             "daily_kline",
             date_str="2026-08-19",
         )
 
-    assert result["status"] == "failed"
-    assert result["returncode"] == 3
+    assert result["status"] == "success"
+    assert result["returncode"] == 0
     assert result["source_policy"] == "external_primary_miniqmt_disabled"
-    assert "EMPTY_TARGET" in result["error"]
+    assert result["attestation"] is None
     assert run.call_args.kwargs["env"]["SM_SKIP_DDL"] == "1"
-    attest.assert_called_once()
+    attest.assert_not_called()
 
 
 def test_external_only_daily_kline_does_not_require_qmt_attestation():

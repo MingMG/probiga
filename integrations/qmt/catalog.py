@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+import hashlib
 from typing import Any, Iterable
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from integrations.qmt._control_schema import (
+    FrozenColumn,
+    FrozenIndex,
+    FrozenTable,
+    character_column,
+    privileged_migrate_frozen_tables,
+    validate_frozen_tables,
+)
 
 
 PROVIDER_ID = "gj_qmt"
@@ -49,7 +59,9 @@ def _market_periods() -> list[ApiDefinition]:
         "northfinancechange1m": ("northbound", "vip", "qmt_northbound_flow", "market,realtime"),
         "northfinancechange1d": ("northbound", "vip", "qmt_northbound_flow", "market,recommendation"),
         "interactiveqa": ("interactive_qa", "vip", "qmt_interactive_qa", "event_risk"),
-        "announcement": ("announcement", "vip", "si_notice_eastmoney", "event_risk"),
+        "announcement": (
+            "announcement", "vip", "st_pit_event_revision", "event_risk"
+        ),
         "l2quote": ("level2", "level2", "qmt_stock_l2_quote", "realtime"),
         "l2quoteaux": ("level2", "level2", "qmt_stock_l2_quote", "realtime"),
         "l2order": ("level2", "level2", "qmt_stock_l2_order", "capital,realtime"),
@@ -105,60 +117,254 @@ def api_definitions() -> list[ApiDefinition]:
     return direct + _market_periods()
 
 
-def ensure_catalog_tables(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS qmt_api_registry (
-                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                    provider VARCHAR(32) NOT NULL,
-                    capability_key VARCHAR(160) NOT NULL,
-                    category VARCHAR(64) NOT NULL,
-                    api_name VARCHAR(96) NOT NULL,
-                    period VARCHAR(64) NOT NULL DEFAULT '',
-                    execution_mode VARCHAR(32) NOT NULL DEFAULT 'native',
-                    required_permission VARCHAR(64) NOT NULL DEFAULT 'basic',
-                    document_url VARCHAR(512) NOT NULL,
-                    target_table VARCHAR(128) NOT NULL DEFAULT '',
-                    consumer_module VARCHAR(256) NOT NULL DEFAULT '',
-                    enabled TINYINT(1) NOT NULL DEFAULT 1,
-                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME NULL,
-                    UNIQUE KEY uk_qmt_api_registry (provider, capability_key),
-                    KEY idx_qmt_api_category (category)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-        )
-        conn.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS qmt_api_capability (
-                    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                    provider VARCHAR(32) NOT NULL,
-                    capability_key VARCHAR(160) NOT NULL,
-                    api_name VARCHAR(96) NOT NULL,
-                    period VARCHAR(64) NOT NULL DEFAULT '',
-                    capability_status VARCHAR(40) NOT NULL,
-                    available TINYINT(1) NULL,
-                    returned_rows BIGINT NOT NULL DEFAULT 0,
-                    returned_fields_json TEXT NULL,
-                    error_message TEXT NULL,
-                    connection_port INT NULL,
-                    sdk_module VARCHAR(512) NULL,
-                    sdk_version VARCHAR(128) NULL,
-                    probed_at DATETIME NOT NULL,
-                    UNIQUE KEY uk_qmt_api_capability (provider, capability_key),
-                    KEY idx_qmt_capability_status (capability_status)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-        )
+CATALOG_TABLE_DDLS: dict[str, str] = {
+    "qmt_api_registry": """
+        CREATE TABLE IF NOT EXISTS qmt_api_registry (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            provider VARCHAR(32) NOT NULL,
+            capability_key VARCHAR(160) NOT NULL,
+            category VARCHAR(64) NOT NULL,
+            api_name VARCHAR(96) NOT NULL,
+            period VARCHAR(64) NOT NULL DEFAULT '',
+            execution_mode VARCHAR(32) NOT NULL DEFAULT 'native',
+            required_permission VARCHAR(64) NOT NULL DEFAULT 'basic',
+            document_url VARCHAR(512) NOT NULL,
+            target_table VARCHAR(128) NOT NULL DEFAULT '',
+            consumer_module VARCHAR(256) NOT NULL DEFAULT '',
+            enabled TINYINT(1) NOT NULL DEFAULT 1,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NULL,
+            UNIQUE KEY uk_qmt_api_registry (provider, capability_key),
+            KEY idx_qmt_api_category (category)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    "qmt_api_capability": """
+        CREATE TABLE IF NOT EXISTS qmt_api_capability (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            provider VARCHAR(32) NOT NULL,
+            capability_key VARCHAR(160) NOT NULL,
+            api_name VARCHAR(96) NOT NULL,
+            period VARCHAR(64) NOT NULL DEFAULT '',
+            capability_status VARCHAR(40) NOT NULL,
+            available TINYINT(1) NULL,
+            returned_rows BIGINT NOT NULL DEFAULT 0,
+            returned_fields_json TEXT NULL,
+            error_message TEXT NULL,
+            connection_port INT NULL,
+            sdk_module VARCHAR(512) NULL,
+            sdk_version VARCHAR(128) NULL,
+            probed_at DATETIME NOT NULL,
+            UNIQUE KEY uk_qmt_api_capability (provider, capability_key),
+            KEY idx_qmt_capability_status (capability_status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+}
 
 
-def seed_registry(engine: Engine, definitions: Iterable[ApiDefinition] | None = None) -> int:
-    rows = list(definitions or api_definitions())
+CATALOG_TABLE_CONTRACTS: dict[str, FrozenTable] = {
+    "qmt_api_registry": FrozenTable(
+        ddl=CATALOG_TABLE_DDLS["qmt_api_registry"],
+        columns=(
+            ("id", FrozenColumn("bigint", False, extra="auto_increment")),
+            ("provider", character_column("varchar(32)", nullable=False)),
+            ("capability_key", character_column("varchar(160)", nullable=False)),
+            ("category", character_column("varchar(64)", nullable=False)),
+            ("api_name", character_column("varchar(96)", nullable=False)),
+            ("period", character_column("varchar(64)", nullable=False, default="")),
+            ("execution_mode", character_column("varchar(32)", nullable=False, default="native")),
+            ("required_permission", character_column("varchar(64)", nullable=False, default="basic")),
+            ("document_url", character_column("varchar(512)", nullable=False)),
+            ("target_table", character_column("varchar(128)", nullable=False, default="")),
+            ("consumer_module", character_column("varchar(256)", nullable=False, default="")),
+            ("enabled", FrozenColumn("tinyint(1)", False, default="1")),
+            ("created_at", FrozenColumn("timestamp", False, default="current_timestamp")),
+            ("updated_at", FrozenColumn("datetime", True)),
+        ),
+        indexes={
+            "PRIMARY": FrozenIndex(("id",), True),
+            "uk_qmt_api_registry": FrozenIndex(("provider", "capability_key"), True),
+            "idx_qmt_api_category": FrozenIndex(("category",), False),
+        },
+    ),
+    "qmt_api_capability": FrozenTable(
+        ddl=CATALOG_TABLE_DDLS["qmt_api_capability"],
+        columns=(
+            ("id", FrozenColumn("bigint", False, extra="auto_increment")),
+            ("provider", character_column("varchar(32)", nullable=False)),
+            ("capability_key", character_column("varchar(160)", nullable=False)),
+            ("api_name", character_column("varchar(96)", nullable=False)),
+            ("period", character_column("varchar(64)", nullable=False, default="")),
+            ("capability_status", character_column("varchar(40)", nullable=False)),
+            ("available", FrozenColumn("tinyint(1)", True)),
+            ("returned_rows", FrozenColumn("bigint", False, default="0")),
+            ("returned_fields_json", character_column("text", nullable=True)),
+            ("error_message", character_column("text", nullable=True)),
+            ("connection_port", FrozenColumn("int", True)),
+            ("sdk_module", character_column("varchar(512)", nullable=True)),
+            ("sdk_version", character_column("varchar(128)", nullable=True)),
+            ("probed_at", FrozenColumn("datetime", False)),
+        ),
+        indexes={
+            "PRIMARY": FrozenIndex(("id",), True),
+            "uk_qmt_api_capability": FrozenIndex(("provider", "capability_key"), True),
+            "idx_qmt_capability_status": FrozenIndex(("capability_status",), False),
+        },
+    ),
+}
+
+
+def validate_catalog_schema(engine: Engine, *, connection=None) -> dict[str, Any]:
+    """Validate the catalog physical contract with SELECT statements only."""
+
+    return validate_frozen_tables(
+        engine,
+        CATALOG_TABLE_CONTRACTS,
+        context="QMT API catalog",
+        connection=connection,
+    )
+
+
+def privileged_migrate_catalog_schema(engine: Engine) -> dict[str, Any]:
+    """Create/validate catalog tables during a fenced privileged migration."""
+
+    return privileged_migrate_frozen_tables(
+        engine,
+        CATALOG_TABLE_CONTRACTS,
+        context="QMT API catalog",
+    )
+
+
+def _seed_payload(
+    definitions: Iterable[ApiDefinition] | None = None,
+) -> list[dict[str, Any]]:
+    rows = list(definitions if definitions is not None else api_definitions())
+    if not rows:
+        raise RuntimeError("QMT catalog seed definitions cannot be empty")
+    payload: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for definition in rows:
+        if definition.capability_key in seen:
+            raise RuntimeError(
+                f"duplicate QMT catalog seed identity: {definition.capability_key}"
+            )
+        seen.add(definition.capability_key)
+        item = asdict(definition)
+        item.update({
+            "provider": PROVIDER_ID,
+            "capability_key": definition.capability_key,
+            "enabled": 1,
+        })
+        payload.append(item)
+    return sorted(payload, key=lambda row: str(row["capability_key"]))
+
+
+def _seed_contract_hash_from_payload(payload: list[dict[str, Any]]) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def catalog_seed_contract_hash(
+    definitions: Iterable[ApiDefinition] | None = None,
+) -> str:
+    return _seed_contract_hash_from_payload(_seed_payload(definitions))
+
+
+def _validate_catalog_seed_on_connection(
+    connection,
+    definitions: Iterable[ApiDefinition] | None = None,
+) -> dict[str, Any]:
+    expected_rows = _seed_payload(definitions)
+    expected = {str(row["capability_key"]): row for row in expected_rows}
+    rows = connection.execute(
+        text(
+            "SELECT provider, capability_key, category, api_name, period, "
+            "execution_mode, required_permission, document_url, target_table, "
+            "consumer_module, enabled FROM qmt_api_registry "
+            "WHERE provider=:provider ORDER BY capability_key"
+        ),
+        {"provider": PROVIDER_ID},
+    ).mappings().all()
+    actual_rows = [dict(row) for row in rows]
+    active: dict[str, dict[str, Any]] = {}
+    inactive_count = 0
+    for row in actual_rows:
+        capability_key = str(row.get("capability_key") or "")
+        if int(row.get("enabled") or 0) != 1:
+            inactive_count += 1
+            continue
+        if capability_key in active:
+            raise RuntimeError(f"duplicate active QMT catalog seed: {capability_key}")
+        active[capability_key] = row
+    if set(active) != set(expected):
+        raise RuntimeError(
+            "QMT catalog active seed identity differs: "
+            f"missing={sorted(set(expected) - set(active))} "
+            f"unexpected={sorted(set(active) - set(expected))}"
+        )
+    identity_fields = (
+        "provider", "capability_key", "category", "api_name", "period",
+        "execution_mode", "required_permission", "document_url", "target_table",
+        "consumer_module",
+    )
+    for capability_key, expected_row in expected.items():
+        actual = active[capability_key]
+        differences = {
+            field: (str(actual.get(field) or ""), str(expected_row.get(field) or ""))
+            for field in identity_fields
+            if str(actual.get(field) or "") != str(expected_row.get(field) or "")
+        }
+        if differences:
+            raise RuntimeError(
+                f"QMT catalog seed payload differs: {capability_key} {differences}"
+            )
+    return {
+        "provider": PROVIDER_ID,
+        "active_registry_rows": len(active),
+        "inactive_registry_rows": inactive_count,
+        "seed_contract_hash": _seed_contract_hash_from_payload(expected_rows),
+        "seed_identity_verified": True,
+        "read_only": True,
+        "runtime_seed_required": False,
+    }
+
+
+def validate_catalog_registry_seed(
+    engine: Engine,
+    definitions: Iterable[ApiDefinition] | None = None,
+    *,
+    connection=None,
+) -> dict[str, Any]:
+    """Validate the immutable active seed identity using SELECT only."""
+
+    if connection is not None:
+        validate_catalog_schema(engine, connection=connection)
+        return _validate_catalog_seed_on_connection(connection, definitions)
+    validate_catalog_schema(engine)
+    with engine.connect() as bound_connection:
+        return _validate_catalog_seed_on_connection(bound_connection, definitions)
+
+
+def privileged_seed_catalog_registry(
+    engine: Engine,
+    definitions: Iterable[ApiDefinition] | None = None,
+) -> dict[str, Any]:
+    """Install the active registry seed during a writer-fenced release phase.
+
+    Removed API definitions are retained for auditability but disabled.  The
+    active set and every active identity field must exactly match the frozen
+    definitions before the migration succeeds.
+    """
+
+    validate_catalog_schema(engine)
+    definition_rows = list(
+        definitions if definitions is not None else api_definitions()
+    )
+    payload = _seed_payload(definition_rows)
     sql = text(
         """
         INSERT INTO qmt_api_registry (
@@ -175,14 +381,22 @@ def seed_registry(engine: Engine, definitions: Iterable[ApiDefinition] | None = 
             consumer_module=VALUES(consumer_module), enabled=1, updated_at=NOW()
         """
     )
-    payload = []
-    for definition in rows:
-        item = asdict(definition)
-        item.update({"provider": PROVIDER_ID, "capability_key": definition.capability_key})
-        payload.append(item)
     with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE qmt_api_registry SET enabled=0, updated_at=NOW() "
+                "WHERE provider=:provider"
+            ),
+            {"provider": PROVIDER_ID},
+        )
         conn.execute(sql, payload)
-    return len(payload)
+        seed_result = _validate_catalog_seed_on_connection(conn, definition_rows)
+    return {
+        **seed_result,
+        "seeded_registry_rows": len(payload),
+        "privileged_seed": True,
+        "read_only": False,
+    }
 
 
 CORE_PROBE_TO_REGISTRY_KEYS: dict[str, tuple[str, ...]] = {
@@ -355,6 +569,7 @@ def complete_capability_ledger(engine: Engine) -> int:
                         c.error_message = 'Documented API is marked embedded_only; native SDK runtime cannot verify it.',
                         c.probed_at = NOW()
                     WHERE r.provider = :provider
+                      AND r.enabled = 1
                       AND r.execution_mode = 'embedded_only'
                       AND c.capability_status IN ('PENDING_NATIVE_PROBE', 'PENDING_SAMPLE_PROBE')
                     """
@@ -387,6 +602,7 @@ def complete_capability_ledger(engine: Engine) -> int:
                   ON c.provider = r.provider
                  AND c.capability_key = r.capability_key
                 WHERE r.provider = :provider
+                  AND r.enabled = 1
                   AND c.id IS NULL
                 ORDER BY r.capability_key
                 """

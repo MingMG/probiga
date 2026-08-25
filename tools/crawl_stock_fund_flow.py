@@ -54,6 +54,8 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.batch_db import replace_table_rows_exact_keys
+from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 # ═══════════════════════════════════════════
 # 配置
@@ -578,42 +580,15 @@ def _save_to_db(engine, rows: list[dict], mode: str = "full", target_date: str =
     df = df.replace({np.nan: None, pd.NaT: None})
     df = df.drop_duplicates(subset=["stock_code", "trade_date"], keep="last")
 
-    if mode == "today" and target_date:
-        # 当天模式: 只删除当天数据
-        with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"),
-                {"d": target_date}
-            )
-    elif mode == "full":
-        # 全量模式: 按日期批量删除已有数据
-        dates = sorted(set(r["trade_date"] for r in rows))
-        print(f"\n  清理已有数据 ({len(dates)} 天)...")
-        with engine.begin() as conn:
-            for d in dates:
-                conn.execute(
-                    text("DELETE FROM `sm_stock_capital_flow_daily` WHERE `trade_date` = :d"),
-                    {"d": d}
-                )
-
     df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-
-    # 分批写入
-    chunk_size = 2000
-    total_written = 0
-    for start in range(0, len(df), chunk_size):
-        chunk = df.iloc[start:start + chunk_size]
-        chunk.to_sql(
-            "sm_stock_capital_flow_daily",
-            engine,
-            if_exists="append",
-            index=False,
-            chunksize=500,
-            method="multi",
-        )
-        total_written += len(chunk)
-        if total_written % 10000 == 0 or total_written == len(df):
-            print(f"  已写入: {total_written}/{len(df)}")
+    replace_table_rows_exact_keys(
+        df,
+        "sm_stock_capital_flow_daily",
+        engine,
+        key_columns=("stock_code", "trade_date"),
+        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        chunksize=500,
+    )
 
     print(f"\n  ✅ 写入完成: sm_stock_capital_flow_daily, 共 {len(df)} 行")
 

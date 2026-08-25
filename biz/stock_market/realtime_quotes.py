@@ -15,14 +15,13 @@ A 股多股「最新价」快照（新浪 ``hq.sinajs.cn``，与 adata 文档中
     python -m biz.stock_market.realtime_quotes --mysql
     python -m biz.stock_market.realtime_quotes --mysql --no-rt-ddl
 
-``--mysql``：追加写入 ``probiga.sm_rt_quote_snapshot``（见 ``biz/stock_market/sql/01_sm_rt_quote_snapshot.sql``），连接串使用 ``MYSQL_URL`` 或项目根目录 ``.env``。
+``--mysql``：只向发布期已准备并验证的 ``probiga.sm_rt_quote_snapshot`` 追加写入，连接串使用 ``MYSQL_URL`` 或项目根目录 ``.env``。
 
 与官方文档对齐的字段：stock_code, short_name, price, change, change_pct, volume, amount。
 """
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +35,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.config import get_mysql_url
+from server.common.runtime_table_schema import (
+    RuntimeColumn,
+    RuntimeIndex,
+    RuntimeTable,
+    privileged_normalize_mysql_storage,
+    validate_runtime_tables,
+)
 
 # 与 adata.common.utils.code_utils.exchange_suffix 一致（6 位代码前两位 -> 交易所字母）
 _EXCHANGE_SUFFIX = {
@@ -118,28 +124,79 @@ def fetch_list_market_current(code_list: list[str]) -> pd.DataFrame:
     return result_df
 
 
-_RT_DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_sm_rt_quote_snapshot.sql"
-def _ensure_rt_snapshot_table(engine) -> None:
-    if not _RT_DDL_PATH.is_file():
-        raise FileNotFoundError(f"缺少建表 SQL：{_RT_DDL_PATH}")
-    sql = _RT_DDL_PATH.read_text(encoding="utf-8")
-    lines = []
-    for line in sql.splitlines():
-        s = line.strip()
-        if s.startswith("--") or s.upper().startswith("USE "):
-            continue
-        lines.append(line)
-    cleaned = "\n".join(lines)
-    parts = [p.strip() for p in re.split(r";\s*\n", cleaned) if p.strip()]
+_RT_SNAPSHOT_DDL = """
+CREATE TABLE IF NOT EXISTS sm_rt_quote_snapshot (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    stock_code VARCHAR(16) NOT NULL,
+    short_name VARCHAR(128) NULL,
+    price DECIMAL(50,6) NULL,
+    `change` DECIMAL(50,6) NULL,
+    change_pct DECIMAL(50,6) NULL,
+    volume DECIMAL(50,6) NULL,
+    amount DECIMAL(50,6) NULL,
+    snapshot_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    KEY idx_rt_snap_code (stock_code),
+    KEY idx_rt_snap_time (snapshot_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+_RT_SNAPSHOT_CONTRACT = {
+    "sm_rt_quote_snapshot": RuntimeTable(
+        columns={
+            "id": RuntimeColumn("bigint", False, numeric_precision=19, numeric_scale=0, auto_increment=True),
+            "stock_code": RuntimeColumn("varchar", False, character_length=16),
+            "short_name": RuntimeColumn("varchar", True, character_length=128),
+            "price": RuntimeColumn("decimal", True, numeric_precision=50, numeric_scale=6),
+            "change": RuntimeColumn("decimal", True, numeric_precision=50, numeric_scale=6),
+            "change_pct": RuntimeColumn("decimal", True, numeric_precision=50, numeric_scale=6),
+            "volume": RuntimeColumn("decimal", True, numeric_precision=50, numeric_scale=6),
+            "amount": RuntimeColumn("decimal", True, numeric_precision=50, numeric_scale=6),
+            "snapshot_at": RuntimeColumn("datetime", False, datetime_precision=0),
+        },
+        indexes=(
+            RuntimeIndex(("id",), unique=True),
+            RuntimeIndex(("stock_code",), unique=False),
+            RuntimeIndex(("snapshot_at",), unique=False),
+        ),
+    )
+}
+
+
+def validate_rt_snapshot_runtime(engine) -> dict[str, object]:
+    validate_runtime_tables(
+        engine,
+        _RT_SNAPSHOT_CONTRACT,
+        context="realtime quote snapshot",
+    )
+    return {
+        "schema": "probiga.realtime-quote-snapshot.v1",
+        "status": "HEALTHY",
+        "table_count": 1,
+        "physical_schema_verified": True,
+        "runtime_ddl_required": False,
+        "read_only": True,
+    }
+
+
+def privileged_migrate_rt_snapshot_table(engine) -> dict[str, object]:
     with engine.begin() as conn:
-        for stmt in parts:
-            conn.execute(text(stmt))
+        conn.execute(text(_RT_SNAPSHOT_DDL))
+        privileged_normalize_mysql_storage(conn, _RT_SNAPSHOT_CONTRACT)
+    return validate_rt_snapshot_runtime(engine)
+
+
+def _ensure_rt_snapshot_table(engine) -> None:
+    """Compatibility runtime guard; persistent DDL is release-only."""
+    validate_rt_snapshot_runtime(engine)
 
 
 def save_to_mysql(df: pd.DataFrame, *, run_ddl: bool) -> int:
     engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
     if run_ddl:
-        _ensure_rt_snapshot_table(engine)
+        raise RuntimeError(
+            "runtime DDL is disabled; run privileged_migrate_rt_snapshot_table during release"
+        )
+    _ensure_rt_snapshot_table(engine)
     ts = datetime.now().replace(microsecond=0)
     out = df.copy()
     out["snapshot_at"] = ts
@@ -163,7 +220,7 @@ def main() -> None:
     p.add_argument(
         "--no-rt-ddl",
         action="store_true",
-        help="与 --mysql 合用：不执行建表 SQL（表已存在时）",
+        help="兼容旧参数；运行时始终不执行DDL，表结构由发布迁移准备",
     )
     args = p.parse_args()
     code_list = [x for x in args.codes.split(",") if x.strip()]
@@ -176,7 +233,7 @@ def main() -> None:
         df.to_csv(args.csv, index=False, encoding="utf-8-sig")
         print(f"\n已写入: {args.csv}")
     if args.mysql:
-        n = save_to_mysql(df, run_ddl=not args.no_rt_ddl)
+        n = save_to_mysql(df, run_ddl=False)
         print(f"\n已写入 MySQL：sm_rt_quote_snapshot，{n} 行（snapshot_at 为抓取时间）。")
 
 

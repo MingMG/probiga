@@ -11,12 +11,14 @@ candidates.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.analysis_output_schema import (
+    validate_ai_failure_sample_schema,
+    validate_analysis_output_schema,
+)
+from server.common.pit_facts import (
+    PIT_AVAILABLE,
+    PIT_DATA_BLOCKED,
+    load_event_facts,
+    load_finance_facts,
+    normalize_decision_at,
+    resolve_common_fact_cutoff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +72,101 @@ class BatchStats:
     market_mood_score: float
     flow_date: str
     hot_date: str
+
+
+def _analysis_lock_key(database_name: str, trade_date: str) -> str:
+    database_digest = hashlib.sha256(
+        str(database_name or "").encode("utf-8")
+    ).hexdigest()[:16]
+    key = f"probiga:analysis-write:{database_digest}:{trade_date}"
+    if len(key) > 64:
+        raise RuntimeError("analysis execution lock key exceeds MySQL limit")
+    return key
+
+
+@contextmanager
+def _analysis_execution_lock(engine: Engine, trade_date: str):
+    """Hold one MySQL advisory lock for all recommendation writers that day."""
+    normalized_date = str(trade_date or "").strip()[:10]
+    if not normalized_date:
+        raise ValueError("analysis execution lock requires trade_date")
+    dialect_name = str(getattr(getattr(engine, "dialect", None), "name", ""))
+    if dialect_name.lower() != "mysql":
+        if (
+            str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "")
+            .strip()
+            .lower()
+            == "production"
+        ):
+            raise RuntimeError(
+                "production analysis execution requires MySQL advisory lock"
+            )
+        yield lambda: None
+        return
+
+    connection = engine.connect()
+    acquired = False
+    lock_key = ""
+    owner_connection_id: int | None = None
+    try:
+        database_name = connection.execute(text("SELECT DATABASE()" )).scalar()
+        if not database_name:
+            raise RuntimeError("analysis advisory lock database identity unavailable")
+        lock_key = _analysis_lock_key(str(database_name), normalized_date)
+        owner_raw = connection.execute(text("SELECT CONNECTION_ID()" )).scalar()
+        try:
+            owner_connection_id = int(owner_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "analysis advisory lock connection identity unavailable"
+            ) from exc
+        acquired_raw = connection.execute(
+            text("SELECT GET_LOCK(:lock_key, 0)"),
+            {"lock_key": lock_key},
+        ).scalar()
+        if acquired_raw is None:
+            raise RuntimeError("analysis advisory lock provider returned NULL")
+        if int(acquired_raw) != 1:
+            raise RuntimeError(
+                f"analysis writer already active for {normalized_date}"
+            )
+        acquired = True
+
+        def _verify_owner() -> None:
+            used_by_raw = connection.execute(
+                text("SELECT IS_USED_LOCK(:lock_key)"),
+                {"lock_key": lock_key},
+            ).scalar()
+            try:
+                used_by = int(used_by_raw)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "analysis advisory lock ownership became unavailable"
+                ) from exc
+            if used_by != owner_connection_id:
+                raise RuntimeError(
+                    "analysis advisory lock ownership was lost before write"
+                )
+
+        yield _verify_owner
+    finally:
+        if acquired:
+            try:
+                released = connection.execute(
+                    text("SELECT RELEASE_LOCK(:lock_key)"),
+                    {"lock_key": lock_key},
+                ).scalar()
+                if int(released or 0) != 1:
+                    logger.error(
+                        "analysis advisory lock release was not acknowledged: %s",
+                        lock_key,
+                    )
+            except Exception:
+                logger.exception(
+                    "analysis advisory lock release failed: %s",
+                    lock_key,
+                )
+        connection.close()
 
 
 MODEL_VERSION = "ai-rec-v3-mainwave"
@@ -158,9 +267,44 @@ def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> 
     score = 100.0
 
     finance_fields = ("roe_wtd", "gross_margin", "net_margin", "asset_liab_ratio")
-    if not any(_safe_number(row.get(field), 0.0) for field in finance_fields):
+    finance_pit_status = str(
+        row.get("finance_pit_status") or PIT_DATA_BLOCKED
+    )
+    if finance_pit_status != PIT_AVAILABLE:
+        flags.append("pit_finance_data_blocked")
+        score -= 35.0
+    elif not any(_safe_number(row.get(field), 0.0) for field in finance_fields):
         flags.append("missing_finance")
         score -= 28.0
+    if row.get("finance_revision_id"):
+        flags.append(f"finance_revision_id={row['finance_revision_id']}")
+    if row.get("finance_content_hash"):
+        flags.append(f"finance_content_hash={row['finance_content_hash']}")
+    if row.get("finance_manifest_hash"):
+        flags.append(f"finance_manifest_hash={row['finance_manifest_hash']}")
+    if row.get("finance_fact_cutoff_at"):
+        flags.append(
+            f"pit_fact_cutoff_at={row['finance_fact_cutoff_at']}"
+        )
+    if row.get("finance_decision_at"):
+        flags.append(f"pit_decision_at={row['finance_decision_at']}")
+    if row.get("pit_common_receipt_root_hash"):
+        flags.append(
+            "pit_common_receipt_root_hash="
+            f"{row['pit_common_receipt_root_hash']}"
+        )
+    if row.get("finance_coverage_id"):
+        flags.append(f"finance_coverage_id={row['finance_coverage_id']}")
+    if row.get("finance_coverage_response_hash"):
+        flags.append(
+            "finance_coverage_response_hash="
+            f"{row['finance_coverage_response_hash']}"
+        )
+    if row.get("finance_coverage_watermark_hash"):
+        flags.append(
+            "finance_coverage_watermark_hash="
+            f"{row['finance_coverage_watermark_hash']}"
+        )
 
     if _safe_number(row.get("main_net_inflow"), 0.0) == 0.0 and _safe_number(row.get("main_net_inflow_5d"), 0.0) == 0.0:
         flags.append("missing_flow")
@@ -175,13 +319,42 @@ def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> 
         score -= 10.0
 
     industry_name = str(row.get("industry_name") or "").strip()
-    if not industry_name:
-        flags.append("missing_industry")
-        score -= 6.0
+    industry_pit_status = str(
+        row.get("industry_pit_status") or PIT_DATA_BLOCKED
+    )
+    if industry_pit_status != PIT_AVAILABLE or not industry_name:
+        flags.append("pit_industry_data_blocked")
+        score -= 12.0
+    if row.get("industry_snapshot_date"):
+        flags.append(
+            f"industry_snapshot_date={row['industry_snapshot_date']}"
+        )
+    if row.get("industry_snapshot_source"):
+        flags.append(
+            f"industry_snapshot_source={row['industry_snapshot_source']}"
+        )
 
-    if row.get("latest_notice_date") is None and int(_safe_number(row.get("notice_count"), 0.0)) == 0:
+    event_pit_status = str(row.get("event_pit_status") or PIT_DATA_BLOCKED)
+    if event_pit_status != PIT_AVAILABLE:
+        flags.append("pit_event_data_blocked")
+        score -= 12.0
+    elif row.get("latest_notice_date") is None and int(_safe_number(row.get("notice_count"), 0.0)) == 0:
         flags.append("missing_notice_context")
         score -= 4.0
+    if row.get("event_manifest_hash"):
+        flags.append(f"event_manifest_hash={row['event_manifest_hash']}")
+    if row.get("event_coverage_id"):
+        flags.append(f"event_coverage_id={row['event_coverage_id']}")
+    if row.get("event_coverage_response_hash"):
+        flags.append(
+            "event_coverage_response_hash="
+            f"{row['event_coverage_response_hash']}"
+        )
+    if row.get("event_coverage_watermark_hash"):
+        flags.append(
+            "event_coverage_watermark_hash="
+            f"{row['event_coverage_watermark_hash']}"
+        )
 
     return clamp_score(score), flags
 
@@ -212,7 +385,13 @@ def choose_recommend_status(
         return "BLOCK", "非沪深A股主代码，不进入推荐池"
     if event_risk_level == "CRITICAL":
         return "BLOCK", "公告存在重大事件风险"
-    if "missing_finance" in flags or "missing_flow" in flags:
+    if (
+        "missing_finance" in flags
+        or "missing_flow" in flags
+        or "pit_finance_data_blocked" in flags
+        or "pit_event_data_blocked" in flags
+        or "pit_industry_data_blocked" in flags
+    ):
         return "SUSPENDED", "关键数据缺失，财务或资金流不完整"
     if data_quality_score < 70:
         return "SUSPENDED", f"数据质量分为{data_quality_score:.1f}，暂不进入推荐池"
@@ -303,81 +482,6 @@ def _table_columns(engine: Engine, table_name: str) -> set[str]:
               AND TABLE_NAME = :table_name
         """), {"table_name": table_name}).fetchall()
     return {str(r[0]) for r in rows}
-
-
-def _ensure_recommended_columns(engine: Engine) -> None:
-    required = {
-        "long_term_score": "DECIMAL(5,1) DEFAULT NULL",
-        "short_term_score": "DECIMAL(5,1) DEFAULT NULL",
-        "recommend_status": "VARCHAR(10) DEFAULT 'ALLOW'",
-        "recommend_reason": "VARCHAR(500) DEFAULT ''",
-        "event_risk_level": "VARCHAR(10) DEFAULT 'LOW'",
-        "last_check_time": "DATETIME DEFAULT NULL",
-        "sentiment_score": "DECIMAL(5,1) DEFAULT NULL",
-        "market_mood_score": "DECIMAL(5,1) DEFAULT NULL",
-        "event_score": "DECIMAL(5,1) DEFAULT NULL",
-        "ultra_short_score": "DECIMAL(5,1) DEFAULT NULL",
-        "swing_score": "DECIMAL(5,1) DEFAULT NULL",
-        "primary_strategy": "VARCHAR(20) DEFAULT ''",
-        "strategy_profile": "VARCHAR(20) DEFAULT ''",
-        "suitable_strategies": "TEXT NULL",
-        "signal_status": "VARCHAR(20) DEFAULT 'WATCH'",
-        "signal_reason": "VARCHAR(500) DEFAULT ''",
-        "entry_price_low": "DECIMAL(12,4) DEFAULT NULL",
-        "entry_price_high": "DECIMAL(12,4) DEFAULT NULL",
-        "stop_loss_price": "DECIMAL(12,4) DEFAULT NULL",
-        "take_profit_1": "DECIMAL(12,4) DEFAULT NULL",
-        "take_profit_2": "DECIMAL(12,4) DEFAULT NULL",
-        "position_weight": "DECIMAL(5,2) DEFAULT NULL",
-        "max_holding_days": "INT DEFAULT NULL",
-        "entry_conditions_json": "TEXT NULL",
-        "sell_rules_json": "TEXT NULL",
-        "invalidation_reason": "VARCHAR(500) DEFAULT ''",
-        "quality_score": "DECIMAL(5,1) DEFAULT NULL",
-        "entry_score": "DECIMAL(5,1) DEFAULT NULL",
-        "final_trade_score": "DECIMAL(5,1) DEFAULT NULL",
-        "expected_return_score": "DECIMAL(5,1) DEFAULT NULL",
-        "expected_return_pct": "DECIMAL(8,2) DEFAULT NULL",
-        "resistance_price": "DECIMAL(12,4) DEFAULT NULL",
-        "heat_overload_score": "DECIMAL(5,1) DEFAULT NULL",
-        "confidence_score": "DECIMAL(5,1) DEFAULT NULL",
-        "sector_rotation_score": "DECIMAL(5,1) DEFAULT NULL",
-        "failure_penalty_score": "DECIMAL(5,1) DEFAULT NULL",
-        "data_quality_score": "DECIMAL(5,1) DEFAULT NULL",
-        "data_quality_flags": "TEXT NULL",
-        "cooldown_days_left": "INT DEFAULT 0",
-        "cooldown_until": "DATE DEFAULT NULL",
-        "main_wave_score": "DECIMAL(5,1) DEFAULT NULL",
-        "trend_hold_score": "DECIMAL(5,1) DEFAULT NULL",
-        "main_wave_stage": "VARCHAR(30) DEFAULT ''",
-        "main_wave_signal": "VARCHAR(30) DEFAULT ''",
-        "main_wave_reason": "VARCHAR(500) DEFAULT ''",
-        "trend_stop_price": "DECIMAL(12,4) DEFAULT NULL",
-        "trend_reduce_price": "DECIMAL(12,4) DEFAULT NULL",
-        "model_version": "VARCHAR(20) DEFAULT ''",
-    }
-    existing = _table_columns(engine, "st_recommended_stocks")
-    with engine.begin() as conn:
-        for column, ddl in required.items():
-            if column not in existing:
-                logger.info("Adding st_recommended_stocks.%s", column)
-                conn.execute(text(f"ALTER TABLE st_recommended_stocks ADD COLUMN `{column}` {ddl}"))
-
-
-def _ensure_analysis_columns(engine: Engine) -> None:
-    required = {
-        "model_version": "VARCHAR(20) DEFAULT ''",
-        "data_quality_score": "DECIMAL(5,1) DEFAULT NULL",
-        "data_quality_flags": "TEXT NULL",
-        "flow_trade_date": "DATE DEFAULT NULL",
-        "hot_trade_date": "DATE DEFAULT NULL",
-    }
-    existing = _table_columns(engine, "stock_analysis_result")
-    with engine.begin() as conn:
-        for column, ddl in required.items():
-            if column not in existing:
-                logger.info("Adding stock_analysis_result.%s", column)
-                conn.execute(text(f"ALTER TABLE stock_analysis_result ADD COLUMN `{column}` {ddl}"))
 
 
 def latest_trade_date(engine: Engine) -> str:
@@ -843,28 +947,84 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
     return latest.reset_index(drop=True)
 
 
-def load_finance(engine: Engine, trade_date: str) -> pd.DataFrame:
-    sql = """
-        SELECT
-          f.stock_code, f.report_date, f.basic_eps, f.net_asset_ps, f.oper_cf_ps,
-          f.total_rev_yoy_gr, f.net_profit_yoy_gr, f.non_gaap_net_profit_yoy_gr,
-          f.roe_wtd, f.gross_margin, f.net_margin,
-          f.curr_ratio, f.cash_flow_ratio, f.asset_liab_ratio
-        FROM si_stock_finance f
-        JOIN (
-          SELECT stock_code, MAX(report_date) AS report_date
-          FROM si_stock_finance
-          WHERE report_date <= :trade_date
-          GROUP BY stock_code
-        ) x ON x.stock_code = f.stock_code AND x.report_date = f.report_date
-    """
-    df = pd.read_sql(text(sql), engine, params={"trade_date": trade_date})
-    if df.empty:
+def load_finance(
+    engine: Engine,
+    trade_date: str,
+    *,
+    decision_at: datetime | str | None,
+    fact_cutoff_at: datetime | str | None = None,
+    stock_codes: list[str],
+) -> pd.DataFrame:
+    """Load strategy finance only from immutable as-known revisions."""
+
+    codes = _normalize_stock_codes(stock_codes) or []
+    if not codes:
         return pd.DataFrame({"stock_code": []})
-    df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
-    for col in df.columns:
-        if col not in {"stock_code", "report_date"}:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if decision_at is None:
+        return pd.DataFrame(
+            [
+                {
+                    "stock_code": code,
+                    "finance_pit_status": PIT_DATA_BLOCKED,
+                    "finance_pit_reason": "PIT_FINANCE_EXACT_DECISION_TIME_REQUIRED",
+                    "finance_manifest_hash": "",
+                }
+                for code in codes
+            ]
+        )
+    batch = load_finance_facts(
+        engine,
+        codes=codes,
+        decision_at=decision_at,
+        fact_cutoff_at=fact_cutoff_at,
+        as_of_date=trade_date,
+    )
+    rows: list[dict[str, Any]] = []
+    for code in codes:
+        raw = dict(batch.facts.get(code) or {})
+        coverage = dict(batch.coverage_by_code.get(code) or {})
+        status = batch.status_for(code)
+        item = {
+            "stock_code": code,
+            **raw,
+            "finance_pit_status": (
+                PIT_AVAILABLE if status == PIT_AVAILABLE else PIT_DATA_BLOCKED
+            ),
+            "finance_pit_reason": (
+                batch.reason_for(code)
+                or (
+                    "" if status == PIT_AVAILABLE
+                    else "PIT_FINANCE_COVERAGE_UNPROVEN"
+                )
+            ),
+            "finance_manifest_hash": batch.manifest_hash,
+            "finance_fact_cutoff_at": batch.fact_cutoff_at,
+            "finance_decision_at": batch.decision_at,
+            "finance_authoritative_empty": bool(
+                status == PIT_AVAILABLE and not raw and coverage
+            ),
+            "finance_coverage_id": coverage.get("coverage_id"),
+            "finance_coverage_response_hash": coverage.get(
+                "coverage_response_hash"
+            ),
+            "finance_coverage_watermark_hash": coverage.get(
+                "coverage_watermark_hash"
+            ),
+            "finance_covered_through_at": coverage.get(
+                "covered_through_at"
+            ),
+        }
+        item["report_date"] = raw.get("finance_report_date")
+        rows.append(item)
+    df = pd.DataFrame(rows)
+    numeric_columns = {
+        "basic_eps", "net_asset_ps", "oper_cf_ps", "total_rev_yoy_gr",
+        "net_profit_yoy_gr", "non_gaap_net_profit_yoy_gr", "roe_wtd",
+        "gross_margin", "net_margin", "curr_ratio", "cash_flow_ratio",
+        "asset_liab_ratio",
+    }
+    for column in numeric_columns & set(df.columns):
+        df[column] = pd.to_numeric(df[column], errors="coerce")
     return df.drop_duplicates("stock_code", keep="last")
 
 
@@ -904,7 +1064,7 @@ def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
         return pd.DataFrame({"stock_code": []}), ""
     hot_date = hot_dates[0]
     sql = """
-        SELECT stock_code, fused_rank, total_score, source_flag, industry_name
+        SELECT stock_code, fused_rank, total_score, source_flag
         FROM st_hot_rank_fused
         WHERE snapshot_date = :hot_date
     """
@@ -914,52 +1074,129 @@ def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
     df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
     df["fused_rank"] = pd.to_numeric(df["fused_rank"], errors="coerce")
     df["hot_total_score"] = pd.to_numeric(df["total_score"], errors="coerce")
+    # ``st_hot_rank_fused.industry_name`` is derived from mutable current
+    # reference data.  It remains available to display APIs, but may not enter
+    # a historical/production recommendation score.  The exact-date QMT
+    # membership loader below is the only strategy-authoritative industry.
+    df["industry_name"] = ""
     return df.drop_duplicates("stock_code", keep="last"), hot_date
 
 
-def load_notice_features(engine: Engine, trade_date: str, lookback_days: int = 14) -> pd.DataFrame:
-    sql = """
-        SELECT stock_code, notice_date, title, column_name
-        FROM si_notice_eastmoney
-        WHERE notice_date >= DATE_SUB(:trade_date, INTERVAL :lookback_days DAY)
-          AND notice_date <= :trade_date
-    """
-    df = pd.read_sql(
-        text(sql),
-        engine,
-        params={"trade_date": trade_date, "lookback_days": int(lookback_days)},
-    )
-    if df.empty:
+def load_notice_features(
+    engine: Engine,
+    trade_date: str,
+    lookback_days: int = 14,
+    *,
+    decision_at: datetime | str | None,
+    fact_cutoff_at: datetime | str | None = None,
+    stock_codes: list[str],
+) -> pd.DataFrame:
+    codes = _normalize_stock_codes(stock_codes) or []
+    if not codes:
         return pd.DataFrame({"stock_code": []})
-
+    if decision_at is None:
+        return pd.DataFrame(
+            [
+                {
+                    "stock_code": code,
+                    "notice_count": 0,
+                    "notice_positive": 0,
+                    "notice_negative": 0,
+                    "notice_critical": 0,
+                    "latest_notice_date": None,
+                    "latest_notice_time": None,
+                    "risk_titles": [],
+                    "positive_titles": [],
+                    "event_revision_ids": [],
+                    "event_content_hashes": [],
+                    "event_pit_status": PIT_DATA_BLOCKED,
+                    "event_pit_reason": "PIT_EVENT_EXACT_DECISION_TIME_REQUIRED",
+                    "event_manifest_hash": "",
+                }
+                for code in codes
+            ]
+        )
+    decision = normalize_decision_at(decision_at)
+    batch = load_event_facts(
+        engine,
+        codes=codes,
+        decision_at=decision,
+        fact_cutoff_at=fact_cutoff_at,
+        start_date=date.fromisoformat(trade_date) - timedelta(days=lookback_days),
+        end_date=trade_date,
+        require_qmt_complete_batch=True,
+    )
     records: dict[str, dict[str, Any]] = {}
-    for row in df.to_dict(orient="records"):
-        code = str(row.get("stock_code") or "").strip().zfill(6)
-        if not code:
-            continue
-        title = str(row.get("title") or "")
-        cls = classify_notice_title(title)
-        rec = records.setdefault(code, {
+    for code in codes:
+        status = batch.status_for(code)
+        coverage = dict(batch.coverage_by_code.get(code) or {})
+        rec = {
             "stock_code": code,
             "notice_count": 0,
             "notice_positive": 0,
             "notice_negative": 0,
             "notice_critical": 0,
             "latest_notice_date": None,
+            "latest_notice_time": None,
             "risk_titles": [],
             "positive_titles": [],
-        })
-        rec["notice_count"] += 1
-        rec["notice_positive"] += cls["positive"]
-        rec["notice_negative"] += cls["negative"]
-        rec["notice_critical"] += cls["critical"]
-        notice_date = row.get("notice_date")
-        if notice_date and (rec["latest_notice_date"] is None or str(notice_date) > str(rec["latest_notice_date"])):
-            rec["latest_notice_date"] = str(notice_date)[:10]
-        if (cls["negative"] or cls["critical"]) and len(rec["risk_titles"]) < 3:
-            rec["risk_titles"].append(title[:80])
-        if cls["positive"] and len(rec["positive_titles"]) < 3:
-            rec["positive_titles"].append(title[:80])
+            "event_revision_ids": [],
+            "event_content_hashes": [],
+            "event_pit_status": (
+                PIT_AVAILABLE if status == PIT_AVAILABLE else PIT_DATA_BLOCKED
+            ),
+            "event_pit_reason": (
+                batch.reason_for(code)
+                or (
+                    "" if status == PIT_AVAILABLE
+                    else "PIT_EVENT_COVERAGE_UNPROVEN"
+                )
+            ),
+            "event_manifest_hash": batch.manifest_hash,
+            "event_fact_cutoff_at": batch.fact_cutoff_at,
+            "event_decision_at": batch.decision_at,
+            "event_authoritative_empty": bool(
+                status == PIT_AVAILABLE
+                and not (batch.facts.get(code) or [])
+                and coverage
+            ),
+            "event_coverage_id": coverage.get("coverage_id"),
+            "event_coverage_response_hash": coverage.get(
+                "coverage_response_hash"
+            ),
+            "event_coverage_watermark_hash": coverage.get(
+                "coverage_watermark_hash"
+            ),
+            "event_covered_through_at": coverage.get("covered_through_at"),
+        }
+        for row in batch.facts.get(code) or []:
+            title = str(row.get("title") or "")
+            cls = classify_notice_title(title)
+            rec["notice_count"] += 1
+            rec["notice_positive"] += cls["positive"]
+            rec["notice_negative"] += cls["negative"]
+            rec["notice_critical"] += cls["critical"]
+            published_at = str(row.get("event_published_at") or "")
+            notice_date = published_at[:10] or None
+            if published_at and (
+                rec["latest_notice_time"] is None
+                or published_at > str(rec["latest_notice_time"])
+            ):
+                rec["latest_notice_time"] = published_at
+            if notice_date and (
+                rec["latest_notice_date"] is None
+                or str(notice_date) > str(rec["latest_notice_date"])
+            ):
+                rec["latest_notice_date"] = notice_date
+            rec["event_revision_ids"].append(row.get("event_revision_id"))
+            rec["event_content_hashes"].append(row.get("event_content_hash"))
+            if (
+                cls["negative"] or cls["critical"]
+            ) and len(rec["risk_titles"]) < 3:
+                rec["risk_titles"].append(title[:80])
+            if cls["positive"] and len(rec["positive_titles"]) < 3:
+                rec["positive_titles"].append(title[:80])
+        records[code] = rec
 
     return pd.DataFrame(records.values())
 
@@ -1094,24 +1331,8 @@ def _table_exists(engine: Engine, table_name: str) -> bool:
     return bool(value)
 
 
-def _ensure_learning_tables(engine: Engine) -> None:
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS `st_ai_failure_samples` (
-                `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
-                `stock_code` VARCHAR(10) NOT NULL,
-                `short_name` VARCHAR(40) DEFAULT '',
-                `strategy_profile` VARCHAR(20) DEFAULT '',
-                `signal_date` DATE DEFAULT NULL,
-                `result` VARCHAR(20) DEFAULT 'fail',
-                `fail_tag` VARCHAR(40) DEFAULT '',
-                `fail_reason` VARCHAR(500) DEFAULT '',
-                `return_pct` DECIMAL(8,4) DEFAULT NULL,
-                `created_at` DATETIME DEFAULT NULL,
-                KEY `idx_stock_date` (`stock_code`, `signal_date`),
-                KEY `idx_fail_tag` (`fail_tag`)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-        """))
+def _validate_learning_tables(engine: Engine) -> None:
+    validate_ai_failure_sample_schema(engine)
 
 
 def load_confidence_features(engine: Engine, trade_date: str, lookback_days: int = 5) -> pd.DataFrame:
@@ -1174,7 +1395,7 @@ def load_recommendation_history(engine: Engine, trade_date: str, lookback_days: 
 
 
 def load_failure_features(engine: Engine, trade_date: str) -> pd.DataFrame:
-    _ensure_learning_tables(engine)
+    _validate_learning_tables(engine)
     pieces: list[pd.DataFrame] = []
     if _table_exists(engine, "st_sim_position"):
         try:
@@ -1213,7 +1434,7 @@ def load_failure_features(engine: Engine, trade_date: str) -> pd.DataFrame:
 
 
 def _load_sector_industry_memberships(engine: Engine, trade_date: str) -> pd.DataFrame:
-    """Prefer a validated immutable QMT L1-industry snapshot."""
+    """Load only the validated immutable QMT snapshot for the exact date."""
     cutoff = datetime.combine(
         date.fromisoformat(str(trade_date)[:10]) + timedelta(days=1),
         datetime.min.time(),
@@ -1228,10 +1449,10 @@ def _load_sector_industry_memberships(engine: Engine, trade_date: str) -> pd.Dat
                     """
                     SELECT snapshot_date, source, industry_relation_count
                     FROM qmt_membership_snapshot_run
-                    WHERE snapshot_date <= :trade_date
+                    WHERE snapshot_date = :trade_date
                       AND quality_status = 'QMT_VALIDATED'
                       AND captured_at < :cutoff
-                    ORDER BY snapshot_date DESC, captured_at DESC, source
+                    ORDER BY captured_at DESC, source
                     LIMIT 1
                     """
                 ),
@@ -1283,23 +1504,14 @@ def _load_sector_industry_memberships(engine: Engine, trade_date: str) -> pd.Dat
                         },
                     )
                     if not rows.empty:
-                        return rows.drop_duplicates("stock_code", keep="first")
+                        rows = rows.drop_duplicates("stock_code", keep="first")
+                        rows["industry_pit_status"] = PIT_AVAILABLE
+                        rows["industry_snapshot_date"] = str(snapshot_date)[:10]
+                        rows["industry_snapshot_source"] = source
+                        return rows
         except Exception as exc:
-            logger.debug("Immutable industry snapshot lookup skipped: %s", exc)
-
-    if not _table_exists(engine, "si_industry_sw"):
-        return pd.DataFrame({"stock_code": []})
-    return pd.read_sql(
-        text(
-            """
-            SELECT stock_code, industry_name
-            FROM si_industry_sw
-            WHERE industry_type IN ('L1', '一级行业', '申万一级', 'SW2021')
-              AND industry_name IS NOT NULL
-            """
-        ),
-        engine,
-    ).drop_duplicates("stock_code", keep="first")
+            logger.warning("Exact-date immutable industry snapshot blocked: %s", exc)
+    return pd.DataFrame({"stock_code": []})
 
 
 def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFrame:
@@ -1311,31 +1523,56 @@ def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFra
         return pd.DataFrame({"stock_code": []})
     start_date = dates[-1]
     flow_join = ""
-    flow_select = "0 AS flow_ratio_3d"
+    main_flow_select = "0 AS main_net_inflow"
     if _table_exists(engine, "sm_stock_capital_flow_daily"):
         flow_join = """
             LEFT JOIN sm_stock_capital_flow_daily f
               ON f.stock_code = k.stock_code AND f.trade_date = k.trade_date
         """
-        flow_select = """
-            SUM(COALESCE(f.main_net_inflow, 0)) / NULLIF(SUM(k.amount), 0) * 100 AS flow_ratio_3d
-        """
+        main_flow_select = "COALESCE(f.main_net_inflow, 0) AS main_net_inflow"
     sql = f"""
-        SELECT i.industry_name,
-               AVG(k.change_pct) AS avg_change_3d,
-               {flow_select}
+        SELECT k.stock_code, k.trade_date, k.change_pct, k.amount,
+               {main_flow_select}
         FROM sm_stock_kline k
-        JOIN si_industry_sw i ON i.stock_code = k.stock_code
         {flow_join}
         WHERE k.k_type = 1
           AND k.adjust_type = 0
           AND k.trade_date >= :start_date
           AND k.trade_date <= :trade_date
-          AND i.industry_type = '申万一级'
-          AND i.industry_name IS NOT NULL
-        GROUP BY i.industry_name
     """
-    sector = pd.read_sql(text(sql), engine, params={"start_date": start_date, "trade_date": trade_date})
+    observations = pd.read_sql(
+        text(sql), engine,
+        params={"start_date": start_date, "trade_date": trade_date},
+    )
+    if observations.empty:
+        return pd.DataFrame({"stock_code": []})
+    observations["stock_code"] = (
+        observations["stock_code"].astype(str).str.strip().str.zfill(6)
+    )
+    observations = observations.merge(
+        memberships[["stock_code", "industry_name"]],
+        on="stock_code",
+        how="inner",
+    )
+    observations["change_pct"] = pd.to_numeric(
+        observations["change_pct"], errors="coerce"
+    ).fillna(0.0)
+    observations["amount"] = pd.to_numeric(
+        observations["amount"], errors="coerce"
+    ).fillna(0.0)
+    observations["main_net_inflow"] = pd.to_numeric(
+        observations["main_net_inflow"], errors="coerce"
+    ).fillna(0.0)
+    sector = observations.groupby("industry_name", as_index=False).agg(
+        avg_change_3d=("change_pct", "mean"),
+        total_amount=("amount", "sum"),
+        total_main_net_inflow=("main_net_inflow", "sum"),
+    )
+    sector["flow_ratio_3d"] = (
+        sector["total_main_net_inflow"]
+        / sector["total_amount"].replace(0, np.nan)
+        * 100.0
+    ).fillna(0.0)
     if sector.empty:
         return pd.DataFrame({"stock_code": []})
     sector["avg_change_3d"] = pd.to_numeric(sector["avg_change_3d"], errors="coerce").fillna(0.0)
@@ -1353,7 +1590,13 @@ def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFra
     codes["stock_code"] = codes["stock_code"].astype(str).str.strip().str.zfill(6)
     out = codes.merge(sector[["industry_name", "sector_rotation_score"]], on="industry_name", how="left")
     out["sector_rotation_score"] = pd.to_numeric(out["sector_rotation_score"], errors="coerce").fillna(55.0)
-    return out[["stock_code", "industry_name", "sector_rotation_score"]]
+    out["industry_pit_status"] = PIT_AVAILABLE
+    out["industry_pit_reason"] = "PIT_EXACT_DATE_QMT_SNAPSHOT"
+    return out[[
+        "stock_code", "industry_name", "sector_rotation_score",
+        "industry_pit_status", "industry_pit_reason",
+        "industry_snapshot_date", "industry_snapshot_source",
+    ]]
 
 
 def _strategy_score(row: dict[str, Any], strategy: str) -> float:
@@ -1891,12 +2134,27 @@ def compute_scores(
         "notice_negative": 0,
         "notice_critical": 0,
         "latest_notice_date": None,
+        "latest_notice_time": None,
         "risk_titles": None,
         "positive_titles": None,
+        "event_revision_ids": None,
+        "event_content_hashes": None,
+        "event_pit_status": PIT_DATA_BLOCKED,
+        "event_pit_reason": "PIT_EVENT_COVERAGE_UNPROVEN",
+        "event_manifest_hash": "",
+        "event_authoritative_empty": False,
+        "event_coverage_id": None,
+        "event_coverage_response_hash": None,
+        "event_coverage_watermark_hash": None,
+        "event_covered_through_at": None,
     })
     sector = _ensure_columns(sector if sector is not None else pd.DataFrame({"stock_code": []}), {
         "industry_name": "",
         "sector_rotation_score": 55.0,
+        "industry_pit_status": PIT_DATA_BLOCKED,
+        "industry_pit_reason": "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_REQUIRED",
+        "industry_snapshot_date": "",
+        "industry_snapshot_source": "",
     })
     if not sector.empty and "industry_name" in sector.columns:
         sector = sector.rename(columns={"industry_name": "sector_industry_name"})
@@ -1904,11 +2162,43 @@ def compute_scores(
     df = df.merge(flow, on="stock_code", how="left", suffixes=("", "_flow"))
     df = df.merge(hot[["stock_code", "fused_rank", "hot_total_score", "source_flag", "industry_name"]], on="stock_code", how="left")
     if not sector.empty:
-        df = df.merge(sector[["stock_code", "sector_industry_name", "sector_rotation_score"]], on="stock_code", how="left")
+        df = df.merge(
+            sector[[
+                "stock_code", "sector_industry_name",
+                "sector_rotation_score", "industry_pit_status",
+                "industry_pit_reason", "industry_snapshot_date",
+                "industry_snapshot_source",
+            ]],
+            on="stock_code",
+            how="left",
+        )
         df["industry_name"] = df["industry_name"].fillna("").astype(str)
         df["sector_industry_name"] = df["sector_industry_name"].fillna("").astype(str)
         df["industry_name"] = df["industry_name"].where(df["industry_name"] != "", df["sector_industry_name"])
     df = df.merge(notices, on="stock_code", how="left")
+
+    if "finance_pit_status" not in df.columns:
+        df["finance_pit_status"] = PIT_DATA_BLOCKED
+    df["finance_pit_status"] = df["finance_pit_status"].fillna(
+        PIT_DATA_BLOCKED
+    )
+    if "finance_pit_reason" not in df.columns:
+        df["finance_pit_reason"] = "PIT_FINANCE_COVERAGE_UNPROVEN"
+    if "finance_manifest_hash" not in df.columns:
+        df["finance_manifest_hash"] = ""
+    df["event_pit_status"] = df["event_pit_status"].fillna(PIT_DATA_BLOCKED)
+    df["event_pit_reason"] = df["event_pit_reason"].fillna(
+        "PIT_EVENT_COVERAGE_UNPROVEN"
+    )
+    if "industry_pit_status" not in df.columns:
+        df["industry_pit_status"] = PIT_DATA_BLOCKED
+    df["industry_pit_status"] = df["industry_pit_status"].fillna(
+        PIT_DATA_BLOCKED
+    )
+    if "industry_pit_reason" not in df.columns:
+        df["industry_pit_reason"] = (
+            "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_REQUIRED"
+        )
 
     for col in ["notice_count", "notice_positive", "notice_negative", "notice_critical"]:
         df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
@@ -2099,6 +2389,23 @@ def _build_text_fields(df: pd.DataFrame, flow_date: str, trade_date: str) -> pd.
             "critical_count": int(row.get("notice_critical") or 0),
             "risk_titles": row.get("risk_titles") or [],
             "positive_titles": row.get("positive_titles") or [],
+            "event_pit_status": row.get("event_pit_status"),
+            "event_pit_reason": row.get("event_pit_reason"),
+            "event_manifest_hash": row.get("event_manifest_hash"),
+            "event_revision_ids": row.get("event_revision_ids") or [],
+            "event_content_hashes": row.get("event_content_hashes") or [],
+            "event_authoritative_empty": bool(
+                row.get("event_authoritative_empty")
+            ),
+            "event_coverage_id": row.get("event_coverage_id"),
+            "event_coverage_response_hash": row.get(
+                "event_coverage_response_hash"
+            ),
+            "event_coverage_watermark_hash": row.get(
+                "event_coverage_watermark_hash"
+            ),
+            "event_covered_through_at": row.get("event_covered_through_at"),
+            "latest_notice_time": row.get("latest_notice_time"),
         }
         summaries.append(summary)
         recommendations.append(recommendation)
@@ -2137,11 +2444,11 @@ def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any
         "event_risk_score",
     ]
     for row in df.to_dict(orient="records"):
-        latest_notice = row.get("latest_notice_date")
+        latest_notice = row.get("latest_notice_time")
         if latest_notice is None or pd.isna(latest_notice) or str(latest_notice).lower() == "nan":
             last_news_time = None
         else:
-            last_news_time = f"{str(latest_notice)[:10]} 00:00:00"
+            last_news_time = str(latest_notice)[:26].replace("T", " ")
         item = {
             "stock_code": str(row.get("stock_code") or "").zfill(6),
             "stock_name": str(row.get("short_name") or "")[:20],
@@ -2441,8 +2748,7 @@ def save_outputs(
             NOW()
         )
     """
-    _ensure_analysis_columns(engine)
-    _ensure_recommended_columns(engine)
+    validate_analysis_output_schema(engine)
     scoped_codes = _normalize_stock_codes(stock_codes)
     with engine.begin() as conn:
         logger.info("Writing %s analysis rows for %s", len(analysis_rows), trade_date)
@@ -2486,31 +2792,104 @@ def _prepare_batch_outputs(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, str, str]:
     scoped_codes = _normalize_stock_codes(stock_codes)
 
-    _emit_progress(progress_callback, stage="load_kline", percent=5, step="鍔犺浇鏃鐗瑰緛...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_kline", percent=5, step="加载日K特征...", trade_date=trade_date)
     kline_all = load_kline_features(engine, trade_date)
     kline = _filter_frame_by_codes(kline_all, scoped_codes)
     if scoped_codes and kline.empty:
         raise RuntimeError(f"No K-line rows found for requested stock codes on {trade_date}")
+    feature_codes = (
+        sorted(
+            kline["stock_code"].astype(str).str.strip().str.zfill(6).unique()
+        )
+        if "stock_code" in kline.columns
+        else []
+    )
+    decision_at: datetime | str | None = (
+        normalize_decision_at(news_cutoff_time)
+        if news_cutoff_time is not None
+        else None
+    )
+    common_cutoff: dict[str, Any] = {
+        "status": PIT_DATA_BLOCKED,
+        "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
+        "fact_cutoff_at": "",
+        "receipt_root_hash": "",
+    }
+    if decision_at is not None:
+        common_cutoff = resolve_common_fact_cutoff(
+            engine,
+            codes=feature_codes,
+            decision_at=decision_at,
+            finance_start_date="1900-01-01",
+            finance_end_date=trade_date,
+            event_start_date=(
+                date.fromisoformat(trade_date) - timedelta(days=14)
+            ),
+            event_end_date=trade_date,
+            require_qmt_event_batch=True,
+        )
+    fact_cutoff_at: datetime | str | None = (
+        common_cutoff.get("fact_cutoff_at")
+        if common_cutoff.get("status") == PIT_AVAILABLE
+        else None
+    )
+    reader_decision_at = (
+        decision_at
+        if common_cutoff.get("status") == PIT_AVAILABLE
+        else None
+    )
 
-    _emit_progress(progress_callback, stage="load_finance", percent=14, step="鍔犺浇璐㈠姟鍥犲瓙...", trade_date=trade_date)
-    finance = _filter_frame_by_codes(load_finance(engine, trade_date), scoped_codes)
-    _emit_progress(progress_callback, stage="load_flow", percent=23, step="鍔犺浇璧勯噾娴佹暟鎹?..", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_finance", percent=14, step="加载财务因子...", trade_date=trade_date)
+    finance = _filter_frame_by_codes(
+        load_finance(
+            engine,
+            trade_date,
+            decision_at=reader_decision_at,
+            fact_cutoff_at=fact_cutoff_at,
+            stock_codes=feature_codes,
+        ),
+        scoped_codes,
+    )
+    finance["pit_common_cutoff_status"] = common_cutoff.get("status")
+    finance["pit_common_cutoff_reason"] = common_cutoff.get("reason") or ""
+    finance["pit_common_receipt_root_hash"] = (
+        common_cutoff.get("receipt_root_hash") or ""
+    )
+    if common_cutoff.get("status") != PIT_AVAILABLE:
+        finance["finance_pit_status"] = PIT_DATA_BLOCKED
+        finance["finance_pit_reason"] = common_cutoff.get("reason")
+    _emit_progress(progress_callback, stage="load_flow", percent=23, step="加载资金流数据...", trade_date=trade_date)
     flow, flow_date = load_flow_features(engine, trade_date)
     flow = _filter_frame_by_codes(flow, scoped_codes)
-    _emit_progress(progress_callback, stage="load_hot", percent=32, step="鍔犺浇鐑害鎺掕...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_hot", percent=32, step="加载热度排行...", trade_date=trade_date)
     hot, hot_date = load_hot_rank(engine, trade_date)
     hot = _filter_frame_by_codes(hot, scoped_codes)
-    _emit_progress(progress_callback, stage="load_notices", percent=40, step="鍔犺浇鍏憡浜嬩欢...", trade_date=trade_date)
-    notices = _filter_frame_by_codes(load_notice_features(engine, trade_date), scoped_codes)
-    news = _filter_frame_by_codes(load_news_features(engine, trade_date, cutoff_time=news_cutoff_time), scoped_codes)
+    _emit_progress(progress_callback, stage="load_notices", percent=40, step="加载公告事件...", trade_date=trade_date)
+    notices = _filter_frame_by_codes(
+        load_notice_features(
+            engine,
+            trade_date,
+            decision_at=reader_decision_at,
+            fact_cutoff_at=fact_cutoff_at,
+            stock_codes=feature_codes,
+        ),
+        scoped_codes,
+    )
+    if common_cutoff.get("status") != PIT_AVAILABLE:
+        notices["event_pit_status"] = PIT_DATA_BLOCKED
+        notices["event_pit_reason"] = common_cutoff.get("reason")
+    # ``st_news_flash`` has no immutable received/revision history.  It remains
+    # available for display, but cannot alter strategy event scores until it is
+    # migrated to the shared PIT contract.
+    news = pd.DataFrame({"stock_code": []})
     notices = merge_event_features(notices, news)
-    _emit_progress(progress_callback, stage="load_confidence", percent=48, step="鍔犺浇浜ゆ槗缃俊搴?..", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_confidence", percent=48, step="加载交易置信度...", trade_date=trade_date)
     confidence = _filter_frame_by_codes(load_confidence_features(engine, trade_date), scoped_codes)
-    _emit_progress(progress_callback, stage="load_history", percent=56, step="鍔犺浇鍘嗗彶鎺ㄨ崘琛ㄧ幇...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_history", percent=56, step="加载历史推荐表现...", trade_date=trade_date)
     rec_history = _filter_frame_by_codes(load_recommendation_history(engine, trade_date), scoped_codes)
-    _emit_progress(progress_callback, stage="load_failures", percent=62, step="鍔犺浇澶辫触鎯╃綒鍥犲瓙...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_failures", percent=62, step="加载失败惩罚因子...", trade_date=trade_date)
     failures = _filter_frame_by_codes(load_failure_features(engine, trade_date), scoped_codes)
-    _emit_progress(progress_callback, stage="load_sector", percent=68, step="鍔犺浇鏉垮潡杞姩鍥犲瓙...", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="load_sector", percent=68, step="加载板块轮动因子...", trade_date=trade_date)
     sector = _filter_frame_by_codes(load_sector_rotation_features(engine, trade_date), scoped_codes)
     market_mood_score = compute_market_mood(kline_all)
 
@@ -2521,7 +2900,7 @@ def _prepare_batch_outputs(
         len(confidence), len(rec_history), len(failures), len(sector), market_mood_score,
     )
 
-    _emit_progress(progress_callback, stage="compute_scores", percent=78, step="璁＄畻鍏ㄥ競鍦鸿瘎鍒?..", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="compute_scores", percent=78, step="计算全市场评分...", trade_date=trade_date)
     scored = compute_scores(
         kline=kline,
         finance=finance,
@@ -2539,7 +2918,7 @@ def _prepare_batch_outputs(
     )
     scored["flow_trade_date"] = flow_date
     scored["hot_trade_date"] = hot_date
-    _emit_progress(progress_callback, stage="build_rows", percent=88, step="鐢熸垚鍒嗘瀽涓庢帹鑽愮粨鏋?..", trade_date=trade_date)
+    _emit_progress(progress_callback, stage="build_rows", percent=88, step="生成分析与推荐结果...", trade_date=trade_date)
     scored = _build_text_fields(scored, flow_date=flow_date, trade_date=trade_date)
     analysis_rows = build_analysis_rows(scored, trade_date)
     rec_rows = build_recommendation_rows(scored, trade_date, top_n=top_n, min_score=min_score)
@@ -2557,6 +2936,14 @@ def run_batch(
     min_kline_coverage: float = 0.80,
     auto_repair_missing_kline: bool = False,
 ) -> BatchStats:
+    if auto_repair_missing_kline and (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    ):
+        raise RuntimeError(
+            "production analysis cannot repair QMT history on the Linux host"
+        )
+    requested_trade_date = trade_date
     if strict_prev_trade_day:
         execution_time = execution_time or datetime.now().replace(microsecond=0).isoformat(sep=" ")
         resolved_trade_date = previous_trade_date(engine, execution_time)
@@ -2596,27 +2983,32 @@ def run_batch(
         )
     else:
         trade_date = trade_date or latest_trade_date(engine)
+        if execution_time is None and requested_trade_date is None:
+            execution_time = datetime.now().replace(microsecond=0).isoformat(
+                sep=" "
+            )
     logger.info("Fast analysis batch started for %s", trade_date)
-
-    analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
-        engine=engine,
-        trade_date=trade_date,
-        min_score=min_score,
-        top_n=top_n,
-        stock_codes=None,
-        progress_callback=progress_callback,
-        news_cutoff_time=execution_time if strict_prev_trade_day else None,
-    )
-    _emit_progress(
-        progress_callback,
-        stage="save_outputs",
-        percent=94,
-        step="save outputs",
-        trade_date=trade_date,
-        analysis_count=len(analysis_rows),
-        recommendation_count=len(rec_rows),
-    )
-    save_outputs(engine, analysis_rows, rec_rows, trade_date)
+    with _analysis_execution_lock(engine, trade_date) as verify_write_owner:
+        analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
+            engine=engine,
+            trade_date=trade_date,
+            min_score=min_score,
+            top_n=top_n,
+            stock_codes=None,
+            progress_callback=progress_callback,
+            news_cutoff_time=execution_time,
+        )
+        _emit_progress(
+            progress_callback,
+            stage="save_outputs",
+            percent=94,
+            step="save outputs",
+            trade_date=trade_date,
+            analysis_count=len(analysis_rows),
+            recommendation_count=len(rec_rows),
+        )
+        verify_write_owner()
+        save_outputs(engine, analysis_rows, rec_rows, trade_date)
 
     stats = BatchStats(
         trade_date=trade_date,
@@ -2650,6 +3042,7 @@ def run_batch_for_codes(
     top_n: int = 80,
     min_score: float = 62.0,
     progress_callback: ProgressCallback | None = None,
+    decision_at: datetime | str | None = None,
 ) -> BatchStats:
     scoped_codes = _normalize_stock_codes(stock_codes)
     if not scoped_codes:
@@ -2657,25 +3050,34 @@ def run_batch_for_codes(
 
     trade_date = trade_date or latest_trade_date(engine)
     logger.info("Fast scoped analysis started for %s with %s codes", trade_date, len(scoped_codes))
-    analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
-        engine=engine,
-        trade_date=trade_date,
-        min_score=min_score,
-        top_n=max(int(top_n), len(scoped_codes)),
-        stock_codes=scoped_codes,
-        progress_callback=progress_callback,
-    )
-    _emit_progress(
-        progress_callback,
-        stage="save_outputs",
-        percent=94,
-        step="save outputs",
-        trade_date=trade_date,
-        analysis_count=len(analysis_rows),
-        recommendation_count=len(rec_rows),
-        done=len(analysis_rows),
-    )
-    save_outputs(engine, analysis_rows, rec_rows, trade_date, stock_codes=scoped_codes)
+    with _analysis_execution_lock(engine, trade_date) as verify_write_owner:
+        analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
+            engine=engine,
+            trade_date=trade_date,
+            min_score=min_score,
+            top_n=max(int(top_n), len(scoped_codes)),
+            stock_codes=scoped_codes,
+            progress_callback=progress_callback,
+            news_cutoff_time=decision_at,
+        )
+        _emit_progress(
+            progress_callback,
+            stage="save_outputs",
+            percent=94,
+            step="save outputs",
+            trade_date=trade_date,
+            analysis_count=len(analysis_rows),
+            recommendation_count=len(rec_rows),
+            done=len(analysis_rows),
+        )
+        verify_write_owner()
+        save_outputs(
+            engine,
+            analysis_rows,
+            rec_rows,
+            trade_date,
+            stock_codes=scoped_codes,
+        )
 
     stats = BatchStats(
         trade_date=trade_date,

@@ -1,16 +1,24 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
 import importlib.util
+import logging
 import os
 from pathlib import Path
+import re
+import secrets
 import subprocess
+from time import monotonic
 
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 
 from server.api.admin_auth import admin_auth_status
-from server.api.scheduler_runtime import scheduler_runtime_info
+from server.api.scheduler_runtime import (
+    _detached_job_log_root,
+    _open_detached_job_log,
+    scheduler_runtime_info,
+)
 from server.common.scheduler_authority import (
     PRODUCTION_SCHEDULER_SERVICE,
     scheduler_authority_contract,
@@ -19,6 +27,9 @@ from server.api.routers._engine import get_engine
 from server.common.scheduler_script_policy import (
     SchedulerScriptPolicyError,
     resolve_scheduler_script,
+)
+from server.common.scheduler_runtime_health import (
+    check_linux_standalone_scheduler_heartbeat,
 )
 from server.common.batch_db import quote_identifier
 from server.common.adata_release import (
@@ -38,6 +49,17 @@ from server.common.config import (
     get_mysql_url,
 )
 from server.common.current_data import get_current_engine
+from server.engine.strategy_funding_checkpoint import (
+    FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+    FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+    FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+    FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+    FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+    FUNDING_CHECKPOINT_TARGET_AVG_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+    FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+    validate_strategy_funding_checkpoint_schema,
+)
 
 try:
     from server.common.config import get_qmt_live_runtime_config as _get_qmt_live_runtime_config
@@ -52,6 +74,34 @@ except ImportError:
         }
 
 router = APIRouter(tags=["health"])
+_LOGGER = logging.getLogger(__name__)
+_EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH = (
+    "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+)
+_EXPECTED_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH = (
+    "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
+)
+_EXPECTED_METRIC_REVIEW_CONTRACT_HASH = (
+    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+)
+_EXPECTED_METRIC_REVIEW_TRIGGER_NAMES = frozenset({
+    "trg_strategy_metric_input_immutable_bd",
+    "trg_strategy_metric_input_review_bu",
+})
+_EXPECTED_FUNDING_TABLE_COUNTS = {
+    "st_strategy_funding_daily_fact": {
+        "column_count": 29,
+        "index_count": 9,
+        "foreign_key_count": 3,
+        "check_count": 7,
+    },
+    "st_strategy_funding_checkpoint": {
+        "column_count": 46,
+        "index_count": 12,
+        "foreign_key_count": 7,
+        "check_count": 13,
+    },
+}
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 _ROOT_SHADOW_SUFFIXES = (".py", ".pyw", ".pyc", ".pyd", ".so")
 _BYTECODE_SCAN_ROOTS = (
@@ -62,6 +112,10 @@ _BYTECODE_SCAN_ROOTS = (
     "scripts",
     "strategies",
     "versions",
+)
+_RELEASE_GIT_TIMEOUT_SECONDS = 15
+_GIT_INDEX_ENTRY_RE = re.compile(
+    r"^(?P<mode>[0-7]{6}) (?P<object>[0-9a-f]{40,64}) (?P<stage>[0-3])\t(?P<path>.*)$"
 )
 
 
@@ -75,32 +129,8 @@ def _release_git_command(*args: str) -> list[str]:
     ]
 
 
-def _untracked_root_shadow_files() -> tuple[str, ...]:
+def _untracked_root_shadow_files(tracked: set[str]) -> tuple[str, ...]:
     """Find root-level import shadows, including files ignored by Git."""
-    tracked = set(
-        subprocess.run(
-            _release_git_command(
-                "ls-files",
-                "--",
-                ":(top,glob)*.py",
-                ":(top,glob)*.pyw",
-                ":(top,glob)*.pyc",
-                ":(top,glob)*.pyd",
-                ":(top,glob)*.so",
-                ":(top,glob)*/__init__.py",
-                ":(top,glob)*/__init__*.pyc",
-                ":(top,glob)*/__init__*.pyd",
-                ":(top,glob)*/__init__*.so",
-            ),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            timeout=5,
-        ).stdout.splitlines()
-    )
     candidates: set[str] = set()
     for child in REPOSITORY_ROOT.iterdir():
         if child.is_file() and child.suffix.lower() in _ROOT_SHADOW_SUFFIXES:
@@ -126,7 +156,7 @@ def _untracked_root_shadow_files() -> tuple[str, ...]:
     return tuple(sorted(candidates - tracked))
 
 
-def _standalone_scheduler_status() -> dict[str, str | bool | None]:
+def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
     """Prove that the production standalone scheduler is active and enabled."""
     try:
         active_result = subprocess.run(
@@ -140,6 +170,21 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         )
         enabled_result = subprocess.run(
             ["systemctl", "is-enabled", PRODUCTION_SCHEDULER_SERVICE],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=5,
+        )
+        pid_result = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                "--property=MainPID",
+                "--value",
+                PRODUCTION_SCHEDULER_SERVICE,
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -166,19 +211,27 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
             )
             load_state = load_result.stdout.strip().lower()
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        _LOGGER.exception("standalone scheduler status probe failed")
         return {
             "verified": False,
             "active": None,
             "state": None,
             "enabled": None,
             "enablement_state": None,
-            "error": type(exc).__name__,
+            "pid": None,
+            "error": "standalone scheduler status probe failed",
+            "error_code": "scheduler_status_probe_failed",
         }
 
     state = active_result.stdout.strip().lower()
     active_returncode = active_result.returncode
     enablement_state = enabled_result.stdout.strip().lower()
     enablement_returncode = enabled_result.returncode
+    pid_text = pid_result.stdout.strip()
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        pid = None
     if load_state == "not-found":
         if not state:
             state = "unknown"
@@ -231,7 +284,8 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         enabled = None
         enablement_verified = False
 
-    verified = active_verified and enablement_verified
+    pid_verified = pid is not None and pid > 0 and pid_result.returncode == 0
+    verified = active_verified and enablement_verified and pid_verified
     error = None
     if not active_verified:
         error = f"systemctl_is_active_exit_{active_returncode}"
@@ -241,96 +295,187 @@ def _standalone_scheduler_status() -> dict[str, str | bool | None]:
         error = "standalone_scheduler_inactive"
     elif enabled is not True:
         error = "standalone_scheduler_disabled"
+    elif not pid_verified:
+        error = "standalone_scheduler_pid_unverified"
     return {
         "verified": verified,
         "active": active,
         "state": state or None,
         "enabled": enabled,
         "enablement_state": enablement_state or None,
+        "pid": pid,
         "error": error,
     }
 
 
-def _deployed_git_revision() -> dict[str, str | bool | None]:
+def _detached_job_log_readiness() -> dict[str, object]:
+    """Prove that detached workers can securely create and fsync a log."""
+
+    probe_path: Path | None = None
+    try:
+        log_root = _detached_job_log_root(
+            root=REPOSITORY_ROOT,
+            env=dict(os.environ),
+        )
+        probe_path = log_root / (
+            f".health-{os.getpid()}-{secrets.token_hex(16)}.probe"
+        )
+        with _open_detached_job_log(probe_path) as handle:
+            handle.write("health\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        probe_path.unlink()
+        probe_path = None
+        return {"status": "ok", "ready": True}
+    except Exception as exc:
+        _log_public_health_probe_failure("detached_job_log_readiness", exc)
+        return {
+            "status": "error",
+            "ready": False,
+            "error": "detached job log readiness probe failed",
+            "error_code": "detached_job_log_readiness_failed",
+        }
+    finally:
+        if probe_path is not None:
+            try:
+                probe_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _standalone_scheduler_heartbeat_readiness(
+    expected_pid: object,
+) -> dict[str, object]:
+    """Bind the fresh DB heartbeat to the live systemd scheduler process."""
+
+    try:
+        pid = int(expected_pid)
+        expected_sha = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "")
+        with get_engine().connect() as connection:
+            passed, detail = check_linux_standalone_scheduler_heartbeat(
+                connection,
+                expected_build_sha=expected_sha,
+                expected_pid=pid,
+            )
+    except Exception as exc:
+        _log_public_health_probe_failure(
+            "standalone_scheduler_heartbeat_readiness", exc
+        )
+        return {
+            "status": "error",
+            "ready": False,
+            "error": "standalone scheduler heartbeat probe failed",
+            "error_code": "scheduler_heartbeat_probe_failed",
+        }
+    return {
+        "status": "ok" if passed else "error",
+        "ready": bool(passed),
+        "detail": detail,
+        **(
+            {}
+            if passed
+            else {
+                "error": "standalone scheduler heartbeat is not current",
+                "error_code": "scheduler_heartbeat_not_current",
+            }
+        ),
+    }
+
+
+def _deployed_git_revision() -> dict[str, object]:
     expected = os.environ.get("PROBIGA_EXPECTED_GIT_SHA", "").strip() or None
     production_mode = (
         os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
         == "production"
     )
+    actual: str | None = None
+    tracked_worktree_clean = False
+    tracked_change_count: int | None = None
+    untracked_executables: tuple[str, ...] = ("GIT_INSPECTION_FAILED",)
+    root_shadow_files: tuple[str, ...] = ("GIT_INSPECTION_FAILED",)
+    inspection_error_code: str | None = None
+    inspection_error_stage: str | None = None
+    inspection_durations_ms: dict[str, int] = {}
+    current_stage = "head_revision"
+
+    def _run_probe(stage: str, *args: str) -> str:
+        nonlocal current_stage
+        current_stage = stage
+        started = monotonic()
+        try:
+            return subprocess.run(
+                _release_git_command(*args),
+                cwd=REPOSITORY_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="strict",
+                timeout=_RELEASE_GIT_TIMEOUT_SECONDS,
+            ).stdout
+        finally:
+            inspection_durations_ms[stage] = round((monotonic() - started) * 1000)
+
+    protected_paths = (
+        "server",
+        "biz",
+        "integrations",
+        "tools",
+        "scripts",
+        "strategies",
+        "versions",
+        "artifacts/trading_v4",
+        "artifacts/trading_v5",
+        "artifacts/trading_v6",
+        ".github",
+        "deploy",
+        "requirements-platform.txt",
+        ".gitattributes",
+        ".gitignore",
+        "sitecustomize.py",
+        "usercustomize.py",
+        ":(top,glob)*.py",
+        ":(top,glob)*.pyw",
+        ":(top,glob)*.pyd",
+        ":(top,glob)*.so",
+        ":(top,glob)*/__init__.py",
+        ":(top,glob)*/__init__*.pyc",
+        ":(top,glob)*/__init__*.pyd",
+        ":(top,glob)*/__init__*.so",
+    )
     try:
-        actual = subprocess.run(
-            _release_git_command("rev-parse", "HEAD"),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            timeout=5,
-        ).stdout.strip()
-        tracked_status = subprocess.run(
-            _release_git_command(
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--",
-                "server",
-                "biz",
-                "integrations",
-                "tools",
-                "scripts",
-                "strategies",
-                "versions",
-                "artifacts/trading_v4",
-                "artifacts/trading_v5",
-                "artifacts/trading_v6",
-                ".github",
-                "deploy",
-                "requirements-platform.txt",
-                ".gitattributes",
-                ".gitignore",
-                "sitecustomize.py",
-                "usercustomize.py",
-                ":(top,glob)*.py",
-                ":(top,glob)*.pyw",
-                ":(top,glob)*.pyd",
-                ":(top,glob)*.so",
-                ":(top,glob)*/__init__.py",
-                ":(top,glob)*/__init__*.pyc",
-                ":(top,glob)*/__init__*.pyd",
-                ":(top,glob)*/__init__*.so",
-            ),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            timeout=5,
-        ).stdout.strip()
-        tracked_worktree_clean = tracked_status == ""
-        untracked_output = subprocess.run(
-            _release_git_command(
-                "ls-files",
-                "--others",
-                "--exclude-standard",
-                "--",
-                "sitecustomize.py",
-                "usercustomize.py",
-                "server",
-                "biz",
-                "integrations",
-                "tools",
-                "scripts",
-            ),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            timeout=5,
-        ).stdout.splitlines()
+        actual = _run_probe("head_revision", "rev-parse", "HEAD").strip()
+        tracked_status = _run_probe(
+            "tracked_status",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            *protected_paths,
+        ).splitlines()
+        tracked_change_count = len(tracked_status)
+        tracked_worktree_clean = not tracked_status
+        index_inventory = _run_probe(
+            "index_inventory",
+            "ls-files",
+            "--stage",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            *protected_paths,
+        ).split("\0")
+        tracked: set[str] = set()
+        untracked_output: list[str] = []
+        for entry in index_inventory:
+            if not entry:
+                continue
+            matched = _GIT_INDEX_ENTRY_RE.fullmatch(entry)
+            if matched is None:
+                untracked_output.append(entry)
+            else:
+                tracked.add(matched.group("path"))
         executable_suffixes = (".py", ".pyw", ".pyc", ".pyd", ".so")
         untracked_executables = tuple(
             sorted(
@@ -339,12 +484,26 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
                 if path.strip().lower().endswith(executable_suffixes)
             )
         )
-        root_shadow_files = _untracked_root_shadow_files()
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        actual = None
-        tracked_worktree_clean = False
-        untracked_executables = ("GIT_INSPECTION_FAILED",)
-        root_shadow_files = ("GIT_INSPECTION_FAILED",)
+        current_stage = "filesystem_shadow_scan"
+        started = monotonic()
+        try:
+            root_shadow_files = _untracked_root_shadow_files(tracked)
+        finally:
+            inspection_durations_ms[current_stage] = round(
+                (monotonic() - started) * 1000
+            )
+    except subprocess.TimeoutExpired:
+        inspection_error_code = "probe_timeout"
+        inspection_error_stage = current_stage
+    except subprocess.CalledProcessError:
+        inspection_error_code = "command_failed"
+        inspection_error_stage = current_stage
+    except OSError:
+        inspection_error_code = "process_or_filesystem_error"
+        inspection_error_stage = current_stage
+    except UnicodeError:
+        inspection_error_code = "invalid_command_output"
+        inspection_error_stage = current_stage
     matches = bool(expected and actual and expected == actual)
     return {
         "expected_git_sha": expected,
@@ -352,9 +511,20 @@ def _deployed_git_revision() -> dict[str, str | bool | None]:
         "deployment_mode": "production" if production_mode else "development",
         "expected_sha_configured": expected is not None,
         "matches_expected": matches if expected is not None else None,
+        "inspection_status": "error" if inspection_error_code else "ok",
+        "inspection_error_code": inspection_error_code,
+        "inspection_error_stage": inspection_error_stage,
+        "inspection_durations_ms": inspection_durations_ms,
         "tracked_worktree_clean": tracked_worktree_clean,
+        "tracked_change_count": tracked_change_count,
         "untracked_executable_paths": untracked_executables[:20],
+        "untracked_executable_count": (
+            None if inspection_error_code else len(untracked_executables)
+        ),
         "untracked_root_shadow_paths": root_shadow_files[:20],
+        "untracked_root_shadow_count": (
+            None if inspection_error_code else len(root_shadow_files)
+        ),
         "code_worktree_clean": (
             tracked_worktree_clean
             and not untracked_executables
@@ -369,16 +539,18 @@ def _deployed_adata_revision() -> dict[str, str | bool | None]:
     expected_tree_sha = os.environ.get(ADATA_TREE_SHA_ENV, "").strip() or None
     configured = bool(source and expected_git_sha and expected_tree_sha)
     result: dict[str, str | bool | None] = {
-        "source_dir": source,
+        "source_configured": bool(source),
         "expected_git_sha": expected_git_sha,
         "expected_tree_sha256": expected_tree_sha,
         "configured": configured,
         "verified": False,
         "read_only": False,
         "error": None,
+        "error_code": None,
     }
     if not configured:
-        result["error"] = "adata release source and hashes are not fully configured"
+        result["error"] = "adata release configuration is incomplete"
+        result["error_code"] = "configuration_incomplete"
         return result
     try:
         validated = validate_adata_release_source(
@@ -399,8 +571,21 @@ def _deployed_adata_revision() -> dict[str, str | bool | None]:
             raise AdataReleaseError(
                 "adata import origin is outside the verified release source"
             ) from exc
-    except (AdataReleaseError, ImportError, OSError, ValueError) as exc:
-        result["error"] = str(exc)
+    except AdataReleaseError:
+        result["error"] = "adata release validation failed"
+        result["error_code"] = "release_validation_failed"
+        return result
+    except ImportError:
+        result["error"] = "adata runtime import validation failed"
+        result["error_code"] = "runtime_import_failed"
+        return result
+    except OSError:
+        result["error"] = "adata filesystem validation failed"
+        result["error_code"] = "filesystem_validation_failed"
+        return result
+    except ValueError:
+        result["error"] = "adata release configuration is invalid"
+        result["error_code"] = "configuration_invalid"
         return result
     result.update(
         {
@@ -410,7 +595,7 @@ def _deployed_adata_revision() -> dict[str, str | bool | None]:
             "tree_marker": ADATA_TREE_MARKER,
             "verified": True,
             "read_only": validated["read_only"],
-            "import_origin": str(origin),
+            "import_within_pinned_source": True,
         }
     )
     return result
@@ -473,11 +658,12 @@ def _table_freshness(table_name: str, code_column: str, *, fresh_window_seconds:
                 {"today_start": today_start, "tomorrow_start": tomorrow_start},
             ).mappings().first() or {}
             total_rows = conn.execute(total_sql, {"table_name": table_name}).scalar() or 0
-    except Exception as exc:
+    except Exception:
         return {
             "table": table_name,
             "status": "error",
-            "error": str(exc),
+            "error": "database freshness probe failed",
+            "error_code": "database_probe_failed",
         }
 
     latest_snapshot_at = row.get("latest_snapshot_at")
@@ -517,6 +703,20 @@ def _combine_qmt_table_status(*items: dict[str, object]) -> str:
     return "ok"
 
 
+def _log_public_health_probe_failure(
+    check_name: str,
+    exc: BaseException,
+) -> None:
+    """Log only non-sensitive correlation data for a public health probe."""
+
+    _LOGGER.error(
+        "public_health_probe_failed check=%s incident_id=%s exception_type=%s",
+        check_name,
+        secrets.token_hex(8),
+        type(exc).__name__,
+    )
+
+
 def _primary_database_readiness() -> dict[str, str | bool]:
     """Prove that the primary database accepts a minimal round trip."""
 
@@ -525,18 +725,118 @@ def _primary_database_readiness() -> dict[str, str | bool]:
         with engine.connect() as conn:
             ready = conn.execute(text("SELECT 1")).scalar_one() == 1
     except Exception as exc:
+        _log_public_health_probe_failure("primary_database_readiness", exc)
         return {
             "status": "error",
             "ready": False,
-            "error": type(exc).__name__,
+            "error": "primary database readiness probe failed",
+            "error_code": "database_readiness_probe_failed",
         }
     if not ready:
         return {
             "status": "error",
             "ready": False,
-            "error": "unexpected_probe_result",
+            "error": "primary database readiness probe returned an invalid result",
+            "error_code": "database_readiness_result_invalid",
         }
     return {"status": "ok", "ready": True}
+
+
+def _strategy_funding_schema_readiness() -> dict[str, object]:
+    """Prove the frozen funding fact/checkpoint contract without exposing metadata."""
+
+    try:
+        from server.engine.strategy_governance import (
+            EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES,
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH,
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+            validate_governance_append_only_triggers,
+            validate_metric_input_review_triggers,
+        )
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            detail = validate_strategy_funding_checkpoint_schema(conn)
+            metric_triggers = validate_metric_input_review_triggers(conn)
+            append_only_triggers = validate_governance_append_only_triggers(
+                conn
+            )
+    except Exception:
+        return {
+            "status": "error",
+            "ready": False,
+            "error": "strategy funding schema validation failed",
+            "error_code": "funding_schema_validation_failed",
+        }
+
+    expected_budgets = {
+        "checkpoint_target_average_bytes": FUNDING_CHECKPOINT_TARGET_AVG_BYTES,
+        "checkpoint_total_target_bytes": FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES,
+        "checkpoint_total_hard_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "batch_max_rows": FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+        "batch_max_bytes": FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+        "manifest_max_bytes": FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+        "audit_max_bytes": FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+    }
+    observed_budgets = {
+        name: detail.get(name) for name in expected_budgets
+    }
+    ready = (
+        FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH
+        == _EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+        and detail.get("table_count") == 2
+        and detail.get("tables") == _EXPECTED_FUNDING_TABLE_COUNTS
+        and detail.get("trigger_count") == 4
+        and detail.get("contract_hash")
+        == _EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
+        and detail.get("rolling_history_storage")
+        == "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN"
+        and detail.get("automatic_real_order_submission") is False
+        and detail.get("real_order_authority") is False
+        and observed_budgets == expected_budgets
+        and GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+        == _EXPECTED_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        and append_only_triggers.get("contract_hash")
+        == _EXPECTED_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        and append_only_triggers.get("trigger_count") == 38
+        and set(append_only_triggers.get("trigger_names") or ())
+        == EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+        and metric_triggers.get("trigger_count") == 2
+        and METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+        == _EXPECTED_METRIC_REVIEW_CONTRACT_HASH
+        and metric_triggers.get("contract_hash")
+        == _EXPECTED_METRIC_REVIEW_CONTRACT_HASH
+        and set(metric_triggers.get("trigger_names") or ())
+        == _EXPECTED_METRIC_REVIEW_TRIGGER_NAMES
+    )
+    if not ready:
+        return {
+            "status": "error",
+            "ready": False,
+            "error": "strategy funding schema contract is incomplete",
+            "error_code": "funding_schema_contract_incomplete",
+        }
+    return {
+        "status": "ok",
+        "ready": True,
+        "contract_hash": _EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH,
+        "table_count": 2,
+        "trigger_count": 4,
+        "funding_trigger_count": 4,
+        "governance_append_only_trigger_count": 38,
+        "governance_metric_review_trigger_count": 2,
+        "governance_trigger_count": 40,
+        "governance_append_only_contract_hash": (
+            _EXPECTED_GOVERNANCE_APPEND_ONLY_CONTRACT_HASH
+        ),
+        "governance_metric_review_contract_hash": (
+            _EXPECTED_METRIC_REVIEW_CONTRACT_HASH
+        ),
+        "rolling_history_storage": "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN",
+        "budgets": expected_budgets,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
 
 
 def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
@@ -548,10 +848,14 @@ def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
             "tools/run_scheduler_daemon.py",
         )
     except (OSError, SchedulerScriptPolicyError) as exc:
+        _log_public_health_probe_failure(
+            "scheduler_script_policy_readiness", exc
+        )
         return {
             "status": "error",
             "ready": False,
-            "error": type(exc).__name__,
+            "error": "scheduler script policy readiness probe failed",
+            "error_code": "scheduler_script_policy_probe_failed",
         }
     return {"status": "ok", "ready": True}
 
@@ -562,6 +866,7 @@ def health():
     adata_revision = _deployed_adata_revision()
     auth = admin_auth_status()
     database = _primary_database_readiness()
+    funding_schema = _strategy_funding_schema_readiness()
     scheduler_script_policy = _scheduler_script_policy_readiness()
     production_mode = revision["deployment_mode"] == "production"
     scheduler_authority = scheduler_authority_contract()
@@ -575,6 +880,27 @@ def health():
             "state": None,
             "enabled": None,
             "enablement_state": None,
+            "pid": None,
+            "error": "not_checked_outside_production",
+        }
+    )
+    detached_job_logs = (
+        _detached_job_log_readiness()
+        if production_mode
+        else {
+            "status": "not_checked",
+            "ready": None,
+            "error": "not_checked_outside_production",
+        }
+    )
+    standalone_scheduler_heartbeat = (
+        _standalone_scheduler_heartbeat_readiness(
+            standalone_scheduler.get("pid")
+        )
+        if production_mode
+        else {
+            "status": "not_checked",
+            "ready": None,
             "error": "not_checked_outside_production",
         }
     )
@@ -590,11 +916,37 @@ def health():
             or not revision["code_worktree_clean"]
         )
     ):
+        if revision.get("inspection_status") == "error":
+            reason = "inspection_failed"
+        elif revision.get("matches_expected") is not True:
+            reason = "revision_mismatch"
+        elif revision.get("tracked_worktree_clean") is not True:
+            reason = "tracked_changes"
+        elif revision.get("untracked_executable_count"):
+            reason = "untracked_executable"
+        else:
+            reason = "untracked_import_shadow"
         raise HTTPException(
             status_code=503,
-            detail=(
-                "deployed checkout differs from the pinned clean release revision"
-            ),
+            detail={
+                "code": "release_identity_check_failed",
+                "message": (
+                    "deployed checkout differs from the pinned clean release revision"
+                ),
+                "reason": reason,
+                "head_matches_expected": revision.get("matches_expected"),
+                "worktree_clean": revision.get("code_worktree_clean"),
+                "probe_stage": revision.get("inspection_error_stage"),
+                "probe_error": revision.get("inspection_error_code"),
+                "probe_durations_ms": revision.get("inspection_durations_ms", {}),
+                "tracked_change_count": revision.get("tracked_change_count"),
+                "untracked_executable_count": revision.get(
+                    "untracked_executable_count"
+                ),
+                "untracked_import_shadow_count": revision.get(
+                    "untracked_root_shadow_count"
+                ),
+            },
         )
     if production_mode and not adata_revision["verified"]:
         raise HTTPException(
@@ -611,10 +963,20 @@ def health():
             status_code=503,
             detail="primary database readiness check failed",
         )
+    if production_mode and funding_schema.get("ready") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail="strategy funding schema readiness check failed",
+        )
     if production_mode and scheduler_script_policy.get("ready") is not True:
         raise HTTPException(
             status_code=503,
             detail="scheduler script policy readiness check failed",
+        )
+    if production_mode and detached_job_logs.get("ready") is not True:
+        raise HTTPException(
+            status_code=503,
+            detail="detached job log readiness check failed",
         )
     if production_mode and (
         scheduler.get("embedded_scheduler_enabled") is not False
@@ -633,16 +995,27 @@ def health():
             status_code=503,
             detail="standalone scheduler activity and enablement could not be proven",
         )
+    if (
+        production_mode
+        and standalone_scheduler_heartbeat.get("ready") is not True
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="standalone scheduler heartbeat could not be proven",
+        )
     return {
         "status": "ok",
         "release_revision": revision,
         "adata_release_revision": adata_revision,
         "admin_auth_ready": bool(auth.get("ready")),
         "database": database,
+        "strategy_funding_schema": funding_schema,
         "scheduler_runtime": scheduler,
         "scheduler_authority": scheduler_authority,
         "scheduler_script_policy": scheduler_script_policy,
         "standalone_scheduler": standalone_scheduler,
+        "standalone_scheduler_heartbeat": standalone_scheduler_heartbeat,
+        "detached_job_logs": detached_job_logs,
         "in_app_deploy_enabled": (
             os.environ.get("PROBIGA_IN_APP_DEPLOY_ENABLED", "").strip() == "1"
         ),

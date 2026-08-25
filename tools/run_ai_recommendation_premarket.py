@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,63 @@ from server.api.routers.hot_data import (
 from server.common.batch_db import create_batch_engine
 from server.common.config import get_wecom_webhook
 from tools.repair_recommendation_data import repair_target_data
+
+
+def _scheduler_recommendation_identity(requested_run_uid: str) -> tuple[str, bool]:
+    """Return the scheduler-bound UID and whether its history row pre-exists."""
+    requested = str(requested_run_uid or "").strip().lower()
+    scheduler_uid = str(
+        os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
+    ).strip().lower()
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    if requested and not re.fullmatch(r"[0-9a-f]{32}", requested):
+        raise RuntimeError("--run-uid must be 32 lowercase hex characters")
+    if scheduler_uid and not re.fullmatch(r"[0-9a-f]{32}", scheduler_uid):
+        raise RuntimeError("scheduler history identity is invalid")
+    if production and not scheduler_uid:
+        raise RuntimeError(
+            "production recommendation must run under the scheduler audit identity"
+        )
+    if requested and scheduler_uid and requested != scheduler_uid:
+        raise RuntimeError(
+            "--run-uid differs from scheduler history identity"
+        )
+    return requested or scheduler_uid, bool(requested)
+
+
+def _assert_prebound_recommendation_history(engine, run_uid: str) -> None:
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT run_uid, scheduler_job_id, trigger_source, build_sha, "
+                "status FROM st_recommended_run_history "
+                "WHERE run_uid=:run_uid LIMIT 2"
+            ),
+            {"run_uid": run_uid},
+        ).mappings().all()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "pre-bound recommendation history is unavailable or ambiguous"
+        )
+    row = rows[0]
+    expected_build = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_build):
+        raise RuntimeError("scheduler build identity is unavailable")
+    if (
+        str(row.get("run_uid") or "").strip().lower() != run_uid
+        or str(row.get("scheduler_job_id") or "").strip().lower() != run_uid
+        or str(row.get("trigger_source") or "").strip().lower() != "manual"
+        or str(row.get("build_sha") or "").strip().lower() != expected_build
+        or str(row.get("status") or "") not in {"submitted", "running"}
+    ):
+        raise RuntimeError("pre-bound recommendation history identity differs")
 
 
 def _wait_for_db(engine, *, attempts: int = 12) -> None:
@@ -242,6 +300,24 @@ def main() -> int:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    if production and (
+        args.auto_repair_missing_kline or args.auto_repair_missing_data
+    ):
+        raise RuntimeError(
+            "production recommendation cannot repair QMT history on the Linux host"
+        )
+    if production and (args.refresh_realtime or args.use_intraday_current):
+        raise RuntimeError(
+            "production recommendation cannot refresh market storage or use "
+            "intraday-current inputs; submit the registered realtime task first"
+        )
+    bound_run_uid, history_prebound = _scheduler_recommendation_identity(
+        args.run_uid
+    )
     os.environ.setdefault("PROBIGA_KLINE_FEATURE_SQL_MODE", "pandas")
     os.environ.setdefault("PROBIGA_BATCH_DB_READ_RETRIES", "8")
     os.environ.setdefault("PROBIGA_KLINE_FEATURE_BATCH_SIZE", "200")
@@ -259,14 +335,34 @@ def main() -> int:
         trade_date=args.date.strip(),
     )
 
-    run_uid = args.run_uid.strip() or _recommended_run_history_start(
-        trade_date=target_trade_date,
-        min_score=float(args.min_score),
-        top_n=int(args.top_n),
-        strict_prev_trade_day=bool(args.strict_prev_trade_day),
-        execution_time=execution_time,
-        message="AI推荐盘前自动预演启动",
-    )
+    if history_prebound:
+        _assert_prebound_recommendation_history(engine, bound_run_uid)
+        run_uid = bound_run_uid
+        if not _recommended_run_history_update(
+            run_uid,
+            status="running",
+            payload={
+                "progress_percent": 1,
+                "done_count": 0,
+                "message": "生产调度推荐任务开始执行",
+                "error": "",
+            },
+        ):
+            raise RuntimeError(
+                "pre-bound recommendation history could not enter running state"
+            )
+    else:
+        run_uid = _recommended_run_history_start(
+            run_uid=bound_run_uid or None,
+            trade_date=target_trade_date,
+            min_score=float(args.min_score),
+            top_n=int(args.top_n),
+            strict_prev_trade_day=bool(args.strict_prev_trade_day),
+            execution_time=execution_time,
+            message="AI推荐盘前自动预演启动",
+            trigger_source="scheduled",
+            scheduler_job_id=bound_run_uid,
+        )
 
     try:
         repair_report = None
@@ -504,11 +600,18 @@ def main() -> int:
             )
         return 0
     except Exception as exc:
-        _recommended_run_history_finish(run_uid, status="error", payload={
-            "trade_date": target_trade_date,
-            "message": "盘前预演失败",
-            "error": str(exc)[:500],
-        })
+        try:
+            _recommended_run_history_finish(run_uid, status="error", payload={
+                "trade_date": target_trade_date,
+                "message": "盘前预演失败",
+                "error": str(exc)[:500],
+            })
+        except Exception as finish_exc:
+            raise RuntimeError(
+                "AI recommendation failed and terminal audit also failed; "
+                f"original={type(exc).__name__}: {exc}; "
+                f"terminal_audit={type(finish_exc).__name__}: {finish_exc}"
+            ) from exc
         raise
 
 

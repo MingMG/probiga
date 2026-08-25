@@ -23,25 +23,7 @@ from server.common.adata_release import ensure_adata_import_path
 ensure_adata_import_path(ROOT)
 
 from server.common.batch_db import read_frame, write_frame
-
-def _ensure_stats_table(engine):
-    sql = """
-    CREATE TABLE IF NOT EXISTS `st_hot_stats` (
-      `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '自增主键',
-      `stat_date` DATE NOT NULL COMMENT '统计日期',
-      `stat_type` VARCHAR(64) NOT NULL COMMENT '统计类型',
-      `stat_name` VARCHAR(256) NOT NULL COMMENT '统计项名称',
-      `stat_value` DECIMAL(50,6) DEFAULT NULL COMMENT '统计值',
-      `stat_desc` VARCHAR(1024) DEFAULT NULL COMMENT '统计说明',
-      `etl_sync_at` DATETIME NOT NULL COMMENT '同步写入时间',
-      PRIMARY KEY (`id`),
-      KEY `idx_stats_date` (`stat_date`),
-      KEY `idx_stats_type` (`stat_type`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='热门数据统计汇总'
-    """
-    with engine.begin() as conn:
-        conn.execute(text(sql))
-    print("已确保 st_hot_stats 表存在")
+from server.common.auxiliary_runtime_schema import validate_hot_stats_runtime_schema
 
 
 def stats_hot_concept_ths(engine, stat_date: str, save: bool):
@@ -185,7 +167,8 @@ def main():
     args = parser.parse_args()
 
     engine = create_tool_engine(resolve_tool_mysql_url())
-    _ensure_stats_table(engine)
+    if args.save:
+        validate_hot_stats_runtime_schema(engine)
 
     if args.recent > 0:
         stats_recent_summary(engine, args.recent)

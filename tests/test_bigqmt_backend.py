@@ -10,6 +10,7 @@ import pytest
 from integrations.bigqmt.backend import BigQmtBackend
 from integrations.bigqmt import bridge
 from integrations.bigqmt.spool import PROVIDER_ID
+from integrations.qmt import bridge as qmt_bridge
 from tools import run_big_qmt_bridge
 
 
@@ -32,6 +33,25 @@ def _level1_tick(price: float, source_at: datetime, received_at: datetime) -> di
         "askVol": [1200],
         "_probiga_received_at": received_at.isoformat(sep=" ", timespec="seconds"),
     }
+
+
+def test_remote_qmt_gateway_does_not_require_local_windows_python(
+    monkeypatch,
+    tmp_path,
+):
+    missing_python = tmp_path / "missing" / "python.exe"
+    expected = {"ok": True, "rows": [{"stock_code": "000001"}]}
+    monkeypatch.setattr(qmt_bridge, "python_path", lambda: missing_python)
+    monkeypatch.setattr(
+        qmt_bridge,
+        "_run_gateway",
+        lambda _payload, *, timeout: expected,
+    )
+    popen = MagicMock()
+    monkeypatch.setattr(qmt_bridge.subprocess, "run", popen)
+
+    assert qmt_bridge._run({"action": "probe"}, timeout=5) == expected
+    popen.assert_not_called()
 
 
 def test_backend_merges_full_and_tracked_with_tracked_winning(monkeypatch):
@@ -426,12 +446,14 @@ def test_refresh_watchlist_prioritizes_production_portfolio(monkeypatch, tmp_pat
     assert result["remote_portfolio"] == ["600522", "002284"]
 
 
-def test_realtime_universe_uses_latest_tradable_daily_pool() -> None:
+def test_realtime_universe_uses_independent_qmt_catalog() -> None:
     normalized = " ".join(run_big_qmt_bridge.ACTIVE_UNIVERSE_SQL.split()).lower()
-    assert "join sm_stock_kline" in normalized
-    assert "max(latest.trade_date)" in normalized
-    assert "latest.adjust_type = 0" in normalized
-    assert "latest.k_type = 1" in normalized
+    assert "qmt_stock_catalog_member" in normalized
+    assert "qmt_stock_catalog_batch" in normalized
+    assert "member.batch_id=:batch_id" in normalized
+    assert "member.list_date <= :target_date" in normalized
+    assert "member.expire_date > :target_date" in normalized
+    assert "sm_stock_kline" not in normalized
 
 
 def test_remote_portfolio_codes_survive_temporary_endpoint_failure(monkeypatch):

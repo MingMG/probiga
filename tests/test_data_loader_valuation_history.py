@@ -121,6 +121,75 @@ class DataLoaderValuationHistoryTest(unittest.TestCase):
         self.assertEqual(valuation["pb_percentile"], 66.7)
         self.assertEqual(valuation["verdict"], "合理")
 
+    def test_strategy_context_never_reads_mutable_reference_inputs(self):
+        forbidden = (
+            "si_stock_plate_east",
+            "si_industry_sw",
+            "si_stock_concept_east",
+            "si_stock_holder",
+            "st_hot_rank_fused",
+            "st_stock_lifting_last_month",
+            "st_mine_clearance_tdx",
+        )
+
+        def strict_reader(sql: str, params: dict | None = None) -> list[dict]:
+            normalized = " ".join(sql.split())
+            for table in forbidden:
+                if table in normalized:
+                    raise AssertionError(f"strategy read leaked into {table}")
+            return self.fake_read_sql(sql, params)
+
+        finance = {
+            "basic_eps": 3.0,
+            "net_asset_ps": 6.0,
+            "finance_report_date": "2026-03-31",
+        }
+        finance_evidence = {
+            "pit_status": "AVAILABLE",
+            "pit_reason": "",
+            "manifest_hash": "f" * 64,
+            "revision_ids": ["a" * 64],
+            "content_hashes": ["b" * 64],
+        }
+        event_evidence = {
+            "event_pit_status": "AVAILABLE",
+            "event_pit_reason": "",
+            "event_manifest_hash": "e" * 64,
+            "event_revision_ids": [],
+            "event_content_hashes": [],
+        }
+        loader = StockDataLoader()
+        with patch(
+            "server.engine.data_loader._latest_kline_trade_date",
+            return_value="2026-06-10",
+        ), patch(
+            "server.engine.data_loader._read_sql", side_effect=strict_reader
+        ), patch(
+            "server.engine.data_loader._pit_finance_bundle",
+            return_value=(finance, [finance], [8.0], [4.0], finance_evidence),
+        ), patch(
+            "server.engine.data_loader._pit_notice_bundle",
+            return_value=([], event_evidence),
+        ):
+            result = loader.load_full_data(
+                "000001",
+                trade_date="2026-06-10",
+                use_realtime=False,
+                strategy_context=True,
+                decision_at="2026-06-10 15:10:00",
+                fact_cutoff_at="2026-06-10 15:00:00",
+            )
+
+        self.assertIsNone(result["industry"])
+        self.assertEqual(result["concepts"], [])
+        self.assertEqual(result["holder"], {})
+        self.assertEqual(result["hot_rank"], {})
+        self.assertIsNone(result["lifting"]["has_lifting_soon"])
+        self.assertEqual(result["mine_clearance"]["pit_status"], "DATA_BLOCKED")
+        self.assertEqual(
+            result["strategy_reference_evidence"]["status"], "DATA_BLOCKED"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
