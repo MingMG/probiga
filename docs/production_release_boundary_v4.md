@@ -89,6 +89,67 @@ root-owned staged source and an independently recorded SHA-256. The installer
 syntax-checks and capability-checks the staged candidate before its atomic rename.
 CI never invokes this installer.
 
+### One-time database boundary bootstrap
+
+The installed v4 root broker can complete the credential-file boundary without
+another Cloud Assistant/root-login step. This is a one-time local handoff, not a
+database-account creator and not a general secret upload channel. Before the
+first eligible release, the operator places exactly these two files in
+`/home/probiga-deploy/.probiga-db-boundary-stage` through the existing protected
+file-transfer channel:
+
+- `mysql-trigger-admin.ini` for `probiga_trigger_admin`;
+- `mysql-migrator.ini` for `probiga_migrator`.
+
+The stage directory must be a real `probiga-deploy:probiga-deploy` directory at
+`0700`. Both entries must be regular, single-link, `probiga-deploy`-owned `0600`
+files no larger than 4 KiB, and there may be no third entry. Each file has one
+strict `[client]` section containing only `protocol=tcp`,
+`host=127.0.0.1`, `port=13306`, its expected user, and a 48--160 character
+base64url password. Passwords must never be placed in a command line, environment
+variable, ticket, log, or deployment receipt.
+
+After the immutable release has been prepared, and only on a non-same-SHA
+activation, the root deploy engine validates the complete stage, fixed CA,
+runtime `.env`, owners, modes, link counts, and target state. It runs only when
+both target option files are absent. `/home` and `/etc` must be on the same
+filesystem; otherwise the bootstrap fails before mutation rather than replacing
+an atomic claim with an unsafe copy fallback.
+
+The handoff is a durable two-phase transaction. `prepare` first writes and
+fsyncs root-only option and `.env` snapshots plus original metadata under
+`/etc/probiga/.database-boundary-bootstrap.transaction`. It then checks the
+stage directory immediately before rename and checks the same device/inode and
+non-symlink directory immediately afterwards, before any metadata change. All
+directory ownership and mode changes use a no-follow directory descriptor. The
+transaction provisionally installs the two option paths, pins the unique
+`MYSQL_SSL_CA=/etc/probiga/mysql84-ca.pem` with unique
+`MYSQL_TLS_REQUIRED=true`, sets `/opt/ProBigA/.env` to `root:probiga 0640`, and
+sets only the top `/opt/ProBigA` directory to `root:root 0755`; it never applies
+a recursive ownership change. The claimed stage and original state remain in
+the root-only transaction while the read-only credential, TLS, identity, grant,
+and schema preflight runs.
+
+The deploy engine persists its normal writer-restore journal before `commit`.
+Only then does the bootstrap durably choose commit, atomically move the
+transaction to a root-only committed tombstone, remove duplicate snapshots, and
+leave both final option files as single-link `root:root 0600` files. A failure
+before that decision invokes `rollback`, which restores the original `.env`
+bytes/ownership/mode/timestamps, application-directory metadata and exact stage,
+then removes provisional targets. SIGTERM, SIGINT and SIGHUP use the same path;
+SIGKILL, process loss or host loss leaves an fsynced state that the next
+`prepare`, `commit`, or `rollback` resumes idempotently. Once the committing
+decision is durable, recovery finishes commit instead of ambiguously restoring
+credentials after database preflight has passed.
+
+Any partial target without a matching transaction, symlink, extra stage entry,
+unsafe CA, unexpected `.env` shape, permission drift, cross-filesystem claim or
+concurrent replacement fails closed. Output is limited to status and SHA-256
+evidence; it never includes option or `.env` contents. Same-SHA deployments use
+read-only `verify` and refuse a reappeared stage. Database accounts and exact
+grants are still provisioned separately in an approved DBA maintenance window;
+the deploy bootstrap cannot create or broaden them.
+
 ## Recovery invariant
 
 The activation snapshot seals both the old and proposed unit/static sets. A
