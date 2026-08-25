@@ -477,13 +477,13 @@ jobs:
           tests/test_production_release_boundary.py
           tests/test_production_deploy_broker.py
           tests/test_production_deploy_recovery_state_machine.py
+          tests/test_production_db_boundary_bootstrap.py
           tests/test_production_governance_contract_recovery.py
           tests/test_deploy_console.py
           tests/test_hot_data_detail.py
           tests/test_portfolio_watch_modal_ui.py
           tests/test_api_error_handling.py
           tests/test_health_endpoints.py
-          tests/test_scheduler_script_policy.py
 
       - name: Run production governance and QMT regressions
         run: >-
@@ -497,6 +497,7 @@ jobs:
           tests/test_strategy_governance_health.py
           tests/test_strategy_governance_ui.py
           tests/test_trading_v3_forward_evidence_version.py
+          tests/test_scheduler_script_policy.py
 
       - name: Run production MySQL acceptance regressions
         run: >-

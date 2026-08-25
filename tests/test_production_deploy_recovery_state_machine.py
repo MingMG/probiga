@@ -2097,6 +2097,7 @@ def test_same_sha_request_identity_mismatch_fails_before_database_phase(
 set -Eeuo pipefail
 PREVIOUS_SHA={sha}
 EXPECTED_SHA={sha}
+run_database_boundary_bootstrap() {{ test "$1" = verify; }}
 prepared_request_is_already_active() {{ return 1; }}
 {gate}
 printf reached > {marker!r}
@@ -2121,6 +2122,7 @@ printf reached > {marker!r}
 set -Eeuo pipefail
 PREVIOUS_SHA={'b' * 40}
 EXPECTED_SHA={sha}
+run_database_boundary_bootstrap() {{ test "$1" = prepare; }}
 prepared_request_is_already_active() {{ return 1; }}
 {gate}
 printf reached > {marker!r}
