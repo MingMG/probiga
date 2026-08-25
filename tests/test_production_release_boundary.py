@@ -2385,6 +2385,10 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
     assert "/etc/probiga/mysql-ca.pem" not in schema_tool
     assert 'EXPECTED_ADMIN_USER = "probiga_trigger_admin@127.0.0.1"' in schema_tool
     assert 'EXPECTED_MIGRATOR_USER = "probiga_migrator@127.0.0.1"' in schema_tool
+    assert 'EXPECTED_CLIENT_ENDPOINT_PORT = 13306' in schema_tool
+    assert 'EXPECTED_SERVER_PORT = 3306' in schema_tool
+    assert 'values["port"] != str(EXPECTED_CLIENT_ENDPOINT_PORT)' in schema_tool
+    assert 'state.server_port != EXPECTED_SERVER_PORT' in schema_tool
     assert 'values["protocol"].casefold() != "tcp"' in schema_tool
     assert "ssl_ca=str(ssl_ca)" in schema_tool
     assert "ssl_verify_cert=True" in schema_tool

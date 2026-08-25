@@ -199,8 +199,8 @@ def _boundary(*, trust: int = 0) -> schema.DatabaseBoundary:
         migrator_engine=None,
         admin_credential=schema.OptionCredential(
             path=Path("/etc/probiga/mysql-trigger-admin.ini"),
-            host="127.0.0.1",
-            port=3306,
+            host=schema.EXPECTED_CLIENT_ENDPOINT_HOST,
+            port=schema.EXPECTED_CLIENT_ENDPOINT_PORT,
             user="probiga_trigger_admin",
             password="A" * 64,
         ),
@@ -310,7 +310,7 @@ def test_option_file_parser_accepts_only_exact_tcp_credential_shape(
         "[client]\n"
         "protocol=tcp\n"
         "host=127.0.0.1\n"
-        "port=3306\n"
+        f"port={schema.EXPECTED_CLIENT_ENDPOINT_PORT}\n"
         "user=probiga_trigger_admin\n"
         f"password={password}\n",
         encoding="utf-8",
@@ -324,8 +324,8 @@ def test_option_file_parser_accepts_only_exact_tcp_credential_shape(
 
     assert credential == schema.OptionCredential(
         path=path,
-        host="127.0.0.1",
-        port=3306,
+        host=schema.EXPECTED_CLIENT_ENDPOINT_HOST,
+        port=schema.EXPECTED_CLIENT_ENDPOINT_PORT,
         user="probiga_trigger_admin",
         password=password,
     )
@@ -335,21 +335,21 @@ def test_option_file_parser_accepts_only_exact_tcp_credential_shape(
 @pytest.mark.parametrize(
     "body",
     (
-        "[mysql]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "[mysql]\nprotocol=tcp\nhost=127.0.0.1\nport=13306\n"
         "user=probiga_trigger_admin\npassword=" + "A" * 64,
-        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=13306\n"
         "user=probiga_trigger_admin\npassword=" + "A" * 64 + "\nssl-mode=REQUIRED",
-        "[client]\nprotocol=socket\nhost=127.0.0.1\nport=3306\n"
+        "[client]\nprotocol=socket\nhost=127.0.0.1\nport=13306\n"
         "user=probiga_trigger_admin\npassword=" + "A" * 64,
-        "[client]\nprotocol=tcp\nhost=db.internal\nport=3306\n"
-        "user=probiga_trigger_admin\npassword=" + "A" * 64,
-        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3307\n"
+        "[client]\nprotocol=tcp\nhost=db.internal\nport=13306\n"
         "user=probiga_trigger_admin\npassword=" + "A" * 64,
         "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "user=probiga_trigger_admin\npassword=" + "A" * 64,
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=13306\n"
         "user=root\npassword=" + "A" * 64,
-        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=13306\n"
         "user=probiga_trigger_admin\npassword=short",
-        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=3306\n"
+        "[client]\nprotocol=tcp\nhost=127.0.0.1\nport=13306\n"
         "user=probiga_trigger_admin\npassword=" + "A" * 47 + "!",
     ),
 )
@@ -382,8 +382,8 @@ def test_option_connection_is_remote_tcp_tls_and_disables_local_infile(
     monkeypatch.setattr(schema.pymysql, "connect", fake_connect)
     credential = schema.OptionCredential(
         path=Path("/etc/probiga/mysql-trigger-admin.ini"),
-        host="127.0.0.1",
-        port=3306,
+        host=schema.EXPECTED_CLIENT_ENDPOINT_HOST,
+        port=schema.EXPECTED_CLIENT_ENDPOINT_PORT,
         user="probiga_trigger_admin",
         password="A" * 64,
     )
@@ -395,8 +395,8 @@ def test_option_connection_is_remote_tcp_tls_and_disables_local_infile(
         configure_trigger_session=False,
         autocommit=True,
     ) is connection
-    assert observed["host"] == "127.0.0.1"
-    assert observed["port"] == 3306
+    assert observed["host"] == schema.EXPECTED_CLIENT_ENDPOINT_HOST
+    assert observed["port"] == schema.EXPECTED_CLIENT_ENDPOINT_PORT
     assert observed["user"] == "probiga_trigger_admin"
     assert observed["database"] is None
     assert str(observed["ssl_ca"]).replace("\\", "/") == (

@@ -62,6 +62,8 @@ from tools.env_config import create_tool_engine, load_project_env  # noqa: E402
 
 DATABASE_NAME = "probiga"
 EXPECTED_SERVER_UUID = "f40c3202-9260-11f1-86ae-74d4dd7f8500"
+EXPECTED_CLIENT_ENDPOINT_HOST = "127.0.0.1"
+EXPECTED_CLIENT_ENDPOINT_PORT = 13306
 EXPECTED_SERVER_PORT = 3306
 EXPECTED_SERVER_HOSTNAME = "WIN-20260322RGF"
 EXPECTED_RUNTIME_USER = "probiga_runtime@127.0.0.1"
@@ -368,8 +370,8 @@ def _read_option_credential(
     }
     if (
         values["protocol"].casefold() != "tcp"
-        or values["host"] != "127.0.0.1"
-        or values["port"] != str(EXPECTED_SERVER_PORT)
+        or values["host"] != EXPECTED_CLIENT_ENDPOINT_HOST
+        or values["port"] != str(EXPECTED_CLIENT_ENDPOINT_PORT)
         or values["user"] != expected_user
         or _OPTION_PASSWORD_RE.fullmatch(values["password"]) is None
     ):
