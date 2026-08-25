@@ -9928,6 +9928,26 @@ run_prepared_database_migration_tool() {
       "$entrypoint" "$@"
   )
 }
+run_database_boundary_bootstrap() {
+  local action="$1"
+  local entrypoint="$PREPARED_CODE_ROOT/deploy/production_db_boundary_bootstrap.py"
+  case "$action" in
+    prepare|commit|rollback|verify) ;;
+    *) echo "database boundary bootstrap action is not allowlisted" >&2; return 2 ;;
+  esac
+  test -f "$entrypoint"
+  test ! -L "$entrypoint"
+  test "$(stat -c '%F' -- "$entrypoint")" = "regular file"
+  test "$(stat -c '%U:%G' -- "$entrypoint")" = root:root
+  test "$(stat -c '%h' -- "$entrypoint")" = 1
+  test $((8#$(stat -c '%a' -- "$entrypoint") & 8#022)) -eq 0
+  sudo -u "$SERVICE_USER" test ! -w "$entrypoint"
+  sudo -u probiga-deploy test ! -w "$entrypoint"
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    "$BOOTSTRAP_PYTHON" -I "$entrypoint" "$action"
+}
 rollback() {
   local failed_status="${1:-$?}"
   local failed_line="${2:-0}"
@@ -9953,6 +9973,11 @@ rollback() {
   local restoration_ready=1
   local service_active_state=""
   local services_quiescent=1
+  local database_boundary_rollback_failed=0
+  if [ -f "$PREPARED_CODE_ROOT/deploy/production_db_boundary_bootstrap.py" ] && \
+    ! run_database_boundary_bootstrap rollback >/dev/null 2>&1; then
+    database_boundary_rollback_failed=1
+  fi
   if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
     [ -L "$DATABASE_WRITER_GUARD_FILE" ]; then
     DATABASE_WRITER_GUARD_PERSISTED=1
@@ -9993,7 +10018,8 @@ rollback() {
     ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
     ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
-    if [ "$current_sha" != "$PREVIOUS_SHA" ] || \
+    if [ "$database_boundary_rollback_failed" -ne 0 ] || \
+      [ "$current_sha" != "$PREVIOUS_SHA" ] || \
       ! systemctl is-active --quiet "$MAIN_SERVICE" || \
       ! curl --fail --silent --show-error --retry 3 --retry-all-errors \
         --retry-delay 1 --retry-connrefused \
@@ -10014,6 +10040,9 @@ rollback() {
     echo "Rollback step failed: $1" >&2
     rollback_failed=1
   }
+  if [ "$database_boundary_rollback_failed" -ne 0 ]; then
+    rollback_failure "restore provisional database boundary transaction"
+  fi
 
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     sudo systemctl stop "$AI_WORKER_TIMER" || \
@@ -10424,6 +10453,8 @@ trap 'rollback 129' HUP
 CUTOVER_STEP=prepare_release
 prepare_release
 if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
+  CUTOVER_STEP=verify_production_database_boundary
+  run_database_boundary_bootstrap verify
   if ! prepared_request_is_already_active; then
     echo "existing release SHA does not match the complete finalized request identity" >&2
     false
@@ -10444,6 +10475,8 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   trap - ERR TERM INT HUP
   exit 0
 fi
+CUTOVER_STEP=prepare_production_database_boundary
+run_database_boundary_bootstrap prepare
 
 # PREPARE DATABASE: read-only verification of the fixed TLS administrator and
 # migrator identities, target server, grants, trust=OFF and existing schema.
@@ -10489,6 +10522,8 @@ prepared_qmt_announcement_snapshot verify \
 CUTOVER_STEP=persist_database_writer_restore_journal
 persist_database_writer_restore_journal
 CUTOVER_STARTED=1
+CUTOVER_STEP=commit_production_database_boundary
+run_database_boundary_bootstrap commit
 DATABASE_GUARD_MIGRATION_UNVERIFIED=1
 CUTOVER_STEP=install_database_writer_guard_dropins
 install_database_writer_guard_dropins

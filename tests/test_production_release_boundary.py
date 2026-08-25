@@ -4544,6 +4544,7 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     for regression in (
         "tests/test_production_deploy_broker.py",
         "tests/test_production_deploy_recovery_state_machine.py",
+        "tests/test_production_db_boundary_bootstrap.py",
         "tests/test_production_governance_contract_recovery.py",
     ):
         assert regression in workflow
@@ -4939,6 +4940,23 @@ def test_schema_preflight_is_read_only_and_global_trust_isolated() -> None:
     assert 'fenced_phases = {"cutover", "resume"}' in prepare
     assert "if phase in fenced_phases and not writers_fenced:" in prepare
     assert "_recover_trust(_open_recovery_boundary())" in prepare
+
+
+def test_database_boundary_bootstrap_precedes_database_preflight() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    same_sha = deploy.index('if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then')
+    bootstrap = deploy.index("CUTOVER_STEP=prepare_production_database_boundary")
+    preflight = deploy.index("CUTOVER_STEP=preflight_strategy_governance_database_schema")
+    writer_journal = deploy.index("CUTOVER_STEP=persist_database_writer_restore_journal")
+    commit = deploy.index("CUTOVER_STEP=commit_production_database_boundary")
+    guard = deploy.index("CUTOVER_STEP=install_database_writer_guard_dropins")
+    assert same_sha < bootstrap
+    assert bootstrap < preflight
+    assert "run_database_boundary_bootstrap prepare" in deploy[bootstrap:preflight]
+    assert preflight < writer_journal < commit < guard
+    assert "run_database_boundary_bootstrap rollback" in deploy
 
 
 def test_all_legacy_mutable_production_entrypoints_are_retired() -> None:
