@@ -59,6 +59,60 @@ def test_mysql84_no_action_fk_metadata_matches_restrict_contract():
     assert funding._normalize_referential_rule("RESTRICT") == "RESTRICT"
 
 
+@pytest.mark.parametrize(
+    ("declared", "mysql84_check_clause"),
+    (
+        (
+            "BINARY fact_hash = BINARY SHA2(fact_json, 256)",
+            "(cast(`fact_hash` as char charset binary) = "
+            "cast(sha2(`fact_json`,256) as char charset binary))",
+        ),
+        (
+            "BINARY checkpoint_hash = BINARY SHA2(state_json, 256)",
+            "(CAST(`checkpoint_hash` AS CHAR CHARACTER SET BINARY) = "
+            "CAST(SHA2(`state_json`, 256) AS CHAR CHARACTER SET BINARY))",
+        ),
+        (
+            "BINARY chain_hash = BINARY SHA2(chain_payload_json, 256)",
+            "((cast(`chain_hash` as char charset binary) = "
+            "cast(sha2(`chain_payload_json`,256) as char charset binary)))",
+        ),
+    ),
+)
+def test_mysql84_binary_operator_metadata_matches_declared_contract(
+    declared,
+    mysql84_check_clause,
+):
+    assert funding._normalize_check(mysql84_check_clause) == (
+        funding._normalize_check(declared)
+    )
+
+
+@pytest.mark.parametrize(
+    "different_clause",
+    (
+        "CAST(fact_hash AS CHAR CHARACTER SET utf8mb4) = "
+        "CAST(SHA2(fact_json, 256) AS CHAR CHARACTER SET utf8mb4)",
+        "CAST(fact_hash AS CHAR(64) CHARSET binary) = "
+        "CAST(SHA2(fact_json, 256) AS CHAR(64) CHARSET binary)",
+        "CAST(fact_hash AS BINARY) = CAST(SHA2(fact_json, 256) AS BINARY)",
+        "CAST(fact_hash AS CHAR CHARSET binary) = "
+        "CAST(SHA2(fact_json, 512) AS CHAR CHARSET binary)",
+        "CAST(fact_hash AS CHAR CHARSET binary) = "
+        "CAST(SHA2(state_json, 256) AS CHAR CHARSET binary)",
+        "BINARY fact_hash = CAST(SHA2(fact_json, 256) AS CHAR CHARSET binary)",
+        "note = 'CAST(fact_hash AS CHAR CHARSET binary)'",
+    ),
+)
+def test_binary_metadata_normalization_keeps_non_equivalent_forms_distinct(
+    different_clause,
+):
+    declared = "BINARY fact_hash = BINARY SHA2(fact_json, 256)"
+    assert funding._normalize_check(different_clause) != (
+        funding._normalize_check(declared)
+    )
+
+
 def test_funding_contract_names_are_unique_and_every_fk_has_explicit_left_prefix():
     expected_counts = {
         funding.FUNDING_DAILY_FACT_TABLE_NAME: (29, 9, 3, 7),

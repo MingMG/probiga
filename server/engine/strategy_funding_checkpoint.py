@@ -698,6 +698,37 @@ def _top_level_boolean_parts(raw: str, keyword: str) -> list[str]:
     return parts
 
 
+_MYSQL_BINARY_HASH_CHECK = re.compile(
+    r"cast\(\s*(?P<target>fact_hash|checkpoint_hash|chain_hash)\s+"
+    r"as\s+char\s+(?:character\s+set|charset)\s+binary\s*\)\s*=\s*"
+    r"cast\(\s*sha2\(\s*(?P<source>fact_json|state_json|"
+    r"chain_payload_json)\s*,\s*256\s*\)\s+as\s+char\s+"
+    r"(?:character\s+set|charset)\s+binary\s*\)",
+    flags=re.IGNORECASE,
+)
+_BINARY_HASH_SOURCE_BY_TARGET = {
+    "fact_hash": "fact_json",
+    "checkpoint_hash": "state_json",
+    "chain_hash": "chain_payload_json",
+}
+
+
+def _canonicalize_mysql_binary_hash_check(clause: str) -> str:
+    """Map MySQL 8.4's exact unary-BINARY metadata form to our DDL form."""
+
+    candidate = clause.strip()
+    while _fully_wrapped(candidate):
+        candidate = candidate[1:-1].strip()
+    match = _MYSQL_BINARY_HASH_CHECK.fullmatch(candidate)
+    if match is None:
+        return clause
+    target = match.group("target").casefold()
+    source = match.group("source").casefold()
+    if _BINARY_HASH_SOURCE_BY_TARGET.get(target) != source:
+        return clause
+    return f"BINARY {target} = BINARY SHA2({source}, 256)"
+
+
 def _normalize_check(value: Any) -> str:
     clause = str(value or "").strip().replace("`", "")
     clause = re.sub(
@@ -712,6 +743,10 @@ def _normalize_check(value: Any) -> str:
         clause,
         flags=re.IGNORECASE,
     )
+    # MySQL 8.4 exposes unary ``BINARY expr`` in CHECK metadata as an
+    # equivalent character cast.  Only the three complete, known hash checks
+    # are canonicalized; partial or differently targeted casts remain drift.
+    clause = _canonicalize_mysql_binary_hash_check(clause)
     clause = re.sub(r"\s+", " ", clause.casefold()).strip()
     def expression(raw: str) -> str:
         raw = raw.strip()
