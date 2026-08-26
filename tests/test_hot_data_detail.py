@@ -456,6 +456,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set") as cache_set_mock, \
              patch("server.api.routers.hot_data._portfolio_market_mode", return_value="post_close"), \
+             patch("server.api.routers.hot_data._stock_detail_portfolio_context", return_value={}), \
              patch("server.api.routers.hot_data._load_stock_detail_payload", return_value=payload) as payload_mock, \
              patch("server.api.routers.hot_data._load_latest_analysis_snapshot", return_value=snapshot) as snapshot_mock, \
              patch("server.api.routers.hot_data._load_latest_recommendation_snapshot", return_value={"final_trade_score": 77.0, "ai_score": 70.0}) as rec_mock, \
@@ -482,6 +483,438 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertTrue(out["flow_is_stale"])
         self.assertTrue(out["analysis_is_stale"])
         cache_set_mock.assert_called_once()
+
+    def test_stock_detail_overlays_current_watchlist_truth_and_holding_strategy(self):
+        payload = {
+            "basic": {
+                "short_name": "旧名称",
+                "exchange": "SH",
+                "list_date": "2021-01-01",
+            },
+            "market": {
+                "price": 28.0,
+                "change_pct": 1.0,
+                "open": 27.5,
+                "high": 28.5,
+                "low": 27.0,
+                "turnover_ratio": 3.0,
+                "total_shares": 1000,
+                "float_shares": 800,
+            },
+            "capital": {"today": {"main_net_inflow": 1.0}},
+            "finance": {"latest": {"basic_eps": 2.0, "net_asset_ps": 10.0}},
+            "valuation": {"pe_ttm": 14.0, "pb": 2.8},
+            "technical": {"ma20": 29.0},
+            "news": {},
+            "holder": {},
+            "holding": None,
+            "industry": "旧行业",
+            "concepts": [],
+            "trade_date": "2026-08-11",
+            "requested_trade_date": "2026-08-26",
+            "quote_trade_date": "2026-08-11",
+            "flow_trade_date": "2026-08-11",
+            "quote_source": "snapshot",
+            "detail_source": "snapshot_light",
+            "hot_rank": {},
+        }
+        watch_analysis = {
+            "operation_advice": "控仓",
+            "trend": "偏弱",
+            "funds": "流出",
+        }
+        holding_strategy = {
+            "stock_code": "601606",
+            "action": "立即卖出",
+            "exit_intent": "SELL",
+            "reason": "latest price 30.6300 invalidated MA20 trend stop 32.4402",
+            "shares": 1200,
+            "sellable_shares": 1200,
+            "execution_authority": "ADVISORY_ONLY",
+        }
+        context = {
+            "row": {
+                "stock_code": "601606",
+                "display_name": "长城军工",
+                "industry_name": "国防军工",
+                "cur_price": 30.63,
+                "change_pct": -2.89,
+                "quote_prev_close": 31.54,
+                "quote_volume": 298048,
+                "quote_amount": 909134200,
+                "quote_trade_date": "2026-08-26",
+                "quote_snapshot_at": "2026-08-26 15:00:04",
+                "quote_source": "current_close_table",
+                "quote_status": "closed",
+                "shares": 1200,
+                "cost_price": 31.467,
+                "position_date": "2026-08-24",
+                "main_net_inflow": -50415295,
+                "max_net_inflow": -100,
+                "lg_net_inflow": -200,
+                "mid_net_inflow": 300,
+                "sm_net_inflow": 400,
+                "flow_trade_date": "2026-08-26",
+                "flow_latest_time": "2026-08-26 14:51:00",
+                "flow_source": "qmt",
+                "flow_status": "closed",
+                "watch_analysis": watch_analysis,
+            },
+            "snapshot_stale": False,
+            "holding_strategy": holding_strategy,
+            "holding_strategy_context": {
+                "status": "ok",
+                "execution_authority": "ADVISORY_ONLY",
+            },
+        }
+        analysis_snapshot = {"analysis_date": "2026-08-06"}
+
+        with patch("server.api.routers.hot_data._cache_get", return_value=None), \
+             patch("server.api.routers.hot_data._cache_set"), \
+             patch("server.api.routers.hot_data._portfolio_market_mode", return_value="post_close"), \
+             patch("server.api.routers.hot_data._stock_detail_portfolio_context", return_value=context), \
+             patch("server.api.routers.hot_data._load_stock_detail_payload", return_value=payload), \
+             patch("server.api.routers.hot_data._load_latest_analysis_snapshot", return_value=analysis_snapshot), \
+             patch("server.api.routers.hot_data._load_latest_recommendation_snapshot", return_value={}), \
+             patch("server.api.routers.hot_data._generate_ai_analysis", return_value={"analysis_date": "2026-08-06"}) as analysis_mock:
+            out = hot_data.stock_detail("601606")
+
+        self.assertTrue(out["watchlist_member"])
+        self.assertEqual(out["short_name"], "长城军工")
+        self.assertEqual(out["market"]["price"], 30.63)
+        self.assertEqual(out["market"]["change_pct"], -2.89)
+        self.assertEqual(out["market"]["pre_close"], 31.54)
+        self.assertIsNone(out["market"]["open"])
+        self.assertEqual(out["market"]["market_cap"], 30630.0)
+        self.assertEqual(out["valuation"]["pe_ttm"], 15.31)
+        self.assertEqual(out["valuation"]["pb"], 3.06)
+        self.assertEqual(out["capital"]["today"]["main_net_inflow"], -50415295)
+        self.assertEqual(out["quote_trade_date"], "2026-08-26")
+        self.assertEqual(out["flow_trade_date"], "2026-08-26")
+        self.assertEqual(out["quote_source"], "current_close_table")
+        self.assertEqual(out["holding"]["shares"], 1200)
+        self.assertEqual(out["watch_analysis"], watch_analysis)
+        self.assertEqual(out["holding_strategy"]["action"], "立即卖出")
+        self.assertFalse(out["quote_is_stale"])
+        self.assertFalse(out["flow_is_stale"])
+        self.assertTrue(out["analysis_is_stale"])
+        self.assertTrue(out["technical_is_stale"])
+        self.assertIn("portfolio_snapshot_overlay", out["detail_source"])
+        self.assertEqual(analysis_mock.call_args.args[2]["price"], 30.63)
+        self.assertEqual(analysis_mock.call_args.args[9]["shares"], 1200)
+
+    def test_stock_detail_portfolio_context_matches_live_row_and_strategy(self):
+        snapshot = {
+            "snapshot_stale": False,
+            "data": [
+                {"stock_code": "000001", "shares": 0},
+                {
+                    "stock_code": "601606",
+                    "shares": 1200,
+                    "quote_status": "closed",
+                },
+            ],
+        }
+        strategy_payload = {
+            "status": "ok",
+            "trade_date": "2026-08-26",
+            "execution_authority": "ADVISORY_ONLY",
+            "data": [
+                {"stock_code": "601606", "action": "立即卖出"},
+                {"stock_code": "002165", "action": "等待数据"},
+            ],
+        }
+
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value=snapshot,
+        ) as snapshot_mock, patch(
+            "server.api.routers.hot_data._cache_get",
+            return_value=None,
+        ), patch(
+            "server.api.routers.hot_data._cache_set",
+        ) as cache_set_mock, patch(
+            "server.api.routers.hot_data.portfolio_holding_strategy",
+            return_value=strategy_payload,
+        ) as strategy_mock:
+            out = hot_data._stock_detail_portfolio_context("601606")
+
+        snapshot_mock.assert_called_once_with(live_mode=True)
+        strategy_mock.assert_called_once_with("")
+        cache_set_mock.assert_called_once_with(
+            "stock_detail_holding_strategy_current",
+            strategy_payload,
+        )
+        self.assertEqual(out["row"]["shares"], 1200)
+        self.assertEqual(out["holding_strategy"]["action"], "立即卖出")
+        self.assertEqual(
+            out["holding_strategy_context"]["execution_authority"],
+            "ADVISORY_ONLY",
+        )
+
+    def test_stock_detail_portfolio_context_failure_is_explicit_and_local(self):
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            side_effect=RuntimeError("temporary snapshot failure"),
+        ):
+            context = hot_data._stock_detail_portfolio_context("601606")
+
+        out = hot_data._apply_stock_detail_portfolio_context(
+            {
+                "market": {"price": 30.0},
+                "holding_strategy": {"action": "旧动作"},
+                "watch_analysis": {"operation_advice": "旧建议"},
+            },
+            context,
+        )
+
+        self.assertEqual(
+            context,
+            {
+                "unavailable": True,
+                "reason_code": "PORTFOLIO_CONTEXT_UNAVAILABLE",
+            },
+        )
+        self.assertIsNone(out["watchlist_member"])
+        self.assertIsNone(out["holding"])
+        self.assertIsNone(out["holding_strategy"])
+        self.assertEqual(out["watch_analysis"], {})
+        self.assertTrue(out["quote_is_stale"])
+        self.assertEqual(
+            out["holding_strategy_context"]["reason_code"],
+            "PORTFOLIO_CONTEXT_UNAVAILABLE",
+        )
+
+    def test_stock_detail_portfolio_context_reuses_shared_strategy_cache(self):
+        cached_strategy = {
+            "status": "ok",
+            "execution_authority": "ADVISORY_ONLY",
+            "data": [
+                {"stock_code": "601606", "action": "立即卖出"},
+            ],
+        }
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value={
+                "data": [
+                    {
+                        "stock_code": "601606",
+                        "shares": 1200,
+                        "quote_status": "closed",
+                    },
+                ],
+            },
+        ), patch(
+            "server.api.routers.hot_data._cache_get",
+            return_value=cached_strategy,
+        ) as cache_get_mock, patch(
+            "server.api.routers.hot_data.portfolio_holding_strategy",
+        ) as strategy_mock:
+            context = hot_data._stock_detail_portfolio_context("601606")
+
+        cache_get_mock.assert_called_once()
+        strategy_mock.assert_not_called()
+        self.assertEqual(context["holding_strategy"]["action"], "立即卖出")
+
+    def test_stock_detail_portfolio_context_blocks_strategy_for_stale_quote(self):
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value={
+                "snapshot_stale": True,
+                "data": [
+                    {
+                        "stock_code": "601606",
+                        "shares": 1200,
+                        "cur_price": 30.63,
+                        "quote_status": "stale",
+                    },
+                ],
+            },
+        ), patch(
+            "server.api.routers.hot_data._cache_get",
+        ) as cache_get_mock, patch(
+            "server.api.routers.hot_data.portfolio_holding_strategy",
+        ) as strategy_mock:
+            context = hot_data._stock_detail_portfolio_context("601606")
+
+        cache_get_mock.assert_not_called()
+        strategy_mock.assert_not_called()
+        self.assertIsNone(context["holding_strategy"])
+        self.assertEqual(
+            context["holding_strategy_context"]["reason_code"],
+            "PORTFOLIO_QUOTE_UNVERIFIED",
+        )
+
+    def test_stock_detail_portfolio_context_blocks_previous_close_strategy(self):
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value={
+                "snapshot_stale": False,
+                "data": [
+                    {
+                        "stock_code": "601606",
+                        "shares": 1200,
+                        "cur_price": 30.63,
+                        "quote_status": "previous_close",
+                    },
+                ],
+            },
+        ), patch(
+            "server.api.routers.hot_data._cache_get",
+        ) as cache_get_mock, patch(
+            "server.api.routers.hot_data.portfolio_holding_strategy",
+        ) as strategy_mock:
+            context = hot_data._stock_detail_portfolio_context("601606")
+
+        cache_get_mock.assert_not_called()
+        strategy_mock.assert_not_called()
+        self.assertIsNone(context["holding_strategy"])
+        self.assertEqual(
+            context["holding_strategy_context"]["reason_code"],
+            "PORTFOLIO_QUOTE_UNVERIFIED",
+        )
+
+    def test_stock_detail_overlay_derives_previous_close_from_current_quote(self):
+        out = hot_data._apply_stock_detail_portfolio_context(
+            {
+                "market": {"price": 9.0, "pre_close": 8.8},
+                "date": "2026-08-25",
+                "quote_trade_date": "2026-08-25",
+            },
+            {
+                "row": {
+                    "stock_code": "000001",
+                    "shares": 0,
+                    "cur_price": 10.2,
+                    "price_change": 0.2,
+                    "change_pct": 2.0,
+                    "quote_trade_date": "2026-08-26",
+                    "quote_status": "closed",
+                },
+            },
+        )
+
+        self.assertEqual(out["market"]["pre_close"], 10.0)
+        self.assertEqual(out["date"], "2026-08-26")
+
+        reapplied = hot_data._apply_stock_detail_portfolio_context(
+            out,
+            {
+                "row": {
+                    "stock_code": "000001",
+                    "shares": 0,
+                    "cur_price": 10.2,
+                    "price_change": 0.2,
+                    "change_pct": 2.0,
+                    "quote_trade_date": "2026-08-26",
+                    "quote_status": "closed",
+                },
+            },
+        )
+        self.assertEqual(
+            reapplied["detail_source"].count("portfolio_snapshot_overlay+"),
+            1,
+        )
+
+    def test_stock_detail_overlay_does_not_replace_newer_same_day_quote_or_industry(self):
+        out = hot_data._apply_stock_detail_portfolio_context(
+            {
+                "market": {"price": 12.0},
+                "industry": "权威行业",
+                "quote_trade_date": "2026-08-26",
+                "quote_snapshot_at": "2026-08-26 15:00:05",
+            },
+            {
+                "row": {
+                    "stock_code": "000001",
+                    "shares": 0,
+                    "cur_price": 11.0,
+                    "industry_name": "旧快照行业",
+                    "quote_trade_date": "2026-08-26",
+                    "quote_snapshot_at": "2026-08-26 14:59:59",
+                    "quote_status": "closed",
+                },
+                "snapshot_stale": False,
+            },
+        )
+
+        self.assertEqual(out["market"]["price"], 12.0)
+        self.assertEqual(out["industry"], "权威行业")
+
+    def test_stock_detail_overlay_does_not_invent_previous_close_without_evidence(self):
+        out = hot_data._apply_stock_detail_portfolio_context(
+            {
+                "market": {"price": 9.0, "pre_close": 8.8},
+                "quote_trade_date": "2026-08-25",
+            },
+            {
+                "row": {
+                    "stock_code": "000001",
+                    "shares": 0,
+                    "cur_price": "10.2",
+                    "price_change": "invalid",
+                    "quote_prev_close": None,
+                    "change_pct": None,
+                    "quote_trade_date": "2026-08-26",
+                    "quote_status": "closed",
+                },
+                "snapshot_stale": False,
+            },
+        )
+
+        self.assertEqual(out["market"]["price"], 10.2)
+        self.assertIsNone(out["market"]["pre_close"])
+
+    def test_stock_detail_portfolio_context_rejects_snapshot_error(self):
+        with patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value={
+                "data": [],
+                "error": "database unavailable",
+                "retryable": True,
+            },
+        ), patch(
+            "server.api.routers.hot_data.portfolio_holding_strategy",
+        ) as strategy_mock:
+            context = hot_data._stock_detail_portfolio_context("601606")
+
+        self.assertEqual(
+            context,
+            {
+                "unavailable": True,
+                "reason_code": "PORTFOLIO_SNAPSHOT_UNAVAILABLE",
+            },
+        )
+        strategy_mock.assert_not_called()
+
+    def test_stock_detail_watchlist_nonholding_gets_watch_advice_without_fake_position(self):
+        payload = {
+            "basic": {"short_name": "测试股"},
+            "market": {"price": 10.0},
+            "trade_date": "2026-08-11",
+            "requested_trade_date": "2026-08-26",
+            "quote_trade_date": "2026-08-11",
+            "flow_trade_date": "2026-08-11",
+        }
+        context = {
+            "row": {
+                "stock_code": "000001",
+                "shares": 0,
+                "cur_price": 11.0,
+                "quote_trade_date": "2026-08-26",
+                "quote_status": "closed",
+                "watch_analysis": {"operation_advice": "关注"},
+            },
+            "holding_strategy": None,
+        }
+
+        out = hot_data._apply_stock_detail_portfolio_context(payload, context)
+
+        self.assertTrue(out["watchlist_member"])
+        self.assertIsNone(out["holding"])
+        self.assertIsNone(out["holding_strategy"])
+        self.assertEqual(out["watch_analysis"]["operation_advice"], "关注")
+        self.assertEqual(out["market"]["price"], 11.0)
 
     def test_portfolio_analyze_exposes_ai_metadata(self):
         payload = {
@@ -1608,11 +2041,14 @@ class HotDataDetailHelperTest(unittest.TestCase):
     def test_stock_detail_uses_short_intraday_cache(self):
         cached = {"stock_code": "000001", "cached": True}
         with patch("server.api.routers.hot_data._portfolio_market_mode", return_value="intraday"), \
+             patch("server.api.routers.hot_data._stock_detail_portfolio_context", return_value={}), \
              patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=True), \
              patch("server.api.routers.hot_data._cache_get", return_value=cached) as cache_get_mock:
             out = hot_data.stock_detail("000001")
 
-        self.assertIs(out, cached)
+        self.assertEqual(out["stock_code"], cached["stock_code"])
+        self.assertTrue(out["cached"])
+        self.assertFalse(out["watchlist_member"])
         cache_get_mock.assert_called_once_with("stock_detail_000001_intraday", ttl_seconds=12)
 
     def test_recommended_stocks_uses_bounded_intraday_cache(self):

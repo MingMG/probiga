@@ -115,7 +115,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert "style.css?v=44" in index
-    assert "app.js?v=113" in index
+    assert "app.js?v=114" in index
     assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
     assert 'data-trading-view="candidates"' in index

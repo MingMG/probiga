@@ -3292,20 +3292,401 @@ def get_analysis_result(
         return {"date": "", "page": page, "page_size": page_size, "total": 0, "data": [], "error": str(e)}
 
 
+def _stock_detail_portfolio_context(stock_code: str) -> dict:
+    """Read the same watchlist truth used by ``/portfolio/live``.
+
+    The legacy stock-detail loader is intentionally broad and may lag the
+    lightweight watchlist quote plane.  A watchlist click must not therefore
+    lose the current quote, recorded position, or advisory holding strategy.
+    Failures stay local to this optional overlay so a general stock detail can
+    still load for securities that are not in the watchlist.
+    """
+
+    code = str(stock_code or "").strip().zfill(6)
+    try:
+        snapshot = _get_portfolio_snapshot(live_mode=True)
+        if not isinstance(snapshot, dict) or snapshot.get("error"):
+            return {
+                "unavailable": True,
+                "reason_code": "PORTFOLIO_SNAPSHOT_UNAVAILABLE",
+            }
+        if not isinstance(snapshot.get("data"), list):
+            return {
+                "unavailable": True,
+                "reason_code": "PORTFOLIO_SNAPSHOT_INVALID",
+            }
+        rows = list((snapshot or {}).get("data") or [])
+        row = next(
+            (
+                dict(item)
+                for item in rows
+                if str((item or {}).get("stock_code") or "").strip().zfill(6)
+                == code
+            ),
+            None,
+        )
+        if row is None:
+            return {}
+
+        snapshot_stale = bool((snapshot or {}).get("snapshot_stale"))
+        quote_status = str(row.get("quote_status") or "").lower()
+        quote_verified = not snapshot_stale and quote_status in {
+            "fresh",
+            "closed",
+        }
+        strategy_payload = (
+            {}
+            if quote_verified
+            else {
+                "status": "error",
+                "reason_code": "PORTFOLIO_QUOTE_UNVERIFIED",
+                "execution_authority": "ADVISORY_ONLY",
+            }
+        )
+        holding_strategy = None
+        if int(row.get("shares") or 0) > 0 and quote_verified:
+            strategy_cache_key = "stock_detail_holding_strategy_current"
+            strategy_payload = _cache_get(
+                strategy_cache_key,
+                ttl_seconds=_trading_live_ttl_seconds(
+                    60,
+                    intraday_seconds=12,
+                ),
+            )
+            if strategy_payload is None:
+                strategy_payload = portfolio_holding_strategy("")
+                if (
+                    isinstance(strategy_payload, dict)
+                    and strategy_payload.get("status") == "ok"
+                    and not strategy_payload.get("error")
+                ):
+                    _cache_set(strategy_cache_key, strategy_payload)
+            if not isinstance(strategy_payload, dict):
+                strategy_payload = {
+                    "status": "error",
+                    "reason_code": "HOLDING_STRATEGY_INVALID",
+                }
+            holding_strategy = next(
+                (
+                    dict(item)
+                    for item in (strategy_payload.get("data") or [])
+                    if str((item or {}).get("stock_code") or "")
+                    .strip()
+                    .zfill(6)
+                    == code
+                ),
+                None,
+            )
+        return {
+            "row": row,
+            "snapshot_stale": snapshot_stale,
+            "holding_strategy": holding_strategy,
+            "holding_strategy_context": {
+                key: strategy_payload.get(key)
+                for key in (
+                    "status",
+                    "trade_date",
+                    "knowledge_cutoff",
+                    "historical_read_only",
+                    "execution_authority",
+                    "decision_run_uid",
+                    "decision_data_date",
+                    "decision_session_date",
+                    "market_context",
+                    "reason_code",
+                    "error",
+                )
+                if key in strategy_payload
+            },
+        }
+    except Exception as exc:
+        _record_fallback("_stock_detail_portfolio_context", exc)
+        return {
+            "unavailable": True,
+            "reason_code": "PORTFOLIO_CONTEXT_UNAVAILABLE",
+        }
+
+
+def _stock_detail_quote_timestamp(value) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone(timedelta(hours=8)))
+    return moment.timestamp()
+
+
+def _apply_stock_detail_portfolio_context(
+    payload: dict,
+    context: dict | None,
+) -> dict:
+    """Overlay newer watchlist quote/position facts without faking missing data."""
+
+    result = dict(payload or {})
+    if (context or {}).get("unavailable") is True:
+        reason_code = str(
+            (context or {}).get("reason_code")
+            or "PORTFOLIO_CONTEXT_UNAVAILABLE"
+        )
+        result["watchlist_member"] = None
+        result["portfolio_context_status"] = "unavailable"
+        result["portfolio_snapshot_stale"] = True
+        result["watch_analysis"] = {}
+        result["holding_strategy"] = None
+        result["holding"] = None
+        result["holding_strategy_context"] = {
+            "status": "error",
+            "reason_code": reason_code,
+            "execution_authority": "ADVISORY_ONLY",
+        }
+        result["quote_is_stale"] = True
+        return result
+    row = dict((context or {}).get("row") or {})
+    if not row:
+        result["watchlist_member"] = False
+        result["portfolio_context_status"] = "not_in_watchlist"
+        result["watch_analysis"] = {}
+        result["holding_strategy"] = None
+        result["holding_strategy_context"] = {}
+        result["holding"] = None
+        return result
+
+    result["watchlist_member"] = True
+    result["portfolio_context_status"] = "ready"
+    result["portfolio_snapshot_stale"] = bool(
+        (context or {}).get("snapshot_stale")
+    )
+    result["watch_analysis"] = dict(row.get("watch_analysis") or {})
+    result["holding_strategy"] = (context or {}).get("holding_strategy")
+    result["holding_strategy_context"] = dict(
+        (context or {}).get("holding_strategy_context") or {}
+    )
+    result["holding"] = dict(row) if int(row.get("shares") or 0) > 0 else None
+
+    basic = dict(result.get("basic") or {})
+    display_name = (
+        row.get("display_name")
+        or row.get("current_name")
+        or row.get("short_name")
+    )
+    if display_name:
+        basic["short_name"] = display_name
+        if "short_name" in result:
+            result["short_name"] = display_name
+    result["basic"] = basic
+    if row.get("industry_name") and not result.get("industry"):
+        result["industry"] = row.get("industry_name")
+
+    portfolio_quote_date = str(
+        row.get("quote_trade_date") or row.get("quote_snapshot_at") or ""
+    )[:10]
+    payload_quote_date = str(
+        result.get("quote_trade_date") or result.get("trade_date") or ""
+    )[:10]
+    portfolio_quote_status = str(row.get("quote_status") or "").lower()
+    portfolio_quote_verified = (
+        not bool((context or {}).get("snapshot_stale"))
+        and portfolio_quote_status in {"fresh", "closed"}
+    )
+    portfolio_quote_moment = _stock_detail_quote_timestamp(
+        row.get("quote_snapshot_at")
+    )
+    payload_quote_moment = _stock_detail_quote_timestamp(
+        result.get("quote_snapshot_at")
+    )
+    portfolio_price = _as_float(row.get("cur_price"))
+    portfolio_change = _as_float(row.get("price_change"))
+    portfolio_pre_close_fact = _as_float(row.get("quote_prev_close"))
+    portfolio_change_pct = _as_float(row.get("change_pct"))
+    same_day_moment_is_newer = bool(
+        portfolio_quote_date != payload_quote_date
+        or portfolio_quote_moment is None
+        or payload_quote_moment is None
+        or portfolio_quote_moment >= payload_quote_moment
+    )
+    quote_is_at_least_as_new = bool(
+        portfolio_quote_verified
+        and portfolio_quote_date
+        and (
+            not payload_quote_date
+            or portfolio_quote_date >= payload_quote_date
+        )
+        and same_day_moment_is_newer
+        and portfolio_price is not None
+        and portfolio_price > 0
+    )
+    if quote_is_at_least_as_new:
+        market = dict(result.get("market") or {})
+        has_previous_close_evidence = any(
+            value is not None
+            for value in (
+                portfolio_change,
+                portfolio_pre_close_fact,
+                portfolio_change_pct,
+            )
+        )
+        portfolio_prev_close = (
+            _portfolio_prev_close(
+                portfolio_price,
+                portfolio_change,
+                portfolio_pre_close_fact,
+                portfolio_change_pct,
+            )
+            if has_previous_close_evidence
+            else None
+        )
+        quote_fields = {
+            "price": portfolio_price,
+            "close": portfolio_price,
+            "change": portfolio_change,
+            "change_pct": portfolio_change_pct,
+            "pre_close": portfolio_prev_close,
+            "volume": row.get("quote_volume"),
+            "amount": row.get("quote_amount"),
+        }
+        for key, value in quote_fields.items():
+            if value is not None:
+                market[key] = value
+        if portfolio_quote_date > payload_quote_date:
+            # The compact quote plane does not publish OHLC/turnover.  Clearing
+            # older values is safer than presenting a mixed-date market row.
+            for key in (
+                "open",
+                "high",
+                "low",
+                "turnover_ratio",
+                "pre_close",
+            ):
+                market[key] = None
+            if portfolio_prev_close is not None:
+                market["pre_close"] = round(portfolio_prev_close, 4)
+            result["technical"] = {}
+            result["technical_trade_date"] = payload_quote_date
+            result["technical_is_stale"] = True
+        price = _as_float(market.get("price"))
+        total_shares = _as_float(market.get("total_shares"))
+        float_shares = _as_float(market.get("float_shares"))
+        if price is not None and total_shares:
+            market["market_cap"] = round(price * total_shares, 2)
+        if price is not None and float_shares:
+            market["float_market_cap"] = round(price * float_shares, 2)
+        result["market"] = market
+        result["trade_date"] = portfolio_quote_date
+        if "date" in result:
+            result["date"] = portfolio_quote_date
+        result["quote_trade_date"] = portfolio_quote_date
+        result["quote_source"] = row.get("quote_source") or "portfolio_snapshot"
+        result["quote_status"] = row.get("quote_status") or ""
+        result["quote_snapshot_at"] = row.get("quote_snapshot_at") or ""
+        result["quote_age_seconds"] = row.get("quote_age_seconds")
+        detail_source = str(result.get("detail_source") or "stock_detail")
+        overlay_prefix = "portfolio_snapshot_overlay+"
+        while detail_source.startswith(overlay_prefix):
+            detail_source = detail_source[len(overlay_prefix):]
+        result["detail_source"] = overlay_prefix + detail_source
+
+        finance_latest = dict((result.get("finance") or {}).get("latest") or {})
+        valuation = dict(result.get("valuation") or {})
+        eps = _as_float(finance_latest.get("basic_eps"))
+        bvps = _as_float(finance_latest.get("net_asset_ps"))
+        if price is not None:
+            valuation["pe_ttm"] = (
+                round(price / eps, 2) if eps is not None and eps > 0 else None
+            )
+            valuation["pb"] = (
+                round(price / bvps, 2)
+                if bvps is not None and bvps > 0
+                else None
+            )
+        result["valuation"] = valuation
+
+    portfolio_flow_date = str(
+        row.get("flow_trade_date") or row.get("flow_latest_time") or ""
+    )[:10]
+    payload_flow_date = str(result.get("flow_trade_date") or "")[:10]
+    flow_status = str(row.get("flow_status") or "").lower()
+    if (
+        not bool((context or {}).get("snapshot_stale"))
+        and portfolio_flow_date
+        and (not payload_flow_date or portfolio_flow_date >= payload_flow_date)
+        and flow_status in {"fresh", "closed"}
+    ):
+        capital = dict(result.get("capital") or {})
+        today = dict(capital.get("today") or {})
+        for key in (
+            "main_net_inflow",
+            "max_net_inflow",
+            "lg_net_inflow",
+            "mid_net_inflow",
+            "sm_net_inflow",
+        ):
+            today[key] = row.get(key)
+        today["data_source"] = row.get("flow_source") or "portfolio_snapshot"
+        capital["today"] = today
+        if portfolio_flow_date > payload_flow_date:
+            for key in ("flow_3d", "flow_5d", "flow_20d"):
+                capital[key] = None
+        result["capital"] = capital
+        result["flow_trade_date"] = portfolio_flow_date
+        result["flow_status"] = flow_status
+        result["flow_source"] = row.get("flow_source") or ""
+        result["flow_latest_time"] = row.get("flow_latest_time") or ""
+
+    return result
+
+
+def _stock_detail_staleness(result: dict) -> dict:
+    output = dict(result or {})
+    requested_trade_date = str(output.get("requested_trade_date") or "")[:10]
+    quote_trade_date = str(output.get("quote_trade_date") or "")[:10]
+    flow_trade_date = str(output.get("flow_trade_date") or "")[:10]
+    analysis_trade_date = str(output.get("analysis_trade_date") or "")[:10]
+    output["quote_is_stale"] = bool(
+        (requested_trade_date and quote_trade_date and quote_trade_date < requested_trade_date)
+        or str(output.get("quote_status") or "").lower()
+        in {"missing", "stale", "previous_close"}
+        or output.get("portfolio_snapshot_stale") is True
+    )
+    output["flow_is_stale"] = bool(
+        (requested_trade_date and flow_trade_date and flow_trade_date < requested_trade_date)
+        or str(output.get("flow_status") or "").lower() in {"missing", "stale"}
+    )
+    output["analysis_is_stale"] = bool(
+        requested_trade_date
+        and analysis_trade_date
+        and analysis_trade_date < requested_trade_date
+    )
+    return output
+
+
 @router.get("/hot-data/stock-detail")
 def stock_detail(stock_code: str = Query()):
     """个股详情：7大模块投资决策数据"""
     code = stock_code.strip().zfill(6)
     mode = _portfolio_market_mode()
+    portfolio_context = _stock_detail_portfolio_context(code)
     cache_key = f"stock_detail_{code}_{mode}"
-    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=12))
+    cached = _cache_get(
+        cache_key,
+        ttl_seconds=_trading_live_ttl_seconds(60, intraday_seconds=12),
+    )
     if cached is not None:
-        return cached
+        return _stock_detail_staleness(
+            _apply_stock_detail_portfolio_context(cached, portfolio_context)
+        )
     try:
         try:
             payload = _load_stock_detail_payload(code, mode=mode, light=True)
         except Exception:
             payload = _load_stock_detail_payload(code, mode=mode, light=False)
+        payload = _apply_stock_detail_portfolio_context(
+            payload,
+            portfolio_context,
+        )
         basic = payload.get("basic") or {}
         market = payload.get("market") or {}
         capital = payload.get("capital") or {}
@@ -3364,6 +3745,18 @@ def stock_detail(stock_code: str = Query()):
             "recommendation_snapshot": recommendation_snapshot,
             "ai_analysis": ai_analysis,
             "holding": holding,
+            "watchlist_member": payload.get("watchlist_member"),
+            "portfolio_context_status": payload.get(
+                "portfolio_context_status"
+            ) or "",
+            "watch_analysis": payload.get("watch_analysis") or {},
+            "holding_strategy": payload.get("holding_strategy"),
+            "holding_strategy_context": payload.get(
+                "holding_strategy_context"
+            ) or {},
+            "portfolio_snapshot_stale": bool(
+                payload.get("portfolio_snapshot_stale")
+            ),
             "mode": mode,
             "data_mode_label": data_mode_label,
             "date": trade_date,
@@ -3372,11 +3765,20 @@ def stock_detail(stock_code: str = Query()):
             "flow_trade_date": flow_trade_date,
             "analysis_trade_date": analysis_trade_date,
             "quote_source": payload.get("quote_source") or "",
+            "quote_status": payload.get("quote_status") or "",
+            "quote_snapshot_at": payload.get("quote_snapshot_at") or "",
+            "quote_age_seconds": payload.get("quote_age_seconds"),
             "detail_source": payload.get("detail_source") or "",
-            "quote_is_stale": bool(requested_trade_date and quote_trade_date and quote_trade_date < requested_trade_date),
-            "flow_is_stale": bool(requested_trade_date and flow_trade_date and flow_trade_date < requested_trade_date),
-            "analysis_is_stale": bool(requested_trade_date and analysis_trade_date and analysis_trade_date < requested_trade_date),
+            "flow_status": payload.get("flow_status") or "",
+            "flow_source": payload.get("flow_source") or "",
+            "flow_latest_time": payload.get("flow_latest_time") or "",
+            "technical_trade_date": payload.get("technical_trade_date") or "",
+            "technical_is_stale": bool(payload.get("technical_is_stale")),
+            "quote_is_stale": False,
+            "flow_is_stale": False,
+            "analysis_is_stale": False,
         }
+        result = _stock_detail_staleness(result)
         if not result.get("error"):
             _cache_set(cache_key, result)
         return result
@@ -6380,6 +6782,9 @@ def _invalidate_portfolio_snapshot_cache() -> None:
         _portfolio_snapshot_generation += 1
         _cache_store.pop("portfolio_snapshot", None)
         _portfolio_completed_force_requests.clear()
+    # Stock-detail results and their short-lived shared holding-strategy overlay
+    # must never retain an old position/action after a portfolio mutation.
+    _cache_drop_prefix("stock_detail_")
 
 
 def _invalidate_market_runtime_caches() -> None:

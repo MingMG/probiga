@@ -3704,6 +3704,59 @@
         return '<button class="sc-mini-btn" onclick="window._strategyFundingDetail(\'' + normalizedType + '\',\'' + escAttr(key || '') + '\',60,\'daily_records\',\'\')">查看资金明细</button>';
     }
 
+    function strategyPaperExecutionPlanHtml(governance) {
+        governance = governance || {};
+        var title = '<div class="sc-section-title"><span>个股级模拟执行计划</span><small>资金分配继续落实到单票；单票、权威一级行业、组合相关性、预期损失和新增买入换手超限的额度自动留在现金，退出不受新增买入上限阻挡</small></div>';
+        var mode = String(governance.strategy_governance_mode || '').toUpperCase();
+        var resultMode = String(governance.result_mode || '').toUpperCase();
+        var deferred = mode === 'DEFERRED_DB' || governance.activation_enabled === false;
+        if (deferred) {
+            return title + '<div class="sc-warning" data-execution-plan-state="blocked"><strong>规范执行计划不可用</strong>：' + escHtml(governance.input_reason || '治理数据库迁移尚未完成') + '。当前保持 100% 现金并禁止新增买入；这不是一个已经验证的“0只空仓”结论。<small>阻断阶段 ' + escHtml(governance.blocking_stage || 'DATABASE_MIGRATION') + ' · 原因 ' + escHtml(governance.reason_code || 'GOVERNANCE_DATABASE_DEFERRED') + '</small></div>';
+        }
+
+        var plan = governance.paper_execution_plan;
+        var targets = plan && Array.isArray(plan.targets) ? plan.targets : null;
+        var exits = plan && Array.isArray(plan.exit_targets) ? plan.exit_targets : null;
+        var planHash = plan && String(plan.plan_hash || '');
+        var topHash = String(governance.paper_execution_plan_hash || '');
+        var canonical = governance.is_canonical === true && resultMode === 'CANONICAL_PERSISTED';
+        var planRowsSafe = targets && targets.every(function (row) {
+            return row && typeof row === 'object' && row.allocation_backed === true && row.new_buy_allowed === true && row.exit_always_allowed === true && row.real_order_authority === false;
+        });
+        var exitRowsSafe = exits && exits.every(function (row) {
+            return row && typeof row === 'object' && row.new_buy_allowed === false && row.exit_always_allowed === true && row.real_order_authority === false;
+        });
+        var weightsValid = plan && Number(plan.invested_bp) >= 0 && Number(plan.cash_bp) >= 0 && Number(plan.invested_bp) + Number(plan.cash_bp) === 10000;
+        var valid = canonical && plan && typeof plan === 'object' && plan.schema === 'probiga.governance-paper-execution-plan.v1' && targets && exits && planHash && planHash === topHash && plan.automatic_real_order_submission === false && plan.real_order_authority === false && governance.automatic_real_order_submission === false && governance.real_order_authority === false && Number(plan.target_count) === targets.length && planRowsSafe && exitRowsSafe && weightsValid;
+        if (!valid) {
+            return title + '<div class="sc-warning" data-execution-plan-state="unavailable"><strong>规范执行计划不可用</strong>：' + escHtml(governance.input_reason || '当前结果未通过规范身份、计划哈希或权限边界校验') + '。页面不会把研究候选升级为执行目标，也不会把缺失计划显示成有效空仓。<small>结果 ' + escHtml(resultMode || 'UNKNOWN') + ' · 阶段 ' + escHtml(governance.blocking_stage || 'CANONICAL_READ') + ' · 原因 ' + escHtml(governance.reason_code || 'PAPER_PLAN_UNAVAILABLE') + '</small></div>';
+        }
+
+        var risk = plan.portfolio_risk || {};
+        var h = title + '<div class="sc-governance-notice" data-execution-plan-state="canonical"><strong>计划摘要</strong><span>' + targets.length + ' 只 · 模拟风险资产 ' + strategyGovernanceMetric(Number(plan.invested_bp) / 100, '%', 1) + ' · 现金 ' + strategyGovernanceMetric(Number(plan.cash_bp) / 100, '%', 1) + ' · 年化波动 ' + strategyGovernanceMetric(risk.annualized_volatility_pct, '%', 2) + ' · 日度ES(95%) ' + strategyGovernanceMetric(risk.expected_shortfall_95_pct, '%', 2) + ' · 真实下单权限关闭</span><small>交易日 ' + escHtml(plan.trade_date || governance.trade_date || '-') + ' · 计划哈希 ' + escHtml(planHash.slice(0, 16)) + '</small></div>';
+        if (!targets.length && !exits.length) {
+            return h + '<div class="sc-governance-notice"><strong>规范空计划已验证</strong><span>本轮没有新增、调仓或退出目标；现金比例和权限边界已经通过规范批次校验。</span></div>';
+        }
+        if (targets.length) {
+            h += '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>证券/行业</th><th>策略/版本</th><th>资金归属</th><th>目标/原权重</th><th>新增买入</th><th>参考价/整手数</th><th>机会/执行分</th><th>盈亏比/止损</th><th>两档止盈</th><th>权限</th></tr></thead><tbody>';
+            targets.forEach(function (row) {
+                var allocation = String(row.allocation_target_type || '-') + ' · ' + String(row.allocation_target_key || '-') + (row.allocation_target_version ? ' · ' + String(row.allocation_target_version) : '');
+                h += '<tr><td><strong>' + escHtml(row.stock_name || row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_code || '-') + ' · ' + escHtml(row.industry_name || '行业待确认') + '</small></td><td>' + escHtml(row.strategy_key || '-') + '<small>' + escHtml(row.strategy_version || '-') + '</small></td><td class="sc-wrap">' + escHtml(allocation) + '</td><td>' + strategyGovernanceMetric(Number(row.target_bp || 0) / 100, '%', 2) + '<small>原 ' + strategyGovernanceMetric(Number(row.previous_target_bp || 0) / 100, '%', 2) + '</small></td><td>' + strategyGovernanceMetric(Number(row.new_buy_delta_bp || 0) / 100, '%', 2) + '</td><td>' + strategyGovernanceMetric(row.reference_price, '', 4) + '<small>' + escHtml(row.reference_board_lot_quantity == null ? '-' : String(row.reference_board_lot_quantity) + ' 股') + ' · 仅参考，OMS重算</small></td><td>' + strategyGovernanceMetric(row.opportunity_score, '', 1) + ' / ' + strategyGovernanceMetric(row.execution_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.planned_risk_reward_ratio, '', 2) + '<small>止损 ' + strategyGovernanceMetric(row.stop_loss_price, '', 4) + '</small></td><td>' + strategyGovernanceMetric(row.take_profit_1, '', 4) + '<small>' + strategyGovernanceMetric(row.take_profit_2, '', 4) + '</small></td><td><span class="sc-gate-result pass">仅模拟</span><small>新增买入允许 · 退出始终允许 · 真实下单关闭</small></td></tr>';
+            });
+            h += '</tbody></table></div>';
+        } else {
+            h += '<div class="sc-governance-notice"><strong>本轮无新增或持有目标</strong><span>规范批次有效；请继续查看下方退出计划。</span></div>';
+        }
+        if (exits.length) {
+            h += '<div class="sc-section-title"><span>退出目标</span><small>退出不受新增买入换手上限阻挡；所有行仍为模拟建议，不授予真实下单权限</small></div><div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>证券</th><th>原权重 → 目标</th><th>动作</th><th>退出权限</th><th>新增买入</th><th>真实下单</th></tr></thead><tbody>';
+            exits.forEach(function (row) {
+                h += '<tr><td><strong>' + escHtml(row.stock_code || '-') + '</strong></td><td>' + strategyGovernanceMetric(Number(row.previous_target_bp || 0) / 100, '%', 2) + ' → 0.00%</td><td>' + escHtml(row.action === 'EXIT_OR_REDUCE_ONLY' ? '仅退出或减仓' : row.action || '-') + '</td><td><span class="sc-gate-result pass">始终允许退出</span></td><td>禁止</td><td>关闭</td></tr>';
+            });
+            h += '</tbody></table></div>';
+        }
+        return h;
+    }
+
     function strategyGovernanceHtml(governance, history) {
         governance = governance || {};
         history = history || {};
@@ -3784,7 +3837,7 @@
             var strategyRankHtml = officialStrategyRank == null ? '<strong>未入榜</strong>' : '<strong>' + escHtml(officialStrategyRankBasis) + ' #' + Number(officialStrategyRank) + '</strong>';
             h += '<tr><td>' + strategyRankHtml + '<small>' + escHtml(row.lane || '-') + '</small></td><td><strong>' + escHtml(row.strategy_name || row.strategy_key) + '</strong><small>' + escHtml(row.strategy_key || '-') + ' · ' + escHtml(row.current_version || '-') + '</small></td><td>' + strategyExecutionAdapterSummary(row) + '</td><td>' + strategyIndustryFocusSummary(row) + '</td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td>' + strategyCompetitionScoreSummary(row) + '</td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + strategyFundingDetailButton(row, 'STRATEGY') + '</td><td>' + strategyGovernanceMetric(m.completed_trades, '', 0) + '笔<small>' + strategyGovernanceMetric(m.coverage_days, '', 0) + '日</small></td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'win_rate_pct'), '%', 1) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'net_expectancy_pct'), '%', 3) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'payoff_ratio'), '', 2) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'profit_factor'), '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '内部日频组合权益' : '交易序列诊断') + '</small></td><td><span class="sc-gate-result ' + (strategyAdmissionReady ? 'pass' : (paperChainStructureReady && adapterExecutable ? 'pending' : 'fail')) + '">' + (strategyAdmissionReady ? '盈利、执行、成熟资金证据与行情均通过' : (!fundingPipelineReady && adapterExecutable && paperChainStructureReady ? '模拟链结构已就绪，证据积累中' : (!fundingPipelineReady && adapterExecutable ? '模拟链校验失败' : '继续验证/当前不路由'))) + '</span><small>' + escHtml(row.profit_gate_reason || row.recommendation_reason || '-') + '</small>' + (evidenceBlocks ? '<small>证据账本阻断：' + escHtml(evidenceBlocks) + '</small>' : '') + '<small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small></td><td class="sc-wrap">' + escHtml((row.recovery_conditions || []).join('；') || '-') + '</td><td>' + strategyGovernanceActions(row, 'STRATEGY') + '</td></tr>';
         });
-        if (!strategies.length) h += '<tr><td colspan="16" class="sc-empty-cell">尚无已注册策略</td></tr>';
+        if (!strategies.length) h += '<tr><td colspan="16" class="sc-empty-cell">' + (governanceDeferred ? '治理数据库门禁未完成，已登记策略暂不进入规范展示' : '尚无已注册策略') + '</td></tr>';
         h += '</tbody></table></div>';
 
         h += '<div class="sc-section-title"><span>冠军 / 挑战者策略工厂</span><small>策略公式不在原版本上热改；客户端产物先冻结，服务器重算结构与哈希，复核通过最多晋级为无资金影子版本，不能证明权威行情来源</small></div><div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>提交时间</th><th>策略</th><th>冠军 → 挑战者</th><th>状态</th><th>客户端声明样本外门槛</th><th>操作</th></tr></thead><tbody>';
@@ -3817,7 +3870,7 @@
             if (officialCombinationScore == null) combinationScoreHtml += '<small>成员参考 ' + strategyGovernanceMetric(row.provisional_member_reference_score, '', 1) + '，不参与正式排名</small>';
             h += '<tr><td>' + combinationRankHtml + '<small>' + escHtml(row.lane || '-') + '</small></td><td><strong>' + escHtml(row.combination_name || row.combination_key) + '</strong><small>' + escHtml(row.current_version || '-') + '</small></td><td><span class="sc-life ' + strategyLifecycleTone(row.current_status) + '">' + escHtml(strategyLifecycleLabel(row.current_status)) + '</span><small>' + escHtml(row.status_reason || '-') + '</small></td><td>' + combinationScoreHtml + '</td><td class="sc-window-cell">' + strategyGovernanceWindowSummary(row) + strategyFundingDetailButton(row, 'COMBINATION') + '</td><td class="sc-wrap">' + escHtml(members || '-') + sleeveDetails + strategyCombinationRecipeSummary(row) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'win_rate_pct'), '%', 1) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'net_expectancy_pct'), '%', 3) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'payoff_ratio'), '', 2) + '</td><td>' + strategyGovernanceMetric(strategyGovernanceMetricValue(row, m, 'profit_factor'), '', 2) + '</td><td>' + strategyGovernanceMetric(m.max_drawdown_pct, '%', 2) + '<small>' + (m.drawdown_basis === 'internal_version_bound_portfolio_equity' ? '成员事实链复算净值' : '交易序列诊断') + '</small></td><td class="sc-wrap">' + strategyCombinationConstraintSummary(row) + '</td><td><span class="sc-gate-result ' + (row.paper_allocation_eligible ? 'pass' : 'fail') + '">' + (row.paper_allocation_eligible ? '可获模拟资金' : '继续验证/当前不路由') + '</span><small>' + escHtml(row.gate_reason || '-') + '</small><small>行情路由：' + escHtml(row.market_route_reason || '-') + '</small><small>恢复条件：' + escHtml((row.recovery_conditions || []).join('；') || '-') + '</small></td><td>' + strategyGovernanceActions(row, 'COMBINATION') + '</td></tr>';
         });
-        if (!combinations.length) h += '<tr><td colspan="14" class="sc-empty-cell">尚无组合策略</td></tr>';
+        if (!combinations.length) h += '<tr><td colspan="14" class="sc-empty-cell">' + (governanceDeferred ? '治理数据库门禁未完成，已登记组合暂不进入规范展示' : '尚无组合策略') + '</td></tr>';
         h += '</tbody></table></div>';
 
         h += '<div class="sc-section-title"><span>今日分层票池</span><small>观察池用于展示可审计研究候选且允许为空；确认池等待价格与数据；模拟可交易池允许为空且不代表真实下单 · ' + escHtml(tradingGateLabel) + ' · 风险上限 ' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</small></div>';
@@ -3826,10 +3879,7 @@
         h += '<div class="sc-section-title"><span>模拟资金分配</span><small>只分配给通过盈利硬门槛且适配当前市场的策略或组合；组合逐成员展示基础、生效及留现金袖套</small></div><div class="sc-allocation-grid">';
         allocations.forEach(function (row) { h += '<div class="' + (row.target_type === 'CASH' ? 'cash' : 'risk') + '"><strong>' + escHtml(row.name || row.target_key) + '</strong><b>' + strategyGovernanceMetric(row.simulated_weight_pct, '%', 1) + '</b><span>' + escHtml(row.reason || '-') + '</span>' + strategyMemberSleevesSummary(row) + '</div>'; });
         h += '</div>';
-        var paperPlan = governance.paper_execution_plan || {};
-        var paperRisk = paperPlan.portfolio_risk || {};
-        h += '<div class="sc-section-title"><span>个股级模拟执行计划</span><small>资金分配继续落实到单票；单票、权威一级行业、组合相关性、预期损失和新增买入换手超限的额度自动留在现金，退出不受新增买入上限阻挡</small></div>';
-        h += '<div class="sc-governance-notice"><strong>计划摘要</strong><span>' + Number(paperPlan.target_count || 0) + ' 只 · 模拟风险资产 ' + strategyGovernanceMetric(Number(paperPlan.invested_bp || 0) / 100, '%', 1) + ' · 现金 ' + strategyGovernanceMetric(Number(paperPlan.cash_bp == null ? 10000 : paperPlan.cash_bp) / 100, '%', 1) + ' · 年化波动 ' + strategyGovernanceMetric(paperRisk.annualized_volatility_pct, '%', 2) + ' · 日度ES(95%) ' + strategyGovernanceMetric(paperRisk.expected_shortfall_95_pct, '%', 2) + ' · 真实下单权限关闭</span></div>';
+        h += strategyPaperExecutionPlanHtml(governance);
 
         var adapterRunReceipts = Array.isArray(history.adapter_run_receipts) ? history.adapter_run_receipts : [];
         h += '<div class="sc-section-title"><span>动态适配器运行回执</span><small>零候选也单独留档；运行号和完成时间只用于审计，不改变同日权威决策哈希</small></div>';
@@ -7230,6 +7280,80 @@
         }).catch(function () { body.innerHTML = '<div class="loading">加载失败</div>'; });
     };
 
+    function stockDetailStrategyRange(plan) {
+        plan = plan || {};
+        var range = plan.range || {};
+        if (range.low == null && range.high == null) return '-';
+        if (range.low != null && range.high != null && Number(range.low) !== Number(range.high)) {
+            return fmtPrice(range.low) + ' - ' + fmtPrice(range.high);
+        }
+        return fmtPrice(range.low != null ? range.low : range.high);
+    }
+
+    function stockDetailStrategyReason(reason) {
+        var text = localizeMachineText(reason || '');
+        return text
+            .replace(/latest price ([0-9.]+) invalidated MA20 trend stop ([0-9.]+)/i, '最新价 $1 跌破 MA20 趋势保护位 $2')
+            .replace(/latest price ([0-9.]+) breached stop loss ([0-9.]+)/i, '最新价 $1 跌破止损位 $2')
+            .replace(/latest price ([0-9.]+) breached trend stop ([0-9.]+)/i, '最新价 $1 跌破趋势止损位 $2')
+            .replace(/latest price ([0-9.]+) breached reduction line ([0-9.]+)/i, '最新价 $1 跌破减仓观察位 $2')
+            .replace(/persisted strategy signal is 卖出提醒/i, '已持久化策略信号触发卖出提醒')
+            .replace(/persisted strategy signal is REDUCE/i, '已持久化策略信号触发减仓')
+            .replace(/no cutoff-eligible recommendation row/i, '截止时点没有可用的推荐证据')
+            .replace(/no cutoff-eligible analysis row/i, '截止时点没有可用的分析证据')
+            .replace(/no cutoff-eligible holding price/i, '截止时点没有可用的持仓价格');
+    }
+
+    function renderStockDetailExecutionStrategy(d) {
+        d = d || {};
+        var strategy = d.holding_strategy;
+        var watch = d.watch_analysis || {};
+        var holding = d.holding || {};
+        var context = d.holding_strategy_context || {};
+        var contextReason = String(context.reason_code || '');
+        var quoteUnavailable = contextReason === 'PORTFOLIO_QUOTE_UNVERIFIED';
+        var contextUnavailable = contextReason.indexOf('PORTFOLIO_') === 0 || d.portfolio_context_status === 'unavailable';
+        if (d.watchlist_member !== true && !contextUnavailable) return '';
+        var h = '<section id="stockDetailExecutionStrategy" style="border:1px solid #dbe4f0;background:#f8fbff;border-radius:10px;padding:14px 16px;margin-bottom:16px">';
+        h += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:12px"><div><div style="font-size:14px;font-weight:800;color:#172033">当前执行策略</div><div style="font-size:11px;color:#64748b;margin-top:3px">自选持仓连续策略 · 仅供决策参考，不会自动下单</div></div>';
+        if (quoteUnavailable) {
+            h += '<span style="background:#b45309;color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">动作冻结</span></div>';
+            h += '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:11px 12px;color:#9a3412;font-size:13px;line-height:1.7"><strong>持仓信息已读取，但行情时效或完整性未通过校验。</strong> 页面不会基于未验证价格生成或复用买卖动作。' + (d.portfolio_snapshot_stale ? '<br>当前持仓来自最近一次缓存快照，请刷新后再复核。' : '') + '<br>状态：' + escHtml(contextReason) + '</div>';
+        } else if (contextUnavailable) {
+            h += '<span style="background:#b45309;color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">校验失败</span></div>';
+            h += '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:11px 12px;color:#9a3412;font-size:13px;line-height:1.7"><strong>自选与持仓状态暂时无法校验，执行策略不可用。</strong> 页面已清除缓存中的旧持仓和旧动作，不会把历史策略当成当前策略。<br>状态：' + escHtml(context.reason_code || 'PORTFOLIO_CONTEXT_UNAVAILABLE') + '</div>';
+        } else if (strategy) {
+            var intent = String(strategy.exit_intent || 'WAIT_DATA').toUpperCase();
+            var actionColor = intent === 'SELL' ? '#b91c1c' : (intent === 'REDUCE' || intent === 'WAIT_DATA' ? '#b45309' : '#166534');
+            var sellPlan = strategy.sell_plan || {};
+            var emergency = strategy.emergency_exit || {};
+            h += '<span style="background:' + actionColor + ';color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">' + escHtml(strategy.action || '等待数据') + '</span></div>';
+            h += '<div style="font-size:13px;line-height:1.7;color:#334155;margin-bottom:12px"><strong>判断依据：</strong>' + escHtml(stockDetailStrategyReason(strategy.reason || '证据不足，暂不形成动作')) + '</div>';
+            h += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px;margin-bottom:10px">';
+            h += '<div style="background:#fff;border:1px solid #e5eaf1;border-radius:8px;padding:10px"><small style="color:#64748b">持仓 / 可卖</small><strong style="display:block;margin-top:4px">' + escHtml(String(strategy.shares == null ? holding.shares || 0 : strategy.shares)) + ' / ' + escHtml(String(strategy.sellable_shares == null ? '-' : strategy.sellable_shares)) + ' 股</strong></div>';
+            h += '<div style="background:#fff;border:1px solid #e5eaf1;border-radius:8px;padding:10px"><small style="color:#64748b">卖出计划</small><strong style="display:block;margin-top:4px">' + escHtml(stockDetailStrategyRange(sellPlan)) + '</strong><span style="display:block;color:#64748b;font-size:11px;margin-top:3px">' + escHtml(sellPlan.label || '-') + '</span></div>';
+            h += '<div style="background:#fff;border:1px solid #e5eaf1;border-radius:8px;padding:10px"><small style="color:#64748b">紧急退出位</small><strong style="display:block;margin-top:4px;color:' + (emergency.direct ? '#b91c1c' : '#172033') + '">' + escHtml(emergency.price == null ? '-' : fmtPrice(emergency.price)) + '</strong><span style="display:block;color:#64748b;font-size:11px;margin-top:3px">' + escHtml(emergency.label || '-') + '</span></div>';
+            h += '<div style="background:#fff;border:1px solid #e5eaf1;border-radius:8px;padding:10px"><small style="color:#64748b">浮动盈亏</small><strong style="display:block;margin-top:4px">' + escHtml(strategy.pnl_pct == null ? '-' : pct(strategy.pnl_pct)) + '</strong><span style="display:block;color:#64748b;font-size:11px;margin-top:3px">成本 ' + escHtml(strategy.cost_price == null ? '-' : fmtPrice(strategy.cost_price)) + ' / 现价 ' + escHtml(strategy.latest_price == null ? '-' : fmtPrice(strategy.latest_price)) + '</span></div>';
+            h += '</div>';
+            h += '<div style="background:#eef4ff;border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.7;color:#334155"><strong>下一交易日：</strong>' + escHtml(strategy.next_session_plan || '收盘后重新评估') + '<br><strong>买入权限：</strong>' + escHtml(((strategy.buy_plan || {}).label) || '持仓策略默认不加仓') + '</div>';
+            if (strategy.market_context_status && String(strategy.market_context_status).toUpperCase() !== 'READY') {
+                h += '<div style="margin-top:8px;color:#b45309;font-size:12px"><strong>市场数据门禁：</strong>' + escHtml(strategy.market_context_reason || strategy.market_context_status) + '</div>';
+            }
+            h += '<div style="margin-top:9px;color:#64748b;font-size:11px">策略时点 ' + escHtml(strategy.knowledge_cutoff || strategy.evaluated_at || '-') + ' · 行情日 ' + escHtml(strategy.price_trade_date || d.quote_trade_date || '-') + ' · 权限 ' + escHtml(strategy.execution_authority || context.execution_authority || 'ADVISORY_ONLY') + '</div>';
+        } else if (Number(holding.shares || 0) > 0) {
+            h += '<span style="background:#b45309;color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">等待数据</span></div>';
+            h += '<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:11px 12px;color:#9a3412;font-size:13px;line-height:1.7"><strong>持仓执行策略暂不可用。</strong> 当前不会沿用旧 AI 建议形成持有或加仓动作；已知硬止损仍应优先复核。' + (context.reason_code ? '<br>状态：' + escHtml(context.reason_code) : '') + '</div>';
+        } else if (watch.operation_advice) {
+            h += '<span style="background:#475569;color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">' + escHtml(watch.operation_advice) + '</span></div>';
+            h += '<div style="font-size:13px;line-height:1.7;color:#334155"><strong>未持仓盯盘建议：</strong>' + escHtml(watch.operation_advice) + '；趋势 ' + escHtml(watch.trend || '-') + '，资金 ' + escHtml(watch.funds || '-') + '，热度 ' + escHtml(watch.heat || '-') + '。<br><strong>风险提示：</strong>' + escHtml(watch.risk_tip || '暂无明显风险') + '。该建议不构成买入授权。</div>';
+            h += '<div style="margin-top:9px;color:#64748b;font-size:11px">数据时刻 ' + escHtml(((watch.data_quality || {}).quote_time) || d.quote_snapshot_at || d.quote_trade_date || '-') + '</div>';
+        } else {
+            h += '<span style="background:#b45309;color:#fff;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:700">不可用</span></div>';
+            h += '<div style="color:#9a3412;font-size:13px">当前自选股策略数据不可用，页面不会用旧分析冒充今日执行策略。</div>';
+        }
+        return h + '</section>';
+    }
+
     function renderStockDetail(body, d) {
         var m = d.market || {};
         var cap = d.capital || {};
@@ -7272,6 +7396,8 @@
             h += '<div style="text-align:center"><div style="font-size:10px;color:#aaa">盈亏比例</div><div style="font-size:16px;font-weight:700;color:' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + pnl + '%</div></div>';
             h += '</div>';
         }
+
+        h += renderStockDetailExecutionStrategy(d);
 
         // ── 七、AI投资分析（置顶）──
         // 原格式：显示 DeepSeek 生成的详细分析

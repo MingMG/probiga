@@ -13,7 +13,7 @@ def test_strategy_governance_has_a_dedicated_navigation_page():
     assert "🏆 动态策略竞技场" in index
     assert "旧候选中心（研究）" not in index
     assert "style.css?v=44" in index
-    assert "app.js?v=113" in index
+    assert "app.js?v=114" in index
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():
@@ -75,6 +75,67 @@ def test_strategy_governance_page_exposes_both_arenas_and_three_pools():
     assert "内部非重叠时序" in script
     assert "精确间隔确认" in script
     assert "不可变日历回执已绑定" in script
+
+
+def test_paper_execution_plan_distinguishes_blocked_unavailable_and_canonical():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    renderer = _javascript_block(
+        script,
+        "    function strategyPaperExecutionPlanHtml(governance) {",
+        "    function strategyGovernanceHtml(governance, history) {",
+    )
+
+    assert 'data-execution-plan-state="blocked"' in renderer
+    assert 'data-execution-plan-state="unavailable"' in renderer
+    assert 'data-execution-plan-state="canonical"' in renderer
+    assert "这不是一个已经验证的“0只空仓”结论" in renderer
+    assert "页面不会把研究候选升级为执行目标" in renderer
+    assert "规范空计划已验证" in renderer
+    for contract in (
+        "governance.is_canonical === true",
+        "resultMode === 'CANONICAL_PERSISTED'",
+        "probiga.governance-paper-execution-plan.v1",
+        "planHash === topHash",
+        "plan.automatic_real_order_submission === false",
+        "plan.real_order_authority === false",
+        "governance.automatic_real_order_submission === false",
+        "governance.real_order_authority === false",
+    ):
+        assert contract in renderer
+
+
+def test_paper_execution_plan_renders_every_target_and_exit_without_truncation():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    renderer = _javascript_block(
+        script,
+        "    function strategyPaperExecutionPlanHtml(governance) {",
+        "    function strategyGovernanceHtml(governance, history) {",
+    )
+
+    assert "targets.forEach(function (row)" in renderer
+    assert "exits.forEach(function (row)" in renderer
+    assert "targets.slice(" not in renderer
+    assert "exits.slice(" not in renderer
+    for field in (
+        "row.stock_code",
+        "row.stock_name",
+        "row.industry_name",
+        "row.strategy_key",
+        "row.strategy_version",
+        "row.target_bp",
+        "row.previous_target_bp",
+        "row.new_buy_delta_bp",
+        "row.reference_price",
+        "row.reference_board_lot_quantity",
+        "row.opportunity_score",
+        "row.execution_score",
+        "row.planned_risk_reward_ratio",
+        "row.stop_loss_price",
+        "row.take_profit_1",
+        "row.take_profit_2",
+    ):
+        assert field in renderer
+    assert "window._strategyCenterData" not in renderer
 
 
 def test_large_rankings_use_revision_bound_server_pagination():
