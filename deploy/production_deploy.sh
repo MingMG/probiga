@@ -5589,7 +5589,7 @@ runtime_bundle_runtime = (
     if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff"
+    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
 )
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
@@ -5935,9 +5935,9 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 24
+    and runtime_bundle.get("migration_count") == 25
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 27
+    and runtime_bundle.get("validator_count") == 28
     and isinstance(runtime_bundle.get("migration_names"), list)
     and isinstance(runtime_bundle.get("seed_names"), list)
     and isinstance(runtime_bundle.get("validator_names"), list)
@@ -6060,7 +6060,7 @@ runtime_bundle = (
     p.get("runtime_schema_bundle") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff"
+    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
 )
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
@@ -6332,9 +6332,9 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 24
+    and runtime_bundle.get("migration_count") == 25
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 27
+    and runtime_bundle.get("validator_count") == 28
     and isinstance(runtime_bundle.get("validator_names"), list)
     and isinstance(runtime_bundle.get("contracts"), dict)
     and set(runtime_bundle["contracts"])

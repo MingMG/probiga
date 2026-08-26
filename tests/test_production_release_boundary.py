@@ -3384,7 +3384,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
-        "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff",
+        "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
