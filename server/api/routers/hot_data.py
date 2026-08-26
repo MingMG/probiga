@@ -4964,7 +4964,12 @@ def _portfolio_apply_kline_quote(row: dict, kline: dict | None, *, status: str =
     row["quote_age_seconds"] = None
 
 
-def _portfolio_rebase_quote_change(row: dict, kline: dict | None) -> None:
+def _portfolio_rebase_quote_change(
+    row: dict,
+    kline: dict | None,
+    *,
+    expected_previous_trade_date: str = "",
+) -> None:
     """Recompute intraday change from live price and the latest daily close."""
     if not row or not kline or row.get("cur_price") is None:
         return
@@ -4975,6 +4980,24 @@ def _portfolio_rebase_quote_change(row: dict, kline: dict | None) -> None:
     kline_trade_date = str(kline.get("trade_date") or "")[:10]
     prev_close = 0.0
     if quote_trade_date and kline_trade_date and quote_trade_date > kline_trade_date:
+        # A delayed daily-kline pipeline must not turn an otherwise correct
+        # provider day change into a multi-session change.  Only the immediately
+        # preceding trading session is a valid base for an intraday/close quote.
+        try:
+            kline_age_days = (
+                date.fromisoformat(quote_trade_date)
+                - date.fromisoformat(kline_trade_date)
+            ).days
+        except ValueError:
+            kline_age_days = 0
+        if (
+            kline_age_days > 3
+            or (
+                expected_previous_trade_date
+                and kline_trade_date != str(expected_previous_trade_date)[:10]
+            )
+        ):
+            return
         prev_close = _portfolio_num(kline.get("close"))
     elif quote_trade_date and kline_trade_date and quote_trade_date == kline_trade_date:
         prev_close = _portfolio_num(kline.get("pre_close"))
@@ -5851,6 +5874,7 @@ def _portfolio_apply_snapshot_quote(
     kline: dict | None,
     live_quote: dict | None = None,
     closed_quote: dict | None = None,
+    expected_previous_trade_date: str = "",
 ) -> None:
     """Apply the freshest valid quote for intraday or post-close display."""
     kline = kline or {}
@@ -5866,7 +5890,11 @@ def _portfolio_apply_snapshot_quote(
     else:
         _portfolio_apply_kline_quote(row, kline, status="previous_close")
 
-    _portfolio_rebase_quote_change(row, kline)
+    _portfolio_rebase_quote_change(
+        row,
+        kline,
+        expected_previous_trade_date=expected_previous_trade_date,
+    )
 
 
 def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
@@ -5905,6 +5933,13 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
 
     portfolio_mode = _portfolio_market_mode()
     close_trade_date = _portfolio_close_trade_date()
+    quote_trade_date = date.today().isoformat() if portfolio_mode == "intraday" else close_trade_date
+    try:
+        expected_previous_trade_date = _portfolio_last_trade_date(
+            date.fromisoformat(quote_trade_date) - timedelta(days=1)
+        )
+    except (TypeError, ValueError):
+        expected_previous_trade_date = ""
     flow_target_date = date.today().isoformat() if portfolio_mode == "intraday" else close_trade_date
     closed_quotes = {}
     try:
@@ -6034,6 +6069,7 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
             kline=kline,
             live_quote=live_quotes.get(stock_code),
             closed_quote=closed_quotes.get(stock_code),
+            expected_previous_trade_date=expected_previous_trade_date,
         )
         flow = flow_map.get(stock_code) or {}
         row["main_net_inflow"] = flow.get("main_net_inflow")

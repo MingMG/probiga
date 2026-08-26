@@ -131,6 +131,35 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(row["quote_status"], "closed")
         self.assertEqual(row["change_pct"], 10.0)
 
+    def test_portfolio_live_quote_keeps_provider_day_change_when_kline_is_stale(self):
+        row = {}
+        hot_data._portfolio_apply_snapshot_quote(
+            row,
+            portfolio_mode="post_close",
+            close_trade_date="2026-08-26",
+            expected_previous_trade_date="2026-08-25",
+            kline={
+                "trade_date": "2026-08-21",
+                "close": 36.61,
+                "pre_close": 33.28,
+                "change_pct": 10.01,
+            },
+            closed_quote={
+                "stock_code": "000603",
+                "price": 37.16,
+                "change": 0.89,
+                "change_pct": 2.453819,
+                "snapshot_at": "2026-08-26 15:00:00",
+                "source": "current_close_table",
+                "quote_status": "closed",
+            },
+        )
+
+        self.assertEqual(row["quote_trade_date"], "2026-08-26")
+        self.assertEqual(row["price_change"], 0.89)
+        self.assertEqual(row["change_pct"], 2.453819)
+        self.assertNotIn("quote_prev_close", row)
+
     def test_hot_data_cache_evicts_least_recently_used_entry(self):
         self._clear_hot_data_cache()
         try:
