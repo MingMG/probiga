@@ -10130,7 +10130,7 @@ valid = (
     and payload.get("automatic_real_order_submission") is False
     and payload.get("real_order_authority") is False
     and isinstance(revision, dict)
-    and revision.get("expected_sha") == expected_sha
+    and revision.get("expected_git_sha") == expected_sha
     and revision.get("matches_expected") is True
     and revision.get("code_worktree_clean") is True
     and isinstance(standalone, dict)
