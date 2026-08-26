@@ -1,118 +1,99 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""获取新浪热股榜（按关注热度），写入 st_hot_rank_sina。"""
+"""Fail closed for Sina's unverifiable pseudo-attention ranking."""
+
+from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
-from sqlalchemy import text
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
 if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
-from server.common.batch_db import create_batch_engine, replace_table_rows
 from server.common.hot_rank_schema import validate_hot_rank_runtime_schema
+from server.common.hot_rank_source_contract import (
+    HOT_RANK_SINA_TASK_TYPE,
+    HotRankDataBlocked,
+    SINA_ATTENTION_DATA_BLOCK_REASON,
+    build_blocked_receipt,
+    shanghai_now,
+)
 
-
-def _run_ddl(engine):
+# ``Market_Center.getHQNodeData`` silently ignores ``sort=attention``: the
+# response has no attention/heat field and falls back to a security-code
+# ordering.  Shape checks alone would therefore certify a fabricated "hot"
+# Top100.  Keep the collector fail-closed until Sina exposes a provider field
+# whose ranking semantics can be independently verified.
+def _run_ddl(engine) -> None:
     validate_hot_rank_runtime_schema(engine, tables={"st_hot_rank_sina"})
 
 
-def fetch_hot_rank_sina(snapshot_date: str, top: int = 100):
-    import requests
-    import time as _time
+def _fetch_sina_rows() -> list[dict]:
+    """Retired unsafe helper retained as an explicit fail-closed boundary."""
 
-    print(f"开始获取新浪热股榜，快照日期: {snapshot_date}，top={top}")
+    raise HotRankDataBlocked(SINA_ATTENTION_DATA_BLOCK_REASON)
 
-    engine = create_batch_engine()
-    _run_ddl(engine)
 
-    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://finance.sina.com.cn/",
-    }
+def fetch_hot_rank_sina(
+    snapshot_date: str,
+    top: int = 100,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if int(top) != 100:
+        raise ValueError("Sina formal publisher requires exactly top=100")
+    # This must stay before schema inspection, provider requests, and writes.
+    # It is also deliberately independent of the requested date: Sina has no
+    # valid success path, so every invocation has the same auditable block.
+    # The endpoint currently returns a quote inventory ordered by stock code.
+    raise HotRankDataBlocked(SINA_ATTENTION_DATA_BLOCK_REASON)
 
-    all_items = []
-    page_size = 200
-    max_pages = 5
-    for page in range(1, max_pages + 1):
-        params = {"page": page, "num": page_size, "sort": "attention", "asc": 0, "node": "hs_a"}
-        data = None
-        for attempt in range(1, 4):
-            try:
-                r = requests.get(url, params=params, headers=headers, timeout=15)
-                r.raise_for_status()
-                data = r.json()
-                if data:
-                    break
-            except Exception as e:
-                print(f"  第{page}页第{attempt}次请求失败: {e}")
-            if attempt < 3:
-                _time.sleep(attempt * 3)
-        if not data:
-            break
-        for item in data:
-            code = str(item.get("code", "")).zfill(6)
-            sym = str(item.get("symbol", ""))
-            if sym[:2] in ("sh", "sz") and code[0] in ("0", "3", "6"):
-                all_items.append(item)
-        if len(all_items) >= top:
-            break
-        _time.sleep(0.3)
 
-    if not all_items:
-        print("未获取到新浪热股榜数据")
-        return
-
-    rows = []
-    for i, item in enumerate(all_items[:top], 1):
-        rows.append({
-            "rank": i,
-            "stock_code": str(item.get("code", "")).zfill(6),
-            "short_name": item.get("name", ""),
-            "price": float(item.get("trade", 0)) if item.get("trade") else None,
-            "price_change": float(item.get("pricechange", 0)) if item.get("pricechange") else None,
-            "change_pct": float(item.get("changepercent", 0)) if item.get("changepercent") else None,
-            "amount": float(item.get("amount", 0)) if item.get("amount") else None,
-            "volume": float(item.get("volume", 0)) if item.get("volume") else None,
-            "market_capital": float(item.get("mktcap", 0)) if item.get("mktcap") else None,
-            "turnover_ratio": float(item.get("turnoverratio", 0)) if item.get("turnoverratio") else None,
-        })
-
-    df = pd.DataFrame(rows)
-    df["snapshot_date"] = snapshot_date
-    df["etl_sync_at"] = datetime.now().replace(microsecond=0)
-    df = df.replace({np.nan: None, pd.NaT: None})
-
-    replace_table_rows(
-        df,
-        "st_hot_rank_sina",
-        engine,
-        where_sql="snapshot_date = :d",
-        params={"d": snapshot_date},
-        chunksize=500,
-        method="multi",
+def main() -> int:
+    parser = argparse.ArgumentParser(description="新浪当前交易日热股Top100同步")
+    parser.add_argument(
+        "snapshot_date",
+        nargs="?",
+        default=shanghai_now().date().isoformat(),
+        help="快照日期 YYYY-MM-DD",
     )
-
-    print(f"写入完成: st_hot_rank_sina, 共 {len(df)} 行")
-    print(f"  TOP5: {', '.join(df.head(5)['short_name'].tolist())}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="新浪热股榜同步")
-    parser.add_argument("snapshot_date", nargs="?", default=datetime.now().strftime("%Y-%m-%d"), help="快照日期 YYYY-MM-DD")
-    parser.add_argument("--top", type=int, default=100, help="排行数量")
+    parser.add_argument("--top", type=int, default=100, help="固定为100")
     args = parser.parse_args()
+    try:
+        datetime.strptime(args.snapshot_date, "%Y-%m-%d")
+    except ValueError:
+        print("日期格式错误，应为 YYYY-MM-DD", file=sys.stderr)
+        return 1
 
-    fetch_hot_rank_sina(args.snapshot_date, args.top)
+    started_at = shanghai_now()
+    try:
+        result = fetch_hot_rank_sina(
+            args.snapshot_date,
+            args.top,
+            now=started_at,
+        )
+    except HotRankDataBlocked as exc:
+        result = build_blocked_receipt(
+            task_type=HOT_RANK_SINA_TASK_TYPE,
+            requested_date=args.snapshot_date,
+            started_at=started_at,
+            reason=str(exc),
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        print(f"Sina hot rank sync blocked: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"Sina hot rank sync failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

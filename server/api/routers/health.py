@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import importlib.util
 import logging
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import subprocess
@@ -119,6 +119,17 @@ _BYTECODE_SCAN_ROOTS = (
     "versions",
 )
 _RELEASE_GIT_TIMEOUT_SECONDS = 15
+_PROC_ROOT = Path("/proc")
+_PRODUCTION_RELEASE_ROOT = PurePosixPath("/opt/ProBigA-releases")
+_PRODUCTION_RELEASE_VENV_ROOT = PurePosixPath(
+    "/var/lib/probiga/release-venvs"
+)
+_DEFERRED_SCHEDULER_EXPECTED_SHA_ENV = (
+    "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA"
+)
+_DEFERRED_SCHEDULER_CODE_ROOT_ENV = (
+    "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT"
+)
 _GIT_INDEX_ENTRY_RE = re.compile(
     r"^(?P<mode>[0-7]{6}) (?P<object>[0-9a-f]{40,64}) (?P<stage>[0-3])\t(?P<path>.*)$"
 )
@@ -159,6 +170,124 @@ def _untracked_root_shadow_files(tracked: set[str]) -> tuple[str, ...]:
                 for item in code_root.rglob(pattern)
             )
     return tuple(sorted(candidates - tracked))
+
+
+def _standalone_scheduler_release_identity(
+    pid: int,
+) -> dict[str, str | bool | None]:
+    """Bind the live scheduler process to one explicit immutable release.
+
+    The database heartbeat is intentionally unavailable while governance DDL
+    is deferred.  A deferred cutover deliberately preserves the prior
+    scheduler, so that mode uses a separately injected SHA/root contract and
+    reports both identities truthfully.  Normal mode still requires the
+    scheduler and API to run the same build.  Only allowlisted, non-secret
+    environment fields are returned.
+    """
+
+    api_build_sha = str(
+        os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or ""
+    ).strip().lower()
+    deferred = (
+        get_strategy_governance_mode()
+        is StrategyGovernanceMode.DEFERRED_DB
+    )
+    expected_sha = api_build_sha
+    expected_code_root = str(_PRODUCTION_RELEASE_ROOT / expected_sha)
+    identity_mode = "SAME_BUILD_REQUIRED"
+    contract_error = None
+    if deferred:
+        identity_mode = "PRESERVED_DEFERRED"
+        expected_sha = str(
+            os.environ.get(_DEFERRED_SCHEDULER_EXPECTED_SHA_ENV) or ""
+        ).strip().lower()
+        expected_code_root = str(
+            os.environ.get(_DEFERRED_SCHEDULER_CODE_ROOT_ENV) or ""
+        ).strip()
+        canonical_root = str(_PRODUCTION_RELEASE_ROOT / expected_sha)
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
+            or expected_sha == "0" * 40
+            or expected_code_root != canonical_root
+        ):
+            contract_error = "deferred_scheduler_identity_contract_invalid"
+    base: dict[str, str | bool | None] = {
+        "ready": False,
+        "identity_mode": identity_mode,
+        "api_build_sha": api_build_sha or None,
+        "expected_build_sha": expected_sha or None,
+        "expected_code_root": expected_code_root or None,
+        "observed_build_sha": None,
+        "observed_code_root": None,
+        "same_build_as_api": None,
+        "error_code": None,
+    }
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", api_build_sha) is None
+        or api_build_sha == "0" * 40
+    ):
+        return {**base, "error_code": "scheduler_expected_build_invalid"}
+    if contract_error is not None:
+        return {**base, "error_code": contract_error}
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
+        or expected_sha == "0" * 40
+    ):
+        return {**base, "error_code": "scheduler_expected_build_invalid"}
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return {**base, "error_code": "scheduler_pid_invalid"}
+
+    proc_root = _PROC_ROOT / str(pid)
+    try:
+        environ_tokens = (proc_root / "environ").read_bytes().split(b"\0")
+        argv_tokens = (proc_root / "cmdline").read_bytes().split(b"\0")
+        environ = {
+            key.decode("utf-8", errors="strict"): value.decode(
+                "utf-8", errors="strict"
+            )
+            for token in environ_tokens
+            if token and b"=" in token
+            for key, value in (token.split(b"=", 1),)
+            if key
+            in {
+                b"PROBIGA_EXPECTED_GIT_SHA",
+                b"PROBIGA_BUILD_COMMIT_SHA",
+                b"PROBIGA_CODE_ROOT",
+            }
+        }
+        argv = [
+            token.decode("utf-8", errors="strict")
+            for token in argv_tokens
+            if token
+        ]
+    except (OSError, UnicodeError):
+        return {**base, "error_code": "scheduler_process_identity_unreadable"}
+
+    expected_python = str(
+        _PRODUCTION_RELEASE_VENV_ROOT / expected_sha / "bin" / "python"
+    )
+    expected_entrypoint = str(
+        _PRODUCTION_RELEASE_ROOT
+        / expected_sha
+        / "tools"
+        / "run_scheduler_daemon.py"
+    )
+    observed_sha = str(environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").lower()
+    observed_code_root = str(environ.get("PROBIGA_CODE_ROOT") or "")
+    matches = (
+        environ.get("PROBIGA_EXPECTED_GIT_SHA") == expected_sha
+        and observed_sha == expected_sha
+        and observed_code_root == expected_code_root
+        and argv == [expected_python, "-P", expected_entrypoint]
+    )
+    return {
+        **base,
+        "ready": matches,
+        "observed_build_sha": observed_sha or None,
+        "observed_code_root": observed_code_root or None,
+        "same_build_as_api": observed_sha == api_build_sha,
+        "error_code": None if matches else "scheduler_release_mismatch",
+    }
 
 
 def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
@@ -290,7 +419,18 @@ def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
         enablement_verified = False
 
     pid_verified = pid is not None and pid > 0 and pid_result.returncode == 0
-    verified = active_verified and enablement_verified and pid_verified
+    release_identity = (
+        _standalone_scheduler_release_identity(pid)
+        if pid_verified and pid is not None
+        else _standalone_scheduler_release_identity(-1)
+    )
+    release_verified = release_identity.get("ready") is True
+    verified = (
+        active_verified
+        and enablement_verified
+        and pid_verified
+        and release_verified
+    )
     error = None
     if not active_verified:
         error = f"systemctl_is_active_exit_{active_returncode}"
@@ -302,6 +442,8 @@ def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
         error = "standalone_scheduler_disabled"
     elif not pid_verified:
         error = "standalone_scheduler_pid_unverified"
+    elif not release_verified:
+        error = "standalone_scheduler_release_unverified"
     return {
         "verified": verified,
         "active": active,
@@ -310,6 +452,7 @@ def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
         "enablement_state": enablement_state or None,
         "pid": pid,
         "error": error,
+        "release_identity": release_identity,
     }
 
 
@@ -1138,7 +1281,7 @@ def health_qmt_bridge():
 
     runtime = _get_qmt_live_runtime_config()
     runtime_enabled = bool(runtime.get("enabled"))
-    local_bridge_configured = bridge.is_configured()
+    local_bridge_configured = bridge.is_probe_runtime_configured()
     if local_bridge_configured:
         qmt = diagnostics(timeout=int(get_gj_qmt_config()["ping_timeout"] or 8))
     else:
@@ -1208,7 +1351,7 @@ def health_qmt_capabilities(force: bool = False):
     # must not make this endpoint probe a non-existent local Windows runtime.
     # ``force=true`` remains available for hosts that intentionally configure
     # a local SDK probe.
-    if not force and not bridge.is_configured():
+    if not force and not bridge.is_probe_runtime_configured():
         return {
             "ok": False,
             "provider": "gj_qmt",
@@ -1223,7 +1366,18 @@ def health_qmt_capabilities(force: bool = False):
 
 @router.get("/health/qmt-core-probe")
 def health_qmt_core_probe(force: bool = False):
+    from integrations.qmt import bridge
     from integrations.qmt.diagnostics import core_probe
 
+    runtime = _get_qmt_live_runtime_config()
+    if not force and not bridge.is_probe_runtime_configured():
+        return {
+            "ok": False,
+            "provider": "gj_qmt",
+            "status": "external_windows_collector",
+            "reason": "生产服务器通过 Windows QMT 采集器接收数据，本机不直接加载 QMT SDK",
+            "qmt_live_runtime": runtime,
+            "probes": [],
+        }
     timeout = max(15, int(get_gj_qmt_config()["ping_timeout"] or 8) + 22)
     return core_probe(timeout=timeout, force=force)

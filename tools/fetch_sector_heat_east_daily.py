@@ -12,13 +12,15 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as datetime_time
 from pathlib import Path
+from typing import Any, Mapping
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -28,10 +30,78 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
 
 CACHE_FILE = ROOT / "runtime" / "cache" / "east_sector_heat_cache.json"
+FORMAL_RESULT_SCHEMA = "probiga.sector-heat-east-result.v1"
+FORMAL_SOURCE = "eastmoney.push2.industry"
+SECTOR_HEAT_CLOSE_READY_TIME = datetime_time(15, 10)
 
 from server.common.process_env import build_child_env
+
+
+class SectorHeatContractError(RuntimeError):
+    """Raised before publication when the exact sector snapshot is incomplete."""
+
+
+def _canonical_hash(value: object) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_number(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SectorHeatContractError(f"invalid numeric sector value: {value!r}") from exc
+    if not math.isfinite(number):
+        raise SectorHeatContractError(f"non-finite sector value: {value!r}")
+    return f"{number:.6f}"
+
+
+def canonical_sector_rows(rows: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return the stable business representation used by the formal receipt."""
+
+    canonical = [
+        {
+            "snapshot_date": str(row.get("snapshot_date") or "")[:10],
+            "plate_type": int(row.get("plate_type") or 0),
+            "rank": int(row.get("rank") or 0),
+            "concept_code": str(row.get("concept_code") or "").strip(),
+            "concept_name": str(row.get("concept_name") or "").strip(),
+            "change_pct": _canonical_number(row.get("change_pct")),
+            "hot_value": _canonical_number(row.get("hot_value")),
+            "hot_tag": str(row.get("hot_tag") or "").strip(),
+        }
+        for row in rows
+    ]
+    return sorted(
+        canonical,
+        key=lambda row: (
+            row["plate_type"],
+            row["rank"],
+            row["concept_code"],
+            row["concept_name"],
+        ),
+    )
+
+
+def sector_heat_row_hash(rows: list[Mapping[str, Any]]) -> str:
+    return _canonical_hash(canonical_sector_rows(rows))
+
+
+def _with_receipt_id(payload: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    result["receipt_id"] = _canonical_hash(result)
+    return result
 
 EASTMONEY_CLIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -628,10 +698,192 @@ def _build_primary_rows(rows_l2: list[dict]) -> list[dict]:
     return rows_l1
 
 
-def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> dict:
+def validate_formal_sector_rows(
+    rows: list[Mapping[str, Any]],
+    *,
+    target_date: str,
+    raw_count: int,
+) -> dict[str, Any]:
+    """Require the complete fixed Eastmoney L1/L2 industry inventory."""
+
+    mapping = _industry_map()
+    if not mapping:
+        raise SectorHeatContractError("EAST_INDUSTRY_MAP is empty")
+    expected_names = {
+        3: set(mapping),
+        4: {child for children in mapping.values() for child in children},
+    }
+    if raw_count < len(expected_names[4]):
+        raise SectorHeatContractError(
+            "Eastmoney raw industry inventory is incomplete: "
+            f"raw={raw_count} expected_at_least={len(expected_names[4])}"
+        )
+
+    canonical = canonical_sector_rows(rows)
+    if not canonical:
+        raise SectorHeatContractError("formal sector snapshot is empty")
+    if any(row["snapshot_date"] != target_date for row in canonical):
+        observed = sorted({row["snapshot_date"] for row in canonical})
+        raise SectorHeatContractError(
+            f"formal sector target date differs: expected={target_date} observed={observed}"
+        )
+
+    counts: dict[str, int] = {}
+    for plate_type in (3, 4):
+        plate_rows = [row for row in canonical if row["plate_type"] == plate_type]
+        expected = expected_names[plate_type]
+        names = {row["concept_name"] for row in plate_rows}
+        codes = {row["concept_code"] for row in plate_rows}
+        ranks = {row["rank"] for row in plate_rows}
+        if len(plate_rows) != len(expected) or names != expected:
+            raise SectorHeatContractError(
+                f"plate_type={plate_type} fixed inventory differs: "
+                f"expected={len(expected)} actual={len(plate_rows)} "
+                f"missing={sorted(expected - names)[:10]} "
+                f"unexpected={sorted(names - expected)[:10]}"
+            )
+        if "" in codes or len(codes) != len(expected):
+            raise SectorHeatContractError(
+                f"plate_type={plate_type} code inventory is empty or duplicated"
+            )
+        if ranks != set(range(1, len(expected) + 1)):
+            raise SectorHeatContractError(
+                f"plate_type={plate_type} rank inventory is incomplete"
+            )
+        for row in plate_rows:
+            hot_value = float(row["hot_value"] or 0.0)
+            if (
+                hot_value <= 0
+                or row["change_pct"] is None
+                or not row["hot_tag"]
+                or "无匹配" in row["hot_tag"]
+            ):
+                raise SectorHeatContractError(
+                    "formal sector row lacks provider evidence: "
+                    f"plate_type={plate_type} concept={row['concept_name']}"
+                )
+        counts[f"plate_type_{plate_type}"] = len(plate_rows)
+
+    if len(canonical) != sum(counts.values()):
+        bad_types = sorted({row["plate_type"] for row in canonical} - {3, 4})
+        raise SectorHeatContractError(f"unexpected sector plate types: {bad_types}")
+    return {
+        "raw_count": raw_count,
+        "expected_l1_count": len(expected_names[3]),
+        "expected_l2_count": len(expected_names[4]),
+        "l1_count": counts["plate_type_3"],
+        "l2_count": counts["plate_type_4"],
+        "coverage": 1.0,
+        "row_count": len(canonical),
+        "row_hash": _canonical_hash(canonical),
+    }
+
+
+def _select_sector_rows(connection: Any, target_date: str) -> list[dict[str, Any]]:
+    from sqlalchemy import text
+
+    return [
+        dict(row)
+        for row in connection.execute(
+            text(
+                "SELECT snapshot_date, plate_type, `rank`, concept_code, "
+                "concept_name, change_pct, hot_value, hot_tag "
+                "FROM st_hot_concept_ths_daily "
+                "WHERE snapshot_date=:snapshot_date AND plate_type IN (3,4) "
+                "ORDER BY plate_type, `rank`, concept_code"
+            ),
+            {"snapshot_date": target_date},
+        ).mappings()
+    ]
+
+
+def _readback_sector_rows(engine: Any, target_date: str) -> list[dict[str, Any]]:
+    with engine.connect() as connection:
+        return _select_sector_rows(connection, target_date)
+
+
+def resolve_formal_sector_target_date(engine: Any, *, now: datetime | None = None) -> str:
+    """Resolve the latest exchange session closed for this provider at 15:10."""
+
+    target = str(
+        authoritative_closed_trade_date(
+            engine,
+            now=now,
+            close_ready_time=SECTOR_HEAT_CLOSE_READY_TIME,
+        )
+        or ""
+    )[:10]
+    try:
+        parsed = datetime.strptime(target, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise SectorHeatContractError(
+            f"cannot resolve formal sector target date from si_trade_calendar: {target!r}"
+        ) from exc
+    if parsed.isoformat() != target:
+        raise SectorHeatContractError(
+            f"non-canonical formal sector target date from si_trade_calendar: {target!r}"
+        )
+    return target
+
+
+def _formal_sector_receipt(
+    *,
+    status: str,
+    requested_date: str,
+    data_date: str,
+    started_at: datetime,
+    finished_at: datetime,
+    published: bool,
+    evidence: Mapping[str, Any] | None = None,
+    error: BaseException | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema": FORMAL_RESULT_SCHEMA,
+        "status": status,
+        "source": FORMAL_SOURCE,
+        "requested_date": requested_date,
+        "data_date": data_date,
+        "published": bool(published),
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "finished_at": finished_at.isoformat(timespec="seconds"),
+        "evidence": dict(evidence or {}),
+    }
+    if error is not None:
+        payload["error_type"] = type(error).__name__
+        payload["error"] = str(error)[:1000]
+    return _with_receipt_id(payload)
+
+
+def _progress(message: str, *, formal: bool) -> None:
+    print(message, file=sys.stderr if formal else sys.stdout, flush=True)
+
+
+def fetch_sector_heat_east_daily(
+    snapshot_date: str,
+    dry_run: bool = False,
+    *,
+    formal: bool = False,
+    diagnostic_cache: bool = False,
+    engine: Any | None = None,
+    now: datetime | None = None,
+) -> dict:
+    started_at = (now or datetime.now()).replace(microsecond=0)
     requested_date = snapshot_date
     raw_count = 0
-    print(f"开始同步东财板块热度，请求日期: {requested_date}")
+    if diagnostic_cache and (formal or not dry_run):
+        raise SectorHeatContractError(
+            "diagnostic cache is allowed only with --dry-run and without --formal"
+        )
+    try:
+        parsed_target = datetime.strptime(requested_date, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise SectorHeatContractError(
+            f"invalid requested sector date: {requested_date!r}"
+        ) from exc
+    if parsed_target.isoformat() != requested_date:
+        raise SectorHeatContractError(f"non-canonical requested sector date: {requested_date!r}")
+
+    _progress(f"开始同步东财板块热度，请求日期: {requested_date}", formal=formal)
     try:
         raw_rows = _fetch_eastmoney_industries()
         raw_count = len(raw_rows)
@@ -653,7 +905,7 @@ def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> d
             raw_rows = historical_rows
 
         rows_l1, rows_l2 = _build_fixed_industry_rows(raw_rows)
-        now = datetime.now().replace(microsecond=0)
+        captured_at = (now or datetime.now()).replace(microsecond=0)
         db_rows = []
         for plate_type, rows in ((3, rows_l1), (4, rows_l2)):
             for row in rows:
@@ -667,25 +919,71 @@ def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> d
                         "change_pct": row["change_pct"],
                         "hot_value": row["hot_value"],
                         "hot_tag": row["hot_tag"],
-                        "etl_sync_at": now,
+                        "etl_sync_at": captured_at,
                     }
                 )
     except Exception as exc:
-        cached = _load_cached_rows()
+        cached = _load_cached_rows() if diagnostic_cache else None
         if not cached:
-            print(f"未获取到东财行业板块数据: {exc}")
-            print("SYNCED=0")
-            return {"synced": 0, "l1_count": 0, "l2_count": 0}
+            raise SectorHeatContractError(
+                f"Eastmoney sector fetch failed without admissible cache: {exc}"
+            ) from exc
         db_rows = cached["db_rows"]
         snapshot_date = cached["snapshot_date"] or requested_date
         rows_l1 = [r for r in db_rows if int(r.get("plate_type") or 0) == 3]
         rows_l2 = [r for r in db_rows if int(r.get("plate_type") or 0) == 4]
-        print(f"东财抓取失败，使用本地缓存快照 {snapshot_date}: {exc}")
+        evidence = {
+            "cache_snapshot_date": snapshot_date,
+            "row_count": len(db_rows),
+            "row_hash": sector_heat_row_hash(db_rows),
+        }
+        return _formal_sector_receipt(
+            status="DIAGNOSTIC_CACHE",
+            requested_date=requested_date,
+            data_date=snapshot_date,
+            started_at=started_at,
+            finished_at=(now or datetime.now()).replace(microsecond=0),
+            published=False,
+            evidence=evidence,
+            error=exc,
+        )
 
-    _cache_rows(db_rows, snapshot_date, requested_date)
+    if formal and snapshot_date != requested_date:
+        raise SectorHeatContractError(
+            "formal sector source date differs from target: "
+            f"requested={requested_date} source={snapshot_date}"
+        )
+    evidence = validate_formal_sector_rows(
+        db_rows,
+        target_date=snapshot_date,
+        raw_count=raw_count,
+    ) if formal else {
+        "raw_count": raw_count,
+        "l1_count": len(rows_l1),
+        "l2_count": len(rows_l2),
+        "row_count": len(db_rows),
+        "row_hash": sector_heat_row_hash(db_rows),
+    }
+
+    if diagnostic_cache:
+        _cache_rows(db_rows, snapshot_date, requested_date)
 
     if dry_run:
-        print(f"干跑完成: 快照日期 {snapshot_date}, 东财一级行业 {len(rows_l1)} 条, 东财二级行业 {len(rows_l2)} 条")
+        _progress(
+            f"干跑完成: 快照日期 {snapshot_date}, 东财一级行业 {len(rows_l1)} 条, "
+            f"东财二级行业 {len(rows_l2)} 条",
+            formal=formal,
+        )
+        if formal:
+            return _formal_sector_receipt(
+                status="VALIDATED",
+                requested_date=requested_date,
+                data_date=snapshot_date,
+                started_at=started_at,
+                finished_at=(now or datetime.now()).replace(microsecond=0),
+                published=False,
+                evidence=evidence,
+            )
         print(f"RAW={raw_count}")
         print(f"DATE={snapshot_date}")
         print(f"SYNCED={len(db_rows)}")
@@ -693,19 +991,48 @@ def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> d
 
     from sqlalchemy import text
 
-    engine = create_tool_engine(resolve_tool_mysql_url())
+    engine = engine or create_tool_engine(resolve_tool_mysql_url())
     insert_sql = text(
         "INSERT INTO st_hot_concept_ths_daily "
         "(snapshot_date, plate_type, `rank`, concept_code, concept_name, change_pct, hot_value, hot_tag, etl_sync_at) "
         "VALUES (:snapshot_date, :plate_type, :rank, :concept_code, :concept_name, :change_pct, :hot_value, :hot_tag, :etl_sync_at)"
     )
 
+    persisted_evidence: dict[str, Any] | None = None
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM st_hot_concept_ths_daily WHERE snapshot_date = :d AND plate_type IN (3, 4)"),
             {"d": snapshot_date},
         )
-        conn.execute(insert_sql, db_rows)
+        inserted = conn.execute(insert_sql, db_rows)
+        if inserted.rowcount is not None and inserted.rowcount >= 0 and int(inserted.rowcount) != len(db_rows):
+            raise SectorHeatContractError(
+                f"sector publication row count differs: expected={len(db_rows)} actual={inserted.rowcount}"
+            )
+        if formal:
+            persisted = _select_sector_rows(conn, snapshot_date)
+            persisted_evidence = validate_formal_sector_rows(
+                persisted,
+                target_date=snapshot_date,
+                raw_count=raw_count,
+            )
+            if persisted_evidence != evidence:
+                raise SectorHeatContractError(
+                    "persisted formal sector snapshot differs from collected receipt"
+                )
+
+    if formal:
+        if persisted_evidence is None:  # pragma: no cover - defensive contract guard
+            raise SectorHeatContractError("formal sector readback evidence is missing")
+        return _formal_sector_receipt(
+            status="PASS",
+            requested_date=requested_date,
+            data_date=snapshot_date,
+            started_at=started_at,
+            finished_at=(now or datetime.now()).replace(microsecond=0),
+            published=True,
+            evidence=persisted_evidence,
+        )
 
     print(f"写入完成: 快照日期 {snapshot_date}, 东财一级行业 {len(rows_l1)} 条, 东财二级行业 {len(rows_l2)} 条")
     print(f"RAW={raw_count}")
@@ -714,21 +1041,57 @@ def fetch_sector_heat_east_daily(snapshot_date: str, dry_run: bool = False) -> d
     return {"synced": len(db_rows), "raw_count": raw_count, "l1_count": len(rows_l1), "l2_count": len(rows_l2), "date": snapshot_date}
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="同步东财板块热度（写入 st_hot_concept_ths_daily 的 plate_type=3/4）")
-    parser.add_argument("date", help="快照日期，格式：YYYY-MM-DD")
+    parser.add_argument("date", nargs="?", default="", help="快照日期，格式：YYYY-MM-DD；正式模式默认从交易日历解析")
     parser.add_argument("--dry-run", action="store_true", help="只抓取并聚合，不写入数据库")
-    args = parser.parse_args()
+    parser.add_argument("--formal", action="store_true", help="启用精确目标日、完整目录和写后回读合同")
+    parser.add_argument(
+        "--diagnostic-cache",
+        action="store_true",
+        help="仅诊断干跑时允许读取缓存；缓存永不写正式表",
+    )
+    parser.add_argument("--json", action="store_true", help="输出唯一机器结果 JSON")
+    args = parser.parse_args(argv)
 
+    started_at = datetime.now().replace(microsecond=0)
+    engine = None
+    requested_date = str(args.date or "").strip()
     try:
-        datetime.strptime(args.date, "%Y-%m-%d")
-    except ValueError:
-        raise SystemExit(f"日期格式错误，应为 YYYY-MM-DD，输入: {args.date}")
+        if args.formal and not requested_date:
+            engine = create_tool_engine(resolve_tool_mysql_url())
+            requested_date = resolve_formal_sector_target_date(engine, now=started_at)
+        if not requested_date:
+            raise SectorHeatContractError("sector target date is required")
+        result = fetch_sector_heat_east_daily(
+            requested_date,
+            dry_run=args.dry_run,
+            formal=args.formal,
+            diagnostic_cache=args.diagnostic_cache,
+            engine=engine,
+            now=started_at,
+        )
+    except Exception as exc:
+        result = _formal_sector_receipt(
+            status="FAILED",
+            requested_date=requested_date,
+            data_date="",
+            started_at=started_at,
+            finished_at=datetime.now().replace(microsecond=0),
+            published=False,
+            error=exc,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+        return 1
 
-    result = fetch_sector_heat_east_daily(args.date, dry_run=args.dry_run)
-    if result.get("synced", 0) <= 0:
-        raise SystemExit(1)
+    if args.formal or args.diagnostic_cache or args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    if args.formal:
+        return 0 if result.get("status") in {"PASS", "VALIDATED"} else 1
+    if args.diagnostic_cache:
+        return 0
+    return 0 if int(result.get("synced") or 0) > 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

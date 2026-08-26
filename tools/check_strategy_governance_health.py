@@ -1717,6 +1717,7 @@ def _supporting_release_trigger_inventory_check(
             "qmt_history_coverage": 4,
             "qmt_reference": 10,
             "scheduler_task_history": 2,
+            "schema_recovery_evidence": 2,
             "strategy_governance": 40,
         }
         if (
@@ -1743,13 +1744,14 @@ def _supporting_release_trigger_inventory_check(
     except Exception as exc:
         return False, {
             "trigger_count": 0,
-            "expected_trigger_count": 68,
+            "expected_trigger_count": 70,
             "expected_owner_counts": {
                 "pit_facts": 6,
                 "qmt_attestation": 6,
                 "qmt_history_coverage": 4,
                 "qmt_reference": 10,
                 "scheduler_task_history": 2,
+                "schema_recovery_evidence": 2,
                 "strategy_governance": 40,
             },
             "database_triggers_required": True,

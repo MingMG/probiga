@@ -32,7 +32,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 log = logging.getLogger("evening")
 
 from server.common.batch_db import create_batch_engine, read_records
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.config import get_settings, get_wecom_webhook
+from server.common.daily_stock_universe import (
+    load_daily_stock_universe,
+    validate_daily_stock_coverage,
+)
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
 from integrations.wecom.delivery import deliver_markdown
 try:
@@ -42,6 +47,11 @@ except Exception:
     format_radar_markdown = None
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+EXPECTED_A_SHARE_INDEX_CODES = frozenset(
+    {"000001", "399001", "399006", "000688", "000300"}
+)
+MIN_HOT_CONCEPT_ROWS = 20
+MIN_FUSED_HOT_STOCK_ROWS = 20
 
 
 def get_engine():
@@ -89,17 +99,172 @@ def _green(v: float | None) -> str:
     return '<font color="info">' if v < 0 else ""
 
 
+def _iso_trade_date(value: object, *, field: str) -> str:
+    raw = str(value or "")[:10]
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"DATA_BLOCKED: {field} is not a valid trade date") from exc
+    if parsed.isoformat() != raw:
+        raise RuntimeError(f"DATA_BLOCKED: {field} is not a valid trade date")
+    return raw
+
+
+def resolve_review_trade_date(
+    engine, explicit_date: str = "", *, now: datetime | None = None
+) -> str:
+    """Resolve a closed exchange session; never infer readiness from K-line MAX."""
+
+    authoritative = authoritative_closed_trade_date(engine, now=now)
+    if not authoritative:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative closed trade date is unavailable"
+        )
+    authoritative = _iso_trade_date(
+        authoritative, field="authoritative closed trade date"
+    )
+    if not explicit_date:
+        return authoritative
+    target = _iso_trade_date(explicit_date, field="requested review date")
+    if target > authoritative:
+        raise RuntimeError(
+            "DATA_BLOCKED: requested review date is not a closed session: "
+            f"requested={target}, authoritative={authoritative}"
+        )
+    rows = _query(
+        engine,
+        "SELECT COUNT(*) AS n FROM si_trade_calendar "
+        "WHERE trade_status=1 AND trade_date=:d",
+        {"d": target},
+    )
+    if not rows or int(rows[0].get("n") or 0) != 1:
+        raise RuntimeError(
+            f"DATA_BLOCKED: requested review date is not an open session: {target}"
+        )
+    return target
+
+
+def _assert_rows_on_target(
+    rows: list[dict], *, date_field: str, target: str, source: str
+) -> None:
+    wrong = sorted(
+        {
+            str(row.get(date_field) or "")[:10] or "<empty>"
+            for row in rows
+            if str(row.get(date_field) or "")[:10] != target
+        }
+    )
+    if wrong:
+        raise RuntimeError(
+            f"DATA_BLOCKED: {source} contains mixed dates: "
+            f"target={target}, actual_dates={wrong[:10]}"
+        )
+
+
+def _assert_legacy_market_data_contract(data: dict, target_date: str) -> dict:
+    contract = data.get("_data_contract") if isinstance(data, dict) else None
+    if not isinstance(contract, dict):
+        raise RuntimeError("DATA_BLOCKED: legacy evening data contract is missing")
+    target = _iso_trade_date(target_date, field="target review date")
+    if (
+        contract.get("status") != "PASS"
+        or contract.get("target_trade_date") != target
+        or int(contract.get("expected_stock_count") or 0) <= 0
+        or float(contract.get("kline_coverage") or 0) != 1.0
+        or float(contract.get("traded_flow_coverage") or 0) != 1.0
+        or int(contract.get("index_count") or 0) != len(EXPECTED_A_SHARE_INDEX_CODES)
+        or int(contract.get("hot_concept_count") or 0) < MIN_HOT_CONCEPT_ROWS
+        or int(contract.get("fused_stock_count") or 0) < MIN_FUSED_HOT_STOCK_ROWS
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: legacy evening data contract is stale or incomplete"
+        )
+    return contract
+
+
+def _assert_digest_target_contract(digest: dict, target_date: str) -> dict:
+    """Prove that a ready digest was built from the requested target session."""
+
+    target = _iso_trade_date(target_date, field="target review date")
+    quality = digest.get("quality_json") if isinstance(digest, dict) else None
+    source_dates = quality.get("source_dates") if isinstance(quality, dict) else None
+    actual = {
+        "review_date": str(digest.get("review_date") or "")[:10]
+        if isinstance(digest, dict)
+        else "",
+        "quality_target_date": str(quality.get("target_date") or "")[:10]
+        if isinstance(quality, dict)
+        else "",
+        "target_bars": str(source_dates.get("target_bars") or "")[:10]
+        if isinstance(source_dates, dict)
+        else "",
+    }
+    if any(value != target for value in actual.values()):
+        raise RuntimeError(
+            "DATA_BLOCKED: quant review input dates do not match target: "
+            f"target={target}, actual={actual}"
+        )
+    return quality
+
+
 def collect_market_data(engine, date_str: str) -> dict:
-    """采集当天盘面数据"""
-    data = {}
+    """采集一个已闭市目标交易日的盘面数据。"""
+    target = _iso_trade_date(date_str, field="target review date")
+    params = {"d": target}
+    daily_rows = _query(
+        engine,
+        "SELECT stock_code, trade_date, volume, amount FROM sm_stock_kline "
+        "WHERE trade_date=:d AND k_type=1 AND adjust_type=0 ORDER BY stock_code",
+        params,
+    )
+    flow_coverage_rows = _query(
+        engine,
+        "SELECT stock_code, trade_date FROM sm_stock_capital_flow_daily "
+        "WHERE trade_date=:d ORDER BY stock_code",
+        params,
+    )
+    _assert_rows_on_target(
+        daily_rows, date_field="trade_date", target=target, source="daily K-line"
+    )
+    _assert_rows_on_target(
+        flow_coverage_rows,
+        date_field="trade_date",
+        target=target,
+        source="capital flow",
+    )
+    universe = load_daily_stock_universe(
+        engine,
+        target,
+        decision_known_at=datetime.now().replace(microsecond=0),
+    )
+    coverage = validate_daily_stock_coverage(
+        universe,
+        kline_rows=daily_rows,
+        flow_rows=flow_coverage_rows,
+    )
+    data = {"A股数据日期": target}
 
     # 1. 指数表现
     rows = _query(engine, """
-        SELECT i.index_code, i.price, i.change_pct
+        SELECT i.index_code, i.price, i.change_pct, i.trade_date
         FROM sm_index_current i
-        WHERE i.index_code IN ('000001','399001','399006','000688','000300')
+        WHERE i.trade_date=:d
+          AND i.index_code IN ('000001','399001','399006','000688','000300')
         ORDER BY FIELD(i.index_code,'000001','399001','399006','000688','000300')
-    """)
+    """, params)
+    _assert_rows_on_target(
+        rows, date_field="trade_date", target=target, source="A-share index"
+    )
+    index_codes = {
+        str(row.get("index_code") or "").strip()
+        for row in rows
+        if row.get("price") is not None
+    }
+    if index_codes != EXPECTED_A_SHARE_INDEX_CODES:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date A-share index snapshot is incomplete: "
+            f"target={target}, missing={sorted(EXPECTED_A_SHARE_INDEX_CODES-index_codes)}"
+        )
     nm = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指", "000688": "科创50", "000300": "沪深300"}
     data["指数"] = {nm.get(r["index_code"], r["index_code"]): r for r in rows if r.get("price")}
 
@@ -113,7 +278,8 @@ def collect_market_data(engine, date_str: str) -> dict:
             COALESCE(SUM(amount), 0) AS total_amt,
             AVG(change_pct) AS avg_chg,
             AVG(turnover_ratio) AS avg_turnover
-        FROM sm_stock_kline WHERE trade_date = :d AND k_type = 1
+        FROM sm_stock_kline
+        WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
     """, {"d": date_str})
     if rows and rows[0]["total_cnt"]:
         r = rows[0]
@@ -149,24 +315,45 @@ def collect_market_data(engine, date_str: str) -> dict:
 
     # 4. 热门板块
     rows = _query(engine, """
-        SELECT concept_name, change_pct, hot_value, plate_type
+        SELECT concept_name, change_pct, hot_value, plate_type, snapshot_date
         FROM st_hot_concept_ths_daily
-        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_concept_ths_daily WHERE snapshot_date >= :d)
+        WHERE snapshot_date = :d AND plate_type IN (1,2)
         ORDER BY plate_type, `rank`
     """, {"d": date_str})
+    _assert_rows_on_target(
+        rows, date_field="snapshot_date", target=target, source="hot concept"
+    )
+    if (
+        len(rows) < MIN_HOT_CONCEPT_ROWS
+        or not {1, 2} <= {int(row.get("plate_type") or 0) for row in rows}
+    ):
+        raise RuntimeError(
+            f"DATA_BLOCKED: target-date hot concept snapshot is incomplete: target={target}, rows={len(rows)}"
+        )
+    hot_concept_count = len(rows)
     data["热门行业"] = [r for r in rows if r.get("plate_type") == 2][:8]
     data["热门概念"] = [r for r in rows if r.get("plate_type") == 1][:10]
 
     # 5. 融合榜热门个股TOP10
     rows = _query(engine, """
-        SELECT f.short_name, f.stock_code, f.change_pct, f.fused_rank,
+        SELECT f.short_name, f.stock_code, f.change_pct, f.fused_rank, f.snapshot_date,
                t.pop_tag, t.concept_tag
         FROM st_hot_rank_fused f
         LEFT JOIN st_hot_rank_ths t ON t.stock_code = f.stock_code COLLATE utf8mb4_unicode_ci
             AND t.snapshot_date = f.snapshot_date
-        WHERE f.snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_rank_fused WHERE snapshot_date >= :d)
-        ORDER BY f.fused_rank LIMIT 10
+        WHERE f.snapshot_date = :d
+        ORDER BY f.fused_rank LIMIT 20
     """, {"d": date_str})
+    _assert_rows_on_target(
+        rows, date_field="snapshot_date", target=target, source="fused hot stock"
+    )
+    fused_stock_count = len(
+        {str(row.get("stock_code") or "").strip() for row in rows}
+    )
+    if fused_stock_count < MIN_FUSED_HOT_STOCK_ROWS:
+        raise RuntimeError(
+            f"DATA_BLOCKED: target-date fused hot-stock snapshot is incomplete: target={target}"
+        )
     data["热门个股"] = rows
 
     # 6. 龙虎榜概要
@@ -182,7 +369,7 @@ def collect_market_data(engine, date_str: str) -> dict:
     rows = _query(engine, """
         SELECT stock_code, short_name, close, change_pct
         FROM sm_stock_kline
-        WHERE trade_date = :d AND k_type = 1 AND change_pct >= 0.09
+        WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0 AND change_pct >= 0.09
         ORDER BY change_pct DESC LIMIT 8
     """, {"d": date_str})
     data["涨停板"] = rows
@@ -190,11 +377,22 @@ def collect_market_data(engine, date_str: str) -> dict:
     rows = _query(engine, """
         SELECT stock_code, short_name, close, change_pct
         FROM sm_stock_kline
-        WHERE trade_date = :d AND k_type = 1 AND change_pct <= -0.09
+        WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0 AND change_pct <= -0.09
         ORDER BY change_pct ASC LIMIT 5
     """, {"d": date_str})
     data["跌停板"] = rows
 
+    data["_data_contract"] = {
+        "status": "PASS",
+        "target_trade_date": target,
+        "expected_stock_count": int(coverage["expected_count"]),
+        "kline_coverage": float(coverage["kline_coverage"]),
+        "traded_flow_coverage": float(coverage["traded_flow_coverage"]),
+        "index_count": len(index_codes),
+        "hot_concept_count": hot_concept_count,
+        "fused_stock_count": fused_stock_count,
+    }
+    _assert_legacy_market_data_contract(data, target)
     return data
 
 
@@ -348,10 +546,9 @@ def _query(engine, sql: str, params: dict = None):
 
 
 def _find_latest_trade_date(engine) -> str:
-    rows = _query(engine, "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1")
-    if rows and rows[0].get("d"):
-        return str(rows[0]["d"])
-    return datetime.now().strftime("%Y-%m-%d")
+    """Compatibility wrapper for callers; authoritative calendar is the source."""
+
+    return resolve_review_trade_date(engine)
 
 
 def analyze_with_deepseek(data: dict, date_str: str) -> str:
@@ -535,16 +732,14 @@ def main():
 
     engine = get_engine()
 
-    if args.date:
-        date_str = args.date
-    else:
-        date_str = _find_latest_trade_date(engine)
-        log.info("使用最新交易日: %s", date_str)
+    date_str = resolve_review_trade_date(engine, args.date or "")
+    log.info("使用权威闭市交易日: %s", date_str)
 
     if args.legacy:
         # 旧版只保留为显式诊断入口，不再作为质量门禁失败时的发布回退。
         log.info("采集盘面数据...")
         data = collect_market_data(engine, date_str)
+        _assert_legacy_market_data_contract(data, date_str)
 
         log.info("DeepSeek AI 盘面分析中...")
         ai_analysis = analyze_with_deepseek(data, date_str)
@@ -560,6 +755,7 @@ def main():
 
         log.info("生成三段式盘后量化复盘...")
         digest = generate_quant_digest(engine, date_str, persist=not args.test)
+        _assert_digest_target_contract(digest, date_str)
         if digest.get("publish_status") != PUBLISH_READY:
             quality = digest.get("quality_json") or {}
             reasons = quality.get("errors") or ["未知质量门禁错误"]

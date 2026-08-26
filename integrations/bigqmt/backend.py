@@ -50,7 +50,7 @@ class BigQmtBackend:
         if not symbols:
             return pd.DataFrame()
         dividend_type = str(kwargs.get("dividend_type") or os.environ.get("QMT_DIVIDEND_TYPE", "none"))
-        raw = bridge.kline(
+        capture = bridge.kline_capture(
             symbols,
             start_date=start_date,
             end_date=end_date,
@@ -59,8 +59,14 @@ class BigQmtBackend:
             batch_size=int(os.environ.get("BIG_QMT_KLINE_BATCH_SIZE", "200")),
             timeout=int(os.environ.get("BIG_QMT_KLINE_TIMEOUT", "600")),
         )
-        if raw is None or raw.empty:
-            return pd.DataFrame()
+        raw = pd.DataFrame(capture.get("rows") or [])
+        capture_proof = {
+            key: value for key, value in capture.items() if key != "rows"
+        } | {"requested_codes": list(symbols), "row_count": len(raw)}
+        if raw.empty:
+            empty = pd.DataFrame()
+            empty.attrs["bigqmt_capture"] = capture_proof
+            return empty
         out = raw.copy()
         out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
         # Standard QMT daily bars report volume in lots. Canonical ProBigA
@@ -88,7 +94,9 @@ class BigQmtBackend:
             "turnover_ratio", "pre_close", "pre_close_origin", "qmt_code", "data_source", "source_time",
             "received_at", "batch_id", "data_version", "quality_status", "permission_status",
         ]
-        return out.reindex(columns=columns)
+        result = out.reindex(columns=columns)
+        result.attrs["bigqmt_capture"] = capture_proof
+        return result
 
     def fetch_minute(
         self,
@@ -99,7 +107,7 @@ class BigQmtBackend:
         symbols = self._symbols(stock_codes)
         if not symbols:
             return pd.DataFrame()
-        raw = bridge.minute(
+        capture = bridge.minute_capture(
             symbols,
             trade_date=trade_date,
             start_date=kwargs.get("start_date", trade_date),
@@ -109,18 +117,26 @@ class BigQmtBackend:
             batch_size=int(os.environ.get("BIG_QMT_MINUTE_BATCH_SIZE", "200")),
             timeout=int(os.environ.get("BIG_QMT_MINUTE_TIMEOUT", "600")),
         )
-        if raw is None or raw.empty:
-            return pd.DataFrame()
+        raw = pd.DataFrame(capture.get("rows") or [])
+        capture_proof = {
+            key: value for key, value in capture.items() if key != "rows"
+        } | {"requested_codes": list(symbols), "row_count": len(raw)}
+        if raw.empty:
+            empty = pd.DataFrame()
+            empty.attrs["bigqmt_capture"] = capture_proof
+            return empty
         out = raw.copy()
         out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
         out = self._with_provenance(out, batch_prefix="bigqmt_minute")
         columns = [
             "stock_code", "trade_time", "trade_date", "price", "avg_price",
-            "change", "change_pct", "volume", "amount", "qmt_code", "data_source",
-            "source_time", "received_at", "batch_id", "data_version", "quality_status",
-            "permission_status",
+            "change", "change_pct", "volume", "amount", "pre_close", "qmt_code",
+            "data_source", "source_time", "received_at", "batch_id", "data_version",
+            "quality_status", "permission_status",
         ]
-        return out.reindex(columns=columns)
+        result = out.reindex(columns=columns)
+        result.attrs["bigqmt_capture"] = capture_proof
+        return result
 
     def fetch_current(self, stock_codes: list[str], **kwargs) -> pd.DataFrame:
         qmt_home = kwargs.get("qmt_home")

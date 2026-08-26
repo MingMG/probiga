@@ -39,11 +39,22 @@ def test_other_rank_writers_replace_each_date_atomically():
     for function in (
         fetch_hot_rank_ths.fetch_hot_rank_ths,
         fetch_hot_pop_rank_east.fetch_hot_pop_rank_east,
-        fetch_hot_rank_sina.fetch_hot_rank_sina,
     ):
         source = _source(function)
         assert "REPLACE_TABLE_ROWS" in source
         assert "TRUNCATE TABLE" not in source
+
+
+def test_sina_semantics_block_has_no_publish_path():
+    source = _source(fetch_hot_rank_sina.fetch_hot_rank_sina)
+    assert "SINA_ATTENTION_DATA_BLOCK_REASON" in source
+    assert (
+        fetch_hot_rank_sina.SINA_ATTENTION_DATA_BLOCK_REASON
+        == "PROVIDER_ATTENTION_SEMANTICS_UNVERIFIABLE"
+    )
+    assert "REPLACE_TABLE_ROWS" not in source
+    assert "TO_SQL" not in source
+    assert "TRUNCATE TABLE" not in source
 
 
 def test_release_migration_is_the_only_hot_rank_schema_writer():

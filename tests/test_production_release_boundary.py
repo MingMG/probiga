@@ -260,7 +260,10 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
     deploy_job = workflow_source[workflow_source.index("\n  deploy:"):]
 
-    assert len(workflow_source) < 32_000
+    # The exact-data completion suite adds three bounded, directly auditable
+    # pytest batches while keeping the workflow comfortably below GitHub's
+    # practical size limits.
+    assert len(workflow_source) < 34_000
     assert "envs: EXPECTED_SHA" in deploy_job
     assert (
         'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
@@ -1156,8 +1159,8 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"',
         quality_gate,
     )
-    premarket_task = normalized.index(
-        "--task-type analysis_premarket_external", premarket_probe
+    premarket_task = premarket_probe + len(
+        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"'
     )
     code_cleanup = normalized.index(
         'prune_code_releases "$PREPARED_CODE_ROOT" "$PREVIOUS_CODE_ROOT"',
@@ -1169,12 +1172,20 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     post_prune_health = normalized.index(
         "CUTOVER_STEP=verify_post_prune_health", post_prune_identity,
     )
-    governance_smoke = normalized.index(
-        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+    login_smoke = normalized.index(
+        "CUTOVER_STEP=verify_account_login_api_and_page_smoke",
         post_prune_health,
     )
+    governance_smoke = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+        login_smoke,
+    )
+    pool_smoke = normalized.index(
+        "CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke",
+        governance_smoke,
+    )
     receipt_pending = normalized.index(
-        "persist_deployed_receipt_pending", governance_smoke
+        "persist_deployed_receipt_pending", pool_smoke
     )
     deployed_receipt = normalized.index(
         "publish_deployed_receipt_pending", receipt_pending
@@ -1202,7 +1213,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         < code_cleanup
         < post_prune_identity
         < post_prune_health
+        < login_smoke
         < governance_smoke
+        < pool_smoke
         < receipt_pending
         < journal_finalize
         < deployed_receipt
@@ -1283,17 +1296,115 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
     ):
         assert required in smoke
     assert "|| true" not in smoke
+    pool_smoke = deploy_script[
+        deploy_script.index(
+            "verify_strategy_pool_api_and_page_smoke() {"
+        ):
+        deploy_script.index("release_identity_check() {")
+    ]
+    for required in (
+        "/api/v3/stock-pool?trade_date=$expected_trade_date",
+        "/api/v3/stock-pool?before_session_date=$expected_trade_date",
+        "/api/v3/context?trade_date=$expected_trade_date",
+        'envelope.get("code_commit_sha") != expected_sha',
+        'pool.get("pool_readable") is True',
+        'pool.get("run_status") == "COMPLETED"',
+        'pool.get("decision_integrity_verified") is True',
+        'status in {"READY", "EMPTY"}',
+        'candidate_count != sum(',
+        'status == "READY" and candidate_count > 0',
+        'status == "EMPTY" and candidate_count == 0',
+        'latest.get("decision_session_date") or "") >= expected_trade_date',
+        'latest.get("before_session_date") == expected_trade_date',
+        'latest.get("requested_trade_date") == expected_trade_date',
+        'latest.get("is_historical_fallback") is True',
+        'latest.get("historical_read_only") is True',
+        'latest.get("historical_fallback_status")',
+        '== "HISTORICAL_READ_ONLY"',
+        'latest.get("historical_fallback_session_date")',
+        '== latest.get("decision_session_date")',
+        'context.get("run_uid") != exact.get("run_uid")',
+        "HISTORICAL_READ_ONLY",
+        "/static/trading-v3.html",
+        "/static/js/trading-v3.js",
+        "function stockPoolIsReadable(pool)",
+        "HISTORICAL_READ_ONLY / 历史只读",
+    ):
+        assert required in pool_smoke
+    assert "|| true" not in pool_smoke
     post_prune_health = normalized.index(
         "CUTOVER_STEP=verify_post_prune_health"
     )
-    smoke_call = normalized.index(
-        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+    login_smoke_call = normalized.index(
+        "CUTOVER_STEP=verify_account_login_api_and_page_smoke",
         post_prune_health,
     )
-    receipt = normalized.index(
-        "CUTOVER_STEP=persist_deployed_receipt_pending", smoke_call,
+    governance_smoke_call = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+        login_smoke_call,
     )
-    assert post_prune_health < smoke_call < receipt
+    pool_smoke_call = normalized.index(
+        "CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke",
+        governance_smoke_call,
+    )
+    receipt = normalized.index(
+        "CUTOVER_STEP=persist_deployed_receipt_pending", pool_smoke_call,
+    )
+    assert (
+        post_prune_health
+        < login_smoke_call
+        < governance_smoke_call
+        < pool_smoke_call
+        < receipt
+    )
+
+
+def test_final_account_login_smoke_exercises_runtime_schema_and_real_page():
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    login_smoke = deploy_script[
+        deploy_script.index("verify_account_login_api_and_page_smoke() {"):
+        deploy_script.index(
+            "verify_strategy_governance_api_and_page_smoke() {"
+        )
+    ]
+
+    for required in (
+        "http://127.0.0.1/api/auth/status",
+        "http://127.0.0.1/api/auth/login",
+        "__release_probe_",
+        "secrets.token_hex(16)",
+        '[ "$login_http_code" != 401 ]',
+        'status.get("required") is True',
+        'status.get("user_initialized") is True',
+        'status["user_count"] >= 1',
+        'status.get("registration_open") is False',
+        'login.get("error") == "invalid_credentials"',
+        "http://127.0.0.1/login",
+        "/static/js/login.js",
+        "server/static/login.html",
+        "server/static/js/login.js",
+    ):
+        assert required in login_smoke
+    assert "|| true" not in login_smoke
+
+    post_prune_health = normalized.index(
+        "CUTOVER_STEP=verify_post_prune_health"
+    )
+    login_call = normalized.index(
+        "CUTOVER_STEP=verify_account_login_api_and_page_smoke",
+        post_prune_health,
+    )
+    governance_call = normalized.index(
+        "CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke",
+        login_call,
+    )
+    receipt = normalized.index(
+        "CUTOVER_STEP=persist_deployed_receipt_pending", governance_call,
+    )
+    assert post_prune_health < login_call < governance_call < receipt
 
 
 def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code() -> None:
@@ -1879,7 +1990,7 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     ) in deploy_script
     assert "previous release virtual environment" in workflow
     assert "tools/ensure_quality_gate.py" in deploy_script
-    assert "--task-type analysis_premarket_external" in deploy_script
+    assert "--task-type analysis_premarket_external" not in deploy_script
     assert 'find "$tree_root"' in workflow
     assert '! -type l -perm /0222 -print -quit' in workflow
     assert "-perm /0222 -print -quit" in workflow
@@ -3314,6 +3425,15 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'funding.get("manifest_max_bytes") == 1048576',
         'funding.get("audit_max_bytes") == 131072',
         'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
+        'runtime_bundle.get("recovery_planner_count") == 3',
+        'runtime_bundle.get("recovery_planner_names")',
+        'runtime_bundle.get("recovery_plan_count") == 3',
+        'set(runtime_bundle["recovery_plans"])',
+        'get("status") == "PLANNED"',
+        'get("read_only") is True',
+        '"ready_for_privileged_apply"',
+        'r"[0-9a-f]{64}"',
+        'runtime_bundle.get("recovery_ready_for_privileged_apply") is True',
         'runtime_bundle_runtime.get("contract_hash")',
     ):
         assert required_resume_evidence in resume_validator
@@ -3360,6 +3480,16 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'governance_source.get("core_metric_review_contract_hash")',
         'governance_names_hash == expected_trigger_names_hash',
         'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
+        'runtime_bundle.get("recovery_planner_count") == 3',
+        'runtime_bundle.get("recovery_planner_names")',
+        'runtime_bundle.get("recovery_plan_count") == 3',
+        'set(runtime_bundle["recovery_plans"])',
+        'get("status") == "PLANNED"',
+        'get("read_only") is True',
+        '"ready_for_privileged_apply"',
+        'r"[0-9a-f]{64}"',
+        'runtime_bundle.get("recovery_ready_for_privileged_apply") is True',
+        'or not runtime_bundle.get("recovery_ready_for_privileged_apply")',
         'runtime_bundle.get("migration_required")',
     ):
         assert required_preflight_evidence in preflight_validator
@@ -3384,7 +3514,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
-        "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e",
+        "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
@@ -5038,6 +5168,12 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     )
     bodies = _shell_function_bodies(deploy)
     deferred = bodies["deploy_deferred_database_release"]
+    scheduler_cmdline = bodies[
+        "assert_deferred_scheduler_process_cmdline"
+    ]
+    capture_identity = bodies["capture_deferred_scheduler_identity"]
+    prepare_release = bodies["prepare_release"]
+    main_dropin = bodies["write_dropin"]
     auth_header_writer = bodies["write_admin_auth_header_file"]
     static_cutover = bodies["point_static_release_to_checkout"]
     static_verifier = bodies["assert_nginx_static_matches_checkout"]
@@ -5052,6 +5188,32 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     ]
 
     assert "STRATEGY_GOVERNANCE_MODE=DEFERRED_DB" in deploy
+    assert "capture_deferred_scheduler_identity" in prepare_release
+    assert prepare_release.index("capture_deferred_scheduler_identity") < (
+        prepare_release.index("write_dropin")
+    )
+    assert "PROBIGA_EXPECTED_GIT_SHA" in capture_identity
+    assert "PROBIGA_BUILD_COMMIT_SHA" in capture_identity
+    assert "PROBIGA_CODE_ROOT" in capture_identity
+    assert 'test "$observed_build_sha" = "$observed_expected_sha"' in (
+        capture_identity
+    )
+    assert "assert_deferred_scheduler_process_cmdline" in capture_identity
+    assert "assert_deferred_scheduler_process_cmdline" in deferred
+    for exact_argv_proof in (
+        'mapfile -d \'\' -t scheduler_argv < "/proc/$scheduler_pid/cmdline"',
+        'test "${#scheduler_argv[@]}" -eq 3',
+        '"$RELEASE_VENV_ROOT/$expected_sha/bin/python"',
+        'test "${scheduler_argv[1]}" = -P',
+        '"$expected_code_root/tools/run_scheduler_daemon.py"',
+    ):
+        assert exact_argv_proof in scheduler_cmdline
+    for variable in (
+        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA",
+        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT",
+    ):
+        assert variable in main_dropin
+        assert variable in verifier
     assert "PROBIGA_ADMIN_TOKEN" not in deploy
     assert "get_admin_auth_config" in auth_header_writer
     assert "chown root:root" in auth_header_writer
@@ -5108,22 +5270,38 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert 'payload.get("base_schema_ready") is True' in verifier
     assert 'payload.get("activation_enabled") is False' in verifier
     assert 'revision.get("expected_git_sha") == expected_sha' in verifier
+    assert 'identity.get("identity_mode") == "PRESERVED_DEFERRED"' in verifier
+    assert 'identity.get("api_build_sha") == expected_sha' in verifier
+    assert 'identity.get("expected_build_sha") == scheduler_sha' in verifier
+    assert 'identity.get("observed_build_sha") == scheduler_sha' in verifier
+    assert (
+        'identity.get("same_build_as_api") == '
+        "(scheduler_sha == expected_sha)"
+    ) in verifier
     assert 'revision.get("expected_sha") == expected_sha' not in verifier
     assert "--retry 45" in verifier
     assert "--retry-max-time 120" in verifier
     assert 'allocations[0].get("target_type") == "CASH"' in verifier
+    assert "for deferred_v3_endpoint in context readiness stock-pool" in verifier
+    assert 'data.get("decision_status") == "BLOCKED"' in verifier
+    assert 'data.get("paper_ready") is False' in verifier
+    assert 'item.get("actionability") == "RESEARCH_ONLY"' in verifier
+    assert 'item["action_plan"].get("buy_range") is None' in verifier
     assert "verify_trading_v3_production.py" in verifier
     assert "--real-trading-closed-only" in verifier
     assert "assert_nginx_static_matches_checkout" in verifier
+    assert 'verify_account_login_api_and_page_smoke "$EXPECTED_SHA"' in verifier
     for gate in (
         "health_contract",
         "governance_contract",
+        "v3_deferred_contract",
         "runtime_health",
         "deferred_schema_verify",
         "governance_task_disabled",
         "deferred_writer_fence",
         "real_trading_closed",
         "static_release_identity",
+        "account_login",
     ):
         assert f"deferred_runtime_gate_failed gate={gate}" in verifier
 

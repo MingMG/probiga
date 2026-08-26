@@ -38,6 +38,10 @@ from server.common.analysis_output_schema import (
     validate_ai_failure_sample_schema,
     validate_analysis_output_schema,
 )
+from server.common.daily_stock_universe import (
+    load_daily_stock_universe,
+    validate_daily_stock_coverage,
+)
 from server.common.pit_facts import (
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
@@ -306,10 +310,19 @@ def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> 
             f"{row['finance_coverage_watermark_hash']}"
         )
 
-    if _safe_number(row.get("main_net_inflow"), 0.0) == 0.0 and _safe_number(row.get("main_net_inflow_5d"), 0.0) == 0.0:
+    flow_trade_date_value = row.get("flow_trade_date")
+    if isinstance(flow_trade_date_value, datetime):
+        row_flow_date = flow_trade_date_value.date().isoformat()
+    elif isinstance(flow_trade_date_value, date):
+        row_flow_date = flow_trade_date_value.isoformat()
+    else:
+        row_flow_date = str(flow_trade_date_value or "").strip()[:10]
+        if row_flow_date.lower() in {"nan", "nat", "none"}:
+            row_flow_date = ""
+    if not row_flow_date:
         flags.append("missing_flow")
         score -= 24.0
-    elif flow_date and flow_date != trade_date:
+    elif row_flow_date != trade_date:
         flags.append("stale_flow")
         score -= 12.0
 
@@ -385,9 +398,12 @@ def choose_recommend_status(
         return "BLOCK", "非沪深A股主代码，不进入推荐池"
     if event_risk_level == "CRITICAL":
         return "BLOCK", "公告存在重大事件风险"
+    if "missing_flow" in flags:
+        return "SUSPENDED", "缺少目标交易日资金流，暂不进入推荐池"
+    if "stale_flow" in flags:
+        return "SUSPENDED", "资金流不是目标交易日，暂不进入推荐池"
     if (
         "missing_finance" in flags
-        or "missing_flow" in flags
         or "pit_finance_data_blocked" in flags
         or "pit_event_data_blocked" in flags
         or "pit_industry_data_blocked" in flags
@@ -401,8 +417,6 @@ def choose_recommend_status(
         return "SUSPENDED", "公告风险较高，等待风险消化"
     if ai_score < min_score:
         return "SUSPENDED", "综合评分未达到推荐阈值"
-    if "stale_flow" in flags and ai_score < min_score + 6:
-        return "SUSPENDED", "资金流数据不是当日，暂缓推荐"
     if amount < 30_000_000:
         return "SUSPENDED", "成交额偏低，流动性不足"
     if change_pct >= 9.7:
@@ -1053,24 +1067,101 @@ def load_flow_features(engine: Engine, trade_date: str, lookback: int = 25) -> t
     grouped = df.groupby("stock_code", group_keys=False)
     df["main_net_inflow_5d"] = grouped["main_net_inflow"].transform(lambda s: s.rolling(5, min_periods=1).sum())
     df["main_net_inflow_20d"] = grouped["main_net_inflow"].transform(lambda s: s.rolling(20, min_periods=1).sum())
-    latest = df.groupby("stock_code", as_index=False).tail(1).copy()
+    target = date.fromisoformat(trade_date)
+    latest = df[df["trade_date"] == target].copy()
     latest = latest.rename(columns={"trade_date": "flow_trade_date"})
     return latest.reset_index(drop=True), flow_date
 
 
+def validate_exact_daily_flow_coverage(
+    engine: Engine,
+    *,
+    trade_date: str,
+    kline: pd.DataFrame,
+    flow: pd.DataFrame,
+    decision_known_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Prove exact target-date flow coverage against the immutable universe."""
+
+    universe = load_daily_stock_universe(
+        engine,
+        trade_date,
+        decision_known_at=decision_known_at,
+    )
+    kline_rows = (
+        kline[["stock_code", "volume", "amount"]].to_dict(orient="records")
+        if {"stock_code", "volume", "amount"}.issubset(kline.columns)
+        else []
+    )
+    flow_rows = (
+        flow[["stock_code"]].to_dict(orient="records")
+        if "stock_code" in flow.columns
+        else []
+    )
+    audit = validate_daily_stock_coverage(
+        universe,
+        kline_rows=kline_rows,
+        flow_rows=flow_rows,
+    )
+    logger.info(
+        "Exact capital-flow coverage verified: date=%s expected=%s traded=%s "
+        "flow=%s catalog_hash=%s",
+        trade_date,
+        audit["expected_count"],
+        audit["traded_count"],
+        audit["flow_count"],
+        audit["expected_code_set_hash"],
+    )
+    return audit
+
+
 def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
-    hot_dates = _recent_dates(engine, "st_hot_rank_fused", "snapshot_date", trade_date, 1)
-    if not hot_dates:
-        return pd.DataFrame({"stock_code": []}), ""
-    hot_date = hot_dates[0]
+    """Load only exact-date, per-stock multi-source heat evidence.
+
+    The provider feeds behind this table are current-snapshot-only.  Falling
+    back to an older partition would silently score historical heat as fresh;
+    accepting a one-source row would call an unfused ranking a consensus.
+    Both cases degrade to a missing heat factor instead.
+    """
+
     sql = """
         SELECT stock_code, fused_rank, total_score, source_flag
         FROM st_hot_rank_fused
-        WHERE snapshot_date = :hot_date
+        WHERE snapshot_date = :trade_date
     """
-    df = pd.read_sql(text(sql), engine, params={"hot_date": hot_date})
+    df = pd.read_sql(text(sql), engine, params={"trade_date": trade_date})
     if df.empty:
-        return pd.DataFrame({"stock_code": []}), hot_date
+        logger.warning(
+            "DATA_BLOCKED: exact-date multi-source hot rank is unavailable: "
+            "trade_date=%s",
+            trade_date,
+        )
+        return pd.DataFrame({"stock_code": []}), ""
+    multi_source_flags = {
+        "all",
+        "east_ths_xq",
+        "east_ths_sina",
+        "east_xq_sina",
+        "ths_xq_sina",
+        "both",
+        "east_xq",
+        "east_sina",
+        "ths_xq",
+        "ths_sina",
+        "xq_sina",
+    }
+    df = df[
+        df["source_flag"].fillna("").astype(str).str.strip().str.lower().isin(
+            multi_source_flags
+        )
+    ].copy()
+    if df.empty:
+        logger.warning(
+            "DATA_BLOCKED: exact-date hot rank has no per-stock multi-source "
+            "consensus: trade_date=%s",
+            trade_date,
+        )
+        return pd.DataFrame({"stock_code": []}), ""
     df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
     df["fused_rank"] = pd.to_numeric(df["fused_rank"], errors="coerce")
     df["hot_total_score"] = pd.to_numeric(df["total_score"], errors="coerce")
@@ -1079,7 +1170,7 @@ def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
     # a historical/production recommendation score.  The exact-date QMT
     # membership loader below is the only strategy-authoritative industry.
     df["industry_name"] = ""
-    return df.drop_duplicates("stock_code", keep="last"), hot_date
+    return df.drop_duplicates("stock_code", keep="last"), trade_date
 
 
 def load_notice_features(
@@ -2342,6 +2433,10 @@ def _build_text_fields(df: pd.DataFrame, flow_date: str, trade_date: str) -> pd.
     for row in df.to_dict(orient="records"):
         strengths: list[str] = []
         risks: list[str] = []
+        try:
+            quality_flags = set(json.loads(row.get("data_quality_flags") or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            quality_flags = set()
         if float(row.get("technical_score") or 0) >= 68:
             strengths.append("技术趋势较强")
         if float(row.get("capital_score") or 0) >= 68:
@@ -2359,8 +2454,15 @@ def _build_text_fields(df: pd.DataFrame, flow_date: str, trade_date: str) -> pd.
             risks.append("近期公告存在风险事项")
         if row.get("risk_titles"):
             risks.extend([f"公告风险: {t}" for t in row.get("risk_titles", [])[:2]])
-        if flow_date and flow_date != trade_date:
-            risks.append(f"资金流使用最近可用日期{flow_date}")
+        row_flow_date = str(row.get("flow_trade_date") or "").strip()[:10]
+        if "missing_flow" in quality_flags:
+            risks.append("缺少目标交易日资金流，资金因子不可用于推荐")
+        elif "stale_flow" in quality_flags:
+            risks.append(
+                f"资金流日期{row_flow_date or '未知'}不是目标交易日{trade_date}"
+            )
+        if "missing_hot_rank" in quality_flags:
+            risks.append("目标交易日缺少至少双源热榜，热度因子已禁用")
         if float(row.get("amount") or 0) < 30_000_000:
             risks.append("成交额偏低")
         if float(row.get("change_pct") or 0) >= 9.7:
@@ -2859,8 +2961,15 @@ def _prepare_batch_outputs(
         finance["finance_pit_status"] = PIT_DATA_BLOCKED
         finance["finance_pit_reason"] = common_cutoff.get("reason")
     _emit_progress(progress_callback, stage="load_flow", percent=23, step="加载资金流数据...", trade_date=trade_date)
-    flow, flow_date = load_flow_features(engine, trade_date)
-    flow = _filter_frame_by_codes(flow, scoped_codes)
+    flow_all, flow_date = load_flow_features(engine, trade_date)
+    validate_exact_daily_flow_coverage(
+        engine,
+        trade_date=trade_date,
+        kline=kline_all,
+        flow=flow_all,
+        decision_known_at=(decision_at if isinstance(decision_at, datetime) else None),
+    )
+    flow = _filter_frame_by_codes(flow_all, scoped_codes)
     _emit_progress(progress_callback, stage="load_hot", percent=32, step="加载热度排行...", trade_date=trade_date)
     hot, hot_date = load_hot_rank(engine, trade_date)
     hot = _filter_frame_by_codes(hot, scoped_codes)
@@ -2916,7 +3025,6 @@ def _prepare_batch_outputs(
         rec_history=rec_history,
         failures=failures,
     )
-    scored["flow_trade_date"] = flow_date
     scored["hot_trade_date"] = hot_date
     _emit_progress(progress_callback, stage="build_rows", percent=88, step="生成分析与推荐结果...", trade_date=trade_date)
     scored = _build_text_fields(scored, flow_date=flow_date, trade_date=trade_date)

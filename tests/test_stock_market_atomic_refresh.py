@@ -175,6 +175,16 @@ def test_qmt_minute_multibatch_publish_is_receipt_barriered():
     passed = source.index("quality_status=final_quality_status")
 
     assert generation_lock < publishing < commit < failed < passed
+    assert "load_target_stock_catalog" in source
+    assert "load_trade_calendar_receipt" in source
+    assert '"reference_roots": reference_evidence' in source
+    assert "probiga_scheduler_executor_role" in source
+    assert "probiga_build_commit_sha" in source
+    assert "_formal_bigqmt_release_proof" in source
+    assert "bigqmt_bridge.capabilities" in _source(
+        sync_stock_market._formal_bigqmt_release_proof
+    )
+    assert '"release_build_sha": release_build_sha' in source
     commit_source = _source(sync_stock_market._commit_qmt_minute_stage)
     assert "stock_minute_freeze_lock_name" in commit_source
     assert "connection_id()" in commit_source
@@ -187,6 +197,85 @@ def test_qmt_minute_multibatch_publish_is_receipt_barriered():
     update = update[: update.index("insert into st_qmt_minute_sync_receipt_v2")]
     assert "quality_status='superseded'" in update
     assert "source_provider" not in update
+
+
+def test_qmt_minute_stage_keeps_supported_provenance_and_drops_local_only_fields(
+    monkeypatch,
+):
+    target_columns = [
+        "id",
+        "stock_code",
+        "trade_time",
+        "trade_date",
+        "price",
+        "volume",
+        "amount",
+        "etl_sync_at",
+        "qmt_code",
+        "data_source",
+        "source_time",
+        "received_at",
+        "batch_id",
+        "data_version",
+        "quality_status",
+        "permission_status",
+    ]
+
+    class Result:
+        def fetchall(self):
+            return [(column,) for column in target_columns]
+
+    class Connection:
+        def __init__(self):
+            self.commits = 0
+
+        def execute(self, _statement):
+            return Result()
+
+        def commit(self):
+            self.commits += 1
+
+        def begin(self):
+            return nullcontext()
+
+    captured = {}
+
+    def record_frame(frame, table_name, _connection, **_kwargs):
+        captured["frame"] = frame.copy()
+        captured["table_name"] = table_name
+
+    monkeypatch.setattr(sync_stock_market, "write_frame", record_frame)
+    connection = Connection()
+    written = sync_stock_market._append_qmt_minute_stage(
+        connection,
+        "sm_stock_minute_qmt_stage_test",
+        pd.DataFrame(
+            [{
+                "stock_code": "000001",
+                "trade_time": "2026-08-26 09:30:00",
+                "trade_date": "2026-08-26",
+                "price": 10.1,
+                "volume": 100,
+                "amount": 1010,
+                "pre_close": 10.0,
+                "qmt_code": "000001.SZ",
+                "data_source": "gj_big_qmt_inner",
+                "source_time": "2026-08-26 09:30:00",
+                "received_at": "2026-08-26 15:01:00",
+                "batch_id": "minute-run",
+                "data_version": "bigqmt_inner_v2",
+                "quality_status": "VERIFIED",
+                "permission_status": "SUPPORTED",
+            }]
+        ),
+    )
+
+    assert written == 1
+    assert connection.commits == 1
+    assert captured["table_name"] == "sm_stock_minute_qmt_stage_test"
+    assert "pre_close" not in captured["frame"].columns
+    assert captured["frame"].iloc[0]["data_source"] == "gj_big_qmt_inner"
+    assert captured["frame"].iloc[0]["batch_id"] == "minute-run"
 
 
 def test_every_stock_minute_publisher_uses_one_freeze_lock_on_target_connection():
@@ -499,7 +588,10 @@ def test_85_percent_qmt_minute_receipt_cannot_gain_forward_authority():
     assert disposition_evidence == evidence
     assert status == "PARTIAL"
     assert forward_eligible is False
-    with pytest.raises(ValueError, match="exact requested coverage"):
+    with pytest.raises(
+        ValueError,
+        match="exact per-code time-grid manifest|exact requested coverage",
+    ):
         sync_stock_market._record_qmt_minute_receipt(
             object(),
             trade_date="2026-08-25",
@@ -528,7 +620,10 @@ def test_85_percent_qmt_minute_receipt_cannot_gain_forward_authority():
     assert full_evidence["published_stock_code_count"] == 19
     assert full_status == "PASS"
     assert full_forward is True
-    with pytest.raises(ValueError, match="frozen universe evidence"):
+    with pytest.raises(
+        ValueError,
+        match="exact per-code time-grid manifest|frozen universe evidence",
+    ):
         sync_stock_market._record_qmt_minute_receipt(
             object(),
             trade_date="2026-08-25",
@@ -543,6 +638,74 @@ def test_85_percent_qmt_minute_receipt_cannot_gain_forward_authority():
             quality_status="PASS",
             evidence={},
         )
+
+
+def test_qmt_minute_publish_replaces_the_whole_day_for_every_requested_code():
+    class Result:
+        def __init__(self, *, scalar_value=None, rows=None, rowcount=1):
+            self._scalar_value = scalar_value
+            self._rows = list(rows or [])
+            self.rowcount = rowcount
+
+        def scalar(self):
+            return self._scalar_value
+
+        def fetchall(self):
+            return list(self._rows)
+
+        def one(self):
+            return self._rows[0]
+
+    class Connection:
+        def __init__(self):
+            self.dml = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            upper = sql.upper()
+            if "IS_USED_LOCK" in upper:
+                return Result(rows=[(17, 17)])
+            if "SELECT COUNT(*)" in upper:
+                return Result(scalar_value=1)
+            if "SELECT DISTINCT STOCK_CODE" in upper:
+                return Result(rows=[("000001",)])
+            if "INFORMATION_SCHEMA.COLUMNS" in upper:
+                return Result(rows=[("stock_code",), ("trade_time",), ("price",)])
+            if upper.lstrip().startswith(("DELETE", "INSERT")):
+                self.dml.append((sql, dict(params or {})))
+                return Result(rowcount=1)
+            raise AssertionError(sql)
+
+        def commit(self):
+            return None
+
+        def rollback(self):
+            return None
+
+        def begin(self):
+            return nullcontext(self)
+
+    connection = Connection()
+    published = sync_stock_market._commit_qmt_minute_stage(
+        object(),
+        connection,
+        "minute_stage",
+        trade_date="2026-08-26",
+        replacement_codes=["000001", "600000"],
+    )
+
+    assert published == 1
+    delete_sql, delete_params = connection.dml[0]
+    assert "trade_time >= :day_start" in delete_sql
+    assert "trade_time < :day_end" in delete_sql
+    assert delete_params == {
+        "code_0": "000001",
+        "code_1": "600000",
+        "day_start": datetime(2026, 8, 26, 0, 0),
+        "day_end": datetime(2026, 8, 27, 0, 0),
+    }
+    assert "first_trade_time" not in delete_sql
+    assert "last_trade_time" not in delete_sql
 
 
 class _AuthorityMappings:

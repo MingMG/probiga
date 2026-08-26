@@ -439,18 +439,46 @@ def authenticate(
     except AuthError:
         display, normalized = str(username or "").strip()[:64], "\0"
     now = utcnow()
+    pending_error: AuthError | None = None
+    issued: IssuedSession | None = None
     with engine.begin() as conn:
         row = conn.execute(
             select(auth_user)
             .where(auth_user.c.username_norm == normalized)
             .with_for_update()
         ).mappings().first()
-        valid = bool(
+        locked_until = row["locked_until"] if row else None
+        valid = False
+        already_locked = bool(
             row
             and row["is_active"]
-            and verify_password(password, str(row["password_hash"]))
+            and isinstance(locked_until, datetime)
+            and locked_until > now
         )
-        if not valid:
+        if already_locked:
+            retry_after = max(1, int((locked_until - now).total_seconds()))
+            _audit(
+                conn,
+                event_type="LOGIN_LOCKED",
+                success=False,
+                username=str(row["username"]),
+                user_id=int(row["id"]),
+                client_ip=client_ip,
+                detail=f"retry_after={retry_after}",
+            )
+            pending_error = AuthError(
+                "account_temporarily_locked",
+                "登录失败次数过多，请稍后再试。",
+                status_code=429,
+                retry_after=retry_after,
+            )
+        else:
+            valid = bool(
+                row
+                and row["is_active"]
+                and verify_password(password, str(row["password_hash"]))
+            )
+        if pending_error is None and not valid:
             if row:
                 failures = int(row["failed_login_count"] or 0) + 1
                 locked_until = row["locked_until"]
@@ -471,67 +499,59 @@ def authenticate(
                 client_ip=client_ip,
                 detail="invalid credentials",
             )
-            raise AuthError("invalid_credentials", "账号或密码不正确。", status_code=401)
-
-        locked_until = row["locked_until"]
-        if isinstance(locked_until, datetime) and locked_until > now:
-            retry_after = max(1, int((locked_until - now).total_seconds()))
+            # Raising inside ``engine.begin()`` rolls back both the failed-login
+            # counter and its audit record.  Defer the public error until the
+            # transaction has committed the security state.
+            pending_error = AuthError(
+                "invalid_credentials",
+                "账号或密码不正确。",
+                status_code=401,
+            )
+        if pending_error is None:
+            user = AuthUser(
+                id=int(row["id"]),
+                username=str(row["username"]),
+                role=str(row["role"]),
+                is_active=bool(row["is_active"]),
+            )
+            conn.execute(
+                update(auth_user)
+                .where(auth_user.c.id == user.id)
+                .values(failed_login_count=0, locked_until=None, last_login_at=now, updated_at=now)
+            )
+            conn.execute(
+                update(auth_session)
+                .where(
+                    and_(
+                        auth_session.c.user_id == user.id,
+                        auth_session.c.revoked_at.is_(None),
+                        auth_session.c.expires_at <= now,
+                    )
+                )
+                .values(revoked_at=now)
+            )
+            issued = _issue_session_in_connection(
+                conn,
+                user=user,
+                session_hours=session_hours,
+                refresh_after_hours=refresh_after_hours,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
             _audit(
                 conn,
-                event_type="LOGIN_LOCKED",
-                success=False,
-                username=str(row["username"]),
-                user_id=int(row["id"]),
+                event_type="LOGIN",
+                success=True,
+                username=user.username,
+                user_id=user.id,
                 client_ip=client_ip,
-                detail=f"retry_after={retry_after}",
+                detail="password login",
             )
-            raise AuthError(
-                "account_temporarily_locked",
-                "登录失败次数过多，请稍后再试。",
-                status_code=429,
-                retry_after=retry_after,
-            )
-
-        user = AuthUser(
-            id=int(row["id"]),
-            username=str(row["username"]),
-            role=str(row["role"]),
-            is_active=bool(row["is_active"]),
-        )
-        conn.execute(
-            update(auth_user)
-            .where(auth_user.c.id == user.id)
-            .values(failed_login_count=0, locked_until=None, last_login_at=now, updated_at=now)
-        )
-        conn.execute(
-            update(auth_session)
-            .where(
-                and_(
-                    auth_session.c.user_id == user.id,
-                    auth_session.c.revoked_at.is_(None),
-                    auth_session.c.expires_at <= now,
-                )
-            )
-            .values(revoked_at=now)
-        )
-        issued = _issue_session_in_connection(
-            conn,
-            user=user,
-            session_hours=session_hours,
-            refresh_after_hours=refresh_after_hours,
-            client_ip=client_ip,
-            user_agent=user_agent,
-        )
-        _audit(
-            conn,
-            event_type="LOGIN",
-            success=True,
-            username=user.username,
-            user_id=user.id,
-            client_ip=client_ip,
-            detail="password login",
-        )
-        return issued
+    if pending_error is not None:
+        raise pending_error
+    if issued is None:  # pragma: no cover - defensive invariant
+        raise RuntimeError("authentication completed without a session or error")
+    return issued
 
 
 def resolve_session(engine: Engine, token: str, *, touch: bool = True) -> SessionIdentity | None:

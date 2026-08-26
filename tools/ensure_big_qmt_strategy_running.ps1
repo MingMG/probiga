@@ -353,6 +353,15 @@ public static class ProBigAQmtWindow
         public int Bottom;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
     [DllImport("user32.dll")]
     public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
 
@@ -367,6 +376,18 @@ public static class ProBigAQmtWindow
 
     [DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromWindow(
+        IntPtr hWnd,
+        uint flags
+    );
+
+    [DllImport("user32.dll")]
+    public static extern bool GetMonitorInfo(
+        IntPtr monitor,
+        ref MONITORINFO info
+    );
 
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -391,6 +412,235 @@ public static class ProBigAQmtWindow
         uint data,
         UIntPtr extraInfo
     );
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFOHEADER
+    {
+        public uint biSize;
+        public int biWidth;
+        public int biHeight;
+        public ushort biPlanes;
+        public ushort biBitCount;
+        public uint biCompression;
+        public uint biSizeImage;
+        public int biXPelsPerMeter;
+        public int biYPelsPerMeter;
+        public uint biClrUsed;
+        public uint biClrImportant;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RGBQUAD
+    {
+        public byte rgbBlue;
+        public byte rgbGreen;
+        public byte rgbRed;
+        public byte rgbReserved;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BITMAPINFO
+    {
+        public BITMAPINFOHEADER bmiHeader;
+        public RGBQUAD bmiColors;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetDC(IntPtr handle);
+
+    [DllImport("user32.dll")]
+    private static extern int ReleaseDC(IntPtr handle, IntPtr dc);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateCompatibleDC(IntPtr dc);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteDC(IntPtr dc);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateDIBSection(
+        IntPtr dc,
+        ref BITMAPINFO info,
+        uint usage,
+        out IntPtr bits,
+        IntPtr section,
+        uint offset
+    );
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr SelectObject(IntPtr dc, IntPtr value);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool DeleteObject(IntPtr value);
+
+    [DllImport("gdi32.dll")]
+    private static extern bool BitBlt(
+        IntPtr target,
+        int x,
+        int y,
+        int width,
+        int height,
+        IntPtr source,
+        int sourceX,
+        int sourceY,
+        uint operation
+    );
+
+    private static int Luminance(byte[] pixels, int width, int x, int y)
+    {
+        int index = ((y * width) + x) * 4;
+        int blue = pixels[index];
+        int green = pixels[index + 1];
+        int red = pixels[index + 2];
+        return ((2126 * red) + (7152 * green) + (722 * blue)) / 10000;
+    }
+
+    public static int FindStrategyPaneLeft(
+        int left,
+        int top,
+        int right,
+        int bottom
+    )
+    {
+        int width = right - left;
+        int height = bottom - top;
+        if (width < 900 || height < 500)
+        {
+            return -1;
+        }
+        IntPtr screen = GetDC(IntPtr.Zero);
+        IntPtr memory = IntPtr.Zero;
+        IntPtr bitmap = IntPtr.Zero;
+        IntPtr previous = IntPtr.Zero;
+        try
+        {
+            if (screen == IntPtr.Zero)
+            {
+                return -1;
+            }
+            memory = CreateCompatibleDC(screen);
+            if (memory == IntPtr.Zero)
+            {
+                return -1;
+            }
+            BITMAPINFO info = new BITMAPINFO();
+            info.bmiHeader.biSize = (uint)Marshal.SizeOf(
+                typeof(BITMAPINFOHEADER)
+            );
+            info.bmiHeader.biWidth = width;
+            info.bmiHeader.biHeight = -height;
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            IntPtr bits;
+            bitmap = CreateDIBSection(
+                screen,
+                ref info,
+                0,
+                out bits,
+                IntPtr.Zero,
+                0
+            );
+            if (bitmap == IntPtr.Zero || bits == IntPtr.Zero)
+            {
+                return -1;
+            }
+            previous = SelectObject(memory, bitmap);
+            if (previous == IntPtr.Zero)
+            {
+                return -1;
+            }
+            if (!BitBlt(
+                memory,
+                0,
+                0,
+                width,
+                height,
+                screen,
+                left,
+                top,
+                0x40CC0020
+            ))
+            {
+                return -1;
+            }
+            byte[] pixels = new byte[width * height * 4];
+            Marshal.Copy(bits, pixels, 0, pixels.Length);
+            int[] rows = new int[] { 100, 180, 300 };
+            bool inRun = false;
+            int runCount = 0;
+            int paneLeft = -1;
+            int limit = Math.Min(width - 100, 1500);
+            for (int x = 250; x < limit; x += 2)
+            {
+                int dark = 0;
+                int light = 0;
+                foreach (int row in rows)
+                {
+                    dark += Luminance(pixels, width, x - 24, row);
+                    light += Luminance(pixels, width, x + 24, row);
+                }
+                bool transition = dark / rows.Length < 80 &&
+                    light / rows.Length > 220;
+                if (transition && !inRun)
+                {
+                    runCount += 1;
+                    paneLeft = x + 24;
+                    inRun = true;
+                }
+                else if (!transition)
+                {
+                    inRun = false;
+                }
+            }
+            if (runCount == 1)
+            {
+                return left + paneLeft;
+            }
+            int fullWidthLight = 0;
+            int[] fullWidthColumns = new int[] { 60, 250, 400, 600 };
+            int[] fullWidthRows = new int[] { 180, 300 };
+            foreach (int column in fullWidthColumns)
+            {
+                foreach (int row in fullWidthRows)
+                {
+                    fullWidthLight += Luminance(
+                        pixels,
+                        width,
+                        column,
+                        row
+                    );
+                }
+            }
+            int fullWidthSamples = fullWidthColumns.Length *
+                fullWidthRows.Length;
+            if (runCount == 0 && fullWidthLight / fullWidthSamples > 220)
+            {
+                // QMT's dedicated model-research list starts immediately to
+                // the right of the 51-pixel navigation rail.
+                return left + 51;
+            }
+            return -1;
+        }
+        finally
+        {
+            if (previous != IntPtr.Zero && memory != IntPtr.Zero)
+            {
+                SelectObject(memory, previous);
+            }
+            if (bitmap != IntPtr.Zero)
+            {
+                DeleteObject(bitmap);
+            }
+            if (memory != IntPtr.Zero)
+            {
+                DeleteDC(memory);
+            }
+            if (screen != IntPtr.Zero)
+            {
+                ReleaseDC(IntPtr.Zero, screen);
+            }
+        }
+    }
 
     public static IntPtr FindVisibleWindow(uint processId, string titlePart)
     {
@@ -425,16 +675,50 @@ function Invoke-WindowClick {
     param(
         [IntPtr]$Handle,
         [double]$XRatio,
-        [double]$YRatio
+        [double]$YRatio,
+        [switch]$UseMonitorWorkArea
     )
     $rect = New-Object ProBigAQmtWindow+RECT
     if (![ProBigAQmtWindow]::GetWindowRect($Handle, [ref]$rect)) {
         throw "cannot read QMT window bounds"
     }
-    $width = [Math]::Max(1, $rect.Right - $rect.Left)
-    $height = [Math]::Max(1, $rect.Bottom - $rect.Top)
-    $x = $rect.Left + [int]($width * $XRatio)
-    $y = $rect.Top + [int]($height * $YRatio)
+    $clickLeft = $rect.Left
+    $clickTop = $rect.Top
+    $clickRight = $rect.Right
+    $clickBottom = $rect.Bottom
+    if ($UseMonitorWorkArea) {
+        # QMT's main wrapper can span monitors with different resolutions.
+        # Its actionable navigation pane is anchored to the work area of the
+        # monitor that owns the main window, not to the wrapper's union rect.
+        $monitor = [ProBigAQmtWindow]::MonitorFromWindow($Handle, 2)
+        if ($monitor -eq [IntPtr]::Zero) {
+            throw "cannot resolve QMT main monitor"
+        }
+        $monitorInfo = New-Object ProBigAQmtWindow+MONITORINFO
+        $monitorInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf(
+            $monitorInfo
+        )
+        if (![ProBigAQmtWindow]::GetMonitorInfo($monitor, [ref]$monitorInfo)) {
+            throw "cannot read QMT main monitor bounds"
+        }
+        $clickLeft = $monitorInfo.rcWork.Left
+        $clickTop = $monitorInfo.rcWork.Top
+        $clickRight = $monitorInfo.rcWork.Right
+        $clickBottom = $monitorInfo.rcWork.Bottom
+        $boundsTolerance = 8
+        if (
+            $clickLeft -lt $rect.Left - $boundsTolerance -or
+            $clickTop -lt $rect.Top - $boundsTolerance -or
+            $clickRight -gt $rect.Right + $boundsTolerance -or
+            $clickBottom -gt $rect.Bottom + $boundsTolerance
+        ) {
+            throw "QMT main window does not cover its navigation monitor"
+        }
+    }
+    $width = [Math]::Max(1, $clickRight - $clickLeft)
+    $height = [Math]::Max(1, $clickBottom - $clickTop)
+    $x = $clickLeft + [int]($width * $XRatio)
+    $y = $clickTop + [int]($height * $YRatio)
     [ProBigAQmtWindow]::SetForegroundWindow($Handle) | Out-Null
     [ProBigAQmtWindow]::SetCursorPos($x, $y) | Out-Null
     [ProBigAQmtWindow]::mouse_event(
@@ -451,6 +735,91 @@ function Invoke-WindowClick {
         0,
         [UIntPtr]::Zero
     )
+}
+
+function Get-QmtMainWorkArea {
+    param([IntPtr]$Handle)
+    $rect = New-Object ProBigAQmtWindow+RECT
+    if (![ProBigAQmtWindow]::GetWindowRect($Handle, [ref]$rect)) {
+        throw "cannot read QMT main window bounds"
+    }
+    $monitor = [ProBigAQmtWindow]::MonitorFromWindow($Handle, 2)
+    if ($monitor -eq [IntPtr]::Zero) {
+        throw "cannot resolve QMT main monitor"
+    }
+    $monitorInfo = New-Object ProBigAQmtWindow+MONITORINFO
+    $monitorInfo.cbSize = [Runtime.InteropServices.Marshal]::SizeOf(
+        $monitorInfo
+    )
+    if (![ProBigAQmtWindow]::GetMonitorInfo($monitor, [ref]$monitorInfo)) {
+        throw "cannot read QMT main monitor bounds"
+    }
+    $boundsTolerance = 8
+    if (
+        $monitorInfo.rcWork.Left -lt $rect.Left - $boundsTolerance -or
+        $monitorInfo.rcWork.Top -lt $rect.Top - $boundsTolerance -or
+        $monitorInfo.rcWork.Right -gt $rect.Right + $boundsTolerance -or
+        $monitorInfo.rcWork.Bottom -gt $rect.Bottom + $boundsTolerance
+    ) {
+        throw "QMT main window does not cover its navigation monitor"
+    }
+    return [pscustomobject]@{
+        Left = [int]$monitorInfo.rcWork.Left
+        Top = [int]$monitorInfo.rcWork.Top
+        Right = [int]$monitorInfo.rcWork.Right
+        Bottom = [int]$monitorInfo.rcWork.Bottom
+    }
+}
+
+function Invoke-WindowPointClick {
+    param(
+        [IntPtr]$Handle,
+        [int]$X,
+        [int]$Y
+    )
+    $rect = New-Object ProBigAQmtWindow+RECT
+    if (![ProBigAQmtWindow]::GetWindowRect($Handle, [ref]$rect)) {
+        throw "cannot read QMT point-click bounds"
+    }
+    if (
+        $X -lt $rect.Left -or
+        $X -ge $rect.Right -or
+        $Y -lt $rect.Top -or
+        $Y -ge $rect.Bottom
+    ) {
+        throw "QMT point click escapes the target window"
+    }
+    [ProBigAQmtWindow]::SetForegroundWindow($Handle) | Out-Null
+    [ProBigAQmtWindow]::SetCursorPos($X, $Y) | Out-Null
+    [ProBigAQmtWindow]::mouse_event(
+        0x0002, 0, 0, 0, [UIntPtr]::Zero
+    )
+    [ProBigAQmtWindow]::mouse_event(
+        0x0004, 0, 0, 0, [UIntPtr]::Zero
+    )
+}
+
+function Get-QmtStrategyPaneLayout {
+    param([IntPtr]$MainHandle)
+    $work = Get-QmtMainWorkArea $MainHandle
+    $paneLeft = [ProBigAQmtWindow]::FindStrategyPaneLeft(
+        $work.Left,
+        $work.Top,
+        $work.Right,
+        $work.Bottom
+    )
+    $relativeLeft = $paneLeft - $work.Left
+    $fullWidthList = $relativeLeft -ge 45 -and $relativeLeft -le 60
+    $embeddedList = $relativeLeft -ge 400 -and $relativeLeft -le 1000
+    if (!$fullWidthList -and !$embeddedList) {
+        throw "QMT model-research strategy pane is not visibly identifiable"
+    }
+    return [pscustomobject]@{
+        SearchX = [int]($paneLeft + 70)
+        SearchY = [int]($work.Top + 67)
+        EditX = [int]($paneLeft + 322)
+        EditY = [int]($work.Top + 137)
+    }
 }
 
 $createdNew = $false
@@ -642,75 +1011,45 @@ try {
         "$StrategyName-"
     )
     if ($editorHandle -eq [IntPtr]::Zero) {
-        # QMT 2.1.19: open model research, filter to the exact bridge strategy,
-        # then click the result-row edit action. Ratios keep the operation
-        # resolution-independent and inside the read-only strategy pane.
+        # QMT 2.1.19: open model research, visually locate its strategy pane,
+        # filter to the exact bridge strategy, then click that row's edit
+        # action. The pane boundary is detected from the visible chart/pane
+        # relationship so both single-screen and spanning layouts are safe.
         # Closing an editor may leave QMT on its model backtest/trading
         # subpage.  The same location is a harmless market-index tab on the
         # home page, so this safely normalizes both states before navigation.
-        Invoke-WindowClick $mainHandle 0.105 0.078
+        Invoke-WindowClick $mainHandle 0.056 0.039 -UseMonitorWorkArea
         Start-Sleep -Milliseconds 800
-        Invoke-WindowClick $mainHandle 0.470 0.030
+        Invoke-WindowClick $mainHandle 0.470 0.015
         Start-Sleep -Milliseconds 1000
-        # QMT can show the 2.1.19 full-width list, an older full-width list, or
-        # the dashboard's embedded strategy pane. Search and edit coordinates
-        # must be paired because filtering moves the exact strategy to row 1.
-        # Every attempt still requires an actual editor window before running.
-        $layouts = @(
-            @{
-                SearchX = 0.325
-                SearchY = 0.065
-                EditX = 0.474
-                EditY = 0.133
-            },
-            @{
-                SearchX = 0.125
-                SearchY = 0.128
-                EditX = 0.403
-                EditY = 0.264
-            },
-            @{
-                SearchX = 0.380
-                SearchY = 0.128
-                EditX = 0.648
-                EditY = 0.264
-            }
-        )
-        foreach ($layout in $layouts) {
-            Invoke-WindowClick `
-                $mainHandle `
-                $layout.SearchX `
-                $layout.SearchY
-            [System.Windows.Forms.SendKeys]::SendWait("^a")
-            [System.Windows.Forms.SendKeys]::SendWait($StrategyName)
-            [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-            Start-Sleep -Milliseconds 1200
-            Invoke-WindowClick `
-                $mainHandle `
-                $layout.EditX `
-                $layout.EditY
-            $editorDeadline = (Get-Date).AddSeconds(4)
-            do {
-                Start-Sleep -Milliseconds 500
-                $heartbeat = Get-Heartbeat $heartbeatPath
-                if (Test-HeartbeatHealthy $heartbeat) {
-                    break
-                }
-                $editorHandle = [ProBigAQmtWindow]::FindVisibleWindow(
-                    [uint32]$qmt.Id,
-                    "$StrategyName-"
-                )
-            } while (
-                $editorHandle -eq [IntPtr]::Zero -and
-                (Get-Date) -lt $editorDeadline
-            )
-            if (
-                (Test-HeartbeatHealthy $heartbeat) -or
-                $editorHandle -ne [IntPtr]::Zero
-            ) {
+        $layout = Get-QmtStrategyPaneLayout $mainHandle
+        Invoke-WindowPointClick `
+            $mainHandle `
+            $layout.SearchX `
+            $layout.SearchY
+        [System.Windows.Forms.SendKeys]::SendWait("^a")
+        [System.Windows.Forms.SendKeys]::SendWait($StrategyName)
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        Start-Sleep -Milliseconds 1200
+        Invoke-WindowPointClick `
+            $mainHandle `
+            $layout.EditX `
+            $layout.EditY
+        $editorDeadline = (Get-Date).AddSeconds(8)
+        do {
+            Start-Sleep -Milliseconds 500
+            $heartbeat = Get-Heartbeat $heartbeatPath
+            if (Test-HeartbeatHealthy $heartbeat) {
                 break
             }
-        }
+            $editorHandle = [ProBigAQmtWindow]::FindVisibleWindow(
+                [uint32]$qmt.Id,
+                "$StrategyName-"
+            )
+        } while (
+            $editorHandle -eq [IntPtr]::Zero -and
+            (Get-Date) -lt $editorDeadline
+        )
     }
     $heartbeat = Get-Heartbeat $heartbeatPath
     $healthy = Test-HeartbeatHealthy $heartbeat
@@ -721,7 +1060,7 @@ try {
     if (!$healthy) {
         # QMT 2.1.19 full-screen editor: run is the second labeled action in
         # the compact toolbar immediately above the source pane.
-        Invoke-WindowClick $editorHandle 0.183 0.095
+        Invoke-WindowClick $editorHandle 0.339 0.151
     }
 
     $deadline = (Get-Date).AddSeconds(55)

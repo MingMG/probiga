@@ -271,6 +271,7 @@ def _decision_truth_status(
     result: dict[str, Any],
     *,
     execution_enabled: bool,
+    forecast_count: int,
 ) -> tuple[str, str]:
     portfolio = dict(result.get("portfolio") or {})
     regime = dict(result.get("regime") or {})
@@ -280,6 +281,12 @@ def _decision_truth_status(
         == "DATA_BLOCKED"
     )
     if data_blocked:
+        return "BLOCKED", "DATA_BLOCKED"
+    # A valid evaluation may conclude that none of its non-empty forecasts
+    # deserves a target.  An empty forecast ledger is different: there is no
+    # auditable strategy output to evaluate, so calling it NO_ACTION would
+    # turn an upstream data/model failure into a successful decision.
+    if int(forecast_count) <= 0:
         return "BLOCKED", "DATA_BLOCKED"
     if not execution_enabled:
         return "COMPLETED", "REPLAY_ONLY"
@@ -477,10 +484,29 @@ def run_daily_decision_v3(
         "order_authority": False,
     }
     portfolio["opportunity_audit"] = opportunity_audit
+    if not all_forecasts:
+        warnings = list(opportunity_audit.get("warnings") or [])
+        if "FORECAST_LEDGER_EMPTY" not in warnings:
+            warnings.insert(0, "FORECAST_LEDGER_EMPTY")
+        opportunity_audit.update({
+            "status": "ATTENTION",
+            "warnings": warnings,
+            "forecast_ledger": {
+                "status": "DATA_BLOCKED",
+                "forecast_count": 0,
+                "reason": "FORECAST_LEDGER_EMPTY",
+            },
+        })
+        portfolio.update({
+            "status": "DATA_BLOCKED",
+            "targets": [],
+            "opportunity_audit": opportunity_audit,
+        })
     result = {**result, "portfolio": portfolio}
     run_status, actionable_status = _decision_truth_status(
         result,
         execution_enabled=execution_enabled,
+        forecast_count=len(all_forecasts),
     )
     run_uid = uuid.uuid4().hex
     regime = classify_regime_probabilities(
@@ -523,7 +549,7 @@ def run_daily_decision_v3(
         snapshot_manifest=snapshot["manifest"],
         defer_completion=True,
     )
-    if execution_enabled:
+    if execution_enabled and all_forecasts:
         try:
             position_sync = sync_position_states(
                 primary_engine,
@@ -545,13 +571,15 @@ def run_daily_decision_v3(
                 f"V3_POSITION_SYNC_FAILED: {exc}"
             ) from exc
     else:
-        # Historical/replay decisions may persist their own immutable research
-        # batch, but must never rewrite today's position state projection.
+        # Historical/replay decisions and an empty forecast ledger may persist
+        # immutable evidence, but neither may rewrite today's position state.
         position_sync = {
-            "status": "replay_only",
+            "status": (
+                "data_blocked" if execution_enabled else "replay_only"
+            ),
             "updated_count": 0,
         }
-    if execution_enabled:
+    if execution_enabled and all_forecasts:
         try:
             execution = materialize_internal_paper_orders(
                 primary_engine,
@@ -568,7 +596,9 @@ def run_daily_decision_v3(
             ) from exc
     else:
         execution = {
-            "status": "replay_only",
+            "status": (
+                "data_blocked" if execution_enabled else "replay_only"
+            ),
             "paper_order_count": 0,
             "created": [],
             "skipped": [],
@@ -583,10 +613,15 @@ def run_daily_decision_v3(
         )
         raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
     return {
+        "schema": "probiga.trading-v3-decision-result.v1",
         "status": "blocked" if run_status == "BLOCKED" else "ok",
+        # DATA_BLOCKED is persisted as decision truth, but remains retryable
+        # at the scheduler layer after upstream data arrives the same day.
+        "retryable": run_status == "BLOCKED",
         **saved,
         "run_status": run_status,
         "actionable_status": actionable_status,
+        "execution_enabled": bool(execution_enabled),
         "snapshot_manifest_hash": snapshot["manifest"]["manifest_hash"],
         "trade_date": dataset["trade_date"].isoformat(),
         "decision_at": decision_at.isoformat(sep=" "),

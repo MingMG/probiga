@@ -24,6 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from integrations.bigqmt import bridge as bigqmt_bridge
+from integrations.bigqmt.release_identity import (
+    STRATEGY_RELEASE_PROTOCOL,
+    validate_strategy_release_payload,
+)
 from integrations.qmt import bridge
 from integrations.qmt.local_history import (
     get_local_history_engine,
@@ -44,6 +49,35 @@ from server.common.scheduler_runtime_health import (
     check_qmt_windows_edge_identity,
     check_qmt_windows_edge_release_receipt,
 )
+
+
+BIGQMT_STRATEGY_SOURCE = (
+    ROOT
+    / "integrations"
+    / "bigqmt"
+    / "qmt_strategy"
+    / "probiga_big_qmt_bridge.py"
+)
+
+
+def validate_bigqmt_strategy_release(
+    payload: dict[str, Any],
+    *,
+    expected_build_sha: str,
+    expected_source_sha256: str | None = None,
+    expected_git_blob: str | None = None,
+    expected_artifact_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Prove QMT is serving the exact build's frozen strategy bytes."""
+    return validate_strategy_release_payload(
+        payload,
+        expected_build_sha=expected_build_sha,
+        root=ROOT,
+        source_path=BIGQMT_STRATEGY_SOURCE,
+        expected_source_sha256=expected_source_sha256,
+        expected_git_blob=expected_git_blob,
+        expected_artifact_sha256=expected_artifact_sha256,
+    )
 
 
 def _git_head(root: Path = ROOT) -> str:
@@ -79,6 +113,87 @@ def read_release_request(
             connection, expected_build_sha=expected_build_sha
         )
     return {"mode": "check-request", **payload, "database_writes": False}
+
+
+def check_existing_release_ready(
+    primary_engine: Any,
+    *,
+    expected_build_sha: str,
+    expected_poll_seconds: int = DEFAULT_SCHEDULER_POLL_SECONDS,
+    bigqmt_capabilities_runner: Callable[..., dict[str, Any]] = (
+        bigqmt_bridge.capabilities
+    ),
+    platform_name: str | None = None,
+    git_head: str | None = None,
+) -> dict[str, Any]:
+    """Read-only proof that this exact edge release is already healthy.
+
+    The five-minute Windows updater calls this before stopping its scheduler or
+    opening QMT.  A durable receipt alone is insufficient because the QMT model
+    can be changed independently; the live model must also return the exact
+    frozen build/source/artifact identity.
+    """
+
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform != "nt":
+        raise RuntimeError("QMT release readiness probe is Windows-edge only")
+    if os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") != QMT_WINDOWS_EDGE_ROLE:
+        raise RuntimeError("QMT Windows edge executor role is not bound")
+    observed_sha = str(git_head or _git_head()).strip().lower()
+    expected_sha = str(expected_build_sha or "").strip().lower()
+    if observed_sha != expected_sha:
+        raise RuntimeError("QMT Windows edge checkout differs from requested build")
+
+    with primary_engine.connect() as connection:
+        ready, receipt = check_qmt_windows_edge_release_receipt(
+            connection,
+            expected_build_sha=expected_sha,
+            expected_poll_seconds=expected_poll_seconds,
+        )
+    if not ready:
+        errors = [str(item) for item in receipt.get("errors") or ()]
+        if {"scheduler_runtime_query_failed", "release_receipt_query_failed"} & set(
+            errors
+        ):
+            raise RuntimeError(
+                "QMT exact-release readiness database proof is unavailable"
+            )
+        return {
+            "mode": "check-ready",
+            "status": "NOT_READY",
+            "expected_build_sha": expected_sha,
+            "release_receipt": receipt,
+            "strategy_release": None,
+            "database_writes": False,
+            "qmt_calls": False,
+        }
+
+    capabilities = bigqmt_capabilities_runner(timeout=60)
+    try:
+        strategy_release = validate_bigqmt_strategy_release(
+            capabilities,
+            expected_build_sha=expected_sha,
+        )
+    except RuntimeError as exc:
+        return {
+            "mode": "check-ready",
+            "status": "NOT_READY",
+            "expected_build_sha": expected_sha,
+            "release_receipt": receipt,
+            "strategy_release": None,
+            "strategy_error": str(exc),
+            "database_writes": False,
+            "qmt_calls": True,
+        }
+    return {
+        "mode": "check-ready",
+        "status": "READY",
+        "expected_build_sha": expected_sha,
+        "release_receipt": receipt,
+        "strategy_release": strategy_release,
+        "database_writes": False,
+        "qmt_calls": True,
+    }
 
 
 def _wait_for_identity(
@@ -118,6 +233,9 @@ def run_release_bootstrap(
     sync_runner: Callable[..., dict[str, Any]] | None = None,
     ping_runner: Callable[..., dict[str, Any]] = bridge.ping,
     capabilities_runner: Callable[..., dict[str, Any]] = bridge.capabilities,
+    bigqmt_capabilities_runner: Callable[..., dict[str, Any]] = (
+        bigqmt_bridge.capabilities
+    ),
     now: datetime | None = None,
     sleep: Callable[[float], None] = time.sleep,
     platform_name: str | None = None,
@@ -187,6 +305,7 @@ def run_release_bootstrap(
 
     ping = ping_runner(timeout=60)
     capabilities = capabilities_runner(timeout=180)
+    bigqmt_capabilities = bigqmt_capabilities_runner(timeout=180)
     ping_rows = ping.get("rows") if isinstance(ping, dict) else None
     capability_rows = (
         capabilities.get("rows") if isinstance(capabilities, dict) else None
@@ -202,10 +321,15 @@ def run_release_bootstrap(
         or str(capabilities.get("provider") or "") != "gj_qmt"
     ):
         raise RuntimeError("QMT bridge capability proof is unavailable")
+    bigqmt_strategy_release = validate_bigqmt_strategy_release(
+        bigqmt_capabilities,
+        expected_build_sha=expected_sha,
+    )
     capability_evidence = {
         "schema": "probiga.qmt-windows-edge-capability-proof.v1",
         "ping": ping,
         "capabilities": capabilities,
+        "bigqmt_strategy_release": bigqmt_strategy_release,
         "coverage_schema": coverage_schema,
     }
 
@@ -284,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--request", action="store_true")
     modes.add_argument("--check-request", action="store_true")
+    modes.add_argument("--check-ready", action="store_true")
     modes.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--expected-build-sha", required=True)
     parser.add_argument("--expected-poll-seconds", type=int, default=60)
@@ -305,6 +430,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.check_request:
             result = read_release_request(
                 engine, expected_build_sha=args.expected_build_sha
+            )
+        elif args.check_ready:
+            result = check_existing_release_ready(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+                expected_poll_seconds=args.expected_poll_seconds,
             )
         else:
             result = run_release_bootstrap(
@@ -331,6 +462,8 @@ def main(argv: list[str] | None = None) -> int:
         indent=None if args.compact else 2,
         default=str,
     ))
+    if args.check_ready and result.get("status") == "NOT_READY":
+        return 4
     return 0
 
 

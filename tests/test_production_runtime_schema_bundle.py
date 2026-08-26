@@ -4,7 +4,7 @@ from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
+    "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3"
 )
 
 
@@ -12,9 +12,15 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
     migration_names = [name for name, _ in bundle._MIGRATIONS]
     seed_names = [name for name, _ in bundle._SEEDS]
     validator_names = [name for name, _ in bundle._VALIDATORS]
+    recovery_planner_names = [name for name, _ in bundle._RECOVERY_PLANNERS]
     assert len(migration_names) == len(set(migration_names))
     assert len(seed_names) == len(set(seed_names))
     assert len(validator_names) == len(set(validator_names))
+    assert recovery_planner_names == [
+        "analysis_output",
+        "recommended_run_history",
+        "sim_trade",
+    ]
     assert set(seed_names) <= set(migration_names)
     assert {
         "scheduler_tasks",
@@ -38,7 +44,27 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
     assert metadata["migration_count"] == len(migration_names)
     assert metadata["seed_count"] == len(seed_names)
     assert metadata["validator_count"] == len(validator_names)
+    assert metadata["recovery_planner_names"] == recovery_planner_names
+    assert metadata["recovery_planner_count"] == 3
     assert metadata["contract_hash"] == EXPECTED_BUNDLE_CONTRACT_HASH
+
+
+def test_recovery_planner_registry_names_and_count_are_hash_bound(monkeypatch):
+    original = bundle._contract_metadata()
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        bundle._RECOVERY_PLANNERS[:-1],
+    )
+
+    changed = bundle._contract_metadata()
+
+    assert changed["recovery_planner_count"] == 2
+    assert changed["recovery_planner_names"] == [
+        "analysis_output",
+        "recommended_run_history",
+    ]
+    assert changed["contract_hash"] != original["contract_hash"]
 
 
 def test_privileged_bundle_runs_migrations_then_seeds_then_read_only_validation(monkeypatch):
@@ -58,9 +84,22 @@ def test_privileged_bundle_runs_migrations_then_seeds_then_read_only_validation(
         "validate_runtime_schema_bundle",
         lambda _engine: events.append("validate") or {"read_only": True},
     )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "receipt",
+            lambda _engine: events.append("plan") or {
+                "plan_sha256": "a" * 64,
+                "ready_for_privileged_apply": True,
+            },
+        ),),
+    )
     result = bundle.privileged_migrate_runtime_schema_bundle(object())
-    assert events == ["migrate", "seed", "validate"]
+    assert events == ["migrate", "seed", "validate", "plan"]
     assert result["runtime_validation"]["read_only"] is True
+    assert result["recovery_plan_count"] == 1
+    assert result["recovery_ready_for_privileged_apply"] is True
     assert result["privileged_migration"] is True
 
 
@@ -92,3 +131,116 @@ def test_preflight_reports_migration_without_leaking_exception_message(monkeypat
         "error_type": "RuntimeError",
         "read_only": True,
     }
+
+
+def test_preflight_includes_read_only_recovery_plans(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "legacy",
+            lambda _engine: calls.append("legacy") or {
+                "plan_sha256": "a" * 64,
+                "ready_for_privileged_apply": True,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert calls == ["legacy"]
+    assert result["recovery_plan_count"] == 1
+    assert result["recovery_plans"]["legacy"] == {
+        "plan_sha256": "a" * 64,
+        "ready_for_privileged_apply": True,
+        "read_only": True,
+        "status": "PLANNED",
+    }
+    assert result["recovery_ready_for_privileged_apply"] is True
+    assert result["migration_required"] is False
+
+
+def test_preflight_plan_failure_is_not_publishable_and_does_not_leak_message(
+    monkeypatch,
+):
+    def fail(_engine):
+        raise RuntimeError("secret recovery detail")
+
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(bundle, "_RECOVERY_PLANNERS", (("broken", fail),))
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert result["migration_required"] is True
+    assert result["recovery_ready_for_privileged_apply"] is False
+    assert result["recovery_plans"]["broken"] == {
+        "status": "PLAN_UNAVAILABLE",
+        "error_type": "RuntimeError",
+        "plan_sha256": None,
+        "ready_for_privileged_apply": False,
+        "read_only": True,
+    }
+
+
+def test_preflight_rejects_invalid_or_unsafe_recovery_plan(monkeypatch):
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "unsafe",
+            lambda _engine: {
+                "plan_sha256": "not-a-sha256",
+                "ready_for_privileged_apply": False,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert result["migration_required"] is True
+    assert result["recovery_ready_for_privileged_apply"] is False
+    assert result["recovery_plans"]["unsafe"]["status"] == "PLAN_UNAVAILABLE"
+
+
+def test_preflight_keeps_safe_hash_but_blocks_plan_not_ready_for_apply(monkeypatch):
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "manual",
+            lambda _engine: {
+                "plan_sha256": "b" * 64,
+                "ready_for_privileged_apply": False,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert result["recovery_plans"]["manual"]["status"] == "PLANNED"
+    assert result["recovery_plans"]["manual"]["plan_sha256"] == "b" * 64
+    assert result["recovery_ready_for_privileged_apply"] is False
+    assert result["migration_required"] is True

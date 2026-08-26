@@ -6,6 +6,7 @@
 盘中实时检测信号，以当前价模拟交易。
 """
 
+import hashlib
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -24,6 +25,18 @@ from server.common.minute_data import (
 from server.common.sim_trade_schema import validate_sim_trade_runtime_schema
 
 logger = logging.getLogger(__name__)
+
+
+def _identity_set_hash(values) -> str:
+    """Hash one sorted identity set for scheduler/database reconciliation."""
+
+    normalized = sorted({str(value).strip() for value in values if str(value).strip()})
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 # ── 策略配置 ──
 STRATEGY_CONFIG = {
@@ -915,8 +928,29 @@ class SimTradeEngine:
             }
 
         total_recommendations = 0
+        recommendation_codes = sorted(
+            {
+                str(rec.get("stock_code") or "").strip().zfill(6)
+                for rec in recs
+                if str(rec.get("stock_code") or "").strip()
+            }
+        )
+        if len(recommendation_codes) != len(recs):
+            return {
+                "status": "error",
+                "error": "推荐股票代码存在空值或重复，模拟信号池拒绝准备",
+                "trade_date": trade_date,
+                "signal_date": signal_date,
+                "expected_signal_date": expected_signal_date,
+                "total_recommendations": len(recs),
+                "recommendation_code_count": len(recommendation_codes),
+                "recommendation_code_set_hash": _identity_set_hash(
+                    recommendation_codes
+                ),
+            }
         allowed_count = 0
         rejected_count = 0
+        allowed_signal_identities: list[str] = []
         for rec in recs:
             total_recommendations += 1
             code = str(rec.get("stock_code") or "").zfill(6)
@@ -929,6 +963,7 @@ class SimTradeEngine:
                     continue
 
                 allowed_count += 1
+                allowed_signal_identities.append(f"{code}:{stype}")
                 analysis = decision.get("analysis") or {}
                 _exec_sql("""
                     INSERT INTO st_sim_signal
@@ -994,15 +1029,40 @@ class SimTradeEngine:
                     "take_profit_2": rec.get("take_profit_2"),
                 })
 
+        counts = self.signal_pool_counts(trade_date)
+        signal_identities = sorted(set(allowed_signal_identities))
+        if len(signal_identities) != allowed_count:
+            return {
+                "status": "error",
+                "error": "模拟信号身份存在重复，信号池拒绝发布",
+                "trade_date": trade_date,
+                "signal_date": signal_date,
+                "expected_signal_date": expected_signal_date,
+                "total_recommendations": total_recommendations,
+                "recommendation_code_count": len(recommendation_codes),
+                "recommendation_code_set_hash": _identity_set_hash(
+                    recommendation_codes
+                ),
+                "allowed_count": allowed_count,
+                "rejected_count": rejected_count,
+                "counts": counts,
+            }
         return {
             "status": "ok",
             "trade_date": trade_date,
             "signal_date": signal_date,
             "expected_signal_date": expected_signal_date,
             "total_recommendations": total_recommendations,
+            "recommendation_code_count": len(recommendation_codes),
+            "recommendation_code_set_hash": _identity_set_hash(
+                recommendation_codes
+            ),
+            "strategy_count": len(STRATEGY_CONFIG),
             "allowed_count": allowed_count,
             "rejected_count": rejected_count,
-            "counts": self.signal_pool_counts(trade_date),
+            "signal_identity_count": len(signal_identities),
+            "signal_identity_hash": _identity_set_hash(signal_identities),
+            "counts": counts,
         }
 
     def signal_pool_counts(self, trade_date: str = "", trade_mode: str = "live") -> dict:

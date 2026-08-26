@@ -276,13 +276,28 @@ def current(
     batch_size: int | None = None,
     timeout: int | float | None = None,
 ) -> pd.DataFrame:
-    response = _call(
+    response = current_capture(
+        stock_codes,
+        batch_size=batch_size,
+        timeout=timeout,
+    )
+    return pd.DataFrame(response.get("rows") or [])
+
+
+def current_capture(
+    stock_codes: Iterable[str] | str,
+    *,
+    batch_size: int | None = None,
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
+    """Return current rows with the exact loaded-strategy response identity."""
+
+    return _call(
         "current",
         timeout=timeout,
         stock_codes=_codes(stock_codes),
         batch_size=batch_size,
     )
-    return pd.DataFrame(response.get("rows") or [])
 
 
 def kline(
@@ -295,7 +310,37 @@ def kline(
     batch_size: int | None = None,
     timeout: int | float | None = None,
 ) -> pd.DataFrame:
-    response = _call(
+    response = kline_capture(
+        stock_codes,
+        start_date=start_date,
+        end_date=end_date,
+        dividend_type=dividend_type,
+        download_history=download_history,
+        batch_size=batch_size,
+        timeout=timeout,
+    )
+    return pd.DataFrame(response.get("rows") or [])
+
+
+def kline_capture(
+    stock_codes: Iterable[str] | str,
+    *,
+    start_date: str,
+    end_date: str,
+    dividend_type: str = "none",
+    download_history: bool = True,
+    batch_size: int | None = None,
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
+    """Return daily bars together with the loaded-strategy release proof.
+
+    Most callers only need a frame and should keep using :func:`kline`.
+    Formal publishers use this capture form so the exact request response can
+    be bound to QMT's frozen, in-memory strategy identity before any database
+    partition is replaced.
+    """
+
+    return _call(
         "kline",
         timeout=timeout,
         stock_codes=_codes(stock_codes),
@@ -305,7 +350,6 @@ def kline(
         download_history=bool(download_history),
         batch_size=batch_size,
     )
-    return pd.DataFrame(response.get("rows") or [])
 
 
 def minute(
@@ -319,6 +363,32 @@ def minute(
     batch_size: int | None = None,
     timeout: int | float | None = None,
 ) -> pd.DataFrame:
+    capture = minute_capture(
+        stock_codes,
+        trade_date=trade_date,
+        start_date=start_date,
+        end_date=end_date,
+        count=count,
+        download_history=download_history,
+        batch_size=batch_size,
+        timeout=timeout,
+    )
+    return pd.DataFrame(capture.get("rows") or [])
+
+
+def minute_capture(
+    stock_codes: Iterable[str] | str,
+    *,
+    trade_date: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    count: int = 0,
+    download_history: bool | None = None,
+    batch_size: int | None = None,
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
+    """Return all batched minute rows and each response's frozen identity."""
+
     start_bound = _minute_bound(start_date or trade_date, end=False)
     end_bound = _minute_bound(end_date or trade_date, end=True)
     codes = _codes(stock_codes)
@@ -335,6 +405,7 @@ def minute(
     ] or [[]]
 
     rows: list[dict[str, Any]] = []
+    batch_receipts: list[dict[str, Any]] = []
     for code_batch in code_batches:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -368,7 +439,19 @@ def minute(
         if not isinstance(batch_rows, list):
             raise RuntimeError("Big QMT minute response rows must be a list")
         rows.extend(batch_rows)
-    return pd.DataFrame(rows)
+        batch_receipts.append({
+            key: value for key, value in response.items() if key != "rows"
+        } | {
+            "requested_codes": list(code_batch),
+            "row_count": len(batch_rows),
+        })
+    return {
+        "status": "ok",
+        "source": "gj_big_qmt_inner",
+        "bridge_version": "bigqmt_inner_v2",
+        "rows": rows,
+        "batch_receipts": batch_receipts,
+    }
 
 
 def sector_list(*, timeout: int | float | None = None) -> pd.DataFrame:
@@ -413,6 +496,44 @@ def instrument_details(
         stock_codes=_codes(stock_codes),
         iscomplete=bool(iscomplete),
         batch_size=batch_size,
+    )
+    return pd.DataFrame(response.get("rows") or [])
+
+
+def trading_calendar_capture(
+    market: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source_stock_code: str = "000001.SH",
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
+    """Return rows plus the exact built-in QMT source-method evidence."""
+
+    return _call(
+        "trading_calendar",
+        timeout=timeout or 300,
+        market=str(market or "SH").strip().upper(),
+        start_date=str(start_date or ""),
+        end_date=str(end_date or ""),
+        source_stock_code=str(source_stock_code or "").strip().upper(),
+    )
+
+
+def trading_calendar(
+    market: str,
+    *,
+    start_date: str,
+    end_date: str,
+    source_stock_code: str = "000001.SH",
+    timeout: int | float | None = None,
+) -> pd.DataFrame:
+    response = trading_calendar_capture(
+        market,
+        start_date=start_date,
+        end_date=end_date,
+        source_stock_code=source_stock_code,
+        timeout=timeout,
     )
     return pd.DataFrame(response.get("rows") or [])
 

@@ -89,7 +89,8 @@ PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
 PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS = 3
 PORTFOLIO_FORCE_REQUEST_TTL_SECONDS = 120
 
-LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 雪球热股 / 新浪热股 / 同花顺热股"
+LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 同花顺热股（双源校验）"
+SINA_HOT_UNAVAILABLE_REASON = "PROVIDER_SEMANTICS_UNVERIFIED"
 
 
 # ── 内存 TTL 缓存（避免重复请求外部 API / 历史数据） ──
@@ -647,33 +648,20 @@ def _fetch_live_xq_rank(top: int = 100) -> pd.DataFrame:
 
 
 def _fetch_live_sina_rank(top: int = 100) -> pd.DataFrame:
-    import requests
-
-    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-    params = {"page": 1, "num": top, "sort": "attention", "asc": 0, "node": "hs_a"}
-    headers = {"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn/"}
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
-    resp.raise_for_status()
-    rows = []
-    for i, item in enumerate(resp.json() or [], 1):
-        rows.append({
-            "rank": i,
-            "stock_code": str(item.get("code", "")).zfill(6),
-            "short_name": item.get("name", ""),
-            "price": float(item.get("trade", 0)) if item.get("trade") else None,
-            "price_change": float(item.get("pricechange", 0)) if item.get("pricechange") else None,
-            "change_pct": float(item.get("changepercent", 0)) if item.get("changepercent") else None,
-            "amount": float(item.get("amount", 0)) if item.get("amount") else None,
-            "volume": float(item.get("volume", 0)) if item.get("volume") else None,
-            "market_capital": float(item.get("mktcap", 0)) if item.get("mktcap") else None,
-            "turnover_ratio": float(item.get("turnoverratio", 0)) if item.get("turnoverratio") else None,
-        })
-    return pd.DataFrame(rows)
+    del top
+    raise RuntimeError(SINA_HOT_UNAVAILABLE_REASON)
 
 
 def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from tools.merge_hot_rank import _attach_industry, _filter_hs_a, _fuse_single_day, _load_industry_map
+    from server.common.hot_rank_source_contract import (
+        HOT_POP_EAST_TASK_TYPE,
+        validate_rank_inventory as validate_exact_rank_inventory,
+    )
+    from server.common.ths_hot_contract import (
+        validate_rank_inventory as validate_ths_rank_inventory,
+    )
 
     # 缓存 60 秒，避免频繁切换页面时重复请求外部 API
     cache_key = f"fused_live_{top}"
@@ -687,17 +675,27 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
     fetchers = {
         "east": _fetch_live_east_rank,
         "ths": _fetch_live_ths_rank,
-        "xq": _fetch_live_xq_rank,
-        "sina": _fetch_live_sina_rank,
     }
-    # 并行抓取 4 个外部数据源（原来串行，最坏 60s → 并行约 15s）
+    # Only East + THS have independently enforceable semantics here.  XQ is
+    # collected separately with type=12, but old type=10 database batches
+    # cannot yet be distinguished until a scheduler receipt is bound to the
+    # exact batch.  Sina exposes no verifiable attention field at all.
     def _fetch_one(source, fetcher):
         try:
-            return source, _filter_hs_a(fetcher(top))
+            frame = _filter_hs_a(fetcher(100))
+            records = frame.to_dict(orient="records")
+            if source == "east":
+                validate_exact_rank_inventory(
+                    records,
+                    task_type=HOT_POP_EAST_TASK_TYPE,
+                )
+            else:
+                validate_ths_rank_inventory(records)
+            return source, frame
         except Exception as exc:
             return source, exc
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {pool.submit(_fetch_one, s, f): s for s, f in fetchers.items()}
         for future in as_completed(futures):
             source, result = future.result()
@@ -707,8 +705,12 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
             else:
                 frames[source] = result
 
-    if all(df.empty for df in frames.values()):
+    if set(frames) != set(fetchers) or any(
+        frames[source].empty for source in fetchers
+    ):
         return {
+            "status": "DATA_UNAVAILABLE",
+            "reason_code": "TRUSTED_DUAL_SOURCE_INCOMPLETE",
             "date": date.today().isoformat(),
             "data": [],
             "total": 0,
@@ -718,10 +720,15 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
             "fetched_at": fetched_at.isoformat(sep=" "),
             "source_counts": {k: 0 for k in fetchers},
             "errors": errors,
-            "error": "实时数据源均未返回数据",
+            "error": "东财与同花顺双源校验未全部通过，实时融合榜已关闭",
         }
 
-    result_df = _fuse_single_day(frames["east"], frames["ths"], frames["xq"], frames["sina"])
+    result_df = _fuse_single_day(
+        frames["east"],
+        frames["ths"],
+        pd.DataFrame(),
+        pd.DataFrame(),
+    )
     result_df["fused_rank"] = range(1, len(result_df) + 1)
     result_df["snapshot_date"] = date.today().isoformat()
     result_df["etl_sync_at"] = fetched_at
@@ -756,6 +763,189 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
     }
     _cache_set(cache_key, _result)
     return _result
+
+
+def _validated_persisted_hot_dual_sources(
+    snapshot_date: str,
+) -> tuple[dict, dict[str, dict[str, int]]]:
+    """Prove the requested date has complete East + THS source batches."""
+
+    from server.common.hot_rank_source_contract import (
+        HOT_POP_EAST_TASK_TYPE,
+        HOT_RANK_READY_TIMES,
+        batch_timestamp as exact_batch_timestamp,
+        validate_rank_inventory as validate_exact_rank_inventory,
+    )
+    from server.common.ths_hot_contract import (
+        THS_HOT_RANK_TASK_TYPE,
+        THS_HOT_READY_TIMES,
+        batch_timestamp as ths_batch_timestamp,
+        validate_rank_inventory as validate_ths_rank_inventory,
+    )
+
+    open_rows = _read_sql(
+        "SELECT COUNT(*) AS n FROM si_trade_calendar "
+        "WHERE trade_date=:d AND trade_status=1",
+        {"d": snapshot_date},
+    )
+    if not open_rows or int(open_rows[0].get("n") or 0) != 1:
+        raise RuntimeError("REQUEST_DATE_NOT_OPEN_SESSION")
+
+    east = _read_sql(
+        """
+        SELECT snapshot_date, `rank`, stock_code, short_name, rank_change,
+               his_rank, price, price_change, change_pct, hot_value, pop_tag,
+               concept_tag, etl_sync_at
+          FROM st_hot_pop_rank_east
+         WHERE snapshot_date=:d
+         ORDER BY `rank`, stock_code
+        """,
+        {"d": snapshot_date},
+    )
+    ths = _read_sql(
+        """
+        SELECT snapshot_date, `rank`, stock_code, short_name, change_pct,
+               hot_value, pop_tag, concept_tag, etl_sync_at
+          FROM st_hot_rank_ths
+         WHERE snapshot_date=:d
+         ORDER BY `rank`, stock_code
+        """,
+        {"d": snapshot_date},
+    )
+    east_inventory = validate_exact_rank_inventory(
+        east,
+        task_type=HOT_POP_EAST_TASK_TYPE,
+        target_date=snapshot_date,
+    )
+    ths_inventory = validate_ths_rank_inventory(
+        ths,
+        target_date=snapshot_date,
+    )
+    batches = {
+        "east": exact_batch_timestamp(east),
+        "ths": ths_batch_timestamp(ths),
+    }
+    ready_times = {
+        "east": HOT_RANK_READY_TIMES[HOT_POP_EAST_TASK_TYPE],
+        "ths": THS_HOT_READY_TIMES[THS_HOT_RANK_TASK_TYPE],
+    }
+    for source, batch_text in batches.items():
+        batch_at = datetime.fromisoformat(batch_text)
+        if (
+            batch_at.tzinfo is not None
+            or batch_at.date().isoformat() != snapshot_date
+            or batch_at.time() < ready_times[source]
+        ):
+            raise RuntimeError(
+                f"{source.upper()}_SAME_DAY_CLOSED_BATCH_UNPROVEN"
+            )
+    evidence = {
+        "east": {
+            "rows": int(east_inventory["row_count"]),
+            "batch_at": batches["east"],
+            "persisted_row_sha256": east_inventory["persisted_row_sha256"],
+        },
+        "ths": {
+            "rows": int(ths_inventory["row_count"]),
+            "batch_at": batches["ths"],
+            "persisted_row_sha256": ths_inventory["persisted_row_sha256"],
+        },
+    }
+    rank_maps = {
+        "east": {
+            str(row.get("stock_code") or "").strip().zfill(6): int(
+                row.get("rank") or 0
+            )
+            for row in east
+        },
+        "ths": {
+            str(row.get("stock_code") or "").strip().zfill(6): int(
+                row.get("rank") or 0
+            )
+            for row in ths
+        },
+    }
+    return evidence, rank_maps
+
+
+def _validate_dual_source_fused_rows(
+    rows: list[dict],
+    snapshot_date: str,
+    source_rank_maps: dict[str, dict[str, int]],
+) -> None:
+    """Bind every fused row and score to the proven East/THS inventories."""
+
+    if not rows:
+        raise RuntimeError("FUSED_BATCH_MISSING")
+    ranks = [int(row.get("fused_rank") or 0) for row in rows]
+    codes = [str(row.get("stock_code") or "").strip().zfill(6) for row in rows]
+    if (
+        ranks != list(range(1, len(rows) + 1))
+        or len(codes) != len(set(codes))
+        or {
+            str(row.get("snapshot_date") or "")[:10]
+            for row in rows
+        } != {snapshot_date}
+    ):
+        raise RuntimeError("FUSED_BATCH_INVENTORY_INVALID")
+
+    totals: list[float] = []
+    for row, code in zip(rows, codes):
+        east_rank = (
+            int(row["east_rank"])
+            if row.get("east_rank") is not None
+            else None
+        )
+        ths_rank = (
+            int(row["ths_rank"])
+            if row.get("ths_rank") is not None
+            else None
+        )
+        xq_rank = row.get("xq_rank")
+        sina_rank = row.get("sina_rank")
+        flag = str(row.get("source_flag") or "").strip().lower()
+        xq_score = float(row.get("xq_score") or 0)
+        sina_score = float(row.get("sina_score") or 0)
+        east_score = float(row.get("east_score") or 0)
+        ths_score = float(row.get("ths_score") or 0)
+        total_score = float(row.get("total_score") or 0)
+        expected_east_rank = source_rank_maps["east"].get(code)
+        expected_ths_rank = source_rank_maps["ths"].get(code)
+        expected_east_score = (
+            max(0.0, 101.0 - expected_east_rank)
+            if expected_east_rank is not None
+            else 0.0
+        )
+        expected_ths_score = (
+            max(0.0, 101.0 - expected_ths_rank)
+            if expected_ths_rank is not None
+            else 0.0
+        )
+        expected_flag = (
+            "both"
+            if expected_east_rank is not None and expected_ths_rank is not None
+            else "east_only"
+            if expected_east_rank is not None
+            else "ths_only"
+            if expected_ths_rank is not None
+            else ""
+        )
+        if (
+            east_rank != expected_east_rank
+            or ths_rank != expected_ths_rank
+            or xq_rank is not None
+            or sina_rank is not None
+            or abs(xq_score) > 1e-9
+            or abs(sina_score) > 1e-9
+            or flag != expected_flag
+            or abs(east_score - expected_east_score) > 1e-6
+            or abs(ths_score - expected_ths_score) > 1e-6
+            or abs(total_score - east_score - ths_score) > 1e-6
+        ):
+            raise RuntimeError("FUSED_BATCH_HAS_UNTRUSTED_SOURCE")
+        totals.append(total_score)
+    if any(left < right for left, right in zip(totals, totals[1:])):
+        raise RuntimeError("FUSED_BATCH_RANK_ORDER_INVALID")
 
 
 # ========== API ==========
@@ -1102,27 +1292,40 @@ def available_dates():
 @router.get("/hot-data/fused")
 def fused(snapshot_date: str = Query(default_factory=lambda: date.today().isoformat()), top: int = 100):
     try:
+        source_evidence, source_rank_maps = (
+            _validated_persisted_hot_dual_sources(snapshot_date)
+        )
         rows = _read_sql("""
             SELECT f.*, t.pop_tag, t.concept_tag
             FROM st_hot_rank_fused f
             LEFT JOIN st_hot_rank_ths t ON t.stock_code = f.stock_code COLLATE utf8mb4_unicode_ci AND t.snapshot_date = f.snapshot_date
             WHERE f.snapshot_date = :d
-            ORDER BY f.fused_rank LIMIT :n
-        """, {"d": snapshot_date, "n": top})
-        if not rows:
-            fb = _fallback_date("st_hot_rank_fused", "snapshot_date", snapshot_date)
-            if fb != snapshot_date:
-                rows = _read_sql("""
-                    SELECT f.*, t.pop_tag, t.concept_tag
-                    FROM st_hot_rank_fused f
-                    LEFT JOIN st_hot_rank_ths t ON t.stock_code = f.stock_code COLLATE utf8mb4_unicode_ci AND t.snapshot_date = f.snapshot_date
-                    WHERE f.snapshot_date = :d
-                    ORDER BY f.fused_rank LIMIT :n
-                """, {"d": fb, "n": top})
-                return {"date": fb, "fallback": True, "data": rows, "total": len(rows)}
-        return {"date": snapshot_date, "data": rows, "total": len(rows)}
+            ORDER BY f.fused_rank
+        """, {"d": snapshot_date})
+        _validate_dual_source_fused_rows(
+            rows,
+            snapshot_date,
+            source_rank_maps,
+        )
+        selected = rows[:max(0, int(top))]
+        return {
+            "status": "OK",
+            "date": snapshot_date,
+            "fallback": False,
+            "data": selected,
+            "total": len(selected),
+            "source_evidence": source_evidence,
+        }
     except Exception as e:
-        return {"date": snapshot_date, "data": [], "total": 0, "error": str(e)}
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "reason_code": "TRUSTED_DUAL_SOURCE_UNPROVEN",
+            "date": snapshot_date,
+            "fallback": False,
+            "data": [],
+            "total": 0,
+            "error": str(e),
+        }
 
 
 @router.get("/hot-data/fused-live")
@@ -1130,11 +1333,13 @@ def fused_live(
     top: int = Query(default=100, ge=1, le=200),
     fresh: bool = Query(default=False),
 ):
-    """盘中实时融合榜：直接抓取东财/同花顺/雪球/新浪热股并即时融合，不落库。"""
+    """盘中实时融合榜：仅融合通过库存校验的东财/同花顺双源。"""
     try:
         return _live_fused_rank(top, force_refresh=bool(fresh))
     except Exception as e:
         return {
+            "status": "DATA_UNAVAILABLE",
+            "reason_code": "TRUSTED_DUAL_SOURCE_ERROR",
             "date": date.today().isoformat(),
             "data": [],
             "total": 0,
@@ -1285,31 +1490,17 @@ def pop_rank_east(snapshot_date: str = Query(default_factory=lambda: date.today(
 
 @router.get("/hot-data/rank-sina")
 def rank_sina(top: int = Query(default=100, ge=1, le=200)):
-    """新浪热股榜 - 按关注热度实时排行（不落库）"""
-    try:
-        import httpx
-        url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
-        params = {"page": 1, "num": top, "sort": "attention", "asc": 0, "node": "hs_a"}
-        with httpx.Client(timeout=10, headers={"User-Agent": "Mozilla/5.0 ProBigA", "Referer": "https://finance.sina.com.cn/"}) as c:
-            r = c.get(url, params=params, timeout=10)
-            data = r.json()
-        items = []
-        for i, item in enumerate(data, 1):
-            items.append({
-                "rank": i,
-                "stock_code": item.get("code", ""),
-                "short_name": item.get("name", ""),
-                "price": float(item.get("trade", 0)),
-                "price_change": float(item.get("pricechange", 0)),
-                "change_pct": float(item.get("changepercent", 0)),
-                "amount": float(item.get("amount", 0)),
-                "volume": float(item.get("volume", 0)),
-                "market_capital": float(item.get("mktcap", 0)),
-                "turnover_ratio": float(item.get("turnoverratio", 0)),
-            })
-        return {"date": date.today().isoformat(), "data": items, "total": len(items)}
-    except Exception as e:
-        return {"date": date.today().isoformat(), "data": [], "total": 0, "error": str(e)}
+    """Sina quote inventory is not a verifiable attention ranking."""
+
+    del top
+    return {
+        "status": "DATA_UNAVAILABLE",
+        "reason_code": SINA_HOT_UNAVAILABLE_REASON,
+        "date": date.today().isoformat(),
+        "data": [],
+        "total": 0,
+        "error": "新浪行情接口未返回可验证的关注度字段，已停止展示伪热榜",
+    }
 
 
 @router.get("/hot-data/rank-xq")
@@ -2194,8 +2385,8 @@ def refresh_news_flash():
     result = launch_registered_manual_task(
         get_engine(),
         task_type="news_sync",
-        expected_script_path="biz/news/sync_news.py",
-        script_args="--pages 2 --mode realtime",
+        expected_script_path="tools/sync_news_formal.py",
+        script_args="--pages 2 --json",
         root=_ROOT,
     )
     return {
@@ -5286,7 +5477,13 @@ def _portfolio_log_trans(
 
 
 def _watchlist_write_flow(code: str, short_name: str, trans_type: str, price: float, shares: int):
-    """自选股操作同步写入操作流水表 st_trade_flow"""
+    """自选股手工记账同步写入 st_trade_flow。
+
+    这类记录没有券商成交回报，不能借用表的 ``live`` 默认值冒充
+    真实成交。显式使用 ``manual_bookkeeping``，让模拟/live 看板与策略
+    执行统计按交易模式天然排除，同时账务事实仍由 st_portfolio_trans_log
+    独立保留。
+    """
     try:
         from server.api.routers.portfolio_math import portfolio_trade_fee as _fee
         amount = round(price * shares, 2)
@@ -5294,12 +5491,13 @@ def _watchlist_write_flow(code: str, short_name: str, trans_type: str, price: fl
         flow_type = "watch_buy" if trans_type == "buy" else "watch_sell"
         _exec_sql("""
             INSERT INTO st_trade_flow
-            (stock_code, short_name, flow_type, source, strategy_type, trans_type,
+            (stock_code, short_name, flow_type, source, strategy_type, trade_mode, trans_type,
              price, shares, amount, fee, reason, ai_score, trans_date, trans_time)
-            VALUES (:code, :name, :ft, 'watchlist', '', :tt,
+            VALUES (:code, :name, :ft, 'watchlist', '', :trade_mode, :tt,
                     :price, :shares, :amount, :fee, '自选股操作', 0, CURDATE(), DATE_FORMAT(NOW(), '%H:%i'))
         """, {"code": code, "name": short_name or "", "ft": flow_type, "tt": trans_type,
-              "price": price, "shares": shares, "amount": amount, "fee": fee})
+              "trade_mode": "manual_bookkeeping", "price": price, "shares": shares,
+              "amount": amount, "fee": fee})
     except Exception as exc:
         _record_fallback('_watchlist_write_flow:4336', exc)
 
@@ -6393,17 +6591,21 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     except Exception:
         profile_map = {}
     try:
+        profile_date = close_trade_date
         concept_rows = _read_sql(f"""
-            SELECT stock_code, concept_tag, pop_tag
+            SELECT stock_code, concept_tag, pop_tag, snapshot_date
             FROM st_hot_rank_ths
-            WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_rank_ths)
+            WHERE snapshot_date = :profile_date
               AND stock_code IN ({placeholders})
-        """, code_params)
+        """, {**code_params, "profile_date": profile_date})
         for item in concept_rows:
             stock_code = str(item.get("stock_code") or "").strip().zfill(6)
             profile_map.setdefault(stock_code, {})
             profile_map[stock_code]["concept_tag"] = item.get("concept_tag") or ""
             profile_map[stock_code]["pop_tag"] = item.get("pop_tag") or ""
+            profile_map[stock_code]["concept_tag_date"] = str(
+                item.get("snapshot_date") or ""
+            )[:10]
     except Exception as exc:
         _record_fallback('_build_portfolio_snapshot:5196', exc)
 
@@ -6451,6 +6653,7 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         row["industry_name"] = profile.get("industry_name") or row.get("industry_name") or ""
         row["concept_tag"] = profile.get("concept_tag") or row.get("concept_tag") or ""
         row["pop_tag"] = profile.get("pop_tag") or row.get("pop_tag") or ""
+        row["concept_tag_date"] = profile.get("concept_tag_date") or ""
         row["macro_risk_triggered"] = bool(
             tech_risk_news_signal.get("triggered")
             and int(row.get("shares") or 0) > 0
@@ -8340,8 +8543,82 @@ def _live_quotes_from_current_table(
     return out
 
 
+def _portfolio_verified_close_receipt(trade_date: str) -> dict | None:
+    """Return a full-market QMT receipt captured after the target close.
+
+    A same-day timestamp alone does not prove a close: the realtime collector
+    can stop in the morning and leave that snapshot in ``sm_stock_current``.
+    The bridge publishes the receipt only after atomically replacing the full
+    current table, so the receipt plus a 15:00-or-later source timestamp is the
+    minimum evidence accepted by the off-hours watchlist.
+    """
+
+    td = str(trade_date or "")[:10]
+    try:
+        day_start = datetime.strptime(td, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    close_start = day_start.replace(hour=15)
+    day_end = day_start + timedelta(days=1)
+    try:
+        with get_current_engine().connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT receipt_id, expected_count, observed_count, coverage,
+                           source_generated_at, published_at, capture_mode
+                    FROM st_qmt_realtime_sync_receipt_v2
+                    WHERE source_provider='gj_big_qmt_inner'
+                      AND quality_status='PASS'
+                      AND capture_mode IN ('LIVE_FORWARD','OFF_SESSION_SNAPSHOT')
+                      AND source_generated_at >= :close_start
+                      AND source_generated_at < :day_end
+                      AND published_at >= :close_start
+                      AND published_at < :day_end
+                    ORDER BY published_at DESC, created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"close_start": close_start, "day_end": day_end},
+            ).mappings().first()
+    except Exception as exc:
+        _record_fallback('_portfolio_verified_close_receipt', exc)
+        return None
+    if not row:
+        return None
+    receipt = dict(row)
+    try:
+        expected = int(receipt.get("expected_count") or 0)
+        observed = int(receipt.get("observed_count") or 0)
+        coverage = float(receipt.get("coverage") or 0)
+        source_generated_at = receipt.get("source_generated_at")
+        published_at = receipt.get("published_at")
+        source_time = (
+            source_generated_at
+            if isinstance(source_generated_at, datetime)
+            else datetime.fromisoformat(str(source_generated_at)[:19])
+        )
+        publish_time = (
+            published_at
+            if isinstance(published_at, datetime)
+            else datetime.fromisoformat(str(published_at)[:19])
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        expected <= 0
+        or observed <= 0
+        or coverage < 0.95
+        or observed / expected < 0.95
+        or not close_start <= source_time < day_end
+        or not close_start <= publish_time < day_end
+    ):
+        return None
+    return receipt
+
+
 def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: str) -> dict[str, dict]:
-    """Return stable close/off-hours quotes from the latest stored quote snapshot for a trade date."""
+    """Return only receipt-backed, 15:00-or-later quotes for one close."""
     clean = _safe_portfolio_stock_codes(codes)
     td = str(trade_date or "")[:10]
     out: dict[str, dict] = {}
@@ -8351,13 +8628,15 @@ def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: st
         from datetime import datetime as _dt, timedelta as _td
 
         td_start = _dt.strptime(td, "%Y-%m-%d")
+        td_close_start = td_start.replace(hour=15)
         td_end = td_start + _td(days=1)
     except Exception:
         return out
+    if _portfolio_verified_close_receipt(td) is None:
+        return out
     placeholders = ", ".join([f":code_{idx}" for idx, _ in enumerate(clean)])
     params = {f"code_{idx}": code for idx, code in enumerate(clean)}
-    params["td"] = td
-    params["td_start"] = td_start.strftime("%Y-%m-%d %H:%M:%S")
+    params["td_close_start"] = td_close_start.strftime("%Y-%m-%d %H:%M:%S")
     params["td_end"] = td_end.strftime("%Y-%m-%d %H:%M:%S")
 
     def _coerce_rows(rows: list[dict], source: str) -> dict[str, dict]:
@@ -8367,6 +8646,14 @@ def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: st
             if not stock_code or row.get("price") is None:
                 continue
             snapshot_at = str(row.get("snapshot_at") or "")
+            try:
+                snapshot_time = _dt.strptime(
+                    snapshot_at[:19], "%Y-%m-%d %H:%M:%S"
+                )
+            except (TypeError, ValueError):
+                continue
+            if not td_close_start <= snapshot_time < td_end:
+                continue
             out[stock_code] = {
                 "stock_code": stock_code,
                 "short_name": row.get("short_name"),
@@ -8388,7 +8675,7 @@ def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: st
             SELECT stock_code, short_name, price, `change`, change_pct, volume, amount, snapshot_at
             FROM sm_stock_current
             WHERE stock_code IN ({placeholders})
-              AND snapshot_at >= :td_start AND snapshot_at < :td_end
+              AND snapshot_at >= :td_close_start AND snapshot_at < :td_end
             """,
             params,
         )
@@ -8408,7 +8695,7 @@ def _portfolio_closed_quotes_from_current_table(codes: list[str], trade_date: st
                 SELECT stock_code, MAX(snapshot_at) AS snapshot_at
                 FROM sm_rt_quote_snapshot
                 WHERE stock_code IN ({placeholders})
-                  AND snapshot_at >= :td_start AND snapshot_at < :td_end
+                  AND snapshot_at >= :td_close_start AND snapshot_at < :td_end
                 GROUP BY stock_code
             ) x ON q.stock_code = x.stock_code AND q.snapshot_at = x.snapshot_at
             """,
@@ -10838,9 +11125,16 @@ def recommended_stocks_run_history(limit: int = Query(default=10, ge=1, le=50)):
             ORDER BY started_at DESC, id DESC
             LIMIT :limit
         """, {"limit": limit})
-        return {"data": rows, "total": len(rows)}
-    except Exception as e:
-        return {"data": [], "total": 0, "error": str(e)}
+        return {"status": "READY", "data": rows, "total": len(rows)}
+    except Exception as exc:
+        _record_fallback("recommended_stocks_run_history", exc)
+        return {
+            "status": "DATA_UNAVAILABLE",
+            "data": [],
+            "total": 0,
+            "error_code": "recommended_run_history_unavailable",
+            "message": "筛选执行记录暂不可用，系统正在修复数据结构。",
+        }
 
 
 def _active_recommended_run() -> dict | None:

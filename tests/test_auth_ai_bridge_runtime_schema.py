@@ -5,6 +5,7 @@ import inspect as python_inspect
 import pytest
 from sqlalchemy import create_engine, text
 
+from server.auth import schema as auth_schema
 from server.ai_bridge.schema import (
     ensure_ai_bridge_schema,
     privileged_migrate_ai_bridge_schema,
@@ -64,6 +65,16 @@ def test_auth_runtime_rejects_bootstrap_non_singleton(tmp_path):
             validate_auth_runtime_schema(engine)
     finally:
         engine.dispose()
+
+
+def test_mysql_auth_bootstrap_contract_matches_created_primary_key() -> None:
+    """Keep the production login schema check aligned with SQLAlchemy DDL."""
+
+    assert auth_schema._AUTH_COLUMN_CONTRACTS["st_auth_bootstrap"]["id"] == (
+        "int",
+        "NO",
+        "auto_increment",
+    )
 
 
 def test_privileged_ai_bridge_migration_then_runtime_read_only_validation(tmp_path):

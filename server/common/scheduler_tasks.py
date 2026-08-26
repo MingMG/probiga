@@ -42,6 +42,17 @@ BASE_SCHEDULER_COLUMNS = frozenset({
     "last_run_at",
     "created_at",
 })
+
+# ``created_at`` is part of the scheduler's established base surface, but one
+# production generation predates that audit timestamp.  It is the sole base
+# column that can be introduced without inventing task identity or execution
+# state: existing rows receive ``NULL`` and all current registration paths
+# populate it when the column is available.  Keep this privilege-only allowlist
+# separate from ``DEFAULT_SCHEDULER_COLUMNS`` so runtime callers still fail
+# closed until the fenced release migrator has completed the upgrade.
+PRIVILEGED_ADDITIVE_BASE_COLUMNS: dict[str, str] = {
+    "created_at": "DATETIME DEFAULT NULL",
+}
 SCHEDULER_REQUIRED_COLUMNS = frozenset(
     BASE_SCHEDULER_COLUMNS | set(DEFAULT_SCHEDULER_COLUMNS)
 )
@@ -243,14 +254,21 @@ def privileged_migrate_scheduler_task_columns(
     columns = table_columns(engine, table_name)
     if not columns:
         raise RuntimeError(f"{table_name} does not exist")
-    missing_base = sorted(BASE_SCHEDULER_COLUMNS - columns)
+    missing_base = sorted(
+        BASE_SCHEDULER_COLUMNS
+        - columns
+        - set(PRIVILEGED_ADDITIVE_BASE_COLUMNS)
+    )
     if missing_base:
         raise RuntimeError(
             f"{table_name} base schema is incompatible: "
             f"missing_columns={missing_base}"
         )
 
-    definitions = _scheduler_column_definitions(column_definitions)
+    definitions = {
+        **PRIVILEGED_ADDITIVE_BASE_COLUMNS,
+        **_scheduler_column_definitions(column_definitions),
+    }
     added: list[str] = []
 
     with engine.begin() as conn:

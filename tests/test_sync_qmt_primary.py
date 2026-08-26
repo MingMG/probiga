@@ -27,6 +27,25 @@ def test_remote_gateway_is_a_valid_configuration_without_local_qmt_python(monkey
     assert bridge.is_configured() is False
 
 
+def test_health_probe_requires_an_explicit_gateway_or_local_runtime(
+    monkeypatch,
+    tmp_path,
+):
+    worker = tmp_path / "worker.py"
+    worker.write_text("", encoding="utf-8")
+    monkeypatch.setattr(bridge, "WORKER", worker)
+    monkeypatch.setenv("QMT_PYTHON", str(tmp_path / "missing-python"))
+    monkeypatch.setenv("QMT_GATEWAY_ENABLED", "1")
+    monkeypatch.delenv("QMT_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("QMT_GATEWAY_REQUIRED", raising=False)
+
+    assert bridge.is_configured() is True
+    assert bridge.is_probe_runtime_configured() is False
+
+    monkeypatch.setenv("QMT_GATEWAY_URL", "http://127.0.0.1:18765")
+    assert bridge.is_probe_runtime_configured() is True
+
+
 def test_qmt_primary_wrapper_sets_bounded_minute_policy():
     completed = SimpleNamespace(returncode=0)
     with patch(

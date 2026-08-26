@@ -8176,16 +8176,75 @@
         });
     }
 
+    function candidateCenterStockPoolIsReadable(pool) {
+        pool = pool || {};
+        var items = pool.items, summary = pool.summary || {};
+        var poolStatus = String(pool.pool_status || '').toUpperCase();
+        var runStatus = String(pool.run_status || '').toUpperCase();
+        var sessionDate = String(pool.decision_session_date || '').slice(0, 10);
+        var dataDate = String(pool.trade_date || pool.data_date || '').slice(0, 10);
+        var datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        var stockCount = summary.stock_count;
+        var candidateCount = summary.strategy_candidate_count;
+        var actualCandidateCount = Array.isArray(items) ? items.filter(function(item) { return item && item.is_strategy_candidate === true; }).length : -1;
+        return !!pool.run_uid && pool.pool_readable === true && runStatus === 'COMPLETED' && pool.decision_integrity_verified === true && (poolStatus === 'READY' || poolStatus === 'EMPTY') && datePattern.test(sessionDate) && datePattern.test(dataDate) && dataDate <= sessionDate && Array.isArray(items) && Number.isInteger(stockCount) && stockCount === items.length && Number.isInteger(candidateCount) && candidateCount === actualCandidateCount && ((poolStatus === 'READY' && candidateCount > 0) || (poolStatus === 'EMPTY' && candidateCount === 0));
+    }
+
+    function candidateCenterStockPoolWithHistoricalFallback(requestedDate) {
+        var target = String(requestedDate || '').slice(0, 10);
+        var exactPath = '/api/v3/stock-pool' + (target ? '?trade_date=' + encodeURIComponent(target) : '');
+        return fetchRawJsonWithTimeout(exactPath, 15000).then(function(exactEnvelope) {
+            var exact = (exactEnvelope || {}).data || exactEnvelope || {};
+            var exactSession = String(exact.decision_session_date || exact.trade_date || '').slice(0, 10);
+            var exactReadable = candidateCenterStockPoolIsReadable(exact) && exact.is_historical_fallback !== true && exact.historical_read_only !== true && (!target || exactSession === target);
+            if (exactReadable) {
+                return Object.assign({}, exact, {
+                    requested_trade_date: target || exactSession,
+                    is_historical_fallback: false
+                });
+            }
+            function missingExact() {
+                return Object.assign({}, exact, {
+                    requested_trade_date: target,
+                    exact_run_missing: true,
+                    exact_run_unreadable: !!exact.run_uid,
+                    is_historical_fallback: false
+                });
+            }
+            if (!target) return missingExact();
+            return fetchRawJsonWithTimeout('/api/v3/stock-pool?before_session_date=' + encodeURIComponent(target), 15000).then(function(latestEnvelope) {
+                var latest = (latestEnvelope || {}).data || latestEnvelope || {};
+                var latestSession = String(latest.decision_session_date || latest.trade_date || '').slice(0, 10);
+                var boundedTarget = String(latest.before_session_date || latest.requested_trade_date || '').slice(0, 10);
+                var fallbackSession = String(latest.historical_fallback_session_date || '').slice(0, 10);
+                var readable = candidateCenterStockPoolIsReadable(latest) && latest.is_historical_fallback === true && latest.historical_read_only === true && String(latest.historical_fallback_status || '') === 'HISTORICAL_READ_ONLY' && boundedTarget === target && fallbackSession === latestSession && !!latestSession && latestSession < target;
+                if (!readable) return missingExact();
+                return Object.assign({}, latest, {
+                    requested_trade_date: target,
+                    exact_run_missing: true,
+                    exact_run_unreadable: !!exact.run_uid,
+                    is_historical_fallback: true,
+                    historical_read_only: true,
+                    historical_fallback_session_date: latestSession,
+                    historical_fallback_reason: latest.historical_fallback_reason || '请求日没有完整可验证的 V3 决策批次，展示此前最近一次 COMPLETED 历史策略池'
+                });
+            }).catch(missingExact);
+        });
+    }
+
     function loadCandidateCenterPage(d, container) {
         container.innerHTML = '<div class="loading">正在按统一决策批次加载候选与拒绝...</div>';
         var requestedDate = String(d || '').slice(0, 10);
         Promise.all([
-            fetchRawJsonWithTimeout('/api/v3/stock-pool?trade_date=' + encodeURIComponent(requestedDate), 15000),
-            fetchRawJsonWithTimeout('/api/v3/context?trade_date=' + encodeURIComponent(requestedDate), 10000)
+            candidateCenterStockPoolWithHistoricalFallback(requestedDate),
+            fetchRawJsonWithTimeout('/api/v3/context?trade_date=' + encodeURIComponent(requestedDate), 10000).catch(function(error) {
+                return { data: {}, _load_error: String(error && error.message || error || '统一决策上下文读取失败') };
+            })
         ]).then(function(unifiedResult) {
             var poolEnvelope = unifiedResult[0] || {}, contextEnvelope = unifiedResult[1] || {};
             var pool = poolEnvelope.data || poolEnvelope;
             var context = contextEnvelope.data || contextEnvelope;
+            var contextLoadError = String(contextEnvelope._load_error || '');
             var rows = Array.isArray(pool.items) ? pool.items.slice() : [];
             rows.sort(function (left, right) {
                 var leftRank = Number(left.rank_no == null ? 999999 : left.rank_no);
@@ -8193,16 +8252,19 @@
                 return leftRank - rightRank || String(left.stock_code || '').localeCompare(String(right.stock_code || ''));
             });
             var summary = pool.summary || {};
-            var resolvedDate = String(context.data_date || pool.trade_date || '').slice(0, 10);
-            var batchMismatch = !!(context.run_uid && pool.run_uid && context.run_uid !== pool.run_uid);
-            var contextState = tradingDecisionTruth(context);
+            var historicalFallback = pool.is_historical_fallback === true;
+            var decisionSessionDate = String(historicalFallback ? (pool.decision_session_date || pool.trade_date || '') : (context.decision_session_date || pool.decision_session_date || '')).slice(0, 10);
+            var resolvedDate = String(historicalFallback ? (pool.trade_date || pool.data_date || '') : (context.data_date || pool.trade_date || '')).slice(0, 10);
+            var batchMismatch = !!(!historicalFallback && context.run_uid && pool.run_uid && context.run_uid !== pool.run_uid);
+            var contextState = historicalFallback ? 'STALE' : tradingDecisionTruth(context);
             var projectedTargetCount = Number(context.target_count);
             var poolTargetCount = Number(summary.target_count);
-            if (batchMismatch || !pool.run_uid || ((contextState === 'READY' || contextState === 'EMPTY') && (!Number.isFinite(poolTargetCount) || poolTargetCount !== projectedTargetCount))) contextState = 'UNAVAILABLE';
+            if (batchMismatch || (!historicalFallback && (contextState === 'READY' || contextState === 'EMPTY') && (!Number.isFinite(poolTargetCount) || poolTargetCount !== projectedTargetCount))) contextState = 'UNAVAILABLE';
+            if (!pool.run_uid && contextState !== 'BLOCKED') contextState = 'UNAVAILABLE';
             var filter = _screenerState.centerFilter || {};
             var filterStock = String(filter.stock || '').trim();
             var filterKind = String(filter.kind || '');
-            _screenerState.center = { candidates: rows, data_date: resolvedDate, run_uid: pool.run_uid };
+            _screenerState.center = { candidates: rows, data_date: resolvedDate, run_uid: pool.run_uid, historical_read_only: historicalFallback, requested_trade_date: requestedDate };
 
             function kindOf(row) {
                 if (row.target) return 'TARGET';
@@ -8219,9 +8281,20 @@
             }
 
             var h = '<div class="screen-page candidate-center unified-stock-pool">';
-            h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + rows.length + '</strong><span>同批次股票</span></div></section>';
-            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '决策会话日与请求上下文不匹配或证据过期，仅供历史复核' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>页面请求日</dt><dd>' + escHtml(context.requested_date || requestedDate || '-') + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(context.decision_session_date || context.requested_date || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(context.expected_data_date || resolvedDate || '-') + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(context.run_uid || pool.run_uid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(context.decision_at || pool.generated_at || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(context.evidence_as_of || '-') + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(context.valid_until || '-') + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'STALE' ? '历史复核' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经统一执行复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
-            var metricsReadable = contextState === 'READY' || contextState === 'EMPTY';
+            var introCount = pool.run_uid ? rows.length : '—';
+            var introCountLabel = historicalFallback ? '历史只读股票' : pool.run_uid ? '同批次股票' : '当前不可用';
+            h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + introCount + '</strong><span>' + introCountLabel + '</span></div></section>';
+            if (historicalFallback) h += '<div class="sc-freshness warn"><strong>HISTORICAL_READ_ONLY / 历史只读</strong><span>原请求日 ' + escHtml(requestedDate || '-') + ' 没有 V3 决策批次；当前只回看严格更早的最近可读批次（决策日 ' + escHtml(decisionSessionDate || '-') + '，数据日 ' + escHtml(resolvedDate || '-') + '）。全部股票不可执行，不会创建模拟或真实订单，也不代表请求日的 READY 结论。</span></div>';
+            if (pool.exact_run_missing && !historicalFallback) h += '<div class="sc-freshness error"><strong>' + escHtml(contextState === 'BLOCKED' ? 'BLOCKED' : 'UNAVAILABLE') + '</strong><span>原请求日 ' + escHtml(requestedDate || '-') + ' 没有 V3 决策批次，且没有严格更早的可读历史策略池。这不是正常空态，不得解释为没有候选。</span></div>';
+            if (contextLoadError) h += '<div class="sc-freshness error"><strong>请求日上下文 UNAVAILABLE</strong><span>' + escHtml(contextLoadError) + '；' + (historicalFallback ? '历史批次仍只作独立只读回看，不与请求日合并。' : '当前策略池不得升级为 READY 或正常空态。') + '</span></div>';
+            var displayedRequestedDate = pool.requested_trade_date || requestedDate || context.requested_date || '-';
+            var displayedExpectedDataDate = historicalFallback ? '-' : (context.expected_data_date || resolvedDate || '-');
+            var displayedRunUid = historicalFallback ? pool.run_uid : (context.run_uid || pool.run_uid);
+            var displayedDecisionAt = historicalFallback ? (pool.decision_at || pool.generated_at) : (context.decision_at || pool.decision_at || pool.generated_at);
+            var displayedEvidenceAsOf = historicalFallback ? '-' : (context.evidence_as_of || '-');
+            var displayedValidUntil = historicalFallback ? '-' : (context.valid_until || '-');
+            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '历史策略池仅供只读复核，不是原请求日的同批次 READY 结论' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>原请求日</dt><dd>' + escHtml(displayedRequestedDate) + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(decisionSessionDate || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(displayedExpectedDataDate) + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(displayedRunUid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(displayedDecisionAt || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(displayedEvidenceAsOf) + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(displayedValidUntil) + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (historicalFallback ? '历史只读' : contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(historicalFallback ? '历史批次不可入队' : contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经统一执行复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
+            var metricsReadable = historicalFallback || contextState === 'READY' || contextState === 'EMPTY';
             h += '<div class="stats-bar">' + card('同批次股票', metricsReadable ? Number(summary.stock_count || 0) : '—', 'blue') + card('研究候选', metricsReadable ? Number(summary.strategy_candidate_count || 0) : '—', 'orange') + card('研究目标', metricsReadable ? Number(summary.target_count || 0) : '—', 'red') + card('明确拒绝', metricsReadable ? Number(summary.rejected_count || 0) : '—', 'green') + '</div>';
             h += '<section class="sc-panel"><div class="candidate-center-filterbar" aria-label="候选与拒绝筛选"><label><span>决策日期</span><input id="candidateCenterDateFilter" type="date" value="' + escAttr(requestedDate || resolvedDate) + '"></label><label><span>账本状态</span><select id="candidateCenterKindFilter"><option value="">全部状态</option><option value="TARGET">研究目标</option><option value="CANDIDATE">研究候选</option><option value="REJECTED">组合拒绝</option><option value="RESEARCH">研究样本</option></select></label><label class="candidate-center-stock-filter"><span>股票</span><input id="candidateCenterStockFilter" type="search" value="' + escAttr(filterStock) + '" placeholder="代码或名称" autocomplete="off"></label><button id="candidateCenterQueryButton" class="sc-primary" type="button">查询批次</button><span id="candidateCenterFilterCount" class="candidate-center-filter-count"></span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>账本状态</th><th>独立策略</th><th>主题</th><th>研究分 / 净期望</th><th>证据或拒绝原因</th><th>权限</th></tr></thead><tbody id="candidateCenterUnifiedRows"></tbody></table></div><div class="sc-table-note">显示上限 300 条；每一行都属于 run_uid ' + escHtml(pool.run_uid || '-') + '。V4 硬拒绝会计入证据覆盖，但只保留在研究审计层；RESEARCH_ONLY 永远不会显示为“可执行”。</div></section></div>';
             container.innerHTML = h;
@@ -8231,8 +8304,8 @@
                 var keyword = String((stockInput || {}).value || '').trim().toLowerCase(), selectedKind = String((kindInput || {}).value || '');
                 var filtered = rows.filter(function(row) { var haystack=(String(row.stock_code||'')+' '+String(row.stock_name||'')).toLowerCase();return (!keyword||haystack.indexOf(keyword)>=0)&&(!selectedKind||kindOf(row)===selectedKind); });
                 var visible = filtered.slice(0, 300);
-                var emptyCopy = contextState === 'LOADING' ? '批次仍在生成，当前没有记录不是空态结论。' : contextState === 'UNAVAILABLE' ? '批次真值或账本不可验证，不能据此判断没有记录。' : contextState === 'BLOCKED' ? '批次已被门禁阻断，不得解释为正常空态。' : contextState === 'STALE' ? '当前是历史或过期证据，不代表现在没有机会。' : contextState === 'EMPTY' ? '完整批次已验证为无研究目标，当前筛选也没有记录。' : '统一批次有效，但当前筛选条件没有记录。';
-                tbody.innerHTML = visible.length ? visible.map(function(row, index) { var code=String(row.stock_code||'').padStart(6,'0'),kind=kindOf(row),target=row.target||{};return '<tr><td>' + escHtml(row.rank_no || target.rank_no || index+1) + '</td><td><strong>' + nameLink(code,row.stock_name||code) + '</strong><small>' + escHtml(code) + '</small></td><td><span class="sc-status-pill">' + escHtml(kindText(kind)) + '</span></td><td>' + escHtml((row.strategy_keys||[]).join(' / ')||'-') + '</td><td>' + escHtml((row.theme_codes||[]).join(' / ')||'-') + '</td><td><b class="sc-score">' + escHtml(fmt(row.raw_score,3)) + '</b><small>' + (row.expected_return_net_pct==null?'未校准':escHtml(fmt(row.expected_return_net_pct,2)+'%')) + '</small></td><td title="' + escAttr(reasonText(row)) + '">' + escHtml(localizeMachineText(reasonText(row)).slice(0,180)) + '</td><td><span class="sc-status-pill">RESEARCH_ONLY</span><small>不可直接下单</small></td></tr>'; }).join('') : '<tr><td colspan="8" class="sc-empty-cell">' + escHtml(emptyCopy) + '</td></tr>';
+                var emptyCopy = historicalFallback ? '历史只读批次没有可展示记录；该回看不代表原请求日没有策略候选。' : contextState === 'LOADING' ? '批次仍在生成，当前没有记录不是空态结论。' : contextState === 'UNAVAILABLE' ? '批次真值或账本不可验证，不能据此判断没有记录。' : contextState === 'BLOCKED' ? '批次已被门禁阻断，不得解释为正常空态。' : contextState === 'STALE' ? '当前是历史或过期证据，不代表现在没有机会。' : contextState === 'EMPTY' ? '完整批次已验证为无研究目标，当前筛选也没有记录。' : '统一批次有效，但当前筛选条件没有记录。';
+                tbody.innerHTML = visible.length ? visible.map(function(row, index) { var code=String(row.stock_code||'').padStart(6,'0'),kind=kindOf(row),target=row.target||{};return '<tr><td>' + escHtml(row.rank_no || target.rank_no || index+1) + '</td><td><strong>' + nameLink(code,row.stock_name||code) + '</strong><small>' + escHtml(code) + '</small></td><td><span class="sc-status-pill">' + escHtml(kindText(kind)) + '</span></td><td>' + escHtml((row.strategy_keys||[]).join(' / ')||'-') + '</td><td>' + escHtml((row.theme_codes||[]).join(' / ')||'-') + '</td><td><b class="sc-score">' + escHtml(fmt(row.raw_score,3)) + '</b><small>' + (row.expected_return_net_pct==null?'未校准':escHtml(fmt(row.expected_return_net_pct,2)+'%')) + '</small></td><td title="' + escAttr(reasonText(row)) + '">' + escHtml(localizeMachineText(reasonText(row)).slice(0,180)) + '</td><td><span class="sc-status-pill">' + (historicalFallback ? 'HISTORICAL_READ_ONLY' : 'RESEARCH_ONLY') + '</span><small>' + (historicalFallback ? '历史回看，全部不可执行' : '不可直接下单') + '</small></td></tr>'; }).join('') : '<tr><td colspan="8" class="sc-empty-cell">' + escHtml(emptyCopy) + '</td></tr>';
                 count.textContent = '显示 ' + visible.length + ' / ' + filtered.length + ' 条';
                 _screenerState.centerFilter = { tradeDate:String((dateInput||{}).value||requestedDate),stock:keyword,kind:selectedKind };
                 if (typeof window.updateTradingRouteFilters === 'function') window.updateTradingRouteFilters({trade_date:String((dateInput||{}).value||requestedDate),q:keyword,kind:selectedKind});
@@ -10786,6 +10859,10 @@
         fetch('/api/hot-data/recommended-stocks/run-history?limit=8')
             .then(function(r) { return r.json(); })
             .then(function(res) {
+                if (res.status === 'DATA_UNAVAILABLE' || res.error_code) {
+                    mount.innerHTML = '<div style="padding:10px 12px;background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;color:#9a3412;font-size:12px;">' + escHtml(res.message || '筛选执行记录暂不可用，请稍后重试。') + '</div>';
+                    return;
+                }
                 var rows = res.data || [];
                 if (!rows.length) {
                     mount.innerHTML = '<div style="padding:10px 12px;background:#fff;border:1px solid #eee;border-radius:8px;color:#888;font-size:12px;">暂无筛选执行记录</div>';

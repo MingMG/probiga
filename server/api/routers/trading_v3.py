@@ -17,6 +17,9 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
+from server.common.strategy_governance_mode import (
+    strategy_governance_database_deferred,
+)
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.decision_intelligence import (
     DecisionIntelligenceError,
@@ -97,6 +100,158 @@ def _research_target_projection(row: dict[str, Any]) -> dict[str, Any]:
         "decision_scope": "RESEARCH_ONLY",
         "new_buy_eligible": False,
         "display_action": "WATCH",
+    }
+
+
+_GOVERNANCE_DATABASE_DEFERRED_REASON = "GOVERNANCE_DATABASE_DEFERRED"
+
+
+def _deferred_decision_context(
+    *,
+    requested_date: date | None,
+) -> dict[str, Any]:
+    """Return a cash-only V3 context without consulting decision storage."""
+
+    projected = _decision_context_projection(
+        None,
+        requested_date=requested_date,
+    )
+    reason_codes = list(projected.get("reason_codes") or [])
+    if _GOVERNANCE_DATABASE_DEFERRED_REASON not in reason_codes:
+        reason_codes.append(_GOVERNANCE_DATABASE_DEFERRED_REASON)
+    return {
+        **projected,
+        "data_status": "BLOCKED",
+        "decision_status": "BLOCKED",
+        "decision_scope": "RESEARCH_ONLY",
+        "paper_order_authority": "NONE",
+        "order_authority": False,
+        "real_order_authority": "DISABLED",
+        "real_order_allowed": False,
+        "actionable_output_allowed": False,
+        "actionable_status": "GOVERNANCE_DATABASE_DEFERRED",
+        "strategy_governance_mode": "DEFERRED_DB",
+        "governance_deferred": True,
+        "activation_enabled": False,
+        "reason_codes": reason_codes,
+    }
+
+
+def _deferred_stock_pool_projection(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Keep immutable audit rows while removing every current action plan."""
+
+    projected_items: list[dict[str, Any]] = []
+    for raw_item in list(payload.get("items") or []):
+        if not isinstance(raw_item, Mapping):
+            continue
+        item = dict(raw_item)
+        raw_plan = item.get("action_plan")
+        plan = dict(raw_plan) if isinstance(raw_plan, Mapping) else {}
+        source_actionability = str(
+            item.get("actionability")
+            or plan.get("actionability")
+            or "RESEARCH_ONLY"
+        ).upper()
+        item["source_actionability"] = source_actionability
+        item["actionability"] = "RESEARCH_ONLY"
+        item["action_plan"] = {
+            **plan,
+            "source_actionability": source_actionability,
+            "actionability": "RESEARCH_ONLY",
+            "label": "治理数据库迁移延期；当前仅保留只读研究审计",
+            "buy_range": None,
+            "sell_range": None,
+            "protective_stop": None,
+            "range_status": "GOVERNANCE_DATABASE_DEFERRED",
+            "execution_authority": "NONE",
+        }
+        projected_items.append(item)
+
+    summary = dict(payload.get("summary") or {})
+    for field in (
+        "display_count",
+        "buy_zone_count",
+        "wait_trigger_count",
+        "paper_only_count",
+    ):
+        summary[field] = 0
+    reason_codes = list(payload.get("reason_codes") or [])
+    if _GOVERNANCE_DATABASE_DEFERRED_REASON not in reason_codes:
+        reason_codes.append(_GOVERNANCE_DATABASE_DEFERRED_REASON)
+    return {
+        **dict(payload),
+        "strategy_governance_mode": "DEFERRED_DB",
+        "governance_deferred": True,
+        "activation_enabled": False,
+        "decision_scope": "RESEARCH_ONLY",
+        "paper_order_authority": "NONE",
+        "order_authority": False,
+        "real_order_authority": "DISABLED",
+        "real_order_allowed": False,
+        "actionable_output_allowed": False,
+        "reason_codes": reason_codes,
+        "items": projected_items,
+        "summary": summary,
+    }
+
+
+def _deferred_readiness_projection() -> dict[str, Any]:
+    """Expose an explicit non-activatable V3 boundary in deferred mode."""
+
+    config = load_v3_config()
+    portfolio = dict(config.get("portfolio") or {})
+    paper_discovery = dict(config.get("paper_discovery") or {})
+    paper_execution = dict(config.get("paper_execution") or {})
+    return {
+        "schema": {},
+        "production_columns": {},
+        "real_trading_database_guards": {},
+        "active_calibrated_sleeves": [],
+        "active_oos_models": [],
+        "incompatible_calibrated_sleeves": [],
+        "calibration_rejections": {},
+        "validated_portfolio_ready": False,
+        "paper_discovery_ready": False,
+        "structural_ready": False,
+        "data_ready": False,
+        "decision_ready": False,
+        "paper_authority_ready": False,
+        "execution_ready": False,
+        "execution_readiness_source": "GOVERNANCE_DATABASE_DEFERRED",
+        "execution_blocks": [_GOVERNANCE_DATABASE_DEFERRED_REASON],
+        "learning_ready": False,
+        "learning_status": "BLOCKED",
+        "learning_runtime": {},
+        "learning_task_healthy": False,
+        "learning_task_status": "BLOCKED",
+        "latest_context": None,
+        "paper_ready": False,
+        "portfolio_limits": {
+            "minimum_positions": int(portfolio.get("minimum_positions", 0)),
+            "maximum_positions": int(portfolio.get("maximum_positions", 0)),
+            "maximum_add_count": int(portfolio.get("maximum_add_count", 0)),
+            "maximum_paper_discovery_positions": int(
+                paper_discovery.get("maximum_positions", 0)
+            ),
+            "maximum_live_positions": int(
+                paper_execution.get("maximum_live_positions", 0)
+            ),
+        },
+        "real_trading_enabled": False,
+        "strategy_governance_mode": "DEFERRED_DB",
+        "governance_deferred": True,
+        "activation_enabled": False,
+        "paper_order_authority": "NONE",
+        "order_authority": False,
+        "real_order_authority": "DISABLED",
+        "real_order_allowed": False,
+        "actionable_output_allowed": False,
+        "blocks": [_GOVERNANCE_DATABASE_DEFERRED_REASON],
+        "warnings": [
+            "治理数据库迁移待完成；策略输出仅供只读审计，禁止新增买入"
+        ],
     }
 
 
@@ -1151,6 +1306,11 @@ def _research_object_list(value: Any, field: str) -> list[dict[str, Any]]:
 
 @router.get("/readiness")
 def readiness():
+    if strategy_governance_database_deferred():
+        return _envelope(
+            _deferred_readiness_projection(),
+            status="blocked",
+        )
     repository = _repo()
     config = load_v3_config()
     tables = repository.table_readiness()
@@ -1520,6 +1680,11 @@ def decision_context(
 ):
     """Resolve the one immutable context every trading page must share."""
 
+    if strategy_governance_database_deferred():
+        return _envelope(
+            _deferred_decision_context(requested_date=trade_date),
+            status="blocked",
+        )
     repository = _repo()
     run = repository.latest_run_metadata(trade_date)
     projected = _decision_context_projection(
@@ -1589,9 +1754,23 @@ def latest_forecasts(
 @router.get("/stock-pool")
 def stock_pool(
     trade_date: date | None = Query(default=None),
+    before_session_date: date | None = None,
 ):
     """Read-only, per-stock projection of the latest V3 decision run."""
-    return _envelope(_repo().stock_pool(trade_date=trade_date))
+    if trade_date is not None and before_session_date is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "trade_date and before_session_date are mutually exclusive"
+            ),
+        )
+    payload = _repo().stock_pool(
+        trade_date=trade_date,
+        before_session_date=before_session_date,
+    )
+    if strategy_governance_database_deferred():
+        payload = _deferred_stock_pool_projection(payload)
+    return _envelope(payload)
 
 
 @router.get("/hypotheses/latest")

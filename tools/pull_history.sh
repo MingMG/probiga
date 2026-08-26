@@ -66,19 +66,8 @@ echo "========================================"
 echo " [3] 热门数据..."
 echo "========================================"
 
-echo "  --- 3-a: 同花顺热门概念 (近7天) ---"
-for d in $(python -c "from datetime import datetime,timedelta; n=datetime.now(); [print((n-timedelta(days=i)).strftime('%Y-%m-%d')) for i in range(7,0,-1)]"); do
-    echo "    日期: $d"
-    python tools/fetch_hot_concept_ths_daily.py "$d"
-done
-echo "  ✅  hot_concept 完成"
-
-echo "  --- 3-b: 同花顺热股 (近7天) ---"
-for d in $(python -c "from datetime import datetime,timedelta; n=datetime.now(); [print((n-timedelta(days=i)).strftime('%Y-%m-%d')) for i in range(7,0,-1)]"); do
-    echo "    日期: $d"
-    python tools/fetch_hot_rank_ths.py "$d"
-done
-echo "  ✅  hot_rank_ths 完成"
+echo "  --- 3-a/3-b: 同花顺历史热榜不可恢复，已硬性跳过 ---"
+echo "  THS 提供方只有当前快照；禁止把当前响应标成历史日期。"
 
 echo "  --- 3-c: 东财人气榜 (近7天) ---"
 for d in $(python -c "from datetime import datetime,timedelta; n=datetime.now(); [print((n-timedelta(days=i)).strftime('%Y-%m-%d')) for i in range(7,0,-1)]"); do
@@ -87,13 +76,8 @@ for d in $(python -c "from datetime import datetime,timedelta; n=datetime.now();
 done
 echo "  ✅  hot_pop_east 完成"
 
-echo "  --- 3-d: 融合榜单 ---"
-python tools/merge_hot_rank.py $(date '+%Y-%m-%d') --top 100
-echo "  ✅  fused 完成"
-python tools/merge_hot_rank.py $(date '+%Y-%m-%d') --top 100 --days 3
-echo "  ✅  fused(3天) 完成"
-python tools/merge_hot_rank.py $(date '+%Y-%m-%d') --top 100 --days 5
-echo "  ✅  fused(5天) 完成"
+echo "  --- 3-d: 历史回填不生成融合榜 ---"
+echo "  东财权威历史结果只作为单源数据；融合必须由正式多源当日流水线生成。"
 
 # ---- 第4步：个股行情数据（依赖 si_all_code）----
 echo ""

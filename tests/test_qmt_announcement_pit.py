@@ -85,8 +85,11 @@ class _XtData:
         self.fail_download = fail_download
         self.downloads = []
         self.reads = []
+        self.connected_ports = []
 
-    def connect(self):
+    def connect(self, *, port, remember_if_success):
+        assert remember_if_success is False
+        self.connected_ports.append(port)
         return None
 
     def download_history_data(self, code, **kwargs):
@@ -269,6 +272,7 @@ def test_full_catalog_batch_writes_events_and_authoritative_empty_for_beijing(
 
 
 def test_missing_one_catalog_stock_publishes_nothing(monkeypatch, tmp_path):
+    monkeypatch.delenv("QMT_PORT", raising=False)
     engine = _engine()
     catalog = _catalog(("000001", "000001.SZ"), ("600000", "600000.SH"))
     _patch_catalog(monkeypatch, catalog)
@@ -288,6 +292,7 @@ def test_missing_one_catalog_stock_publishes_nothing(monkeypatch, tmp_path):
     )
     assert result["status"] == "DATA_BLOCKED"
     assert result["reason_code"] == "QMT_ANNOUNCEMENT_RESPONSE_MISSING_STOCK"
+    assert xtdata.connected_ports == [58610]
     with engine.connect() as connection:
         assert connection.execute(
             text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")

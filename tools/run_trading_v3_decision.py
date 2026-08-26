@@ -97,6 +97,11 @@ def main() -> int:
         type=int,
         default=DEFAULT_PER_SLEEVE_LIMIT,
     )
+    parser.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="只生成历史决策证据，禁止持仓同步和模拟订单物化",
+    )
     args = parser.parse_args()
     load_project_env()
     primary = create_tool_engine()
@@ -128,11 +133,14 @@ def main() -> int:
                 execution_enabled=execution_enabled_for_request(
                     as_of=requested_as_of,
                     decision_at=decision_at,
-                ),
+                )
+                and not args.replay_only,
             )
         except Exception as exc:
             result = {
+                "schema": "probiga.trading-v3-decision-result.v1",
                 "status": "failed",
+                "retryable": True,
                 "run_status": "FAILED",
                 "actionable_status": "UNAVAILABLE",
                 "decision_at": decision_at.isoformat(sep=" "),
@@ -144,7 +152,9 @@ def main() -> int:
     finally:
         primary.dispose()
         kline.dispose()
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    # One schema-labelled JSON line gives the scheduler an unambiguous receipt
+    # even when providers or notification libraries emit surrounding logs.
+    print(json.dumps(result, ensure_ascii=False, default=str))
     if result.get("status") == "ok":
         return 0
     return 2 if result.get("status") == "blocked" else 1

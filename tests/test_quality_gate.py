@@ -193,6 +193,11 @@ class QualityGateTaskTest(unittest.TestCase):
             ) as factory,
             patch.object(ensure_quality_gate, "run", return_value={}) as run,
             patch.object(
+                ensure_quality_gate,
+                "validate_managed_task_contracts",
+                return_value={},
+            ) as validate_managed,
+            patch.object(
                 sqlalchemy,
                 "create_engine",
                 side_effect=AssertionError("direct SQLAlchemy engine bypassed TLS policy"),
@@ -206,6 +211,10 @@ class QualityGateTaskTest(unittest.TestCase):
             sentinel_engine,
             task_types=ensure_quality_gate.REVIEW_DELIVERY_TASK_TYPES,
             intraday_alert_mode="shadow",
+        )
+        validate_managed.assert_called_once_with(
+            sentinel_engine,
+            task_types=ensure_quality_gate.REVIEW_DELIVERY_TASK_TYPES,
         )
 
     def test_validate_cli_is_read_only(self):
@@ -269,6 +278,41 @@ class QualityGateTaskTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown scheduled task types: typo"):
                 ensure_quality_gate.run(object(), task_types={"typo"})
         ensure.assert_not_called()
+
+    def test_release_quarantines_legacy_generic_stock_writers(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE st_scheduled_tasks (
+                    id INTEGER PRIMARY KEY,
+                    task_type TEXT NOT NULL,
+                    enabled INTEGER NOT NULL,
+                    updated_at DATETIME
+                )
+            """))
+            connection.connection.create_function(
+                "NOW", 0, lambda: "2026-08-26 20:00:00"
+            )
+            connection.execute(text("""
+                INSERT INTO st_scheduled_tasks VALUES
+                    (1,'stock_kline',1,NULL),
+                    (2,'stock_minute',1,NULL),
+                    (3,'intraday_minute_flow',1,NULL)
+            """))
+
+        assert (
+            ensure_quality_gate.quarantine_legacy_canonical_market_writers(
+                engine
+            )
+            == 2
+        )
+        with engine.connect() as connection:
+            rows = dict(connection.execute(text(
+                "SELECT task_type,enabled FROM st_scheduled_tasks"
+            )).all())
+        self.assertEqual(rows["stock_kline"], 0)
+        self.assertEqual(rows["stock_minute"], 0)
+        self.assertEqual(rows["intraday_minute_flow"], 1)
 
     def test_review_delivery_validation_accepts_exact_rows_and_rejects_drift(self):
         engine = create_engine("sqlite+pysqlite:///:memory:")

@@ -6,6 +6,7 @@ through userdata/probiga_bridge.  It contains no order or cancel API calls.
 """
 
 import gzip
+import hashlib
 import json
 import os
 import threading
@@ -14,6 +15,14 @@ import traceback
 
 
 BRIDGE_VERSION = "bigqmt_inner_v2"
+STRATEGY_RELEASE_PROTOCOL = "probiga.bigqmt-strategy-release.v2"
+STRATEGY_IDENTITY_PROTOCOL = "probiga.bigqmt-loaded-strategy-identity.v1"
+STRATEGY_RELEASE_MANIFEST_SCHEMA = "probiga.bigqmt-strategy-manifest.v1"
+STRATEGY_RELEASE_MANIFEST_NAME = "probiga_big_qmt_bridge.release.json"
+EMBEDDED_STRATEGY_BUILD_SHA = "__PROBIGA_EMBEDDED_BUILD_SHA__"
+EMBEDDED_STRATEGY_GIT_BLOB = "__PROBIGA_EMBEDDED_GIT_BLOB__"
+EMBEDDED_STRATEGY_SOURCE_SHA256 = "__PROBIGA_EMBEDDED_SOURCE_SHA256__"
+EMBEDDED_STRATEGY_IDENTITY_SHA256 = "__PROBIGA_EMBEDDED_IDENTITY_SHA256__"
 MAX_TRACKED_CODES = 280
 
 _lock = threading.RLock()
@@ -83,6 +92,153 @@ def _json_safe(value):
         except Exception:
             return str(value)
     return str(value)
+
+
+def _file_sha256(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _valid_hex(value, lengths):
+    text = str(value or "").strip().lower()
+    return (
+        len(text) in lengths
+        and all(character in "0123456789abcdef" for character in text)
+    )
+
+
+def _freeze_loaded_strategy_identity():
+    """Freeze source/build evidence once, while QMT loads this model.
+
+    Capabilities and heartbeats must never re-read these files.  Therefore an
+    installer overwriting the strategy or manifest cannot make already-loaded
+    Python code advertise the new release; a real model reload is required.
+    """
+    unavailable = {
+        "strategy_identity_protocol": STRATEGY_IDENTITY_PROTOCOL,
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "UNAVAILABLE",
+        "strategy_identity_error": "load_identity_unavailable",
+        "strategy_build_sha": "",
+        "strategy_git_blob": "",
+        "strategy_source_sha256": "",
+        "strategy_artifact_sha256": "",
+        "strategy_loaded_identity_sha256": "",
+        "strategy_identity_loaded_at": time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        ),
+    }
+    try:
+        build_sha = str(EMBEDDED_STRATEGY_BUILD_SHA or "").lower()
+        git_blob = str(EMBEDDED_STRATEGY_GIT_BLOB or "").lower()
+        source_sha256 = str(EMBEDDED_STRATEGY_SOURCE_SHA256 or "").lower()
+        identity_sha256 = str(
+            EMBEDDED_STRATEGY_IDENTITY_SHA256 or ""
+        ).lower()
+        expected_identity = hashlib.sha256(
+            (
+                STRATEGY_IDENTITY_PROTOCOL
+                + "\n" + build_sha
+                + "\n" + git_blob
+                + "\n" + source_sha256
+            ).encode("ascii")
+        ).hexdigest()
+        if (
+            not _valid_hex(build_sha, (40,))
+            or build_sha == "0" * 40
+            or not _valid_hex(git_blob, (40, 64))
+            or not _valid_hex(source_sha256, (64,))
+            or not _valid_hex(identity_sha256, (64,))
+            or identity_sha256 != expected_identity
+        ):
+            return unavailable
+        script_path = globals().get("__file__")
+        manifest_candidates = []
+        if script_path:
+            path = os.path.abspath(script_path)
+            manifest_candidates.append(os.path.join(
+                os.path.dirname(path), STRATEGY_RELEASE_MANIFEST_NAME
+            ))
+        try:
+            bridge_root = _find_bridge_root()
+            qmt_home = os.path.dirname(os.path.dirname(bridge_root))
+            manifest_candidates.append(os.path.join(
+                qmt_home, "python", STRATEGY_RELEASE_MANIFEST_NAME
+            ))
+        except Exception:
+            pass
+        manifest_path = next(
+            (
+                candidate for candidate in manifest_candidates
+                if os.path.isfile(candidate)
+            ),
+            "",
+        )
+        if not manifest_path:
+            return unavailable
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if not isinstance(manifest, dict):
+            return unavailable
+        artifact_sha256 = str(
+            manifest.get("strategy_artifact_sha256") or ""
+        ).lower()
+        if (
+            manifest.get("schema") != STRATEGY_RELEASE_MANIFEST_SCHEMA
+            or manifest.get("strategy_release_protocol")
+            != STRATEGY_RELEASE_PROTOCOL
+            or manifest.get("strategy_identity_protocol")
+            != STRATEGY_IDENTITY_PROTOCOL
+            or str(manifest.get("strategy_build_sha") or "").lower()
+            != build_sha
+            or str(manifest.get("strategy_git_blob") or "").lower()
+            != git_blob
+            or str(manifest.get("strategy_source_sha256") or "").lower()
+            != source_sha256
+            or str(
+                manifest.get("strategy_loaded_identity_sha256") or ""
+            ).lower() != identity_sha256
+            or not _valid_hex(artifact_sha256, (64,))
+        ):
+            return unavailable
+        if script_path:
+            path = os.path.abspath(script_path)
+            if (
+                os.path.basename(path).casefold()
+                != "probiga_big_qmt_bridge.py".casefold()
+                or not os.path.isfile(path)
+                or _file_sha256(path) != artifact_sha256
+            ):
+                return unavailable
+        return {
+            "strategy_identity_protocol": STRATEGY_IDENTITY_PROTOCOL,
+            "strategy_identity_frozen": True,
+            "strategy_identity_status": "BOUND",
+            "strategy_identity_error": "",
+            "strategy_build_sha": build_sha,
+            "strategy_git_blob": git_blob,
+            "strategy_source_sha256": source_sha256,
+            "strategy_artifact_sha256": artifact_sha256,
+            "strategy_loaded_identity_sha256": identity_sha256,
+            "strategy_identity_loaded_at": unavailable[
+                "strategy_identity_loaded_at"
+            ],
+        }
+    except Exception:
+        return unavailable
+
+
+_LOADED_STRATEGY_IDENTITY = _freeze_loaded_strategy_identity()
+
+
+def _strategy_identity_payload():
+    return dict(_LOADED_STRATEGY_IDENTITY)
 
 
 def _atomic_write(name, payload):
@@ -374,6 +530,66 @@ def _instrument_row(C, symbol, iscomplete=False):
     }
 
 
+def _trading_calendar_rows(C, params):
+    """Read the native built-in QMT trading-date series without inference."""
+    market = str(params.get("market") or "SH").strip().upper() or "SH"
+    if market != "SH":
+        raise ValueError("Big QMT trading calendar currently supports SH only")
+    source_stock_code = str(
+        params.get("source_stock_code") or "000001.SH"
+    ).strip().upper()
+    if _valid_symbol(source_stock_code) != source_stock_code:
+        raise ValueError("Big QMT trading calendar source stock is invalid")
+    start_date = _date_digits(params.get("start_date"))[:8]
+    end_date = _date_digits(params.get("end_date"))[:8]
+    if (
+        len(start_date) != 8
+        or len(end_date) != 8
+        or start_date > end_date
+    ):
+        raise ValueError("Big QMT trading calendar range is invalid")
+    get_dates = getattr(C, "get_trading_dates", None)
+    if not callable(get_dates):
+        raise RuntimeError(
+            "standard QMT built-in ContextInfo.get_trading_dates is unavailable"
+        )
+    values = get_dates(
+        source_stock_code, start_date, end_date, -1, "1d"
+    )
+    normalized = set()
+    for value in values or []:
+        rendered = _time_text(value, "1d")
+        trade_date = rendered[:10] if rendered else ""
+        compact = trade_date.replace("-", "")
+        if len(compact) == 8 and start_date <= compact <= end_date:
+            normalized.add(trade_date)
+    if not normalized:
+        raise RuntimeError("Big QMT native trading calendar returned no sessions")
+    rows = []
+    for trade_date in sorted(normalized):
+        parsed = time.strptime(trade_date, "%Y-%m-%d")
+        rows.append({
+            "market": market,
+            "trade_date": trade_date,
+            "calendar_year": int(trade_date[:4]),
+            "trade_status": 1,
+            "day_week": int(parsed.tm_wday) + 1,
+        })
+    return {
+        "rows": rows,
+        "source_method": "ContextInfo.get_trading_dates",
+        "source_stock_code": source_stock_code,
+        "requested_start_date": (
+            start_date[:4] + "-" + start_date[4:6] + "-" + start_date[6:8]
+        ),
+        "requested_end_date": (
+            end_date[:4] + "-" + end_date[4:6] + "-" + end_date[6:8]
+        ),
+        "observed_start_date": rows[0]["trade_date"],
+        "observed_end_date": rows[-1]["trade_date"],
+    }
+
+
 def _download_history(symbols, period, start_time, end_time):
     # Newer QMT builds expose the batch downloader used by xtquant.  One
     # batch call is materially faster and more reliable than hundreds of
@@ -484,10 +700,10 @@ def _market_rows(C, params, period):
     if params.get("download_history"):
         _download_history(symbols, period, start_time, end_time)
     count = int(params.get("count", -1) or 0) if period == "1m" else -1
-    # A synthetic filled bar is not an exchange observation and must never
-    # enter the daily governance universe.  Minute consumers retain their
-    # historical fill behavior; daily attestation requires actual raw bars.
-    fill_data = period != "1d"
+    # Synthetic padding cannot prove either a traded minute or a suspension.
+    # The publisher separately requires one native raw daily row to classify
+    # no-trade codes, so both daily and minute reads remain unfilled facts.
+    fill_data = False
     raw_reader = getattr(C, "get_market_data_ex_ori", None)
     if callable(raw_reader):
         data = raw_reader(
@@ -540,15 +756,29 @@ def _current_rows(C, params):
 
 def _execute_request(C, action, params):
     if action in ("ping", "capabilities"):
-        return {
+        payload = {
             "bridge_version": BRIDGE_VERSION,
+            "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
             "read_only": True,
             "pandas_free_history": True,
             "actions": [
                 "current", "kline", "minute", "sector_list", "sector_members_many",
-                "instrument_details", "index_members_many"
+                "instrument_details", "index_members_many", "trading_calendar"
             ],
+            "native_capabilities": [{
+                "capability": "trading_calendar",
+                "action": "trading_calendar",
+                "available": callable(getattr(C, "get_trading_dates", None)),
+                "source_method": "ContextInfo.get_trading_dates",
+            }, {
+                "capability": "index_weight",
+                "action": "index_members_many",
+                "available": False,
+                "source_method": "membership_only_no_native_weight",
+            }],
         }
+        payload.update(_strategy_identity_payload())
+        return payload
     if action == "current":
         return {"rows": _current_rows(C, params)}
     if action == "kline":
@@ -574,6 +804,8 @@ def _execute_request(C, action, params):
             if row:
                 rows.append(row)
         return {"rows": rows}
+    if action == "trading_calendar":
+        return _trading_calendar_rows(C, params)
     if action == "index_members_many":
         rows = []
         for index_symbol in _normalize_codes(params.get("index_codes")):
@@ -625,6 +857,7 @@ def _process_one_request(C):
             "bridge_version": BRIDGE_VERSION,
             "generated_at": _now_text(),
         }
+        response.update(_strategy_identity_payload())
         response.update(result)
         _atomic_gzip_write(response_path, response)
         _last_error = ""
@@ -655,6 +888,7 @@ def _write_heartbeat(status):
     payload = {
         "schema_version": 2,
         "bridge_version": BRIDGE_VERSION,
+        "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
         "source": "gj_big_qmt_inner",
         "status": status,
         "updated_at": _now_text(),
@@ -673,6 +907,7 @@ def _write_heartbeat(status):
         "last_request_action": _last_request_action,
         "last_error": _last_error,
     }
+    payload.update(_strategy_identity_payload())
     _atomic_write("heartbeat.json", payload)
 
 

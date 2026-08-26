@@ -12,12 +12,15 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import logging
+import uuid
 from pathlib import Path as _Path
 from datetime import date, datetime, time
+from typing import Any, Mapping
 
 _ROOT = _Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
@@ -34,6 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SIM_TRADE_TASK_RESULT_SCHEMA = "probiga.sim-trade-task-result.v1"
+
 
 def _is_intraday_runtime() -> bool:
     now = datetime.now()
@@ -46,7 +51,11 @@ def _recommendation_count(pick_date: str) -> int:
     try:
         with get_engine().connect() as conn:
             return int(conn.execute(
-                text("SELECT COUNT(*) FROM st_recommended_stocks WHERE pick_date = :d"),
+                text(
+                    "SELECT COUNT(*) FROM st_recommended_stocks "
+                    "WHERE pick_date = :d "
+                    "AND (recommend_status IS NULL OR recommend_status = 'ALLOW')"
+                ),
                 {"d": pick_date[:10]},
             ).scalar() or 0)
     except Exception:
@@ -173,7 +182,150 @@ def run_sim_trade_scan():
     }
 
 
-if __name__ == "__main__":
+def _nonnegative_int(value: Any) -> int:
+    try:
+        result = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, result)
+
+
+def _signal_count(output: Mapping[str, Any]) -> int:
+    counts = output.get("counts")
+    if isinstance(counts, Mapping):
+        for key in ("total", "all", "signal_count"):
+            if key in counts:
+                return _nonnegative_int(counts.get(key))
+        return sum(_nonnegative_int(value) for value in counts.values())
+    return _nonnegative_int(output.get("signal_count"))
+
+
+def _empty_identity_hash() -> str:
+    return hashlib.sha256(b"[]").hexdigest()
+
+
+def build_task_receipt(
+    output: Mapping[str, Any],
+    *,
+    task_mode: str,
+    requested_trade_date: str,
+    requested_signal_date: str,
+    started_at: datetime,
+    finished_at: datetime,
+) -> dict[str, Any]:
+    """Build the one scheduler-facing result for a sim task invocation."""
+
+    source_status = str(output.get("status") or "").strip().lower()
+    prerequisite = output.get("recommendation_prerequisite")
+    prerequisite = prerequisite if isinstance(prerequisite, Mapping) else {}
+    trade_date = str(
+        output.get("trade_date")
+        or requested_trade_date
+        or date.today().isoformat()
+    )[:10]
+    signal_date = str(
+        output.get("signal_date")
+        or prerequisite.get("signal_date")
+        or requested_signal_date
+    )[:10]
+    if task_mode == "prepare_signals":
+        recommendation_count = _nonnegative_int(prerequisite.get("count"))
+        total_recommendations = _nonnegative_int(
+            output.get("total_recommendations")
+        )
+        if (
+            source_status == "ok"
+            and recommendation_count > 0
+            and total_recommendations > 0
+        ):
+            status = "PASS"
+        elif source_status == "skipped":
+            status = "SKIPPED"
+        else:
+            status = "DATA_BLOCKED"
+    else:
+        recommendation_count = _nonnegative_int(prerequisite.get("count"))
+        total_recommendations = _nonnegative_int(
+            output.get("total_recommendations")
+        )
+        status = "SKIPPED" if source_status == "skipped" else "PASS"
+
+    receipt: dict[str, Any] = {
+        "schema": SIM_TRADE_TASK_RESULT_SCHEMA,
+        "receipt_id": uuid.uuid4().hex,
+        "status": status,
+        "task_mode": task_mode,
+        "trade_date": trade_date,
+        "signal_date": signal_date or None,
+        "recommendation_count": recommendation_count,
+        "total_recommendations": total_recommendations,
+        "recommendation_code_count": _nonnegative_int(
+            output.get("recommendation_code_count")
+        ),
+        "recommendation_code_set_hash": str(
+            output.get("recommendation_code_set_hash")
+            or _empty_identity_hash()
+        ),
+        "strategy_count": _nonnegative_int(output.get("strategy_count")),
+        "signal_count": _signal_count(output),
+        "allowed_count": _nonnegative_int(output.get("allowed_count")),
+        "rejected_count": _nonnegative_int(output.get("rejected_count")),
+        "signal_identity_count": _nonnegative_int(
+            output.get("signal_identity_count")
+        ),
+        "signal_identity_hash": str(
+            output.get("signal_identity_hash") or _empty_identity_hash()
+        ),
+        "buy_order_count": _nonnegative_int(output.get("buy_order_count")),
+        "buy_fill_count": _nonnegative_int(output.get("buy_fill_count")),
+        "sell_fill_count": _nonnegative_int(output.get("sell_fill_count")),
+        "started_at": started_at.isoformat(sep=" ", timespec="seconds"),
+        "finished_at": finished_at.isoformat(sep=" ", timespec="seconds"),
+    }
+    error = str(output.get("error") or output.get("reason") or "").strip()
+    if error:
+        receipt["reason"] = error[:500]
+    if task_mode == "prepare_signals" and receipt["status"] == "PASS":
+        expected_decisions = (
+            receipt["total_recommendations"] * receipt["strategy_count"]
+        )
+        exact_identity = bool(
+            receipt["recommendation_code_count"]
+            == receipt["total_recommendations"]
+            == receipt["recommendation_count"]
+            and receipt["strategy_count"] > 0
+            and receipt["allowed_count"] + receipt["rejected_count"]
+            == expected_decisions
+            and receipt["signal_identity_count"]
+            == receipt["signal_count"]
+            == receipt["allowed_count"]
+            and len(receipt["recommendation_code_set_hash"]) == 64
+            and len(receipt["signal_identity_hash"]) == 64
+        )
+        if not exact_identity:
+            receipt["status"] = "DATA_BLOCKED"
+            receipt["reason"] = "signal pool identity/count contract is incomplete"
+    unsigned = json.dumps(
+        receipt,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    receipt["result_sha256"] = hashlib.sha256(unsigned.encode("utf-8")).hexdigest()
+    return receipt
+
+
+def _receipt_exit_code(receipt: Mapping[str, Any]) -> int:
+    status = str(receipt.get("status") or "").upper()
+    if status in {"PASS", "SKIPPED"}:
+        return 0
+    if status == "DATA_BLOCKED":
+        return 2
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="事件驱动模拟交易任务")
     parser.add_argument("date_arg", nargs="?", default="", help="兼容旧调度传入的日期参数")
     parser.add_argument("--prepare-signals", action="store_true", help="只准备今日信号池")
@@ -188,7 +340,7 @@ if __name__ == "__main__":
     parser.add_argument("--min-kline-coverage", type=float, default=0.80, help="补生成AI推荐时使用的K线覆盖率")
     parser.add_argument("--json", action="store_true", help="JSON 输出")
     parser.add_argument("--skip-outside-intraday", action="store_true", help="非盘中时段直接跳过tick")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.ensure_recommendations and (
         str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
@@ -200,6 +352,7 @@ if __name__ == "__main__":
         )
 
     trade_date = args.trade_date or (args.date_arg if args.date_arg and args.date_arg.startswith("20") else "")
+    started_at = datetime.now().replace(microsecond=0)
     if args.prepare_signals:
         output = prepare_signals(
             trade_date=trade_date,
@@ -217,12 +370,35 @@ if __name__ == "__main__":
         else:
             output = run_sim_trade_scan()
 
+    receipt = build_task_receipt(
+        output,
+        task_mode="prepare_signals" if args.prepare_signals else "tick",
+        requested_trade_date=trade_date,
+        requested_signal_date=args.signal_date,
+        started_at=started_at,
+        finished_at=datetime.now().replace(microsecond=0),
+    )
+
     if args.json:
-        print(json.dumps(output, ensure_ascii=False, default=str))
+        print(json.dumps(receipt, ensure_ascii=False, sort_keys=True, default=str))
     else:
-        if output.get("status") == "skipped":
+        if receipt["status"] == "SKIPPED":
             print("结果: 非盘中时段，跳过")
         elif args.prepare_signals:
-            print(f"结果: 信号池 {output.get('status')} counts={output.get('counts')}")
+            print(
+                "结果: 信号池 "
+                f"{receipt['status']} trade_date={receipt['trade_date']} "
+                f"signal_date={receipt['signal_date']} "
+                f"recommendations={receipt['recommendation_count']} "
+                f"signals={receipt['signal_count']}"
+            )
         else:
-            print(f"\n结果: 卖出 {output['sell_count']} 笔, 买入 {output['buy_count']} 笔")
+            print(
+                f"\n结果: 卖出 {_nonnegative_int(output.get('sell_count'))} 笔, "
+                f"买入 {_nonnegative_int(output.get('buy_count'))} 笔"
+            )
+    return _receipt_exit_code(receipt)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -27,6 +27,9 @@ from server.common.strategy_governance_mode import (
 
 from .config import load_v3_config
 from .decision_truth import (
+    DECISION_INTEGRITY_SCHEMA_VERSION,
+    FORECAST_LEDGER_SQL_COLUMNS,
+    canonical_forecast_ledger,
     canonical_hash,
     canonical_target_ledger,
     decision_result_hash,
@@ -615,9 +618,9 @@ def _verify_persisted_decision_truth(
 
     decision_integrity = dict(portfolio.get("decision_integrity") or {})
     if str(decision_integrity.get("schema_version") or "") != (
-        "probiga.trading-v3.decision-integrity.v1"
+        DECISION_INTEGRITY_SCHEMA_VERSION
     ):
-        block("V3_DECISION_INTEGRITY_ENVELOPE_MISSING")
+        block("V3_DECISION_INTEGRITY_V2_REQUIRED")
     else:
         try:
             source_trade_date = (
@@ -648,6 +651,25 @@ def _verify_persisted_decision_truth(
                 decision_integrity.get("target_count") or 0
             ):
                 raise ValueError("target count mismatch")
+            forecast_rows = connection.execute(
+                text(
+                    f"""
+                    SELECT {FORECAST_LEDGER_SQL_COLUMNS}
+                    FROM st_alpha_forecast_v3
+                    WHERE run_uid = :run_uid
+                    ORDER BY rank_no, stock_code, strategy_key, forecast_id
+                    """
+                ),
+                {"run_uid": str(run.get("run_uid") or "")},
+            ).mappings().all()
+            forecast_ledger = canonical_forecast_ledger(forecast_rows)
+            if (
+                canonical_hash(forecast_ledger)
+                != str(
+                    decision_integrity.get("forecast_ledger_hash") or ""
+                )
+            ):
+                raise ValueError("forecast ledger hash mismatch")
             persisted_counts = connection.execute(
                 text(
                     """
@@ -667,6 +689,8 @@ def _verify_persisted_decision_truth(
             expected_forecast_count = int(
                 decision_integrity.get("forecast_count") or 0
             )
+            if len(forecast_rows) != expected_forecast_count:
+                raise ValueError("forecast ledger row count mismatch")
             expected_theme_count = int(
                 decision_integrity.get("persisted_theme_signal_count") or 0
             )
@@ -701,7 +725,12 @@ def _verify_persisted_decision_truth(
             )
             if recomputed_result_hash != str(run.get("result_hash") or ""):
                 raise ValueError("decision result hash mismatch")
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (
+            ArithmeticError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             block("V3_DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED")
 
     truth_verified = bool(

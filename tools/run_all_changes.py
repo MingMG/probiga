@@ -13,9 +13,17 @@ def run(script, args=[]):
     result = subprocess.run(cmd, capture_output=False)
     return result.returncode
 
-date = datetime.now().strftime("%Y-%m-%d")
+today = datetime.now().strftime("%Y-%m-%d")
+date = today
 if len(sys.argv) > 1:
     date = sys.argv[1]
+
+if date != today:
+    print(
+        "雪球是当前快照源，legacy 聚合入口拒绝历史日期；未生成融合榜。",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 skip_concept = "--skip-concept" in sys.argv
 
@@ -29,6 +37,9 @@ ret2 = run("tools/setup_scheduler_groups.py")
 
 print("\n[3/6] 获取雪球热股TOP100...")
 ret3 = run("tools/fetch_hot_rank_xq.py", [date])
+if ret3 != 0:
+    print("雪球精确Top100未通过，停止后续融合，未写 fused。", file=sys.stderr)
+    raise SystemExit(1)
 
 print("\n[4/6] 融合三榜（东财+同花顺+雪球）...")
 ret4 = run("tools/merge_hot_rank.py", [date])

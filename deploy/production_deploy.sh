@@ -98,6 +98,7 @@ QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/var/lib/probiga/qmt-announcement-checkpoints
 QMT_FULL_MARKET_HISTORY_STATE_ROOT=/var/lib/probiga/qmt-full-market-history
 QMT_LOCAL_GAP_REPAIR_STATE_ROOT=/var/lib/probiga/qmt-local-gap-repair
 PROBIGA_JOB_LOG_ROOT=/var/lib/probiga/jobs
+RELEASE_DATA_READINESS_STATUS_ROOT=/var/lib/probiga/release-data-readiness
 LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA/.release_venvs
 DEPLOY_LOCK_ROOT=/run/probiga
 DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
@@ -2596,7 +2597,7 @@ expected_trigger_source_hash = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 expected_supporting_trigger_source_hash = (
-    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
 )
 expected_qmt_reference_contract_hash = (
     "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
@@ -2610,6 +2611,7 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
+    "schema_recovery_evidence": 2,
     "strategy_governance": 40,
     }
 expected_qmt_task = {
@@ -2880,10 +2882,10 @@ valid = valid and (
     and qmt_operations_contract_detail.get("actual")
     == expected_qmt_operations_tasks
     and isinstance(supporting_trigger_detail, dict)
-    and supporting_trigger_detail.get("required_count") == 68
+    and supporting_trigger_detail.get("required_count") == 70
     and supporting_trigger_detail.get("optional_count") == 0
-    and supporting_trigger_detail.get("observed_count") == 68
-    and supporting_trigger_detail.get("expected_trigger_count") == 68
+    and supporting_trigger_detail.get("observed_count") == 70
+    and supporting_trigger_detail.get("expected_trigger_count") == 70
     and supporting_trigger_detail.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_trigger_detail.get("expected_owner_counts")
@@ -3702,8 +3704,7 @@ controlled_guard_verify_restored_runtime() {
   RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
   controlled_guard_run_service_gate_with_deadline "$service_user" \
     "${guarded_command_prefix[@]}" "$python_path" -P \
-    "$code_root/tools/ensure_quality_gate.py" \
-    --task-type analysis_premarket_external || return 1
+    "$code_root/tools/ensure_quality_gate.py" || return 1
   if [ "$input_readiness_mode" = recover-input-readiness ]; then
     RESTORED_RUNTIME_FAILURE_CODE=governance-date-final
     governance_result_file="$(mktemp \
@@ -5589,8 +5590,13 @@ runtime_bundle_runtime = (
     if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
+    "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3"
 )
+expected_recovery_planners = [
+    "analysis_output",
+    "recommended_run_history",
+    "sim_trade",
+]
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
@@ -5601,10 +5607,10 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
 )
 expected_supporting_names_hash = (
-    "b9afbb35a8adc7fdcf6f53fe014139069add38e6711742607daf050e1127d0be"
+    "5a7897fafd07d20115d5cb60b07aafc549b1ceea88a718d3a99e94fcd5ccf341"
 )
 expected_supporting_owner_counts = {
     "pit_facts": 6,
@@ -5612,6 +5618,7 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
+    "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }  # expected_supporting_owner_counts
 expected_pit_contract_hash = (
@@ -5844,9 +5851,9 @@ supporting_source_exact = (
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
-    and supporting_source.get("required_count") == 68
+    and supporting_source.get("required_count") == 70
     and supporting_source.get("optional_count") == 0
-    and supporting_source.get("observed_count") == 68
+    and supporting_source.get("observed_count") == 70
     and supporting_source.get("definer")
     == "probiga_migrator@127.0.0.1"
     and supporting_source.get("metadata_frozen") is True
@@ -5861,7 +5868,7 @@ supporting_source_exact = (
     and set(supporting_source.get("created_names") or [])
     <= set(supporting_names or [])
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 68
+    and len(supporting_names or []) == 70
     and supporting_names_hash == expected_supporting_names_hash
 )
 pit_schema_exact = (
@@ -5938,6 +5945,9 @@ runtime_bundle_exact = (
     and runtime_bundle.get("migration_count") == 25
     and runtime_bundle.get("seed_count") == 3
     and runtime_bundle.get("validator_count") == 28
+    and runtime_bundle.get("recovery_planner_count") == 3
+    and runtime_bundle.get("recovery_planner_names")
+    == expected_recovery_planners
     and isinstance(runtime_bundle.get("migration_names"), list)
     and isinstance(runtime_bundle.get("seed_names"), list)
     and isinstance(runtime_bundle.get("validator_names"), list)
@@ -5946,6 +5956,27 @@ runtime_bundle_exact = (
     == set(runtime_bundle["migration_names"])
     and isinstance(runtime_bundle.get("seeds"), dict)
     and set(runtime_bundle["seeds"]) == set(runtime_bundle["seed_names"])
+    and runtime_bundle.get("recovery_plan_count") == 3
+    and isinstance(runtime_bundle.get("recovery_plans"), dict)
+    and set(runtime_bundle["recovery_plans"])
+    == set(expected_recovery_planners)
+    and all(
+        isinstance(runtime_bundle["recovery_plans"].get(name), dict)
+        and runtime_bundle["recovery_plans"][name].get("status") == "PLANNED"
+        and runtime_bundle["recovery_plans"][name].get("read_only") is True
+        and runtime_bundle["recovery_plans"][name].get(
+            "ready_for_privileged_apply"
+        ) is True
+        and isinstance(
+            runtime_bundle["recovery_plans"][name].get("plan_sha256"), str
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            runtime_bundle["recovery_plans"][name]["plan_sha256"],
+        ) is not None
+        for name in expected_recovery_planners
+    )
+    and runtime_bundle.get("recovery_ready_for_privileged_apply") is True
     and runtime_bundle.get("runtime_ddl_required") is False
     and runtime_bundle.get("privileged_migration") is True
     and isinstance(runtime_bundle.get("runtime_validation"), dict)
@@ -5955,6 +5986,9 @@ runtime_bundle_exact = (
         "required_surface_verified"
     ) is True
     and runtime_bundle["runtime_validation"].get("read_only") is True
+    and runtime_bundle["runtime_validation"].get("recovery_planner_count") == 3
+    and runtime_bundle["runtime_validation"].get("recovery_planner_names")
+    == expected_recovery_planners
     and isinstance(runtime_bundle["runtime_validation"].get("contracts"), dict)
     and set(runtime_bundle["runtime_validation"]["contracts"])
     == set(runtime_bundle["validator_names"])
@@ -5963,6 +5997,9 @@ runtime_bundle_exact = (
     == expected_runtime_bundle_hash
     and runtime_bundle_runtime.get("required_surface_verified") is True
     and runtime_bundle_runtime.get("read_only") is True
+    and runtime_bundle_runtime.get("recovery_planner_count") == 3
+    and runtime_bundle_runtime.get("recovery_planner_names")
+    == expected_recovery_planners
     and isinstance(runtime_bundle_runtime.get("contracts"), dict)
     and set(runtime_bundle_runtime["contracts"])
     == set(runtime_bundle_runtime.get("validator_names") or [])
@@ -6015,9 +6052,9 @@ ok = (
     and trigger.get("metadata_frozen") is True
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
-    and trigger.get("required_count") == 88
+    and trigger.get("required_count") == 90
     and trigger.get("optional_count") == 0
-    and trigger.get("observed_count") == 88
+    and trigger.get("observed_count") == 90
     and isinstance(p.get("seeded_strategy_count"), int)
     and p["seeded_strategy_count"] > 0
     and p.get("automatic_real_order_submission") is False
@@ -6031,6 +6068,7 @@ controlled_guard_validate_preflight_json() {
     '
 import hashlib
 import json
+import re
 import sys
 
 p = json.load(sys.stdin)
@@ -6060,8 +6098,13 @@ runtime_bundle = (
     p.get("runtime_schema_bundle") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
+    "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3"
 )
+expected_recovery_planners = [
+    "analysis_output",
+    "recommended_run_history",
+    "sim_trade",
+]
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
@@ -6072,10 +6115,10 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
 )
 expected_supporting_names_hash = (
-    "b9afbb35a8adc7fdcf6f53fe014139069add38e6711742607daf050e1127d0be"
+    "5a7897fafd07d20115d5cb60b07aafc549b1ceea88a718d3a99e94fcd5ccf341"
 )
 expected_supporting_owner_counts = {
     "pit_facts": 6,
@@ -6083,6 +6126,7 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
+    "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }  # expected_supporting_owner_counts
 expected_pit_contract_hash = (
@@ -6244,13 +6288,13 @@ supporting_names_hash = (
 )
 supporting_source_exact = (
     isinstance(supporting_source, dict)
-    and supporting_source.get("trigger_count") == 68
+    and supporting_source.get("trigger_count") == 70
     and supporting_source.get("source_contract_hash")
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 68
+    and len(supporting_names or []) == 70
     and supporting_names_hash == expected_supporting_names_hash
 )
 pit_schema_exact = (
@@ -6335,10 +6379,34 @@ runtime_bundle_exact = (
     and runtime_bundle.get("migration_count") == 25
     and runtime_bundle.get("seed_count") == 3
     and runtime_bundle.get("validator_count") == 28
+    and runtime_bundle.get("recovery_planner_count") == 3
+    and runtime_bundle.get("recovery_planner_names")
+    == expected_recovery_planners
     and isinstance(runtime_bundle.get("validator_names"), list)
     and isinstance(runtime_bundle.get("contracts"), dict)
     and set(runtime_bundle["contracts"])
     == set(runtime_bundle["validator_names"])
+    and runtime_bundle.get("recovery_plan_count") == 3
+    and isinstance(runtime_bundle.get("recovery_plans"), dict)
+    and set(runtime_bundle["recovery_plans"])
+    == set(expected_recovery_planners)
+    and all(
+        isinstance(runtime_bundle["recovery_plans"].get(name), dict)
+        and runtime_bundle["recovery_plans"][name].get("status") == "PLANNED"
+        and runtime_bundle["recovery_plans"][name].get("read_only") is True
+        and runtime_bundle["recovery_plans"][name].get(
+            "ready_for_privileged_apply"
+        ) is True
+        and isinstance(
+            runtime_bundle["recovery_plans"][name].get("plan_sha256"), str
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            runtime_bundle["recovery_plans"][name]["plan_sha256"],
+        ) is not None
+        for name in expected_recovery_planners
+    )
+    and runtime_bundle.get("recovery_ready_for_privileged_apply") is True
     and all(
         isinstance(item, dict)
         and item.get("status") in {"READY", "MIGRATION_REQUIRED"}
@@ -6346,9 +6414,12 @@ runtime_bundle_exact = (
         for item in runtime_bundle["contracts"].values()
     )
     and runtime_bundle.get("migration_required")
-    is any(
-        item.get("status") != "READY"
-        for item in runtime_bundle["contracts"].values()
+    is (
+        any(
+            item.get("status") != "READY"
+            for item in runtime_bundle["contracts"].values()
+        )
+        or not runtime_bundle.get("recovery_ready_for_privileged_apply")
     )
     and runtime_bundle.get("read_only") is True
 )
@@ -6384,8 +6455,8 @@ ok = (
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
     and trigger.get("required_count") == 20
-    and trigger.get("optional_count") == 68
-    and trigger.get("observed_count") == 88
+    and trigger.get("optional_count") == 70
+    and trigger.get("observed_count") == 90
     and p.get("qmt_table_count") == 4
     and p.get("governance_table_count") == 15
     and p.get("automatic_real_order_submission") is False
@@ -7568,12 +7639,14 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
     'Environment=PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
+    "Environment=PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+    "Environment=PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
     "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
@@ -8094,6 +8167,144 @@ PY
   test "$(stat -c '%s' -- "$output_file")" -le 2048 || return 1
   grep -q '^X-ProBigA-Admin-Token: [!-~][!-~]*$' "$output_file" || return 1
 }
+verify_account_login_api_and_page_smoke() {
+  local expected_sha="$1"
+  local status_response login_response login_request static_response
+  local login_http_code
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  status_response="$(mktemp)" || return 1
+  login_response="$(mktemp)" || {
+    rm -f -- "$status_response"
+    return 1
+  }
+  login_request="$(mktemp)" || {
+    rm -f -- "$status_response" "$login_response"
+    return 1
+  }
+  static_response="$(mktemp)" || {
+    rm -f -- "$status_response" "$login_response" "$login_request"
+    return 1
+  }
+  chmod 0600 "$status_response" "$login_response" "$login_request" \
+    "$static_response" || {
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  }
+  if ! "$BOOTSTRAP_PYTHON" -I - "$login_request" <<'PY'
+import json
+import secrets
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(
+    json.dumps({
+        "username": "__release_probe_" + secrets.token_hex(16),
+        "password": secrets.token_urlsafe(32),
+    }, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+  then
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$status_response" http://127.0.0.1/api/auth/status; then
+    cat "$status_response" >&2
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  if ! login_http_code="$(curl --silent --show-error --retry 3 \
+      --retry-connrefused --retry-delay 1 \
+      --header 'Accept: application/json' \
+      --header 'Content-Type: application/json' \
+      --data-binary @"$login_request" --output "$login_response" \
+      --write-out '%{http_code}' http://127.0.0.1/api/auth/login)" || \
+    [ "$login_http_code" != 401 ]; then
+    echo "Account login negative-path smoke returned HTTP $login_http_code" >&2
+    cat "$login_response" >&2
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$status_response" "$login_response" \
+      "$expected_sha" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+status_path, login_path = map(Path, sys.argv[1:3])
+expected_sha = sys.argv[3]
+
+def fail(message):
+    print(f"account_login_api_smoke invalid={message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def read(path):
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            fail(f"response_too_large:{path.name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"json:{path.name}:{type(exc).__name__}")
+    if not isinstance(payload, dict):
+        fail(f"payload_type:{path.name}")
+    return payload
+
+status = read(status_path)
+login = read(login_path)
+if not (
+    status.get("status") == "ok"
+    and status.get("required") is True
+    and status.get("authenticated") is False
+    and status.get("user_initialized") is True
+    and type(status.get("user_count")) is int
+    and status["user_count"] >= 1
+    and status.get("registration_open") is False
+):
+    fail("status_or_initialized_account")
+if not (
+    login.get("status") == "error"
+    and login.get("error") == "invalid_credentials"
+    and login.get("authenticated") is not True
+):
+    fail("negative_login_contract")
+print(
+    "account_login_api_smoke status=PASS "
+    f"build={expected_sha} initialized_users={status['user_count']}"
+)
+PY
+  then
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$static_response" http://127.0.0.1/login || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/login.html" \
+      "$static_response" || \
+    ! grep -F -- 'login.js?v=1' "$static_response" >/dev/null || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$static_response" http://127.0.0.1/static/js/login.js || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/login.js" \
+      "$static_response" || \
+    ! grep -F -- "fetch('/api/auth/' + mode" "$static_response" >/dev/null || \
+    ! grep -F -- "fetch('/api/auth/status'" "$static_response" >/dev/null; then
+    echo "Account login page/static release smoke failed" >&2
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  rm -f -- "$status_response" "$login_response" "$login_request" \
+    "$static_response"
+  echo "Account login API and page smoke passed"
+}
 verify_strategy_governance_api_and_page_smoke() {
   local expected_sha="$1"
   local expected_trade_date="$2"
@@ -8319,6 +8530,224 @@ PY
   rm -f -- "$governance_response" "$index_response" "$app_response" \
     "$admin_header"
   echo "Strategy governance API and page smoke passed"
+}
+verify_strategy_pool_api_and_page_smoke() {
+  local expected_sha="$1"
+  local expected_trade_date="$2"
+  local exact_response latest_response context_response static_response
+  local admin_header
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$expected_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  exact_response="$(mktemp)" || return 1
+  latest_response="$(mktemp)" || {
+    rm -f -- "$exact_response"
+    return 1
+  }
+  context_response="$(mktemp)" || {
+    rm -f -- "$exact_response" "$latest_response"
+    return 1
+  }
+  static_response="$(mktemp)" || {
+    rm -f -- "$exact_response" "$latest_response" "$context_response"
+    return 1
+  }
+  admin_header="$(mktemp)" || {
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response"
+    return 1
+  }
+  chown "$SERVICE_USER:$SERVICE_USER" "$admin_header" || {
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response" "$admin_header"
+    return 1
+  }
+  chmod 0600 "$exact_response" "$latest_response" "$context_response" \
+    "$static_response" "$admin_header" || {
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response" "$admin_header"
+    return 1
+  }
+  if ! write_admin_auth_header_file "$admin_header" || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" --output "$exact_response" \
+      "http://127.0.0.1/api/v3/stock-pool?trade_date=$expected_trade_date" || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" --output "$latest_response" \
+      "http://127.0.0.1/api/v3/stock-pool?before_session_date=$expected_trade_date" || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" --output "$context_response" \
+      "http://127.0.0.1/api/v3/context?trade_date=$expected_trade_date"; then
+    cat "$exact_response" "$latest_response" "$context_response" >&2
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response" "$admin_header"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$exact_response" "$latest_response" \
+      "$context_response" "$expected_sha" "$expected_trade_date" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+exact_path, latest_path, context_path = map(Path, sys.argv[1:4])
+expected_sha, expected_trade_date = sys.argv[4:]
+
+def fail(message):
+    print(f"strategy_pool_api_smoke invalid={message}", file=sys.stderr)
+    raise SystemExit(2)
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+def read_envelope(path):
+    try:
+        if path.stat().st_size > 16 * 1024 * 1024:
+            fail(f"response_too_large:{path.name}")
+        envelope = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+        )
+    except Exception as exc:
+        fail(f"json:{path.name}:{type(exc).__name__}")
+    if not isinstance(envelope, dict):
+        fail(f"envelope_type:{path.name}")
+    if envelope.get("code_commit_sha") != expected_sha:
+        fail(f"code_identity:{path.name}")
+    payload = envelope.get("data")
+    if not isinstance(payload, dict):
+        fail(f"payload_type:{path.name}")
+    return payload
+
+def valid_pool(pool):
+    items = pool.get("items")
+    summary = pool.get("summary")
+    status = str(pool.get("pool_status") or "").upper()
+    if not (
+        isinstance(pool.get("run_uid"), str)
+        and bool(pool["run_uid"])
+        and pool.get("pool_readable") is True
+        and pool.get("run_status") == "COMPLETED"
+        and pool.get("decision_integrity_verified") is True
+        and status in {"READY", "EMPTY"}
+        and re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}",
+            str(pool.get("decision_session_date") or ""),
+        )
+        and re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}",
+            str(pool.get("trade_date") or ""),
+        )
+        and isinstance(items, list)
+        and all(isinstance(item, dict) for item in items)
+        and isinstance(summary, dict)
+    ):
+        return False
+    stock_count = summary.get("stock_count")
+    candidate_count = summary.get("strategy_candidate_count")
+    if (
+        type(stock_count) is not int
+        or stock_count != len(items)
+        or type(candidate_count) is not int
+        or candidate_count < 0
+        or candidate_count != sum(
+            item.get("is_strategy_candidate") is True for item in items
+        )
+    ):
+        return False
+    return (
+        status == "READY" and candidate_count > 0
+    ) or (
+        status == "EMPTY" and candidate_count == 0
+    )
+
+exact = read_envelope(exact_path)
+latest = read_envelope(latest_path)
+context = read_envelope(context_path)
+if valid_pool(exact):
+    if exact.get("decision_session_date") != expected_trade_date:
+        fail("exact_session_date")
+    if context.get("run_uid") != exact.get("run_uid"):
+        fail("exact_context_run_uid")
+    selected = exact
+    mode = "EXACT_COMPLETED"
+else:
+    if not (
+        exact.get("run_uid") is None
+        and exact.get("pool_status") == "UNAVAILABLE"
+        and exact.get("pool_readable") is False
+        and exact.get("decision_integrity_verified") is False
+        and exact.get("items") == []
+    ):
+        fail("exact_unreadable_contract")
+    if not valid_pool(latest):
+        fail("historical_pool_unreadable")
+    if str(latest.get("decision_session_date") or "") >= expected_trade_date:
+        fail("historical_pool_not_strictly_older")
+    if not (
+        latest.get("before_session_date") == expected_trade_date
+        and latest.get("requested_trade_date") == expected_trade_date
+        and latest.get("is_historical_fallback") is True
+        and latest.get("historical_read_only") is True
+        and latest.get("historical_fallback_status")
+        == "HISTORICAL_READ_ONLY"
+        and latest.get("historical_fallback_session_date")
+        == latest.get("decision_session_date")
+    ):
+        fail("historical_pool_boundary_contract")
+    if (
+        context.get("decision_integrity_verified") is True
+        and str(context.get("data_status") or "") == "READY"
+        and str(context.get("decision_status") or "")
+        in {"CANDIDATE_AVAILABLE", "EMPTY"}
+    ):
+        fail("context_ready_but_exact_pool_missing")
+    selected = latest
+    mode = "HISTORICAL_READ_ONLY"
+print(
+    "strategy_pool_api_smoke status=PASS "
+    f"mode={mode} requested_trade_date={expected_trade_date} "
+    f"decision_session_date={selected['decision_session_date']} "
+    f"run_uid={selected['run_uid']} "
+    f"pool_status={selected['pool_status']}"
+)
+PY
+  then
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response" "$admin_header"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$static_response" http://127.0.0.1/static/trading-v3.html || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/trading-v3.html" \
+      "$static_response" || \
+    ! grep -F -- 'id="candidateHistoryNotice"' "$static_response" >/dev/null || \
+    ! grep -F -- 'trading-v3.js?v=31' "$static_response" >/dev/null || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$static_response" http://127.0.0.1/static/js/trading-v3.js || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/trading-v3.js" \
+      "$static_response" || \
+    ! grep -F -- 'function stockPoolIsReadable(pool)' \
+      "$static_response" >/dev/null || \
+    ! grep -F -- 'HISTORICAL_READ_ONLY / 历史只读' \
+      "$static_response" >/dev/null; then
+    echo "Strategy pool iframe/static release smoke failed" >&2
+    rm -f -- "$exact_response" "$latest_response" "$context_response" \
+      "$static_response" "$admin_header"
+    return 1
+  fi
+  rm -f -- "$exact_response" "$latest_response" "$context_response" \
+    "$static_response" "$admin_header"
+  echo "Strategy pool API and real iframe page smoke passed"
 }
 release_identity_check() {
   local require_clean="$1"
@@ -9453,6 +9882,9 @@ prepare_release_venv() {
   ADATA_WHEEL_DIR=""
 }
 prepare_release() {
+  if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
+    capture_deferred_scheduler_identity
+  fi
   prepare_code_staging
   if [ -n "$PREVIOUS_ADATA_TREE_SHA256" ]; then
     "$BOOTSTRAP_PYTHON" -I \
@@ -9527,6 +9959,20 @@ prepare_release() {
   grep -Fx \
     "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
     "$PREPARED_MAIN_DROPIN" >/dev/null
+  if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
+    grep -Fx \
+      "Environment=PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+      "$PREPARED_MAIN_DROPIN" >/dev/null
+    grep -Fx \
+      "Environment=PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
+      "$PREPARED_MAIN_DROPIN" >/dev/null
+    grep -F -- \
+      "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+      "$PREPARED_MAIN_DROPIN" >/dev/null
+    grep -F -- \
+      "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
+      "$PREPARED_MAIN_DROPIN" >/dev/null
+  fi
   grep -Fx "Environment=PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
     "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
@@ -9828,6 +10274,162 @@ run_prepared_python_tool() {
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$@"
   )
 }
+start_release_data_readiness_observer() {
+  # This observer is intentionally outside the activation transaction.  It
+  # may take hours for both scheduler hosts to produce exact-build evidence,
+  # so enqueue a hardened transient service and never make code rollback wait
+  # for data completion.
+  local parent_root=/var/lib/probiga
+  local protected_env=/opt/ProBigA/.env
+  local service_group
+  local status_file
+  local unit_name
+  local observer_entrypoint
+  local observer_python
+  test "${DEPLOY_SUCCEEDED:-0}" -eq 1 || return 1
+  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$PREPARED_CODE_ROOT" = "$CODE_RELEASE_ROOT/$EXPECTED_SHA" || return 1
+  service_group="$(id -gn "$SERVICE_USER")" || return 1
+  test -n "$service_group" || return 1
+  status_file="$RELEASE_DATA_READINESS_STATUS_ROOT/$EXPECTED_SHA.json"
+  unit_name="probiga-release-data-readiness-$EXPECTED_SHA.service"
+  observer_entrypoint="$PREPARED_CODE_ROOT/tools/wait_release_data_readiness.py"
+  observer_python="$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+
+  test -d "$parent_root" || return 1
+  test ! -L "$parent_root" || return 1
+  test "$(readlink -f -- "$parent_root")" = "$parent_root" || return 1
+  test "$(stat -c '%U:%G' -- "$parent_root")" = root:root || return 1
+  test "$(stat -c '%a' -- "$parent_root")" = 755 || return 1
+  if [ -e "$RELEASE_DATA_READINESS_STATUS_ROOT" ] || \
+    [ -L "$RELEASE_DATA_READINESS_STATUS_ROOT" ]; then
+    test -d "$RELEASE_DATA_READINESS_STATUS_ROOT" || return 1
+    test ! -L "$RELEASE_DATA_READINESS_STATUS_ROOT" || return 1
+    test "$(readlink -f -- "$RELEASE_DATA_READINESS_STATUS_ROOT")" = \
+      "$RELEASE_DATA_READINESS_STATUS_ROOT" || return 1
+    test "$(stat -c '%U:%G' -- \
+      "$RELEASE_DATA_READINESS_STATUS_ROOT")" = root:root || return 1
+    test "$(stat -c '%a' -- \
+      "$RELEASE_DATA_READINESS_STATUS_ROOT")" = 755 || return 1
+  else
+    install -d -o root -g root -m 0755 \
+      "$RELEASE_DATA_READINESS_STATUS_ROOT" || return 1
+  fi
+
+  # The immutable checkout has no .env.  Prove that the existing production
+  # secret file is readable only through the service group; it is loaded by
+  # the observer process and is never copied into an argument, unit property,
+  # public receipt, or deploy-user output.
+  test -d /opt/ProBigA || return 1
+  test ! -L /opt/ProBigA || return 1
+  test "$(readlink -f -- /opt/ProBigA)" = /opt/ProBigA || return 1
+  test "$(stat -c '%U:%G' -- /opt/ProBigA)" = root:root || return 1
+  test "$(stat -c '%a' -- /opt/ProBigA)" = 755 || return 1
+  test -f "$protected_env" || return 1
+  test ! -L "$protected_env" || return 1
+  test "$(stat -c '%U:%G' -- "$protected_env")" = \
+    "root:$service_group" || return 1
+  test "$(stat -c '%a' -- "$protected_env")" = 640 || return 1
+  test "$(stat -c '%h' -- "$protected_env")" = 1 || return 1
+  sudo -u "$SERVICE_USER" test -r "$protected_env" || return 1
+
+  test -f "$observer_entrypoint" || return 1
+  test ! -L "$observer_entrypoint" || return 1
+  test "$(stat -c '%U:%G' -- "$observer_entrypoint")" = root:root || return 1
+  sudo -u "$SERVICE_USER" test ! -w "$observer_entrypoint" || return 1
+  test -x "$observer_python" || return 1
+  test -x /usr/bin/systemd-run || return 1
+  test -x /usr/bin/flock || return 1
+
+  if [ -e "$status_file" ] || [ -L "$status_file" ]; then
+    test -f "$status_file" || return 1
+    test ! -L "$status_file" || return 1
+    test "$(stat -c '%U:%G' -- "$status_file")" = \
+      "$SERVICE_USER:$service_group" || return 1
+    test "$(stat -c '%a' -- "$status_file")" = 644 || return 1
+    test "$(stat -c '%h' -- "$status_file")" = 1 || return 1
+  else
+    install -o "$SERVICE_USER" -g "$service_group" -m 0644 \
+      /dev/null "$status_file" || return 1
+  fi
+
+  # An idempotent same-build deployment may find the exact observer still
+  # active.  Reuse it only after proving its service identity and immutable
+  # entrypoint; otherwise a completed --collect unit is recreated below.
+  if systemctl is-active --quiet "$unit_name"; then
+    test "$(systemctl show -p User --value "$unit_name")" = \
+      "$SERVICE_USER" || return 1
+    systemctl show -p ExecStart --value "$unit_name" | \
+      grep -F -- "$observer_python" >/dev/null || return 1
+    systemctl show -p ExecStart --value "$unit_name" | \
+      grep -F -- "$observer_entrypoint" >/dev/null || return 1
+    systemctl show -p ExecStart --value "$unit_name" | \
+      grep -F -- "$EXPECTED_SHA" >/dev/null || return 1
+    return 0
+  fi
+
+  truncate -s 0 -- "$status_file" || return 1
+  sync -f "$status_file" || return 1
+  sync -f "$RELEASE_DATA_READINESS_STATUS_ROOT" || return 1
+
+  /usr/bin/systemd-run \
+    --unit="$unit_name" \
+    --description="ProBigA exact-build release data readiness observer" \
+    --quiet --no-block --collect --service-type=exec \
+    --uid="$SERVICE_USER" --gid="$service_group" \
+    --working-directory="$PREPARED_CODE_ROOT" \
+    --property=Restart=always \
+    --property=RestartSec=300 \
+    --property='RestartPreventExitStatus=3 4' \
+    --property=StartLimitIntervalSec=0 \
+    --property=RuntimeMaxSec=21900 \
+    --property=TimeoutStopSec=30 \
+    --property=KillMode=mixed \
+    --property=ProtectSystem=strict \
+    --property="ReadWritePaths=$status_file" \
+    --property="ReadOnlyPaths=$protected_env" \
+    --property=ProtectHome=true \
+    --property=NoNewPrivileges=true \
+    --property=PrivateTmp=true \
+    --property=PrivateDevices=true \
+    --property=ProtectKernelTunables=true \
+    --property=ProtectKernelModules=true \
+    --property=ProtectKernelLogs=true \
+    --property=ProtectControlGroups=true \
+    --property=ProtectClock=true \
+    --property=RestrictRealtime=true \
+    --property=RestrictSUIDSGID=true \
+    --property=LockPersonality=true \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property='RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' \
+    --property=UMask=0077 \
+    --property=Nice=10 \
+    --property=IOSchedulingClass=idle \
+    /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
+      QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+      PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
+      PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
+      PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
+      "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+      "$observer_python" -P "$observer_entrypoint" \
+        --local-runtime \
+        --expected-build-sha "$EXPECTED_SHA" \
+        --timeout-seconds 21600 \
+        --poll-seconds 60 \
+        --status-file "$status_file" || return 1
+  return 0
+}
 prepared_governance_snapshot() {
   local action="$1"
   local entrypoint="$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py"
@@ -10061,6 +10663,53 @@ run_database_boundary_bootstrap() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     "$BOOTSTRAP_PYTHON" -I "$entrypoint" "$action"
 }
+assert_deferred_scheduler_process_cmdline() {
+  local scheduler_pid="$1"
+  local expected_sha="$2"
+  local expected_code_root="$3"
+  local -a scheduler_argv=()
+  case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$expected_code_root" = "$CODE_RELEASE_ROOT/$expected_sha" || return 1
+  mapfile -d '' -t scheduler_argv < "/proc/$scheduler_pid/cmdline" || return 1
+  test "${#scheduler_argv[@]}" -eq 3 || return 1
+  test "${scheduler_argv[0]}" = \
+    "$RELEASE_VENV_ROOT/$expected_sha/bin/python" || return 1
+  test "${scheduler_argv[1]}" = -P || return 1
+  test "${scheduler_argv[2]}" = \
+    "$expected_code_root/tools/run_scheduler_daemon.py" || return 1
+}
+capture_deferred_scheduler_identity() {
+  local scheduler_pid
+  local observed_expected_sha
+  local observed_build_sha
+  local observed_code_root
+  test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
+  systemctl is-active --quiet probiga-scheduler || return 1
+  systemctl is-enabled --quiet probiga-scheduler || return 1
+  scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)" || \
+    return 1
+  case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  observed_expected_sha="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
+  observed_build_sha="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
+  observed_code_root="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
+  [[ "$observed_expected_sha" =~ ^[0-9a-f]{40}$ ]]
+  test "$observed_build_sha" = "$observed_expected_sha"
+  case "$observed_code_root" in
+    "$CODE_RELEASE_ROOT/$observed_expected_sha") ;;
+    *) return 1 ;;
+  esac
+  assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
+    "$observed_expected_sha" "$observed_code_root" || return 1
+  DEFERRED_SCHEDULER_EXPECTED_SHA="$observed_expected_sha"
+  DEFERRED_SCHEDULER_CODE_ROOT="$observed_code_root"
+}
 fence_deferred_release_writers() {
   local writer_fence_result
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
@@ -10073,6 +10722,7 @@ fence_deferred_release_writers() {
     'import json,sys; p=json.load(sys.stdin); t=p.get("fenced_task_types") if isinstance(p,dict) else None; expected={"trading_v3_counterfactual_audit","trading_v3_continuous_calibration","trading_v3_close_decision","trading_v3_premarket_review"}; ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="deferred-release-fence-only" and p.get("writer_fence_active") is True and p.get("layer4_writers_enabled") is False and p.get("paper_buy_writers_enabled") is False and p.get("fenced_row_count")==4 and isinstance(t,list) and len(t)==4 and set(t)==expected and p.get("tasks")==[]; raise SystemExit(0 if ok else 2)'
 }
 assert_deferred_database_runtime() {
+  local deferred_v3_endpoint
   local governance_response
   local health_response
   local admin_header
@@ -10095,6 +10745,12 @@ assert_deferred_database_runtime() {
   grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
     "/proc/$main_pid/environ" >/dev/null || return 1
   grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- \
+    "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- \
+    "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
     "/proc/$main_pid/environ" >/dev/null || return 1
   grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
     "/proc/$scheduler_pid/environ" >/dev/null || return 1
@@ -10125,15 +10781,20 @@ assert_deferred_database_runtime() {
       --retry-all-errors --retry-delay 2 --retry-max-time 120 \
       --retry-connrefused \
       --output "$health_response" http://127.0.0.1/api/health || \
-    ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" <<'PY'
+    ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" \
+      "$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+      "$DEFERRED_SCHEDULER_CODE_ROOT" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 expected_sha = sys.argv[2]
+scheduler_sha = sys.argv[3]
+scheduler_code_root = sys.argv[4]
 revision = payload.get("release_revision")
 standalone = payload.get("standalone_scheduler")
+identity = standalone.get("release_identity") if isinstance(standalone, dict) else None
 valid = (
     isinstance(payload, dict)
     and payload.get("status") == "degraded"
@@ -10152,6 +10813,15 @@ valid = (
     and standalone.get("verified") is True
     and standalone.get("active") is True
     and standalone.get("enabled") is True
+    and isinstance(identity, dict)
+    and identity.get("ready") is True
+    and identity.get("identity_mode") == "PRESERVED_DEFERRED"
+    and identity.get("api_build_sha") == expected_sha
+    and identity.get("expected_build_sha") == scheduler_sha
+    and identity.get("expected_code_root") == scheduler_code_root
+    and identity.get("observed_build_sha") == scheduler_sha
+    and identity.get("observed_code_root") == scheduler_code_root
+    and identity.get("same_build_as_api") == (scheduler_sha == expected_sha)
 )
 raise SystemExit(0 if valid else 2)
 PY
@@ -10200,6 +10870,71 @@ PY
     rm -f -- "$health_response" "$governance_response" "$admin_header"
     return 1
   fi
+  for deferred_v3_endpoint in context readiness stock-pool; do
+    if ! curl --fail-with-body --silent --show-error --retry 5 \
+        --retry-all-errors --retry-delay 1 --retry-connrefused \
+        --header @"$admin_header" \
+        --output "$governance_response" \
+        "http://127.0.0.1/api/v3/$deferred_v3_endpoint" || \
+      ! "$BOOTSTRAP_PYTHON" -I - "$governance_response" \
+        "$deferred_v3_endpoint" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+endpoint = sys.argv[2]
+data = payload.get("data") if isinstance(payload, dict) else None
+valid = (
+    isinstance(data, dict)
+    and data.get("strategy_governance_mode") == "DEFERRED_DB"
+    and data.get("governance_deferred") is True
+    and data.get("activation_enabled") is False
+    and data.get("actionable_output_allowed") is False
+)
+if endpoint == "context":
+    valid = (
+        valid
+        and payload.get("status") == "blocked"
+        and data.get("decision_status") == "BLOCKED"
+        and data.get("decision_scope") == "RESEARCH_ONLY"
+        and data.get("paper_order_authority") == "NONE"
+    )
+elif endpoint == "readiness":
+    valid = (
+        valid
+        and payload.get("status") == "blocked"
+        and data.get("paper_ready") is False
+        and data.get("paper_authority_ready") is False
+        and data.get("execution_ready") is False
+    )
+elif endpoint == "stock-pool":
+    items = data.get("items")
+    valid = (
+        valid
+        and isinstance(items, list)
+        and all(
+            isinstance(item, dict)
+            and item.get("actionability") == "RESEARCH_ONLY"
+            and isinstance(item.get("action_plan"), dict)
+            and item["action_plan"].get("actionability") == "RESEARCH_ONLY"
+            and item["action_plan"].get("buy_range") is None
+            and item["action_plan"].get("sell_range") is None
+            and item["action_plan"].get("protective_stop") is None
+            for item in items
+        )
+    )
+else:
+    valid = False
+raise SystemExit(0 if valid else 2)
+PY
+    then
+      echo "deferred_runtime_gate_failed gate=v3_deferred_contract endpoint=$deferred_v3_endpoint" >&2
+      cat "$governance_response" >&2
+      rm -f -- "$health_response" "$governance_response" "$admin_header"
+      return 1
+    fi
+  done
   rm -f -- "$health_response" "$governance_response" "$admin_header" || \
     return 1
   curl --fail --silent --show-error --retry 3 --retry-all-errors \
@@ -10232,6 +10967,10 @@ PY
     }
   assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || {
     echo "deferred_runtime_gate_failed gate=static_release_identity" >&2
+    return 1
+  }
+  verify_account_login_api_and_page_smoke "$EXPECTED_SHA" || {
+    echo "deferred_runtime_gate_failed gate=account_login" >&2
     return 1
   }
   return 0
@@ -10327,6 +11066,9 @@ rollback_deferred_database_release() {
 }
 deploy_deferred_database_release() {
   local scheduler_pid
+  local observed_scheduler_expected_sha
+  local observed_scheduler_build_sha
+  local observed_scheduler_code_root
   local schema_result
   local schema_status
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB
@@ -10335,17 +11077,21 @@ deploy_deferred_database_release() {
   test "$PREVIOUS_SCHEDULER_ENABLED" -eq 1
   scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)"
   case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
-  DEFERRED_SCHEDULER_EXPECTED_SHA="$(tr '\0' '\n' \
+  observed_scheduler_expected_sha="$(tr '\0' '\n' \
     < "/proc/$scheduler_pid/environ" | sed -n \
     's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
-  DEFERRED_SCHEDULER_CODE_ROOT="$(tr '\0' '\n' \
+  observed_scheduler_build_sha="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
+  observed_scheduler_code_root="$(tr '\0' '\n' \
     < "/proc/$scheduler_pid/environ" | sed -n \
     's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
-  [[ "$DEFERRED_SCHEDULER_EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
-  case "$DEFERRED_SCHEDULER_CODE_ROOT" in
-    "$CODE_RELEASE_ROOT/$DEFERRED_SCHEDULER_EXPECTED_SHA") ;;
-    *) return 1 ;;
-  esac
+  test "$observed_scheduler_expected_sha" = \
+    "$DEFERRED_SCHEDULER_EXPECTED_SHA"
+  test "$observed_scheduler_build_sha" = "$DEFERRED_SCHEDULER_EXPECTED_SHA"
+  test "$observed_scheduler_code_root" = "$DEFERRED_SCHEDULER_CODE_ROOT"
+  assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
+    "$DEFERRED_SCHEDULER_EXPECTED_SHA" "$DEFERRED_SCHEDULER_CODE_ROOT"
   if test "$PREVIOUS_SHA" = "$EXPECTED_SHA"; then
     test "$PREVIOUS_CODE_ROOT" = "$PREPARED_CODE_ROOT"
     cmp --silent "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"
@@ -10978,6 +11724,9 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   DEPLOY_SUCCEEDED=1
   trap - ERR TERM INT HUP
+  if ! start_release_data_readiness_observer; then
+    echo "Warning: release data readiness observer did not start" >&2
+  fi
   exit 0
 fi
 CUTOVER_STEP=prepare_production_database_boundary
@@ -11597,8 +12346,22 @@ sudo -u "$SERVICE_USER" /usr/bin/env -i \
   PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
   "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py"
+sudo -u "$SERVICE_USER" /usr/bin/env -i \
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+  PROBIGA_DEPLOYMENT_MODE=production \
+  PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+  PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+  PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
+  PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
+  PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+  PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
+  PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
+  PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
+  "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+  "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
   "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
-  --task-type analysis_premarket_external
+  --validate-required-data-completion
 if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
   echo "Warning: release venv cleanup failed before final verification" >&2
 fi
@@ -11626,8 +12389,13 @@ HEALTH_RESPONSE=""
 curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
   http://127.0.0.1/api/health/runtime >/dev/null
+CUTOVER_STEP=verify_account_login_api_and_page_smoke
+verify_account_login_api_and_page_smoke "$EXPECTED_SHA"
 CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
 verify_strategy_governance_api_and_page_smoke \
+  "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
+CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
+verify_strategy_pool_api_and_page_smoke \
   "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
 ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
 ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
@@ -11646,4 +12414,7 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
+if ! start_release_data_readiness_observer; then
+  echo "Warning: release data readiness observer did not start" >&2
+fi
 df -h / >&2

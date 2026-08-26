@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -9,6 +11,7 @@ import pytest
 
 from integrations.bigqmt.backend import BigQmtBackend
 from integrations.bigqmt import bridge
+from integrations.bigqmt.release_identity import render_strategy_artifact
 from integrations.bigqmt.spool import PROVIDER_ID
 from integrations.qmt import bridge as qmt_bridge
 from tools import run_big_qmt_bridge
@@ -22,6 +25,76 @@ def _tick(price: float, timestamp: int) -> dict:
         "volume": 100,
         "amount": 1000,
     }
+
+
+def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
+    monkeypatch, tmp_path,
+):
+    qmt_home = tmp_path / "QMT"
+    expected_sha = "a" * 40
+    source_bytes = Path(run_big_qmt_bridge.STRATEGY_SOURCE_PATH).read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "git_strategy_artifact",
+        lambda **_kwargs: {
+            "build_sha": expected_sha,
+            "git_blob": "b" * 40,
+            "source_bytes": source_bytes,
+            "source_sha256": source_hash,
+            "repository_path": (
+                "integrations/bigqmt/qmt_strategy/"
+                "probiga_big_qmt_bridge.py"
+            ),
+        },
+    )
+    rendered = render_strategy_artifact(
+        source_bytes,
+        build_sha=expected_sha,
+        git_blob="b" * 40,
+        source_sha256=source_hash,
+    )
+
+    result = run_big_qmt_bridge.install_strategy_release(
+        qmt_home=qmt_home,
+        expected_build_sha=expected_sha,
+        git_head=expected_sha,
+    )
+
+    assert result["status"] == "installed"
+    assert result["build_sha"] == expected_sha
+    assert result["strategy_git_blob"] == "b" * 40
+    assert result["strategy_source_sha256"] == source_hash
+    assert result["database_writes"] is False
+    assert result["automatic_order_submission"] is False
+    assert result["installed_paths"]
+    assert set(result["installed_hashes"].values()) == {
+        rendered["artifact_sha256"]
+    }
+    assert result["strategy_artifact_sha256"] == rendered["artifact_sha256"]
+    assert result["strategy_loaded_identity_sha256"] == rendered[
+        "identity_sha256"
+    ]
+    manifest = json.loads(
+        Path(result["strategy_release_manifest"]).read_text(encoding="utf-8")
+    )
+    assert manifest["strategy_build_sha"] == expected_sha
+    assert manifest["strategy_git_blob"] == "b" * 40
+    assert manifest["strategy_source_sha256"] == source_hash
+    assert manifest["strategy_artifact_sha256"] == rendered[
+        "artifact_sha256"
+    ]
+
+
+def test_strategy_installer_rejects_checkout_drift_before_copy(tmp_path):
+    qmt_home = tmp_path / "QMT"
+    with pytest.raises(RuntimeError, match="checkout differs"):
+        run_big_qmt_bridge.install_strategy_release(
+            qmt_home=qmt_home,
+            expected_build_sha="a" * 40,
+            git_head="b" * 40,
+        )
+    assert not (qmt_home / "python").exists()
 
 
 def _level1_tick(price: float, source_at: datetime, received_at: datetime) -> dict:
@@ -183,9 +256,8 @@ def test_backend_exposes_verified_live_level1(monkeypatch):
 
 def test_history_frames_keep_standard_qmt_provenance(monkeypatch):
     monkeypatch.setattr(
-        "integrations.bigqmt.backend.bridge.minute",
-        lambda *_args, **_kwargs: pd.DataFrame(
-            [{
+        "integrations.bigqmt.backend.bridge.minute_capture",
+        lambda *_args, **_kwargs: {"rows": [{
                 "qmt_code": "000001.SZ",
                 "stock_code": "000001",
                 "trade_time": "2026-07-21 09:30:00",
@@ -196,14 +268,15 @@ def test_history_frames_keep_standard_qmt_provenance(monkeypatch):
                 "change_pct": 0.96,
                 "volume": 100,
                 "amount": 1050,
-            }]
-        ),
+                "pre_close": 10.4,
+            }]},
     )
 
     frame = BigQmtBackend().fetch_minute(["000001"], "2026-07-21")
 
     assert frame.iloc[0]["data_source"] == PROVIDER_ID
     assert frame.iloc[0]["qmt_code"] == "000001.SZ"
+    assert frame.iloc[0]["pre_close"] == 10.4
     assert frame.iloc[0]["data_version"] == "bigqmt_inner_v2"
 
 
@@ -228,6 +301,39 @@ def test_minute_request_expands_bare_dates_to_intraday_bounds(monkeypatch):
     assert captured["action"] == "minute"
     assert captured["start_date"] == "2026-07-27 00:00:00"
     assert captured["end_date"] == "2026-07-27 23:59:59"
+
+
+def test_trading_calendar_capture_preserves_native_source_evidence(monkeypatch):
+    captured = {}
+
+    def fake_call(action, **kwargs):
+        captured["action"] = action
+        captured.update(kwargs)
+        return {
+            "rows": [{"trade_date": "2026-08-26", "trade_status": 1}],
+            "source_method": "ContextInfo.get_trading_dates",
+            "observed_start_date": "2026-08-26",
+            "observed_end_date": "2026-08-26",
+        }
+
+    monkeypatch.setattr(bridge, "_call", fake_call)
+    result = bridge.trading_calendar_capture(
+        "SH",
+        start_date="2026-08-24",
+        end_date="2026-08-26",
+        timeout=17,
+    )
+
+    assert captured == {
+        "action": "trading_calendar",
+        "timeout": 17,
+        "market": "SH",
+        "start_date": "2026-08-24",
+        "end_date": "2026-08-26",
+        "source_stock_code": "000001.SH",
+    }
+    assert result["source_method"] == "ContextInfo.get_trading_dates"
+    assert result["observed_end_date"] == "2026-08-26"
 
 
 @pytest.mark.parametrize(
@@ -371,9 +477,8 @@ def test_minute_request_rejects_malformed_rows_from_later_batch(monkeypatch):
 
 def test_daily_history_normalizes_qmt_lots_to_shares(monkeypatch):
     monkeypatch.setattr(
-        "integrations.bigqmt.backend.bridge.kline",
-        lambda *_args, **_kwargs: pd.DataFrame(
-            [{
+        "integrations.bigqmt.backend.bridge.kline_capture",
+        lambda *_args, **_kwargs: {"rows": [{
                 "qmt_code": "510300.SH",
                 "stock_code": "510300",
                 "trade_time": "2026-07-21 15:00:00",
@@ -388,8 +493,7 @@ def test_daily_history_normalizes_qmt_lots_to_shares(monkeypatch):
                 "change_pct": 2.44,
                 "pre_close": 4.1,
                 "pre_close_origin": "NATIVE_QMT",
-            }]
-        ),
+            }]},
     )
 
     frame = BigQmtBackend().fetch_kline(
@@ -403,9 +507,8 @@ def test_daily_history_normalizes_qmt_lots_to_shares(monkeypatch):
 
 def test_daily_history_never_promotes_missing_native_pre_close(monkeypatch):
     monkeypatch.setattr(
-        "integrations.bigqmt.backend.bridge.kline",
-        lambda *_args, **_kwargs: pd.DataFrame(
-            [{
+        "integrations.bigqmt.backend.bridge.kline_capture",
+        lambda *_args, **_kwargs: {"rows": [{
                 "qmt_code": "510300.SH",
                 "stock_code": "510300",
                 "trade_time": "2026-07-22 15:00:00",
@@ -417,8 +520,7 @@ def test_daily_history_never_promotes_missing_native_pre_close(monkeypatch):
                 "volume": 1234,
                 "amount": 518280,
                 "pre_close": None,
-            }]
-        ),
+            }]},
     )
 
     frame = BigQmtBackend().fetch_kline(

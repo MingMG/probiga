@@ -2,13 +2,16 @@
 from env_config import create_tool_engine, resolve_tool_mysql_url
 # -*- coding: utf-8 -*-
 """
-融合东财人气榜 + 同花顺热股 + 雪球热股 + 新浪热股 → 统一榜单，支持单日和 N 天统计。
+融合东财人气榜 + 同花顺热股 → 统一榜单，支持单日和 N 天统计。
 
 数据源：
   - st_hot_pop_rank_east（东财人气榜TOP100）
   - st_hot_rank_ths（同花顺热股TOP100）
-  - st_hot_rank_xq（雪球热股TOP100）
-  - st_hot_rank_sina（新浪热股TOP100）
+
+新浪 ``Market_Center.getHQNodeData`` 不提供可验证的关注度字段，旧数据是
+证券代码序列而非热度榜，永久不得参与融合。
+旧雪球 ``type=10`` 全球榜过滤后也曾写入过无法区分的伪 A 股批次；在正式
+scheduler receipt 能独立绑定 XQ 数据库批次之前，雪球同样不得参与融合。
 
 输出表：
   - st_hot_rank_fused：单日融合Top100
@@ -18,7 +21,7 @@ from env_config import create_tool_engine, resolve_tool_mysql_url
 import argparse
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +31,13 @@ from server.common.batch_db import read_frame, replace_table_rows
 from server.common.auxiliary_runtime_schema import (
     validate_hot_rank_fusion_runtime_schema,
 )
+from server.common.hot_rank_source_contract import (
+    HOT_POP_EAST_TASK_TYPE,
+    validate_rank_inventory as validate_exact_rank_inventory,
+)
+from server.common.ths_hot_contract import (
+    validate_rank_inventory as validate_ths_rank_inventory,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 _ROOT_STR = str(ROOT)
@@ -36,6 +46,12 @@ if _ROOT_STR not in sys.path:
 from server.common.adata_release import ensure_adata_import_path
 
 ensure_adata_import_path(ROOT)
+
+
+_HOT_RANK_SOURCE_TABLES = (
+    ("east", "st_hot_pop_rank_east"),
+    ("ths", "st_hot_rank_ths"),
+)
 
 
 def _warn(message: str, exc: Exception) -> None:
@@ -105,7 +121,9 @@ def _filter_hs_a(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     if "stock_code" in df.columns:
-        df = df[df["stock_code"].astype(str).str.match(r"^(0|6|3)")]
+        df = df[
+            df["stock_code"].astype(str).str.match(r"^(0|3|4|6|8|9)")
+        ]
     return df
 
 
@@ -121,40 +139,278 @@ def _read_day_data(engine, dt: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
         text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY `rank`"),
         engine, params={"d": dt}
     )
-    if east.empty:
-        fallback = read_frame(
-            text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date <= :d ORDER BY snapshot_date DESC, `rank` LIMIT 200"),
-            engine, params={"d": dt}
-        )
-        if not fallback.empty:
-            fb_date = fallback.iloc[0]["snapshot_date"]
-            east = fallback[fallback["snapshot_date"] == fb_date].copy()
-            print(f"  [兜底] 东财当日({dt})无数据，使用 {fb_date} 的 {len(east)} 条数据")
     ths = read_frame(
         text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY `rank`"),
         engine, params={"d": dt}
     )
-    try:
-        xq = read_frame(
-            text("SELECT * FROM st_hot_rank_xq WHERE snapshot_date = :d ORDER BY `rank`"),
-            engine, params={"d": dt}
-        )
-    except Exception as exc:
-        _warn(f"failed to read xq hot rank for {dt}", exc)
-        xq = pd.DataFrame()
-    try:
-        sina = read_frame(
-            text("SELECT * FROM st_hot_rank_sina WHERE snapshot_date = :d ORDER BY `rank`"),
-            engine, params={"d": dt}
-        )
-    except Exception as exc:
-        _warn(f"failed to read sina hot rank for {dt}", exc)
-        sina = pd.DataFrame()
     east = _filter_hs_a(east)
     ths = _filter_hs_a(ths)
-    xq = _filter_hs_a(xq)
-    sina = _filter_hs_a(sina)
-    return east, ths, xq, sina
+    # XQ and Sina are deliberately not queried.  Empty compatibility slots
+    # keep the existing internal tuple/schema stable while making old
+    # unproven batches impossible to fuse.
+    return east, ths, pd.DataFrame(), pd.DataFrame()
+
+
+def _trusted_same_day_sources(
+    snapshot_date: str,
+    east: pd.DataFrame,
+    ths: pd.DataFrame,
+    xq: pd.DataFrame,
+    sina: pd.DataFrame,
+) -> tuple[
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    tuple[str, ...],
+]:
+    """Return only exact-date sources whose complete inventory is valid."""
+
+    sources = {
+        "east": east,
+        "ths": ths,
+    }
+    trusted: dict[str, pd.DataFrame] = {
+        "east": pd.DataFrame(),
+        "ths": pd.DataFrame(),
+    }
+    available: list[str] = []
+    for source, frame in sources.items():
+        if frame.empty:
+            continue
+        if "snapshot_date" not in frame.columns:
+            raise RuntimeError(
+                "DATA_BLOCKED: "
+                f"{source} hot-rank rows have no snapshot_date for {snapshot_date}"
+            )
+        observed_dates = {
+            str(value)[:10]
+            for value in frame["snapshot_date"].dropna().tolist()
+        }
+        if observed_dates != {snapshot_date}:
+            raise RuntimeError(
+                "DATA_BLOCKED: "
+                f"{source} hot-rank date mismatch for {snapshot_date}: "
+                f"observed={sorted(observed_dates)}"
+            )
+        try:
+            records = frame.to_dict(orient="records")
+            if source == "east":
+                validate_exact_rank_inventory(
+                    records,
+                    task_type=HOT_POP_EAST_TASK_TYPE,
+                    target_date=snapshot_date,
+                )
+            else:
+                validate_ths_rank_inventory(
+                    records,
+                    target_date=snapshot_date,
+                )
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            _warn(
+                f"DATA_BLOCKED: excluded invalid {source} hot-rank inventory "
+                f"for {snapshot_date}",
+                exc,
+            )
+            continue
+        trusted[source] = frame
+        available.append(source)
+    return (
+        (trusted["east"], trusted["ths"], pd.DataFrame(), pd.DataFrame()),
+        tuple(available),
+    )
+
+
+def _exact_date_sources(
+    snapshot_date: str,
+    east: pd.DataFrame,
+    ths: pd.DataFrame,
+    xq: pd.DataFrame,
+    sina: pd.DataFrame,
+) -> tuple[str, ...]:
+    _trusted, available = _trusted_same_day_sources(
+        snapshot_date,
+        east,
+        ths,
+        xq,
+        sina,
+    )
+    return available
+
+
+def _require_trusted_same_day_sources(
+    snapshot_date: str,
+    east: pd.DataFrame,
+    ths: pd.DataFrame,
+    xq: pd.DataFrame,
+    sina: pd.DataFrame,
+) -> tuple[
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+    tuple[str, ...],
+]:
+    trusted, available = _trusted_same_day_sources(
+        snapshot_date,
+        east,
+        ths,
+        xq,
+        sina,
+    )
+    if len(available) < 2:
+        raise RuntimeError(
+            "DATA_BLOCKED: hot-rank fusion requires at least two exact-date "
+            "complete trusted sources: "
+            f"snapshot_date={snapshot_date}, available={available}"
+        )
+    return trusted, available
+
+
+def _require_same_day_sources(
+    snapshot_date: str,
+    east: pd.DataFrame,
+    ths: pd.DataFrame,
+    xq: pd.DataFrame,
+    sina: pd.DataFrame,
+) -> tuple[str, ...]:
+    _trusted, available = _require_trusted_same_day_sources(
+        snapshot_date,
+        east,
+        ths,
+        xq,
+        sina,
+    )
+    return available
+
+
+def _candidate_snapshot_dates(engine, end_date: str) -> list[str]:
+    """Return source-backed open-market dates up to the requested upper bound."""
+
+    candidates: set[str] = set()
+    for source, table_name in _HOT_RANK_SOURCE_TABLES:
+        try:
+            frame = read_frame(
+                text(
+                    f"SELECT DISTINCT snapshot_date FROM `{table_name}` "
+                    "WHERE snapshot_date <= :end_date "
+                    "ORDER BY snapshot_date DESC"
+                ),
+                engine,
+                params={"end_date": end_date},
+            )
+        except Exception as exc:
+            _warn(f"failed to load {source} hot-rank date index", exc)
+            continue
+        if frame.empty:
+            continue
+        if "snapshot_date" not in frame.columns:
+            raise RuntimeError(
+                "DATA_BLOCKED: hot-rank date index has no snapshot_date: "
+                f"source={source}"
+            )
+        for value in frame["snapshot_date"].dropna().tolist():
+            candidate = str(value)[:10]
+            try:
+                parsed = datetime.strptime(candidate, "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "DATA_BLOCKED: hot-rank date index contains an invalid date: "
+                    f"source={source}, value={candidate}"
+                ) from exc
+            if parsed.isoformat() != candidate:
+                raise RuntimeError(
+                    "DATA_BLOCKED: hot-rank date index contains a non-canonical date: "
+                    f"source={source}, value={candidate}"
+                )
+            if candidate <= end_date:
+                candidates.add(candidate)
+
+    try:
+        calendar = read_frame(
+            text(
+                "SELECT trade_date FROM si_trade_calendar "
+                "WHERE trade_status = 1 AND trade_date <= :end_date "
+                "ORDER BY trade_date DESC"
+            ),
+            engine,
+            params={"end_date": end_date},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative trading calendar is unavailable for "
+            "hot-rank multi-day fusion"
+        ) from exc
+    if calendar.empty or "trade_date" not in calendar.columns:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative trading calendar has no open dates for "
+            f"hot-rank multi-day fusion through {end_date}"
+        )
+    trading_dates = {
+        str(value)[:10]
+        for value in calendar["trade_date"].dropna().tolist()
+    }
+    return sorted(candidates.intersection(trading_dates))
+
+
+def _select_multi_day_window(
+    engine,
+    requested_end_date: str,
+    num_days: int,
+) -> list[
+    tuple[
+        str,
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+        tuple[str, ...],
+    ]
+]:
+    """Select the latest N exact-date snapshots backed by at least two sources.
+
+    ``requested_end_date`` is an inclusive upper bound, not a date to stamp on
+    older data.  The last selected source date becomes the persisted
+    ``stat_date``.  This lets a weekend request resolve to Friday and a Monday
+    request use Monday/Friday/Thursday while keeping the two-source gate on
+    every observation day.
+    """
+
+    if num_days < 1:
+        raise ValueError("num_days must be positive")
+    requested = datetime.strptime(requested_end_date, "%Y-%m-%d").date()
+    if requested.isoformat() != requested_end_date:
+        raise ValueError("requested_end_date must be canonical YYYY-MM-DD")
+
+    selected_desc: list[
+        tuple[
+            str,
+            tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame],
+            tuple[str, ...],
+        ]
+    ] = []
+    for snapshot_date in reversed(
+        _candidate_snapshot_dates(engine, requested_end_date)
+    ):
+        frames = _read_day_data(engine, snapshot_date)
+        trusted_frames, available = _trusted_same_day_sources(
+            snapshot_date,
+            *frames,
+        )
+        if len(available) < 2:
+            print(
+                "  [跳过] "
+                f"{snapshot_date} 同日独立来源不足2个: {list(available)}"
+            )
+            continue
+        # Keep the same fail-closed contract as single-day fusion.  Calling
+        # the public guard here also makes future source-policy changes apply
+        # to every selected multi-day observation.
+        _require_same_day_sources(snapshot_date, *trusted_frames)
+        selected_desc.append((snapshot_date, trusted_frames, available))
+        if len(selected_desc) == num_days:
+            break
+
+    if len(selected_desc) < num_days:
+        raise RuntimeError(
+            "DATA_BLOCKED: hot-rank multi-day fusion has too few exact-date "
+            "two-source snapshots: "
+            f"requested_end_date={requested_end_date}, required={num_days}, "
+            f"available={len(selected_desc)}"
+        )
+    selected_desc.reverse()
+    return selected_desc
 
 
 def _fuse_single_day(east_df: pd.DataFrame, ths_df: pd.DataFrame, xq_df: pd.DataFrame, sina_df: pd.DataFrame) -> pd.DataFrame:
@@ -192,64 +448,16 @@ def _fuse_single_day(east_df: pd.DataFrame, ths_df: pd.DataFrame, xq_df: pd.Data
         if r["change_pct"] is None and pd.notna(row.get("change_pct")):
             r["change_pct"] = row["change_pct"]
 
-    for _, row in xq_df.iterrows():
-        code = str(row["stock_code"]).strip()
-        r = _get(code)
-        r["xq_rank"] = int(row["rank"])
-        r["xq_score"] = _score_from_rank(row["rank"])
-        r["sources"].add("xq")
-        if not r["short_name"]:
-            r["short_name"] = str(row.get("short_name", "") or "")
-        if r["change_pct"] is None and pd.notna(row.get("percent")):
-            r["change_pct"] = row["percent"]
-
-    for _, row in sina_df.iterrows():
-        code = str(row["stock_code"]).strip()
-        r = _get(code)
-        r["sina_rank"] = int(row["rank"])
-        r["sina_score"] = _score_from_rank(row["rank"])
-        r["sources"].add("sina")
-        if not r["short_name"]:
-            r["short_name"] = str(row.get("short_name", "") or "")
-        if r["change_pct"] is None and pd.notna(row.get("change_pct")):
-            r["change_pct"] = row["change_pct"]
-
     for r in stock_map.values():
-        r["total_score"] = r["east_score"] + r["ths_score"] + r["xq_score"] + r["sina_score"]
+        r["total_score"] = r["east_score"] + r["ths_score"]
         srcs = r["sources"]
-        if len(srcs) == 4:
-            r["source_flag"] = "all"
-        elif len(srcs) == 3:
-            if "east" in srcs and "ths" in srcs and "xq" in srcs:
-                r["source_flag"] = "east_ths_xq"
-            elif "east" in srcs and "ths" in srcs and "sina" in srcs:
-                r["source_flag"] = "east_ths_sina"
-            elif "east" in srcs and "xq" in srcs and "sina" in srcs:
-                r["source_flag"] = "east_xq_sina"
-            else:
-                r["source_flag"] = "ths_xq_sina"
-        elif len(srcs) == 2:
-            if "east" in srcs and "ths" in srcs:
-                r["source_flag"] = "both"
-            elif "east" in srcs and "xq" in srcs:
-                r["source_flag"] = "east_xq"
-            elif "east" in srcs and "sina" in srcs:
-                r["source_flag"] = "east_sina"
-            elif "ths" in srcs and "xq" in srcs:
-                r["source_flag"] = "ths_xq"
-            elif "ths" in srcs and "sina" in srcs:
-                r["source_flag"] = "ths_sina"
-            else:
-                r["source_flag"] = "xq_sina"
+        if len(srcs) == 2:
+            r["source_flag"] = "both"
         else:
             if "east" in srcs:
                 r["source_flag"] = "east_only"
-            elif "ths" in srcs:
-                r["source_flag"] = "ths_only"
-            elif "xq" in srcs:
-                r["source_flag"] = "xq_only"
             else:
-                r["source_flag"] = "sina_only"
+                r["source_flag"] = "ths_only"
         del r["sources"]
 
     df = pd.DataFrame(list(stock_map.values()))
@@ -259,19 +467,20 @@ def _fuse_single_day(east_df: pd.DataFrame, ths_df: pd.DataFrame, xq_df: pd.Data
 
 def run_single_day(engine, snapshot_date: str, top_n: int, save: bool):
     print(f"\n{'='*70}")
-    print(f"  单日融合榜单：东财人气榜 × 同花顺热股 × 雪球热股  → 统一 Top{top_n}")
+    print(f"  单日融合榜单：东财人气榜 × 同花顺热股 → 统一 Top{top_n}")
     print(f"  快照日期: {snapshot_date}")
     print(f"{'='*70}")
 
-    east_df, ths_df, xq_df, sina_df = _read_day_data(engine, snapshot_date)
-    if east_df.empty and ths_df.empty and xq_df.empty and sina_df.empty:
-        print("  所有数据源均无数据，请先执行 fetch 脚本获取数据。")
-        return
+    raw_frames = _read_day_data(engine, snapshot_date)
+    trusted_frames, available_sources = _require_trusted_same_day_sources(
+        snapshot_date,
+        *raw_frames,
+    )
+    east_df, ths_df, xq_df, sina_df = trusted_frames
+    print(f"  同日可用来源: {', '.join(available_sources)}")
 
     print(f"  东财人气榜: {len(east_df)} 条")
     print(f"  同花顺热股: {len(ths_df)} 条")
-    print(f"  雪球热股: {len(xq_df)} 条")
-    print(f"  新浪热股: {len(sina_df)} 条")
 
     result_df = _fuse_single_day(east_df, ths_df, xq_df, sina_df)
     result_df["fused_rank"] = range(1, len(result_df) + 1)
@@ -284,32 +493,22 @@ def run_single_day(engine, snapshot_date: str, top_n: int, save: bool):
     top_df = result_df.head(top_n).copy()
 
     print(f"\n  {'═'*78}")
-    print(f"  {'排名':>4} {'代码':<10} {'名称':<14} {'涨跌幅':>8} {'东财排名':>8} {'同花顺':>8} {'雪球':>6} {'综合分':>8} {'来源'}")
+    print(f"  {'排名':>4} {'代码':<10} {'名称':<14} {'涨跌幅':>8} {'东财排名':>8} {'同花顺':>8} {'综合分':>8} {'来源'}")
     print(f"  {'═'*78}")
     for _, r in top_df.iterrows():
         src = source_tag(r["source_flag"])
         east_r = f"{int(r['east_rank'])}" if pd.notna(r["east_rank"]) else "-"
         ths_r = f"{int(r['ths_rank'])}" if pd.notna(r["ths_rank"]) else "-"
-        xq_r = f"{int(r['xq_rank'])}" if pd.notna(r["xq_rank"]) else "-"
         chg = f"{r['change_pct']:.2f}%" if pd.notna(r["change_pct"]) else "-"
-        print(f"  {int(r['fused_rank']):>4} {r['stock_code']:<10} {r['short_name']:<14} {chg:>8} {east_r:>8} {ths_r:>8} {xq_r:>6} {r['total_score']:>8.2f} {src}")
+        print(f"  {int(r['fused_rank']):>4} {r['stock_code']:<10} {r['short_name']:<14} {chg:>8} {east_r:>8} {ths_r:>8} {r['total_score']:>8.2f} {src}")
 
     both = len(top_df[top_df["source_flag"] == "both"])
-    all_three = len(top_df[top_df["source_flag"].isin(["east_ths_xq", "east_ths_sina", "east_xq_sina", "ths_xq_sina"])])
-    all_four = len(top_df[top_df["source_flag"] == "all"])
-    east_xq = len(top_df[top_df["source_flag"] == "east_xq"])
-    ths_xq = len(top_df[top_df["source_flag"] == "ths_xq"])
-    east_sina = len(top_df[top_df["source_flag"] == "east_sina"])
-    ths_sina = len(top_df[top_df["source_flag"] == "ths_sina"])
-    xq_sina = len(top_df[top_df["source_flag"] == "xq_sina"])
     east_only = len(top_df[top_df["source_flag"] == "east_only"])
     ths_only = len(top_df[top_df["source_flag"] == "ths_only"])
-    xq_only = len(top_df[top_df["source_flag"] == "xq_only"])
-    sina_only = len(top_df[top_df["source_flag"] == "sina_only"])
-    print(f"\n  融合统计: 4源 {all_four} | 3源 {all_three} | 东财+同花顺 {both} | "
-          f"东财+雪球 {east_xq} | 东财+新浪 {east_sina} | 同花顺+雪球 {ths_xq} | "
-          f"同花顺+新浪 {ths_sina} | 雪球+新浪 {xq_sina} | "
-          f"仅东财 {east_only} | 仅同花顺 {ths_only} | 仅雪球 {xq_only} | 仅新浪 {sina_only}")
+    print(
+        f"\n  融合统计: 东财+同花顺 {both} | "
+        f"仅东财 {east_only} | 仅同花顺 {ths_only}"
+    )
 
     if save:
         validate_hot_rank_fusion_runtime_schema(
@@ -330,25 +529,25 @@ def run_single_day(engine, snapshot_date: str, top_n: int, save: bool):
 
 def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
     print(f"\n{'='*70}")
-    print(f"  ★ 多日持续上榜统计：近 {num_days} 天强势股追踪（东财+同花顺+雪球）★")
-    print(f"  截止日期: {end_date}，统计区间: 近{num_days}天")
+    print(f"  ★ 多日持续上榜统计：近 {num_days} 个合规快照日强势股追踪 ★")
+    print(f"  请求截止上限: {end_date}")
     print(f"{'='*70}")
 
-    end = datetime.strptime(end_date, "%Y-%m-%d")
-    date_list = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(num_days)]
-    date_list.reverse()
+    window = _select_multi_day_window(engine, end_date, num_days)
+    date_list = [item[0] for item in window]
+    stat_date = date_list[-1]
 
-    print(f"  扫描日期: {date_list[0]} ~ {date_list[-1]} 共 {num_days} 天")
+    print(f"  实际统计日: {stat_date}")
+    print(f"  合规日期序列: {', '.join(date_list)}")
 
     stock_days: dict[str, dict] = defaultdict(lambda: {
         "appear_days": 0, "east_ranks": [], "ths_ranks": [], "xq_ranks": [], "sina_ranks": [],
         "scores": [], "change_pcts": [], "short_name": "",
     })
 
-    for dt in date_list:
-        east_df, ths_df, xq_df, sina_df = _read_day_data(engine, dt)
-        if east_df.empty and ths_df.empty and xq_df.empty and sina_df.empty:
-            continue
+    for dt, frames, available_sources in window:
+        east_df, ths_df, xq_df, sina_df = frames
+        print(f"  {dt} 同日可用来源: {', '.join(available_sources)}")
         day_codes = set()
         for _, row in east_df.iterrows():
             code = str(row["stock_code"]).strip()
@@ -370,33 +569,12 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
             stock_days[code]["scores"].append(_score_from_rank(row["rank"]))
             if pd.notna(row.get("change_pct")):
                 stock_days[code]["change_pcts"].append(float(row["change_pct"]))
-        for _, row in xq_df.iterrows():
-            code = str(row["stock_code"]).strip()
-            if code not in day_codes:
-                stock_days[code]["appear_days"] += 1
-                if not stock_days[code]["short_name"]:
-                    stock_days[code]["short_name"] = str(row.get("short_name", "") or "")
-            stock_days[code]["xq_ranks"].append(int(row["rank"]))
-            stock_days[code]["scores"].append(_score_from_rank(row["rank"]))
-            chg_val = row.get("percent") if pd.notna(row.get("percent")) else row.get("change_pct")
-            if chg_val is not None and pd.notna(chg_val):
-                stock_days[code]["change_pcts"].append(float(chg_val))
-        for _, row in sina_df.iterrows():
-            code = str(row["stock_code"]).strip()
-            if code not in day_codes:
-                stock_days[code]["appear_days"] += 1
-                if not stock_days[code]["short_name"]:
-                    stock_days[code]["short_name"] = str(row.get("short_name", "") or "")
-            stock_days[code]["sina_ranks"].append(int(row["rank"]))
-            stock_days[code]["scores"].append(_score_from_rank(row["rank"]))
-            if pd.notna(row.get("change_pct")):
-                stock_days[code]["change_pcts"].append(float(row["change_pct"]))
-
     if not stock_days:
-        print("  区间内无数据")
-        return
+        raise RuntimeError(
+            "DATA_BLOCKED: selected hot-rank multi-day window has no stock rows"
+        )
 
-    last_east, last_ths, last_xq, last_sina = _read_day_data(engine, date_list[-1])
+    last_east, last_ths, last_xq, last_sina = window[-1][1]
     last_east_map = {str(r["stock_code"]).strip(): int(r["rank"]) for _, r in last_east.iterrows()}
     last_ths_map = {str(r["stock_code"]).strip(): int(r["rank"]) for _, r in last_ths.iterrows()}
     last_xq_map = {str(r["stock_code"]).strip(): int(r["rank"]) for _, r in last_xq.iterrows()}
@@ -416,43 +594,13 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
             srcs.add("east")
         if info["ths_ranks"]:
             srcs.add("ths")
-        if info["xq_ranks"]:
-            srcs.add("xq")
-        if info["sina_ranks"]:
-            srcs.add("sina")
-        if len(srcs) == 4:
-            src = "all"
-        elif len(srcs) == 3:
-            if "east" in srcs and "ths" in srcs and "xq" in srcs:
-                src = "east_ths_xq"
-            elif "east" in srcs and "ths" in srcs and "sina" in srcs:
-                src = "east_ths_sina"
-            elif "east" in srcs and "xq" in srcs and "sina" in srcs:
-                src = "east_xq_sina"
-            else:
-                src = "ths_xq_sina"
-        elif len(srcs) == 2:
-            if "east" in srcs and "ths" in srcs:
-                src = "both"
-            elif "east" in srcs and "xq" in srcs:
-                src = "east_xq"
-            elif "east" in srcs and "sina" in srcs:
-                src = "east_sina"
-            elif "ths" in srcs and "xq" in srcs:
-                src = "ths_xq"
-            elif "ths" in srcs and "sina" in srcs:
-                src = "ths_sina"
-            else:
-                src = "xq_sina"
+        if len(srcs) == 2:
+            src = "both"
         else:
             if "east" in srcs:
                 src = "east_only"
-            elif "ths" in srcs:
-                src = "ths_only"
-            elif "xq" in srcs:
-                src = "xq_only"
             else:
-                src = "sina_only"
+                src = "ths_only"
 
         rows.append({
             "stock_code": code,
@@ -482,30 +630,31 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
     top_df = result_df.head(top_n).copy()
 
     print(f"\n  {'═'*95}")
-    print(f"  {'排名':>4} {'代码':<10} {'名称':<12} {'出现/总':>8} {'频率':>6} {'均东财':>7} {'均同花':>7} {'均雪球':>7} {'最新东':>6} {'最新同':>6} {'最新雪':>6} {'均涨跌':>8}")
+    print(f"  {'排名':>4} {'代码':<10} {'名称':<12} {'出现/总':>8} {'频率':>6} {'均东财':>7} {'均同花':>7} {'最新东':>6} {'最新同':>6} {'均涨跌':>8}")
     print(f"  {'═'*95}")
     for _, r in top_df.iterrows():
         app = f"{int(r['appear_days'])}/{num_days}"
         freq = f"{r['continuity_rate']:.0f}%"
         ae = f"{r['avg_east_rank']:.1f}" if pd.notna(r["avg_east_rank"]) else "-"
         at = f"{r['avg_ths_rank']:.1f}" if pd.notna(r["avg_ths_rank"]) else "-"
-        ax = f"{r['avg_xq_rank']:.1f}" if pd.notna(r["avg_xq_rank"]) else "-"
         le = f"{int(r['last_east_rank'])}" if pd.notna(r["last_east_rank"]) else "-"
         lt = f"{int(r['last_ths_rank'])}" if pd.notna(r["last_ths_rank"]) else "-"
-        lx = f"{int(r['last_xq_rank'])}" if pd.notna(r["last_xq_rank"]) else "-"
         chg = f"{r['avg_change_pct']:.2f}%" if pd.notna(r["avg_change_pct"]) else "-"
-        print(f"  {int(r['fused_rank']):>4} {r['stock_code']:<10} {r['short_name']:<12} {app:>8} {freq:>6} {ae:>7} {at:>7} {ax:>7} {le:>6} {lt:>6} {lx:>6} {chg:>8}")
+        print(f"  {int(r['fused_rank']):>4} {r['stock_code']:<10} {r['short_name']:<12} {app:>8} {freq:>6} {ae:>7} {at:>7} {le:>6} {lt:>6} {chg:>8}")
 
     full_cover = len(top_df[top_df["appear_days"] == num_days])
     appear_ge_half = len(top_df[top_df["appear_days"] >= (num_days + 1) // 2])
-    print(f"\n  多日统计: 全部{num_days}天均上榜 {full_cover} 只 | 半数以上 {appear_ge_half} 只")
+    print(
+        f"\n  多日统计: 全部{num_days}个合规日均上榜 {full_cover} 只 | "
+        f"半数以上 {appear_ge_half} 只"
+    )
 
     if save:
         validate_hot_rank_fusion_runtime_schema(
             engine,
             tables=("st_hot_rank_multi_day",),
         )
-        top_df["stat_date"] = end_date
+        top_df["stat_date"] = stat_date
         top_df["stat_days"] = num_days
         top_df["etl_sync_at"] = datetime.now().replace(microsecond=0)
         replace_table_rows(
@@ -513,19 +662,29 @@ def run_multi_day(engine, end_date: str, num_days: int, top_n: int, save: bool):
             "st_hot_rank_multi_day",
             engine,
             where_sql="stat_date = :stat_date AND stat_days = :stat_days",
-            params={"stat_date": end_date, "stat_days": num_days},
+            params={"stat_date": stat_date, "stat_days": num_days},
             chunksize=500,
             method="multi",
         )
         print(f"  已写入 st_hot_rank_multi_day，共 {len(top_df)} 行")
+    print(f"DATE={stat_date}")
+    return {
+        "requested_end_date": end_date,
+        "stat_date": stat_date,
+        "snapshot_dates": date_list,
+        "rows": len(top_df),
+    }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="融合东财人气榜 + 同花顺热股 + 雪球热股 → 统一榜单")
+    parser = argparse.ArgumentParser(description="融合东财人气榜 + 同花顺热股 → 统一榜单")
     parser.add_argument("date", nargs="?", help="快照/截止日期，格式：YYYY-MM-DD，默认今天")
     parser.add_argument("--top", type=int, default=100, help="输出前N名，默认100")
     parser.add_argument("--days", type=int, default=0,
-                        help="多日统计模式：统计近 N 天持续上榜的股票。例：--days 3, --days 5。默认0=单日")
+                        help=(
+                            "多日统计模式：统计截止上限之前最近 N 个同日双源"
+                            "合规交易日。例：--days 3, --days 5。默认0=单日"
+                        ))
     parser.add_argument("--no-save", action="store_true", help="不写入数据库，仅打印")
     args = parser.parse_args()
 

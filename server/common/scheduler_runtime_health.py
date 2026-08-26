@@ -1,6 +1,7 @@
 """Fail-closed validation for the production standalone scheduler heartbeat."""
 from __future__ import annotations
 
+from datetime import datetime
 import re
 from socket import gethostname
 from typing import Any
@@ -205,6 +206,128 @@ def check_linux_standalone_scheduler_heartbeat(
         "expected_pid": pid,
         "expected_build_sha": build_sha,
         "expected_poll_seconds": poll,
+        "current": current_detail,
+        "errors": errors,
+    }
+
+
+def check_linux_standalone_active_release(
+    connection,
+    *,
+    expected_build_sha: str,
+    expected_poll_seconds: int = DEFAULT_SCHEDULER_POLL_SECONDS,
+) -> tuple[bool, dict[str, Any]]:
+    """Prove the one fresh Linux executor for a build across hosts.
+
+    Unlike the local systemd check above, a Windows edge does not know the
+    Linux PID in advance.  It therefore derives the identity only after the
+    shared heartbeat lease proves there is exactly one fresh Linux executor,
+    then binds activation evidence to that exact instance and start time.
+    """
+
+    build_sha = str(expected_build_sha or "").strip().lower()
+    poll = _integer(expected_poll_seconds)
+    errors: list[str] = []
+    base = {
+        "executor_role": LINUX_STANDALONE_ROLE,
+        "expected_build_sha": build_sha or None,
+        "expected_poll_seconds": poll,
+        "role_row_count": 0,
+        "fresh_row_count": 0,
+        "future_row_count": 0,
+        "current": None,
+        "errors": errors,
+    }
+    if not BUILD_SHA_RE.fullmatch(build_sha) or build_sha == "0" * 40:
+        errors.append("expected_build_sha_invalid")
+    if poll is None or poll < 15:
+        errors.append("expected_poll_seconds_invalid")
+    if errors:
+        return False, base
+    try:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT instance_id, mode, host_name, pid, build_sha, "
+                    "executor_role, started_at, heartbeat_at, "
+                    "TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
+                    "AS heartbeat_age_seconds, poll_seconds, "
+                    "max_concurrent_tasks FROM st_scheduler_runtime "
+                    "WHERE executor_role=:executor_role "
+                    "ORDER BY heartbeat_at DESC, instance_id ASC"
+                ),
+                {"executor_role": LINUX_STANDALONE_ROLE},
+            ).mappings()
+        ]
+    except Exception:
+        return False, {**base, "errors": ["scheduler_runtime_query_failed"]}
+    assert poll is not None
+    fresh_rows, future_rows, classification_errors = (
+        _classify_current_heartbeats(
+            rows,
+            expected_poll_seconds=poll,
+        )
+    )
+    errors.extend(classification_errors)
+    if len(fresh_rows) != 1:
+        errors.append("fresh_heartbeat_not_unique")
+    current = fresh_rows[0] if len(fresh_rows) == 1 else None
+    current_detail: dict[str, Any] | None = None
+    if current is not None:
+        host_name = str(current.get("host_name") or "").strip()
+        pid = _integer(current.get("pid"))
+        instance_id = str(current.get("instance_id") or "")
+        current_poll = _integer(current.get("poll_seconds"))
+        concurrency = _integer(current.get("max_concurrent_tasks"))
+        started_at = str(current.get("started_at") or "")[:19].replace(" ", "T")
+        current_detail = {
+            "instance_id": instance_id,
+            "mode": str(current.get("mode") or ""),
+            "host_name": host_name,
+            "pid": pid,
+            "build_sha": str(current.get("build_sha") or "").lower(),
+            "executor_role": str(current.get("executor_role") or ""),
+            "started_at": started_at,
+            "heartbeat_age_seconds": _integer(
+                current.get("heartbeat_age_seconds")
+            ),
+            "poll_seconds": current_poll,
+            "max_concurrent_tasks": concurrency,
+        }
+        if not host_name or len(host_name) > 128:
+            errors.append("host_invalid")
+        if pid is None or pid <= 0:
+            errors.append("pid_invalid")
+        if instance_id != f"{host_name}-{pid}":
+            errors.append("instance_id_mismatch")
+        if current_detail["mode"] != "standalone":
+            errors.append("mode_mismatch")
+        if current_detail["build_sha"] != build_sha:
+            errors.append("build_sha_mismatch")
+        if current_detail["executor_role"] != LINUX_STANDALONE_ROLE:
+            errors.append("executor_role_mismatch")
+        if current_poll != poll:
+            errors.append("poll_seconds_mismatch")
+        if concurrency is None or concurrency < 1:
+            errors.append("max_concurrent_tasks_invalid")
+        try:
+            if (
+                not started_at
+                or datetime.fromisoformat(started_at).replace(microsecond=0)
+                .isoformat(timespec="seconds")
+                != started_at
+            ):
+                raise ValueError
+        except ValueError:
+            errors.append("started_at_invalid")
+        if current.get("heartbeat_at") is None:
+            errors.append("heartbeat_at_missing")
+    return not errors, {
+        **base,
+        "role_row_count": len(rows),
+        "fresh_row_count": len(fresh_rows),
+        "future_row_count": len(future_rows),
         "current": current_detail,
         "errors": errors,
     }
@@ -741,6 +864,7 @@ __all__ = [
     "QMT_WINDOWS_EDGE_EXECUTION_PROOF_TASK_TYPES",
     "QMT_WINDOWS_EDGE_TASK_TYPES",
     "check_qmt_windows_edge_identity",
+    "check_linux_standalone_active_release",
     "check_linux_standalone_scheduler_heartbeat",
     "check_qmt_windows_edge_executor",
     "check_qmt_windows_edge_release_receipt",

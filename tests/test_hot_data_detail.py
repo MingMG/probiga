@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime, timedelta
 from decimal import Decimal
+import inspect
 import os
 import threading
 import unittest
@@ -159,6 +160,102 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(row["price_change"], 0.89)
         self.assertEqual(row["change_pct"], 2.453819)
         self.assertNotIn("quote_prev_close", row)
+
+    def test_portfolio_close_receipt_requires_post_close_full_market_proof(self):
+        engine = MagicMock()
+        connection = engine.connect.return_value.__enter__.return_value
+        connection.execute.return_value.mappings.return_value.first.return_value = {
+            "receipt_id": "r1",
+            "expected_count": 5205,
+            "observed_count": 5205,
+            "coverage": Decimal("1.0"),
+            "source_generated_at": "2026-08-26 15:00:05",
+            "published_at": "2026-08-26 15:00:09",
+            "capture_mode": "OFF_SESSION_SNAPSHOT",
+        }
+
+        with patch(
+            "server.api.routers.hot_data.get_current_engine",
+            return_value=engine,
+        ):
+            receipt = hot_data._portfolio_verified_close_receipt("2026-08-26")
+
+        self.assertEqual(receipt["receipt_id"], "r1")
+        sql = str(connection.execute.call_args.args[0])
+        params = connection.execute.call_args.args[1]
+        self.assertIn("source_generated_at >= :close_start", sql)
+        self.assertEqual(params["close_start"], datetime(2026, 8, 26, 15, 0))
+
+        connection.execute.return_value.mappings.return_value.first.return_value = {
+            **receipt,
+            "source_generated_at": "2026-08-26 11:30:00",
+        }
+        with patch(
+            "server.api.routers.hot_data.get_current_engine",
+            return_value=engine,
+        ):
+            self.assertIsNone(
+                hot_data._portfolio_verified_close_receipt("2026-08-26")
+            )
+
+    def test_portfolio_closed_quote_rejects_morning_snapshot_even_with_receipt(self):
+        morning = {
+            "stock_code": "000001",
+            "short_name": "示例股份",
+            "price": 10.5,
+            "change": 0.5,
+            "change_pct": 5.0,
+            "volume": 100,
+            "amount": 1000,
+            "snapshot_at": "2026-08-26 11:30:00",
+        }
+        with patch(
+            "server.api.routers.hot_data._portfolio_verified_close_receipt",
+            return_value={"receipt_id": "r1"},
+        ), patch(
+            "server.api.routers.hot_data._read_sql",
+            side_effect=[[morning], [morning]],
+        ) as read_sql:
+            result = hot_data._portfolio_closed_quotes_from_current_table(
+                ["000001"], "2026-08-26"
+            )
+
+        self.assertEqual(result, {})
+        self.assertIn(":td_close_start", read_sql.call_args_list[0].args[0])
+
+    def test_portfolio_closed_quote_accepts_receipt_backed_close_snapshot(self):
+        close = {
+            "stock_code": "000001",
+            "short_name": "示例股份",
+            "price": 10.8,
+            "change": 0.8,
+            "change_pct": 8.0,
+            "volume": 100,
+            "amount": 1000,
+            "snapshot_at": "2026-08-26 15:00:01",
+        }
+        with patch(
+            "server.api.routers.hot_data._portfolio_verified_close_receipt",
+            return_value={"receipt_id": "r1"},
+        ), patch(
+            "server.api.routers.hot_data._read_sql",
+            return_value=[close],
+        ):
+            result = hot_data._portfolio_closed_quotes_from_current_table(
+                ["000001"], "2026-08-26"
+            )
+
+        self.assertEqual(result["000001"]["quote_status"], "closed")
+        self.assertEqual(result["000001"]["source"], "current_close_table")
+        self.assertEqual(result["000001"]["price"], 10.8)
+
+    def test_portfolio_concept_tags_bind_the_explicit_closed_trade_date(self):
+        source = inspect.getsource(hot_data._build_portfolio_snapshot)
+
+        self.assertIn("snapshot_date = :profile_date", source)
+        self.assertIn('"profile_date": profile_date', source)
+        self.assertNotIn("SELECT MAX(snapshot_date) FROM st_hot_rank_ths", source)
+        self.assertIn('row["concept_tag_date"]', source)
 
     def test_hot_data_cache_evicts_least_recently_used_entry(self):
         self._clear_hot_data_cache()
@@ -2665,7 +2762,22 @@ class HotDataDetailHelperTest(unittest.TestCase):
             out = hot_data.recommended_stocks_run_history(limit=5)
 
         self.assertEqual(out["total"], 1)
+        self.assertEqual(out["status"], "READY")
         self.assertEqual(out["data"][0]["run_uid"], "abc")
+
+    def test_recommended_run_history_endpoint_never_masks_schema_failure_as_empty(self):
+        with patch(
+            "server.api.routers.hot_data._recommended_run_history_reconcile_scheduler_terminal"
+        ), patch(
+            "server.api.routers.hot_data._ensure_recommended_run_history_table",
+            side_effect=RuntimeError("missing physical column"),
+        ):
+            out = hot_data.recommended_stocks_run_history(limit=5)
+
+        self.assertEqual(out["status"], "DATA_UNAVAILABLE")
+        self.assertEqual(out["error_code"], "recommended_run_history_unavailable")
+        self.assertEqual(out["data"], [])
+        self.assertNotIn("missing physical column", str(out))
 
     def test_recommended_run_history_start_and_finish_write_sql(self):
         build_sha = "c" * 40

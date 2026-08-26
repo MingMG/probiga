@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -16,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from integrations.bigqmt import bridge as bigqmt_bridge
+from integrations.bigqmt.release_identity import (
+    validate_strategy_release_payload,
+)
 from integrations.qmt import bridge
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.info import (
@@ -54,6 +59,13 @@ from server.common.qmt_trade_calendar import (
 
 
 PROVIDER_ID = "gj_qmt"
+BIGQMT_STRATEGY_SOURCE = (
+    ROOT
+    / "integrations"
+    / "bigqmt"
+    / "qmt_strategy"
+    / "probiga_big_qmt_bridge.py"
+)
 INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
     "probiga.qmt-index-weight-publication-receipt.v1"
 )
@@ -1306,27 +1318,188 @@ def _business_index_rows(details: pd.DataFrame) -> pd.DataFrame:
     return out[(out["index_code"] != "") & (out["name"] != "")].drop_duplicates(subset=["index_code"], keep="first")
 
 
-def _fetch_trading_calendar(start_year: int, end_year: int) -> pd.DataFrame:
+def _fetch_trading_calendar(
+    start_year: int,
+    end_year: int,
+    *,
+    expected_build_sha: str,
+    as_of_date: date | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Capture native calendar partitions through the loaded BigQMT model."""
+
+    release_proof = validate_strategy_release_payload(
+        bigqmt_bridge.capabilities(timeout=180),
+        expected_build_sha=expected_build_sha,
+        root=ROOT,
+        source_path=BIGQMT_STRATEGY_SOURCE,
+    )
+    observed_as_of = as_of_date or date.today()
+    if start_year > observed_as_of.year:
+        raise RuntimeError("BigQMT requested calendar range is entirely future")
     frames: list[pd.DataFrame] = []
-    for year in range(start_year, end_year + 1):
-        df = bridge.trading_calendar(
+    partitions: list[dict[str, Any]] = []
+    capture_end_year = min(end_year, observed_as_of.year)
+    for year in range(start_year, capture_end_year + 1):
+        requested_start = f"{year:04d}-01-01"
+        requested_end = (
+            observed_as_of.isoformat()
+            if year == observed_as_of.year
+            else f"{year:04d}-12-31"
+        )
+        capture = bigqmt_bridge.trading_calendar_capture(
             "SH",
-            start_date=f"{year}0101",
-            end_date=f"{year}1231",
+            start_date=requested_start,
+            end_date=requested_end,
             timeout=120,
         )
-        if df is not None and not df.empty:
-            frames.append(df)
+        for key in (
+            "strategy_release_protocol",
+            "strategy_identity_protocol",
+            "strategy_identity_frozen",
+            "strategy_identity_status",
+            "strategy_build_sha",
+            "strategy_git_blob",
+            "strategy_source_sha256",
+            "strategy_artifact_sha256",
+            "strategy_loaded_identity_sha256",
+        ):
+            if capture.get(key) != release_proof.get(key):
+                raise RuntimeError(
+                    "BigQMT calendar response release identity differs"
+                )
+        rows = capture.get("rows")
+        if (
+            capture.get("status") != "ok"
+            or capture.get("source") != "gj_big_qmt_inner"
+            or capture.get("action") != "trading_calendar"
+            or capture.get("source_method")
+            != "ContextInfo.get_trading_dates"
+            or capture.get("source_stock_code") != "000001.SH"
+            or capture.get("requested_start_date") != requested_start
+            or capture.get("requested_end_date") != requested_end
+            or not isinstance(rows, list)
+            or not rows
+        ):
+            raise RuntimeError(
+                f"BigQMT native trading-calendar partition {year} is incomplete"
+            )
+        df = pd.DataFrame(rows)
+        required = {
+            "market", "calendar_year", "trade_date", "trade_status", "day_week",
+        }
+        if not required.issubset(df.columns):
+            raise RuntimeError(
+                f"BigQMT native trading-calendar partition {year} lacks columns"
+            )
+        normalized_dates = pd.to_datetime(
+            df["trade_date"], errors="coerce"
+        )
+        if (
+            normalized_dates.isna().any()
+            or df["trade_date"].astype(str).duplicated().any()
+            or set(df["market"].astype(str)) != {"SH"}
+            or set(pd.to_numeric(df["calendar_year"], errors="coerce"))
+            != {year}
+            or set(pd.to_numeric(df["trade_status"], errors="coerce"))
+            != {1}
+            or not (
+                pd.to_numeric(df["day_week"], errors="coerce").astype("Int64")
+                == normalized_dates.dt.isocalendar().day.astype("Int64")
+            ).all()
+            or str(capture.get("observed_start_date") or "")
+            != normalized_dates.min().date().isoformat()
+            or str(capture.get("observed_end_date") or "")
+            != normalized_dates.max().date().isoformat()
+        ):
+            raise RuntimeError(
+                f"BigQMT native trading-calendar partition {year} differs"
+            )
+        frames.append(df)
+        partitions.append({
+            "calendar_year": year,
+            "requested_start_date": requested_start,
+            "requested_end_date": requested_end,
+            "observed_start_date": capture["observed_start_date"],
+            "observed_end_date": capture["observed_end_date"],
+            "session_count": int(len(df)),
+            "session_set_hash": canonical_digest({
+                "schema": "probiga.bigqmt-calendar-partition.v1",
+                "calendar_year": year,
+                "sessions": sorted(df["trade_date"].astype(str).tolist()),
+            }),
+        })
     if not frames:
-        return pd.DataFrame(columns=["calendar_year", "trade_date", "trade_status", "day_week"])
+        raise RuntimeError("BigQMT native trading calendar returned no partitions")
     out = pd.concat(frames, ignore_index=True)
     out["calendar_year"] = pd.to_numeric(out["calendar_year"], errors="coerce").astype("Int64")
     out["trade_status"] = 1
     out["day_week"] = pd.to_numeric(out["day_week"], errors="coerce").astype("Int64")
-    return out[["calendar_year", "trade_date", "trade_status", "day_week"]].drop_duplicates(
+    out = out[["calendar_year", "trade_date", "trade_status", "day_week"]].drop_duplicates(
         subset=["calendar_year", "trade_date"],
         keep="first",
     )
+    proven_start = str(out["trade_date"].min())
+    proven_end = str(out["trade_date"].max())
+    requested_start = f"{start_year:04d}-01-01"
+    requested_end = f"{end_year:04d}-12-31"
+    unproven_after = (
+        (date.fromisoformat(proven_end) + timedelta(days=1)).isoformat()
+        if proven_end < requested_end
+        else None
+    )
+    evidence = {
+        "schema": "probiga.bigqmt-calendar-capture.v1",
+        "provider": "gj_big_qmt_inner",
+        "source_method": "ContextInfo.get_trading_dates",
+        "strategy_release": release_proof,
+        "requested_start_date": requested_start,
+        "requested_end_date": requested_end,
+        "proven_start_date": proven_start,
+        "proven_end_date": proven_end,
+        "unproven_after_date": unproven_after,
+        "future_range_status": (
+            "NOT_COVERED_NO_AUTHORITATIVE_FUTURE_CALENDAR"
+            if unproven_after else "NONE"
+        ),
+        "partitions": partitions,
+        "partition_manifest_hash": canonical_digest({
+            "schema": "probiga.bigqmt-calendar-partition-manifest.v1",
+            "partitions": partitions,
+        }),
+    }
+    return out, evidence
+
+
+def _build_proven_calendar_manifest(
+    *,
+    batch_id: str,
+    captured_at: datetime,
+    calendar: pd.DataFrame,
+    capture_evidence: Mapping[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Build a receipt only for the native source's observed interval."""
+
+    proven_start_date = str(capture_evidence.get("proven_start_date") or "")
+    proven_end_date = str(capture_evidence.get("proven_end_date") or "")
+    if calendar.empty or not proven_start_date or not proven_end_date:
+        raise RuntimeError("BigQMT calendar proven range is unavailable")
+    sessions = calendar["trade_date"].astype(str).tolist()
+    if min(sessions) != proven_start_date or max(sessions) != proven_end_date:
+        raise RuntimeError("BigQMT calendar sessions differ from proven range")
+    source_id = calendar_source_batch_id(
+        start_date=proven_start_date,
+        end_date=proven_end_date,
+        sessions=sessions,
+    )
+    manifest, _ = build_calendar_manifest(
+        batch_id=batch_id,
+        source_batch_id=source_id,
+        known_at=captured_at,
+        start_date=proven_start_date,
+        end_date=proven_end_date,
+        sessions=sessions,
+    )
+    return manifest, source_id
 
 
 def _append_replace_source(engine: Engine, table_name: str, df: pd.DataFrame, *, source_column: str, source_value: str) -> int:
@@ -1734,12 +1907,20 @@ def sync_reference_data(
     historical_instrument_archive: str = "",
     release_build_sha: str = "",
 ) -> dict[str, Any]:
+    normalized_release_sha = str(release_build_sha or "").strip().lower()
+    if not skip_calendar and not normalized_release_sha:
+        normalized_release_sha = os.environ.get(
+            "PROBIGA_BUILD_COMMIT_SHA", ""
+        ).strip().lower()
+    if not skip_calendar and not normalized_release_sha:
+        raise RuntimeError(
+            "BigQMT formal calendar capture requires a release build SHA"
+        )
     engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
     # The scheduled runtime account is DML-only.  DDL/triggers are installed
     # once by the privileged schema migration path.
     validate_reference_tables(engine)
     captured_at = datetime.now().replace(microsecond=0)
-    normalized_release_sha = str(release_build_sha or "").strip().lower()
     if normalized_release_sha:
         # The full release identity is committed into both append-only
         # manifests while keeping the shared VARCHAR(64) batch contract.
@@ -1986,11 +2167,18 @@ def sync_reference_data(
     )
 
     calendar_error = ""
+    calendar_capture_evidence: dict[str, Any] | None = None
     if skip_calendar:
         calendar = pd.DataFrame(columns=["calendar_year", "trade_date", "trade_status", "day_week"])
     else:
         try:
-            calendar = _stamp(_fetch_trading_calendar(start_year, end_year), batch_id)
+            calendar, calendar_capture_evidence = _fetch_trading_calendar(
+                start_year,
+                end_year,
+                expected_build_sha=normalized_release_sha,
+                as_of_date=captured_at.date(),
+            )
+            calendar = _stamp(calendar, batch_id)
         except Exception as exc:
             calendar_error = str(exc)
             calendar = pd.DataFrame(columns=["calendar_year", "trade_date", "trade_status", "day_week"])
@@ -2002,18 +2190,11 @@ def sync_reference_data(
                 "QMT trade calendar receipt is incomplete: "
                 + (calendar_error or "empty source")
             )
-        calendar_source_id = calendar_source_batch_id(
-            start_date=f"{start_year:04d}-01-01",
-            end_date=f"{end_year:04d}-12-31",
-            sessions=calendar["trade_date"].tolist(),
-        )
-        calendar_manifest, _ = build_calendar_manifest(
+        calendar_manifest, calendar_source_id = _build_proven_calendar_manifest(
             batch_id=batch_id,
-            source_batch_id=calendar_source_id,
-            known_at=datetime.now().replace(microsecond=0),
-            start_date=f"{start_year:04d}-01-01",
-            end_date=f"{end_year:04d}-12-31",
-            sessions=calendar["trade_date"].tolist(),
+            captured_at=datetime.now().replace(microsecond=0),
+            calendar=calendar,
+            capture_evidence=calendar_capture_evidence or {},
         )
 
     if dry_run:
@@ -2038,6 +2219,7 @@ def sync_reference_data(
             },
             "stock_catalog": catalog_manifest,
             "trade_calendar": calendar_manifest,
+            "trade_calendar_capture": calendar_capture_evidence,
             "index_weight_publication": {
                 **index_weight_coverage,
                 "publication_status": "DRY_RUN_NOT_PUBLISHED",
@@ -2053,6 +2235,7 @@ def sync_reference_data(
         "release_build_sha": normalized_release_sha or None,
         "stock_catalog": catalog_manifest,
         "trade_calendar": calendar_manifest,
+        "trade_calendar_capture": calendar_capture_evidence,
         "index_weight_publication": index_weight_coverage,
         "tables": {},
     }

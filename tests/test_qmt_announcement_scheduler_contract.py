@@ -187,7 +187,7 @@ def test_production_checkpoint_root_is_frozen_and_must_preexist(
         _checkpoint_root(str(tmp_path / "mutable-other-root"))
 
 
-def test_analysis_waits_for_today_terminal_qmt_task_but_accepts_data_blocked_terminal():
+def test_analysis_requires_exact_successful_capital_flow_and_terminal_qmt_task():
     now = datetime(2026, 8, 25, 18, 50)
     ready, reason = evaluate_strategy_pipeline_dependencies(
         "analysis_fast", [], now=now
@@ -197,23 +197,42 @@ def test_analysis_waits_for_today_terminal_qmt_task_but_accepts_data_blocked_ter
 
     ready, reason = evaluate_strategy_pipeline_dependencies(
         "analysis_fast",
-        [_dependency("qmt_announcement_pit", datetime(2026, 8, 25, 18, 20), "blocked")],
+        [
+            _dependency("qmt_announcement_pit", datetime(2026, 8, 25, 18, 20), "blocked"),
+            _dependency("capital_flow_batch_fast", datetime(2026, 8, 25, 15, 20)),
+        ],
         now=now,
     )
     assert ready is True
     assert reason == "ready"
+
+    ready, reason = evaluate_strategy_pipeline_dependencies(
+        "analysis_fast",
+        [
+            _dependency("qmt_announcement_pit", datetime(2026, 8, 25, 18, 20)),
+            _dependency(
+                "capital_flow_batch_fast",
+                datetime(2026, 8, 25, 15, 20),
+                "blocked",
+            ),
+        ],
+        now=now,
+    )
+    assert ready is False
+    assert reason == "capital_flow_batch_fast:not_success_today"
 
 
 def test_governance_requires_analysis_to_have_run_after_qmt_terminal():
     now = datetime(2026, 8, 25, 22, 35)
     rows = [
         _dependency("qmt_announcement_pit", datetime(2026, 8, 25, 18, 20)),
+        _dependency("capital_flow_batch_fast", datetime(2026, 8, 25, 15, 20)),
         _dependency("analysis_fast", datetime(2026, 8, 25, 18, 50)),
     ]
     assert evaluate_strategy_pipeline_dependencies(
         "strategy_governance_daily", rows, now=now
     ) == (True, "ready")
-    rows[1]["last_triggered_at"] = datetime(2026, 8, 25, 18, 10)
+    rows[2]["last_triggered_at"] = datetime(2026, 8, 25, 18, 10)
     assert evaluate_strategy_pipeline_dependencies(
         "strategy_governance_daily", rows, now=now
     )[0] is False

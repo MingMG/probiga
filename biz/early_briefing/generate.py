@@ -34,7 +34,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 log = logging.getLogger("briefing")
 
 from server.common.batch_db import create_batch_engine, read_records
+from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.config import get_settings, get_wecom_webhook
+from server.common.daily_stock_universe import (
+    load_daily_stock_universe,
+    validate_daily_stock_coverage,
+)
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
 from integrations.wecom.delivery import deliver_markdown
 try:
@@ -44,6 +49,11 @@ except Exception:
     format_radar_markdown = None
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+EXPECTED_A_SHARE_INDEX_CODES = frozenset(
+    {"000001", "399001", "399006", "000688", "000300"}
+)
+MIN_HOT_CONCEPT_ROWS = 20
+MIN_FUSED_HOT_STOCK_ROWS = 20
 
 HEADERS_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -54,6 +64,217 @@ def get_engine():
 
 def _read_sql(engine, sql: str, params: dict = None) -> list[dict]:
     return read_records(sql, engine, params=params, ignore_errors=True)
+
+
+def _read_required_sql(engine, sql: str, params: dict = None) -> list[dict]:
+    """Read one publication input without hiding a database/schema failure."""
+
+    return read_records(sql, engine, params=params, ignore_errors=False)
+
+
+def _iso_trade_date(value: object, *, field: str) -> str:
+    raw = str(value or "")[:10]
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"DATA_BLOCKED: {field} is not a valid trade date") from exc
+    if parsed.isoformat() != raw:
+        raise RuntimeError(f"DATA_BLOCKED: {field} is not a valid trade date")
+    return raw
+
+
+def resolve_target_trade_date(engine, *, now: datetime | None = None) -> str:
+    target = authoritative_closed_trade_date(engine, now=now)
+    if not target:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative closed trade date is unavailable"
+        )
+    return _iso_trade_date(target, field="authoritative closed trade date")
+
+
+def _row_date(value: object) -> str:
+    return str(value or "")[:10]
+
+
+def _assert_rows_on_target(
+    rows: list[dict], *, date_field: str, target: str, source: str
+) -> None:
+    wrong = sorted(
+        {
+            _row_date(row.get(date_field)) or "<empty>"
+            for row in rows
+            if _row_date(row.get(date_field)) != target
+        }
+    )
+    if wrong:
+        raise RuntimeError(
+            f"DATA_BLOCKED: {source} contains mixed dates: "
+            f"target={target}, actual_dates={wrong[:10]}"
+        )
+
+
+def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
+    """Load and prove one same-date A-share briefing snapshot."""
+
+    target = _iso_trade_date(target_trade_date, field="target trade date")
+    params = {"target_date": target}
+    kline_rows = _read_required_sql(
+        engine,
+        """
+        SELECT stock_code, trade_date, volume, amount
+        FROM sm_stock_kline
+        WHERE trade_date=:target_date AND k_type=1 AND adjust_type=0
+        ORDER BY stock_code
+        """,
+        params,
+    )
+    flow_rows = _read_required_sql(
+        engine,
+        """
+        SELECT f.stock_code, f.trade_date,
+               COALESCE(s.short_name, '') AS sn, f.main_net_inflow
+        FROM sm_stock_capital_flow_daily f
+        LEFT JOIN si_all_code s ON f.stock_code=s.stock_code
+        WHERE f.trade_date=:target_date
+        ORDER BY f.stock_code
+        """,
+        params,
+    )
+    _assert_rows_on_target(
+        kline_rows,
+        date_field="trade_date",
+        target=target,
+        source="daily K-line",
+    )
+    _assert_rows_on_target(
+        flow_rows,
+        date_field="trade_date",
+        target=target,
+        source="capital flow",
+    )
+    universe = load_daily_stock_universe(
+        engine,
+        target,
+        decision_known_at=datetime.now().replace(microsecond=0),
+    )
+    coverage = validate_daily_stock_coverage(
+        universe,
+        kline_rows=kline_rows,
+        flow_rows=flow_rows,
+    )
+
+    index_rows = _read_required_sql(
+        engine,
+        """
+        SELECT index_code, price, change_pct, trade_date
+        FROM sm_index_current
+        WHERE trade_date=:target_date
+          AND index_code IN ('000001','399001','399006','000688','000300')
+        ORDER BY FIELD(index_code,'000001','399001','399006','000688','000300')
+        """,
+        params,
+    )
+    _assert_rows_on_target(
+        index_rows,
+        date_field="trade_date",
+        target=target,
+        source="A-share index",
+    )
+    index_codes = {
+        str(row.get("index_code") or "").strip() for row in index_rows
+        if row.get("price") is not None and _row_date(row.get("trade_date")) == target
+    }
+    if index_codes != EXPECTED_A_SHARE_INDEX_CODES:
+        missing = sorted(EXPECTED_A_SHARE_INDEX_CODES - index_codes)
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date A-share index snapshot is incomplete: "
+            f"target={target}, actual={len(index_codes)}, missing={missing}"
+        )
+
+    hot_rows = _read_required_sql(
+        engine,
+        """
+        SELECT concept_code, concept_name, change_pct, hot_value, plate_type,
+               snapshot_date
+        FROM st_hot_concept_ths_daily
+        WHERE snapshot_date=:target_date AND plate_type IN (1,2)
+        ORDER BY plate_type, `rank`
+        """,
+        params,
+    )
+    _assert_rows_on_target(
+        hot_rows,
+        date_field="snapshot_date",
+        target=target,
+        source="hot concept",
+    )
+    plate_types = {int(row.get("plate_type") or 0) for row in hot_rows}
+    if len(hot_rows) < MIN_HOT_CONCEPT_ROWS or not {1, 2} <= plate_types:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date hot concept snapshot is incomplete: "
+            f"target={target}, rows={len(hot_rows)}, plate_types={sorted(plate_types)}"
+        )
+
+    fused_rows = _read_required_sql(
+        engine,
+        """
+        SELECT f.short_name, f.stock_code, f.change_pct, f.fused_rank,
+               f.snapshot_date, t.pop_tag, t.concept_tag
+        FROM st_hot_rank_fused f
+        LEFT JOIN st_hot_rank_ths t
+          ON t.stock_code=f.stock_code COLLATE utf8mb4_unicode_ci
+         AND t.snapshot_date=f.snapshot_date
+        WHERE f.snapshot_date=:target_date
+        ORDER BY f.fused_rank
+        """,
+        params,
+    )
+    _assert_rows_on_target(
+        fused_rows,
+        date_field="snapshot_date",
+        target=target,
+        source="fused hot stock",
+    )
+    fused_codes = {
+        str(row.get("stock_code") or "").strip() for row in fused_rows
+        if str(row.get("stock_code") or "").strip()
+    }
+    if len(fused_codes) < MIN_FUSED_HOT_STOCK_ROWS:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date fused hot-stock snapshot is incomplete: "
+            f"target={target}, distinct_stocks={len(fused_codes)}"
+        )
+
+    return {
+        "target_trade_date": target,
+        "kline_rows": kline_rows,
+        "flow_rows": flow_rows,
+        "index_rows": index_rows,
+        "hot_rows": hot_rows,
+        "fused_rows": fused_rows,
+        "coverage": coverage,
+    }
+
+
+def _assert_market_data_contract(data: dict, target_trade_date: str) -> dict:
+    contract = data.get("_data_contract") if isinstance(data, dict) else None
+    if not isinstance(contract, dict):
+        raise RuntimeError("DATA_BLOCKED: early briefing data contract is missing")
+    target = _iso_trade_date(target_trade_date, field="target trade date")
+    if (
+        contract.get("status") != "PASS"
+        or contract.get("target_trade_date") != target
+        or int(contract.get("index_count") or 0) != len(EXPECTED_A_SHARE_INDEX_CODES)
+        or int(contract.get("hot_concept_count") or 0) < MIN_HOT_CONCEPT_ROWS
+        or int(contract.get("fused_stock_count") or 0) < MIN_FUSED_HOT_STOCK_ROWS
+        or int(contract.get("expected_stock_count") or 0) <= 0
+        or float(contract.get("kline_coverage") or 0) != 1.0
+        or float(contract.get("traded_flow_coverage") or 0) != 1.0
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: early briefing data contract is stale or incomplete"
+        )
+    return contract
 
 
 def _fmt_pct(v) -> str:
@@ -73,9 +294,13 @@ def _fmt_money(v) -> str:
 # 1. 市场数据采集
 # ═══════════════════════════════════════════
 
-def collect_market_data(engine) -> dict:
-    """采集所有市场数据用于 AI 分析"""
-    data = {}
+def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
+    """采集一个权威目标交易日的完整核心市场数据。"""
+
+    target = target_trade_date or resolve_target_trade_date(engine)
+    core = _load_core_market_snapshot(engine, target)
+    target = core["target_trade_date"]
+    data = {"A股数据日期": target}
 
     # 1.1 美股
     try:
@@ -96,48 +321,50 @@ def collect_market_data(engine) -> dict:
         data["美股"] = {"数据状态": f"暂不可用：{e}"}
 
     # 1.2 A股指数
-    rows = _read_sql(engine, """SELECT i.index_code, i.price, i.change_pct FROM sm_index_current i WHERE i.index_code IN
-        ('000001','399001','399006','000688','000300') ORDER BY FIELD(i.index_code,'000001','399001','399006','000688','000300')""")
+    rows = core["index_rows"]
     nm = {"000001": "上证", "399001": "深成指", "399006": "创业板", "000688": "科创50", "000300": "沪深300"}
     data["A股指数"] = {nm.get(r["index_code"], r["index_code"]): f"{_fmt_pct(r.get('change_pct'))} ({r.get('price')})"
                        for r in rows if r.get("price")}
 
-    # 1.3 热门板块（基于最新交易日）
-    latest_trade_date = _read_sql(engine, "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
-    trade_date = latest_trade_date[0]["d"] if latest_trade_date and latest_trade_date[0].get("d") else None
-
-    rows = _read_sql(engine, "SELECT * FROM st_hot_concept_ths_daily WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_concept_ths_daily WHERE snapshot_date >= :d) ORDER BY plate_type, `rank` LIMIT 20", {"d": trade_date})
+    # 1.3 热门板块（严格绑定权威目标交易日）
+    rows = core["hot_rows"]
     concepts = [f"{r['concept_name']}({_fmt_pct(r.get('change_pct'))})" for r in rows if r.get("plate_type") == 1][:8]
     industries = [f"{r['concept_name']}({_fmt_pct(r.get('change_pct'))})" for r in rows if r.get("plate_type") == 2][:5]
     data["热门概念"] = concepts
     data["热门行业"] = industries
 
     # 1.4 资金流向
-    rows = _read_sql(engine, """SELECT f.stock_code, COALESCE(s.short_name,'') AS sn, f.main_net_inflow
-        FROM sm_stock_capital_flow_daily f LEFT JOIN si_all_code s ON f.stock_code=s.stock_code
-        WHERE f.trade_date = (SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily)
-        ORDER BY f.main_net_inflow DESC LIMIT 8""")
-    data["净流入TOP"] = [f"{r['sn']}({_fmt_money(r['main_net_inflow'])})" for r in rows if float(r['main_net_inflow'] or 0) > 0]
-
-    rows = _read_sql(engine, """SELECT f.stock_code, COALESCE(s.short_name,'') AS sn, f.main_net_inflow
-        FROM sm_stock_capital_flow_daily f LEFT JOIN si_all_code s ON f.stock_code=s.stock_code
-        WHERE f.trade_date = (SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily)
-        ORDER BY f.main_net_inflow ASC LIMIT 5""")
-    data["净流出TOP"] = [f"{r['sn']}({_fmt_money(abs(float(r['main_net_inflow'] or 0)))})" for r in rows if float(r['main_net_inflow'] or 0) < 0]
+    flow_rows = sorted(
+        core["flow_rows"],
+        key=lambda row: float(row.get("main_net_inflow") or 0),
+        reverse=True,
+    )
+    data["净流入TOP"] = [
+        f"{r['sn']}({_fmt_money(r['main_net_inflow'])})"
+        for r in flow_rows[:8]
+        if float(r.get("main_net_inflow") or 0) > 0
+    ]
+    data["净流出TOP"] = [
+        f"{r['sn']}({_fmt_money(abs(float(r['main_net_inflow'] or 0)))})"
+        for r in reversed(flow_rows[-5:])
+        if float(r.get("main_net_inflow") or 0) < 0
+    ]
 
     # 1.5 成交额（基于最新交易日）
-    if trade_date:
-        rows = _read_sql(engine, "SELECT COALESCE(SUM(amount),0) AS a FROM sm_stock_kline WHERE k_type=1 AND trade_date=:d", {"d": trade_date})
-        if rows and rows[0].get("a"):
-            data["成交额"] = f"{float(rows[0]['a']) / 1e8:.0f}亿"
+    total_amount = sum(float(row.get("amount") or 0) for row in core["kline_rows"])
+    if total_amount <= 0:
+        raise RuntimeError(
+            f"DATA_BLOCKED: target-date turnover is empty: target={target}"
+        )
+    data["成交额"] = f"{total_amount / 1e8:.0f}亿"
 
     # 1.6 热门个股（基于最新交易日）
-    if trade_date:
-        rows = _read_sql(engine, """SELECT f.*, t.pop_tag, t.concept_tag FROM st_hot_rank_fused f
-            LEFT JOIN st_hot_rank_ths t ON t.stock_code=f.stock_code COLLATE utf8mb4_unicode_ci AND t.snapshot_date=f.snapshot_date
-            WHERE f.snapshot_date=(SELECT MAX(snapshot_date) FROM st_hot_rank_fused WHERE snapshot_date >= :d) ORDER BY f.fused_rank LIMIT 10""", {"d": trade_date})
-        data["热门个股"] = [f"{r['short_name']}({r['stock_code']}) {_fmt_pct(r.get('change_pct'))} {r.get('pop_tag','') or r.get('concept_tag','')}"
-                           for r in rows]
+    rows = core["fused_rows"][:10]
+    data["热门个股"] = [
+        f"{r['short_name']}({r['stock_code']}) {_fmt_pct(r.get('change_pct'))} "
+        f"{r.get('pop_tag','') or r.get('concept_tag','')}"
+        for r in rows
+    ]
 
     # 1.7 数据库快讯（近2天重要）
     yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -145,14 +372,33 @@ def collect_market_data(engine) -> dict:
         WHERE DATE(publish_time) >= :d ORDER BY is_top DESC, publish_time DESC LIMIT 30""", {"d": yesterday})
     data["DB快讯"] = [f"[{r.get('source','')}] {r.get('title','') or r.get('content','')}" for r in rows]
     if build_research_radar is not None:
-        data["研报趋势雷达"] = build_research_radar(engine, str(trade_date)[:10] if trade_date else None)
+        data["研报趋势雷达"] = build_research_radar(engine, target)
     else:
         data["研报趋势雷达"] = {}
     data["风险机会决策雷达"] = fetch_tech_risk_signal(
         lambda sql, params=None: _read_sql(engine, sql, params),
-        str(trade_date)[:10] if trade_date else None,
+        target,
     )
     data["科技风险雷达"] = data["风险机会决策雷达"]
+    coverage = core["coverage"]
+    data["_data_contract"] = {
+        "status": "PASS",
+        "target_trade_date": target,
+        "expected_stock_count": int(coverage["expected_count"]),
+        "kline_count": int(coverage["kline_count"]),
+        "kline_coverage": float(coverage["kline_coverage"]),
+        "flow_count": int(coverage["flow_count"]),
+        "traded_flow_coverage": float(coverage["traded_flow_coverage"]),
+        "catalog_manifest_hash": coverage["catalog_manifest_hash"],
+        "expected_code_set_hash": coverage["expected_code_set_hash"],
+        "index_count": len(EXPECTED_A_SHARE_INDEX_CODES),
+        "hot_concept_count": len(core["hot_rows"]),
+        "fused_stock_count": len({
+            str(row.get("stock_code") or "").strip()
+            for row in core["fused_rows"]
+        }),
+    }
+    _assert_market_data_contract(data, target)
 
     return data
 
@@ -412,7 +658,9 @@ def main():
 
     # 采集数据
     log.info("1/4 采集市场数据...")
-    market_data = collect_market_data(engine)
+    target_trade_date = resolve_target_trade_date(engine)
+    market_data = collect_market_data(engine, target_trade_date)
+    _assert_market_data_contract(market_data, target_trade_date)
 
     log.info("2/4 爬取新闻快讯...")
     news = crawl_all_news()
@@ -473,7 +721,11 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
     now = datetime.now()
     date_label = f"{now.month}月{now.day}日 星期{['一','二','三','四','五','六','日'][now.weekday()]}"
 
-    lines = [f"## A股早报 | {date_label}", ""]
+    lines = [
+        f"## A股早报 | {date_label}",
+        f"> A股核心数据日期：{market_data.get('A股数据日期', '-')}",
+        "",
+    ]
 
     us = market_data.get("美股", {})
     if us:

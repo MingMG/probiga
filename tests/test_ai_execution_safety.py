@@ -420,10 +420,20 @@ def test_sim_trade_missing_recommendation_never_generates_or_prepares() -> None:
 
 def test_registered_sim_prepare_and_morning_analysis_have_no_repair_flags() -> None:
     tasks = {item["task_type"]: item for item in ensure_quality_gate.TASKS}
-    assert tasks["sim_trade_signal_prepare"]["script_args"] == "--prepare-signals --json"
+    assert tasks["sim_trade_signal_prepare"]["script_args"] == (
+        "--prepare-signals --reset --json"
+    )
     assert "--ensure-recommendations" not in tasks["sim_trade_signal_prepare"]["script_args"]
     assert "--auto-repair" not in tasks["analysis_morning_strict"]["script_args"]
     assert "--auto-repair" not in tasks["analysis_premarket_external"]["script_args"]
+    assert tasks["analysis_fast"]["script_path"] == (
+        "tools/run_ai_recommendation_premarket.py"
+    )
+    assert tasks["analysis_morning_strict"]["script_path"] == (
+        "tools/run_ai_recommendation_premarket.py"
+    )
+    assert "--json" in tasks["analysis_fast"]["script_args"]
+    assert "--json" in tasks["analysis_morning_strict"]["script_args"]
 
 
 def test_retired_worker_has_no_database_or_subprocess_execution(monkeypatch) -> None:

@@ -7,7 +7,10 @@ from pathlib import Path
 import pandas as pd
 
 from integrations.qmt.backend import QmtBackend, from_qmt_symbol, to_qmt_symbol
-from integrations.qmt.runtime import ensure_xtquant_on_path
+from integrations.qmt.runtime import (
+    ensure_xtquant_on_path,
+    qmt_connection_port_candidates,
+)
 
 
 def test_qmt_symbol_mapping_roundtrip():
@@ -105,3 +108,30 @@ def test_current_transform_accepts_fractional_qmt_timetag(monkeypatch):
 
     assert rows[0]["snapshot_at"] == "2026-06-26 15:00:00"
     assert rows[0]["stock_code"] == "000001"
+
+
+def test_worker_connect_never_uses_bigqmt_58600_as_default_fallback(
+    monkeypatch,
+):
+    fake_xtquant = types.ModuleType("xtquant")
+    fake_xtdata = types.ModuleType("xtdata")
+    fake_xtquant.xtdata = fake_xtdata
+    monkeypatch.setitem(sys.modules, "xtquant", fake_xtquant)
+    monkeypatch.setitem(sys.modules, "xtquant.xtdata", fake_xtdata)
+
+    from integrations.qmt import worker
+
+    attempted: list[int] = []
+
+    def connect(*, port, remember_if_success):
+        assert remember_if_success is False
+        attempted.append(port)
+        if port != 58610:
+            raise RuntimeError("not this QMT desktop port")
+
+    monkeypatch.setenv("QMT_PORT", "59999")
+    monkeypatch.setattr(worker.xtdata, "connect", connect, raising=False)
+
+    assert worker._connect() == 58610
+    assert attempted == [59999, 58610]
+    assert 58600 not in qmt_connection_port_candidates("")

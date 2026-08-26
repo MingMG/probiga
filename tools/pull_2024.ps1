@@ -39,31 +39,9 @@ python tools/run_single_table.py si_concept_constituent_east
 Write-Host "✅ 东财概念代码完成" -ForegroundColor Green
 
 # ====== 第二步：逐日热门数据（同花顺热股+概念+东财人气+融合）======
-Write-Host "`n----- 2/6 逐日热门数据（2024-01-01 ~ 今天）-----" -ForegroundColor Green
-$d = $START_DATE
-$day = 0
-while ($d -le $END_DATE) {
-    $dateStr = $d.ToString("yyyy-MM-dd")
-    $day++
-    if ($day % 100 -eq 0) { Write-Host "  进度: $day/$TOTAL_DAYS ($dateStr)" -ForegroundColor Yellow }
-    
-    # 同花顺热股（有历史）
-    python tools/fetch_hot_rank_ths.py $dateStr 2>$null
-    
-    # 同花顺概念（有历史）
-    python tools/fetch_hot_concept_ths_daily.py $dateStr 2>$null
-    
-    # 东财人气榜（仅当天有数据，历史日期跳过空）
-    python tools/fetch_hot_pop_rank_east.py $dateStr 2>$null
-    
-    # 融合榜单（有历史）
-    python tools/merge_hot_rank.py $dateStr --top 100 2>$null
-    python tools/merge_hot_rank.py $dateStr --top 100 --days 3 2>$null
-    python tools/merge_hot_rank.py $dateStr --top 100 --days 5 2>$null
-    
-    $d = $d.AddDays(1)
-}
-Write-Host "✅ 逐日热门数据完成" -ForegroundColor Green
+Write-Host "`n----- 2/6 逐日热门数据历史批量入口已禁用 -----" -ForegroundColor Green
+Write-Host "THS/Sina/XQ 只有当前快照；东财历史榜须按目标日期通过正式脚本单独恢复。" -ForegroundColor Yellow
+Write-Host "✅ 安全跳过（未生成融合榜）" -ForegroundColor Green
 
 # ====== 第三步：逐日龙虎榜（2024-01-01 起）======
 Write-Host "`n----- 3/6 逐日龙虎榜（2024-01-01 ~ 今天）-----" -ForegroundColor Green
@@ -125,9 +103,7 @@ python tools/fetch_sector_heat_east_daily.py $today
 python tools/fetch_hot_rank_ths.py $today
 python tools/fetch_hot_concept_ths_daily.py $today
 python tools/fetch_hot_pop_rank_east.py $today
-python tools/merge_hot_rank.py $today --top 100
-python tools/merge_hot_rank.py $today --top 100 --days 3
-python tools/merge_hot_rank.py $today --top 100 --days 5
+# Legacy bulk recovery never publishes fused data; the formal scheduler owns it.
 Write-Host "✅ 当天热门数据完成" -ForegroundColor Green
 
 python tools/run_single_table.py sm_stock_current

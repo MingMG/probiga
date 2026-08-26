@@ -238,7 +238,21 @@ def install_qmt_strategy(
     for installed_target in targets:
         if str(installed_target) in installed_paths:
             continue
-        shutil.copy2(source, installed_target)
+        # QMT keeps the already-running model in memory while a release is
+        # prepared.  Publish each on-disk alias with an atomic replace so the
+        # model editor can never observe a partially copied Python file.  The
+        # release installer verifies every alias before the UI control plane
+        # is allowed to stop the old in-memory model.
+        temporary_target = installed_target.with_name(
+            f".{installed_target.name}.{os.getpid()}.tmp"
+        )
+        try:
+            shutil.copy2(source, temporary_target)
+            with temporary_target.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            _replace_with_retry(temporary_target, installed_target)
+        finally:
+            temporary_target.unlink(missing_ok=True)
         installed_paths.add(str(installed_target))
     bridge_dir(home).mkdir(parents=True, exist_ok=True)
     return target

@@ -50,15 +50,18 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert "client_started_at" in source
     assert "no daily attempt limit" in source
     assert "QMT 2.1.19" in source
-    assert "0.105 0.078" in source
-    assert "0.470 0.030" in source
-    assert "SearchX = 0.325" in source
-    assert "SearchY = 0.065" in source
-    assert "EditX = 0.474" in source
-    assert "EditY = 0.133" in source
-    assert "SearchX = 0.125" in source
-    assert "SearchX = 0.380" in source
-    assert "0.183 0.095" in source
+    assert "0.056 0.039" in source
+    assert "0.470 0.015" in source
+    assert "FindStrategyPaneLeft" in source
+    assert "CreateDIBSection" in source
+    assert "BitBlt" in source
+    assert "$fullWidthList" in source
+    assert "$embeddedList" in source
+    assert "$paneLeft + 70" in source
+    assert "$paneLeft + 322" in source
+    assert "SearchX = 0.325" not in source
+    assert "EditX = 0.458" not in source
+    assert "0.339 0.151" in source
     assert "last_price" not in source
 
 

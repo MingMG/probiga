@@ -55,6 +55,28 @@ def test_privileged_migrator_adds_only_missing_extension_columns():
     assert result["required_surface_verified"] is True
 
 
+def test_privileged_migrator_adds_legacy_nullable_created_at():
+    engine = MagicMock()
+    before = _complete_columns() - {"created_at"}
+    after = _complete_columns()
+    with patch.object(
+        scheduler_tasks,
+        "table_columns",
+        side_effect=[before, after],
+    ):
+        result = scheduler_tasks.privileged_migrate_scheduler_task_columns(
+            engine
+        )
+
+    sql = "\n".join(
+        str(call.args[0])
+        for call in engine.begin.return_value.__enter__.return_value.execute.call_args_list
+    ).upper()
+    assert sql.count("ALTER TABLE") == 1
+    assert "ADD COLUMN `CREATED_AT` DATETIME DEFAULT NULL" in sql
+    assert result["added_columns"] == ("created_at",)
+
+
 def test_privileged_migrator_never_fabricates_missing_base_schema():
     engine = MagicMock()
     with patch.object(

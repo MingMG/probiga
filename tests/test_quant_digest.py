@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -467,6 +468,29 @@ def test_persistence_stores_quality_receipt_for_blocked_generation_too(monkeypat
     assert payload["publish_status"] == PUBLISH_BLOCKED
     assert payload["compact_review"] == ""
     assert '"status":"blocked"' in payload["quality_json"]
+
+
+def test_persistence_serializes_nested_database_dates_in_quality_receipt(monkeypatch):
+    monkeypatch.setattr(
+        quant_digest_module, "validate_quant_digest_runtime", lambda _engine: None,
+    )
+    engine = _Engine()
+    result = _ready_result()
+    result["quality_json"]["gates"][0]["actual"] = {
+        "snapshot_date": date(2026, 8, 12),
+        "captured_at": datetime(2026, 8, 12, 16, 0),
+        "nested": [date(2026, 8, 11)],
+    }
+
+    persist_quant_digest(engine, result)
+
+    _, payload = engine.connection.calls[-1]
+    receipt = json.loads(payload["quality_json"])
+    assert receipt["gates"][0]["actual"] == {
+        "snapshot_date": "2026-08-12",
+        "captured_at": "2026-08-12T16:00:00",
+        "nested": ["2026-08-11"],
+    }
 
 
 def test_blocked_rerun_cannot_overwrite_existing_ready_digest(monkeypatch):

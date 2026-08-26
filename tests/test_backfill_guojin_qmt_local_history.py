@@ -10,6 +10,7 @@ from sqlalchemy.engine import make_url
 from integrations.qmt import local_history
 from integrations.qmt.local_history import (
     LOCAL_KLINE_TABLE,
+    LOCAL_MINUTE_TABLE,
     LocalBackfillBatchResult,
     LocalBackfillResult,
 )
@@ -109,6 +110,36 @@ def _result(*, code_count=2, fetched_rows=2, written_rows=0):
             )
         ],
     )
+
+
+def test_positive_rows_cannot_resolve_a_partial_or_unattested_gap():
+    partial_minute = LocalBackfillResult(
+        run_id="run-partial",
+        dataset=LOCAL_MINUTE_TABLE,
+        status="SUCCESS",
+        local_database="probiga_qmt_history",
+        start_date="2026-08-19",
+        end_date="2026-08-19",
+        code_count=80,
+        batch_count=1,
+        fetched_rows=1,
+        written_rows=1,
+        batches=[],
+        coverage_status="PARTIAL",
+    )
+
+    assert backfill_tool._result_proves_exact_gap_coverage(
+        dataset="sm_stock_minute.1m",
+        result=partial_minute,
+        authoritative_codes=[f"{code:06d}" for code in range(80)],
+        trade_dates=["2026-08-19"],
+    ) is False
+    assert backfill_tool._result_proves_exact_gap_coverage(
+        dataset="sm_stock_kline.1d",
+        result=_result(written_rows=1),
+        authoritative_codes=["000001", "600000"],
+        trade_dates=["2026-08-19"],
+    ) is False
 
 
 def test_target_window_universe_uses_exact_a_share_union_and_dates(

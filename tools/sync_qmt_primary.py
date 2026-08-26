@@ -691,6 +691,7 @@ def run_dataset(
     minute_count: int = 0,
     start_date: str = "",
     end_date: str = "",
+    require_bigqmt: bool = False,
 ) -> dict[str, object]:
     table_name, overrides = DATASETS[dataset]
     env = build_child_env(ROOT)
@@ -722,7 +723,12 @@ def run_dataset(
     # Canonical daily bars are funding evidence.  No percentage floor can
     # waive an independent catalog/source/target set mismatch.
     env["QMT_KLINE_MIN_COVERAGE"] = "1.0"
-    env.setdefault("QMT_MINUTE_MIN_COVERAGE", "0.85")
+    if dataset == "minute_price":
+        # Canonical stock-minute publication is receipt-authoritative.  A
+        # percentage floor cannot waive one immutable-catalog symbol.
+        env["QMT_MINUTE_MIN_COVERAGE"] = "1.0"
+    else:
+        env.setdefault("QMT_MINUTE_MIN_COVERAGE", "0.85")
     env.setdefault("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")
     # Twenty bars for 200 symbols stay comfortably bounded while reducing
     # full-market spool round trips from roughly 140 to 28.  The previous
@@ -741,6 +747,22 @@ def run_dataset(
         and _bigqmt_runtime_available()
     )
     legacy_miniqmt_enabled = _enabled(env.get("LEGACY_MINIQMT_ENABLED"))
+    if require_bigqmt and not bigqmt_available:
+        return {
+            "status": "DATA_BLOCKED",
+            "dataset": dataset,
+            "table": table_name,
+            "returncode": 3,
+            "error": "exact-main BigQMT runtime is unavailable",
+            "minute_count": max(0, int(minute_count)),
+            "start_date": start_date.strip(),
+            "end_date": end_date.strip(),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "source_policy": "bigqmt_required_unavailable",
+            "attestation": None,
+            "level1_capture": None,
+        }
     source_policy = "bigqmt_primary" if bigqmt_available else "qmt_primary_external_fallback"
     if bigqmt_available:
         env.update(BIGQMT_OVERRIDES[dataset])
@@ -901,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--require-bigqmt", action="store_true")
     args = parser.parse_args(argv)
     result = run_dataset(
         args.dataset,
@@ -908,6 +931,7 @@ def main(argv: list[str] | None = None) -> int:
         minute_count=args.minute_count,
         start_date=args.start_date.strip(),
         end_date=args.end_date.strip(),
+        require_bigqmt=args.require_bigqmt,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, default=str))

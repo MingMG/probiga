@@ -8,6 +8,7 @@ import pytest
 from server.common.scheduler_runtime_health import (
     QMT_WINDOWS_EDGE_EXECUTION_PROOF_TASK_TYPES,
     QMT_WINDOWS_EDGE_TASK_TYPES,
+    check_linux_standalone_active_release,
     check_linux_standalone_scheduler_heartbeat,
     check_qmt_windows_edge_executor,
 )
@@ -75,6 +76,36 @@ def test_linux_standalone_heartbeat_accepts_one_exact_fresh_executor():
     assert detail["fresh_row_count"] == 1
     assert detail["future_row_count"] == 0
     assert detail["errors"] == []
+
+
+def test_linux_active_release_derives_one_exact_fresh_executor_identity():
+    passed, detail = check_linux_standalone_active_release(
+        _HeartbeatConnection([_heartbeat_row()]),
+        expected_build_sha=BUILD_SHA,
+    )
+
+    assert passed is True
+    assert detail["fresh_row_count"] == 1
+    assert detail["current"] == {
+        "instance_id": f"{HOST}-{PID}",
+        "mode": "standalone",
+        "host_name": HOST,
+        "pid": PID,
+        "build_sha": BUILD_SHA,
+        "executor_role": "linux_standalone",
+        "started_at": "2026-08-25T09:00:00",
+        "heartbeat_age_seconds": 5,
+        "poll_seconds": 60,
+        "max_concurrent_tasks": 2,
+    }
+    assert detail["errors"] == []
+
+    passed, detail = check_linux_standalone_active_release(
+        _HeartbeatConnection([_heartbeat_row(build_sha="b" * 40)]),
+        expected_build_sha=BUILD_SHA,
+    )
+    assert passed is False
+    assert "build_sha_mismatch" in detail["errors"]
 
 
 @pytest.mark.parametrize(
@@ -232,7 +263,7 @@ def test_qmt_windows_edge_requires_live_identity_and_recent_successes():
     assert detail["strategy_eligible"] is True
     assert detail["fresh_row_count"] == 1
     assert detail["task_count"] == 3
-    assert detail["owned_task_count"] == 7
+    assert detail["owned_task_count"] == len(EDGE_TASK_TYPES)
     assert detail["last_success_count"] == 3
     assert detail["required_task_types"] == list(EDGE_PROOF_TASK_TYPES)
     assert detail["owned_task_types"] == list(EDGE_TASK_TYPES)

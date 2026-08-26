@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
+import hashlib
+import json
 import os
 import re
 import signal
@@ -9,15 +11,38 @@ import sys
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
 from socket import gethostname
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date,
+)
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
 from server.common.process_env import build_child_env
+from server.common.release_data_readiness_contract import (
+    RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
+    RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES,
+    RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES,
+    RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES,
+    RELEASE_DATA_ACTIVATION_TASK_TYPE,
+    RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE,
+    RELEASE_DATA_CATCHUP_DEPENDENCIES,
+    RELEASE_DATA_CATCHUP_TASK_TYPES,
+    build_release_data_activation_receipt,
+    release_catchup_closed_ready_time,
+    release_data_activation_run_uid,
+    validate_release_data_activation_receipt,
+)
+from server.common.scheduler_runtime_health import (
+    check_linux_standalone_active_release,
+    check_qmt_windows_edge_release_receipt,
+)
 from server.common.scheduler_script_policy import (
     SchedulerScriptPolicyError,
     resolve_scheduler_script,
@@ -37,6 +62,8 @@ from server.common.scheduler_validation import (
     validate_scheduler_task_result,
 )
 from tools.qmt_host_ownership_contract import (
+    LINUX_PROVIDER_TASKS_BY_TYPE,
+    LINUX_PROVIDER_TASK_TYPES,
     LINUX_QMT_TASKS_BY_TYPE,
     LINUX_QMT_TASK_TYPES,
     UNFROZEN_PROVIDER_SCRIPT_PATHS,
@@ -61,6 +88,37 @@ QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES = 8 * 60
 CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRON_CATCHUP_WINDOW_SECONDS", "180"))
 CRITICAL_CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRITICAL_CRON_CATCHUP_WINDOW_SECONDS", "10800"))
 CRON_RETRY_INTERVAL_MINUTES = max(1, int(os.environ.get("SCHEDULER_CRON_RETRY_INTERVAL_MINUTES", "15")))
+RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES = max(
+    5,
+    int(os.environ.get("SCHEDULER_RELEASE_CATCHUP_RETRY_MINUTES", "15")),
+)
+RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
+    RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES,
+    int(os.environ.get("SCHEDULER_RELEASE_CATCHUP_BLOCKED_RETRY_MINUTES", "30")),
+)
+RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
+    RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+)
+RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES = (
+    RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES
+)
+# These ingestion jobs stamp a live snapshot and explicitly reject backdating.
+# They remain on the Shanghai run date; they are not closed-session outputs.
+RELEASE_CATCHUP_RUN_DATE_SNAPSHOT_TASK_TYPES = frozenset(
+    {
+        "hot_concept",
+        "hot_rank_ths",
+        "hot_pop_east",
+        "qmt_index_current",
+    }
+)
+RELEASE_CATCHUP_CURRENT_SNAPSHOT_READY_TIMES = {
+    "hot_concept": datetime_time(17, 10),
+    "hot_rank_ths": datetime_time(17, 12),
+    "hot_pop_east": datetime_time(17, 14),
+    "qmt_index_current": datetime_time(15, 10),
+}
+RETRYABLE_CRON_STATUSES = frozenset({"failed", "timeout", "stopped"})
 STALE_RUNNING_GRACE_MINUTES = int(os.environ.get("SCHEDULER_STALE_RUNNING_GRACE_MINUTES", "5"))
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SCHEDULER_HISTORY_RETENTION_DAYS", "90")))
 HISTORY_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_BATCH_SIZE", "1000")))
@@ -89,6 +147,27 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
+        "alist_daily",
+        "alist_info",
+        "concept_flow",
+        "eastmoney_concept_flow_snapshot",
+        "eastmoney_concept_current",
+        "eastmoney_concept_kline",
+        "eastmoney_concept_minute",
+        "etf_forward_daily",
+        "hot_concept",
+        "hot_rank_ths",
+        "hot_pop_east",
+        "hot_fused",
+        "hot_fused_3",
+        "hot_fused_5",
+        "notice_eastmoney",
+        "quality_check_post",
+        "quality_check_pre",
+        "sector_heat_east",
+        "stock_snapshot_daily",
+        "stock_finance",
+        "stock_dividend_baidu",
         "news_daily",
         "daily_review",
         "evening_review",
@@ -105,15 +184,48 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "trading_v3_continuous_calibration",
         "qmt_membership_snapshot",
         "qmt_announcement_pit",
+        "qmt_index_kline",
+        "qmt_index_minute",
+        "qmt_stock_daily_canonical",
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_canonical_history_gap_repair",
+        "linux_recent_data_gap_repair",
         "concept_constituent_east",
         "capital_flow",
         "capital_flow_batch_fast",
         "market_overview_daily",
+        "news_sync",
         "screener_premarket_delivery",
         "screener_intraday_delivery",
     }
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
+    # These source snapshots and quality gates must not disappear merely
+    # because the single general worker was occupied during their exact cron
+    # minute.  They remain bounded to the same trading day and `_cron_due`
+    # still prevents a second successful run.
+    "alist_daily": 8 * 60 * 60,
+    "alist_info": 8 * 60 * 60,
+    "concept_flow": 8 * 60 * 60,
+    "eastmoney_concept_flow_snapshot": 8 * 60 * 60,
+    "eastmoney_concept_current": 8 * 60 * 60,
+    "eastmoney_concept_kline": 8 * 60 * 60,
+    "eastmoney_concept_minute": 8 * 60 * 60,
+    "etf_forward_daily": 8 * 60 * 60,
+    "hot_concept": 8 * 60 * 60,
+    "hot_rank_ths": 8 * 60 * 60,
+    "hot_pop_east": 8 * 60 * 60,
+    "hot_fused": 8 * 60 * 60,
+    "hot_fused_3": 8 * 60 * 60,
+    "hot_fused_5": 8 * 60 * 60,
+    "notice_eastmoney": 3 * 60 * 60,
+    "quality_check_post": 4 * 60 * 60,
+    "quality_check_pre": 3 * 60 * 60,
+    "sector_heat_east": 8 * 60 * 60,
+    "stock_snapshot_daily": 4 * 60 * 60,
+    "stock_finance": 4 * 60 * 60,
+    "stock_dividend_baidu": 6 * 60 * 60,
     "news_daily": EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS,
     "daily_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
     "evening_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
@@ -130,6 +242,13 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v3_continuous_calibration": 8 * 60 * 60,
     "qmt_membership_snapshot": 8 * 60 * 60,
     "qmt_announcement_pit": 60 * 60,
+    "qmt_index_kline": 8 * 60 * 60,
+    "qmt_index_minute": 8 * 60 * 60,
+    "qmt_stock_daily_canonical": 8 * 60 * 60,
+    "qmt_stock_minute_canonical": 8 * 60 * 60,
+    "qmt_stock_minute_flow_canonical": 8 * 60 * 60,
+    "qmt_canonical_history_gap_repair": 24 * 60 * 60,
+    "linux_recent_data_gap_repair": 24 * 60 * 60,
     "concept_constituent_east": 8 * 60 * 60,
     # These tables feed the watchlist's current-session market and funds
     # labels.  Missing their exact cron minute must not leave the UI pinned to
@@ -137,6 +256,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "capital_flow": 8 * 60 * 60,
     "capital_flow_batch_fast": 8 * 60 * 60,
     "market_overview_daily": 8 * 60 * 60,
+    "news_sync": 8 * 60 * 60,
 }
 PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS = int(
     os.environ.get("SCHEDULER_PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS", "7200")
@@ -155,15 +275,26 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "concept_east_kline",
     "concept_east_minute",
     "concept_flow",
+    "eastmoney_concept_flow_snapshot",
+    "eastmoney_concept_current",
+    "eastmoney_concept_kline",
+    "eastmoney_concept_minute",
     "concept_ths_current",
     "concept_ths_kline",
     "concept_ths_minute",
     "daily_review",
     "evening_review",
+    "hot_concept",
+    "hot_rank_ths",
+    "hot_pop_east",
+    "hot_fused",
+    "hot_fused_3",
+    "hot_fused_5",
     "etf_forward_daily",
     "index_current",
     "index_kline",
     "index_minute",
+    "notice_eastmoney",
     "intraday_quality_check",
     "intraday_realtime",
     "intraday_market_alert",
@@ -174,8 +305,15 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "market_overview_daily",
     "news_daily",
     "qmt_intraday_realtime",
+    "qmt_index_current",
+    "qmt_index_kline",
+    "qmt_index_minute",
+    "qmt_stock_daily_canonical",
+    "qmt_stock_minute_canonical",
+    "qmt_stock_minute_flow_canonical",
     "quality_check_post",
     "quality_check_pre",
+    "sector_heat_east",
     "qmt_membership_snapshot",
     "qmt_announcement_pit",
     "qmt_local_gap_repair_execute",
@@ -247,7 +385,13 @@ _task_history_schema_lock = threading.Lock()
 _task_history_ready_engines: set[int] = set()
 _history_cleanup_lock = threading.Lock()
 _history_cleanup_next_at = 0.0
-_HISTORY_OUTPUT_LIMIT = 5000
+# ``output`` is a MySQL TEXT column (65,535 bytes).  Keep a deliberately
+# bounded replay envelope plus a small operator-facing tail below that hard
+# limit; never depend on an unbounded child-process log being durable.
+_HISTORY_OUTPUT_LIMIT = 60000
+_HISTORY_REPLAY_OUTPUT_LIMIT = 24000
+_HISTORY_EVIDENCE_LIMIT = 50000
+_HISTORY_EVIDENCE_SCHEMA = "probiga.scheduler-validation-evidence.v1"
 _HISTORY_SECRET_PATTERNS = (
     (re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+\-/=]+)"), r"\1[REDACTED]"),
     (re.compile(r"(?i)([\"']?\b(?:authorization|password|passwd|pwd|token|api[_-]?key|api[_-]?secret|access[_-]?token|secret)\b[\"']?\s*[:=]\s*[\"']?)([^\"'\s,;&}]+)"), r"\1[REDACTED]"),
@@ -265,6 +409,8 @@ LONG_RUNNING_TASK_TYPES = {
     "concept_east_kline",
     "concept_east_minute",
     "concept_flow",
+    "eastmoney_concept_flow_snapshot",
+    "etf_forward_daily",
     "concept_ths_kline",
     "concept_ths_minute",
     "index_kline",
@@ -273,9 +419,19 @@ LONG_RUNNING_TASK_TYPES = {
     "qmt_local_history_2024",
     "qmt_nightly_reconciliation",
     "qmt_announcement_pit",
+    "qmt_index_kline",
+    "qmt_index_minute",
+    "qmt_stock_daily_canonical",
+    "qmt_stock_minute_canonical",
+    "qmt_stock_minute_flow_canonical",
+    "qmt_canonical_history_gap_repair",
+    "linux_recent_data_gap_repair",
+    "notice_eastmoney",
     "stock_kline",
     "stock_minute",
     "stock_minute_flow",
+    "stock_finance",
+    "stock_dividend_baidu",
     "trading_v3_continuous_calibration",
 }
 LONG_RUNNING_PATH_PARTS = {
@@ -286,7 +442,6 @@ LONG_RUNNING_PATH_PARTS = {
 FAST_RUNNING_TASK_TYPES = {
     "screener_premarket_delivery",
     "screener_intraday_delivery",
-    "hot_rank_sina",
     "hot_rank_ths",
     "hot_pop_east",
     "intraday_minute_flow",
@@ -297,6 +452,7 @@ FAST_RUNNING_TASK_TYPES = {
     "quality_check_post",
     "quality_check_pre",
     "qmt_intraday_realtime",
+    "qmt_index_current",
     "public_quote_failover",
     "sim_trade",
     "trading_v2_intraday_activation",
@@ -331,6 +487,7 @@ INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_realtime",
     "intraday_market_alert",
     "qmt_intraday_realtime",
+    "qmt_index_current",
     "public_quote_failover",
     "sim_trade",
     "stock_current",
@@ -393,6 +550,593 @@ def _coerce_datetime(value) -> datetime | None:
         return None
 
 
+def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
+    """Validate enough persisted identity to decide whether catch-up is due.
+
+    The full hashes and data proof are revalidated by the final readiness gate;
+    this smaller check only prevents a status-only row from suppressing the
+    new-build replay that could create that proof.
+    """
+
+    source = str(row.get("_release_terminal_output") or "")
+    candidates = []
+    for line in source.splitlines():
+        candidate = line.strip()
+        if not candidate.startswith("{"):
+            continue
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == _HISTORY_EVIDENCE_SCHEMA
+        ):
+            candidates.append(payload)
+    if len(candidates) != 1:
+        return False
+    evidence = candidates[0]
+    if row.get("_release_expected_target_required") is True:
+        if row.get("_release_expected_target_available") is not True:
+            return False
+        expected_target = str(
+            row.get("_release_expected_target_date") or ""
+        ).strip()
+        evidence_target = str(evidence.get("release_target_date") or "").strip()
+        try:
+            parsed_expected = date.fromisoformat(expected_target)
+            parsed_evidence = date.fromisoformat(evidence_target)
+        except ValueError:
+            return False
+        if (
+            parsed_expected.isoformat() != expected_target
+            or parsed_evidence.isoformat() != evidence_target
+            or evidence_target != expected_target
+        ):
+            return False
+    evidence_task_id = evidence.get("task_id")
+    evidence_exit_code = evidence.get("exit_code")
+    terminal_exit_code = row.get("_release_terminal_exit_code")
+    if (
+        isinstance(evidence_task_id, bool)
+        or not isinstance(evidence_task_id, int)
+        or isinstance(evidence_exit_code, bool)
+        or not isinstance(evidence_exit_code, int)
+        or isinstance(terminal_exit_code, bool)
+        or not isinstance(terminal_exit_code, int)
+    ):
+        return False
+    supplied_hash = str(evidence.get("evidence_sha256") or "").lower()
+    core = dict(evidence)
+    core.pop("evidence_sha256", None)
+    canonical_core = json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    replay_output = str(evidence.get("replay_output") or "")
+    return (
+        re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is not None
+        and _history_digest(canonical_core) == supplied_hash
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(evidence.get("machine_output_sha256") or "").lower(),
+        )
+        is not None
+        and str(evidence.get("replay_output_sha256") or "").lower()
+        == _history_digest(replay_output)
+        and str(row.get("_release_terminal_status") or "") == "success"
+        and str(row.get("_release_terminal_build_sha") or "").lower()
+        == build_sha
+        and terminal_exit_code == 0
+        and str(evidence.get("run_uid") or "")
+        == str(row.get("_release_terminal_run_uid") or "")
+        and evidence_task_id == int(row.get("id") or 0)
+        and str(evidence.get("task_type") or "")
+        == str(row.get("task_type") or "")
+        and str(evidence.get("build_sha") or "").lower() == build_sha
+        and evidence.get("status") == "success"
+        and evidence_exit_code == 0
+        and evidence.get("validation_checked") is True
+        and evidence.get("validation_ok") is True
+    )
+
+
+def _attach_release_catchup_history(engine, rows: list[dict]) -> bool:
+    """Attach each readiness task's latest terminal audit row using SELECT only."""
+
+    selected = [
+        row
+        for row in rows
+        if str(row.get("task_type") or "").strip()
+        in RELEASE_DATA_CATCHUP_TASK_TYPES
+    ]
+    for row in selected:
+        row["_release_history_available"] = False
+    if not selected:
+        return True
+    task_pairs = sorted(
+        {
+            (int(row["id"]), str(row.get("task_type") or "").strip())
+            for row in selected
+        }
+    )
+    pair_predicates = " OR ".join(
+        "(task_id=:release_task_id_"
+        f"{index} AND task_type=:release_task_type_{index})"
+        for index, _ in enumerate(task_pairs)
+    )
+    params = {}
+    for index, (task_id, task_type) in enumerate(task_pairs):
+        params.update(
+            {
+                f"release_task_id_{index}": task_id,
+                f"release_task_type_{index}": task_type,
+            }
+        )
+    statement = text(f"""
+        SELECT history.id, history.run_uid, history.task_id, history.task_type,
+               history.status,
+               history.build_sha, history.run_at, history.finished_at,
+               history.exit_code, history.output, history.trigger_source
+          FROM st_scheduled_task_history AS history
+          JOIN (
+                SELECT task_id, MAX(id) AS latest_id
+                 FROM st_scheduled_task_history
+                 WHERE ({pair_predicates})
+                   AND status IN ('success','blocked','failed','timeout','stopped')
+                 GROUP BY task_id, task_type
+               ) AS latest
+            ON latest.latest_id=history.id
+         ORDER BY history.task_id
+    """)
+    try:
+        with engine.connect() as connection:
+            history_rows = {
+                (int(item["task_id"]), str(item.get("task_type") or "")): dict(item)
+                for item in connection.execute(statement, params).mappings()
+            }
+    except Exception as exc:
+        logger.error(
+            "Release data catch-up history is unavailable; fail closed: %s",
+            type(exc).__name__,
+        )
+        return False
+    for row in selected:
+        history = history_rows.get(
+            (int(row["id"]), str(row.get("task_type") or "").strip()),
+            {},
+        )
+        row.update(
+            {
+                "_release_history_available": True,
+                "_release_terminal_id": history.get("id"),
+                "_release_terminal_run_uid": history.get("run_uid"),
+                "_release_terminal_status": str(history.get("status") or ""),
+                "_release_terminal_build_sha": str(
+                    history.get("build_sha") or ""
+                ).lower(),
+                "_release_terminal_run_at": history.get("run_at"),
+                "_release_terminal_finished_at": history.get("finished_at"),
+                "_release_terminal_exit_code": history.get("exit_code"),
+                "_release_terminal_output": history.get("output"),
+                "_release_terminal_trigger_source": str(
+                    history.get("trigger_source") or ""
+                ).strip(),
+            }
+        )
+    return True
+
+
+def _load_local_release_health(*, timeout_seconds: int = 5) -> dict:
+    request = Request(
+        "http://127.0.0.1/api/health",
+        headers={"Accept": "application/json", "User-Agent": "probiga-scheduler/1"},
+        method="GET",
+    )
+    with urlopen(request, timeout=max(1, int(timeout_seconds))) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > 1024 * 1024:
+            raise RuntimeError("active release health response is too large")
+        raw = response.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise RuntimeError("active release health response is too large")
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("active release health response is invalid")
+    return payload
+
+
+def _linux_active_release_ready(
+    build_sha: str,
+    *,
+    health_loader=_load_local_release_health,
+    active_code_root_loader=lambda: Path("/opt/ProBigA-current").resolve(
+        strict=True
+    ),
+) -> tuple[bool, str]:
+    """Require the exact healthy API and static link before Linux catch-up."""
+
+    expected_root = f"/opt/ProBigA-releases/{build_sha}"
+    if os.name != "posix":
+        return False, "linux_runtime_required"
+    if str(os.environ.get("PROBIGA_CODE_ROOT") or "").replace("\\", "/") != expected_root:
+        return False, "code_root_mismatch"
+    try:
+        active_root = str(active_code_root_loader()).replace("\\", "/")
+        health = health_loader()
+    except Exception as exc:
+        return False, f"active_health_unavailable:{type(exc).__name__}"
+    revision = health.get("release_revision")
+    scheduler_heartbeat = health.get("standalone_scheduler_heartbeat")
+    heartbeat_detail = (
+        scheduler_heartbeat.get("detail")
+        if isinstance(scheduler_heartbeat, dict)
+        else None
+    )
+    if active_root != expected_root:
+        return False, "active_link_mismatch"
+    if not isinstance(revision, dict):
+        return False, "release_revision_missing"
+    if (
+        health.get("status") != "ok"
+        or revision.get("deployment_mode") != "production"
+        or revision.get("matches_expected") is not True
+        or revision.get("code_worktree_clean") is not True
+        or str(revision.get("expected_git_sha") or "").lower() != build_sha
+        or str(revision.get("actual_git_sha") or "").lower() != build_sha
+        or not isinstance(scheduler_heartbeat, dict)
+        or scheduler_heartbeat.get("ready") is not True
+        or not isinstance(heartbeat_detail, dict)
+        or str(heartbeat_detail.get("expected_build_sha") or "").lower()
+        != build_sha
+        or health.get("automatic_real_order_submission") is not False
+        or health.get("real_order_authority") is not False
+    ):
+        return False, "active_health_identity_mismatch"
+    return True, "ready"
+
+
+def _publish_linux_release_activation(
+    engine,
+    *,
+    build_sha: str,
+    anchor_task_id: int,
+    activated_at: datetime,
+) -> tuple[bool, str]:
+    """Append one canonical active-release receipt for this Linux lease."""
+
+    started_at = _scheduler_started_at.replace(microsecond=0)
+    receipt = build_release_data_activation_receipt(
+        build_sha=build_sha,
+        scheduler_instance_id=_scheduler_instance_id,
+        scheduler_host_name=gethostname(),
+        scheduler_pid=os.getpid(),
+        scheduler_started_at=started_at,
+        activated_at=activated_at.replace(microsecond=0),
+    )
+    run_uid = release_data_activation_run_uid(
+        build_sha,
+        _scheduler_instance_id,
+        started_at,
+    )
+    serialized = json.dumps(
+        receipt,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        with engine.begin() as connection:
+            existing = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        "SELECT run_uid, task_id, task_type, status, exit_code, "
+                        "output, host_name, scheduler_instance_id, build_sha, "
+                        "trigger_source FROM st_scheduled_task_history "
+                        "WHERE run_uid=:run_uid"
+                    ),
+                    {"run_uid": run_uid},
+                ).mappings()
+            ]
+            if existing:
+                if len(existing) != 1:
+                    return False, "activation_receipt_not_unique"
+                row = existing[0]
+                validate_release_data_activation_receipt(
+                    str(row.get("output") or ""),
+                    expected_build_sha=build_sha,
+                    expected_scheduler_instance_id=_scheduler_instance_id,
+                )
+                if (
+                    str(row.get("run_uid") or "") != run_uid
+                    or int(row.get("task_id") or 0) != int(anchor_task_id)
+                    or str(row.get("task_type") or "")
+                    != RELEASE_DATA_ACTIVATION_TASK_TYPE
+                    or str(row.get("status") or "") != "success"
+                    or int(
+                        row.get("exit_code")
+                        if row.get("exit_code") is not None
+                        else -1
+                    )
+                    != 0
+                    or str(row.get("host_name") or "") != gethostname()
+                    or str(row.get("scheduler_instance_id") or "")
+                    != _scheduler_instance_id
+                    or str(row.get("build_sha") or "").lower() != build_sha
+                    or str(row.get("trigger_source") or "")
+                    != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
+                ):
+                    return False, "activation_receipt_row_mismatch"
+                return True, "idempotent"
+            connection.execute(
+                text(
+                    "INSERT INTO st_scheduled_task_history ("
+                    "run_uid, task_id, task_name, task_type, run_at, "
+                    "finished_at, status, duration, exit_code, output, "
+                    "host_name, scheduler_instance_id, build_sha, "
+                    "trigger_source) VALUES ("
+                    ":run_uid, :task_id, 'Release data activation', "
+                    ":task_type, :activated_at, :activated_at, 'success', 0, "
+                    "0, :output, :host_name, :scheduler_instance_id, "
+                    ":build_sha, :trigger_source)"
+                ),
+                {
+                    "run_uid": run_uid,
+                    "task_id": int(anchor_task_id),
+                    "task_type": RELEASE_DATA_ACTIVATION_TASK_TYPE,
+                    "activated_at": receipt["activated_at"].replace("T", " "),
+                    "output": serialized,
+                    "host_name": gethostname(),
+                    "scheduler_instance_id": _scheduler_instance_id,
+                    "build_sha": build_sha,
+                    "trigger_source": RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE,
+                },
+            )
+    except Exception as exc:
+        return False, f"activation_publish_failed:{type(exc).__name__}"
+    return True, "inserted"
+
+
+def _windows_release_activation_ready(
+    engine,
+    *,
+    build_sha: str,
+) -> tuple[bool, str]:
+    """Require current Linux activation and QMT bootstrap on Windows."""
+
+    try:
+        expected_poll_seconds = int(
+            get_scheduler_runtime_config()["poll_seconds"]
+        )
+        with engine.connect() as connection:
+            linux_ready, linux_detail = check_linux_standalone_active_release(
+                connection,
+                expected_build_sha=build_sha,
+                expected_poll_seconds=expected_poll_seconds,
+            )
+            current = linux_detail.get("current") if linux_ready else None
+            if not isinstance(current, dict):
+                return False, "linux_active_lease_unavailable"
+            activation_rows = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        "SELECT run_uid, task_type, status, exit_code, output, "
+                        "host_name, scheduler_instance_id, build_sha, "
+                        "trigger_source FROM st_scheduled_task_history "
+                        "WHERE task_type=:task_type AND build_sha=:build_sha "
+                        "AND scheduler_instance_id=:scheduler_instance_id "
+                        "AND status='success' AND exit_code=0 "
+                        "ORDER BY finished_at DESC, id DESC"
+                    ),
+                    {
+                        "task_type": RELEASE_DATA_ACTIVATION_TASK_TYPE,
+                        "build_sha": build_sha,
+                        "scheduler_instance_id": current["instance_id"],
+                    },
+                ).mappings()
+            ]
+            if len(activation_rows) != 1:
+                return False, "linux_activation_receipt_not_unique"
+            activation_row = activation_rows[0]
+            receipt = validate_release_data_activation_receipt(
+                str(activation_row.get("output") or ""),
+                expected_build_sha=build_sha,
+                expected_scheduler_instance_id=str(current["instance_id"]),
+            )
+            if (
+                str(activation_row.get("task_type") or "")
+                != RELEASE_DATA_ACTIVATION_TASK_TYPE
+                or str(activation_row.get("status") or "") != "success"
+                or int(
+                    activation_row.get("exit_code")
+                    if activation_row.get("exit_code") is not None
+                    else -1
+                )
+                != 0
+                or str(activation_row.get("host_name") or "")
+                != str(current.get("host_name") or "")
+                or str(activation_row.get("scheduler_instance_id") or "")
+                != str(current.get("instance_id") or "")
+                or str(activation_row.get("build_sha") or "").lower()
+                != build_sha
+                or str(activation_row.get("trigger_source") or "")
+                != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
+                or receipt["scheduler_started_at"]
+                != str(current.get("started_at") or "")
+            ):
+                return False, "linux_activation_receipt_mismatch"
+            qmt_ready, _qmt_detail = check_qmt_windows_edge_release_receipt(
+                connection,
+                expected_build_sha=build_sha,
+                expected_poll_seconds=expected_poll_seconds,
+            )
+            if not qmt_ready:
+                return False, "qmt_release_bootstrap_unavailable"
+    except Exception as exc:
+        return False, f"release_activation_check_failed:{type(exc).__name__}"
+    return True, "ready"
+
+
+def _attach_release_catchup_authorization(
+    engine,
+    rows: list[dict],
+    *,
+    mode: str,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Attach one host-wide active-release decision before task sorting."""
+
+    selected = [
+        row
+        for row in rows
+        if str(row.get("task_type") or "").strip()
+        in RELEASE_DATA_CATCHUP_TASK_TYPES
+    ]
+    for row in selected:
+        row["_release_catchup_authorized"] = False
+    if not selected:
+        return True, "not_applicable"
+    if _release_catchup_disabled_for_deferred_database():
+        return False, "governance_database_deferred"
+    build_sha = _scheduler_build_commit_sha()
+    if build_sha == "0" * 40:
+        return False, "build_identity_unavailable"
+    role = _scheduler_executor_role(mode)
+    if role == "linux_standalone":
+        ready, reason = _linux_active_release_ready(build_sha)
+        if ready:
+            ready, reason = _publish_linux_release_activation(
+                engine,
+                build_sha=build_sha,
+                anchor_task_id=min(int(row["id"]) for row in selected),
+                activated_at=now,
+            )
+    elif role == "qmt_windows_edge":
+        ready, reason = _windows_release_activation_ready(
+            engine,
+            build_sha=build_sha,
+        )
+    else:
+        ready, reason = False, "executor_role_unclassified"
+    if ready:
+        for row in selected:
+            row["_release_catchup_authorized"] = True
+    return ready, reason
+
+
+def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
+    """Return whether this host should replay an exact task for the new build."""
+
+    if _release_catchup_disabled_for_deferred_database():
+        return False
+    task_type = str(row.get("task_type") or "").strip()
+    if (
+        task_type not in RELEASE_DATA_CATCHUP_TASK_TYPES
+        or row.get("_release_history_available") is not True
+        or row.get("_release_catchup_authorized") is not True
+        or (
+            row.get("_release_expected_target_required") is True
+            and row.get("_release_expected_target_available") is not True
+        )
+    ):
+        return False
+    build_sha = _scheduler_build_commit_sha()
+    if not re.fullmatch(r"[0-9a-f]{40}", build_sha) or build_sha == "0" * 40:
+        return False
+    if _release_history_evidence_valid(row, build_sha):
+        return False
+    terminal_build = str(row.get("_release_terminal_build_sha") or "").lower()
+    terminal_status = str(row.get("_release_terminal_status") or "").lower()
+    if terminal_build != build_sha or not terminal_status:
+        return True
+    # A terminal success with invalid evidence is not a failed attempt that
+    # needs backoff.  This includes the deliberate 18:00 target rollover: run
+    # the new closed session immediately instead of waiting behind the old
+    # target's otherwise successful receipt.
+    if terminal_status == "success":
+        return True
+    retry_reference = _coerce_datetime(
+        row.get("_release_terminal_finished_at")
+        or row.get("_release_terminal_run_at")
+    )
+    if retry_reference is None:
+        return True
+    retry_minutes = (
+        RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES
+        if terminal_status == "blocked"
+        else RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES
+    )
+    return (now - retry_reference).total_seconds() >= retry_minutes * 60
+
+
+def _release_build_catchup_pending(row: dict) -> bool:
+    """Fail closed while a release task lacks exact-build success evidence.
+
+    Authorization/history outages must not turn ``release_catchup_due`` false
+    and accidentally let the same row run through its ordinary cron path.
+    """
+
+    if _release_catchup_disabled_for_deferred_database():
+        return False
+    if (
+        str(row.get("task_type") or "").strip()
+        not in RELEASE_DATA_CATCHUP_TASK_TYPES
+    ):
+        return False
+    build_sha = _scheduler_build_commit_sha()
+    if not re.fullmatch(r"[0-9a-f]{40}", build_sha) or build_sha == "0" * 40:
+        return True
+    return not _release_history_evidence_valid(row, build_sha)
+
+
+def _release_catchup_disabled_for_deferred_database() -> bool:
+    """Disable build replay while a release intentionally defers DB cutover.
+
+    DEFERRED_DB has no release request or activation receipt by design.  Its
+    writer fences remain enforced elsewhere; ordinary non-governance data jobs
+    must keep their normal interval/cron behavior instead of waiting forever
+    for release evidence that this deployment mode cannot create.
+    """
+
+    try:
+        return strategy_governance_database_deferred()
+    except StrategyGovernanceModeError:
+        # Preserve the existing fail-closed release behavior for an invalid
+        # mode.  Only the exact, explicitly configured DEFERRED_DB mode opts
+        # out of release replay.
+        return False
+
+
+def _release_catchup_dependencies_ready(
+    row: dict,
+    rows: list[dict],
+) -> tuple[bool, str]:
+    """Require exact-build validated upstream histories before downstream replay."""
+
+    task_type = str(row.get("task_type") or "").strip()
+    dependencies = RELEASE_DATA_CATCHUP_DEPENDENCIES.get(task_type, ())
+    if not dependencies:
+        return True, "not_applicable"
+    grouped: dict[str, list[dict]] = {}
+    for candidate in rows:
+        grouped.setdefault(
+            str(candidate.get("task_type") or "").strip(), []
+        ).append(candidate)
+    build_sha = _scheduler_build_commit_sha()
+    for dependency in dependencies:
+        matches = grouped.get(dependency, [])
+        if len(matches) != 1:
+            return False, f"{dependency}:missing_or_duplicate"
+        if not _release_history_evidence_valid(matches[0], build_sha):
+            return False, f"{dependency}:exact_build_not_ready"
+    return True, "ready"
+
+
 def _parse_hhmm(value: str) -> int | None:
     try:
         hour, minute = str(value or "").strip().split(":")
@@ -403,6 +1147,41 @@ def _parse_hhmm(value: str) -> int | None:
     if not (0 <= hour_i <= 23 and 0 <= minute_i <= 59):
         return None
     return hour_i * 60 + minute_i
+
+
+def _ordinary_cron_required_after_early_release(
+    row: dict,
+    *,
+    now: datetime,
+    cron_time: str,
+) -> bool:
+    """Do not let a pre-cron release replay replace today's scheduled run.
+
+    Release catch-up proves that the new build can publish the data available
+    at deployment time.  For close-derived and continuously disclosed feeds,
+    a successful replay before the task's ordinary wall-clock deadline is not
+    proof that the later daily source window was captured.
+    """
+
+    if (
+        str(row.get("task_type") or "").strip()
+        not in RELEASE_DATA_CATCHUP_TASK_TYPES
+        or str(row.get("_release_terminal_trigger_source") or "").strip()
+        != "release_catchup"
+        or str(row.get("_release_terminal_status") or "").strip().lower()
+        != "success"
+    ):
+        return False
+    cron_min = _parse_hhmm(cron_time)
+    release_run_at = _coerce_datetime(row.get("_release_terminal_run_at"))
+    if (
+        cron_min is None
+        or release_run_at is None
+        or release_run_at.date() != now.date()
+    ):
+        return False
+    release_min = release_run_at.hour * 60 + release_run_at.minute
+    return release_min < cron_min
 
 
 def _cron_catchup_allowed(*, now: datetime, cron_time: str, startup_time: datetime) -> bool:
@@ -434,9 +1213,18 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     if catchup_window <= 0:
         return False
     last_triggered = _coerce_datetime(row.get("last_triggered_at"))
-    if last_triggered and last_triggered.date() == now.date():
+    early_release_needs_ordinary = _ordinary_cron_required_after_early_release(
+        row,
+        now=now,
+        cron_time=cron_time,
+    )
+    if (
+        last_triggered
+        and last_triggered.date() == now.date()
+        and not early_release_needs_ordinary
+    ):
         status = str(row.get("last_run_status") or "").strip().lower()
-        if status not in {"failed", "timeout", "stopped"}:
+        if status not in RETRYABLE_CRON_STATUSES:
             return False
         retry_at = _cron_retry_reference(row, fallback=last_triggered)
         if (
@@ -499,8 +1287,15 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     if not last_triggered or last_triggered.date() < today:
         return True
 
+    if _ordinary_cron_required_after_early_release(
+        row,
+        now=now,
+        cron_time=str(row.get("cron_time") or "17:10"),
+    ):
+        return True
+
     status = str(row.get("last_run_status") or "").strip().lower()
-    if status not in {"failed", "timeout", "stopped"}:
+    if status not in RETRYABLE_CRON_STATUSES:
         return False
     retry_at = _cron_retry_reference(row, fallback=last_triggered)
     return (now - retry_at).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
@@ -536,7 +1331,16 @@ def _contract_path_matches(row: dict, contract: dict) -> bool:
     script_path = str(row.get("script_path") or "").strip().replace("\\", "/")
     # Some ownership-only callers intentionally select task_type without the
     # payload.  A present path, however, must match the frozen identity.
-    return not script_path or script_path == str(contract["script_path"])
+    if script_path and script_path != str(contract["script_path"]):
+        return False
+    # Ownership-only callers omit payload fields.  A persisted scheduler row
+    # includes them, so any present argument string must match exactly; a
+    # drifted row may not inherit the provider identity from task_type alone.
+    if "script_args" in contract and "script_args" in row:
+        script_args = str(row.get("script_args") or "").strip()
+        if script_args != str(contract.get("script_args") or "").strip():
+            return False
+    return True
 
 
 def scheduler_task_host_owner(row: dict) -> str:
@@ -561,6 +1365,13 @@ def scheduler_task_host_owner(row: dict) -> str:
             if _contract_path_matches(row, contract)
             else SCHEDULER_OWNER_UNAVAILABLE
         )
+    if task_type in LINUX_PROVIDER_TASK_TYPES:
+        contract = LINUX_PROVIDER_TASKS_BY_TYPE[task_type]
+        return (
+            SCHEDULER_OWNER_LINUX
+            if _contract_path_matches(row, contract)
+            else SCHEDULER_OWNER_UNAVAILABLE
+        )
     if task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES:
         contract = WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE[task_type]
         return (
@@ -568,10 +1379,15 @@ def scheduler_task_host_owner(row: dict) -> str:
             if _contract_path_matches(row, contract)
             else SCHEDULER_OWNER_UNAVAILABLE
         )
-    if (
-        task_type in UNFROZEN_PROVIDER_TASK_TYPES
-        or script_path in UNFROZEN_PROVIDER_SCRIPT_PATHS
-    ):
+    # The legacy crawler path is quarantined for generic/aliased rows.  The
+    # two explicitly named intraday public-source jobs retain their Linux
+    # ownership; their task types, arguments and post-run validators are
+    # independent of the canonical QMT close publishers.
+    frozen_script_alias = (
+        script_path in UNFROZEN_PROVIDER_SCRIPT_PATHS
+        and task_type not in {"intraday_minute_kline", "intraday_minute_flow"}
+    )
+    if task_type in UNFROZEN_PROVIDER_TASK_TYPES or frozen_script_alias:
         return SCHEDULER_OWNER_UNAVAILABLE
     if (
         task_type.startswith("qmt_")
@@ -629,6 +1445,11 @@ def scheduler_task_owned_by_current_host(row: dict) -> bool:
 _PIPELINE_TERMINAL_STATUSES = frozenset(
     {"success", "blocked", "failed", "timeout", "stopped"}
 )
+_HOT_RANK_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "hot_fused": ("hot_rank_ths", "hot_pop_east"),
+    "hot_fused_3": ("hot_fused",),
+    "hot_fused_5": ("hot_fused_3",),
+}
 
 
 def strategy_governance_task_block_reason(row: dict) -> str:
@@ -658,7 +1479,7 @@ def evaluate_strategy_pipeline_dependencies(
     grouped: dict[str, list[dict]] = {}
     for row in dependency_rows:
         grouped.setdefault(str(row.get("task_type") or ""), []).append(row)
-    required = ["qmt_announcement_pit"]
+    required = ["qmt_announcement_pit", "capital_flow_batch_fast"]
     if normalized_type == "strategy_governance_daily":
         required.append("analysis_fast")
     for dependency in required:
@@ -668,22 +1489,85 @@ def evaluate_strategy_pipeline_dependencies(
         row = rows[0]
         triggered = _coerce_datetime(row.get("last_triggered_at"))
         status = str(row.get("last_run_status") or "").strip().lower()
+        if int(row.get("enabled") or 0) != 1:
+            return False, f"{dependency}:disabled"
+        if triggered is None or triggered.date() != now.date():
+            return False, f"{dependency}:not_terminal_today"
+        if dependency == "capital_flow_batch_fast" and status != "success":
+            return False, f"{dependency}:not_success_today"
         if (
-            int(row.get("enabled") or 0) != 1
-            or triggered is None
-            or triggered.date() != now.date()
-            or status not in _PIPELINE_TERMINAL_STATUSES
+            dependency != "capital_flow_batch_fast"
+            and status not in _PIPELINE_TERMINAL_STATUSES
         ):
             return False, f"{dependency}:not_terminal_today"
     if normalized_type == "strategy_governance_daily":
-        event_time = _coerce_datetime(
-            grouped["qmt_announcement_pit"][0].get("last_triggered_at")
-        )
+        upstream_times = [
+            _coerce_datetime(
+                grouped[dependency][0].get("last_triggered_at")
+            )
+            for dependency in ("qmt_announcement_pit", "capital_flow_batch_fast")
+        ]
         analysis_time = _coerce_datetime(
             grouped["analysis_fast"][0].get("last_triggered_at")
         )
-        if event_time is None or analysis_time is None or analysis_time < event_time:
-            return False, "analysis_fast:ran_before_qmt_announcement"
+        if (
+            any(item is None for item in upstream_times)
+            or analysis_time is None
+            or analysis_time < max(item for item in upstream_times if item is not None)
+        ):
+            return False, "analysis_fast:ran_before_strategy_input"
+    return True, "ready"
+
+
+def evaluate_hot_rank_pipeline_dependencies(
+    task_type: str,
+    dependency_rows: list[dict],
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Require each fusion stage's exact upstream tasks to succeed today."""
+
+    normalized_type = str(task_type or "").strip()
+    required = _HOT_RANK_PIPELINE_DEPENDENCIES.get(normalized_type)
+    if required is None:
+        return True, "not_applicable"
+    grouped: dict[str, list[dict]] = {}
+    for row in dependency_rows:
+        grouped.setdefault(str(row.get("task_type") or "").strip(), []).append(row)
+    dependency_times: list[datetime] = []
+    for dependency in required:
+        rows = grouped.get(dependency, [])
+        if len(rows) != 1:
+            return False, f"{dependency}:missing_or_duplicate"
+        dependency_row = rows[0]
+        triggered = _coerce_datetime(dependency_row.get("last_triggered_at"))
+        status = str(
+            dependency_row.get("last_run_status") or ""
+        ).strip().lower()
+        if int(dependency_row.get("enabled") or 0) != 1:
+            return False, f"{dependency}:disabled"
+        if triggered is None or triggered.date() != now.date():
+            return False, f"{dependency}:not_run_today"
+        if status != "success":
+            return False, f"{dependency}:not_success_today"
+        dependency_times.append(triggered)
+    downstream_triggered = _coerce_datetime(
+        next(
+            (
+                row.get("last_triggered_at")
+                for row in grouped.get(normalized_type, [])
+                if row.get("last_triggered_at")
+            ),
+            None,
+        )
+    )
+    if (
+        downstream_triggered is not None
+        and downstream_triggered.date() == now.date()
+        and dependency_times
+        and downstream_triggered < max(dependency_times)
+    ):
+        return False, f"{normalized_type}:ran_before_dependency"
     return True, "ready"
 
 
@@ -691,8 +1575,28 @@ def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
     task_type = str(row.get("task_type") or "").strip()
-    if task_type not in {"analysis_fast", "strategy_governance_daily"}:
+    hot_dependencies = _HOT_RANK_PIPELINE_DEPENDENCIES.get(task_type)
+    if (
+        task_type not in {"analysis_fast", "strategy_governance_daily"}
+        and hot_dependencies is None
+    ):
         return True, "not_applicable"
+    dependency_types = (
+        set(hot_dependencies or ()) | {task_type}
+        if hot_dependencies is not None
+        else {
+            "qmt_announcement_pit",
+            "capital_flow_batch_fast",
+            "analysis_fast",
+        }
+    )
+    placeholders = ",".join(
+        f":dependency_{index}" for index, _ in enumerate(sorted(dependency_types))
+    )
+    params = {
+        f"dependency_{index}": dependency
+        for index, dependency in enumerate(sorted(dependency_types))
+    }
     try:
         with engine.connect() as connection:
             dependencies = [
@@ -701,17 +1605,19 @@ def _strategy_pipeline_dependencies_ready(
                     text(
                         "SELECT task_type, enabled, last_triggered_at, "
                         "last_run_status FROM st_scheduled_tasks "
-                        "WHERE task_type IN "
-                        "('qmt_announcement_pit','analysis_fast') "
+                        f"WHERE task_type IN ({placeholders}) "
                         "ORDER BY task_type, id"
-                    )
+                    ),
+                    params,
                 ).mappings()
             ]
     except Exception as exc:
         return False, f"dependency_query_failed:{type(exc).__name__}"
-    return evaluate_strategy_pipeline_dependencies(
-        task_type, dependencies, now=now
-    )
+    if hot_dependencies is not None:
+        return evaluate_hot_rank_pipeline_dependencies(
+            task_type, dependencies, now=now
+        )
+    return evaluate_strategy_pipeline_dependencies(task_type, dependencies, now=now)
 
 
 def _task_timeout_minutes(row: dict) -> int:
@@ -748,6 +1654,10 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     Due tasks are now ordered by overdue seconds; the oldest due task gets the
     worker slot first, while not-yet-due tasks remain at the end.
     """
+    if _release_build_catchup_allowed(row, now=now):
+        # New-build proofs are finite release work.  Give them priority over
+        # recurring realtime tasks while preserving stable task-id ordering.
+        return (0, -7 * 24 * 60 * 60.0, int(row.get("id") or 0))
     interval_minutes = int(row.get("interval_minutes") or 0)
     if interval_minutes > 0:
         reference = _coerce_datetime(row.get("last_triggered_at")) or _coerce_datetime(row.get("last_run_at"))
@@ -1080,6 +1990,277 @@ def _claim_task_run(row: dict, engine) -> bool:
 
 def _build_task_args(row: dict, script_path: str, today: str) -> list[str]:
     return build_scheduler_task_args(row, script_path, today)
+
+
+def _release_catchup_closed_target_date(
+    engine,
+    *,
+    now: datetime | None = None,
+    task_type: str = "",
+    close_ready_time: datetime_time | None = None,
+) -> str:
+    """Resolve one DB-authoritative closed session or fail without guessing."""
+
+    ready_time = close_ready_time or release_catchup_closed_ready_time(task_type)
+    try:
+        target = authoritative_closed_trade_date(
+            engine,
+            now=now,
+            close_ready_time=ready_time,
+        )
+        parsed = date.fromisoformat(str(target or ""))
+    except Exception as exc:
+        raise RuntimeError(
+            "release catch-up authoritative closed target date is unavailable"
+        ) from exc
+    if parsed.isoformat() != target:
+        raise RuntimeError(
+            "release catch-up authoritative closed target date is unavailable"
+        )
+    return target
+
+
+class ReleaseCatchupDataBlocked(RuntimeError):
+    """A release replay cannot yet bind a current-only source to today."""
+
+
+def _release_catchup_current_snapshot_date(
+    engine,
+    *,
+    task_type: str,
+    now: datetime,
+) -> str:
+    """Prove a current-only source is in today's post-close publish window."""
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    ready_time = RELEASE_CATCHUP_CURRENT_SNAPSHOT_READY_TIMES.get(task_type)
+    if ready_time is None:
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up current-snapshot task is unclassified"
+        )
+    try:
+        published_session = authoritative_closed_trade_date(
+            engine,
+            now=current,
+            close_ready_time=ready_time,
+        )
+        parsed = date.fromisoformat(str(published_session or ""))
+    except Exception as exc:
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up current-snapshot publication authority is unavailable"
+        ) from exc
+    run_date = current.date().isoformat()
+    if parsed.isoformat() != published_session or published_session != run_date:
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up current-snapshot publication window is not open"
+        )
+    return run_date
+
+
+def _release_catchup_previous_session_target_date(
+    engine,
+    *,
+    now: datetime,
+) -> str:
+    """Resolve the session before the bound execution date without fallback."""
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    try:
+        target = authoritative_closed_trade_date(
+            engine,
+            # Midnight preserves the bound execution date while forcing the
+            # shared market clock's strict ``trade_date < execution_date``
+            # branch, including at 23:59:59.999999.
+            now=current.replace(hour=0, minute=0, second=0, microsecond=0),
+        )
+        parsed = date.fromisoformat(str(target or ""))
+    except Exception as exc:
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up previous-session authority is unavailable"
+        ) from exc
+    if parsed.isoformat() != target or target >= current.date().isoformat():
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up previous-session authority is unavailable"
+        )
+    return target
+
+
+def _attach_release_catchup_expected_targets(
+    engine,
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> bool:
+    """Bind date-sensitive release rows to this poll's authoritative target.
+
+    The binding is recomputed before every scheduler sort.  In particular, an
+    18:00 Shanghai closed-session rollover invalidates a 17:59 success receipt
+    even when its build SHA is unchanged.  Calendar lookup failure blocks only
+    the affected release rows and never falls back to the host calendar.
+    """
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    selected = [
+        row
+        for row in rows
+        if str(row.get("task_type") or "").strip()
+        in RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES
+    ]
+    selected_ids = {id(row) for row in selected}
+    for row in rows:
+        required = id(row) in selected_ids
+        row["_release_expected_target_required"] = required
+        if required:
+            row["_release_expected_target_available"] = False
+            row["_release_expected_target_date"] = ""
+    if not selected:
+        return True
+
+    resolved: dict[str, str] = {
+        "current": current.date().isoformat(),
+    }
+    failures: dict[str, str] = {}
+    closed_task_types = sorted(
+        {
+            str(row.get("task_type") or "").strip()
+            for row in selected
+            if str(row.get("task_type") or "").strip()
+            in RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+        }
+    )
+    for task_type in closed_task_types:
+        category = f"closed:{task_type}"
+        try:
+            resolved[category] = _release_catchup_closed_target_date(
+                engine,
+                now=current,
+                task_type=task_type,
+            )
+        except Exception as exc:
+            failures[category] = type(exc).__name__
+    if any(
+        str(row.get("task_type") or "").strip()
+        in RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES
+        for row in selected
+    ):
+        try:
+            resolved["previous"] = (
+                _release_catchup_previous_session_target_date(
+                    engine,
+                    now=current,
+                )
+            )
+        except Exception as exc:
+            failures["previous"] = type(exc).__name__
+
+    for row in selected:
+        task_type = str(row.get("task_type") or "").strip()
+        category = (
+            f"closed:{task_type}"
+            if task_type in RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+            else "previous"
+            if task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES
+            else "current"
+        )
+        target = str(resolved.get(category) or "")
+        if target:
+            row["_release_expected_target_available"] = True
+            row["_release_expected_target_date"] = target
+    if failures:
+        logger.warning(
+            "Release catch-up target authority is unavailable; fail closed: %s",
+            ",".join(
+                f"{category}={error}"
+                for category, error in sorted(failures.items())
+            ),
+        )
+    return not failures
+
+
+def _task_dispatch_date(
+    row: dict,
+    engine,
+    *,
+    now: datetime | None = None,
+) -> str:
+    task_type = str(row.get("task_type") or "").strip()
+    trigger_source = str(row.get("_trigger_source") or "").strip()
+    current = now or datetime.now(PRODUCTION_TIMEZONE)
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    if (
+        trigger_source == "release_catchup"
+        and task_type in RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES
+    ):
+        return _release_catchup_closed_target_date(
+            engine,
+            now=current,
+            task_type=task_type,
+        )
+    if (
+        trigger_source == "release_catchup"
+        and task_type in RELEASE_CATCHUP_RUN_DATE_SNAPSHOT_TASK_TYPES
+    ):
+        return _release_catchup_current_snapshot_date(
+            engine,
+            task_type=task_type,
+            now=current,
+        )
+    return current.date().isoformat()
+
+
+def _task_argument_row(row: dict, *, now: datetime) -> dict:
+    """Bind strict previous-session analysis to one Shanghai execution time."""
+
+    task_type = str(row.get("task_type") or "").strip()
+    trigger_source = str(row.get("_trigger_source") or "").strip()
+    if (
+        trigger_source != "release_catchup"
+        or task_type not in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES
+    ):
+        return row
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    return {
+        **row,
+        "_release_execution_time": current.replace(microsecond=0).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+def _bind_release_validation_target(
+    row: dict,
+    engine,
+    *,
+    dispatch_date: str,
+    now: datetime,
+) -> dict:
+    """Carry the exact scheduler-selected data date into durable validation."""
+
+    if str(row.get("_trigger_source") or "").strip() != "release_catchup":
+        return row
+    task_type = str(row.get("task_type") or "").strip()
+    if task_type in (
+        RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES
+        | RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES
+    ):
+        target = dispatch_date
+    elif task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES:
+        target = _release_catchup_previous_session_target_date(
+            engine,
+            now=now,
+        )
+    else:
+        return row
+    return {**row, "_release_target_date": target}
 
 
 def _get_task_semaphore() -> threading.Semaphore:
@@ -1617,7 +2798,8 @@ def _maybe_cleanup_history(engine, *, monotonic_now: float | None = None) -> dic
                     protected_filter = (
                         " AND task_type NOT IN "
                         "('qmt_edge_release_request',"
-                        "'qmt_edge_release_bootstrap')"
+                        "'qmt_edge_release_bootstrap',"
+                        "'release_data_activation')"
                         if table_name == "st_scheduled_task_history"
                         else ""
                     )
@@ -1643,7 +2825,183 @@ def _redact_history_output(value: object) -> str:
     output = str(value or "")
     for pattern, replacement in _HISTORY_SECRET_PATTERNS:
         output = pattern.sub(replacement, output)
-    return output[-_HISTORY_OUTPUT_LIMIT:]
+    encoded = output.encode("utf-8")
+    if len(encoded) <= _HISTORY_OUTPUT_LIMIT:
+        return output
+    return encoded[-_HISTORY_OUTPUT_LIMIT:].decode("utf-8", errors="ignore")
+
+
+def _history_digest(value: object) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _history_validation_replay_output(machine_output: object) -> str:
+    """Keep only bounded machine receipts and explicit daily date markers.
+
+    Scheduler children may emit megabytes of diagnostics.  Release
+    revalidation needs the schema-labelled result receipts, not those logs.
+    Redaction happens before selection so the evidence itself cannot become a
+    credential side channel.  An oversized individual receipt fails closed:
+    it is never silently truncated into something that merely looks valid.
+    """
+
+    redacted = str(machine_output or "")
+    for pattern, replacement in _HISTORY_SECRET_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+
+    def contains_machine_schema(value: object, depth: int = 0) -> bool:
+        if depth > 4:
+            return False
+        if isinstance(value, dict):
+            schema = str(value.get("schema") or "")
+            return schema.startswith("probiga.") or any(
+                contains_machine_schema(item, depth + 1)
+                for item in value.values()
+                if isinstance(item, (dict, list, tuple, str))
+            )
+        if isinstance(value, (list, tuple)):
+            return any(contains_machine_schema(item, depth + 1) for item in value)
+        if isinstance(value, str) and "{" in value:
+            for nested_line in value.splitlines():
+                nested = nested_line.strip()
+                if not nested.startswith("{"):
+                    continue
+                try:
+                    parsed = json.loads(nested)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if contains_machine_schema(parsed, depth + 1):
+                    return True
+        return False
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    for raw_line in redacted.splitlines():
+        line = raw_line.strip()
+        candidate = ""
+        if re.fullmatch(r"DATE=\d{4}-\d{2}-\d{2}", line):
+            candidate = line
+        elif line.startswith("{"):
+            try:
+                payload = json.loads(line)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and contains_machine_schema(payload):
+                candidate = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+        if not candidate or candidate in seen:
+            continue
+        candidate_size = len(candidate.encode("utf-8"))
+        if candidate_size > _HISTORY_REPLAY_OUTPUT_LIMIT:
+            raise RuntimeError(
+                "scheduler machine receipt exceeds bounded history evidence"
+            )
+        projected = "\n".join([*selected, candidate])
+        if len(projected.encode("utf-8")) > _HISTORY_REPLAY_OUTPUT_LIMIT:
+            raise RuntimeError(
+                "scheduler machine receipts exceed bounded history evidence"
+            )
+        seen.add(candidate)
+        selected.append(candidate)
+    return "\n".join(selected)
+
+
+def _build_history_validation_evidence(
+    row: dict,
+    *,
+    run_uid: str,
+    machine_output: object,
+    status: str,
+    exit_code: int,
+    started_at: datetime,
+    validation_message: object,
+) -> str:
+    """Return one hash-bound, replayable, non-secret scheduler evidence line."""
+
+    replay_output = _history_validation_replay_output(machine_output)
+    replay_disposition = scheduler_output_status(
+        row,
+        replay_output,
+        return_code=exit_code,
+    )
+    if replay_disposition is not None and replay_disposition != status:
+        raise RuntimeError(
+            "bounded scheduler receipt cannot replay the successful disposition"
+        )
+    safe_validation_message = str(validation_message or "")[:2000]
+    for pattern, replacement in _HISTORY_SECRET_PATTERNS:
+        safe_validation_message = pattern.sub(
+            replacement,
+            safe_validation_message,
+        )
+    core = {
+        "schema": _HISTORY_EVIDENCE_SCHEMA,
+        "run_uid": str(run_uid),
+        "task_id": int(row["id"]),
+        "task_name": str(row.get("task_name") or ""),
+        "task_type": str(row.get("task_type") or ""),
+        "build_sha": _scheduler_build_commit_sha(),
+        "status": str(status),
+        "exit_code": int(exit_code),
+        "started_at": started_at.replace(microsecond=0).isoformat(sep=" "),
+        "validation_checked": True,
+        "validation_ok": True,
+        "validation_message": safe_validation_message,
+        "machine_output_sha256": _history_digest(machine_output),
+        "replay_output": replay_output,
+        "replay_output_sha256": _history_digest(replay_output),
+    }
+    release_target_date = str(row.get("_release_target_date") or "").strip()
+    if release_target_date:
+        try:
+            parsed_target = date.fromisoformat(release_target_date)
+        except ValueError as exc:
+            raise RuntimeError(
+                "scheduler release validation target date is invalid"
+            ) from exc
+        if (
+            str(row.get("_trigger_source") or "").strip() != "release_catchup"
+            or parsed_target.isoformat() != release_target_date
+        ):
+            raise RuntimeError(
+                "scheduler release validation target date is invalid"
+            )
+        core["release_target_date"] = release_target_date
+    evidence = {**core, "evidence_sha256": _history_digest(json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ))}
+    encoded = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    if len(encoded.encode("utf-8")) > _HISTORY_EVIDENCE_LIMIT:
+        raise RuntimeError("scheduler validation evidence exceeds TEXT budget")
+    return encoded
+
+
+def _history_output_with_validation_evidence(
+    display_output: object,
+    evidence: str,
+) -> str:
+    tail = _redact_history_output(display_output)[-6000:]
+    combined = (tail + "\n" + evidence).strip()
+    if len(combined.encode("utf-8")) > _HISTORY_OUTPUT_LIMIT:
+        combined = evidence
+    if len(combined.encode("utf-8")) > _HISTORY_OUTPUT_LIMIT:
+        raise RuntimeError("scheduler validation evidence exceeds history budget")
+    return combined
 
 
 def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str | None:
@@ -1747,14 +3105,23 @@ def _run_task(row: dict, root: Path, engine) -> None:
         task_id = int(row["id"])
         stopped_by_user = _task_stop_requested(task_id)
         timed_out = _task_timeout_requested(task_id)
-        status = "stopped" if stopped_by_user else ("timeout" if timed_out else "failed")
+        release_data_blocked = isinstance(exc, ReleaseCatchupDataBlocked)
+        status = "stopped" if stopped_by_user else (
+            "timeout" if timed_out else (
+                "blocked" if release_data_blocked else "failed"
+            )
+        )
         output = (
             f"scheduler task stopped after confirmed termination: {exc}"
             if stopped_by_user
             else (
                 f"scheduler task timed out after confirmed termination: {exc}"
                 if timed_out
-                else f"scheduler task execution failed: {exc}"
+                else (
+                    f"DATA_BLOCKED: {exc}"
+                    if release_data_blocked
+                    else f"scheduler task execution failed: {exc}"
+                )
             )
         )
         try:
@@ -1791,7 +3158,6 @@ def _run_task_impl(
     task_id = row["id"]
     task_name = row["task_name"]
     script_path = row["script_path"] or ""
-    today = datetime.now().strftime("%Y-%m-%d")
 
     try:
         script = resolve_scheduler_script(root, script_path)
@@ -1836,7 +3202,16 @@ def _run_task_impl(
         )
         return
 
-    args = _build_task_args(row, script_path, today)
+    dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
+    argument_row = _task_argument_row(row, now=dispatch_now)
+    dispatch_date = _task_dispatch_date(argument_row, engine, now=dispatch_now)
+    argument_row = _bind_release_validation_target(
+        argument_row,
+        engine,
+        dispatch_date=dispatch_date,
+        now=dispatch_now,
+    )
+    args = _build_task_args(argument_row, script_path, dispatch_date)
 
     cmd = [sys.executable, str(script)] + args
 
@@ -1865,6 +3240,14 @@ def _run_task_impl(
     )
 
     start_t = datetime.now()
+    validation_started_at = (
+        dispatch_now.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        if str(argument_row.get("_trigger_source") or "").strip()
+        == "release_catchup"
+        else start_t
+    )
+    validation = None
+    machine_output = ""
     try:
         timeout_seconds = max(60, _task_timeout_minutes(row) * 60)
         popen_kwargs = dict(
@@ -1955,8 +3338,23 @@ def _run_task_impl(
             status = scheduler_output_status(
                 row, machine_output, return_code=proc.returncode
             ) or status
-        if status == "success" and not is_market_closed_skip_output(output):
-            validation = validate_scheduler_task_result(row, engine=engine, started_at=start_t)
+        validate_blocked_v3_receipt = (
+            status == "blocked"
+            and str(row.get("task_type") or "").strip()
+            in {
+                "trading_v3_close_decision",
+                "trading_v3_premarket_review",
+            }
+        )
+        if (
+            status == "success" or validate_blocked_v3_receipt
+        ) and not is_market_closed_skip_output(output):
+            validation = validate_scheduler_task_result(
+                argument_row,
+                engine=engine,
+                started_at=validation_started_at,
+                output=machine_output,
+            )
             if validation.checked:
                 marker = "DATA_VALIDATION_OK" if validation.ok else "DATA_VALIDATION_FAILED"
                 output = output + f"\n{marker}: {validation.message}"
@@ -1982,6 +3380,31 @@ def _run_task_impl(
             )
         )
 
+    history_output = output
+    if (
+        status == "success"
+        and getattr(validation, "checked", None) is True
+        and getattr(validation, "ok", None) is True
+    ):
+        try:
+            evidence = _build_history_validation_evidence(
+                argument_row,
+                run_uid=str(history_run_uid or ""),
+                machine_output=machine_output,
+                status=status,
+                exit_code=int(getattr(locals().get("proc"), "returncode", 0)),
+                started_at=validation_started_at,
+                validation_message=validation.message,
+            )
+            history_output = _history_output_with_validation_evidence(
+                output,
+                evidence,
+            )
+        except Exception as exc:
+            status = "failed"
+            output = output + f"\nDATA_EVIDENCE_FAILED: {exc}"
+            history_output = output
+
     update_scheduler_task(
         engine,
         int(task_id),
@@ -1997,7 +3420,7 @@ def _run_task_impl(
         status=status,
         duration=duration,
         exit_code=getattr(locals().get("proc"), "returncode", None),
-        output=output,
+        output=history_output,
     )
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
@@ -2298,6 +3721,29 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
 
             now = datetime.now()
+            if _release_catchup_disabled_for_deferred_database():
+                release_authorized = False
+                release_authorization_reason = "governance_database_deferred"
+            else:
+                _attach_release_catchup_history(engine, rows)
+                _attach_release_catchup_expected_targets(
+                    engine,
+                    rows,
+                    now=now,
+                )
+                release_authorized, release_authorization_reason = (
+                    _attach_release_catchup_authorization(
+                        engine,
+                        rows,
+                        mode=mode,
+                        now=now,
+                    )
+                )
+            if not release_authorized:
+                logger.debug(
+                    "Release data catch-up is not active: %s",
+                    release_authorization_reason,
+                )
             time_str = now.strftime("%H:%M")
             max_pending_tasks = max(1, int(get_scheduler_runtime_config()["max_concurrent_tasks"]))
 
@@ -2312,6 +3758,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 cron_time = str(row["cron_time"] or "17:10")
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
+                release_catchup_due = _release_build_catchup_allowed(
+                    row,
+                    now=now,
+                )
+                release_catchup_pending = _release_build_catchup_pending(row)
 
                 governance_block_reason = strategy_governance_task_block_reason(
                     row
@@ -2347,6 +3798,13 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _delegated_skip_logged_for.add(skip_key)
                     continue
 
+                if release_catchup_pending and not release_catchup_due:
+                    logger.debug(
+                        "Defer ordinary dispatch for exact-build release task: %s",
+                        task_name,
+                    )
+                    continue
+
                 if interval_minutes > 0:
                     ref_time = last_triggered or row.get("last_run_at")
                     if ref_time and isinstance(ref_time, str):
@@ -2357,12 +3815,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                             ref_time = None
                     if ref_time:
                         elapsed = (now - ref_time).total_seconds() / 60
-                        if elapsed < interval_minutes:
+                        if elapsed < interval_minutes and not release_catchup_due:
                             continue
                 else:
-                    if not _cron_due(row, now=now):
+                    if not release_catchup_due and not _cron_due(row, now=now):
                         continue
-                    if time_str != cron_time:
+                    if not release_catchup_due and time_str != cron_time:
                         if not _overdue_cron_allowed(
                             row,
                             now=now,
@@ -2380,7 +3838,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 _overdue_skip_logged_for.add(skip_key)
                             continue
                         status = str(row.get("last_run_status") or "").strip().lower()
-                        if status in {"failed", "timeout", "stopped"}:
+                        if status in RETRYABLE_CRON_STATUSES:
                             logger.warning(
                                 "retry overdue cron task: %s (cron=%s, now=%s, status=%s)",
                                 task_name,
@@ -2407,7 +3865,24 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     )
                     continue
 
-                non_trading_day_action = _should_skip_non_trading_day(row, engine, now)
+                if release_catchup_due:
+                    release_dependencies_ready, release_dependency_reason = (
+                        _release_catchup_dependencies_ready(row, rows)
+                    )
+                    if not release_dependencies_ready:
+                        logger.info(
+                            "Defer release catch-up task %s until exact-build "
+                            "prerequisite: %s",
+                            task_name,
+                            release_dependency_reason,
+                        )
+                        continue
+
+                non_trading_day_action = (
+                    False
+                    if release_catchup_due
+                    else _should_skip_non_trading_day(row, engine, now)
+                )
                 if non_trading_day_action is None:
                     logger.warning(
                         "Defer scheduled market task until trade calendar is available: %s (type=%s)",
@@ -2435,6 +3910,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         )
                         _intraday_skip_logged_for.add(skip_key)
                     continue
+
+                if release_catchup_due:
+                    row["_trigger_source"] = "release_catchup"
 
                 with _running_lock:
                     task_running = task_id in _running_task_ids

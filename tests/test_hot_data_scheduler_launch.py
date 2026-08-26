@@ -22,6 +22,25 @@ def _registered_task(
     }
 
 
+def test_news_refresh_launches_only_the_formal_registered_sync_task():
+    engine = MagicMock()
+    with patch.object(hot_data, "get_engine", return_value=engine), patch.object(
+        hot_data,
+        "launch_registered_manual_task",
+        return_value={"accepted": True, "status": "running", "job_id": "news-1"},
+    ) as launch:
+        result = hot_data.refresh_news_flash()
+
+    launch.assert_called_once_with(
+        engine,
+        task_type="news_sync",
+        expected_script_path="tools/sync_news_formal.py",
+        script_args="--pages 2 --json",
+        root=hot_data._ROOT,
+    )
+    assert result["accepted"] is True
+
+
 def test_registered_hot_data_task_uses_unique_row_copy_and_launcher():
     persisted = _registered_task("daily_review")
     engine = MagicMock()

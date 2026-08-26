@@ -179,7 +179,7 @@ jobs:
               r"--hash=sha256:([0-9a-f]{64})"
           )
           requirements = [requirement_re.fullmatch(line) for line in lock_lines[8:]]
-          check(len(requirements) == 44 and all(requirements), "44 hashed requirements")
+          check(len(requirements) == 47 and all(requirements), "47 hashed requirements")
           requirements = [match.groups() for match in requirements]
           canonical = lambda name: re.sub(r"[-_.]+", "-", name).lower()
           requirement_names = [canonical(row[0]) for row in requirements]
@@ -200,11 +200,11 @@ jobs:
           )
           wheel_re = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9_.+-]+[.]whl)")
           wheels = [wheel_re.fullmatch(line) for line in wheel_lines[3:]]
-          check(len(wheels) == 44 and all(wheels), "44 wheel manifest entries")
+          check(len(wheels) == 47 and all(wheels), "47 wheel manifest entries")
           wheels = [match.groups() for match in wheels]
           wheel_hashes, wheel_names = map(list, zip(*wheels, strict=True))
           check(wheel_names == sorted(set(wheel_names)), "wheel filenames")
-          check(len(set(wheel_hashes)) == 44, "wheel hashes")
+          check(len(set(wheel_hashes)) == 47, "wheel hashes")
           check(
               set(wheel_hashes) == {row[2] for row in requirements},
               "lock/manifest hashes",
@@ -230,9 +230,9 @@ jobs:
             find "$LOCK_WHEELHOUSE" -mindepth 1 -maxdepth 1 -type f \
               -name '*.whl' -printf '%f\n' | LC_ALL=C sort
           )
-          test "${#downloaded_wheels[@]}" -eq 44
+          test "${#downloaded_wheels[@]}" -eq 47
           test "$(find "$LOCK_WHEELHOUSE" -mindepth 1 -maxdepth 1 \
-            -printf '%f\n' | wc -l)" -eq 44
+            -printf '%f\n' | wc -l)" -eq 47
           tail -n +4 "$WHEEL_MANIFEST" | LC_ALL=C sort \
             > "$RUNNER_TEMP/probiga-expected-wheels.txt"
           (
@@ -296,7 +296,7 @@ jobs:
           if len(names) != len(set(names)):
               raise SystemExit("duplicate installed distribution")
           observed = dict(pairs)
-          if len(expected) != 44 or len(observed) != 44 or observed != expected:
+          if len(expected) != 47 or len(observed) != 47 or observed != expected:
               raise SystemExit(
                   "installed set differs: "
                   f"missing={sorted(expected.keys() - observed.keys())}, "
@@ -490,6 +490,12 @@ jobs:
           tests/test_api_error_handling.py
           tests/test_health_endpoints.py
 
+      - name: Run account authentication regressions
+        run: >-
+          python -m pytest -q
+          tests/test_account_auth.py
+          tests/test_admin_auth.py
+
       - name: Run production governance and QMT regressions
         run: >-
           python -m pytest -q
@@ -629,6 +635,11 @@ jobs:
           tests/test_import_gm_minute_runtime_boundary.py
           tests/test_legacy_table_surface.py
 
+      - name: Run QMT model release reload regressions
+        run: >-
+          python -m pytest -q
+          tests/test_qmt_model_release_reload.py
+
       - name: Run atomic refresh and event truth regressions
         run: >-
           python -m pytest -q
@@ -638,6 +649,56 @@ jobs:
           tests/test_sentiment_atomic_refresh.py
           tests/test_stock_market_atomic_refresh.py
           tests/test_sync_stock_info_atomic_refresh.py
+
+      - name: Run exact data completion regressions
+        run: >-
+          python -m pytest -q
+          tests/test_concept_flow_snapshot_contract.py
+          tests/test_daily_derived_date_contract.py
+          tests/test_daily_stock_universe_coverage.py
+          tests/test_dividend_baidu_pipeline.py
+          tests/test_eastmoney_alist_exact.py
+          tests/test_etf_dividend_scheduler_contract.py
+          tests/test_etf_formal_pipeline.py
+          tests/test_formal_provider_scheduler_receipts.py
+          tests/test_hot_rank_scheduler_chain.py
+          tests/test_qmt_canonical_history_gap_repair.py
+
+      - name: Run scheduler receipt and QMT data regressions
+        run: >-
+          python -m pytest -q
+          tests/test_main_strategy_pool_historical_fallback_ui.py
+          tests/test_merge_hot_rank_source_contract.py
+          tests/test_notice_sim_scheduler_receipts.py
+          tests/test_notice_sync_cli_status.py
+          tests/test_qmt_index_edge_task.py
+          tests/test_qmt_minute_flow_exact.py
+          tests/test_qmt_minute_formal_publisher.py
+          tests/test_qmt_stock_edge_task.py
+          tests/test_release_data_readiness.py
+          tests/test_required_data_scheduler_contract.py
+
+      - name: Run formal pipeline and recovery evidence regressions
+        run: >-
+          python -m pytest -q
+          tests/test_scheduler_args_analysis_date.py
+          tests/test_schema_recovery_evidence.py
+          tests/test_sector_heat_east_formal.py
+          tests/test_sim_trade_cli_contract.py
+          tests/test_sync_eastmoney_concept_market.py
+          tests/test_sync_finance_cli_status.py
+          tests/test_sync_news_formal.py
+          tests/test_ths_hot_sync_contract.py
+          tests/test_trading_v3_empty_forecast_contract.py
+          tests/test_release_data_readiness_waiter.py
+
+      - name: Run remaining exact data regressions
+        run: >-
+          python -m pytest -q
+          tests/test_linux_recent_data_gap_repair.py
+          tests/test_capital_flow_release_contract.py
+          tests/test_hot_rank_api_safety.py
+          tests/test_hot_rank_source_contract.py
 
   deployment-disabled:
     name: Production deployment disabled

@@ -1,7 +1,7 @@
 """
 全市场股票快照表 刷新脚本
 
-从 sm_stock_kline（最新日K）+ sm_stock_capital_flow_daily（最新资金流向）
+从同一目标日的 sm_stock_kline + sm_stock_capital_flow_daily
 合并写入 sm_stock_snapshot，每只股票一行，约5000条。
 
 用法：
@@ -10,6 +10,7 @@
 """
 
 import argparse
+import json
 import sys
 from datetime import datetime
 
@@ -23,6 +24,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.daily_stock_universe import (
+    load_daily_stock_universe,
+    validate_daily_stock_coverage,
+)
 
 
 def get_engine():
@@ -39,9 +44,10 @@ def get_latest_trade_date(engine) -> str:
     """)
     row = pd.read_sql(sql, engine).iloc[0]
     if pd.isna(row["d"]):
-        print("[ERROR] sm_stock_kline 表无数据，无法确定最新交易日")
-        sys.exit(1)
-    return str(row["d"])
+        raise RuntimeError(
+            "DATA_BLOCKED: sm_stock_kline 表无数据，无法确定最新交易日"
+        )
+    return str(row["d"])[:10]
 
 
 def get_nth_trade_date(engine, trade_date: str, offset: int) -> str:
@@ -60,6 +66,8 @@ def get_nth_trade_date(engine, trade_date: str, offset: int) -> str:
 
 def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
     """从 sm_stock_kline + sm_stock_capital_flow_daily 合并数据，预计算多日涨幅、市值、行业"""
+    universe = load_daily_stock_universe(engine, trade_date)
+
     # 1. 主查询：当日K线
     sql = text("""
         SELECT
@@ -82,13 +90,22 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
           AND k.adjust_type = 0
     """)
     df = pd.read_sql(sql, engine, params={"d": trade_date})
+    validate_daily_stock_coverage(
+        universe,
+        kline_rows=df.to_dict("records"),
+    )
 
-    # 1a. 实时行情（sm_stock_current，取最新快照）
+    # 1a. 实时行情仅允许使用目标日快照；显式历史模式没有留存行情时，
+    # 安全回退到同日K线收盘价，绝不拼入另一天的当前价。
     cur = pd.read_sql(text("""
         SELECT stock_code, price AS cur_price, change_pct AS cur_change_pct
         FROM sm_stock_current
-        WHERE snapshot_at = (SELECT MAX(snapshot_at) FROM sm_stock_current)
-    """), engine)
+        WHERE snapshot_at = (
+            SELECT MAX(snapshot_at)
+            FROM sm_stock_current
+            WHERE DATE(snapshot_at) = :d
+        )
+    """), engine, params={"d": trade_date})
     cur = cur.drop_duplicates(subset=["stock_code"], keep="first")
     df = df.merge(cur, on="stock_code", how="left")
     # price = 实时价优先，回退到K线close
@@ -96,19 +113,21 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
     df.drop(columns=["cur_price", "cur_change_pct"], inplace=True)
     print(f"[INFO] 实时行情: {len(cur)} 条")
 
-    # 1b. 资金流向（取最新可用日期，不要求与K线日期一致）
-    flow_td = pd.read_sql(text("SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily"), engine)
-    flow_date = flow_td.iloc[0]["d"]
-    if flow_date is not None and not pd.isna(flow_date):
-        flow = pd.read_sql(text("""
-            SELECT stock_code, main_net_inflow, max_net_inflow,
-                   lg_net_inflow, mid_net_inflow, sm_net_inflow
-            FROM sm_stock_capital_flow_daily
-            WHERE trade_date = :d
-        """), engine, params={"d": str(flow_date)})
-        flow = flow.drop_duplicates(subset=["stock_code"], keep="first")
-        df = df.merge(flow, on="stock_code", how="left")
-        print(f"[INFO] 资金流向日期: {flow_date}, {len(flow)} 条")
+    # 1b. 资金流向必须与K线属于同一目标日。缺失或明显不完整时在写前阻断，
+    # 保留上一份原子快照供页面继续读取。
+    flow = pd.read_sql(text("""
+        SELECT stock_code, main_net_inflow, max_net_inflow,
+               lg_net_inflow, mid_net_inflow, sm_net_inflow
+        FROM sm_stock_capital_flow_daily
+        WHERE trade_date = :d
+    """), engine, params={"d": trade_date})
+    coverage_audit = validate_daily_stock_coverage(
+        universe,
+        kline_rows=df.to_dict("records"),
+        flow_rows=flow.to_dict("records"),
+    )
+    df = df.merge(flow, on="stock_code", how="left")
+    print(f"[INFO] 资金流向日期: {trade_date}, {len(flow)} 条")
 
     # 2. 近3/5/10日涨幅
     td3 = get_nth_trade_date(engine, trade_date, 2)
@@ -144,6 +163,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
 
     # 最终去重（防止 merge 产生重复行）
     df = df.drop_duplicates(subset=["stock_code"], keep="first")
+    df.attrs["coverage_audit"] = coverage_audit
 
     return df
 
@@ -178,26 +198,49 @@ def write_snapshot(engine, df: pd.DataFrame) -> None:
 
 
 # ── 主流程 ──────────────────────────────────────────────────
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="刷新全市场股票快照表")
     parser.add_argument("--date", type=str, default=None, help="交易日期，格式 YYYY-MM-DD，默认自动取最新")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     engine = get_engine()
+    try:
+        if args.date:
+            try:
+                trade_date = datetime.strptime(args.date, "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                print(
+                    f"[ERROR] 日期格式错误，应为 YYYY-MM-DD，输入: {args.date}",
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            trade_date = get_latest_trade_date(engine)
+        print(f"[INFO] 快照日期: {trade_date}")
 
-    trade_date = args.date or get_latest_trade_date(engine)
-    print(f"[INFO] 快照日期: {trade_date}")
+        try:
+            df = fetch_snapshot(engine, trade_date)
+        except RuntimeError as exc:
+            print(f"[ERROR] {exc}", file=sys.stderr)
+            return 2
+        print(f"[INFO] 拉取到 {len(df)} 只股票数据")
+        print(
+            "COVERAGE_MANIFEST="
+            + json.dumps(
+                df.attrs.get("coverage_audit") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
 
-    df = fetch_snapshot(engine, trade_date)
-    print(f"[INFO] 拉取到 {len(df)} 只股票数据")
-
-    if df.empty:
-        print("[WARN] 无数据，跳过写入")
-        return
-
-    write_snapshot(engine, df)
-    print(f"[OK] sm_stock_snapshot 已刷新，共 {len(df)} 行，日期 {trade_date}")
+        write_snapshot(engine, df)
+        print(f"[OK] sm_stock_snapshot 已刷新，共 {len(df)} 行，日期 {trade_date}")
+        print(f"DATE={trade_date}")
+        return 0
+    finally:
+        engine.dispose()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -25,6 +25,7 @@ from server.common.qmt_history_coverage import (
     combine_minute_coverage_partitions,
     coverage_table_ddl_statements,
     coverage_trigger_ddl_statements,
+    minute_grid_profile_for_capture,
     minute_time_grid,
     require_exact_coverage,
     unavailable_coverage_bundle,
@@ -119,6 +120,26 @@ def test_qmt_minute_grid_matches_native_qmt_241_fixture():
     assert canonical_digest(list(grid)) == QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH
     with pytest.raises(QmtHistoryCoverageError, match="unsupported"):
         minute_time_grid("guessed-grid")
+
+
+def test_intraday_minute_grid_is_one_strict_native_prefix():
+    morning_profile = minute_grid_profile_for_capture(
+        trade_date="2026-08-26",
+        captured_at="2026-08-26 10:15:40",
+    )
+    lunch_profile = minute_grid_profile_for_capture(
+        trade_date="2026-08-26",
+        captured_at="2026-08-26 12:30:00",
+    )
+    closed_profile = minute_grid_profile_for_capture(
+        trade_date="2026-08-26",
+        captured_at="2026-08-26 15:01:00",
+    )
+
+    assert minute_time_grid(morning_profile)[-1] == "10:15:00"
+    assert minute_time_grid(lunch_profile)[-1] == "11:30:00"
+    assert closed_profile == QMT_MINUTE_GRID_PROFILE
+    assert len(minute_time_grid(closed_profile)) == 241
 
 
 def test_daily_exact_manifest_binds_universe_source_and_every_entity():
@@ -258,6 +279,28 @@ def test_minute_empty_partial_duplicate_or_wrong_source_is_ineligible(
 
     assert bundle["manifest"]["status"] == COVERAGE_INCOMPLETE
     assert reason in {
+        row["code"] for row in bundle["manifest"]["reasons"]
+    }
+    with pytest.raises(QmtHistoryCoverageError, match="not exact"):
+        require_exact_coverage(bundle)
+
+
+def test_minute_late_session_cache_cannot_prove_a_closed_day():
+    rows = [
+        row
+        for row in _minute_rows("000001")
+        if str(row["trade_time"])[11:] >= "13:37:00"
+    ]
+
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"],
+        daily_rows=[_daily_row("000001")],
+        minute_rows=rows,
+        **_minute_context(),
+    )
+
+    assert bundle["manifest"]["status"] == COVERAGE_INCOMPLETE
+    assert "MINUTE_GRID_MISMATCH" in {
         row["code"] for row in bundle["manifest"]["reasons"]
     }
     with pytest.raises(QmtHistoryCoverageError, match="not exact"):
@@ -846,7 +889,21 @@ def test_historical_bridge_disables_synthetic_minute_fill(monkeypatch):
     assert captured["timeout"] == 17
 
 
-def test_empty_native_minute_batch_marks_local_run_failed(monkeypatch):
+def _patch_local_minute_reference(monkeypatch, local_history, codes):
+    monkeypatch.setattr(
+        local_history,
+        "_load_minute_coverage_reference",
+        lambda *_args, **_kwargs: {
+            "catalog_batch_id": "catalog_20260821",
+            "catalog_manifest_hash": HASH_A,
+            "calendar_batch_id": "calendar_2026",
+            "calendar_manifest_hash": HASH_B,
+            "eligible_codes": tuple(codes),
+        },
+    )
+
+
+def test_empty_native_minute_batch_marks_local_run_partial(monkeypatch):
     from integrations.qmt import local_history
 
     source_engine = SimpleNamespace()
@@ -864,22 +921,211 @@ def test_empty_native_minute_batch_marks_local_run_failed(monkeypatch):
         "_record_run_finish",
         lambda *_a, **kwargs: finishes.append(kwargs),
     )
+    monkeypatch.setattr(local_history, "_short_name_map", lambda *_a, **_k: {})
+    _patch_local_minute_reference(monkeypatch, local_history, ["000001"])
 
     def empty_minute(*_args, **kwargs):
         captured.update(kwargs)
         return pd.DataFrame()
 
     monkeypatch.setattr(local_history.bridge, "minute", empty_minute)
+    monkeypatch.setattr(
+        local_history.bridge,
+        "kline",
+        lambda *_args, **_kwargs: pd.DataFrame([_daily_row("000001")]),
+    )
 
-    with pytest.raises(RuntimeError, match="returned no native rows"):
-        local_history.backfill_minute_local(
-            source_engine=source_engine,
-            local_engine=local_engine,
-            stock_codes=["000001"],
-            trade_dates=[TRADE_DATE],
-            batch_size=1,
-        )
+    result = local_history.backfill_minute_local(
+        source_engine=source_engine,
+        local_engine=local_engine,
+        stock_codes=["000001"],
+        trade_dates=[TRADE_DATE],
+        batch_size=1,
+        provider=local_history.LEGACY_PROVIDER_ID,
+    )
 
     assert captured["fill_data"] is False
-    assert finishes[-1]["status"] == "FAILED"
+    assert result.status == "PARTIAL"
+    assert result.coverage_status == "PARTIAL"
+    assert result.batches[0].responded_stock_codes == ()
+    assert result.batches[0].written_rows == 0
+    assert finishes[-1]["status"] == "PARTIAL"
     assert finishes[-1]["fetched_rows"] == 0
+
+
+def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
+    monkeypatch,
+):
+    from integrations.bigqmt.backend import BigQmtBackend
+    from integrations.qmt import local_history
+
+    source_engine = SimpleNamespace()
+    local_engine = SimpleNamespace(
+        url="mysql+pymysql://user:" + "password@localhost/probiga_qmt_history"
+    )
+    fetch_calls = []
+    writes = []
+    finishes = []
+    monkeypatch.setattr(
+        local_history, "validate_local_history_tables", lambda _engine: None
+    )
+    monkeypatch.setattr(local_history, "_short_name_map", lambda *_a, **_k: {})
+    monkeypatch.setattr(local_history, "_record_run_start", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        local_history,
+        "_record_run_finish",
+        lambda *_a, **kwargs: finishes.append(kwargs),
+    )
+    _patch_local_minute_reference(monkeypatch, local_history, ["000001"])
+
+    def fetch_minute(_self, stock_codes, trade_date, **kwargs):
+        fetch_calls.append((stock_codes, trade_date, kwargs))
+        return pd.DataFrame([
+            {
+                    "stock_code": "000001",
+                    "qmt_code": "000001.SZ",
+                    "trade_time": f"{TRADE_DATE} {minute_time}",
+                    "trade_date": TRADE_DATE,
+                    "price": 10.1,
+                    "avg_price": 10.1,
+                    "volume": 100,
+                    "amount": 1010,
+                    "pre_close": 10.0,
+                    "data_source": local_history.BIGQMT_PROVIDER_ID,
+                    "source_time": f"{TRADE_DATE} {minute_time}",
+                    "received_at": f"{TRADE_DATE} 15:01:00",
+                    "batch_id": "transient-bridge-request",
+                    "quality_status": "VERIFIED",
+                    "permission_status": "SUPPORTED",
+            }
+            for minute_time in minute_time_grid()
+        ])
+
+    def fetch_kline(_self, stock_codes, start_date, end_date, **kwargs):
+        assert stock_codes == ["000001"]
+        assert start_date == end_date == TRADE_DATE
+        assert kwargs["dividend_type"] == "none"
+        return pd.DataFrame([_daily_row("000001")])
+
+    def upsert(_engine, **kwargs):
+        writes.extend(kwargs["rows"])
+        return len(kwargs["rows"])
+
+    monkeypatch.setattr(BigQmtBackend, "fetch_minute", fetch_minute)
+    monkeypatch.setattr(BigQmtBackend, "fetch_kline", fetch_kline)
+    monkeypatch.setattr(local_history, "_upsert_rows", upsert)
+
+    result = local_history.backfill_minute_local(
+        source_engine=source_engine,
+        local_engine=local_engine,
+        stock_codes=["000001"],
+        trade_dates=[TRADE_DATE],
+        batch_size=1,
+    )
+
+    assert fetch_calls == [
+        (
+            ["000001"],
+            TRADE_DATE,
+            {
+                "start_date": TRADE_DATE,
+                "end_date": TRADE_DATE,
+                "count": 0,
+                "download_history": True,
+            },
+        )
+    ]
+    assert result.status == "SUCCESS"
+    assert result.coverage_status == COVERAGE_EXACT
+    assert result.fetched_rows == 241
+    assert result.written_rows == 241
+    assert local_history.local_backfill_result_proves_exact_minute(
+        result,
+        requested_codes=["000001"],
+        trade_dates=[TRADE_DATE],
+    ) is True
+    assert writes[0]["provider"] == local_history.BIGQMT_PROVIDER_ID
+    assert writes[0]["qmt_code"] == "000001.SZ"
+    assert writes[0]["source_time"] == f"{TRADE_DATE} 09:30:00"
+    assert writes[0]["received_at"] == f"{TRADE_DATE} 15:01:00"
+    assert writes[0]["pre_close"] == 10.0
+    assert writes[0]["quality_status"] == "VERIFIED"
+    assert writes[0]["batch_id"] == result.run_id
+    assert writes[0]["batch_id"] != "transient-bridge-request"
+    assert finishes[-1]["status"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("partial_kind", ["missing_code", "late_grid"])
+def test_minute_local_partial_code_or_grid_never_writes_or_proves_exact(
+    monkeypatch,
+    partial_kind,
+):
+    from integrations.bigqmt.backend import BigQmtBackend
+    from integrations.qmt import local_history
+
+    local_engine = SimpleNamespace(
+        url="mysql+pymysql://user@localhost/probiga_qmt_history"
+    )
+    requested = ["000001", "600000"] if partial_kind == "missing_code" else ["000001"]
+    _patch_local_minute_reference(monkeypatch, local_history, requested)
+    monkeypatch.setattr(
+        local_history, "validate_local_history_tables", lambda _engine: None
+    )
+    monkeypatch.setattr(local_history, "_short_name_map", lambda *_a, **_k: {})
+    monkeypatch.setattr(local_history, "_record_run_start", lambda *_a, **_k: None)
+    monkeypatch.setattr(local_history, "_record_run_finish", lambda *_a, **_k: None)
+
+    minute_values = list(minute_time_grid())
+    if partial_kind == "late_grid":
+        minute_values = [value for value in minute_values if value >= "13:37:00"]
+
+    def fetch_minute(_self, _codes, _trade_date, **_kwargs):
+        return pd.DataFrame([
+            {
+                "stock_code": "000001",
+                "trade_time": f"{TRADE_DATE} {value}",
+                "trade_date": TRADE_DATE,
+                "price": 10.0,
+                "avg_price": 10.0,
+                "volume": 100,
+                "amount": 1000,
+                "data_source": local_history.BIGQMT_PROVIDER_ID,
+            }
+            for value in minute_values
+        ])
+
+    def fetch_kline(_self, codes, *_args, **_kwargs):
+        return pd.DataFrame([_daily_row(code) for code in codes])
+
+    monkeypatch.setattr(BigQmtBackend, "fetch_minute", fetch_minute)
+    monkeypatch.setattr(BigQmtBackend, "fetch_kline", fetch_kline)
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("partial capture must not write")
+        ),
+    )
+
+    result = local_history.backfill_minute_local(
+        source_engine=SimpleNamespace(),
+        local_engine=local_engine,
+        stock_codes=requested,
+        trade_dates=[TRADE_DATE],
+        batch_size=80,
+    )
+
+    assert result.status == "PARTIAL"
+    assert result.coverage_status == "PARTIAL"
+    assert result.written_rows == 0
+    assert result.batches[0].coverage_status == COVERAGE_INCOMPLETE
+    assert local_history.local_backfill_result_proves_exact_minute(
+        result,
+        requested_codes=requested,
+        trade_dates=[TRADE_DATE],
+    ) is False
+    if partial_kind == "missing_code":
+        assert result.batches[0].requested_stock_codes == (
+            "000001", "600000",
+        )
+        assert result.batches[0].responded_stock_codes == ("000001",)

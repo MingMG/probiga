@@ -7,11 +7,18 @@ import sys
 import time
 import traceback
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import xtquant
 from xtquant import xtdata
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from integrations.qmt.runtime import connect_xtdata
 
 
 PROVIDER_ID = "gj_qmt"
@@ -777,28 +784,7 @@ def _connect() -> int | None:
             xtdata.enable_hello = False
         except Exception:
             pass
-    raw_port = str(os.environ.get("QMT_PORT", "") or "").strip()
-    port_candidates: list[int] = []
-    if raw_port:
-        try:
-            port_candidates.append(int(raw_port))
-        except Exception:
-            pass
-    for fallback_port in (58610, 58670, 58671, 58672, 58673, 58680):
-        if fallback_port not in port_candidates:
-            port_candidates.append(fallback_port)
-
-    last_error: Exception | None = None
-    for port in port_candidates:
-        try:
-            xtdata.connect(port=port, remember_if_success=False)
-            return port
-        except Exception as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    xtdata.connect()
-    return None
+    return connect_xtdata(xtdata)
 
 
 def _capabilities(connection_port: int | None) -> dict[str, Any]:

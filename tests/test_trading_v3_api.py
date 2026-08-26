@@ -1,6 +1,9 @@
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import pytest
+from fastapi import HTTPException
+
 from server.api.routers import trading_v2, trading_v3
 
 
@@ -101,7 +104,8 @@ class FakeRepository:
     def latest_targets(self):
         return []
 
-    def stock_pool(self, *, trade_date):
+    def stock_pool(self, *, trade_date, before_session_date=None):
+        assert before_session_date is None
         return {
             "trade_date": trade_date,
             "items": [{"stock_code": "000001"}],
@@ -262,11 +266,82 @@ def test_v3_forecast_history_passes_date_without_recalculation(
 
 
 def test_v3_stock_pool_is_a_read_only_per_stock_snapshot(monkeypatch):
+    monkeypatch.delenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        raising=False,
+    )
     monkeypatch.setattr(trading_v3, "_repo", lambda: FakeRepository())
     selected = date(2026, 7, 27)
     result = trading_v3.stock_pool(trade_date=selected)
     assert result["data"]["trade_date"] == selected
     assert result["data"]["items"] == [{"stock_code": "000001"}]
+
+
+def test_v3_stock_pool_required_mode_preserves_run_native_advisory_plan(
+    monkeypatch,
+):
+    monkeypatch.delenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        raising=False,
+    )
+    native = {
+        "run_uid": "run-required",
+        "items": [{
+            "stock_code": "600036",
+            "actionability": "BUY_ZONE",
+            "action_plan": {
+                "actionability": "BUY_ZONE",
+                "buy_range": {"low": 42.0, "high": 42.5},
+                "sell_range": {"low": 45.0, "high": 46.0},
+                "protective_stop": 40.5,
+            },
+        }],
+        "summary": {"buy_zone_count": 1},
+    }
+
+    class Repository:
+        def stock_pool(self, *, trade_date, before_session_date):
+            return native
+
+    monkeypatch.setattr(trading_v3, "_repo", lambda: Repository())
+
+    result = trading_v3.stock_pool(trade_date=date(2026, 8, 27))["data"]
+
+    assert result is native
+    assert result["items"][0]["actionability"] == "BUY_ZONE"
+    assert result["items"][0]["action_plan"]["buy_range"] == {
+        "low": 42.0,
+        "high": 42.5,
+    }
+    assert "governance_deferred" not in result
+
+
+def test_v3_stock_pool_forwards_bounded_history_and_rejects_mixed_dates(
+    monkeypatch,
+):
+    class Repository:
+        def stock_pool(self, *, trade_date, before_session_date):
+            return {
+                "trade_date": trade_date,
+                "before_session_date": before_session_date,
+            }
+
+    monkeypatch.setattr(trading_v3, "_repo", lambda: Repository())
+    target = date(2026, 7, 27)
+
+    result = trading_v3.stock_pool(
+        trade_date=None,
+        before_session_date=target,
+    )
+
+    assert result["data"]["trade_date"] is None
+    assert result["data"]["before_session_date"] == target
+    with pytest.raises(HTTPException) as exc_info:
+        trading_v3.stock_pool(
+            trade_date=target,
+            before_session_date=target,
+        )
+    assert exc_info.value.status_code == 422
 
 
 def test_v3_validation_and_recall_are_read_only_snapshots(monkeypatch):

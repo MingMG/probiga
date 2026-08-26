@@ -15,12 +15,14 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -54,6 +56,25 @@ SESSION.trust_env = False
 SESSION.verify = False
 
 BATCH_API = "https://push2delay.eastmoney.com/api/qt/clist/get"
+CAPITAL_FLOW_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
+CAPITAL_FLOW_TASK_TYPE = "capital_flow_batch_fast"
+CAPITAL_FLOW_DATASET = "stock_capital_flow_daily"
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _signed_receipt(payload: dict) -> dict:
+    result = dict(payload)
+    canonical = json.dumps(
+        result,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    result["receipt_id"] = hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+    return result
 
 
 def _is_trade_day(engine, day: date | None = None) -> bool:
@@ -121,9 +142,93 @@ def _latest_open_trade_date(engine) -> str:
             ).scalar()
         if value is not None:
             return str(value)[:10]
-    except Exception:
-        pass
-    return date.today().isoformat()
+    except Exception as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative capital-flow calendar is unavailable"
+        ) from exc
+    raise RuntimeError(
+        "DATA_BLOCKED: authoritative capital-flow calendar has no open session"
+    )
+
+
+def _canonical_trade_date(value: str) -> str:
+    raw = str(value or "").strip()
+    try:
+        normalized = date.fromisoformat(raw).isoformat()
+    except ValueError as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow target date is invalid"
+        ) from exc
+    if raw != normalized:
+        raise RuntimeError("DATA_BLOCKED: capital-flow target date is invalid")
+    return normalized
+
+
+def _require_open_trade_date(engine, trade_date: str) -> None:
+    try:
+        with engine.connect() as conn:
+            count = int(
+                conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM si_trade_calendar "
+                        "WHERE trade_date=:trade_date AND trade_status=1"
+                    ),
+                    {"trade_date": trade_date},
+                ).scalar()
+                or 0
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: authoritative capital-flow calendar is unavailable"
+        ) from exc
+    if count != 1:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow target is not one authoritative open session"
+        )
+
+
+def _eastmoney_source_trade_date(value) -> str:
+    try:
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        parsed = datetime.fromtimestamp(timestamp, SHANGHAI)
+    except (OSError, OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow source timestamp is invalid"
+        ) from exc
+    if timestamp <= 0:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow source timestamp is invalid"
+        )
+    return parsed.date().isoformat()
+
+
+def _exact_flow_source_items(items: list[dict], *, trade_date: str) -> list[dict]:
+    """Keep only target-session rows and reject any newer live snapshot."""
+
+    accepted: list[dict] = []
+    future_dates: set[str] = set()
+    for item in items:
+        try:
+            source_date = _eastmoney_source_trade_date(item.get("f124"))
+        except RuntimeError:
+            continue
+        if source_date > trade_date:
+            future_dates.add(source_date)
+        elif source_date == trade_date:
+            accepted.append(item)
+    if future_dates:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow live source is newer than target date: "
+            f"target={trade_date} source_dates={sorted(future_dates)}"
+        )
+    if not accepted:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow source has no exact target-date rows: "
+            f"target={trade_date}"
+        )
+    return accepted
 
 
 def safe_float(val) -> float:
@@ -301,17 +406,23 @@ def refresh_flow(
     *,
     trade_date: str | None = None,
     min_coverage: float = 0.0,
+    require_source_date: bool = False,
 ) -> int:
     """刷新资金流向 sm_stock_capital_flow_daily（今天的数据）"""
     items = fetch_batch(
         "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,"
         "m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2,m:1+t:3+f:!2",
-        "f12,f14,f62,f66,f72,f78,f84"
+        "f12,f14,f62,f66,f72,f78,f84,f124"
     )
     if not items:
         return 0
 
-    today = (trade_date or _latest_open_trade_date(engine)).strip()
+    today = _canonical_trade_date(
+        trade_date or _latest_open_trade_date(engine)
+    )
+    if require_source_date:
+        _require_open_trade_date(engine, today)
+        items = _exact_flow_source_items(items, trade_date=today)
     now = datetime.now().replace(microsecond=0)
     rows = []
     for item in items:
@@ -489,10 +600,14 @@ def main():
             print(f"  snapshot: {n} stocks", flush=True)
 
     if args.only in ("flow", "all"):
+        flow_trade_date = _canonical_trade_date(
+            args.trade_date.strip() or _latest_open_trade_date(engine)
+        )
         n = refresh_flow(
             engine,
-            trade_date=args.trade_date.strip() or None,
+            trade_date=flow_trade_date,
             min_coverage=args.min_coverage,
+            require_source_date=True,
         )
         results["flow"] = n
         if not args.json:
@@ -511,12 +626,27 @@ def main():
             print(f"  index: {n}", flush=True)
 
     elapsed = time.time() - t0
-    result = {
-        "status": "success",
-        "results": results,
-        "elapsed_seconds": round(elapsed, 1),
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    generated_at = datetime.now().isoformat(timespec="seconds")
+    if args.only == "flow":
+        result = _signed_receipt({
+            "schema": CAPITAL_FLOW_RESULT_SCHEMA,
+            "status": "PASS",
+            "task_type": CAPITAL_FLOW_TASK_TYPE,
+            "dataset": CAPITAL_FLOW_DATASET,
+            "trade_date": flow_trade_date,
+            "source_trade_date": flow_trade_date,
+            "source_timestamp_required": True,
+            "row_count": int(results.get("flow") or 0),
+            "elapsed_seconds": round(elapsed, 1),
+            "generated_at": generated_at,
+        })
+    else:
+        result = {
+            "status": "success",
+            "results": results,
+            "elapsed_seconds": round(elapsed, 1),
+            "generated_at": generated_at,
+        }
     if args.json:
         print(json.dumps(result, ensure_ascii=False, default=str))
     else:

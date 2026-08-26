@@ -4,19 +4,192 @@ import unittest
 from biz.analysis.sync_analysis_fast import (
     _load_sector_industry_memberships,
     add_strategy_signals,
+    build_data_quality,
     build_recommendation_rows,
     build_strategy_trade_plan,
     choose_recommend_status,
     clamp_score,
     classify_notice_title,
     linear_score,
+    load_flow_features,
+    load_hot_rank,
     select_primary_strategy,
+    validate_exact_daily_flow_coverage,
 )
 import pandas as pd
 from unittest.mock import patch
 
+from server.common.daily_stock_universe import DailyStockUniverse
+
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_flow_features_keep_only_exact_target_rows_per_stock(self):
+        source = pd.DataFrame([
+            {
+                "stock_code": "1",
+                "trade_date": "2026-08-25",
+                "main_net_inflow": 10,
+                "max_net_inflow": 1,
+                "lg_net_inflow": 2,
+                "mid_net_inflow": 3,
+                "sm_net_inflow": 4,
+            },
+            {
+                "stock_code": "1",
+                "trade_date": "2026-08-26",
+                "main_net_inflow": 20,
+                "max_net_inflow": 2,
+                "lg_net_inflow": 3,
+                "mid_net_inflow": 4,
+                "sm_net_inflow": 5,
+            },
+            {
+                "stock_code": "2",
+                "trade_date": "2026-08-25",
+                "main_net_inflow": 30,
+                "max_net_inflow": 3,
+                "lg_net_inflow": 4,
+                "mid_net_inflow": 5,
+                "sm_net_inflow": 6,
+            },
+        ])
+        with patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-26", "2026-08-25"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=source,
+        ):
+            frame, flow_date = load_flow_features(object(), "2026-08-26")
+
+        self.assertEqual(flow_date, "2026-08-26")
+        self.assertEqual(frame["stock_code"].tolist(), ["000001"])
+        self.assertEqual(str(frame.iloc[0]["flow_trade_date"]), "2026-08-26")
+        self.assertEqual(frame.iloc[0]["main_net_inflow_5d"], 30)
+
+    def test_flow_quality_uses_each_stock_date_and_accepts_exact_zero(self):
+        _, exact_flags = build_data_quality(
+            {
+                "flow_trade_date": "2026-08-26",
+                "main_net_inflow": 0,
+                "main_net_inflow_5d": 0,
+            },
+            trade_date="2026-08-26",
+            flow_date="2026-08-26",
+        )
+        _, stale_flags = build_data_quality(
+            {"flow_trade_date": "2026-08-25"},
+            trade_date="2026-08-26",
+            flow_date="2026-08-26",
+        )
+        _, missing_flags = build_data_quality(
+            {"flow_trade_date": None},
+            trade_date="2026-08-26",
+            flow_date="2026-08-26",
+        )
+
+        self.assertNotIn("missing_flow", exact_flags)
+        self.assertNotIn("stale_flow", exact_flags)
+        self.assertIn("stale_flow", stale_flags)
+        self.assertIn("missing_flow", missing_flags)
+
+    def test_exact_flow_coverage_blocks_missing_traded_stock(self):
+        universe = DailyStockUniverse(
+            target_date="2026-08-26",
+            catalog_batch_id="catalog",
+            catalog_manifest_hash="a" * 64,
+            catalog_member_set_hash="b" * 64,
+            expected_codes=("000001", "000002"),
+            expected_code_set_hash="c" * 64,
+        )
+        kline = pd.DataFrame([
+            {"stock_code": "000001", "volume": 100, "amount": 1000},
+            {"stock_code": "000002", "volume": 0, "amount": 0},
+        ])
+        with patch(
+            "biz.analysis.sync_analysis_fast.load_daily_stock_universe",
+            return_value=universe,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "DATA_BLOCKED.*capital-flow"):
+                validate_exact_daily_flow_coverage(
+                    object(),
+                    trade_date="2026-08-26",
+                    kline=kline,
+                    flow=pd.DataFrame({"stock_code": []}),
+                )
+
+    def test_hot_rank_never_falls_back_to_an_older_partition(self):
+        observed = {}
+
+        def read_sql(statement, _engine, params):
+            observed["sql"] = str(statement)
+            observed["params"] = dict(params)
+            return pd.DataFrame()
+
+        with patch("biz.analysis.sync_analysis_fast.pd.read_sql", side_effect=read_sql):
+            frame, hot_date = load_hot_rank(object(), "2026-08-26")
+
+        self.assertTrue(frame.empty)
+        self.assertEqual(hot_date, "")
+        self.assertIn("snapshot_date = :trade_date", observed["sql"])
+        self.assertNotIn("snapshot_date <=", observed["sql"])
+        self.assertEqual(observed["params"], {"trade_date": "2026-08-26"})
+
+    def test_hot_rank_rejects_exact_date_single_source_rows(self):
+        source = pd.DataFrame([
+            {
+                "stock_code": "1",
+                "fused_rank": 1,
+                "total_score": 100,
+                "source_flag": "east_only",
+            },
+            {
+                "stock_code": "2",
+                "fused_rank": 2,
+                "total_score": 99,
+                "source_flag": "ths_only",
+            },
+        ])
+        with patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=source,
+        ):
+            frame, hot_date = load_hot_rank(object(), "2026-08-26")
+
+        self.assertTrue(frame.empty)
+        self.assertEqual(hot_date, "")
+
+    def test_hot_rank_keeps_only_exact_date_multi_source_consensus(self):
+        source = pd.DataFrame([
+            {
+                "stock_code": "1",
+                "fused_rank": 1,
+                "total_score": 100,
+                "source_flag": "east_only",
+            },
+            {
+                "stock_code": "2",
+                "fused_rank": 2,
+                "total_score": 99,
+                "source_flag": "east_ths",
+            },
+            {
+                "stock_code": "3",
+                "fused_rank": 3,
+                "total_score": 98,
+                "source_flag": "east_sina",
+            },
+        ])
+        with patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=source,
+        ):
+            frame, hot_date = load_hot_rank(object(), "2026-08-26")
+
+        self.assertEqual(hot_date, "2026-08-26")
+        self.assertEqual(frame["stock_code"].tolist(), ["000003"])
+        self.assertEqual(frame["source_flag"].tolist(), ["east_sina"])
+
     def test_sector_membership_prefers_complete_immutable_snapshot(self):
         run = pd.DataFrame([
             {
@@ -122,6 +295,23 @@ class SyncAnalysisFastTest(unittest.TestCase):
         )
         self.assertEqual(status, "SUSPENDED")
         self.assertTrue(reason)
+
+    def test_recommend_gate_never_allows_stale_flow_even_with_high_score(self):
+        status, reason = choose_recommend_status(
+            stock_code="300001",
+            short_name="测试股份",
+            ai_score=99,
+            short_term_score=98,
+            long_term_score=97,
+            event_risk_level="LOW",
+            amount=120_000_000,
+            change_pct=3,
+            min_score=62,
+            data_quality_score=88,
+            data_quality_flags=["stale_flow"],
+        )
+        self.assertEqual(status, "SUSPENDED")
+        self.assertIn("目标交易日", reason)
 
     def test_recommendation_rows_keep_soft_risk_in_observation_ledger(self):
         row = {
@@ -317,6 +507,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
         with patch("biz.analysis.sync_analysis_fast.load_kline_features", return_value=empty_df), \
              patch("biz.analysis.sync_analysis_fast.load_finance", return_value=empty_df), \
              patch("biz.analysis.sync_analysis_fast.load_flow_features", return_value=(empty_df, "2026-06-13")), \
+             patch("biz.analysis.sync_analysis_fast.validate_exact_daily_flow_coverage"), \
              patch("biz.analysis.sync_analysis_fast.load_hot_rank", return_value=(empty_df, "2026-06-13")), \
              patch("biz.analysis.sync_analysis_fast.load_notice_features", return_value=empty_df), \
              patch("biz.analysis.sync_analysis_fast.load_confidence_features", return_value=empty_df), \

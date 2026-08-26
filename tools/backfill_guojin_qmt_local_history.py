@@ -25,6 +25,7 @@ from integrations.qmt.local_history import (
     backfill_daily_kline_local,
     backfill_minute_local,
     get_local_history_engine,
+    local_backfill_result_proves_exact_minute,
     load_stock_codes,
     load_trade_dates,
     _normalize_date,
@@ -1452,6 +1453,27 @@ def _update_gap_status(
     return "PENDING"
 
 
+def _result_proves_exact_gap_coverage(
+    *,
+    dataset: str,
+    result,
+    authoritative_codes: list[str],
+    trade_dates: list[str],
+) -> bool:
+    """Only an exact immutable code/date/grid proof may close a gap."""
+
+    if dataset == "sm_stock_minute.1m":
+        return local_backfill_result_proves_exact_minute(
+            result,
+            requested_codes=authoritative_codes,
+            trade_dates=trade_dates,
+        )
+    # Daily local history does not yet emit one immutable per-session coverage
+    # manifest.  A SUCCESS flag or positive row count is not enough to close a
+    # multi-code/multi-date production gap.
+    return False
+
+
 def _print(payload: dict[str, Any], *, as_json: bool) -> None:
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str))
@@ -1787,6 +1809,7 @@ def main(argv: list[str] | None = None) -> int:
             trade_dates=trade_dates,
             batch_size=max(1, args.batch_size),
             dry_run=dry_run,
+            provider=args.provider,
         )
         payload = result_dict(result)
         payload["dry_run"] = dry_run
@@ -1823,11 +1846,43 @@ def main(argv: list[str] | None = None) -> int:
             start_date = str(gap["gap_start"])[:10]
             end_date = str(gap["gap_end"])[:10]
             try:
+                if dataset not in {
+                    "sm_stock_kline.1d", "sm_stock_minute.1m",
+                }:
+                    results.append(
+                        {
+                            "gap_id": gap["id"],
+                            "dataset": dataset,
+                            "status": "skipped",
+                            "reason": "unsupported_dataset",
+                        }
+                    )
+                    continue
+                authoritative_codes, authoritative_trade_dates = (
+                    _target_window_codes(
+                        source_engine,
+                        start_date=start_date,
+                        end_date=end_date,
+                    )
+                )
+                if args.codes:
+                    selected = set(codes)
+                    gap_codes = [
+                        code for code in authoritative_codes if code in selected
+                    ]
+                elif limits.stock_limit > 0:
+                    gap_codes = authoritative_codes[: limits.stock_limit]
+                else:
+                    gap_codes = authoritative_codes
+                if not gap_codes:
+                    raise RuntimeError(
+                        "QMT gap requested universe has no authoritative codes"
+                    )
                 if dataset == "sm_stock_kline.1d":
                     result = backfill_daily_kline_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=codes,
+                        stock_codes=gap_codes,
                         start_date=start_date,
                         end_date=end_date,
                         batch_size=max(1, args.batch_size),
@@ -1839,28 +1894,25 @@ def main(argv: list[str] | None = None) -> int:
                     result = backfill_minute_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=codes,
-                        trade_dates=[start_date],
+                        stock_codes=gap_codes,
+                        trade_dates=authoritative_trade_dates,
                         batch_size=max(1, min(args.batch_size, 80)),
                         dry_run=dry_run,
+                        provider=args.provider,
                     )
-                else:
-                    results.append(
-                        {
-                            "gap_id": gap["id"],
-                            "dataset": dataset,
-                            "status": "skipped",
-                            "reason": "unsupported_dataset",
-                        }
-                    )
-                    continue
 
                 item = result_dict(result)
                 item["gap_id"] = gap["id"]
-                resolved = result.status == "SUCCESS" and (dry_run or result.written_rows > 0)
+                resolved = _result_proves_exact_gap_coverage(
+                    dataset=dataset,
+                    result=result,
+                    authoritative_codes=authoritative_codes,
+                    trade_dates=authoritative_trade_dates,
+                )
                 message = (
                     f"backfill {result.status}: fetched={result.fetched_rows}, "
-                    f"written={result.written_rows}, dry_run={dry_run}"
+                    f"written={result.written_rows}, dry_run={dry_run}, "
+                    f"coverage={getattr(result, 'coverage_status', 'UNASSESSED')}"
                 )
                 item["gap_status_update"] = _update_gap_status(
                     source_engine,
@@ -1894,9 +1946,22 @@ def main(argv: list[str] | None = None) -> int:
             _release_lock(lock_path)
 
     failed_count = sum(1 for item in results if item.get("status") == "failed")
+    partial_count = sum(
+        1
+        for item in results
+        if str(item.get("status") or "").upper() == "PARTIAL"
+        or (
+            item.get("gap_status_update") == "PENDING"
+            and item.get("status") != "failed"
+        )
+    )
     _print(
         {
-            "status": "ok" if failed_count == 0 else "partial_failed",
+            "status": (
+                "ok"
+                if failed_count == 0 and partial_count == 0
+                else "partial_failed"
+            ),
             "mode": "from-gaps",
             "dry_run": dry_run,
             "stock_count": len(codes),
@@ -1906,11 +1971,12 @@ def main(argv: list[str] | None = None) -> int:
             "executed": len(results),
             "resolved": sum(1 for item in results if item.get("gap_status_update") == "RESOLVED"),
             "failed": failed_count,
+            "partial": partial_count,
             "results": results,
         },
         as_json=args.json,
     )
-    return 0 if failed_count == 0 else 2
+    return 0 if failed_count == 0 and partial_count == 0 else 2
 
 
 if __name__ == "__main__":

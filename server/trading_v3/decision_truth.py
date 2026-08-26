@@ -53,6 +53,57 @@ _TARGET_DECIMAL_SCALES = {
     "expected_mae_pct": 8,
 }
 
+DECISION_INTEGRITY_SCHEMA_VERSION = (
+    "probiga.trading-v3.decision-integrity.v2"
+)
+FORECAST_LEDGER_FIELDS = (
+    "forecast_id",
+    "run_uid",
+    "trade_date",
+    "rank_no",
+    "stock_code",
+    "short_name",
+    "strategy_key",
+    "horizon_days",
+    "raw_score",
+    "expected_return_net_pct",
+    "return_q10_pct",
+    "return_q50_pct",
+    "return_q90_pct",
+    "probability_positive",
+    "expected_mae_pct",
+    "expected_mfe_pct",
+    "profit_factor",
+    "payoff_ratio",
+    "sample_count",
+    "confidence",
+    "forecast_status",
+    "theme_code",
+    "model_version",
+    "dataset_hash",
+    "feature_time",
+    "valid_until",
+    "initial_stop_pct",
+    "reasons_json",
+    "features_json",
+    "created_at",
+)
+FORECAST_LEDGER_SQL_COLUMNS = ", ".join(FORECAST_LEDGER_FIELDS)
+_FORECAST_DECIMAL_FIELDS = frozenset({
+    "raw_score",
+    "expected_return_net_pct",
+    "return_q10_pct",
+    "return_q50_pct",
+    "return_q90_pct",
+    "probability_positive",
+    "expected_mae_pct",
+    "expected_mfe_pct",
+    "profit_factor",
+    "payoff_ratio",
+    "confidence",
+    "initial_stop_pct",
+})
+
 
 def _fixed_decimal(value: Any, scale: int) -> str:
     """Match the canonical value written to a MySQL DECIMAL column."""
@@ -64,6 +115,88 @@ def _fixed_decimal(value: Any, scale: int) -> str:
             rounding=ROUND_HALF_UP,
         ),
         f".{scale}f",
+    )
+
+
+def _nullable_fixed_decimal(value: Any, scale: int) -> str | None:
+    if value is None:
+        return None
+    return _fixed_decimal(value, scale)
+
+
+def _canonical_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return date.fromisoformat(str(value or "")[:10]).isoformat()
+
+
+def _canonical_datetime(value: Any) -> str:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(
+            str(value or "").strip().replace("Z", "+00:00")
+        )
+    return parsed.isoformat(sep=" ")
+
+
+def _canonical_json_field(value: Any, *, expected_type: type) -> Any:
+    parsed = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(parsed, expected_type):
+        raise ValueError("forecast ledger JSON field has an invalid shape")
+    return parsed
+
+
+def canonical_forecast_projection(
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize every persisted forecast field for immutable readback.
+
+    The projection deliberately includes identifiers, timestamps and the full
+    feature/reason payload in addition to ranking and scores.  A same-count row
+    replacement or any content mutation must therefore invalidate the run.
+    """
+
+    projection: dict[str, Any] = {}
+    for field in FORECAST_LEDGER_FIELDS:
+        value = item.get(field)
+        if field in _FORECAST_DECIMAL_FIELDS:
+            projection[field] = _nullable_fixed_decimal(value, 8)
+        elif field in {"rank_no", "horizon_days", "sample_count"}:
+            projection[field] = int(value or 0)
+        elif field == "trade_date":
+            projection[field] = _canonical_date(value)
+        elif field in {"feature_time", "valid_until", "created_at"}:
+            projection[field] = _canonical_datetime(value)
+        elif field == "reasons_json":
+            projection[field] = _canonical_json_field(
+                value,
+                expected_type=list,
+            )
+        elif field == "features_json":
+            projection[field] = _canonical_json_field(
+                value,
+                expected_type=dict,
+            )
+        else:
+            projection[field] = str(value or "")
+    return projection
+
+
+def canonical_forecast_ledger(
+    rows: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    projections = [canonical_forecast_projection(item) for item in rows]
+    return sorted(
+        projections,
+        key=lambda item: (
+            item["rank_no"],
+            item["stock_code"],
+            item["strategy_key"],
+            item["forecast_id"],
+        ),
     )
 
 

@@ -18,6 +18,13 @@ from integrations.qmt import bridge
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.diagnostics import PROVIDER_ID as LEGACY_PROVIDER_ID
 from server.common.config import get_mysql_url, get_qmt_history_mysql_url
+from server.common.qmt_history_coverage import (
+    COVERAGE_EXACT,
+    assess_minute_coverage,
+    canonical_digest as coverage_digest,
+    combine_minute_coverage_partitions,
+    validate_coverage_bundle,
+)
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
@@ -29,6 +36,9 @@ LOCAL_RUN_TABLE = "qmt_local_backfill_run"
 LOCAL_KLINE_PROVENANCE_COLUMN = "pre_close_origin"
 LOCAL_KLINE_LEGACY_PROVENANCE = "UNVERIFIED_LEGACY"
 LOCAL_KLINE_NATIVE_PROVENANCE = "NATIVE_QMT"
+LOCAL_MINUTE_CAPTURE_MANIFEST_SCHEMA = (
+    "probiga.qmt-local-minute-capture.v1"
+)
 LOCAL_HISTORY_MIGRATION_LOCK_WAIT_SECONDS = 30
 LOCAL_KLINE_ATTESTATION_REQUIRED_COLUMNS = frozenset(
     {
@@ -154,6 +164,13 @@ class LocalBackfillBatchResult:
     skipped: bool
     error: str | None = None
     allowed_missing_codes: tuple[str, ...] = ()
+    coverage_status: str = "UNASSESSED"
+    requested_stock_codes: tuple[str, ...] = ()
+    responded_stock_codes: tuple[str, ...] = ()
+    requested_code_set_hash: str = ""
+    responded_code_set_hash: str = ""
+    coverage_manifest_hash: str = ""
+    coverage_manifest_json: str = ""
 
 
 @dataclass(frozen=True)
@@ -169,6 +186,11 @@ class LocalBackfillResult:
     fetched_rows: int
     written_rows: int
     batches: list[LocalBackfillBatchResult]
+    coverage_status: str = "UNASSESSED"
+    requested_code_set_hash: str = ""
+    responded_code_set_hash: str = ""
+    coverage_manifest_hash: str = ""
+    coverage_manifest_json: str = ""
 
 
 def now_china() -> datetime:
@@ -878,7 +900,14 @@ def _prepare_kline_rows(
     return prepared
 
 
-def _prepare_minute_rows(frame: pd.DataFrame, *, source_engine: Engine, period: str, batch_id: str) -> list[dict[str, Any]]:
+def _prepare_minute_rows(
+    frame: pd.DataFrame,
+    *,
+    source_engine: Engine,
+    period: str,
+    batch_id: str,
+    provider: str = LEGACY_PROVIDER_ID,
+) -> list[dict[str, Any]]:
     if frame is None or frame.empty:
         return []
     rows = frame.to_dict(orient="records")
@@ -888,10 +917,10 @@ def _prepare_minute_rows(frame: pd.DataFrame, *, source_engine: Engine, period: 
     for raw in rows:
         stock_code = str(raw.get("stock_code") or "").zfill(6)
         row = {
-            "provider": LEGACY_PROVIDER_ID,
+            "provider": raw.get("data_source") or provider,
             "qmt_code": raw.get("qmt_code") or to_qmt_symbol(stock_code) or "",
             "stock_code": stock_code,
-            "short_name": names.get(stock_code, ""),
+            "short_name": raw.get("short_name") or names.get(stock_code, ""),
             "period": period,
             "trade_time": raw.get("trade_time"),
             "trade_date": raw.get("trade_date"),
@@ -902,11 +931,15 @@ def _prepare_minute_rows(frame: pd.DataFrame, *, source_engine: Engine, period: 
             "volume": raw.get("volume"),
             "amount": raw.get("amount"),
             "pre_close": raw.get("pre_close"),
-            "source_time": raw.get("trade_time"),
-            "received_at": received_at,
+            "source_time": raw.get("source_time") or raw.get("trade_time"),
+            "received_at": raw.get("received_at") or received_at,
+            # The local immutable coverage receipt binds every partition to
+            # this backfill run.  Preserve native source/receive timestamps,
+            # but never replace the coverage batch identity with a transient
+            # bridge request id.
             "batch_id": batch_id,
-            "quality_status": "PENDING",
-            "permission_status": "SUPPORTED",
+            "quality_status": raw.get("quality_status") or "SOURCE_CAPTURED",
+            "permission_status": raw.get("permission_status") or "SUPPORTED",
         }
         row = {key: _clean_value(value) for key, value in row.items()}
         row["data_version"] = _data_version(row)
@@ -1035,6 +1068,7 @@ def _record_run_finish(
     fetched_rows: int,
     written_rows: int,
     error_message: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> None:
     with engine.begin() as conn:
         conn.execute(
@@ -1042,7 +1076,9 @@ def _record_run_finish(
                 f"""
                 UPDATE {LOCAL_RUN_TABLE}
                 SET status=:status, fetched_rows=:fetched_rows, written_rows=:written_rows,
-                    error_message=:error_message, finished_at=:finished_at
+                    error_message=:error_message,
+                    extra_json=COALESCE(:extra_json, extra_json),
+                    finished_at=:finished_at
                 WHERE run_id=:run_id
                 """
             ),
@@ -1052,6 +1088,7 @@ def _record_run_finish(
                 "fetched_rows": fetched_rows,
                 "written_rows": written_rows,
                 "error_message": error_message,
+                "extra_json": _canonical(extra) if extra is not None else None,
                 "finished_at": now_china(),
             },
         )
@@ -1240,6 +1277,160 @@ def backfill_daily_kline_local(
     )
 
 
+def _load_minute_coverage_reference(
+    source_engine: Engine,
+    *,
+    trade_date: str,
+    decision_known_at: datetime,
+) -> dict[str, Any]:
+    """Load immutable catalog/calendar roots for one requested session."""
+
+    with source_engine.begin() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=decision_known_at,
+        )
+        calendar = load_trade_calendar_receipt(
+            connection,
+            start_date=trade_date,
+            end_date=trade_date,
+            decision_known_at=decision_known_at,
+        )
+    if calendar.sessions_between(trade_date, trade_date) != [trade_date]:
+        raise RuntimeError(
+            "QMT minute target is not an immutable trading session"
+        )
+    eligible_codes = tuple(catalog.eligible_codes(trade_date))
+    if not eligible_codes:
+        raise RuntimeError("QMT minute target-date catalog is empty")
+    return {
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "calendar_batch_id": calendar.batch_id,
+        "calendar_manifest_hash": calendar.manifest_hash,
+        "eligible_codes": eligible_codes,
+    }
+
+
+def _coverage_responded_codes(bundle: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return codes with native bars or an exact native no-trade proof."""
+
+    responded = {
+        str(row.get("stock_code") or "")
+        for row in bundle.get("entities") or ()
+        if str(row.get("expected_state") or "") != "UNEXPECTED"
+        and (
+            int(row.get("bar_count") or 0) > 0
+            or str(row.get("classification") or "") == "NO_TRADE"
+        )
+    }
+    return tuple(sorted(code for code in responded if code))
+
+
+def _local_minute_capture_manifest(
+    *,
+    run_id: str,
+    provider: str,
+    captured_at: datetime,
+    requested_codes: Sequence[str],
+    trade_dates: Sequence[str],
+    date_proofs: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], str, str]:
+    requested = tuple(sorted(set(requested_codes)))
+    responded = tuple(sorted({
+        str(code)
+        for proof in date_proofs
+        for code in proof.get("responded_stock_codes") or ()
+    }))
+    exact_dates = {
+        str(proof.get("trade_date") or "")
+        for proof in date_proofs
+        if proof.get("coverage_status") == COVERAGE_EXACT
+        and tuple(proof.get("requested_stock_codes") or ()) == requested
+        and tuple(proof.get("responded_stock_codes") or ()) == requested
+    }
+    status = (
+        COVERAGE_EXACT
+        if exact_dates == set(trade_dates) and len(date_proofs) == len(trade_dates)
+        else "PARTIAL"
+    )
+    core = {
+        "schema": LOCAL_MINUTE_CAPTURE_MANIFEST_SCHEMA,
+        "dataset": LOCAL_MINUTE_TABLE,
+        "period": "1m",
+        "run_id": run_id,
+        "provider": provider,
+        "captured_at": captured_at.isoformat(sep=" "),
+        "start_date": trade_dates[0],
+        "end_date": trade_dates[-1],
+        "coverage_status": status,
+        "requested_stock_codes": list(requested),
+        "responded_stock_codes": list(responded),
+        "requested_code_set_hash": coverage_digest(list(requested)),
+        "responded_code_set_hash": coverage_digest(list(responded)),
+        "trade_dates": list(trade_dates),
+        "trade_date_count": len(trade_dates),
+        "date_proofs": [dict(proof) for proof in date_proofs],
+    }
+    manifest_json = _canonical(core)
+    manifest_hash = coverage_digest(core)
+    return {**core, "manifest_hash": manifest_hash}, manifest_json, manifest_hash
+
+
+def local_backfill_result_proves_exact_minute(
+    result: LocalBackfillResult,
+    *,
+    requested_codes: Sequence[str],
+    trade_dates: Sequence[str],
+) -> bool:
+    """Verify the result's immutable code/date/grid roots before gap closure."""
+
+    if result.status != "SUCCESS" or result.coverage_status != COVERAGE_EXACT:
+        return False
+    requested = sorted({
+        str(code or "").strip().split(".", 1)[0].zfill(6)
+        for code in requested_codes
+        if str(code or "").strip()
+    })
+    dates = sorted({_normalize_date(value) for value in trade_dates})
+    try:
+        core = json.loads(result.coverage_manifest_json)
+    except (TypeError, ValueError):
+        return False
+    if type(core) is not dict:
+        return False
+    supplied_hash = str(result.coverage_manifest_hash or "").lower()
+    if (
+        core.get("schema") != LOCAL_MINUTE_CAPTURE_MANIFEST_SCHEMA
+        or core.get("dataset") != LOCAL_MINUTE_TABLE
+        or core.get("period") != "1m"
+        or core.get("run_id") != result.run_id
+        or core.get("coverage_status") != COVERAGE_EXACT
+        or core.get("requested_stock_codes") != requested
+        or core.get("responded_stock_codes") != requested
+        or core.get("trade_dates") != dates
+        or core.get("requested_code_set_hash") != coverage_digest(requested)
+        or core.get("responded_code_set_hash") != coverage_digest(requested)
+        or supplied_hash != coverage_digest(core)
+        or len(supplied_hash) != 64
+    ):
+        return False
+    proofs = core.get("date_proofs")
+    if not isinstance(proofs, list) or len(proofs) != len(dates):
+        return False
+    for proof, trade_date in zip(proofs, dates):
+        if (
+            not isinstance(proof, dict)
+            or proof.get("trade_date") != trade_date
+            or proof.get("coverage_status") != COVERAGE_EXACT
+            or proof.get("requested_stock_codes") != requested
+            or proof.get("responded_stock_codes") != requested
+            or len(str(proof.get("coverage_manifest_hash") or "")) != 64
+        ):
+            return False
+    return True
+
+
 def backfill_minute_local(
     *,
     source_engine: Engine,
@@ -1248,14 +1439,46 @@ def backfill_minute_local(
     trade_dates: Sequence[str],
     batch_size: int = 50,
     dry_run: bool = False,
+    provider: str = BIGQMT_PROVIDER_ID,
 ) -> LocalBackfillResult:
+    if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
+        raise ValueError("minute QMT history provider is not supported")
+    requested_stock_codes = sorted({
+        str(code or "").strip().split(".", 1)[0].zfill(6)
+        for code in stock_codes
+        if str(code or "").strip()
+    })
+    normalized_trade_dates = sorted({
+        _normalize_date(value) for value in trade_dates if str(value or "").strip()
+    })
+    if not requested_stock_codes:
+        raise ValueError("minute QMT history requires at least one stock code")
+    if not normalized_trade_dates:
+        raise ValueError("minute QMT history requires at least one trade date")
+    unsupported = [
+        code for code in requested_stock_codes if not to_qmt_symbol(code)
+    ]
+    if unsupported:
+        raise ValueError(
+            "minute QMT history contains unsupported stock codes: "
+            f"{unsupported[:10]}"
+        )
     validate_local_history_tables(local_engine)
-    start_date = trade_dates[0] if trade_dates else ""
-    end_date = trade_dates[-1] if trade_dates else ""
-    run_id = f"qmt_hist_minute_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    start_date = normalized_trade_dates[0]
+    end_date = normalized_trade_dates[-1]
+    captured_at = now_china()
+    run_id = (
+        f"qmt_hist_minute_{captured_at.strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    daily_source_batch_id = f"{run_id}_daily"
     batches: list[LocalBackfillBatchResult] = []
     fetched_total = 0
     written_total = 0
+    date_proofs: list[dict[str, Any]] = []
+    final_manifest: dict[str, Any] | None = None
+    final_manifest_json = ""
+    final_manifest_hash = ""
     _record_run_start(
         local_engine,
         run_id=run_id,
@@ -1263,38 +1486,130 @@ def backfill_minute_local(
         period="1m",
         start_date=start_date,
         end_date=end_date,
-        requested_codes=len(stock_codes),
-        provider=LEGACY_PROVIDER_ID,
-        extra={"dry_run": dry_run, "batch_size": batch_size, "trade_dates": list(trade_dates)},
+        requested_codes=len(requested_stock_codes),
+        provider=provider,
+        extra={
+            "dry_run": dry_run,
+            "batch_size": batch_size,
+            "trade_dates": normalized_trade_dates,
+            "provider": provider,
+            "requested_stock_codes": requested_stock_codes,
+            "requested_code_set_hash": coverage_digest(requested_stock_codes),
+        },
     )
     status = "SUCCESS"
     error_message: str | None = None
     try:
-        for trade_date in trade_dates:
-            for batch in _chunked(list(stock_codes), batch_size):
-                qmt_codes = [to_qmt_symbol(code) for code in batch]
-                qmt_codes = [code for code in qmt_codes if code]
-                frame = bridge.minute(
-                    qmt_codes,
-                    trade_date=trade_date,
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    fill_data=False,
-                    batch_size=batch_size,
-                    timeout=900,
+        if provider == BIGQMT_PROVIDER_ID:
+            from integrations.bigqmt.backend import BigQmtBackend
+
+            backend: Any = BigQmtBackend()
+        else:
+            backend = None
+        for trade_date in normalized_trade_dates:
+            reference = _load_minute_coverage_reference(
+                source_engine,
+                trade_date=trade_date,
+                decision_known_at=captured_at,
+            )
+            outside_catalog = sorted(
+                set(requested_stock_codes) - set(reference["eligible_codes"])
+            )
+            if outside_catalog:
+                raise RuntimeError(
+                    "QMT minute requested universe differs from target-date "
+                    f"catalog: {outside_catalog[:10]}"
                 )
-                rows = _prepare_minute_rows(frame, source_engine=source_engine, period="1m", batch_id=run_id)
-                if not rows:
-                    raise RuntimeError(
-                        "QMT minute history returned no native rows: "
-                        f"trade_date={trade_date}, requested_codes={len(qmt_codes)}"
+            partitions: list[dict[str, Any]] = []
+            date_responded: set[str] = set()
+            for batch in _chunked(requested_stock_codes, batch_size):
+                qmt_codes = [str(to_qmt_symbol(code)) for code in batch]
+                if provider == BIGQMT_PROVIDER_ID:
+                    frame = backend.fetch_minute(
+                        list(batch),
+                        trade_date,
+                        start_date=trade_date,
+                        end_date=trade_date,
+                        count=0,
+                        download_history=True,
                     )
+                    daily_frame = backend.fetch_kline(
+                        list(batch),
+                        trade_date,
+                        trade_date,
+                        dividend_type="none",
+                        download_history=True,
+                    )
+                else:
+                    frame = bridge.minute(
+                        qmt_codes,
+                        trade_date=trade_date,
+                        start_date=trade_date,
+                        end_date=trade_date,
+                        fill_data=False,
+                        batch_size=batch_size,
+                        timeout=900,
+                    )
+                    daily_frame = bridge.kline(
+                        qmt_codes,
+                        start_date=trade_date,
+                        end_date=trade_date,
+                        dividend_type="none",
+                        batch_size=batch_size,
+                        timeout=900,
+                    )
+                rows = _prepare_minute_rows(
+                    frame,
+                    source_engine=source_engine,
+                    period="1m",
+                    batch_id=run_id,
+                    provider=provider,
+                )
+                daily_rows = _prepare_kline_rows(
+                    daily_frame,
+                    source_engine=source_engine,
+                    period="1d",
+                    batch_id=daily_source_batch_id,
+                    provider=provider,
+                )
+                for row in daily_rows:
+                    row["provider"] = provider
+                    row["batch_id"] = daily_source_batch_id
+                    row["period"] = "1d"
+                    row["adjust_type"] = 0
                 fetched_total += len(rows)
-                written = 0 if dry_run else _upsert_rows(
-                    local_engine,
-                    table_name=LOCAL_MINUTE_TABLE,
-                    rows=rows,
-                    key_columns=["provider", "stock_code", "period", "trade_time"],
+                bundle = assess_minute_coverage(
+                    expected_codes=batch,
+                    daily_rows=daily_rows,
+                    minute_rows=rows,
+                    trade_date=trade_date,
+                    provider=provider,
+                    daily_provider=provider,
+                    run_id=run_id,
+                    catalog_batch_id=reference["catalog_batch_id"],
+                    catalog_manifest_hash=reference["catalog_manifest_hash"],
+                    calendar_batch_id=reference["calendar_batch_id"],
+                    calendar_manifest_hash=reference["calendar_manifest_hash"],
+                    source_batch_id=run_id,
+                    daily_source_batch_id=daily_source_batch_id,
+                    captured_at=captured_at,
+                )
+                manifest = validate_coverage_bundle(bundle)
+                partitions.append(bundle)
+                responded_codes = _coverage_responded_codes(bundle)
+                date_responded.update(responded_codes)
+                exact = manifest["status"] == COVERAGE_EXACT
+                written = (
+                    0
+                    if dry_run or not exact or not rows
+                    else _upsert_rows(
+                        local_engine,
+                        table_name=LOCAL_MINUTE_TABLE,
+                        rows=rows,
+                        key_columns=[
+                            "provider", "stock_code", "period", "trade_time",
+                        ],
+                    )
                 )
                 written_total += written
                 batches.append(
@@ -1303,12 +1618,77 @@ def backfill_minute_local(
                         period="1m",
                         start_date=trade_date,
                         end_date=trade_date,
-                        requested_codes=len(qmt_codes),
+                        requested_codes=len(batch),
                         fetched_rows=len(rows),
                         written_rows=written,
-                        skipped=dry_run,
+                        skipped=dry_run or not exact,
+                        error=(
+                            None
+                            if exact
+                            else ",".join(
+                                str(reason.get("code") or "")
+                                for reason in manifest.get("reasons") or ()
+                            )[:1000]
+                        ),
+                        coverage_status=str(manifest["status"]),
+                        requested_stock_codes=tuple(batch),
+                        responded_stock_codes=responded_codes,
+                        requested_code_set_hash=coverage_digest(list(batch)),
+                        responded_code_set_hash=coverage_digest(
+                            list(responded_codes)
+                        ),
+                        coverage_manifest_hash=str(manifest["manifest_hash"]),
+                        coverage_manifest_json=str(
+                            bundle["manifest"]["manifest_json"]
+                        ),
                     )
                 )
+            date_bundle = combine_minute_coverage_partitions(
+                expected_codes=requested_stock_codes,
+                partitions=partitions,
+            )
+            date_manifest = validate_coverage_bundle(date_bundle)
+            date_proofs.append({
+                "trade_date": trade_date,
+                "coverage_status": str(date_manifest["status"]),
+                "requested_stock_codes": list(requested_stock_codes),
+                "responded_stock_codes": sorted(date_responded),
+                "requested_code_set_hash": coverage_digest(
+                    requested_stock_codes
+                ),
+                "responded_code_set_hash": coverage_digest(
+                    sorted(date_responded)
+                ),
+                "grid_profile": str(date_manifest.get("grid_profile") or ""),
+                "minute_grid_hash": str(
+                    date_manifest.get("minute_grid_hash") or ""
+                ),
+                "coverage_manifest_hash": str(
+                    date_manifest["manifest_hash"]
+                ),
+                "entity_root_hash": str(
+                    date_manifest.get("entity_root_hash") or ""
+                ),
+                "bar_count": int(date_manifest.get("bar_count") or 0),
+            })
+        (
+            final_manifest,
+            final_manifest_json,
+            final_manifest_hash,
+        ) = _local_minute_capture_manifest(
+            run_id=run_id,
+            provider=provider,
+            captured_at=captured_at,
+            requested_codes=requested_stock_codes,
+            trade_dates=normalized_trade_dates,
+            date_proofs=date_proofs,
+        )
+        if final_manifest["coverage_status"] != COVERAGE_EXACT:
+            status = "PARTIAL"
+            error_message = (
+                "QMT minute capture is partial; requested/responded code sets "
+                "or per-code native minute grids differ"
+            )
     except Exception as exc:
         status = "FAILED"
         error_message = str(exc)
@@ -1321,19 +1701,47 @@ def backfill_minute_local(
             fetched_rows=fetched_total,
             written_rows=written_total,
             error_message=error_message,
+            extra=(
+                {
+                    "dry_run": dry_run,
+                    "batch_size": batch_size,
+                    "trade_dates": normalized_trade_dates,
+                    "provider": provider,
+                    "requested_stock_codes": requested_stock_codes,
+                    "requested_code_set_hash": coverage_digest(
+                        requested_stock_codes
+                    ),
+                    "coverage_manifest": final_manifest,
+                    "coverage_manifest_hash": final_manifest_hash,
+                }
+                if final_manifest is not None
+                else None
+            ),
         )
+    responded_union = sorted({
+        str(code)
+        for proof in date_proofs
+        for code in proof.get("responded_stock_codes") or ()
+    })
     return LocalBackfillResult(
         run_id=run_id,
         dataset=LOCAL_MINUTE_TABLE,
         status=status,
         local_database=str(make_url(str(local_engine.url)).database or ""),
-        start_date=_normalize_date(start_date),
-        end_date=_normalize_date(end_date),
-        code_count=len(stock_codes),
+        start_date=start_date,
+        end_date=end_date,
+        code_count=len(requested_stock_codes),
         batch_count=len(batches),
         fetched_rows=fetched_total,
         written_rows=written_total,
         batches=batches,
+        coverage_status=str(
+            (final_manifest or {}).get("coverage_status") or "UNASSESSED"
+        ),
+        requested_code_set_hash=coverage_digest(requested_stock_codes),
+        responded_code_set_hash=coverage_digest(responded_union),
+        coverage_manifest_hash=final_manifest_hash,
+        coverage_manifest_json=final_manifest_json,
     )
 
 

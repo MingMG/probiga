@@ -1404,7 +1404,9 @@ def check_sim_trade_integrity(engine: Engine) -> CheckResult:
     invalid_modes = _rows(engine, """
         SELECT COALESCE(trade_mode, '') AS trade_mode, COUNT(*) AS cnt
         FROM st_trade_flow
-        WHERE COALESCE(trade_mode, '') NOT IN ('live', 'backtest', 'forward', 'invalid_offhours')
+        WHERE COALESCE(trade_mode, '') NOT IN (
+            'live', 'backtest', 'forward', 'invalid_offhours', 'manual_bookkeeping'
+        )
         GROUP BY COALESCE(trade_mode, '')
     """)
     ok = offhours == 0 and not invalid_modes

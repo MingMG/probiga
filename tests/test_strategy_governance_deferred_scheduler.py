@@ -10,6 +10,7 @@ import pytest
 from server.api import scheduler_runtime
 from server.api.routers import datasource as datasource_router
 from server.api.routers import scheduler as scheduler_router
+from server.common.scheduler_authority import DEFERRED_RELEASE_WRITER_TASK_TYPES
 from tools import add_strategy_governance_task as task_installer
 from tools import run_strategy_governance_daily as daily
 from tools.strategy_governance_task_contract import TASK
@@ -257,6 +258,166 @@ def test_deferred_mode_auto_dispatch_never_claims_governance(monkeypatch):
 
     claim.assert_not_called()
     thread.assert_not_called()
+
+
+def test_deferred_mode_disables_release_replay_without_freezing_ordinary_data(
+    monkeypatch,
+):
+    monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "DEFERRED_DB")
+    row = {
+        "id": 918,
+        "task_name": "daily finance",
+        "task_type": "stock_finance",
+        "cron_time": "00:00",
+        "interval_minutes": 1,
+        "last_run_at": None,
+        "last_triggered_at": None,
+        "last_run_status": "success",
+        "_release_history_available": True,
+        "_release_catchup_authorized": True,
+    }
+
+    assert scheduler_runtime._release_build_catchup_allowed(
+        row,
+        now=scheduler_runtime.datetime.now(),
+    ) is False
+    assert scheduler_runtime._release_build_catchup_pending(row) is False
+    assert scheduler_runtime.strategy_governance_task_block_reason(row) == ""
+
+    authorized, reason = scheduler_runtime._attach_release_catchup_authorization(
+        MagicMock(),
+        [row],
+        mode="standalone",
+        now=scheduler_runtime.datetime.now(),
+    )
+    assert authorized is False
+    assert reason == "governance_database_deferred"
+    assert row["_release_catchup_authorized"] is False
+
+
+def test_deferred_mode_keeps_governance_and_v3_writer_fences(monkeypatch):
+    monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "DEFERRED_DB")
+
+    assert scheduler_runtime.strategy_governance_task_block_reason(
+        _governance_task_row()
+    ) == "governance_database_deferred"
+    assert {
+        "trading_v3_close_decision",
+        "trading_v3_premarket_review",
+    }.issubset(DEFERRED_RELEASE_WRITER_TASK_TYPES)
+
+
+def test_deferred_scheduler_launches_due_non_governance_data_task(monkeypatch):
+    stop_event = MagicMock()
+    stop_event.is_set.return_value = False
+    stop_event.wait.return_value = True
+    engine = MagicMock()
+    result = MagicMock()
+    result.keys.return_value = [
+        "id",
+        "task_name",
+        "task_type",
+        "script_path",
+        "script_args",
+        "cron_time",
+        "interval_minutes",
+        "enabled",
+        "date_param",
+        "last_run_at",
+        "last_triggered_at",
+        "last_run_status",
+        "last_run_duration",
+    ]
+    result.fetchall.return_value = [(
+        918,
+        "daily finance",
+        "stock_finance",
+        "biz/stock_finance/sync_finance.py",
+        "",
+        "00:00",
+        1,
+        1,
+        "",
+        None,
+        None,
+        "success",
+        0,
+    )]
+    engine.connect.return_value.__enter__.return_value.execute.return_value = result
+    claim = MagicMock(return_value=True)
+    thread = MagicMock()
+    monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "DEFERRED_DB")
+    monkeypatch.setattr(scheduler_runtime, "get_engine", lambda: engine)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "get_scheduler_runtime_config",
+        lambda: {"poll_seconds": 15, "max_concurrent_tasks": 1},
+    )
+    monkeypatch.setattr(scheduler_runtime, "_write_scheduler_heartbeat", lambda *_: None)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_standalone_heartbeat_allows_dispatch",
+        lambda *_: (True, {"errors": []}),
+    )
+    monkeypatch.setattr(scheduler_runtime, "_cleanup_stale_running_tasks", lambda *_: None)
+    monkeypatch.setattr(scheduler_runtime, "_maybe_cleanup_history", lambda *_: None)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_attach_release_catchup_history",
+        lambda *_: pytest.fail("deferred mode must not load release history"),
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_attach_release_catchup_expected_targets",
+        lambda *_args, **_kwargs: pytest.fail(
+            "deferred mode must not resolve release targets"
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_should_skip_task_for_host",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_strategy_pipeline_dependencies_ready",
+        lambda *_args, **_kwargs: (True, "ready"),
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_should_skip_non_trading_day",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_should_skip_outside_intraday_window",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_scheduler_lane_has_capacity",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(scheduler_runtime, "_claim_task_run", claim)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_task_history_start",
+        lambda *_args, **_kwargs: "a" * 32,
+    )
+    monkeypatch.setattr(scheduler_runtime.threading, "Thread", thread)
+    scheduler_runtime._running_task_ids.discard(918)
+
+    scheduler_runtime._check_and_run_tasks(
+        mode="standalone",
+        stop_event=stop_event,
+    )
+
+    claim.assert_called_once()
+    thread.assert_called_once()
+    launched_row = thread.call_args.kwargs["args"][0]
+    assert launched_row["task_type"] == "stock_finance"
+    assert launched_row.get("_trigger_source") != "release_catchup"
+    scheduler_runtime._running_task_ids.discard(918)
 
 
 def test_deferred_mode_toggle_allows_disable_but_rejects_enable(monkeypatch):

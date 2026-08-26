@@ -30,7 +30,7 @@ def main():
                 INSERT INTO st_scheduled_tasks
                     (task_name, task_type, script_path, script_args, cron_time, date_param, date_param_desc, sort_order, etl_sync_at)
                 VALUES
-                    ('新浪热股TOP100', 'hot_rank_sina', 'tools/fetch_hot_rank_sina.py', '', '17:16', '', '空=当天, 或 YYYY-MM-DD', 14, NOW())
+                    ('新浪热股TOP100', 'hot_rank_sina', 'tools/fetch_hot_rank_sina.py', '', '17:16', '', '仅当天；历史日期拒绝', 14, NOW())
             """))
             conn.commit()
             print("✓ 已成功添加新浪热股定时任务")

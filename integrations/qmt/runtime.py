@@ -6,6 +6,16 @@ from pathlib import Path
 from types import ModuleType
 
 
+DEFAULT_QMT_CONNECTION_PORTS = (
+    58610,
+    58670,
+    58671,
+    58672,
+    58673,
+    58680,
+)
+
+
 def _dedupe(items: list[Path]) -> list[Path]:
     result: list[Path] = []
     seen: set[str] = set()
@@ -83,3 +93,47 @@ def import_xtdata() -> ModuleType:
                 "or QMT_PYTHON to your QMT installation."
                 f" searched={searched}"
             ) from inner_exc
+
+
+def qmt_connection_port_candidates(
+    configured_port: str | int | None = None,
+) -> list[int]:
+    raw = (
+        os.environ.get("QMT_PORT", "")
+        if configured_port is None
+        else str(configured_port)
+    ).strip()
+    ports: list[int] = []
+    if raw:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        if 1 <= value <= 65535:
+            ports.append(value)
+    for value in DEFAULT_QMT_CONNECTION_PORTS:
+        if value not in ports:
+            ports.append(value)
+    return ports
+
+
+def connect_xtdata(
+    xtdata: ModuleType | object,
+    *,
+    configured_port: str | int | None = None,
+) -> int:
+    """Connect to one known desktop service without ambient auto-discovery."""
+
+    connector = getattr(xtdata, "connect", None)
+    if not callable(connector):
+        raise RuntimeError("xtdata.connect is unavailable")
+    last_error: Exception | None = None
+    for port in qmt_connection_port_candidates(configured_port):
+        try:
+            connector(port=port, remember_if_success=False)
+            return port
+        except Exception as exc:  # native SDK exposes several exception types
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("QMT desktop connection candidates are unavailable")

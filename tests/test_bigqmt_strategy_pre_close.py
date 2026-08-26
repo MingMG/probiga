@@ -1,5 +1,11 @@
 from datetime import datetime
 
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+from integrations.bigqmt.release_identity import render_strategy_artifact
 from integrations.bigqmt.qmt_strategy import probiga_big_qmt_bridge as producer
 
 
@@ -70,4 +76,179 @@ def test_daily_reader_never_requests_synthetic_filled_bars():
     assert producer._market_rows(context, params, "1d") == []
     assert context.calls[-1]["fill_data"] is False
     assert producer._market_rows(context, params, "1m") == []
-    assert context.calls[-1]["fill_data"] is True
+    assert context.calls[-1]["fill_data"] is False
+
+
+def test_native_trading_calendar_capability_uses_context_api_without_inference():
+    class Context:
+        def __init__(self):
+            self.calls = []
+
+        def get_trading_dates(self, *args):
+            self.calls.append(args)
+            return ["20260826", "20260824", "20260825", "20260825"]
+
+    context = Context()
+    capabilities = producer._execute_request(context, "capabilities", {})
+    result = producer._execute_request(
+        context,
+        "trading_calendar",
+        {
+            "market": "SH",
+            "start_date": "2026-08-24",
+            "end_date": "2026-08-26",
+        },
+    )
+
+    assert capabilities["strategy_release_protocol"] == (
+        producer.STRATEGY_RELEASE_PROTOCOL
+    )
+    assert capabilities["strategy_identity_frozen"] is True
+    assert capabilities["strategy_identity_status"] == "UNAVAILABLE"
+    assert capabilities["strategy_source_sha256"] == ""
+    assert capabilities["native_capabilities"] == [
+        {
+            "capability": "trading_calendar",
+            "action": "trading_calendar",
+            "available": True,
+            "source_method": "ContextInfo.get_trading_dates",
+        },
+        {
+            "capability": "index_weight",
+            "action": "index_members_many",
+            "available": False,
+            "source_method": "membership_only_no_native_weight",
+        },
+    ]
+    assert context.calls == [
+        ("000001.SH", "20260824", "20260826", -1, "1d")
+    ]
+    assert result["source_method"] == "ContextInfo.get_trading_dates"
+    assert result["source_stock_code"] == "000001.SH"
+    assert result["requested_start_date"] == "2026-08-24"
+    assert result["requested_end_date"] == "2026-08-26"
+    assert result["observed_start_date"] == "2026-08-24"
+    assert result["observed_end_date"] == "2026-08-26"
+    assert [row["trade_date"] for row in result["rows"]] == [
+        "2026-08-24",
+        "2026-08-25",
+        "2026-08-26",
+    ]
+    assert [row["day_week"] for row in result["rows"]] == [1, 2, 3]
+
+
+def test_native_trading_calendar_capability_fails_closed_when_unavailable():
+    capabilities = producer._execute_request(object(), "capabilities", {})
+    assert capabilities["native_capabilities"][0]["available"] is False
+    assert capabilities["native_capabilities"][1] == {
+        "capability": "index_weight",
+        "action": "index_members_many",
+        "available": False,
+        "source_method": "membership_only_no_native_weight",
+    }
+    try:
+        producer._execute_request(
+            object(),
+            "trading_calendar",
+            {
+                "market": "SH",
+                "start_date": "2026-08-24",
+                "end_date": "2026-08-26",
+            },
+        )
+    except RuntimeError as exc:
+        assert "get_trading_dates is unavailable" in str(exc)
+    else:
+        raise AssertionError("missing native calendar API must fail closed")
+
+
+def test_strategy_identity_is_frozen_at_module_load_not_reread_from_disk(
+    tmp_path,
+):
+    source_path = Path(producer.__file__)
+    source_bytes = source_path.read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    rendered = render_strategy_artifact(
+        source_bytes,
+        build_sha="a" * 40,
+        git_blob="b" * 40,
+        source_sha256=source_hash,
+    )
+    installed_path = tmp_path / "probiga_big_qmt_bridge.py"
+    installed_path.write_bytes(rendered["source_bytes"])
+    manifest_path = tmp_path / producer.STRATEGY_RELEASE_MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps({
+            "schema": producer.STRATEGY_RELEASE_MANIFEST_SCHEMA,
+            "strategy_release_protocol": producer.STRATEGY_RELEASE_PROTOCOL,
+            "strategy_identity_protocol": producer.STRATEGY_IDENTITY_PROTOCOL,
+            "strategy_build_sha": "a" * 40,
+            "strategy_git_blob": "b" * 40,
+            "strategy_source_sha256": source_hash,
+            "strategy_artifact_sha256": rendered["artifact_sha256"],
+            "strategy_loaded_identity_sha256": rendered["identity_sha256"],
+        }),
+        encoding="utf-8",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_probiga_frozen_strategy_test", installed_path
+    )
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+
+    before = loaded._execute_request(object(), "capabilities", {})
+    installed_path.write_text("# overwritten after QMT model load\n", encoding="utf-8")
+    manifest_path.write_text("{}", encoding="utf-8")
+    after = loaded._execute_request(object(), "capabilities", {})
+
+    assert before["strategy_identity_status"] == "BOUND"
+    assert before["strategy_build_sha"] == "a" * 40
+    assert before["strategy_git_blob"] == "b" * 40
+    assert before["strategy_source_sha256"] == source_hash
+    assert after["strategy_build_sha"] == before["strategy_build_sha"]
+    assert after["strategy_git_blob"] == before["strategy_git_blob"]
+    assert after["strategy_source_sha256"] == before["strategy_source_sha256"]
+
+
+def test_embedded_strategy_identity_loads_without_dunder_file(
+    monkeypatch, tmp_path,
+):
+    template = Path(producer.__file__).read_bytes()
+    source_hash = hashlib.sha256(template).hexdigest()
+    rendered = render_strategy_artifact(
+        template,
+        build_sha="a" * 40,
+        git_blob="b" * 40,
+        source_sha256=source_hash,
+    )
+    (tmp_path / "userdata").mkdir()
+    python_dir = tmp_path / "python"
+    python_dir.mkdir()
+    (python_dir / producer.STRATEGY_RELEASE_MANIFEST_NAME).write_text(
+        json.dumps({
+            "schema": producer.STRATEGY_RELEASE_MANIFEST_SCHEMA,
+            "strategy_release_protocol": producer.STRATEGY_RELEASE_PROTOCOL,
+            "strategy_identity_protocol": producer.STRATEGY_IDENTITY_PROTOCOL,
+            "strategy_build_sha": "a" * 40,
+            "strategy_git_blob": "b" * 40,
+            "strategy_source_sha256": source_hash,
+            "strategy_artifact_sha256": rendered["artifact_sha256"],
+            "strategy_loaded_identity_sha256": rendered["identity_sha256"],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    namespace = {"__name__": "_qmt_model_without_dunder_file"}
+    exec(compile(rendered["source_bytes"], "<qmt-model>", "exec"), namespace)
+
+    capabilities = namespace["_execute_request"](
+        object(), "capabilities", {}
+    )
+
+    assert "__file__" not in namespace
+    assert capabilities["strategy_identity_status"] == "BOUND"
+    assert capabilities["strategy_build_sha"] == "a" * 40
+    assert capabilities["strategy_loaded_identity_sha256"] == (
+        rendered["identity_sha256"]
+    )

@@ -111,6 +111,17 @@ from server.common.mysql_lock import (
     mysql_named_lock,
     supersede_overlapping_qmt_minute_forward_receipts,
 )
+from server.common.qmt_history_coverage import (
+    QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH,
+    QMT_MINUTE_GRID_PROFILE,
+    assess_minute_coverage,
+    canonical_digest as qmt_coverage_digest,
+    combine_minute_coverage_partitions,
+    insert_coverage_bundle,
+    minute_grid_profile_for_capture,
+    minute_time_grid,
+    require_exact_coverage,
+)
 from server.common.process_env import temporary_env
 from integrations.qmt.safe_upsert import safe_upsert_rows
 
@@ -1071,6 +1082,28 @@ def _append_qmt_minute_stage(
     if df is None or df.empty:
         return 0
     stamped = _with_etl(df).copy()
+    stage = quote_identifier(stage_table)
+    target_columns = [
+        str(row[0])
+        for row in connection.execute(
+            text(f"SHOW COLUMNS FROM {stage}")
+        ).fetchall()
+        if row and str(row[0]) != "id"
+    ]
+    connection.commit()
+    required_columns = {"stock_code", "trade_time", "trade_date", "price"}
+    if not required_columns.issubset(stamped.columns):
+        raise RuntimeError("QMT minute stage frame lacks canonical columns")
+    publish_columns = [
+        column for column in target_columns if column in stamped.columns
+    ]
+    if not required_columns.issubset(publish_columns):
+        raise RuntimeError("QMT minute target lacks canonical columns")
+    # BigQMT also carries local-only evidence such as native ``pre_close``.
+    # Publish every column supported by the canonical target and leave the
+    # additional evidence in qmt_local_stock_minute instead of issuing an
+    # unknown-column insert.
+    stamped = stamped.reindex(columns=publish_columns)
     with connection.begin():
         write_frame(
             _clean_df(stamped),
@@ -1089,8 +1122,8 @@ def _commit_qmt_minute_stage(
     stage_connection: Connection,
     stage_table: str,
     *,
-    first_trade_time: datetime,
-    last_trade_time: datetime,
+    trade_date: str,
+    replacement_codes: list[str],
 ) -> int:
     """Publish a validated minute stage in small per-code transactions.
 
@@ -1120,16 +1153,17 @@ def _commit_qmt_minute_stage(
         stage_connection.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar()
         or 0
     )
-    if staged_rows <= 0:
-        stage_connection.rollback()
-        return 0
-    codes = [
+    staged_codes = {
         str(row[0]).zfill(6)
         for row in stage_connection.execute(
             text(f"SELECT DISTINCT stock_code FROM {stage} ORDER BY stock_code")
         ).fetchall()
         if row[0] is not None
-    ]
+    }
+    codes = sorted({str(code).strip().zfill(6) for code in replacement_codes})
+    if not codes or not staged_codes.issubset(codes):
+        stage_connection.rollback()
+        raise RuntimeError("QMT minute replacement universe differs from stage")
     column_rows = stage_connection.execute(
         text(
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
@@ -1138,12 +1172,12 @@ def _commit_qmt_minute_stage(
         ),
     ).fetchall()
     stage_connection.commit()
-    if not codes:
-        return 0
     columns = [quote_identifier(str(row[0])) for row in column_rows]
     if not columns:
         raise RuntimeError("sm_stock_minute has no publishable columns")
     column_list = ", ".join(columns)
+    day_start = datetime.fromisoformat(f"{trade_date} 00:00:00")
+    day_end = day_start + timedelta(days=1)
     inserted_rows = 0
     total_batches = (len(codes) + batch_size - 1) // batch_size
     for offset in range(0, len(codes), batch_size):
@@ -1154,16 +1188,16 @@ def _commit_qmt_minute_stage(
         }
         params.update(
             {
-                "first_trade_time": first_trade_time,
-                "last_trade_time": last_trade_time,
+                "day_start": day_start,
+                "day_end": day_end,
             }
         )
         with stage_connection.begin():
             stage_connection.execute(
                 text(
                     f"DELETE FROM {target} WHERE stock_code IN ({placeholders}) "
-                    "AND trade_time >= :first_trade_time "
-                    "AND trade_time <= :last_trade_time"
+                    "AND trade_time >= :day_start "
+                    "AND trade_time < :day_end"
                 ),
                 params,
             )
@@ -1220,6 +1254,14 @@ def _record_qmt_minute_receipt(
         raise ValueError("QMT minute receipt quality status is invalid")
     if status != "PASS" and forward_eligible:
         raise ValueError("unfinished QMT minute publication cannot be forward eligible")
+    if status == "PASS" and not _qmt_minute_evidence_proves_exact_grid(
+        evidence,
+        expected_count=expected_count,
+        row_count=row_count,
+    ):
+        raise ValueError(
+            "PASS QMT minute receipt requires an exact per-code time-grid manifest"
+        )
     if forward_eligible and (
         expected_count <= 0
         or observed_count != expected_count
@@ -1463,6 +1505,70 @@ def _qmt_minute_evidence_proves_full_coverage(
         evidence.get("requested_stock_codes_sha256") == responded_hash
         and evidence.get("responded_stock_codes_sha256") == responded_hash
         and evidence.get("published_stock_codes_sha256") == published_hash
+        and _qmt_minute_evidence_proves_exact_grid(
+            evidence,
+            expected_count=expected_count,
+        )
+    )
+
+
+def _qmt_minute_evidence_proves_exact_grid(
+    evidence: dict[str, Any],
+    *,
+    expected_count: int,
+    row_count: int | None = None,
+) -> bool:
+    """Validate the hash-bound per-code grid manifest in a minute receipt."""
+
+    manifest = evidence.get("minute_coverage_manifest")
+    if not isinstance(manifest, dict):
+        return False
+    supplied_hash = str(manifest.get("manifest_hash") or "").lower()
+    supplied_json = str(manifest.get("manifest_json") or "")
+    core = {
+        key: value
+        for key, value in manifest.items()
+        if key not in {"manifest_hash", "manifest_json"}
+    }
+    canonical_json = json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    try:
+        grid = minute_time_grid(str(manifest.get("grid_profile") or ""))
+    except Exception:
+        return False
+    expected_set_hash = str(
+        evidence.get("requested_stock_codes_sha256") or ""
+    )
+    expected_traded = int(manifest.get("expected_traded_count") or 0)
+    actual_traded = int(manifest.get("actual_traded_count") or 0)
+    no_trade = int(manifest.get("no_trade_count") or 0)
+    bar_count = int(manifest.get("bar_count") or 0)
+    return bool(
+        manifest.get("schema") == "probiga.qmt-history-coverage.v1"
+        and manifest.get("dataset") == "stock_minute"
+        and manifest.get("period") == "1m"
+        and manifest.get("status") == "EXACT"
+        and manifest.get("strategy_eligible") is True
+        and int(manifest.get("expected_entity_count") or 0) == expected_count
+        and int(manifest.get("entity_count") or 0) == expected_count
+        and expected_traded == actual_traded
+        and expected_traded + no_trade == expected_count
+        and bar_count == actual_traded * len(grid)
+        and (row_count is None or bar_count == int(row_count))
+        and manifest.get("expected_entity_set_hash") == expected_set_hash
+        and manifest.get("minute_grid_hash")
+        == qmt_coverage_digest(list(grid))
+        and evidence.get("minute_grid_profile") == manifest.get("grid_profile")
+        and evidence.get("minute_grid_hash") == manifest.get("minute_grid_hash")
+        and int(evidence.get("minute_grid_bar_count") or 0) == len(grid)
+        and supplied_json == canonical_json
+        and len(supplied_hash) == 64
+        and qmt_coverage_digest(core) == supplied_hash
     )
 
 
@@ -2451,6 +2557,93 @@ def _step_stock_kline_myquant(
         stage_connection.close()
 
 
+_BIGQMT_IDENTITY_FIELDS = (
+    "strategy_release_protocol",
+    "strategy_identity_protocol",
+    "strategy_identity_frozen",
+    "strategy_build_sha",
+    "strategy_git_blob",
+    "strategy_source_sha256",
+    "strategy_artifact_sha256",
+    "strategy_loaded_identity_sha256",
+)
+
+
+def _formal_bigqmt_release_proof() -> dict[str, Any]:
+    executor_role = os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "").strip()
+    build_sha = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+    if executor_role != "qmt_windows_edge":
+        raise RuntimeError("formal BigQMT publisher is not Windows-edge bound")
+    if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None or build_sha == "0" * 40:
+        raise RuntimeError("formal BigQMT publisher build SHA is unavailable")
+    from integrations.bigqmt import bridge as bigqmt_bridge
+    from tools.run_qmt_windows_edge_release_bootstrap import (
+        validate_bigqmt_strategy_release,
+    )
+
+    return validate_bigqmt_strategy_release(
+        bigqmt_bridge.capabilities(timeout=180),
+        expected_build_sha=build_sha,
+    )
+
+
+def _validate_bigqmt_capture_identity(
+    capture: dict[str, Any],
+    *,
+    release_proof: dict[str, Any],
+    requested_codes: list[str],
+    action: str,
+) -> dict[str, Any]:
+    receipts = (
+        capture.get("batch_receipts")
+        if action == "minute"
+        else [capture]
+    )
+    if not isinstance(receipts, list) or not receipts:
+        raise RuntimeError(f"BigQMT {action} response receipts are unavailable")
+    requested = sorted({str(code).split(".", 1)[0].zfill(6) for code in requested_codes})
+    receipt_requested: list[str] = []
+    receipt_ids: list[str] = []
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            raise RuntimeError(f"BigQMT {action} response receipt is malformed")
+        if (
+            receipt.get("status") != "ok"
+            or receipt.get("source") != "gj_big_qmt_inner"
+            or receipt.get("bridge_version") != "bigqmt_inner_v2"
+            or receipt.get("action") != action
+            or not str(receipt.get("request_id") or "")
+        ):
+            raise RuntimeError(f"BigQMT {action} response provenance is incomplete")
+        for field in _BIGQMT_IDENTITY_FIELDS:
+            if receipt.get(field) != release_proof.get(field):
+                raise RuntimeError(
+                    f"BigQMT {action} response release identity differs: {field}"
+                )
+        receipt_ids.append(str(receipt["request_id"]))
+        raw_requested = receipt.get("requested_codes")
+        if isinstance(raw_requested, list):
+            receipt_requested.extend(
+                str(code).split(".", 1)[0].zfill(6) for code in raw_requested
+            )
+    if sorted(receipt_requested) != requested:
+        raise RuntimeError(f"BigQMT {action} response request set differs")
+    return {
+        "response_count": len(receipts),
+        "request_id_set_hash": hashlib.sha256(
+            "\n".join(sorted(receipt_ids)).encode("utf-8")
+        ).hexdigest(),
+        "requested_code_count": len(requested),
+        "requested_code_set_hash": hashlib.sha256(
+            "\n".join(requested).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _step_stock_kline_qmt(
     engine: Engine,
     backend: Any,
@@ -2466,6 +2659,9 @@ def _step_stock_kline_qmt(
     from server.common.qmt_stock_catalog import load_stock_catalog
     from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
+    bigqmt_release_proof = None
+    if str(getattr(backend, "name", "")).lower() == "bigqmt":
+        bigqmt_release_proof = _formal_bigqmt_release_proof()
     batch_size = max(20, int(os.environ.get("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")))
     history_engine = get_kline_engine()
     normalized_start = pd.to_datetime(start, errors="coerce")
@@ -2534,6 +2730,13 @@ def _step_stock_kline_qmt(
                 raise RuntimeError(
                     f"QMT daily K-line batch {batch_no}/{total_batches} returned no rows; "
                     "preserving previous data"
+                )
+            if bigqmt_release_proof is not None:
+                _validate_bigqmt_capture_identity(
+                    dict(frame.attrs.get("bigqmt_capture") or {}),
+                    release_proof=bigqmt_release_proof,
+                    requested_codes=batch,
+                    action="kline",
                 )
             frame = frame.copy()
             frame["trade_date"] = pd.to_datetime(
@@ -2827,13 +3030,94 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     This avoids materializing roughly 1.3 million rows in one JSON response and
     prevents a failed QMT call from clearing the canonical trading day.
     """
-    stock_codes = sorted(
+    executor_role = os.environ.get(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", ""
+    ).strip()
+    release_build_sha = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+    if executor_role != "qmt_windows_edge":
+        raise RuntimeError("QMT minute publisher is not Windows-edge bound")
+    if (
+        len(release_build_sha) != 40
+        or release_build_sha == "0" * 40
+        or any(
+            character not in "0123456789abcdef"
+            for character in release_build_sha
+        )
+    ):
+        raise RuntimeError("QMT minute publisher build identity is unavailable")
+    strategy_release_proof: dict[str, Any] | None = None
+    if str(getattr(backend, "name", "")).strip().lower() == "bigqmt":
+        strategy_release_proof = _formal_bigqmt_release_proof()
+    caller_stock_codes = sorted(
         {str(code).strip().zfill(6) for code in stock_codes if str(code).strip()}
     )
-    if not stock_codes:
-        raise RuntimeError("QMT minute requested stock universe is empty")
-    requested_code_set = set(stock_codes)
     trade_date = _default_myquant_minute_date(engine)
+    decision_known_at = datetime.now().replace(microsecond=0)
+    from server.common.qmt_stock_catalog import load_target_stock_catalog
+    from server.common.qmt_trade_calendar import load_trade_calendar_receipt
+
+    catalog, stock_codes = load_target_stock_catalog(
+        engine,
+        target_date=trade_date,
+        decision_known_at=decision_known_at,
+    )
+    with engine.connect() as connection:
+        calendar_receipt = load_trade_calendar_receipt(
+            connection,
+            start_date=trade_date,
+            end_date=trade_date,
+            decision_known_at=decision_known_at,
+        )
+    sessions = calendar_receipt.sessions_between(trade_date, trade_date)
+    if sessions != [trade_date]:
+        raise RuntimeError(
+            "QMT minute target is not one authoritative trading session"
+        )
+    if not stock_codes:
+        raise RuntimeError("QMT minute immutable target universe is empty")
+    requested_code_set = set(stock_codes)
+    reference_evidence = {
+        "schema": "probiga.qmt-minute-reference-roots.v1",
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "calendar_batch_id": calendar_receipt.batch_id,
+        "calendar_manifest_hash": calendar_receipt.manifest_hash,
+        "calendar_source_batch_id": calendar_receipt.source_batch_id,
+        "trade_date": trade_date,
+        "release_build_sha": release_build_sha,
+        "executor_role": executor_role,
+        "bigqmt_strategy_release": strategy_release_proof,
+        "caller_stock_code_count": len(caller_stock_codes),
+        "caller_stock_codes_sha256": _qmt_minute_code_set_sha256(
+            caller_stock_codes
+        ),
+    }
+    source_provider = (
+        "gj_big_qmt_inner"
+        if str(getattr(backend, "name", "")).lower() == "bigqmt"
+        else "guojin_miniqmt_gateway"
+    )
+    coverage_captured_at = datetime.now().replace(microsecond=0)
+    minute_run_id = (
+        f"qmt_min_{trade_date.replace('-', '')}_"
+        f"{coverage_captured_at.strftime('%H%M%S')}_{os.getpid()}"
+    )
+    daily_run_id = (
+        f"qmt_day_{trade_date.replace('-', '')}_"
+        f"{coverage_captured_at.strftime('%H%M%S')}_{os.getpid()}"
+    )
+    grid_profile = minute_grid_profile_for_capture(
+        trade_date=trade_date,
+        captured_at=coverage_captured_at,
+    )
+    expected_minute_grid = minute_time_grid(grid_profile)
+    expected_minute_times = set(expected_minute_grid)
+    full_native_minute_times = set(minute_time_grid(QMT_MINUTE_GRID_PROFILE))
     history_engine = get_kline_engine()
     batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40")))
     count = max(0, int(os.environ.get("QMT_MINUTE_COUNT", "0") or 0))
@@ -2842,8 +3126,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     written = 0
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
-    first_trade_time: pd.Timestamp | None = None
-    last_trade_time: pd.Timestamp | None = None
+    coverage_partitions: list[dict[str, Any]] = []
+    source_response_receipts: list[dict[str, Any]] = []
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
     stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
     try:
@@ -2860,10 +3144,22 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 # otherwise uncached symbols return padded zero-volume rows.
                 download_history=True,
             )
-            if frame is None or frame.empty:
-                logger.warning("QMT minute batch %d/%d returned no rows", batch_no, total_batches)
-                continue
-            frame = frame.copy()
+            frame = frame.copy() if frame is not None else pd.DataFrame()
+            if strategy_release_proof is not None:
+                source_response_receipts.append(
+                    {
+                        "kind": "minute",
+                        "batch_number": batch_no,
+                        **_validate_bigqmt_capture_identity(
+                            dict(frame.attrs.get("bigqmt_capture") or {}),
+                            release_proof=strategy_release_proof,
+                            requested_codes=batch,
+                            action="minute",
+                        ),
+                    }
+                )
+            if "stock_code" not in frame.columns:
+                frame["stock_code"] = pd.Series(dtype=str)
             frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
             returned_codes = set(frame["stock_code"].astype(str))
             outside_batch = returned_codes - set(batch)
@@ -2872,42 +3168,111 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     "QMT minute returned codes outside the requested batch: "
                     f"{sorted(outside_batch)[:10]}"
                 )
-            frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
-            frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            frame = frame[frame["trade_date"] == trade_date]
+            if "trade_time" not in frame.columns:
+                frame["trade_time"] = pd.Series(dtype="datetime64[ns]")
+            frame["trade_time"] = pd.to_datetime(
+                frame["trade_time"], errors="coerce"
+            )
+            if "trade_date" not in frame.columns:
+                frame["trade_date"] = frame["trade_time"]
+            frame["trade_date"] = pd.to_datetime(
+                frame["trade_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            # Freeze a live capture at one session prefix.  Native bars that
+            # arrive after that cutoff are excluded consistently across later
+            # batches; non-native timestamps remain and fail the assessment.
+            observed_times = frame["trade_time"].dt.strftime("%H:%M:%S")
+            later_native_rows = observed_times.isin(
+                full_native_minute_times - expected_minute_times
+            )
+            frame = frame.loc[~later_native_rows].copy()
             for column in ("price", "avg_price", "change", "change_pct", "volume", "amount"):
+                if column not in frame.columns:
+                    frame[column] = None
                 frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            frame = frame.dropna(subset=["stock_code", "trade_time", "trade_date", "price"])
-            frame = frame[(frame["price"] > 0) & (frame["volume"] >= 0) & (frame["amount"] >= 0)]
-            (
-                validated_response_codes,
-                active_codes,
-            ) = _qmt_minute_validated_code_sets(frame)
-            responded_codes.update(validated_response_codes)
-            # Match canonical semantics: a zero-volume suspended symbol has no
-            # minute transaction rows for that day.  Its validated response
-            # still proves request coverage, but it must never enter the
-            # published-code authority membership set.
+            frame["period"] = "1m"
+            frame["data_source"] = source_provider
+            frame["batch_id"] = minute_run_id
+
+            daily_frame = backend.fetch_kline(
+                batch,
+                trade_date,
+                trade_date,
+                dividend_type="none",
+                download_history=True,
+            )
+            daily_frame = (
+                daily_frame.copy()
+                if daily_frame is not None else pd.DataFrame()
+            )
+            if strategy_release_proof is not None:
+                source_response_receipts.append(
+                    {
+                        "kind": "daily_no_trade_evidence",
+                        "batch_number": batch_no,
+                        **_validate_bigqmt_capture_identity(
+                            dict(daily_frame.attrs.get("bigqmt_capture") or {}),
+                            release_proof=strategy_release_proof,
+                            requested_codes=batch,
+                            action="kline",
+                        ),
+                    }
+                )
+            if "stock_code" not in daily_frame.columns:
+                daily_frame["stock_code"] = pd.Series(dtype=str)
+            daily_frame["stock_code"] = (
+                daily_frame["stock_code"].astype(str).str.zfill(6)
+            )
+            outside_daily_batch = set(daily_frame["stock_code"]) - set(batch)
+            if outside_daily_batch:
+                raise RuntimeError(
+                    "QMT daily no-trade evidence returned codes outside the "
+                    f"requested batch: {sorted(outside_daily_batch)[:10]}"
+                )
+            daily_frame["data_source"] = source_provider
+            daily_frame["batch_id"] = daily_run_id
+
+            partition = assess_minute_coverage(
+                expected_codes=batch,
+                daily_rows=daily_frame.to_dict(orient="records"),
+                minute_rows=frame.to_dict(orient="records"),
+                trade_date=trade_date,
+                provider=source_provider,
+                daily_provider=source_provider,
+                run_id=minute_run_id,
+                catalog_batch_id=catalog.batch_id,
+                catalog_manifest_hash=catalog.manifest_hash,
+                calendar_batch_id=calendar_receipt.batch_id,
+                calendar_manifest_hash=calendar_receipt.manifest_hash,
+                source_batch_id=minute_run_id,
+                daily_source_batch_id=daily_run_id,
+                captured_at=coverage_captured_at,
+                grid_profile=grid_profile,
+            )
+            require_exact_coverage(partition)
+            coverage_partitions.append(partition)
+            active_codes = {
+                str(row["stock_code"])
+                for row in partition["entities"]
+                if row.get("expected_state") == "TRADED"
+            }
+            responded_codes.update(batch)
+            published_codes.update(active_codes)
             frame = frame[frame["stock_code"].isin(active_codes)]
             if frame.empty:
                 logger.info(
                     "QMT minute batch %d/%d: validated=%d published=0",
                     batch_no,
                     total_batches,
-                    len(validated_response_codes),
+                    len(batch),
                 )
                 continue
-            batch_first = frame["trade_time"].min()
-            batch_last = frame["trade_time"].max()
-            first_trade_time = batch_first if first_trade_time is None else min(first_trade_time, batch_first)
-            last_trade_time = batch_last if last_trade_time is None else max(last_trade_time, batch_last)
             batch_written = _append_qmt_minute_stage(
                 stage_connection,
                 stage_table,
                 frame,
             )
             written += batch_written
-            published_codes.update(active_codes)
             logger.info(
                 "QMT minute batch %d/%d: rows=%d responded=%d published=%d",
                 batch_no,
@@ -2917,14 +3282,24 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 len(published_codes),
             )
 
+        coverage_bundle = combine_minute_coverage_partitions(
+            expected_codes=stock_codes,
+            partitions=coverage_partitions,
+        )
+        coverage_manifest = require_exact_coverage(coverage_bundle)
         coverage = len(responded_codes) / max(len(stock_codes), 1)
-        if written <= 0 or coverage < min_coverage:
-            raise RuntimeError(
-                f"QMT minute coverage below threshold: {len(responded_codes)}/{len(stock_codes)} "
-                f"({coverage:.1%}) < {min_coverage:.1%}"
-            )
-        if first_trade_time is None or last_trade_time is None:
-            raise RuntimeError("QMT minute source returned no valid trade-time window")
+        if (
+            responded_codes != requested_code_set
+            or coverage != 1.0
+            or int(coverage_manifest["bar_count"]) != written
+        ):
+            raise RuntimeError("QMT minute exact coverage/physical stage differs")
+        first_trade_time = pd.Timestamp(
+            f"{trade_date} {expected_minute_grid[0]}"
+        )
+        last_trade_time = pd.Timestamp(
+            f"{trade_date} {expected_minute_grid[-1]}"
+        )
         captured_at = datetime.now().replace(microsecond=0)
         (
             capture_mode,
@@ -2935,11 +3310,11 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             last_trade_time=last_trade_time.to_pydatetime(),
             captured_at=captured_at,
         )
-        source_provider = (
-            "gj_big_qmt_inner"
-            if str(getattr(backend, "name", "")).lower() == "bigqmt"
-            else "guojin_miniqmt_gateway"
-        )
+        with engine.begin() as coverage_connection:
+            coverage_insert = insert_coverage_bundle(
+                coverage_connection,
+                coverage_bundle,
+            )
         (
             universe_evidence,
             final_quality_status,
@@ -2965,6 +3340,20 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             "capture_mode": capture_mode,
             "captured_at": captured_at.isoformat(sep=" "),
             "capture_lag_seconds": capture_lag_seconds,
+            "reference_roots": reference_evidence,
+            "minute_coverage_manifest": coverage_manifest,
+            "minute_coverage_insert": coverage_insert,
+            "minute_grid_profile": grid_profile,
+            "minute_grid_hash": coverage_manifest["minute_grid_hash"],
+            "minute_grid_bar_count": len(expected_minute_grid),
+            "minute_grid_native_fixture_hash": (
+                QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH
+            ),
+            "source_response_receipt_count": len(source_response_receipts),
+            "source_response_receipt_hash": qmt_coverage_digest(
+                source_response_receipts
+            ),
+            "source_response_receipts": source_response_receipts,
             **universe_evidence,
         }
         # Publication intentionally uses bounded per-code transactions to
@@ -3002,8 +3391,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     history_engine,
                     stage_connection,
                     stage_table,
-                    first_trade_time=first_trade_time.to_pydatetime(),
-                    last_trade_time=last_trade_time.to_pydatetime(),
+                    trade_date=trade_date,
+                    replacement_codes=stock_codes,
                 )
                 if published_rows != written:
                     raise RuntimeError(

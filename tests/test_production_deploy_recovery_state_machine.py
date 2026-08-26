@@ -2904,16 +2904,17 @@ shift
                 },
             },
             "supporting_release_trigger_inventory_exact": {
-                "required_count": 68,
+                "required_count": 70,
                 "optional_count": 0,
-                "observed_count": 68,
-                "expected_trigger_count": 68,
+                "observed_count": 70,
+                "expected_trigger_count": 70,
                 "owner_counts": {
                     "pit_facts": 6,
                     "qmt_attestation": 6,
                     "qmt_history_coverage": 4,
                     "qmt_reference": 10,
                     "scheduler_task_history": 2,
+                    "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
                 "expected_owner_counts": {
@@ -2922,10 +2923,11 @@ shift
                     "qmt_history_coverage": 4,
                     "qmt_reference": 10,
                     "scheduler_task_history": 2,
+                    "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
                 "source_contract_hash": (
-                    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+                    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
                 ),
                 "database_triggers_required": True,
                 "metadata_frozen": True,
@@ -3886,7 +3888,7 @@ systemctl() {{
       ActiveState:probiga) printf 'inactive\n' ;;
       ActiveState:*) printf 'active\n' ;;
       MainPID:*|ExecMainPID:*) printf '0\n' ;;
-      *) return 88 ;;
+      *) return 90 ;;
     esac
     return 0
   fi

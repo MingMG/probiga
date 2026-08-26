@@ -27,6 +27,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from integrations.qmt.runtime import connect_xtdata
+
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 QMT_ANNOUNCEMENT_SOURCE = "qmt.announcement"
@@ -1250,9 +1252,7 @@ def synchronize_qmt_announcements(
         resume=resume,
     )
     try:
-        connector = getattr(xtdata, "connect", None)
-        if callable(connector):
-            connector()
+        connect_xtdata(xtdata)
         results = _download_and_read(
             xtdata,
             checkpoint=checkpoint,

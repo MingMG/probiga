@@ -39,25 +39,12 @@ run([PY, "tools/run_single_table.py", "si_concept_constituent_east"])
 print("[1/6] ✅")
 
 # ==== 2/6 逐日热门数据 ====
-print("\n[2/6] 逐日热门数据（2024-01-01 ~ 今天）...")
+print("\n[2/6] 逐日热门数据历史批量入口已禁用")
+print("THS/Sina/XQ 只有当前快照；东财历史榜须按目标日期通过正式脚本单独恢复。")
 start = datetime(2024, 1, 1)
 end = datetime.now()
 total = (end - start).days + 1
-d = start
-day = 0
-while d <= end:
-    date_str = d.strftime("%Y-%m-%d")
-    day += 1
-    if day % 100 == 0 or day <= 3:
-        print(f"  进度 {day}/{total}  ({date_str})", flush=True)
-    run([PY, "tools/fetch_hot_rank_ths.py", date_str], capture=True)
-    run([PY, "tools/fetch_hot_concept_ths_daily.py", date_str], capture=True)
-    run([PY, "tools/fetch_hot_pop_rank_east.py", date_str], capture=True)
-    run([PY, "tools/merge_hot_rank.py", date_str, "--top", "100"], capture=True)
-    run([PY, "tools/merge_hot_rank.py", date_str, "--top", "100", "--days", "3"], capture=True)
-    run([PY, "tools/merge_hot_rank.py", date_str, "--top", "100", "--days", "5"], capture=True)
-    d += timedelta(days=1)
-print("[2/6] ✅")
+print("[2/6] ✅ 安全跳过（未生成融合榜）")
 
 # ==== 3/6 逐日龙虎榜 ====
 print("\n[3/6] 逐日龙虎榜（2024-01-01 ~ 今天）...")
@@ -109,9 +96,8 @@ run([PY, "tools/fetch_sector_heat_east_daily.py", today])
 run([PY, "tools/fetch_hot_rank_ths.py", today])
 run([PY, "tools/fetch_hot_concept_ths_daily.py", today])
 run([PY, "tools/fetch_hot_pop_rank_east.py", today])
-run([PY, "tools/merge_hot_rank.py", today, "--top", "100"])
-run([PY, "tools/merge_hot_rank.py", today, "--top", "100", "--days", "3"])
-run([PY, "tools/merge_hot_rank.py", today, "--top", "100", "--days", "5"])
+# Legacy bulk recovery deliberately never publishes fused data.  The formal
+# multi-source scheduler owns all fused output.
 run([PY, "tools/run_single_table.py", "sm_stock_current"])
 run([PY, "tools/run_single_table.py", "sm_concept_ths_current"])
 run([PY, "tools/run_single_table.py", "sm_index_current"])

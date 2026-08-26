@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -155,6 +155,157 @@ def test_qmt_calendar_receipt_freezes_sessions_known_at_and_source_batch():
             start_date="2026-08-01",
             end_date="2026-08-31",
             sessions=sessions,
+        )
+
+
+def _bigqmt_calendar_release_proof():
+    return {
+        "strategy_release_protocol": "probiga.bigqmt-strategy-release.v2",
+        "strategy_identity_protocol": (
+            "probiga.bigqmt-loaded-strategy-identity.v1"
+        ),
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+        "strategy_build_sha": "a" * 40,
+        "strategy_git_blob": "b" * 40,
+        "strategy_source_sha256": "c" * 64,
+        "strategy_artifact_sha256": "d" * 64,
+        "strategy_loaded_identity_sha256": "e" * 64,
+    }
+
+
+def test_formal_reference_calendar_uses_bigqmt_and_limits_proven_range(
+    monkeypatch,
+):
+    proof = _bigqmt_calendar_release_proof()
+    monkeypatch.setattr(
+        reference_sync,
+        "validate_strategy_release_payload",
+        lambda *_args, **_kwargs: proof,
+    )
+    monkeypatch.setattr(
+        reference_sync.bigqmt_bridge,
+        "capabilities",
+        lambda **_kwargs: {"status": "ok"},
+    )
+
+    def capture(_market, *, start_date, end_date, **_kwargs):
+        assert start_date == "2026-01-01"
+        assert end_date == "2026-08-26"
+        rows = [
+            {
+                "market": "SH",
+                "calendar_year": 2026,
+                "trade_date": day,
+                "trade_status": 1,
+                "day_week": pd.Timestamp(day).isoweekday(),
+            }
+            for day in ("2026-08-24", "2026-08-25", "2026-08-26")
+        ]
+        return {
+            **proof,
+            "status": "ok",
+            "source": "gj_big_qmt_inner",
+            "action": "trading_calendar",
+            "source_method": "ContextInfo.get_trading_dates",
+            "source_stock_code": "000001.SH",
+            "requested_start_date": start_date,
+            "requested_end_date": end_date,
+            "observed_start_date": "2026-08-24",
+            "observed_end_date": "2026-08-26",
+            "rows": rows,
+        }
+
+    monkeypatch.setattr(
+        reference_sync.bigqmt_bridge,
+        "trading_calendar_capture",
+        capture,
+    )
+    monkeypatch.setattr(
+        reference_sync.bridge,
+        "trading_calendar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("formal calendar must not use direct QMT")
+        ),
+        raising=False,
+    )
+
+    frame, evidence = reference_sync._fetch_trading_calendar(
+        2026,
+        2027,
+        expected_build_sha="a" * 40,
+        as_of_date=date(2026, 8, 26),
+    )
+
+    assert frame["trade_date"].tolist() == [
+        "2026-08-24", "2026-08-25", "2026-08-26",
+    ]
+    assert evidence["proven_start_date"] == "2026-08-24"
+    assert evidence["proven_end_date"] == "2026-08-26"
+    assert evidence["requested_end_date"] == "2027-12-31"
+    assert evidence["unproven_after_date"] == "2026-08-27"
+    assert evidence["future_range_status"] == (
+        "NOT_COVERED_NO_AUTHORITATIVE_FUTURE_CALENDAR"
+    )
+    manifest, _source_id = reference_sync._build_proven_calendar_manifest(
+        batch_id="calendar-bound-test",
+        captured_at=datetime(2026, 8, 26, 16, 0, 0),
+        calendar=frame,
+        capture_evidence=evidence,
+    )
+    assert manifest["start_date"] == "2026-08-24"
+    assert manifest["end_date"] == "2026-08-26"
+    assert manifest["end_date"] != evidence["requested_end_date"]
+
+
+def test_bigqmt_calendar_response_identity_drift_fails_closed(monkeypatch):
+    proof = _bigqmt_calendar_release_proof()
+    monkeypatch.setattr(
+        reference_sync,
+        "validate_strategy_release_payload",
+        lambda *_args, **_kwargs: proof,
+    )
+    monkeypatch.setattr(
+        reference_sync.bigqmt_bridge,
+        "capabilities",
+        lambda **_kwargs: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        reference_sync.bigqmt_bridge,
+        "trading_calendar_capture",
+        lambda *_args, **_kwargs: {
+            **proof,
+            "strategy_build_sha": "d" * 40,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="release identity differs"):
+        reference_sync._fetch_trading_calendar(
+            2026,
+            2026,
+            expected_build_sha="a" * 40,
+            as_of_date=date(2026, 8, 26),
+        )
+
+
+def test_formal_calendar_without_build_identity_fails_before_database(
+    monkeypatch,
+):
+    monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
+    monkeypatch.setattr(
+        reference_sync,
+        "create_engine",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("database must follow build identity")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="requires a release build SHA"):
+        reference_sync.sync_reference_data(
+            start_year=2026,
+            end_year=2027,
+            iscomplete=True,
+            refresh_timeout=1,
+            skip_calendar=False,
         )
 
 

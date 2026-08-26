@@ -443,7 +443,7 @@ def _local_minute_rows(
                 ),
                 {
                     "trade_date": trade_date,
-                    "provider": "gj_qmt",
+                    "provider": BIGQMT_PROVIDER_ID,
                     "batch_id": batch_id,
                     **code_parameters,
                 },
@@ -469,7 +469,7 @@ def _local_minute_identity(
             ),
             {
                 "trade_date": trade_date,
-                "provider": "gj_qmt",
+                "provider": BIGQMT_PROVIDER_ID,
                 "batch_id": batch_id,
             },
         )
@@ -543,7 +543,7 @@ def _minute_coverage_bundle(
         daily_rows=daily_rows,
         minute_rows=minute_rows,
         trade_date=trade_date,
-        provider="gj_qmt",
+        provider=BIGQMT_PROVIDER_ID,
         daily_provider=BIGQMT_PROVIDER_ID,
         run_id=minute_run_id,
         catalog_batch_id=catalog.batch_id,

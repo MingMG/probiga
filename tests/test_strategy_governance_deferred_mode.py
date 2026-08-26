@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from server.api import main as api_main
-from server.api.routers import health, strategy_center
+from server.api.routers import health, strategy_center, trading_v3
 from server.common.strategy_governance_mode import (
     STRATEGY_GOVERNANCE_BASE_SCHEMA_READY_ENV,
     STRATEGY_GOVERNANCE_MODE_ENV,
@@ -194,6 +194,124 @@ def test_deferred_overview_is_cash_only_without_governance_database_access(
     }]
     assert payload["activation_enabled"] is False
     assert payload["base_schema_ready"] is True
+
+
+def test_deferred_v3_context_and_readiness_are_blocked_without_repository_access(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(STRATEGY_GOVERNANCE_MODE_ENV, "DEFERRED_DB")
+    monkeypatch.setattr(
+        trading_v3,
+        "_repo",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("deferred V3 readiness/context touched storage")
+        ),
+    )
+
+    context = trading_v3.decision_context(
+        trade_date=trading_v3.date(2026, 8, 27),
+    )
+    readiness = trading_v3.readiness()
+
+    assert context["status"] == "blocked"
+    assert context["data"]["decision_status"] == "BLOCKED"
+    assert context["data"]["data_status"] == "BLOCKED"
+    assert context["data"]["decision_scope"] == "RESEARCH_ONLY"
+    assert context["data"]["paper_order_authority"] == "NONE"
+    assert context["data"]["governance_deferred"] is True
+    assert context["data"]["activation_enabled"] is False
+    assert (
+        "GOVERNANCE_DATABASE_DEFERRED"
+        in context["data"]["reason_codes"]
+    )
+    assert readiness["status"] == "blocked"
+    assert readiness["data"]["paper_ready"] is False
+    assert readiness["data"]["paper_authority_ready"] is False
+    assert readiness["data"]["execution_ready"] is False
+    assert readiness["data"]["governance_deferred"] is True
+    assert readiness["data"]["activation_enabled"] is False
+    assert readiness["data"]["blocks"] == [
+        "GOVERNANCE_DATABASE_DEFERRED"
+    ]
+
+
+def test_deferred_v3_stock_pool_keeps_audit_rows_but_removes_action_plans(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(STRATEGY_GOVERNANCE_MODE_ENV, "DEFERRED_DB")
+
+    class AuditRepository:
+        def stock_pool(self, *, trade_date, before_session_date):
+            assert trade_date == trading_v3.date(2026, 8, 27)
+            assert before_session_date is None
+            return {
+                "run_uid": "run-audit",
+                "pool_status": "READY",
+                "pool_readable": True,
+                "reason_codes": [],
+                "items": [
+                    {
+                        "stock_code": "600036",
+                        "is_strategy_candidate": True,
+                        "actionability": "BUY_ZONE",
+                        "action_plan": {
+                            "actionability": "BUY_ZONE",
+                            "label": "进入买入区后再执行",
+                            "buy_range": {"low": 42.0, "high": 42.5},
+                            "sell_range": {"low": 45.0, "high": 46.0},
+                            "protective_stop": 40.5,
+                            "range_status": "READY",
+                            "execution_authority": "ADVISORY_ONLY",
+                        },
+                    },
+                    {
+                        "stock_code": "000001",
+                        "is_strategy_candidate": True,
+                        "actionability": "WAIT_TRIGGER",
+                        "action_plan": {
+                            "actionability": "WAIT_TRIGGER",
+                            "protective_stop": 10.0,
+                        },
+                    },
+                ],
+                "summary": {
+                    "stock_count": 2,
+                    "strategy_candidate_count": 2,
+                    "target_count": 1,
+                    "display_count": 2,
+                    "buy_zone_count": 1,
+                    "wait_trigger_count": 1,
+                    "paper_only_count": 0,
+                },
+            }
+
+    monkeypatch.setattr(trading_v3, "_repo", lambda: AuditRepository())
+
+    result = trading_v3.stock_pool(
+        trade_date=trading_v3.date(2026, 8, 27),
+    )["data"]
+
+    assert result["run_uid"] == "run-audit"
+    assert result["pool_status"] == "READY"
+    assert result["governance_deferred"] is True
+    assert result["activation_enabled"] is False
+    assert result["decision_scope"] == "RESEARCH_ONLY"
+    assert result["paper_order_authority"] == "NONE"
+    assert result["summary"]["strategy_candidate_count"] == 2
+    assert result["summary"]["buy_zone_count"] == 0
+    assert result["summary"]["wait_trigger_count"] == 0
+    assert result["summary"]["display_count"] == 0
+    assert [row["source_actionability"] for row in result["items"]] == [
+        "BUY_ZONE",
+        "WAIT_TRIGGER",
+    ]
+    for row in result["items"]:
+        assert row["actionability"] == "RESEARCH_ONLY"
+        assert row["action_plan"]["actionability"] == "RESEARCH_ONLY"
+        assert row["action_plan"]["buy_range"] is None
+        assert row["action_plan"]["sell_range"] is None
+        assert row["action_plan"]["protective_stop"] is None
+        assert row["action_plan"]["execution_authority"] == "NONE"
 
 
 @pytest.mark.parametrize(

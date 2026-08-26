@@ -462,6 +462,92 @@ def _load_bars(
     return frame
 
 
+def _eligible_daily_history_codes(
+    frame: pd.DataFrame,
+    *,
+    expected_trade_date: date,
+    required_codes: Iterable[str] = (),
+    minimum_history_sessions: int = 65,
+) -> list[str]:
+    """Keep entry histories exact while retaining held stocks for monitoring.
+
+    A global latest-date check cannot prove that every security has a bar for
+    that date.  Ordinary universe members therefore need both sufficient
+    history and one exact target-date tail.  Required position codes may be
+    retained with an older tail, but the caller must mark them monitoring-only
+    before any strategy evaluation.
+    """
+
+    if frame.empty:
+        return []
+    required = {
+        str(code).zfill(6)
+        for code in required_codes
+        if str(code)
+    }
+    result: list[str] = []
+    for raw_code, group in frame.groupby(
+        "stock_code",
+        sort=False,
+        observed=True,
+    ):
+        code = str(raw_code).zfill(6)
+        if len(group) < int(minimum_history_sessions):
+            continue
+        latest = pd.Timestamp(group["trade_date"].max()).date()
+        if latest == expected_trade_date or code in required:
+            result.append(code)
+    return sorted(set(result))
+
+
+def _restricted_entry_name(value: Any) -> bool:
+    """Treat an unavailable target-date name as restricted, not as ordinary."""
+
+    name = str(value or "").strip()
+    return not name or "ST" in name.upper() or "退" in name
+
+
+_MONITORING_ONLY_NUMERIC_FIELDS = frozenset(
+    {
+        "price",
+        "latest_low",
+        "entry_eligible",
+        "required_position_monitor",
+        "latest_tradable",
+    }
+)
+
+
+def _block_entry_candidate_features(
+    item: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    """Preserve risk-monitoring identity but make every sleeve insufficient.
+
+    Strategy sleeves have different required feature sets.  Nulling every
+    derived numeric input (apart from the small monitoring allow-list) keeps a
+    held security visible to exit/risk code without relying on each current or
+    future sleeve to remember a separate stale-data check.
+    """
+
+    for key, value in tuple(item.items()):
+        if key in _MONITORING_ONLY_NUMERIC_FIELDS or isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            item[key] = None
+    item.update(
+        {
+            "entry_eligible": 0.0,
+            "latest_tradable": 0.0,
+            "data_quality_status": "DATA_BLOCKED",
+            "market_data_quality_status": "DATA_BLOCKED",
+            "theme_feature_quality_status": "DATA_BLOCKED",
+            "entry_data_quality_reason": str(reason),
+        }
+    )
+
+
 def _load_industries(
     engine: Engine,
     codes: list[str],
@@ -1206,11 +1292,12 @@ def load_daily_feature_universe(
     frame = _load_bars(kline_engine, dates=dates)
     if frame.empty or len(dates) < 65:
         raise RuntimeError("至少需要 65 个已收盘交易日的日 K 数据")
-    codes = sorted(
-        str(code)
-        for code, count in frame["stock_code"].value_counts().items()
-        if int(count) >= 65
+    codes = _eligible_daily_history_codes(
+        frame,
+        expected_trade_date=expected_trade_date,
+        required_codes=required_code_set,
     )
+    code_set = set(codes)
     industries, industry_evidence = _load_industries(
         primary_engine,
         codes,
@@ -1232,6 +1319,7 @@ def load_daily_feature_universe(
             .tail(1)
             .itertuples(index=False)
         )
+        if str(row.stock_code)[:6] in code_set
     }
     for code, inferred in infer_name_theme_memberships(latest_names).items():
         existing = theme_memberships.setdefault(code, [])
@@ -1279,6 +1367,8 @@ def load_daily_feature_universe(
     )
 
     base: dict[str, dict[str, Any]] = {}
+    strategy_eligible_codes: set[str] = set()
+    monitoring_only_reasons: dict[str, str] = {}
     for raw_code, group in frame.groupby(
         "stock_code",
         sort=False,
@@ -1287,9 +1377,14 @@ def load_daily_feature_universe(
         group = group.sort_values("trade_date", kind="mergesort")
         if len(group) < 65:
             continue
-        code = str(raw_code)
+        code = str(raw_code).zfill(6)
+        if code not in code_set:
+            continue
+        latest_bar_date = pd.Timestamp(group.iloc[-1]["trade_date"]).date()
+        latest_bar_exact = latest_bar_date == expected_trade_date
         name = str(group.iloc[-1]["short_name"] or "")
-        restricted_name = "ST" in name.upper() or "退" in name
+        name_known = bool(name.strip())
+        restricted_name = _restricted_entry_name(name)
         if restricted_name and code not in required_code_set:
             continue
         close = group["close"].astype(float)
@@ -1300,12 +1395,30 @@ def load_daily_feature_universe(
         # They preserve the last price but are not executable market data and
         # must never enter a decision universe.
         entry_data_blocked = (
-            close.iloc[-1] < 2
+            not latest_bar_exact
+            or close.iloc[-1] < 2
             or amount.iloc[-1] <= 0
             or amount.iloc[-20:].mean() < 50_000_000
         )
         if entry_data_blocked and code not in required_code_set:
             continue
+        monitoring_reasons = []
+        if not latest_bar_exact:
+            monitoring_reasons.append(
+                "MISSING_EXACT_TARGET_BAR:"
+                f"expected={expected_trade_date.isoformat()},"
+                f"actual={latest_bar_date.isoformat()}"
+            )
+        if not name_known:
+            monitoring_reasons.append("TARGET_DATE_STOCK_NAME_UNAVAILABLE")
+        elif restricted_name:
+            monitoring_reasons.append("RESTRICTED_ST_OR_DELISTING_SECURITY")
+        if entry_data_blocked and latest_bar_exact:
+            monitoring_reasons.append("TARGET_DATE_ENTRY_MARKET_DATA_BLOCKED")
+        if monitoring_reasons:
+            monitoring_only_reasons[code] = ";".join(monitoring_reasons)
+        else:
+            strategy_eligible_codes.add(code)
         ma20 = float(close.iloc[-20:].mean())
         ma20_prior = float(close.iloc[-25:-5].mean())
         ma5 = float(close.iloc[-5:].mean())
@@ -1358,14 +1471,12 @@ def load_daily_feature_universe(
         )
         base[code] = {
             "stock_code": code,
-            "stock_name": name,
-            "latest_trade_date": pd.Timestamp(
-                group.iloc[-1]["trade_date"]
-            ).date().isoformat(),
+            "stock_name": name or code,
+            "latest_trade_date": latest_bar_date.isoformat(),
             "price": float(group.iloc[-1]["raw_close"]),
             "latest_low": float(group.iloc[-1]["raw_low"]),
             "entry_eligible": float(
-                not restricted_name and not entry_data_blocked
+                code in strategy_eligible_codes
             ),
             "required_position_monitor": float(
                 code in required_code_set
@@ -1528,9 +1639,13 @@ def load_daily_feature_universe(
             ),
         )
         for code, item in base.items()
+        if code in strategy_eligible_codes
     }
+    strategy_frame = frame.loc[
+        frame["stock_code"].astype(str).str[:6].isin(strategy_eligible_codes)
+    ].copy()
     theme_statistics = calculate_theme_statistics(
-        frame,
+        strategy_frame,
         as_of=dates[-1],
         memberships=theme_memberships,
         member_scores=member_scores,
@@ -1652,6 +1767,8 @@ def load_daily_feature_universe(
             len(missing_fields)
         )
         item["finance_missing_fields"] = missing_fields
+        if code not in strategy_eligible_codes:
+            continue
         if all(
             values[key] is not None
             for key in (
@@ -1709,7 +1826,12 @@ def load_daily_feature_universe(
             if math.isfinite(float(value)):
                 base[code][feature] = float(value)
 
-    ranked_codes = diversified_universe_codes(base, limit=limit)
+    strategy_base = {
+        code: item
+        for code, item in base.items()
+        if code in strategy_eligible_codes
+    }
+    ranked_codes = diversified_universe_codes(strategy_base, limit=limit)
     for code in sorted(required_code_set):
         if code in base and code not in ranked_codes:
             ranked_codes.append(code)
@@ -1806,6 +1928,14 @@ def load_daily_feature_universe(
                 distance_ma20_pct=item["distance_ma20_pct"],
             )
         )
+        if code not in strategy_eligible_codes:
+            _block_entry_candidate_features(
+                item,
+                reason=monitoring_only_reasons.get(
+                    code,
+                    "ENTRY_DATA_QUALITY_BLOCKED",
+                ),
+            )
         selected.append(item)
     snapshot_payload = {
         "as_of": as_of.isoformat(),

@@ -147,14 +147,30 @@ def _json_value(value: Any) -> Any:
         return None
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return value.isoformat()
+    if isinstance(value, Mapping):
+        return {key: _json_value(member) for key, member in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(member) for member in value]
     if hasattr(value, "item"):
         try:
-            return value.item()
+            scalar = value.item()
+            return scalar if scalar is value else _json_value(scalar)
         except (TypeError, ValueError):
             pass
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _dump_json(value: Any) -> str:
+    """Serialize database-bound digest JSON after recursive scalar normalization."""
+
+    return json.dumps(
+        _json_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def _as_beijing(value: datetime | None) -> datetime:
@@ -1750,10 +1766,10 @@ def persist_quant_digest(engine: Any, result: Mapping[str, Any]) -> None:
         "adjust_type": int(result["adjust_type"]),
         "publish_status": result["publish_status"],
         "compact_review": result.get("compact_review") or "",
-        "quality_json": json.dumps(result["quality_json"], ensure_ascii=False, separators=(",", ":")),
-        "market_structure_json": json.dumps(result["market_structure_json"], ensure_ascii=False, separators=(",", ":")),
-        "industry_rotation_json": json.dumps(result["industry_rotation_json"], ensure_ascii=False, separators=(",", ":")),
-        "factor_validation_json": json.dumps(result["factor_validation_json"], ensure_ascii=False, separators=(",", ":")),
+        "quality_json": _dump_json(result["quality_json"]),
+        "market_structure_json": _dump_json(result["market_structure_json"]),
+        "industry_rotation_json": _dump_json(result["industry_rotation_json"]),
+        "factor_validation_json": _dump_json(result["factor_validation_json"]),
         "data_cutoff_at": (
             pd.Timestamp(result["data_cutoff_at"]).to_pydatetime().replace(tzinfo=None)
             if result.get("data_cutoff_at")

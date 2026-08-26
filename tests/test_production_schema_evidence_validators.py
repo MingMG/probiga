@@ -31,7 +31,7 @@ GOVERNANCE_SOURCE_HASH = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 SUPPORTING_SOURCE_HASH = (
-    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
 )
 PIT_CONTRACT_HASH = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
@@ -58,6 +58,7 @@ SUPPORTING_OWNER_COUNTS = {
     "qmt_history_coverage": 4,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
+    "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }
 GOVERNANCE_TRIGGER_NAMES = sorted(EXPECTED_GOVERNANCE_TRIGGER_NAMES)
@@ -65,6 +66,20 @@ SUPPORTING_TRIGGER_NAMES = sorted(_non_v3_trigger_contracts())
 QMT_TABLE_NAMES = list(REFERENCE_TABLE_NAMES)
 QMT_TRIGGER_NAMES = list(REFERENCE_TRIGGER_NAMES)
 RUNTIME_BUNDLE_METADATA = _contract_metadata()
+
+
+def _runtime_bundle_recovery_plans() -> dict[str, Any]:
+    return {
+        name: {
+            "status": "PLANNED",
+            "read_only": True,
+            "ready_for_privileged_apply": True,
+            "plan_sha256": chr(ord("a") + index) * 64,
+        }
+        for index, name in enumerate(
+            RUNTIME_BUNDLE_METADATA["recovery_planner_names"]
+        )
+    }
 
 
 def _runtime_bundle_validation() -> dict[str, Any]:
@@ -82,6 +97,7 @@ def _runtime_bundle_validation() -> dict[str, Any]:
 
 
 def _runtime_bundle_migration() -> dict[str, Any]:
+    recovery_plans = _runtime_bundle_recovery_plans()
     return {
         **RUNTIME_BUNDLE_METADATA,
         "migrations": {
@@ -93,6 +109,9 @@ def _runtime_bundle_migration() -> dict[str, Any]:
             for name in RUNTIME_BUNDLE_METADATA["seed_names"]
         },
         "runtime_validation": _runtime_bundle_validation(),
+        "recovery_plans": recovery_plans,
+        "recovery_plan_count": len(recovery_plans),
+        "recovery_ready_for_privileged_apply": True,
         "runtime_ddl_required": False,
         "privileged_migration": True,
     }
@@ -103,10 +122,14 @@ def _runtime_bundle_preflight() -> dict[str, Any]:
         name: {"status": "READY", "read_only": True}
         for name in RUNTIME_BUNDLE_METADATA["validator_names"]
     }
+    recovery_plans = _runtime_bundle_recovery_plans()
     return {
         **RUNTIME_BUNDLE_METADATA,
         "contracts": contracts,
         "contract_count": len(contracts),
+        "recovery_plans": recovery_plans,
+        "recovery_plan_count": len(recovery_plans),
+        "recovery_ready_for_privileged_apply": True,
         "migration_required": False,
         "read_only": True,
     }
@@ -272,9 +295,9 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     if resume:
         detail.update(
             {
-                "required_count": 68,
+                "required_count": 70,
                 "optional_count": 0,
-                "observed_count": 68,
+                "observed_count": 70,
                 "definer": "probiga_migrator@127.0.0.1",
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
@@ -286,7 +309,7 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     else:
         detail.update(
             {
-                "trigger_count": 68,
+                "trigger_count": 70,
                 "trigger_names": SUPPORTING_TRIGGER_NAMES,
             }
         )
@@ -302,9 +325,9 @@ def _resume_payload() -> dict[str, Any]:
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
-                "required_count": 88,
+                "required_count": 90,
                 "optional_count": 0,
-                "observed_count": 88,
+                "observed_count": 90,
             },
             "legacy_trigger_repair": {
                 "candidate_names": [],
@@ -443,8 +466,8 @@ def _preflight_payload() -> dict[str, Any]:
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
                 "required_count": 20,
-                "optional_count": 68,
-                "observed_count": 88,
+                "optional_count": 70,
+                "observed_count": 90,
             },
             "governance_trigger_source_contract": _governance_source(
                 resume=False

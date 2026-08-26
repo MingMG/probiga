@@ -19,6 +19,9 @@ from .calibration import CalibrationTable
 from .config import config_hash as current_config_hash
 from .config import load_v3_config
 from .decision_truth import (
+    DECISION_INTEGRITY_SCHEMA_VERSION,
+    FORECAST_LEDGER_SQL_COLUMNS,
+    canonical_forecast_ledger,
     canonical_hash,
     canonical_target_ledger,
     decision_result_hash,
@@ -995,10 +998,12 @@ class TradingV3Repository:
             ownership_by_code=target_ownership,
         )
         portfolio["decision_integrity"] = {
-            "schema_version": (
-                "probiga.trading-v3.decision-integrity.v1"
-            ),
+            "schema_version": DECISION_INTEGRITY_SCHEMA_VERSION,
             "forecast_count": len(forecast_rows),
+            # Filled from the rows read back inside the same transaction after
+            # persistence.  The transaction cannot commit a run with this
+            # placeholder because the final UPDATE below is mandatory.
+            "forecast_ledger_hash": "",
             "raw_theme_signal_count": len(raw_theme_signal_rows),
             "persisted_theme_signal_count": len(theme_signal_rows),
             "hypothesis_count": len(hypothesis_rows),
@@ -1423,6 +1428,55 @@ class TradingV3Repository:
                         "updated_at": now,
                     },
                 )
+            persisted_forecast_rows = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        f"""
+                        SELECT {FORECAST_LEDGER_SQL_COLUMNS}
+                        FROM st_alpha_forecast_v3
+                        WHERE run_uid = :run_uid
+                        ORDER BY rank_no, stock_code, strategy_key, forecast_id
+                        """
+                    ),
+                    {"run_uid": run_uid},
+                ).mappings().all()
+            ]
+            if len(persisted_forecast_rows) != len(ranked):
+                raise RuntimeError(
+                    "persisted forecast ledger count differs before commit"
+                )
+            portfolio["decision_integrity"]["forecast_ledger_hash"] = (
+                canonical_hash(
+                    canonical_forecast_ledger(persisted_forecast_rows)
+                )
+            )
+            result_hash = decision_result_hash(
+                regime=regime,
+                portfolio=portfolio,
+                forecast_count=len(forecast_rows),
+                theme_signal_count=len(raw_theme_signal_rows),
+                hypothesis_count=len(hypothesis_rows),
+            )
+            integrity_update = connection.execute(
+                text(
+                    """
+                    UPDATE st_decision_run_v3
+                    SET portfolio_json = :portfolio_json,
+                        result_hash = :result_hash
+                    WHERE run_uid = :run_uid
+                    """
+                ),
+                {
+                    "run_uid": run_uid,
+                    "portfolio_json": _json(portfolio),
+                    "result_hash": result_hash,
+                },
+            )
+            if int(getattr(integrity_update, "rowcount", 0) or 0) != 1:
+                raise RuntimeError(
+                    "decision integrity manifest update did not affect one run"
+                )
             _save_progress(
                 "transaction_ready",
                 save_started_at,
@@ -1556,13 +1610,43 @@ class TradingV3Repository:
         self,
         trade_date: date | None = None,
     ) -> dict[str, Any] | None:
-        where = ""
+        rows = self._decision_run_candidates(
+            trade_date=trade_date,
+            completed_only=False,
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def _decision_run_candidates(
+        self,
+        *,
+        trade_date: date | None = None,
+        before_session_date: date | None = None,
+        completed_only: bool,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Read ordered decision runs without upgrading lifecycle truth.
+
+        The ordinary context endpoints intentionally need to see the newest
+        PROCESSING/BLOCKED run.  A stock-pool projection has a different
+        contract: it may publish only a cryptographically verified COMPLETED
+        run.  Keeping the status predicate explicit here prevents either use
+        case from silently changing the other.
+        """
+
+        if trade_date is not None and before_session_date is not None:
+            raise ValueError(
+                "trade_date and before_session_date are mutually exclusive"
+            )
+        bounded_limit = max(1, min(int(limit), 256))
+        conditions: list[str] = []
         params: dict[str, Any] = {}
+        requested_expression = ""
         dialect_name = str(
             getattr(getattr(self.engine, "dialect", None), "name", "")
         ).casefold()
         with self.engine.connect() as connection:
-            if trade_date is not None:
+            if trade_date is not None or before_session_date is not None:
                 has_requested_as_of = self._decision_run_has_requested_as_of(
                     connection,
                     dialect_name=dialect_name,
@@ -1584,45 +1668,71 @@ class TradingV3Repository:
                         "portfolio_json, '$.decision_snapshot.requested_as_of'"
                         ")), '%Y-%m-%d'), DATE(decision_at))"
                     )
-                where = f"WHERE {requested_expression} = :trade_date"
-                params["trade_date"] = trade_date
-            row = connection.execute(
+                if trade_date is not None:
+                    conditions.append(
+                        f"{requested_expression} = :trade_date"
+                    )
+                    params["trade_date"] = trade_date
+                else:
+                    conditions.append(
+                        f"{requested_expression} < :before_session_date"
+                    )
+                    params["before_session_date"] = before_session_date
+            if completed_only:
+                conditions.append("status = 'COMPLETED'")
+            where = (
+                "WHERE " + " AND ".join(conditions)
+                if conditions
+                else ""
+            )
+            ordering = (
+                f"{requested_expression} DESC, decision_at DESC, created_at DESC"
+                if before_session_date is not None
+                else "decision_at DESC, created_at DESC"
+            )
+            rows = connection.execute(
                 text(
                     f"""
                     SELECT *
                     FROM st_decision_run_v3
                     {where}
-                    ORDER BY decision_at DESC, created_at DESC
-                    LIMIT 1
+                    ORDER BY {ordering}
+                    LIMIT {bounded_limit}
                     """
                 ),
                 params,
-            ).mappings().first()
-        if not row:
-            return None
-        result = dict(row)
-        if result.get("requested_as_of") is None:
-            snapshot = {}
+            ).mappings().all()
+
+        results: list[dict[str, Any]] = []
+        for row in rows:
             try:
-                snapshot = json.loads(
-                    str(result.get("portfolio_json") or "{}")
-                ).get("decision_snapshot") or {}
-            except (TypeError, ValueError):
-                snapshot = {}
-            decision_value = result["decision_at"]
-            decision_date = (
-                decision_value.date()
-                if isinstance(decision_value, datetime)
-                else date.fromisoformat(str(decision_value)[:10])
-            )
-            result["requested_as_of"] = snapshot.get(
-                "requested_as_of"
-            ) or decision_date
-        for key in ("regime_json", "portfolio_json"):
-            result[key.removesuffix("_json")] = json.loads(
-                str(result.pop(key))
-            )
-        return result
+                result = dict(row)
+                if result.get("requested_as_of") is None:
+                    snapshot = {}
+                    snapshot = json.loads(
+                        str(result.get("portfolio_json") or "{}")
+                    ).get("decision_snapshot") or {}
+                    decision_value = result["decision_at"]
+                    decision_date = (
+                        decision_value.date()
+                        if isinstance(decision_value, datetime)
+                        else date.fromisoformat(str(decision_value)[:10])
+                    )
+                    result["requested_as_of"] = snapshot.get(
+                        "requested_as_of"
+                    ) or decision_date
+                for key in ("regime_json", "portfolio_json"):
+                    result[key.removesuffix("_json")] = json.loads(
+                        str(result.pop(key))
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                if completed_only:
+                    # A malformed immutable candidate is unreadable evidence,
+                    # not a reason to hide an older verified historical pool.
+                    continue
+                raise
+            results.append(result)
+        return results
 
     def overview(self) -> dict[str, Any]:
         run = self._latest_run()
@@ -1774,6 +1884,7 @@ class TradingV3Repository:
         self,
         *,
         trade_date: date | None = None,
+        before_session_date: date | None = None,
     ) -> dict[str, Any]:
         """Return one read-only, de-duplicated stock-pool snapshot.
 
@@ -1781,12 +1892,41 @@ class TradingV3Repository:
         needs to reason about a security only once. This projection keeps the
         immutable run data intact and only consolidates it for display.
         """
-        run = self._latest_run(trade_date)
+        if trade_date is not None and before_session_date is not None:
+            raise ValueError(
+                "trade_date and before_session_date are mutually exclusive"
+            )
+        run = self._latest_verified_completed_run(
+            trade_date,
+            before_session_date=before_session_date,
+        )
         if not run:
+            requested_date = trade_date or before_session_date
             return {
                 "run_uid": None,
                 "trade_date": trade_date.isoformat() if trade_date else None,
+                "decision_session_date": (
+                    trade_date.isoformat() if trade_date else None
+                ),
+                "requested_trade_date": (
+                    requested_date.isoformat() if requested_date else None
+                ),
+                "before_session_date": (
+                    before_session_date.isoformat()
+                    if before_session_date
+                    else None
+                ),
+                "is_historical_fallback": False,
+                "historical_read_only": False,
+                "historical_fallback_status": None,
                 "generated_at": None,
+                "pool_status": "UNAVAILABLE",
+                "pool_readable": False,
+                "run_status": None,
+                "decision_integrity_verified": False,
+                "reason_codes": [
+                    "NO_VERIFIED_COMPLETED_DECISION_RUN",
+                ],
                 "items": [],
                 "summary": {
                     "stock_count": 0,
@@ -1798,38 +1938,13 @@ class TradingV3Repository:
             }
 
         with self.engine.connect() as connection:
-            forecast_columns = _table_column_names(
-                connection,
-                "st_alpha_forecast_v3",
-            )
-            optional_forecast_columns = (
-                "sample_count",
-                "profit_factor",
-                "payoff_ratio",
-                "initial_stop_pct",
-                "return_q50_pct",
-                "return_q90_pct",
-                "features_json",
-                "feature_time",
-            )
-            optional_forecast_select = ", ".join(
-                column
-                if column in forecast_columns
-                else f"NULL AS {column}"
-                for column in optional_forecast_columns
-            )
             forecast_rows = connection.execute(
                 text(
                     f"""
-                    SELECT forecast_id, rank_no, stock_code, short_name,
-                           strategy_key, raw_score,
-                           expected_return_net_pct, probability_positive,
-                           confidence, forecast_status, theme_code,
-                           valid_until, reasons_json,
-                           {optional_forecast_select}
+                    SELECT {FORECAST_LEDGER_SQL_COLUMNS}
                     FROM st_alpha_forecast_v3
                     WHERE run_uid = :run_uid
-                    ORDER BY rank_no, stock_code, strategy_key
+                    ORDER BY rank_no, stock_code, strategy_key, forecast_id
                     """
                 ),
                 {"run_uid": run["run_uid"]},
@@ -1845,6 +1960,70 @@ class TradingV3Repository:
                 ),
                 {"run_uid": run["run_uid"]},
             ).mappings().all()
+
+        integrity = dict(
+            (run.get("portfolio") or {}).get("decision_integrity") or {}
+        )
+        try:
+            source_date = run.get("trade_date")
+            source_date = (
+                source_date
+                if isinstance(source_date, date)
+                else date.fromisoformat(str(source_date)[:10])
+            )
+            fetched_forecast_ledger = canonical_forecast_ledger(forecast_rows)
+            fetched_target_ledger = canonical_target_ledger(
+                target_rows,
+                run_uid=str(run.get("run_uid") or ""),
+                trade_date=source_date,
+                persisted=True,
+            )
+            fetched_ledgers_verified = all((
+                canonical_hash(fetched_forecast_ledger)
+                == str(integrity.get("forecast_ledger_hash") or ""),
+                len(forecast_rows)
+                == int(integrity.get("forecast_count") or 0),
+                canonical_hash(fetched_target_ledger)
+                == str(integrity.get("target_ledger_hash") or ""),
+                len(target_rows)
+                == int(integrity.get("target_count") or 0),
+            ))
+        except (ArithmeticError, TypeError, ValueError, json.JSONDecodeError):
+            fetched_ledgers_verified = False
+        if not fetched_ledgers_verified:
+            requested_date = trade_date or before_session_date
+            return {
+                "run_uid": None,
+                "trade_date": trade_date.isoformat() if trade_date else None,
+                "decision_session_date": (
+                    trade_date.isoformat() if trade_date else None
+                ),
+                "requested_trade_date": (
+                    requested_date.isoformat() if requested_date else None
+                ),
+                "before_session_date": (
+                    before_session_date.isoformat()
+                    if before_session_date
+                    else None
+                ),
+                "is_historical_fallback": False,
+                "historical_read_only": False,
+                "historical_fallback_status": None,
+                "generated_at": None,
+                "pool_status": "UNAVAILABLE",
+                "pool_readable": False,
+                "run_status": None,
+                "decision_integrity_verified": False,
+                "reason_codes": ["DECISION_LEDGER_CHANGED_DURING_READ"],
+                "items": [],
+                "summary": {
+                    "stock_count": 0,
+                    "forecast_count": 0,
+                    "strategy_candidate_count": 0,
+                    "target_count": 0,
+                    "rejected_count": 0,
+                },
+            }
 
         def _list_json(value: Any) -> list[Any]:
             try:
@@ -2054,52 +2233,89 @@ class TradingV3Repository:
             item["action_plan"]["label"] = (
                 "等待触发优先级未进入前 20，移入研究审计"
             )
+        summary = {
+            "stock_count": len(items),
+            "forecast_count": len(forecast_rows),
+            "strategy_candidate_count": sum(
+                1 for item in items if item["is_strategy_candidate"]
+            ),
+            "target_count": sum(
+                1 for item in items if item["target"]
+            ),
+            "rejected_count": sum(
+                1 for item in items if item["rejection"]
+            ),
+            "display_count": sum(
+                1
+                for item in items
+                if item["actionability"] != "RESEARCH_ONLY"
+            ),
+            "buy_zone_count": sum(
+                1
+                for item in items
+                if item["actionability"] == "BUY_ZONE"
+            ),
+            "wait_trigger_count": sum(
+                1
+                for item in items
+                if item["actionability"] == "WAIT_TRIGGER"
+            ),
+            "paper_only_count": sum(
+                1
+                for item in items
+                if item["actionability"] == "PAPER_ONLY"
+            ),
+            "visible_wait_limit": visible_wait_limit,
+        }
+        pool_status = (
+            "READY" if summary["strategy_candidate_count"] > 0 else "EMPTY"
+        )
+        decision_session_date = str(
+            run.get("requested_as_of")
+            or str(run.get("decision_at") or "")[:10]
+        )
+        historical_fallback = before_session_date is not None
         return {
             "run_uid": run["run_uid"],
             "trade_date": str(run["trade_date"]),
-            "decision_session_date": str(
-                run.get("requested_as_of")
-                or str(run.get("decision_at") or "")[:10]
+            "decision_session_date": decision_session_date,
+            "requested_trade_date": (
+                before_session_date.isoformat()
+                if before_session_date
+                else trade_date.isoformat()
+                if trade_date
+                else decision_session_date
+            ),
+            "before_session_date": (
+                before_session_date.isoformat()
+                if before_session_date
+                else None
+            ),
+            "is_historical_fallback": historical_fallback,
+            "historical_read_only": historical_fallback,
+            "historical_fallback_status": (
+                "HISTORICAL_READ_ONLY" if historical_fallback else None
+            ),
+            "historical_fallback_session_date": (
+                decision_session_date if historical_fallback else None
+            ),
+            "historical_fallback_reason": (
+                "请求日没有完整可验证的 V3 决策批次，"
+                "展示此前最近一次 COMPLETED 历史策略池"
+                if historical_fallback
+                else ""
             ),
             "decision_at": str(run.get("decision_at") or ""),
             "generated_at": str(
                 run.get("completed_at") or run.get("decision_at") or ""
             ),
+            "pool_status": pool_status,
+            "pool_readable": True,
+            "run_status": "COMPLETED",
+            "decision_integrity_verified": True,
+            "reason_codes": [],
             "items": items,
-            "summary": {
-                "stock_count": len(items),
-                "forecast_count": len(forecast_rows),
-                "strategy_candidate_count": sum(
-                    1 for item in items if item["is_strategy_candidate"]
-                ),
-                "target_count": sum(
-                    1 for item in items if item["target"]
-                ),
-                "rejected_count": sum(
-                    1 for item in items if item["rejection"]
-                ),
-                "display_count": sum(
-                    1
-                    for item in items
-                    if item["actionability"] != "RESEARCH_ONLY"
-                ),
-                "buy_zone_count": sum(
-                    1
-                    for item in items
-                    if item["actionability"] == "BUY_ZONE"
-                ),
-                "wait_trigger_count": sum(
-                    1
-                    for item in items
-                    if item["actionability"] == "WAIT_TRIGGER"
-                ),
-                "paper_only_count": sum(
-                    1
-                    for item in items
-                    if item["actionability"] == "PAPER_ONLY"
-                ),
-                "visible_wait_limit": visible_wait_limit,
-            },
+            "summary": summary,
         }
 
     @staticmethod
@@ -2227,6 +2443,15 @@ class TradingV3Repository:
         run = self._latest_run(trade_date)
         if not run:
             return None
+        return self._with_decision_integrity(run)
+
+    def _with_decision_integrity(
+        self,
+        run: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Attach a read-time proof for one immutable decision run."""
+
+        run = dict(run)
         run["decision_integrity_verified"] = False
         run["decision_integrity_reason"] = (
             "DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED"
@@ -2235,8 +2460,11 @@ class TradingV3Repository:
             portfolio = dict(run.get("portfolio") or {})
             integrity = dict(portfolio.get("decision_integrity") or {})
             if str(integrity.get("schema_version") or "") != (
-                "probiga.trading-v3.decision-integrity.v1"
+                DECISION_INTEGRITY_SCHEMA_VERSION
             ):
+                run["decision_integrity_reason"] = (
+                    "DECISION_INTEGRITY_V2_REQUIRED"
+                )
                 return run
             run_uid = str(run.get("run_uid") or "")
             source_date = run.get("trade_date")
@@ -2255,6 +2483,21 @@ class TradingV3Repository:
                             FROM st_target_portfolio_v3
                             WHERE run_uid = :run_uid
                             ORDER BY rank_no, stock_code
+                            """
+                        ),
+                        {"run_uid": run_uid},
+                    ).mappings().all()
+                ]
+                forecasts = [
+                    dict(row)
+                    for row in connection.execute(
+                        text(
+                            f"""
+                            SELECT {FORECAST_LEDGER_SQL_COLUMNS}
+                            FROM st_alpha_forecast_v3
+                            WHERE run_uid = :run_uid
+                            ORDER BY rank_no, stock_code, strategy_key,
+                                     forecast_id
                             """
                         ),
                         {"run_uid": run_uid},
@@ -2281,8 +2524,12 @@ class TradingV3Repository:
                 persisted=True,
             )
             forecast_count = int(integrity.get("forecast_count") or 0)
+            forecast_ledger = canonical_forecast_ledger(forecasts)
             hypothesis_count = int(integrity.get("hypothesis_count") or 0)
             checks = (
+                canonical_hash(forecast_ledger)
+                == str(integrity.get("forecast_ledger_hash") or ""),
+                len(forecasts) == forecast_count,
                 canonical_hash(ledger)
                 == str(integrity.get("target_ledger_hash") or ""),
                 len(targets) == int(integrity.get("target_count") or 0),
@@ -2312,6 +2559,7 @@ class TradingV3Repository:
                 run["decision_integrity_verified"] = True
                 run["decision_integrity_reason"] = ""
         except (
+            ArithmeticError,
             AttributeError,
             TypeError,
             ValueError,
@@ -2320,6 +2568,32 @@ class TradingV3Repository:
         ):
             pass
         return run
+
+    def _latest_verified_completed_run(
+        self,
+        trade_date: date | None = None,
+        *,
+        before_session_date: date | None = None,
+    ) -> dict[str, Any] | None:
+        """Return only a complete run whose persisted ledgers still verify.
+
+        A failed/partial run must remain visible through the decision-context
+        endpoint, but it must never suppress an older readable stock pool or
+        masquerade as a verified empty selection.  The bounded candidate scan
+        also lets a corrupt newest COMPLETED row fail closed while retaining a
+        prior immutable batch for explicitly historical display.
+        """
+
+        for run in self._decision_run_candidates(
+            trade_date=trade_date,
+            before_session_date=before_session_date,
+            completed_only=True,
+            limit=256,
+        ):
+            verified = self._with_decision_integrity(run)
+            if verified.get("decision_integrity_verified") is True:
+                return verified
+        return None
 
     def ensure_intraday_hypothesis(
         self,

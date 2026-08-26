@@ -80,10 +80,23 @@ def test_sync_raises_when_jq_returns_no_rows(monkeypatch):
     monkeypatch.setattr("tools.sync_jq_minute_gml.jq_auth", lambda: None)
     monkeypatch.setattr("tools.sync_jq_minute_gml.jq", FakeJQ)
     monkeypatch.setattr("tools.sync_jq_minute_gml._read_codes", lambda *args, **kwargs: ["000001.XSHE"])
+    schema_validations: list[object] = []
+    monkeypatch.setattr(
+        "tools.sync_jq_minute_gml._run_ddl",
+        lambda engine: schema_validations.append(engine),
+    )
+    engine = object()
 
     try:
-        sync_jq_minute_gml(object(), codes="000001", dry_run=True, skip_ddl=True, skip_closed=False)
+        sync_jq_minute_gml(
+            engine,
+            codes="000001",
+            dry_run=True,
+            skip_ddl=True,
+            skip_closed=False,
+        )
     except RuntimeError as exc:
         assert "returned no rows" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+    assert schema_validations == [engine]

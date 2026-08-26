@@ -8,7 +8,9 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from server.trading_v3.decision_truth import (
+    DECISION_INTEGRITY_SCHEMA_VERSION,
     DecisionTruthBlocked,
+    canonical_forecast_ledger,
     canonical_hash,
     canonical_target_ledger,
     decision_result_hash,
@@ -125,6 +127,45 @@ def _load_snapshot(engine):
     )
 
 
+def _persisted_forecast_row(
+    *,
+    run_uid: str = "run-risk-reject",
+    trade_date: date = date(2026, 8, 5),
+) -> dict:
+    return {
+        "forecast_id": f"{run_uid}-forecast-1",
+        "run_uid": run_uid,
+        "trade_date": trade_date,
+        "rank_no": 1,
+        "stock_code": "000001",
+        "short_name": "平安银行",
+        "strategy_key": "right_side_trend",
+        "horizon_days": 5,
+        "raw_score": 0.8,
+        "expected_return_net_pct": 1.0,
+        "return_q10_pct": -2.0,
+        "return_q50_pct": 1.0,
+        "return_q90_pct": 4.0,
+        "probability_positive": 0.6,
+        "expected_mae_pct": -2.0,
+        "expected_mfe_pct": 3.0,
+        "profit_factor": 1.4,
+        "payoff_ratio": 1.2,
+        "sample_count": 50,
+        "confidence": 0.7,
+        "forecast_status": "VALIDATED_POSITIVE",
+        "theme_code": "BANK",
+        "model_version": "dynamic-test-version",
+        "dataset_hash": "a" * 64,
+        "feature_time": f"{trade_date.isoformat()} 15:00:00",
+        "valid_until": f"{trade_date.isoformat()} 23:59:59",
+        "initial_stop_pct": -5.0,
+        "reasons_json": "[]",
+        "features_json": "{}",
+        "created_at": f"{trade_date.isoformat()} 16:05:00",
+    }
+
+
 def _verified_portfolio_json(
     *,
     trade_date: date = date(2026, 8, 5),
@@ -153,6 +194,9 @@ def _verified_portfolio_json(
     }
     manifest["manifest_hash"] = canonical_hash(manifest)
     target_rows = list(target_rows or [])
+    forecast_rows = [
+        _persisted_forecast_row(run_uid=run_uid, trade_date=trade_date)
+    ]
     targets = [
         {
             "stock_code": row["stock_code"],
@@ -190,8 +234,11 @@ def _verified_portfolio_json(
             "real_order_allowed": False,
         },
         "decision_integrity": {
-            "schema_version": "probiga.trading-v3.decision-integrity.v1",
+            "schema_version": DECISION_INTEGRITY_SCHEMA_VERSION,
             "forecast_count": 1,
+            "forecast_ledger_hash": canonical_hash(
+                canonical_forecast_ledger(forecast_rows)
+            ),
             "raw_theme_signal_count": 0,
             "persisted_theme_signal_count": 0,
             "hypothesis_count": 0,
@@ -326,6 +373,7 @@ def test_run_truth_does_not_report_data_block_as_completed_or_actionable():
             "portfolio": {"status": "DATA_BLOCKED", "targets": []},
         },
         execution_enabled=True,
+        forecast_count=1,
     ) == ("BLOCKED", "DATA_BLOCKED")
     assert _decision_truth_status(
         {
@@ -333,7 +381,26 @@ def test_run_truth_does_not_report_data_block_as_completed_or_actionable():
             "portfolio": {"status": "READY", "targets": [{"id": 1}]},
         },
         execution_enabled=False,
+        forecast_count=1,
     ) == ("COMPLETED", "REPLAY_ONLY")
+
+
+def test_empty_forecast_ledger_blocks_but_nonempty_zero_target_is_valid():
+    no_target_result = {
+        "regime": {"quality_status": "PASS"},
+        "portfolio": {"status": "READY", "targets": []},
+    }
+
+    assert _decision_truth_status(
+        no_target_result,
+        execution_enabled=True,
+        forecast_count=0,
+    ) == ("BLOCKED", "DATA_BLOCKED")
+    assert _decision_truth_status(
+        no_target_result,
+        execution_enabled=True,
+        forecast_count=12,
+    ) == ("COMPLETED", "NO_ACTION")
 
 
 def test_cumulative_risk_reserves_cash_and_rejects_the_next_order():
@@ -385,17 +452,37 @@ def test_cumulative_risk_reserves_cash_and_rejects_the_next_order():
     assert second["first_failure"] == "CASH_AVAILABLE"
 
 
-@pytest.mark.parametrize("tamper", ["target", "result_hash"])
+@pytest.mark.parametrize(
+    "tamper",
+    ["target", "forecast", "result_hash", "schema_v1"],
+)
 def test_persisted_decision_integrity_rejects_relational_drift(tamper):
     target = _persisted_target_row()
     portfolio_json, result_hash = _verified_portfolio_json(
         target_rows=[target],
     )
     persisted_target = dict(target)
+    persisted_forecast = _persisted_forecast_row()
     if tamper == "target":
         persisted_target["target_quantity"] = 2_000
+    if tamper == "forecast":
+        persisted_forecast["raw_score"] = -999
     if tamper == "result_hash":
         result_hash = "0" * 64
+    if tamper == "schema_v1":
+        portfolio = json.loads(portfolio_json)
+        portfolio["decision_integrity"]["schema_version"] = (
+            "probiga.trading-v3.decision-integrity.v1"
+        )
+        portfolio["decision_integrity"].pop("forecast_ledger_hash", None)
+        portfolio_json = json.dumps(portfolio)
+        result_hash = decision_result_hash(
+            regime={"dominant_state": "RISK_ON"},
+            portfolio=portfolio,
+            forecast_count=1,
+            theme_signal_count=0,
+            hypothesis_count=0,
+        )
 
     class Result:
         def __init__(self, row):
@@ -406,6 +493,9 @@ def test_persisted_decision_integrity_rejects_relational_drift(tamper):
 
         def first(self):
             return self.row
+
+        def all(self):
+            return list(self.row or []) if isinstance(self.row, list) else []
 
     class Connection:
         def execute(self, statement, params=None):
@@ -424,6 +514,8 @@ def test_persisted_decision_integrity_rejects_relational_drift(tamper):
                     "theme_signal_count": 0,
                     "hypothesis_count": 0,
                 })
+            if "FROM st_alpha_forecast_v3" in sql:
+                return Result([persisted_forecast])
             raise AssertionError(sql)
 
     run = {
@@ -454,7 +546,11 @@ def test_persisted_decision_integrity_rejects_relational_drift(tamper):
     )
 
     assert verified is False
-    assert reason == "V3_DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED"
+    assert reason == (
+        "V3_DECISION_INTEGRITY_V2_REQUIRED"
+        if tamper == "schema_v1"
+        else "V3_DECISION_RESULT_OR_TARGET_LEDGER_UNVERIFIED"
+    )
 
 
 def test_next_trade_session_never_falls_back_to_calendar_day():
@@ -491,6 +587,7 @@ def test_materializer_persists_rejected_risk_without_creating_order(
         target_rows=[target_row],
     )
     persisted_target = dict(target_row)
+    persisted_forecast = _persisted_forecast_row()
     if tamper_target:
         persisted_target["target_quantity"] = 2_000
 
@@ -564,6 +661,8 @@ def test_materializer_persists_rejected_risk_without_creating_order(
                     "theme_signal_count": 0,
                     "hypothesis_count": 0,
                 })
+            if "FROM st_alpha_forecast_v3" in sql:
+                return Result(all_rows=[persisted_forecast])
             if "SUM(ABS(gross_amount))" in sql:
                 return Result(scalar=1_500.0)
             if (
@@ -693,8 +792,16 @@ def test_repository_persists_run_and_actionable_status_separately(
     has_requested_as_of,
 ):
     class Result:
+        rowcount = 1
+
         def scalar(self):
             return 1 if has_requested_as_of else None
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
 
     class Connection:
         def __init__(self):
@@ -760,6 +867,20 @@ def test_repository_persists_run_and_actionable_status_separately(
     assert portfolio["decision_truth"]["execution_authority"] == (
         "V2_CANONICAL_LEDGER"
     )
+    integrity_sql, integrity_params = next(
+        (sql, params)
+        for sql, params in connection.calls
+        if "SET portfolio_json = :portfolio_json" in sql
+    )
+    assert "WHERE run_uid = :run_uid" in integrity_sql
+    persisted_portfolio = json.loads(integrity_params["portfolio_json"])
+    persisted_integrity = persisted_portfolio["decision_integrity"]
+    assert persisted_integrity["schema_version"] == (
+        DECISION_INTEGRITY_SCHEMA_VERSION
+    )
+    assert persisted_integrity["forecast_count"] == 0
+    assert persisted_integrity["forecast_ledger_hash"] == canonical_hash([])
+    assert saved["result_hash"] == integrity_params["result_hash"]
     assert saved["run_status"] == "BLOCKED"
     assert saved["persisted_run_status"] == "PROCESSING"
     repository.finalize_run("run-blocked", status="BLOCKED")

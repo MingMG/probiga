@@ -32,6 +32,29 @@ def is_configured() -> bool:
     return python_path().exists() and WORKER.exists()
 
 
+def is_probe_runtime_configured() -> bool:
+    """Return whether this host explicitly owns a probe-capable QMT runtime.
+
+    ``is_configured`` intentionally treats the default localhost gateway as a
+    usable execution fallback.  Health endpoints need a stricter distinction:
+    a Linux API host with neither an explicitly configured gateway nor a local
+    Windows interpreter is an external-collector reader and must not report a
+    missing ``python.exe`` as a QMT outage.
+    """
+
+    gateway_enabled = os.environ.get("QMT_GATEWAY_ENABLED", "1").strip().lower()
+    gateway_explicit = bool(
+        str(os.environ.get("QMT_GATEWAY_URL") or "").strip()
+        or str(os.environ.get("QMT_GATEWAY_REQUIRED") or "").strip() == "1"
+    )
+    if (
+        gateway_enabled not in {"0", "false", "no", "off"}
+        and gateway_explicit
+    ):
+        return True
+    return python_path().exists() and WORKER.exists()
+
+
 def _decode_output(text: str) -> dict[str, Any]:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     for line in reversed(lines):

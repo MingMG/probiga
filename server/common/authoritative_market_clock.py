@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -10,14 +10,21 @@ from sqlalchemy import text
 
 PRODUCTION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DAILY_CLOSE_READY_HOUR = 18
+DAILY_CLOSE_READY_TIME = time(DAILY_CLOSE_READY_HOUR, 0)
 
 
-def authoritative_closed_trade_date(engine, now: datetime | None = None) -> str:
+def authoritative_closed_trade_date(
+    engine,
+    now: datetime | None = None,
+    *,
+    close_ready_time: time = DAILY_CLOSE_READY_TIME,
+) -> str:
     """Return the latest exchange session whose daily inputs may be closed.
 
     On a trading day the current session is intentionally unavailable until
-    18:00 Asia/Shanghai.  Weekends and exchange holidays naturally resolve to
-    the most recent open session in ``si_trade_calendar``.
+    ``close_ready_time`` (18:00 by default). Weekends and exchange holidays
+    naturally resolve to the most recent open session in
+    ``si_trade_calendar``.
     """
 
     current = now or datetime.now(PRODUCTION_TIMEZONE)
@@ -25,8 +32,7 @@ def authoritative_closed_trade_date(engine, now: datetime | None = None) -> str:
         current = current.astimezone(PRODUCTION_TIMEZONE)
     comparator = (
         "<="
-        if (current.hour, current.minute, current.second)
-        >= (DAILY_CLOSE_READY_HOUR, 0, 0)
+        if current.time().replace(tzinfo=None) >= close_ready_time
         else "<"
     )
     connection_scope = (

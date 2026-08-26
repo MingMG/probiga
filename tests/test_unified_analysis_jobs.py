@@ -44,12 +44,19 @@ class UnifiedAnalysisJobsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(mock_run_codes.call_args.kwargs["stock_codes"], ["000001", "000002"])
 
-    def test_prepare_signals_can_ensure_recommendations_first(self):
-        with patch("biz.analysis.sync_sim_trade._is_trade_date", return_value=True), \
-             patch("biz.analysis.sync_sim_trade._previous_trade_date", return_value="2026-06-26"), \
+    def test_prepare_signals_requires_read_only_recommendation_prerequisite(self):
+        with patch.dict(
+            sync_sim_trade.os.environ,
+            {"PROBIGA_DEPLOYMENT_MODE": "test"},
+        ), patch("biz.analysis.sync_sim_trade._previous_trade_date", return_value="2026-06-26"), \
              patch(
                  "biz.analysis.sync_sim_trade.ensure_recommendations_for_signal_date",
-                 return_value={"status": "generated", "signal_date": "2026-06-26"},
+                 return_value={
+                     "status": "exists",
+                     "signal_date": "2026-06-26",
+                     "count": 3,
+                     "read_only": True,
+                 },
              ) as ensure_mock, \
              patch("biz.analysis.sync_sim_trade.SimTradeEngine") as engine_cls:
             engine_cls.return_value.prepare_signal_pool.return_value = {
@@ -65,7 +72,9 @@ class UnifiedAnalysisJobsTest(unittest.TestCase):
             )
 
         ensure_mock.assert_called_once()
-        self.assertEqual(out["ensure_recommendations"]["status"], "generated")
+        self.assertEqual(out["recommendation_prerequisite"]["status"], "exists")
+        self.assertTrue(out["recommendation_prerequisite"]["read_only"])
+        self.assertNotIn("ensure_recommendations", out)
         engine_cls.return_value.prepare_signal_pool.assert_called_once_with(
             trade_date="2026-06-29",
             signal_date="2026-06-26",

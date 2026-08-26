@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -56,6 +57,7 @@ from server.ai_bridge.schema import (
 from server.auth.schema import privileged_migrate_auth_schema, validate_auth_runtime_schema
 from server.common.analysis_output_schema import (
     migrate_analysis_output_schema,
+    plan_analysis_output_recovery,
     validate_analysis_output_schema,
 )
 from server.common.auxiliary_runtime_schema import (
@@ -80,6 +82,7 @@ from server.common.portfolio_schema import (
 )
 from server.common.recommended_run_history_schema import (
     migrate_recommended_run_history,
+    plan_recommended_run_history_recovery,
     validate_recommended_run_history_schema,
 )
 from server.common.scheduler_tasks import (
@@ -95,6 +98,7 @@ from server.common.screener_schema import (
     validate_screener_runtime,
 )
 from server.common.sim_trade_schema import (
+    plan_sim_trade_legacy_recovery,
     privileged_migrate_sim_trade_schema,
     validate_sim_trade_runtime_schema,
 )
@@ -178,6 +182,14 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("qmt_audit", validate_audit_schema),
 )
 
+_RECOVERY_PLANNERS: tuple[tuple[str, SchemaCallable], ...] = (
+    ("analysis_output", plan_analysis_output_recovery),
+    ("recommended_run_history", plan_recommended_run_history_recovery),
+    ("sim_trade", plan_sim_trade_legacy_recovery),
+)
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
 
 def _contract_metadata() -> dict[str, Any]:
     payload = {
@@ -185,7 +197,9 @@ def _contract_metadata() -> dict[str, Any]:
         "migration_names": [name for name, _ in _MIGRATIONS],
         "seed_names": [name for name, _ in _SEEDS],
         "validator_names": [name for name, _ in _VALIDATORS],
+        "recovery_planner_names": [name for name, _ in _RECOVERY_PLANNERS],
     }
+    payload["recovery_planner_count"] = len(payload["recovery_planner_names"])
     encoded = json.dumps(
         payload,
         ensure_ascii=False,
@@ -216,17 +230,84 @@ def _run(entries: tuple[tuple[str, SchemaCallable], ...], engine) -> dict[str, A
     return result
 
 
+def _normalize_recovery_plan(name: str, value: Any) -> dict[str, Any]:
+    plan = _result(value)
+    declared_hashes = [
+        candidate
+        for candidate in (
+            plan.get("plan_sha256"),
+            plan.get("recovery_bundle_sha256"),
+        )
+        if candidate is not None
+    ]
+    raw_hash = declared_hashes[0] if declared_hashes else None
+    ready = plan.get("ready_for_privileged_apply")
+    if name == "sim_trade" and ready is None:
+        ready = plan.get("safe_automatic_rewrite")
+    declared_read_only = plan.get("read_only")
+    if (
+        not isinstance(raw_hash, str)
+        or _SHA256.fullmatch(raw_hash) is None
+        or any(candidate != raw_hash for candidate in declared_hashes)
+        or type(ready) is not bool
+        or (declared_read_only is not None and declared_read_only is not True)
+    ):
+        raise RuntimeError("production schema recovery plan contract differs")
+    return {
+        **plan,
+        "plan_sha256": raw_hash,
+        "ready_for_privileged_apply": ready,
+        "read_only": True,
+        "status": "PLANNED",
+    }
+
+
+def _collect_recovery_plans(engine) -> dict[str, Any]:
+    plans: dict[str, Any] = {}
+    for name, function in _RECOVERY_PLANNERS:
+        if name in plans:
+            raise RuntimeError(f"duplicate production recovery planner key: {name}")
+        try:
+            plans[name] = _normalize_recovery_plan(name, function(engine))
+        except Exception as exc:  # fail closed without exposing database details
+            plans[name] = {
+                "status": "PLAN_UNAVAILABLE",
+                "error_type": type(exc).__name__,
+                "plan_sha256": None,
+                "ready_for_privileged_apply": False,
+                "read_only": True,
+            }
+    ready = (
+        len(plans) == len(_RECOVERY_PLANNERS)
+        and all(
+            item.get("status") == "PLANNED"
+            and item.get("read_only") is True
+            and item.get("ready_for_privileged_apply") is True
+            and isinstance(item.get("plan_sha256"), str)
+            and _SHA256.fullmatch(item["plan_sha256"]) is not None
+            for item in plans.values()
+        )
+    )
+    return {
+        "recovery_plans": plans,
+        "recovery_plan_count": len(plans),
+        "recovery_ready_for_privileged_apply": ready,
+    }
+
+
 def privileged_migrate_runtime_schema_bundle(engine) -> dict[str, Any]:
     """Run all non-core DDL and configuration seeds inside the release fence."""
 
     migrations = _run(_MIGRATIONS, engine)
     seeds = _run(_SEEDS, engine)
     validation = validate_runtime_schema_bundle(engine)
+    recovery = _collect_recovery_plans(engine)
     return {
         **_contract_metadata(),
         "migrations": migrations,
         "seeds": seeds,
         "runtime_validation": validation,
+        **recovery,
         "runtime_ddl_required": False,
         "privileged_migration": True,
     }
@@ -258,13 +339,16 @@ def preflight_runtime_schema_bundle(engine) -> dict[str, Any]:
                 "error_type": type(exc).__name__,
                 "read_only": True,
             }
+    recovery = _collect_recovery_plans(engine)
     return {
         **_contract_metadata(),
         "contracts": contracts,
         "contract_count": len(contracts),
-        "migration_required": any(
-            item["status"] != "READY" for item in contracts.values()
+        "migration_required": (
+            any(item["status"] != "READY" for item in contracts.values())
+            or not recovery["recovery_ready_for_privileged_apply"]
         ),
+        **recovery,
         "read_only": True,
     }
 

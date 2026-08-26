@@ -8617,8 +8617,11 @@ def test_application_integrity_health_requires_exact_database_triggers():
     ledger_passed, ledger = health._governance_append_only_trigger_check(
         connection
     )
+    supporting_passed, supporting = (
+        health._supporting_release_trigger_inventory_check(connection)
+    )
 
-    assert metric_passed is ledger_passed is True
+    assert metric_passed is ledger_passed is supporting_passed is True
     assert metric["trigger_count"] == 2
     assert ledger["trigger_count"] == 38
     assert ledger["total_governance_trigger_count"] == 40
@@ -8650,6 +8653,12 @@ def test_application_integrity_health_requires_exact_database_triggers():
     )
     assert ledger["funding_contract_hash"] == (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
+    )
+    assert supporting["observed_count"] == 70
+    assert supporting["expected_trigger_count"] == 70
+    assert supporting["owner_counts"]["schema_recovery_evidence"] == 2
+    assert supporting["source_contract_hash"] == (
+        "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
     )
 
 
@@ -8764,9 +8773,13 @@ def test_qmt_attestation_health_rejects_missing_completed_run_guard():
             "trg_scheduler_history_qmt_release_no_delete",
             "scheduler_task_history",
         ),
+        (
+            "trg_privileged_schema_recovery_evidence_immutable_bd",
+            "schema_recovery_evidence",
+        ),
     ),
 )
-def test_supporting_release_inventory_rejects_missing_reference_or_pit_guard(
+def test_supporting_release_inventory_rejects_missing_guard(
     trigger_name,
     owner,
 ):
@@ -8784,12 +8797,13 @@ def test_supporting_release_inventory_rejects_missing_reference_or_pit_guard(
 
     assert passed is False
     assert detail["trigger_count"] == 0
-    assert detail["expected_trigger_count"] == 68
+    assert detail["expected_trigger_count"] == 70
     assert detail["expected_owner_counts"][owner] == {
         "qmt_reference": 10,
         "pit_facts": 6,
         "qmt_history_coverage": 4,
         "scheduler_task_history": 2,
+        "schema_recovery_evidence": 2,
     }[owner]
     assert detail["database_triggers_required"] is True
 

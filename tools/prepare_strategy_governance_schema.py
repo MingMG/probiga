@@ -150,9 +150,12 @@ EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH = (
 EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
-EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 68
+EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 70
 EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH = (
-    "4a59e6364edc9191dc08131e1806fe58ddf5231b41a4bd7627606d024a6c5175"
+    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+)
+EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH = (
+    "c6f0b347b0f9b1f9d4e78ab53469ffbefbdceed4c2e2184e0b0b3dfd00db22b5"
 )
 ADMIN_IO_TIMEOUT_SECONDS = 60
 MIGRATOR_IO_TIMEOUT_SECONDS = 900
@@ -1232,6 +1235,7 @@ def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
     from server.common.scheduler_task_history_schema import (
         scheduler_task_history_trigger_ddl_statements,
     )
+    from server.common.schema_recovery_evidence import TRIGGER_STATEMENTS
     from server.engine.strategy_governance import (
         GOVERNANCE_APPEND_ONLY_TRIGGER_STATEMENTS,
         METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS,
@@ -1242,6 +1246,13 @@ def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
     )
 
     contracts: dict[str, TriggerContract] = {}
+    for statement in TRIGGER_STATEMENTS.values():
+        contract = _parse_create_trigger(
+            statement,
+            normalizer="qmt",
+            owner="schema_recovery_evidence",
+        )
+        contracts[contract.name] = contract
     for statement in ATTESTATION_TRIGGER_STATEMENTS.values():
         contract = _parse_create_trigger(
             statement,
@@ -1389,6 +1400,7 @@ def _frozen_non_v3_release_trigger_contracts(
             "qmt_history_coverage": 4,
             "qmt_reference": 10,
             "scheduler_task_history": 2,
+            "schema_recovery_evidence": 2,
             "strategy_governance": 40,
         }
         or _release_trigger_source_contract_hash(frozen)
@@ -2545,6 +2557,10 @@ def _cutover_schema(
             migrate_scheduler_task_history,
             validate_scheduler_task_history_schema,
         )
+        from server.common.schema_recovery_evidence import (
+            ensure_evidence_table,
+            validate_recovery_evidence_schema,
+        )
         from server.common.production_runtime_schema_bundle import (
             privileged_migrate_runtime_schema_bundle,
         )
@@ -2584,6 +2600,24 @@ def _cutover_schema(
             admin,
             trigger_create_allowlist,
             window_evidence,
+        )
+        evidence_trigger_contracts = {
+            name: contract for name, contract in non_v3_contracts.items()
+            if contract.owner == "schema_recovery_evidence"
+        }
+        with boundary.migrator_engine.begin() as connection:
+            ensure_evidence_table(connection, require_triggers=False)
+        evidence_trigger_source_detail = _ensure_frozen_release_triggers(
+            boundary.migrator_engine,
+            evidence_trigger_contracts,
+            expected_names=frozenset(evidence_trigger_contracts),
+            expected_source_contract_hash=(
+                EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH
+            ),
+            trigger_ddl_executor=trigger_ddl_executor,
+        )
+        evidence_schema_detail = validate_recovery_evidence_schema(
+            boundary.migrator_engine
         )
         legacy_trigger_repair = {
             "candidate_names": [],
@@ -2750,6 +2784,10 @@ def _cutover_schema(
             "supporting_trigger_source_contract": (
                 supporting_trigger_source_detail
             ),
+            "schema_recovery_evidence": {
+                **evidence_schema_detail,
+                "trigger_source_contract": evidence_trigger_source_detail,
+            },
             "rehomed_legacy_triggers": list(rehomed),
             "legacy_binding_plan": {
                 key: value for key, value in legacy_binding.items()

@@ -16,6 +16,7 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
         lambda _path: {
             "MYSQL_URL": "mysql://runtime",
             "SCHEDULER_INTRADAY_START": "09:20",
+            "QMT_PYTHON": r"E:\My Code\ProBigA\runtime\stale.exe",
         },
     )
     monkeypatch.setenv("MYSQL_URL", "mysql://stale")
@@ -35,14 +36,51 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
             ),
         },
     )
+    monkeypatch.setattr(
+        run_scheduler_daemon,
+        "_bind_windows_qmt_python",
+        lambda: os.environ.__setitem__(
+            "QMT_PYTHON",
+            r"E:\My Code\ProBigA-qmt-production\runtime\qmt-py313\Scripts\python.exe",
+        ),
+    )
 
     loaded = run_scheduler_daemon._load_windows_runtime_env()
 
-    assert loaded == 2
+    assert loaded == 3
     assert os.environ["MYSQL_URL"] == "mysql://runtime"
     assert os.environ["SCHEDULER_INTRADAY_START"] == "09:20"
     assert "PROBIGA_SCHEDULER_STDOUT" not in os.environ
     assert os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] == "qmt_windows_edge"
+    assert os.environ["QMT_PYTHON"].startswith(
+        r"E:\My Code\ProBigA-qmt-production"
+    )
+
+
+def test_windows_qmt_python_is_frozen_inside_checkout(monkeypatch, tmp_path):
+    root = tmp_path / "production-checkout"
+    qmt_python = root / "runtime/qmt-py313/Scripts/python.exe"
+    qmt_python.parent.mkdir(parents=True)
+    qmt_python.touch()
+    monkeypatch.setattr(run_scheduler_daemon, "ROOT", root)
+    monkeypatch.setenv("QMT_PYTHON", r"E:\dirty-user-tree\python.exe")
+
+    assert run_scheduler_daemon._bind_windows_qmt_python() == str(
+        qmt_python.resolve()
+    )
+    assert os.environ["QMT_PYTHON"] == str(qmt_python.resolve())
+
+
+def test_windows_qmt_python_missing_from_checkout_fails_closed(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "production-checkout"
+    root.mkdir()
+    monkeypatch.setattr(run_scheduler_daemon, "ROOT", root)
+
+    with pytest.raises(RuntimeError, match="runtime is unavailable"):
+        run_scheduler_daemon._bind_windows_qmt_python()
 
 
 def test_windows_build_identity_is_bound_to_exact_checkout(monkeypatch):
@@ -90,6 +128,39 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert "ProBigA\\scheduler" in installer
     assert "ProBigA\\jobs" in installer
     assert "-MultipleInstances IgnoreNew" in installer
+    assert '@("fetch", "--prune", "origin", "main")' in installer
+    assert '@("symbolic-ref", "--short", "HEAD")' in installer
+    assert '"status", "--porcelain", "--untracked-files=normal"' in installer
+    assert '@("rev-parse", "origin/main")' in installer
+    assert '$CurrentSha -cne $TargetSha' in installer
+    assert "registration refused" in installer
+    assert '[string]$ProductionRoot' in installer
+    assert '"^[A-Za-z]:[\\\\/]"' in installer
+    assert "https://github.com/MingMG/probiga.git" in installer
+    assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in installer
+    assert "-Execute $PowerShellExe" in installer
+    assert installer.count("-WorkingDirectory $ExpectedRoot") == 2
+    assert '@("rev-parse", "--show-toplevel")' in installer
+    assert '@("remote", "get-url", "origin")' in installer
+    assert installer.index('@("remote", "get-url", "origin")') < (
+        installer.index('@("fetch", "--prune", "origin", "main")')
+    )
+    assert 'Join-Path $Root ".env"' in installer
+    assert 'Join-Path $Root "runtime\\qmt-py313\\Scripts\\python.exe"' in installer
+    assert '-RegisteredRoot `"$ExpectedRoot`"' in installer
+    assert "$Registered.Actions[0].Arguments -cne $SchedulerArgument" in installer
+    assert "$RegisteredUpdater.Actions[0].Arguments -cne $UpdaterArgument" in installer
+    assert "Stop-ExistingTask $UpdateTaskName" in installer
+    assert "Stop-ExistingTask $TaskName" in installer
+    assert installer.index("Stop-ExistingTask $TaskName") < installer.index(
+        "Register-ScheduledTask"
+    )
+    assert installer.index("scheduled task registration/root binding differs") < (
+        installer.index("Start-ScheduledTask -TaskName $TaskName")
+    )
+    assert 'GetFullPath("E:\\My Code\\ProBigA")' not in installer
+    assert "git reset" not in installer.lower()
+    assert "git clean" not in installer.lower()
 
 
 def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
@@ -104,6 +175,20 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert 'Join-Path $ExpectedRoot "data"' not in wrapper
     assert "ReparsePoint" in wrapper
     assert "$env:PROBIGA_JOB_LOG_ROOT = $JobLogRoot" in wrapper
+    assert '[string]$RegisteredRoot' in wrapper
+    assert 'Get-ScheduledTask -TaskName $SchedulerTaskName' in wrapper
+    assert 'Get-ScheduledTask -TaskName $UpdateTaskName' in wrapper
+    assert '@("fetch", "--prune", "origin", "main")' in wrapper
+    assert '@("rev-parse", "origin/main")' in wrapper
+    assert "$BuildSha -cne $TargetSha" in wrapper
+    assert 'Join-Path $ExpectedRoot ".env"' in wrapper
+    assert 'Join-Path $ExpectedRoot "runtime\\qmt-py313\\Scripts\\python.exe"' in wrapper
+    assert "$env:QMT_PYTHON = $QmtPythonExe" in wrapper
+    assert "https://github.com/MingMG/probiga.git" in wrapper
+    assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in wrapper
+    assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in wrapper
+    assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in wrapper
+    assert 'GetFullPath("E:\\My Code\\ProBigA")' not in wrapper
 
 
 def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
@@ -124,6 +209,21 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert "git reset" not in updater.lower()
     assert "git clean" not in updater.lower()
     assert "ReparsePoint" in updater
+    assert '[string]$RegisteredRoot' in updater
+    assert 'Get-ScheduledTask -TaskName $SchedulerTaskName' in updater
+    assert 'Get-ScheduledTask -TaskName $UpdateTaskName' in updater
+    assert "$Registered.Actions[0].Arguments -cne $SchedulerArgument" in updater
+    assert "$RegisteredUpdater.Actions[0].Arguments -cne $UpdaterArgument" in updater
+    assert '@("rev-parse", "--show-toplevel")' in updater
+    assert '@("remote", "get-url", "origin")' in updater
+    assert 'Join-Path $ExpectedRoot ".env"' in updater
+    assert 'Join-Path $ExpectedRoot "runtime\\qmt-py313\\Scripts\\python.exe"' in updater
+    assert "$env:QMT_PYTHON = $QmtPythonExe" in updater
+    assert "https://github.com/MingMG/probiga.git" in updater
+    assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in updater
+    assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in updater
+    assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in updater
+    assert 'GetFullPath("E:\\My Code\\ProBigA")' not in updater
 
 
 def test_windows_state_roots_are_bound_outside_source_tree(monkeypatch, tmp_path):

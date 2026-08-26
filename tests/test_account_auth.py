@@ -13,6 +13,7 @@ import pytest
 
 from server.api import admin_auth
 from server.api.routers import auth as auth_router
+from server.auth import service as auth_service
 from server.auth.schema import (
     auth_audit,
     auth_session,
@@ -137,6 +138,77 @@ def test_first_account_registration_login_refresh_and_logout(monkeypatch, tmp_pa
         )
         assert logged_in.status_code == 200
         assert client.get("/api/private").status_code == 200
+    finally:
+        client.close()
+        engine.dispose()
+        get_settings.cache_clear()
+
+
+def test_failed_login_lockout_and_audit_commit_before_error_response(monkeypatch, tmp_path):
+    client, engine = _build_client(monkeypatch, tmp_path)
+    try:
+        registered = client.post(
+            "/api/auth/register",
+            json={"username": "owner", "password": "correct-horse-2026"},
+        )
+        assert registered.status_code == 201
+        assert client.post("/api/auth/logout").status_code == 200
+
+        for _ in range(5):
+            rejected = client.post(
+                "/api/auth/login",
+                json={"username": "owner", "password": "definitely-wrong"},
+            )
+            assert rejected.status_code == 401
+            assert rejected.json()["error"] == "invalid_credentials"
+
+        with engine.connect() as conn:
+            lock_state = conn.execute(select(auth_user)).mappings().one()
+        locked_until_before = lock_state["locked_until"]
+        assert lock_state["failed_login_count"] == 0
+        assert locked_until_before is not None
+
+        def _password_verification_must_not_run(*_args, **_kwargs):
+            raise AssertionError("locked accounts must be rejected before password verification")
+
+        monkeypatch.setattr(
+            auth_service,
+            "verify_password",
+            _password_verification_must_not_run,
+        )
+        locked_wrong = client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "still-wrong"},
+        )
+        locked_correct = client.post(
+            "/api/auth/login",
+            json={"username": "owner", "password": "correct-horse-2026"},
+        )
+        for locked in (locked_wrong, locked_correct):
+            assert locked.status_code == 429
+            assert locked.json()["error"] == "account_temporarily_locked"
+
+        with engine.connect() as conn:
+            user_row = conn.execute(select(auth_user)).mappings().one()
+            audit_rows = conn.execute(
+                select(auth_audit)
+                .where(auth_audit.c.event_type.in_(["LOGIN", "LOGIN_LOCKED"]))
+                .order_by(auth_audit.c.id)
+            ).mappings().all()
+
+        assert user_row["failed_login_count"] == 0
+        assert user_row["locked_until"] == locked_until_before
+        failed_login_rows = [
+            row
+            for row in audit_rows
+            if row["event_type"] == "LOGIN" and not row["success"]
+        ]
+        assert len(failed_login_rows) == 5
+        locked_rows = [
+            row for row in audit_rows if row["event_type"] == "LOGIN_LOCKED"
+        ]
+        assert len(locked_rows) == 2
+        assert all(row["success"] is False for row in locked_rows)
     finally:
         client.close()
         engine.dispose()

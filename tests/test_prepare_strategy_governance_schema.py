@@ -1440,6 +1440,9 @@ def test_trigger_executor_restores_off_after_create_failure(monkeypatch):
 
 
 class _NoDeltaEngine:
+    def begin(self):
+        return nullcontext(SimpleNamespace())
+
     def connect(self):
         return nullcontext(SimpleNamespace())
 
@@ -1453,6 +1456,7 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     from server.common import qmt_history_coverage
     from server.common import scheduler_runtime_schema
     from server.common import scheduler_task_history_schema
+    from server.common import schema_recovery_evidence
     from server.db import migrations_v3
     from server.engine import dynamic_shadow_ledger_schema
     from server.engine import strategy_governance
@@ -1477,6 +1481,21 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(schema, "_dbapi_grants", lambda _connection: ADMIN_GRANTS)
     monkeypatch.setattr(schema, "_acquire_lock", lambda _connection: True)
     monkeypatch.setattr(schema, "_release_lock", lambda _connection: True)
+    monkeypatch.setattr(
+        schema_recovery_evidence,
+        "ensure_evidence_table",
+        lambda _connection, **_kwargs: calls.append(
+            "schema-recovery-evidence-table-off"
+        ),
+    )
+    monkeypatch.setattr(
+        schema_recovery_evidence,
+        "validate_recovery_evidence_schema",
+        lambda _engine: {
+            "physical_contract_verified": True,
+            "append_only_verified": True,
+        },
+    )
     monkeypatch.setattr(
         scheduler_runtime_schema,
         "migrate_scheduler_runtime_heartbeat",
@@ -2203,7 +2222,17 @@ def test_non_v3_release_contract_freezes_all_truth_guards():
         "trg_qmt_kline_attestation_run_completed_bd",
         "trg_pit_source_coverage_immutable_bu",
         "trg_pit_source_coverage_immutable_bd",
+        "trg_privileged_schema_recovery_evidence_immutable_bu",
+        "trg_privileged_schema_recovery_evidence_immutable_bd",
     } <= set(contracts)
+    evidence_contracts = {
+        name: contract for name, contract in contracts.items()
+        if contract.owner == "schema_recovery_evidence"
+    }
+    assert len(evidence_contracts) == 2
+    assert schema._release_trigger_source_contract_hash(evidence_contracts) == (
+        schema.EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH
+    )
 
 
 def test_qmt_reference_table_preparation_never_creates_triggers():

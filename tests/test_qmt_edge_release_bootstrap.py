@@ -9,6 +9,9 @@ from typing import Any
 
 import pytest
 
+from integrations.bigqmt.release_identity import (
+    strategy_loaded_identity_sha256,
+)
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common import qmt_edge_release_receipt as receipt_contract
 from tools import run_qmt_windows_edge_release_bootstrap as bootstrap
@@ -197,10 +200,36 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "--writer-drain-timeout-seconds 660" in deploy
 
     # An arbitrary-time release does not wait for the three cron schedules.
-    assert "if ($CurrentSha -ceq $TargetSha)" not in updater
     assert "--check-request" in updater
+    assert "--check-ready" in updater
     migration = updater.index("backfill_guojin_qmt_local_history.py")
     request_check = updater.index("--check-request")
+    ready_check = updater.index("--check-ready")
+    ready_exit = updater.index("exit 0", updater.index("if ($ReadyExit -eq 0)"))
+    migration_state = updater.index('$PreparedSha = ""')
+    first_stop = updater.index("Stop-EdgeScheduler", updater.index("# Phase two"))
+    fast_forward = updater.index('Invoke-Git @("merge", "--ff-only"')
+    migration_call = updater.index("$MigrationOutput = &")
+    authorization_failure = updater[
+        updater.index("$AuthorizationExit = $LASTEXITCODE"):
+        updater.index("# Phase two")
+    ]
+    assert request_check < first_stop
+    assert request_check < fast_forward
+    assert request_check < migration_call
+    assert "$TargetSha" in updater[request_check - 100:request_check + 100]
+    assert "Stop-EdgeScheduler" not in authorization_failure
+    assert 'Invoke-Git @("merge"' not in authorization_failure
+    assert "$MigrationOutput" not in authorization_failure
+    assert "exit 0" in authorization_failure
+    assert "not authorized or unavailable" in authorization_failure
+    assert request_check < ready_check < ready_exit < first_stop < migration_state
+    equal_sha_probe = updater[
+        updater.index("if ($CurrentSha -ceq $TargetSha)"):
+        updater.index("# Phase two")
+    ]
+    assert "$ReadyExit -ne 4" in equal_sha_probe
+    assert "Stop-EdgeScheduler" not in equal_sha_probe
     assert migration < request_check
     assert "init --windows-local-option-file --json" in updater
     assert '"local-history-schema.sha"' in updater
@@ -214,6 +243,130 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     )
     assert "Start-EdgeScheduler" in updater
     assert "--bootstrap --expected-build-sha" in updater
+    strategy_reload = updater.index("$StrategyReloadOutput = &")
+    reload_call = updater.index("-ExpectedBuildSha $CurrentSha")
+    scheduler_start = updater.index("Start-EdgeScheduler", reload_call)
+    bootstrap_call = updater.index(
+        "--bootstrap --expected-build-sha", scheduler_start
+    )
+    assert request_check < first_stop < fast_forward < migration_call
+    assert request_check < strategy_reload < reload_call < scheduler_start < bootstrap_call
+    assert "BigQMT exact strategy reloaded and identity-bound" in updater
+    assert "$StrategyReloadExit -eq 3" in updater
+    assert "NEEDS_USER_ACTION" in updater
+    assert updater.count("--check-request") == 1
+
+
+def _bigqmt_strategy_release_payload(
+    source_hash: str,
+    *,
+    build_sha: str = BUILD_SHA,
+    git_blob: str = "c" * 40,
+    artifact_hash: str = "e" * 64,
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "source": "gj_big_qmt_inner",
+        "bridge_version": "bigqmt_inner_v2",
+        "strategy_release_protocol": bootstrap.STRATEGY_RELEASE_PROTOCOL,
+        "strategy_identity_protocol": (
+            "probiga.bigqmt-loaded-strategy-identity.v1"
+        ),
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+        "strategy_build_sha": build_sha,
+        "strategy_git_blob": git_blob,
+        "strategy_source_sha256": source_hash,
+        "strategy_artifact_sha256": artifact_hash,
+        "strategy_loaded_identity_sha256": strategy_loaded_identity_sha256(
+            build_sha=build_sha,
+            git_blob=git_blob,
+            source_sha256=source_hash,
+        ),
+        "actions": ["current", "trading_calendar"],
+        "native_capabilities": [
+            {
+                "capability": "trading_calendar",
+                "action": "trading_calendar",
+                "available": True,
+                "source_method": "ContextInfo.get_trading_dates",
+            },
+            {
+                "capability": "index_weight",
+                "action": "index_members_many",
+                "available": False,
+                "source_method": "membership_only_no_native_weight",
+            },
+        ],
+    }
+
+
+def test_bigqmt_strategy_release_proof_binds_exact_source_and_native_calendar():
+    source_hash = "d" * 64
+    proof = bootstrap.validate_bigqmt_strategy_release(
+        _bigqmt_strategy_release_payload(source_hash),
+        expected_build_sha=BUILD_SHA,
+        expected_source_sha256=source_hash,
+        expected_git_blob="c" * 40,
+        expected_artifact_sha256="e" * 64,
+    )
+
+    assert proof == {
+        "schema": "probiga.bigqmt-strategy-release-proof.v2",
+        "strategy_release_protocol": bootstrap.STRATEGY_RELEASE_PROTOCOL,
+        "strategy_identity_protocol": (
+            "probiga.bigqmt-loaded-strategy-identity.v1"
+        ),
+        "strategy_identity_frozen": True,
+        "strategy_build_sha": BUILD_SHA,
+        "strategy_git_blob": "c" * 40,
+        "strategy_source_sha256": source_hash,
+        "strategy_artifact_sha256": "e" * 64,
+        "strategy_loaded_identity_sha256": strategy_loaded_identity_sha256(
+            build_sha=BUILD_SHA,
+            git_blob="c" * 40,
+            source_sha256=source_hash,
+        ),
+        "trading_calendar": {
+            "capability": "trading_calendar",
+            "action": "trading_calendar",
+            "available": True,
+            "source_method": "ContextInfo.get_trading_dates",
+        },
+        "index_weight": {
+            "capability": "index_weight",
+            "action": "index_members_many",
+            "available": False,
+            "source_method": "membership_only_no_native_weight",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "drift", ["hash", "build", "frozen", "calendar", "index_weight"]
+)
+def test_bigqmt_strategy_release_proof_fails_closed_on_drift(drift: str):
+    source_hash = "d" * 64
+    payload = _bigqmt_strategy_release_payload(source_hash)
+    if drift == "hash":
+        payload["strategy_source_sha256"] = "0" * 64
+    elif drift == "build":
+        payload["strategy_build_sha"] = OTHER_BUILD_SHA
+    elif drift == "frozen":
+        payload["strategy_identity_frozen"] = False
+    elif drift == "calendar":
+        payload["native_capabilities"][0]["available"] = False
+    else:
+        payload["native_capabilities"][1]["available"] = True
+
+    with pytest.raises(RuntimeError, match="install and reload"):
+        bootstrap.validate_bigqmt_strategy_release(
+            payload,
+            expected_build_sha=BUILD_SHA,
+            expected_source_sha256=source_hash,
+            expected_git_blob="c" * 40,
+            expected_artifact_sha256="e" * 64,
+        )
 
 
 def test_release_receipt_binds_request_sha_instance_and_reference_batch(
@@ -450,6 +603,117 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     assert result["identity"] == identity
     assert result["release_receipt"] == existing
     assert engine.connect_calls == 2
+    assert engine.begin_calls == 0
+
+
+def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    engine = _ReadOnlyEngine()
+    receipt = {
+        "status": "AVAILABLE",
+        "receipt": _release_receipt(),
+        "errors": [],
+    }
+    capabilities = {"status": "ok", "strategy_build_sha": BUILD_SHA}
+    calls: list[object] = []
+
+    monkeypatch.setattr(
+        bootstrap,
+        "check_qmt_windows_edge_release_receipt",
+        lambda *_args, **_kwargs: (True, receipt),
+    )
+
+    def _capabilities(*, timeout: int) -> dict[str, Any]:
+        calls.append(("capabilities", timeout))
+        return capabilities
+
+    def _validate(payload: dict[str, Any], *, expected_build_sha: str, **_kwargs):
+        calls.append(("validate", payload, expected_build_sha))
+        return {"strategy_build_sha": expected_build_sha}
+
+    monkeypatch.setattr(bootstrap, "validate_bigqmt_strategy_release", _validate)
+    result = bootstrap.check_existing_release_ready(
+        engine,
+        expected_build_sha=BUILD_SHA,
+        expected_poll_seconds=60,
+        bigqmt_capabilities_runner=_capabilities,
+        platform_name="nt",
+        git_head=BUILD_SHA,
+    )
+
+    assert result["status"] == "READY"
+    assert result["database_writes"] is False
+    assert result["qmt_calls"] is True
+    assert result["release_receipt"] is receipt
+    assert calls == [
+        ("capabilities", 60),
+        ("validate", capabilities, BUILD_SHA),
+    ]
+    assert engine.connect_calls == 1
+    assert engine.begin_calls == 0
+
+
+def test_not_ready_probe_never_calls_qmt_or_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    engine = _ReadOnlyEngine()
+    monkeypatch.setattr(
+        bootstrap,
+        "check_qmt_windows_edge_release_receipt",
+        lambda *_args, **_kwargs: (
+            False,
+            {"status": "UNAVAILABLE", "errors": ["release_receipt_not_unique"]},
+        ),
+    )
+
+    result = bootstrap.check_existing_release_ready(
+        engine,
+        expected_build_sha=BUILD_SHA,
+        bigqmt_capabilities_runner=_forbidden,
+        platform_name="nt",
+        git_head=BUILD_SHA,
+    )
+
+    assert result["status"] == "NOT_READY"
+    assert result["database_writes"] is False
+    assert result["qmt_calls"] is False
+    assert engine.connect_calls == 1
+    assert engine.begin_calls == 0
+
+
+def test_ready_probe_database_outage_does_not_become_reload_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    engine = _ReadOnlyEngine()
+    monkeypatch.setattr(
+        bootstrap,
+        "check_qmt_windows_edge_release_receipt",
+        lambda *_args, **_kwargs: (
+            False,
+            {"status": "UNAVAILABLE", "errors": ["release_receipt_query_failed"]},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="database proof is unavailable"):
+        bootstrap.check_existing_release_ready(
+            engine,
+            expected_build_sha=BUILD_SHA,
+            bigqmt_capabilities_runner=_forbidden,
+            platform_name="nt",
+            git_head=BUILD_SHA,
+        )
+
+    assert engine.connect_calls == 1
     assert engine.begin_calls == 0
 
 

@@ -64,7 +64,13 @@ def test_etf_forward_delegation_runs_once_on_qmt_host():
     ) as claim, patch.object(
         bridge,
         "update_scheduler_task",
-    ) as update:
+    ) as update, patch(
+        "server.common.scheduler_validation.scheduler_output_status",
+        return_value="success",
+    ), patch(
+        "server.common.scheduler_validation.validate_scheduler_task_result",
+        return_value=MagicMock(checked=True, ok=True, message="verified"),
+    ):
         result = bridge.maybe_run_etf_forward_daily(
             engine,
             now=datetime(2026, 7, 27, 15, 20),
@@ -81,7 +87,11 @@ def test_etf_forward_delegation_runs_once_on_qmt_host():
 
 def test_etf_forward_command_does_not_invoke_legacy_ssh_promotion():
     completed = MagicMock(returncode=0, pid=1234)
-    completed.communicate.return_value = ('{"status":"success"}', "")
+    receipt = {
+        "schema": "probiga.etf-forward-daily-receipt.v1",
+        "status": "PASS",
+    }
+    completed.communicate.return_value = (json.dumps(receipt), "")
 
     with patch.object(bridge.subprocess, "Popen", return_value=completed) as popen:
         result = bridge._run_etf_forward_command()
@@ -89,8 +99,25 @@ def test_etf_forward_command_does_not_invoke_legacy_ssh_promotion():
     assert popen.call_count == 1
     completed.communicate.assert_called_once_with(timeout=1200)
     assert result["returncode"] == 0
+    assert result["machine_receipt"] == receipt
     assert result["delivery_mode"] == "CONFIGURED_DATABASE_DIRECT"
     assert result["promotion_stderr_tail"] == ""
+
+
+def test_etf_forward_command_parses_receipt_before_diagnostic_truncation():
+    receipt = {
+        "schema": "probiga.etf-forward-daily-receipt.v1",
+        "status": "PASS",
+        "diagnostic": "x" * 4000,
+    }
+    completed = MagicMock(returncode=0, pid=1234)
+    completed.communicate.return_value = (json.dumps(receipt), "")
+
+    with patch.object(bridge.subprocess, "Popen", return_value=completed):
+        result = bridge._run_etf_forward_command()
+
+    assert result["machine_receipt"] == receipt
+    assert len(result["daily_stdout_tail"]) == 1000
 
 
 def test_etf_forward_delegation_does_not_repeat_success():
@@ -142,6 +169,12 @@ def test_etf_forward_delegation_retries_failed_run_after_cooldown():
     ) as claim, patch.object(
         bridge,
         "update_scheduler_task",
+    ), patch(
+        "server.common.scheduler_validation.scheduler_output_status",
+        return_value="success",
+    ), patch(
+        "server.common.scheduler_validation.validate_scheduler_task_result",
+        return_value=MagicMock(checked=True, ok=True, message="verified"),
     ):
         waiting = bridge.maybe_run_etf_forward_daily(
             engine,

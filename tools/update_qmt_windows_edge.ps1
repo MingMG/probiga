@@ -1,11 +1,33 @@
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$RegisteredRoot
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
-$ExpectedRoot = [System.IO.Path]::GetFullPath("E:\My Code\ProBigA")
+$UpdateTaskName = "ProBigA QMT Windows Edge Updater"
+$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
+$WindowsRoot = [System.Environment]::GetFolderPath(
+    [System.Environment+SpecialFolder]::Windows
+)
+$PowerShellExe = Join-Path $WindowsRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+if ($RegisteredRoot -notmatch "^[A-Za-z]:[\\/]") {
+    throw "QMT Windows edge registered root must be an absolute local path"
+}
+$ExpectedRoot = [System.IO.Path]::GetFullPath($RegisteredRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 if ($Root -ine $ExpectedRoot) {
-    throw "QMT Windows edge updater is outside the production workspace"
+    throw "QMT Windows edge updater differs from its registered production root"
+}
+$RootItem = Get-Item -LiteralPath $Root -Force
+if (
+    !$RootItem.PSIsContainer -or
+    ($RootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+) {
+    throw "QMT Windows edge production root must be an ordinary directory"
 }
 
 $ProgramDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
@@ -13,8 +35,13 @@ $SchedulerStateRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $ProgramDataRoot "ProBigA\scheduler")
 )
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
+$QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $BootstrapTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
 $LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\backfill_guojin_qmt_local_history.py"
+$StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
+$Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
+$Updater = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
+$EnvFile = Join-Path $ExpectedRoot ".env"
 if (!$SchedulerStateRoot.StartsWith(
     $ProgramDataRoot + [System.IO.Path]::DirectorySeparatorChar
 )) {
@@ -23,9 +50,25 @@ if (!$SchedulerStateRoot.StartsWith(
 if (!(Test-Path -LiteralPath $SchedulerStateRoot -PathType Container)) {
     throw "QMT Windows scheduler state root was not installed"
 }
-foreach ($Path in @($PythonExe, $BootstrapTool, $LocalHistoryMigrationTool)) {
+foreach ($Path in @(
+    $PythonExe,
+    $QmtPythonExe,
+    $BootstrapTool,
+    $LocalHistoryMigrationTool,
+    $StrategyReloader,
+    $Wrapper,
+    $Updater,
+    $EnvFile
+)) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "QMT Windows edge bootstrap dependency is missing: $Path"
+    }
+    $DependencyItem = Get-Item -LiteralPath $Path -Force
+    if (
+        ($DependencyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) `
+            -ne 0
+    ) {
+        throw "QMT Windows edge dependency cannot be a reparse point: $Path"
     }
 }
 $StateItem = Get-Item -LiteralPath $SchedulerStateRoot -Force
@@ -48,6 +91,29 @@ function Invoke-Git([string[]]$Arguments) {
         throw "git command failed: git $($Arguments -join ' ')"
     }
     return @($Output)
+}
+
+$SchedulerArgument = (
+    "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +
+    "-File `"$Wrapper`" -RegisteredRoot `"$ExpectedRoot`""
+)
+$UpdaterArgument = (
+    "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +
+    "-File `"$Updater`" -RegisteredRoot `"$ExpectedRoot`""
+)
+$Registered = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+$RegisteredUpdater = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction Stop
+if (
+    @($Registered.Actions).Count -ne 1 -or
+    @($RegisteredUpdater.Actions).Count -ne 1 -or
+    $Registered.Actions[0].Execute -ine $PowerShellExe -or
+    $RegisteredUpdater.Actions[0].Execute -ine $PowerShellExe -or
+    $Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
+    $RegisteredUpdater.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
+    $Registered.Actions[0].Arguments -cne $SchedulerArgument -or
+    $RegisteredUpdater.Actions[0].Arguments -cne $UpdaterArgument
+) {
+    throw "QMT Windows edge registered production root binding differs"
 }
 
 function Stop-EdgeScheduler() {
@@ -74,6 +140,15 @@ function Start-EdgeScheduler() {
     }
 }
 
+$TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
+if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
+    throw "QMT Windows edge Git top level differs from registered production root"
+}
+$Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
+if ($Origin -ine $ExpectedOrigin) {
+    throw "QMT Windows edge origin differs from the production repository"
+}
+$env:QMT_PYTHON = $QmtPythonExe
 $Branch = ((Invoke-Git @("symbolic-ref", "--short", "HEAD")) -join "").Trim()
 if ($Branch -cne "main") {
     throw "QMT Windows edge checkout must remain on main"
@@ -94,9 +169,44 @@ if ($CurrentSha -cne $TargetSha) {
     if ($LASTEXITCODE -ne 0) {
         throw "QMT Windows edge main diverged; automatic update refused"
     }
-    # Stop before changing code and remain stopped until Linux appends the
-    # post-schema, build-bound release request.  This drains the shared writer
-    # heartbeat before the privileged schema cutover.
+}
+
+# Phase one is deliberately read-only and runs from the currently trusted
+# checkout.  Linux appends this exact target-SHA request only after its schema
+# cutover is complete.  A missing request and an unavailable proof are both
+# non-authority: keep the existing scheduler/code untouched and retry later.
+$env:PROBIGA_BUILD_COMMIT_SHA = $TargetSha
+$env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
+$AuthorizationOutput = & $PythonExe -P $BootstrapTool `
+    --check-request --expected-build-sha $TargetSha --compact 2>&1
+$AuthorizationExit = $LASTEXITCODE
+if ($AuthorizationExit -ne 0) {
+    Write-UpdateLog "release request not authorized or unavailable for $TargetSha"
+    exit 0
+}
+
+# An equal-SHA retry can prove that the release is already complete without
+# stopping anything.  A different checkout cannot make that claim because the
+# live scheduler and Git identity still belong to the prior release.
+if ($CurrentSha -ceq $TargetSha) {
+    $ReadyOutput = & $PythonExe -P $BootstrapTool `
+        --check-ready --expected-build-sha $TargetSha `
+        --expected-poll-seconds 60 --compact 2>&1
+    $ReadyExit = $LASTEXITCODE
+    if ($ReadyExit -eq 0) {
+        Write-UpdateLog "release already exact-ready for $TargetSha; updater is a no-op"
+        exit 0
+    }
+    if ($ReadyExit -ne 4) {
+        # A read/probe outage is not authority to disturb an equal-SHA edge.
+        Write-UpdateLog "exact release readiness probe unavailable for $TargetSha"
+        exit $ReadyExit
+    }
+}
+
+# Phase two may quiesce the writer and switch code only after the exact remote
+# target has a valid, immutable Linux release request.
+if ($CurrentSha -cne $TargetSha) {
     Stop-EdgeScheduler
     Invoke-Git @("merge", "--ff-only", "origin/main") | Out-Null
     $UpdatedSha = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
@@ -106,6 +216,9 @@ if ($CurrentSha -cne $TargetSha) {
     Write-UpdateLog "updated $CurrentSha -> $UpdatedSha"
     $CurrentSha = $UpdatedSha
 }
+
+$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+$env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 
 # The migration receipt is written only after the idempotent privileged init
 # succeeds for this exact release.  Keeping it outside the Git checkout makes
@@ -144,16 +257,29 @@ if ($PreparedSha -cne $CurrentSha) {
     Write-UpdateLog "local history schema prepared for $CurrentSha"
 }
 
-$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
-$env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
-$RequestOutput = & $PythonExe -P $BootstrapTool `
-    --check-request --expected-build-sha $CurrentSha --compact 2>&1
-$RequestExit = $LASTEXITCODE
-if ($RequestExit -ne 0) {
-    Stop-EdgeScheduler
-    Write-UpdateLog "release request not ready for $CurrentSha"
-    exit 0
+# Keep the database-writing edge stopped while the interactive QMT control
+# plane atomically installs, stops, reopens and starts only the exact bridge
+# model.  The reloader verifies the new model's own frozen build/source/
+# artifact identity and restores the previous artifact/model on failure.
+Stop-EdgeScheduler
+$StrategyReloadOutput = & $PowerShellExe `
+    -NoProfile -ExecutionPolicy Bypass `
+    -File $StrategyReloader `
+    -RegisteredRoot $ExpectedRoot `
+    -ExpectedBuildSha $CurrentSha 2>&1
+$StrategyReloadExit = $LASTEXITCODE
+if ($StrategyReloadExit -eq 3) {
+    Write-UpdateLog "BigQMT strategy reload NEEDS_USER_ACTION for $CurrentSha"
+    # Login expiry, broker CAPTCHA and interactive confirmations cannot be
+    # bypassed.  Preserve the explicit exit status for Task Scheduler while
+    # leaving the writer edge stopped and the prior model untouched/restored.
+    exit 3
 }
+if ($StrategyReloadExit -ne 0) {
+    Write-UpdateLog "BigQMT strategy reload failed closed for ${CurrentSha}: $($StrategyReloadOutput -join ' ')"
+    throw "BigQMT strategy release reload failed closed"
+}
+Write-UpdateLog "BigQMT exact strategy reloaded and identity-bound for $CurrentSha"
 
 Start-EdgeScheduler
 $BootstrapOutput = & $PythonExe -P $BootstrapTool `

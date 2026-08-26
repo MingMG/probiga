@@ -21,9 +21,18 @@ def test_xueqiu_hot_rank_filters_non_a_shares_and_reranks():
         },
     )
 
-    with patch.object(fetch_hot_rank_xq._SESSION, "get", return_value=response):
+    with patch.object(
+        fetch_hot_rank_xq._SESSION,
+        "get",
+        return_value=response,
+    ) as request:
         frame = fetch_hot_rank_xq._fetch_hot_rank_xq()
 
+    assert request.call_args.kwargs["params"] == {
+        "size": 100,
+        "_type": 12,
+        "type": 12,
+    }
     assert frame is not None
     assert frame["stock_code"].tolist() == ["600000", "000001", "430047"]
     assert frame["rank"].tolist() == [1, 2, 3]

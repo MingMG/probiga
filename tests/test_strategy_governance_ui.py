@@ -13,7 +13,7 @@ def test_strategy_governance_has_a_dedicated_navigation_page():
     assert "🏆 动态策略竞技场" in index
     assert "旧候选中心（研究）" not in index
     assert "style.css?v=44" in index
-    assert "app.js?v=114" in index
+    assert "app.js?v=116" in index
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():

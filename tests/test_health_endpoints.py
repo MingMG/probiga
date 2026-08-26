@@ -21,6 +21,204 @@ def test_release_git_inspection_marks_immutable_checkout_safe() -> None:
     ]
 
 
+def test_scheduler_process_identity_requires_the_same_immutable_release(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sha = "a" * 40
+    pid = 4321
+    proc = tmp_path / str(pid)
+    proc.mkdir()
+    code_root = f"/opt/ProBigA-releases/{sha}"
+    (proc / "environ").write_bytes(
+        b"PROBIGA_EXPECTED_GIT_SHA=" + sha.encode() + b"\0"
+        b"PROBIGA_BUILD_COMMIT_SHA=" + sha.encode() + b"\0"
+        b"PROBIGA_CODE_ROOT=" + code_root.encode() + b"\0"
+    )
+    (proc / "cmdline").write_bytes(
+        f"/var/lib/probiga/release-venvs/{sha}/bin/python\0"
+        f"-P\0{code_root}/tools/run_scheduler_daemon.py\0".encode()
+    )
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    monkeypatch.delenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        raising=False,
+    )
+    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
+
+    payload = health._standalone_scheduler_release_identity(pid)
+
+    assert payload == {
+        "ready": True,
+        "identity_mode": "SAME_BUILD_REQUIRED",
+        "api_build_sha": sha,
+        "expected_build_sha": sha,
+        "expected_code_root": code_root,
+        "observed_build_sha": sha,
+        "observed_code_root": code_root,
+        "same_build_as_api": True,
+        "error_code": None,
+    }
+
+
+def test_scheduler_process_identity_rejects_an_old_scheduler_build(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    expected_sha = "a" * 40
+    old_sha = "b" * 40
+    pid = 4321
+    proc = tmp_path / str(pid)
+    proc.mkdir()
+    old_root = f"/opt/ProBigA-releases/{old_sha}"
+    (proc / "environ").write_bytes(
+        b"PROBIGA_EXPECTED_GIT_SHA=" + old_sha.encode() + b"\0"
+        b"PROBIGA_BUILD_COMMIT_SHA=" + old_sha.encode() + b"\0"
+        b"PROBIGA_CODE_ROOT=" + old_root.encode() + b"\0"
+    )
+    (proc / "cmdline").write_bytes(
+        f"/var/lib/probiga/release-venvs/{old_sha}/bin/python\0"
+        f"-P\0{old_root}/tools/run_scheduler_daemon.py\0".encode()
+    )
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", expected_sha)
+    monkeypatch.delenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        raising=False,
+    )
+    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
+
+    payload = health._standalone_scheduler_release_identity(pid)
+
+    assert payload["ready"] is False
+    assert payload["expected_build_sha"] == expected_sha
+    assert payload["observed_build_sha"] == old_sha
+    assert payload["observed_code_root"] == old_root
+    assert payload["error_code"] == "scheduler_release_mismatch"
+
+
+def test_scheduler_process_identity_rejects_expected_script_as_decoy_argument(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sha = "a" * 40
+    pid = 4321
+    proc = tmp_path / str(pid)
+    proc.mkdir()
+    code_root = f"/opt/ProBigA-releases/{sha}"
+    (proc / "environ").write_bytes(
+        b"PROBIGA_EXPECTED_GIT_SHA=" + sha.encode() + b"\0"
+        b"PROBIGA_BUILD_COMMIT_SHA=" + sha.encode() + b"\0"
+        b"PROBIGA_CODE_ROOT=" + code_root.encode() + b"\0"
+    )
+    (proc / "cmdline").write_bytes(
+        f"/var/lib/probiga/release-venvs/{sha}/bin/python\0"
+        f"-P\0/tmp/untrusted.py\0"
+        f"{code_root}/tools/run_scheduler_daemon.py\0".encode()
+    )
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    monkeypatch.delenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        raising=False,
+    )
+    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
+
+    payload = health._standalone_scheduler_release_identity(pid)
+
+    assert payload["ready"] is False
+    assert payload["error_code"] == "scheduler_release_mismatch"
+
+
+def test_scheduler_process_identity_accepts_explicit_preserved_deferred_build(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    api_sha = "a" * 40
+    scheduler_sha = "b" * 40
+    pid = 4321
+    proc = tmp_path / str(pid)
+    proc.mkdir()
+    scheduler_root = f"/opt/ProBigA-releases/{scheduler_sha}"
+    (proc / "environ").write_bytes(
+        b"PROBIGA_EXPECTED_GIT_SHA=" + scheduler_sha.encode() + b"\0"
+        b"PROBIGA_BUILD_COMMIT_SHA=" + scheduler_sha.encode() + b"\0"
+        b"PROBIGA_CODE_ROOT=" + scheduler_root.encode() + b"\0"
+        b"DATABASE_URL=opaque-database-runtime-sentinel\0"
+        b"PROBIGA_ADMIN_TOKEN=do-not-expose\0"
+    )
+    (proc / "cmdline").write_bytes(
+        f"/var/lib/probiga/release-venvs/{scheduler_sha}/bin/python\0"
+        f"-P\0{scheduler_root}/tools/run_scheduler_daemon.py\0".encode()
+    )
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", api_sha)
+    monkeypatch.setenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        "DEFERRED_DB",
+    )
+    monkeypatch.setenv(
+        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA",
+        scheduler_sha,
+    )
+    monkeypatch.setenv(
+        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT",
+        scheduler_root,
+    )
+    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
+
+    payload = health._standalone_scheduler_release_identity(pid)
+
+    assert payload == {
+        "ready": True,
+        "identity_mode": "PRESERVED_DEFERRED",
+        "api_build_sha": api_sha,
+        "expected_build_sha": scheduler_sha,
+        "expected_code_root": scheduler_root,
+        "observed_build_sha": scheduler_sha,
+        "observed_code_root": scheduler_root,
+        "same_build_as_api": False,
+        "error_code": None,
+    }
+    assert "opaque-database-runtime-sentinel" not in str(payload)
+    assert "do-not-expose" not in str(payload)
+
+
+@pytest.mark.parametrize(
+    ("expected_sha", "expected_root"),
+    [
+        ("", ""),
+        ("b" * 40, "/opt/ProBigA-releases/not-the-bound-sha"),
+    ],
+)
+def test_scheduler_process_identity_rejects_invalid_deferred_contract(
+    monkeypatch,
+    tmp_path,
+    expected_sha: str,
+    expected_root: str,
+) -> None:
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "a" * 40)
+    monkeypatch.setenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        "DEFERRED_DB",
+    )
+    monkeypatch.setenv(
+        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA",
+        expected_sha,
+    )
+    monkeypatch.setenv(
+        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT",
+        expected_root,
+    )
+    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
+
+    payload = health._standalone_scheduler_release_identity(4321)
+
+    assert payload["ready"] is False
+    assert payload["identity_mode"] == "PRESERVED_DEFERRED"
+    assert payload["api_build_sha"] == "a" * 40
+    assert payload["error_code"] == (
+        "deferred_scheduler_identity_contract_invalid"
+    )
+
+
 def test_release_git_inspection_reports_the_timed_out_stage(monkeypatch) -> None:
     expected_sha = "a" * 40
     calls: list[list[str]] = []
@@ -656,7 +854,7 @@ def test_qmt_capabilities_uses_external_collector_without_local_sdk(monkeypatch)
     from integrations.qmt import bridge
     from integrations.qmt import diagnostics
 
-    monkeypatch.setattr(bridge, "is_configured", lambda: False)
+    monkeypatch.setattr(bridge, "is_probe_runtime_configured", lambda: False)
     monkeypatch.setattr(
         health,
         "_get_qmt_live_runtime_config",
@@ -679,7 +877,7 @@ def test_qmt_capabilities_force_keeps_explicit_local_probe(monkeypatch):
     from integrations.qmt import bridge
     from integrations.qmt import diagnostics
 
-    monkeypatch.setattr(bridge, "is_configured", lambda: False)
+    monkeypatch.setattr(bridge, "is_probe_runtime_configured", lambda: False)
     monkeypatch.setattr(
         health,
         "_get_qmt_live_runtime_config",
@@ -704,3 +902,26 @@ def test_qmt_capabilities_force_keeps_explicit_local_probe(monkeypatch):
     payload = health.health_qmt_capabilities(force=True)
 
     assert payload == {"ok": True, "status": "ok", "timeout": 12, "force": True}
+
+
+def test_qmt_core_probe_uses_external_collector_without_local_sdk(monkeypatch):
+    from integrations.qmt import bridge
+    from integrations.qmt import diagnostics
+
+    monkeypatch.setattr(bridge, "is_probe_runtime_configured", lambda: False)
+    monkeypatch.setattr(
+        health,
+        "_get_qmt_live_runtime_config",
+        lambda: {"enabled": True, "poll_seconds": 10},
+    )
+
+    def _unexpected_local_probe(*args, **kwargs):
+        raise AssertionError("external collector mode must not probe local QMT SDK")
+
+    monkeypatch.setattr(diagnostics, "core_probe", _unexpected_local_probe)
+
+    payload = health.health_qmt_core_probe()
+
+    assert payload["status"] == "external_windows_collector"
+    assert payload["qmt_live_runtime"]["enabled"] is True
+    assert payload["probes"] == []

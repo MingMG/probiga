@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import text
@@ -11,6 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.daily_stock_universe import (
+    DailyStockUniverse,
+    load_daily_stock_universe,
+    validate_daily_stock_coverage,
+)
 from server.common.auxiliary_runtime_schema import (
     validate_market_overview_daily_runtime_schema,
 )
@@ -20,6 +27,10 @@ from tools.env_config import load_project_env
 
 def _date_list(raw: str) -> list[str]:
     return [item.strip() for item in str(raw or "").split(",") if item.strip()]
+
+
+def _validated_date(value: str) -> str:
+    return datetime.strptime(str(value), "%Y-%m-%d").date().isoformat()
 
 
 def resolve_dates(kline_conn, *, dates: list[str], start_date: str, end_date: str) -> list[str]:
@@ -55,7 +66,34 @@ def resolve_dates(kline_conn, *, dates: list[str], start_date: str, end_date: st
     return [str(row[0])[:10] for row in rows if row[0]]
 
 
-def refresh_one(conn, kline_conn, trade_date: str) -> dict:
+def refresh_one(
+    conn,
+    kline_conn,
+    trade_date: str,
+    *,
+    universe: DailyStockUniverse,
+) -> dict:
+    coverage_rows = (
+        kline_conn.execute(
+            text(
+                """
+                SELECT stock_code, volume, amount
+                FROM sm_stock_kline
+                WHERE trade_date=:trade_date
+                  AND k_type=1
+                  AND adjust_type=0
+                ORDER BY stock_code
+                """
+            ),
+            {"trade_date": trade_date},
+        )
+        .mappings()
+        .all()
+    )
+    coverage = validate_daily_stock_coverage(
+        universe,
+        kline_rows=[dict(row) for row in coverage_rows],
+    )
     row = (
         kline_conn.execute(
             text(
@@ -92,8 +130,12 @@ def refresh_one(conn, kline_conn, trade_date: str) -> dict:
         or {}
     )
     total = int(row.get("total") or 0)
-    if total <= 0:
-        return {"date": trade_date, "status": "skip_empty"}
+    if total != universe.expected_count:
+        raise RuntimeError(
+            "DATA_BLOCKED: market-overview aggregate count differs from "
+            f"validated catalog coverage: total={total}, "
+            f"expected={universe.expected_count}"
+        )
     conn.execute(
         text(
             """
@@ -132,28 +174,95 @@ def refresh_one(conn, kline_conn, trade_date: str) -> dict:
             "quality_status": row.get("quality_status"),
         },
     )
-    return {"date": trade_date, "status": "ok", "total": total}
+    return {
+        "date": trade_date,
+        "status": "ok",
+        "total": total,
+        "coverage": coverage,
+    }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Refresh daily market overview summary for monitor page.")
     parser.add_argument("date_arg", nargs="?", default="", help="Trade date, for scheduler positional-date compatibility.")
     parser.add_argument("--dates", default="", help="Comma separated trade dates.")
     parser.add_argument("--start-date", default="")
     parser.add_argument("--end-date", default="")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    try:
+        explicit_dates = [
+            _validated_date(value)
+            for value in _date_list(args.dates or args.date_arg)
+        ]
+        start_date = _validated_date(args.start_date) if args.start_date else ""
+        end_date = _validated_date(args.end_date) if args.end_date else ""
+    except ValueError as exc:
+        print(f"[ERROR] 日期格式错误，应为 YYYY-MM-DD: {exc}", file=sys.stderr)
+        return 2
 
     load_project_env()
     engine = create_batch_engine(future=True)
     kline_engine = get_kline_engine()
-    explicit_dates = _date_list(args.dates or args.date_arg)
-    validate_market_overview_daily_runtime_schema(engine)
-    with engine.begin() as conn:
+    try:
+        validate_market_overview_daily_runtime_schema(engine)
         with kline_engine.connect() as kline_conn:
-            dates = resolve_dates(kline_conn, dates=explicit_dates, start_date=args.start_date, end_date=args.end_date)
+            dates = resolve_dates(
+                kline_conn,
+                dates=explicit_dates,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            if not dates:
+                print(
+                    "[ERROR] DATA_BLOCKED: no target-date daily K-line rows",
+                    file=sys.stderr,
+                )
+                return 2
+            blocked: list[dict] = []
             for trade_date in dates:
-                print(refresh_one(conn, kline_conn, trade_date), flush=True)
-    return 0
+                try:
+                    universe = load_daily_stock_universe(engine, trade_date)
+                    with engine.begin() as conn:
+                        result = refresh_one(
+                            conn,
+                            kline_conn,
+                            trade_date,
+                            universe=universe,
+                        )
+                except RuntimeError as exc:
+                    result = {
+                        "date": trade_date,
+                        "status": "DATA_BLOCKED",
+                        "reason": str(exc),
+                    }
+                print(result, flush=True)
+                if result.get("status") != "ok":
+                    blocked.append(result)
+                    continue
+                print(
+                    "COVERAGE_MANIFEST="
+                    + json.dumps(
+                        result.get("coverage") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    flush=True,
+                )
+                print(f"DATE={trade_date}", flush=True)
+            if blocked:
+                print(
+                    "[ERROR] DATA_BLOCKED: one or more target dates have "
+                    f"missing/incomplete K-line data: {blocked}",
+                    file=sys.stderr,
+                )
+                return 2
+        return 0
+    finally:
+        engine.dispose()
+        if kline_engine is not engine:
+            kline_engine.dispose()
 
 
 if __name__ == "__main__":

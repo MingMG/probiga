@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -44,6 +45,12 @@ from integrations.bigqmt.spool import (
     snapshot_frame,
     write_watchlist,
 )
+from integrations.bigqmt.release_identity import (
+    STRATEGY_RELEASE_MANIFEST_NAME,
+    build_strategy_release_manifest,
+    git_strategy_artifact,
+    render_strategy_artifact,
+)
 from integrations.bigqmt.bridge import (
     level1_snapshot,
     request_level1_reconnect,
@@ -70,6 +77,13 @@ _maintenance_processes: set[subprocess.Popen] = set()
 MEMBERSHIP_SNAPSHOT_TASK_TYPE = "qmt_membership_snapshot"
 ETF_FORWARD_TASK_TYPE = "etf_forward_daily"
 ETF_FORWARD_RETRY_MINUTES = 10
+STRATEGY_SOURCE_PATH = (
+    ROOT
+    / "integrations"
+    / "bigqmt"
+    / "qmt_strategy"
+    / "probiga_big_qmt_bridge.py"
+)
 
 ACTIVE_UNIVERSE_SQL = """
 SELECT member.stock_code, COALESCE(detail.short_name, '') AS short_name
@@ -91,6 +105,138 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _git_head(root: Path = ROOT) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        check=True,
+        timeout=30,
+    )
+    return completed.stdout.strip().lower()
+
+
+def install_strategy_release(
+    *,
+    qmt_home: Path,
+    expected_build_sha: str,
+    git_head: str | None = None,
+) -> dict[str, Any]:
+    """Install exact Git-blob bytes plus a load-time identity manifest."""
+    expected_sha = str(expected_build_sha or "").strip().lower()
+    if (
+        len(expected_sha) != 40
+        or expected_sha == "0" * 40
+        or any(character not in "0123456789abcdef" for character in expected_sha)
+    ):
+        raise RuntimeError("BigQMT strategy release build SHA is invalid")
+    environment_sha = os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
+    if environment_sha and environment_sha != expected_sha:
+        raise RuntimeError("BigQMT strategy release environment SHA differs")
+    observed_sha = str(git_head or _git_head()).strip().lower()
+    if observed_sha != expected_sha:
+        raise RuntimeError("BigQMT strategy source checkout differs from requested build")
+    if not STRATEGY_SOURCE_PATH.is_file():
+        raise RuntimeError("BigQMT strategy release source is unavailable")
+
+    artifact = git_strategy_artifact(
+        root=ROOT,
+        source_path=STRATEGY_SOURCE_PATH,
+        build_sha=expected_sha,
+    )
+    source_hash = str(artifact["source_sha256"])
+    rendered = render_strategy_artifact(
+        artifact["source_bytes"],
+        build_sha=expected_sha,
+        git_blob=str(artifact["git_blob"]),
+        source_sha256=source_hash,
+    )
+    artifact_hash = str(rendered["artifact_sha256"])
+    temporary_source: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix="probiga_big_qmt_bridge_",
+            suffix=".py",
+            delete=False,
+        ) as handle:
+            handle.write(rendered["source_bytes"])
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_source = Path(handle.name)
+        installed_path = install_qmt_strategy(
+            qmt_home=qmt_home,
+            source_path=temporary_source,
+        )
+    finally:
+        if temporary_source is not None:
+            temporary_source.unlink(missing_ok=True)
+    installed_paths = sorted(
+        (
+            path
+            for path in installed_path.parent.iterdir()
+            if path.is_file()
+            and path.name.casefold() == installed_path.name.casefold()
+        ),
+        key=lambda path: str(path).casefold(),
+    )
+    if not installed_paths:
+        raise RuntimeError("BigQMT strategy release install produced no target")
+    installed_hashes = {
+        str(path): _file_sha256(path) for path in installed_paths
+    }
+    if any(value != artifact_hash for value in installed_hashes.values()):
+        raise RuntimeError("BigQMT installed strategy aliases differ from exact source")
+    manifest = build_strategy_release_manifest(
+        build_sha=expected_sha,
+        git_blob=str(artifact["git_blob"]),
+        source_sha256=source_hash,
+        artifact_sha256=artifact_hash,
+        identity_sha256=str(rendered["identity_sha256"]),
+    )
+    manifest_path = installed_path.parent / STRATEGY_RELEASE_MANIFEST_NAME
+    manifest_temporary = manifest_path.with_name(
+        f".{manifest_path.name}.{os.getpid()}.tmp"
+    )
+    with manifest_temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(
+            manifest,
+            handle,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    _replace_with_retry(manifest_temporary, manifest_path)
+    if json.loads(manifest_path.read_text(encoding="utf-8")) != manifest:
+        raise RuntimeError("BigQMT strategy release manifest verification failed")
+    return {
+        "schema": "probiga.bigqmt-strategy-install.v1",
+        "status": "installed",
+        "build_sha": expected_sha,
+        "strategy_git_blob": artifact["git_blob"],
+        "strategy_source_sha256": source_hash,
+        "strategy_artifact_sha256": artifact_hash,
+        "strategy_loaded_identity_sha256": rendered["identity_sha256"],
+        "strategy_release_manifest": str(manifest_path),
+        "installed_paths": [str(path) for path in installed_paths],
+        "installed_hashes": installed_hashes,
+        "database_writes": False,
+        "automatic_order_submission": False,
+    }
 
 
 def _is_live_market_window(
@@ -488,9 +634,17 @@ def _run_etf_forward_command() -> dict[str, Any]:
     finally:
         with _maintenance_process_lock:
             _maintenance_processes.discard(daily)
+    from server.common.scheduler_validation import _etf_forward_payload
+
+    machine_receipt = _etf_forward_payload(stdout)
+    if machine_receipt is None:
+        raise RuntimeError(
+            "ETF daily command did not emit exactly one machine receipt"
+        )
     return {
         "returncode": int(daily.returncode),
-        "daily_stdout_tail": stdout.strip()[-3000:],
+        "machine_receipt": dict(machine_receipt),
+        "daily_stdout_tail": stdout.strip()[-1000:],
         "daily_stderr_tail": stderr.strip()[-1500:],
         "delivery_mode": "CONFIGURED_DATABASE_DIRECT",
         "promotion_stdout_tail": "",
@@ -545,21 +699,47 @@ def maybe_run_etf_forward_daily(
         return {"status": "already_running"}
 
     started = time.monotonic()
+    started_at = datetime.now()
     execute = runner or _run_etf_forward_command
     try:
         command_result = execute()
         duration = int(time.monotonic() - started)
-        succeeded = int(command_result.get("returncode") or 0) == 0
-        status = "success" if succeeded else "failed"
+        envelope = {
+            "executor": "windows_big_qmt_bridge",
+            "trade_date": current.date().isoformat(),
+            **command_result,
+        }
         output = json.dumps(
-            {
-                "executor": "windows_big_qmt_bridge",
-                "trade_date": current.date().isoformat(),
-                **command_result,
-            },
+            envelope,
             ensure_ascii=False,
             default=str,
         )
+        from server.common.scheduler_validation import (
+            scheduler_output_status,
+            validate_scheduler_task_result,
+        )
+
+        status = scheduler_output_status(
+            {"task_type": ETF_FORWARD_TASK_TYPE},
+            output,
+            return_code=int(command_result.get("returncode") or 0),
+        ) or "failed"
+        validation_message = ""
+        if status == "success":
+            validation = validate_scheduler_task_result(
+                {"task_type": ETF_FORWARD_TASK_TYPE},
+                engine=engine,
+                started_at=started_at,
+                now=current,
+                output=output,
+            )
+            validation_message = validation.message
+            if not validation.checked or not validation.ok:
+                status = "failed"
+        envelope["machine_receipt_status"] = status
+        if validation_message:
+            envelope["database_validation"] = validation_message
+        output = json.dumps(envelope, ensure_ascii=False, default=str)
         update_scheduler_task(
             engine,
             task_id,
@@ -1600,15 +1780,37 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the standard QMT quote bridge consumer")
     parser.add_argument("--install-strategy", action="store_true")
+    parser.add_argument(
+        "--install-only",
+        action="store_true",
+        help="Install and hash-verify the exact strategy source, then exit.",
+    )
+    parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=1.0)
     parser.add_argument("--tracked-limit", type=int, default=280)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    if args.install_only and not args.install_strategy:
+        parser.error("--install-only requires --install-strategy")
+    if args.install_only and not args.expected_build_sha:
+        parser.error("--install-only requires --expected-build-sha")
 
     qmt_home = resolve_big_qmt_home(required=True)
     assert qmt_home is not None
     installed_path = None
+    if args.install_only:
+        result = install_strategy_release(
+            qmt_home=qmt_home,
+            expected_build_sha=args.expected_build_sha,
+        )
+        print(
+            json.dumps(result, ensure_ascii=False, sort_keys=True)
+            if args.json
+            else result,
+            flush=True,
+        )
+        return 0
     if args.install_strategy:
         installed_path = install_qmt_strategy(qmt_home=qmt_home)
 

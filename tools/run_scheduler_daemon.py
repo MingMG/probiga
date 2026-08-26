@@ -15,6 +15,9 @@ if str(ROOT) not in sys.path:
 _WINDOWS_MUTEX_NAME = "Global\\ProBigA.RunSchedulerDaemon"
 _COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _WINDOWS_SCHEDULER_POLL_SECONDS = 60
+_WINDOWS_QMT_PYTHON = Path(
+    "runtime/qmt-py313/Scripts/python.exe"
+)
 
 
 def _bind_windows_state_roots() -> dict[str, str]:
@@ -69,6 +72,32 @@ def _bind_windows_build_sha() -> str:
     return actual
 
 
+def _bind_windows_qmt_python() -> str:
+    """Freeze xtquant subprocesses to the registered checkout's runtime."""
+
+    root = ROOT.resolve(strict=True)
+    candidate = ROOT / _WINDOWS_QMT_PYTHON
+    chain = (
+        ROOT,
+        ROOT / "runtime",
+        ROOT / "runtime" / "qmt-py313",
+        ROOT / "runtime" / "qmt-py313" / "Scripts",
+        candidate,
+    )
+    for item in chain:
+        if not item.exists():
+            raise RuntimeError("Windows QMT Python runtime is unavailable")
+        is_junction = getattr(item, "is_junction", lambda: False)
+        if item.is_symlink() or is_junction():
+            raise RuntimeError("Windows QMT Python runtime is a reparse point")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_file() or root not in resolved.parents:
+        raise RuntimeError("Windows QMT Python runtime escapes checkout")
+    value = str(resolved)
+    os.environ["QMT_PYTHON"] = value
+    return value
+
+
 def _load_windows_runtime_env() -> int:
     """Load the Windows owner's local environment before runtime imports."""
 
@@ -82,6 +111,7 @@ def _load_windows_runtime_env() -> int:
         if key and value is not None
     }
     os.environ.update(values)
+    _bind_windows_qmt_python()
     _bind_windows_state_roots()
     # Clear stale launcher controls, then force the one capability identity
     # accepted by the shared scheduler/health contract.

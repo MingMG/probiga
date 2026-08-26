@@ -50,6 +50,7 @@ SUPPORTED_DATASETS = frozenset(
 )
 
 QMT_MINUTE_GRID_PROFILE = "CN_A_SHARE_QMT_NATIVE_241_V1"
+QMT_MINUTE_GRID_PREFIX = QMT_MINUTE_GRID_PROFILE + "_PREFIX_"
 QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH = (
     "61f40868016c42b63414c65bb0cc47bf0d30f51a45e188a5198622e8edc298dd"
 )
@@ -178,7 +179,10 @@ def minute_time_grid(
 ) -> tuple[str, ...]:
     """Return the exact native-QMT A-share one-minute bar-start grid."""
 
-    if profile != QMT_MINUTE_GRID_PROFILE:
+    if (
+        profile != QMT_MINUTE_GRID_PROFILE
+        and not str(profile).startswith(QMT_MINUTE_GRID_PREFIX)
+    ):
         raise QmtHistoryCoverageError(
             f"unsupported QMT minute grid profile: {profile!r}"
         )
@@ -194,7 +198,47 @@ def minute_time_grid(
         )
     if canonical_digest(values) != QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH:
         raise QmtHistoryCoverageError("native QMT minute grid fixture differs")
+    if profile != QMT_MINUTE_GRID_PROFILE:
+        suffix = str(profile)[len(QMT_MINUTE_GRID_PREFIX):]
+        if len(suffix) != 6 or not suffix.isdigit():
+            raise QmtHistoryCoverageError(
+                f"unsupported QMT minute grid profile: {profile!r}"
+            )
+        cutoff = f"{suffix[:2]}:{suffix[2:4]}:{suffix[4:]}"
+        if cutoff not in values:
+            raise QmtHistoryCoverageError(
+                f"unsupported QMT minute prefix cutoff: {cutoff!r}"
+            )
+        values = values[: values.index(cutoff) + 1]
     return tuple(values)
+
+
+def minute_grid_profile_for_capture(
+    *,
+    trade_date: Any,
+    captured_at: Any,
+) -> str:
+    """Freeze a full-session grid or the exact observable intraday prefix."""
+
+    normalized_date = _iso_date(trade_date, field="trade_date")
+    normalized_capture = _iso_datetime(captured_at, field="captured_at")
+    captured = datetime.fromisoformat(normalized_capture)
+    target = date.fromisoformat(normalized_date)
+    if target > captured.date():
+        raise QmtHistoryCoverageError("minute capture precedes trade date")
+    if target < captured.date():
+        return QMT_MINUTE_GRID_PROFILE
+    full_grid = minute_time_grid()
+    cutoff = captured.strftime("%H:%M:%S")
+    observable = [value for value in full_grid if value <= cutoff]
+    if not observable:
+        raise QmtHistoryCoverageError(
+            "intraday minute capture precedes the first native bar"
+        )
+    last_observable = observable[-1]
+    if last_observable == full_grid[-1]:
+        return QMT_MINUTE_GRID_PROFILE
+    return QMT_MINUTE_GRID_PREFIX + last_observable.replace(":", "")
 
 
 def _row_trade_time(value: Any, *, trade_date: str) -> str:
@@ -1985,6 +2029,7 @@ __all__ = [
     "DATASET_STOCK_DAILY",
     "DATASET_STOCK_MINUTE",
     "QMT_MINUTE_GRID_PROFILE",
+    "QMT_MINUTE_GRID_PREFIX",
     "QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH",
     "QmtHistoryCoverageError",
     "assess_daily_coverage",
@@ -1995,6 +2040,7 @@ __all__ = [
     "coverage_trigger_ddl_statements",
     "insert_coverage_bundle",
     "minute_time_grid",
+    "minute_grid_profile_for_capture",
     "require_exact_coverage",
     "unavailable_coverage_bundle",
     "validate_coverage_authority",
