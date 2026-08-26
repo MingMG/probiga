@@ -54,10 +54,26 @@ def _governance_api():
         FUNDING_CHECKPOINT_TABLE_NAME,
         FUNDING_DAILY_FACT_TABLE_NAME,
     )
-    from server.common.production_runtime_schema_bundle import (
-        privileged_migrate_runtime_schema_bundle,
-        validate_runtime_schema_bundle,
+    from server.auth.schema import (
+        privileged_migrate_auth_schema,
+        validate_auth_runtime_schema,
     )
+    from server.common.scheduler_task_history_schema import (
+        migrate_scheduler_task_history,
+        validate_scheduler_task_history_schema,
+    )
+
+    def migrate_deferred_runtime_repairs(engine):
+        return {
+            "auth": privileged_migrate_auth_schema(engine),
+            "scheduler_task_history": migrate_scheduler_task_history(engine),
+        }
+
+    def validate_deferred_runtime_repairs(engine):
+        return {
+            "auth": validate_auth_runtime_schema(engine),
+            "scheduler_task_history": validate_scheduler_task_history_schema(engine),
+        }
 
     return {
         "core_tables": tuple(GOVERNANCE_TABLE_NAMES),
@@ -70,8 +86,8 @@ def _governance_api():
         "seed": seed_governance_registry,
         "validate": validate_deferred_governance_base_schema,
         "validate_triggers": validate_deferred_governance_trigger_inventory,
-        "migrate_runtime_bundle": privileged_migrate_runtime_schema_bundle,
-        "validate_runtime_bundle": validate_runtime_schema_bundle,
+        "migrate_runtime_repairs": migrate_deferred_runtime_repairs,
+        "validate_runtime_repairs": validate_deferred_runtime_repairs,
     }
 
 
@@ -147,7 +163,7 @@ def _preflight(engine, api: dict[str, Any]) -> dict[str, Any]:
 def _verified_payload(engine, api: dict[str, Any], *, action: str) -> dict[str, Any]:
     identity = _identity(engine)
     detail = api["validate"](engine)
-    runtime_bundle = api["validate_runtime_bundle"](engine)
+    runtime_repairs = api["validate_runtime_repairs"](engine)
     missing_trigger_count = int(detail.get("missing_trigger_count") or 0)
     if missing_trigger_count <= 0:
         raise DeferredBaseSchemaError(
@@ -165,7 +181,7 @@ def _verified_payload(engine, api: dict[str, Any], *, action: str) -> dict[str, 
         "automatic_real_order_submission": False,
         "real_order_authority": False,
         "identity": identity,
-        "runtime_schema_bundle_validation": runtime_bundle,
+        "deferred_runtime_repairs_validation": runtime_repairs,
         **detail,
     }
 
@@ -202,7 +218,7 @@ def prepare_deferred_base_schema(
         if not apply:
             return _verified_payload(engine, api, action="verify")
         preflight = _preflight(engine, api)
-        runtime_bundle = api["migrate_runtime_bundle"](engine)
+        runtime_repairs = api["migrate_runtime_repairs"](engine)
         api["ensure"](
             engine=engine,
             writers_fenced=True,
@@ -220,7 +236,7 @@ def prepare_deferred_base_schema(
     finally:
         verify_engine.dispose()
     result["preflight"] = preflight
-    result["runtime_schema_bundle"] = runtime_bundle
+    result["deferred_runtime_repairs"] = runtime_repairs
     result["fresh_connection_verified"] = True
     return result
 

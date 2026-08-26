@@ -223,11 +223,11 @@ def test_deferred_tool_apply_is_fresh_verified_and_machine_readable(monkeypatch)
 
     engines = iter((Engine("apply"), Engine("verify")))
     api = {
-        "migrate_runtime_bundle": lambda engine: {
+        "migrate_runtime_repairs": lambda engine: {
             "status": "ok",
             "engine": engine.name,
         },
-        "validate_runtime_bundle": lambda engine: {
+        "validate_runtime_repairs": lambda engine: {
             "status": "ok",
             "engine": engine.name,
             "read_only": True,
@@ -273,8 +273,8 @@ def test_deferred_tool_apply_is_fresh_verified_and_machine_readable(monkeypatch)
     assert result["missing_trigger_count"] == 40
     assert result["database_triggers_installed"] is False
     assert result["fresh_connection_verified"] is True
-    assert result["runtime_schema_bundle"]["engine"] == "apply"
-    assert result["runtime_schema_bundle_validation"]["engine"] == "verify"
+    assert result["deferred_runtime_repairs"]["engine"] == "apply"
+    assert result["deferred_runtime_repairs_validation"]["engine"] == "verify"
     ensure_call = next(item for item in calls if item[0] == "ensure")
     assert ensure_call[1]["writers_fenced"] is True
     assert ensure_call[1]["defer_triggers"] is True
