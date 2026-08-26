@@ -738,6 +738,11 @@ def _normalize_trigger_body(value: Any) -> str:
     return "".join(pieces).strip().rstrip(";").strip()
 
 
+def _normalize_referential_rule(value: Any) -> str:
+    rule = str(value or "").strip().upper()
+    return "RESTRICT" if rule == "NO ACTION" else rule
+
+
 def _validate_table(connection, table_name: str) -> dict[str, int]:
     contract = _TABLE_CONTRACTS[table_name]
     table_rows = _rows(connection,
@@ -814,8 +819,8 @@ def _validate_table(connection, table_name: str) -> dict[str, int]:
         observed = (tuple(str(r.get("column_name") or "") for r in rows),
                     str(rows[0].get("referenced_table_name") or ""),
                     tuple(str(r.get("referenced_column_name") or "") for r in rows),
-                    str(rows[0].get("update_rule") or "").upper(),
-                    str(rows[0].get("delete_rule") or "").upper())
+                    _normalize_referential_rule(rows[0].get("update_rule")),
+                    _normalize_referential_rule(rows[0].get("delete_rule")))
         if observed != expected:
             raise RuntimeError(f"资金事实外键契约漂移：{table_name}.{name}")
     check_rows = _rows(connection,

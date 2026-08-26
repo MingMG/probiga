@@ -231,10 +231,74 @@ def test_read_only_validator_reports_dynamic_scope_counts_and_contract_hash():
         "real_order_authority": False,
     }
     assert result["contract_hash"] == (
-        "25dd0ffab488c22f628a8f8248521ff8e4f337931cfffe856cd069670006d49c"
+        "ac729821b55f72b64ae32f82b487d7c16a0867773e550ea7a4e2eaa258e17ebd"
     )
     assert re.fullmatch(r"[0-9a-f]{64}", result["contract_hash"])
     assert connection.ddl_statements == []
+
+
+def test_cross_ledger_foreign_key_columns_match_frozen_legacy_collation():
+    expected = {
+        "st_dynamic_shadow_trial_chain": {
+            "source_intent_id",
+            "entry_order_id",
+            "entry_fill_id",
+            "forward_evidence_id",
+        },
+        "st_dynamic_shadow_trial_exit_binding": {
+            "allocation_id",
+            "exit_order_id",
+            "exit_fill_id",
+        },
+    }
+    ddl_by_table = dict(zip(
+        schema.DYNAMIC_SHADOW_LEDGER_TABLE_NAMES,
+        schema.dynamic_shadow_ledger_ddl_statements(),
+    ))
+
+    for table_name, column_names in expected.items():
+        contracts = {
+            column["name"]: column
+            for column in schema._DYNAMIC_COLUMN_CONTRACTS[table_name]
+        }
+        for column_name in column_names:
+            assert contracts[column_name]["collation_name"] == (
+                "utf8mb4_general_ci"
+            )
+            assert re.search(
+                rf"\b{column_name}\s+(?:var)?char\(64\)\s+"
+                r"character\s+set\s+utf8mb4\s+"
+                r"collate\s+utf8mb4_general_ci\s+not\s+null\b",
+                ddl_by_table[table_name],
+                flags=re.IGNORECASE,
+            )
+
+    assert next(
+        column for column in
+        schema._DYNAMIC_COLUMN_CONTRACTS["st_dynamic_shadow_trial_chain"]
+        if column["name"] == "plan_id"
+    )["collation_name"] == "utf8mb4_unicode_ci"
+
+
+def test_mysql84_equivalent_fk_rules_and_escaped_check_literals_validate():
+    connection = _exact_connection()
+    for row in connection.foreign_keys:
+        row["update_rule"] = "NO ACTION"
+        row["delete_rule"] = "NO ACTION"
+    for row in connection.checks:
+        if row["constraint_name"] == "ck_dynamic_shadow_plan_account":
+            row["check_clause"] = (
+                r"((`account_id` = _utf8mb4\'paper-main-v2\'))"
+            )
+        elif row["constraint_name"] == "ck_dynamic_shadow_plan_status":
+            row["check_clause"] = (
+                r"((`plan_status` = _utf8mb4\'PLANNED_SHADOW_TRIAL\'))"
+            )
+
+    result = schema.validate_dynamic_shadow_ledger_schema(connection)
+
+    assert result["foreign_key_count"] == 15
+    assert result["check_count"] == 10
 
 
 def test_every_foreign_key_has_an_explicit_left_prefix_supporting_index():

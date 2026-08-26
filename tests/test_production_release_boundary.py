@@ -5072,6 +5072,12 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     )
     assert "prepare_strategy_governance_deferred_schema.py" in deferred
     assert "--apply --writers-fenced" in _normalized_shell(deferred)
+    assert 'if schema_result="$(run_prepared_python_tool' in deferred
+    assert "deploy_failure phase=cutover cutover_step=%s status=%s" in deferred
+    assert 'return "$schema_status"' in deferred
+    assert deferred.index("printf '%s\\n' \"$schema_result\" >&2") < (
+        deferred.index('return "$schema_status"')
+    )
     assert deferred.index("--deferred-disable --snapshot-file") < deferred.index(
         "--apply --writers-fenced"
     )

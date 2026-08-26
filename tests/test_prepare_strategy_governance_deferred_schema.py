@@ -294,7 +294,7 @@ def test_deferred_marker_never_asserts_trigger_installation():
         "20260826_001_strategy_governance_deferred_base_schema"
     )
     assert governance.DEFERRED_BASE_SCHEMA_MIGRATION_HASH == (
-        "a45fa150c5c6b35ab3214957ab8adb9ec101f4a3b6bc78722ebe809d3410c41c"
+        "4dabc068644b87f5f13c40f48e379a2539db9516b55c4a09d6023cebfb58b51e"
     )
     assert len(governance.DEFERRED_BASE_SCHEMA_MIGRATION_HASH) == 64
     assert funding.FUNDING_CHECKPOINT_BASE_MIGRATION_HASH != (

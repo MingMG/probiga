@@ -54,6 +54,11 @@ def test_mysql84_trigger_metadata_normalizes_sqlstate_value_only_outside_literal
     )
 
 
+def test_mysql84_no_action_fk_metadata_matches_restrict_contract():
+    assert funding._normalize_referential_rule("NO ACTION") == "RESTRICT"
+    assert funding._normalize_referential_rule("RESTRICT") == "RESTRICT"
+
+
 def test_funding_contract_names_are_unique_and_every_fk_has_explicit_left_prefix():
     expected_counts = {
         funding.FUNDING_DAILY_FACT_TABLE_NAME: (29, 9, 3, 7),

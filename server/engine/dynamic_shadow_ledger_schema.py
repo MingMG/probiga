@@ -24,6 +24,7 @@ DYNAMIC_SHADOW_LEDGER_TABLE_NAMES = (
 )
 
 _DYNAMIC_TABLE_COLLATION = "utf8mb4_unicode_ci"
+_LEGACY_LEDGER_COLLATION = "utf8mb4_general_ci"
 _DYNAMIC_TABLE_ENGINE = "InnoDB"
 
 
@@ -35,6 +36,7 @@ def _column(
     default: str | None = None,
     extra: str = "",
     character: bool = False,
+    collation: str | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -43,7 +45,9 @@ def _column(
         "column_default": default,
         "extra": extra,
         "character_set_name": "utf8mb4" if character else None,
-        "collation_name": _DYNAMIC_TABLE_COLLATION if character else None,
+        "collation_name": (
+            collation or _DYNAMIC_TABLE_COLLATION
+        ) if character else None,
         "ddl": ddl,
     }
 
@@ -123,13 +127,21 @@ _DYNAMIC_COLUMN_CONTRACTS: dict[str, tuple[dict[str, Any], ...]] = {
         _column("plan_id", "char(64)", "plan_id CHAR(64) NOT NULL",
                 character=True),
         _column("source_intent_id", "varchar(64)",
-                "source_intent_id VARCHAR(64) NOT NULL", character=True),
+                "source_intent_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("entry_order_id", "varchar(64)",
-                "entry_order_id VARCHAR(64) NOT NULL", character=True),
+                "entry_order_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("entry_fill_id", "varchar(64)",
-                "entry_fill_id VARCHAR(64) NOT NULL", character=True),
+                "entry_fill_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("forward_evidence_id", "char(64)",
-                "forward_evidence_id CHAR(64) NOT NULL", character=True),
+                "forward_evidence_id CHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("intent_fact_hash", "char(64)",
                 "intent_fact_hash CHAR(64) NOT NULL", character=True),
         _column("risk_decision_fact_hash", "char(64)",
@@ -171,11 +183,17 @@ _DYNAMIC_COLUMN_CONTRACTS: dict[str, tuple[dict[str, Any], ...]] = {
         _column("chain_id", "char(64)", "chain_id CHAR(64) NOT NULL",
                 character=True),
         _column("allocation_id", "char(64)",
-                "allocation_id CHAR(64) NOT NULL", character=True),
+                "allocation_id CHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("exit_order_id", "varchar(64)",
-                "exit_order_id VARCHAR(64) NOT NULL", character=True),
+                "exit_order_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("exit_fill_id", "varchar(64)",
-                "exit_fill_id VARCHAR(64) NOT NULL", character=True),
+                "exit_fill_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE "
+                "utf8mb4_general_ci NOT NULL", character=True,
+                collation=_LEGACY_LEDGER_COLLATION),
         _column("allocation_fact_hash", "char(64)",
                 "allocation_fact_hash CHAR(64) NOT NULL", character=True),
         _column("exit_order_fact_hash", "char(64)",
@@ -501,10 +519,14 @@ def dynamic_shadow_ledger_ddl_statements() -> tuple[str, ...]:
         CREATE TABLE IF NOT EXISTS st_dynamic_shadow_trial_chain (
             chain_id CHAR(64) PRIMARY KEY,
             plan_id CHAR(64) NOT NULL,
-            source_intent_id VARCHAR(64) NOT NULL,
-            entry_order_id VARCHAR(64) NOT NULL,
-            entry_fill_id VARCHAR(64) NOT NULL,
-            forward_evidence_id CHAR(64) NOT NULL,
+            source_intent_id VARCHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
+            entry_order_id VARCHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
+            entry_fill_id VARCHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
+            forward_evidence_id CHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
             intent_fact_hash CHAR(64) NOT NULL,
             risk_decision_fact_hash CHAR(64) NOT NULL,
             entry_order_fact_hash CHAR(64) NOT NULL,
@@ -554,9 +576,12 @@ def dynamic_shadow_ledger_ddl_statements() -> tuple[str, ...]:
         CREATE TABLE IF NOT EXISTS st_dynamic_shadow_trial_exit_binding (
             binding_id CHAR(64) PRIMARY KEY,
             chain_id CHAR(64) NOT NULL,
-            allocation_id CHAR(64) NOT NULL,
-            exit_order_id VARCHAR(64) NOT NULL,
-            exit_fill_id VARCHAR(64) NOT NULL,
+            allocation_id CHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
+            exit_order_id VARCHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
+            exit_fill_id VARCHAR(64) CHARACTER SET utf8mb4
+                COLLATE utf8mb4_general_ci NOT NULL,
             allocation_fact_hash CHAR(64) NOT NULL,
             exit_order_fact_hash CHAR(64) NOT NULL,
             exit_fill_fact_hash CHAR(64) NOT NULL,
@@ -757,8 +782,23 @@ def _normalized_default(value: Any, column_type: str) -> Any:
 
 
 def _normalized_check_clause(value: Any) -> str:
-    clause = str(value or "").strip().casefold().replace("`", "")
-    clause = re.sub(r"_[a-z0-9]+(?=')", "", clause)
+    clause = str(value or "").strip().replace("`", "")
+    # MySQL 8.4 may expose CHECK string literals either as
+    # ``_utf8mb4'value'`` or as ``_utf8mb4\'value\'``.  Both represent the
+    # same frozen SQL expression and neither changes the stored constraint.
+    clause = re.sub(
+        r"_[a-z0-9]+\\'([^\\']*)\\'",
+        lambda match: "'" + match.group(1) + "'",
+        clause,
+        flags=re.IGNORECASE,
+    )
+    clause = re.sub(
+        r"_[a-z0-9]+'([^']*)'",
+        lambda match: "'" + match.group(1) + "'",
+        clause,
+        flags=re.IGNORECASE,
+    )
+    clause = clause.casefold()
 
     def fully_wrapped(raw: str) -> bool:
         if not raw.startswith("(") or not raw.endswith(")"):
@@ -788,6 +828,13 @@ def _normalized_check_clause(value: Any) -> str:
     while fully_wrapped(clause):
         clause = clause[1:-1].strip()
     return re.sub(r"\s+", "", clause)
+
+
+def _normalized_referential_rule(value: Any) -> str:
+    rule = str(value or "").strip().upper()
+    # InnoDB implements omitted NO ACTION and explicit RESTRICT identically.
+    # MySQL versions differ only in how information_schema renders the rule.
+    return "RESTRICT" if rule == "NO ACTION" else rule
 
 
 def _column_matches(row: dict[str, Any], expected: dict[str, Any]) -> bool:
@@ -979,14 +1026,16 @@ def _assess_dynamic_schema(
             tuple(
                 str(row.get("referenced_column_name") or "") for row in rows
             ),
-            str(rows[0].get("update_rule") or "").upper(),
-            str(rows[0].get("delete_rule") or "").upper(),
+            _normalized_referential_rule(rows[0].get("update_rule")),
+            _normalized_referential_rule(rows[0].get("delete_rule")),
         )
         consistent = all(
             str(row.get("table_name") or "") == observed[0]
             and str(row.get("referenced_table_name") or "") == observed[2]
-            and str(row.get("update_rule") or "").upper() == observed[4]
-            and str(row.get("delete_rule") or "").upper() == observed[5]
+            and _normalized_referential_rule(row.get("update_rule"))
+            == observed[4]
+            and _normalized_referential_rule(row.get("delete_rule"))
+            == observed[5]
             for row in rows
         )
         if (

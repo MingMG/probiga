@@ -10293,6 +10293,7 @@ rollback_deferred_database_release() {
 deploy_deferred_database_release() {
   local scheduler_pid
   local schema_result
+  local schema_status
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB
   test "$PREVIOUS_MAIN_ACTIVE_STATE" = active
   test "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1
@@ -10357,9 +10358,20 @@ deploy_deferred_database_release() {
   fence_deferred_paper_buy_writers
   CUTOVER_STEP=prepare_deferred_governance_base_schema
   CUTOVER_BASE_SCHEMA_STARTED=1
-  schema_result="$(run_prepared_python_tool \
+  if schema_result="$(run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_deferred_schema.py" \
-    --apply --writers-fenced)"
+    --apply --writers-fenced)"; then
+    schema_status=0
+  else
+    schema_status=$?
+    # The tool emits a deliberately redacted JSON failure payload.  Print it
+    # before ERR handling detaches the SSH transport so a failed production
+    # migration is diagnosable without exposing SQL or credentials.
+    printf '%s\n' "$schema_result" >&2
+    printf 'deploy_failure phase=cutover cutover_step=%s status=%s\n' \
+      "$CUTOVER_STEP" "$schema_status" >&2
+    return "$schema_status"
+  fi
   printf '%s\n' "$schema_result"
   printf '%s' "$schema_result" | "$BOOTSTRAP_PYTHON" -I -c \
     'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="DEFERRED_DB_BASE_SCHEMA" and p.get("schema_ready_without_triggers") is True and type(p.get("missing_trigger_count")) is int and p["missing_trigger_count"]>0 and p.get("database_triggers_installed") is False; raise SystemExit(0 if ok else 2)'
