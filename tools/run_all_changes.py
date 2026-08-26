@@ -3,6 +3,10 @@
 import subprocess
 import sys
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+PRODUCTION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def run(script, args=[]):
@@ -13,7 +17,7 @@ def run(script, args=[]):
     result = subprocess.run(cmd, capture_output=False)
     return result.returncode
 
-today = datetime.now().strftime("%Y-%m-%d")
+today = datetime.now(PRODUCTION_TIMEZONE).strftime("%Y-%m-%d")
 date = today
 if len(sys.argv) > 1:
     date = sys.argv[1]
