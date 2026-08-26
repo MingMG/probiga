@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=12">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=13">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -178,18 +178,21 @@
       <section class="view" id="view-candidates">
         <article class="panel">
           <div class="panel-head wrap">
-            <div><p>ACTIONABLE STRATEGY POOL</p><h3>可操作候选与等待触发</h3></div>
+            <div><p>STRATEGY-SELECTED STOCK POOL</p><h3>策略选股池</h3></div>
             <div class="filters">
               <label>历史日期<input type="date" id="candidateDate"></label>
               <label>策略<select id="strategyFilter"><option value="">全部策略</option></select></label>
-              <label>状态<select id="statusFilter"><option value="">默认策略池</option><option value="BUY_ZONE">允许买入区间</option><option value="WAIT_TRIGGER">等待触发</option><option value="PAPER_ONLY">仅模拟研究</option><option value="REJECTED">查看组合拒绝</option></select></label>
+              <label>状态<select id="statusFilter"><option value="">默认策略入选</option><option value="BUY_ZONE">允许买入区间</option><option value="WAIT_TRIGGER">等待触发</option><option value="PAPER_ONLY">仅模拟研究</option><option value="RESEARCH_ONLY">研究观察（不可执行）</option><option value="REJECTED">查看组合拒绝</option></select></label>
               <label>代码/中文/主题<input id="candidateSearch" placeholder="输入代码、中文名或主题"></label>
             </div>
           </div>
           <div class="candidate-toolbar">
-            <p class="note">这里只展示同一 V3 不可变批次中的可操作候选、等待触发和明确拒绝。买卖范围没有同批次校准证据时直接显示“未生成”，不再拼接旧推荐表。</p>
+            <p class="note">默认优先展示同一 V3 不可变批次里的允许买入区间、等待触发和模拟目标；没有这些分层时才回看策略排名中的研究观察，不混入未被策略选中的全市场样本。研究观察与组合拒绝也可单独筛选。</p>
             <span class="badge" id="candidateSummary">读取候选中</span>
           </div>
+          <div id="candidateHistoryNotice" class="candidate-history-notice" role="status" hidden></div>
+          <div id="candidateResearchNotice" class="candidate-history-notice" role="status" hidden></div>
+          <div id="candidatePoolStats" class="candidate-pool-stats" aria-label="策略池汇总"><span><b>—</b>研究候选</span><span><b>—</b>等待触发</span><span><b>—</b>研究目标（不可直接下单）</span><span><b>—</b>明确拒绝</span></div>
           <div id="candidateCards" class="candidate-list" aria-live="polite"></div>
           <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>买入范围</th><th>卖出范围</th><th>突发退出</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
           <div class="candidate-pager" id="candidatePager"><button type="button" id="candidatePrev">上一页</button><span id="candidatePageStatus">第 1 / 1 页</span><button type="button" id="candidateNext">下一页</button></div>
@@ -388,6 +391,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=28"></script>
+  <script src="/static/js/trading-v3.js?v=29"></script>
 </body>
 </html>
