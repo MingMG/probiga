@@ -86,6 +86,10 @@ from server.common.scheduler_tasks import (
     privileged_migrate_scheduler_task_columns,
     validate_scheduler_task_runtime_schema,
 )
+from server.common.scheduler_task_history_schema import (
+    migrate_scheduler_task_history,
+    validate_scheduler_task_history_schema,
+)
 from server.common.screener_schema import (
     privileged_migrate_screener_tables,
     validate_screener_runtime,
@@ -111,6 +115,7 @@ BUNDLE_CONTRACT_SCHEMA = "probiga.production-runtime-schema-bundle.v1"
 
 _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("scheduler_tasks", privileged_migrate_scheduler_task_columns),
+    ("scheduler_task_history", migrate_scheduler_task_history),
     ("auth", privileged_migrate_auth_schema),
     ("ai_bridge", privileged_migrate_ai_bridge_schema),
     ("analysis_output", migrate_analysis_output_schema),
@@ -144,6 +149,7 @@ _SEEDS: tuple[tuple[str, SchemaCallable], ...] = (
 
 _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("scheduler_tasks", validate_scheduler_task_runtime_schema),
+    ("scheduler_task_history", validate_scheduler_task_history_schema),
     ("auth", validate_auth_runtime_schema),
     ("ai_bridge", validate_ai_bridge_runtime_schema),
     ("analysis_output", validate_analysis_output_schema),

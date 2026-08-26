@@ -4,7 +4,7 @@ from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "171810752503bfeba9a0ff8fb52a23ff788289858088b807a6a0469d754186ff"
+    "7b4e2b261e0a8b2ad0c07c6c536574b4abc64022f251f2c104190009d0c36c3e"
 )
 
 
@@ -18,6 +18,7 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
     assert set(seed_names) <= set(migration_names)
     assert {
         "scheduler_tasks",
+        "scheduler_task_history",
         "auth",
         "ai_bridge",
         "versioned_strategy",

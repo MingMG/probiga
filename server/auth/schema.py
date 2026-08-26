@@ -292,6 +292,30 @@ def validate_auth_runtime_schema(engine: Engine) -> dict[str, object]:
 def privileged_migrate_auth_schema(engine: Engine) -> dict[str, object]:
     """Create and seed authentication storage in a fenced release window."""
     metadata.create_all(engine, checkfirst=True)
+    if engine.dialect.name == "mysql":
+        # Older installations created these tables with the database default
+        # ``utf8mb4_general_ci`` collation.  Runtime authentication validates
+        # the exact physical contract and therefore correctly fails closed on
+        # that legacy shape.  ``create_all(checkfirst=True)`` never repairs an
+        # existing table, so perform the conversion in the privileged release
+        # window instead of leaving every login request permanently at 503.
+        with engine.begin() as conn:
+            rows = conn.execute(text(
+                "SELECT TABLE_NAME,TABLE_COLLATION FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME LIKE 'st_auth_%'"
+            )).mappings().all()
+            collations = {
+                str(row.get("TABLE_NAME") or row.get("table_name") or ""):
+                str(row.get("TABLE_COLLATION") or row.get("table_collation") or "")
+                for row in rows
+            }
+            for table_name in _AUTH_COLUMN_CONTRACTS:
+                observed = collations.get(table_name)
+                if observed and observed != "utf8mb4_unicode_ci":
+                    conn.execute(text(
+                        f"ALTER TABLE `{table_name}` CONVERT TO CHARACTER SET "
+                        "utf8mb4 COLLATE utf8mb4_unicode_ci"
+                    ))
     now = _utcnow()
     try:
         with engine.begin() as conn:
