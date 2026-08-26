@@ -7,6 +7,9 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from server.common.scheduler_authority import (
+    DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
+)
 from tools import trading_v3_fourth_layer_readiness as readiness
 from tools import verify_trading_v3_production as production_verifier
 
@@ -443,7 +446,7 @@ def test_deferred_paper_buy_writer_truth_requires_two_unique_disabled_tasks():
     rows = [
         {"task_type": task_type, "enabled": 0}
         for task_type in sorted(
-            production_verifier._DEFERRED_PAPER_BUY_TASK_TYPES
+            DEFERRED_PAPER_BUY_WRITER_TASK_TYPES
         )
     ]
     assert (
@@ -519,7 +522,7 @@ def test_real_trading_closed_only_in_deferred_mode_requires_paper_buy_fence(
     task_rows = [
         {"task_type": task_type, "enabled": 0}
         for task_type in sorted(
-            production_verifier._DEFERRED_PAPER_BUY_TASK_TYPES
+            DEFERRED_PAPER_BUY_WRITER_TASK_TYPES
         )
     ]
 

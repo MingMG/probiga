@@ -16,6 +16,16 @@ LAYER4_WRITER_TASK_TYPES = (
     "trading_v3_continuous_calibration",
 )
 
+DEFERRED_PAPER_BUY_WRITER_TASK_TYPES = (
+    "trading_v3_close_decision",
+    "trading_v3_premarket_review",
+)
+
+DEFERRED_RELEASE_WRITER_TASK_TYPES = (
+    *LAYER4_WRITER_TASK_TYPES,
+    *DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
+)
+
 
 def scheduler_authority_contract() -> dict[str, object]:
     """Return the serializable production authority contract."""
@@ -30,6 +40,8 @@ def scheduler_authority_contract() -> dict[str, object]:
 
 
 __all__ = [
+    "DEFERRED_PAPER_BUY_WRITER_TASK_TYPES",
+    "DEFERRED_RELEASE_WRITER_TASK_TYPES",
     "LAYER4_WRITER_TASK_TYPES",
     "PRODUCTION_EMBEDDED_SCHEDULER_ENABLED",
     "PRODUCTION_SCHEDULER_MODE",

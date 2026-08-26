@@ -10,7 +10,11 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from server.common import trading_v3_maintenance as maintenance_lock
-from server.common.scheduler_authority import LAYER4_WRITER_TASK_TYPES
+from server.common.scheduler_authority import (
+    DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
+    DEFERRED_RELEASE_WRITER_TASK_TYPES,
+    LAYER4_WRITER_TASK_TYPES,
+)
 from server.trading_v3 import (
     counterfactual_worker,
     decision_worker,
@@ -18,6 +22,7 @@ from server.trading_v3 import (
 )
 from tools import add_trading_v3_tasks as task_deployment
 from tools import trading_v3_layer4_maintenance as maintenance_cli
+from tools import verify_trading_v3_production as production_verifier
 
 
 class _Engine:
@@ -75,6 +80,92 @@ def test_fence_only_is_atomic_disable_without_upsert_or_schema_changes(
         "tasks": [],
     }
     assert engine.disposed is True
+
+
+def test_deferred_release_fence_only_disables_every_required_writer(
+    monkeypatch,
+    capsys,
+) -> None:
+    engine = _Engine()
+    calls: list[str] = []
+    monkeypatch.setattr(task_deployment, "load_project_env", lambda: None)
+    monkeypatch.setattr(task_deployment, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        task_deployment,
+        "enforce_deferred_release_writer_fence_atomically",
+        lambda _engine: calls.append("disable-deferred-release")
+        or len(DEFERRED_RELEASE_WRITER_TASK_TYPES),
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "enforce_layer4_writer_fence_atomically",
+        lambda *_args: pytest.fail("deferred release fence must be one transaction"),
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "upsert_scheduler_task",
+        lambda *_args, **_kwargs: pytest.fail("isolated fence must not upsert"),
+    )
+
+    assert task_deployment.main(["--deferred-release-fence-only"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == ["disable-deferred-release"]
+    assert payload["mode"] == "deferred-release-fence-only"
+    assert payload["fenced_row_count"] == len(DEFERRED_RELEASE_WRITER_TASK_TYPES)
+    assert set(payload["fenced_task_types"]) == set(
+        DEFERRED_RELEASE_WRITER_TASK_TYPES
+    )
+    assert payload["layer4_writers_enabled"] is False
+    assert payload["paper_buy_writers_enabled"] is False
+    assert payload["tasks"] == []
+    assert engine.disposed is True
+
+
+def test_deferred_release_fence_satisfies_real_trading_closed_task_contract() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                task_type TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL
+            )
+        """))
+        connection.execute(
+            text("""
+                INSERT INTO st_scheduled_tasks (id, task_type, enabled)
+                VALUES (:id, :task_type, 1)
+            """),
+            [
+                {"id": index, "task_type": task_type}
+                for index, task_type in enumerate(
+                    DEFERRED_RELEASE_WRITER_TASK_TYPES,
+                    start=1,
+                )
+            ],
+        )
+
+    assert task_deployment.enforce_deferred_release_writer_fence_atomically(
+        engine
+    ) == len(DEFERRED_RELEASE_WRITER_TASK_TYPES)
+    with engine.connect() as connection:
+        rows = [
+            dict(row)
+            for row in connection.execute(text("""
+                SELECT task_type, enabled
+                FROM st_scheduled_tasks
+                WHERE task_type IN (
+                    'trading_v3_close_decision',
+                    'trading_v3_premarket_review'
+                )
+                ORDER BY task_type
+            """)).mappings()
+        ]
+    assert {row["task_type"] for row in rows} == set(
+        DEFERRED_PAPER_BUY_WRITER_TASK_TYPES
+    )
+    assert production_verifier._deferred_paper_buy_writer_rows_valid(rows)
+    engine.dispose()
 
 
 def test_fence_only_rejects_drain_options_before_database_access(

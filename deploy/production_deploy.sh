@@ -8010,25 +8010,38 @@ point_static_release_to_checkout() {
   sudo rmdir "$link_build"
   test -L "$STATIC_RELEASE_LINK"
   test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$checkout_root"
+  # Nginx may retain an open-file-cache entry for the stable symlink path even
+  # after the link is atomically replaced.  Reload workers without dropping
+  # connections so every subsequent exact-byte probe resolves the new tree.
+  /usr/sbin/nginx -t
+  systemctl reload nginx
+  systemctl is-active --quiet nginx
 }
 assert_nginx_static_matches_checkout() {
   local checkout_root="${1:-$REPOSITORY_ROOT}"
   local asset
+  local attempt
+  local matched
   local response
   test -L "$STATIC_RELEASE_LINK" || return 1
   test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$checkout_root" || \
     return 1
   for asset in js/app.js css/style.css; do
     response="$(mktemp)" || return 1
-    if ! curl --fail --silent --show-error \
-      -H 'Cache-Control: no-cache' \
-      "http://127.0.0.1/static/$asset" > "$response"; then
+    matched=0
+    for attempt in $(seq 1 15); do
+      if curl --fail --silent --show-error \
+          -H 'Cache-Control: no-cache' \
+          "http://127.0.0.1/static/$asset" > "$response" && \
+        cmp --silent "$checkout_root/server/static/$asset" "$response"; then
+        matched=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$matched" -ne 1 ]; then
       rm -f "$response" || true
-      return 1
-    fi
-    if ! cmp --silent "$checkout_root/server/static/$asset" "$response"; then
-      rm -f "$response" || true
-      echo "Nginx served stale static asset: $asset" >&2
+      echo "Nginx did not serve the expected static asset after reload: $asset" >&2
       return 1
     fi
     rm -f "$response" || return 1
@@ -8340,7 +8353,7 @@ CUTOVER_STARTED=0
 DEFERRED_DB_CUTOVER_STARTED=0
 CUTOVER_BASE_SCHEMA_STARTED=0
 CUTOVER_BASE_SCHEMA_APPLIED=0
-DEFERRED_PAPER_WRITER_FENCE_STARTED=0
+DEFERRED_RELEASE_WRITER_FENCE_STARTED=0
 DEFERRED_SCHEDULER_EXPECTED_SHA=""
 DEFERRED_SCHEDULER_CODE_ROOT=""
 CUTOVER_STEP=preparation
@@ -10048,15 +10061,16 @@ run_database_boundary_bootstrap() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     "$BOOTSTRAP_PYTHON" -I "$entrypoint" "$action"
 }
-fence_deferred_paper_buy_writers() {
+fence_deferred_release_writers() {
   local writer_fence_result
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
   writer_fence_result="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" --fence-only)" || \
+    "$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" \
+    --deferred-release-fence-only)" || \
     return 1
   printf '%s\n' "$writer_fence_result"
   printf '%s' "$writer_fence_result" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="fence-only" and p.get("writer_fence_active") is True and p.get("layer4_writers_enabled") is False and type(p.get("fenced_row_count")) is int and p["fenced_row_count"]>=0 and p.get("tasks")==[]; raise SystemExit(0 if ok else 2)'
+    'import json,sys; p=json.load(sys.stdin); t=p.get("fenced_task_types") if isinstance(p,dict) else None; expected={"trading_v3_counterfactual_audit","trading_v3_continuous_calibration","trading_v3_close_decision","trading_v3_premarket_review"}; ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="deferred-release-fence-only" and p.get("writer_fence_active") is True and p.get("layer4_writers_enabled") is False and p.get("paper_buy_writers_enabled") is False and p.get("fenced_row_count")==4 and isinstance(t,list) and len(t)==4 and set(t)==expected and p.get("tasks")==[]; raise SystemExit(0 if ok else 2)'
 }
 assert_deferred_database_runtime() {
   local governance_response
@@ -10142,6 +10156,7 @@ valid = (
 raise SystemExit(0 if valid else 2)
 PY
   then
+    echo "deferred_runtime_gate_failed gate=health_contract" >&2
     cat "$health_response" >&2
     rm -f -- "$health_response" "$governance_response" "$admin_header"
     return 1
@@ -10180,6 +10195,7 @@ valid = (
 raise SystemExit(0 if valid else 2)
 PY
   then
+    echo "deferred_runtime_gate_failed gate=governance_contract" >&2
     cat "$governance_response" >&2
     rm -f -- "$health_response" "$governance_response" "$admin_header"
     return 1
@@ -10188,18 +10204,36 @@ PY
     return 1
   curl --fail --silent --show-error --retry 3 --retry-all-errors \
     --retry-delay 1 --retry-connrefused \
-    http://127.0.0.1/api/health/runtime >/dev/null || return 1
+    http://127.0.0.1/api/health/runtime >/dev/null || {
+      echo "deferred_runtime_gate_failed gate=runtime_health" >&2
+      return 1
+    }
   run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_deferred_schema.py" \
-    --verify >/dev/null || return 1
+    --verify >/dev/null || {
+      echo "deferred_runtime_gate_failed gate=deferred_schema_verify" >&2
+      return 1
+    }
   run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
-    --deferred-disable >/dev/null || return 1
-  fence_deferred_paper_buy_writers >/dev/null || return 1
+    --deferred-disable >/dev/null || {
+      echo "deferred_runtime_gate_failed gate=governance_task_disabled" >&2
+      return 1
+    }
+  fence_deferred_release_writers >/dev/null || {
+    echo "deferred_runtime_gate_failed gate=deferred_writer_fence" >&2
+    return 1
+  }
   run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/verify_trading_v3_production.py" \
-    --real-trading-closed-only >/dev/null || return 1
-  assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || return 1
+    --real-trading-closed-only >/dev/null || {
+      echo "deferred_runtime_gate_failed gate=real_trading_closed" >&2
+      return 1
+    }
+  assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || {
+    echo "deferred_runtime_gate_failed gate=static_release_identity" >&2
+    return 1
+  }
   return 0
 }
 rollback_deferred_database_release() {
@@ -10220,8 +10254,8 @@ rollback_deferred_database_release() {
       rollback_failed=1
     fi
   fi
-  if [ "$DEFERRED_PAPER_WRITER_FENCE_STARTED" -eq 1 ] && \
-    ! fence_deferred_paper_buy_writers >/dev/null; then
+  if [ "$DEFERRED_RELEASE_WRITER_FENCE_STARTED" -eq 1 ] && \
+    ! fence_deferred_release_writers >/dev/null; then
     scheduler_safe_to_start=0
     rollback_failed=1
   fi
@@ -10354,9 +10388,9 @@ deploy_deferred_database_release() {
     "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
     --deferred-disable --snapshot-file "$GOVERNANCE_TASK_OLD_SOURCE"
   GOVERNANCE_TASK_TOUCHED=1
-  CUTOVER_STEP=fence_deferred_paper_buy_writers
-  DEFERRED_PAPER_WRITER_FENCE_STARTED=1
-  fence_deferred_paper_buy_writers
+  CUTOVER_STEP=fence_deferred_release_writers
+  DEFERRED_RELEASE_WRITER_FENCE_STARTED=1
+  fence_deferred_release_writers
   CUTOVER_STEP=prepare_deferred_governance_base_schema
   CUTOVER_BASE_SCHEMA_STARTED=1
   if schema_result="$(run_prepared_python_tool \

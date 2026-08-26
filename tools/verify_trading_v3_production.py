@@ -22,6 +22,9 @@ if str(ROOT) not in sys.path:
 
 from server.common.kline_data import get_kline_engine
 from server.common.adata_release import validate_adata_release_source
+from server.common.scheduler_authority import (
+    DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
+)
 from server.common.strategy_governance_mode import (
     StrategyGovernanceMode,
     get_strategy_governance_mode,
@@ -282,12 +285,6 @@ _EXPECTED_REAL_TRADING_GUARDS = {
         "BEFORE", "UPDATE", "st_execution_plan_v3", "real_order_allowed"
     ),
 }
-_DEFERRED_PAPER_BUY_TASK_TYPES = frozenset({
-    "trading_v3_close_decision",
-    "trading_v3_premarket_review",
-})
-
-
 def _real_trading_guard_rows_valid(rows: Any) -> bool:
     """Require the exact trigger surface and a fail-closed SIGNAL body."""
 
@@ -337,7 +334,7 @@ def _deferred_paper_buy_writer_rows_valid(rows: Any) -> bool:
         if not task_type or task_type in by_type:
             return False
         by_type[task_type] = raw
-    return set(by_type) == set(_DEFERRED_PAPER_BUY_TASK_TYPES) and all(
+    return set(by_type) == set(DEFERRED_PAPER_BUY_WRITER_TASK_TYPES) and all(
         int(row.get("enabled") or 0) == 0 for row in by_type.values()
     )
 

@@ -2191,6 +2191,64 @@ fi
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_nginx_static_identity_retries_until_exact_release_bytes(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable static identity test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    helper = _function(
+        "assert_nginx_static_matches_checkout",
+        _shell_function_bodies(source)["assert_nginx_static_matches_checkout"],
+    )
+    root = tmp_path.as_posix()
+    harness = f"""
+set -Eeuo pipefail
+TEST_ROOT={root!r}
+CHECKOUT="$TEST_ROOT/checkout"
+STATIC_RELEASE_LINK="$TEST_ROOT/current"
+COUNT_FILE="$TEST_ROOT/app-count"
+mkdir -p "$CHECKOUT/server/static/js" "$CHECKOUT/server/static/css"
+printf js > "$CHECKOUT/server/static/js/app.js"
+printf css > "$CHECKOUT/server/static/css/style.css"
+printf 0 > "$COUNT_FILE"
+test() {{
+  if [ "$#" -eq 2 ] && [ "$1" = -L ]; then return 0; fi
+  builtin test "$@"
+}}
+readlink() {{ printf '%s\n' "$CHECKOUT"; }}
+sleep() {{ :; }}
+curl() {{
+  case "${{@: -1}}" in
+    */js/app.js)
+      count="$(cat "$COUNT_FILE")"
+      count=$((count + 1))
+      printf '%s' "$count" > "$COUNT_FILE"
+      if [ "$count" -lt 3 ]; then printf stale; else printf js; fi
+      ;;
+    */css/style.css) printf css ;;
+    *) return 90 ;;
+  esac
+}}
+{helper}
+assert_nginx_static_matches_checkout "$CHECKOUT"
+test "$(cat "$COUNT_FILE")" = 3
+"""
+    harness_path = tmp_path / "static-identity-retry-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_closed_transport_enters_and_completes_failure_handler(
     tmp_path: Path,
 ) -> None:

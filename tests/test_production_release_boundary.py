@@ -5039,6 +5039,9 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     bodies = _shell_function_bodies(deploy)
     deferred = bodies["deploy_deferred_database_release"]
     auth_header_writer = bodies["write_admin_auth_header_file"]
+    static_cutover = bodies["point_static_release_to_checkout"]
+    static_verifier = bodies["assert_nginx_static_matches_checkout"]
+    deferred_writer_fence = bodies["fence_deferred_release_writers"]
     verifier = deploy[
         deploy.index("assert_deferred_database_runtime() {"):
         deploy.index("rollback_deferred_database_release() {")
@@ -5054,6 +5057,11 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert "chown root:root" in auth_header_writer
     assert "chmod 0600" in auth_header_writer
     assert "print(" not in auth_header_writer
+    assert "/usr/sbin/nginx -t" in static_cutover
+    assert "systemctl reload nginx" in static_cutover
+    assert "systemctl is-active --quiet nginx" in static_cutover
+    assert "for attempt in $(seq 1 15)" in static_verifier
+    assert "cmp --silent" in static_verifier
     for absent_path in (
         "/etc/probiga/mysql-trigger-admin.ini",
         "/etc/probiga/mysql-migrator.ini",
@@ -5061,7 +5069,8 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     ):
         assert absent_path in deploy
     assert "--deferred-disable --snapshot-file" in deferred
-    assert "fence_deferred_paper_buy_writers" in deferred
+    assert "fence_deferred_release_writers" in deferred
+    assert "--deferred-release-fence-only" in deferred_writer_fence
     assert "systemctl stop probiga-scheduler" in deferred
     assert 'systemctl stop "$MAIN_SERVICE"' in deferred
     assert deferred.index('systemctl stop "$MAIN_SERVICE"') < deferred.index(
@@ -5081,7 +5090,7 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert deferred.index("--deferred-disable --snapshot-file") < deferred.index(
         "--apply --writers-fenced"
     )
-    assert deferred.index("fence_deferred_paper_buy_writers") < deferred.index(
+    assert deferred.index("fence_deferred_release_writers") < deferred.index(
         "--apply --writers-fenced"
     )
     assert deferred.index("--apply --writers-fenced") < (
@@ -5094,7 +5103,7 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert "PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB" in verifier
     assert "PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true" in verifier
     assert '--header @"$admin_header"' in verifier
-    assert "fence_deferred_paper_buy_writers" in verifier
+    assert "fence_deferred_release_writers" in verifier
     assert 'payload.get("status") == "degraded"' in verifier
     assert 'payload.get("base_schema_ready") is True' in verifier
     assert 'payload.get("activation_enabled") is False' in verifier
@@ -5106,13 +5115,24 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert "verify_trading_v3_production.py" in verifier
     assert "--real-trading-closed-only" in verifier
     assert "assert_nginx_static_matches_checkout" in verifier
+    for gate in (
+        "health_contract",
+        "governance_contract",
+        "runtime_health",
+        "deferred_schema_verify",
+        "governance_task_disabled",
+        "deferred_writer_fence",
+        "real_trading_closed",
+        "static_release_identity",
+    ):
+        assert f"deferred_runtime_gate_failed gate={gate}" in verifier
 
     assert "ROLLED_BACK_DEFERRED_SCHEMA_RETAINED" in rollback
     assert "ROLLED_BACK_GOVERNANCE_TASK_DISABLED" in rollback
     assert "CUTOVER_BASE_SCHEMA_STARTED" in rollback
     assert "scheduler_safe_to_start" in rollback
-    assert "DEFERRED_PAPER_WRITER_FENCE_STARTED" in rollback
-    assert "fence_deferred_paper_buy_writers" in rollback
+    assert "DEFERRED_RELEASE_WRITER_FENCE_STARTED" in rollback
+    assert "fence_deferred_release_writers" in rollback
     assert "--deferred-disable" in rollback
     assert 'point_static_release_to_checkout "$PREVIOUS_CODE_ROOT"' in rollback
     assert "--restore-snapshot" not in rollback

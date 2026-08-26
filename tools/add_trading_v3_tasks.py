@@ -13,7 +13,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.scheduler_authority import LAYER4_WRITER_TASK_TYPES
+from server.common.scheduler_authority import (
+    DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
+    DEFERRED_RELEASE_WRITER_TASK_TYPES,
+    LAYER4_WRITER_TASK_TYPES,
+)
 from server.common.scheduler_tasks import (
     read_fresh_scheduler_writers,
     set_scheduler_tasks_enabled_atomically,
@@ -150,6 +154,23 @@ def enforce_layer4_writer_fence_atomically(engine) -> int:
     )
 
 
+def enforce_deferred_release_writer_fence_atomically(engine) -> int:
+    """Disable every deferred-release writer in one exact transaction."""
+
+    task_types = tuple(DEFERRED_RELEASE_WRITER_TASK_TYPES)
+    expected_count = len(LAYER4_WRITER_TASK_TYPES) + len(
+        DEFERRED_PAPER_BUY_WRITER_TASK_TYPES
+    )
+    if len(task_types) != expected_count or len(set(task_types)) != expected_count:
+        raise RuntimeError("deferred release writer contract must be disjoint")
+    return set_scheduler_tasks_enabled_atomically(
+        engine,
+        task_types,
+        enabled=False,
+        expected_row_count=expected_count,
+    )
+
+
 def wait_for_scheduler_writer_quiescence(
     engine,
     *,
@@ -199,6 +220,14 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     mode.add_argument(
+        "--deferred-release-fence-only",
+        action="store_true",
+        help=(
+            "atomically disable existing Layer-4 and paper-buy writer rows "
+            "for a deferred governance release; do not upsert or activate"
+        ),
+    )
+    mode.add_argument(
         "--activate-layer4",
         action="store_true",
         help=(
@@ -233,13 +262,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     activate_layer4 = bool(args.activate_layer4)
     fence_only = bool(args.fence_only)
-    if fence_only and (
+    deferred_release_fence_only = bool(args.deferred_release_fence_only)
+    isolated_fence_only = fence_only or deferred_release_fence_only
+    if isolated_fence_only and (
         args.require_no_live_scheduler_writers
         or args.writer_drain_timeout_seconds != 0.0
         or args.writer_drain_poll_seconds != 5.0
     ):
         _parser().error(
-            "--fence-only cannot be combined with writer-drain options"
+            "isolated fence modes cannot be combined with writer-drain options"
         )
     load_project_env()
     engine = create_tool_engine()
@@ -259,19 +290,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Fence every matching row before validation or definition upserts.
         # This also neutralizes duplicate legacy rows and makes an accidental
         # early activation request fail safe instead of leaving old writers on.
-        fenced_row_count = enforce_layer4_writer_fence_atomically(engine)
-        if fence_only:
+        if deferred_release_fence_only:
+            fenced_row_count = enforce_deferred_release_writer_fence_atomically(engine)
+        else:
+            fenced_row_count = enforce_layer4_writer_fence_atomically(engine)
+        if isolated_fence_only:
+            payload = {
+                "status": "ok",
+                "mode": (
+                    "deferred-release-fence-only"
+                    if deferred_release_fence_only
+                    else "fence-only"
+                ),
+                "writer_fence_active": True,
+                "fenced_row_count": fenced_row_count,
+                "layer4_writers_enabled": False,
+                "writer_quiescence": writer_quiescence,
+                "migration_readiness": preconditions,
+                "tasks": [],
+            }
+            if deferred_release_fence_only:
+                payload.update({
+                    "paper_buy_writers_enabled": False,
+                    "fenced_task_types": list(DEFERRED_RELEASE_WRITER_TASK_TYPES),
+                })
             print(json.dumps(
-                {
-                    "status": "ok",
-                    "mode": "fence-only",
-                    "writer_fence_active": True,
-                    "fenced_row_count": fenced_row_count,
-                    "layer4_writers_enabled": False,
-                    "writer_quiescence": writer_quiescence,
-                    "migration_readiness": preconditions,
-                    "tasks": [],
-                },
+                payload,
                 ensure_ascii=False,
                 indent=2,
                 default=str,
