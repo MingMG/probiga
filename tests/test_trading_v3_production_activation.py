@@ -5,6 +5,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from tools import trading_v3_fourth_layer_readiness as readiness
 from tools import verify_trading_v3_production as production_verifier
@@ -436,6 +437,108 @@ def test_real_trading_guard_truth_rejects_query_error():
     assert production_verifier._real_trading_guard_rows_valid([
         {"query_error": "permission denied"}
     ]) is False
+
+
+def test_deferred_paper_buy_writer_truth_requires_two_unique_disabled_tasks():
+    rows = [
+        {"task_type": task_type, "enabled": 0}
+        for task_type in sorted(
+            production_verifier._DEFERRED_PAPER_BUY_TASK_TYPES
+        )
+    ]
+    assert (
+        production_verifier._deferred_paper_buy_writer_rows_valid(rows) is True
+    )
+    assert production_verifier._deferred_paper_buy_writer_rows_valid(
+        [{**rows[0], "enabled": 1}, rows[1]]
+    ) is False
+    assert production_verifier._deferred_paper_buy_writer_rows_valid(
+        [rows[0], rows[0]]
+    ) is False
+
+
+def test_real_trading_closed_only_requires_zero_flags_and_all_four_guards(
+    monkeypatch, capsys,
+):
+    class Engine:
+        disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    engine = Engine()
+    monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "REQUIRED")
+    rows = [
+        {
+            "TRIGGER_NAME": name,
+            "ACTION_TIMING": timing,
+            "EVENT_MANIPULATION": event,
+            "EVENT_OBJECT_TABLE": table_name,
+            "ACTION_STATEMENT": (
+                f"BEGIN IF COALESCE(NEW.{column}, 0) <> 0 THEN "
+                "SIGNAL SQLSTATE '45000'; END IF; END"
+            ),
+        }
+        for name, (timing, event, table_name, column) in
+        production_verifier._EXPECTED_REAL_TRADING_GUARDS.items()
+    ]
+    monkeypatch.setattr(production_verifier, "load_project_env", lambda: None)
+    monkeypatch.setattr(production_verifier, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        production_verifier, "_safe_one", lambda *_args: {"unsafe_count": 0}
+    )
+    monkeypatch.setattr(production_verifier, "_safe_all", lambda *_args: rows)
+
+    assert production_verifier.verify_real_trading_closed_only() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["real_trading_closed"] is True
+    assert payload["account_guard_count"] == 4
+    assert payload["automatic_real_order_submission"] is False
+    assert engine.disposed is True
+
+
+def test_real_trading_closed_only_in_deferred_mode_requires_paper_buy_fence(
+    monkeypatch, capsys,
+):
+    engine = MagicMock()
+    guard_rows = [
+        {
+            "TRIGGER_NAME": name,
+            "ACTION_TIMING": timing,
+            "EVENT_MANIPULATION": event,
+            "EVENT_OBJECT_TABLE": table_name,
+            "ACTION_STATEMENT": (
+                f"BEGIN IF COALESCE(NEW.{column}, 0) <> 0 THEN "
+                "SIGNAL SQLSTATE '45000'; END IF; END"
+            ),
+        }
+        for name, (timing, event, table_name, column) in
+        production_verifier._EXPECTED_REAL_TRADING_GUARDS.items()
+    ]
+    task_rows = [
+        {"task_type": task_type, "enabled": 0}
+        for task_type in sorted(
+            production_verifier._DEFERRED_PAPER_BUY_TASK_TYPES
+        )
+    ]
+
+    def safe_all(_engine, statement):
+        return task_rows if "st_scheduled_tasks" in statement else guard_rows
+
+    monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "DEFERRED_DB")
+    monkeypatch.setattr(production_verifier, "load_project_env", lambda: None)
+    monkeypatch.setattr(production_verifier, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        production_verifier, "_safe_one", lambda *_args: {"unsafe_count": 0}
+    )
+    monkeypatch.setattr(production_verifier, "_safe_all", safe_all)
+
+    assert production_verifier.verify_real_trading_closed_only() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["paper_buy_writers_checked"] is True
+    assert payload["paper_buy_writers_closed"] is True
+    engine.dispose.assert_called_once()
 
 
 def test_latest_shadow_outcome_requires_every_bar_to_be_qmt_attested():

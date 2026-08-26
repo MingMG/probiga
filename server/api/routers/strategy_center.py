@@ -71,6 +71,10 @@ from server.engine.strategy_challenger_factory import (
     review_strategy_challenger,
     submit_strategy_challenger_evidence,
 )
+from server.common.strategy_governance_mode import (
+    strategy_governance_base_schema_declared_ready,
+    strategy_governance_database_deferred,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -462,6 +466,52 @@ def _bounded_governance_overview(
     }
 
 
+def _deferred_database_governance_overview(
+    trade_date: str,
+) -> dict[str, Any]:
+    """Return a fixed cash-only view without touching governance storage."""
+
+    return {
+        "status": "degraded",
+        "strategy_governance_mode": "DEFERRED_DB",
+        "base_schema_ready": strategy_governance_base_schema_declared_ready(),
+        "schema_ready": False,
+        "governance_ready": False,
+        "activation_enabled": False,
+        "result_mode": "CANONICAL_UNAVAILABLE",
+        "is_canonical": False,
+        "trade_date": str(trade_date or "")[:10],
+        "authoritative_trade_date": "",
+        "last_canonical": {},
+        "last_canonical_summary": {},
+        "input_ready": False,
+        "input_reason": "治理数据库迁移待完成，当前保持100%现金",
+        "reason_code": "GOVERNANCE_DATABASE_DEFERRED",
+        "blocking_stage": "DATABASE_MIGRATION",
+        "statistical_funding_eligible": False,
+        "new_buy_allowed": False,
+        "summary": {
+            "strategy_count": 0,
+            "combination_count": 0,
+            "tradable_count": 0,
+            "cash_weight_pct": 100.0,
+        },
+        "strategies": [],
+        "combinations": [],
+        "pools": {"observation": [], "confirmation": [], "tradable": []},
+        "allocations": [{
+            "target_type": "CASH",
+            "target_key": "cash",
+            "name": "现金",
+            "simulated_weight_pct": 100.0,
+            "reason": "治理数据库迁移待完成，禁止新增买入",
+            "real_order_authority": False,
+        }],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 def _canonical_funding_entity(
     *, trade_date: str, run_uid: str, canonical_result_hash: str,
     entity_type: str, entity_key: str,
@@ -758,6 +808,8 @@ def strategy_center_configuration():
 def strategy_center_governance(trade_date: str = Query(default="")):
     """Return a bounded overview of the verified immutable canonical result."""
 
+    if strategy_governance_database_deferred():
+        return _deferred_database_governance_overview(trade_date)
     try:
         return _bounded_governance_overview(
             load_canonical_governance_snapshot(trade_date=trade_date)

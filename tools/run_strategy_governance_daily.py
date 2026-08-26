@@ -26,6 +26,9 @@ from server.engine.strategy_governance_orchestrator import (
     orchestrate_strategy_governance,
 )
 from server.common.governance_safety import real_order_authority_is_closed
+from server.common.strategy_governance_mode import (
+    strategy_governance_database_deferred,
+)
 
 
 def _load_project_env() -> None:
@@ -80,6 +83,31 @@ def _blocked(
         )
     )
     return 2
+
+
+def _deferred_database_blocked_output() -> dict:
+    """Return the fixed cash-only result for the explicit deferred DB mode."""
+
+    return {
+        "status": "blocked",
+        "orchestration_status": NOT_READY,
+        "reason_code": "GOVERNANCE_DATABASE_DEFERRED",
+        "error_class": "NOT_READY",
+        "retryable": True,
+        "input_ready": False,
+        "reason": "策略治理数据库迁移尚未完成，治理任务已失败关闭",
+        "blocking_stage": "governance_database",
+        "target_trade_date": "",
+        "requested_trade_date": "",
+        "input_trade_date": "",
+        "allocations": [{
+            "target_type": "CASH",
+            "simulated_weight_pct": 100.0,
+            "real_order_authority": False,
+        }],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
 
 
 def _input_block_reason(
@@ -333,6 +361,12 @@ def main() -> int:
             print(f"invalid:{type(exc).__name__}", file=sys.stderr)
             return 2
     _load_project_env()
+    if strategy_governance_database_deferred():
+        output = _deferred_database_blocked_output()
+        process_exit = 2
+        validate_cli_result(output, process_exit)
+        print(json.dumps(output, ensure_ascii=False, default=str))
+        return process_exit
     requested_trade_date = str(args.trade_date or "").strip()
     engine = _create_tool_engine()
     try:

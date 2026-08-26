@@ -13,7 +13,7 @@ def test_strategy_governance_has_a_dedicated_navigation_page():
     assert "🏆 动态策略竞技场" in index
     assert "旧候选中心（研究）" not in index
     assert "style.css?v=44" in index
-    assert "app.js?v=112" in index
+    assert "app.js?v=113" in index
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():
@@ -354,3 +354,15 @@ def test_governance_history_shows_canonical_revision_state_in_chinese():
     assert "supersedes_run_uid" in script
     assert "run_revision, supersedes_run_uid" in engine
     assert "is_canonical, market_state" in engine
+
+
+def test_governance_ui_disables_mutations_during_deferred_database_mode():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    assert "governance.strategy_governance_mode || ''" in script
+    assert "governance.activation_enabled === false" in script
+    assert "authRole === 'ADMIN' && !governanceDeferred" in script
+    assert "数据库防篡改门禁待完成" in script
+    assert "基础表、字段、索引、初始化数据和版本标记已上线" in script
+    assert "governance.base_schema_ready === true" in script
+    assert "模拟资金保持 100% 现金" in script
+    assert "真实下单与新买入均关闭" in script

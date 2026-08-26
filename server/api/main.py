@@ -28,6 +28,10 @@ from server.api.scheduler_runtime import start_embedded_scheduler, stop_embedded
 from server.common.config import get_api_lifespan_config, get_api_observability_config
 from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
+from server.common.strategy_governance_mode import (
+    strategy_governance_database_deferred,
+    get_strategy_governance_mode,
+)
 from server.engine.strategy_execution_adapters import (
     bootstrap_strategy_execution_adapter_registry,
 )
@@ -121,6 +125,31 @@ def _desktop_runtimes_allowed() -> bool:
     return os.name == "nt"
 
 
+_STRATEGY_CENTER_API_ROOT = "/api/strategy-center"
+_STRATEGY_GOVERNANCE_OVERVIEW_PATH = (
+    f"{_STRATEGY_CENTER_API_ROOT}/governance"
+)
+_SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _deferred_governance_request_blocked(method: str, path: str) -> bool:
+    """Identify governance access that cannot run without its DB contract."""
+
+    normalized_method = str(method or "").upper()
+    normalized_path = str(path or "")
+    in_strategy_center = (
+        normalized_path == _STRATEGY_CENTER_API_ROOT
+        or normalized_path.startswith(f"{_STRATEGY_CENTER_API_ROOT}/")
+    )
+    if not in_strategy_center:
+        return False
+    if normalized_method not in _SAFE_HTTP_METHODS:
+        return True
+    return normalized_path.startswith(
+        f"{_STRATEGY_GOVERNANCE_OVERVIEW_PATH}/"
+    )
+
+
 def dispose_shared_engines() -> None:
     for label, dispose in (
         ("api", dispose_api_engine),
@@ -139,6 +168,9 @@ def dispose_shared_engines() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # Unknown mode values must stop startup before any worker or DB writer is
+    # allowed to run.
+    get_strategy_governance_mode()
     # Fail before starting any background worker if the production code-owned
     # adapter manifest is absent, unexpected, or does not match the release seal.
     bootstrap_strategy_execution_adapter_registry()
@@ -200,6 +232,33 @@ app.include_router(deploy.router, prefix="/api")
 app.include_router(market_radar.router, prefix="/api")
 app.include_router(trading_v2.router, prefix="/api")
 app.include_router(trading_v3.router, prefix="/api")
+
+
+@app.middleware("http")
+async def enforce_deferred_governance_boundary(
+    request: Request, call_next,
+):
+    if (
+        strategy_governance_database_deferred()
+        and _deferred_governance_request_blocked(
+            request.method, request.url.path,
+        )
+    ):
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "blocked",
+                "error": "governance_database_deferred",
+                "message": "治理数据库迁移待完成，当前接口暂不可用。",
+                "strategy_governance_mode": "DEFERRED_DB",
+                "schema_ready": False,
+                "governance_ready": False,
+                "activation_enabled": False,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            },
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")

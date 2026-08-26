@@ -21,6 +21,9 @@ from server.trading_v2.legacy_strategy_account_boundary import (
 )
 from server.trading_v2.oms import order_idempotency_key
 from server.trading_v2.position_monitor import _persist_exit_chain
+from server.common.strategy_governance_mode import (
+    strategy_governance_database_deferred,
+)
 
 from .config import load_v3_config
 from .decision_truth import (
@@ -88,6 +91,8 @@ def _canonical_governance_buy_receipt(
     stock-level paper plan plus the live lifecycle registry.
     """
 
+    if strategy_governance_database_deferred():
+        return None, "GOVERNANCE_DATABASE_DEFERRED"
     try:
         rows = connection.execute(
             text(

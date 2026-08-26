@@ -34,6 +34,9 @@ FUNDING_CHECKPOINT_BATCH_MAX_BYTES = 4 * 1024 * 1024
 FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 FUNDING_CHECKPOINT_AUDIT_MAX_BYTES = 128 * 1024
 FUNDING_CHECKPOINT_MIGRATION_KEY = "20260824_003_strategy_funding_checkpoint"
+FUNDING_CHECKPOINT_BASE_MIGRATION_KEY = (
+    "20260826_000_strategy_funding_checkpoint_base_schema"
+)
 _COLLATION = "utf8mb4_unicode_ci"
 _ENGINE = "InnoDB"
 
@@ -604,8 +607,33 @@ def _schema_contract_payload() -> dict[str, Any]:
                 "audit_max_bytes": FUNDING_CHECKPOINT_AUDIT_MAX_BYTES}}
 
 
+def _base_schema_contract_payload() -> dict[str, Any]:
+    return {
+        "schema": "probiga.strategy-funding-checkpoint-base-schema.v1",
+        "engine": _ENGINE,
+        "collation": _COLLATION,
+        "tables": _schema_jsonable(_TABLE_CONTRACTS),
+        "ddl_sha256": canonical_hash({
+            FUNDING_DAILY_FACT_TABLE_NAME: re.sub(
+                r"\s+", " ", funding_daily_fact_ddl_statement().strip()
+            ),
+            FUNDING_CHECKPOINT_TABLE_NAME: re.sub(
+                r"\s+", " ", funding_checkpoint_ddl_statement().strip()
+            ),
+        }),
+        "trigger_installation_asserted": False,
+        "automatic_real_order_submission": False,
+    }
+
+
 FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH = canonical_hash(_schema_contract_payload())
 FUNDING_CHECKPOINT_MIGRATION_HASH = FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH
+FUNDING_CHECKPOINT_BASE_SCHEMA_CONTRACT_HASH = canonical_hash(
+    _base_schema_contract_payload()
+)
+FUNDING_CHECKPOINT_BASE_MIGRATION_HASH = (
+    FUNDING_CHECKPOINT_BASE_SCHEMA_CONTRACT_HASH
+)
 
 
 def _rows(connection, sql: str) -> list[dict[str, Any]]:
@@ -851,10 +879,61 @@ def validate_strategy_funding_checkpoint_schema(connection) -> dict[str, Any]:
             "automatic_real_order_submission":False,"real_order_authority":False}
 
 
+def validate_strategy_funding_checkpoint_base_schema(
+        connection) -> dict[str, Any]:
+    """Validate the exact funding tables without asserting trigger install.
+
+    This is the deliberately narrower gate used by the deferred database
+    phase.  It proves every table, column, index, foreign key and CHECK
+    constraint while making no claim that the append-only trigger phase has
+    completed.
+    """
+
+    tables = {
+        name: _validate_table(connection, name)
+        for name in (
+            FUNDING_DAILY_FACT_TABLE_NAME,
+            FUNDING_CHECKPOINT_TABLE_NAME,
+        )
+    }
+    return {
+        "table_count": len(tables),
+        "tables": tables,
+        "column_count": sum(
+            int(detail["column_count"]) for detail in tables.values()
+        ),
+        "index_count": sum(
+            int(detail["index_count"]) for detail in tables.values()
+        ),
+        "foreign_key_count": sum(
+            int(detail["foreign_key_count"]) for detail in tables.values()
+        ),
+        "check_count": sum(
+            int(detail["check_count"]) for detail in tables.values()
+        ),
+        "contract_hash": FUNDING_CHECKPOINT_BASE_SCHEMA_CONTRACT_HASH,
+        "full_trigger_bound_contract_hash": (
+            FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH
+        ),
+        "trigger_installation_asserted": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 def ensure_strategy_funding_checkpoint_schema(connection, *,
-        trigger_ddl_executor: Callable[[str], None] | None = None) -> dict[str, Any]:
+        trigger_ddl_executor: Callable[[str], None] | None = None,
+        defer_triggers: bool = False) -> dict[str, Any]:
+    if type(defer_triggers) is not bool:
+        raise TypeError("defer_triggers must be bool")
+    if defer_triggers and trigger_ddl_executor is not None:
+        raise ValueError(
+            "deferred funding schema cannot accept a trigger DDL executor"
+        )
     connection.execute(text(funding_daily_fact_ddl_statement()))
     connection.execute(text(funding_checkpoint_ddl_statement()))
+    if defer_triggers:
+        return validate_strategy_funding_checkpoint_base_schema(connection)
     existing = {str(r.get("trigger_name") or "") for r in _rows(connection,
         "SELECT TRIGGER_NAME AS trigger_name FROM information_schema.TRIGGERS "
         "WHERE TRIGGER_SCHEMA=DATABASE() "
@@ -875,4 +954,5 @@ __all__ = [name for name in globals() if name.startswith("FUNDING_")] + [
     "ensure_strategy_funding_checkpoint_schema","funding_checkpoint_ddl_statement",
     "funding_daily_fact_ddl_statement","funding_daily_fact_hash",
     "funding_daily_fact_identity","ordered_funding_fact_set_hash",
+    "validate_strategy_funding_checkpoint_base_schema",
     "validate_strategy_funding_checkpoint_schema"]

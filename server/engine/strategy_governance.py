@@ -72,6 +72,7 @@ from server.engine.strategy_execution_adapters import (
     verify_persisted_strategy_adapter_run_receipt,
 )
 from server.engine.dynamic_shadow_ledger_schema import (
+    DYNAMIC_SHADOW_LEDGER_SCHEMA_CONTRACT_HASH,
     DYNAMIC_SHADOW_LEDGER_COLUMN_NAMES,
     DYNAMIC_SHADOW_LEDGER_TABLE_NAMES,
     ensure_dynamic_shadow_ledger_schema,
@@ -80,6 +81,9 @@ from server.engine.dynamic_shadow_ledger_schema import (
 from server.engine.strategy_funding_checkpoint import (
     FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
     FUNDING_CHECKPOINT_AUDIT_SCHEMA,
+    FUNDING_CHECKPOINT_BASE_MIGRATION_HASH,
+    FUNDING_CHECKPOINT_BASE_MIGRATION_KEY,
+    FUNDING_CHECKPOINT_BASE_SCHEMA_CONTRACT_HASH,
     FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
     FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
     FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
@@ -106,6 +110,7 @@ from server.engine.strategy_funding_checkpoint import (
     funding_daily_fact_hash,
     funding_daily_fact_identity,
     ordered_funding_fact_set_hash,
+    validate_strategy_funding_checkpoint_base_schema,
     validate_strategy_funding_checkpoint_schema,
 )
 from server.engine.strategy_statistical_guards import (
@@ -2451,6 +2456,149 @@ GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH = _checkpoint_canonical_hash({
     )],
 })
 
+DEFERRED_BASE_SCHEMA_MIGRATION_KEY = (
+    "20260826_001_strategy_governance_deferred_base_schema"
+)
+DEFERRED_BASE_SCHEMA_MIGRATION_HASH = _checkpoint_canonical_hash({
+    "schema": "probiga.strategy-governance-deferred-base-schema.v1",
+    "core_table_source_hash": hashlib.sha256(
+        "\n".join(
+            " ".join(statement.split())
+            for statement in governance_table_ddl_statements()
+        ).encode("utf-8")
+    ).hexdigest(),
+    "dynamic_shadow_contract_hash": (
+        DYNAMIC_SHADOW_LEDGER_SCHEMA_CONTRACT_HASH
+    ),
+    "funding_checkpoint_base_contract_hash": (
+        FUNDING_CHECKPOINT_BASE_SCHEMA_CONTRACT_HASH
+    ),
+    "prerequisite_migrations": {
+        RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
+        STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
+            STRATEGY_CONTENT_HASH_MIGRATION_HASH
+        ),
+        FUNDING_CHECKPOINT_BASE_MIGRATION_KEY: (
+            FUNDING_CHECKPOINT_BASE_MIGRATION_HASH
+        ),
+    },
+    "expected_trigger_count": (
+        len(EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES)
+        + len(EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES)
+    ),
+    "trigger_installation_asserted": False,
+    "automatic_real_order_submission": False,
+})
+
+
+def validate_deferred_governance_trigger_inventory(
+    connection,
+) -> dict[str, Any]:
+    """Validate any installed governance triggers and report exact gaps.
+
+    Missing triggers are expected in ``DEFERRED_DB_BASE_SCHEMA`` mode.  Any
+    unexpected trigger or any installed trigger whose metadata differs from
+    the frozen contract remains a hard failure.
+    """
+
+    append_rows = _governance_append_only_trigger_inventory(connection)
+    observed_append = {
+        str(row.get("trigger_name") or ""): dict(row)
+        for row in append_rows
+    }
+    append_extras = (
+        set(observed_append)
+        - EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
+    )
+    if append_extras:
+        raise RuntimeError(
+            "存在未管理的治理不可变触发器："
+            + ",".join(sorted(append_extras))
+        )
+    for name, row in observed_append.items():
+        contract = GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS[name]
+        if (
+            str(row.get("action_timing") or "").upper() != contract[0]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract[1]
+            or str(row.get("event_object_table") or "") != contract[2]
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or _normalized_governance_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_governance_trigger_body(contract[3])
+        ):
+            raise RuntimeError(f"治理不可变触发器元数据漂移：{name}")
+
+    metric_rows = _metric_input_trigger_inventory(connection)
+    observed_metric = {
+        str(row.get("trigger_name") or ""): dict(row)
+        for row in metric_rows
+    }
+    metric_extras = (
+        set(observed_metric) - EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+    )
+    if metric_extras:
+        raise RuntimeError(
+            "存在未管理的指标复核触发器："
+            + ",".join(sorted(metric_extras))
+        )
+    for name, row in observed_metric.items():
+        contract = METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS[name]
+        if (
+            str(row.get("action_timing") or "").upper()
+            != contract["timing"]
+            or str(row.get("event_manipulation") or "").upper()
+            != contract["event"]
+            or str(row.get("event_object_table") or "")
+            != contract["table"]
+            or str(row.get("action_orientation") or "").upper() != "ROW"
+            or _normalized_metric_input_trigger_body(
+                row.get("action_statement")
+            ) != _normalized_metric_input_trigger_body(contract["body"])
+        ):
+            raise RuntimeError(f"指标复核触发器元数据漂移：{name}")
+
+    expected = set(EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES) | set(
+        EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
+    )
+    expected_names_sql = ", ".join(
+        f"'{name}'" for name in sorted(expected)
+    )
+    globally_named_rows = connection.execute(text(
+        "SELECT TRIGGER_NAME AS trigger_name "
+        "FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA=DATABASE() "
+        f"AND TRIGGER_NAME IN ({expected_names_sql}) "
+        "ORDER BY BINARY TRIGGER_NAME"
+    )).mappings().all()
+    globally_named = {
+        str(row.get("trigger_name") or "") for row in globally_named_rows
+    }
+    installed = set(observed_append) | set(observed_metric)
+    misplaced = globally_named - installed
+    if misplaced:
+        raise RuntimeError(
+            "治理触发器名称已被错误目标表占用："
+            + ",".join(sorted(misplaced))
+        )
+    missing = sorted(expected - installed)
+    return {
+        "expected_trigger_count": len(expected),
+        "installed_trigger_count": len(installed),
+        "missing_trigger_count": len(missing),
+        "installed_trigger_names": sorted(installed),
+        "missing_trigger_names": missing,
+        "installed_trigger_metadata_valid": True,
+        "trigger_installation_asserted": False,
+        "database_triggers_installed": len(missing) == 0,
+        "governance_append_only_trigger_contract_hash": (
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+        ),
+        "metric_review_trigger_contract_hash": (
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+        ),
+    }
+
 
 def _normalized_governance_column_default(
     value: Any,
@@ -2621,19 +2769,27 @@ def ensure_strategy_governance_tables(
     engine: Any | None = None,
     trigger_ddl_executor: Callable[[str], None] | None = None,
     writers_fenced: bool = False,
+    defer_triggers: bool = False,
 ) -> None:
-    """Create governance tables, columns and indexes without trigger DDL.
+    """Create governance tables, columns, indexes and migration markers.
 
     Normal callers use the shared runtime engine.  The production release
     broker supplies its separately authenticated, schema-scoped migration
     engine while all writers are fenced.  ``trigger_ddl_executor`` is retained
-    for rolling compatibility but is never invoked.
+    for the full immutable-trigger phase.  ``defer_triggers`` is the explicit
+    base-schema-only phase and never invokes or accepts a trigger executor.
     """
 
+    if type(defer_triggers) is not bool:
+        raise TypeError("defer_triggers must be bool")
     if trigger_ddl_executor is not None and not callable(
         trigger_ddl_executor
     ):
         raise TypeError("trigger_ddl_executor must be callable")
+    if defer_triggers and trigger_ddl_executor is not None:
+        raise ValueError(
+            "deferred governance schema cannot accept a trigger DDL executor"
+        )
     statements = governance_table_ddl_statements()
     production_mode = (
         os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
@@ -2657,6 +2813,7 @@ def ensure_strategy_governance_tables(
         ensure_strategy_funding_checkpoint_schema(
             connection,
             trigger_ddl_executor=trigger_ddl_executor,
+            defer_triggers=defer_triggers,
         )
         metric_entity_type = connection.execute(
             text(
@@ -2979,12 +3136,22 @@ def ensure_strategy_governance_tables(
                     f"{index_name} ({columns})"
                 ))
         _ensure_strategy_content_hash_schema(connection)
+        checkpoint_migration_key = (
+            FUNDING_CHECKPOINT_BASE_MIGRATION_KEY
+            if defer_triggers
+            else FUNDING_CHECKPOINT_MIGRATION_KEY
+        )
+        checkpoint_migration_hash = (
+            FUNDING_CHECKPOINT_BASE_MIGRATION_HASH
+            if defer_triggers
+            else FUNDING_CHECKPOINT_MIGRATION_HASH
+        )
         checkpoint_migration = connection.execute(text(
             "SELECT migration_hash "
             "FROM st_strategy_governance_schema_migration "
             "WHERE migration_key=:migration_key"
         ), {
-            "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+            "migration_key": checkpoint_migration_key,
         }).mappings().first()
         if checkpoint_migration is None:
             connection.execute(text(
@@ -2992,21 +3159,64 @@ def ensure_strategy_governance_tables(
                 "(migration_key, migration_hash) "
                 "VALUES (:migration_key, :migration_hash)"
             ), {
-                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
-                "migration_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+                "migration_key": checkpoint_migration_key,
+                "migration_hash": checkpoint_migration_hash,
             })
         elif str(checkpoint_migration.get("migration_hash") or "") != (
-            FUNDING_CHECKPOINT_MIGRATION_HASH
+            checkpoint_migration_hash
         ):
             raise RuntimeError("资金检查点迁移标记哈希不一致")
-        _ensure_governance_append_only_triggers(
-            connection,
-            trigger_ddl_executor=trigger_ddl_executor,
-        )
-        _ensure_metric_input_review_triggers(
-            connection,
-            trigger_ddl_executor=trigger_ddl_executor,
-        )
+        if defer_triggers:
+            validate_governance_table_schema(connection)
+            validate_dynamic_shadow_ledger_schema(connection)
+            validate_strategy_funding_checkpoint_base_schema(connection)
+            trigger_detail = validate_deferred_governance_trigger_inventory(
+                connection
+            )
+            if int(trigger_detail["missing_trigger_count"]) <= 0:
+                raise RuntimeError(
+                    "治理触发器已完整安装；不得登记延期基础结构阶段"
+                )
+            full_funding_marker = connection.execute(text(
+                "SELECT migration_hash "
+                "FROM st_strategy_governance_schema_migration "
+                "WHERE migration_key=:migration_key"
+            ), {
+                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+            }).mappings().first()
+            if full_funding_marker is not None:
+                raise RuntimeError(
+                    "资金触发器未完整安装但完整迁移标记已存在"
+                )
+            deferred_marker = connection.execute(text(
+                "SELECT migration_hash "
+                "FROM st_strategy_governance_schema_migration "
+                "WHERE migration_key=:migration_key"
+            ), {
+                "migration_key": DEFERRED_BASE_SCHEMA_MIGRATION_KEY,
+            }).mappings().first()
+            if deferred_marker is None:
+                connection.execute(text(
+                    "INSERT INTO st_strategy_governance_schema_migration "
+                    "(migration_key, migration_hash) "
+                    "VALUES (:migration_key, :migration_hash)"
+                ), {
+                    "migration_key": DEFERRED_BASE_SCHEMA_MIGRATION_KEY,
+                    "migration_hash": DEFERRED_BASE_SCHEMA_MIGRATION_HASH,
+                })
+            elif str(deferred_marker.get("migration_hash") or "") != (
+                DEFERRED_BASE_SCHEMA_MIGRATION_HASH
+            ):
+                raise RuntimeError("治理延期基础结构迁移标记哈希不一致")
+        else:
+            _ensure_governance_append_only_triggers(
+                connection,
+                trigger_ddl_executor=trigger_ddl_executor,
+            )
+            _ensure_metric_input_review_triggers(
+                connection,
+                trigger_ddl_executor=trigger_ddl_executor,
+            )
 
 
 def _audit_record(
@@ -3100,9 +3310,10 @@ def _recovery_conditions(status: str = "SHADOW") -> list[str]:
     return common
 
 
-def seed_manifest_strategies() -> None:
+def seed_manifest_strategies(*, engine: Any | None = None) -> None:
     """Register the current manifest as the initial inventory, not a cap."""
 
+    runtime_engine = engine or get_engine()
     manifest = load_stock_manifest()
     manifest_version = str(manifest["manifest_version"])
     frozen_at = _normalize_evidence_revision(manifest.get("frozen_at"))
@@ -3195,7 +3406,7 @@ def seed_manifest_strategies() -> None:
             "version_created_at": frozen_at,
             "reason": reason,
         }
-        with get_engine().begin() as connection:
+        with runtime_engine.begin() as connection:
             if not versions:
                 connection.execute(text(
                     """
@@ -3285,9 +3496,10 @@ def seed_manifest_strategies() -> None:
                 )
 
 
-def seed_v3_strategies() -> None:
+def seed_v3_strategies(*, engine: Any | None = None) -> None:
     """Register every immutable V3 sleeve as an independent strategy."""
 
+    runtime_engine = engine or get_engine()
     config = load_v3_config()
     model_version = str(config.get("strategy_version") or "").strip()
     frozen_at = _normalize_evidence_revision(config.get("frozen_at"))
@@ -3376,7 +3588,7 @@ def seed_v3_strategies() -> None:
             "recovery": _json_text(_recovery_conditions()),
             "reason": reason,
         }
-        with get_engine().begin() as connection:
+        with runtime_engine.begin() as connection:
             if not versions:
                 connection.execute(text(
                     """
@@ -3509,7 +3721,8 @@ DEFAULT_SEEDED_COMBINATIONS = (
 )
 
 
-def seed_default_combinations() -> None:
+def seed_default_combinations(*, engine: Any | None = None) -> None:
+    runtime_engine = engine or get_engine()
     registered = {
         row["strategy_key"]: row["current_version"]
         for row in load_registry()
@@ -3564,7 +3777,7 @@ def seed_default_combinations() -> None:
             "config_hash": config_hash,
             "reason": reason,
         }
-        with get_engine().begin() as connection:
+        with runtime_engine.begin() as connection:
             connection.execute(text(
                 """
                 INSERT INTO st_strategy_combination_version
@@ -4064,7 +4277,7 @@ def validate_default_governance_seed_contract(
     }
 
 
-def seed_governance_registry() -> None:
+def seed_governance_registry(*, engine: Any | None = None) -> None:
     """Idempotently seed governance rows after the schema is verified."""
 
     global _SEED_READY
@@ -4073,9 +4286,10 @@ def seed_governance_registry() -> None:
     with _SEED_LOCK:
         if _SEED_READY:
             return
-        seed_manifest_strategies()
-        seed_v3_strategies()
-        seed_default_combinations()
+        runtime_engine = engine or get_engine()
+        seed_manifest_strategies(engine=runtime_engine)
+        seed_v3_strategies(engine=runtime_engine)
+        seed_default_combinations(engine=runtime_engine)
         _SEED_READY = True
 
 
@@ -4204,6 +4418,114 @@ def validate_prepared_governance_runtime(
         "immutability_enforcement": (
             "database_exact_38_append_only_plus_2_metric_review_triggers"
         ),
+    }
+
+
+def validate_deferred_governance_base_schema(
+    engine: Any | None = None,
+) -> dict[str, Any]:
+    """Prove all governance data structures while triggers remain deferred."""
+
+    runtime_engine = engine or get_engine()
+    expected_migrations = {
+        RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
+        STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
+            STRATEGY_CONTENT_HASH_MIGRATION_HASH
+        ),
+        FUNDING_CHECKPOINT_BASE_MIGRATION_KEY: (
+            FUNDING_CHECKPOINT_BASE_MIGRATION_HASH
+        ),
+        DEFERRED_BASE_SCHEMA_MIGRATION_KEY: (
+            DEFERRED_BASE_SCHEMA_MIGRATION_HASH
+        ),
+    }
+    with runtime_engine.connect() as connection:
+        schema_detail = validate_governance_table_schema(connection)
+        dynamic_schema_detail = validate_dynamic_shadow_ledger_schema(
+            connection
+        )
+        funding_schema_detail = (
+            validate_strategy_funding_checkpoint_base_schema(connection)
+        )
+        migration_rows = connection.execute(text(
+            "SELECT migration_key, migration_hash "
+            "FROM st_strategy_governance_schema_migration "
+            "WHERE migration_key IN "
+            "(:run_revision, :content_hash, :funding_checkpoint_base, "
+            ":deferred_base)"
+        ), {
+            "run_revision": RUN_REVISION_MIGRATION_KEY,
+            "content_hash": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
+            "funding_checkpoint_base": FUNDING_CHECKPOINT_BASE_MIGRATION_KEY,
+            "deferred_base": DEFERRED_BASE_SCHEMA_MIGRATION_KEY,
+        }).mappings().all()
+        observed_migrations = {
+            str(row.get("migration_key") or ""): str(
+                row.get("migration_hash") or ""
+            )
+            for row in migration_rows
+        }
+        if observed_migrations != expected_migrations:
+            raise RuntimeError(
+                "治理延期基础结构迁移标记不完整或已漂移"
+            )
+        full_funding_marker = connection.execute(text(
+            "SELECT COUNT(*) "
+            "FROM st_strategy_governance_schema_migration "
+            "WHERE migration_key=:migration_key"
+        ), {
+            "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+        }).scalar()
+        if int(full_funding_marker or 0) != 0:
+            raise RuntimeError(
+                "资金触发器延期时不得存在完整迁移标记"
+            )
+        trigger_detail = validate_deferred_governance_trigger_inventory(
+            connection
+        )
+        if int(trigger_detail["missing_trigger_count"]) <= 0:
+            raise RuntimeError(
+                "治理触发器已经完整安装；延期基础结构模式不再适用"
+            )
+    seed_detail = validate_default_governance_seed_contract(runtime_engine)
+    return {
+        "mode": "DEFERRED_DB_BASE_SCHEMA",
+        "schema_ready_without_triggers": True,
+        "core_table_count": int(schema_detail["table_count"]),
+        "core_column_count": int(schema_detail["column_count"]),
+        "core_index_count": int(schema_detail["index_count"]),
+        "dynamic_shadow_schema": dynamic_schema_detail,
+        "dynamic_shadow_table_count": int(
+            dynamic_schema_detail["table_count"]
+        ),
+        "dynamic_shadow_column_count": int(
+            dynamic_schema_detail["column_count"]
+        ),
+        "dynamic_shadow_index_count": int(
+            dynamic_schema_detail["index_count"]
+        ),
+        "funding_checkpoint_schema": funding_schema_detail,
+        "funding_checkpoint_table_count": int(
+            funding_schema_detail["table_count"]
+        ),
+        "funding_checkpoint_column_count": int(
+            funding_schema_detail["column_count"]
+        ),
+        "funding_checkpoint_index_count": int(
+            funding_schema_detail["index_count"]
+        ),
+        "migration_count": len(observed_migrations),
+        "migration_keys": sorted(observed_migrations),
+        "seeded_strategy_count": int(seed_detail["seeded_strategy_count"]),
+        "seeded_combination_count": int(
+            seed_detail["seeded_combination_count"]
+        ),
+        "seed_contract_hash": str(seed_detail["seed_contract_hash"]),
+        "trigger_installation_deferred": True,
+        "database_triggers_required": True,
+        **trigger_detail,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
     }
 
 
@@ -27534,6 +27856,8 @@ def governance_history(
 
 
 __all__ = [
+    "DEFERRED_BASE_SCHEMA_MIGRATION_HASH",
+    "DEFERRED_BASE_SCHEMA_MIGRATION_KEY",
     "DECAY_GATE_20_POLICY",
     "HEALTH_SCORE_WEIGHTS",
     "LIFECYCLE_LABELS",
@@ -27544,6 +27868,7 @@ __all__ = [
     "calculate_health_score",
     "calculate_return_metrics",
     "ensure_and_seed_governance",
+    "ensure_strategy_governance_tables",
     "evaluate_decay_gate_20",
     "evaluate_profit_gate",
     "evaluate_window_gate",
@@ -27562,5 +27887,7 @@ __all__ = [
     "transition_lifecycle",
     "toggle_strategy_enabled",
     "validate_funding_checkpoint_manifest_contract",
+    "validate_deferred_governance_base_schema",
+    "validate_deferred_governance_trigger_inventory",
     "validate_strategy_key",
 ]

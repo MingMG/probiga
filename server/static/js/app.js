@@ -3726,9 +3726,10 @@
         var marketRiskCap = summary.market_risk_cap_pct;
         if (marketRiskCap == null) marketRiskCap = tradingGate.market_risk_cap_pct;
         var authRole = String(((((window._strategyCenterAuth || {}).user) || {}).role) || '').toUpperCase();
-        var canAdmin = authRole === 'ADMIN';
+        var governanceDeferred = String(governance.strategy_governance_mode || '').toUpperCase() === 'DEFERRED_DB' || governance.activation_enabled === false;
+        var canAdmin = authRole === 'ADMIN' && !governanceDeferred;
         var canReview = authRole === 'EVIDENCE_REVIEWER';
-        var roleLabel = canAdmin ? '管理员' : (canReview ? '证据复核员' : '只读账号');
+        var roleLabel = authRole === 'ADMIN' ? (governanceDeferred ? '管理员（治理暂锁）' : '管理员') : (canReview ? '证据复核员' : '只读账号');
         var resultMode = String(governance.result_mode || '').toUpperCase();
         var canonicalLabel = governance.is_canonical === true || resultMode.indexOf('CANONICAL_PERSISTED') === 0 ? '当前规范结果' : (resultMode.indexOf('PREVIEW') === 0 ? '实时预览（不生效）' : (resultMode === 'CANONICAL_UNAVAILABLE' ? '尚无规范结果' : '结果状态待确认'));
         window._strategyCenterAdapterCapabilities = adapterCapabilities;
@@ -3739,6 +3740,10 @@
         }).join('');
         var h = '<section class="sc-governance">';
         h += '<div class="sc-section-title"><span>动态策略治理总览</span><small>策略数量不设上限 · 每日重新评估 · 无合格策略保持现金</small></div>';
+        if (governanceDeferred) {
+            var baseSchemaMessage = governance.base_schema_ready === true ? '基础表、字段、索引、初始化数据和版本标记已上线' : '基础数据库结构尚未完成验证';
+            h += '<div class="sc-warning"><strong>数据库防篡改门禁待完成</strong>：' + baseSchemaMessage + '；排行、健康度、治理票池和状态变更暂不生效，模拟资金保持 100% 现金，真实下单与新买入均关闭。</div>';
+        }
         h += '<div class="sc-governance-toolbar">' + (canAdmin ? '<button id="scGovernanceRunBtn" class="sc-btn primary" onclick="window._strategyGovernanceRun()">执行最新数据日治理</button><button class="sc-btn" onclick="window._strategyRegistrationToggle()">新增策略 / 新版本</button><button class="sc-btn" onclick="window._strategyCombinationToggle()">新增组合 / 新版本</button><button class="sc-btn" onclick="window._strategyReviewerToggle()">创建独立复核账号</button>' : '') + '<span>当前职责：' + escHtml(roleLabel) + '</span><span>结果口径：' + escHtml(canonicalLabel) + '</span><span>真实下单权限：关闭</span><span>市场门禁：' + escHtml(tradingGateLabel) + '</span><span>风险上限：' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</span><span>模拟现金：' + strategyGovernanceMetric(summary.cash_weight_pct, '%', 1) + '</span><span>构建：' + escHtml(String(governance.build_commit_sha || '-').slice(0, 12)) + '</span><span>路由：' + escHtml(String(governance.router_snapshot_hash || '-').slice(0, 12)) + '</span><span>决策哈希：' + escHtml(String(governance.decision_hash || '-').slice(0, 12)) + '</span></div>';
         h += '<div class="sc-governance-notice"><strong>收益与双榜口径</strong><span>客户端声明信号榜只比较经双人复核、结构可重算的外部提交，但提交来源未与权威行情逐行认证；成交实证榜只比较内部模拟成交、实际费用和逐日净值。共享账户里同票未成交不会被伪造成 fill。声明信号榜不授予模拟资金，缺少它也不会否定已由内部账本完整证明的资金资格。正期望、盈亏比和利润因子不代表未来一定盈利；任何内部证据、行情或风险门槛失败时资金回到现金。</span></div>';
         h += '<div class="sc-governance-notice"><strong>行业数据口径</strong><span>精确日期行业/概念成分归属、来源特定板块热度、按成分股聚合的强弱、QMT原生 .BKZS 板块指数是四类不同证据；不得互相替代，未认证的 .BKZS 不用合成曲线补齐。</span></div>';
@@ -3961,7 +3966,7 @@
         var strategies = Array.isArray(data.strategies) ? data.strategies : [];
         var candidates = Array.isArray(data.candidates) ? data.candidates : [];
         var conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
-        var canAdmin = String(((((window._strategyCenterAuth || {}).user) || {}).role) || '').toUpperCase() === 'ADMIN';
+        var canAdmin = String(((((window._strategyCenterAuth || {}).user) || {}).role) || '').toUpperCase() === 'ADMIN' && governance.activation_enabled !== false;
         var strategyMap = {};
         strategies.forEach(function (item) { strategyMap[item.key] = item; });
         var categories = [];

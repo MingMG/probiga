@@ -9,7 +9,10 @@ from fastapi import APIRouter, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
-from server.api.scheduler_runtime import launch_scheduler_task
+from server.api.scheduler_runtime import (
+    launch_scheduler_task,
+    strategy_governance_task_block_reason,
+)
 
 router = APIRouter(tags=["datasource"])
 
@@ -280,9 +283,21 @@ def run_task(task_id: int):
 @router.post("/datasource/{task_id}/toggle")
 def toggle_task(task_id: int):
     """启用/禁用数据源"""
-    row = _read_sql("SELECT id, enabled FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
+    row = _read_sql(
+        "SELECT id, task_type, script_path, enabled "
+        "FROM st_scheduled_tasks WHERE id = :id",
+        {"id": task_id},
+    )
     if not row:
         return {"error": "任务不存在"}
     new_enabled = 0 if row[0]["enabled"] == 1 else 1
+    governance_block_reason = strategy_governance_task_block_reason(row[0])
+    if new_enabled == 1 and governance_block_reason:
+        return {
+            "id": task_id,
+            "enabled": 0,
+            "error": "治理数据库延迟模式下禁止启用策略治理任务",
+            "status": governance_block_reason,
+        }
     _execute_sql("UPDATE st_scheduled_tasks SET enabled = :e, updated_at = NOW() WHERE id = :id", {"e": new_enabled, "id": task_id})
     return {"id": task_id, "enabled": new_enabled}

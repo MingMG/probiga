@@ -22,6 +22,10 @@ if str(ROOT) not in sys.path:
 
 from server.common.kline_data import get_kline_engine
 from server.common.adata_release import validate_adata_release_source
+from server.common.strategy_governance_mode import (
+    StrategyGovernanceMode,
+    get_strategy_governance_mode,
+)
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.counterfactual_worker import (
     counterfactual_queue_stats,
@@ -278,6 +282,10 @@ _EXPECTED_REAL_TRADING_GUARDS = {
         "BEFORE", "UPDATE", "st_execution_plan_v3", "real_order_allowed"
     ),
 }
+_DEFERRED_PAPER_BUY_TASK_TYPES = frozenset({
+    "trading_v3_close_decision",
+    "trading_v3_premarket_review",
+})
 
 
 def _real_trading_guard_rows_valid(rows: Any) -> bool:
@@ -314,6 +322,121 @@ def _real_trading_guard_rows_valid(rows: Any) -> bool:
         ):
             return False
     return True
+
+
+def _deferred_paper_buy_writer_rows_valid(rows: Any) -> bool:
+    """Require exactly one disabled row for each paper-buy decision task."""
+
+    if not isinstance(rows, list) or not _query_ok(rows):
+        return False
+    by_type: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            return False
+        task_type = str(raw.get("task_type") or "")
+        if not task_type or task_type in by_type:
+            return False
+        by_type[task_type] = raw
+    return set(by_type) == set(_DEFERRED_PAPER_BUY_TASK_TYPES) and all(
+        int(row.get("enabled") or 0) == 0 for row in by_type.values()
+    )
+
+
+def verify_real_trading_closed_only() -> int:
+    """Prove the small, invariant production real-order boundary."""
+
+    load_project_env()
+    engine = create_tool_engine()
+    try:
+        governance_deferred = (
+            get_strategy_governance_mode() is StrategyGovernanceMode.DEFERRED_DB
+        )
+        accounts = _safe_one(
+            engine,
+            """
+            SELECT COUNT(*) AS unsafe_count
+            FROM st_trade_account_v2
+            WHERE COALESCE(real_trading_enabled, 0) <> 0
+            """,
+        )
+        plans = _safe_one(
+            engine,
+            """
+            SELECT COUNT(*) AS unsafe_count
+            FROM st_execution_plan_v3
+            WHERE COALESCE(real_order_allowed, 0) <> 0
+            """,
+        )
+        guards = _safe_all(
+            engine,
+            """
+            SELECT TRIGGER_NAME, EVENT_MANIPULATION,
+                   ACTION_TIMING, EVENT_OBJECT_TABLE,
+                   ACTION_STATEMENT
+            FROM information_schema.TRIGGERS
+            WHERE TRIGGER_SCHEMA = DATABASE()
+              AND TRIGGER_NAME IN (
+                  'trg_trade_account_v2_real_disabled_bi',
+                  'trg_trade_account_v2_real_disabled_bu',
+                  'trg_execution_plan_v3_real_disabled_bi',
+                  'trg_execution_plan_v3_real_disabled_bu'
+              )
+            ORDER BY TRIGGER_NAME
+            """,
+        )
+        paper_buy_writers = (
+            _safe_all(
+                engine,
+                """
+                SELECT task_type, enabled
+                FROM st_scheduled_tasks
+                WHERE task_type IN (
+                    'trading_v3_close_decision',
+                    'trading_v3_premarket_review'
+                )
+                ORDER BY task_type, id
+                """,
+            )
+            if governance_deferred
+            else []
+        )
+        paper_buy_writers_closed = (
+            _deferred_paper_buy_writer_rows_valid(paper_buy_writers)
+            if governance_deferred
+            else True
+        )
+        valid = (
+            _query_ok(accounts)
+            and _query_ok(plans)
+            and _real_trading_guard_rows_valid(guards)
+            and int(accounts.get("unsafe_count") or 0) == 0
+            and int(plans.get("unsafe_count") or 0) == 0
+            and paper_buy_writers_closed
+        )
+        print(json.dumps(
+            {
+                "status": "ok" if valid else "blocked",
+                "real_trading_closed": bool(valid),
+                "account_guard_count": len(guards) if _query_ok(guards) else 0,
+                "unsafe_account_count": int(accounts.get("unsafe_count") or 0)
+                if _query_ok(accounts) else None,
+                "unsafe_plan_count": int(plans.get("unsafe_count") or 0)
+                if _query_ok(plans) else None,
+                "paper_buy_writers_checked": governance_deferred,
+                "paper_buy_writers_closed": (
+                    bool(paper_buy_writers_closed)
+                    if governance_deferred
+                    else None
+                ),
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ))
+        return 0 if valid else 2
+    finally:
+        engine.dispose()
 
 
 def _is_production_runtime() -> bool:
@@ -1592,6 +1715,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--real-trading-closed-only" in sys.argv:
+        sys.argv.remove("--real-trading-closed-only")
+        if len(sys.argv) != 1:
+            raise SystemExit(2)
+        raise SystemExit(verify_real_trading_closed_only())
     if "--local-runtime" in sys.argv:
         sys.argv.remove("--local-runtime")
         identity_ready, identity_reason = _local_production_runtime_identity()

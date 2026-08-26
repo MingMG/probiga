@@ -27,6 +27,10 @@ from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
     update_scheduler_task,
 )
+from server.common.strategy_governance_mode import (
+    StrategyGovernanceModeError,
+    strategy_governance_database_deferred,
+)
 from server.common.scheduler_validation import (
     is_market_closed_skip_output,
     scheduler_output_status,
@@ -625,6 +629,19 @@ def scheduler_task_owned_by_current_host(row: dict) -> bool:
 _PIPELINE_TERMINAL_STATUSES = frozenset(
     {"success", "blocked", "failed", "timeout", "stopped"}
 )
+
+
+def strategy_governance_task_block_reason(row: dict) -> str:
+    """Return a fail-closed reason when governance dispatch is unavailable."""
+
+    if str(row.get("task_type") or "").strip() != "strategy_governance_daily":
+        return ""
+    try:
+        if strategy_governance_database_deferred():
+            return "governance_database_deferred"
+    except StrategyGovernanceModeError:
+        return "governance_mode_invalid"
+    return ""
 
 
 def evaluate_strategy_pipeline_dependencies(
@@ -2028,6 +2045,15 @@ def launch_scheduler_task(
     requested_history_uid = str(
         row.get("_manual_history_run_uid") or ""
     ).strip().lower()
+    governance_block_reason = strategy_governance_task_block_reason(row)
+    if governance_block_reason:
+        return {
+            "accepted": False,
+            "status": governance_block_reason,
+            "task_id": task_id,
+            "task_name": task_name,
+            "job_id": "",
+        }
     if requested_history_uid and not re.fullmatch(
         r"[0-9a-f]{32}", requested_history_uid
     ):
@@ -2286,6 +2312,18 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 cron_time = str(row["cron_time"] or "17:10")
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
+
+                governance_block_reason = strategy_governance_task_block_reason(
+                    row
+                )
+                if governance_block_reason:
+                    logger.warning(
+                        "Skip strategy governance task while dispatch is blocked: "
+                        "%s (reason=%s)",
+                        task_name,
+                        governance_block_reason,
+                    )
+                    continue
 
                 owner = scheduler_task_host_owner(row)
                 if _should_skip_task_for_host(row):

@@ -31,6 +31,11 @@ from server.common.scheduler_script_policy import (
 from server.common.scheduler_runtime_health import (
     check_linux_standalone_scheduler_heartbeat,
 )
+from server.common.strategy_governance_mode import (
+    StrategyGovernanceMode,
+    get_strategy_governance_mode,
+    strategy_governance_base_schema_declared_ready,
+)
 from server.common.batch_db import quote_identifier
 from server.common.adata_release import (
     ADATA_GIT_MARKER,
@@ -863,12 +868,29 @@ def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
 @router.get("/health")
 def health():
     revision = _deployed_git_revision()
+    production_mode = revision["deployment_mode"] == "production"
+    governance_mode = get_strategy_governance_mode()
+    governance_database_deferred = (
+        production_mode
+        and governance_mode is StrategyGovernanceMode.DEFERRED_DB
+    )
     adata_revision = _deployed_adata_revision()
     auth = admin_auth_status()
     database = _primary_database_readiness()
-    funding_schema = _strategy_funding_schema_readiness()
+    funding_schema = (
+        {
+            "status": "deferred",
+            "ready": False,
+            "schema_ready": False,
+            "error": "strategy governance database migration is deferred",
+            "error_code": "governance_database_deferred",
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+        if governance_database_deferred
+        else _strategy_funding_schema_readiness()
+    )
     scheduler_script_policy = _scheduler_script_policy_readiness()
-    production_mode = revision["deployment_mode"] == "production"
     scheduler_authority = scheduler_authority_contract()
     scheduler = scheduler_runtime_info()
     standalone_scheduler = (
@@ -897,7 +919,14 @@ def health():
         _standalone_scheduler_heartbeat_readiness(
             standalone_scheduler.get("pid")
         )
-        if production_mode
+        if production_mode and not governance_database_deferred
+        else {
+            "status": "deferred",
+            "ready": False,
+            "error": "same-build scheduler heartbeat check is deferred",
+            "error_code": "governance_database_deferred",
+        }
+        if governance_database_deferred
         else {
             "status": "not_checked",
             "ready": None,
@@ -963,7 +992,11 @@ def health():
             status_code=503,
             detail="primary database readiness check failed",
         )
-    if production_mode and funding_schema.get("ready") is not True:
+    if (
+        production_mode
+        and not governance_database_deferred
+        and funding_schema.get("ready") is not True
+    ):
         raise HTTPException(
             status_code=503,
             detail="strategy funding schema readiness check failed",
@@ -997,6 +1030,7 @@ def health():
         )
     if (
         production_mode
+        and not governance_database_deferred
         and standalone_scheduler_heartbeat.get("ready") is not True
     ):
         raise HTTPException(
@@ -1004,7 +1038,28 @@ def health():
             detail="standalone scheduler heartbeat could not be proven",
         )
     return {
-        "status": "ok",
+        "status": "degraded" if governance_database_deferred else "ok",
+        "strategy_governance_mode": governance_mode.value,
+        "base_schema_ready": (
+            strategy_governance_base_schema_declared_ready()
+            if governance_database_deferred
+            else funding_schema.get("ready") is True
+        ),
+        "schema_ready": (
+            False
+            if governance_database_deferred
+            else funding_schema.get("ready") is True
+        ),
+        "governance_ready": (
+            not governance_database_deferred
+            and funding_schema.get("ready") is True
+        ),
+        "activation_enabled": (
+            not governance_database_deferred
+            and funding_schema.get("ready") is True
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
         "release_revision": revision,
         "adata_release_revision": adata_revision,
         "admin_auth_ready": bool(auth.get("ready")),

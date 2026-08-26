@@ -590,8 +590,11 @@ def test_dynamic_governance_completion_regression_inventory_is_frozen() -> None:
         "tests/test_strategy_governance_history_paging.py",
         "tests/test_strategy_membership_api_truth.py",
         "tests/test_strategy_metric_artifact_paging.py",
+        "tests/test_prepare_strategy_governance_deferred_schema.py",
         "tests/test_strategy_metric_artifact_size_limit.py",
         "tests/test_strategy_statistical_guards.py",
+        "tests/test_strategy_governance_deferred_mode.py",
+        "tests/test_strategy_governance_deferred_scheduler.py",
         "tests/test_production_schema_evidence_validators.py",
         "tests/test_api_generic_error_sanitization.py",
         "tests/test_trading_v2_error_sanitization.py",
@@ -5027,3 +5030,79 @@ def test_all_legacy_mutable_production_entrypoints_are_retired() -> None:
         assert completed.returncode == 2, relative
         assert completed.stdout == "", relative
         assert "retired" in completed.stderr.casefold(), relative
+
+
+def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    deferred = bodies["deploy_deferred_database_release"]
+    auth_header_writer = bodies["write_admin_auth_header_file"]
+    verifier = deploy[
+        deploy.index("assert_deferred_database_runtime() {"):
+        deploy.index("rollback_deferred_database_release() {")
+    ]
+    rollback = deploy[
+        deploy.index("rollback_deferred_database_release() {"):
+        deploy.index("deploy_deferred_database_release() {")
+    ]
+
+    assert "STRATEGY_GOVERNANCE_MODE=DEFERRED_DB" in deploy
+    assert "PROBIGA_ADMIN_TOKEN" not in deploy
+    assert "get_admin_auth_config" in auth_header_writer
+    assert "chown root:root" in auth_header_writer
+    assert "chmod 0600" in auth_header_writer
+    assert "print(" not in auth_header_writer
+    for absent_path in (
+        "/etc/probiga/mysql-trigger-admin.ini",
+        "/etc/probiga/mysql-migrator.ini",
+        "/home/probiga-deploy/.probiga-db-boundary-stage",
+    ):
+        assert absent_path in deploy
+    assert "--deferred-disable --snapshot-file" in deferred
+    assert "fence_deferred_paper_buy_writers" in deferred
+    assert "systemctl stop probiga-scheduler" in deferred
+    assert 'systemctl stop "$MAIN_SERVICE"' in deferred
+    assert deferred.index('systemctl stop "$MAIN_SERVICE"') < deferred.index(
+        "--deferred-disable --snapshot-file"
+    )
+    assert deferred.index("systemctl stop probiga-scheduler") < deferred.index(
+        "--deferred-disable --snapshot-file"
+    )
+    assert "prepare_strategy_governance_deferred_schema.py" in deferred
+    assert "--apply --writers-fenced" in _normalized_shell(deferred)
+    assert deferred.index("--deferred-disable --snapshot-file") < deferred.index(
+        "--apply --writers-fenced"
+    )
+    assert deferred.index("fence_deferred_paper_buy_writers") < deferred.index(
+        "--apply --writers-fenced"
+    )
+    assert deferred.index("--apply --writers-fenced") < (
+        deferred.index("install_deferred_main_runtime")
+    )
+    assert "DEPLOYED_CODE_ONLY_DEGRADED" in deferred
+    assert "run_database_boundary_bootstrap" not in deferred
+    assert "prepare_strategy_governance_schema.py" not in deferred
+
+    assert "PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB" in verifier
+    assert "PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true" in verifier
+    assert '--header @"$admin_header"' in verifier
+    assert "fence_deferred_paper_buy_writers" in verifier
+    assert 'payload.get("status") == "degraded"' in verifier
+    assert 'payload.get("base_schema_ready") is True' in verifier
+    assert 'payload.get("activation_enabled") is False' in verifier
+    assert 'allocations[0].get("target_type") == "CASH"' in verifier
+    assert "verify_trading_v3_production.py" in verifier
+    assert "--real-trading-closed-only" in verifier
+    assert "assert_nginx_static_matches_checkout" in verifier
+
+    assert "ROLLED_BACK_DEFERRED_SCHEMA_RETAINED" in rollback
+    assert "ROLLED_BACK_GOVERNANCE_TASK_DISABLED" in rollback
+    assert "CUTOVER_BASE_SCHEMA_STARTED" in rollback
+    assert "scheduler_safe_to_start" in rollback
+    assert "DEFERRED_PAPER_WRITER_FENCE_STARTED" in rollback
+    assert "fence_deferred_paper_buy_writers" in rollback
+    assert "--deferred-disable" in rollback
+    assert 'point_static_release_to_checkout "$PREVIOUS_CODE_ROOT"' in rollback
+    assert "--restore-snapshot" not in rollback

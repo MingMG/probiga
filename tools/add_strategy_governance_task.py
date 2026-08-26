@@ -19,6 +19,10 @@ if str(ROOT) not in sys.path:
 
 from server.common.batch_db import quote_identifier
 from server.common.scheduler_tasks import table_columns, upsert_scheduler_task
+from server.common.strategy_governance_mode import (
+    StrategyGovernanceMode,
+    get_strategy_governance_mode,
+)
 from tools.env_config import create_tool_engine, load_project_env
 from tools.strategy_governance_task_contract import TASK
 
@@ -49,6 +53,130 @@ def _require_unique_task(engine) -> list[dict[str, Any]]:
             f"{len(rows)} matching rows"
         )
     return rows
+
+
+def _require_exact_deferred_task(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Require the one immutable scheduler identity that may be disabled."""
+
+    if len(rows) != 1:
+        raise RuntimeError(
+            "deferred strategy governance disable requires exactly one matching "
+            f"scheduler row; observed {len(rows)}"
+        )
+    row = rows[0]
+    if (
+        str(row.get("task_type") or "") != TASK["task_type"]
+        or str(row.get("script_path") or "") != TASK["script_path"]
+    ):
+        raise RuntimeError(
+            "deferred strategy governance scheduler identity is not exact"
+        )
+    if str(row.get("last_run_status") or "").strip().lower() == "running":
+        raise RuntimeError(
+            "cannot disable the strategy governance task while it is running"
+        )
+    try:
+        enabled = int(row.get("enabled") or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "strategy governance scheduler enabled bit is invalid"
+        ) from exc
+    if enabled not in {0, 1}:
+        raise RuntimeError(
+            "strategy governance scheduler enabled bit is invalid"
+        )
+    return row
+
+
+def _deferred_disable_task(
+    engine,
+    *,
+    snapshot_path: Path | None = None,
+) -> dict[str, Any]:
+    """Atomically disable the exact non-running governance task without DDL."""
+
+    identity = {
+        "task_type": TASK["task_type"],
+        "script_path": TASK["script_path"],
+    }
+    select_sql = text(
+        "SELECT * FROM st_scheduled_tasks "
+        "WHERE task_type=:task_type OR script_path=:script_path "
+        "ORDER BY id FOR UPDATE"
+    )
+    with engine.begin() as connection:
+        before_rows = [
+            dict(row)
+            for row in connection.execute(
+                select_sql,
+                identity,
+            ).mappings().all()
+        ]
+        before = _require_exact_deferred_task(before_rows)
+        if snapshot_path is not None:
+            _write_snapshot(snapshot_path, before_rows)
+
+        task_id = int(before.get("id") or 0)
+        if task_id <= 0:
+            raise RuntimeError(
+                "strategy governance scheduler row has no valid primary key"
+            )
+        update_result = connection.execute(
+            text(
+                "UPDATE st_scheduled_tasks SET enabled=0 "
+                "WHERE id=:task_id AND task_type=:task_type "
+                "AND script_path=:script_path "
+                "AND COALESCE(LOWER(TRIM(last_run_status)), '') <> 'running'"
+            ),
+            {**identity, "task_id": task_id},
+        )
+        changed = int(update_result.rowcount or 0)
+        if int(before.get("enabled") or 0) == 1 and changed != 1:
+            raise RuntimeError(
+                "strategy governance task was not atomically disabled"
+            )
+        if changed not in {0, 1}:
+            raise RuntimeError(
+                "strategy governance disable changed an unexpected row count"
+            )
+
+        after_rows = [
+            dict(row)
+            for row in connection.execute(
+                select_sql,
+                identity,
+            ).mappings().all()
+        ]
+        after = _require_exact_deferred_task(after_rows)
+        if int(after.get("id") or 0) != task_id:
+            raise RuntimeError(
+                "strategy governance scheduler identity changed during disable"
+            )
+        if int(after.get("enabled") or 0) != 0:
+            raise RuntimeError(
+                "strategy governance task remained enabled after deferred disable"
+            )
+        before_unchanged = {
+            key: value for key, value in before.items() if key != "enabled"
+        }
+        after_unchanged = {
+            key: value for key, value in after.items() if key != "enabled"
+        }
+        if after_unchanged != before_unchanged:
+            raise RuntimeError(
+                "strategy governance task changed outside the enabled bit"
+            )
+
+    return {
+        "action": (
+            "disabled" if int(before.get("enabled") or 0) == 1
+            else "already_disabled"
+        ),
+        "id": task_id,
+        "enabled": 0,
+        "snapshot_file": str(snapshot_path) if snapshot_path is not None else None,
+        "schema_preparation_performed": False,
+    }
 
 
 def _write_snapshot(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -182,6 +310,14 @@ def main() -> int:
         help="安装任务但保持禁用，供生产切换窗口使用",
     )
     parser.add_argument(
+        "--deferred-disable",
+        action="store_true",
+        help=(
+            "仅在PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB时，"
+            "原子停用已存在且未运行的唯一治理任务；不执行任何结构准备"
+        ),
+    )
+    parser.add_argument(
         "--snapshot-file",
         default="",
         help="变更前将唯一治理任务行写入此回滚快照",
@@ -226,11 +362,20 @@ def main() -> int:
         parser.error("snapshot capture, verification and restore are mutually exclusive")
     if any(read_or_restore_modes) and (
         args.disabled
+        or args.deferred_disable
         or args.snapshot_file
         or args.schema_prepared
         or args.writers_fenced_schema_preparation
     ):
         parser.error("snapshot-only modes cannot be combined with install options")
+    if args.deferred_disable and (
+        args.disabled
+        or args.schema_prepared
+        or args.writers_fenced_schema_preparation
+    ):
+        parser.error(
+            "--deferred-disable can only be combined with --snapshot-file"
+        )
     if args.writers_fenced_schema_preparation and (
         args.schema_prepared or not args.disabled
     ):
@@ -241,6 +386,7 @@ def main() -> int:
     if (
         os.environ.get("PROBIGA_DEPLOYMENT_MODE") == "production"
         and not any(read_or_restore_modes)
+        and not args.deferred_disable
         and not args.schema_prepared
     ):
         parser.error(
@@ -248,6 +394,15 @@ def main() -> int:
             "persistent DDL belongs to the fenced migration account"
         )
     load_project_env()
+    if (
+        args.deferred_disable
+        and get_strategy_governance_mode()
+        is not StrategyGovernanceMode.DEFERRED_DB
+    ):
+        parser.error(
+            "--deferred-disable requires "
+            "PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB"
+        )
     engine = create_tool_engine()
     try:
         if args.restore_snapshot:
@@ -276,6 +431,25 @@ def main() -> int:
                 json.dumps(
                     {"status": "ok", "snapshot_verified": True, "result": result},
                     ensure_ascii=False,
+                )
+            )
+            return 0
+        if args.deferred_disable:
+            result = _deferred_disable_task(
+                engine,
+                snapshot_path=(
+                    Path(args.snapshot_file) if args.snapshot_file else None
+                ),
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "deferred_disabled": True,
+                        "result": result,
+                    },
+                    ensure_ascii=False,
+                    default=str,
                 )
             )
             return 0

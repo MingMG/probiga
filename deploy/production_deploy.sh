@@ -6933,6 +6933,20 @@ trap 'precutover_failure 143 "$LINENO"' TERM
 trap 'precutover_failure 130 "$LINENO"' INT
 trap 'precutover_failure 129 "$LINENO"' HUP
 MAIN_SERVICE=probiga
+STRATEGY_GOVERNANCE_MODE=REQUIRED
+if [ ! -e /etc/probiga/mysql-trigger-admin.ini ] && \
+  [ ! -L /etc/probiga/mysql-trigger-admin.ini ] && \
+  [ ! -e /etc/probiga/mysql-migrator.ini ] && \
+  [ ! -L /etc/probiga/mysql-migrator.ini ] && \
+  [ ! -e /home/probiga-deploy/.probiga-db-boundary-stage ] && \
+  [ ! -L /home/probiga-deploy/.probiga-db-boundary-stage ]; then
+  # The ordinary application account can install additive governance tables,
+  # columns and indexes, but it cannot create the reviewed trigger boundary.
+  # Keep the release usable in an explicit fail-closed mode until the fixed
+  # database identities are provisioned; never represent this as READY.
+  STRATEGY_GOVERNANCE_MODE=DEFERRED_DB
+fi
+readonly STRATEGY_GOVERNANCE_MODE
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
@@ -7554,10 +7568,12 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
+    'Environment=PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
     'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
     "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
@@ -7595,11 +7611,13 @@ write_scheduler_dropin() {
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
+    "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
+    'Environment=PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
     'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
     "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
@@ -8017,10 +8035,56 @@ assert_nginx_static_matches_checkout() {
   done
   return 0
 }
+write_admin_auth_header_file() {
+  local output_file="$1"
+  test -f "$output_file" || return 1
+  test ! -L "$output_file" || return 1
+  test "$(stat -c '%U:%G' -- "$output_file")" = \
+    "$SERVICE_USER:$SERVICE_USER" || return 1
+  test "$(stat -c '%a' -- "$output_file")" = 600 || return 1
+  (
+    cd "$PREPARED_CODE_ROOT" || return 1
+    sudo -u "$SERVICE_USER" /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_ADMIN_AUTH_ENABLED=true \
+      "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P - \
+      "$output_file" <<'PY'
+from pathlib import Path
+import sys
+
+from server.common.config import get_admin_auth_config
+
+config = get_admin_auth_config()
+token = str(config.get("token") or "")
+if config.get("enabled") is not True or not token:
+    raise SystemExit(2)
+try:
+    token.encode("ascii")
+except UnicodeEncodeError:
+    raise SystemExit(2)
+if any(ord(character) < 33 or ord(character) > 126 for character in token):
+    raise SystemExit(2)
+Path(sys.argv[1]).write_text(
+    "X-ProBigA-Admin-Token: " + token,
+    encoding="ascii",
+)
+PY
+  ) || return 1
+  chown root:root -- "$output_file" || return 1
+  chmod 0600 -- "$output_file" || return 1
+  test "$(stat -c '%U:%G' -- "$output_file")" = root:root || return 1
+  test "$(stat -c '%a' -- "$output_file")" = 600 || return 1
+  test "$(stat -c '%s' -- "$output_file")" -gt 28 || return 1
+  test "$(stat -c '%s' -- "$output_file")" -le 2048 || return 1
+  grep -q '^X-ProBigA-Admin-Token: [!-~][!-~]*$' "$output_file" || return 1
+}
 verify_strategy_governance_api_and_page_smoke() {
   local expected_sha="$1"
   local expected_trade_date="$2"
-  local governance_response index_response app_response
+  local governance_response index_response app_response admin_header
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$expected_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
   governance_response="$(mktemp)" || return 1
@@ -8032,16 +8096,34 @@ verify_strategy_governance_api_and_page_smoke() {
     rm -f -- "$governance_response" "$index_response"
     return 1
   }
-  chmod 0600 "$governance_response" "$index_response" "$app_response" || {
+  admin_header="$(mktemp)" || {
     rm -f -- "$governance_response" "$index_response" "$app_response"
     return 1
   }
+  chown "$SERVICE_USER:$SERVICE_USER" "$admin_header" || {
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
+    return 1
+  }
+  chmod 0600 "$governance_response" "$index_response" "$app_response" \
+    "$admin_header" || {
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
+    return 1
+  }
+  if ! write_admin_auth_header_file "$admin_header"; then
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
+    return 1
+  fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" \
       --output "$governance_response" \
       "http://127.0.0.1/api/strategy-center/governance?trade_date=$expected_trade_date"; then
     cat "$governance_response" >&2
-    rm -f -- "$governance_response" "$index_response" "$app_response"
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
     return 1
   fi
   if ! "$BOOTSTRAP_PYTHON" -I - "$governance_response" \
@@ -8195,17 +8277,20 @@ print(
 )
 PY
   then
-    rm -f -- "$governance_response" "$index_response" "$app_response"
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
     return 1
   fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" \
       --output "$index_response" http://127.0.0.1/ || \
     ! grep -F -- 'data-tab="strategy-center"' "$index_response" >/dev/null || \
     ! grep -F -- 'id="tab-strategy-center"' "$index_response" >/dev/null || \
     ! grep -F -- '动态策略竞技场' "$index_response" >/dev/null; then
     echo "Strategy governance page entry smoke failed" >&2
-    rm -f -- "$governance_response" "$index_response" "$app_response"
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
     return 1
   fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
@@ -8214,10 +8299,12 @@ PY
     ! grep -F -- '/api/strategy-center/governance' "$app_response" >/dev/null || \
     ! grep -F -- '真实下单权限：关闭' "$app_response" >/dev/null; then
     echo "Strategy governance page application smoke failed" >&2
-    rm -f -- "$governance_response" "$index_response" "$app_response"
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
     return 1
   fi
-  rm -f -- "$governance_response" "$index_response" "$app_response"
+  rm -f -- "$governance_response" "$index_response" "$app_response" \
+    "$admin_header"
   echo "Strategy governance API and page smoke passed"
 }
 release_identity_check() {
@@ -8250,6 +8337,12 @@ test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 sudo -u "$SERVICE_USER" test ! -w "$BOOTSTRAP_PYTHON"
 test "$($BOOTSTRAP_PYTHON -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.14"
 CUTOVER_STARTED=0
+DEFERRED_DB_CUTOVER_STARTED=0
+CUTOVER_BASE_SCHEMA_STARTED=0
+CUTOVER_BASE_SCHEMA_APPLIED=0
+DEFERRED_PAPER_WRITER_FENCE_STARTED=0
+DEFERRED_SCHEDULER_EXPECTED_SHA=""
+DEFERRED_SCHEDULER_CODE_ROOT=""
 CUTOVER_STEP=preparation
 API_STOPPED=0
 DEPLOY_SUCCEEDED=0
@@ -9418,6 +9511,9 @@ prepare_release() {
   chmod 0600 "$PREPARED_MAIN_DROPIN"
   grep -Fx 'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     "$PREPARED_MAIN_DROPIN" >/dev/null
+  grep -Fx \
+    "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
+    "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
     "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
@@ -9444,6 +9540,9 @@ prepare_release() {
   grep -Fx 'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx 'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    "$PREPARED_SCHEDULER_DROPIN" >/dev/null
+  grep -Fx \
+    "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx "Environment=PROBIGA_BUILD_COMMIT_SHA=$EXPECTED_SHA" \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
@@ -9702,6 +9801,7 @@ run_prepared_python_tool() {
       PYTHONDONTWRITEBYTECODE=1 \
       PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
       QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
@@ -9948,6 +10048,358 @@ run_database_boundary_bootstrap() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     "$BOOTSTRAP_PYTHON" -I "$entrypoint" "$action"
 }
+fence_deferred_paper_buy_writers() {
+  local writer_fence_result
+  test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
+  writer_fence_result="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" --fence-only)" || \
+    return 1
+  printf '%s\n' "$writer_fence_result"
+  printf '%s' "$writer_fence_result" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="fence-only" and p.get("writer_fence_active") is True and p.get("layer4_writers_enabled") is False and type(p.get("fenced_row_count")) is int and p["fenced_row_count"]>=0 and p.get("tasks")==[]; raise SystemExit(0 if ok else 2)'
+}
+assert_deferred_database_runtime() {
+  local governance_response
+  local health_response
+  local admin_header
+  local main_pid
+  local scheduler_pid
+  test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
+  systemctl is-active --quiet "$MAIN_SERVICE" || return 1
+  systemctl is-active --quiet probiga-scheduler || return 1
+  systemctl is-enabled --quiet probiga-scheduler || return 1
+  main_pid="$(systemctl show -p MainPID --value "$MAIN_SERVICE")" || return 1
+  scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)" || \
+    return 1
+  case "$main_pid:$scheduler_pid" in
+    *[!0-9:]*|0:*|*:0|:*|*:) return 1 ;;
+  esac
+  grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
+    "/proc/$main_pid/environ" >/dev/null || return 1
+  grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
+    "/proc/$scheduler_pid/environ" >/dev/null || return 1
+  grep -zFx -- "PROBIGA_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
+    "/proc/$scheduler_pid/environ" >/dev/null || return 1
+  health_response="$(mktemp)" || return 1
+  governance_response="$(mktemp)" || {
+    rm -f -- "$health_response"
+    return 1
+  }
+  admin_header="$(mktemp)" || {
+    rm -f -- "$health_response" "$governance_response"
+    return 1
+  }
+  chown "$SERVICE_USER:$SERVICE_USER" "$admin_header" || {
+    rm -f -- "$health_response" "$governance_response" "$admin_header"
+    return 1
+  }
+  chmod 0600 "$health_response" "$governance_response" "$admin_header" || {
+    rm -f -- "$health_response" "$governance_response" "$admin_header"
+    return 1
+  }
+  if ! write_admin_auth_header_file "$admin_header"; then
+    rm -f -- "$health_response" "$governance_response" "$admin_header"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$health_response" http://127.0.0.1/api/health || \
+    ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected_sha = sys.argv[2]
+revision = payload.get("release_revision")
+standalone = payload.get("standalone_scheduler")
+valid = (
+    isinstance(payload, dict)
+    and payload.get("status") == "degraded"
+    and payload.get("strategy_governance_mode") == "DEFERRED_DB"
+    and payload.get("base_schema_ready") is True
+    and payload.get("schema_ready") is False
+    and payload.get("governance_ready") is False
+    and payload.get("activation_enabled") is False
+    and payload.get("automatic_real_order_submission") is False
+    and payload.get("real_order_authority") is False
+    and isinstance(revision, dict)
+    and revision.get("expected_sha") == expected_sha
+    and revision.get("matches_expected") is True
+    and revision.get("code_worktree_clean") is True
+    and isinstance(standalone, dict)
+    and standalone.get("verified") is True
+    and standalone.get("active") is True
+    and standalone.get("enabled") is True
+)
+raise SystemExit(0 if valid else 2)
+PY
+  then
+    cat "$health_response" >&2
+    rm -f -- "$health_response" "$governance_response" "$admin_header"
+    return 1
+  fi
+  if ! curl --fail-with-body --silent --show-error --retry 5 \
+      --retry-all-errors --retry-delay 1 --retry-connrefused \
+      --header @"$admin_header" \
+      --output "$governance_response" \
+      http://127.0.0.1/api/strategy-center/governance || \
+    ! "$BOOTSTRAP_PYTHON" -I - "$governance_response" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+allocations = payload.get("allocations")
+pools = payload.get("pools")
+valid = (
+    isinstance(payload, dict)
+    and payload.get("status") == "degraded"
+    and payload.get("strategy_governance_mode") == "DEFERRED_DB"
+    and payload.get("base_schema_ready") is True
+    and payload.get("result_mode") == "CANONICAL_UNAVAILABLE"
+    and payload.get("activation_enabled") is False
+    and payload.get("schema_ready") is False
+    and payload.get("strategies") == []
+    and payload.get("combinations") == []
+    and pools == {"observation": [], "confirmation": [], "tradable": []}
+    and isinstance(allocations, list)
+    and len(allocations) == 1
+    and allocations[0].get("target_type") == "CASH"
+    and float(allocations[0].get("simulated_weight_pct")) == 100.0
+    and payload.get("automatic_real_order_submission") is False
+    and payload.get("real_order_authority") is False
+)
+raise SystemExit(0 if valid else 2)
+PY
+  then
+    cat "$governance_response" >&2
+    rm -f -- "$health_response" "$governance_response" "$admin_header"
+    return 1
+  fi
+  rm -f -- "$health_response" "$governance_response" "$admin_header" || \
+    return 1
+  curl --fail --silent --show-error --retry 3 --retry-all-errors \
+    --retry-delay 1 --retry-connrefused \
+    http://127.0.0.1/api/health/runtime >/dev/null || return 1
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_deferred_schema.py" \
+    --verify >/dev/null || return 1
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+    --deferred-disable >/dev/null || return 1
+  fence_deferred_paper_buy_writers >/dev/null || return 1
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/verify_trading_v3_production.py" \
+    --real-trading-closed-only >/dev/null || return 1
+  assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || return 1
+  return 0
+}
+rollback_deferred_database_release() {
+  local failed_status="${1:-2}"
+  local scheduler_safe_to_start=1
+  local rollback_failed=0
+  trap - ERR TERM INT HUP
+  set +e
+  echo "Deferred database release failed; restoring previous API/static runtime" >&2
+  systemctl stop "$MAIN_SERVICE" || rollback_failed=1
+  systemctl stop probiga-scheduler || rollback_failed=1
+  if [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ] || \
+    [ "$CUTOVER_BASE_SCHEMA_STARTED" -eq 1 ]; then
+    if ! run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+      --deferred-disable >/dev/null; then
+      scheduler_safe_to_start=0
+      rollback_failed=1
+    fi
+  fi
+  if [ "$DEFERRED_PAPER_WRITER_FENCE_STARTED" -eq 1 ] && \
+    ! fence_deferred_paper_buy_writers >/dev/null; then
+    scheduler_safe_to_start=0
+    rollback_failed=1
+  fi
+  if [ "$PREVIOUS_DROPIN_PRESENT" -eq 1 ]; then
+    install -o root -g root -m 0644 "$PREVIOUS_DROPIN" \
+      "$MAIN_RELEASE_DROPIN" || rollback_failed=1
+  else
+    rm -f -- "$MAIN_RELEASE_DROPIN" || rollback_failed=1
+  fi
+  systemctl daemon-reload || rollback_failed=1
+  point_static_release_to_checkout "$PREVIOUS_CODE_ROOT" || rollback_failed=1
+  if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ] && \
+    [ "$scheduler_safe_to_start" -eq 1 ]; then
+    systemctl start probiga-scheduler || rollback_failed=1
+  else
+    systemctl stop probiga-scheduler || rollback_failed=1
+    if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+      rollback_failed=1
+    fi
+  fi
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    if [ "$PREVIOUS_AI_WORKER_SERVICE_ACTIVE" -eq 1 ]; then
+      systemctl start "$AI_WORKER_SERVICE" || rollback_failed=1
+    else
+      systemctl stop "$AI_WORKER_SERVICE" || rollback_failed=1
+    fi
+    if [ "$PREVIOUS_AI_WORKER_TIMER_ACTIVE" -eq 1 ]; then
+      systemctl start "$AI_WORKER_TIMER" || rollback_failed=1
+    else
+      systemctl stop "$AI_WORKER_TIMER" || rollback_failed=1
+    fi
+  fi
+  if [ "$PREVIOUS_MAIN_ACTIVE_STATE" = active ]; then
+    systemctl start "$MAIN_SERVICE" || rollback_failed=1
+  fi
+  if ! systemctl is-active --quiet "$MAIN_SERVICE" || \
+    ! curl --fail --silent --show-error --retry 15 --retry-all-errors \
+      --retry-delay 2 --retry-connrefused \
+      http://127.0.0.1/api/health/runtime >/dev/null || \
+    ! assert_nginx_static_matches_checkout "$PREVIOUS_CODE_ROOT"; then
+    rollback_failed=1
+  fi
+  if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ] && \
+    [ "$scheduler_safe_to_start" -eq 1 ]; then
+    systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+    systemctl is-enabled --quiet probiga-scheduler || rollback_failed=1
+    run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+      --deferred-disable >/dev/null || rollback_failed=1
+  fi
+  ACTIVE_INPUT_LOCK_SHA256="$PREVIOUS_INPUT_LOCK_SHA256"
+  ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
+  ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
+  ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
+  if [ "$rollback_failed" -eq 0 ]; then
+    if [ "$CUTOVER_BASE_SCHEMA_STARTED" -eq 1 ]; then
+      # MySQL DDL may auto-commit before a later statement fails. Keep all
+      # additive results and record that the trigger boundary is still absent.
+      write_receipt ROLLED_BACK_DEFERRED_SCHEMA_RETAINED "$PREVIOUS_SHA" || true
+    elif [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ]; then
+      write_receipt ROLLED_BACK_GOVERNANCE_TASK_DISABLED "$PREVIOUS_SHA" || true
+    else
+      write_receipt ROLLED_BACK "$PREVIOUS_SHA" || true
+    fi
+  else
+    write_receipt ROLLBACK_FAILED "$PREVIOUS_SHA" || true
+  fi
+  exit "$failed_status"
+}
+deploy_deferred_database_release() {
+  local scheduler_pid
+  local schema_result
+  test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB
+  test "$PREVIOUS_MAIN_ACTIVE_STATE" = active
+  test "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1
+  test "$PREVIOUS_SCHEDULER_ENABLED" -eq 1
+  scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)"
+  case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  DEFERRED_SCHEDULER_EXPECTED_SHA="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
+  DEFERRED_SCHEDULER_CODE_ROOT="$(tr '\0' '\n' \
+    < "/proc/$scheduler_pid/environ" | sed -n \
+    's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
+  [[ "$DEFERRED_SCHEDULER_EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+  case "$DEFERRED_SCHEDULER_CODE_ROOT" in
+    "$CODE_RELEASE_ROOT/$DEFERRED_SCHEDULER_EXPECTED_SHA") ;;
+    *) return 1 ;;
+  esac
+  if test "$PREVIOUS_SHA" = "$EXPECTED_SHA"; then
+    test "$PREVIOUS_CODE_ROOT" = "$PREPARED_CODE_ROOT"
+    cmp --silent "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"
+    run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_deferred_schema.py" \
+      --verify >/dev/null
+    run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+      --deferred-disable >/dev/null
+    assert_deferred_database_runtime
+    ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
+    ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
+    ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
+    ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
+    write_receipt DEPLOYED_CODE_ONLY_DEGRADED "$EXPECTED_SHA"
+    DEPLOY_SUCCEEDED=1
+    trap - ERR TERM INT HUP
+    exit 0
+  fi
+  test -L "$STATIC_RELEASE_LINK"
+  test "$(readlink -f "$STATIC_RELEASE_LINK")" = "$PREVIOUS_CODE_ROOT"
+  test "${#PREVIOUS_LEGACY_MAIN_DROPINS[@]}" -eq 0
+  GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
+  chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
+  chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
+  DEFERRED_DB_CUTOVER_STARTED=$((1))
+  CUTOVER_STARTED="$DEFERRED_DB_CUTOVER_STARTED"
+  CUTOVER_STEP=stop_deferred_database_writers
+  API_STOPPED=1
+  systemctl stop "$MAIN_SERVICE"
+  ! systemctl is-active --quiet "$MAIN_SERVICE"
+  systemctl stop probiga-scheduler
+  ! systemctl is-active --quiet probiga-scheduler
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    systemctl stop "$AI_WORKER_TIMER"
+    systemctl stop "$AI_WORKER_SERVICE"
+  fi
+  CUTOVER_STEP=disable_governance_task_for_deferred_database
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
+    --deferred-disable --snapshot-file "$GOVERNANCE_TASK_OLD_SOURCE"
+  GOVERNANCE_TASK_TOUCHED=1
+  CUTOVER_STEP=fence_deferred_paper_buy_writers
+  DEFERRED_PAPER_WRITER_FENCE_STARTED=1
+  fence_deferred_paper_buy_writers
+  CUTOVER_STEP=prepare_deferred_governance_base_schema
+  CUTOVER_BASE_SCHEMA_STARTED=1
+  schema_result="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_deferred_schema.py" \
+    --apply --writers-fenced)"
+  printf '%s\n' "$schema_result"
+  printf '%s' "$schema_result" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("mode")=="DEFERRED_DB_BASE_SCHEMA" and p.get("schema_ready_without_triggers") is True and type(p.get("missing_trigger_count")) is int and p["missing_trigger_count"]>0 and p.get("database_triggers_installed") is False; raise SystemExit(0 if ok else 2)'
+  CUTOVER_BASE_SCHEMA_APPLIED=1
+  CUTOVER_STEP=install_deferred_main_runtime
+  install -d -o root -g root -m 0755 "$(dirname "$MAIN_RELEASE_DROPIN")"
+  install -o root -g root -m 0644 "$PREPARED_MAIN_DROPIN" \
+    "$MAIN_RELEASE_DROPIN"
+  sync -f /etc/systemd/system
+  systemctl daemon-reload
+  controlled_guard_assert_file "$MAIN_RELEASE_DROPIN" 644
+  cmp --silent "$MAIN_RELEASE_DROPIN" "$PREPARED_MAIN_DROPIN"
+  CUTOVER_STEP=restart_preserved_runtime_writers
+  systemctl start probiga-scheduler
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    if [ "$PREVIOUS_AI_WORKER_SERVICE_ACTIVE" -eq 1 ]; then
+      systemctl start "$AI_WORKER_SERVICE"
+    fi
+    if [ "$PREVIOUS_AI_WORKER_TIMER_ACTIVE" -eq 1 ]; then
+      systemctl start "$AI_WORKER_TIMER"
+    fi
+  fi
+  CUTOVER_STEP=start_deferred_api
+  systemctl start "$MAIN_SERVICE"
+  systemctl is-active --quiet "$MAIN_SERVICE"
+  CUTOVER_STEP=switch_deferred_static_release
+  point_static_release_to_checkout "$PREPARED_CODE_ROOT"
+  CUTOVER_STEP=verify_deferred_database_release
+  assert_deferred_database_runtime
+  ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
+  ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
+  ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
+  ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
+  CUTOVER_STEP=write_deferred_database_receipt
+  write_receipt DEPLOYED_CODE_ONLY_DEGRADED "$EXPECTED_SHA"
+  DEPLOY_SUCCEEDED=1
+  trap - ERR TERM INT HUP
+  echo "Deployed $EXPECTED_SHA with deferred trigger boundary; governance remains locked"
+  exit 0
+}
 rollback() {
   local failed_status="${1:-$?}"
   local failed_line="${2:-0}"
@@ -9974,6 +10426,9 @@ rollback() {
   local service_active_state=""
   local services_quiescent=1
   local database_boundary_rollback_failed=0
+  if [ "${DEFERRED_DB_CUTOVER_STARTED:-0}" -eq 1 ]; then
+    rollback_deferred_database_release "$failed_status"
+  fi
   if [ -f "$PREPARED_CODE_ROOT/deploy/production_db_boundary_bootstrap.py" ] && \
     ! run_database_boundary_bootstrap rollback >/dev/null 2>&1; then
     database_boundary_rollback_failed=1
@@ -10452,6 +10907,9 @@ trap 'rollback 129' HUP
 # the old API remains active. This phase must not mutate the live checkout.
 CUTOVER_STEP=prepare_release
 prepare_release
+if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
+  deploy_deferred_database_release
+fi
 if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   CUTOVER_STEP=verify_production_database_boundary
   run_database_boundary_bootstrap verify

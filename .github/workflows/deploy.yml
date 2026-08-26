@@ -535,8 +535,11 @@ jobs:
       - name: Run dynamic strategy governance guard regressions
         run: >-
           python -m pytest -q
+          tests/test_prepare_strategy_governance_deferred_schema.py
           tests/test_strategy_metric_artifact_size_limit.py
           tests/test_strategy_statistical_guards.py
+          tests/test_strategy_governance_deferred_mode.py
+          tests/test_strategy_governance_deferred_scheduler.py
           tests/test_production_schema_evidence_validators.py
           tests/test_api_generic_error_sanitization.py
           tests/test_trading_v2_error_sanitization.py
