@@ -160,6 +160,25 @@ _AUTH_INDEX_CONTRACTS = {
     "st_auth_audit": {(True, ("id",)), (False, ("created_at",))},
     "st_auth_bootstrap": {(True, ("id",))},
 }
+_AUTH_CHARACTER_COLUMN_DDL = {
+    "st_auth_user": {
+        "username": "VARCHAR(64)",
+        "username_norm": "VARCHAR(64)",
+        "password_hash": "VARCHAR(255)",
+        "role": "VARCHAR(20)",
+    },
+    "st_auth_session": {
+        "token_hash": "VARCHAR(64)",
+        "client_ip": "VARCHAR(64)",
+        "user_agent": "VARCHAR(255)",
+    },
+    "st_auth_audit": {
+        "username": "VARCHAR(64)",
+        "event_type": "VARCHAR(40)",
+        "client_ip": "VARCHAR(64)",
+        "detail": "TEXT",
+    },
+}
 
 
 def _inspector_index_shapes(inspector, table_name: str) -> set[tuple[bool, tuple[str, ...]]]:
@@ -313,9 +332,22 @@ def privileged_migrate_auth_schema(engine: Engine) -> dict[str, object]:
                 observed = collations.get(table_name)
                 if observed and observed != "utf8mb4_unicode_ci":
                     conn.execute(text(
-                        f"ALTER TABLE `{table_name}` CONVERT TO CHARACTER SET "
+                        f"ALTER TABLE `{table_name}` DEFAULT CHARACTER SET "
                         "utf8mb4 COLLATE utf8mb4_unicode_ci"
                     ))
+                    # Do not use ``CONVERT TO CHARACTER SET`` here.  MySQL
+                    # rebuilds every column for that form and can reject the
+                    # otherwise unchanged auth user/session foreign key.  Only
+                    # character columns need conversion; integer relationship
+                    # columns must remain untouched.
+                    for column_name, column_ddl in (
+                        _AUTH_CHARACTER_COLUMN_DDL.get(table_name, {}).items()
+                    ):
+                        conn.execute(text(
+                            f"ALTER TABLE `{table_name}` MODIFY COLUMN "
+                            f"`{column_name}` {column_ddl} CHARACTER SET utf8mb4 "
+                            "COLLATE utf8mb4_unicode_ci NOT NULL"
+                        ))
     now = _utcnow()
     try:
         with engine.begin() as conn:
