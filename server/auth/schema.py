@@ -143,7 +143,11 @@ _AUTH_COLUMN_CONTRACTS = {
         "created_at": ("datetime", "NO", ""),
     },
     "st_auth_bootstrap": {
-        "id": ("int", "NO", ""),
+        # SQLAlchemy/MySQL creates an integer primary key as AUTO_INCREMENT
+        # unless autoincrement is explicitly disabled.  Match the table this
+        # module itself creates so the production validator does not reject a
+        # healthy bootstrap singleton after migration.
+        "id": ("int", "NO", "auto_increment"),
         "registration_open": ("tinyint(1)", "NO", ""),
         "claimed_user_id": ("int", "YES", ""),
         "created_at": ("datetime", "NO", ""),
