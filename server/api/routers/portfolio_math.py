@@ -92,10 +92,22 @@ def portfolio_recalc_cost_from_history(
     read_sql_fn: callable(sql, params) -> list[dict]
     """
     rows = read_sql_fn(
-        "SELECT trans_type, price, shares FROM st_portfolio_trans_log "
+        "SELECT trans_type, price, shares, source FROM st_portfolio_trans_log "
         "WHERE stock_code = :c ORDER BY created_at, id",
         {"c": stock_code},
     )
+    # ``initial`` and ``position_add`` rows are authoritative position
+    # snapshots.  A stock can be cleared and added again many times; carrying
+    # transactions from an older cycle into the new position inflates shares
+    # and can make a reduction appear to fail.  Start from the newest snapshot
+    # while retaining the legacy all-history behaviour for rows that predate
+    # the source column.
+    reset_index = None
+    for index, row in enumerate(rows):
+        if str(row.get("source") or "").strip().lower() in {"initial", "position_add"}:
+            reset_index = index
+    if reset_index is not None:
+        rows = rows[reset_index:]
     total_buy_amount = 0.0
     total_sell_amount = 0.0
     total_buy_shares = 0

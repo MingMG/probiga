@@ -114,6 +114,35 @@ class PortfolioCostTest(unittest.TestCase):
         self.assertEqual(result["new_shares"], 0)
         self.assertEqual(result["new_cost"], 0.0)
 
+    def test_recalc_starts_from_latest_position_snapshot(self):
+        def mock_read(sql, params):
+            self.assertIn("source", sql)
+            return [
+                {"trans_type": "buy", "price": 40.0, "shares": 5000, "source": "trade"},
+                {"trans_type": "sell", "price": 42.0, "shares": 100, "source": "trade"},
+                {"trans_type": "buy", "price": 34.5, "shares": 300, "source": "position_add"},
+                {"trans_type": "sell", "price": 33.5, "shares": 200, "source": "trade"},
+            ]
+
+        result = portfolio_recalc_cost_from_history("600522", mock_read)
+
+        self.assertEqual(result["new_shares"], 100)
+        self.assertAlmostEqual(result["new_cost"], 36.5, places=4)
+
+    def test_recalc_starts_from_latest_initial_snapshot(self):
+        def mock_read(sql, params):
+            return [
+                {"trans_type": "buy", "price": 20.0, "shares": 100, "source": "initial"},
+                {"trans_type": "sell", "price": 21.0, "shares": 100, "source": "trade"},
+                {"trans_type": "buy", "price": 10.0, "shares": 300, "source": "initial"},
+                {"trans_type": "buy", "price": 12.0, "shares": 100, "source": "trade"},
+            ]
+
+        result = portfolio_recalc_cost_from_history("000001", mock_read)
+
+        self.assertEqual(result["new_shares"], 400)
+        self.assertAlmostEqual(result["new_cost"], 10.5, places=4)
+
     def test_cost_profit_allows_zero_or_negative_cost(self):
         self.assertEqual(portfolio_cost_profit(100, 10, 0), 1000)
         self.assertEqual(portfolio_cost_profit(100, 10, -2), 1200)
