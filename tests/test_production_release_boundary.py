@@ -5100,6 +5100,8 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert 'payload.get("activation_enabled") is False' in verifier
     assert 'revision.get("expected_git_sha") == expected_sha' in verifier
     assert 'revision.get("expected_sha") == expected_sha' not in verifier
+    assert "--retry 45" in verifier
+    assert "--retry-max-time 120" in verifier
     assert 'allocations[0].get("target_type") == "CASH"' in verifier
     assert "verify_trading_v3_production.py" in verifier
     assert "--real-trading-closed-only" in verifier

@@ -10107,8 +10107,9 @@ assert_deferred_database_runtime() {
     rm -f -- "$health_response" "$governance_response" "$admin_header"
     return 1
   fi
-  if ! curl --fail-with-body --silent --show-error --retry 15 \
-      --retry-all-errors --retry-delay 2 --retry-connrefused \
+  if ! curl --fail-with-body --silent --show-error --retry 45 \
+      --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+      --retry-connrefused \
       --output "$health_response" http://127.0.0.1/api/health || \
     ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" <<'PY'
 import json
