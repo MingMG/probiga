@@ -168,7 +168,7 @@ def test_deferred_release_fence_satisfies_real_trading_closed_task_contract() ->
     engine.dispose()
 
 
-def test_fence_only_rejects_drain_options_before_database_access(
+def test_deferred_release_fence_only_rejects_drain_options_before_database_access(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -178,10 +178,67 @@ def test_fence_only_rejects_drain_options_before_database_access(
     )
     with pytest.raises(SystemExit) as captured:
         task_deployment.main([
-            "--fence-only",
+            "--deferred-release-fence-only",
             "--require-no-live-scheduler-writers",
         ])
     assert captured.value.code == 2
+
+
+def test_fence_only_drains_writers_without_upsert_or_schema_changes(
+    monkeypatch,
+    capsys,
+) -> None:
+    engine = _Engine()
+    calls: list[object] = []
+    monkeypatch.setattr(task_deployment, "load_project_env", lambda: None)
+    monkeypatch.setattr(task_deployment, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        task_deployment,
+        "enforce_layer4_writer_fence_atomically",
+        lambda _engine: calls.append("disable") or 4,
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "wait_for_scheduler_writer_quiescence",
+        lambda _engine, **kwargs: calls.append(("drain", kwargs)) or (),
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "upsert_scheduler_task",
+        lambda *_args, **_kwargs: pytest.fail("fence-only must not upsert"),
+    )
+    monkeypatch.setattr(
+        task_deployment,
+        "layer4_activation_preconditions",
+        lambda *_args, **_kwargs: pytest.fail("fence-only must not inspect schema"),
+    )
+
+    assert task_deployment.main([
+        "--fence-only",
+        "--require-no-live-scheduler-writers",
+        "--writer-drain-timeout-seconds",
+        "150",
+        "--writer-drain-poll-seconds",
+        "2",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [
+        "disable",
+        (
+            "drain",
+            {"timeout_seconds": 150.0, "poll_seconds": 2.0},
+        ),
+    ]
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "fence-only"
+    assert payload["writer_quiescence"] == {
+        "checked": True,
+        "ready": True,
+        "reason_codes": [],
+        "live_writers": [],
+    }
+    assert payload["tasks"] == []
+    assert engine.disposed is True
 
 
 def test_writer_decorator_holds_shared_mysql_lock_for_complete_call(

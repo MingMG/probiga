@@ -97,11 +97,17 @@ def test_deploy_workflow_fences_layer4_before_starting_standalone() -> None:
     assert deploy_script.count(
         "Environment=API_EMBEDDED_SCHEDULER_ENABLED=false"
     ) >= 2
-    fence = workflow.index("tools/add_trading_v3_tasks.py --writer-fence")
+    fence = workflow.index("tools/add_trading_v3_tasks.py --fence-only")
+    schema_cutover = workflow.index("--phase cutover --writers-fenced", fence)
+    stage = workflow.index(
+        '"$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py"',
+        schema_cutover,
+    )
+    assert "--writer-fence" in workflow[stage:stage + 200]
     enable = workflow.index("sudo systemctl enable probiga-scheduler", fence)
     restart = workflow.index("sudo systemctl restart probiga-scheduler", enable)
     health = workflow.index("http://127.0.0.1/api/health", restart)
-    assert fence < enable < restart < health
+    assert fence < schema_cutover < stage < enable < restart < health
     assert "systemctl is-active --quiet probiga-scheduler" in workflow[restart:]
     assert "systemctl is-enabled --quiet probiga-scheduler" in workflow[restart:]
 

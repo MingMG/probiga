@@ -979,7 +979,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" '
         '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" '
         '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P '
-        "tools/add_trading_v3_tasks.py --writer-fence "
+        "tools/add_trading_v3_tasks.py --fence-only "
         "--require-no-live-scheduler-writers "
         "--writer-drain-timeout-seconds 150 "
         "--writer-drain-poll-seconds 5"
@@ -992,6 +992,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     ]
     assert python_cutover_commands == [
         expected_writer_fence_command,
+        'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" '
+        '--writer-fence',
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" '
         '--disabled; then',
@@ -2660,6 +2663,9 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         "sudo systemctl daemon-reload", guard_file
     )
     writer_fence = deploy_script.index("CUTOVER_STEP=writer_fence", first_service_stop)
+    stage_trading_v3_tasks = deploy_script.index(
+        "CUTOVER_STEP=stage_trading_v3_tasks_disabled", recover_call
+    )
     qmt_history = deploy_script.index(
         "CUTOVER_STEP=prepare_strategy_governance_qmt_history", recover_call
     )
@@ -2690,6 +2696,7 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         < writer_fence
         < cutover_call
         < recover_call
+        < stage_trading_v3_tasks
         < qmt_history
         < install_units
         < task_install
@@ -2713,6 +2720,8 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert "--phase cutover --writers-fenced" in cutover_command
     assert "prepare_strategy_governance_schema.py" in recover_command
     assert "--phase recover" in recover_command
+    assert "add_trading_v3_tasks.py" in recover_command
+    assert "--writer-fence" in recover_command
     assert "prepare_strategy_governance_qmt_history.py" not in preflight_command
     assert "sync_guojin_qmt_reference_data.py" not in preflight_command
     assert "--readiness-only" in recover_command

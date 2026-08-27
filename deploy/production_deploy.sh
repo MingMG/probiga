@@ -12000,7 +12000,7 @@ WRITER_FENCE_STATUS=0
     PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
     "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-    tools/add_trading_v3_tasks.py --writer-fence \
+    tools/add_trading_v3_tasks.py --fence-only \
       --require-no-live-scheduler-writers \
       --writer-drain-timeout-seconds 150 \
       --writer-drain-poll-seconds 5
@@ -12029,6 +12029,10 @@ CUTOVER_STEP=recover_strategy_governance_database_trust
 run_prepared_database_migration_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
   --phase recover
+CUTOVER_STEP=stage_trading_v3_tasks_disabled
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" \
+  --writer-fence
 CUTOVER_STEP=install_qmt_announcement_task_disabled
 if ! run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" --disabled; then

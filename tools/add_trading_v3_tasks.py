@@ -264,13 +264,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     fence_only = bool(args.fence_only)
     deferred_release_fence_only = bool(args.deferred_release_fence_only)
     isolated_fence_only = fence_only or deferred_release_fence_only
-    if isolated_fence_only and (
+    if deferred_release_fence_only and (
         args.require_no_live_scheduler_writers
         or args.writer_drain_timeout_seconds != 0.0
         or args.writer_drain_poll_seconds != 5.0
     ):
         _parser().error(
-            "isolated fence modes cannot be combined with writer-drain options"
+            "deferred release fence-only mode cannot be combined with "
+            "writer-drain options"
         )
     load_project_env()
     engine = create_tool_engine()
@@ -294,33 +295,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             fenced_row_count = enforce_deferred_release_writer_fence_atomically(engine)
         else:
             fenced_row_count = enforce_layer4_writer_fence_atomically(engine)
-        if isolated_fence_only:
-            payload = {
-                "status": "ok",
-                "mode": (
-                    "deferred-release-fence-only"
-                    if deferred_release_fence_only
-                    else "fence-only"
-                ),
-                "writer_fence_active": True,
-                "fenced_row_count": fenced_row_count,
-                "layer4_writers_enabled": False,
-                "writer_quiescence": writer_quiescence,
-                "migration_readiness": preconditions,
-                "tasks": [],
-            }
-            if deferred_release_fence_only:
-                payload.update({
-                    "paper_buy_writers_enabled": False,
-                    "fenced_task_types": list(DEFERRED_RELEASE_WRITER_TASK_TYPES),
-                })
-            print(json.dumps(
-                payload,
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            ))
-            return 0
         if args.require_no_live_scheduler_writers:
             try:
                 live_writers = wait_for_scheduler_writer_quiescence(
@@ -387,6 +361,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                     default=str,
                 ))
                 return WRITER_QUIESCENCE_BLOCK_EXIT_CODE
+        if isolated_fence_only:
+            payload = {
+                "status": "ok",
+                "mode": (
+                    "deferred-release-fence-only"
+                    if deferred_release_fence_only
+                    else "fence-only"
+                ),
+                "writer_fence_active": True,
+                "fenced_row_count": fenced_row_count,
+                "layer4_writers_enabled": False,
+                "writer_quiescence": writer_quiescence,
+                "migration_readiness": preconditions,
+                "tasks": [],
+            }
+            if deferred_release_fence_only:
+                payload.update({
+                    "paper_buy_writers_enabled": False,
+                    "fenced_task_types": list(DEFERRED_RELEASE_WRITER_TASK_TYPES),
+                })
+            print(json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ))
+            return 0
         if activate_layer4:
             preconditions = {
                 **layer4_activation_preconditions(engine),
