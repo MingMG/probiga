@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 import pymysql
-from pymysql.cursors import DictCursor
+from pymysql.cursors import Cursor, DictCursor
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.pool import NullPool
@@ -477,6 +477,7 @@ def _connect_option(
     configure_trigger_session: bool,
     autocommit: bool,
     io_timeout_seconds: int = ADMIN_IO_TIMEOUT_SECONDS,
+    cursorclass: type[Cursor] = DictCursor,
 ) -> pymysql.Connection:
     if type(io_timeout_seconds) is not int or io_timeout_seconds <= 0:
         raise PrivilegedSchemaPreparationError(
@@ -490,7 +491,7 @@ def _connect_option(
         database=database,
         charset="utf8mb4",
         autocommit=autocommit,
-        cursorclass=DictCursor,
+        cursorclass=cursorclass,
         connect_timeout=10,
         read_timeout=io_timeout_seconds,
         write_timeout=io_timeout_seconds,
@@ -531,6 +532,10 @@ def _create_migrator_engine(
             configure_trigger_session=True,
             autocommit=False,
             io_timeout_seconds=MIGRATOR_IO_TIMEOUT_SECONDS,
+            # SQLAlchemy's MySQL dialect reads its initial server-version
+            # result positionally.  DictCursor is reserved for the direct
+            # DB-API administrator/lock paths below.
+            cursorclass=Cursor,
         )
 
     return create_engine(

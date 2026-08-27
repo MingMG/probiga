@@ -452,8 +452,42 @@ def test_option_connection_is_remote_tcp_tls_and_disables_local_infile(
     )
     assert observed["ssl_verify_cert"] is True
     assert observed["local_infile"] is False
+    assert observed["cursorclass"] is schema.DictCursor
     assert "unix_socket" not in observed
     assert "read_default_file" not in observed
+
+
+def test_migrator_sqlalchemy_engine_uses_positional_cursor(monkeypatch):
+    observed = {}
+    connection = SimpleNamespace()
+
+    def fake_connect_option(*_args, **kwargs):
+        observed.update(kwargs)
+        return connection
+
+    def fake_create_engine(_url, **kwargs):
+        assert kwargs["creator"]() is connection
+        return SimpleNamespace()
+
+    monkeypatch.setattr(schema, "_connect_option", fake_connect_option)
+    monkeypatch.setattr(schema, "create_engine", fake_create_engine)
+    credential = schema.OptionCredential(
+        path=Path("/etc/probiga/mysql-migrator.ini"),
+        host=schema.EXPECTED_CLIENT_ENDPOINT_HOST,
+        port=schema.EXPECTED_CLIENT_ENDPOINT_PORT,
+        user="probiga_migrator",
+        password="A" * 64,
+    )
+
+    schema._create_migrator_engine(
+        credential,
+        Path("/etc/probiga/mysql84-ca.pem"),
+    )
+
+    assert observed["cursorclass"] is schema.Cursor
+    assert observed["database"] == schema.DATABASE_NAME
+    assert observed["configure_trigger_session"] is True
+    assert observed["autocommit"] is False
 
 
 def test_all_three_database_identity_grant_boundaries_accept_exact_grants():
