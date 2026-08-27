@@ -852,6 +852,78 @@ def test_show_create_user_tls_is_attached_to_usage_grant():
     schema._validate_runtime_grants(resolved)
 
 
+class _GrantMetadataCursor:
+    def __init__(self, grants, create_user):
+        self.grants = grants
+        self.create_user = create_user
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement):
+        self.statement = statement
+
+    def fetchall(self):
+        assert self.statement == "SHOW GRANTS FOR CURRENT_USER()"
+        return [{"grant": item} for item in self.grants]
+
+    def fetchone(self):
+        assert self.statement == "SHOW CREATE USER CURRENT_USER()"
+        return {"CREATE USER": self.create_user}
+
+
+class _GrantMetadataDbapiConnection:
+    def __init__(self, grants, create_user):
+        self.grants = grants
+        self.create_user = create_user
+
+    def cursor(self):
+        return _GrantMetadataCursor(self.grants, self.create_user)
+
+
+class _GrantMetadataResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def one(self):
+        assert len(self.rows) == 1
+        return self.rows[0]
+
+
+class _GrantMetadataSaConnection:
+    def __init__(self, grants, create_user):
+        self.grants = grants
+        self.create_user = create_user
+
+    def execute(self, statement):
+        sql = str(statement)
+        if sql == "SHOW GRANTS FOR CURRENT_USER()":
+            return _GrantMetadataResult([(item,) for item in self.grants])
+        assert sql == "SHOW CREATE USER CURRENT_USER()"
+        return _GrantMetadataResult([(self.create_user,)])
+
+
+def test_grant_readers_accept_mysql_single_column_show_create_user():
+    grants_without_tls = tuple(item.replace(" REQUIRE SSL", "") for item in RUNTIME_GRANTS)
+    create_user = (
+        "CREATE USER `probiga_runtime`@`127.0.0.1` "
+        "IDENTIFIED WITH 'caching_sha2_password' AS '<redacted>' REQUIRE SSL"
+    )
+
+    assert schema._dbapi_grants(
+        _GrantMetadataDbapiConnection(grants_without_tls, create_user)
+    ) == RUNTIME_GRANTS
+    assert schema._sa_grants(
+        _GrantMetadataSaConnection(grants_without_tls, create_user)
+    ) == RUNTIME_GRANTS
+
+
 def test_show_create_user_without_tls_does_not_forge_tls_requirement():
     grants_without_tls = tuple(item.replace(" REQUIRE SSL", "") for item in RUNTIME_GRANTS)
 

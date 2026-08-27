@@ -683,7 +683,7 @@ def _dbapi_grants(connection: pymysql.Connection) -> tuple[str, ...]:
         if not isinstance(row, Mapping) or len(row) != 1:
             raise PrivilegedSchemaPreparationError("database grants were malformed")
         grants.append(str(next(iter(row.values())) or ""))
-    if not isinstance(create_user_row, Mapping) or len(create_user_row) < 2:
+    if not isinstance(create_user_row, Mapping) or len(create_user_row) < 1:
         raise PrivilegedSchemaPreparationError("database account metadata was malformed")
     create_user = str(tuple(create_user_row.values())[-1] or "")
     return _with_account_tls_clause(grants, create_user)
@@ -718,7 +718,7 @@ def _sa_grants(connection: Connection) -> tuple[str, ...]:
     create_user_row = connection.execute(
         text("SHOW CREATE USER CURRENT_USER()")
     ).one()
-    if len(create_user_row) < 2:
+    if len(create_user_row) < 1:
         raise PrivilegedSchemaPreparationError("database account metadata was malformed")
     return _with_account_tls_clause(grants, str(create_user_row[-1] or ""))
 
