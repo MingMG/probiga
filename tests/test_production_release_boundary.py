@@ -3746,7 +3746,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
     assert (
-        'test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in recovery
+        "ci-resolved-freeze-v1|static-wheel-lock-v2" in recovery
     )
     assert 'test "$guarded_sha" != "$EXPECTED_SHA"' not in recovery
     assert (
@@ -4123,6 +4123,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert service_user < caller < previous_state < stale_guard_rejection
     caller_block = normalized[service_user:previous_state]
     assert '"$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1' in caller_block
+    assert '"$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2' in caller_block
     for state_path in (
         "DATABASE_WRITER_GUARD_FILE",
         "DATABASE_WRITER_RESTORE_FILE",

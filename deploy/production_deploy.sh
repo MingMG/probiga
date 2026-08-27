@@ -5055,7 +5055,10 @@ controlled_v2_rollback_only_recovery() {
   local -a state_lines=()
   V2_RECOVERY_STEP=rollback-validate-request
   test "$DEPLOY_OPERATION" = deploy || return 1
-  test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
+  case "$DEPLOY_ARTIFACT_MODE" in
+    ci-resolved-freeze-v1|static-wheel-lock-v2) ;;
+    *) return 1 ;;
+  esac
   [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
   V2_RECOVERY_STEP=rollback-validate-transaction
   guarded_sha="$(activation_snapshot_recorded_release)" || return 1
@@ -7215,7 +7218,8 @@ if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
   trap 'precutover_failure 130 "$LINENO"' INT
   trap 'precutover_failure 129 "$LINENO"' HUP
 fi
-if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
+if { [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] || \
+    [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; } && \
   { [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] || \
     [ -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" ]; } && \
   { [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
