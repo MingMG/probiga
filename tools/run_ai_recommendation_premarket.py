@@ -39,8 +39,20 @@ from server.api.routers.hot_data import (
     _recommended_run_history_update,
 )
 from server.common.batch_db import create_batch_engine
+from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.config import get_wecom_webhook
 from tools.repair_recommendation_data import repair_target_data
+
+
+def _now_shanghai_naive(current: datetime | None = None) -> datetime:
+    """Return a naive Shanghai wall clock for existing DATETIME contracts."""
+
+    value = current or datetime.now(PRODUCTION_TIMEZONE)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=PRODUCTION_TIMEZONE)
+    else:
+        value = value.astimezone(PRODUCTION_TIMEZONE)
+    return value.replace(tzinfo=None)
 
 
 def _scheduler_recommendation_identity(requested_run_uid: str) -> tuple[str, bool]:
@@ -182,7 +194,11 @@ def _resolve_target_trade_date(engine, *, strict_prev_trade_day: bool, execution
     if trade_date:
         return str(trade_date)[:10]
     if strict_prev_trade_day:
-        return previous_trade_date(engine, execution_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        return previous_trade_date(
+            engine,
+            execution_time
+            or _now_shanghai_naive().strftime("%Y-%m-%d %H:%M:%S"),
+        )
     return latest_trade_date(engine)
 
 
@@ -190,7 +206,7 @@ def _premarket_theme_cutoff(execution_time: str) -> datetime:
     execution_dt = datetime.fromisoformat(str(execution_time).replace("Z", "+00:00"))
     if execution_dt.tzinfo is not None:
         execution_dt = execution_dt.replace(tzinfo=None)
-    now = datetime.now().replace(microsecond=0)
+    now = _now_shanghai_naive().replace(microsecond=0)
     hard_cutoff = datetime.combine(execution_dt.date(), datetime_time(9, 7, 59))
     if now.date() == execution_dt.date():
         return min(now, hard_cutoff)
@@ -321,7 +337,12 @@ def main() -> int:
     os.environ.setdefault("PROBIGA_KLINE_FEATURE_SQL_MODE", "pandas")
     os.environ.setdefault("PROBIGA_BATCH_DB_READ_RETRIES", "8")
     os.environ.setdefault("PROBIGA_KLINE_FEATURE_BATCH_SIZE", "200")
-    execution_time = args.execution_time.strip() or datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+    execution_time = (
+        args.execution_time.strip()
+        or _now_shanghai_naive().replace(microsecond=0).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    )
     engine = create_batch_engine()
     try:
         wait_attempts = int(os.environ.get("PROBIGA_AI_RECOMMEND_DB_WAIT_ATTEMPTS", "12"))
@@ -405,7 +426,9 @@ def main() -> int:
                 }
             # Use a completion-side cutoff so the snapshot captured during this
             # run is always eligible for the model context.
-            batch_execution_time = datetime.now().replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+            batch_execution_time = _now_shanghai_naive().replace(
+                microsecond=0
+            ).strftime("%Y-%m-%d %H:%M:%S")
             _recommended_run_history_update(run_uid, status="running", payload={
                 "progress_percent": 7,
                 "done_count": 0,
@@ -553,6 +576,18 @@ def main() -> int:
             "auto_repair_missing_kline": bool(args.auto_repair_missing_kline),
             "progress_callback": _progress_callback,
         }
+        publisher_task_type = str(
+            os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") or ""
+        ).strip()
+        publisher_build_sha = str(
+            os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA") or ""
+        ).strip().lower()
+        if bound_run_uid:
+            batch_kwargs.update({
+                "publication_run_uid": run_uid,
+                "publisher_task_type": publisher_task_type,
+                "publisher_build_sha": publisher_build_sha,
+            })
         if args.use_intraday_current:
             if "use_intraday_current" not in inspect.signature(run_batch).parameters:
                 raise RuntimeError(
@@ -562,10 +597,26 @@ def main() -> int:
         stats = run_batch(
             **batch_kwargs,
         )
+        publication_receipt = getattr(stats, "publication_receipt", None)
+        if bound_run_uid and (
+            not isinstance(publication_receipt, dict)
+            or int(publication_receipt.get("executable_count") or 0) <= 0
+        ):
+            raise RuntimeError(
+                "scheduled analysis did not return a non-empty canonical "
+                "strategy-pool publication receipt"
+            )
         payload = {
             "trade_date": stats.trade_date,
             "analysis_count": stats.analysis_count,
             "recommendation_count": stats.recommendation_count,
+            "executable_count": int(
+                getattr(stats, "executable_count", 0) or 0
+            ),
+            "canonical_pool_sha256": str(
+                getattr(stats, "canonical_pool_sha256", "") or ""
+            ),
+            "publication_receipt": publication_receipt,
             "market_mood_score": stats.market_mood_score,
             "external_market": external_report,
             "premarket_theme_forecast": {
@@ -592,6 +643,13 @@ def main() -> int:
             "message": f"盘前预演完成，通过 {stats.recommendation_count} 只",
         })
         if args.json:
+            if publication_receipt is not None:
+                print(json.dumps(
+                    publication_receipt,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ))
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
             print(

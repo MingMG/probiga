@@ -381,6 +381,45 @@ STOCK_DIVIDEND_BAIDU_TASK = {
     ),
 }
 
+# One deterministic post-close recommendation evidence chain.  The Linux
+# collector freezes the full-market target-day turnover facts; the signed-in
+# Windows edge then computes the deterministic preliminary Top80 and captures
+# the MyQuant upper-limit history in the same process.  All three stages bind
+# the same D+23:55 Shanghai decision cutoff and exact deployed build.
+TARGET_TURNOVER_SNAPSHOT_TASK = {
+    "task_name": "目标日全市场换手率不可变快照",
+    "task_type": "target_turnover_snapshot",
+    "group_name": "AI推荐",
+    "script_path": "tools/sync_target_turnover_snapshot.py",
+    "script_args": "",
+    "cron_time": "15:50",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 89,
+    "date_param": "",
+    "description": (
+        "Linux按完整目标日股票目录逐股采集东财历史K线f61；全覆盖、"
+        "QMT OHLCV逐行匹配、PIT截止与不可变回执全部通过后才NULL-only补写。"
+    ),
+}
+
+ANALYSIS_UPPER_EVIDENCE_TASK = {
+    "task_name": "策略预选80与MyQuant涨停价证据",
+    "task_type": "analysis_upper_evidence_prepare",
+    "group_name": "AI推荐",
+    "script_path": "tools/sync_upper_limit_snapshot.py",
+    "script_args": "--prepare-preliminary --min-score 62",
+    "cron_time": "23:40",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 90,
+    "date_param": "",
+    "description": (
+        "Windows QMT边缘节点以固定PIT截止重算有序Top80，再用MyQuant"
+        "history_instruments采集21日涨跌停价；preview hash写入不可变证据账本。"
+    ),
+}
+
 
 WINDOWS_QMT_EDGE_TASKS = (
     QMT_CATALOG_CAPABILITY_TASK,
@@ -398,12 +437,14 @@ WINDOWS_QMT_EDGE_TASKS = (
     QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK,
     QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK,
     ETF_FORWARD_DAILY_TASK,
+    ANALYSIS_UPPER_EVIDENCE_TASK,
 )
 LINUX_QMT_TASKS = (
     TASKS_BY_TYPE["qmt_nightly_reconciliation"],
     TASKS_BY_TYPE["qmt_gap_repair_plan"],
 )
 LINUX_PROVIDER_TASKS = (
+    TARGET_TURNOVER_SNAPSHOT_TASK,
     LINUX_RECENT_DATA_GAP_REPAIR_TASK,
     EASTMONEY_ALIST_DAILY_TASK,
     EASTMONEY_ALIST_INFO_TASK,
@@ -495,6 +536,7 @@ if (
 
 
 __all__ = [
+    "ANALYSIS_UPPER_EVIDENCE_TASK",
     "EASTMONEY_ALIST_DAILY_TASK",
     "EASTMONEY_ALIST_INFO_TASK",
     "EASTMONEY_CONCEPT_FLOW_TASK",
@@ -516,6 +558,7 @@ __all__ = [
     "QMT_STOCK_MINUTE_CANONICAL_TASK",
     "QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK",
     "STOCK_DIVIDEND_BAIDU_TASK",
+    "TARGET_TURNOVER_SNAPSHOT_TASK",
     "UNFROZEN_PROVIDER_TASK_TYPES",
     "UNFROZEN_PROVIDER_SCRIPT_PATHS",
     "WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE",

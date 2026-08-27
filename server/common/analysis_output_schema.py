@@ -75,6 +75,29 @@ RECOMMENDATION_COLUMN_CONTRACT = {
     "short_term_score": _spec("decimal(5,1)"),
     "recommend_status": _varchar(10, "BLOCK"),
     "recommend_reason": _varchar(500, ""),
+    "candidate_recommend_status": _varchar(
+        10, "BLOCK", nullable=False
+    ),
+    "chase_risk_status": _varchar(
+        20, "DATA_BLOCKED", nullable=False
+    ),
+    "ordinary_buy_eligible": _spec("tinyint(1)", False, "0"),
+    "candidate_ordinary_buy_eligible": _spec(
+        "tinyint(1)", False, "0"
+    ),
+    "publisher_run_uid": _spec(
+        "char(32)", False, "", character=True
+    ),
+    "publication_status": _varchar(
+        16, "PENDING", nullable=False
+    ),
+    "membership_snapshot_date": _spec("date"),
+    "membership_snapshot_source": _varchar(64, "", nullable=False),
+    "membership_proof_sha256": _spec(
+        "char(64)", False, "", character=True
+    ),
+    "turnover_evidence_json": _text(),
+    "upper_limit_evidence_json": _text(),
     "event_risk_level": _varchar(10, "LOW"),
     "last_check_time": _spec("datetime"),
     "sentiment_score": _spec("decimal(5,1)"),
@@ -173,6 +196,34 @@ RECOMMENDATION_ADDITIVE_COLUMNS = {
     "short_term_score": "DECIMAL(5,1) DEFAULT NULL",
     "recommend_status": "VARCHAR(10) DEFAULT 'BLOCK'",
     "recommend_reason": "VARCHAR(500) DEFAULT ''",
+    "candidate_recommend_status": (
+        "VARCHAR(10) NOT NULL DEFAULT 'BLOCK'"
+    ),
+    "chase_risk_status": (
+        "VARCHAR(20) NOT NULL DEFAULT 'DATA_BLOCKED'"
+    ),
+    "ordinary_buy_eligible": "TINYINT(1) NOT NULL DEFAULT 0",
+    "candidate_ordinary_buy_eligible": (
+        "TINYINT(1) NOT NULL DEFAULT 0"
+    ),
+    "publisher_run_uid": (
+        "CHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci "
+        "NOT NULL DEFAULT ''"
+    ),
+    "publication_status": (
+        "VARCHAR(16) NOT NULL DEFAULT 'PENDING'"
+    ),
+    "membership_snapshot_date": "DATE NULL",
+    "membership_snapshot_source": (
+        "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci "
+        "NOT NULL DEFAULT ''"
+    ),
+    "membership_proof_sha256": (
+        "CHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci "
+        "NOT NULL DEFAULT ''"
+    ),
+    "turnover_evidence_json": "TEXT NULL",
+    "upper_limit_evidence_json": "TEXT NULL",
     "event_risk_level": "VARCHAR(10) DEFAULT 'LOW'",
     "last_check_time": "DATETIME DEFAULT NULL",
     "sentiment_score": "DECIMAL(5,1) DEFAULT NULL",

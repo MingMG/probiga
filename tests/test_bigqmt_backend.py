@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import json
 import hashlib
-from datetime import datetime
+import sys
+from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine, event, text
 
 from integrations.bigqmt.backend import BigQmtBackend
-from integrations.bigqmt import bridge
+from integrations.bigqmt import bridge, membership_snapshot
 from integrations.bigqmt.release_identity import render_strategy_artifact
 from integrations.bigqmt.spool import PROVIDER_ID
 from integrations.qmt import bridge as qmt_bridge
-from tools import run_big_qmt_bridge
+from tools import run_big_qmt_bridge, sync_bigqmt_reference
 
 
 def _tick(price: float, timestamp: int) -> dict:
@@ -810,3 +812,541 @@ def test_explicit_off_session_refresh_does_not_persist_level1_events(
 
     assert result["market_session"] == "off_session"
     assert result["quote_events_skipped_off_session"] == 1
+
+
+def _membership_readback_engine():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    concept_rows = [("C001", "Concept 1", "600001", "Stock 1")]
+    industry_rows = [
+        ("I001", "Industry 1", "SW1", "600001", "Stock 1")
+    ]
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE si_trade_calendar (
+                trade_date DATE NOT NULL,
+                trade_status INTEGER NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_membership_snapshot_run (
+                snapshot_date DATE NOT NULL,
+                source TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                capture_mode TEXT NOT NULL,
+                concept_count INTEGER NOT NULL,
+                concept_relation_count INTEGER NOT NULL,
+                industry_count INTEGER NOT NULL,
+                industry_relation_count INTEGER NOT NULL,
+                concept_hash TEXT NOT NULL,
+                industry_hash TEXT NOT NULL,
+                captured_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_concept_member_snapshot (
+                snapshot_date DATE NOT NULL,
+                source TEXT NOT NULL,
+                concept_code TEXT NOT NULL,
+                concept_name TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                short_name TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                captured_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_industry_member_snapshot (
+                snapshot_date DATE NOT NULL,
+                source TEXT NOT NULL,
+                industry_code TEXT NOT NULL,
+                industry_name TEXT NOT NULL,
+                industry_type TEXT NOT NULL,
+                stock_code TEXT NOT NULL,
+                short_name TEXT NOT NULL,
+                quality_status TEXT NOT NULL,
+                captured_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(
+            text("INSERT INTO si_trade_calendar VALUES ('2026-08-26', 1)")
+        )
+        connection.execute(
+            text("""
+                INSERT INTO qmt_membership_snapshot_run VALUES
+                ('2026-08-26', 'gj_big_qmt_inner', 'QMT_VALIDATED',
+                 'qmt_close_full_refresh', 1, 1, 1, 1,
+                 :concept_hash, :industry_hash, '2026-08-26 15:12:00')
+            """),
+            {
+                "concept_hash": membership_snapshot._canonical_hash(
+                    concept_rows
+                ),
+                "industry_hash": membership_snapshot._canonical_hash(
+                    industry_rows
+                ),
+            },
+        )
+        connection.execute(text("""
+            INSERT INTO qmt_concept_member_snapshot VALUES
+            ('2026-08-26', 'gj_big_qmt_inner', 'C001', 'Concept 1',
+             '600001', 'Stock 1', 'QMT_VALIDATED', '2026-08-26 15:12:00')
+        """))
+        connection.execute(text("""
+            INSERT INTO qmt_industry_member_snapshot VALUES
+            ('2026-08-26', 'gj_big_qmt_inner', 'I001', 'Industry 1', 'SW1',
+             '600001', 'Stock 1', 'QMT_VALIDATED', '2026-08-26 15:12:00')
+        """))
+    return engine
+
+
+def test_existing_membership_verifier_is_select_only_and_hash_bound(
+    monkeypatch,
+) -> None:
+    engine = _membership_readback_engine()
+    statements: list[str] = []
+    for name in (
+        "MIN_CONCEPT_COUNT",
+        "MIN_CONCEPT_RELATION_COUNT",
+        "MIN_CONCEPT_STOCK_COUNT",
+        "MIN_INDUSTRY_RELATION_COUNT",
+        "MIN_INDUSTRY_STOCK_COUNT",
+    ):
+        monkeypatch.setattr(membership_snapshot, name, 1)
+    monkeypatch.setattr(
+        membership_snapshot,
+        "validate_qmt_membership_snapshot_runtime_schema",
+        lambda _engine: {},
+    )
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def capture_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(str(statement))
+
+    proof = membership_snapshot.verify_existing_membership_snapshot(
+        engine,
+        snapshot_date=date(2026, 8, 26),
+        decision_known_at=datetime(2026, 8, 27, 3, 5),
+    )
+
+    assert proof["snapshot_date"] == "2026-08-26"
+    assert proof["concept_relation_count"] == 1
+    assert proof["industry_relation_count"] == 1
+    assert statements
+    assert all(
+        statement.lstrip().upper().startswith("SELECT")
+        for statement in statements
+    )
+
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE qmt_membership_snapshot_run
+               SET concept_hash = :bad_hash
+             WHERE snapshot_date = '2026-08-26'
+        """), {"bad_hash": "f" * 64})
+    with pytest.raises(RuntimeError, match="count/hash proof differs"):
+        membership_snapshot.verify_existing_membership_snapshot(
+            engine,
+            snapshot_date=date(2026, 8, 26),
+            decision_known_at=datetime(2026, 8, 27, 3, 5),
+        )
+
+
+def _set_membership_concept_stock_count(engine, stock_count: int) -> None:
+    concept_rows = [
+        ("C001", "Concept 1", f"{600_000 + index:06d}", f"Stock {index}")
+        for index in range(1, stock_count + 1)
+    ]
+    with engine.begin() as connection:
+        if stock_count > 1:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO qmt_concept_member_snapshot VALUES
+                    ('2026-08-26', 'gj_big_qmt_inner', :concept_code,
+                     :concept_name, :stock_code, :short_name,
+                     'QMT_VALIDATED', '2026-08-26 15:12:00')
+                    """
+                ),
+                [
+                    {
+                        "concept_code": row[0],
+                        "concept_name": row[1],
+                        "stock_code": row[2],
+                        "short_name": row[3],
+                    }
+                    for row in concept_rows[1:]
+                ],
+            )
+        connection.execute(
+            text(
+                """
+                UPDATE qmt_membership_snapshot_run
+                   SET concept_relation_count = :relation_count,
+                       concept_hash = :concept_hash
+                 WHERE snapshot_date = '2026-08-26'
+                """
+            ),
+            {
+                "relation_count": stock_count,
+                "concept_hash": membership_snapshot._canonical_hash(
+                    concept_rows
+                ),
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("concept_stock_count", "passes"),
+    ((1, False), (2_999, False), (3_000, True)),
+)
+def test_existing_membership_verifier_enforces_concept_stock_boundary(
+    monkeypatch,
+    concept_stock_count: int,
+    passes: bool,
+) -> None:
+    assert membership_snapshot.MIN_CONCEPT_STOCK_COUNT == 3_000
+    engine = _membership_readback_engine()
+    _set_membership_concept_stock_count(engine, concept_stock_count)
+    for name in (
+        "MIN_CONCEPT_COUNT",
+        "MIN_CONCEPT_RELATION_COUNT",
+        "MIN_INDUSTRY_RELATION_COUNT",
+        "MIN_INDUSTRY_STOCK_COUNT",
+    ):
+        monkeypatch.setattr(membership_snapshot, name, 1)
+    monkeypatch.setattr(
+        membership_snapshot,
+        "validate_qmt_membership_snapshot_runtime_schema",
+        lambda _engine: {},
+    )
+
+    if not passes:
+        with pytest.raises(RuntimeError, match="count/hash proof differs"):
+            membership_snapshot.verify_existing_membership_snapshot(
+                engine,
+                snapshot_date=date(2026, 8, 26),
+                decision_known_at=datetime(2026, 8, 27, 3, 5),
+            )
+        return
+
+    proof = membership_snapshot.verify_existing_membership_snapshot(
+        engine,
+        snapshot_date=date(2026, 8, 26),
+        decision_known_at=datetime(2026, 8, 27, 3, 5),
+    )
+    assert proof["concept_stock_count"] == 3_000
+
+
+def test_membership_publish_rejects_next_day_historical_relabelling_before_dml(
+    monkeypatch,
+) -> None:
+    connection = MagicMock()
+    write = MagicMock(
+        side_effect=AssertionError("date-window rejection must precede DML")
+    )
+    monkeypatch.setattr(membership_snapshot, "write_frame", write)
+
+    with pytest.raises(RuntimeError, match="cannot relabel"):
+        membership_snapshot.publish_membership_snapshot(
+            connection,
+            {},
+            snapshot_date=date(2026, 8, 26),
+            captured_at=datetime(2026, 8, 27, 3, 5),
+        )
+
+    connection.execute.assert_not_called()
+    write.assert_not_called()
+
+
+def _single_membership_frames() -> dict[str, pd.DataFrame]:
+    return {
+        "si_concept_constituent_east": pd.DataFrame([{
+            "concept_code": "C001",
+            "stock_code": "600001",
+            "short_name": "Stock 1",
+        }]),
+        "si_concept_code_east": pd.DataFrame([{
+            "concept_code": "C001",
+            "name": "Concept 1",
+        }]),
+        "si_industry_sw": pd.DataFrame([{
+            "sw_code": "I001",
+            "industry_name": "Industry 1",
+            "industry_type": "SW1",
+            "stock_code": "600001",
+        }]),
+        "si_all_code": pd.DataFrame([{
+            "stock_code": "600001",
+            "short_name": "Stock 1",
+        }]),
+    }
+
+
+def _relax_membership_thresholds(monkeypatch) -> None:
+    for name in (
+        "MIN_CONCEPT_COUNT",
+        "MIN_CONCEPT_RELATION_COUNT",
+        "MIN_CONCEPT_STOCK_COUNT",
+        "MIN_INDUSTRY_RELATION_COUNT",
+        "MIN_INDUSTRY_STOCK_COUNT",
+    ):
+        monkeypatch.setattr(membership_snapshot, name, 1)
+    monkeypatch.setattr(
+        membership_snapshot,
+        "validate_qmt_membership_snapshot_runtime_schema",
+        lambda _engine: {},
+    )
+
+
+def test_membership_idempotent_publish_rechecks_persisted_children(monkeypatch):
+    engine = _membership_readback_engine()
+    _relax_membership_thresholds(monkeypatch)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "DELETE FROM qmt_concept_member_snapshot"
+        ))
+
+    with pytest.raises(RuntimeError, match="count/hash proof differs"):
+        with engine.begin() as connection:
+            membership_snapshot.publish_membership_snapshot(
+                connection,
+                _single_membership_frames(),
+                snapshot_date=date(2026, 8, 26),
+                captured_at=datetime(2026, 8, 26, 15, 12),
+            )
+
+
+def test_created_membership_readback_failure_rolls_back_transaction(monkeypatch):
+    engine = _membership_readback_engine()
+    _relax_membership_thresholds(monkeypatch)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM qmt_membership_snapshot_run"))
+        connection.execute(text("DELETE FROM qmt_concept_member_snapshot"))
+        connection.execute(text("DELETE FROM qmt_industry_member_snapshot"))
+    real_write = membership_snapshot.write_frame
+
+    def write_then_tamper(frame, table, connection, **kwargs):
+        written = real_write(frame, table, connection, **kwargs)
+        if table == "qmt_concept_member_snapshot":
+            connection.execute(text(
+                "UPDATE qmt_concept_member_snapshot "
+                "SET short_name='tampered'"
+            ))
+        return written
+
+    monkeypatch.setattr(membership_snapshot, "write_frame", write_then_tamper)
+    with pytest.raises(RuntimeError, match="count/hash proof differs"):
+        with engine.begin() as connection:
+            membership_snapshot.publish_membership_snapshot(
+                connection,
+                _single_membership_frames(),
+                snapshot_date=date(2026, 8, 26),
+                captured_at=datetime(2026, 8, 26, 15, 12),
+            )
+
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM qmt_membership_snapshot_run"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM qmt_concept_member_snapshot"
+        )).scalar_one() == 0
+        assert connection.execute(text(
+            "SELECT COUNT(*) FROM qmt_industry_member_snapshot"
+        )).scalar_one() == 0
+
+
+@pytest.mark.parametrize(
+    "requested",
+    ("2026-08-23", "2026-08-24", "2026-08-25"),
+)
+def test_membership_publication_rejects_non_authoritative_target_before_dml(
+    monkeypatch,
+    requested: str,
+) -> None:
+    engine = MagicMock()
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "authoritative_closed_trade_date",
+        lambda *_args, **_kwargs: "2026-08-26",
+    )
+    ensure = MagicMock()
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "ensure_membership_snapshot_tables",
+        ensure,
+    )
+
+    with pytest.raises(RuntimeError, match="authoritative closed session"):
+        sync_bigqmt_reference.publish(
+            engine,
+            {},
+            snapshot_date=date.fromisoformat(requested),
+            captured_at=datetime(2026, 8, 26, 15, 12),
+        )
+
+    ensure.assert_not_called()
+    engine.begin.assert_not_called()
+
+
+def test_membership_snapshot_date_requires_exact_iso_before_lookup(monkeypatch):
+    authoritative = MagicMock(return_value="2026-08-26")
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "authoritative_closed_trade_date",
+        authoritative,
+    )
+
+    with pytest.raises(RuntimeError, match="exact ISO"):
+        sync_bigqmt_reference.resolve_snapshot_date(
+            object(), "2026-08-26T15:12:00"
+        )
+
+    authoritative.assert_not_called()
+
+
+def _full_membership_proof() -> dict:
+    return {
+        "snapshot_date": "2026-08-26",
+        "source": "gj_big_qmt_inner",
+        "quality_status": "QMT_VALIDATED",
+        "capture_mode": "qmt_close_full_refresh",
+        "captured_at": "2026-08-26 15:12:00",
+        "concept_count": 500,
+        "concept_relation_count": 30_000,
+        "concept_stock_count": 3_000,
+        "concept_hash": "a" * 64,
+        "industry_count": 20,
+        "industry_relation_count": 5_000,
+        "industry_stock_count": 4_500,
+        "industry_hash": "b" * 64,
+    }
+
+
+@pytest.mark.parametrize(
+    ("concept_stock_count", "passes"),
+    ((1, False), (2_999, False), (3_000, True)),
+)
+def test_membership_receipt_enforces_concept_stock_boundary(
+    concept_stock_count: int,
+    passes: bool,
+) -> None:
+    assert sync_bigqmt_reference.MIN_CONCEPT_STOCK_COUNT == 3_000
+    proof = {
+        **_full_membership_proof(),
+        "concept_stock_count": concept_stock_count,
+    }
+    receipt = sync_bigqmt_reference._membership_verification_receipt(
+        status="PASS",
+        snapshot_date="2026-08-26",
+        verified_at=datetime(2026, 8, 27, 3, 6),
+        proof=proof,
+    )
+
+    if not passes:
+        with pytest.raises(ValueError, match="PASS receipt is incomplete"):
+            sync_bigqmt_reference.validate_membership_verification_receipt(
+                receipt,
+                0,
+                expected_snapshot_date="2026-08-26",
+            )
+        return
+
+    assert sync_bigqmt_reference.validate_membership_verification_receipt(
+        receipt,
+        0,
+        expected_snapshot_date="2026-08-26",
+    ) == "complete"
+
+
+def test_membership_release_cli_only_verifies_existing_snapshot(
+    monkeypatch,
+    capsys,
+) -> None:
+    engine = MagicMock()
+    monkeypatch.setattr(sys, "argv", [
+        "sync_bigqmt_reference.py",
+        "--verify-existing-snapshot",
+        "--snapshot-date",
+        "2026-08-26",
+        "--json",
+    ])
+    monkeypatch.setattr(sync_bigqmt_reference, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "create_tool_engine",
+        lambda **_kwargs: engine,
+    )
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "verify_existing_membership_snapshot",
+        lambda *_args, **_kwargs: _full_membership_proof(),
+    )
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "fetch_and_validate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("release verification must not call QMT")
+        ),
+    )
+
+    assert sync_bigqmt_reference.main() == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert sync_bigqmt_reference.validate_membership_verification_receipt(
+        payload,
+        0,
+        expected_snapshot_date="2026-08-26",
+    ) == "complete"
+    assert payload["read_only"] is True
+    engine.dispose.assert_called_once_with()
+
+
+def test_membership_release_cli_emits_retryable_block_without_qmt_or_dml(
+    monkeypatch,
+    capsys,
+) -> None:
+    engine = MagicMock()
+    monkeypatch.setattr(sys, "argv", [
+        "sync_bigqmt_reference.py",
+        "--verify-existing-snapshot",
+        "--snapshot-date",
+        "2026-08-26",
+        "--json",
+    ])
+    monkeypatch.setattr(sync_bigqmt_reference, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "create_tool_engine",
+        lambda **_kwargs: engine,
+    )
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "verify_existing_membership_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("exact snapshot is unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        sync_bigqmt_reference,
+        "fetch_and_validate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("blocked verification must not call QMT")
+        ),
+    )
+
+    assert sync_bigqmt_reference.main() == 2
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert sync_bigqmt_reference.validate_membership_verification_receipt(
+        payload,
+        2,
+        expected_snapshot_date="2026-08-26",
+    ) == "blocked"
+    assert payload["read_only"] is True
+    engine.dispose.assert_called_once_with()

@@ -2815,6 +2815,11 @@ shift
         GOVERNANCE_HEALTH_CONTRACT_VERSION,
         governance_health_required_check_names,
     )
+    from tools.prepare_strategy_governance_schema import (
+        _final_v3_trigger_contracts,
+        _non_v3_trigger_contracts,
+        _v2_release_trigger_contract,
+    )
     from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 
     qmt_operation_fields = (
@@ -2838,6 +2843,11 @@ shift
         {"id": 300 + index, **payload}
         for index, payload in enumerate(qmt_operations_expected.values(), 1)
     ]
+    full_trigger_names = sorted({
+        *_v2_release_trigger_contract()[0],
+        *_final_v3_trigger_contracts(),
+        *_non_v3_trigger_contracts(),
+    })
 
     def checks_for(disposition: str) -> list[dict[str, object]]:
         waived_names = (
@@ -2904,34 +2914,65 @@ shift
                 },
             },
             "supporting_release_trigger_inventory_exact": {
-                "required_count": 70,
+                "required_count": 81,
                 "optional_count": 0,
-                "observed_count": 70,
-                "expected_trigger_count": 70,
+                "observed_count": 81,
+                "expected_trigger_count": 81,
                 "owner_counts": {
+                    "market_field_capture": 5,
                     "pit_facts": 6,
                     "qmt_attestation": 6,
                     "qmt_history_coverage": 4,
+                    "qmt_membership": 6,
                     "qmt_reference": 10,
                     "scheduler_task_history": 2,
                     "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
                 "expected_owner_counts": {
+                    "market_field_capture": 5,
                     "pit_facts": 6,
                     "qmt_attestation": 6,
                     "qmt_history_coverage": 4,
+                    "qmt_membership": 6,
                     "qmt_reference": 10,
                     "scheduler_task_history": 2,
                     "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
                 "source_contract_hash": (
-                    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+                    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
                 ),
                 "database_triggers_required": True,
                 "metadata_frozen": True,
                 "definer": "probiga_migrator@127.0.0.1",
+            },
+            "full_database_trigger_inventory_exact": {
+                "expected_count": 142,
+                "observed_count": 142,
+                "v2_count": 41,
+                "managed_count": 101,
+                "expected_names": full_trigger_names,
+                "nameset_sha256": (
+                    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                ),
+                "v2_source_contract_sha256": (
+                    "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+                ),
+                "managed_source_contract_sha256": (
+                    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+                ),
+                "observed_metadata_sha256": "8" * 64,
+                "managed_contract": {
+                    "required_count": 101,
+                    "optional_count": 0,
+                    "observed_count": 101,
+                    "definer": "probiga_migrator@127.0.0.1",
+                    "metadata_frozen": True,
+                    "legacy_rehome_names": [],
+                },
+                "metadata_frozen": True,
+                "read_only": True,
             },
             "qmt_reference_physical_schema_and_seal": {
                 "contract_key": "qmt_reference_truth_v2",

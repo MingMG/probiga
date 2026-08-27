@@ -45,6 +45,7 @@ from server.common.scheduler_tasks import (
 )
 from tools.qmt_announcement_task_contract import TASK as QMT_ANNOUNCEMENT_TASK
 from tools.qmt_host_ownership_contract import (
+    ANALYSIS_UPPER_EVIDENCE_TASK,
     ETF_FORWARD_DAILY_TASK,
     LINUX_PROVIDER_TASKS,
     QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK,
@@ -85,13 +86,30 @@ REVIEW_DELIVERY_TASK_TYPES = frozenset(
         "evening_review",
     }
 )
-REQUIRED_DATA_TASK_CONTRACT_TYPES = frozenset(
+CORE_REQUIRED_DATA_TASK_CONTRACT_TYPES = frozenset(
     {
         "stock_finance",
         "notice_eastmoney",
         "notice_eastmoney_historical_repair",
         "stock_dividend_baidu",
     }
+)
+DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES = frozenset(
+    {
+        "qmt_stock_daily_canonical",
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+        "analysis_fast",
+        # These legacy publishers must remain present but disabled.  Omitting
+        # them from the exact release contract would allow an old deployment
+        # row to keep overwriting the canonical fixed-cutoff pool.
+        "analysis_morning_strict",
+        "analysis_premarket_external",
+    }
+)
+REQUIRED_DATA_TASK_CONTRACT_TYPES = frozenset(
+    CORE_REQUIRED_DATA_TASK_CONTRACT_TYPES
+    | DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES
 )
 # Backward compatibility for release scripts that still pass the old CLI
 # spelling.  This set proves scheduler-row ownership only; it never proves
@@ -275,6 +293,7 @@ TASKS = [
     dict(QMT_STOCK_MINUTE_CANONICAL_TASK),
     dict(QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK),
     dict(QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK),
+    dict(ANALYSIS_UPPER_EVIDENCE_TASK),
     dict(ETF_FORWARD_DAILY_TASK),
     *(dict(task) for task in LINUX_PROVIDER_TASKS),
     *(dict(task) for task in DERIVED_MARKET_TASKS),
@@ -489,12 +508,15 @@ TASKS = [
         "group_name": "系统管理",
         "script_path": "tools/run_ai_recommendation_premarket.py",
         "script_args": "--top-n 80 --min-score 62 --json",
-        "cron_time": "18:50",
+        "cron_time": "23:56",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 90,
         "date_param": "",
-        "description": "基于最新日K批量生成分析与推荐票池，并写入可追溯的筛选执行记录。",
+        "description": (
+            "在23:55固定上海PIT截止之后，复算与Windows不可变upper证据"
+            "相同的有序Top80，再原子生成、验证并激活正式推荐票池。"
+        ),
     },
     {
         "task_name": "AI推荐盘前严格生成",
@@ -504,10 +526,10 @@ TASKS = [
         "script_args": "--strict-prev-trade-day --top-n 80 --min-score 62 --min-kline-coverage 0.80 --json",
         "cron_time": "08:30",
         "interval_minutes": 0,
-        "enabled": 1,
+        "enabled": 0,
         "sort_order": 91,
         "date_param": "",
-        "description": "每天08:30按执行日上一交易日严格生成AI推荐；数据不足时失败关闭，不在Linux任务内修复QMT历史，也不回退更早日期。",
+        "description": "已停用：canonical票池仅由23:56固定PIT流水线发布；早盘不得用不同cutoff覆盖前夜已验证票池。",
     },
     {
         "task_name": "AI推荐09:08盘前主线预判",
@@ -517,10 +539,10 @@ TASKS = [
         "script_args": "--strict-prev-trade-day --external-market --theme-forecast --push-theme-forecast --theme-top-n 12 --theme-stocks-per-theme 5 --top-n 80 --min-score 62 --min-kline-coverage 0.80 --json",
         "cron_time": "09:07",
         "interval_minutes": 0,
-        "enabled": 1,
+        "enabled": 0,
         "sort_order": 92,
         "date_param": "",
-        "description": "09:07启动，在09:08档结合美股、日韩、港股、产业ETF与龙头、期货商品、汇率、美债、隔夜催化和上一完整交易日A股数据，生成并冻结主线与动态成分股候选，推送企业微信早报机器人。",
+        "description": "已停用旧的一体化publisher：主题早报需拆为只读交付任务；不得在缺少同cutoff upper证据时覆盖canonical票池。",
     },
     {
         "task_name": "盘后数据质量体检",
@@ -1462,6 +1484,10 @@ def validate_release_data_readiness(
             )
         replay_output = str(evidence.get("replay_output") or "")
         task["_trigger_source"] = str(history.get("trigger_source") or "")
+        # Replay the persisted-data validator against the same immutable
+        # scheduler/recommendation audit identity used by the live run.
+        task["_scheduler_history_run_uid"] = str(history.get("run_uid") or "")
+        task["_scheduler_expected_build_sha"] = build_sha
         evidence_target = evidence.get("release_target_date")
         expected_target = expected_targets.get(task_type)
         if expected_target is not None and str(evidence_target or "") != expected_target:

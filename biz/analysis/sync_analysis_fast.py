@@ -16,13 +16,16 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as datetime_time, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -38,6 +41,9 @@ from server.common.analysis_output_schema import (
     validate_ai_failure_sample_schema,
     validate_analysis_output_schema,
 )
+from server.common.recommended_run_history_schema import (
+    validate_recommended_run_history_schema,
+)
 from server.common.daily_stock_universe import (
     load_daily_stock_universe,
     validate_daily_stock_coverage,
@@ -50,10 +56,72 @@ from server.common.pit_facts import (
     normalize_decision_at,
     resolve_common_fact_cutoff,
 )
+from server.common.analysis_pool_receipt import (
+    ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    build_publication_receipt,
+    build_preliminary_upper_subject_receipt,
+    build_turnover_evidence,
+    build_upper_limit_evidence,
+    canonical_sha256,
+    is_executable_recommendation,
+    read_persisted_pool_manifest,
+    validate_turnover_evidence,
+    validate_preliminary_upper_subject_receipt,
+    validate_upper_limit_evidence,
+)
+from server.common.turnover_snapshot import load_verified_turnover_evidence
+from server.common.upper_limit_snapshot import (
+    load_latest_verified_upper_limit_evidence,
+)
+from server.common.chase_risk_policy import (
+    CanonicalChaseBar,
+    assess_chase_risk,
+)
 
 logger = logging.getLogger(__name__)
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def _now_shanghai_naive(current: datetime | None = None) -> datetime:
+    """Return the production wall clock without leaking the host timezone."""
+
+    value = current or datetime.now(_SHANGHAI)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_SHANGHAI)
+    else:
+        value = value.astimezone(_SHANGHAI)
+    return value.replace(tzinfo=None)
+
+
+def _formal_analysis_decision_at(value: datetime | str | None) -> datetime:
+    """Validate the exact naive Shanghai cutoff carried by a publisher."""
+
+    if isinstance(value, datetime):
+        parsed = value
+        exact = parsed.tzinfo is None and parsed.microsecond == 0
+    else:
+        raw = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                "formal analysis requires an exact Shanghai execution time"
+            ) from exc
+        exact = (
+            parsed.tzinfo is None
+            and parsed.microsecond == 0
+            and raw in {
+                parsed.isoformat(timespec="seconds"),
+                parsed.isoformat(sep=" ", timespec="seconds"),
+            }
+        )
+    if not exact:
+        raise RuntimeError(
+            "formal analysis requires an exact Shanghai execution time"
+        )
+    return parsed
 
 CRITICAL_NOTICE_KEYWORDS = (
     "退市", "终止上市", "暂停上市", "重大违法", "被立案", "立案调查", "欺诈发行",
@@ -76,6 +144,9 @@ class BatchStats:
     market_mood_score: float
     flow_date: str
     hot_date: str
+    executable_count: int = 0
+    canonical_pool_sha256: str = ""
+    publication_receipt: dict[str, Any] | None = None
 
 
 def _analysis_lock_key(database_name: str, trade_date: str) -> str:
@@ -710,21 +781,449 @@ def repair_missing_qmt_kline_for_trade_date(
     return payload
 
 
-def _recent_dates(engine: Engine, table: str, column: str, end_date: str, limit: int) -> list[str]:
+def _recent_dates(
+    engine: Engine,
+    table: str,
+    column: str,
+    end_date: str,
+    limit: int,
+    *,
+    known_at_column: str | None = None,
+    decision_known_at: datetime | str | None = None,
+) -> list[str]:
     limit = max(1, int(limit))
+    known_clause = ""
+    params: dict[str, Any] = {"end_date": end_date}
+    if known_at_column is not None:
+        if decision_known_at is None:
+            raise ValueError("knowledge-aware recent dates require a decision cutoff")
+        known_clause = (
+            f" AND `{known_at_column}` IS NOT NULL "
+            f"AND `{known_at_column}` <= :decision_known_at"
+        )
+        params["decision_known_at"] = normalize_decision_at(
+            decision_known_at
+        )
     with engine.connect() as conn:
         rows = conn.execute(text(f"""
             SELECT DISTINCT `{column}` AS d
             FROM `{table}`
             WHERE `{column}` <= :end_date
+              {known_clause}
             ORDER BY `{column}` DESC
             LIMIT {limit}
-        """), {"end_date": end_date}).fetchall()
+        """), params).fetchall()
     return [str(r[0])[:10] for r in rows if r[0] is not None]
 
 
-def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> pd.DataFrame:
-    dates = _recent_dates(engine, "sm_stock_kline", "trade_date", trade_date, lookback)
+def _load_canonical_chase_risk_evidence(
+    engine: Engine,
+    *,
+    start_date: str,
+    trade_date: str,
+    decision_known_at: datetime | str | None = None,
+    upper_limit_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """Build the complete conservative V4 execution-risk projection.
+
+    Every consumed bar must be the QMT-attested, supported canonical row.
+    Possible limit events are matched against every exchange limit band after
+    the 0.01 price-tick rounding rule, conservatively covering unknown ST and
+    board classifications without understating V4 risk.
+    """
+
+    bars = pd.read_sql(
+        text("""
+            SELECT stock_code, trade_date, `open`, high, low, `close`,
+                   volume, amount, pre_close, turnover_ratio,
+                   data_source, batch_id, data_version, quality_status,
+                   permission_status, received_at
+            FROM sm_stock_kline
+            WHERE k_type=1 AND adjust_type=0
+              AND trade_date>=:start_date AND trade_date<=:trade_date
+            ORDER BY stock_code, trade_date
+        """),
+        engine,
+        params={"start_date": start_date, "trade_date": trade_date},
+    )
+    columns = (
+        "stock_code",
+        "turnover_ratio_effective",
+        "turnover_evidence_json",
+        "upper_limit_evidence_json",
+        "chase_evidence_status",
+        "chase_effective_streak",
+        "chase_recent_peak_streak",
+        "chase_sessions_since_peak",
+        "chase_cooldown_active",
+        "chase_atr14",
+        "chase_ma5_extension_atr",
+        "chase_extreme_extension",
+        "chase_no_capacity",
+        "chase_bar_window_root_sha256",
+    )
+    if bars.empty:
+        return pd.DataFrame(columns=columns)
+    bars["stock_code"] = (
+        bars["stock_code"].astype(str).str.strip().str.zfill(6)
+    )
+    bars["trade_date"] = pd.to_datetime(
+        bars["trade_date"], errors="coerce"
+    ).dt.date
+    bars["received_at"] = pd.to_datetime(
+        bars["received_at"], errors="coerce"
+    )
+    numeric_columns = (
+        "open", "high", "low", "close", "volume", "amount",
+        "pre_close", "turnover_ratio",
+    )
+    historical_numeric_columns = tuple(
+        column for column in numeric_columns if column != "turnover_ratio"
+    )
+    for column in numeric_columns:
+        bars[column] = pd.to_numeric(bars[column], errors="coerce")
+    bars = bars.drop_duplicates(
+        ["stock_code", "trade_date"], keep=False
+    ).sort_values(["stock_code", "trade_date"])
+    target = date.fromisoformat(trade_date)
+    share_cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(target, datetime.max.time()).replace(microsecond=0)
+    )
+    turnover_snapshot = load_verified_turnover_evidence(
+        engine,
+        target_date=target,
+        decision_at=share_cutoff,
+    )
+    # A shares denominator and an older QMT instrument snapshot do not prove
+    # target-session turnover: either input may have changed after its last
+    # capture.  Until the close collector publishes an immutable, target-date
+    # direct-turnover receipt, the producer must not convert those stale facts
+    # into a Frozen-V4 PASS.
+    upper_snapshot = dict(upper_limit_evidence or {})
+    records: list[dict[str, Any]] = []
+
+    for stock_code, raw_group in bars.groupby("stock_code", sort=False):
+        # V4 needs 21 observations for return-20/MA20 and only a 10-session
+        # cooldown lookback.  Bind exactly that consumed window; older legacy
+        # rows must not taint an otherwise fully attested decision input.
+        group = raw_group.tail(21).reset_index(drop=True)
+        consumed_bar_rows: list[dict[str, Any]] = []
+        for bar in group.to_dict(orient="records"):
+            numeric_payload: dict[str, Any] = {}
+            for field in (
+                "open", "high", "low", "close", "volume", "amount",
+                "pre_close", "turnover_ratio",
+            ):
+                raw_value = bar.get(field)
+                numeric_payload[field] = (
+                    None
+                    if raw_value is None or pd.isna(raw_value)
+                    else format(Decimal(str(raw_value)).normalize(), "f")
+                )
+            received = bar.get("received_at")
+            received_text = (
+                None
+                if received is None or pd.isna(received)
+                else pd.Timestamp(received).to_pydatetime().isoformat(
+                    timespec="microseconds"
+                )
+            )
+            consumed_bar_rows.append({
+                "stock_code": stock_code,
+                "trade_date": (
+                    bar["trade_date"].isoformat()
+                    if isinstance(bar.get("trade_date"), date)
+                    else str(bar.get("trade_date") or "")
+                ),
+                **numeric_payload,
+                "data_source": str(bar.get("data_source") or ""),
+                "batch_id": str(bar.get("batch_id") or ""),
+                "data_version": str(bar.get("data_version") or ""),
+                "quality_status": str(bar.get("quality_status") or ""),
+                "permission_status": str(
+                    bar.get("permission_status") or ""
+                ),
+                "received_at": received_text,
+            })
+        chase_bar_window_root_sha256 = canonical_sha256({
+            "schema": "probiga.analysis-chase-bar-window.v1",
+            "stock_code": stock_code,
+            "target_date": trade_date,
+            "decision_at": share_cutoff.isoformat(timespec="seconds"),
+            "rows": consumed_bar_rows,
+        })
+        latest = group.iloc[-1]
+        raw_turnover = latest["turnover_ratio"]
+        turnover = Decimal(str(raw_turnover)) if pd.notna(raw_turnover) else None
+        turnover_core: dict[str, Any]
+        snapshot_row = turnover_snapshot.get(stock_code)
+        if snapshot_row is not None:
+            turnover = Decimal(str(snapshot_row["turnover_ratio"]))
+            if not turnover.is_finite() or turnover < 0:
+                raise RuntimeError(
+                    f"verified turnover snapshot is invalid for {stock_code}"
+                )
+            turnover_evidence_json = str(
+                snapshot_row["turnover_evidence_json"]
+            )
+        elif turnover is not None and turnover.is_finite() and turnover >= 0:
+            # Historical BigQMT rows contain an unversioned mix of fractional
+            # and percentage turnover units.  Preserve the stored fact
+            # (NULL-only supplementation) but do not feed it to a percentage-
+            # threshold strategy until a producer-side unit contract exists.
+            turnover = None
+            turnover_core = {
+                "status": "DATA_BLOCKED",
+                "stock_code": stock_code,
+                "trade_date": trade_date,
+                "decision_known_at": share_cutoff.isoformat(sep=" "),
+                "source_table": "sm_stock_kline",
+                "reason": (
+                    "DATA_BLOCKED: stored turnover unit is not versioned"
+                ),
+            }
+            turnover_evidence_json = build_turnover_evidence(turnover_core)
+        else:
+            turnover = None
+            turnover_core = {
+                "status": "DATA_BLOCKED",
+                "stock_code": stock_code,
+                "trade_date": trade_date,
+                "decision_known_at": share_cutoff.isoformat(sep=" "),
+                "source_table": "st_market_field_capture_row",
+                "reason": (
+                    "DATA_BLOCKED: immutable target-date direct turnover "
+                    "snapshot unavailable"
+                ),
+            }
+            turnover_evidence_json = build_turnover_evidence(turnover_core)
+        upper_row = upper_snapshot.get(stock_code)
+        upper_limits: dict[date, Decimal] = {}
+        upper_limit_evidence_json: str
+        if upper_row is not None:
+            upper_limit_evidence_json = str(
+                upper_row.get("upper_limit_evidence_json") or ""
+            )
+            upper_proof = validate_upper_limit_evidence(
+                upper_limit_evidence_json
+            )
+            if (
+                upper_proof.get("status") != "PASS"
+                or upper_proof.get("stock_code") != stock_code
+                or upper_proof.get("trade_date") != trade_date
+            ):
+                raise RuntimeError(
+                    f"verified upper-limit snapshot identity differs for {stock_code}"
+                )
+            upper_limits = {
+                date.fromisoformat(str(session)): Decimal(str(value))
+                for session, value in dict(
+                    upper_row.get("upper_limits") or {}
+                ).items()
+            }
+        else:
+            upper_limit_evidence_json = build_upper_limit_evidence({
+                "status": "DATA_BLOCKED",
+                "stock_code": stock_code,
+                "trade_date": trade_date,
+                "decision_known_at": share_cutoff.isoformat(sep=" "),
+                "source_table": "st_market_field_capture_row",
+                "reason": (
+                    "DATA_BLOCKED: immutable 21-session upper-limit "
+                    "snapshot unavailable"
+                ),
+            })
+        core_complete = bool(
+            len(group) >= 21
+            and latest["trade_date"] == target
+            and group[list(historical_numeric_columns)].notna().all(axis=None)
+            and turnover is not None
+            and (group[["open", "high", "low", "close"]] > 0).all(axis=None)
+            and (group["pre_close"] > 0).all()
+            and (group[["volume", "amount"]] >= 0).all(axis=None)
+            and (group["high"] >= group[["open", "close", "low"]].max(axis=1)).all()
+            and (group["low"] <= group[["open", "close", "high"]].min(axis=1)).all()
+        )
+        source_complete = bool(
+            (group["data_source"] == "gj_big_qmt_inner").all()
+            and (group["quality_status"] == "QMT_ATTESTED").all()
+            and (group["permission_status"] == "SUPPORTED").all()
+            and group["received_at"].notna().all()
+            and (group["received_at"] <= share_cutoff).all()
+            and group["batch_id"].fillna("").astype(str).str.strip().ne("").all()
+            and group["data_version"].fillna("").astype(str).str.strip().ne("").all()
+        )
+        status = "DATA_BLOCKED"
+        effective_streak = recent_peak = 0
+        sessions_since_peak: int | None = None
+        cooldown_active = False
+        atr14 = ma5_extension_atr = np.nan
+        extreme_extension = False
+        no_capacity = True
+        group_dates = tuple(group["trade_date"].tolist())
+        upper_limit_evidence_complete = bool(
+            len(upper_limits) == 21
+            and set(upper_limits) == set(group_dates)
+            and all(value.is_finite() and value > 0 for value in upper_limits.values())
+        )
+        if core_complete and source_complete and upper_limit_evidence_complete:
+            try:
+                upper_proof = validate_upper_limit_evidence(
+                    upper_limit_evidence_json
+                )
+                turnover_proof = validate_turnover_evidence(
+                    turnover_evidence_json
+                )
+                evidence_known_at = max(
+                    datetime.fromisoformat(str(upper_proof["captured_at"])),
+                    datetime.fromisoformat(str(turnover_proof["captured_at"])),
+                )
+                source_bars: list[CanonicalChaseBar] = []
+                for index, bar in group.iterrows():
+                    session = bar["trade_date"]
+                    qmt_known_at = pd.Timestamp(
+                        bar["received_at"]
+                    ).to_pydatetime()
+                    knowledge_naive = max(qmt_known_at, evidence_known_at)
+                    knowledge_aware = knowledge_naive.replace(tzinfo=_SHANGHAI)
+                    source_bars.append(CanonicalChaseBar(
+                        record_id=(
+                            f"{stock_code}:{session.isoformat()}:"
+                            f"{str(bar['batch_id'])}:{str(bar['data_version'])}"
+                        ),
+                        instrument=stock_code,
+                        session=session,
+                        knowledge_time=knowledge_aware,
+                        open=Decimal(str(bar["open"])),
+                        high=Decimal(str(bar["high"])),
+                        low=Decimal(str(bar["low"])),
+                        close=Decimal(str(bar["close"])),
+                        previous_close=Decimal(str(bar["pre_close"])),
+                        volume=Decimal(str(bar["volume"])),
+                        amount=Decimal(str(bar["amount"])),
+                        upper_limit=upper_limits[session],
+                        turnover_pct=(
+                            turnover if index == len(group) - 1 else None
+                        ),
+                        suspended=False,
+                        quality_status="PASS",
+                    ))
+                cutoff_aware = share_cutoff.replace(tzinfo=_SHANGHAI)
+                assessment = assess_chase_risk(
+                    tuple(source_bars),
+                    instrument=stock_code,
+                    cutoff=cutoff_aware,
+                )
+                effective_streak = max(
+                    assessment.surge_streak,
+                    assessment.limit_streak or 0,
+                    assessment.recent_peak_streak
+                    if assessment.cooldown_active else 0,
+                )
+                recent_peak = assessment.recent_peak_streak
+                sessions_since_peak = assessment.sessions_since_peak
+                cooldown_active = assessment.cooldown_active
+                atr14 = (
+                    float(assessment.atr14)
+                    if assessment.atr14 is not None else np.nan
+                )
+                ma5_extension_atr = (
+                    float(assessment.ma5_extension_atr)
+                    if assessment.ma5_extension_atr is not None else np.nan
+                )
+                extreme_extension = assessment.extreme_extension
+                no_capacity = assessment.no_capacity
+                status = (
+                    "ALLOW"
+                    if assessment.ordinary_buy_eligible
+                    else "BLOCK"
+                )
+                if (
+                    assessment.quality_status != "PASS"
+                    or assessment.missing_fields
+                ):
+                    status = "DATA_BLOCKED"
+            except Exception as exc:
+                logger.warning(
+                    "Frozen V4 evidence blocked one stock %s: %s",
+                    stock_code,
+                    exc,
+                )
+                status = "DATA_BLOCKED"
+        records.append(
+            {
+                "stock_code": stock_code,
+                "turnover_ratio_effective": (
+                    float(turnover) if turnover is not None else np.nan
+                ),
+                "turnover_evidence_json": turnover_evidence_json,
+                "upper_limit_evidence_json": upper_limit_evidence_json,
+                "chase_evidence_status": status,
+                "chase_effective_streak": effective_streak,
+                "chase_recent_peak_streak": recent_peak,
+                "chase_sessions_since_peak": sessions_since_peak,
+                "chase_cooldown_active": int(cooldown_active),
+                "chase_atr14": atr14,
+                "chase_ma5_extension_atr": ma5_extension_atr,
+                "chase_extreme_extension": int(extreme_extension),
+                "chase_no_capacity": int(no_capacity),
+                "chase_bar_window_root_sha256": (
+                    chase_bar_window_root_sha256
+                ),
+            }
+        )
+    return pd.DataFrame(records, columns=columns)
+
+
+def _attach_canonical_chase_risk_evidence(
+    frame: pd.DataFrame,
+    engine: Engine,
+    *,
+    start_date: str,
+    trade_date: str,
+    decision_known_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    evidence = _load_canonical_chase_risk_evidence(
+        engine,
+        start_date=start_date,
+        trade_date=trade_date,
+        decision_known_at=decision_known_at,
+    )
+    if frame.empty:
+        return frame
+    out = frame.merge(evidence, on="stock_code", how="left")
+    if "turnover_ratio_effective" in out.columns:
+        out["turnover_ratio"] = pd.to_numeric(
+            out["turnover_ratio_effective"], errors="coerce"
+        )
+        out = out.drop(columns=["turnover_ratio_effective"])
+    return out
+
+
+def load_kline_features(
+    engine: Engine,
+    trade_date: str,
+    lookback: int = 90,
+    *,
+    decision_known_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    target_date = date.fromisoformat(trade_date)
+    decision_cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(target_date, datetime.max.time()).replace(
+            microsecond=0
+        )
+    )
+    dates = _recent_dates(
+        engine,
+        "sm_stock_kline",
+        "trade_date",
+        trade_date,
+        lookback,
+        known_at_column="received_at",
+        decision_known_at=decision_cutoff,
+    )
     if not dates:
         raise RuntimeError(f"No K-line dates found before {trade_date}")
     start_date = dates[-1]
@@ -754,6 +1253,8 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
               AND k.adjust_type = 0
               AND k.trade_date >= :start_date
               AND k.trade_date <= :trade_date
+              AND k.received_at IS NOT NULL
+              AND k.received_at <= :decision_known_at
             WINDOW
               wfull AS (PARTITION BY k.stock_code ORDER BY k.trade_date),
               w5 AS (PARTITION BY k.stock_code ORDER BY k.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
@@ -781,7 +1282,11 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
         fast = pd.read_sql(
             text(window_sql),
             engine,
-            params={"start_date": start_date, "trade_date": trade_date},
+            params={
+                "start_date": start_date,
+                "trade_date": trade_date,
+                "decision_known_at": decision_cutoff,
+            },
         )
         if not fast.empty:
             numeric_cols = [
@@ -797,7 +1302,13 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
             fast["stock_code"] = fast["stock_code"].astype(str).str.strip().str.zfill(6)
             fast["short_name"] = fast["short_name"].fillna("").astype(str)
             fast["trade_date"] = pd.to_datetime(fast["trade_date"]).dt.date
-            return fast.drop_duplicates("stock_code", keep="last").reset_index(drop=True)
+            return _attach_canonical_chase_risk_evidence(
+                fast.drop_duplicates("stock_code", keep="last").reset_index(drop=True),
+                engine,
+                start_date=start_date,
+                trade_date=trade_date,
+                decision_known_at=decision_known_at,
+            )
     except Exception as exc:
         logger.debug("Window K-line feature query skipped, falling back to grouped aggregate: %s", exc)
 
@@ -818,6 +1329,8 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
         WHERE k.k_type = 1
           AND k.adjust_type = 0
           AND k.trade_date = :trade_date
+          AND k.received_at IS NOT NULL
+          AND k.received_at <= :decision_known_at
     """
     agg_sql = """
         SELECT
@@ -837,10 +1350,19 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
           AND adjust_type = 0
           AND trade_date >= :ma60_start
           AND trade_date <= :trade_date
+          AND received_at IS NOT NULL
+          AND received_at <= :decision_known_at
         GROUP BY stock_code
     """
     try:
-        latest = pd.read_sql(text(latest_sql), engine, params={"trade_date": trade_date})
+        latest = pd.read_sql(
+            text(latest_sql),
+            engine,
+            params={
+                "trade_date": trade_date,
+                "decision_known_at": decision_cutoff,
+            },
+        )
         if not latest.empty:
             agg = pd.read_sql(
                 text(agg_sql),
@@ -851,6 +1373,7 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
                     "ma10_start": _date_at(9),
                     "ma20_start": _date_at(19),
                     "ma60_start": _date_at(59),
+                    "decision_known_at": decision_cutoff,
                 },
             )
             latest["stock_code"] = latest["stock_code"].astype(str).str.strip().str.zfill(6)
@@ -866,9 +1389,14 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
                             WHERE k_type = 1
                               AND adjust_type = 0
                               AND trade_date = :lag_date
+                              AND received_at IS NOT NULL
+                              AND received_at <= :decision_known_at
                         """),
                         engine,
-                        params={"lag_date": dates[offset]},
+                        params={
+                            "lag_date": dates[offset],
+                            "decision_known_at": decision_cutoff,
+                        },
                     )
                     if not lag.empty:
                         lag["stock_code"] = lag["stock_code"].astype(str).str.strip().str.zfill(6)
@@ -901,7 +1429,13 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
             drop_cols = [c for c in ("close_5d_ago", "close_20d_ago") if c in out.columns]
             if drop_cols:
                 out = out.drop(columns=drop_cols)
-            return out.drop_duplicates("stock_code", keep="last").reset_index(drop=True)
+            return _attach_canonical_chase_risk_evidence(
+                out.drop_duplicates("stock_code", keep="last").reset_index(drop=True),
+                engine,
+                start_date=start_date,
+                trade_date=trade_date,
+                decision_known_at=decision_known_at,
+            )
     except Exception as exc:
         logger.warning("Grouped K-line feature query failed, falling back to pandas rolling: %s", exc)
 
@@ -918,9 +1452,19 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
           AND k.adjust_type = 0
           AND k.trade_date >= :start_date
           AND k.trade_date <= :trade_date
+          AND k.received_at IS NOT NULL
+          AND k.received_at <= :decision_known_at
         ORDER BY k.stock_code, k.trade_date
     """
-    df = pd.read_sql(text(sql), engine, params={"start_date": start_date, "trade_date": trade_date})
+    df = pd.read_sql(
+        text(sql),
+        engine,
+        params={
+            "start_date": start_date,
+            "trade_date": trade_date,
+            "decision_known_at": decision_cutoff,
+        },
+    )
     if df.empty:
         raise RuntimeError(f"No K-line rows found for {trade_date}")
 
@@ -958,7 +1502,13 @@ def load_kline_features(engine: Engine, trade_date: str, lookback: int = 90) -> 
     latest = df[df["trade_date"] == target].copy()
     if latest.empty:
         raise RuntimeError(f"No K-line rows exactly on {trade_date}")
-    return latest.reset_index(drop=True)
+    return _attach_canonical_chase_risk_evidence(
+        latest.reset_index(drop=True),
+        engine,
+        start_date=start_date,
+        trade_date=trade_date,
+        decision_known_at=decision_known_at,
+    )
 
 
 def load_finance(
@@ -1042,34 +1592,101 @@ def load_finance(
     return df.drop_duplicates("stock_code", keep="last")
 
 
-def load_flow_features(engine: Engine, trade_date: str, lookback: int = 25) -> tuple[pd.DataFrame, str]:
-    dates = _recent_dates(engine, "sm_stock_capital_flow_daily", "trade_date", trade_date, lookback)
+def load_flow_features(
+    engine: Engine,
+    trade_date: str,
+    lookback: int = 25,
+    *,
+    decision_known_at: datetime | str | None = None,
+) -> tuple[pd.DataFrame, str]:
+    target = date.fromisoformat(trade_date)
+    decision_cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(target, datetime.max.time()).replace(microsecond=0)
+    )
+    dates = _recent_dates(
+        engine,
+        "sm_stock_capital_flow_daily",
+        "trade_date",
+        trade_date,
+        lookback,
+        known_at_column="etl_sync_at",
+        decision_known_at=decision_cutoff,
+    )
     if not dates:
         return pd.DataFrame({"stock_code": []}), ""
     start_date = dates[-1]
     flow_date = dates[0]
     sql = """
         SELECT stock_code, trade_date, main_net_inflow, max_net_inflow, lg_net_inflow,
-               mid_net_inflow, sm_net_inflow
+               mid_net_inflow, sm_net_inflow, etl_sync_at
         FROM sm_stock_capital_flow_daily
         WHERE trade_date >= :start_date
           AND trade_date <= :trade_date
+          AND etl_sync_at IS NOT NULL
+          AND etl_sync_at >= TIMESTAMP(trade_date, '15:10:00')
+          AND etl_sync_at <= :decision_known_at
         ORDER BY stock_code, trade_date
     """
-    df = pd.read_sql(text(sql), engine, params={"start_date": start_date, "trade_date": trade_date})
+    df = pd.read_sql(
+        text(sql),
+        engine,
+        params={
+            "start_date": start_date,
+            "trade_date": trade_date,
+            "decision_known_at": decision_cutoff,
+        },
+    )
     if df.empty:
         return pd.DataFrame({"stock_code": []}), flow_date
     df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+    df["etl_sync_at"] = pd.to_datetime(df["etl_sync_at"], errors="coerce")
     for col in ["main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     df = df.drop_duplicates(["stock_code", "trade_date"], keep="last").sort_values(["stock_code", "trade_date"])
     grouped = df.groupby("stock_code", group_keys=False)
     df["main_net_inflow_5d"] = grouped["main_net_inflow"].transform(lambda s: s.rolling(5, min_periods=1).sum())
     df["main_net_inflow_20d"] = grouped["main_net_inflow"].transform(lambda s: s.rolling(20, min_periods=1).sum())
-    target = date.fromisoformat(trade_date)
     latest = df[df["trade_date"] == target].copy()
     latest = latest.rename(columns={"trade_date": "flow_trade_date"})
+    close_ready = datetime.combine(target, datetime_time(15, 10))
+    if (
+        latest.empty
+        or latest["etl_sync_at"].isna().any()
+        or bool((latest["etl_sync_at"] < close_ready).any())
+        or bool((latest["etl_sync_at"] > decision_cutoff).any())
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date capital flow is not a post-close PIT fact"
+        )
+    flow_rows = [
+        {
+            "stock_code": str(row["stock_code"]),
+            "flow_trade_date": row["flow_trade_date"].isoformat(),
+            "main_net_inflow": row["main_net_inflow"],
+            "max_net_inflow": row["max_net_inflow"],
+            "lg_net_inflow": row["lg_net_inflow"],
+            "mid_net_inflow": row["mid_net_inflow"],
+            "sm_net_inflow": row["sm_net_inflow"],
+            "main_net_inflow_5d": row["main_net_inflow_5d"],
+            "main_net_inflow_20d": row["main_net_inflow_20d"],
+            "etl_sync_at": row["etl_sync_at"].to_pydatetime().isoformat(
+                timespec="seconds"
+            ),
+        }
+        for row in latest.sort_values("stock_code").to_dict(orient="records")
+    ]
+    flow_root = canonical_sha256({
+        "schema": "probiga.analysis-eod-flow-input.v1",
+        "trade_date": target.isoformat(),
+        "rows": flow_rows,
+    })
+    latest["flow_input_root_sha256"] = flow_root
+    latest["flow_input_count"] = len(latest)
+    latest["flow_input_min_etl_sync_at"] = latest["etl_sync_at"].min()
+    latest["flow_input_max_etl_sync_at"] = latest["etl_sync_at"].max()
+    latest["flow_input_decision_at"] = decision_cutoff
     return latest.reset_index(drop=True), flow_date
 
 
@@ -1103,6 +1720,78 @@ def validate_exact_daily_flow_coverage(
         kline_rows=kline_rows,
         flow_rows=flow_rows,
     )
+    required_proof_columns = {
+        "flow_input_root_sha256",
+        "flow_input_count",
+        "flow_input_min_etl_sync_at",
+        "flow_input_max_etl_sync_at",
+        "flow_input_decision_at",
+    }
+    if not required_proof_columns.issubset(flow.columns):
+        raise RuntimeError("DATA_BLOCKED: exact capital-flow input proof is absent")
+    proof_rows = flow[list(required_proof_columns)].drop_duplicates()
+    if len(proof_rows) != 1:
+        raise RuntimeError("DATA_BLOCKED: capital-flow input proof is ambiguous")
+    proof = proof_rows.iloc[0]
+    root = str(proof["flow_input_root_sha256"] or "").strip().lower()
+    count = int(proof["flow_input_count"] or 0)
+    min_etl = pd.to_datetime(proof["flow_input_min_etl_sync_at"], errors="coerce")
+    max_etl = pd.to_datetime(proof["flow_input_max_etl_sync_at"], errors="coerce")
+    proof_decision = pd.to_datetime(proof["flow_input_decision_at"], errors="coerce")
+    canonical_flow_rows = [
+        {
+            "stock_code": str(row["stock_code"]).strip().zfill(6),
+            "flow_trade_date": str(row["flow_trade_date"])[:10],
+            "main_net_inflow": row["main_net_inflow"],
+            "max_net_inflow": row["max_net_inflow"],
+            "lg_net_inflow": row["lg_net_inflow"],
+            "mid_net_inflow": row["mid_net_inflow"],
+            "sm_net_inflow": row["sm_net_inflow"],
+            "main_net_inflow_5d": row["main_net_inflow_5d"],
+            "main_net_inflow_20d": row["main_net_inflow_20d"],
+            "etl_sync_at": pd.to_datetime(row["etl_sync_at"]).to_pydatetime().isoformat(
+                timespec="seconds"
+            ),
+        }
+        for row in flow.sort_values("stock_code").to_dict(orient="records")
+    ]
+    calculated_root = canonical_sha256({
+        "schema": "probiga.analysis-eod-flow-input.v1",
+        "trade_date": trade_date,
+        "rows": canonical_flow_rows,
+    })
+    cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(
+            date.fromisoformat(trade_date), datetime.max.time()
+        ).replace(microsecond=0)
+    )
+    close_ready = datetime.combine(
+        date.fromisoformat(trade_date), datetime_time(15, 10)
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", root) is None
+        or calculated_root != root
+        or count != len(flow)
+        or pd.isna(min_etl)
+        or pd.isna(max_etl)
+        or pd.isna(proof_decision)
+        or min_etl.to_pydatetime() < close_ready
+        or max_etl.to_pydatetime() > cutoff
+        or proof_decision.to_pydatetime() != cutoff
+    ):
+        raise RuntimeError("DATA_BLOCKED: capital-flow PIT proof differs")
+    audit.update({
+        "flow_input_root_sha256": root,
+        "flow_input_count": count,
+        "flow_input_min_etl_sync_at": min_etl.to_pydatetime().isoformat(
+            timespec="seconds"
+        ),
+        "flow_input_max_etl_sync_at": max_etl.to_pydatetime().isoformat(
+            timespec="seconds"
+        ),
+        "flow_input_decision_at": cutoff.isoformat(timespec="seconds"),
+    })
     logger.info(
         "Exact capital-flow coverage verified: date=%s expected=%s traded=%s "
         "flow=%s catalog_hash=%s",
@@ -1115,7 +1804,97 @@ def validate_exact_daily_flow_coverage(
     return audit
 
 
-def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
+def _verify_full_market_turnover_inputs(
+    frame: pd.DataFrame,
+    *,
+    trade_date: str,
+) -> dict[str, Any]:
+    """Bind every scored target row to one immutable turnover run/root."""
+
+    if frame.empty or "turnover_evidence_json" not in frame.columns:
+        raise RuntimeError(
+            "DATA_BLOCKED: full-market turnover evidence is unavailable"
+        )
+    identities: set[tuple[str, ...]] = set()
+    proof_items: list[dict[str, str]] = []
+    codes: set[str] = set()
+    for source in frame.to_dict(orient="records"):
+        code = str(source.get("stock_code") or "").strip().zfill(6)
+        if code in codes:
+            raise RuntimeError(
+                "DATA_BLOCKED: full-market turnover evidence is duplicated"
+            )
+        codes.add(code)
+        try:
+            proof = validate_turnover_evidence(
+                source.get("turnover_evidence_json")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"DATA_BLOCKED: turnover evidence invalid for {code}: {exc}"
+            ) from exc
+        if (
+            proof.get("status") != "PASS"
+            or str(proof.get("stock_code") or "") != code
+            or str(proof.get("trade_date") or "") != trade_date
+        ):
+            raise RuntimeError(
+                f"DATA_BLOCKED: turnover evidence incomplete for {code}"
+            )
+        identity = tuple(
+            str(proof.get(field) or "").strip().lower()
+            for field in (
+                "snapshot_run_id",
+                "snapshot_semantic_sha256",
+                "authority_proof_identity",
+                "authority_proof_sha256",
+                "authority_set_sha256",
+                "collector_build_sha",
+                "collector_binary_sha256",
+            )
+        )
+        if (
+            not identity[0]
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in (identity[1], identity[3], identity[4], identity[6])
+            )
+            or re.fullmatch(r"[0-9a-f]{40}", identity[5]) is None
+        ):
+            raise RuntimeError(
+                f"DATA_BLOCKED: turnover run identity incomplete for {code}"
+            )
+        identities.add(identity)
+        proof_items.append({
+            "stock_code": code,
+            "proof_sha256": str(proof.get("proof_sha256") or "").lower(),
+        })
+    if len(identities) != 1:
+        raise RuntimeError("DATA_BLOCKED: turnover inputs span multiple runs")
+    identity = next(iter(identities))
+    return {
+        "turnover_snapshot_run_id": identity[0],
+        "turnover_snapshot_semantic_sha256": identity[1],
+        "turnover_authority_identity": identity[2],
+        "turnover_authority_sha256": identity[3],
+        "turnover_authority_set_sha256": identity[4],
+        "turnover_collector_build_sha": identity[5],
+        "turnover_collector_binary_sha256": identity[6],
+        "turnover_full_market_count": len(codes),
+        "turnover_full_market_proof_root_sha256": canonical_sha256({
+            "schema": "probiga.analysis-turnover-input-set.v1",
+            "trade_date": trade_date,
+            "proofs": sorted(proof_items, key=lambda item: item["stock_code"]),
+        }),
+    }
+
+
+def load_hot_rank(
+    engine: Engine,
+    trade_date: str,
+    *,
+    decision_at: datetime | str | None = None,
+) -> tuple[pd.DataFrame, str]:
     """Load only exact-date, per-stock multi-source heat evidence.
 
     The provider feeds behind this table are current-snapshot-only.  Falling
@@ -1123,6 +1902,21 @@ def load_hot_rank(engine: Engine, trade_date: str) -> tuple[pd.DataFrame, str]:
     accepting a one-source row would call an unfused ranking a consensus.
     Both cases degrade to a missing heat factor instead.
     """
+
+    # ``merge_hot_rank`` replaces the mutable same-day partition.  The table
+    # therefore cannot answer an as-of query: filtering its current rows by an
+    # ETL timestamp would not restore rows deleted by a later replacement.
+    # Formal publications always carry ``decision_at`` and must use a neutral,
+    # explicitly-missing factor until hot-rank batches are append-only and
+    # receipt-bound.
+    if decision_at is not None:
+        logger.warning(
+            "DATA_BLOCKED: mutable hot-rank partition is not PIT-replayable; "
+            "formal factor disabled: trade_date=%s decision_at=%s",
+            trade_date,
+            decision_at,
+        )
+        return pd.DataFrame({"stock_code": []}), ""
 
     sql = """
         SELECT stock_code, fused_rank, total_score, source_flag
@@ -1426,7 +2220,25 @@ def _validate_learning_tables(engine: Engine) -> None:
     validate_ai_failure_sample_schema(engine)
 
 
-def load_confidence_features(engine: Engine, trade_date: str, lookback_days: int = 5) -> pd.DataFrame:
+def load_confidence_features(
+    engine: Engine,
+    trade_date: str,
+    lookback_days: int = 5,
+    *,
+    decision_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    # ``stock_analysis_result`` has no immutable publication/knowledge-time
+    # receipt.  Backfilled historical rows can otherwise change a replay after
+    # its decision cutoff.  Use the deterministic neutral default for formal
+    # publications until that history is versioned.
+    if decision_at is not None:
+        logger.warning(
+            "DATA_BLOCKED: mutable confidence history is not PIT-replayable; "
+            "formal factor disabled: trade_date=%s decision_at=%s",
+            trade_date,
+            decision_at,
+        )
+        return pd.DataFrame({"stock_code": []})
     if not _table_exists(engine, "stock_analysis_result"):
         return pd.DataFrame({"stock_code": []})
     with engine.connect() as conn:
@@ -1461,7 +2273,25 @@ def load_confidence_features(engine: Engine, trade_date: str, lookback_days: int
     return out[["stock_code", "confidence_score", "score_std_5d"]]
 
 
-def load_recommendation_history(engine: Engine, trade_date: str, lookback_days: int = 30) -> pd.DataFrame:
+def load_recommendation_history(
+    engine: Engine,
+    trade_date: str,
+    lookback_days: int = 30,
+    *,
+    decision_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    # The recommendation partition is mutable and its rows do not expose a
+    # per-version knowledge timestamp.  Do not let later activation, repair, or
+    # backfill change a formal replay's score.
+    if decision_at is not None:
+        logger.warning(
+            "DATA_BLOCKED: mutable recommendation history is not "
+            "PIT-replayable; formal factor disabled: trade_date=%s "
+            "decision_at=%s",
+            trade_date,
+            decision_at,
+        )
+        return pd.DataFrame({"stock_code": []})
     if not _table_exists(engine, "st_recommended_stocks"):
         return pd.DataFrame({"stock_code": []})
     columns = _table_columns(engine, "st_recommended_stocks")
@@ -1485,7 +2315,24 @@ def load_recommendation_history(engine: Engine, trade_date: str, lookback_days: 
     return df
 
 
-def load_failure_features(engine: Engine, trade_date: str) -> pd.DataFrame:
+def load_failure_features(
+    engine: Engine,
+    trade_date: str,
+    *,
+    decision_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    # Failure samples and simulated positions are mutable and do not provide a
+    # complete knowledge-time lineage.  In particular, a failure entered after
+    # the decision cutoff must not downgrade or suppress an earlier signal.
+    if decision_at is not None:
+        logger.warning(
+            "DATA_BLOCKED: mutable failure-learning history is not "
+            "PIT-replayable; formal factor disabled: trade_date=%s "
+            "decision_at=%s",
+            trade_date,
+            decision_at,
+        )
+        return pd.DataFrame({"stock_code": []})
     _validate_learning_tables(engine)
     pieces: list[pd.DataFrame] = []
     if _table_exists(engine, "st_sim_position"):
@@ -1524,118 +2371,142 @@ def load_failure_features(engine: Engine, trade_date: str) -> pd.DataFrame:
     return out
 
 
-def _load_sector_industry_memberships(engine: Engine, trade_date: str) -> pd.DataFrame:
+def _load_sector_industry_memberships(
+    engine: Engine,
+    trade_date: str,
+    *,
+    decision_known_at: datetime | str | None = None,
+) -> pd.DataFrame:
     """Load only the validated immutable QMT snapshot for the exact date."""
-    cutoff = datetime.combine(
-        date.fromisoformat(str(trade_date)[:10]) + timedelta(days=1),
-        datetime.min.time(),
+    target = date.fromisoformat(str(trade_date))
+    cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(
+            target + timedelta(days=1),
+            datetime.min.time(),
+        )
     )
     if (
         _table_exists(engine, "qmt_membership_snapshot_run")
         and _table_exists(engine, "qmt_industry_member_snapshot")
     ):
         try:
-            run = pd.read_sql(
+            from integrations.bigqmt.membership_snapshot import (
+                verify_existing_membership_snapshot,
+            )
+            proof = verify_existing_membership_snapshot(
+                engine,
+                snapshot_date=target,
+                decision_known_at=cutoff,
+            )
+            source = str(proof["source"])
+            proof_hash = canonical_sha256(proof)
+            rows = pd.read_sql(
                 text(
                     """
-                    SELECT snapshot_date, source, industry_relation_count
-                    FROM qmt_membership_snapshot_run
-                    WHERE snapshot_date = :trade_date
+                    SELECT stock_code, industry_name
+                    FROM qmt_industry_member_snapshot
+                    WHERE snapshot_date = :snapshot_date
+                      AND source = :source
                       AND quality_status = 'QMT_VALIDATED'
-                      AND captured_at < :cutoff
-                    ORDER BY captured_at DESC, source
-                    LIMIT 1
+                      AND captured_at = :captured_at
+                      AND industry_type IN
+                          ('L1', '一级行业', '申万一级', 'SW2021')
                     """
                 ),
                 engine,
-                params={"trade_date": trade_date, "cutoff": cutoff},
+                params={
+                    "snapshot_date": target,
+                    "source": source,
+                    "captured_at": proof["captured_at"],
+                },
             )
-            if not run.empty:
-                snapshot_date = run.iloc[0]["snapshot_date"]
-                source = str(run.iloc[0]["source"] or "")
-                expected = int(run.iloc[0]["industry_relation_count"] or 0)
-                evidence = pd.read_sql(
-                    text(
-                        """
-                        SELECT COUNT(*) AS relation_count
-                        FROM qmt_industry_member_snapshot
-                        WHERE snapshot_date = :snapshot_date
-                          AND source = :source
-                          AND quality_status = 'QMT_VALIDATED'
-                          AND captured_at < :cutoff
-                        """
-                    ),
-                    engine,
-                    params={
-                        "snapshot_date": snapshot_date,
-                        "source": source,
-                        "cutoff": cutoff,
-                    },
-                )
-                actual = int(evidence.iloc[0]["relation_count"] or 0)
-                if expected > 0 and actual == expected:
-                    rows = pd.read_sql(
-                        text(
-                            """
-                            SELECT stock_code, industry_name
-                            FROM qmt_industry_member_snapshot
-                            WHERE snapshot_date = :snapshot_date
-                              AND source = :source
-                              AND quality_status = 'QMT_VALIDATED'
-                              AND captured_at < :cutoff
-                              AND industry_type IN
-                                  ('L1', '一级行业', '申万一级', 'SW2021')
-                            """
-                        ),
-                        engine,
-                        params={
-                            "snapshot_date": snapshot_date,
-                            "source": source,
-                            "cutoff": cutoff,
-                        },
-                    )
-                    if not rows.empty:
-                        rows = rows.drop_duplicates("stock_code", keep="first")
-                        rows["industry_pit_status"] = PIT_AVAILABLE
-                        rows["industry_snapshot_date"] = str(snapshot_date)[:10]
-                        rows["industry_snapshot_source"] = source
-                        return rows
+            if not rows.empty:
+                rows = rows.drop_duplicates("stock_code", keep="first")
+                rows["industry_pit_status"] = PIT_AVAILABLE
+                rows["industry_snapshot_date"] = target.isoformat()
+                rows["industry_snapshot_source"] = source
+                rows["membership_proof_sha256"] = proof_hash
+                return rows
         except Exception as exc:
             logger.warning("Exact-date immutable industry snapshot blocked: %s", exc)
     return pd.DataFrame({"stock_code": []})
 
 
-def load_sector_rotation_features(engine: Engine, trade_date: str) -> pd.DataFrame:
-    memberships = _load_sector_industry_memberships(engine, trade_date)
+def load_sector_rotation_features(
+    engine: Engine,
+    trade_date: str,
+    *,
+    decision_known_at: datetime | str | None = None,
+) -> pd.DataFrame:
+    target = date.fromisoformat(trade_date)
+    decision_cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(target, datetime.max.time()).replace(microsecond=0)
+    )
+    memberships = _load_sector_industry_memberships(
+        engine,
+        trade_date,
+        decision_known_at=decision_cutoff,
+    )
     if memberships.empty:
         return pd.DataFrame({"stock_code": []})
-    dates = _recent_dates(engine, "sm_stock_kline", "trade_date", trade_date, 3)
+    dates = _recent_dates(
+        engine,
+        "sm_stock_kline",
+        "trade_date",
+        trade_date,
+        3,
+        known_at_column="received_at",
+        decision_known_at=decision_cutoff,
+    )
     if not dates:
         return pd.DataFrame({"stock_code": []})
     start_date = dates[-1]
     flow_join = ""
     main_flow_select = "0 AS main_net_inflow"
+    flow_etl_select = "NULL AS flow_etl_sync_at"
     if _table_exists(engine, "sm_stock_capital_flow_daily"):
         flow_join = """
             LEFT JOIN sm_stock_capital_flow_daily f
               ON f.stock_code = k.stock_code AND f.trade_date = k.trade_date
+             AND f.etl_sync_at IS NOT NULL
+             AND f.etl_sync_at >= TIMESTAMP(f.trade_date, '15:10:00')
+             AND f.etl_sync_at <= :decision_known_at
         """
         main_flow_select = "COALESCE(f.main_net_inflow, 0) AS main_net_inflow"
+        flow_etl_select = "f.etl_sync_at AS flow_etl_sync_at"
     sql = f"""
         SELECT k.stock_code, k.trade_date, k.change_pct, k.amount,
-               {main_flow_select}
+               {main_flow_select}, {flow_etl_select}
         FROM sm_stock_kline k
         {flow_join}
         WHERE k.k_type = 1
           AND k.adjust_type = 0
           AND k.trade_date >= :start_date
           AND k.trade_date <= :trade_date
+          AND k.received_at IS NOT NULL
+          AND k.received_at <= :decision_known_at
     """
     observations = pd.read_sql(
         text(sql), engine,
-        params={"start_date": start_date, "trade_date": trade_date},
+        params={
+            "start_date": start_date,
+            "trade_date": trade_date,
+            "decision_known_at": decision_cutoff,
+        },
     )
     if observations.empty:
+        return pd.DataFrame({"stock_code": []})
+    if (
+        "flow_etl_sync_at" not in observations.columns
+        or observations["flow_etl_sync_at"].isna().any()
+    ):
+        logger.warning(
+            "DATA_BLOCKED: sector rotation lacks complete post-close flow: "
+            "trade_date=%s",
+            trade_date,
+        )
         return pd.DataFrame({"stock_code": []})
     observations["stock_code"] = (
         observations["stock_code"].astype(str).str.strip().str.zfill(6)
@@ -2246,6 +3117,7 @@ def compute_scores(
         "industry_pit_reason": "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_REQUIRED",
         "industry_snapshot_date": "",
         "industry_snapshot_source": "",
+        "membership_proof_sha256": "",
     })
     if not sector.empty and "industry_name" in sector.columns:
         sector = sector.rename(columns={"industry_name": "sector_industry_name"})
@@ -2258,7 +3130,7 @@ def compute_scores(
                 "stock_code", "sector_industry_name",
                 "sector_rotation_score", "industry_pit_status",
                 "industry_pit_reason", "industry_snapshot_date",
-                "industry_snapshot_source",
+                "industry_snapshot_source", "membership_proof_sha256",
             ]],
             on="stock_code",
             how="left",
@@ -2538,6 +3410,27 @@ def _none_if_nan(value: Any) -> Any:
     return value
 
 
+def apply_canonical_execution_eligibility(df: pd.DataFrame) -> pd.DataFrame:
+    """Persist only the complete, QMT-attested conservative V4 projection."""
+
+    out = df.copy()
+    evidence = (
+        out["chase_evidence_status"].fillna("DATA_BLOCKED")
+        .astype(str)
+        .str.upper()
+        if "chase_evidence_status" in out.columns
+        else pd.Series("DATA_BLOCKED", index=out.index, dtype="object")
+    )
+    evidence = evidence.where(
+        evidence.isin({"ALLOW", "BLOCK", "DATA_BLOCKED"}),
+        "DATA_BLOCKED",
+    )
+    # No latest-row shortcut may upgrade an incomplete historical window.
+    out["chase_risk_status"] = evidence
+    out["ordinary_buy_eligible"] = (evidence == "ALLOW").astype(int)
+    return out
+
+
 def build_analysis_rows(df: pd.DataFrame, trade_date: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     score_cols = [
@@ -2620,13 +3513,66 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         _numeric_col(eligible, "final_trade_score", 0.0),
         _numeric_col(eligible, "main_wave_score", 0.0),
     ], axis=1).max(axis=1)
+    eligible["stock_code"] = (
+        eligible["stock_code"].astype(str).str.strip().str.zfill(6)
+    )
     eligible = eligible.sort_values(
-        ["ranking_score", "final_trade_score", "main_wave_score", "entry_score", "quality_score", "capital_score"],
-        ascending=False,
+        [
+            "ranking_score",
+            "final_trade_score",
+            "main_wave_score",
+            "entry_score",
+            "quality_score",
+            "capital_score",
+            "stock_code",
+        ],
+        ascending=[False, False, False, False, False, False, True],
+        kind="mergesort",
     ).head(int(top_n))
 
     rows: list[dict[str, Any]] = []
     for row in eligible.to_dict(orient="records"):
+        turnover_evidence_json = row.get("turnover_evidence_json")
+        if not isinstance(turnover_evidence_json, str) or not turnover_evidence_json:
+            turnover_evidence_json = build_turnover_evidence({
+                "status": "DATA_BLOCKED",
+                "stock_code": str(row.get("stock_code") or "").zfill(6),
+                "trade_date": trade_date,
+                "decision_known_at": f"{trade_date} 23:59:59",
+                "source_table": "st_market_field_capture_row",
+                "reason": "DATA_BLOCKED: turnover evidence not propagated",
+            })
+        upper_limit_evidence_json = row.get("upper_limit_evidence_json")
+        upper_limit_pass = False
+        if isinstance(upper_limit_evidence_json, str) and upper_limit_evidence_json:
+            try:
+                upper_limit_pass = (
+                    validate_upper_limit_evidence(upper_limit_evidence_json)
+                    .get("status")
+                    == "PASS"
+                )
+            except ValueError:
+                upper_limit_evidence_json = None
+        if not isinstance(upper_limit_evidence_json, str) or not upper_limit_evidence_json:
+            upper_limit_evidence_json = build_upper_limit_evidence({
+                "status": "DATA_BLOCKED",
+                "stock_code": str(row.get("stock_code") or "").zfill(6),
+                "trade_date": trade_date,
+                "decision_known_at": f"{trade_date} 23:59:59",
+                "source_table": "st_market_field_capture_row",
+                "reason": "DATA_BLOCKED: upper-limit evidence not propagated",
+            })
+            upper_limit_pass = False
+        chase_risk_status = str(
+            row.get("chase_risk_status") or "DATA_BLOCKED"
+        ).upper()
+        ordinary_buy_eligible = bool(
+            row.get("ordinary_buy_eligible") is True
+            or row.get("ordinary_buy_eligible") == 1
+        )
+        if not upper_limit_pass:
+            chase_risk_status = "DATA_BLOCKED"
+            ordinary_buy_eligible = False
         reason = (
             f"综合{row.get('ai_score'):.1f}: "
             f"短线{row.get('short_term_score'):.1f}/长线{row.get('long_term_score'):.1f}; "
@@ -2637,6 +3583,7 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             sources += f"+hot:{row.get('source_flag')}"
         rows.append({
             "stock_code": str(row.get("stock_code") or "").zfill(6),
+            "ranking_score": round(float(row.get("ranking_score") or 0), 1),
             "short_name": str(row.get("short_name") or "")[:20],
             "ai_score": round(float(row.get("ai_score") or 0), 1),
             "long_term_score": round(float(row.get("long_term_score") or 0), 1),
@@ -2650,6 +3597,12 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "pick_date": trade_date,
             "recommend_status": row.get("recommend_status") or "BLOCK",
             "recommend_reason": str(row.get("recommend_reason") or "")[:500],
+            "candidate_recommend_status": (
+                row.get("recommend_status") or "BLOCK"
+            ),
+            "chase_risk_status": chase_risk_status,
+            "ordinary_buy_eligible": 1 if ordinary_buy_eligible else 0,
+            "candidate_ordinary_buy_eligible": 1 if ordinary_buy_eligible else 0,
             "event_risk_level": row.get("event_risk_level") or "LOW",
             "sentiment_score": round(float(row.get("sentiment_score") or 0), 1),
             "market_mood_score": round(float(row.get("market_mood_score") or 0), 1),
@@ -2693,6 +3646,46 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "trend_stop_price": _none_if_nan(row.get("trend_stop_price")),
             "trend_reduce_price": _none_if_nan(row.get("trend_reduce_price")),
             "model_version": row.get("model_version") or MODEL_VERSION,
+            "membership_snapshot_date": row.get("industry_snapshot_date"),
+            "membership_snapshot_source": str(
+                row.get("industry_snapshot_source") or ""
+            ),
+            "membership_proof_sha256": str(
+                row.get("membership_proof_sha256") or ""
+            ).lower(),
+            "pit_common_receipt_root_hash": str(
+                row.get("pit_common_receipt_root_hash") or ""
+            ).lower(),
+            "finance_manifest_hash": str(
+                row.get("finance_manifest_hash") or ""
+            ).lower(),
+            "event_manifest_hash": str(
+                row.get("event_manifest_hash") or ""
+            ).lower(),
+            **{
+                field: row.get(field)
+                for field in (
+                    "turnover_snapshot_run_id",
+                    "turnover_snapshot_semantic_sha256",
+                    "turnover_authority_identity",
+                    "turnover_authority_sha256",
+                    "turnover_authority_set_sha256",
+                    "turnover_collector_build_sha",
+                    "turnover_collector_binary_sha256",
+                    "turnover_full_market_count",
+                    "turnover_full_market_proof_root_sha256",
+                    "flow_input_root_sha256",
+                    "flow_input_count",
+                    "flow_input_min_etl_sync_at",
+                    "flow_input_max_etl_sync_at",
+                    "flow_input_decision_at",
+                )
+            },
+            "turnover_evidence_json": turnover_evidence_json,
+            "upper_limit_evidence_json": upper_limit_evidence_json,
+            "chase_bar_window_root_sha256": str(
+                row.get("chase_bar_window_root_sha256") or ""
+            ).lower(),
         })
     return rows
 
@@ -2759,7 +3752,11 @@ def save_outputs(
     rec_rows: list[dict[str, Any]],
     trade_date: str,
     stock_codes: list[str] | None = None,
-) -> None:
+    *,
+    publication_run_uid: str = "",
+    publisher_task_type: str = "",
+    publisher_build_sha: str = "",
+) -> dict[str, Any] | None:
     analysis_sql = """
         INSERT INTO stock_analysis_result (
             stock_code, stock_name, analysis_date, last_news_time,
@@ -2814,7 +3811,13 @@ def save_outputs(
             stock_code, short_name, ai_score, long_term_score, short_term_score,
             fundamental, capital_score, valuation, technical,
             reason, sources, pick_date,
-            recommend_status, recommend_reason, event_risk_level,
+            recommend_status, recommend_reason, candidate_recommend_status,
+            chase_risk_status, ordinary_buy_eligible,
+            candidate_ordinary_buy_eligible, publisher_run_uid,
+            publication_status, membership_snapshot_date,
+            membership_snapshot_source, membership_proof_sha256,
+            turnover_evidence_json, upper_limit_evidence_json,
+            event_risk_level,
             last_check_time, sentiment_score, market_mood_score, event_score,
             ultra_short_score, swing_score, primary_strategy, strategy_profile,
             suitable_strategies, signal_status, signal_reason,
@@ -2833,7 +3836,13 @@ def save_outputs(
             :stock_code, :short_name, :ai_score, :long_term_score, :short_term_score,
             :fundamental, :capital_score, :valuation, :technical,
             :reason, :sources, :pick_date,
-            :recommend_status, :recommend_reason, :event_risk_level,
+            :recommend_status, :recommend_reason, :candidate_recommend_status,
+            :chase_risk_status, :ordinary_buy_eligible,
+            :candidate_ordinary_buy_eligible, :publisher_run_uid,
+            :publication_status, :membership_snapshot_date,
+            :membership_snapshot_source, :membership_proof_sha256,
+            :turnover_evidence_json, :upper_limit_evidence_json,
+            :event_risk_level,
             NOW(), :sentiment_score, :market_mood_score, :event_score,
             :ultra_short_score, :swing_score, :primary_strategy, :strategy_profile,
             :suitable_strategies, :signal_status, :signal_reason,
@@ -2850,8 +3859,68 @@ def save_outputs(
             NOW()
         )
     """
-    validate_analysis_output_schema(engine)
     scoped_codes = _normalize_stock_codes(stock_codes)
+    identity_values = (
+        str(publication_run_uid or "").strip().lower(),
+        str(publisher_task_type or "").strip(),
+        str(publisher_build_sha or "").strip().lower(),
+    )
+    publish = any(identity_values)
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    if production and not publish:
+        raise RuntimeError(
+            "production analysis output writer requires an exact canonical "
+            "publication identity"
+        )
+    if publish:
+        run_uid, task_type, build_sha = identity_values
+        if (
+            not all(identity_values)
+            or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+            or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+            or build_sha == "0" * 40
+            or task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        ):
+            raise RuntimeError("analysis publication identity is invalid")
+        if scoped_codes:
+            raise RuntimeError(
+                "scoped analysis cannot publish the full daily partition"
+            )
+        validate_recommended_run_history_schema(engine)
+    validate_analysis_output_schema(engine)
+    write_rec_rows: list[dict[str, Any]] = []
+    for source in rec_rows:
+        row = dict(source)
+        candidate_status = str(
+            row.get("candidate_recommend_status")
+            or row.get("recommend_status")
+            or "BLOCK"
+        ).strip().upper()
+        candidate_ordinary = 1 if (
+            row.get("candidate_ordinary_buy_eligible") is True
+            or row.get("candidate_ordinary_buy_eligible") == 1
+            or row.get("ordinary_buy_eligible") is True
+            or row.get("ordinary_buy_eligible") == 1
+        ) else 0
+        row.update({
+            "candidate_recommend_status": candidate_status,
+            "candidate_ordinary_buy_eligible": candidate_ordinary,
+            "publisher_run_uid": run_uid if publish else "",
+            "publication_status": "PENDING" if publish else "ACTIVE",
+        })
+        if publish:
+            # The mutable pool is committed fail-closed.  Scheduler
+            # postvalidation later activates these two already-ubiquitous
+            # execution gates together with publication_status.
+            row["recommend_status"] = "PENDING"
+            row["ordinary_buy_eligible"] = 0
+        else:
+            row["recommend_status"] = candidate_status
+            row["ordinary_buy_eligible"] = candidate_ordinary
+        write_rec_rows.append(row)
     with engine.begin() as conn:
         logger.info("Writing %s analysis rows for %s", len(analysis_rows), trade_date)
         _delete_scope_rows(
@@ -2870,8 +3939,138 @@ def save_outputs(
             trade_date=trade_date,
             stock_codes=scoped_codes,
         )
-        if rec_rows:
-            _execute_batches(conn, rec_sql, rec_rows)
+        if write_rec_rows:
+            _execute_batches(conn, rec_sql, write_rec_rows)
+        if not publish:
+            return None
+
+        manifest = read_persisted_pool_manifest(conn, trade_date)
+        if (
+            int(manifest["analysis_count"]) != len(analysis_rows)
+            or int(manifest["recommendation_count"]) != len(write_rec_rows)
+        ):
+            raise RuntimeError(
+                "analysis publication readback count differs from written rows"
+            )
+        if int(manifest["executable_count"]) <= 0:
+            raise RuntimeError(
+                "analysis publication has no four-gate executable strategy pool"
+            )
+        membership_proofs = manifest.get("membership_proofs")
+        membership = (
+            dict(membership_proofs[0])
+            if isinstance(membership_proofs, list)
+            and len(membership_proofs) == 1
+            and isinstance(membership_proofs[0], Mapping)
+            else {}
+        )
+        membership_hash = str(
+            membership.get("proof_sha256") or ""
+        ).lower()
+        if (
+            manifest.get("publisher_run_uids") != [run_uid]
+            or manifest.get("publication_statuses") != ["PENDING"]
+            or manifest.get("live_gate_alignment") is not True
+            or membership.get("snapshot_date") != trade_date
+            or membership.get("source") != "gj_big_qmt_inner"
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                membership_hash,
+            ) is None
+        ):
+            raise RuntimeError(
+                "analysis publication staging identity differs from writer"
+            )
+        dialect_name = str(
+            getattr(getattr(engine, "dialect", None), "name", "")
+        ).lower()
+        if dialect_name == "mysql":
+            published_at = conn.execute(
+                # st_recommended_run_history.started_at/finished_at use
+                # second-precision DATETIME/NOW.  Source publication time
+                # from the same database clock and precision so same-second
+                # publish/finish ordering remains comparable.
+                text("SELECT CURRENT_TIMESTAMP")
+            ).scalar()
+            if not isinstance(published_at, datetime):
+                raise RuntimeError(
+                    "analysis publication database timestamp is unavailable"
+                )
+        else:
+            published_at = _now_shanghai_naive()
+        result = conn.execute(text("""
+            UPDATE st_recommended_run_history
+            SET publisher_task_type=:publisher_task_type,
+                canonical_pool_sha256=:canonical_pool_sha256,
+                published_at=:published_at,
+                executable_count=:executable_count,
+                membership_snapshot_date=:membership_snapshot_date,
+                membership_snapshot_source=:membership_snapshot_source,
+                membership_proof_sha256=:membership_proof_sha256,
+                total=:analysis_count,
+                passed=:recommendation_count
+            WHERE run_uid=:run_uid
+              AND scheduler_job_id=:run_uid
+              AND trade_date=:trade_date
+              AND build_sha=:build_sha
+              AND status='running'
+              AND canonical_pool_sha256 IS NULL
+              AND published_at IS NULL
+        """), {
+            "publisher_task_type": task_type,
+            "canonical_pool_sha256": manifest["canonical_pool_sha256"],
+            "published_at": published_at,
+            "executable_count": int(manifest["executable_count"]),
+            "membership_snapshot_date": membership["snapshot_date"],
+            "membership_snapshot_source": membership["source"],
+            "membership_proof_sha256": membership_hash,
+            "analysis_count": int(manifest["analysis_count"]),
+            "recommendation_count": int(manifest["recommendation_count"]),
+            "run_uid": run_uid,
+            "trade_date": trade_date,
+            "build_sha": build_sha,
+        })
+        if int(result.rowcount or 0) != 1:
+            raise RuntimeError(
+                "analysis publication history was not bound exactly once"
+            )
+        history_rows = conn.execute(text("""
+            SELECT publisher_task_type, canonical_pool_sha256, published_at,
+                   executable_count, membership_snapshot_date,
+                   membership_snapshot_source, membership_proof_sha256,
+                   total, passed
+            FROM st_recommended_run_history
+            WHERE run_uid=:run_uid
+            LIMIT 2
+        """), {"run_uid": run_uid}).mappings().all()
+        if len(history_rows) != 1:
+            raise RuntimeError("analysis publication history readback is ambiguous")
+        history = history_rows[0]
+        if (
+            str(history.get("publisher_task_type") or "") != task_type
+            or str(history.get("canonical_pool_sha256") or "").lower()
+            != manifest["canonical_pool_sha256"]
+            or int(history.get("executable_count") or 0)
+            != int(manifest["executable_count"])
+            or int(history.get("total") or 0) != int(manifest["analysis_count"])
+            or int(history.get("passed") or 0)
+            != int(manifest["recommendation_count"])
+            or str(history.get("membership_snapshot_date") or "")[:10]
+            != membership["snapshot_date"]
+            or str(history.get("membership_snapshot_source") or "")
+            != membership["source"]
+            or str(history.get("membership_proof_sha256") or "").lower()
+            != membership_hash
+            or history.get("published_at") is None
+        ):
+            raise RuntimeError("analysis publication history readback differs")
+        return build_publication_receipt(
+            manifest=manifest,
+            run_uid=run_uid,
+            publisher_task_type=task_type,
+            build_sha=build_sha,
+            published_at=history["published_at"],
+        )
 
 
 def _emit_progress(progress_callback: ProgressCallback | None, **payload: Any) -> None:
@@ -2883,6 +4082,118 @@ def _emit_progress(progress_callback: ProgressCallback | None, **payload: Any) -
         logger.debug("progress callback failed", exc_info=True)
 
 
+def _refresh_exact_upper_limit_execution_evidence(
+    *,
+    engine: Engine,
+    scored: pd.DataFrame,
+    trade_date: str,
+    decision_at: datetime | str | None,
+    top_n: int,
+    min_score: float,
+    flow_date: str,
+    publisher_build_sha: str,
+) -> pd.DataFrame:
+    """Recompute Frozen V4 only when one exact top-80 capture is available."""
+
+    preliminary_rec_rows = build_recommendation_rows(
+        scored, trade_date, top_n=top_n, min_score=min_score
+    )
+    preliminary_bar_roots = {
+        str(row.get("stock_code") or "").strip(): str(
+            row.get("chase_bar_window_root_sha256") or ""
+        ).strip().lower()
+        for row in preliminary_rec_rows
+    }
+    preliminary_codes = sorted(
+        str(row.get("stock_code") or "").strip()
+        for row in preliminary_rec_rows
+    )
+    if (
+        decision_at is None
+        or int(top_n) != 80
+        or len(preliminary_codes) != 80
+        or len(set(preliminary_codes)) != 80
+        or set(preliminary_bar_roots) != set(preliminary_codes)
+        or any(
+            re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in preliminary_bar_roots.values()
+        )
+    ):
+        return scored
+    preliminary_receipt = build_preliminary_upper_subject_receipt(
+        trade_date=trade_date,
+        decision_at=decision_at,
+        build_sha=publisher_build_sha,
+        model_version=MODEL_VERSION,
+        min_score=min_score,
+        candidates=preliminary_rec_rows,
+    )
+    validate_preliminary_upper_subject_receipt(preliminary_receipt)
+    upper_snapshot = load_latest_verified_upper_limit_evidence(
+        engine,
+        target_date=trade_date,
+        decision_at=decision_at,
+        stock_codes=preliminary_codes,
+        preliminary_receipt_sha256=preliminary_receipt["receipt_sha256"],
+        preliminary_build_sha=publisher_build_sha,
+    )
+    if not upper_snapshot:
+        return scored
+    chase_dates = _recent_dates(
+        engine,
+        "sm_stock_kline",
+        "trade_date",
+        trade_date,
+        90,
+        known_at_column="received_at",
+        decision_known_at=decision_at,
+    )
+    if not chase_dates:
+        raise RuntimeError(
+            "upper-limit recomputation has no knowledge-aware bars"
+        )
+    refreshed = _load_canonical_chase_risk_evidence(
+        engine,
+        start_date=chase_dates[-1],
+        trade_date=trade_date,
+        decision_known_at=decision_at,
+        upper_limit_evidence=upper_snapshot,
+    )
+    refreshed_codes = refreshed[refreshed["stock_code"].isin(preliminary_codes)].copy()
+    if (
+        len(refreshed_codes) != len(preliminary_codes)
+        or refreshed_codes["stock_code"].duplicated().any()
+    ):
+        raise RuntimeError(
+            "upper-limit recomputation exact chase bar subject differs"
+        )
+    refreshed_bar_roots = dict(zip(
+        refreshed_codes["stock_code"].astype(str),
+        refreshed_codes["chase_bar_window_root_sha256"].astype(str).str.lower(),
+    ))
+    if refreshed_bar_roots != preliminary_bar_roots:
+        raise RuntimeError(
+            "upper-limit recomputation chase bar evidence changed after preview"
+        )
+    refreshed = refreshed.rename(columns={
+        "turnover_ratio_effective": "turnover_ratio",
+    })
+    refreshed_columns = [
+        column for column in refreshed.columns if column != "stock_code"
+    ]
+    result = scored.drop(
+        columns=[
+            column for column in refreshed_columns
+            if column in scored.columns
+        ],
+        errors="ignore",
+    ).merge(refreshed, on="stock_code", how="left")
+    result = apply_canonical_execution_eligibility(result)
+    return _build_text_fields(
+        result, flow_date=flow_date, trade_date=trade_date
+    )
+
+
 def _prepare_batch_outputs(
     engine: Engine,
     trade_date: str,
@@ -2891,11 +4202,22 @@ def _prepare_batch_outputs(
     stock_codes: list[str] | None = None,
     progress_callback: ProgressCallback | None = None,
     news_cutoff_time: str | None = None,
+    publisher_build_sha: str = "",
+    refresh_upper_limit: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, str, str]:
     scoped_codes = _normalize_stock_codes(stock_codes)
+    decision_at: datetime | str | None = (
+        normalize_decision_at(news_cutoff_time)
+        if news_cutoff_time is not None
+        else None
+    )
 
     _emit_progress(progress_callback, stage="load_kline", percent=5, step="加载日K特征...", trade_date=trade_date)
-    kline_all = load_kline_features(engine, trade_date)
+    kline_all = load_kline_features(
+        engine,
+        trade_date,
+        decision_known_at=decision_at,
+    )
     kline = _filter_frame_by_codes(kline_all, scoped_codes)
     if scoped_codes and kline.empty:
         raise RuntimeError(f"No K-line rows found for requested stock codes on {trade_date}")
@@ -2906,11 +4228,12 @@ def _prepare_batch_outputs(
         if "stock_code" in kline.columns
         else []
     )
-    decision_at: datetime | str | None = (
-        normalize_decision_at(news_cutoff_time)
-        if news_cutoff_time is not None
-        else None
-    )
+    turnover_input_proof: dict[str, Any] = {}
+    if decision_at is not None:
+        turnover_input_proof = _verify_full_market_turnover_inputs(
+            kline_all,
+            trade_date=trade_date,
+        )
     common_cutoff: dict[str, Any] = {
         "status": PIT_DATA_BLOCKED,
         "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
@@ -2961,8 +4284,12 @@ def _prepare_batch_outputs(
         finance["finance_pit_status"] = PIT_DATA_BLOCKED
         finance["finance_pit_reason"] = common_cutoff.get("reason")
     _emit_progress(progress_callback, stage="load_flow", percent=23, step="加载资金流数据...", trade_date=trade_date)
-    flow_all, flow_date = load_flow_features(engine, trade_date)
-    validate_exact_daily_flow_coverage(
+    flow_all, flow_date = load_flow_features(
+        engine,
+        trade_date,
+        decision_known_at=decision_at,
+    )
+    flow_input_proof = validate_exact_daily_flow_coverage(
         engine,
         trade_date=trade_date,
         kline=kline_all,
@@ -2971,7 +4298,11 @@ def _prepare_batch_outputs(
     )
     flow = _filter_frame_by_codes(flow_all, scoped_codes)
     _emit_progress(progress_callback, stage="load_hot", percent=32, step="加载热度排行...", trade_date=trade_date)
-    hot, hot_date = load_hot_rank(engine, trade_date)
+    hot, hot_date = load_hot_rank(
+        engine,
+        trade_date,
+        decision_at=decision_at,
+    )
     hot = _filter_frame_by_codes(hot, scoped_codes)
     _emit_progress(progress_callback, stage="load_notices", percent=40, step="加载公告事件...", trade_date=trade_date)
     notices = _filter_frame_by_codes(
@@ -2993,13 +4324,41 @@ def _prepare_batch_outputs(
     news = pd.DataFrame({"stock_code": []})
     notices = merge_event_features(notices, news)
     _emit_progress(progress_callback, stage="load_confidence", percent=48, step="加载交易置信度...", trade_date=trade_date)
-    confidence = _filter_frame_by_codes(load_confidence_features(engine, trade_date), scoped_codes)
+    confidence = _filter_frame_by_codes(
+        load_confidence_features(
+            engine,
+            trade_date,
+            decision_at=decision_at,
+        ),
+        scoped_codes,
+    )
     _emit_progress(progress_callback, stage="load_history", percent=56, step="加载历史推荐表现...", trade_date=trade_date)
-    rec_history = _filter_frame_by_codes(load_recommendation_history(engine, trade_date), scoped_codes)
+    rec_history = _filter_frame_by_codes(
+        load_recommendation_history(
+            engine,
+            trade_date,
+            decision_at=decision_at,
+        ),
+        scoped_codes,
+    )
     _emit_progress(progress_callback, stage="load_failures", percent=62, step="加载失败惩罚因子...", trade_date=trade_date)
-    failures = _filter_frame_by_codes(load_failure_features(engine, trade_date), scoped_codes)
+    failures = _filter_frame_by_codes(
+        load_failure_features(
+            engine,
+            trade_date,
+            decision_at=decision_at,
+        ),
+        scoped_codes,
+    )
     _emit_progress(progress_callback, stage="load_sector", percent=68, step="加载板块轮动因子...", trade_date=trade_date)
-    sector = _filter_frame_by_codes(load_sector_rotation_features(engine, trade_date), scoped_codes)
+    sector = _filter_frame_by_codes(
+        load_sector_rotation_features(
+            engine,
+            trade_date,
+            decision_known_at=decision_at,
+        ),
+        scoped_codes,
+    )
     market_mood_score = compute_market_mood(kline_all)
 
     logger.info(
@@ -3026,11 +4385,76 @@ def _prepare_batch_outputs(
         failures=failures,
     )
     scored["hot_trade_date"] = hot_date
+    flow_proof_fields = (
+        "flow_input_root_sha256",
+        "flow_input_count",
+        "flow_input_min_etl_sync_at",
+        "flow_input_max_etl_sync_at",
+        "flow_input_decision_at",
+    )
+    scoring_input_proof = dict(turnover_input_proof)
+    if isinstance(flow_input_proof, Mapping) and all(
+        key in flow_input_proof for key in flow_proof_fields
+    ):
+        scoring_input_proof.update({
+            key: flow_input_proof[key] for key in flow_proof_fields
+        })
+    elif decision_at is not None:
+        raise RuntimeError("DATA_BLOCKED: formal flow input proof is unavailable")
+    for field, value in scoring_input_proof.items():
+        scored[field] = value
+    scored = apply_canonical_execution_eligibility(scored)
     _emit_progress(progress_callback, stage="build_rows", percent=88, step="生成分析与推荐结果...", trade_date=trade_date)
     scored = _build_text_fields(scored, flow_date=flow_date, trade_date=trade_date)
+    if refresh_upper_limit:
+        scored = _refresh_exact_upper_limit_execution_evidence(
+            engine=engine,
+            scored=scored,
+            trade_date=trade_date,
+            decision_at=decision_at,
+            top_n=top_n,
+            min_score=min_score,
+            flow_date=flow_date,
+            publisher_build_sha=publisher_build_sha,
+        )
     analysis_rows = build_analysis_rows(scored, trade_date)
     rec_rows = build_recommendation_rows(scored, trade_date, top_n=top_n, min_score=min_score)
     return analysis_rows, rec_rows, market_mood_score, flow_date, hot_date
+
+
+def prepare_preliminary_upper_subject_receipt(
+    engine: Engine,
+    *,
+    trade_date: str,
+    decision_at: datetime | str,
+    build_sha: str,
+    min_score: float = 62.0,
+) -> dict[str, Any]:
+    """Read facts only and seal the deterministic ordered pre-upper top 80."""
+
+    exact_decision = _formal_analysis_decision_at(decision_at)
+    _analysis_rows, candidates, _mood, _flow_date, _hot_date = (
+        _prepare_batch_outputs(
+            engine=engine,
+            trade_date=trade_date,
+            min_score=min_score,
+            top_n=80,
+            stock_codes=None,
+            progress_callback=None,
+            news_cutoff_time=exact_decision,
+            publisher_build_sha=build_sha,
+            refresh_upper_limit=False,
+        )
+    )
+    receipt = build_preliminary_upper_subject_receipt(
+        trade_date=trade_date,
+        decision_at=exact_decision,
+        build_sha=build_sha,
+        model_version=MODEL_VERSION,
+        min_score=min_score,
+        candidates=candidates,
+    )
+    return validate_preliminary_upper_subject_receipt(receipt)
 
 
 def run_batch(
@@ -3043,17 +4467,54 @@ def run_batch(
     execution_time: str | None = None,
     min_kline_coverage: float = 0.80,
     auto_repair_missing_kline: bool = False,
+    publication_run_uid: str = "",
+    publisher_task_type: str = "",
+    publisher_build_sha: str = "",
 ) -> BatchStats:
-    if auto_repair_missing_kline and (
+    publication_identity = (
+        str(publication_run_uid or "").strip().lower(),
+        str(publisher_task_type or "").strip(),
+        str(publisher_build_sha or "").strip().lower(),
+    )
+    publish = any(publication_identity)
+    production = (
         str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
         == "production"
+    )
+    if publish:
+        run_uid, task_type, build_sha = publication_identity
+        if (
+            not all(publication_identity)
+            or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+            or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+            or build_sha == "0" * 40
+            or task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        ):
+            raise RuntimeError("analysis publication identity is invalid")
+    if production and not publish:
+        raise RuntimeError(
+            "production analysis requires an exact canonical publication identity"
+        )
+    if production or publish:
+        # Validate before any mutable input is read.  A publisher with an
+        # explicit date but no cutoff would otherwise re-enable current-state
+        # hot/learning data and make its result impossible to replay.
+        exact_decision_at = _formal_analysis_decision_at(execution_time)
+        if _now_shanghai_naive() < exact_decision_at:
+            raise RuntimeError(
+                "formal analysis cannot publish before its decision cutoff"
+            )
+    if auto_repair_missing_kline and (
+        production
     ):
         raise RuntimeError(
             "production analysis cannot repair QMT history on the Linux host"
         )
     requested_trade_date = trade_date
     if strict_prev_trade_day:
-        execution_time = execution_time or datetime.now().replace(microsecond=0).isoformat(sep=" ")
+        execution_time = execution_time or _now_shanghai_naive().replace(
+            microsecond=0
+        ).isoformat(sep=" ")
         resolved_trade_date = previous_trade_date(engine, execution_time)
         if trade_date and str(trade_date)[:10] != resolved_trade_date:
             raise RuntimeError(
@@ -3092,7 +4553,7 @@ def run_batch(
     else:
         trade_date = trade_date or latest_trade_date(engine)
         if execution_time is None and requested_trade_date is None:
-            execution_time = datetime.now().replace(microsecond=0).isoformat(
+            execution_time = _now_shanghai_naive().replace(microsecond=0).isoformat(
                 sep=" "
             )
     logger.info("Fast analysis batch started for %s", trade_date)
@@ -3105,6 +4566,7 @@ def run_batch(
             stock_codes=None,
             progress_callback=progress_callback,
             news_cutoff_time=execution_time,
+            publisher_build_sha=publisher_build_sha,
         )
         _emit_progress(
             progress_callback,
@@ -3116,7 +4578,26 @@ def run_batch(
             recommendation_count=len(rec_rows),
         )
         verify_write_owner()
-        save_outputs(engine, analysis_rows, rec_rows, trade_date)
+        publication_receipt = save_outputs(
+            engine,
+            analysis_rows,
+            rec_rows,
+            trade_date,
+            publication_run_uid=publication_run_uid,
+            publisher_task_type=publisher_task_type,
+            publisher_build_sha=publisher_build_sha,
+        )
+
+    receipt = (
+        dict(publication_receipt)
+        if isinstance(publication_receipt, Mapping)
+        else None
+    )
+    executable_count = (
+        int(receipt.get("executable_count") or 0)
+        if receipt is not None
+        else sum(1 for row in rec_rows if is_executable_recommendation(row))
+    )
 
     stats = BatchStats(
         trade_date=trade_date,
@@ -3125,6 +4606,11 @@ def run_batch(
         market_mood_score=market_mood_score,
         flow_date=flow_date,
         hot_date=hot_date,
+        executable_count=executable_count,
+        canonical_pool_sha256=str(
+            (receipt or {}).get("canonical_pool_sha256") or ""
+        ),
+        publication_receipt=receipt,
     )
     _emit_progress(
         progress_callback,
@@ -3137,6 +4623,7 @@ def run_batch(
         market_mood_score=stats.market_mood_score,
         flow_date=stats.flow_date,
         hot_date=stats.hot_date,
+        executable_count=stats.executable_count,
         done=stats.analysis_count,
     )
     logger.info("Fast analysis completed: %s", stats)
@@ -3152,6 +4639,13 @@ def run_batch_for_codes(
     progress_callback: ProgressCallback | None = None,
     decision_at: datetime | str | None = None,
 ) -> BatchStats:
+    if (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    ):
+        raise RuntimeError(
+            "production scoped analysis cannot mutate the canonical daily pool"
+        )
     scoped_codes = _normalize_stock_codes(stock_codes)
     if not scoped_codes:
         raise ValueError("stock_codes must not be empty")
@@ -3167,6 +4661,7 @@ def run_batch_for_codes(
             stock_codes=scoped_codes,
             progress_callback=progress_callback,
             news_cutoff_time=decision_at,
+            publisher_build_sha="",
         )
         _emit_progress(
             progress_callback,
@@ -3194,6 +4689,9 @@ def run_batch_for_codes(
         market_mood_score=market_mood_score,
         flow_date=flow_date,
         hot_date=hot_date,
+        executable_count=sum(
+            1 for row in rec_rows if is_executable_recommendation(row)
+        ),
     )
     _emit_progress(
         progress_callback,
@@ -3206,10 +4704,115 @@ def run_batch_for_codes(
         market_mood_score=stats.market_mood_score,
         flow_date=stats.flow_date,
         hot_date=stats.hot_date,
+        executable_count=stats.executable_count,
         done=stats.analysis_count,
     )
     logger.info("Fast scoped analysis completed: %s", stats)
     return stats
+
+
+def _prebind_direct_publication_history(
+    engine: Engine,
+    *,
+    run_uid: str,
+    task_type: str,
+    build_sha: str,
+    trade_date: str,
+    min_score: float,
+    top_n: int,
+    strict_prev_trade_day: bool,
+    execution_time: str,
+) -> None:
+    """Create the exact recommendation audit row for a direct scheduler CLI."""
+
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or date.fromisoformat(trade_date).isoformat() != trade_date
+    ):
+        raise RuntimeError("direct analysis publication identity is invalid")
+    validate_recommended_run_history_schema(engine)
+    with engine.begin() as connection:
+        existing = connection.execute(text("""
+            SELECT run_uid
+            FROM st_recommended_run_history
+            WHERE run_uid=:run_uid
+            LIMIT 2
+        """), {"run_uid": run_uid}).mappings().all()
+        if existing:
+            raise RuntimeError(
+                "direct analysis recommendation history already exists"
+            )
+        result = connection.execute(text("""
+            INSERT INTO st_recommended_run_history
+                (run_uid, scheduler_job_id, trade_date, status, min_score,
+                 top_n, strict_prev_trade_day, execution_time, started_at,
+                 progress_percent, done_count, message, trigger_source,
+                 build_sha, publisher_task_type)
+            VALUES
+                (:run_uid, :run_uid, :trade_date, 'running', :min_score,
+                 :top_n, :strict_prev_trade_day, :execution_time,
+                 CURRENT_TIMESTAMP, 0, 0, 'scheduled analysis started',
+                 'scheduled', :build_sha, :task_type)
+        """), {
+            "run_uid": run_uid,
+            "trade_date": trade_date,
+            "min_score": float(min_score),
+            "top_n": int(top_n),
+            "strict_prev_trade_day": 1 if strict_prev_trade_day else 0,
+            "execution_time": (
+                str(execution_time or "")[:19].replace("T", " ") or None
+            ),
+            "build_sha": build_sha,
+            "task_type": task_type,
+        })
+        if int(result.rowcount or 0) != 1:
+            raise RuntimeError(
+                "direct analysis recommendation history was not prebound"
+            )
+
+
+def _finish_direct_publication_history(
+    engine: Engine,
+    *,
+    run_uid: str,
+    success: bool,
+    error: str = "",
+) -> None:
+    """Persist one terminal recommendation audit before scheduler validation."""
+
+    with engine.begin() as connection:
+        if success:
+            result = connection.execute(text("""
+                UPDATE st_recommended_run_history
+                SET status='done', finished_at=CURRENT_TIMESTAMP,
+                    progress_percent=100, done_count=total,
+                    message='scheduled analysis completed', error=NULL
+                WHERE run_uid=:run_uid
+                  AND scheduler_job_id=:run_uid
+                  AND status='running'
+                  AND canonical_pool_sha256 IS NOT NULL
+                  AND published_at IS NOT NULL
+                  AND executable_count>0
+            """), {"run_uid": run_uid})
+        else:
+            result = connection.execute(text("""
+                UPDATE st_recommended_run_history
+                SET status='error', finished_at=CURRENT_TIMESTAMP,
+                    message='scheduled analysis failed', error=:error
+                WHERE run_uid=:run_uid
+                  AND scheduler_job_id=:run_uid
+                  AND status='running'
+            """), {
+                "run_uid": run_uid,
+                "error": str(error or "")[:500],
+            })
+        if int(result.rowcount or 0) != 1:
+            raise RuntimeError(
+                "direct analysis recommendation terminal audit differs"
+            )
 
 
 def main() -> int:
@@ -3226,16 +4829,87 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     engine = create_batch_engine()
-    stats = run_batch(
-        engine=engine,
-        trade_date=args.date.strip() or None,
-        top_n=args.top_n,
-        min_score=args.min_score,
-        strict_prev_trade_day=args.strict_prev_trade_day,
-        execution_time=args.execution_time.strip() or None,
-        min_kline_coverage=args.min_kline_coverage,
-        auto_repair_missing_kline=args.auto_repair_missing_kline,
-    )
+    publication_run_uid = str(
+        os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""
+    ).strip().lower()
+    publisher_task_type = str(
+        os.environ.get("PROBIGA_SCHEDULER_TASK_TYPE") or ""
+    ).strip()
+    publisher_build_sha = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA") or ""
+    ).strip().lower()
+    publication_identity = any((
+        publication_run_uid,
+        publisher_task_type,
+        publisher_build_sha,
+    ))
+    history_prebound = False
+    try:
+        execution_time = (
+            args.execution_time.strip()
+            or _now_shanghai_naive().replace(microsecond=0).isoformat(sep=" ")
+        )
+        if args.strict_prev_trade_day:
+            resolved_trade_date = previous_trade_date(engine, execution_time)
+            if (
+                args.date.strip()
+                and args.date.strip() != resolved_trade_date
+            ):
+                raise RuntimeError(
+                    "strict direct analysis target differs from previous session"
+                )
+        else:
+            resolved_trade_date = (
+                args.date.strip() or latest_trade_date(engine)
+            )
+        if publication_identity:
+            _prebind_direct_publication_history(
+                engine,
+                run_uid=publication_run_uid,
+                task_type=publisher_task_type,
+                build_sha=publisher_build_sha,
+                trade_date=resolved_trade_date,
+                min_score=args.min_score,
+                top_n=args.top_n,
+                strict_prev_trade_day=args.strict_prev_trade_day,
+                execution_time=execution_time,
+            )
+            history_prebound = True
+        stats = run_batch(
+            engine=engine,
+            trade_date=resolved_trade_date,
+            top_n=args.top_n,
+            min_score=args.min_score,
+            strict_prev_trade_day=args.strict_prev_trade_day,
+            execution_time=execution_time,
+            min_kline_coverage=args.min_kline_coverage,
+            auto_repair_missing_kline=args.auto_repair_missing_kline,
+            publication_run_uid=publication_run_uid,
+            publisher_task_type=publisher_task_type,
+            publisher_build_sha=publisher_build_sha,
+        )
+        if history_prebound:
+            _finish_direct_publication_history(
+                engine,
+                run_uid=publication_run_uid,
+                success=True,
+            )
+    except Exception as exc:
+        if history_prebound:
+            try:
+                _finish_direct_publication_history(
+                    engine,
+                    run_uid=publication_run_uid,
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception as audit_exc:
+                raise RuntimeError(
+                    "direct analysis failed and terminal audit also failed: "
+                    f"original={type(exc).__name__}: {exc}; "
+                    f"audit={type(audit_exc).__name__}: {audit_exc}"
+                ) from exc
+        raise
     payload = {
         "trade_date": stats.trade_date,
         "analysis_count": stats.analysis_count,
@@ -3243,8 +4917,21 @@ def main() -> int:
         "market_mood_score": stats.market_mood_score,
         "flow_date": stats.flow_date,
         "hot_date": stats.hot_date,
+        "executable_count": stats.executable_count,
     }
-    if args.json:
+    if stats.publication_receipt is not None:
+        # Scheduler publication validation consumes this signed nested receipt.
+        # Keep it as one canonical stdout line even when the production task
+        # does not pass --json; logging remains on stderr.
+        payload["publication_receipt"] = stats.publication_receipt
+        print(json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ))
+    elif args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print(
@@ -3252,6 +4939,7 @@ def main() -> int:
             f"analysis={stats.analysis_count}, recommendations={stats.recommendation_count}, "
             f"market_mood={stats.market_mood_score:.1f}, flow_date={stats.flow_date or '-'}, hot_date={stats.hot_date or '-'}"
         )
+    engine.dispose()
     return 0
 
 

@@ -8,6 +8,7 @@ from .bridge import (
     is_configured,
     to_gm_symbol,
     to_stock_code,
+    upper_limit_history_evidence,
 )
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "is_configured",
     "to_gm_symbol",
     "to_stock_code",
+    "upper_limit_history_evidence",
 ]

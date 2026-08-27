@@ -2284,6 +2284,186 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(history_finish.call_args.kwargs["exit_code"], 0)
         self.assertIn("sent", history_finish.call_args.kwargs["output"])
 
+    def test_linux_gap_repair_child_gets_narrow_provider_role_from_standalone_parent(self):
+        engine = MagicMock()
+        row = {
+            "id": 713,
+            "task_name": "recent Linux data repair",
+            "task_type": "linux_recent_data_gap_repair",
+            "script_path": "tools/repair_linux_recent_data_gaps.py",
+            "script_args": "--apply --json",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+        fake_proc = MagicMock()
+        fake_proc.communicate.return_value = ("{}", "")
+        fake_proc.returncode = 0
+        validate_result = MagicMock(
+            return_value=SchedulerValidationResult(
+                checked=True,
+                ok=True,
+                message="exact repair receipt verified",
+            )
+        )
+        build_sha = "7" * 40
+
+        with patch(
+            "server.api.scheduler_runtime._task_history_start",
+            return_value="00000000000000000000000000000713",
+        ), patch(
+            "server.api.scheduler_runtime.os.name",
+            "posix",
+        ), patch(
+            "server.api.scheduler_runtime.os.setsid",
+            create=True,
+        ), patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ), patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/repair_linux_recent_data_gaps.py"),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env",
+            return_value={
+                "PROBIGA_SCHEDULER_EXECUTOR_ROLE": "linux_standalone",
+            },
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args",
+            return_value=["--apply", "--json"],
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+            return_value=fake_proc,
+        ) as popen, patch(
+            "server.api.scheduler_runtime.validate_scheduler_task_result",
+            validate_result,
+        ), patch(
+            "server.api.scheduler_runtime.scheduler_output_status",
+            return_value="success",
+        ), patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value=build_sha,
+        ), patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ):
+            scheduler_runtime._run_task(row, Path("E:/fake"), engine)
+
+        child_env = popen.call_args.kwargs["env"]
+        self.assertEqual(
+            child_env["PROBIGA_SCHEDULER_EXECUTOR_ROLE"],
+            "linux_provider",
+        )
+        self.assertEqual(
+            child_env["PROBIGA_SCHEDULER_TASK_TYPE"],
+            "linux_recent_data_gap_repair",
+        )
+        self.assertEqual(
+            child_env["PROBIGA_SCHEDULER_HISTORY_RUN_UID"],
+            "00000000000000000000000000000713",
+        )
+        validated_task = validate_result.call_args.args[0]
+        self.assertEqual(
+            validated_task["_scheduler_history_run_uid"],
+            "00000000000000000000000000000713",
+        )
+        self.assertEqual(
+            validated_task["_scheduler_expected_build_sha"],
+            build_sha,
+        )
+
+    def test_linux_provider_child_role_rejects_task_script_identity_mismatch(self):
+        row = {
+            "id": 714,
+            "task_name": "misbound provider repair",
+            "task_type": "linux_recent_data_gap_repair",
+            "script_path": "tools/sync_news_formal.py",
+            "script_args": "--json",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+
+        with patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/sync_news_formal.py"),
+        ), patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env",
+            return_value={
+                "PROBIGA_SCHEDULER_EXECUTOR_ROLE": "linux_standalone",
+            },
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args",
+            return_value=["--json"],
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+        ) as popen:
+            with self.assertRaisesRegex(RuntimeError, "exact script path"):
+                scheduler_runtime._run_task_impl(
+                    row,
+                    Path("E:/fake"),
+                    MagicMock(),
+                    history_run_uid="00000000000000000000000000000714",
+                )
+
+        popen.assert_not_called()
+
+    def test_linux_provider_child_role_requires_posix_standalone_parent(self):
+        row = {
+            "id": 715,
+            "task_name": "recent Linux data repair",
+            "task_type": "linux_recent_data_gap_repair",
+            "script_path": "tools/repair_linux_recent_data_gaps.py",
+            "script_args": "--apply --json",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+        cases = (
+            ("nt", "linux_standalone", "requires a POSIX host"),
+            ("posix", "linux_provider", "exact linux_standalone parent"),
+            ("posix", "", "exact linux_standalone parent"),
+        )
+        for host_kind, parent_role, message in cases:
+            with self.subTest(host_kind=host_kind, parent_role=parent_role):
+                with patch(
+                    "server.api.scheduler_runtime.os.name",
+                    host_kind,
+                ), patch(
+                    "server.api.scheduler_runtime.resolve_scheduler_script",
+                    return_value=Path(
+                        "E:/fake/repair_linux_recent_data_gaps.py"
+                    ),
+                ), patch.object(
+                    Path,
+                    "exists",
+                    return_value=True,
+                ), patch(
+                    "server.api.scheduler_runtime.build_child_env",
+                    return_value={
+                        "PROBIGA_SCHEDULER_EXECUTOR_ROLE": parent_role,
+                    },
+                ), patch(
+                    "server.api.scheduler_runtime._build_task_args",
+                    return_value=["--apply", "--json"],
+                ), patch(
+                    "server.api.scheduler_runtime.subprocess.Popen",
+                ) as popen:
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        scheduler_runtime._run_task_impl(
+                            row,
+                            Path("E:/fake"),
+                            MagicMock(),
+                            history_run_uid=(
+                                "00000000000000000000000000000715"
+                            ),
+                        )
+
+                popen.assert_not_called()
+
     def test_confirmed_user_stop_is_persisted_by_owner_with_same_audit_uid(self):
         engine = MagicMock()
         row = {
@@ -2872,7 +3052,7 @@ def test_release_catchup_retries_failed_and_blocked_rows_after_bounded_backoff()
 def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane():
     graph = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES
     nodes = readiness_contract.RELEASE_DATA_CATCHUP_TASK_TYPES
-    analysis_dependencies = {
+    morning_dependencies = {
         "capital_flow_batch_fast",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
@@ -2880,8 +3060,20 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "notice_eastmoney",
         "linux_recent_data_gap_repair",
     }
-    assert set(graph["analysis_fast"]) == analysis_dependencies
-    assert set(graph["analysis_morning_strict"]) == analysis_dependencies
+    fast_dependencies = morning_dependencies | {
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+        "qmt_membership_snapshot",
+    }
+    assert set(graph["analysis_fast"]) == fast_dependencies
+    assert set(graph["analysis_morning_strict"]) == morning_dependencies
+    assert graph["target_turnover_snapshot"] == ("qmt_stock_daily_canonical",)
+    assert set(graph["analysis_upper_evidence_prepare"]) == {
+        "target_turnover_snapshot",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_stock_daily_canonical",
+    }
     assert (
         "analysis_morning_strict"
         in readiness_contract.RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
@@ -2890,6 +3082,20 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "analysis_morning_strict"
         not in readiness_contract.RELEASE_DATA_READINESS_TASK_TYPES
     )
+    assert (
+        "qmt_membership_snapshot"
+        in readiness_contract.RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
+    )
+    assert (
+        "qmt_membership_snapshot"
+        not in readiness_contract.RELEASE_DATA_READINESS_TASK_TYPES
+    )
+    assert "qmt_membership_snapshot" in graph["analysis_fast"]
+    assert "qmt_membership_snapshot" not in graph["analysis_morning_strict"]
+    assert {
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+    } <= readiness_contract.RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
     assert set(graph).issubset(nodes)
     assert {
         dependency for dependencies in graph.values() for dependency in dependencies
@@ -2916,11 +3122,12 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
     assert visited == set(nodes)
 
     loop_source = inspect.getsource(scheduler_runtime._check_and_run_tasks)
-    assert "if not release_catchup_due and not _cron_due" in loop_source
+    assert "and not membership_ordinary_due" in loop_source
+    assert "and not _cron_due(row, now=now)" in loop_source
     assert "elapsed < interval_minutes and not release_catchup_due" in loop_source
     dependency_gate = loop_source.index("_release_catchup_dependencies_ready")
     pending_gate = loop_source.index(
-        "if release_catchup_pending and not release_catchup_due"
+        "release_catchup_pending\n"
     )
     normal_schedule_gate = loop_source.index("if interval_minutes > 0")
     running_lock = loop_source.index("with _running_lock:", dependency_gate)
@@ -2999,13 +3206,10 @@ def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():
 
 def test_release_analysis_pools_wait_for_every_exact_build_market_input():
     build_sha = "c" * 40
-    dependencies = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
-        "analysis_fast"
-    ]
-    assert dependencies == readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
-        "analysis_morning_strict"
-    ]
     for downstream_type in ("analysis_fast", "analysis_morning_strict"):
+        dependencies = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
+            downstream_type
+        ]
         downstream = {"id": 950, "task_type": downstream_type}
         exact_rows = [
             _release_terminal_row(
@@ -3157,7 +3361,7 @@ def test_release_closed_target_uses_calendar_for_overnight_preclose_and_closed_d
         assert params == {"today": now.date().isoformat()}
 
 
-def test_release_expected_target_rollover_invalidates_1759_success_at_1800():
+def test_release_expected_target_rollover_waits_for_formal_analysis_cutoff():
     build_sha = "c" * 40
     row = _release_terminal_row(
         "analysis_fast",
@@ -3184,11 +3388,95 @@ def test_release_expected_target_rollover_invalidates_1759_success_at_1800():
         assert not scheduler_runtime._release_build_catchup_pending(row)
 
         row["_release_expected_target_date"] = "2026-08-27"
-        assert scheduler_runtime._release_build_catchup_allowed(
+        assert not scheduler_runtime._release_build_catchup_allowed(
             row,
             now=datetime(2026, 8, 27, 18, 0),
         )
         assert scheduler_runtime._release_build_catchup_pending(row)
+        assert scheduler_runtime._release_build_catchup_allowed(
+            row,
+            now=datetime(2026, 8, 27, 23, 55),
+        )
+
+
+def test_release_daily_analysis_dag_obeys_each_immutable_capture_window():
+    active_build = "c" * 40
+
+    def due_row(task_type: str, task_id: int) -> dict:
+        row = _release_terminal_row(
+            task_type,
+            task_id=task_id,
+            build_sha="b" * 40,
+            target_date="2026-08-27",
+        )
+        row.update(
+            {
+                "_release_expected_target_required": True,
+                "_release_expected_target_available": True,
+                "_release_expected_target_date": "2026-08-27",
+            }
+        )
+        return row
+
+    turnover = due_row("target_turnover_snapshot", 991)
+    upper = due_row("analysis_upper_evidence_prepare", 992)
+    analysis = due_row("analysis_fast", 993)
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=active_build,
+    ):
+        assert scheduler_runtime._release_build_catchup_allowed(
+            turnover, now=datetime(2026, 8, 27, 19, 0)
+        )
+        assert not scheduler_runtime._release_build_catchup_allowed(
+            upper, now=datetime(2026, 8, 27, 19, 0)
+        )
+        assert not scheduler_runtime._release_build_catchup_allowed(
+            analysis, now=datetime(2026, 8, 27, 19, 0)
+        )
+        assert scheduler_runtime._release_build_catchup_allowed(
+            upper, now=datetime(2026, 8, 27, 23, 40)
+        )
+        assert not scheduler_runtime._release_build_catchup_allowed(
+            analysis, now=datetime(2026, 8, 27, 23, 40)
+        )
+        assert scheduler_runtime._release_build_catchup_allowed(
+            analysis, now=datetime(2026, 8, 27, 23, 55)
+        )
+
+
+def test_release_daily_analysis_rejects_exact_build_dependency_for_other_date():
+    build_sha = "c" * 40
+    downstream = {
+        "id": 994,
+        "task_type": "analysis_fast",
+        "_release_expected_target_required": True,
+        "_release_expected_target_available": True,
+        "_release_expected_target_date": "2026-08-27",
+    }
+    upper = _release_terminal_row(
+        "analysis_upper_evidence_prepare",
+        task_id=995,
+        build_sha=build_sha,
+        target_date="2026-08-26",
+    )
+    upper.update(
+        {
+            "_release_expected_target_required": True,
+            "_release_expected_target_available": True,
+            "_release_expected_target_date": "2026-08-26",
+        }
+    )
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ):
+        ready, reason = scheduler_runtime._release_catchup_dependencies_ready(
+            downstream,
+            [downstream, upper],
+        )
+    assert not ready
+    assert reason == "analysis_upper_evidence_prepare:target_date_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -3238,10 +3526,45 @@ def test_release_qmt_closed_evidence_rolls_over_exactly_at_1800(task_type):
         )
 
 
+def test_release_membership_evidence_rolls_over_exactly_at_1510():
+    build_sha = "c" * 40
+    row = _release_terminal_row(
+        "qmt_membership_snapshot",
+        task_id=994,
+        build_sha=build_sha,
+        finished_at=datetime(2026, 8, 27, 15, 9),
+        target_date="2026-08-26",
+    )
+    shanghai = ZoneInfo("Asia/Shanghai")
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ):
+        assert scheduler_runtime._attach_release_catchup_expected_targets(
+            _ClosedDateEngine("2026-08-26"),
+            [row],
+            now=datetime(2026, 8, 27, 15, 9, tzinfo=shanghai),
+        )
+        assert not scheduler_runtime._release_build_catchup_pending(row)
+
+        assert scheduler_runtime._attach_release_catchup_expected_targets(
+            _ClosedDateEngine("2026-08-27"),
+            [row],
+            now=datetime(2026, 8, 27, 15, 10, tzinfo=shanghai),
+        )
+        assert row["_release_expected_target_date"] == "2026-08-27"
+        assert scheduler_runtime._release_build_catchup_pending(row)
+        assert scheduler_runtime._release_build_catchup_allowed(
+            row,
+            now=datetime(2026, 8, 27, 15, 10),
+        )
+
+
 def test_release_expected_targets_use_closed_previous_and_current_clocks():
     rows = [
         {"task_type": "analysis_fast"},
         {"task_type": "analysis_morning_strict"},
+        {"task_type": "qmt_membership_snapshot"},
         {"task_type": "hot_fused"},
         {"task_type": "sim_trade_signal_prepare"},
         {"task_type": "stock_finance"},
@@ -3266,6 +3589,12 @@ def test_release_expected_targets_use_closed_previous_and_current_clocks():
         by_type = {row["task_type"]: row for row in rows}
         assert by_type["analysis_fast"]["_release_expected_target_date"] == closed_target
         assert by_type["analysis_morning_strict"]["_release_expected_target_date"] == "2026-08-26"
+        assert (
+            by_type["qmt_membership_snapshot"][
+                "_release_expected_target_date"
+            ]
+            == closed_target
+        )
         assert by_type["hot_fused"]["_release_expected_target_date"] == "2026-08-27"
         assert by_type["sim_trade_signal_prepare"]["_release_expected_target_date"] == "2026-08-27"
         assert by_type["stock_finance"]["_release_expected_target_required"] is False
@@ -3370,6 +3699,15 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         object(),
         now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
     ) == "2026-08-27"
+    utc_bound = scheduler_runtime._task_argument_row(
+        ordinary,
+        now=datetime(2026, 8, 27, 10, 50, tzinfo=ZoneInfo("UTC")),
+        target_date="2026-08-27",
+    )
+    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T23:55:00"
+    assert utc_bound["_scheduler_pipeline_decision_at"] == (
+        "2026-08-27T23:55:00"
+    )
 
     live_snapshot = {
         "task_type": "hot_rank_ths",
@@ -3393,6 +3731,7 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
             "_trigger_source": "release_catchup",
         },
         now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
+        target_date="2026-08-27",
     )
     morning_row = scheduler_runtime._bind_release_validation_target(
         morning_row,
@@ -3501,6 +3840,21 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
     date_sensitive = set()
     for task_type, row in definitions.items():
         release_row = {**row, "_trigger_source": "release_catchup"}
+        if task_type in (
+            scheduler_runtime.ANALYSIS_DAILY_EVIDENCE_TASK_TYPES
+            | {"analysis_fast"}
+        ):
+            release_row.update(
+                {
+                    "_scheduler_execution_time": "2026-08-26T23:55:00",
+                    "_scheduler_pipeline_decision_at": "2026-08-26T23:55:00",
+                    "_scheduler_pipeline_target_date": "2026-08-26",
+                }
+            )
+        elif task_type in scheduler_runtime.ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+            release_row["_scheduler_execution_time"] = (
+                "2026-08-26T03:05:00"
+            )
         if task_type in scheduler_runtime.RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES:
             release_row["_release_execution_time"] = "2026-08-26T03:05:00"
         args_26 = scheduler_runtime._build_task_args(
@@ -3508,6 +3862,21 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
             str(row.get("script_path") or ""),
             "2026-08-26",
         )
+        if task_type in (
+            scheduler_runtime.ANALYSIS_DAILY_EVIDENCE_TASK_TYPES
+            | {"analysis_fast"}
+        ):
+            release_row.update(
+                {
+                    "_scheduler_execution_time": "2026-08-27T23:55:00",
+                    "_scheduler_pipeline_decision_at": "2026-08-27T23:55:00",
+                    "_scheduler_pipeline_target_date": "2026-08-27",
+                }
+            )
+        elif task_type in scheduler_runtime.ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+            release_row["_scheduler_execution_time"] = (
+                "2026-08-27T03:05:00"
+            )
         if task_type in scheduler_runtime.RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES:
             release_row["_release_execution_time"] = "2026-08-27T03:05:00"
         args_27 = scheduler_runtime._build_task_args(
@@ -3716,3 +4085,108 @@ def test_non_trading_day_skips_all_intraday_and_postmarket_heavy_tasks():
                 object(),
                 datetime(2026, 7, 18, 10, 0),
             )
+
+
+def test_scheduler_cron_wall_clock_is_shanghai_when_host_clock_is_utc(
+    monkeypatch,
+) -> None:
+    class UtcHostDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(
+                2026, 8, 27, 7, 50, tzinfo=ZoneInfo("UTC")
+            )
+            if tz is None:
+                return current.replace(tzinfo=None)
+            return current.astimezone(tz)
+
+    monkeypatch.setattr(scheduler_runtime, "datetime", UtcHostDateTime)
+
+    shanghai_now = scheduler_runtime._now_shanghai_naive()
+    assert shanghai_now == datetime(2026, 8, 27, 15, 50)
+    assert scheduler_runtime._cron_due(
+        {
+            "task_type": "target_turnover_snapshot",
+            "cron_time": "15:50",
+            "last_triggered_at": None,
+            "last_run_status": None,
+        },
+        now=shanghai_now,
+    )
+    assert not scheduler_runtime._cron_due(
+        {
+            "task_type": "analysis_upper_evidence_prepare",
+            "cron_time": "23:40",
+            "last_triggered_at": None,
+            "last_run_status": None,
+        },
+        now=shanghai_now,
+    )
+    assert "_now_shanghai_naive()" in inspect.getsource(
+        scheduler_runtime._cleanup_stale_running_tasks
+    )
+    assert "startup_time = _now_shanghai_naive()" in inspect.getsource(
+        scheduler_runtime._check_and_run_tasks
+    )
+
+
+def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None:
+    now = datetime(2026, 8, 27, 23, 40)
+
+    def row(task_type: str, minute: int) -> dict:
+        return {
+            "task_type": task_type,
+            "enabled": 1,
+            "last_triggered_at": datetime(2026, 8, 27, 15, minute),
+            "last_run_status": "success",
+        }
+
+    upper_rows = [
+        row("target_turnover_snapshot", 50),
+        row("capital_flow_batch_fast", 24),
+        row("qmt_membership_snapshot", 12),
+        row("qmt_stock_daily_canonical", 45),
+        {
+            **row("analysis_upper_evidence_prepare", 55),
+            "last_triggered_at": None,
+            "last_run_status": None,
+        },
+    ]
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_upper_evidence_prepare", upper_rows, now=now
+        )
+    )
+    assert ready, reason
+
+    missing_flow = [
+        item for item in upper_rows
+        if item["task_type"] != "capital_flow_batch_fast"
+    ]
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_upper_evidence_prepare", missing_flow, now=now
+        )
+    )
+    assert not ready
+    assert reason == "capital_flow_batch_fast:missing_or_duplicate"
+
+    analysis_rows = [
+        row("analysis_upper_evidence_prepare", 56),
+        row("target_turnover_snapshot", 50),
+        row("capital_flow_batch_fast", 24),
+        row("qmt_membership_snapshot", 12),
+        row("qmt_stock_daily_canonical", 45),
+        row("qmt_announcement_pit", 30),
+        {
+            **row("analysis_fast", 57),
+            "last_triggered_at": datetime(2026, 8, 27, 15, 40),
+        },
+    ]
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_fast", analysis_rows, now=now
+        )
+    )
+    assert not ready
+    assert reason == "analysis_fast:ran_before_dependency"

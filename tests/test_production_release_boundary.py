@@ -3435,6 +3435,11 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'r"[0-9a-f]{64}"',
         'runtime_bundle.get("recovery_ready_for_privileged_apply") is True',
         'runtime_bundle_runtime.get("contract_hash")',
+        'full_trigger_inventory.get("expected_count") == 142',
+        'full_trigger_inventory.get("observed_count") == 142',
+        'full_trigger_inventory.get("managed_count") == 101',
+        'full_trigger_inventory.get("v2_count") == 41',
+        'full_trigger_inventory_exact',
     ):
         assert required_resume_evidence in resume_validator
     for required_writer_fence_evidence in (
@@ -3514,10 +3519,17 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
-        "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3",
+        "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
+    for resume_only_trigger_literal in (
+        "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc",
+        "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87",
+        "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883",
+        "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423",
+    ):
+        assert resume_only_trigger_literal in resume_validator
 
     assert cleanup.count("controlled_guard_restore_after_cleanup_failure") >= 2
     assert 'rm -f -- "$DATABASE_WRITER_GUARD_FILE"' in cleanup

@@ -24,6 +24,11 @@ from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
 )
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
+from server.common.analysis_pool_receipt import (
+    ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    canonical_sha256,
+    read_persisted_pool_manifest,
+)
 from server.common.process_env import build_child_env
 from server.common.release_data_readiness_contract import (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
@@ -47,7 +52,11 @@ from server.common.scheduler_script_policy import (
     SchedulerScriptPolicyError,
     resolve_scheduler_script,
 )
-from server.common.scheduler_args import build_scheduler_task_args
+from server.common.scheduler_args import (
+    ANALYSIS_DAILY_EVIDENCE_TASK_TYPES,
+    ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
+    build_scheduler_task_args,
+)
 from server.common.scheduler_tasks import (
     claim_scheduler_task_run,
     update_scheduler_task,
@@ -96,6 +105,8 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
     RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES,
     int(os.environ.get("SCHEDULER_RELEASE_CATCHUP_BLOCKED_RETRY_MINUTES", "30")),
 )
+_QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
+_QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
 )
@@ -147,6 +158,8 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
         "alist_daily",
         "alist_info",
         "concept_flow",
@@ -201,6 +214,8 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     }
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
+    "target_turnover_snapshot": 8 * 60 * 60,
+    "analysis_upper_evidence_prepare": 20 * 60,
     # These source snapshots and quality gates must not disappear merely
     # because the single general worker was occupied during their exact cron
     # minute.  They remain bounded to the same trading day and `_cron_due`
@@ -265,6 +280,8 @@ RECOMMENDATION_CRON_CATCHUP_WINDOW_SECONDS = int(
     os.environ.get("SCHEDULER_RECOMMENDATION_CATCHUP_WINDOW_SECONDS", "21600")
 )
 NON_TRADING_DAY_SKIP_TYPES = {
+    "target_turnover_snapshot",
+    "analysis_upper_evidence_prepare",
     "analysis_fast",
     "analysis_morning_strict",
     "analysis_premarket_external",
@@ -379,7 +396,13 @@ _alert_lane_semaphore: threading.Semaphore | None = None
 _delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
-_scheduler_started_at = datetime.now()
+def _now_shanghai_naive() -> datetime:
+    """Return the sole scheduler/DB wall clock (Asia/Shanghai, naive)."""
+
+    return datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+
+
+_scheduler_started_at = _now_shanghai_naive()
 _scheduler_instance_id = f"{gethostname()}-{os.getpid()}"
 _task_history_schema_lock = threading.Lock()
 _task_history_ready_engines: set[int] = set()
@@ -402,6 +425,8 @@ _HISTORY_SECRET_PATTERNS = (
 
 
 LONG_RUNNING_TASK_TYPES = {
+    "target_turnover_snapshot",
+    "analysis_upper_evidence_prepare",
     "analysis_fast",
     "analysis_premarket_external",
     "capital_flow",
@@ -510,7 +535,7 @@ def _is_trade_day(engine, day: date | None = None) -> bool | None:
     calendar sync may be incomplete or between truncate and refill.  Callers
     must only skip work for an explicit ``trade_status = 0`` row.
     """
-    day = day or datetime.now().date()
+    day = day or _now_shanghai_naive().date()
     try:
         with engine.connect() as conn:
             trade_status = conn.execute(
@@ -1045,6 +1070,12 @@ def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
         )
     ):
         return False
+    if task_type in (ANALYSIS_DAILY_EVIDENCE_TASK_TYPES | {"analysis_fast"}):
+        current = now
+        if current.tzinfo is not None:
+            current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        if current.time() < release_catchup_closed_ready_time(task_type):
+            return False
     build_sha = _scheduler_build_commit_sha()
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha) or build_sha == "0" * 40:
         return False
@@ -1128,12 +1159,29 @@ def _release_catchup_dependencies_ready(
             str(candidate.get("task_type") or "").strip(), []
         ).append(candidate)
     build_sha = _scheduler_build_commit_sha()
+    downstream_target = str(
+        row.get("_release_expected_target_date") or ""
+    ).strip()
     for dependency in dependencies:
         matches = grouped.get(dependency, [])
         if len(matches) != 1:
             return False, f"{dependency}:missing_or_duplicate"
-        if not _release_history_evidence_valid(matches[0], build_sha):
+        upstream = matches[0]
+        if not _release_history_evidence_valid(upstream, build_sha):
             return False, f"{dependency}:exact_build_not_ready"
+        if (
+            task_type
+            in (ANALYSIS_DAILY_EVIDENCE_TASK_TYPES | {"analysis_fast"})
+            and upstream.get("_release_expected_target_required") is True
+        ):
+            upstream_target = str(
+                upstream.get("_release_expected_target_date") or ""
+            ).strip()
+            if (
+                not downstream_target
+                or upstream_target != downstream_target
+            ):
+                return False, f"{dependency}:target_date_mismatch"
     return True, "ready"
 
 
@@ -1450,6 +1498,23 @@ _HOT_RANK_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "hot_fused_3": ("hot_fused",),
     "hot_fused_5": ("hot_fused_3",),
 }
+_DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
+    "analysis_upper_evidence_prepare": (
+        "target_turnover_snapshot",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_stock_daily_canonical",
+    ),
+    "analysis_fast": (
+        "analysis_upper_evidence_prepare",
+        "target_turnover_snapshot",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_stock_daily_canonical",
+        "qmt_announcement_pit",
+    ),
+}
 
 
 def strategy_governance_task_block_reason(row: dict) -> str:
@@ -1571,24 +1636,84 @@ def evaluate_hot_rank_pipeline_dependencies(
     return True, "ready"
 
 
+def evaluate_daily_analysis_evidence_dependencies(
+    task_type: str,
+    dependency_rows: list[dict],
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Require each cross-host evidence producer to finish in DAG order."""
+
+    normalized_type = str(task_type or "").strip()
+    required = _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES.get(normalized_type)
+    if required is None:
+        return True, "not_applicable"
+    grouped: dict[str, list[dict]] = {}
+    for item in dependency_rows:
+        grouped.setdefault(
+            str(item.get("task_type") or "").strip(), []
+        ).append(item)
+    dependency_times: list[datetime] = []
+    for dependency in required:
+        rows = grouped.get(dependency, [])
+        if len(rows) != 1:
+            return False, f"{dependency}:missing_or_duplicate"
+        upstream = rows[0]
+        triggered = _coerce_datetime(upstream.get("last_triggered_at"))
+        if int(upstream.get("enabled") or 0) != 1:
+            return False, f"{dependency}:disabled"
+        if triggered is None or triggered.date() != now.date():
+            return False, f"{dependency}:not_run_today"
+        if (
+            str(upstream.get("last_run_status") or "").strip().lower()
+            != "success"
+        ):
+            return False, f"{dependency}:not_success_today"
+        dependency_times.append(triggered)
+    downstream_rows = grouped.get(normalized_type, [])
+    if len(downstream_rows) > 1:
+        return False, f"{normalized_type}:duplicate"
+    downstream_triggered = (
+        _coerce_datetime(downstream_rows[0].get("last_triggered_at"))
+        if downstream_rows
+        else None
+    )
+    if (
+        downstream_triggered is not None
+        and downstream_triggered.date() == now.date()
+        and dependency_times
+        and downstream_triggered < max(dependency_times)
+    ):
+        return False, f"{normalized_type}:ran_before_dependency"
+    return True, "ready"
+
+
 def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
     task_type = str(row.get("task_type") or "").strip()
     hot_dependencies = _HOT_RANK_PIPELINE_DEPENDENCIES.get(task_type)
+    evidence_dependencies = _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES.get(
+        task_type
+    )
     if (
         task_type not in {"analysis_fast", "strategy_governance_daily"}
         and hot_dependencies is None
+        and evidence_dependencies is None
     ):
         return True, "not_applicable"
     dependency_types = (
         set(hot_dependencies or ()) | {task_type}
         if hot_dependencies is not None
-        else {
-            "qmt_announcement_pit",
-            "capital_flow_batch_fast",
-            "analysis_fast",
-        }
+        else (
+            set(evidence_dependencies or ()) | {task_type}
+            if evidence_dependencies is not None
+            else {
+                "qmt_announcement_pit",
+                "capital_flow_batch_fast",
+                "analysis_fast",
+            }
+        )
     )
     placeholders = ",".join(
         f":dependency_{index}" for index, _ in enumerate(sorted(dependency_types))
@@ -1615,6 +1740,10 @@ def _strategy_pipeline_dependencies_ready(
         return False, f"dependency_query_failed:{type(exc).__name__}"
     if hot_dependencies is not None:
         return evaluate_hot_rank_pipeline_dependencies(
+            task_type, dependencies, now=now
+        )
+    if evidence_dependencies is not None:
+        return evaluate_daily_analysis_evidence_dependencies(
             task_type, dependencies, now=now
         )
     return evaluate_strategy_pipeline_dependencies(task_type, dependencies, now=now)
@@ -1822,7 +1951,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
         logger.warning("僵尸检测异常: %s", exc)
         return 0
 
-    now = datetime.now()
+    now = _now_shanghai_naive()
     cleaned = 0
     for row in rows:
         data = dict(row)
@@ -1939,7 +2068,7 @@ def _should_skip_non_trading_day(
     avoids both a false-success skip and an early briefing built from stale
     market data.
     """
-    now = now or datetime.now()
+    now = now or _now_shanghai_naive()
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     script_args = str(row.get("script_args") or "").strip()
@@ -2119,6 +2248,7 @@ def _attach_release_catchup_expected_targets(
         if required:
             row["_release_expected_target_available"] = False
             row["_release_expected_target_date"] = ""
+        row["_membership_ordinary_snapshot_available"] = False
     if not selected:
         return True
 
@@ -2172,6 +2302,37 @@ def _attach_release_catchup_expected_targets(
         if target:
             row["_release_expected_target_available"] = True
             row["_release_expected_target_date"] = target
+    membership_rows = [
+        row for row in rows
+        if str(row.get("task_type") or "").strip()
+        == _QMT_MEMBERSHIP_TASK_TYPE
+    ]
+    if membership_rows:
+        try:
+            with engine.connect() as connection:
+                snapshot_rows = connection.execute(text("""
+                    SELECT snapshot_date, source, quality_status
+                    FROM qmt_membership_snapshot_run
+                    WHERE snapshot_date=:snapshot_date
+                      AND source=:source
+                      AND quality_status='QMT_VALIDATED'
+                    LIMIT 2
+                """), {
+                    "snapshot_date": current.date().isoformat(),
+                    "source": _QMT_MEMBERSHIP_PROVIDER,
+                }).mappings().all()
+            snapshot_available = len(snapshot_rows) == 1
+        except Exception as exc:
+            snapshot_available = False
+            logger.warning(
+                "QMT membership ordinary-publisher state is unavailable; "
+                "publisher remains fail-closed due: %s",
+                type(exc).__name__,
+            )
+        for row in membership_rows:
+            row["_membership_ordinary_snapshot_available"] = (
+                snapshot_available
+            )
     if failures:
         logger.warning(
             "Release catch-up target authority is unavailable; fail closed: %s",
@@ -2181,6 +2342,33 @@ def _attach_release_catchup_expected_targets(
             ),
         )
     return not failures
+
+
+def _membership_ordinary_publish_due(row: dict, *, now: datetime) -> bool:
+    """Prioritize the 15:12 publisher while today's snapshot is absent."""
+
+    if (
+        str(row.get("task_type") or "").strip()
+        != _QMT_MEMBERSHIP_TASK_TYPE
+        or row.get("_membership_ordinary_snapshot_available") is True
+    ):
+        return False
+    cron_min = _parse_hhmm(str(row.get("cron_time") or "15:12"))
+    if cron_min is None or now.hour * 60 + now.minute < cron_min:
+        return False
+    last_triggered = _coerce_datetime(row.get("last_triggered_at"))
+    if last_triggered is None or last_triggered.date() < now.date():
+        return True
+    if last_triggered.date() > now.date():
+        return False
+    if last_triggered.hour * 60 + last_triggered.minute < cron_min:
+        # In particular, a 15:10 read-only release BLOCK must not consume the
+        # ordinary 15:12 publisher slot or impose release backoff on it.
+        return True
+    retry_at = _cron_retry_reference(row, fallback=last_triggered)
+    return (
+        now - retry_at
+    ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
 
 
 def _task_dispatch_date(
@@ -2215,25 +2403,58 @@ def _task_dispatch_date(
     return current.date().isoformat()
 
 
-def _task_argument_row(row: dict, *, now: datetime) -> dict:
-    """Bind strict previous-session analysis to one Shanghai execution time."""
+def _task_argument_row(
+    row: dict,
+    *,
+    now: datetime,
+    target_date: str,
+) -> dict:
+    """Bind formal analysis to one Shanghai execution/decision wall clock."""
 
     task_type = str(row.get("task_type") or "").strip()
     trigger_source = str(row.get("_trigger_source") or "").strip()
+    daily_pipeline = (
+        task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES
+        or task_type == "analysis_fast"
+    )
     if (
-        trigger_source != "release_catchup"
-        or task_type not in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES
+        task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        and not daily_pipeline
     ):
         return row
     current = now
     if current.tzinfo is not None:
         current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-    return {
+    bound = current.replace(microsecond=0).isoformat(timespec="seconds")
+    if daily_pipeline:
+        try:
+            parsed_target = date.fromisoformat(str(target_date or ""))
+        except ValueError as exc:
+            raise RuntimeError(
+                "scheduler analysis pipeline target date is invalid"
+            ) from exc
+        exact_target = parsed_target.isoformat()
+        if exact_target != str(target_date or ""):
+            raise RuntimeError(
+                "scheduler analysis pipeline target date is invalid"
+            )
+        bound = (
+            f"{exact_target}T"
+            f"{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+        )
+    result = {
         **row,
-        "_release_execution_time": current.replace(microsecond=0).isoformat(
-            timespec="seconds"
-        ),
+        "_scheduler_execution_time": bound,
     }
+    if daily_pipeline:
+        result["_scheduler_pipeline_decision_at"] = bound
+        result["_scheduler_pipeline_target_date"] = exact_target
+    if (
+        trigger_source == "release_catchup"
+        and task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES
+    ):
+        result["_release_execution_time"] = bound
+    return result
 
 
 def _bind_release_validation_target(
@@ -3038,6 +3259,191 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
         return None
 
 
+def _activate_analysis_strategy_pool(
+    connection,
+    *,
+    run_uid: str,
+    task_type: str,
+) -> None:
+    """Activate one validated pool in the scheduler-success transaction."""
+
+    if task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+        return
+    audit_rows = connection.execute(text("""
+        SELECT task_type, status
+        FROM st_scheduled_task_history
+        WHERE run_uid=:run_uid
+        LIMIT 2
+    """), {"run_uid": run_uid}).mappings().all()
+    if (
+        len(audit_rows) != 1
+        or str(audit_rows[0].get("task_type") or "").strip() != task_type
+        or str(audit_rows[0].get("status") or "").strip().lower()
+        != "running"
+    ):
+        raise RuntimeError("analysis pool activation scheduler audit differs")
+    history_rows = connection.execute(text("""
+        SELECT run_uid, scheduler_job_id, publisher_task_type, trade_date,
+               status, total, passed, executable_count,
+               canonical_pool_sha256, membership_snapshot_date,
+               membership_snapshot_source, membership_proof_sha256
+        FROM st_recommended_run_history
+        WHERE run_uid=:run_uid
+        LIMIT 2
+    """), {"run_uid": run_uid}).mappings().all()
+    if len(history_rows) != 1:
+        raise RuntimeError(
+            "analysis pool activation history is unavailable or ambiguous"
+        )
+    history = history_rows[0]
+    try:
+        analysis_count = int(history.get("total") or 0)
+        expected_rows = int(history.get("passed") or 0)
+        executable_count = int(history.get("executable_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "analysis pool activation counters are invalid"
+        ) from exc
+    if (
+        str(history.get("run_uid") or "").strip().lower() != run_uid
+        or str(history.get("scheduler_job_id") or "").strip().lower()
+        != run_uid
+        or str(history.get("publisher_task_type") or "").strip()
+        != task_type
+        or str(history.get("status") or "").strip().lower() != "done"
+        or analysis_count <= 0
+        or expected_rows <= 0
+        or executable_count <= 0
+        or executable_count > expected_rows
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(history.get("canonical_pool_sha256") or "").strip().lower(),
+        ) is None
+    ):
+        raise RuntimeError("analysis pool activation history differs")
+    trade_date = str(history.get("trade_date") or "")[:10]
+    history_hash = str(
+        history.get("canonical_pool_sha256") or ""
+    ).strip().lower()
+    membership = {
+        "snapshot_date": str(
+            history.get("membership_snapshot_date") or ""
+        )[:10],
+        "source": str(
+            history.get("membership_snapshot_source") or ""
+        ).strip(),
+        "proof_sha256": str(
+            history.get("membership_proof_sha256") or ""
+        ).strip().lower(),
+    }
+    if (
+        membership["snapshot_date"] != trade_date
+        or membership["source"] != _QMT_MEMBERSHIP_PROVIDER
+        or re.fullmatch(r"[0-9a-f]{64}", membership["proof_sha256"])
+        is None
+    ):
+        raise RuntimeError("analysis pool activation membership identity differs")
+    from integrations.bigqmt.membership_snapshot import (
+        verify_existing_membership_snapshot,
+    )
+
+    membership_proof = verify_existing_membership_snapshot(
+        connection,
+        snapshot_date=date.fromisoformat(trade_date),
+        decision_known_at=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
+    )
+    if (
+        membership_proof.get("source") != membership["source"]
+        or canonical_sha256(membership_proof) != membership["proof_sha256"]
+    ):
+        raise RuntimeError("analysis pool activation membership proof differs")
+    staged_manifest = read_persisted_pool_manifest(connection, trade_date)
+    if (
+        int(staged_manifest["analysis_count"]) != analysis_count
+        or int(staged_manifest["recommendation_count"]) != expected_rows
+        or int(staged_manifest["executable_count"]) != executable_count
+        or str(staged_manifest["canonical_pool_sha256"]).lower()
+        != history_hash
+        or staged_manifest.get("publisher_run_uids") != [run_uid]
+        or staged_manifest.get("publication_statuses") not in (
+            ["PENDING"],
+            ["ACTIVE"],
+        )
+        or staged_manifest.get("live_gate_alignment") is not True
+        or staged_manifest.get("membership_proofs") != [membership]
+    ):
+        raise RuntimeError("analysis pool activation manifest differs")
+    state = connection.execute(text("""
+        SELECT COUNT(*) AS total_rows,
+               SUM(CASE WHEN publication_status='PENDING' THEN 1 ELSE 0 END)
+                   AS pending_rows,
+               SUM(CASE WHEN publication_status='ACTIVE' THEN 1 ELSE 0 END)
+                   AS active_rows,
+               SUM(CASE WHEN publication_status='ACTIVE'
+                         AND recommend_status=candidate_recommend_status
+                         AND ordinary_buy_eligible=
+                             candidate_ordinary_buy_eligible
+                        THEN 1 ELSE 0 END) AS aligned_active_rows
+        FROM st_recommended_stocks
+        WHERE pick_date=:trade_date
+          AND publisher_run_uid=:run_uid
+    """), {
+        "trade_date": history.get("trade_date"),
+        "run_uid": run_uid,
+    }).mappings().one()
+    total_rows = int(state.get("total_rows") or 0)
+    pending_rows = int(state.get("pending_rows") or 0)
+    active_rows = int(state.get("active_rows") or 0)
+    aligned_active_rows = int(state.get("aligned_active_rows") or 0)
+    if total_rows != expected_rows:
+        raise RuntimeError("analysis pool activation row count differs")
+    if active_rows == expected_rows and aligned_active_rows == expected_rows:
+        return
+    if pending_rows != expected_rows or active_rows != 0:
+        raise RuntimeError("analysis pool activation state is mixed")
+    result = connection.execute(text("""
+        UPDATE st_recommended_stocks
+        SET recommend_status=candidate_recommend_status,
+            ordinary_buy_eligible=candidate_ordinary_buy_eligible,
+            publication_status='ACTIVE'
+        WHERE pick_date=:trade_date
+          AND publisher_run_uid=:run_uid
+          AND publication_status='PENDING'
+    """), {
+        "trade_date": history.get("trade_date"),
+        "run_uid": run_uid,
+    })
+    if int(result.rowcount or 0) != expected_rows:
+        raise RuntimeError("analysis pool activation did not update exact rows")
+    activated = connection.execute(text("""
+        SELECT COUNT(*)
+        FROM st_recommended_stocks
+        WHERE pick_date=:trade_date
+          AND publisher_run_uid=:run_uid
+          AND publication_status='ACTIVE'
+          AND recommend_status=candidate_recommend_status
+          AND ordinary_buy_eligible=candidate_ordinary_buy_eligible
+    """), {
+        "trade_date": history.get("trade_date"),
+        "run_uid": run_uid,
+    }).scalar()
+    if int(activated or 0) != expected_rows:
+        raise RuntimeError("analysis pool activation readback differs")
+    activated_manifest = read_persisted_pool_manifest(connection, trade_date)
+    if (
+        activated_manifest.get("publication_statuses") != ["ACTIVE"]
+        or activated_manifest.get("live_gate_alignment") is not True
+        or activated_manifest.get("publisher_run_uids") != [run_uid]
+        or activated_manifest.get("membership_proofs") != [membership]
+        or int(activated_manifest["analysis_count"]) != analysis_count
+        or int(activated_manifest["recommendation_count"]) != expected_rows
+        or int(activated_manifest["executable_count"]) != executable_count
+        or str(activated_manifest["canonical_pool_sha256"]).lower()
+        != history_hash
+    ):
+        raise RuntimeError("analysis pool activated manifest differs")
+
+
 def _task_history_finish(
     engine,
     run_uid: str | None,
@@ -3046,11 +3452,22 @@ def _task_history_finish(
     duration: int,
     exit_code: int | None,
     output: object,
+    task_type: str = "",
 ) -> None:
     if not run_uid:
         return
     try:
         with engine.begin() as conn:
+            if (
+                status == "success"
+                and str(task_type or "").strip()
+                in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            ):
+                _activate_analysis_strategy_pool(
+                    conn,
+                    run_uid=str(run_uid or "").strip().lower(),
+                    task_type=str(task_type or "").strip(),
+                )
             conn.execute(
                 text(
                     "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
@@ -3066,6 +3483,14 @@ def _task_history_finish(
                 },
             )
     except Exception as exc:
+        if (
+            status == "success"
+            and str(task_type or "").strip()
+            in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        ):
+            raise RuntimeError(
+                "validated analysis pool activation/terminal audit failed"
+            ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
 
 
@@ -3203,8 +3628,12 @@ def _run_task_impl(
         return
 
     dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
-    argument_row = _task_argument_row(row, now=dispatch_now)
-    dispatch_date = _task_dispatch_date(argument_row, engine, now=dispatch_now)
+    dispatch_date = _task_dispatch_date(row, engine, now=dispatch_now)
+    argument_row = _task_argument_row(
+        row,
+        now=dispatch_now,
+        target_date=dispatch_date,
+    )
     argument_row = _bind_release_validation_target(
         argument_row,
         engine,
@@ -3221,16 +3650,49 @@ def _run_task_impl(
         raise RuntimeError(
             "scheduler child launch requires an exact 32-hex audit identity"
         )
+    task_type = str(row.get("task_type") or "").strip()
     child_env.update(
         {
             "PROBIGA_SCHEDULER_HISTORY_RUN_UID": exact_history_uid,
             "PROBIGA_SCHEDULER_TASK_ID": str(int(task_id)),
-            "PROBIGA_SCHEDULER_TASK_TYPE": str(
-                row.get("task_type") or ""
-            )[:64],
+            "PROBIGA_SCHEDULER_TASK_TYPE": task_type[:64],
             "PROBIGA_SCHEDULER_BUILD_SHA": _scheduler_build_commit_sha(),
         }
     )
+    # Post-run strategy validation must be bound to this exact scheduler
+    # audit row and build.  These private fields never cross the process
+    # boundary or become user-controlled command-line arguments.
+    argument_row = {
+        **argument_row,
+        "_scheduler_history_run_uid": exact_history_uid,
+        "_scheduler_expected_build_sha": child_env[
+            "PROBIGA_SCHEDULER_BUILD_SHA"
+        ],
+    }
+    if task_type == "linux_recent_data_gap_repair":
+        expected_script_path = str(
+            LINUX_PROVIDER_TASKS_BY_TYPE[task_type]["script_path"]
+        ).replace("\\", "/")
+        if str(script_path).replace("\\", "/").strip() != expected_script_path:
+            raise RuntimeError(
+                "Linux gap-repair child identity requires its exact script path"
+            )
+        parent_executor_role = str(
+            child_env.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
+        ).strip()
+        if os.name != "posix":
+            raise RuntimeError(
+                "Linux gap-repair child role override requires a POSIX host"
+            )
+        if parent_executor_role != "linux_standalone":
+            raise RuntimeError(
+                "Linux gap-repair child role override requires the exact "
+                "linux_standalone parent role"
+            )
+        # The standalone daemon remains the exclusive Linux scheduler owner;
+        # only this narrowly identified child runs as the provider repair
+        # executor required by the script's fail-closed ownership contract.
+        child_env["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] = "linux_provider"
 
     update_scheduler_task(
         engine,
@@ -3240,12 +3702,12 @@ def _run_task_impl(
     )
 
     start_t = datetime.now()
-    validation_started_at = (
-        dispatch_now.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-        if str(argument_row.get("_trigger_source") or "").strip()
-        == "release_catchup"
-        else start_t
-    )
+    # Database audit timestamps and all market-data knowledge cutoffs use
+    # naive Asia/Shanghai wall time.  Never compare them with the host's
+    # local ``datetime.now()`` (the Linux scheduler commonly runs in UTC).
+    validation_started_at = dispatch_now.astimezone(
+        PRODUCTION_TIMEZONE
+    ).replace(tzinfo=None)
     validation = None
     machine_output = ""
     try:
@@ -3353,6 +3815,7 @@ def _run_task_impl(
                 argument_row,
                 engine=engine,
                 started_at=validation_started_at,
+                now=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
                 output=machine_output,
             )
             if validation.checked:
@@ -3405,6 +3868,31 @@ def _run_task_impl(
             output = output + f"\nDATA_EVIDENCE_FAILED: {exc}"
             history_output = output
 
+    try:
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status=status,
+            duration=duration,
+            exit_code=getattr(locals().get("proc"), "returncode", None),
+            output=history_output,
+            task_type=str(row.get("task_type") or "").strip(),
+        )
+    except Exception as exc:
+        status = "failed"
+        output = output + f"\nPOOL_ACTIVATION_FAILED: {exc}"
+        history_output = output
+        # The activation transaction rolled back, so every staged row remains
+        # fail-closed.  Terminalize the scheduler audit as failed in a second
+        # transaction; never leave the task summary claiming success.
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=duration,
+            exit_code=getattr(locals().get("proc"), "returncode", None),
+            output=history_output,
+        )
     update_scheduler_task(
         engine,
         int(task_id),
@@ -3413,14 +3901,6 @@ def _run_task_impl(
             "last_run_output": output,
             "last_run_duration": duration,
         },
-    )
-    _task_history_finish(
-        engine,
-        history_run_uid,
-        status=status,
-        duration=duration,
-        exit_code=getattr(locals().get("proc"), "returncode", None),
-        output=history_output,
     )
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
@@ -3676,7 +4156,7 @@ def _catchup_on_startup() -> None:
 def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | None = None) -> None:
     """后台调度线程：每分钟检查一次，到点执行任务"""
     root = Path(__file__).resolve().parents[2]
-    startup_time = datetime.now()
+    startup_time = _now_shanghai_naive()
     poll_seconds = int(get_scheduler_runtime_config()["poll_seconds"])
     while not (stop_event and stop_event.is_set()):
         try:
@@ -3720,7 +4200,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 )
                 rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
 
-            now = datetime.now()
+            now = _now_shanghai_naive()
             if _release_catchup_disabled_for_deferred_database():
                 release_authorized = False
                 release_authorization_reason = "governance_database_deferred"
@@ -3763,6 +4243,15 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     now=now,
                 )
                 release_catchup_pending = _release_build_catchup_pending(row)
+                membership_ordinary_due = _membership_ordinary_publish_due(
+                    row,
+                    now=now,
+                )
+                if membership_ordinary_due:
+                    # The ordinary QMT publisher owns creation of today's
+                    # immutable snapshot.  Read-only release verification is
+                    # allowed only on a later poll after that row exists.
+                    release_catchup_due = False
 
                 governance_block_reason = strategy_governance_task_block_reason(
                     row
@@ -3798,7 +4287,11 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _delegated_skip_logged_for.add(skip_key)
                     continue
 
-                if release_catchup_pending and not release_catchup_due:
+                if (
+                    release_catchup_pending
+                    and not release_catchup_due
+                    and not membership_ordinary_due
+                ):
                     logger.debug(
                         "Defer ordinary dispatch for exact-build release task: %s",
                         task_name,
@@ -3818,9 +4311,17 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         if elapsed < interval_minutes and not release_catchup_due:
                             continue
                 else:
-                    if not release_catchup_due and not _cron_due(row, now=now):
+                    if (
+                        not release_catchup_due
+                        and not membership_ordinary_due
+                        and not _cron_due(row, now=now)
+                    ):
                         continue
-                    if not release_catchup_due and time_str != cron_time:
+                    if (
+                        not release_catchup_due
+                        and not membership_ordinary_due
+                        and time_str != cron_time
+                    ):
                         if not _overdue_cron_allowed(
                             row,
                             now=now,

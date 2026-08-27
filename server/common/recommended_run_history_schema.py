@@ -43,6 +43,9 @@ REQUIRED_COLUMNS = (
     "duration_seconds", "progress_percent", "done_count", "total", "passed",
     "flow_date", "hot_date", "market_mood_score", "message", "error",
     "trigger_source", "scheduler_job_id", "host_name", "build_sha",
+    "publisher_task_type", "canonical_pool_sha256", "published_at",
+    "executable_count", "membership_snapshot_date",
+    "membership_snapshot_source", "membership_proof_sha256",
     "created_at", "updated_at",
 )
 
@@ -92,6 +95,25 @@ EXPECTED_COLUMN_CONTRACT = {
     "scheduler_job_id": _column_spec("char(32)", True, character=True),
     "host_name": _column_spec("varchar(128)", True, character=True),
     "build_sha": _column_spec("char(40)", True, character=True),
+    "publisher_task_type": _column_spec(
+        "varchar(64)", True, character=True
+    ),
+    "canonical_pool_sha256": _column_spec(
+        "char(64)", True, character=True
+    ),
+    # Recommendation history starts/finishes at MySQL DATETIME/NOW second
+    # precision.  Keep publication time at that same database precision so a
+    # publish and finish within one wall-clock second compare as the same
+    # ordered instant instead of manufacturing a microsecond inversion.
+    "published_at": _column_spec("datetime", True),
+    "executable_count": _column_spec("int", True),
+    "membership_snapshot_date": _column_spec("date", True),
+    "membership_snapshot_source": _column_spec(
+        "varchar(64)", True, character=True
+    ),
+    "membership_proof_sha256": _column_spec(
+        "char(64)", True, character=True
+    ),
     "created_at": _column_spec("datetime", False, "current_timestamp"),
     "updated_at": _column_spec(
         "datetime", False, "current_timestamp",
@@ -146,6 +168,21 @@ _COLUMN_DDL = {
     "build_sha": (
         "CHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
     ),
+    "publisher_task_type": (
+        "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
+    ),
+    "canonical_pool_sha256": (
+        "CHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
+    ),
+    "published_at": "DATETIME NULL",
+    "executable_count": "INT NULL",
+    "membership_snapshot_date": "DATE NULL",
+    "membership_snapshot_source": (
+        "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
+    ),
+    "membership_proof_sha256": (
+        "CHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NULL"
+    ),
     "created_at": "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP",
     "updated_at": (
         "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
@@ -162,6 +199,7 @@ _REQUIRED_INDEX_SHAPES = {
     (True, ("run_uid",)),
     (False, ("trade_date", "started_at")),
     (False, ("status", "started_at")),
+    (False, ("trade_date", "build_sha", "published_at")),
 }
 
 
@@ -745,12 +783,20 @@ def migrate_recommended_run_history(engine) -> dict[str, Any]:
             "trigger_source VARCHAR(32) NOT NULL DEFAULT 'scheduled', "
             "scheduler_job_id CHAR(32) NULL, "
             "host_name VARCHAR(128) NULL, build_sha CHAR(40) NULL, "
+            "publisher_task_type VARCHAR(64) NULL, "
+            "canonical_pool_sha256 CHAR(64) NULL, "
+            "published_at DATETIME NULL, executable_count INT NULL, "
+            "membership_snapshot_date DATE NULL, "
+            "membership_snapshot_source VARCHAR(64) NULL, "
+            "membership_proof_sha256 CHAR(64) NULL, "
             "created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "
             "updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP "
             "ON UPDATE CURRENT_TIMESTAMP, "
             "PRIMARY KEY (id), UNIQUE KEY uk_rec_run_uid (run_uid), "
             "KEY idx_rec_run_date (trade_date, started_at), "
             "KEY idx_rec_status_started (status, started_at)"
+            ", KEY idx_rec_publication "
+            "(trade_date, build_sha, published_at)"
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
             "COLLATE=utf8mb4_unicode_ci"
         ))
@@ -916,6 +962,11 @@ def migrate_recommended_run_history(engine) -> dict[str, Any]:
             (
                 (False, ("status", "started_at")),
                 "idx_rec_status_started", "INDEX", "`status`, `started_at`",
+            ),
+            (
+                (False, ("trade_date", "build_sha", "published_at")),
+                "idx_rec_publication", "INDEX",
+                "`trade_date`, `build_sha`, `published_at`",
             ),
         )
         for shape, preferred_name, index_type, columns_sql in index_specs:

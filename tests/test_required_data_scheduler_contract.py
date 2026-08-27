@@ -55,12 +55,24 @@ def _scheduler_engine():
 
 def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
     tasks = _tasks()
-    assert ensure_quality_gate.REQUIRED_DATA_COMPLETION_TASK_TYPES == {
+    assert ensure_quality_gate.CORE_REQUIRED_DATA_TASK_CONTRACT_TYPES == {
         "stock_finance",
         "notice_eastmoney",
         "notice_eastmoney_historical_repair",
         "stock_dividend_baidu",
     }
+    assert ensure_quality_gate.DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES == {
+        "qmt_stock_daily_canonical",
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+        "analysis_fast",
+        "analysis_morning_strict",
+        "analysis_premarket_external",
+    }
+    assert ensure_quality_gate.REQUIRED_DATA_COMPLETION_TASK_TYPES == (
+        ensure_quality_gate.CORE_REQUIRED_DATA_TASK_CONTRACT_TYPES
+        | ensure_quality_gate.DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES
+    )
     assert tasks["stock_finance"] == {
         "task_name": "全市场股票财务PIT同步",
         "task_type": "stock_finance",
@@ -129,18 +141,54 @@ def test_required_data_task_install_is_idempotent_and_validated() -> None:
         rows = connection.execute(
             text("SELECT task_type, COUNT(*) FROM st_scheduled_tasks GROUP BY task_type")
         ).all()
-    assert dict(rows) == {
-        "notice_eastmoney": 1,
-        "notice_eastmoney_historical_repair": 1,
-        "stock_dividend_baidu": 1,
-        "stock_finance": 1,
-    }
+    assert dict(rows) == {task_type: 1 for task_type in expected_types}
     assert ensure_quality_gate.validate_required_data_completion(engine) == {
-        "notice_eastmoney": "validated",
-        "notice_eastmoney_historical_repair": "validated",
-        "stock_dividend_baidu": "validated",
-        "stock_finance": "validated",
+        task_type: "validated" for task_type in sorted(expected_types)
     }
+
+
+def test_daily_strategy_pipeline_task_contract_is_exact_and_drift_fails() -> None:
+    tasks = _tasks()
+    expected = {
+        "qmt_stock_daily_canonical": ("15:45", 1),
+        "target_turnover_snapshot": ("15:50", 1),
+        "analysis_upper_evidence_prepare": ("23:40", 1),
+        "analysis_fast": ("23:56", 1),
+        "analysis_morning_strict": ("08:30", 0),
+        "analysis_premarket_external": ("09:07", 0),
+    }
+    assert {
+        task_type: (tasks[task_type]["cron_time"], tasks[task_type]["enabled"])
+        for task_type in expected
+    } == expected
+
+    engine = _scheduler_engine()
+    ensure_quality_gate.run(
+        engine,
+        task_types=ensure_quality_gate.REQUIRED_DATA_COMPLETION_TASK_TYPES,
+    )
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE st_scheduled_tasks SET cron_time='18:50' "
+            "WHERE task_type='analysis_fast'"
+        ))
+    with pytest.raises(RuntimeError, match="analysis_fast drifted fields: cron_time"):
+        ensure_quality_gate.validate_required_task_contracts(engine)
+
+    ensure_quality_gate.run(
+        engine,
+        task_types=ensure_quality_gate.REQUIRED_DATA_COMPLETION_TASK_TYPES,
+    )
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE st_scheduled_tasks SET enabled=1 "
+            "WHERE task_type='analysis_premarket_external'"
+        ))
+    with pytest.raises(
+        RuntimeError,
+        match="analysis_premarket_external drifted fields: enabled",
+    ):
+        ensure_quality_gate.validate_required_task_contracts(engine)
 
 
 def test_required_data_validation_rejects_duplicate_task_identity() -> None:

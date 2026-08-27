@@ -141,6 +141,22 @@ class _InventoryConnection:
         return _InventoryResult(self.rows)
 
 
+class _FullInventoryConnection(_InventoryConnection):
+    def __init__(self, rows, managed_names):
+        super().__init__(rows)
+        self.managed_names = set(managed_names)
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        if "WHERE TRIGGER_SCHEMA=DATABASE() AND (" in sql:
+            return _InventoryResult([
+                row for row in self.rows
+                if str(row.get("trigger_name") or "") in self.managed_names
+            ])
+        return _InventoryResult(self.rows)
+
+
 def _contract(
     name: str,
     *,
@@ -179,6 +195,38 @@ def _trigger_row(
     }
     row.update(changes)
     return row
+
+
+def _full_trigger_rows(
+    managed: dict[str, schema.TriggerContract],
+) -> list[dict[str, object]]:
+    v2_contracts, v2_bodies, v2_orders = schema._v2_release_trigger_contract()
+    rows = [
+        {
+            **_trigger_row(contract),
+            "trigger_schema": schema.DATABASE_NAME,
+            "event_object_schema": schema.DATABASE_NAME,
+            "action_order": 1,
+        }
+        for contract in managed.values()
+    ]
+    rows.extend({
+        "trigger_name": name,
+        "definer": schema.EXPECTED_MIGRATOR_USER,
+        "trigger_schema": schema.DATABASE_NAME,
+        "event_object_schema": schema.DATABASE_NAME,
+        "action_timing": "BEFORE",
+        "event_manipulation": event,
+        "event_object_table": table_name,
+        "action_orientation": "ROW",
+        "action_statement": v2_bodies[name],
+        "action_order": v2_orders[name],
+        "sql_mode": schema.EXPECTED_SQL_MODE,
+        "character_set_client": schema.EXPECTED_CHARACTER_SET_CLIENT,
+        "collation_connection": schema.EXPECTED_COLLATION_CONNECTION,
+        "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+    } for name, (event, table_name) in v2_contracts.items())
+    return rows
 
 
 class _RuntimeEngine:
@@ -898,6 +946,68 @@ def test_trigger_inventory_allows_required_and_optional_absence(monkeypatch):
     )
 
 
+def test_full_database_trigger_inventory_attests_exact_142_contracts():
+    managed = {
+        **schema._final_v3_trigger_contracts(),
+        **schema._frozen_non_v3_release_trigger_contracts(
+            schema._non_v3_trigger_contracts()
+        ),
+    }
+    rows = _full_trigger_rows(managed)
+    connection = _FullInventoryConnection(rows, managed)
+
+    detail = schema.validate_full_database_trigger_inventory(
+        connection,
+        managed_contracts=managed,
+    )
+
+    assert detail["expected_count"] == 142
+    assert detail["observed_count"] == 142
+    assert detail["v2_count"] == 41
+    assert detail["managed_count"] == 101
+    assert detail["nameset_sha256"] == (
+        schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+    )
+    assert detail["v2_source_contract_sha256"] == (
+        schema.EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+    )
+    assert detail["metadata_frozen"] is True
+    assert all(
+        statement.lstrip().startswith("SELECT ")
+        for statement in connection.statements
+    )
+
+
+@pytest.mark.parametrize("case", ("missing", "unexpected", "v2_body"))
+def test_full_database_trigger_inventory_rejects_any_global_drift(case):
+    managed = {
+        **schema._final_v3_trigger_contracts(),
+        **schema._frozen_non_v3_release_trigger_contracts(
+            schema._non_v3_trigger_contracts()
+        ),
+    }
+    rows = _full_trigger_rows(managed)
+    if case == "missing":
+        rows.pop()
+    elif case == "unexpected":
+        rows.append({
+            **rows[0],
+            "trigger_name": "trg_unapproved_global_trigger",
+        })
+    else:
+        v2_names = set(schema._v2_release_trigger_contract()[0])
+        target = next(
+            row for row in rows if row["trigger_name"] in v2_names
+        )
+        target["action_statement"] = "SIGNAL SQLSTATE '45000'"
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema.validate_full_database_trigger_inventory(
+            _FullInventoryConnection(rows, managed),
+            managed_contracts=managed,
+        )
+
+
 class _FrozenTriggerConnection:
     def __init__(self, engine):
         self.engine = engine
@@ -1532,11 +1642,17 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         production_runtime_schema_bundle,
         "privileged_migrate_runtime_schema_bundle",
-        lambda _engine: calls.append("runtime-schema-bundle-off") or {
-            "migrations": {},
-            "seeds": {},
-            "runtime_ddl_required": False,
-        },
+        lambda _engine, **kwargs: (
+            calls.append("runtime-schema-bundle-off")
+            or {
+                "migrations": {},
+                "seeds": {},
+                "runtime_ddl_required": False,
+                "trigger_validation_deferred": kwargs.get(
+                    "defer_trigger_validation"
+                ),
+            }
+        ),
     )
     monkeypatch.setattr(
         production_runtime_schema_bundle,
@@ -1607,6 +1723,14 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         schema,
         "validate_release_trigger_contracts",
         lambda *_args, **_kwargs: {"observed_count": 0},
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        lambda *_args, **_kwargs: {
+            "observed_count": 0,
+            "metadata_frozen": True,
+        },
     )
 
     def fake_migrations(_engine, *, dry_run=False, **kwargs):
@@ -2206,6 +2330,12 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
 
 
 def test_non_v3_release_contract_freezes_all_truth_guards():
+    from server.common.auxiliary_runtime_schema import (
+        QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES,
+    )
+    from server.common.turnover_snapshot_schema import (
+        _expected_trigger_contracts as field_capture_trigger_contracts,
+    )
     from tools.sync_guojin_qmt_reference_data import REFERENCE_TRIGGER_NAMES
 
     contracts = schema._frozen_non_v3_release_trigger_contracts(
@@ -2217,6 +2347,19 @@ def test_non_v3_release_contract_freezes_all_truth_guards():
         schema.EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
     )
     assert set(REFERENCE_TRIGGER_NAMES) <= set(contracts)
+    assert set(QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES) <= set(contracts)
+    assert set(field_capture_trigger_contracts()) <= set(contracts)
+    assert schema._release_trigger_owner_counts(contracts) == {
+        "market_field_capture": 5,
+        "pit_facts": 6,
+        "qmt_attestation": 6,
+        "qmt_history_coverage": 4,
+        "qmt_membership": 6,
+        "qmt_reference": 10,
+        "scheduler_task_history": 2,
+        "schema_recovery_evidence": 2,
+        "strategy_governance": 40,
+    }
     assert {
         "trg_qmt_kline_attestation_run_completed_bu",
         "trg_qmt_kline_attestation_run_completed_bd",

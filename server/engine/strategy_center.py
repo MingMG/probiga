@@ -588,6 +588,9 @@ def _strategy_signal_basis(
     ordinary_buy_eligible = _is_explicit_database_true(
         row.get("ordinary_buy_eligible")
     )
+    publication_status = str(
+        row.get("publication_status") or "PENDING"
+    ).upper()
     item = next(
         (
             value
@@ -617,6 +620,17 @@ def _strategy_signal_basis(
             "hard_block": False,
             "reason": "上游趋势失效或减仓信号已触发",
             "hard_hits": hard_hits,
+            "strategy_hits": strategy_hits,
+            "min_score": min_score,
+            "confirm_score": confirm_score,
+        }
+
+    if publication_status != "ACTIVE":
+        return {
+            "direction": "HOLD",
+            "hard_block": True,
+            "reason": "推荐票池尚未通过调度后验证并激活",
+            "hard_hits": [*hard_hits, "publication_not_active"],
             "strategy_hits": strategy_hits,
             "min_score": min_score,
             "confirm_score": confirm_score,
@@ -1899,7 +1913,7 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
         "ultra_short_score", "swing_score", "main_wave_score", "trend_hold_score", "main_wave_signal", "main_wave_reason",
         "quality_score", "entry_score", "valuation", "fundamental", "technical", "sector_rotation_score", "sector_width_pct",
         "heat_overload_score", "confidence_score", "event_score", "event_risk_level", "recommend_status", "recommend_reason",
-        "chase_risk_status", "ordinary_buy_eligible",
+        "chase_risk_status", "ordinary_buy_eligible", "publication_status",
         "signal_status", "signal_reason", "primary_strategy", "strategy_profile", "suitable_strategies", "entry_price_low",
         "entry_price_high", "stop_loss_price", "trend_stop_price", "take_profit_1", "take_profit_2", "resistance_price",
         "risk_reward_ratio", "entry_conditions_json", "evidence_chain_json", "data_quality_score", "data_quality_flags", "model_version",

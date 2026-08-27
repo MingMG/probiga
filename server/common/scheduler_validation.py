@@ -16,7 +16,17 @@ from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
 from server.common.batch_db import quote_identifier, routed_read_engine
-from server.common.authoritative_market_clock import authoritative_closed_trade_date
+from server.common.analysis_pool_receipt import (
+    ANALYSIS_POOL_RECEIPT_SCHEMA,
+    ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+    canonical_sha256,
+    publication_receipt_is_valid,
+    read_persisted_pool_manifest,
+)
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date,
+)
 from server.common.daily_stock_universe import (
     load_daily_stock_universe,
     validate_daily_stock_coverage,
@@ -111,6 +121,15 @@ _NOTICE_HISTORY_REPLACEMENT_SCOPE = "one_stock_full_history"
 _CAPITAL_FLOW_BATCH_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
 _CAPITAL_FLOW_BATCH_TASK_TYPE = "capital_flow_batch_fast"
 _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
+_TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
+_UPPER_EVIDENCE_TASK_TYPE = "analysis_upper_evidence_prepare"
+_QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
+_QMT_MEMBERSHIP_VERIFICATION_SCHEMA = (
+    "probiga.qmt-membership-verification.v1"
+)
+_QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
+    "probiga.qmt-membership-publication.v1"
+)
 
 
 def _single_nested_machine_payload(
@@ -258,6 +277,194 @@ def _capital_flow_batch_payload(
     return _single_nested_machine_payload(
         output,
         schema=_CAPITAL_FLOW_BATCH_RESULT_SCHEMA,
+    )
+
+
+def _daily_analysis_evidence_identity(
+    task: Mapping[str, Any],
+) -> tuple[str, datetime, str]:
+    target = str(task.get("_scheduler_pipeline_target_date") or "").strip()
+    cutoff_raw = str(
+        task.get("_scheduler_pipeline_decision_at") or ""
+    ).strip()
+    build_sha = str(
+        task.get("_scheduler_expected_build_sha") or ""
+    ).strip().lower()
+    try:
+        target_date = date.fromisoformat(target)
+        cutoff = datetime.fromisoformat(cutoff_raw)
+    except ValueError as exc:
+        raise ValueError(
+            "daily analysis evidence scheduler identity is invalid"
+        ) from exc
+    if (
+        target_date.isoformat() != target
+        or cutoff.tzinfo is not None
+        or cutoff.microsecond != 0
+        or cutoff.date() != target_date
+        or cutoff_raw != cutoff.isoformat(timespec="seconds")
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+    ):
+        raise ValueError(
+            "daily analysis evidence scheduler identity is invalid"
+        )
+    return target, cutoff, build_sha
+
+
+def _validate_target_turnover_scheduler_receipt(
+    task: Mapping[str, Any],
+    *,
+    engine: Engine,
+    output: str | None,
+) -> tuple[bool, str]:
+    from server.common.analysis_pool_receipt import validate_turnover_evidence
+    from server.common.turnover_snapshot import (
+        MIN_TURNOVER_UNIVERSE_COUNT,
+        TURNOVER_SNAPSHOT_VERSION,
+        load_verified_turnover_evidence,
+    )
+
+    target, cutoff, build_sha = _daily_analysis_evidence_identity(task)
+    payload = _single_nested_machine_payload(
+        output,
+        schema=TURNOVER_SNAPSHOT_VERSION,
+    )
+    if payload is None:
+        return False, "target turnover exact machine receipt is missing"
+    try:
+        expected_count = int(payload.get("expected_count") or 0)
+        promoted_count = int(payload.get("promoted_count") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False, "target turnover machine counters are invalid"
+    if (
+        payload.get("status") != "COMPLETED"
+        or str(payload.get("target_date") or "") != target
+        or str(payload.get("decision_at") or "")
+        != cutoff.isoformat(timespec="seconds")
+        or str(payload.get("collector_build_sha") or "").lower()
+        != build_sha
+        or expected_count < MIN_TURNOVER_UNIVERSE_COUNT
+        or promoted_count != expected_count
+        or re.fullmatch(
+            r"[0-9a-f]{32}", str(payload.get("run_id") or "")
+        ) is None
+    ):
+        return False, "target turnover machine receipt identity differs"
+    try:
+        evidence = load_verified_turnover_evidence(
+            engine,
+            target_date=target,
+            decision_at=cutoff,
+        )
+        proofs = [
+            validate_turnover_evidence(item["turnover_evidence_json"])
+            for item in evidence.values()
+        ]
+    except Exception as exc:
+        return False, f"target turnover persisted receipt is invalid: {exc}"
+    if len(evidence) != expected_count or {
+        str(item.get("snapshot_run_id") or "") for item in proofs
+    } != {str(payload.get("run_id") or "")} or {
+        str(item.get("collector_build_sha") or "").lower()
+        for item in proofs
+    } != {build_sha} or {
+        str(item.get("snapshot_semantic_sha256") or "") for item in proofs
+    } != {str(payload.get("semantic_sha256") or "")}:
+        return False, "target turnover persisted proof differs from receipt"
+    return True, (
+        "target turnover exact immutable snapshot verified: "
+        f"date={target} rows={expected_count} run_id={payload['run_id']}"
+    )
+
+
+def _validate_upper_evidence_scheduler_receipt(
+    task: Mapping[str, Any],
+    *,
+    engine: Engine,
+    output: str | None,
+) -> tuple[bool, str]:
+    from biz.analysis.sync_analysis_fast import (
+        prepare_preliminary_upper_subject_receipt,
+    )
+    from server.common.analysis_pool_receipt import validate_upper_limit_evidence
+    from server.common.upper_limit_snapshot import (
+        UPPER_LIMIT_EXPECTED_DATE_COUNT,
+        UPPER_LIMIT_EXPECTED_STOCK_COUNT,
+        UPPER_LIMIT_SNAPSHOT_VERSION,
+        load_latest_verified_upper_limit_evidence,
+    )
+
+    target, cutoff, build_sha = _daily_analysis_evidence_identity(task)
+    payload = _single_nested_machine_payload(
+        output,
+        schema=UPPER_LIMIT_SNAPSHOT_VERSION,
+    )
+    if payload is None:
+        return False, "upper evidence exact machine receipt is missing"
+    preliminary = prepare_preliminary_upper_subject_receipt(
+        engine,
+        trade_date=target,
+        decision_at=cutoff,
+        build_sha=build_sha,
+        min_score=62.0,
+    )
+    if (
+        payload.get("status") != "COMPLETED"
+        or str(payload.get("target_date") or "") != target
+        or str(payload.get("decision_at") or "")
+        != cutoff.isoformat(timespec="seconds")
+        or str(payload.get("collector_build_sha") or "").lower()
+        != build_sha
+        or str(payload.get("preliminary_receipt_sha256") or "")
+        != preliminary["receipt_sha256"]
+        or int(payload.get("expected_stock_count") or 0)
+        != UPPER_LIMIT_EXPECTED_STOCK_COUNT
+        or int(payload.get("expected_date_count") or 0)
+        != UPPER_LIMIT_EXPECTED_DATE_COUNT
+    ):
+        return False, "upper evidence machine receipt identity differs"
+    evidence = load_latest_verified_upper_limit_evidence(
+        engine,
+        target_date=target,
+        decision_at=cutoff,
+        stock_codes=preliminary["ordered_stock_codes"],
+        preliminary_receipt_sha256=preliminary["receipt_sha256"],
+        preliminary_build_sha=build_sha,
+    )
+    try:
+        proofs = [
+            validate_upper_limit_evidence(item["upper_limit_evidence_json"])
+            for item in evidence.values()
+        ]
+    except Exception as exc:
+        return False, f"upper evidence persisted receipt is invalid: {exc}"
+    if len(evidence) != UPPER_LIMIT_EXPECTED_STOCK_COUNT or {
+        str(item.get("snapshot_run_id") or "") for item in proofs
+    } != {str(payload.get("run_id") or "")}:
+        return False, "upper evidence persisted proof differs from receipt"
+    return True, (
+        "upper evidence exact immutable snapshot verified: "
+        f"date={target} stocks={len(evidence)} run_id={payload['run_id']} "
+        f"preview={preliminary['receipt_sha256']}"
+    )
+
+
+def _qmt_membership_verification_payload(
+    output: str | None,
+) -> Mapping[str, Any] | None:
+    return _single_nested_machine_payload(
+        output,
+        schema=_QMT_MEMBERSHIP_VERIFICATION_SCHEMA,
+    )
+
+
+def _qmt_membership_publication_payload(
+    output: str | None,
+) -> Mapping[str, Any] | None:
+    return _single_nested_machine_payload(
+        output,
+        schema=_QMT_MEMBERSHIP_PUBLICATION_SCHEMA,
     )
 
 
@@ -1551,6 +1758,42 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == _QMT_MEMBERSHIP_TASK_TYPE:
+        release_verification = (
+            str(task.get("_trigger_source") or "").strip()
+            == "release_catchup"
+        )
+        payload = (
+            _qmt_membership_verification_payload(output)
+            if release_verification
+            else _qmt_membership_publication_payload(output)
+        )
+        if payload is None:
+            return "failed"
+        if return_code is None:
+            return "failed"
+        try:
+            from tools.sync_bigqmt_reference import (
+                validate_membership_publication_receipt,
+                validate_membership_verification_receipt,
+            )
+
+            disposition = (
+                validate_membership_verification_receipt(
+                    dict(payload),
+                    int(return_code),
+                )
+                if release_verification
+                else validate_membership_publication_receipt(
+                    dict(payload),
+                    int(return_code),
+                )
+            )
+        except (ImportError, TypeError, ValueError, OverflowError):
+            return "failed"
+        if disposition == "blocked":
+            return "blocked"
+        return "success" if disposition == "complete" else "failed"
     if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
         payload = _capital_flow_batch_payload(output)
         if payload is None or return_code is None:
@@ -2121,10 +2364,6 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             target="latest_kline_date",
             distinct_col="stock_code",
             min_distinct=1000,
-            # A completed analysis can legitimately produce zero picks.  The
-            # per-stock recommendation decision is the durable completion
-            # evidence; requiring a row in st_recommended_stocks turns that
-            # valid zero-result outcome into a false scheduler failure.
             where_sql="recommend_status IS NOT NULL AND TRIM(recommend_status) <> ''",
             freshness_col="updated_at",
         ),
@@ -2235,6 +2474,262 @@ def _analysis_web_manual_profile_is_exact(task: Mapping[str, Any]) -> bool:
     )
 
 
+def _validate_analysis_strategy_pool(
+    engine: Engine,
+    *,
+    target_date: date,
+    started_at: datetime,
+    now: datetime,
+    scheduler_run_uid: str,
+    expected_build_sha: str,
+    output: str | None,
+) -> tuple[bool, str]:
+    """Verify the latest exact-build canonical producer of the daily pool."""
+
+    target = target_date.isoformat()
+    run_uid = str(scheduler_run_uid or "").strip().lower()
+    build_sha = str(expected_build_sha or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
+        return False, "analysis strategy pool scheduler run identity is unavailable"
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+    ):
+        return False, "analysis strategy pool build identity is unavailable"
+    current_receipt = _single_nested_machine_payload(
+        output,
+        schema=ANALYSIS_POOL_RECEIPT_SCHEMA,
+    )
+    if (
+        current_receipt is None
+        or not publication_receipt_is_valid(current_receipt)
+    ):
+        return False, "analysis strategy pool exact publication receipt is missing"
+
+    with engine.connect() as connection:
+        history_rows = connection.execute(text("""
+            SELECT id, run_uid, scheduler_job_id, trade_date, status, build_sha,
+                   total, passed, started_at, finished_at,
+                   publisher_task_type, canonical_pool_sha256, published_at,
+                   executable_count, membership_snapshot_date,
+                   membership_snapshot_source, membership_proof_sha256
+            FROM st_recommended_run_history
+            WHERE run_uid=:run_uid
+            LIMIT 2
+        """), {"run_uid": run_uid}).mappings().all()
+        if len(history_rows) != 1:
+            return (
+                False,
+                "analysis strategy pool recommendation history is unavailable "
+                f"or ambiguous: run_uid={run_uid}",
+            )
+        history = dict(history_rows[0])
+        history_started_at = _coerce_datetime(history.get("started_at"))
+        history_finished_at = _coerce_datetime(history.get("finished_at"))
+        history_published_at = _coerce_datetime(history.get("published_at"))
+        try:
+            history_total = int(history.get("total"))
+            history_passed = int(history.get("passed"))
+            history_executable = int(history.get("executable_count"))
+        except (TypeError, ValueError):
+            history_total = history_passed = history_executable = -1
+        current_task_type = str(
+            history.get("publisher_task_type") or ""
+        ).strip()
+        history_membership = {
+            "snapshot_date": str(
+                history.get("membership_snapshot_date") or ""
+            )[:10],
+            "source": str(
+                history.get("membership_snapshot_source") or ""
+            ).strip(),
+            "proof_sha256": str(
+                history.get("membership_proof_sha256") or ""
+            ).strip().lower(),
+        }
+        if (
+            str(history.get("run_uid") or "").strip().lower() != run_uid
+            or str(history.get("scheduler_job_id") or "").strip().lower()
+            != run_uid
+            or str(history.get("trade_date") or "")[:10] != target
+            or str(history.get("status") or "").strip().lower() != "done"
+            or str(history.get("build_sha") or "").strip().lower() != build_sha
+            or current_task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(history.get("canonical_pool_sha256") or "").lower(),
+            ) is None
+            or history_total <= 0
+            or history_passed <= 0
+            or history_passed > history_total
+            or history_executable <= 0
+            or history_executable > history_passed
+            or history_started_at is None
+            or history_finished_at is None
+            or history_published_at is None
+            or history_started_at < started_at - timedelta(minutes=5)
+            or history_started_at > now + timedelta(minutes=5)
+            or history_finished_at < history_started_at
+            or history_published_at < history_started_at
+            or history_published_at > history_finished_at
+            or history_finished_at > now + timedelta(minutes=5)
+            or history_membership["snapshot_date"] != target
+            or history_membership["source"] != "gj_big_qmt_inner"
+            or re.fullmatch(
+                r"[0-9a-f]{64}", history_membership["proof_sha256"]
+            ) is None
+        ):
+            return (
+                False,
+                "analysis strategy pool recommendation history differs from "
+                f"the current scheduler run: run_uid={run_uid} date={target} "
+                f"status={history.get('status')} total={history_total} "
+                f"passed={history_passed} executable={history_executable}",
+            )
+
+        receipt_published_at = _coerce_datetime(
+            current_receipt.get("published_at")
+        )
+        if (
+            str(current_receipt.get("run_uid") or "").lower() != run_uid
+            or str(current_receipt.get("build_sha") or "").lower() != build_sha
+            or str(current_receipt.get("publisher_task_type") or "")
+            != current_task_type
+            or str(current_receipt.get("trade_date") or "") != target
+            or str(current_receipt.get("canonical_pool_sha256") or "").lower()
+            != str(history.get("canonical_pool_sha256") or "").lower()
+            or int(current_receipt.get("analysis_count") or -1)
+            != history_total
+            or int(current_receipt.get("recommendation_count") or -1)
+            != history_passed
+            or int(current_receipt.get("executable_count") or -1)
+            != history_executable
+            or receipt_published_at != history_published_at
+            or current_receipt.get("membership_proofs")
+            != [history_membership]
+        ):
+            return False, "analysis strategy pool scheduler receipt differs from run history"
+
+        producer_rows = connection.execute(text("""
+            SELECT id, run_uid, scheduler_job_id, trade_date, status, build_sha,
+                   total, passed, started_at, finished_at,
+                   publisher_task_type, canonical_pool_sha256, published_at,
+                   executable_count, membership_snapshot_date,
+                   membership_snapshot_source, membership_proof_sha256
+            FROM st_recommended_run_history
+            WHERE trade_date=:trade_date
+              AND build_sha=:build_sha
+              AND status='done'
+              AND published_at IS NOT NULL
+            ORDER BY published_at DESC, id DESC
+            LIMIT 2
+        """), {
+            "trade_date": target,
+            "build_sha": build_sha,
+        }).mappings().all()
+        if not producer_rows:
+            return False, "analysis strategy pool has no completed canonical producer"
+        producer = dict(producer_rows[0])
+        producer_uid = str(producer.get("run_uid") or "").strip().lower()
+        producer_task_type = str(
+            producer.get("publisher_task_type") or ""
+        ).strip()
+        producer_started_at = _coerce_datetime(producer.get("started_at"))
+        producer_finished_at = _coerce_datetime(producer.get("finished_at"))
+        producer_published_at = _coerce_datetime(producer.get("published_at"))
+        try:
+            producer_total = int(producer.get("total"))
+            producer_passed = int(producer.get("passed"))
+            producer_executable = int(producer.get("executable_count"))
+        except (TypeError, ValueError):
+            producer_total = producer_passed = producer_executable = -1
+        producer_hash = str(
+            producer.get("canonical_pool_sha256") or ""
+        ).strip().lower()
+        producer_membership = {
+            "snapshot_date": str(
+                producer.get("membership_snapshot_date") or ""
+            )[:10],
+            "source": str(
+                producer.get("membership_snapshot_source") or ""
+            ).strip(),
+            "proof_sha256": str(
+                producer.get("membership_proof_sha256") or ""
+            ).strip().lower(),
+        }
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", producer_uid) is None
+            or str(producer.get("scheduler_job_id") or "").strip().lower()
+            != producer_uid
+            or producer_task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            or re.fullmatch(r"[0-9a-f]{64}", producer_hash) is None
+            or producer_total <= 0
+            or producer_passed <= 0
+            or producer_passed > producer_total
+            or producer_executable <= 0
+            or producer_executable > producer_passed
+            or producer_started_at is None
+            or producer_finished_at is None
+            or producer_published_at is None
+            or producer_published_at < producer_started_at
+            or producer_published_at > producer_finished_at
+            or producer_finished_at > now + timedelta(minutes=5)
+            or producer_membership["snapshot_date"] != target
+            or producer_membership["source"] != "gj_big_qmt_inner"
+            or re.fullmatch(
+                r"[0-9a-f]{64}", producer_membership["proof_sha256"]
+            ) is None
+        ):
+            return False, "analysis strategy pool latest producer receipt is invalid"
+
+        from integrations.bigqmt.membership_snapshot import (
+            verify_existing_membership_snapshot,
+        )
+
+        exact_membership = verify_existing_membership_snapshot(
+            connection,
+            snapshot_date=target_date,
+            decision_known_at=now,
+        )
+        if (
+            exact_membership.get("source") != producer_membership["source"]
+            or canonical_sha256(exact_membership)
+            != producer_membership["proof_sha256"]
+        ):
+            return False, "analysis strategy pool membership proof differs"
+        manifest = read_persisted_pool_manifest(connection, target)
+    if (
+        int(manifest["analysis_count"]) != producer_total
+        or int(manifest["recommendation_count"]) != producer_passed
+        or int(manifest["executable_count"]) != producer_executable
+        or int(manifest["executable_count"]) <= 0
+        or str(manifest["canonical_pool_sha256"]).lower() != producer_hash
+        or manifest.get("publisher_run_uids") != [producer_uid]
+        or manifest.get("publication_statuses")
+        not in (["PENDING"], ["ACTIVE"])
+        or manifest.get("live_gate_alignment") is not True
+        or manifest.get("membership_proofs") != [producer_membership]
+    ):
+        return (
+            False,
+            "analysis strategy pool mutable partition differs from latest "
+            f"canonical producer: producer_run_uid={producer_uid} date={target} "
+            f"analysis={manifest['analysis_count']}/{producer_total} "
+            f"picks={manifest['recommendation_count']}/{producer_passed} "
+            f"executable={manifest['executable_count']}/{producer_executable}",
+        )
+    return (
+        True,
+        "analysis strategy pool verified: "
+        f"validated_run_uid={run_uid} producer_run_uid={producer_uid} "
+        f"producer_task_type={producer_task_type} build={build_sha} "
+        f"date={target} analysis={manifest['analysis_count']} "
+        f"picks={manifest['recommendation_count']} "
+        f"executable={manifest['executable_count']} "
+        f"canonical_pool_sha256={producer_hash}",
+    )
+
+
 def validate_scheduler_task_result(
     task: Mapping[str, Any],
     *,
@@ -2246,6 +2741,11 @@ def validate_scheduler_task_result(
     task_type = str(task.get("task_type") or "").strip()
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
     exact_v3_receipt = task_type in TRADING_V3_DECISION_TASK_TYPES
+    exact_membership_receipt = task_type == _QMT_MEMBERSHIP_TASK_TYPE
+    exact_analysis_evidence = task_type in {
+        _TARGET_TURNOVER_TASK_TYPE,
+        _UPPER_EVIDENCE_TASK_TYPE,
+    }
     exact_provider_receipt = task_type in HOT_RANK_SOURCE_TASK_TYPES or task_type in {
         "etf_forward_daily",
         "stock_dividend_baidu",
@@ -2290,13 +2790,42 @@ def validate_scheduler_task_result(
         requirements = ()
     if _analysis_web_manual_profile_is_exact(task):
         requirements = TASK_OUTPUT_REQUIREMENTS["analysis_morning_strict"]
-    if not requirements and not exact_v3_receipt and not exact_provider_receipt:
+    if (
+        not requirements
+        and not exact_v3_receipt
+        and not exact_provider_receipt
+        and not exact_membership_receipt
+        and not exact_analysis_evidence
+    ):
         return SchedulerValidationResult(checked=False, ok=True, message="no data validation configured")
 
-    started_at = started_at or datetime.now()
-    now = now or datetime.now()
+    shanghai_now = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    started_at = started_at or shanghai_now
+    now = now or shanghai_now
     messages: list[str] = []
     try:
+        if task_type == _TARGET_TURNOVER_TASK_TYPE:
+            ok, message = _validate_target_turnover_scheduler_receipt(
+                task,
+                engine=engine,
+                output=output,
+            )
+            return SchedulerValidationResult(
+                checked=True,
+                ok=ok,
+                message=message,
+            )
+        if task_type == _UPPER_EVIDENCE_TASK_TYPE:
+            ok, message = _validate_upper_evidence_scheduler_receipt(
+                task,
+                engine=engine,
+                output=output,
+            )
+            return SchedulerValidationResult(
+                checked=True,
+                ok=ok,
+                message=message,
+            )
         release_target_date = _release_target_date_from_task(task)
         for requirement in requirements or ():
             ok, message = _validate_requirement(
@@ -2310,6 +2839,92 @@ def validate_scheduler_task_result(
             messages.append(message)
             if not ok:
                 return SchedulerValidationResult(checked=True, ok=False, message=message)
+        if exact_membership_receipt:
+            release_verification = (
+                str(task.get("_trigger_source") or "").strip()
+                == "release_catchup"
+            )
+            if release_verification:
+                if release_target_date is None:
+                    raise ValueError(
+                        "qmt_membership_snapshot: release target date is missing"
+                    )
+                target = release_target_date
+                payload = _qmt_membership_verification_payload(output)
+                receipt_time_field = "verified_at"
+            else:
+                raw_target = authoritative_closed_trade_date(
+                    engine,
+                    now=now,
+                    close_ready_time=time(15, 10),
+                )
+                try:
+                    target = date.fromisoformat(raw_target)
+                except ValueError as exc:
+                    raise ValueError(
+                        "qmt_membership_snapshot: authoritative publication "
+                        "target is unavailable"
+                    ) from exc
+                if target.isoformat() != raw_target:
+                    raise ValueError(
+                        "qmt_membership_snapshot: authoritative publication "
+                        "target is invalid"
+                    )
+                payload = _qmt_membership_publication_payload(output)
+                receipt_time_field = "published_at"
+            if payload is None:
+                raise ValueError(
+                    "qmt_membership_snapshot: exact persisted receipt is missing"
+                )
+            from integrations.bigqmt.membership_snapshot import (
+                verify_existing_membership_snapshot,
+            )
+            from tools.sync_bigqmt_reference import (
+                validate_membership_publication_receipt,
+                validate_membership_verification_receipt,
+            )
+
+            disposition = (
+                validate_membership_verification_receipt(
+                    dict(payload),
+                    0,
+                    expected_snapshot_date=target.isoformat(),
+                )
+                if release_verification
+                else validate_membership_publication_receipt(
+                    dict(payload),
+                    0,
+                    expected_snapshot_date=target.isoformat(),
+                )
+            )
+            if disposition != "complete":
+                raise ValueError(
+                    "qmt_membership_snapshot: exact persisted receipt is incomplete"
+                )
+            verified_at = _machine_timestamp(payload.get(receipt_time_field))
+            if (
+                verified_at is None
+                or verified_at < started_at - timedelta(minutes=5)
+                or verified_at > now + timedelta(minutes=5)
+            ):
+                raise ValueError(
+                    "qmt_membership_snapshot: verification receipt is not fresh"
+                )
+            proof = verify_existing_membership_snapshot(
+                engine,
+                snapshot_date=target,
+                decision_known_at=now,
+            )
+            if payload.get("proof") != proof:
+                raise ValueError(
+                    "qmt_membership_snapshot: persisted exact proof differs from receipt"
+                )
+            messages.append(
+                "qmt_membership_snapshot exact immutable snapshot verified: "
+                f"date={target.isoformat()} "
+                f"concept_relations={int(proof['concept_relation_count'])} "
+                f"industry_relations={int(proof['industry_relation_count'])}"
+            )
         if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
             payload = _capital_flow_batch_payload(output)
             if payload is None or scheduler_output_status(
@@ -2341,7 +2956,10 @@ def validate_scheduler_task_result(
                 "capital_flow_batch_fast exact source receipt verified: "
                 f"date={target_date.isoformat()} rows={int(payload['row_count'])}"
             )
-        if task_type in {"capital_flow_batch_fast", "analysis_fast"}:
+        if task_type in (
+            {"capital_flow_batch_fast"}
+            | ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        ):
             target_requirement = (requirements or ())[0]
             target_date = release_target_date or _resolve_target_date(
                 engine,
@@ -2355,6 +2973,58 @@ def validate_scheduler_task_result(
                 task_type=task_type,
                 target_date=target_date,
                 decision_known_at=now,
+            )
+            messages.append(message)
+            if not ok:
+                return SchedulerValidationResult(
+                    checked=True,
+                    ok=False,
+                    message=message,
+                )
+        if task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+            target_requirement = (requirements or ())[0]
+            target_date = release_target_date or _resolve_target_date(
+                engine,
+                target_requirement,
+                started_at=started_at,
+                now=now,
+                output=output,
+            )
+            # Membership is intentionally verified against the analysis
+            # target, not against the membership support task's own cutoff.
+            # At 15:10 that support task rolls to today's closed snapshot
+            # while morning/18:50 analysis can still target the prior session.
+            from integrations.bigqmt.membership_snapshot import (
+                verify_existing_membership_snapshot,
+            )
+
+            membership_proof = verify_existing_membership_snapshot(
+                engine,
+                snapshot_date=target_date,
+                decision_known_at=now,
+            )
+            messages.append(
+                "analysis membership snapshot verified: "
+                f"date={target_date.isoformat()} "
+                f"concept_relations="
+                f"{int(membership_proof['concept_relation_count'])} "
+                f"industry_relations="
+                f"{int(membership_proof['industry_relation_count'])} "
+                f"concept_hash={membership_proof['concept_hash']} "
+                f"industry_hash={membership_proof['industry_hash']}"
+            )
+            ok, message = _validate_analysis_strategy_pool(
+                engine,
+                target_date=target_date,
+                started_at=started_at,
+                now=now,
+                scheduler_run_uid=str(
+                    task.get("_scheduler_history_run_uid") or ""
+                ),
+                expected_build_sha=str(
+                    task.get("_scheduler_expected_build_sha") or ""
+                ),
+                output=output,
             )
             messages.append(message)
             if not ok:

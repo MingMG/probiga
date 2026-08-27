@@ -219,6 +219,54 @@ def test_release_readiness_requires_every_exact_build_receipt_and_post_validatio
     assert result["phase"] == "post_activation_data_readiness"
 
 
+def test_release_readiness_replay_binds_analysis_to_scheduler_run_and_build(
+    monkeypatch,
+):
+    engine = _readiness_engine()
+    observed = {}
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "authoritative_closed_trade_date",
+        lambda *_args, **_kwargs: "2026-08-26",
+    )
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "scheduler_output_status",
+        lambda *_args, **_kwargs: "success",
+    )
+
+    def validate(task, **_kwargs):
+        if task["task_type"] == "analysis_fast":
+            observed.update(task)
+        return SchedulerValidationResult(
+            checked=True,
+            ok=True,
+            message="persisted exact data verified",
+        )
+
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "validate_scheduler_task_result",
+        validate,
+    )
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "_validate_qmt_strategy_input_window",
+        lambda *_args, **_kwargs: {"sessions": [], "session_count": 0},
+    )
+
+    ensure_quality_gate.validate_release_data_readiness(
+        engine,
+        BUILD_SHA,
+        NOW,
+    )
+
+    assert observed["_scheduler_expected_build_sha"] == BUILD_SHA
+    assert observed["_scheduler_history_run_uid"]
+    assert len(observed["_scheduler_history_run_uid"]) == 32
+    assert observed["_release_target_date"] == "2026-08-26"
+
+
 def test_release_readiness_rejects_mixed_dates_after_closed_session_rollover(
     monkeypatch,
 ):
@@ -243,6 +291,7 @@ def test_release_readiness_rejects_mixed_dates_after_closed_session_rollover(
     (
         ("etf_forward_daily", time(15, 10)),
         ("sector_heat_east", time(15, 10)),
+        ("qmt_membership_snapshot", time(15, 13)),
         ("alist_daily", time(16, 30)),
         ("alist_info", time(16, 30)),
         ("eastmoney_concept_current", time(18, 0)),
@@ -438,6 +487,59 @@ def test_release_readiness_rejects_unchecked_post_validation(monkeypatch):
         lambda *_args, **_kwargs: {},
     )
     with pytest.raises(RuntimeError, match="persisted data is not verified"):
+        ensure_quality_gate.validate_release_data_readiness(
+            engine,
+            BUILD_SHA,
+            NOW,
+        )
+
+
+def test_release_readiness_rejects_empty_or_non_actionable_analysis_pool(
+    monkeypatch,
+):
+    engine = _readiness_engine()
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "authoritative_closed_trade_date",
+        lambda *_args, **_kwargs: "2026-08-26",
+    )
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "scheduler_output_status",
+        lambda *_args, **_kwargs: "success",
+    )
+
+    def validate(task, **_kwargs):
+        if task["task_type"] == "analysis_fast":
+            return SchedulerValidationResult(
+                checked=True,
+                ok=False,
+                message=(
+                    "analysis strategy pool is empty or has no actionable "
+                    "signal: analysis_allow=0 picks=0 actionable=0"
+                ),
+            )
+        return SchedulerValidationResult(
+            checked=True,
+            ok=True,
+            message="persisted exact data verified",
+        )
+
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "validate_scheduler_task_result",
+        validate,
+    )
+    monkeypatch.setattr(
+        ensure_quality_gate,
+        "_validate_qmt_strategy_input_window",
+        lambda *_args, **_kwargs: {},
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="analysis_fast.*persisted data is not verified",
+    ):
         ensure_quality_gate.validate_release_data_readiness(
             engine,
             BUILD_SHA,

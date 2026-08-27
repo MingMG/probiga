@@ -624,6 +624,7 @@ def test_extreme_event_blocks_new_buy_after_signal_adaptation():
         "swing_score": 82,
         "signal_status": "BUY_READY",
         "recommend_status": "ALLOW",
+        "publication_status": "ACTIVE",
         "chase_risk_status": "ALLOW",
         "ordinary_buy_eligible": True,
         "event_risk_level": "LOW",
@@ -645,6 +646,7 @@ def test_strategy_score_cannot_promote_watch_into_buy_ready():
         "swing_score": 99,
         "signal_status": "WATCH",
         "recommend_status": "ALLOW",
+        "publication_status": "ACTIVE",
         "chase_risk_status": "ALLOW",
         "ordinary_buy_eligible": True,
         "event_risk_level": "LOW",
@@ -662,6 +664,34 @@ def test_strategy_score_cannot_promote_watch_into_buy_ready():
     assert signal["source_signal_status"] == "WATCH"
 
 
+def test_unactivated_publication_cannot_adapt_into_buy_signal():
+    row = {
+        "stock_code": "600036",
+        "short_name": "招商银行",
+        "pick_date": "2026-08-05",
+        "final_trade_score": 99,
+        "swing_score": 99,
+        "signal_status": "BUY_READY",
+        "recommend_status": "ALLOW",
+        "publication_status": "PENDING",
+        "chase_risk_status": "ALLOW",
+        "ordinary_buy_eligible": True,
+        "event_risk_level": "LOW",
+        "confidence_score": 99,
+    }
+
+    signal = adapt_recommendation_row(
+        row,
+        "swing",
+        {"market_state": "trend_bullish"},
+    )
+
+    assert signal["signal_direction"] == "HOLD"
+    assert signal["signal_status"] == "BLOCKED"
+    assert signal["gate_status"] == "BLOCK"
+    assert "publication_not_active" in signal["signal_basis"]["hard_hits"]
+
+
 def test_aggregate_candidates_preserves_all_strategy_signals():
     rows = [{
         "stock_code": "600036", "short_name": "招商银行", "pick_date": "2026-07-17",
@@ -669,6 +699,7 @@ def test_aggregate_candidates_preserves_all_strategy_signals():
         "swing_score": 80, "main_wave_score": 78,
         "suitable_strategies": '["value_quality", "trend_breakout"]',
         "signal_status": "BUY_READY", "recommend_status": "ALLOW", "event_risk_level": "LOW",
+        "publication_status": "ACTIVE",
         "chase_risk_status": "ALLOW", "ordinary_buy_eligible": True,
         "confidence_score": 85,
     }]

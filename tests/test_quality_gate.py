@@ -38,13 +38,13 @@ class QualityGateTaskTest(unittest.TestCase):
             },
         )
 
-    def test_0908_theme_forecast_task_is_enabled_and_strictly_validated(self):
+    def test_legacy_0908_combined_publisher_is_disabled_and_validated(self):
         task = next(
             item for item in ensure_quality_gate.TASKS
             if item.get("task_type") == "analysis_premarket_external"
         )
         self.assertEqual(task["cron_time"], "09:07")
-        self.assertEqual(task["enabled"], 1)
+        self.assertEqual(task["enabled"], 0)
         self.assertIn("--theme-forecast", task["script_args"])
         self.assertIn("--push-theme-forecast", task["script_args"])
 

@@ -12,8 +12,13 @@ import pytest
 
 from server.common.production_runtime_schema_bundle import _contract_metadata
 from tools.prepare_strategy_governance_schema import (
+    EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
     EXPECTED_GOVERNANCE_TRIGGER_NAMES,
+    EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+    EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH,
+    _final_v3_trigger_contracts,
     _non_v3_trigger_contracts,
+    _v2_release_trigger_contract,
 )
 from tools.sync_guojin_qmt_reference_data import (
     REFERENCE_TABLE_NAMES,
@@ -31,7 +36,7 @@ GOVERNANCE_SOURCE_HASH = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 SUPPORTING_SOURCE_HASH = (
-    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
 )
 PIT_CONTRACT_HASH = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
@@ -53,9 +58,11 @@ CORE_METRIC_HASH = (
 )
 
 SUPPORTING_OWNER_COUNTS = {
+    "market_field_capture": 5,
     "pit_facts": 6,
     "qmt_attestation": 6,
     "qmt_history_coverage": 4,
+    "qmt_membership": 6,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
     "schema_recovery_evidence": 2,
@@ -63,9 +70,32 @@ SUPPORTING_OWNER_COUNTS = {
 }
 GOVERNANCE_TRIGGER_NAMES = sorted(EXPECTED_GOVERNANCE_TRIGGER_NAMES)
 SUPPORTING_TRIGGER_NAMES = sorted(_non_v3_trigger_contracts())
+FULL_TRIGGER_NAMES = sorted({
+    *_v2_release_trigger_contract()[0],
+    *_final_v3_trigger_contracts(),
+    *_non_v3_trigger_contracts(),
+})
 QMT_TABLE_NAMES = list(REFERENCE_TABLE_NAMES)
 QMT_TRIGGER_NAMES = list(REFERENCE_TRIGGER_NAMES)
 RUNTIME_BUNDLE_METADATA = _contract_metadata()
+
+
+def test_runtime_bundle_fixture_is_the_frozen_production_contract() -> None:
+    assert RUNTIME_BUNDLE_METADATA["contract_hash"] == (
+        "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
+    )
+    assert RUNTIME_BUNDLE_METADATA["migration_count"] == 28
+    assert RUNTIME_BUNDLE_METADATA["validator_count"] == 31
+    assert {
+        "qmt_stock_catalog_truth",
+        "qmt_trade_calendar",
+        "market_field_capture",
+    } <= set(RUNTIME_BUNDLE_METADATA["migration_names"])
+    assert {
+        "qmt_stock_catalog_truth",
+        "qmt_trade_calendar",
+        "market_field_capture",
+    } <= set(RUNTIME_BUNDLE_METADATA["validator_names"])
 
 
 def _runtime_bundle_recovery_plans() -> dict[str, Any]:
@@ -114,6 +144,7 @@ def _runtime_bundle_migration() -> dict[str, Any]:
         "recovery_ready_for_privileged_apply": True,
         "runtime_ddl_required": False,
         "privileged_migration": True,
+        "trigger_validation_deferred": False,
     }
 
 
@@ -295,9 +326,9 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     if resume:
         detail.update(
             {
-                "required_count": 70,
+                "required_count": 81,
                 "optional_count": 0,
-                "observed_count": 70,
+                "observed_count": 81,
                 "definer": "probiga_migrator@127.0.0.1",
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
@@ -309,7 +340,7 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     else:
         detail.update(
             {
-                "trigger_count": 70,
+                "trigger_count": 81,
                 "trigger_names": SUPPORTING_TRIGGER_NAMES,
             }
         )
@@ -325,9 +356,34 @@ def _resume_payload() -> dict[str, Any]:
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
-                "required_count": 90,
+                "required_count": 101,
                 "optional_count": 0,
-                "observed_count": 90,
+                "observed_count": 101,
+            },
+            "full_trigger_inventory": {
+                "expected_count": 142,
+                "observed_count": 142,
+                "v2_count": 41,
+                "managed_count": 101,
+                "expected_names": FULL_TRIGGER_NAMES,
+                "nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+                "v2_source_contract_sha256": (
+                    EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                "managed_source_contract_sha256": (
+                    EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                "observed_metadata_sha256": "d" * 64,
+                "managed_contract": {
+                    "required_count": 101,
+                    "optional_count": 0,
+                    "observed_count": 101,
+                    "definer": "probiga_migrator@127.0.0.1",
+                    "metadata_frozen": True,
+                    "legacy_rehome_names": [],
+                },
+                "metadata_frozen": True,
+                "read_only": True,
             },
             "legacy_trigger_repair": {
                 "candidate_names": [],
@@ -466,8 +522,8 @@ def _preflight_payload() -> dict[str, Any]:
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
                 "required_count": 20,
-                "optional_count": 70,
-                "observed_count": 90,
+                "optional_count": 81,
+                "observed_count": 50,
             },
             "governance_trigger_source_contract": _governance_source(
                 resume=False
@@ -585,6 +641,21 @@ def test_schema_evidence_validator_accepts_only_frozen_legacy_compatibility(
     assert result.returncode == 0, result.stderr
 
 
+def test_preflight_accepts_only_exact_current_or_final_managed_inventory(
+    validator_programs: dict[str, str],
+) -> None:
+    for observed_count in (50, 101):
+        payload = _preflight_payload()
+        payload["trigger_contract"]["observed_count"] = observed_count
+        result = _run_validator(validator_programs["preflight"], payload)
+        assert result.returncode == 0, (observed_count, result.stderr)
+
+    drifted = _preflight_payload()
+    drifted["trigger_contract"]["observed_count"] = 90
+    result = _run_validator(validator_programs["preflight"], drifted)
+    assert result.returncode == 2
+
+
 COMMON_MUTATIONS: tuple[tuple[str, Mutator], ...] = (
     (
         "runtime_contract_label",
@@ -699,6 +770,28 @@ PHASE_MUTATIONS: tuple[tuple[str, PayloadFactory, str, Mutator], ...] = (
         _resume_payload,
         "aggregate_required_count",
         _set_path("trigger_contract", "required_count", 87),
+    ),
+    (
+        "resume",
+        _resume_payload,
+        "full_global_inventory_count",
+        _set_path("full_trigger_inventory", "observed_count", 141),
+    ),
+    (
+        "resume",
+        _resume_payload,
+        "full_global_inventory_names",
+        _drop_last(("full_trigger_inventory", "expected_names")),
+    ),
+    (
+        "resume",
+        _resume_payload,
+        "full_global_inventory_v2_source",
+        _set_path(
+            "full_trigger_inventory",
+            "v2_source_contract_sha256",
+            "0" * 64,
+        ),
     ),
     (
         "resume",

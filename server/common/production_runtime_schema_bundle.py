@@ -102,6 +102,18 @@ from server.common.sim_trade_schema import (
     privileged_migrate_sim_trade_schema,
     validate_sim_trade_runtime_schema,
 )
+from server.common.market_field_capture_schema import (
+    privileged_migrate_market_field_capture_schema,
+    validate_market_field_capture_runtime,
+)
+from server.common.qmt_trade_calendar import (
+    privileged_migrate_trade_calendar_schema,
+    validate_trade_calendar_runtime_schema,
+)
+from server.common.qmt_stock_catalog import (
+    privileged_migrate_stock_catalog_schema,
+    validate_stock_catalog_runtime_schema,
+)
 from server.common.versioned_strategy_config import (
     privileged_migrate_versioned_strategy_tables,
     privileged_seed_versioned_strategy_configs,
@@ -117,12 +129,50 @@ from server.engine.strategy_center import (
 SchemaCallable = Callable[[Any], Any]
 BUNDLE_CONTRACT_SCHEMA = "probiga.production-runtime-schema-bundle.v1"
 
+_BROKER_OWNED_TRIGGER_MIGRATION_NAMES = (
+    "qmt_stock_catalog_truth",
+    "qmt_trade_calendar",
+    "market_field_capture",
+    "auxiliary_runtime",
+)
+
+
+def _migrate_stock_catalog_tables(engine) -> Any:
+    return privileged_migrate_stock_catalog_schema(
+        engine,
+        install_triggers=False,
+    )
+
+
+def _migrate_trade_calendar_tables(engine) -> Any:
+    return privileged_migrate_trade_calendar_schema(
+        engine,
+        install_triggers=False,
+    )
+
+
+def _migrate_market_field_capture_tables(engine) -> Any:
+    return privileged_migrate_market_field_capture_schema(
+        engine,
+        install_triggers=False,
+    )
+
+
+def _migrate_auxiliary_runtime_tables(engine) -> Any:
+    return privileged_migrate_auxiliary_runtime_schema(
+        engine,
+        install_triggers=False,
+    )
+
 _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("scheduler_tasks", privileged_migrate_scheduler_task_columns),
     ("scheduler_task_history", migrate_scheduler_task_history),
     ("auth", privileged_migrate_auth_schema),
     ("ai_bridge", privileged_migrate_ai_bridge_schema),
     ("analysis_output", migrate_analysis_output_schema),
+    ("qmt_stock_catalog_truth", _migrate_stock_catalog_tables),
+    ("qmt_trade_calendar", _migrate_trade_calendar_tables),
+    ("market_field_capture", _migrate_market_field_capture_tables),
     ("recommended_run_history", migrate_recommended_run_history),
     ("versioned_strategy", privileged_migrate_versioned_strategy_tables),
     ("strategy_center", privileged_migrate_strategy_center_tables),
@@ -140,7 +190,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("realtime_quote_snapshot", privileged_migrate_rt_snapshot_table),
     ("stock_kline_short_name", privileged_migrate_sm_stock_kline_short_name),
     ("hot_rank", privileged_migrate_hot_rank_schema),
-    ("auxiliary_runtime", privileged_migrate_auxiliary_runtime_schema),
+    ("auxiliary_runtime", _migrate_auxiliary_runtime_tables),
     ("qmt_catalog", privileged_migrate_catalog_schema),
     ("qmt_audit", privileged_migrate_audit_schema),
 )
@@ -157,6 +207,9 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("auth", validate_auth_runtime_schema),
     ("ai_bridge", validate_ai_bridge_runtime_schema),
     ("analysis_output", validate_analysis_output_schema),
+    ("qmt_stock_catalog_truth", validate_stock_catalog_runtime_schema),
+    ("qmt_trade_calendar", validate_trade_calendar_runtime_schema),
+    ("market_field_capture", validate_market_field_capture_runtime),
     ("recommended_run_history", validate_recommended_run_history_schema),
     ("versioned_strategy", validate_versioned_strategy_runtime),
     ("strategy_center", validate_strategy_center_runtime),
@@ -198,6 +251,10 @@ def _contract_metadata() -> dict[str, Any]:
         "seed_names": [name for name, _ in _SEEDS],
         "validator_names": [name for name, _ in _VALIDATORS],
         "recovery_planner_names": [name for name, _ in _RECOVERY_PLANNERS],
+        "trigger_installation_policy": "FROZEN_RELEASE_BROKER_ONLY",
+        "broker_owned_trigger_migration_names": list(
+            _BROKER_OWNED_TRIGGER_MIGRATION_NAMES
+        ),
     }
     payload["recovery_planner_count"] = len(payload["recovery_planner_names"])
     encoded = json.dumps(
@@ -295,18 +352,36 @@ def _collect_recovery_plans(engine) -> dict[str, Any]:
     }
 
 
-def privileged_migrate_runtime_schema_bundle(engine) -> dict[str, Any]:
+def privileged_migrate_runtime_schema_bundle(
+    engine,
+    *,
+    defer_trigger_validation: bool = False,
+) -> dict[str, Any]:
     """Run all non-core DDL and configuration seeds inside the release fence."""
+
+    if type(defer_trigger_validation) is not bool:
+        raise TypeError("defer_trigger_validation must be bool")
 
     migrations = _run(_MIGRATIONS, engine)
     seeds = _run(_SEEDS, engine)
-    validation = validate_runtime_schema_bundle(engine)
+    validation = (
+        {
+            **_contract_metadata(),
+            "required_surface_verified": False,
+            "trigger_validation_deferred": True,
+            "deferred_until": "FROZEN_RELEASE_BROKER_COMPLETED",
+            "read_only": True,
+        }
+        if defer_trigger_validation
+        else validate_runtime_schema_bundle(engine)
+    )
     recovery = _collect_recovery_plans(engine)
     return {
         **_contract_metadata(),
         "migrations": migrations,
         "seeds": seeds,
         "runtime_validation": validation,
+        "trigger_validation_deferred": defer_trigger_validation,
         **recovery,
         "runtime_ddl_required": False,
         "privileged_migration": True,

@@ -2850,6 +2850,66 @@ class _GovernanceHealthEngine:
 
         if (
             "information_schema.TRIGGERS" in sql
+            and "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY" in sql
+        ):
+            from tools import prepare_strategy_governance_schema as schema
+
+            managed = {
+                **schema._final_v3_trigger_contracts(),
+                **schema._frozen_non_v3_release_trigger_contracts(
+                    schema._non_v3_trigger_contracts()
+                ),
+            }
+            v2_contracts, v2_bodies, v2_orders = (
+                schema._v2_release_trigger_contract()
+            )
+            rows = [
+                {
+                    "trigger_schema": schema.DATABASE_NAME,
+                    "trigger_name": name,
+                    "definer": schema.EXPECTED_MIGRATOR_USER,
+                    "event_object_schema": schema.DATABASE_NAME,
+                    "action_timing": contract.timing,
+                    "event_manipulation": contract.event,
+                    "event_object_table": contract.table,
+                    "action_orientation": "ROW",
+                    "action_statement": contract.body,
+                    "action_order": 1,
+                    "sql_mode": schema.EXPECTED_SQL_MODE,
+                    "character_set_client": (
+                        schema.EXPECTED_CHARACTER_SET_CLIENT
+                    ),
+                    "collation_connection": (
+                        schema.EXPECTED_COLLATION_CONNECTION
+                    ),
+                    "database_collation": (
+                        schema.EXPECTED_DATABASE_COLLATION
+                    ),
+                }
+                for name, contract in sorted(managed.items())
+            ]
+            rows.extend({
+                "trigger_schema": schema.DATABASE_NAME,
+                "trigger_name": name,
+                "definer": schema.EXPECTED_MIGRATOR_USER,
+                "event_object_schema": schema.DATABASE_NAME,
+                "action_timing": "BEFORE",
+                "event_manipulation": event,
+                "event_object_table": table_name,
+                "action_orientation": "ROW",
+                "action_statement": v2_bodies[name],
+                "action_order": v2_orders[name],
+                "sql_mode": schema.EXPECTED_SQL_MODE,
+                "character_set_client": schema.EXPECTED_CHARACTER_SET_CLIENT,
+                "collation_connection": schema.EXPECTED_COLLATION_CONNECTION,
+                "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+            } for name, (event, table_name) in sorted(v2_contracts.items()))
+            return _Result(
+                self._release_trigger_rows_fixture(rows, sql, params)
+            )
+
+        if (
+            "information_schema.TRIGGERS" in sql
             and "DEFINER AS definer" in sql
             and any(
                 str(key).startswith(("trigger_name_", "trigger_table_"))
@@ -2858,7 +2918,10 @@ class _GovernanceHealthEngine:
         ):
             from tools import prepare_strategy_governance_schema as schema
 
-            contracts = schema._non_v3_trigger_contracts()
+            contracts = {
+                **schema._final_v3_trigger_contracts(),
+                **schema._non_v3_trigger_contracts(),
+            }
             requested_names = {
                 str(value)
                 for key, value in params.items()
@@ -8620,8 +8683,17 @@ def test_application_integrity_health_requires_exact_database_triggers():
     supporting_passed, supporting = (
         health._supporting_release_trigger_inventory_check(connection)
     )
+    full_passed, full = health._full_database_trigger_inventory_check(
+        connection
+    )
 
-    assert metric_passed is ledger_passed is supporting_passed is True
+    assert (
+        metric_passed
+        is ledger_passed
+        is supporting_passed
+        is full_passed
+        is True
+    )
     assert metric["trigger_count"] == 2
     assert ledger["trigger_count"] == 38
     assert ledger["total_governance_trigger_count"] == 40
@@ -8654,11 +8726,19 @@ def test_application_integrity_health_requires_exact_database_triggers():
     assert ledger["funding_contract_hash"] == (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
     )
-    assert supporting["observed_count"] == 70
-    assert supporting["expected_trigger_count"] == 70
+    assert supporting["observed_count"] == 81
+    assert supporting["expected_trigger_count"] == 81
+    assert supporting["owner_counts"]["market_field_capture"] == 5
+    assert supporting["owner_counts"]["qmt_membership"] == 6
     assert supporting["owner_counts"]["schema_recovery_evidence"] == 2
     assert supporting["source_contract_hash"] == (
-        "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+        "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    )
+    assert full["expected_count"] == full["observed_count"] == 142
+    assert full["v2_count"] == 41
+    assert full["managed_count"] == 101
+    assert full["nameset_sha256"] == (
+        "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
     )
 
 
@@ -8777,6 +8857,8 @@ def test_qmt_attestation_health_rejects_missing_completed_run_guard():
             "trg_privileged_schema_recovery_evidence_immutable_bd",
             "schema_recovery_evidence",
         ),
+        ("trg_field_capture_row_no_delete", "market_field_capture"),
+        ("trg_qmt_membership_run_no_delete", "qmt_membership"),
     ),
 )
 def test_supporting_release_inventory_rejects_missing_guard(
@@ -8797,15 +8879,40 @@ def test_supporting_release_inventory_rejects_missing_guard(
 
     assert passed is False
     assert detail["trigger_count"] == 0
-    assert detail["expected_trigger_count"] == 70
+    assert detail["expected_trigger_count"] == 81
     assert detail["expected_owner_counts"][owner] == {
         "qmt_reference": 10,
         "pit_facts": 6,
         "qmt_history_coverage": 4,
         "scheduler_task_history": 2,
         "schema_recovery_evidence": 2,
+        "market_field_capture": 5,
+        "qmt_membership": 6,
     }[owner]
     assert detail["database_triggers_required"] is True
+
+
+def test_full_database_trigger_health_rejects_unrelated_trigger():
+    class _UnexpectedGlobalTriggerEngine(_GovernanceHealthEngine):
+        def _release_trigger_rows_fixture(self, rows, sql, _params):
+            rows = deepcopy(rows)
+            if "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY" in sql:
+                rows.append({
+                    **rows[0],
+                    "trigger_name": "trg_unapproved_global_trigger",
+                })
+            return rows
+
+    passed, detail = health._full_database_trigger_inventory_check(
+        _UnexpectedGlobalTriggerEngine().connect()
+    )
+
+    assert passed is False
+    assert detail["expected_count"] == 142
+    assert detail["observed_count"] == 0
+    assert detail["metadata_frozen"] is False
+    assert len(detail["errors"]) == 1
+    assert "exception_type=PrivilegedSchemaPreparationError" in detail["errors"][0]
 
 
 def test_qmt_reference_health_fails_closed_on_physical_seal_drift(

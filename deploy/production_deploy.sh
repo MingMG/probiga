@@ -2269,6 +2269,7 @@ controlled_guard_parse_governance_health_result() {
   /usr/bin/python3.14 -I - "$result_file" "$expected_sha" \
     "$expected_disposition" "$expected_trade_date" \
     "$expected_scheduler_pid" <<'PY'
+import hashlib
 import json
 import re
 import socket
@@ -2440,6 +2441,7 @@ common_required_names = {
     "qmt_operations_scheduler_tasks_unique",
     "qmt_operations_scheduler_tasks_contract",
     "supporting_release_trigger_inventory_exact",
+    "full_database_trigger_inventory_exact",
     "qmt_reference_physical_schema_and_seal",
     "qmt_history_coverage_physical_schema_and_seal",
     "qmt_history_capability_matrix_fail_closed",
@@ -2546,6 +2548,9 @@ scheduler_heartbeat_detail = check_details.get(
 supporting_trigger_detail = check_details.get(
     "supporting_release_trigger_inventory_exact"
 )
+full_trigger_detail = check_details.get(
+    "full_database_trigger_inventory_exact"
+)
 qmt_reference_detail = check_details.get(
     "qmt_reference_physical_schema_and_seal"
 )
@@ -2597,7 +2602,16 @@ expected_trigger_source_hash = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 expected_supporting_trigger_source_hash = (
-    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+)
+expected_full_trigger_nameset_hash = (
+    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+)
+expected_v2_trigger_source_hash = (
+    "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+)
+expected_managed_trigger_source_hash = (
+    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
 )
 expected_qmt_reference_contract_hash = (
     "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
@@ -2606,9 +2620,11 @@ expected_pit_fact_contract_hash = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
 )
 expected_supporting_owner_counts = {
+    "market_field_capture": 5,
     "pit_facts": 6,
     "qmt_attestation": 6,
     "qmt_history_coverage": 4,
+    "qmt_membership": 6,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
     "schema_recovery_evidence": 2,
@@ -2795,6 +2811,31 @@ qmt_edge_release_valid = (
         str(qmt_edge_release_receipt.get("receipt_hash") or ""),
     ) is not None
 )
+full_trigger_names = (
+    full_trigger_detail.get("expected_names")
+    if isinstance(full_trigger_detail, dict)
+    else None
+)
+full_trigger_nameset_hash = (
+    hashlib.sha256(
+        json.dumps(
+            {
+                "schema": "probiga.full-release-trigger-names.v1",
+                "names": full_trigger_names,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(full_trigger_names, list)
+    else ""
+)
+full_managed_contract = (
+    full_trigger_detail.get("managed_contract")
+    if isinstance(full_trigger_detail, dict)
+    else None
+)
 valid = valid and (
     isinstance(funding_schema_detail, dict)
     and funding_schema_detail.get("table_count") == 2
@@ -2882,10 +2923,10 @@ valid = valid and (
     and qmt_operations_contract_detail.get("actual")
     == expected_qmt_operations_tasks
     and isinstance(supporting_trigger_detail, dict)
-    and supporting_trigger_detail.get("required_count") == 70
+    and supporting_trigger_detail.get("required_count") == 81
     and supporting_trigger_detail.get("optional_count") == 0
-    and supporting_trigger_detail.get("observed_count") == 70
-    and supporting_trigger_detail.get("expected_trigger_count") == 70
+    and supporting_trigger_detail.get("observed_count") == 81
+    and supporting_trigger_detail.get("expected_trigger_count") == 81
     and supporting_trigger_detail.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_trigger_detail.get("expected_owner_counts")
@@ -2896,6 +2937,40 @@ valid = valid and (
     and supporting_trigger_detail.get("metadata_frozen") is True
     and supporting_trigger_detail.get("definer")
     == "probiga_migrator@127.0.0.1"
+    and isinstance(full_trigger_detail, dict)
+    and set(full_trigger_detail) == {
+        "expected_count", "observed_count", "v2_count", "managed_count",
+        "expected_names", "nameset_sha256", "v2_source_contract_sha256",
+        "managed_source_contract_sha256", "observed_metadata_sha256",
+        "managed_contract", "metadata_frozen", "read_only",
+    }  # expected_full_inventory_keys
+    and full_trigger_detail.get("expected_count") == 142
+    and full_trigger_detail.get("observed_count") == 142
+    and full_trigger_detail.get("v2_count") == 41
+    and full_trigger_detail.get("managed_count") == 101
+    and full_trigger_names == sorted(set(full_trigger_names or []))
+    and len(full_trigger_names or []) == 142
+    and full_trigger_nameset_hash == expected_full_trigger_nameset_hash
+    and full_trigger_detail.get("nameset_sha256")
+    == expected_full_trigger_nameset_hash
+    and full_trigger_detail.get("v2_source_contract_sha256")
+    == expected_v2_trigger_source_hash
+    and full_trigger_detail.get("managed_source_contract_sha256")
+    == expected_managed_trigger_source_hash
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(full_trigger_detail.get("observed_metadata_sha256") or ""),
+    ) is not None
+    and full_trigger_detail.get("metadata_frozen") is True
+    and full_trigger_detail.get("read_only") is True
+    and isinstance(full_managed_contract, dict)
+    and full_managed_contract.get("required_count") == 101
+    and full_managed_contract.get("optional_count") == 0
+    and full_managed_contract.get("observed_count") == 101
+    and full_managed_contract.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and full_managed_contract.get("metadata_frozen") is True
+    and full_managed_contract.get("legacy_rehome_names") == []
     and isinstance(qmt_reference_detail, dict)
     and qmt_reference_detail.get("contract_key") == "qmt_reference_truth_v2"
     and qmt_reference_detail.get("contract_hash")
@@ -5589,8 +5664,11 @@ runtime_bundle_runtime = (
     p.get("runtime_schema_bundle_validation")
     if isinstance(p, dict) else None
 )
+full_trigger_inventory = (
+    p.get("full_trigger_inventory") if isinstance(p, dict) else None
+)
 expected_runtime_bundle_hash = (
-    "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3"
+    "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
 )
 expected_recovery_planners = [
     "analysis_output",
@@ -5607,20 +5685,31 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
 )
 expected_supporting_names_hash = (
-    "5a7897fafd07d20115d5cb60b07aafc549b1ceea88a718d3a99e94fcd5ccf341"
+    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
 )
 expected_supporting_owner_counts = {
+    "market_field_capture": 5,
     "pit_facts": 6,
     "qmt_attestation": 6,
     "qmt_history_coverage": 4,
+    "qmt_membership": 6,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
     "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }  # expected_supporting_owner_counts
+expected_full_trigger_nameset_hash = (
+    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+)
+expected_v2_trigger_source_hash = (
+    "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+)
+expected_managed_trigger_source_hash = (
+    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+)
 expected_pit_contract_hash = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
 )
@@ -5851,9 +5940,9 @@ supporting_source_exact = (
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
-    and supporting_source.get("required_count") == 70
+    and supporting_source.get("required_count") == 81
     and supporting_source.get("optional_count") == 0
-    and supporting_source.get("observed_count") == 70
+    and supporting_source.get("observed_count") == 81
     and supporting_source.get("definer")
     == "probiga_migrator@127.0.0.1"
     and supporting_source.get("metadata_frozen") is True
@@ -5868,8 +5957,69 @@ supporting_source_exact = (
     and set(supporting_source.get("created_names") or [])
     <= set(supporting_names or [])
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 70
+    and len(supporting_names or []) == 81
     and supporting_names_hash == expected_supporting_names_hash
+)
+full_trigger_names = (
+    full_trigger_inventory.get("expected_names")
+    if isinstance(full_trigger_inventory, dict)
+    else None
+)
+full_trigger_names_hash = (
+    hashlib.sha256(
+        json.dumps(
+            {
+                "schema": "probiga.full-release-trigger-names.v1",
+                "names": full_trigger_names,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if isinstance(full_trigger_names, list)
+    else ""
+)
+full_managed_contract = (
+    full_trigger_inventory.get("managed_contract")
+    if isinstance(full_trigger_inventory, dict)
+    else None
+)
+full_trigger_inventory_exact = (
+    isinstance(full_trigger_inventory, dict)
+    and set(full_trigger_inventory) == {
+        "expected_count", "observed_count", "v2_count", "managed_count",
+        "expected_names", "nameset_sha256", "v2_source_contract_sha256",
+        "managed_source_contract_sha256", "observed_metadata_sha256",
+        "managed_contract", "metadata_frozen", "read_only",
+    }  # expected_full_inventory_keys
+    and full_trigger_inventory.get("expected_count") == 142
+    and full_trigger_inventory.get("observed_count") == 142
+    and full_trigger_inventory.get("v2_count") == 41
+    and full_trigger_inventory.get("managed_count") == 101
+    and full_trigger_names == sorted(set(full_trigger_names or []))
+    and len(full_trigger_names or []) == 142
+    and full_trigger_names_hash == expected_full_trigger_nameset_hash
+    and full_trigger_inventory.get("nameset_sha256")
+    == expected_full_trigger_nameset_hash
+    and full_trigger_inventory.get("v2_source_contract_sha256")
+    == expected_v2_trigger_source_hash
+    and full_trigger_inventory.get("managed_source_contract_sha256")
+    == expected_managed_trigger_source_hash
+    and re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(full_trigger_inventory.get("observed_metadata_sha256") or ""),
+    ) is not None
+    and full_trigger_inventory.get("metadata_frozen") is True
+    and full_trigger_inventory.get("read_only") is True
+    and isinstance(full_managed_contract, dict)
+    and full_managed_contract.get("required_count") == 101
+    and full_managed_contract.get("optional_count") == 0
+    and full_managed_contract.get("observed_count") == 101
+    and full_managed_contract.get("definer")
+    == "probiga_migrator@127.0.0.1"
+    and full_managed_contract.get("metadata_frozen") is True
+    and full_managed_contract.get("legacy_rehome_names") == []
 )
 pit_schema_exact = (
     isinstance(pit_schema, dict)
@@ -5942,12 +6092,20 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 25
+    and runtime_bundle.get("migration_count") == 28
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 28
+    and runtime_bundle.get("validator_count") == 31
     and runtime_bundle.get("recovery_planner_count") == 3
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
+    and runtime_bundle.get("trigger_installation_policy")
+    == "FROZEN_RELEASE_BROKER_ONLY"
+    and runtime_bundle.get("broker_owned_trigger_migration_names") == [
+        "qmt_stock_catalog_truth",
+        "qmt_trade_calendar",
+        "market_field_capture",
+        "auxiliary_runtime",
+    ]
     and isinstance(runtime_bundle.get("migration_names"), list)
     and isinstance(runtime_bundle.get("seed_names"), list)
     and isinstance(runtime_bundle.get("validator_names"), list)
@@ -5979,6 +6137,7 @@ runtime_bundle_exact = (
     and runtime_bundle.get("recovery_ready_for_privileged_apply") is True
     and runtime_bundle.get("runtime_ddl_required") is False
     and runtime_bundle.get("privileged_migration") is True
+    and runtime_bundle.get("trigger_validation_deferred") is False
     and isinstance(runtime_bundle.get("runtime_validation"), dict)
     and runtime_bundle["runtime_validation"].get("contract_hash")
     == expected_runtime_bundle_hash
@@ -6022,6 +6181,7 @@ ok = (
     and funding_exact
     and governance_source_exact
     and supporting_source_exact
+    and full_trigger_inventory_exact
     and pit_schema_exact
     and qmt_reference_exact
     and qmt_coverage_exact
@@ -6052,9 +6212,9 @@ ok = (
     and trigger.get("metadata_frozen") is True
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
-    and trigger.get("required_count") == 90
+    and trigger.get("required_count") == 101
     and trigger.get("optional_count") == 0
-    and trigger.get("observed_count") == 90
+    and trigger.get("observed_count") == 101
     and isinstance(p.get("seeded_strategy_count"), int)
     and p["seeded_strategy_count"] > 0
     and p.get("automatic_real_order_submission") is False
@@ -6098,7 +6258,7 @@ runtime_bundle = (
     p.get("runtime_schema_bundle") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "da7728f7dfa7f7a0fcdce956baa8a54861537cc55eec4fe0a2b921a5fd27c6e3"
+    "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
 )
 expected_recovery_planners = [
     "analysis_output",
@@ -6115,15 +6275,17 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
 )
 expected_supporting_names_hash = (
-    "5a7897fafd07d20115d5cb60b07aafc549b1ceea88a718d3a99e94fcd5ccf341"
+    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
 )
 expected_supporting_owner_counts = {
+    "market_field_capture": 5,
     "pit_facts": 6,
     "qmt_attestation": 6,
     "qmt_history_coverage": 4,
+    "qmt_membership": 6,
     "qmt_reference": 10,
     "scheduler_task_history": 2,
     "schema_recovery_evidence": 2,
@@ -6288,13 +6450,13 @@ supporting_names_hash = (
 )
 supporting_source_exact = (
     isinstance(supporting_source, dict)
-    and supporting_source.get("trigger_count") == 70
+    and supporting_source.get("trigger_count") == 81
     and supporting_source.get("source_contract_hash")
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 70
+    and len(supporting_names or []) == 81
     and supporting_names_hash == expected_supporting_names_hash
 )
 pit_schema_exact = (
@@ -6376,12 +6538,20 @@ runtime_bundle_exact = (
     and runtime_bundle.get("schema")
     == "probiga.production-runtime-schema-bundle.v1"
     and runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash
-    and runtime_bundle.get("migration_count") == 25
+    and runtime_bundle.get("migration_count") == 28
     and runtime_bundle.get("seed_count") == 3
-    and runtime_bundle.get("validator_count") == 28
+    and runtime_bundle.get("validator_count") == 31
     and runtime_bundle.get("recovery_planner_count") == 3
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
+    and runtime_bundle.get("trigger_installation_policy")
+    == "FROZEN_RELEASE_BROKER_ONLY"
+    and runtime_bundle.get("broker_owned_trigger_migration_names") == [
+        "qmt_stock_catalog_truth",
+        "qmt_trade_calendar",
+        "market_field_capture",
+        "auxiliary_runtime",
+    ]
     and isinstance(runtime_bundle.get("validator_names"), list)
     and isinstance(runtime_bundle.get("contracts"), dict)
     and set(runtime_bundle["contracts"])
@@ -6455,8 +6625,8 @@ ok = (
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
     and trigger.get("required_count") == 20
-    and trigger.get("optional_count") == 70
-    and trigger.get("observed_count") == 90
+    and trigger.get("optional_count") == 81
+    and trigger.get("observed_count") in {50, 101}
     and p.get("qmt_table_count") == 4
     and p.get("governance_table_count") == 15
     and p.get("automatic_real_order_submission") is False

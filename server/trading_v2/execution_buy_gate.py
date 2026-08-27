@@ -56,6 +56,7 @@ _RECOMMENDATION_REQUIRED_COLUMNS = frozenset(
         "signal_status",
         "chase_risk_status",
         "ordinary_buy_eligible",
+        "publication_status",
         "event_risk_level",
         "data_quality_score",
         "data_quality_flags",
@@ -482,7 +483,7 @@ def _current_recommendation(
         text(
             "SELECT stock_code, pick_date, recommend_status, signal_status, "
             "chase_risk_status, ordinary_buy_eligible, event_risk_level, "
-            "data_quality_score, data_quality_flags "
+            "data_quality_score, data_quality_flags, publication_status "
             "FROM st_recommended_stocks "
             "WHERE stock_code = :stock_code AND pick_date <= :as_of_date "
             "ORDER BY pick_date DESC LIMIT 1" + lock_clause
@@ -581,6 +582,9 @@ def load_current_buy_gate(
     current_recommend_status = str(
         recommendation.get("recommend_status") or "DATA_BLOCKED"
     ).upper()
+    current_publication_status = str(
+        recommendation.get("publication_status") or "PENDING"
+    ).upper()
     recommend_status = (
         "ALLOW"
         if raw_recommend_status == current_recommend_status == "ALLOW"
@@ -626,6 +630,7 @@ def load_current_buy_gate(
             signal.get("rejection_code") in {None, ""},
             raw_recommend_status == "ALLOW",
             current_recommend_status == "ALLOW",
+            current_publication_status == "ACTIVE",
             raw_signal_status in ACTIONABLE_SIGNAL_STATUSES,
             current_signal_status in ACTIONABLE_SIGNAL_STATUSES,
             str(signal.get("data_snapshot_hash") or "").lower()

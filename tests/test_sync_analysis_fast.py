@@ -1,9 +1,15 @@
 # -*- coding: utf-8 -*-
 import unittest
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from biz.analysis.sync_analysis_fast import (
+    _load_canonical_chase_risk_evidence,
     _load_sector_industry_memberships,
+    _recent_dates,
+    _refresh_exact_upper_limit_execution_evidence,
     add_strategy_signals,
+    apply_canonical_execution_eligibility,
     build_data_quality,
     build_recommendation_rows,
     build_strategy_trade_plan,
@@ -12,17 +18,614 @@ from biz.analysis.sync_analysis_fast import (
     classify_notice_title,
     linear_score,
     load_flow_features,
+    load_confidence_features,
+    load_failure_features,
     load_hot_rank,
+    load_recommendation_history,
+    load_sector_rotation_features,
     select_primary_strategy,
     validate_exact_daily_flow_coverage,
 )
 import pandas as pd
+from sqlalchemy import create_engine, text
 from unittest.mock import patch
 
 from server.common.daily_stock_universe import DailyStockUniverse
+from server.common.analysis_pool_receipt import (
+    TURNOVER_DIRECT_FORMULA,
+    build_turnover_evidence,
+    build_upper_limit_evidence,
+    is_executable_recommendation,
+    validate_turnover_evidence,
+)
+from server.common.chase_risk_policy import (
+    CanonicalChaseBar,
+    ChaseRiskPolicy,
+    assess_chase_risk as assess_production_chase_risk,
+)
+from server.trading_v4.domain import AsOfDataset, AsOfRecord, QualityStatus
+from server.trading_v4.factors.chase_risk import (
+    ChaseRiskPolicy as FrozenV4ChaseRiskPolicy,
+    assess_chase_risk as assess_frozen_v4_chase_risk,
+)
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_recent_dates_excludes_partitions_unknown_at_decision_cutoff(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        with engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE facts (trade_date DATE, received_at DATETIME)"
+            ))
+            connection.execute(
+                text(
+                    "INSERT INTO facts (trade_date, received_at) VALUES "
+                    "('2026-08-25', '2026-08-25 18:00:00'), "
+                    "('2026-08-26', '2026-08-27 08:00:00')"
+                )
+            )
+
+        self.assertEqual(
+            _recent_dates(
+                engine,
+                "facts",
+                "trade_date",
+                "2026-08-26",
+                2,
+                known_at_column="received_at",
+                decision_known_at=datetime(2026, 8, 26, 18, 50),
+            ),
+            ["2026-08-25"],
+        )
+
+    def test_canonical_execution_eligibility_requires_complete_evidence(self):
+        cases = ["ALLOW", "BLOCK", "DATA_BLOCKED", None, "UNKNOWN"]
+        result = apply_canonical_execution_eligibility(
+            pd.DataFrame({"chase_evidence_status": cases})
+        )
+        self.assertEqual(
+            result["chase_risk_status"].tolist(),
+            ["ALLOW", "BLOCK", "DATA_BLOCKED", "DATA_BLOCKED", "DATA_BLOCKED"],
+        )
+        self.assertEqual(
+            result["ordinary_buy_eligible"].tolist(),
+            [1, 0, 0, 0, 0],
+        )
+
+    def test_chase_evidence_blocks_unproven_turnover_and_future_bars(self):
+        days = pd.date_range("2026-07-29", periods=21, freq="D")
+
+        def rows_for(code, closes):
+            rows = []
+            previous = closes[0]
+            for index, (day, close) in enumerate(zip(days, closes)):
+                pre_close = previous if index else close
+                rows.append({
+                    "stock_code": code,
+                    "trade_date": day.date(),
+                    "open": pre_close,
+                    "high": max(pre_close, close),
+                    "low": min(pre_close, close),
+                    "close": close,
+                    "volume": 1000,
+                    "amount": 10000,
+                    "pre_close": pre_close,
+                    "turnover_ratio": 2,
+                    "data_source": "gj_big_qmt_inner",
+                    "batch_id": f"batch-{index}",
+                    "data_version": f"version-{index}",
+                    "quality_status": "QMT_ATTESTED",
+                    "permission_status": "SUPPORTED",
+                    "received_at": day,
+                })
+                previous = close
+            return rows
+
+        low_price = [0.22] * 18 + [0.23, 0.24, 0.25]
+        safe = [10.0] * 21
+        bad = [8.0] * 21
+        source = pd.DataFrame(
+            rows_for("000001", low_price)
+            + rows_for("000002", safe)
+            + rows_for("000003", bad)
+            + rows_for("000004", safe)
+            + rows_for("000005", safe)
+            + rows_for("000006", safe)
+        )
+        source.loc[
+            (source["stock_code"] == "000003")
+            & (source["trade_date"] == days[-1].date()),
+            "pre_close",
+        ] = 0
+        source.loc[
+            source["trade_date"].eq(days[-1].date())
+            & source["stock_code"].ne("000005"),
+            "turnover_ratio",
+        ] = None
+        source.loc[
+            (source["stock_code"] == "000006")
+            & (source["trade_date"] == days[-2].date()),
+            "received_at",
+        ] = days[-1].replace(hour=13)
+        with patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=[source],
+        ), patch(
+            "biz.analysis.sync_analysis_fast.load_verified_turnover_evidence",
+            return_value={},
+        ):
+            result = _load_canonical_chase_risk_evidence(
+                object(),
+                start_date=days[0].date().isoformat(),
+                trade_date=days[-1].date().isoformat(),
+                decision_known_at=days[-1].replace(hour=12),
+            ).set_index("stock_code")
+
+        self.assertEqual(result.loc["000001", "chase_evidence_status"], "DATA_BLOCKED")
+        self.assertEqual(result.loc["000002", "chase_evidence_status"], "DATA_BLOCKED")
+        self.assertEqual(result.loc["000003", "chase_evidence_status"], "DATA_BLOCKED")
+        self.assertEqual(result.loc["000004", "chase_evidence_status"], "DATA_BLOCKED")
+        self.assertEqual(result.loc["000005", "chase_evidence_status"], "DATA_BLOCKED")
+        self.assertEqual(result.loc["000006", "chase_evidence_status"], "DATA_BLOCKED")
+        proof = validate_turnover_evidence(
+            result.loc["000002", "turnover_evidence_json"]
+        )
+        self.assertEqual(proof["status"], "DATA_BLOCKED")
+        self.assertEqual(proof["source_table"], "st_market_field_capture_row")
+        self.assertEqual(
+            proof["decision_known_at"],
+            days[-1].replace(hour=12).isoformat(sep=" "),
+        )
+        raw_proof = validate_turnover_evidence(
+            result.loc["000005", "turnover_evidence_json"]
+        )
+        self.assertEqual(raw_proof["status"], "DATA_BLOCKED")
+        self.assertEqual(
+            raw_proof["decision_known_at"],
+            days[-1].replace(hour=12).isoformat(sep=" "),
+        )
+
+    def test_verified_upper_and_turnover_use_frozen_v4_and_allow_safe_bar(self):
+        days = pd.date_range("2026-07-24", periods=21, freq="B")
+        source = pd.DataFrame([
+            {
+                "stock_code": "000001",
+                "trade_date": day.date(),
+                "open": 10,
+                "high": 10.1,
+                "low": 9.9,
+                "close": 10,
+                "volume": 1000,
+                "amount": 10000,
+                "pre_close": 10,
+                "turnover_ratio": None,
+                "data_source": "gj_big_qmt_inner",
+                "batch_id": f"batch-{index}",
+                "data_version": f"version-{index}",
+                "quality_status": "QMT_ATTESTED",
+                "permission_status": "SUPPORTED",
+                "received_at": day.replace(hour=17),
+            }
+            for index, day in enumerate(days)
+        ])
+        target = days[-1].date().isoformat()
+        decision = days[-1].replace(hour=18, minute=50).to_pydatetime()
+        turnover_proof = build_turnover_evidence({
+            "status": "PASS",
+            "stock_code": "000001",
+            "trade_date": target,
+            "decision_known_at": decision.isoformat(sep=" "),
+            "source_table": "st_market_field_capture_row",
+            "formula": TURNOVER_DIRECT_FORMULA,
+            "volume": "1000",
+            "turnover_ratio": "2.00",
+            "provider": "eastmoney.push2his.kline",
+            "transport_contract": "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1",
+            "resolved_endpoint": "push2his.eastmoney.com:443:61.129.129.48",
+            "source_field": "f61",
+            "unit": "PERCENT",
+            "source_trade_date": target,
+            "captured_at": days[-1].replace(hour=18).isoformat(sep=" "),
+            "provider_http_date": days[-1].replace(hour=10).strftime(
+                "%a, %d %b %Y %H:%M:%S GMT"
+            ),
+            "snapshot_run_id": "1" * 32,
+            "collector_build_sha": "a" * 40,
+            "collector_binary_sha256": "b" * 64,
+            "authority_proof_kind": "QMT_DAILY_MARKET_TRUTH",
+            "authority_proof_identity": "qmt-daily-truth-run-1",
+            "authority_proof_sha256": "c" * 64,
+            "authority_set_sha256": "d" * 64,
+            "raw_payload_sha256": "2" * 64,
+            "snapshot_row_sha256": "3" * 64,
+            "snapshot_semantic_sha256": "4" * 64,
+            "source_open": "10.00", "source_high": "10.10",
+            "source_low": "9.90", "source_close": "10.00",
+            "source_volume_shares": "1000",
+            "qmt_open": "10.00", "qmt_high": "10.10",
+            "qmt_low": "9.90", "qmt_close": "10.00",
+            "qmt_volume_shares": "1000",
+            "qmt_received_at": days[-1].replace(hour=17).isoformat(sep=" "),
+            "qmt_data_source": "gj_big_qmt_inner",
+            "qmt_batch_id": "batch-20", "qmt_data_version": "version-20",
+            "qmt_quality_status": "QMT_ATTESTED",
+            "qmt_permission_status": "SUPPORTED",
+        })
+        upper_proof = build_upper_limit_evidence({
+            "status": "PASS", "stock_code": "000001",
+            "trade_date": target,
+            "window_start_date": days[0].date().isoformat(),
+            "window_end_date": target,
+            "decision_known_at": decision.isoformat(sep=" "),
+            "captured_at": days[-1].replace(hour=18).isoformat(sep=" "),
+            "source_table": "st_market_field_capture_row",
+            "capture_kind": "DAILY_UPPER_LIMIT_HISTORY",
+            "provider": "myquant.gm.get_history_instruments",
+            "source_field": "upper_limit", "unit": "PRICE_CNY",
+            "transport_contract": "MYQUANT_GM_SDK_FIXED_ACTION_V1",
+            "entitlement_status": "SUPPORTED", "timezone": "Asia/Shanghai",
+            "expected_stock_count": 1, "expected_date_count": 21,
+            "snapshot_run_id": "5" * 32,
+            "subject_identity": f"{target}:fixture",
+            "subject_sha256": "6" * 64, "code_set_sha256": "7" * 64,
+            "trade_dates_sha256": "8" * 64,
+            "calendar_batch_id": "calendar-batch-1",
+            "calendar_manifest_sha256": "f" * 64,
+            "calendar_session_set_sha256": "0" * 64,
+            "expected_keyset_sha256": "9" * 64,
+            "snapshot_semantic_sha256": "a" * 64,
+            "stock_rows_sha256": "b" * 64,
+            "provider_response_sha256": "c" * 64,
+            "canonical_request_sha256": "d" * 64,
+            "worker_sha256": "e" * 64,
+            "sdk_version": "3.0.114", "python_version": "3.6.8",
+        })
+        with patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=source,
+        ), patch(
+            "biz.analysis.sync_analysis_fast.load_verified_turnover_evidence",
+            return_value={
+                "000001": {
+                    "turnover_ratio": Decimal("2.00"),
+                    "turnover_evidence_json": turnover_proof,
+                }
+            },
+        ):
+            result = _load_canonical_chase_risk_evidence(
+                object(),
+                start_date=days[0].date().isoformat(),
+                trade_date=target,
+                decision_known_at=decision,
+                upper_limit_evidence={
+                    "000001": {
+                        "upper_limits": {
+                            day.date().isoformat(): Decimal("11.00")
+                            for day in days
+                        },
+                        "upper_limit_evidence_json": upper_proof,
+                    }
+                },
+            ).iloc[0]
+
+        self.assertEqual(result["chase_evidence_status"], "ALLOW")
+        self.assertEqual(result["chase_effective_streak"], 0)
+        self.assertEqual(result["chase_no_capacity"], 0)
+
+    def test_top80_wiring_refreshes_exact_upper_map_and_empty_map_stays_blocked(self):
+        codes = [f"{number:06d}" for number in range(1, 81)]
+        scored = pd.DataFrame({
+            "stock_code": codes,
+            "chase_evidence_status": ["DATA_BLOCKED"] * 80,
+        })
+        preliminary = [
+            {
+                "stock_code": code,
+                "chase_bar_window_root_sha256": f"{index + 1:064x}",
+            }
+            for index, code in enumerate(codes)
+        ]
+        upper_map = {code: {"proof": code} for code in codes}
+        refreshed = pd.DataFrame({
+            "stock_code": codes,
+            "turnover_ratio_effective": [2.0] * 80,
+            "chase_evidence_status": ["ALLOW"] * 80,
+            "chase_bar_window_root_sha256": [
+                f"{index + 1:064x}" for index in range(80)
+            ],
+        })
+        with patch(
+            "biz.analysis.sync_analysis_fast.build_recommendation_rows",
+            return_value=preliminary,
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "build_preliminary_upper_subject_receipt",
+            return_value={"receipt_sha256": "f" * 64},
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "validate_preliminary_upper_subject_receipt",
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "load_latest_verified_upper_limit_evidence",
+            return_value=upper_map,
+        ) as loader, patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-21", "2026-07-24"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "_load_canonical_chase_risk_evidence",
+            return_value=refreshed,
+        ) as chase_loader, patch(
+            "biz.analysis.sync_analysis_fast._build_text_fields",
+            side_effect=lambda frame, **_kwargs: frame,
+        ):
+            result = _refresh_exact_upper_limit_execution_evidence(
+                engine=object(), scored=scored,
+                trade_date="2026-08-21",
+                decision_at="2026-08-27 18:50:00",
+                top_n=80, min_score=62.0, flow_date="2026-08-21",
+                publisher_build_sha="b" * 40,
+            )
+
+        self.assertEqual(result["chase_risk_status"].tolist(), ["ALLOW"] * 80)
+        self.assertEqual(result["ordinary_buy_eligible"].tolist(), [1] * 80)
+        self.assertEqual(
+            loader.call_args.kwargs["stock_codes"], codes
+        )
+        self.assertEqual(
+            loader.call_args.kwargs["preliminary_receipt_sha256"],
+            "f" * 64,
+        )
+        self.assertIs(
+            chase_loader.call_args.kwargs["upper_limit_evidence"], upper_map
+        )
+
+        drifted = refreshed.copy()
+        drifted.loc[0, "chase_bar_window_root_sha256"] = "f" * 64
+        with patch(
+            "biz.analysis.sync_analysis_fast.build_recommendation_rows",
+            return_value=preliminary,
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "build_preliminary_upper_subject_receipt",
+            return_value={"receipt_sha256": "f" * 64},
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "validate_preliminary_upper_subject_receipt",
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "load_latest_verified_upper_limit_evidence",
+            return_value=upper_map,
+        ), patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-21", "2026-07-24"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "_load_canonical_chase_risk_evidence",
+            return_value=drifted,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "chase bar evidence changed"
+            ):
+                _refresh_exact_upper_limit_execution_evidence(
+                    engine=object(), scored=scored,
+                    trade_date="2026-08-21",
+                    decision_at="2026-08-27 18:50:00",
+                    top_n=80, min_score=62.0, flow_date="2026-08-21",
+                    publisher_build_sha="b" * 40,
+                )
+
+        with patch(
+            "biz.analysis.sync_analysis_fast.build_recommendation_rows",
+            return_value=preliminary,
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "build_preliminary_upper_subject_receipt",
+            return_value={"receipt_sha256": "f" * 64},
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "validate_preliminary_upper_subject_receipt",
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "load_latest_verified_upper_limit_evidence",
+            return_value={},
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "_load_canonical_chase_risk_evidence",
+        ) as blocked_chase:
+            unchanged = _refresh_exact_upper_limit_execution_evidence(
+                engine=object(), scored=scored,
+                trade_date="2026-08-21",
+                decision_at="2026-08-27 18:50:00",
+                top_n=80, min_score=62.0, flow_date="2026-08-21",
+                publisher_build_sha="b" * 40,
+            )
+        self.assertIs(unchanged, scored)
+        blocked_chase.assert_not_called()
+
+    def test_projection_threshold_values_match_frozen_v4_policy(self):
+        self.assertEqual(
+            ChaseRiskPolicy().__dict__,
+            FrozenV4ChaseRiskPolicy().__dict__,
+        )
+
+    def test_production_chase_assessment_matches_frozen_v4(self):
+        instrument = "000001"
+        start = datetime(2026, 7, 24, 15, 0, tzinfo=timezone.utc)
+
+        for limit_sessions in (set(), {15, 16, 17}):
+            with self.subTest(limit_sessions=sorted(limit_sessions)):
+                frozen_records = []
+                production_bars = []
+                previous = Decimal("10")
+                for index in range(21):
+                    event_time = start + timedelta(days=index)
+                    is_limit = index in limit_sessions
+                    close = (
+                        previous * Decimal("1.10")
+                        if is_limit
+                        else previous
+                    )
+                    open_price = previous
+                    high = close if is_limit else close + Decimal("0.10")
+                    low = min(open_price, close) - Decimal("0.10")
+                    upper_limit = (
+                        close if is_limit else previous * Decimal("1.10")
+                    )
+                    knowledge_time = event_time + timedelta(minutes=10)
+                    payload = {
+                        "instrument": instrument,
+                        "trade_date": event_time.date().isoformat(),
+                        "open": open_price,
+                        "high": high,
+                        "low": low,
+                        "close": close,
+                        "previous_close": previous,
+                        "volume": Decimal("1000000"),
+                        "amount": Decimal("1000000") * close,
+                        "upper_limit": upper_limit,
+                        "turnover_pct": Decimal("10"),
+                        "is_suspended": False,
+                    }
+                    record_id = f"bar-{index:03d}"
+                    frozen_records.append(AsOfRecord(
+                        record_id=record_id,
+                        source="canonical-parity-fixture",
+                        event_time=event_time,
+                        knowledge_time=knowledge_time,
+                        ingested_at=knowledge_time,
+                        received_at=knowledge_time,
+                        payload=payload,
+                        quality_status=QualityStatus.PASS,
+                    ))
+                    production_bars.append(CanonicalChaseBar(
+                        record_id=record_id,
+                        instrument=instrument,
+                        session=event_time.date(),
+                        knowledge_time=knowledge_time,
+                        open=open_price,
+                        high=high,
+                        low=low,
+                        close=close,
+                        previous_close=previous,
+                        volume=Decimal("1000000"),
+                        amount=Decimal("1000000") * close,
+                        upper_limit=upper_limit,
+                        turnover_pct=Decimal("10"),
+                    ))
+                    previous = close
+
+                cutoff = frozen_records[-1].knowledge_time
+                frozen = assess_frozen_v4_chase_risk(
+                    AsOfDataset(
+                        dataset_name="canonical-parity-fixture",
+                        as_of=cutoff,
+                        records=tuple(frozen_records),
+                        quality_status=QualityStatus.PASS,
+                    ),
+                    instrument=instrument,
+                    cutoff=cutoff,
+                )
+                production = assess_production_chase_risk(
+                    tuple(production_bars),
+                    instrument=instrument,
+                    cutoff=cutoff,
+                )
+                for field_name in (
+                    "bar_count",
+                    "surge_streak",
+                    "limit_streak",
+                    "peak_streak",
+                    "recent_peak_streak",
+                    "sessions_since_peak",
+                    "drawdown_from_peak_pct",
+                    "cooldown_active",
+                    "zero_volume",
+                    "one_price_limit_up",
+                    "has_verified_capacity",
+                    "no_capacity",
+                    "return_1d_pct",
+                    "return_5d_pct",
+                    "return_20d_pct",
+                    "ma5",
+                    "ma20",
+                    "atr14",
+                    "ma5_extension_pct",
+                    "ma20_extension_pct",
+                    "atr14_pct",
+                    "ma5_extension_atr",
+                    "ma20_extension_atr",
+                    "gap_pct",
+                    "crowding_detected",
+                    "extreme_extension",
+                    "ordinary_buy_eligible",
+                    "missing_fields",
+                    "reason_codes",
+                ):
+                    self.assertEqual(
+                        getattr(production, field_name),
+                        getattr(frozen, field_name),
+                        field_name,
+                    )
+                self.assertEqual(
+                    production.candidate_status,
+                    frozen.candidate_status.value,
+                )
+                self.assertEqual(
+                    production.quality_status,
+                    frozen.quality_status.value,
+                )
+
+    def test_executable_pool_requires_all_four_gates(self):
+        base = {
+            "recommend_status": "ALLOW",
+            "signal_status": "BUY_READY",
+            "chase_risk_status": "ALLOW",
+            "ordinary_buy_eligible": 1,
+        }
+        self.assertTrue(is_executable_recommendation(base))
+        for field, blocked in (
+            ("recommend_status", "SUSPENDED"),
+            ("signal_status", "WATCH"),
+            ("chase_risk_status", "BLOCK"),
+            ("ordinary_buy_eligible", 0),
+        ):
+            with self.subTest(field=field):
+                self.assertFalse(
+                    is_executable_recommendation({**base, field: blocked})
+                )
+
+    def test_preliminary_top80_uses_stable_stock_code_tie_breaker(self):
+        rows = []
+        for number in range(81, 0, -1):
+            rows.append({
+                "stock_code": f"{number:06d}",
+                "recommend_status": "ALLOW",
+                "signal_status": "BUY_READY",
+                "main_wave_signal": "",
+                "event_risk_level": "LOW",
+                "quality_score": 70.0,
+                "final_trade_score": 70.0,
+                "main_wave_score": 70.0,
+                "entry_score": 70.0,
+                "capital_score": 70.0,
+                "ai_score": 70.0,
+                "short_term_score": 70.0,
+                "long_term_score": 70.0,
+            })
+
+        selected = build_recommendation_rows(
+            pd.DataFrame(rows),
+            "2026-08-27",
+            top_n=80,
+            min_score=62.0,
+        )
+
+        self.assertEqual(
+            [row["stock_code"] for row in selected],
+            [f"{number:06d}" for number in range(1, 81)],
+        )
+
     def test_flow_features_keep_only_exact_target_rows_per_stock(self):
         source = pd.DataFrame([
             {
@@ -33,6 +636,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 "lg_net_inflow": 2,
                 "mid_net_inflow": 3,
                 "sm_net_inflow": 4,
+                "etl_sync_at": "2026-08-25 17:30:00",
             },
             {
                 "stock_code": "1",
@@ -42,6 +646,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 "lg_net_inflow": 3,
                 "mid_net_inflow": 4,
                 "sm_net_inflow": 5,
+                "etl_sync_at": "2026-08-26 17:30:00",
             },
             {
                 "stock_code": "2",
@@ -51,21 +656,67 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 "lg_net_inflow": 4,
                 "mid_net_inflow": 5,
                 "sm_net_inflow": 6,
+                "etl_sync_at": "2026-08-25 17:30:00",
             },
         ])
+        observed = {}
+
+        def read_sql(statement, _engine, params):
+            observed["sql"] = str(statement)
+            observed["params"] = dict(params)
+            return source
+
         with patch(
             "biz.analysis.sync_analysis_fast._recent_dates",
             return_value=["2026-08-26", "2026-08-25"],
         ), patch(
             "biz.analysis.sync_analysis_fast.pd.read_sql",
-            return_value=source,
+            side_effect=read_sql,
         ):
-            frame, flow_date = load_flow_features(object(), "2026-08-26")
+            frame, flow_date = load_flow_features(
+                object(),
+                "2026-08-26",
+                decision_known_at="2026-08-26 18:50:00",
+            )
 
         self.assertEqual(flow_date, "2026-08-26")
         self.assertEqual(frame["stock_code"].tolist(), ["000001"])
         self.assertEqual(str(frame.iloc[0]["flow_trade_date"]), "2026-08-26")
         self.assertEqual(frame.iloc[0]["main_net_inflow_5d"], 30)
+        self.assertIn("etl_sync_at <= :decision_known_at", observed["sql"])
+        self.assertIn(
+            "etl_sync_at >= TIMESTAMP(trade_date, '15:10:00')",
+            observed["sql"],
+        )
+        self.assertEqual(
+            observed["params"]["decision_known_at"],
+            datetime(2026, 8, 26, 18, 50),
+        )
+
+    def test_flow_features_reject_preclose_target_partition(self):
+        source = pd.DataFrame([{
+            "stock_code": "1",
+            "trade_date": "2026-08-27",
+            "main_net_inflow": 10,
+            "max_net_inflow": 1,
+            "lg_net_inflow": 2,
+            "mid_net_inflow": 3,
+            "sm_net_inflow": 4,
+            "etl_sync_at": "2026-08-27 14:22:00",
+        }])
+        with patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-27"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=source,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "post-close PIT"):
+                load_flow_features(
+                    object(),
+                    "2026-08-27",
+                    decision_known_at="2026-08-27 18:50:00",
+                )
 
     def test_flow_quality_uses_each_stock_date_and_accepts_exact_zero(self):
         _, exact_flags = build_data_quality(
@@ -190,15 +841,49 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(frame["stock_code"].tolist(), ["000003"])
         self.assertEqual(frame["source_flag"].tolist(), ["east_sina"])
 
+    def test_formal_decision_disables_mutable_unversioned_learning_inputs(self):
+        decision_at = datetime(2026, 8, 26, 18, 50)
+        with patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=AssertionError("formal PIT path must not read mutable history"),
+        ) as read_sql, patch(
+            "biz.analysis.sync_analysis_fast._table_exists",
+            side_effect=AssertionError("formal PIT path must not inspect mutable history"),
+        ) as table_exists, patch(
+            "biz.analysis.sync_analysis_fast._validate_learning_tables",
+            side_effect=AssertionError("formal PIT path must not inspect failure history"),
+        ) as validate_learning:
+            hot, hot_date = load_hot_rank(
+                object(),
+                "2026-08-26",
+                decision_at=decision_at,
+            )
+            confidence = load_confidence_features(
+                object(),
+                "2026-08-26",
+                decision_at=decision_at,
+            )
+            recommendations = load_recommendation_history(
+                object(),
+                "2026-08-26",
+                decision_at=decision_at,
+            )
+            failures = load_failure_features(
+                object(),
+                "2026-08-26",
+                decision_at=decision_at,
+            )
+
+        self.assertTrue(hot.empty)
+        self.assertEqual(hot_date, "")
+        self.assertTrue(confidence.empty)
+        self.assertTrue(recommendations.empty)
+        self.assertTrue(failures.empty)
+        read_sql.assert_not_called()
+        table_exists.assert_not_called()
+        validate_learning.assert_not_called()
+
     def test_sector_membership_prefers_complete_immutable_snapshot(self):
-        run = pd.DataFrame([
-            {
-                "snapshot_date": "2026-08-11",
-                "source": "QMT_LOCAL",
-                "industry_relation_count": 2,
-            }
-        ])
-        evidence = pd.DataFrame([{"relation_count": 2}])
         memberships = pd.DataFrame([
             {"stock_code": "000001", "industry_name": "Bank"},
             {"stock_code": "000002", "industry_name": "AI"},
@@ -208,7 +893,25 @@ class SyncAnalysisFastTest(unittest.TestCase):
             "biz.analysis.sync_analysis_fast._table_exists", return_value=True
         ), patch(
             "biz.analysis.sync_analysis_fast.pd.read_sql",
-            side_effect=[run, evidence, memberships],
+            return_value=memberships,
+        ), patch(
+            "integrations.bigqmt.membership_snapshot."
+            "verify_existing_membership_snapshot",
+            return_value={
+                "snapshot_date": "2026-08-11",
+                "source": "gj_big_qmt_inner",
+                "quality_status": "QMT_VALIDATED",
+                "capture_mode": "qmt_close_full_refresh",
+                "captured_at": "2026-08-11 15:12:00",
+                "concept_count": 500,
+                "concept_relation_count": 30000,
+                "concept_stock_count": 3000,
+                "concept_hash": "a" * 64,
+                "industry_count": 20,
+                "industry_relation_count": 5000,
+                "industry_stock_count": 4500,
+                "industry_hash": "b" * 64,
+            },
         ):
             result = _load_sector_industry_memberships(object(), "2026-08-11")
 
@@ -216,6 +919,63 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(
             result.set_index("stock_code").loc["000002", "industry_name"],
             "AI",
+        )
+        self.assertEqual(
+            result["industry_snapshot_source"].unique().tolist(),
+            ["gj_big_qmt_inner"],
+        )
+
+    def test_sector_rotation_filters_kline_and_flow_by_decision_cutoff(self):
+        memberships = pd.DataFrame([{
+            "stock_code": "000001",
+            "industry_name": "Bank",
+            "industry_snapshot_date": "2026-08-26",
+            "industry_snapshot_source": "gj_big_qmt_inner",
+        }])
+        observations = pd.DataFrame([{
+            "stock_code": "000001",
+            "trade_date": "2026-08-26",
+            "change_pct": 1.0,
+            "amount": 1000,
+            "main_net_inflow": 10,
+            "flow_etl_sync_at": "2026-08-26 17:30:00",
+        }])
+        observed = {}
+
+        def read_sql(statement, _engine, params):
+            observed["sql"] = str(statement)
+            observed["params"] = dict(params)
+            return observations
+
+        with patch(
+            "biz.analysis.sync_analysis_fast._load_sector_industry_memberships",
+            return_value=memberships,
+        ), patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-26"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast._table_exists",
+            return_value=True,
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=read_sql,
+        ):
+            result = load_sector_rotation_features(
+                object(),
+                "2026-08-26",
+                decision_known_at="2026-08-26 18:50:00",
+            )
+
+        self.assertEqual(result["stock_code"].tolist(), ["000001"])
+        self.assertIn("k.received_at <= :decision_known_at", observed["sql"])
+        self.assertIn("f.etl_sync_at <= :decision_known_at", observed["sql"])
+        self.assertIn(
+            "f.etl_sync_at >= TIMESTAMP(f.trade_date, '15:10:00')",
+            observed["sql"],
+        )
+        self.assertEqual(
+            observed["params"]["decision_known_at"],
+            datetime(2026, 8, 26, 18, 50),
         )
 
     def test_clamp_score_handles_invalid_values(self):
@@ -533,6 +1293,33 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(progress_events[0]["stage"], "load_kline")
         self.assertEqual(progress_events[-1]["stage"], "done")
         self.assertEqual(progress_events[-1]["analysis_count"], 0)
+
+    def test_publication_requires_exact_decision_time_before_any_input_read(self):
+        from biz.analysis.sync_analysis_fast import run_batch
+
+        identity = {
+            "publication_run_uid": "a" * 32,
+            "publisher_task_type": "analysis_fast",
+            "publisher_build_sha": "b" * 40,
+        }
+        with patch(
+            "biz.analysis.sync_analysis_fast._prepare_batch_outputs"
+        ) as prepare:
+            with self.assertRaisesRegex(RuntimeError, "execution time"):
+                run_batch(
+                    object(),
+                    trade_date="2026-08-27",
+                    execution_time=None,
+                    **identity,
+                )
+            with self.assertRaisesRegex(RuntimeError, "execution time"):
+                run_batch(
+                    object(),
+                    trade_date="2026-08-27",
+                    execution_time="2026-08-27T10:50:00+00:00",
+                    **identity,
+                )
+        prepare.assert_not_called()
 
     def test_strict_run_repairs_missing_qmt_kline_before_analysis(self):
         progress_events = []

@@ -11214,8 +11214,34 @@ def _submit_manual_recommended_stocks(
     refresh_realtime: bool,
     date_policy: str,
 ) -> dict:
-    """Submit one strict previous-day run through the production scheduler."""
+    """Reject the retired dynamic-cutoff publisher with a clear contract."""
     import uuid
+
+    # The executable pool is now one fixed daily publication: immutable
+    # turnover -> post-close flow -> signed preview -> exact upper-limit
+    # evidence -> 23:56 activation.  A button-time cutoff has no matching
+    # upper evidence and must never overwrite the verified ACTIVE partition.
+    if (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "")
+        .strip()
+        .lower()
+        == "production"
+    ):
+        return {
+            "accepted": False,
+            "status": "canonical_pool_managed_by_eod_pipeline",
+            "date": str(trade_date or "")[:10],
+            "job_id": "",
+            "run_uid": "",
+            "strict_prev_trade_day": True,
+            "refresh_realtime": False,
+            "use_intraday_current": False,
+            "next_refresh_time": "23:56 Asia/Shanghai",
+            "error": (
+                "正式策略票池由每日23:56固定PIT流水线生成；手动动态截止"
+                "重算已停用，以免覆盖已验证票池。"
+            ),
+        }
 
     try:
         execution_iso = _manual_recommendation_execution_time(execution_time)

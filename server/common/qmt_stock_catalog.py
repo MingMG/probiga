@@ -450,6 +450,35 @@ def stock_catalog_trigger_ddl_statements() -> tuple[str, ...]:
     return stock_catalog_schema_statements()[9:]
 
 
+def _normalized_trigger_body(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).replace("`", "").lower()
+
+
+def _expected_trigger_contracts() -> dict[str, tuple[str, str, str]]:
+    contracts: dict[str, tuple[str, str, str]] = {}
+    pattern = re.compile(
+        r"^CREATE TRIGGER(?: IF NOT EXISTS)?\s+`?([^`\s]+)`?\s+"
+        r"BEFORE\s+(INSERT|UPDATE|DELETE)\s+ON\s+`?([^`\s]+)`?\s+"
+        r"FOR EACH ROW\s+(.*)$",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for statement in stock_catalog_trigger_ddl_statements():
+        matched = pattern.match(statement.strip())
+        if matched is None:
+            raise RuntimeError("QMT stock catalog trigger DDL is unparsable")
+        name, event, table_name, body = matched.groups()
+        if name in contracts:
+            raise RuntimeError("QMT stock catalog trigger DDL inventory differs")
+        contracts[name] = (
+            table_name.lower(),
+            event.upper(),
+            _normalized_trigger_body(body),
+        )
+    if set(contracts) != set(_IMMUTABILITY_TRIGGERS):
+        raise RuntimeError("QMT stock catalog trigger DDL inventory differs")
+    return contracts
+
+
 def privileged_migrate_stock_catalog_schema(
     engine: Any,
     *,
@@ -468,6 +497,18 @@ def privileged_migrate_stock_catalog_schema(
     if trigger_ddl_executor is not None and not callable(trigger_ddl_executor):
         raise TypeError("trigger_ddl_executor must be callable")
 
+    repair_statements = tuple(
+        f"DROP TRIGGER IF EXISTS `{name}`"
+        for name in _expected_trigger_contracts()
+    )
+    if install_triggers:
+        if trigger_ddl_executor is None:
+            with engine.begin() as connection:
+                for statement in repair_statements:
+                    connection.execute(text(statement))
+        else:
+            for statement in repair_statements:
+                trigger_ddl_executor(statement)
     with engine.begin() as connection:
         for statement in (
             *stock_catalog_table_ddl_statements(),
@@ -518,6 +559,7 @@ def ensure_stock_catalog_tables(engine: Any) -> dict[str, Any]:
 
 
 def validate_stock_catalog_immutability(connection: Any) -> None:
+    expected = _expected_trigger_contracts()
     rows = connection.execute(text("""
         SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, EVENT_MANIPULATION, ACTION_TIMING,
                ACTION_STATEMENT
@@ -534,9 +576,9 @@ def validate_stock_catalog_immutability(connection: Any) -> None:
         str(row.get("TRIGGER_NAME") or row.get("trigger_name") or ""): row
         for row in rows
     }
-    if set(observed) != set(_IMMUTABILITY_TRIGGERS):
+    if set(observed) != set(expected):
         raise RuntimeError("QMT stock catalog append-only triggers are incomplete")
-    for name, (table_name, event) in _IMMUTABILITY_TRIGGERS.items():
+    for name, (table_name, event, action_body) in expected.items():
         row = observed[name]
         actual_table = str(
             row.get("EVENT_OBJECT_TABLE") or row.get("event_object_table") or ""
@@ -547,15 +589,16 @@ def validate_stock_catalog_immutability(connection: Any) -> None:
         timing = str(
             row.get("ACTION_TIMING") or row.get("action_timing") or ""
         ).upper()
-        action = str(
-            row.get("ACTION_STATEMENT") or row.get("action_statement") or ""
-        ).upper()
         if (
             actual_table != table_name
             or actual_event != event
             or timing != "BEFORE"
-            or re.search(r"SIGNAL SQLSTATE(?: VALUE)? '45000'", action) is None
-            or "APPEND-ONLY" not in action
+            or _normalized_trigger_body(
+                row.get("ACTION_STATEMENT")
+                or row.get("action_statement")
+                or ""
+            )
+            != action_body
         ):
             raise RuntimeError("QMT stock catalog append-only trigger differs")
 

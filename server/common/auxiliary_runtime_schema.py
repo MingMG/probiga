@@ -9,6 +9,7 @@ the matching ``validate_*`` functions before publishing data.
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -162,6 +163,15 @@ QMT_MEMBERSHIP_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         }
     ),
 }
+
+QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES = (
+    "trg_qmt_membership_run_no_update",
+    "trg_qmt_membership_run_no_delete",
+    "trg_qmt_membership_concept_no_update",
+    "trg_qmt_membership_concept_no_delete",
+    "trg_qmt_membership_industry_no_update",
+    "trg_qmt_membership_industry_no_delete",
+)
 
 
 _MARKET_OVERVIEW_DDL = """
@@ -351,6 +361,152 @@ _QMT_MEMBERSHIP_DDL = (
     """,
 )
 
+_QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_DDL = (
+    """
+    CREATE TRIGGER `trg_qmt_membership_run_no_update`
+    BEFORE UPDATE ON `qmt_membership_snapshot_run`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_membership_snapshot_run is append-only'
+    """,
+    """
+    CREATE TRIGGER `trg_qmt_membership_run_no_delete`
+    BEFORE DELETE ON `qmt_membership_snapshot_run`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_membership_snapshot_run is append-only'
+    """,
+    """
+    CREATE TRIGGER `trg_qmt_membership_concept_no_update`
+    BEFORE UPDATE ON `qmt_concept_member_snapshot`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_concept_member_snapshot is append-only'
+    """,
+    """
+    CREATE TRIGGER `trg_qmt_membership_concept_no_delete`
+    BEFORE DELETE ON `qmt_concept_member_snapshot`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_concept_member_snapshot is append-only'
+    """,
+    """
+    CREATE TRIGGER `trg_qmt_membership_industry_no_update`
+    BEFORE UPDATE ON `qmt_industry_member_snapshot`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_industry_member_snapshot is append-only'
+    """,
+    """
+    CREATE TRIGGER `trg_qmt_membership_industry_no_delete`
+    BEFORE DELETE ON `qmt_industry_member_snapshot`
+    FOR EACH ROW
+    SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT='qmt_industry_member_snapshot is append-only'
+    """,
+)
+
+
+def qmt_membership_trigger_ddl_statements() -> tuple[str, ...]:
+    """Return the exact six CREATE statements consumed by the release broker."""
+
+    return tuple(_QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_DDL)
+
+
+def _normalized_qmt_membership_trigger_body(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "")).replace("`", "").lower()
+
+
+def _expected_qmt_membership_trigger_contracts() -> dict[str, tuple[str, str, str]]:
+    """Derive the complete runtime contract from the privileged DDL."""
+
+    contracts: dict[str, tuple[str, str, str]] = {}
+    pattern = re.compile(
+        r"^CREATE TRIGGER\s+`?([^`\s]+)`?\s+"
+        r"BEFORE\s+(UPDATE|DELETE)\s+ON\s+`?([^`\s]+)`?\s+"
+        r"FOR EACH ROW\s+(.*)$",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for statement in _QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_DDL:
+        matched = pattern.match(statement.strip())
+        if matched is None:
+            raise RuntimeError("QMT membership trigger DDL is unparsable")
+        name, event, table_name, action_statement = matched.groups()
+        if name in contracts:
+            raise RuntimeError("QMT membership trigger DDL inventory differs")
+        contracts[name] = (
+            table_name.lower(),
+            event.upper(),
+            _normalized_qmt_membership_trigger_body(action_statement),
+        )
+    if set(contracts) != set(QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES):
+        raise RuntimeError("QMT membership trigger DDL inventory differs")
+    return contracts
+
+
+def validate_qmt_membership_snapshot_immutability(connection) -> None:
+    """Attest the exact six-trigger append-only contract on MySQL."""
+
+    expected = _expected_qmt_membership_trigger_contracts()
+    tables = tuple(sorted(QMT_MEMBERSHIP_REQUIRED_COLUMNS))
+    placeholders = ", ".join(
+        f":membership_table_{index}" for index in range(len(tables))
+    )
+    rows = connection.execute(
+        text(
+            "SELECT TRIGGER_NAME, EVENT_OBJECT_TABLE, EVENT_MANIPULATION, "
+            "ACTION_TIMING, ACTION_ORIENTATION, ACTION_STATEMENT "
+            "FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA=DATABASE() AND EVENT_OBJECT_TABLE IN "
+            f"({placeholders})"
+        ),
+        {
+            f"membership_table_{index}": table_name
+            for index, table_name in enumerate(tables)
+        },
+    ).mappings().all()
+    observed = {
+        str(row.get("TRIGGER_NAME") or row.get("trigger_name") or ""): row
+        for row in rows
+    }
+    if len(rows) != len(expected) or set(observed) != set(expected):
+        raise RuntimeError("QMT membership append-only trigger inventory differs")
+    for name, (table_name, event, action_statement) in expected.items():
+        row = observed[name]
+        if (
+            str(
+                row.get("EVENT_OBJECT_TABLE")
+                or row.get("event_object_table")
+                or ""
+            ).lower()
+            != table_name
+            or str(
+                row.get("EVENT_MANIPULATION")
+                or row.get("event_manipulation")
+                or ""
+            ).upper()
+            != event
+            or str(
+                row.get("ACTION_TIMING") or row.get("action_timing") or ""
+            ).upper()
+            != "BEFORE"
+            or str(
+                row.get("ACTION_ORIENTATION")
+                or row.get("action_orientation")
+                or ""
+            ).upper()
+            != "ROW"
+            or _normalized_qmt_membership_trigger_body(
+                row.get("ACTION_STATEMENT")
+                or row.get("action_statement")
+                or ""
+            )
+            != action_statement
+        ):
+            raise RuntimeError(
+                f"QMT membership append-only trigger contract differs: {name}"
+            )
+
 
 def validate_market_overview_daily_runtime_schema(engine) -> dict[str, Any]:
     return validate_required_table_surface(
@@ -423,13 +579,40 @@ def validate_si_all_index_code_runtime_schema(engine) -> dict[str, Any]:
     )
 
 
-def validate_qmt_membership_snapshot_runtime_schema(engine) -> dict[str, Any]:
-    return validate_required_table_surface(
+def validate_qmt_membership_snapshot_runtime_schema(
+    engine,
+    *,
+    require_triggers: bool = True,
+) -> dict[str, Any]:
+    if type(require_triggers) is not bool:
+        raise TypeError("require_triggers must be bool")
+    surface = validate_required_table_surface(
         engine,
         QMT_MEMBERSHIP_REQUIRED_COLUMNS,
         context="BigQMT membership snapshot",
         required_columns=QMT_MEMBERSHIP_REQUIRED_COLUMNS,
     )
+    dialect = str(
+        getattr(getattr(engine, "dialect", None), "name", "") or ""
+    ).lower()
+    if dialect != "mysql" or not require_triggers:
+        return {
+            **surface,
+            "trigger_names": QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES,
+            "append_only_verified": False,
+            "immutability_validation_skipped": (
+                "release_broker_pending"
+                if dialect == "mysql"
+                else dialect or "non_mysql"
+            ),
+        }
+    with engine.connect() as connection:
+        validate_qmt_membership_snapshot_immutability(connection)
+    return {
+        **surface,
+        "trigger_names": QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES,
+        "append_only_verified": True,
+    }
 
 
 def _privileged_create(engine, statements: tuple[str, ...]) -> None:
@@ -478,16 +661,42 @@ def privileged_migrate_si_all_index_code_schema(engine) -> dict[str, Any]:
     }
 
 
-def privileged_migrate_qmt_membership_snapshot_schema(engine) -> dict[str, Any]:
+def privileged_migrate_qmt_membership_snapshot_schema(
+    engine,
+    *,
+    install_triggers: bool = False,
+) -> dict[str, Any]:
+    if type(install_triggers) is not bool:
+        raise TypeError("install_triggers must be bool")
+    if install_triggers:
+        raise RuntimeError(
+            "QMT membership triggers require the frozen release broker"
+        )
     _privileged_create(engine, _QMT_MEMBERSHIP_DDL)
     return {
-        **validate_qmt_membership_snapshot_runtime_schema(engine),
+        **validate_qmt_membership_snapshot_runtime_schema(
+            engine,
+            require_triggers=False,
+        ),
+        "triggers_installed": False,
+        "trigger_installation": "FROZEN_RELEASE_BROKER_REQUIRED",
         "privileged_migration": True,
     }
 
 
-def privileged_migrate_auxiliary_runtime_schema(engine) -> dict[str, Any]:
+def privileged_migrate_auxiliary_runtime_schema(
+    engine,
+    *,
+    install_triggers: bool = False,
+) -> dict[str, Any]:
     """Prepare every auxiliary table inside the fenced release window."""
+
+    if type(install_triggers) is not bool:
+        raise TypeError("install_triggers must be bool")
+    if install_triggers:
+        raise RuntimeError(
+            "auxiliary runtime triggers require the frozen release broker"
+        )
 
     return {
         "market_overview": privileged_migrate_market_overview_daily_schema(engine),
@@ -498,14 +707,24 @@ def privileged_migrate_auxiliary_runtime_schema(engine) -> dict[str, Any]:
         "hot_rank_fusion": privileged_migrate_hot_rank_fusion_schema(engine),
         "si_all_index_code": privileged_migrate_si_all_index_code_schema(engine),
         "qmt_membership_snapshot": (
-            privileged_migrate_qmt_membership_snapshot_schema(engine)
+            privileged_migrate_qmt_membership_snapshot_schema(
+                engine,
+                install_triggers=False,
+            )
         ),
         "privileged_migration": True,
     }
 
 
-def validate_auxiliary_runtime_schema(engine) -> dict[str, Any]:
+def validate_auxiliary_runtime_schema(
+    engine,
+    *,
+    require_triggers: bool = True,
+) -> dict[str, Any]:
     """Validate every auxiliary runtime surface without persistent writes."""
+
+    if type(require_triggers) is not bool:
+        raise TypeError("require_triggers must be bool")
 
     return {
         "market_overview": validate_market_overview_daily_runtime_schema(engine),
@@ -516,7 +735,10 @@ def validate_auxiliary_runtime_schema(engine) -> dict[str, Any]:
         "hot_rank_fusion": validate_hot_rank_fusion_runtime_schema(engine),
         "si_all_index_code": validate_si_all_index_code_runtime_schema(engine),
         "qmt_membership_snapshot": (
-            validate_qmt_membership_snapshot_runtime_schema(engine)
+            validate_qmt_membership_snapshot_runtime_schema(
+                engine,
+                require_triggers=require_triggers,
+            )
         ),
         "read_only": True,
     }
@@ -526,9 +748,11 @@ __all__ = [
     "HOT_RANK_FUSION_REQUIRED_COLUMNS",
     "HOT_STATS_REQUIRED_COLUMNS",
     "MARKET_OVERVIEW_REQUIRED_COLUMNS",
+    "QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES",
     "QMT_MEMBERSHIP_REQUIRED_COLUMNS",
     "QMT_REALTIME_SYNC_RECEIPT_REQUIRED_COLUMNS",
     "SI_ALL_INDEX_CODE_REQUIRED_COLUMNS",
+    "qmt_membership_trigger_ddl_statements",
     "privileged_migrate_auxiliary_runtime_schema",
     "privileged_migrate_hot_rank_fusion_schema",
     "privileged_migrate_hot_stats_schema",
@@ -540,6 +764,7 @@ __all__ = [
     "validate_hot_stats_runtime_schema",
     "validate_hot_rank_fusion_runtime_schema",
     "validate_market_overview_daily_runtime_schema",
+    "validate_qmt_membership_snapshot_immutability",
     "validate_qmt_membership_snapshot_runtime_schema",
     "validate_qmt_realtime_sync_receipt_runtime_schema",
     "validate_si_all_index_code_runtime_schema",

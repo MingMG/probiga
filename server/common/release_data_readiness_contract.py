@@ -192,7 +192,13 @@ RELEASE_DATA_READINESS_TASK_TYPES = frozenset(
 # new release still has to replay them so both recommendation pools are built
 # only after the exact-build market inputs have converged.
 RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES = frozenset(
-    {"qmt_announcement_pit", "analysis_morning_strict"}
+    {
+        "qmt_announcement_pit",
+        "qmt_membership_snapshot",
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+        "analysis_morning_strict",
+    }
 )
 RELEASE_DATA_CATCHUP_TASK_TYPES = (
     RELEASE_DATA_READINESS_TASK_TYPES | RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
@@ -204,6 +210,8 @@ RELEASE_DATA_CATCHUP_TASK_TYPES = (
 RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
     {
         "analysis_fast",
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
         "alist_daily",
         "alist_info",
         "capital_flow_batch_fast",
@@ -221,6 +229,7 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "qmt_stock_minute_flow_canonical",
         "qmt_index_kline",
         "qmt_index_minute",
+        "qmt_membership_snapshot",
     }
 )
 
@@ -229,10 +238,20 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
 # exact-target classification so scheduler dispatch and the SELECT-only
 # readiness gate cannot disagree about when D-1 evidence rolls over to D.
 RELEASE_CATCHUP_CLOSED_TARGET_READY_TIMES = {
+    # Preserve the immutable analysis evidence windows during release replay.
+    # A new build may collect today's evidence only once each ordinary source
+    # window is final; it must never relabel a previous session after cutoff.
+    "target_turnover_snapshot": "15:50",
+    "analysis_upper_evidence_prepare": "23:40",
+    "analysis_fast": "23:55",
     "etf_forward_daily": "15:10",
     "sector_heat_east": "15:10",
     "alist_daily": "16:30",
     "alist_info": "16:30",
+    # The QMT-owning host publishes the immutable close snapshot at 15:12.
+    # Roll release verification one minute later so the read-only replay can
+    # never replace the ordinary publisher at its wall-clock deadline.
+    "qmt_membership_snapshot": "15:13",
 }
 
 
@@ -270,6 +289,13 @@ if not RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES <= RELEASE_DATA_CATCHUP_TASK_TYPE
 # acyclic and contains no live-order execution task.
 RELEASE_DATA_CATCHUP_DEPENDENCIES = {
     "alist_info": ("alist_daily",),
+    "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
+    "analysis_upper_evidence_prepare": (
+        "target_turnover_snapshot",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_stock_daily_canonical",
+    ),
     "qmt_stock_minute_flow_canonical": ("qmt_stock_daily_canonical",),
     "qmt_canonical_history_gap_repair": (
         "qmt_stock_daily_canonical",
@@ -291,6 +317,9 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "market_overview_daily",
     ),
     "analysis_fast": (
+        "analysis_upper_evidence_prepare",
+        "target_turnover_snapshot",
+        "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",

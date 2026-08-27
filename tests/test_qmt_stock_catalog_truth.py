@@ -23,6 +23,7 @@ from server.common.qmt_stock_catalog import (
     load_stock_catalog,
     privileged_migrate_stock_catalog_schema,
     ensure_stock_catalog_tables,
+    validate_stock_catalog_immutability,
     validate_catalog_manifest,
 )
 from server.common.qmt_trade_calendar import (
@@ -32,6 +33,7 @@ from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
     privileged_migrate_trade_calendar_schema,
     ensure_trade_calendar_tables,
+    validate_trade_calendar_immutability,
     validate_calendar_manifest,
 )
 from tools import attest_qmt_daily_kline as attester
@@ -309,37 +311,61 @@ def test_formal_calendar_without_build_identity_fails_before_database(
         )
 
 
+def _calendar_trigger_rows():
+    return [
+        {
+            "TRIGGER_NAME": name,
+            "EVENT_MANIPULATION": event,
+            "ACTION_TIMING": "BEFORE",
+            "ACTION_STATEMENT": (
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
+                f"'{table_name} is append-only'"
+            ),
+            "EVENT_OBJECT_TABLE": table_name,
+        }
+        for name, table_name, event in (
+            (
+                "trg_qmt_calendar_batch_no_update",
+                "qmt_trade_calendar_batch",
+                "UPDATE",
+            ),
+            (
+                "trg_qmt_calendar_batch_no_delete",
+                "qmt_trade_calendar_batch",
+                "DELETE",
+            ),
+            (
+                "trg_qmt_calendar_session_no_update",
+                "qmt_trade_calendar_session",
+                "UPDATE",
+            ),
+            (
+                "trg_qmt_calendar_session_no_delete",
+                "qmt_trade_calendar_session",
+                "DELETE",
+            ),
+        )
+    ]
+
+
 class _CalendarDdlConnection:
-    def __init__(self):
+    def __init__(self, *, trigger_rows=None):
         self.statements = []
+        self.trigger_rows = (
+            _calendar_trigger_rows() if trigger_rows is None else trigger_rows
+        )
 
     def execute(self, statement, _params=None):
         sql = str(statement)
         self.statements.append(sql)
+        trigger_rows = self.trigger_rows
 
         class _Result:
             def mappings(self):
                 return self
 
             def all(self):
-                return [
-                    {
-                        "TRIGGER_NAME": name,
-                        "EVENT_MANIPULATION": event,
-                        "ACTION_TIMING": "BEFORE",
-                        "ACTION_STATEMENT": (
-                            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
-                            "'append-only'"
-                        ),
-                        "EVENT_OBJECT_TABLE": table_name,
-                    }
-                    for name, table_name, event in (
-                        ("trg_qmt_calendar_batch_no_update", "qmt_trade_calendar_batch", "UPDATE"),
-                        ("trg_qmt_calendar_batch_no_delete", "qmt_trade_calendar_batch", "DELETE"),
-                        ("trg_qmt_calendar_session_no_update", "qmt_trade_calendar_session", "UPDATE"),
-                        ("trg_qmt_calendar_session_no_delete", "qmt_trade_calendar_session", "DELETE"),
-                    )
-                ]
+                return trigger_rows
 
         return _Result()
 
@@ -375,6 +401,36 @@ def test_qmt_calendar_schema_installs_database_append_only_guards():
     assert ddl.count("BEFORE UPDATE ON qmt_trade_calendar_") == 2
     assert ddl.count("BEFORE DELETE ON qmt_trade_calendar_") == 2
     assert ddl.count("SIGNAL SQLSTATE '45000'") == 4
+    assert ddl.count("DROP TRIGGER IF EXISTS `trg_qmt_calendar_") == 4
+    assert ddl.index("DROP TRIGGER IF EXISTS `trg_qmt_calendar_batch_no_update`") < (
+        ddl.index("CREATE TRIGGER IF NOT EXISTS trg_qmt_calendar_batch_no_update")
+    )
+
+
+def test_qmt_calendar_trigger_attestation_rejects_missing_inventory():
+    rows = _calendar_trigger_rows()[:-1]
+
+    with pytest.raises(RuntimeError, match="triggers are incomplete"):
+        validate_trade_calendar_immutability(
+            _CalendarDdlConnection(trigger_rows=rows)
+        )
+
+
+def test_qmt_calendar_trigger_attestation_rejects_noop_body_mutation():
+    rows = _calendar_trigger_rows()
+    rows[0] = {
+        **rows[0],
+        "ACTION_STATEMENT": (
+            "BEGIN IF 1=0 THEN SIGNAL SQLSTATE '45000' "
+            "SET MESSAGE_TEXT='qmt_trade_calendar_batch is append-only'; "
+            "END IF; END"
+        ),
+    }
+
+    with pytest.raises(RuntimeError, match="trigger differs"):
+        validate_trade_calendar_immutability(
+            _CalendarDdlConnection(trigger_rows=rows)
+        )
 
 
 def test_qmt_calendar_loader_hides_receipts_unknown_at_decision_time():
@@ -511,37 +567,61 @@ def test_expired_code_collision_rejects_index_as_equity():
         )
 
 
+def _catalog_trigger_rows():
+    return [
+        {
+            "TRIGGER_NAME": name,
+            "EVENT_MANIPULATION": event,
+            "ACTION_TIMING": "BEFORE",
+            "ACTION_STATEMENT": (
+                "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
+                f"'{table_name} is append-only'"
+            ),
+            "EVENT_OBJECT_TABLE": table_name,
+        }
+        for name, table_name, event in (
+            (
+                "trg_qmt_stock_catalog_batch_no_update",
+                "qmt_stock_catalog_batch",
+                "UPDATE",
+            ),
+            (
+                "trg_qmt_stock_catalog_batch_no_delete",
+                "qmt_stock_catalog_batch",
+                "DELETE",
+            ),
+            (
+                "trg_qmt_stock_catalog_member_no_update",
+                "qmt_stock_catalog_member",
+                "UPDATE",
+            ),
+            (
+                "trg_qmt_stock_catalog_member_no_delete",
+                "qmt_stock_catalog_member",
+                "DELETE",
+            ),
+        )
+    ]
+
+
 class _CatalogDdlConnection:
-    def __init__(self):
+    def __init__(self, *, trigger_rows=None):
         self.statements = []
+        self.trigger_rows = (
+            _catalog_trigger_rows() if trigger_rows is None else trigger_rows
+        )
 
     def execute(self, statement, _params=None):
         sql = str(statement)
         self.statements.append(sql)
+        trigger_rows = self.trigger_rows
 
         class _Result:
             def mappings(self):
                 return self
 
             def all(self):
-                return [
-                    {
-                        "TRIGGER_NAME": name,
-                        "EVENT_MANIPULATION": event,
-                        "ACTION_TIMING": "BEFORE",
-                        "ACTION_STATEMENT": (
-                            "SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT="
-                            "'append-only'"
-                        ),
-                        "EVENT_OBJECT_TABLE": table_name,
-                    }
-                    for name, table_name, event in (
-                        ("trg_qmt_stock_catalog_batch_no_update", "qmt_stock_catalog_batch", "UPDATE"),
-                        ("trg_qmt_stock_catalog_batch_no_delete", "qmt_stock_catalog_batch", "DELETE"),
-                        ("trg_qmt_stock_catalog_member_no_update", "qmt_stock_catalog_member", "UPDATE"),
-                        ("trg_qmt_stock_catalog_member_no_delete", "qmt_stock_catalog_member", "DELETE"),
-                    )
-                ]
+                return trigger_rows
 
         return _Result()
 
@@ -572,11 +652,39 @@ def test_qmt_stock_catalog_schema_installs_database_append_only_guards():
     ddl = "\n".join(engine.connection.statements)
 
     assert ddl.index("CREATE TABLE IF NOT EXISTS qmt_stock_catalog_member") < (
-        ddl.index("trg_qmt_stock_catalog_member_no_update")
+        ddl.index(
+            "CREATE TRIGGER IF NOT EXISTS "
+            "trg_qmt_stock_catalog_member_no_update"
+        )
     )
     assert ddl.count("BEFORE UPDATE ON qmt_stock_catalog_") == 2
     assert ddl.count("BEFORE DELETE ON qmt_stock_catalog_") == 2
     assert ddl.count("SIGNAL SQLSTATE '45000'") == 4
+    assert ddl.count("DROP TRIGGER IF EXISTS `trg_qmt_stock_catalog_") == 4
+    assert ddl.index(
+        "DROP TRIGGER IF EXISTS `trg_qmt_stock_catalog_batch_no_update`"
+    ) < ddl.index("UPDATE qmt_stock_catalog_batch")
+
+
+def test_qmt_stock_catalog_trigger_attestation_rejects_missing_or_noop():
+    with pytest.raises(RuntimeError, match="triggers are incomplete"):
+        validate_stock_catalog_immutability(
+            _CatalogDdlConnection(trigger_rows=_catalog_trigger_rows()[:-1])
+        )
+
+    rows = _catalog_trigger_rows()
+    rows[0] = {
+        **rows[0],
+        "ACTION_STATEMENT": (
+            "BEGIN IF 1=0 THEN SIGNAL SQLSTATE '45000' "
+            "SET MESSAGE_TEXT='qmt_stock_catalog_batch is append-only'; "
+            "END IF; END"
+        ),
+    }
+    with pytest.raises(RuntimeError, match="trigger differs"):
+        validate_stock_catalog_immutability(
+            _CatalogDdlConnection(trigger_rows=rows)
+        )
 
 
 def test_qmt_stock_catalog_loader_hides_future_metadata():

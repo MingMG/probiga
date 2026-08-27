@@ -150,9 +150,19 @@ EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH = (
 EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
-EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 70
+EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 81
 EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH = (
-    "f7b9771383a6a203529fd3901f4b7cbdeb234f72957b154d13489f823eefa841"
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+)
+EXPECTED_FULL_RELEASE_TRIGGER_COUNT = 142
+EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH = (
+    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+)
+EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH = (
+    "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+)
+EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH = (
+    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
 )
 EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH = (
     "c6f0b347b0f9b1f9d4e78ab53469ffbefbdceed4c2e2184e0b0b3dfd00db22b5"
@@ -1228,6 +1238,12 @@ def _final_v3_trigger_contracts() -> dict[str, TriggerContract]:
 
 
 def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
+    from server.common.auxiliary_runtime_schema import (
+        qmt_membership_trigger_ddl_statements,
+    )
+    from server.common.turnover_snapshot_schema import (
+        market_field_capture_trigger_ddl_statements,
+    )
     from server.common.pit_facts import PIT_FACT_TRIGGER_STATEMENTS
     from server.common.qmt_history_coverage import (
         coverage_trigger_ddl_statements,
@@ -1314,6 +1330,27 @@ def _non_v3_trigger_contracts() -> dict[str, TriggerContract]:
                 "duplicate release trigger name"
             )
         contracts[contract.name] = contract
+    for owner, statements in (
+        (
+            "market_field_capture",
+            market_field_capture_trigger_ddl_statements(),
+        ),
+        (
+            "qmt_membership",
+            qmt_membership_trigger_ddl_statements(),
+        ),
+    ):
+        for statement in statements:
+            contract = _parse_create_trigger(
+                str(statement),
+                normalizer="qmt",
+                owner=owner,
+            )
+            if contract.name in contracts:
+                raise PrivilegedSchemaPreparationError(
+                    "duplicate release trigger name"
+                )
+            contracts[contract.name] = contract
     for statement in PIT_FACT_TRIGGER_STATEMENTS.values():
         contract = _parse_create_trigger(
             statement,
@@ -1378,6 +1415,91 @@ def _release_trigger_source_contract_hash(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _v2_release_trigger_contract() -> tuple[
+    dict[str, tuple[str, str]],
+    dict[str, str],
+    dict[str, int],
+]:
+    """Load the final canonical V2 trigger shapes, bodies and action order."""
+
+    from server.trading_v2.execution_evidence_schema_gate import (
+        _all_trigger_bodies,
+        _all_trigger_contracts,
+        _trigger_action_order_contracts,
+    )
+
+    contracts = dict(_all_trigger_contracts())
+    bodies = dict(_all_trigger_bodies())
+    action_orders, _references = _trigger_action_order_contracts(contracts)
+    if (
+        len(contracts) != 41
+        or set(contracts) != set(bodies)
+        or set(contracts) != set(action_orders)
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "V2 release trigger source contract differs"
+        )
+    return contracts, bodies, action_orders
+
+
+def _v2_release_trigger_source_contract_hash() -> str:
+    contracts, bodies, action_orders = _v2_release_trigger_contract()
+    payload = {
+        "schema": "probiga.v2-release-trigger-source-contract.v1",
+        "members": [
+            {
+                "name": name,
+                "event": contracts[name][0],
+                "table": contracts[name][1],
+                "body": bodies[name],
+                "action_order": action_orders[name],
+            }
+            for name in sorted(contracts)
+        ],
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+
+
+def _full_release_trigger_nameset_hash(names: Iterable[str]) -> str:
+    payload = {
+        "schema": "probiga.full-release-trigger-names.v1",
+        "names": sorted(set(str(name) for name in names)),
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+
+
+def _frozen_full_release_trigger_names(
+    managed_contracts: Mapping[str, TriggerContract],
+) -> frozenset[str]:
+    v2_contracts, _bodies, _orders = _v2_release_trigger_contract()
+    overlap = set(v2_contracts) & set(managed_contracts)
+    expected = frozenset({*v2_contracts, *managed_contracts})
+    if (
+        overlap
+        or len(expected) != EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+        or _release_trigger_source_contract_hash(managed_contracts)
+        != EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+        or _full_release_trigger_nameset_hash(expected)
+        != EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+        or _v2_release_trigger_source_contract_hash()
+        != EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "full release trigger source contract differs"
+        )
+    return expected
+
+
 def _release_trigger_owner_counts(
     contracts: Mapping[str, TriggerContract],
 ) -> dict[str, int]:
@@ -1395,9 +1517,11 @@ def _frozen_non_v3_release_trigger_contracts(
     if (
         len(frozen) != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
         or owner_counts != {
+            "market_field_capture": 5,
             "pit_facts": 6,
             "qmt_attestation": 6,
             "qmt_history_coverage": 4,
+            "qmt_membership": 6,
             "qmt_reference": 10,
             "scheduler_task_history": 2,
             "schema_recovery_evidence": 2,
@@ -1714,6 +1838,202 @@ def validate_release_trigger_contracts(
         "definer": EXPECTED_MIGRATOR_USER,
         "metadata_frozen": True,
         "legacy_rehome_names": sorted(legacy_rehome),
+    }
+
+
+def _all_database_trigger_inventory(
+    connection: Connection,
+) -> dict[str, dict[str, Any]]:
+    rows = connection.execute(text(
+        "SELECT TRIGGER_SCHEMA AS trigger_schema, "
+        "TRIGGER_NAME AS trigger_name, DEFINER AS definer, "
+        "EVENT_OBJECT_SCHEMA AS event_object_schema, "
+        "ACTION_TIMING AS action_timing, "
+        "EVENT_MANIPULATION AS event_manipulation, "
+        "EVENT_OBJECT_TABLE AS event_object_table, "
+        "ACTION_ORIENTATION AS action_orientation, "
+        "ACTION_STATEMENT AS action_statement, ACTION_ORDER AS action_order, "
+        "SQL_MODE AS sql_mode, CHARACTER_SET_CLIENT AS character_set_client, "
+        "COLLATION_CONNECTION AS collation_connection, "
+        "DATABASE_COLLATION AS database_collation "
+        "FROM information_schema.TRIGGERS "
+        "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"
+    )).mappings().all()
+    observed: dict[str, dict[str, Any]] = {}
+    for raw in rows:
+        row = dict(raw)
+        name = str(
+            row.get("trigger_name") or row.get("TRIGGER_NAME") or ""
+        )
+        if _SAFE_NAME_RE.fullmatch(name) is None or name in observed:
+            raise PrivilegedSchemaPreparationError(
+                "full database trigger inventory is malformed"
+            )
+        observed[name] = row
+    return observed
+
+
+def validate_full_database_trigger_inventory(
+    connection: Connection,
+    *,
+    managed_contracts: Mapping[str, TriggerContract],
+) -> dict[str, Any]:
+    """Attest every production trigger, including the canonical V2 guards."""
+
+    managed = dict(managed_contracts)
+    expected_names = _frozen_full_release_trigger_names(managed)
+    managed_detail = validate_release_trigger_contracts(
+        connection,
+        required=managed,
+        optional={},
+        controlled_contracts=managed,
+    )
+    observed = _all_database_trigger_inventory(connection)
+    if set(observed) != set(expected_names):
+        raise PrivilegedSchemaPreparationError(
+            "full database trigger inventory is incomplete or unexpected"
+        )
+
+    from server.trading_v2.execution_evidence_schema_gate import (
+        _trigger_row_matches_contract,
+    )
+
+    v2_contracts, v2_bodies, v2_action_orders = (
+        _v2_release_trigger_contract()
+    )
+    canonical_rows: list[dict[str, Any]] = []
+    for name in sorted(observed):
+        row = observed[name]
+        trigger_schema = str(
+            row.get("trigger_schema") or row.get("TRIGGER_SCHEMA") or ""
+        )
+        event_object_schema = str(
+            row.get("event_object_schema")
+            or row.get("EVENT_OBJECT_SCHEMA")
+            or ""
+        )
+        action_order_raw = (
+            row.get("action_order")
+            if "action_order" in row
+            else row.get("ACTION_ORDER")
+        )
+        try:
+            action_order = int(action_order_raw)
+        except (TypeError, ValueError) as exc:
+            raise PrivilegedSchemaPreparationError(
+                "full database trigger physical metadata differs"
+            ) from exc
+        if (
+            trigger_schema != DATABASE_NAME
+            or event_object_schema != DATABASE_NAME
+            or str(row.get("definer") or row.get("DEFINER") or "")
+            != EXPECTED_MIGRATOR_USER
+            or str(
+                row.get("action_orientation")
+                or row.get("ACTION_ORIENTATION")
+                or ""
+            ).upper()
+            != "ROW"
+            or str(row.get("sql_mode") or row.get("SQL_MODE") or "")
+            != EXPECTED_SQL_MODE
+            or str(
+                row.get("character_set_client")
+                or row.get("CHARACTER_SET_CLIENT")
+                or ""
+            )
+            != EXPECTED_CHARACTER_SET_CLIENT
+            or str(
+                row.get("collation_connection")
+                or row.get("COLLATION_CONNECTION")
+                or ""
+            )
+            != EXPECTED_COLLATION_CONNECTION
+            or str(
+                row.get("database_collation")
+                or row.get("DATABASE_COLLATION")
+                or ""
+            )
+            != EXPECTED_DATABASE_COLLATION
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "full database trigger physical metadata differs"
+            )
+
+        if name in v2_contracts:
+            if not _trigger_row_matches_contract(
+                row,
+                trigger_name=name,
+                contracts=v2_contracts,
+                bodies=v2_bodies,
+                action_orders=v2_action_orders,
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "V2 release trigger physical contract differs"
+                )
+            normalized_body = v2_bodies[name]
+        else:
+            contract = managed[name]
+            if action_order != 1:
+                raise PrivilegedSchemaPreparationError(
+                    "managed release trigger action order differs"
+                )
+            normalized_body = _normalized_trigger_body(
+                contract,
+                row.get("action_statement")
+                or row.get("ACTION_STATEMENT")
+                or "",
+            )
+        canonical_rows.append({
+            "name": name,
+            "definer": EXPECTED_MIGRATOR_USER,
+            "timing": str(
+                row.get("action_timing")
+                or row.get("ACTION_TIMING")
+                or ""
+            ).upper(),
+            "event": str(
+                row.get("event_manipulation")
+                or row.get("EVENT_MANIPULATION")
+                or ""
+            ).upper(),
+            "table": str(
+                row.get("event_object_table")
+                or row.get("EVENT_OBJECT_TABLE")
+                or ""
+            ),
+            "body": normalized_body,
+            "action_order": action_order,
+            "sql_mode": EXPECTED_SQL_MODE,
+            "character_set_client": EXPECTED_CHARACTER_SET_CLIENT,
+            "collation_connection": EXPECTED_COLLATION_CONNECTION,
+            "database_collation": EXPECTED_DATABASE_COLLATION,
+        })
+    observed_metadata_sha256 = hashlib.sha256(json.dumps(
+        {
+            "schema": "probiga.full-release-trigger-physical-inventory.v1",
+            "members": canonical_rows,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    return {
+        "expected_count": len(expected_names),
+        "observed_count": len(observed),
+        "v2_count": len(v2_contracts),
+        "managed_count": len(managed),
+        "expected_names": sorted(expected_names),
+        "nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+        "v2_source_contract_sha256": (
+            EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+        ),
+        "managed_source_contract_sha256": (
+            EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+        ),
+        "observed_metadata_sha256": observed_metadata_sha256,
+        "managed_contract": managed_detail,
+        "metadata_frozen": True,
+        "read_only": True,
     }
 
 
@@ -2563,6 +2883,7 @@ def _cutover_schema(
         )
         from server.common.production_runtime_schema_bundle import (
             privileged_migrate_runtime_schema_bundle,
+            validate_runtime_schema_bundle,
         )
         from server.common.qmt_history_coverage import (
             validate_coverage_schema,
@@ -2669,7 +2990,8 @@ def _cutover_schema(
             )
         )
         runtime_schema_bundle = privileged_migrate_runtime_schema_bundle(
-            boundary.migrator_engine
+            boundary.migrator_engine,
+            defer_trigger_validation=True,
         )
         qmt_reference_schema = _prepare_qmt_reference_schema_tables(
             boundary.migrator_engine
@@ -2710,6 +3032,13 @@ def _cutover_schema(
         supporting_trigger_source_detail = {
             **supporting_trigger_source_detail,
             "owner_counts": _release_trigger_owner_counts(non_v3_contracts),
+        }
+        runtime_schema_bundle = {
+            **runtime_schema_bundle,
+            "runtime_validation": validate_runtime_schema_bundle(
+                boundary.migrator_engine
+            ),
+            "trigger_validation_deferred": False,
         }
         governance_trigger_source_detail = (
             _ensure_frozen_release_triggers(
@@ -2762,6 +3091,12 @@ def _cutover_schema(
                 optional={},
                 controlled_contracts=final_contracts,
             )
+            full_trigger_inventory = (
+                validate_full_database_trigger_inventory(
+                    connection,
+                    managed_contracts=final_contracts,
+                )
+            )
         final_runtime_security = _runtime_least_privilege_evidence(boundary)
         if final_runtime_security != runtime_security:
             raise PrivilegedSchemaPreparationError(
@@ -2778,6 +3113,7 @@ def _cutover_schema(
                 for item in migrations
             ],
             "trigger_contract": trigger_detail,
+            "full_trigger_inventory": full_trigger_inventory,
             "governance_trigger_source_contract": (
                 governance_trigger_source_detail
             ),

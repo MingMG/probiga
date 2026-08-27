@@ -433,8 +433,9 @@ def test_capability_policy_forbids_observation_time_historical_relabelling() -> 
     assert repair.CAPABILITY_POLICY["sector_heat"]["mode"] == "EXACT_HISTORICAL"
     assert repair.CAPABILITY_POLICY["alist_daily"]["mode"] == "EXACT_HISTORICAL"
     assert repair.CAPABILITY_POLICY["analysis_recommendations"]["mode"] == (
-        "PIT_CONDITIONAL_REPLAY"
+        "CANONICAL_ANALYSIS_PUBLISHER_ONLY"
     )
+    assert repair.CAPABILITY_POLICY["analysis_recommendations"]["safe"] is False
     for dataset in (
         "concept_current",
         "concept_minute",

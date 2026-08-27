@@ -167,11 +167,11 @@ CAPABILITY_POLICY: dict[str, dict[str, Any]] = {
         "reason": "deterministic aggregate of exact target-date canonical daily K-lines",
     },
     "analysis_recommendations": {
-        "mode": "PIT_CONDITIONAL_REPLAY",
-        "safe": True,
+        "mode": "CANONICAL_ANALYSIS_PUBLISHER_ONLY",
+        "safe": False,
         "reason": (
-            "requires one common target-time cutoff for immutable QMT announcements, "
-            "finance facts, sector membership and all same-date market inputs"
+            "the mutable strategy partition may be written only by a scheduler-"
+            "bound canonical analysis producer and its activation transaction"
         ),
     },
     "trading_v3_replay": {
@@ -1596,57 +1596,11 @@ class ProductionPartitionPublisher:
         }
 
     def _analysis_recommendations(self, partition: PartitionRef) -> dict[str, Any]:
-        from biz.analysis.sync_analysis_fast import run_batch
-        from server.common.pit_facts import PIT_AVAILABLE, resolve_common_fact_cutoff
-
-        universe = load_daily_stock_universe(
-            self.primary_engine,
-            partition.trade_date,
-            decision_known_at=self.now.replace(tzinfo=None),
+        raise LinuxGapRepairBlocked(
+            "DATA_BLOCKED: analysis partition repair is delegated to the "
+            "scheduler-bound canonical analysis publisher",
+            retryable=False,
         )
-        decision_at = datetime.combine(
-            date.fromisoformat(partition.trade_date),
-            time(16, 5),
-        )
-        cutoff = resolve_common_fact_cutoff(
-            self.primary_engine,
-            codes=universe.expected_codes,
-            decision_at=decision_at,
-            finance_start_date="1900-01-01",
-            finance_end_date=partition.trade_date,
-            event_start_date=(
-                date.fromisoformat(partition.trade_date) - timedelta(days=14)
-            ),
-            event_end_date=partition.trade_date,
-            require_qmt_event_batch=True,
-        )
-        if cutoff.get("status") != PIT_AVAILABLE:
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: analysis historical PIT common cutoff is unavailable",
-                retryable=False,
-            )
-        stats = run_batch(
-            self.primary_engine,
-            trade_date=partition.trade_date,
-            top_n=80,
-            min_score=62.0,
-            execution_time=decision_at.isoformat(sep=" "),
-        )
-        return {
-            "source_schema": "probiga.analysis-recommendations-replay.v1",
-            "source_status": "PASS",
-            "source_receipt_sha256": _digest(
-                {
-                    "trade_date": stats.trade_date,
-                    "analysis_count": stats.analysis_count,
-                    "recommendation_count": stats.recommendation_count,
-                    "flow_date": stats.flow_date,
-                    "hot_date": stats.hot_date,
-                    "pit_cutoff": cutoff,
-                }
-            ),
-            "automatic_order_submission": False,
-        }
 
     def _trading_v3_replay(self, partition: PartitionRef) -> dict[str, Any]:
         from server.trading_v3.decision_worker import run_daily_decision_v3

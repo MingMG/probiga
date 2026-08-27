@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event, text
@@ -10,6 +11,69 @@ from server.common import auxiliary_runtime_schema as schema
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _TriggerRows:
+    def __init__(self, rows) -> None:
+        self._rows = list(rows)
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _TriggerConnection:
+    def __init__(self, rows) -> None:
+        self.rows = list(rows)
+        self.statements: list[str] = []
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        self.statements.append(sql)
+        if "information_schema.TRIGGERS" in sql:
+            return _TriggerRows(self.rows)
+        return _TriggerRows([])
+
+
+class _ConnectionContext:
+    def __init__(self, connection) -> None:
+        self.connection = connection
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _TriggerEngine:
+    def __init__(self, connection, *, dialect: str = "mysql") -> None:
+        self.connection = connection
+        self.dialect = SimpleNamespace(name=dialect)
+
+    def connect(self):
+        return _ConnectionContext(self.connection)
+
+    def begin(self):
+        return _ConnectionContext(self.connection)
+
+
+def _exact_membership_trigger_rows() -> list[dict[str, str]]:
+    return [
+        {
+            "TRIGGER_NAME": name,
+            "EVENT_OBJECT_TABLE": table_name,
+            "EVENT_MANIPULATION": event_name,
+            "ACTION_TIMING": "BEFORE",
+            "ACTION_ORIENTATION": "ROW",
+            "ACTION_STATEMENT": body,
+        }
+        for name, (table_name, event_name, body) in (
+            schema._expected_qmt_membership_trigger_contracts().items()
+        )
+    ]
 
 
 def _create_surface(engine) -> None:
@@ -41,6 +105,12 @@ def test_auxiliary_runtime_validators_are_metadata_reads_only() -> None:
     result = schema.validate_auxiliary_runtime_schema(engine)
 
     assert result["read_only"] is True
+    membership = result["qmt_membership_snapshot"]
+    assert membership["append_only_verified"] is False
+    assert membership["immutability_validation_skipped"] == "sqlite"
+    assert set(membership["trigger_names"]) == set(
+        schema.QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES
+    )
     assert statements
     normalized = "\n".join(statements).upper()
     assert "CREATE TABLE" not in normalized
@@ -116,7 +186,7 @@ def test_persistent_ddl_is_exposed_only_through_privileged_migrations(
     monkeypatch.setattr(
         schema,
         validator_name,
-        lambda _engine: {"read_only": True},
+        lambda _engine, **_kwargs: {"read_only": True},
     )
 
     result = getattr(schema, migration_name)(object())
@@ -136,6 +206,90 @@ def test_membership_compatibility_guard_is_read_only(monkeypatch) -> None:
     )
 
     assert membership_snapshot.ensure_membership_snapshot_tables("engine") is sentinel
+
+
+def test_membership_mysql_runtime_attests_exact_six_trigger_contract(
+    monkeypatch,
+) -> None:
+    connection = _TriggerConnection(_exact_membership_trigger_rows())
+    engine = _TriggerEngine(connection)
+    monkeypatch.setattr(
+        schema,
+        "validate_required_table_surface",
+        lambda *_args, **_kwargs: {"read_only": True},
+    )
+
+    result = schema.validate_qmt_membership_snapshot_runtime_schema(engine)
+
+    assert result["append_only_verified"] is True
+    assert set(result["trigger_names"]) == set(
+        schema.QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES
+    )
+    assert len(connection.statements) == 1
+    assert connection.statements[0].lstrip().upper().startswith("SELECT ")
+
+
+def test_membership_mysql_runtime_rejects_missing_trigger() -> None:
+    rows = _exact_membership_trigger_rows()[:-1]
+
+    with pytest.raises(RuntimeError, match="trigger inventory differs"):
+        schema.validate_qmt_membership_snapshot_immutability(
+            _TriggerConnection(rows)
+        )
+
+
+def test_membership_mysql_runtime_rejects_noop_trigger_body_mutation() -> None:
+    rows = _exact_membership_trigger_rows()
+    rows[0] = {**rows[0], "ACTION_STATEMENT": "BEGIN SET @noop=1; END"}
+
+    with pytest.raises(RuntimeError, match="trigger contract differs"):
+        schema.validate_qmt_membership_snapshot_immutability(
+            _TriggerConnection(rows)
+        )
+
+
+def test_membership_privileged_migration_defers_all_six_triggers_to_broker(
+    monkeypatch,
+) -> None:
+    captured_table_ddl: list[str] = []
+    connection = _TriggerConnection(_exact_membership_trigger_rows())
+    engine = _TriggerEngine(connection)
+    monkeypatch.setattr(
+        schema,
+        "_privileged_create",
+        lambda _engine, statements: captured_table_ddl.extend(statements),
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_qmt_membership_snapshot_runtime_schema",
+        lambda _engine, **_kwargs: {
+            "read_only": True,
+            "append_only_verified": False,
+        },
+    )
+
+    result = schema.privileged_migrate_qmt_membership_snapshot_schema(engine)
+
+    drops = [
+        sql for sql in connection.statements
+        if sql.lstrip().upper().startswith("DROP TRIGGER")
+    ]
+    creates = [
+        sql for sql in connection.statements
+        if sql.lstrip().upper().startswith("CREATE TRIGGER")
+    ]
+    assert len(captured_table_ddl) == 3
+    assert drops == []
+    assert creates == []
+    assert result["triggers_installed"] is False
+    assert result["trigger_installation"] == "FROZEN_RELEASE_BROKER_REQUIRED"
+    assert result["privileged_migration"] is True
+
+    with pytest.raises(RuntimeError, match="frozen release broker"):
+        schema.privileged_migrate_qmt_membership_snapshot_schema(
+            engine,
+            install_triggers=True,
+        )
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import inspect
+import os
 import sys
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -24,7 +26,20 @@ UID = "a" * 32
 BUILD_SHA = "b" * 40
 
 
+def test_analysis_wall_clock_is_shanghai_even_when_host_clock_is_utc():
+    utc_now = datetime(2026, 8, 27, 10, 50, tzinfo=timezone.utc)
+    expected = datetime(2026, 8, 27, 18, 50)
+
+    assert sync_analysis_fast._now_shanghai_naive(utc_now) == expected
+    assert premarket._now_shanghai_naive(utc_now) == expected
+
+
 def _stats():
+    publication_receipt = {
+        "schema": "probiga.analysis-strategy-pool-publication.v1",
+        "canonical_pool_sha256": "c" * 64,
+        "executable_count": 3,
+    }
     return SimpleNamespace(
         trade_date="2026-08-24",
         analysis_count=5100,
@@ -32,6 +47,9 @@ def _stats():
         market_mood_score=55.0,
         flow_date="2026-08-24",
         hot_date="2026-08-24",
+        executable_count=3,
+        canonical_pool_sha256="c" * 64,
+        publication_receipt=publication_receipt,
     )
 
 
@@ -41,6 +59,7 @@ def _production_env():
         "PROBIGA_SCHEDULER_HISTORY_RUN_UID": UID,
         "PROBIGA_SCHEDULER_BUILD_SHA": BUILD_SHA,
         "PROBIGA_BUILD_COMMIT_SHA": BUILD_SHA,
+        "PROBIGA_SCHEDULER_TASK_TYPE": "analysis_fast",
     }
 
 
@@ -253,36 +272,12 @@ def test_recommendation_history_rejects_scheduler_environment_uid_drift() -> Non
     execute.assert_not_called()
 
 
-def test_manual_recommendation_stops_mismatched_scheduler_job_and_closes_audit() -> None:
-    gate = {"ready": True, "expected_trade_date": "2026-08-24"}
-    with patch.object(
-        hot_data, "_recommendation_gate_status", return_value=gate
-    ), patch.object(
-        hot_data, "_recommended_run_history_start"
-    ), patch.object(
-        hot_data,
-        "_launch_registered_scheduler_task",
-        return_value={
-            "accepted": True,
-            "status": "running",
-            "task_id": 91,
-            "job_id": "c" * 32,
-        },
-    ), patch.object(
-        hot_data,
-        "request_stop_owned_scheduler_task",
-        return_value={
-            "accepted": True,
-            "status": "stop_requested",
-            "task_id": 91,
-            "job_id": "c" * 32,
-            "process_killed": True,
-        },
-    ) as stop, patch.object(
-        hot_data, "_recommended_run_history_finish", return_value={}
-    ) as finish, patch.object(uuid, "uuid4", return_value=SimpleNamespace(hex=UID)):
+def test_manual_dynamic_cutoff_publisher_is_retired_fail_closed() -> None:
+    with patch.dict(
+        os.environ, {"PROBIGA_DEPLOYMENT_MODE": "production"}, clear=False
+    ):
         result = hot_data._submit_manual_recommended_stocks(
-            trade_date="",
+            trade_date="2026-08-24",
             min_score=62,
             top_n=80,
             execution_time="2026-08-25T09:00:00",
@@ -293,11 +288,9 @@ def test_manual_recommendation_stops_mismatched_scheduler_job_and_closes_audit()
             date_policy="previous_complete",
         )
 
-    stop.assert_called_once_with(91)
-    assert finish.call_args.kwargs["status"] == "error"
     assert result["accepted"] is False
-    assert result["status"] == "audit_identity_mismatch"
-    assert result["stop"]["process_killed"] is True
+    assert result["status"] == "canonical_pool_managed_by_eod_pipeline"
+    assert result["next_refresh_time"] == "23:56 Asia/Shanghai"
 
 
 def _mysql_lock_engine(*, get_lock=1, used_by=91, release=1):
@@ -401,6 +394,21 @@ def test_all_analysis_write_entrypoints_verify_lock_before_save() -> None:
         )
 
     assert events == ["verify", "save", "verify", "save"]
+
+
+def test_production_scoped_analysis_is_rejected_before_pool_write() -> None:
+    with patch.dict(
+        "os.environ",
+        {"PROBIGA_DEPLOYMENT_MODE": "production"},
+        clear=False,
+    ), patch.object(sync_analysis_fast, "save_outputs") as save:
+        with pytest.raises(RuntimeError, match="scoped analysis"):
+            sync_analysis_fast.run_batch_for_codes(
+                object(),
+                ["000001"],
+                trade_date="2026-08-27",
+            )
+    save.assert_not_called()
 
 
 def test_sim_trade_missing_recommendation_never_generates_or_prepares() -> None:

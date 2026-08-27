@@ -644,6 +644,7 @@ def governance_health_required_check_names(
         "qmt_operations_scheduler_tasks_unique",
         "qmt_operations_scheduler_tasks_contract",
         "supporting_release_trigger_inventory_exact",
+        "full_database_trigger_inventory_exact",
         "qmt_reference_physical_schema_and_seal",
         "qmt_history_coverage_physical_schema_and_seal",
         "qmt_history_capability_matrix_fail_closed",
@@ -1712,9 +1713,11 @@ def _supporting_release_trigger_inventory_check(
                 owner_counts.get(contract.owner, 0) + 1
             )
         expected_owner_counts = {
+            "market_field_capture": 5,
             "pit_facts": 6,
             "qmt_attestation": 6,
             "qmt_history_coverage": 4,
+            "qmt_membership": 6,
             "qmt_reference": 10,
             "scheduler_task_history": 2,
             "schema_recovery_evidence": 2,
@@ -1744,17 +1747,86 @@ def _supporting_release_trigger_inventory_check(
     except Exception as exc:
         return False, {
             "trigger_count": 0,
-            "expected_trigger_count": 70,
+            "expected_trigger_count": 81,
             "expected_owner_counts": {
+                "market_field_capture": 5,
                 "pit_facts": 6,
                 "qmt_attestation": 6,
                 "qmt_history_coverage": 4,
+                "qmt_membership": 6,
                 "qmt_reference": 10,
                 "scheduler_task_history": 2,
                 "schema_recovery_evidence": 2,
                 "strategy_governance": 40,
             },
             "database_triggers_required": True,
+            "errors": [_safe_exception_message(exc)],
+        }
+
+
+def _full_database_trigger_inventory_check(
+    connection,
+) -> tuple[bool, dict[str, Any]]:
+    """Re-attest the exact source-bound 142-trigger database inventory."""
+
+    try:
+        from tools.prepare_strategy_governance_schema import (
+            EXPECTED_FULL_RELEASE_TRIGGER_COUNT,
+            EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+            EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+            EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH,
+            _final_v3_trigger_contracts,
+            _frozen_non_v3_release_trigger_contracts,
+            _non_v3_trigger_contracts,
+            validate_full_database_trigger_inventory,
+        )
+
+        managed = {
+            **_final_v3_trigger_contracts(),
+            **_frozen_non_v3_release_trigger_contracts(
+                _non_v3_trigger_contracts()
+            ),
+        }
+        detail = validate_full_database_trigger_inventory(
+            connection,
+            managed_contracts=managed,
+        )
+        exact = (
+            detail.get("expected_count")
+            == EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+            and detail.get("observed_count")
+            == EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+            and detail.get("v2_count") == 41
+            and detail.get("managed_count") == 101
+            and detail.get("nameset_sha256")
+            == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+            and detail.get("v2_source_contract_sha256")
+            == EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+            and detail.get("managed_source_contract_sha256")
+            == EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+            and detail.get("metadata_frozen") is True
+            and detail.get("read_only") is True
+        )
+        if not exact:
+            raise RuntimeError("full release trigger inventory differs")
+        return True, detail
+    except Exception as exc:
+        return False, {
+            "expected_count": 142,
+            "observed_count": 0,
+            "v2_count": 41,
+            "managed_count": 101,
+            "nameset_sha256": (
+                "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+            ),
+            "v2_source_contract_sha256": (
+                "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+            ),
+            "managed_source_contract_sha256": (
+                "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+            ),
+            "metadata_frozen": False,
+            "read_only": True,
             "errors": [_safe_exception_message(exc)],
         }
 
@@ -11556,6 +11628,15 @@ def collect_governance_health(
             supporting_triggers_detail,
         )
         schema_ok = schema_ok and supporting_triggers_ok
+        full_triggers_ok, full_triggers_detail = (
+            _full_database_trigger_inventory_check(connection)
+        )
+        add(
+            "full_database_trigger_inventory_exact",
+            full_triggers_ok,
+            full_triggers_detail,
+        )
+        schema_ok = schema_ok and full_triggers_ok
         qmt_reference_ok, qmt_reference_detail = (
             _qmt_reference_frozen_schema_check(engine)
         )

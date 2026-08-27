@@ -59,6 +59,20 @@ RELEASE_LATEST_SESSION_TARGET_TASK_TYPES = frozenset(
     {"alist_daily", "alist_info"}
 )
 RELEASE_POSITIONAL_DATE_TARGET_TASK_TYPES = frozenset({"sector_heat_east"})
+ANALYSIS_EXECUTION_TIME_TASK_TYPES = frozenset(
+    {
+        "analysis_fast",
+        "analysis_morning_strict",
+        "analysis_premarket_external",
+    }
+)
+ANALYSIS_DAILY_PIPELINE_DECISION_TIME = "23:55:00"
+ANALYSIS_DAILY_EVIDENCE_TASK_TYPES = frozenset(
+    {
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+    }
+)
 
 
 def _date_param_args(value: str) -> list[str]:
@@ -92,6 +106,88 @@ def _is_iso_date_arg(value: str) -> bool:
     return parsed.isoformat() == value
 
 
+def _analysis_execution_time(row: Mapping[str, Any]) -> str:
+    """Return the scheduler-bound Shanghai wall clock for analysis children."""
+
+    raw = str(row.get("_scheduler_execution_time") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "scheduler analysis execution time is unavailable"
+        ) from exc
+    if (
+        parsed.tzinfo is not None
+        or parsed.isoformat(timespec="seconds") != raw
+    ):
+        raise ValueError("scheduler analysis execution time is unavailable")
+    return raw
+
+
+def _bind_analysis_execution_time(
+    args: list[str],
+    row: Mapping[str, Any],
+) -> None:
+    execution_time = _analysis_execution_time(row)
+    explicit = _option_values(args, "--execution-time")
+    if explicit and explicit != [execution_time]:
+        raise ValueError(
+            "analysis execution time differs from scheduler dispatch clock"
+        )
+    if not explicit:
+        args.extend(["--execution-time", execution_time])
+
+
+def _analysis_pipeline_decision_at(
+    row: Mapping[str, Any],
+    *,
+    target_date: str,
+) -> str:
+    if str(row.get("_scheduler_pipeline_target_date") or "").strip() != target_date:
+        raise ValueError(
+            "scheduler analysis pipeline target date differs from scheduler"
+        )
+    raw = str(row.get("_scheduler_pipeline_decision_at") or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "scheduler analysis pipeline decision cutoff is unavailable"
+        ) from exc
+    if (
+        parsed.tzinfo is not None
+        or parsed.microsecond != 0
+        or parsed.isoformat(timespec="seconds") != raw
+        or raw != f"{target_date}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+    ):
+        raise ValueError(
+            "scheduler analysis pipeline decision cutoff differs from contract"
+        )
+    return raw
+
+
+def _bind_daily_evidence_identity(
+    args: list[str],
+    row: Mapping[str, Any],
+    *,
+    target_date: str,
+) -> None:
+    decision_at = _analysis_pipeline_decision_at(
+        row,
+        target_date=target_date,
+    )
+    explicit_targets = _option_values(args, "--target-date")
+    explicit_cutoffs = _option_values(args, "--decision-at")
+    if explicit_targets and explicit_targets != [target_date]:
+        raise ValueError("analysis evidence target date differs from scheduler")
+    if explicit_cutoffs and explicit_cutoffs != [decision_at]:
+        raise ValueError("analysis evidence decision cutoff differs from scheduler")
+    if not explicit_targets:
+        args.extend(["--target-date", target_date])
+    if not explicit_cutoffs:
+        args.extend(["--decision-at", decision_at])
+
+
 def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: str) -> list[str]:
     """Build command-line args consistently for manual and scheduled runs."""
     script_args_raw = str(row.get("script_args") or "").strip()
@@ -104,6 +200,33 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
+    if task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES:
+        if not _is_iso_date_arg(today):
+            raise ValueError("analysis evidence target date is invalid")
+        if task_type == "analysis_upper_evidence_prepare":
+            if args.count("--prepare-preliminary") != 1:
+                raise ValueError(
+                    "upper evidence task requires one canonical preliminary build"
+                )
+            if _has_option(args, "--preliminary-receipt-file"):
+                raise ValueError(
+                    "scheduled upper evidence may not consume a local receipt file"
+                )
+        _bind_daily_evidence_identity(args, row, target_date=today)
+        return args
+    if release_catchup and task_type == "qmt_membership_snapshot":
+        if not _is_iso_date_arg(today):
+            raise ValueError("release catch-up membership target date is invalid")
+        if args != ["--apply", "--force-reference-refresh", "--json"]:
+            raise ValueError(
+                "release catch-up membership task arguments differ from contract"
+            )
+        return [
+            "--verify-existing-snapshot",
+            "--snapshot-date",
+            today,
+            "--json",
+        ]
     if release_catchup and task_type in RELEASE_QMT_RANGE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("release catch-up QMT target date is invalid")
@@ -193,8 +316,17 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 raise ValueError(
                     "release catch-up analysis date differs from authoritative target"
                 )
+            pipeline_cutoff = _analysis_pipeline_decision_at(
+                row,
+                target_date=today,
+            )
+            if _analysis_execution_time(row) != pipeline_cutoff:
+                raise ValueError(
+                    "release catch-up analysis cutoff differs from daily pipeline"
+                )
         if not _has_option(args, "--date"):
             args.extend(["--date", today])
+        _bind_analysis_execution_time(args, row)
         return args
     if task_type == "analysis_morning_strict" and release_catchup:
         if "--strict-prev-trade-day" not in args:
@@ -205,28 +337,21 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             raise ValueError(
                 "release catch-up morning analysis may not override previous session"
             )
-        execution_time = str(row.get("_release_execution_time") or "").strip()
-        try:
-            parsed_execution_time = datetime.fromisoformat(execution_time)
-        except ValueError as exc:
-            raise ValueError(
-                "release catch-up morning execution time is unavailable"
-            ) from exc
-        if (
-            parsed_execution_time.tzinfo is not None
-            or parsed_execution_time.isoformat(timespec="seconds")
-            != execution_time
-        ):
-            raise ValueError(
-                "release catch-up morning execution time is unavailable"
-            )
-        explicit_execution_times = _option_values(args, "--execution-time")
-        if explicit_execution_times and explicit_execution_times != [execution_time]:
+        release_execution_time = str(
+            row.get("_release_execution_time") or ""
+        ).strip()
+        execution_time = _analysis_execution_time(row)
+        if release_execution_time != execution_time:
             raise ValueError(
                 "release catch-up morning execution time differs"
             )
-        if not explicit_execution_times:
-            args.extend(["--execution-time", execution_time])
+        _bind_analysis_execution_time(args, row)
+        return args
+    if task_type in {
+        "analysis_morning_strict",
+        "analysis_premarket_external",
+    }:
+        _bind_analysis_execution_time(args, row)
         return args
     if task_type == "trading_v3_close_decision" and release_catchup:
         modes = _option_values(args, "--mode")
@@ -262,13 +387,17 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             args.extend(["--trade-date", today])
         return args
     if task_type == "hot_fused" and release_catchup:
-        explicit_dates = _option_values(args, "--date")
+        if _has_option(args, "--date"):
+            raise ValueError(
+                "release catch-up fused hot-rank requires a positional date"
+            )
+        explicit_dates = [item for item in args if _is_iso_date_arg(item)]
         if explicit_dates and explicit_dates != [today]:
             raise ValueError(
                 "release catch-up fused hot-rank date differs from current target"
             )
         if not explicit_dates:
-            args.extend(["--date", today])
+            args.insert(0, today)
         return args
     if task_type == "stock_snapshot_daily":
         if release_catchup:
