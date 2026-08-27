@@ -1881,6 +1881,200 @@ def test_warning_only_retention_helpers_fail_closed_on_unsafe_paths() -> None:
     assert guard_position < stat_position < remove_position
 
 
+def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    body = _normalized_shell(
+        _shell_function_bodies(deploy_script)["prebuild_reclaim_release_space"]
+    )
+
+    assert "PREBUILD_MIN_AVAILABLE_BYTES=2147483648" in deploy_script
+    assert 'CUTOVER_STEP=prebuild_release_space' in normalized
+    reclaim = normalized.index("prebuild_reclaim_release_space\n")
+    prepare = normalized.index("CUTOVER_STEP=prepare_release", reclaim)
+    assert reclaim < prepare
+    assert 'prune_code_releases "$PREVIOUS_CODE_ROOT"' not in normalized[:prepare]
+
+    guard = body.index('for journal_path in')
+    prune = body.index(
+        'prune_release_venvs "$PREVIOUS_RELEASE_REVISION" "$EXPECTED_SHA"'
+    )
+    space = body.index('df -P -B1 -- "$space_path"')
+    assert guard < prune < space
+    for journal in (
+        '"$ACTIVATION_UNIT_SNAPSHOT_DIR"',
+        '"$DATABASE_WRITER_GUARD_FILE"',
+        '"$DATABASE_WRITER_RESTORE_FILE"',
+    ):
+        assert journal in body
+    assert 'if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then' in body
+    assert "awk 'NR == 2 {print $4}'" in body
+    for space_path in (
+        "/tmp",
+        "/var/tmp",
+        '"$RELEASE_VENV_ROOT"',
+        '"$RELEASE_ARTIFACT_ROOT"',
+        '"$CODE_RELEASE_ROOT"',
+    ):
+        assert space_path in body
+    assert "f_bavail" in body
+    assert 'sudo -u "$BUILD_USER" mktemp -d /tmp/.probiga-prebuild.XXXXXX' in body
+    assert 'sudo -u "$BUILD_USER" rmdir -- "$build_temp_probe"' in body
+    assert '"$LEGACY_RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION")' in body
+    assert "Skipped prebuild release venv cleanup for legacy active runtime" in body
+
+
+def test_prebuild_space_reclamation_never_deletes_with_guard_or_legacy_active(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the prebuild cleanup regression")
+
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _shell_function_bodies(deploy_script)[
+        "prebuild_reclaim_release_space"
+    ]
+    function_definition = (
+        "prebuild_reclaim_release_space() {\n" + body + "}\n"
+    )
+    sandbox = tmp_path.as_posix()
+    harness = function_definition + f'''\nset -u
+TEST_ROOT={sandbox!r}
+mkdir -p "$TEST_ROOT/venvs" "$TEST_ROOT/legacy"
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+RELEASE_ARTIFACT_ROOT="$TEST_ROOT/artifacts"
+CODE_RELEASE_ROOT="$TEST_ROOT/code"
+mkdir -p "$CODE_RELEASE_ROOT"
+LEGACY_RELEASE_VENV_ROOT="$TEST_ROOT/legacy"
+DATABASE_WRITER_GUARD_FILE="$TEST_ROOT/guard"
+DATABASE_WRITER_RESTORE_FILE="$TEST_ROOT/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$TEST_ROOT/activation"
+PREBUILD_MIN_AVAILABLE_BYTES=2147483648
+BUILD_USER=probiga-build
+PREVIOUS_RELEASE_REVISION=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+EXPECTED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+PREVIOUS_VENV="$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
+DELETE_MARKER="$TEST_ROOT/delete-reached"
+prune_release_venvs() {{ : > "$DELETE_MARKER"; return 0; }}
+install() {{ mkdir -p "${{@: -1}}"; }}
+readlink() {{
+  if [ "$1" = -f ]; then printf '%s\n' "${{@: -1}}"; else command readlink "$@"; fi
+}}
+sudo() {{
+  if [ "$1" = -u ]; then shift 2; fi
+  "$@"
+}}
+test() {{
+  if [ "${{1:-}}" = -d ] && [ "${{2:-}}" = /var/tmp ]; then return 0; fi
+  builtin test "$@"
+}}
+df() {{ printf 'Filesystem 1-blocks Used Available Capacity Mounted on\nmock 1 0 3000000000 0%% /\n'; }}
+
+: > "$DATABASE_WRITER_GUARD_FILE"
+if prebuild_reclaim_release_space; then exit 20; fi
+test ! -e "$DELETE_MARKER" || exit 21
+rm -f "$DATABASE_WRITER_GUARD_FILE"
+
+PREVIOUS_VENV="$LEGACY_RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
+prebuild_reclaim_release_space || exit 22
+test ! -e "$DELETE_MARKER" || exit 23
+
+df() {{ printf 'Filesystem 1-blocks Used Available Capacity Mounted on\nmock 1 0 1 100%% /\n'; }}
+if prebuild_reclaim_release_space; then exit 24; fi
+test ! -e "$DELETE_MARKER" || exit 25
+'''
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_prebuild_venv_retention_counts_only_a_published_incoming_release() -> None:
+    if sys.platform == "win32":
+        pytest.skip("Git Bash cannot create native release symlinks on Windows")
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the prebuild retention regression")
+
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _shell_function_bodies(deploy_script)["prune_release_venvs"]
+    definition = "prune_release_venvs() {\n" + body + "}\n"
+    harness = definition + r'''
+set -Eeuo pipefail
+RELEASE_VENV_RETENTION=2
+active=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+incoming=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+second=cccccccccccccccccccccccccccccccccccccccc
+stale=dddddddddddddddddddddddddddddddddddddddd
+referenced=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+path_is_runtime_referenced() { [ "${RUNTIME_REF:-}" = "$1" ]; }
+path_is_opt_link_target() { return 1; }
+
+make_release() {
+  local root="$1" sha="$2" stamp="$3"
+  mkdir -p "$root/build-$sha-1"
+  ln -s "$root/build-$sha-1" "$root/$sha"
+  touch -h -d "@$stamp" "$root/$sha"
+}
+
+with_link="$(readlink -f "$(mktemp -d)")"
+without_link="$(readlink -f "$(mktemp -d)")"
+trap 'rm -rf -- "$with_link" "$without_link"' EXIT
+
+for root in "$with_link" "$without_link"; do
+  make_release "$root" "$active" 100
+  make_release "$root" "$second" 300
+  make_release "$root" "$stale" 200
+done
+make_release "$with_link" "$incoming" 400
+make_release "$with_link" "$referenced" 250
+mkdir -p "$without_link/build-$incoming-1"
+
+RELEASE_VENV_ROOT="$with_link"
+RUNTIME_REF="$with_link/$referenced"
+prune_release_venvs "$active" "$incoming"
+test -L "$with_link/$active"
+test -L "$with_link/$incoming"
+test ! -e "$with_link/$second"
+test ! -e "$with_link/build-$second-1"
+test ! -e "$with_link/$stale"
+test -L "$with_link/$referenced"
+test -d "$with_link/build-$referenced-1"
+
+RELEASE_VENV_ROOT="$without_link"
+RUNTIME_REF=""
+prune_release_venvs "$active" "$incoming"
+test -L "$without_link/$active"
+test -L "$without_link/$second"
+test ! -e "$without_link/$incoming"
+test ! -e "$without_link/build-$incoming-1"
+test ! -e "$without_link/$stale"
+'''
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_code_retention_guards_survive_if_not_conditional_context() -> None:
     bash = _bash()
     if bash is None:

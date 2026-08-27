@@ -93,6 +93,7 @@ RESTORED_RUNTIME_FAILURE_CODE=""
 RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE=""
 RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH=""
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
+RELEASE_ARTIFACT_ROOT=/var/lib/probiga/release-artifacts
 ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/var/lib/probiga/qmt-announcement-checkpoints
 QMT_FULL_MARKET_HISTORY_STATE_ROOT=/var/lib/probiga/qmt-full-market-history
@@ -7697,6 +7698,7 @@ quarantine_unsafe_untracked_release_files() {
 }
 RELEASE_VENV_RETENTION=2
 CODE_RELEASE_RETENTION=2
+PREBUILD_MIN_AVAILABLE_BYTES=2147483648
 
 path_is_runtime_referenced() {
   local candidate="$1"
@@ -7850,6 +7852,88 @@ prune_release_venvs() {
   done < <(find "$RELEASE_VENV_ROOT" -mindepth 1 -maxdepth 1 \
     -type d -name 'build-*' -print0)
   echo "Release venv cleanup reclaimed $removed_bytes bytes" >&2
+}
+
+prebuild_reclaim_release_space() {
+  local available_bytes
+  local build_temp_probe
+  local protected_venv
+  local journal_path
+  local space_path
+
+  # Recovery runs before this point.  If any durable activation state remains,
+  # do not infer its references and do not delete a byte: the bounded recovery
+  # path must resolve that state first.
+  for journal_path in \
+    "$ACTIVATION_UNIT_SNAPSHOT_DIR" \
+    "$DATABASE_WRITER_GUARD_FILE" \
+    "$DATABASE_WRITER_RESTORE_FILE"; do
+    if [ -e "$journal_path" ] || [ -L "$journal_path" ]; then
+      echo "refusing prebuild cleanup while activation journal exists: $journal_path" >&2
+      return 2
+    fi
+  done
+
+  [[ "$PREVIOUS_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]] || return 2
+  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 2
+  protected_venv="$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
+  case "$PREVIOUS_VENV" in
+    "$protected_venv")
+      # Preserve the currently running release and the normal second rollback
+      # generation selected by prune_release_venvs.  The incoming SHA is only
+      # protected when its fully published SHA link already exists; orphaned
+      # build-$EXPECTED_SHA-* trees are incomplete and are safe to reclaim.
+      prune_release_venvs "$PREVIOUS_RELEASE_REVISION" "$EXPECTED_SHA" || \
+        return 2
+      ;;
+    "$LEGACY_RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION")
+      # The active legacy runtime lives outside this cleanup root.  Without an
+      # in-root protected link, retention ordering cannot prove a safe rollback
+      # set, so leave every external release venv untouched and fail later if
+      # the free-space floor is not already satisfied.
+      echo "Skipped prebuild release venv cleanup for legacy active runtime" >&2
+      ;;
+    *)
+      echo "refusing prebuild cleanup for an unknown active venv path" >&2
+      return 2
+      ;;
+  esac
+
+  test ! -L "$RELEASE_ARTIFACT_ROOT" || return 2
+  install -d -o root -g root -m 0755 "$RELEASE_ARTIFACT_ROOT" || return 2
+  test "$(readlink -f -- "$RELEASE_ARTIFACT_ROOT")" = \
+    "$RELEASE_ARTIFACT_ROOT" || return 2
+  # `df` Available is f_bavail, the capacity available to the non-root build
+  # identity.  f_bfree/root write probes include ext4 reserved blocks and would
+  # miss the exact pip-wheel failure this gate prevents.
+  for space_path in \
+    /tmp \
+    /var/tmp \
+    "$RELEASE_VENV_ROOT" \
+    "$RELEASE_ARTIFACT_ROOT" \
+    "$CODE_RELEASE_ROOT"; do
+    test -d "$space_path" || return 2
+    available_bytes="$(df -P -B1 -- "$space_path" | \
+      awk 'NR == 2 {print $4}')" || return 2
+    [[ "$available_bytes" =~ ^[0-9]+$ ]] || return 2
+    if [ "$available_bytes" -lt "$PREBUILD_MIN_AVAILABLE_BYTES" ]; then
+      echo "insufficient prebuild disk space: path=$space_path available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES" >&2
+      return 2
+    fi
+    echo "Prebuild disk space verified: path=$space_path available=$available_bytes required=$PREBUILD_MIN_AVAILABLE_BYTES" >&2
+  done
+  build_temp_probe="$(sudo -u "$BUILD_USER" \
+    mktemp -d /tmp/.probiga-prebuild.XXXXXX)" || return 2
+  case "$build_temp_probe" in
+    /tmp/.probiga-prebuild.*) ;;
+    *) echo "build-user temp probe escaped /tmp" >&2; return 2 ;;
+  esac
+  test -d "$build_temp_probe" || return 2
+  test ! -L "$build_temp_probe" || return 2
+  test "$(dirname -- "$build_temp_probe")" = /tmp || return 2
+  sudo -u "$BUILD_USER" rmdir -- "$build_temp_probe" || return 2
+  test ! -e "$build_temp_probe" || return 2
+  test ! -L "$build_temp_probe" || return 2
 }
 
 prune_code_releases() {
@@ -9912,7 +9996,7 @@ prepare_trusted_wheelhouse() {
   local manifest_entries
   local wheel_file
   local wheel_sha
-  local artifact_root=/var/lib/probiga/release-artifacts
+  local artifact_root="$RELEASE_ARTIFACT_ROOT"
   test ! -L "$artifact_root" || return 1
   install -d -o root -g root -m 0755 "$artifact_root" || return 1
   test "$(readlink -f "$artifact_root")" = "$artifact_root" || return 1
@@ -9964,7 +10048,7 @@ prepare_trusted_wheelhouse() {
 
 prepare_ci_resolved_wheelhouse() {
   local actual_files
-  local artifact_root=/var/lib/probiga/release-artifacts
+  local artifact_root="$RELEASE_ARTIFACT_ROOT"
   local wheel_file
   local wheel_sha
   test ! -L "$artifact_root" || return 1
@@ -12269,6 +12353,8 @@ trap 'rollback 130' INT
 trap 'rollback 129' HUP
 # PREPARE: all network, dependency, and release validation work happens while
 # the old API remains active. This phase must not mutate the live checkout.
+CUTOVER_STEP=prebuild_release_space
+prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
 # PREPARE DATABASE: every production mode runs the same full read-only schema
