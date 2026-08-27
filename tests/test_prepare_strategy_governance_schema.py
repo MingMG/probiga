@@ -839,6 +839,32 @@ def test_every_database_identity_rejects_roles_and_grant_option(
         validator(grants)
 
 
+def test_show_create_user_tls_is_attached_to_usage_grant():
+    grants_without_tls = tuple(item.replace(" REQUIRE SSL", "") for item in RUNTIME_GRANTS)
+
+    resolved = schema._with_account_tls_clause(
+        grants_without_tls,
+        "CREATE USER `probiga_runtime`@`127.0.0.1` "
+        "IDENTIFIED WITH 'caching_sha2_password' AS '<redacted>' REQUIRE SSL",
+    )
+
+    assert resolved == RUNTIME_GRANTS
+    schema._validate_runtime_grants(resolved)
+
+
+def test_show_create_user_without_tls_does_not_forge_tls_requirement():
+    grants_without_tls = tuple(item.replace(" REQUIRE SSL", "") for item in RUNTIME_GRANTS)
+
+    resolved = schema._with_account_tls_clause(
+        grants_without_tls,
+        "CREATE USER `probiga_runtime`@`127.0.0.1` "
+        "IDENTIFIED WITH 'caching_sha2_password' AS '<redacted>' REQUIRE NONE",
+    )
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_runtime_grants(resolved)
+
+
 def test_target_state_is_built_from_fixed_server_and_session_metadata():
     row = {
         "mysql_version": "8.4.11",

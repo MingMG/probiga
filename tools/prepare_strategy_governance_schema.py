@@ -676,12 +676,17 @@ def _dbapi_grants(connection: pymysql.Connection) -> tuple[str, ...]:
     with connection.cursor() as cursor:
         cursor.execute("SHOW GRANTS FOR CURRENT_USER()")
         rows = cursor.fetchall()
+        cursor.execute("SHOW CREATE USER CURRENT_USER()")
+        create_user_row = cursor.fetchone()
     grants: list[str] = []
     for row in rows:
         if not isinstance(row, Mapping) or len(row) != 1:
             raise PrivilegedSchemaPreparationError("database grants were malformed")
         grants.append(str(next(iter(row.values())) or ""))
-    return tuple(grants)
+    if not isinstance(create_user_row, Mapping) or len(create_user_row) < 2:
+        raise PrivilegedSchemaPreparationError("database account metadata was malformed")
+    create_user = str(tuple(create_user_row.values())[-1] or "")
+    return _with_account_tls_clause(grants, create_user)
 
 
 def _dbapi_trigger_exists(
@@ -706,10 +711,35 @@ def _dbapi_trigger_exists(
 
 
 def _sa_grants(connection: Connection) -> tuple[str, ...]:
-    return tuple(
+    grants = tuple(
         str(row[0] or "")
         for row in connection.execute(text("SHOW GRANTS FOR CURRENT_USER()"))
     )
+    create_user_row = connection.execute(
+        text("SHOW CREATE USER CURRENT_USER()")
+    ).one()
+    if len(create_user_row) < 2:
+        raise PrivilegedSchemaPreparationError("database account metadata was malformed")
+    return _with_account_tls_clause(grants, str(create_user_row[-1] or ""))
+
+
+def _with_account_tls_clause(
+    grants: Iterable[str],
+    create_user: str,
+) -> tuple[str, ...]:
+    resolved = tuple(str(item or "") for item in grants)
+    normalized_create_user = " ".join(str(create_user).upper().split())
+    if not normalized_create_user.startswith("CREATE USER "):
+        raise PrivilegedSchemaPreparationError("database account metadata was malformed")
+    if " REQUIRE SSL" not in normalized_create_user:
+        return resolved
+    if any(" REQUIRE SSL" in " ".join(item.upper().split()) for item in resolved):
+        return resolved
+    for index, item in enumerate(resolved):
+        normalized = " ".join(item.upper().split())
+        if normalized.startswith("GRANT USAGE ON *.* TO "):
+            return resolved[:index] + (item.rstrip() + " REQUIRE SSL",) + resolved[index + 1 :]
+    raise PrivilegedSchemaPreparationError("database grants were incomplete")
 
 
 def _normalized_grants(grants: Iterable[str]) -> tuple[str, ...]:
