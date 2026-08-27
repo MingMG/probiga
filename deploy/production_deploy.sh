@@ -319,8 +319,11 @@ elif [ "$#" -ne 0 ]; then
 fi
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
   : "${PROBIGA_RECOVERY_GUARD_SHA:?broker-validated recovery SHA is required}"
+  : "${PROBIGA_RECOVERY_TOOL_SHA:?broker-validated recovery tool SHA is required}"
   [[ "$PROBIGA_RECOVERY_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]
-elif [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ]; then
+  [[ "$PROBIGA_RECOVERY_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]]
+elif [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ] || \
+  [ -n "${PROBIGA_RECOVERY_TOOL_SHA:-}" ]; then
   echo "production deploy engine rejected recovery state during normal deploy" >&2
   exit 2
 fi
@@ -4268,6 +4271,7 @@ controlled_guard_governance_contract_snapshot() {
   local action="$1"
   local guarded_sha="$2"
   local snapshot="$3"
+  local snapshot_kind="${4:-forward-governance}"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$guarded_sha"
   local gate_output=""
@@ -4278,14 +4282,40 @@ controlled_guard_governance_contract_snapshot() {
     restore|verify) ;;
     *) GOVERNANCE_CONTRACT_FAILURE_CODE=action; return 1 ;;
   esac
-  if [ "$snapshot" != "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
-    GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-path
-    return 1
-  fi
-  if ! activation_snapshot_validate_governance_new; then
-    GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
-    return 1
-  fi
+  case "$snapshot_kind:$snapshot" in
+    "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT")
+      if ! activation_snapshot_validate_governance_new; then
+        GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
+        return 1
+      fi
+      ;;
+    "rollback-governance:$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT")
+      if ! controlled_guard_assert_file \
+          "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" 600 || \
+        ! controlled_guard_assert_file \
+          "$ACTIVATION_GOVERNANCE_OLD_SHA" 600 || \
+        [ "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" != \
+          "$(sha256sum "$snapshot" | cut -d' ' -f1)" ]; then
+        GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
+        return 1
+      fi
+      ;;
+    "rollback-qmt:$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")
+      if ! controlled_guard_assert_file \
+          "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || \
+        ! controlled_guard_assert_file \
+          "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || \
+        [ "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" != \
+          "$(sha256sum "$snapshot" | cut -d' ' -f1)" ]; then
+        GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-seal
+        return 1
+      fi
+      ;;
+    *)
+      GOVERNANCE_CONTRACT_FAILURE_CODE=snapshot-path
+      return 1
+      ;;
+  esac
   if ! controlled_guard_assert_governance_restore_runtime "$guarded_sha"; then
     GOVERNANCE_CONTRACT_FAILURE_CODE=runtime-attestation
     return 1
@@ -4370,13 +4400,16 @@ controlled_guard_governance_contract_snapshot() {
         PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
         PYTHONPATH="$adata_source:$code_root" \
         "$release_venv/bin/python" -P \
-        "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" < "$snapshot"
+        "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" \
+          "$snapshot_kind" < "$snapshot"
     ) 2>&1
   )"; then
-    if ! controlled_guard_qmt_announcement_snapshot "$action" "$guarded_sha" \
-        "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; then
-      GOVERNANCE_CONTRACT_FAILURE_CODE=qmt-announcement-task
-      return 1
+    if [ "$snapshot_kind" = forward-governance ]; then
+      if ! controlled_guard_qmt_announcement_snapshot "$action" "$guarded_sha" \
+          "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"; then
+        GOVERNANCE_CONTRACT_FAILURE_CODE=qmt-announcement-task
+        return 1
+      fi
     fi
     return 0
   fi
@@ -4412,23 +4445,22 @@ controlled_guard_restore_and_verify_governance_snapshot() {
   # that case first and avoid unnecessary database writes.  A mismatch falls
   # through to the exact restore, whose own failure remains visible.
   local qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
-  if [ "$2" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
-    qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
-  elif [ "$2" != "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
-    return 1
-  fi
-  if controlled_guard_governance_snapshot verify "$1" "$2" \
+  test "$2" = "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  if controlled_guard_governance_contract_snapshot verify "$1" "$2" \
+      rollback-governance \
       >/dev/null 2>&1 && \
-    controlled_guard_qmt_announcement_snapshot verify "$1" \
-      "$qmt_snapshot" >/dev/null 2>&1; then
+    controlled_guard_governance_contract_snapshot verify "$1" \
+      "$qmt_snapshot" rollback-qmt >/dev/null 2>&1; then
     return 0
   fi
-  controlled_guard_governance_snapshot restore "$1" "$2" || return 1
-  controlled_guard_governance_snapshot verify "$1" "$2" || return 1
-  controlled_guard_qmt_announcement_snapshot restore "$1" \
-    "$qmt_snapshot" || return 1
-  controlled_guard_qmt_announcement_snapshot verify "$1" \
-    "$qmt_snapshot" || return 1
+  controlled_guard_governance_contract_snapshot restore "$1" "$2" \
+    rollback-governance || return 1
+  controlled_guard_governance_contract_snapshot verify "$1" "$2" \
+    rollback-governance || return 1
+  controlled_guard_governance_contract_snapshot restore "$1" \
+    "$qmt_snapshot" rollback-qmt || return 1
+  controlled_guard_governance_contract_snapshot verify "$1" \
+    "$qmt_snapshot" rollback-qmt || return 1
   return 0
 }
 controlled_guard_assert_immutable_venv_tree() {
@@ -4596,10 +4628,7 @@ controlled_guard_capture_current_governance_snapshot() {
   local adapter_registry_seal_sha
   local runtime_release_tree_sha
   local runtime_adapter_registry_seal_sha
-  local capture_root=/tmp
-  local current_snapshot
-  local qmt_current_snapshot
-  local capture_valid=1
+  local tool_digest
   local -a release_identity_lines=()
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -4630,6 +4659,13 @@ controlled_guard_capture_current_governance_snapshot() {
   test "$(<"$ACTIVATION_GOVERNANCE_OLD_SHA")" = \
     "$(sha256sum "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" | cut -d' ' -f1)" || \
     return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" 600 || return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || return 1
+  test "$(<"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA")" = \
+    "$(sha256sum "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" | \
+      cut -d' ' -f1)" || return 1
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test "$(readlink -f "$code_root")" = "$code_root" || return 1
@@ -4688,21 +4724,29 @@ controlled_guard_capture_current_governance_snapshot() {
   test -z "$(find -P "$adata_source" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   sudo -u "$service_user" test ! -w "$adata_source" || return 1
-  test -d "$capture_root" || return 1
-  test ! -L "$capture_root" || return 1
-  test "$(readlink -f "$capture_root")" = "$capture_root" || return 1
-  test "$(stat -c '%U:%G' "$capture_root")" = root:root || return 1
-  test "$(stat -c '%a' "$capture_root")" = 1777 || return 1
-  current_snapshot="$(mktemp \
-    "$capture_root/.probiga-governance-capture.XXXXXX")" || return 1
-  case "$current_snapshot" in
-    "$capture_root"/.probiga-governance-capture.*) ;;
+  test -n "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  [[ "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" =~ ^[0-9a-f]{64}$ ]] || \
+    return 1
+  case "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" in
+    /tmp/.probiga-governance-contract.*) ;;
     *) return 1 ;;
   esac
-  controlled_guard_assert_file "$current_snapshot" 600 || return 1
-  test "$(dirname "$current_snapshot")" = "$capture_root" || return 1
-  if chown "$service_user:$service_user" "$current_snapshot" && \
-    chmod 0600 "$current_snapshot" && \
+  controlled_guard_assert_file "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" 444 || \
+    return 1
+  test "$(readlink -f "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL")" = \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  tool_digest="$(sha256sum "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" | \
+    cut -d' ' -f1)" || return 1
+  test "$tool_digest" = "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL_SHA256" || \
+    return 1
+  sudo -u "$service_user" test -r \
+    "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" || return 1
+  # The old runtime interpreter is still the only guaranteed executable after
+  # a failed cutover, but verification logic comes from the authenticated
+  # incoming release.  It compares only the sealed OLD projection, allowing
+  # additive live columns while preserving the old runtime trust boundary.
+  (
+    cd "$code_root" || exit 1
     controlled_guard_run_service_gate_with_deadline "$service_user" \
       /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -4718,33 +4762,11 @@ controlled_guard_capture_current_governance_snapshot() {
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
       PYTHONPATH="$adata_source:$code_root" \
       "$release_venv/bin/python" -P \
-      "$code_root/tools/add_strategy_governance_task.py" \
-      --capture-snapshot "$current_snapshot" && \
-    test -f "$current_snapshot" && test ! -L "$current_snapshot" && \
-    test "$(stat -c '%U:%G' "$current_snapshot")" = \
-      "$service_user:$service_user" && \
-    test "$(stat -c '%a' "$current_snapshot")" = 600 && \
-    chown root:root "$current_snapshot" && chmod 0600 "$current_snapshot" && \
-    controlled_guard_assert_file "$current_snapshot" 600 && \
-    cmp --silent "$current_snapshot" \
-      "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"; then
-    capture_valid=0
-  fi
-  if ! rm -f -- "$current_snapshot" || [ -e "$current_snapshot" ] || \
-    [ -L "$current_snapshot" ]; then
-    return 1
-  fi
-  test "$capture_valid" -eq 0 || return 1
-  capture_valid=1
-  qmt_current_snapshot="$(mktemp \
-    "$capture_root/.probiga-qmt-announcement-capture.XXXXXX")" || return 1
-  case "$qmt_current_snapshot" in
-    "$capture_root"/.probiga-qmt-announcement-capture.*) ;;
-    *) return 1 ;;
-  esac
-  controlled_guard_assert_file "$qmt_current_snapshot" 600 || return 1
-  if chown "$service_user:$service_user" "$qmt_current_snapshot" && \
-    chmod 0600 "$qmt_current_snapshot" && \
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-governance \
+      < "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+  ) >/dev/null 2>&1 || return 1
+  (
+    cd "$code_root" || exit 1
     controlled_guard_run_service_gate_with_deadline "$service_user" \
       /usr/bin/env -i \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin \
@@ -4760,25 +4782,9 @@ controlled_guard_capture_current_governance_snapshot() {
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
       PYTHONPATH="$adata_source:$code_root" \
       "$release_venv/bin/python" -P \
-      "$code_root/tools/add_qmt_announcement_task.py" \
-      --capture-snapshot "$qmt_current_snapshot" && \
-    test -f "$qmt_current_snapshot" && \
-    test ! -L "$qmt_current_snapshot" && \
-    test "$(stat -c '%U:%G' "$qmt_current_snapshot")" = \
-      "$service_user:$service_user" && \
-    test "$(stat -c '%a' "$qmt_current_snapshot")" = 600 && \
-    chown root:root "$qmt_current_snapshot" && \
-    chmod 0600 "$qmt_current_snapshot" && \
-    controlled_guard_assert_file "$qmt_current_snapshot" 600 && \
-    cmp --silent "$qmt_current_snapshot" \
-      "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"; then
-    capture_valid=0
-  fi
-  if ! rm -f -- "$qmt_current_snapshot" || \
-    [ -e "$qmt_current_snapshot" ] || [ -L "$qmt_current_snapshot" ]; then
-    return 1
-  fi
-  test "$capture_valid" -eq 0 || return 1
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-qmt \
+      < "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
+  ) >/dev/null 2>&1 || return 1
   return 0
 }
 controlled_guard_restore_and_finalize() {
@@ -4816,10 +4822,12 @@ controlled_guard_restore_and_finalize() {
         # The same-process rollback restored and cross-runtime verified this
         # state before the guard was removed.  Once old writers are running,
         # any drift must re-fence rather than trigger another database write.
-        prepared_governance_snapshot verify \
-          "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
-        prepared_qmt_announcement_snapshot verify \
-          "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" || return 1
+        controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+          "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" \
+          rollback-governance || return 1
+        controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+          "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" \
+          rollback-qmt || return 1
         ;;
     esac
   fi
@@ -5285,8 +5293,8 @@ controlled_v2_rollback_only_recovery() {
       # These phases all span a possible governance write.  Prove the sealed
       # forward restore runtime before any additional service mutation.  A
       # previous EXIT cleanup may have removed it only when the database never
-      # changed; in that case the sealed old runtime must independently capture
-      # an exact OLD match before recovery is allowed to continue.
+      # changed; in that case the sealed old runtime must independently execute
+      # the incoming verifier and prove an exact OLD projection match.
       if [ -e "$RELEASE_VENV_ROOT/$guarded_sha" ] || \
         [ -L "$RELEASE_VENV_ROOT/$guarded_sha" ]; then
         V2_RECOVERY_STEP=rollback-validate-forward-runtime
@@ -5450,10 +5458,12 @@ controlled_v2_rollback_only_recovery() {
   fi
   if [ "$restore_forward_governance" -eq 1 ]; then
     V2_RECOVERY_STEP=rollback-probe-old-governance
-    if controlled_guard_governance_snapshot verify "$guarded_sha" \
-        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" >/dev/null 2>&1 && \
-      controlled_guard_qmt_announcement_snapshot verify "$guarded_sha" \
-        "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" >/dev/null 2>&1; then
+    if controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance \
+        >/dev/null 2>&1 && \
+      controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+        "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt \
+        >/dev/null 2>&1; then
       :
     else
       V2_RECOVERY_STEP=rollback-restore-old-governance
@@ -5478,9 +5488,8 @@ controlled_v2_rollback_only_recovery() {
     return 1
   fi
   # A failed release venv is deliberately removed during rollback.  Reuse the
-  # sealed old runtime with the guarded release's read-only capture tool and
-  # require an exact match; any governance drift remains fenced for explicit
-  # recovery instead of depending on the removed forward venv or writing here.
+  # sealed old interpreter with the authenticated incoming projection verifier;
+  # any OLD-column drift remains fenced without depending on the removed venv.
   V2_RECOVERY_STEP=rollback-verify-old-governance
   if ! controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
       "$old_runtime_sha" || \
@@ -7234,7 +7243,7 @@ controlled_activation_snapshot_only_recovery() {
 }
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
   materialize_controlled_governance_contract_tool \
-    "$PROBIGA_RECOVERY_GUARD_SHA"
+    "$PROBIGA_RECOVERY_TOOL_SHA"
   if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
     { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
         restoring-new-no-receipt ] || \
@@ -10960,24 +10969,12 @@ prepared_qmt_announcement_snapshot() {
   return 0
 }
 prepared_restore_and_verify_governance_snapshot() {
-  # The scheduler row is normally unchanged.  Verify first so rollback avoids
-  # an unnecessary write, then restore the exact sealed state only on mismatch.
-  local qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
-  if [ "$1" = "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]; then
-    qmt_snapshot="$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
-  elif [ "$1" != "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" ]; then
-    return 1
-  fi
-  if prepared_governance_snapshot verify "$1" >/dev/null 2>&1 && \
-    prepared_qmt_announcement_snapshot verify "$qmt_snapshot" \
-      >/dev/null 2>&1; then
-    return 0
-  fi
-  prepared_governance_snapshot restore "$1" || return 1
-  prepared_governance_snapshot verify "$1" || return 1
-  prepared_qmt_announcement_snapshot restore "$qmt_snapshot" || return 1
-  prepared_qmt_announcement_snapshot verify "$qmt_snapshot" || return 1
-  return 0
+  # OLD snapshots predate additive scheduler columns.  The authenticated
+  # incoming-release recovery helper compares and restores only their sealed
+  # projection, so it remains valid after the fenced schema expansion.
+  test "$1" = "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
+  controlled_guard_restore_and_verify_governance_snapshot "$EXPECTED_SHA" \
+    "$1"
 }
 prepared_v2_rollback_release_database_guard() {
   local ai_service_record
@@ -11005,10 +11002,10 @@ prepared_v2_rollback_release_database_guard() {
   activation_snapshot_assert_old_set "$EXPECTED_SHA" || return 1
   controlled_guard_assert_boundary "$EXPECTED_SHA" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
-  prepared_governance_snapshot verify \
-    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" || return 1
-  prepared_qmt_announcement_snapshot verify \
-    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" || return 1
+  controlled_guard_governance_contract_snapshot verify "$EXPECTED_SHA" \
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance || return 1
+  controlled_guard_governance_contract_snapshot verify "$EXPECTED_SHA" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
   controlled_guard_capture_current_governance_snapshot "$EXPECTED_SHA" \
     "$old_runtime_sha" || return 1
   assert_scheduler_triggers_quiescent || return 1

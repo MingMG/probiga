@@ -469,8 +469,15 @@ def test_root_broker_has_exact_normal_and_recovery_argv_contracts() -> None:
     assert 'stat -c \'%a\'' in broker
     assert '"${GIT[@]}" show "${EXPECTED_SHA}:deploy/production_deploy.sh"' in normalized
     assert (
-        '"${GIT[@]}" show "${EXPECTED_RECOVERY_GUARD_SHA}:'
+        '"${GIT[@]}" show "${EXPECTED_RECOVERY_TOOL_SHA}:'
         'deploy/production_deploy.sh"'
+        in normalized
+    )
+    assert 'EXPECTED_RECOVERY_TOOL_SHA="$(' in normalized
+    assert '"${GIT[@]}" rev-parse refs/remotes/origin/main' in normalized
+    assert (
+        '"${GIT[@]}" merge-base --is-ancestor '
+        '"$EXPECTED_RECOVERY_GUARD_SHA" "$EXPECTED_RECOVERY_TOOL_SHA"'
         in normalized
     )
     assert "RECOVERY_PROTOCOL_VERSION=probiga-database-guard-recovery-v2" in broker
@@ -491,6 +498,7 @@ def test_root_broker_has_exact_normal_and_recovery_argv_contracts() -> None:
     assert "IFS= read -r RESOLVED_REQUIREMENTS_B64" not in recovery_execution
     assert "RESOLVED_REQUIREMENTS_B64=" not in recovery_execution
     assert 'PROBIGA_RECOVERY_GUARD_SHA="$EXPECTED_RECOVERY_GUARD_SHA"' in recovery_execution
+    assert 'PROBIGA_RECOVERY_TOOL_SHA="$EXPECTED_RECOVERY_TOOL_SHA"' in recovery_execution
 
 
 def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
@@ -2930,12 +2938,23 @@ def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> N
     post_restore_boundary = release.index(
         "controlled_guard_assert_boundary", old_set
     )
-    prepared_verify = release.index(
-        "prepared_governance_snapshot verify", post_restore_boundary
+    projected_verify = release.index(
+        "controlled_guard_governance_contract_snapshot verify",
+        post_restore_boundary,
     )
+    assert "rollback-governance" in release[
+        projected_verify:projected_verify + 300
+    ]
+    qmt_projected_verify = release.index(
+        "controlled_guard_governance_contract_snapshot verify",
+        projected_verify + 1,
+    )
+    assert "rollback-qmt" in release[
+        qmt_projected_verify:qmt_projected_verify + 300
+    ]
     cross_runtime_verify = release.index(
         "controlled_guard_capture_current_governance_snapshot",
-        prepared_verify,
+        qmt_projected_verify,
     )
     triggers = release.index(
         "assert_scheduler_triggers_quiescent", cross_runtime_verify
@@ -2948,7 +2967,8 @@ def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> N
         < daemon_reload
         < old_set
         < post_restore_boundary
-        < prepared_verify
+        < projected_verify
+        < qmt_projected_verify
         < cross_runtime_verify
         < triggers
         < cleanup
@@ -3005,8 +3025,8 @@ def test_ci_normal_rollback_releases_guard_only_after_exact_certification() -> N
     controlled_restore = finalize.index(
         "controlled_guard_restore_and_verify_governance_snapshot"
     )
-    prepared_finalize_verify = finalize.index(
-        "prepared_governance_snapshot verify"
+    prepared_finalize_verify = finalize.rindex(
+        "controlled_guard_governance_contract_snapshot verify"
     )
     writer_restore = finalize.index("controlled_guard_restore_previous_writer_states")
     assert controlled_restore < writer_restore
@@ -3966,14 +3986,14 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     ) in recovery
     assert 'git -C "$code_root" rev-parse HEAD' in capture
     assert "status --porcelain=v1 --untracked-files=all" in capture
-    assert "local capture_root=/tmp" in capture
-    assert 'test "$(stat -c \'%a\' "$capture_root")" = 1777' in capture
-    assert 'chown "$service_user:$service_user" "$current_snapshot"' in capture
-    capture_call = capture.index('--capture-snapshot "$current_snapshot"')
-    compare = capture.index('cmp --silent "$current_snapshot"', capture_call)
-    capture_cleanup = capture.index('rm -f -- "$current_snapshot"', compare)
-    assert capture_call < compare < capture_cleanup
-    assert '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in capture[compare:]
+    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-governance' in capture
+    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-qmt' in capture
+    assert '< "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in capture
+    assert '< "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"' in capture
+    assert "--capture-snapshot" not in capture
+    assert "cmp --silent" not in capture
+    assert "tools/add_strategy_governance_task.py" not in capture
+    assert "tools/add_qmt_announcement_task.py" not in capture
     assert "--restore-snapshot" not in capture
 
     assert 'local verification_mode="${6:-full}"' in verifier
@@ -4159,8 +4179,8 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         "controlled_v2_forward_preserve_no_receipt_recovery"
     )
     old_governance_choice = recovery.index(
-        'controlled_guard_governance_snapshot verify "$guarded_sha" '
-        '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"',
+        'controlled_guard_governance_contract_snapshot verify "$guarded_sha" '
+        '"$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance',
         forward_choice,
     )
     assert forward_choice < old_governance_choice
@@ -4170,7 +4190,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     selector = recovery[selector_start:forward_choice]
     assert "activation_snapshot_assert_new_set" not in selector
     assert "activation_snapshot_validate_governance_new" in selector
-    assert "controlled_guard_governance_snapshot verify" not in selector
+    assert "rollback-governance" not in selector
 
 
 def test_forward_no_receipt_recovery_has_distinct_commit_and_retire_contract() -> None:
@@ -4665,21 +4685,25 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
         "controlled_guard_restore_and_verify_governance_snapshot"
     ]
     initial_verify = restore_and_verify.index(
-        "controlled_guard_governance_snapshot verify"
+        "controlled_guard_governance_contract_snapshot verify"
     )
+    assert "rollback-governance" in restore_and_verify[
+        initial_verify:initial_verify + 250
+    ]
     restore = restore_and_verify.index(
-        "controlled_guard_governance_snapshot restore",
+        "controlled_guard_governance_contract_snapshot restore",
         initial_verify,
     )
     final_verify = restore_and_verify.index(
-        "controlled_guard_governance_snapshot verify",
+        "controlled_guard_governance_contract_snapshot verify",
         restore,
     )
     assert initial_verify < restore < final_verify
     assert "return 0" in restore_and_verify[initial_verify:restore]
-    assert restore_and_verify.count(
-        "controlled_guard_qmt_announcement_snapshot"
-    ) >= 3
+    assert restore_and_verify.count("rollback-governance") == 3
+    assert restore_and_verify.count("rollback-qmt") == 3
+    assert "controlled_guard_governance_snapshot" not in restore_and_verify
+    assert "controlled_guard_qmt_announcement_snapshot" not in restore_and_verify
 
     prepared_handoff = bodies["prepared_governance_snapshot"]
     assert "restore|verify" in prepared_handoff
@@ -4706,24 +4730,15 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     prepared_restore = bodies[
         "prepared_restore_and_verify_governance_snapshot"
     ]
-    initial_prepared_verify = prepared_restore.index(
-        "prepared_governance_snapshot verify"
-    )
-    prepared_restore_call = prepared_restore.index(
-        "prepared_governance_snapshot restore", initial_prepared_verify
-    )
-    final_prepared_verify = prepared_restore.index(
-        "prepared_governance_snapshot verify", prepared_restore_call
+    assert 'test "$1" = "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in (
+        prepared_restore
     )
     assert (
-        initial_prepared_verify
-        < prepared_restore_call
-        < final_prepared_verify
+        'controlled_guard_restore_and_verify_governance_snapshot "$EXPECTED_SHA"'
+        in prepared_restore
     )
-    assert "return 0" in prepared_restore[
-        initial_prepared_verify:prepared_restore_call
-    ]
-    assert prepared_restore.count("prepared_qmt_announcement_snapshot") >= 3
+    assert "prepared_governance_snapshot" not in prepared_restore
+    assert "prepared_qmt_announcement_snapshot" not in prepared_restore
 
     recovery = bodies["controlled_activation_snapshot_only_recovery"]
     old_branch = recovery[: recovery.index("activation_snapshot_restore_new_set")]
@@ -4792,11 +4807,16 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     handoff = bodies["controlled_guard_governance_contract_snapshot"]
     assert 'case "$action" in' in handoff
     assert "restore|verify)" in handoff
-    assert (
-        'if [ "$snapshot" != "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" ]'
-        in handoff
-    )
+    assert 'local snapshot_kind="${4:-forward-governance}"' in handoff
+    for sealed_route in (
+        "forward-governance:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT",
+        "rollback-governance:$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT",
+        "rollback-qmt:$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT",
+    ):
+        assert sealed_route in handoff
     assert "activation_snapshot_validate_governance_new" in handoff
+    assert "$ACTIVATION_GOVERNANCE_OLD_SHA" in handoff
+    assert "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" in handoff
     assert "controlled_guard_assert_governance_restore_runtime" in handoff
     digest_check = handoff.index(
         'test "$tool_digest" = '
@@ -4807,7 +4827,11 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     assert 'sudo -u "$service_user" test -r' in handoff[:deadline]
     assert 'cd "$code_root"' in handoff[:deadline]
     assert '"$release_venv/bin/python" -P' in handoff[deadline:]
-    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action"' in handoff
+    assert (
+        '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" "$action" '
+        '"$snapshot_kind"'
+        in handoff
+    )
     assert '< "$snapshot"' in handoff
     for failure_code in (
         "snapshot-envelope",
@@ -4833,7 +4857,7 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     normalized = _normalized_shell(deploy)
     assert (
         "materialize_controlled_governance_contract_tool "
-        '"$PROBIGA_RECOVERY_GUARD_SHA"'
+        '"$PROBIGA_RECOVERY_TOOL_SHA"'
         in normalized
     )
     assert (

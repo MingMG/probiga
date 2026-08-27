@@ -218,6 +218,7 @@ parse_broker_invocation() {
   EXPECTED_ADATA_SHA=""
   EXPECTED_ADATA_TREE_SHA256=""
   EXPECTED_RECOVERY_GUARD_SHA=""
+  EXPECTED_RECOVERY_TOOL_SHA=""
   case "$#" in
     1)
       if [ "$1" = --capabilities ]; then
@@ -723,13 +724,24 @@ if [ "$BROKER_OPERATION" = deploy ]; then
   "${GIT[@]}" cat-file -e "${EXPECTED_SHA}^{commit}" || \
     fail "requested revision is absent from the trusted release mirror"
 else
+  EXPECTED_RECOVERY_TOOL_SHA="$(
+    "${GIT[@]}" rev-parse refs/remotes/origin/main
+  )" || fail "trusted recovery tool revision cannot be derived"
+  [[ "$EXPECTED_RECOVERY_TOOL_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+    fail "trusted recovery tool revision is invalid"
   "${GIT[@]}" cat-file -e "${EXPECTED_RECOVERY_GUARD_SHA}^{commit}" || \
     fail "recovery revision is absent from the trusted release mirror"
+  "${GIT[@]}" cat-file -e "${EXPECTED_RECOVERY_TOOL_SHA}^{commit}" || \
+    fail "trusted recovery tool revision is absent from the release mirror"
+  "${GIT[@]}" merge-base --is-ancestor "$EXPECTED_RECOVERY_GUARD_SHA" \
+    "$EXPECTED_RECOVERY_TOOL_SHA" || \
+    fail "trusted recovery tool revision does not descend from guarded release"
 fi
 if [ "$BROKER_OPERATION" = deploy ]; then
   assert_commit_attributes_safe "$EXPECTED_SHA"
 else
   assert_commit_attributes_safe "$EXPECTED_RECOVERY_GUARD_SHA"
+  assert_commit_attributes_safe "$EXPECTED_RECOVERY_TOOL_SHA"
 fi
 
 BOOTSTRAP_FILE="$(mktemp /root/probiga-production-deploy.XXXXXX)"
@@ -738,7 +750,7 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     "$BOOTSTRAP_FILE"
 else
   "${GIT[@]}" show \
-    "${EXPECTED_RECOVERY_GUARD_SHA}:deploy/production_deploy.sh" > \
+    "${EXPECTED_RECOVERY_TOOL_SHA}:deploy/production_deploy.sh" > \
     "$BOOTSTRAP_FILE"
 fi
 chmod 0700 "$BOOTSTRAP_FILE"
@@ -746,7 +758,7 @@ chown root:root "$BOOTSTRAP_FILE"
 test "$(sha256sum "$BOOTSTRAP_FILE" | cut -d' ' -f1)" = \
   "$("${GIT[@]}" show \
     "$([ "$BROKER_OPERATION" = deploy ] && printf '%s' "$EXPECTED_SHA" || \
-      printf '%s' "$EXPECTED_RECOVERY_GUARD_SHA"):deploy/production_deploy.sh" | \
+      printf '%s' "$EXPECTED_RECOVERY_TOOL_SHA"):deploy/production_deploy.sh" | \
       sha256sum | cut -d' ' -f1)" || fail "trusted deploy engine digest differs"
 
 if [ "$BROKER_OPERATION" = deploy ]; then
@@ -856,7 +868,7 @@ if [ "$BROKER_OPERATION" = deploy ]; then
   rm -f -- "$RELEASE_MANIFEST_FILE" "$WHEEL_MANIFEST_FILE"
   RELEASE_MANIFEST_FILE=""
   WHEEL_MANIFEST_FILE=""
-  unset PROBIGA_RECOVERY_GUARD_SHA
+  unset PROBIGA_RECOVERY_GUARD_SHA PROBIGA_RECOVERY_TOOL_SHA
   /usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
@@ -879,6 +891,7 @@ else
     PROBIGA_DEPLOY_PROTOCOL_VERSION="$DEPLOY_PROTOCOL_VERSION" \
     PROBIGA_RECOVERY_PROTOCOL_VERSION="$RECOVERY_PROTOCOL_VERSION" \
     PROBIGA_RECOVERY_GUARD_SHA="$EXPECTED_RECOVERY_GUARD_SHA" \
+    PROBIGA_RECOVERY_TOOL_SHA="$EXPECTED_RECOVERY_TOOL_SHA" \
     /usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE" \
       --recover-database-guard
 fi

@@ -467,6 +467,23 @@ def test_broker_fetches_only_into_the_root_owned_bare_code_mirror() -> None:
         '"${GIT[@]}" show "${EXPECTED_SHA}:deploy/production_deploy.sh"'
         in normalized
     )
+    assert 'EXPECTED_RECOVERY_TOOL_SHA="$(' in normalized
+    assert '"${GIT[@]}" rev-parse refs/remotes/origin/main' in normalized
+    assert (
+        '"${GIT[@]}" merge-base --is-ancestor '
+        '"$EXPECTED_RECOVERY_GUARD_SHA" "$EXPECTED_RECOVERY_TOOL_SHA"'
+        in normalized
+    )
+    assert (
+        '"${GIT[@]}" show "${EXPECTED_RECOVERY_TOOL_SHA}:'
+        'deploy/production_deploy.sh"'
+        in normalized
+    )
+    assert (
+        '"${GIT[@]}" show "${EXPECTED_RECOVERY_GUARD_SHA}:'
+        'deploy/production_deploy.sh"'
+        not in normalized
+    )
 
     fetch_commands = [
         line for line in normalized.splitlines() if re.search(r"\bfetch\b", line)
