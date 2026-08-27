@@ -426,7 +426,11 @@ def preflight_runtime_schema_bundle(engine) -> dict[str, Any]:
     contracts: dict[str, Any] = {}
     for name, function in _VALIDATORS:
         try:
-            contracts[name] = {**_result(function(engine)), "status": "READY"}
+            contracts[name] = {
+                **_result(function(engine)),
+                "status": "READY",
+                "read_only": True,
+            }
         except Exception as exc:  # schema drift is expected during preflight
             contracts[name] = {
                 "status": "MIGRATION_REQUIRED",

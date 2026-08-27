@@ -224,6 +224,23 @@ def test_preflight_reports_migration_without_leaking_exception_message(monkeypat
     }
 
 
+def test_preflight_marks_successful_validator_contract_as_read_only(monkeypatch):
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"physical_contract_verified": True}),),
+    )
+    monkeypatch.setattr(bundle, "_RECOVERY_PLANNERS", ())
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert result["contracts"]["ready"] == {
+        "physical_contract_verified": True,
+        "status": "READY",
+        "read_only": True,
+    }
+
+
 def test_preflight_includes_read_only_recovery_plans(monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
