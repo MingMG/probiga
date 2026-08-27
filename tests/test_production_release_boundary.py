@@ -3748,6 +3748,11 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert (
         "ci-resolved-freeze-v1|static-wheel-lock-v2" in recovery
     )
+    assert "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA" in verifier
+    assert "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT" in verifier
+    assert 'scheduler_expected_sha" != "$expected_sha' in verifier
+    assert 'scheduler_build_sha" = "$scheduler_expected_sha' in verifier
+    assert '"$scheduler_code_root/tools/run_scheduler_daemon.py"' in verifier
     assert 'test "$guarded_sha" != "$EXPECTED_SHA"' not in recovery
     assert (
         "prepared|runtime-units-installing|runtime-units-installed|"

@@ -3370,8 +3370,11 @@ controlled_guard_verify_restored_runtime() {
   local code_root="$CODE_RELEASE_ROOT/$expected_sha"
   local release_venv="$RELEASE_VENV_ROOT/$expected_sha"
   local python_path="$release_venv/bin/python"
-  local adata_sha adata_tree_sha adata_source service_user pid
+  local adata_sha adata_tree_sha adata_source service_user pid main_pid
   local release_tree_sha adapter_registry_seal_sha
+  local scheduler_expected_sha scheduler_build_sha scheduler_code_root
+  local scheduler_python_path scheduler_release_tree_sha
+  local scheduler_adapter_registry_seal_sha
   local governance_result_file=""
   local governance_result_status=0
   local governance_trade_date=""
@@ -3464,6 +3467,7 @@ controlled_guard_verify_restored_runtime() {
   if [ "$main_active" = active ]; then
     pid="$(systemctl show -p MainPID --value probiga)" || return 1
     case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+    main_pid="$pid"
     grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$expected_sha" "/proc/$pid/environ" \
       >/dev/null || return 1
     grep -zFx -- "PROBIGA_CODE_ROOT=$code_root" "/proc/$pid/environ" \
@@ -3500,26 +3504,62 @@ controlled_guard_verify_restored_runtime() {
   if [ "$scheduler_load" = loaded ] && [ "$scheduler_active" = active ]; then
     pid="$(systemctl show -p MainPID --value probiga-scheduler)" || return 1
     case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
-    grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$expected_sha" "/proc/$pid/environ" \
-      >/dev/null || return 1
-    grep -zFx -- "PROBIGA_CODE_ROOT=$code_root" "/proc/$pid/environ" \
-      >/dev/null || return 1
+    scheduler_expected_sha="$(tr '\0' '\n' < "/proc/$pid/environ" | \
+      sed -n 's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)" || return 1
+    scheduler_build_sha="$(tr '\0' '\n' < "/proc/$pid/environ" | \
+      sed -n 's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)" || return 1
+    scheduler_code_root="$(tr '\0' '\n' < "/proc/$pid/environ" | \
+      sed -n 's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)" || return 1
+    [[ "$scheduler_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    test "$scheduler_build_sha" = "$scheduler_expected_sha" || return 1
+    test "$scheduler_code_root" = \
+      "$CODE_RELEASE_ROOT/$scheduler_expected_sha" || return 1
+    if [ "$scheduler_expected_sha" != "$expected_sha" ]; then
+      test "$main_active" = active || return 1
+      case "$main_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+      grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
+        "/proc/$main_pid/environ" >/dev/null || return 1
+      grep -zFx -- \
+        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$scheduler_expected_sha" \
+        "/proc/$main_pid/environ" >/dev/null || return 1
+      grep -zFx -- \
+        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$scheduler_code_root" \
+        "/proc/$main_pid/environ" >/dev/null || return 1
+    fi
+    test -d "$scheduler_code_root" || return 1
+    test ! -L "$scheduler_code_root" || return 1
+    test "$(git -C "$scheduler_code_root" rev-parse HEAD)" = \
+      "$scheduler_expected_sha" || return 1
+    scheduler_python_path="$RELEASE_VENV_ROOT/$scheduler_expected_sha/bin/python"
+    test -x "$scheduler_python_path" || return 1
+    test "$(<"$RELEASE_VENV_ROOT/$scheduler_expected_sha/.probiga.gitsha")" = \
+      "$scheduler_expected_sha" || return 1
+    scheduler_release_tree_sha="$(<"$RELEASE_VENV_ROOT/$scheduler_expected_sha/.release-tree.sha256")" || \
+      return 1
+    scheduler_adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$RELEASE_VENV_ROOT/$scheduler_expected_sha/.adapter-registry-seal.sha256")" || \
+      return 1
+    [[ "$scheduler_release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$scheduler_adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || \
+      return 1
     grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" "/proc/$pid/environ" \
       >/dev/null || return 1
     grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
       "/proc/$pid/environ" >/dev/null || return 1
     if [ "$has_attested_identity" -eq 1 ]; then
-      grep -zFx -- "PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha" \
+      grep -zFx -- \
+        "PROBIGA_RELEASE_TREE_SHA256=$scheduler_release_tree_sha" \
         "/proc/$pid/environ" >/dev/null || return 1
       grep -zFx -- \
-        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha" \
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$scheduler_adapter_registry_seal_sha" \
         "/proc/$pid/environ" >/dev/null || return 1
     fi
     mapfile -d '' -t cmdline < "/proc/$pid/cmdline" || return 1
     test "${#cmdline[@]}" -ge 3 || return 1
-    test "${cmdline[0]}" = "$python_path" || return 1
+    test "${cmdline[0]}" = "$scheduler_python_path" || return 1
     test "${cmdline[1]}" = -P || return 1
-    test "${cmdline[2]}" = "$code_root/tools/run_scheduler_daemon.py" || return 1
+    test "${cmdline[2]}" = \
+      "$scheduler_code_root/tools/run_scheduler_daemon.py" || return 1
   elif [ "$scheduler_load" = loaded ]; then
     test "$scheduler_active" = inactive || return 1
   else
