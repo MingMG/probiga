@@ -10,10 +10,48 @@ from types import SimpleNamespace
 
 import pytest
 
+from server.common import adata_release
 from tools import validate_production_release_boundary as boundary
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class _AdataBoundaryPath:
+    def __init__(self, *, uid: int, mode: int) -> None:
+        self.uid = uid
+        self.mode = mode
+
+    def stat(self):
+        return SimpleNamespace(st_uid=self.uid, st_mode=self.mode)
+
+
+def test_root_broker_evaluates_adata_mutability_as_non_root_service(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(adata_release.os, "geteuid", lambda: 0, raising=False)
+
+    assert not adata_release._writable_by_production_service(
+        _AdataBoundaryPath(uid=0, mode=0o755)
+    )
+    assert adata_release._writable_by_production_service(
+        _AdataBoundaryPath(uid=0, mode=0o775)
+    )
+    assert adata_release._writable_by_production_service(
+        _AdataBoundaryPath(uid=1000, mode=0o555)
+    )
+
+
+def test_non_root_adata_mutability_check_uses_effective_access(monkeypatch) -> None:
+    candidate = _AdataBoundaryPath(uid=0, mode=0o555)
+    monkeypatch.setattr(adata_release.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(
+        adata_release.os,
+        "access",
+        lambda path, mode: path is candidate and mode == adata_release.os.W_OK,
+    )
+
+    assert adata_release._writable_by_production_service(candidate)
 
 
 def test_scheduler_heartbeat_schema_ddl_uses_only_privileged_fenced_migrator():

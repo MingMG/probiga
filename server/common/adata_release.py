@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Iterable
 
@@ -35,6 +36,25 @@ _TREE_SHA = re.compile(r"[0-9a-f]{64}\Z")
 
 class AdataReleaseError(RuntimeError):
     """Raised when the separately versioned runtime cannot be proven."""
+
+
+def _writable_by_production_service(path: Path) -> bool:
+    """Evaluate the non-root runtime boundary even in a root broker process."""
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            state = path.stat()
+        except OSError as exc:
+            raise AdataReleaseError(
+                "adata release source metadata is unavailable"
+            ) from exc
+        # The production service is intentionally non-root.  A root-owned
+        # path without group/other write bits is therefore read-only to that
+        # service even though os.access(..., W_OK) is always true for the
+        # privileged schema broker itself.  Any non-root owner is rejected
+        # conservatively because it could be the runtime identity.
+        return state.st_uid != 0 or bool(stat.S_IMODE(state.st_mode) & 0o022)
+    return os.access(path, os.W_OK)
 
 
 def _exact_sha(value: str, *, tree: bool = False) -> str:
@@ -176,7 +196,10 @@ def validate_adata_release_source(
             if path.is_dir() and not path.is_symlink()
         )
         candidates.extend(path for _relative, path in _iter_source_files(source))
-        writable_paths = [str(path) for path in candidates if os.access(path, os.W_OK)]
+        writable_paths = [
+            str(path) for path in candidates
+            if _writable_by_production_service(path)
+        ]
         if writable_paths:
             raise AdataReleaseError(
                 "adata release source is writable by the service account"
