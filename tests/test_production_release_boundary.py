@@ -3750,8 +3750,9 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     )
     assert "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA" in verifier
     assert "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT" in verifier
-    assert 'scheduler_expected_sha" != "$expected_sha' in verifier
-    assert 'scheduler_build_sha" = "$scheduler_expected_sha' in verifier
+    assert 'test -n "$deferred_expected_sha"' in verifier
+    assert 'scheduler_expected_sha="$deferred_expected_sha"' in verifier
+    assert 'scheduler_build_sha="$deferred_expected_sha"' in verifier
     assert '"$scheduler_code_root/tools/run_scheduler_daemon.py"' in verifier
     assert 'test "$guarded_sha" != "$EXPECTED_SHA"' not in recovery
     assert (
@@ -4949,9 +4950,7 @@ def test_runtime_identity_checks_every_active_writer_and_attested_environment() 
         _shell_function_bodies(deploy)["controlled_guard_verify_restored_runtime"]
     )
     main = body.index('if [ "$main_active" = active ]; then')
-    scheduler = body.index(
-        'if [ "$scheduler_load" = loaded ] && [ "$scheduler_active" = active ]; then'
-    )
+    scheduler = body.index('if [ "$scheduler_load" = loaded ]; then')
     ai = body.index('if [ "$ai_service_load" = loaded ]; then')
     assert main < scheduler < ai < body.rindex("return 0")
     assert "return 0" not in body[main:scheduler]
@@ -4963,7 +4962,85 @@ def test_runtime_identity_checks_every_active_writer_and_attested_environment() 
         "PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha",
         "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha",
     ):
-        assert body.count(identity) >= 3
+        assert body.count(identity) >= 2
+    for selected_ai_identity in (
+        "PROBIGA_EXPECTED_GIT_SHA=$ai_expected_sha",
+        "PROBIGA_CODE_ROOT=$ai_code_root",
+        "PROBIGA_RELEASE_TREE_SHA256=$ai_release_tree_sha",
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$ai_adapter_registry_seal_sha",
+    ):
+        assert selected_ai_identity in body[ai:]
+
+
+def test_rollback_runtime_binds_split_scheduler_and_ai_to_main_attestation() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _normalized_shell(
+        _shell_function_bodies(deploy)["controlled_guard_verify_restored_runtime"]
+    )
+    deferred_mode = body.index(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB"
+    )
+    deferred = body.index(
+        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=//p"
+    )
+    scheduler = body.index('if [ "$scheduler_load" = loaded ]; then')
+    ai = body.index('if [ "$ai_service_load" = loaded ]; then')
+    assert deferred_mode < deferred < scheduler < ai
+    deferred_block = body[deferred:scheduler]
+    for proof in (
+        'test "$deferred_expected_sha" != "$expected_sha"',
+        '"$CODE_RELEASE_ROOT/$deferred_expected_sha"',
+        'git -C "$deferred_code_root" rev-parse HEAD',
+        '.probiga.gitsha',
+        '.adata.gitsha',
+        '.adata.tree.sha256',
+        '.release-tree.sha256',
+        '.adapter-registry-seal.sha256',
+    ):
+        assert proof in deferred_block
+    scheduler_block = body[scheduler:ai]
+    assert 'test -n "$deferred_expected_sha"' in scheduler_block
+    assert 'scheduler_expected_sha="$deferred_expected_sha"' in scheduler_block
+    assert 'scheduler_code_root="$deferred_code_root"' in scheduler_block
+    assert "PROBIGA_ADATA_SOURCE_DIR=$scheduler_adata_source" in scheduler_block
+    assert "PYTHONPATH=$scheduler_adata_source:$scheduler_code_root" in scheduler_block
+    assert 'if [ "$scheduler_active" = active ]; then' in scheduler_block
+    assert 'test "$scheduler_active" = inactive' in scheduler_block
+    ai_block = body[ai:body.index('case "$ai_timer_load:$ai_timer_active"', ai)]
+    assert 'test -n "$deferred_expected_sha"' in ai_block
+    assert (
+        "$deferred_python_path -P "
+        "$deferred_code_root/tools/run_ai_recommendation_worker.py --once"
+    ) in ai_block
+    for selected_identity in (
+        'ai_expected_sha="$deferred_expected_sha"',
+        'ai_code_root="$deferred_code_root"',
+        'ai_python_path="$deferred_python_path"',
+        'ai_adata_sha="$deferred_adata_sha"',
+        'ai_adata_tree_sha="$deferred_adata_tree_sha"',
+        'ai_adata_source="$deferred_adata_source"',
+        'ai_release_tree_sha="$deferred_release_tree_sha"',
+        'ai_adapter_registry_seal_sha="$deferred_adapter_registry_seal_sha"',
+    ):
+        assert selected_identity in ai_block
+    for exact_runtime_proof in (
+        "PROBIGA_EXPECTED_GIT_SHA=$ai_expected_sha",
+        "PROBIGA_CODE_ROOT=$ai_code_root",
+        "PROBIGA_EXPECTED_ADATA_SHA=$ai_adata_sha",
+        "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$ai_adata_tree_sha",
+        "PROBIGA_ADATA_SOURCE_DIR=$ai_adata_source",
+        "PYTHONPATH=$ai_adata_source:$ai_code_root",
+        "PROBIGA_RELEASE_TREE_SHA256=$ai_release_tree_sha",
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$ai_adapter_registry_seal_sha",
+        '"${cmdline[0]}" = "$ai_python_path"',
+        '"$ai_code_root/tools/run_ai_recommendation_worker.py"',
+    ):
+        assert exact_runtime_proof in ai_block
+    assert (
+        "$python_path -P $code_root/tools/run_ai_recommendation_worker.py --once"
+    ) in ai_block
 
 
 def test_new_systemd_units_and_activation_identity_bind_tree_and_registry_seal() -> None:

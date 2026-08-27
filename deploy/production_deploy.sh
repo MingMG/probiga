@@ -3371,10 +3371,20 @@ controlled_guard_verify_restored_runtime() {
   local release_venv="$RELEASE_VENV_ROOT/$expected_sha"
   local python_path="$release_venv/bin/python"
   local adata_sha adata_tree_sha adata_source service_user pid main_pid
-  local release_tree_sha adapter_registry_seal_sha
+  local release_tree_sha="" adapter_registry_seal_sha=""
+  local deferred_expected_sha="" deferred_code_root=""
+  local deferred_venv="" deferred_venv_target="" deferred_python_path=""
+  local deferred_adata_sha=""
+  local deferred_adata_tree_sha="" deferred_adata_source=""
+  local deferred_release_tree_sha="" deferred_adapter_registry_seal_sha=""
   local scheduler_expected_sha scheduler_build_sha scheduler_code_root
-  local scheduler_python_path scheduler_release_tree_sha
-  local scheduler_adapter_registry_seal_sha
+  local scheduler_python_path scheduler_adata_sha scheduler_adata_tree_sha
+  local scheduler_adata_source scheduler_release_tree_sha
+  local scheduler_adapter_registry_seal_sha scheduler_exec_start scheduler_identity
+  local scheduler_has_attested_identity
+  local ai_expected_sha ai_code_root ai_python_path ai_adata_sha
+  local ai_adata_tree_sha ai_adata_source ai_release_tree_sha
+  local ai_adapter_registry_seal_sha ai_exec_start ai_has_attested_identity
   local governance_result_file=""
   local governance_result_status=0
   local governance_trade_date=""
@@ -3501,99 +3511,250 @@ controlled_guard_verify_restored_runtime() {
   else
     test "$main_active" = inactive || return 1
   fi
-  if [ "$scheduler_load" = loaded ] && [ "$scheduler_active" = active ]; then
-    pid="$(systemctl show -p MainPID --value probiga-scheduler)" || return 1
-    case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
-    scheduler_expected_sha="$(tr '\0' '\n' < "/proc/$pid/environ" | \
-      sed -n 's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)" || return 1
-    scheduler_build_sha="$(tr '\0' '\n' < "/proc/$pid/environ" | \
-      sed -n 's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)" || return 1
-    scheduler_code_root="$(tr '\0' '\n' < "/proc/$pid/environ" | \
-      sed -n 's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)" || return 1
-    [[ "$scheduler_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-    test "$scheduler_build_sha" = "$scheduler_expected_sha" || return 1
-    test "$scheduler_code_root" = \
-      "$CODE_RELEASE_ROOT/$scheduler_expected_sha" || return 1
-    if [ "$scheduler_expected_sha" != "$expected_sha" ]; then
-      test "$main_active" = active || return 1
-      case "$main_pid" in ''|0|*[!0-9]*) return 1 ;; esac
-      grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
-        "/proc/$main_pid/environ" >/dev/null || return 1
-      grep -zFx -- \
-        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$scheduler_expected_sha" \
-        "/proc/$main_pid/environ" >/dev/null || return 1
-      grep -zFx -- \
-        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$scheduler_code_root" \
-        "/proc/$main_pid/environ" >/dev/null || return 1
+  # A DEFERRED_DB release can intentionally keep the scheduler and the AI
+  # recommendation worker on one older, sealed runtime while the API advances.
+  # Accept that auxiliary identity only when the restored API process attests
+  # the exact SHA and code root.  This prevents a stale unit file from widening
+  # the rollback allowlist on its own.
+  if [ "$main_active" = active ] && \
+    grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
+      "/proc/$main_pid/environ" >/dev/null; then
+    deferred_expected_sha="$(tr '\0' '\n' < "/proc/$main_pid/environ" | \
+      sed -n 's/^PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=//p' | \
+      tail -n 1)" || return 1
+    deferred_code_root="$(tr '\0' '\n' < "/proc/$main_pid/environ" | \
+      sed -n 's/^PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=//p' | tail -n 1)" || \
+      return 1
+    [[ "$deferred_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    test "$deferred_expected_sha" != "$expected_sha" || return 1
+    test "$deferred_code_root" = \
+      "$CODE_RELEASE_ROOT/$deferred_expected_sha" || return 1
+    test -d "$deferred_code_root" || return 1
+    test ! -L "$deferred_code_root" || return 1
+    test "$(git -C "$deferred_code_root" rev-parse HEAD)" = \
+      "$deferred_expected_sha" || return 1
+    test "$(readlink -f "$deferred_code_root")" = "$deferred_code_root" || \
+      return 1
+    test "$(stat -c '%U:%G' "$deferred_code_root")" = root:root || return 1
+    test -z "$(find -P "$deferred_code_root" -xdev \
+      \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+    test -z "$(git -C "$deferred_code_root" \
+      status --porcelain=v1 --untracked-files=all)" || return 1
+    sudo -u "$service_user" test ! -w "$deferred_code_root" || return 1
+    deferred_venv="$RELEASE_VENV_ROOT/$deferred_expected_sha"
+    test -L "$deferred_venv" || return 1
+    deferred_venv_target="$(readlink -f "$deferred_venv")" || return 1
+    case "$deferred_venv_target" in
+      "$RELEASE_VENV_ROOT"/build-*) ;;
+      *) return 1 ;;
+    esac
+    test "$(dirname "$deferred_venv_target")" = "$RELEASE_VENV_ROOT" || \
+      return 1
+    test "$(stat -c '%U:%G' "$deferred_venv_target")" = root:root || \
+      return 1
+    controlled_guard_assert_immutable_venv_tree "$deferred_venv_target" || \
+      return 1
+    sudo -u "$service_user" test ! -w "$deferred_venv_target" || return 1
+    deferred_python_path="$deferred_venv/bin/python"
+    test -x "$deferred_python_path" || return 1
+    test "$(<"$deferred_venv/.probiga.gitsha")" = \
+      "$deferred_expected_sha" || return 1
+    deferred_adata_sha="$(<"$deferred_venv/.adata.gitsha")" || \
+      return 1
+    deferred_adata_tree_sha="$(<"$deferred_venv/.adata.tree.sha256")" || \
+      return 1
+    [[ "$deferred_adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [[ "$deferred_adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    deferred_adata_source="$ADATA_RUNTIME_ROOT/$deferred_adata_sha-$deferred_adata_tree_sha"
+    test -d "$deferred_adata_source" || return 1
+    test ! -L "$deferred_adata_source" || return 1
+    test "$(readlink -f "$deferred_adata_source")" = \
+      "$deferred_adata_source" || return 1
+    test "$(stat -c '%U:%G' "$deferred_adata_source")" = root:root || \
+      return 1
+    test "$(<"$deferred_adata_source/.probiga-adata.gitsha")" = \
+      "$deferred_adata_sha" || return 1
+    test "$(<"$deferred_adata_source/.probiga-adata.tree.sha256")" = \
+      "$deferred_adata_tree_sha" || return 1
+    test -z "$(find -P "$deferred_adata_source" -xdev \
+      \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+    sudo -u "$service_user" test ! -w "$deferred_adata_source" || return 1
+    deferred_release_tree_sha="$(<"$deferred_venv/.release-tree.sha256")" || \
+      return 1
+    deferred_adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$deferred_venv/.adapter-registry-seal.sha256")" || \
+      return 1
+    [[ "$deferred_release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$deferred_adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || \
+      return 1
+  fi
+  if [ "$scheduler_load" = loaded ]; then
+    scheduler_expected_sha="$expected_sha"
+    scheduler_build_sha="$expected_sha"
+    scheduler_code_root="$code_root"
+    scheduler_python_path="$python_path"
+    scheduler_adata_sha="$adata_sha"
+    scheduler_adata_tree_sha="$adata_tree_sha"
+    scheduler_adata_source="$adata_source"
+    scheduler_release_tree_sha="$release_tree_sha"
+    scheduler_adapter_registry_seal_sha="$adapter_registry_seal_sha"
+    scheduler_has_attested_identity="$has_attested_identity"
+    scheduler_exec_start="$(systemctl show -p ExecStart --value \
+      probiga-scheduler)" || return 1
+    if printf '%s' "$scheduler_exec_start" | grep -F -- \
+        "$python_path -P $code_root/tools/run_scheduler_daemon.py" \
+        >/dev/null; then
+      :
+    else
+      test -n "$deferred_expected_sha" || return 1
+      printf '%s' "$scheduler_exec_start" | grep -F -- \
+        "$deferred_python_path -P $deferred_code_root/tools/run_scheduler_daemon.py" \
+        >/dev/null || return 1
+      scheduler_expected_sha="$deferred_expected_sha"
+      scheduler_build_sha="$deferred_expected_sha"
+      scheduler_code_root="$deferred_code_root"
+      scheduler_python_path="$deferred_python_path"
+      scheduler_adata_sha="$deferred_adata_sha"
+      scheduler_adata_tree_sha="$deferred_adata_tree_sha"
+      scheduler_adata_source="$deferred_adata_source"
+      scheduler_release_tree_sha="$deferred_release_tree_sha"
+      scheduler_adapter_registry_seal_sha="$deferred_adapter_registry_seal_sha"
+      scheduler_has_attested_identity=1
     fi
-    test -d "$scheduler_code_root" || return 1
-    test ! -L "$scheduler_code_root" || return 1
-    test "$(git -C "$scheduler_code_root" rev-parse HEAD)" = \
-      "$scheduler_expected_sha" || return 1
-    scheduler_python_path="$RELEASE_VENV_ROOT/$scheduler_expected_sha/bin/python"
-    test -x "$scheduler_python_path" || return 1
-    test "$(<"$RELEASE_VENV_ROOT/$scheduler_expected_sha/.probiga.gitsha")" = \
-      "$scheduler_expected_sha" || return 1
-    scheduler_release_tree_sha="$(<"$RELEASE_VENV_ROOT/$scheduler_expected_sha/.release-tree.sha256")" || \
-      return 1
-    scheduler_adapter_registry_seal_sha="$(/usr/bin/cat -- \
-      "$RELEASE_VENV_ROOT/$scheduler_expected_sha/.adapter-registry-seal.sha256")" || \
-      return 1
-    [[ "$scheduler_release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-    [[ "$scheduler_adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || \
-      return 1
-    grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" "/proc/$pid/environ" \
-      >/dev/null || return 1
-    grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
-      "/proc/$pid/environ" >/dev/null || return 1
-    if [ "$has_attested_identity" -eq 1 ]; then
-      grep -zFx -- \
+    for scheduler_identity in \
+      "PROBIGA_EXPECTED_GIT_SHA=$scheduler_expected_sha" \
+      "PROBIGA_BUILD_COMMIT_SHA=$scheduler_build_sha" \
+      "PROBIGA_CODE_ROOT=$scheduler_code_root" \
+      "PROBIGA_EXPECTED_ADATA_SHA=$scheduler_adata_sha" \
+      "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$scheduler_adata_tree_sha" \
+      "PROBIGA_ADATA_SOURCE_DIR=$scheduler_adata_source" \
+      "PYTHONPATH=$scheduler_adata_source:$scheduler_code_root"; do
+      printf '%s' "$scheduler_exec_start" | grep -F -- \
+        "$scheduler_identity" >/dev/null || return 1
+    done
+    if [ "$scheduler_has_attested_identity" -eq 1 ]; then
+      for scheduler_identity in \
         "PROBIGA_RELEASE_TREE_SHA256=$scheduler_release_tree_sha" \
-        "/proc/$pid/environ" >/dev/null || return 1
-      grep -zFx -- \
-        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$scheduler_adapter_registry_seal_sha" \
-        "/proc/$pid/environ" >/dev/null || return 1
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$scheduler_adapter_registry_seal_sha"; do
+        printf '%s' "$scheduler_exec_start" | grep -F -- \
+          "$scheduler_identity" >/dev/null || return 1
+      done
     fi
-    mapfile -d '' -t cmdline < "/proc/$pid/cmdline" || return 1
-    test "${#cmdline[@]}" -ge 3 || return 1
-    test "${cmdline[0]}" = "$scheduler_python_path" || return 1
-    test "${cmdline[1]}" = -P || return 1
-    test "${cmdline[2]}" = \
-      "$scheduler_code_root/tools/run_scheduler_daemon.py" || return 1
-  elif [ "$scheduler_load" = loaded ]; then
-    test "$scheduler_active" = inactive || return 1
+    if [ "$scheduler_active" = active ]; then
+      pid="$(systemctl show -p MainPID --value probiga-scheduler)" || return 1
+      case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+      for scheduler_identity in \
+        "PROBIGA_EXPECTED_GIT_SHA=$scheduler_expected_sha" \
+        "PROBIGA_BUILD_COMMIT_SHA=$scheduler_build_sha" \
+        "PROBIGA_CODE_ROOT=$scheduler_code_root" \
+        "PROBIGA_EXPECTED_ADATA_SHA=$scheduler_adata_sha" \
+        "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$scheduler_adata_tree_sha" \
+        "PROBIGA_ADATA_SOURCE_DIR=$scheduler_adata_source" \
+        "PYTHONPATH=$scheduler_adata_source:$scheduler_code_root"; do
+        grep -zFx -- "$scheduler_identity" "/proc/$pid/environ" \
+          >/dev/null || return 1
+      done
+      if [ "$scheduler_has_attested_identity" -eq 1 ]; then
+        for scheduler_identity in \
+          "PROBIGA_RELEASE_TREE_SHA256=$scheduler_release_tree_sha" \
+          "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$scheduler_adapter_registry_seal_sha"; do
+          grep -zFx -- "$scheduler_identity" "/proc/$pid/environ" \
+            >/dev/null || return 1
+        done
+      fi
+      mapfile -d '' -t cmdline < "/proc/$pid/cmdline" || return 1
+      test "${#cmdline[@]}" -ge 3 || return 1
+      test "${cmdline[0]}" = "$scheduler_python_path" || return 1
+      test "${cmdline[1]}" = -P || return 1
+      test "${cmdline[2]}" = \
+        "$scheduler_code_root/tools/run_scheduler_daemon.py" || return 1
+    else
+      test "$scheduler_active" = inactive || return 1
+    fi
   else
     test "$scheduler_load:$scheduler_active:$scheduler_unit_file" = \
       not-found:not-found:not-found || return 1
   fi
   if [ "$ai_service_load" = loaded ]; then
-    systemctl show -p ExecStart --value probiga-ai-recommendation-worker.service \
-      | grep -F -- "$python_path -P $code_root/tools/run_ai_recommendation_worker.py --once" \
+    ai_expected_sha="$expected_sha"
+    ai_code_root="$code_root"
+    ai_python_path="$python_path"
+    ai_adata_sha="$adata_sha"
+    ai_adata_tree_sha="$adata_tree_sha"
+    ai_adata_source="$adata_source"
+    ai_release_tree_sha="$release_tree_sha"
+    ai_adapter_registry_seal_sha="$adapter_registry_seal_sha"
+    ai_has_attested_identity="$has_attested_identity"
+    ai_exec_start="$(systemctl show -p ExecStart --value \
+      probiga-ai-recommendation-worker.service)" || return 1
+    if printf '%s' "$ai_exec_start" | grep -F -- \
+        "$python_path -P $code_root/tools/run_ai_recommendation_worker.py --once" \
+        >/dev/null; then
+      :
+    else
+      test -n "$deferred_expected_sha" || return 1
+      printf '%s' "$ai_exec_start" | grep -F -- \
+        "$deferred_python_path -P $deferred_code_root/tools/run_ai_recommendation_worker.py --once" \
         >/dev/null || return 1
+      ai_expected_sha="$deferred_expected_sha"
+      ai_code_root="$deferred_code_root"
+      ai_python_path="$deferred_python_path"
+      ai_adata_sha="$deferred_adata_sha"
+      ai_adata_tree_sha="$deferred_adata_tree_sha"
+      ai_adata_source="$deferred_adata_source"
+      ai_release_tree_sha="$deferred_release_tree_sha"
+      ai_adapter_registry_seal_sha="$deferred_adapter_registry_seal_sha"
+      ai_has_attested_identity=1
+    fi
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PROBIGA_EXPECTED_GIT_SHA=$ai_expected_sha" >/dev/null || return 1
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PROBIGA_CODE_ROOT=$ai_code_root" >/dev/null || return 1
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PROBIGA_EXPECTED_ADATA_SHA=$ai_adata_sha" >/dev/null || return 1
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$ai_adata_tree_sha" \
+      >/dev/null || return 1
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PROBIGA_ADATA_SOURCE_DIR=$ai_adata_source" >/dev/null || return 1
+    printf '%s' "$ai_exec_start" | grep -F -- \
+      "PYTHONPATH=$ai_adata_source:$ai_code_root" >/dev/null || return 1
+    if [ "$ai_has_attested_identity" -eq 1 ]; then
+      printf '%s' "$ai_exec_start" | grep -F -- \
+        "PROBIGA_RELEASE_TREE_SHA256=$ai_release_tree_sha" \
+        >/dev/null || return 1
+      printf '%s' "$ai_exec_start" | grep -F -- \
+        "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$ai_adapter_registry_seal_sha" \
+        >/dev/null || return 1
+    fi
     if [ "$ai_service_active" = active ]; then
       pid="$(systemctl show -p MainPID --value \
         probiga-ai-recommendation-worker.service)" || return 1
       case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
-      grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$expected_sha" "/proc/$pid/environ" \
+      grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$ai_expected_sha" "/proc/$pid/environ" \
         >/dev/null || return 1
-      grep -zFx -- "PROBIGA_CODE_ROOT=$code_root" "/proc/$pid/environ" \
+      grep -zFx -- "PROBIGA_CODE_ROOT=$ai_code_root" "/proc/$pid/environ" \
         >/dev/null || return 1
-      grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
+      grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$ai_adata_sha" \
         "/proc/$pid/environ" >/dev/null || return 1
-      grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
+      grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$ai_adata_tree_sha" \
         "/proc/$pid/environ" >/dev/null || return 1
-      if [ "$has_attested_identity" -eq 1 ]; then
-        grep -zFx -- "PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha" \
+      grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$ai_adata_source" \
+        "/proc/$pid/environ" >/dev/null || return 1
+      grep -zFx -- "PYTHONPATH=$ai_adata_source:$ai_code_root" \
+        "/proc/$pid/environ" >/dev/null || return 1
+      if [ "$ai_has_attested_identity" -eq 1 ]; then
+        grep -zFx -- "PROBIGA_RELEASE_TREE_SHA256=$ai_release_tree_sha" \
           "/proc/$pid/environ" >/dev/null || return 1
         grep -zFx -- \
-          "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha" \
+          "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$ai_adapter_registry_seal_sha" \
           "/proc/$pid/environ" >/dev/null || return 1
       fi
       mapfile -d '' -t cmdline < "/proc/$pid/cmdline" || return 1
-      test "${cmdline[0]}" = "$python_path" || return 1
+      test "${cmdline[0]}" = "$ai_python_path" || return 1
       test "${cmdline[1]}" = -P || return 1
       test "${cmdline[2]}" = \
-        "$code_root/tools/run_ai_recommendation_worker.py" || return 1
+        "$ai_code_root/tools/run_ai_recommendation_worker.py" || return 1
       test "${cmdline[3]}" = --once || return 1
     else
       test "$ai_service_active" = inactive || return 1
