@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
+    "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
 )
 
 
@@ -17,9 +19,12 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
     assert len(seed_names) == len(set(seed_names))
     assert len(validator_names) == len(set(validator_names))
     assert recovery_planner_names == [
+        "ai_bridge",
         "analysis_output",
         "recommended_run_history",
         "sim_trade",
+        "qmt_catalog",
+        "qmt_audit",
     ]
     assert set(seed_names) <= set(migration_names)
     assert {
@@ -48,7 +53,7 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
     assert metadata["seed_count"] == len(seed_names)
     assert metadata["validator_count"] == len(validator_names)
     assert metadata["recovery_planner_names"] == recovery_planner_names
-    assert metadata["recovery_planner_count"] == 3
+    assert metadata["recovery_planner_count"] == 6
     assert metadata["trigger_installation_policy"] == (
         "FROZEN_RELEASE_BROKER_ONLY"
     )
@@ -114,10 +119,13 @@ def test_recovery_planner_registry_names_and_count_are_hash_bound(monkeypatch):
 
     changed = bundle._contract_metadata()
 
-    assert changed["recovery_planner_count"] == 2
+    assert changed["recovery_planner_count"] == 5
     assert changed["recovery_planner_names"] == [
+        "ai_bridge",
         "analysis_output",
         "recommended_run_history",
+        "sim_trade",
+        "qmt_catalog",
     ]
     assert changed["contract_hash"] != original["contract_hash"]
 
@@ -248,6 +256,169 @@ def test_preflight_includes_read_only_recovery_plans(monkeypatch):
     }
     assert result["recovery_ready_for_privileged_apply"] is True
     assert result["migration_required"] is False
+
+
+def test_preflight_uses_recovery_bundle_hash_as_canonical_plan_hash(monkeypatch):
+    atomic_hash = "a" * 64
+    bundle_hash = "b" * 64
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "dual_hash",
+            lambda _engine: {
+                "plan_sha256": atomic_hash,
+                "recovery_bundle_sha256": bundle_hash,
+                "ready_for_privileged_apply": True,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    plan = result["recovery_plans"]["dual_hash"]
+    assert plan["status"] == "PLANNED"
+    assert plan["plan_sha256"] == bundle_hash
+    assert plan["recovery_bundle_sha256"] == bundle_hash
+    assert plan["atomic_plan_sha256"] == atomic_hash
+    assert result["recovery_ready_for_privileged_apply"] is True
+    assert result["migration_required"] is False
+
+
+def test_preflight_rejects_each_invalid_declared_recovery_hash(monkeypatch):
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    invalid_plans = (
+        {
+            "plan_sha256": "not-a-sha256",
+            "recovery_bundle_sha256": "b" * 64,
+            "ready_for_privileged_apply": True,
+            "read_only": True,
+        },
+        {
+            "plan_sha256": "a" * 64,
+            "recovery_bundle_sha256": "not-a-sha256",
+            "ready_for_privileged_apply": True,
+            "read_only": True,
+        },
+    )
+
+    for invalid_plan in invalid_plans:
+        monkeypatch.setattr(
+            bundle,
+            "_RECOVERY_PLANNERS",
+            (("dual_hash", lambda _engine, plan=invalid_plan: plan),),
+        )
+
+        result = bundle.preflight_runtime_schema_bundle(object())
+
+        assert result["recovery_plans"]["dual_hash"] == {
+            "status": "PLAN_UNAVAILABLE",
+            "error_type": "RuntimeError",
+            "plan_sha256": None,
+            "ready_for_privileged_apply": False,
+            "read_only": True,
+        }
+        assert result["recovery_ready_for_privileged_apply"] is False
+        assert result["migration_required"] is True
+
+
+@pytest.mark.parametrize(
+    "invalid_plan",
+    (
+        {
+            "plan_sha256": "a" * 64,
+            "atomic_plan_sha256": "not-a-sha256",
+        },
+        {
+            "plan_sha256": "a" * 64,
+            "recovery_bundle_sha256": "b" * 64,
+            "atomic_plan_sha256": "c" * 64,
+        },
+        {
+            "plan_sha256": "a" * 64,
+            "atomic_plan_sha256": "b" * 64,
+        },
+        {
+            "recovery_bundle_sha256": "b" * 64,
+            "atomic_plan_sha256": "a" * 64,
+        },
+    ),
+)
+def test_preflight_rejects_invalid_or_inconsistent_declared_atomic_hash(
+    monkeypatch,
+    invalid_plan,
+):
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "dual_hash",
+            lambda _engine: {
+                **invalid_plan,
+                "ready_for_privileged_apply": True,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    assert result["recovery_plans"]["dual_hash"] == {
+        "status": "PLAN_UNAVAILABLE",
+        "error_type": "RuntimeError",
+        "plan_sha256": None,
+        "ready_for_privileged_apply": False,
+        "read_only": True,
+    }
+    assert result["recovery_ready_for_privileged_apply"] is False
+    assert result["migration_required"] is True
+
+
+def test_preflight_accepts_declared_atomic_hash_matching_source_plan(monkeypatch):
+    atomic_hash = "a" * 64
+    bundle_hash = "b" * 64
+    monkeypatch.setattr(
+        bundle,
+        "_VALIDATORS",
+        (("ready", lambda _engine: {"read_only": True}),),
+    )
+    monkeypatch.setattr(
+        bundle,
+        "_RECOVERY_PLANNERS",
+        ((
+            "dual_hash",
+            lambda _engine: {
+                "plan_sha256": atomic_hash,
+                "recovery_bundle_sha256": bundle_hash,
+                "atomic_plan_sha256": atomic_hash,
+                "ready_for_privileged_apply": True,
+                "read_only": True,
+            },
+        ),),
+    )
+
+    result = bundle.preflight_runtime_schema_bundle(object())
+
+    plan = result["recovery_plans"]["dual_hash"]
+    assert plan["status"] == "PLANNED"
+    assert plan["plan_sha256"] == bundle_hash
+    assert plan["atomic_plan_sha256"] == atomic_hash
+    assert result["recovery_ready_for_privileged_apply"] is True
 
 
 def test_preflight_plan_failure_is_not_publishable_and_does_not_leak_message(

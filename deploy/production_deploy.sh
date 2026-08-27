@@ -5872,13 +5872,39 @@ full_trigger_inventory = (
     p.get("full_trigger_inventory") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
+    "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
 )
 expected_recovery_planners = [
+    "ai_bridge",
     "analysis_output",
     "recommended_run_history",
     "sim_trade",
+    "qmt_catalog",
+    "qmt_audit",
 ]
+
+def recovery_hashes_exact(plan):
+    def valid_hash(value):
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+    if not isinstance(plan, dict) or not valid_hash(plan.get("plan_sha256")):
+        return False
+    canonical = plan["plan_sha256"]
+    recovery_bundle = plan.get("recovery_bundle_sha256")
+    atomic = plan.get("atomic_plan_sha256")
+    if recovery_bundle is not None and (
+        not valid_hash(recovery_bundle) or recovery_bundle != canonical
+    ):
+        return False
+    if atomic is not None and (
+        not valid_hash(atomic)
+        or (recovery_bundle is None and atomic != canonical)
+    ):
+        return False
+    return True
+
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
@@ -6299,7 +6325,7 @@ runtime_bundle_exact = (
     and runtime_bundle.get("migration_count") == 28
     and runtime_bundle.get("seed_count") == 3
     and runtime_bundle.get("validator_count") == 31
-    and runtime_bundle.get("recovery_planner_count") == 3
+    and runtime_bundle.get("recovery_planner_count") == 6
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
     and runtime_bundle.get("trigger_installation_policy")
@@ -6318,7 +6344,7 @@ runtime_bundle_exact = (
     == set(runtime_bundle["migration_names"])
     and isinstance(runtime_bundle.get("seeds"), dict)
     and set(runtime_bundle["seeds"]) == set(runtime_bundle["seed_names"])
-    and runtime_bundle.get("recovery_plan_count") == 3
+    and runtime_bundle.get("recovery_plan_count") == 6
     and isinstance(runtime_bundle.get("recovery_plans"), dict)
     and set(runtime_bundle["recovery_plans"])
     == set(expected_recovery_planners)
@@ -6329,13 +6355,7 @@ runtime_bundle_exact = (
         and runtime_bundle["recovery_plans"][name].get(
             "ready_for_privileged_apply"
         ) is True
-        and isinstance(
-            runtime_bundle["recovery_plans"][name].get("plan_sha256"), str
-        )
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            runtime_bundle["recovery_plans"][name]["plan_sha256"],
-        ) is not None
+        and recovery_hashes_exact(runtime_bundle["recovery_plans"][name])
         for name in expected_recovery_planners
     )
     and runtime_bundle.get("recovery_ready_for_privileged_apply") is True
@@ -6349,7 +6369,7 @@ runtime_bundle_exact = (
         "required_surface_verified"
     ) is True
     and runtime_bundle["runtime_validation"].get("read_only") is True
-    and runtime_bundle["runtime_validation"].get("recovery_planner_count") == 3
+    and runtime_bundle["runtime_validation"].get("recovery_planner_count") == 6
     and runtime_bundle["runtime_validation"].get("recovery_planner_names")
     == expected_recovery_planners
     and isinstance(runtime_bundle["runtime_validation"].get("contracts"), dict)
@@ -6360,7 +6380,7 @@ runtime_bundle_exact = (
     == expected_runtime_bundle_hash
     and runtime_bundle_runtime.get("required_surface_verified") is True
     and runtime_bundle_runtime.get("read_only") is True
-    and runtime_bundle_runtime.get("recovery_planner_count") == 3
+    and runtime_bundle_runtime.get("recovery_planner_count") == 6
     and runtime_bundle_runtime.get("recovery_planner_names")
     == expected_recovery_planners
     and isinstance(runtime_bundle_runtime.get("contracts"), dict)
@@ -6462,13 +6482,39 @@ runtime_bundle = (
     p.get("runtime_schema_bundle") if isinstance(p, dict) else None
 )
 expected_runtime_bundle_hash = (
-    "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
+    "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
 )
 expected_recovery_planners = [
+    "ai_bridge",
     "analysis_output",
     "recommended_run_history",
     "sim_trade",
+    "qmt_catalog",
+    "qmt_audit",
 ]
+
+def recovery_hashes_exact(plan):
+    def valid_hash(value):
+        return (
+            isinstance(value, str)
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+    if not isinstance(plan, dict) or not valid_hash(plan.get("plan_sha256")):
+        return False
+    canonical = plan["plan_sha256"]
+    recovery_bundle = plan.get("recovery_bundle_sha256")
+    atomic = plan.get("atomic_plan_sha256")
+    if recovery_bundle is not None and (
+        not valid_hash(recovery_bundle) or recovery_bundle != canonical
+    ):
+        return False
+    if atomic is not None and (
+        not valid_hash(atomic)
+        or (recovery_bundle is None and atomic != canonical)
+    ):
+        return False
+    return True
+
 expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
@@ -6745,7 +6791,7 @@ runtime_bundle_exact = (
     and runtime_bundle.get("migration_count") == 28
     and runtime_bundle.get("seed_count") == 3
     and runtime_bundle.get("validator_count") == 31
-    and runtime_bundle.get("recovery_planner_count") == 3
+    and runtime_bundle.get("recovery_planner_count") == 6
     and runtime_bundle.get("recovery_planner_names")
     == expected_recovery_planners
     and runtime_bundle.get("trigger_installation_policy")
@@ -6760,7 +6806,7 @@ runtime_bundle_exact = (
     and isinstance(runtime_bundle.get("contracts"), dict)
     and set(runtime_bundle["contracts"])
     == set(runtime_bundle["validator_names"])
-    and runtime_bundle.get("recovery_plan_count") == 3
+    and runtime_bundle.get("recovery_plan_count") == 6
     and isinstance(runtime_bundle.get("recovery_plans"), dict)
     and set(runtime_bundle["recovery_plans"])
     == set(expected_recovery_planners)
@@ -6771,13 +6817,7 @@ runtime_bundle_exact = (
         and runtime_bundle["recovery_plans"][name].get(
             "ready_for_privileged_apply"
         ) is True
-        and isinstance(
-            runtime_bundle["recovery_plans"][name].get("plan_sha256"), str
-        )
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            runtime_bundle["recovery_plans"][name]["plan_sha256"],
-        ) is not None
+        and recovery_hashes_exact(runtime_bundle["recovery_plans"][name])
         for name in expected_recovery_planners
     )
     and runtime_bundle.get("recovery_ready_for_privileged_apply") is True
@@ -11018,6 +11058,139 @@ run_prepared_database_migration_tool() {
       "$entrypoint" "$@"
   )
 }
+validate_initial_database_schema_preflight_json() {
+  local python_bin="$1"
+  "$python_bin" -I -c \
+    '
+import json
+import re
+import sys
+
+payload = json.load(sys.stdin)
+bundle = (
+    payload.get("runtime_schema_bundle")
+    if isinstance(payload, dict) else None
+)
+expected_planners = [
+    "ai_bridge",
+    "analysis_output",
+    "recommended_run_history",
+    "sim_trade",
+    "qmt_catalog",
+    "qmt_audit",
+]
+expected_bundle_hash = (
+    "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
+)
+plans = bundle.get("recovery_plans") if isinstance(bundle, dict) else None
+contracts = bundle.get("contracts") if isinstance(bundle, dict) else None
+validator_names = (
+    bundle.get("validator_names") if isinstance(bundle, dict) else None
+)
+def valid_hash(value):
+    return (
+        isinstance(value, str)
+        and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
+
+def recovery_hashes_exact(plan):
+    if not isinstance(plan, dict) or not valid_hash(plan.get("plan_sha256")):
+        return False
+    canonical = plan["plan_sha256"]
+    recovery_bundle = plan.get("recovery_bundle_sha256")
+    atomic = plan.get("atomic_plan_sha256")
+    if recovery_bundle is not None and (
+        not valid_hash(recovery_bundle) or recovery_bundle != canonical
+    ):
+        return False
+    if atomic is not None and (
+        not valid_hash(atomic)
+        or (recovery_bundle is None and atomic != canonical)
+    ):
+        return False
+    return True
+
+recognized_runtime_contract = (
+    isinstance(payload, dict)
+    and type(payload.get("runtime_least_privilege_verified")) is bool
+    and type(payload.get("runtime_legacy_ddl_compatibility")) is bool
+    and payload.get("runtime_least_privilege_verified")
+    is not payload.get("runtime_legacy_ddl_compatibility")
+)
+contracts_exact = (
+    isinstance(validator_names, list)
+    and validator_names == list(dict.fromkeys(validator_names))
+    and isinstance(contracts, dict)
+    and set(contracts) == set(validator_names)
+    and bundle.get("validator_count") == 31
+    and len(validator_names) == 31
+    and bundle.get("contract_count") == len(contracts)
+    and all(
+        isinstance(item, dict)
+        and item.get("status") in {"READY", "MIGRATION_REQUIRED"}
+        and item.get("read_only") is True
+        for item in contracts.values()
+    )
+)
+recovery_exact = (
+    isinstance(bundle, dict)
+    and bundle.get("recovery_planner_count") == 6
+    and bundle.get("recovery_planner_names") == expected_planners
+    and bundle.get("recovery_plan_count") == 6
+    and isinstance(plans, dict)
+    and set(plans) == set(expected_planners)
+    and all(
+        isinstance(plans.get(name), dict)
+        and plans[name].get("status") == "PLANNED"
+        and plans[name].get("read_only") is True
+        and plans[name].get("ready_for_privileged_apply") is True
+        and recovery_hashes_exact(plans[name])
+        for name in expected_planners
+    )
+    and bundle.get("recovery_ready_for_privileged_apply") is True
+)
+ok = (
+    isinstance(payload, dict)
+    and payload.get("status") == "ok"
+    and payload.get("phase") == "preflight"
+    and payload.get("runtime_privilege_boundary_verified") is True
+    and recognized_runtime_contract
+    and payload.get("runtime_self_definer_routine_count") == 0
+    and payload.get("migrator_self_definer_routine_count") == 0
+    and payload.get("runtime_definer_routine_count") == 0
+    and payload.get("runtime_definer_routine_inventory_verified") is True
+    and payload.get("runtime_definer_routine_inventory_complete") is True
+    and payload.get("runtime_privileges_changed") is False
+    and payload.get("global_trust_changed") is False
+    and payload.get("trust_restoration_verified") is True
+    and payload.get("automatic_real_order_submission") is False
+    and isinstance(bundle, dict)
+    and bundle.get("schema")
+    == "probiga.production-runtime-schema-bundle.v1"
+    and bundle.get("contract_hash") == expected_bundle_hash
+    and bundle.get("migration_count") == 28
+    and bundle.get("seed_count") == 3
+    and bundle.get("trigger_installation_policy")
+    == "FROZEN_RELEASE_BROKER_ONLY"
+    and bundle.get("broker_owned_trigger_migration_names") == [
+        "qmt_stock_catalog_truth",
+        "qmt_trade_calendar",
+        "market_field_capture",
+        "auxiliary_runtime",
+    ]
+    and bundle.get("read_only") is True
+    and contracts_exact
+    and recovery_exact
+    and type(bundle.get("migration_required")) is bool
+    and bundle.get("migration_required")
+    is (
+        any(item.get("status") != "READY" for item in contracts.values())
+        or not bundle.get("recovery_ready_for_privileged_apply")
+    )
+)
+raise SystemExit(0 if ok else 2)
+'
+}
 run_database_boundary_bootstrap() {
   local action="$1"
   local entrypoint="$PREPARED_CODE_ROOT/deploy/production_db_boundary_bootstrap.py"
@@ -11037,6 +11210,32 @@ run_database_boundary_bootstrap() {
     HOME=/root LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     "$BOOTSTRAP_PYTHON" -I "$entrypoint" "$action"
+}
+run_initial_database_schema_preflight() {
+  local output
+  local tool_status=0
+  case "$STRATEGY_GOVERNANCE_MODE" in
+    DEFERRED_DB) ;;
+    REQUIRED)
+      CUTOVER_STEP=prepare_production_database_boundary
+      run_database_boundary_bootstrap prepare
+      ;;
+    *)
+      echo "initial database schema preflight mode is unsupported" >&2
+      return 2
+      ;;
+  esac
+  CUTOVER_STEP=preflight_strategy_governance_database_schema
+  output="$(
+    run_prepared_database_migration_tool \
+      "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+      --phase preflight
+  )" || tool_status=$?
+  printf '%s\n' "$output"
+  printf '%s' "$output" \
+    | validate_initial_database_schema_preflight_json \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+  test "$tool_status" -eq 0
 }
 assert_deferred_scheduler_process_cmdline() {
   local scheduler_pid="$1"
@@ -12075,6 +12274,12 @@ trap 'rollback 129' HUP
 # the old API remains active. This phase must not mutate the live checkout.
 CUTOVER_STEP=prepare_release
 prepare_release
+# PREPARE DATABASE: every production mode runs the same full read-only schema
+# plan and strictly validates its JSON while all existing writers remain online.
+# REQUIRED first stages its recoverable credential boundary; DEFERRED_DB without
+# that boundary fails here before its service-stop branch can be entered.
+CUTOVER_STEP=initial_database_schema_preflight
+run_initial_database_schema_preflight
 if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
   deploy_deferred_database_release
 fi
@@ -12103,18 +12308,6 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
     echo "Warning: release data readiness observer did not start" >&2
   fi
   exit 0
-fi
-CUTOVER_STEP=prepare_production_database_boundary
-run_database_boundary_bootstrap prepare
-
-# PREPARE DATABASE: read-only verification of the fixed TLS administrator and
-# migrator identities, target server, grants, trust=OFF and existing schema.
-# No DDL or DML is accepted while the old writers remain active.
-if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
-  CUTOVER_STEP=preflight_strategy_governance_database_schema
-  run_prepared_database_migration_tool \
-    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-    --phase preflight
 fi
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"

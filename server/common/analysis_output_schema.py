@@ -24,7 +24,10 @@ RECOMMENDATION_TABLE = "st_recommended_stocks"
 ANALYSIS_TABLE = "stock_analysis_result"
 FAILURE_TABLE = "st_ai_failure_samples"
 RECOVERY_VERSION = "analysis-output-business-key-recovery.v1"
-PHYSICAL_RECOVERY_VERSION = "analysis-output-physical-normalization.v1"
+PHYSICAL_RECOVERY_VERSION = "analysis-output-physical-normalization.v2"
+_TARGET_CONTRACT_HASH_VERSION = "analysis-output-target-contract.v1"
+_NORMALIZE_TABLE_ACTION = "NORMALIZE_TABLE_STORAGE"
+_MODIFY_COLUMN_ACTION_PREFIX = "MODIFY_COLUMN:"
 _LEGACY_UTF8MB4_COLLATIONS = frozenset(
     {"utf8mb4_general_ci", EXPECTED_COLLATION}
 )
@@ -301,6 +304,26 @@ _REQUIRED_INDEXES = {
 }
 
 
+def _physical_target_contract_sha256(
+    table_name: str,
+    expected: Mapping[str, dict[str, Any]],
+) -> str:
+    indexes = [
+        {"unique": unique, "columns": list(columns)}
+        for unique, columns in sorted(_REQUIRED_INDEXES[table_name])
+    ]
+    return plan_sha256(
+        recovery_version=_TARGET_CONTRACT_HASH_VERSION,
+        payload={
+            "table": table_name,
+            "engine": EXPECTED_ENGINE,
+            "table_collation": EXPECTED_COLLATION,
+            "columns": {name: dict(spec) for name, spec in expected.items()},
+            "required_indexes": indexes,
+        },
+    )
+
+
 def _value(row: Any, *names: str) -> Any:
     for name in names:
         try:
@@ -573,14 +596,97 @@ def _only_collation_diff(
     return all(token in extra for token in expected["extra_contains"])
 
 
+def _exact_legacy_recommendation_column(
+    name: str,
+    observed: dict[str, Any],
+) -> bool:
+    """Match only the two production-observed, lossless legacy shapes."""
+
+    legacy = {
+        "chase_risk_status": {
+            "column_type": "varchar(30)",
+            "is_nullable": "YES",
+            "column_default": "data_blocked",
+            "character_set_name": "utf8mb4",
+        },
+        "ordinary_buy_eligible": {
+            "column_type": "tinyint(1)",
+            "is_nullable": "YES",
+            "column_default": "0",
+            "character_set_name": None,
+        },
+    }.get(name)
+    if legacy is None:
+        return False
+    if str(observed.get("extra") or "").strip():
+        return False
+    for field, expected in legacy.items():
+        actual = observed.get(field)
+        if field == "column_default":
+            actual = _default(actual)
+            expected = _default(expected)
+        if actual != expected:
+            return False
+    collation = observed.get("collation_name")
+    if name == "chase_risk_status":
+        return collation in _LEGACY_UTF8MB4_COLLATIONS
+    return collation is None
+
+
+def _legacy_recommendation_rewrite_columns(
+    table_name: str,
+    drift: Mapping[str, dict[str, Any] | None],
+) -> list[str]:
+    if table_name != RECOMMENDATION_TABLE:
+        return []
+    return sorted(
+        name
+        for name, observed in drift.items()
+        if observed is not None
+        and _exact_legacy_recommendation_column(name, observed)
+    )
+
+
+def _recommendation_legacy_data_contract(
+    connection,
+    legacy_columns: list[str],
+) -> dict[str, int]:
+    expressions = ["COUNT(*) AS row_count"]
+    counters = ["row_count"]
+    if "chase_risk_status" in legacy_columns:
+        expressions.extend((
+            "COALESCE(SUM(CASE WHEN chase_risk_status IS NULL "
+            "THEN 1 ELSE 0 END),0) AS chase_null_count",
+            "COALESCE(SUM(CASE WHEN CHAR_LENGTH(chase_risk_status)>20 "
+            "THEN 1 ELSE 0 END),0) AS chase_overlength_count",
+        ))
+        counters.extend(("chase_null_count", "chase_overlength_count"))
+    if "ordinary_buy_eligible" in legacy_columns:
+        expressions.extend((
+            "COALESCE(SUM(CASE WHEN ordinary_buy_eligible IS NULL "
+            "THEN 1 ELSE 0 END),0) AS ordinary_null_count",
+            "COALESCE(SUM(CASE WHEN ordinary_buy_eligible NOT IN (0,1) "
+            "THEN 1 ELSE 0 END),0) AS ordinary_invalid_count",
+        ))
+        counters.extend(("ordinary_null_count", "ordinary_invalid_count"))
+    row = connection.execute(text(
+        f"SELECT {', '.join(expressions)} FROM `{RECOMMENDATION_TABLE}`"
+    )).mappings().one()
+    return {
+        name: int(_value(row, name, name.upper()) or 0)
+        for name in counters
+    }
+
+
 def _assert_safe_nonempty_collation_rewrite(
+    connection,
     *,
     table_name: str,
     columns: dict[str, dict[str, Any]],
     metadata: dict[str, str],
     expected: Mapping[str, dict[str, Any]],
     drift: dict[str, dict[str, Any] | None],
-) -> None:
+) -> dict[str, Any]:
     if metadata["engine"].casefold() != EXPECTED_ENGINE.casefold():
         raise RuntimeError(f"nonempty {table_name} engine differs")
     if metadata["table_collation"].casefold() not in _LEGACY_UTF8MB4_COLLATIONS:
@@ -592,15 +698,186 @@ def _assert_safe_nonempty_collation_rewrite(
             charset != "utf8mb4" or collation not in _LEGACY_UTF8MB4_COLLATIONS
         ):
             raise RuntimeError(f"nonempty {table_name} character encoding differs")
+    legacy_columns = _legacy_recommendation_rewrite_columns(table_name, drift)
     unsafe = sorted(
-        name for name, observed in drift.items()
-        if observed is None or not _only_collation_diff(observed, expected[name])
+        name
+        for name, observed in drift.items()
+        if observed is None
+        or (
+            not _only_collation_diff(observed, expected[name])
+            and name not in legacy_columns
+        )
     )
     if unsafe:
         raise RuntimeError(
             f"nonempty {table_name} physical drift cannot be modified in place: "
             f"columns={unsafe}, metadata={metadata}"
         )
+    data_contract = None
+    if legacy_columns:
+        data_contract = _recommendation_legacy_data_contract(
+            connection,
+            legacy_columns,
+        )
+        unsafe_data = {
+            name: count
+            for name, count in data_contract.items()
+            if name != "row_count" and count != 0
+        }
+        if unsafe_data:
+            raise RuntimeError(
+                "nonempty recommendation legacy columns contain unsafe data: "
+                f"{unsafe_data}"
+            )
+    return {
+        "legacy_column_rewrites": legacy_columns,
+        "legacy_data_contract": data_contract,
+    }
+
+
+def _required_physical_rewrite_actions(
+    *,
+    metadata: Mapping[str, str],
+    expected: Mapping[str, dict[str, Any]],
+    drift: Mapping[str, dict[str, Any] | None],
+    legacy_columns: list[str],
+) -> list[str]:
+    actions: set[str] = set()
+    if (
+        metadata["engine"].casefold() != EXPECTED_ENGINE.casefold()
+        or metadata["table_collation"].casefold()
+        != EXPECTED_COLLATION.casefold()
+        or any(
+            observed is not None
+            and name not in legacy_columns
+            and _only_collation_diff(observed, expected[name])
+            for name, observed in drift.items()
+        )
+    ):
+        actions.add(_NORMALIZE_TABLE_ACTION)
+    actions.update(
+        f"{_MODIFY_COLUMN_ACTION_PREFIX}{name}"
+        for name in legacy_columns
+    )
+    return sorted(actions)
+
+
+def _validate_pending_physical_plan_binding(
+    *,
+    table_name: str,
+    expected: Mapping[str, dict[str, Any]],
+    pending: Mapping[str, Any],
+) -> frozenset[str]:
+    manifest = pending.get("source_row")
+    payload = pending.get("plan_payload")
+    if not isinstance(manifest, dict) or not isinstance(payload, dict):
+        raise RuntimeError(f"{table_name} pending physical PLAN shape differs")
+    required_manifest_fields = {
+        "before_fingerprint",
+        "fingerprint_columns",
+        "column_drift",
+        "engine",
+        "table_collation",
+        "legacy_column_rewrites",
+        "legacy_data_contract",
+        "target_contract_sha256",
+        "allowed_actions",
+    }
+    if set(manifest) != required_manifest_fields or payload != {
+        "table": table_name,
+        **manifest,
+    }:
+        raise RuntimeError(f"{table_name} pending physical PLAN manifest differs")
+    if manifest.get("target_contract_sha256") != _physical_target_contract_sha256(
+        table_name,
+        expected,
+    ):
+        raise RuntimeError(f"{table_name} pending physical PLAN target differs")
+    fingerprint = manifest.get("before_fingerprint")
+    fingerprint_columns = manifest.get("fingerprint_columns")
+    column_drift = manifest.get("column_drift")
+    source_engine = manifest.get("engine")
+    source_collation = manifest.get("table_collation")
+    if (
+        not isinstance(fingerprint, dict)
+        or type(fingerprint.get("row_count")) is not int
+        or int(fingerprint["row_count"]) <= 0
+        or not isinstance(fingerprint_columns, list)
+        or set(fingerprint_columns) != set(expected)
+        or len(fingerprint_columns) != len(expected)
+        or not isinstance(column_drift, list)
+        or not all(type(name) is str for name in column_drift)
+        or column_drift != sorted(set(column_drift))
+        or not set(column_drift).issubset(expected)
+        or type(source_engine) is not str
+        or source_engine.casefold() != EXPECTED_ENGINE.casefold()
+        or type(source_collation) is not str
+        or source_collation.casefold() not in _LEGACY_UTF8MB4_COLLATIONS
+    ):
+        raise RuntimeError(f"{table_name} pending physical PLAN scope differs")
+    allowed_raw = manifest.get("allowed_actions")
+    legacy_raw = manifest.get("legacy_column_rewrites")
+    if (
+        not isinstance(allowed_raw, list)
+        or not allowed_raw
+        or not all(type(action) is str for action in allowed_raw)
+        or allowed_raw != sorted(set(allowed_raw))
+        or not isinstance(legacy_raw, list)
+        or not all(type(name) is str for name in legacy_raw)
+        or legacy_raw != sorted(set(legacy_raw))
+    ):
+        raise RuntimeError(f"{table_name} pending physical PLAN actions differ")
+    allowed = frozenset(allowed_raw)
+    known_actions = {_NORMALIZE_TABLE_ACTION}
+    if table_name == RECOMMENDATION_TABLE:
+        known_actions.update({
+            f"{_MODIFY_COLUMN_ACTION_PREFIX}chase_risk_status",
+            f"{_MODIFY_COLUMN_ACTION_PREFIX}ordinary_buy_eligible",
+        })
+    expected_modify_actions = {
+        f"{_MODIFY_COLUMN_ACTION_PREFIX}{name}" for name in legacy_raw
+    }
+    if (
+        not allowed.issubset(known_actions)
+        or {action for action in allowed if action.startswith(
+            _MODIFY_COLUMN_ACTION_PREFIX
+        )} != expected_modify_actions
+        or (
+            source_collation.casefold() != EXPECTED_COLLATION.casefold()
+            and _NORMALIZE_TABLE_ACTION not in allowed
+        )
+    ):
+        raise RuntimeError(f"{table_name} pending physical PLAN actions differ")
+    data_contract = manifest.get("legacy_data_contract")
+    if legacy_raw:
+        expected_data_keys = {"row_count"}
+        if "chase_risk_status" in legacy_raw:
+            expected_data_keys.update({
+                "chase_null_count",
+                "chase_overlength_count",
+            })
+        if "ordinary_buy_eligible" in legacy_raw:
+            expected_data_keys.update({
+                "ordinary_null_count",
+                "ordinary_invalid_count",
+            })
+        if (
+            not isinstance(data_contract, dict)
+            or set(data_contract) != expected_data_keys
+            or type(data_contract.get("row_count")) is not int
+            or data_contract["row_count"] != fingerprint["row_count"]
+            or any(
+                type(value) is not int or value != 0
+                for name, value in data_contract.items()
+                if name != "row_count"
+            )
+        ):
+            raise RuntimeError(
+                f"{table_name} pending physical PLAN data proof differs"
+            )
+    elif data_contract is not None:
+        raise RuntimeError(f"{table_name} pending physical PLAN data proof differs")
+    return allowed
 
 
 def _physical_dry_run(
@@ -629,13 +906,18 @@ def _physical_dry_run(
         or bool(drift)
     )
     safe = True
+    rewrite_safety = {
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+    }
     if row_count and rewrite_required:
         safety_drift = {
             name: observed for name, observed in drift.items()
             if not (observed is None and name in safe_additive_columns)
         }
         try:
-            _assert_safe_nonempty_collation_rewrite(
+            rewrite_safety = _assert_safe_nonempty_collation_rewrite(
+                connection,
                 table_name=table_name,
                 columns=columns,
                 metadata=metadata,
@@ -644,6 +926,16 @@ def _physical_dry_run(
             )
         except RuntimeError:
             safe = False
+    allowed_actions = (
+        _required_physical_rewrite_actions(
+            metadata=metadata,
+            expected=expected,
+            drift=drift,
+            legacy_columns=rewrite_safety["legacy_column_rewrites"],
+        )
+        if row_count and rewrite_required and safe
+        else []
+    )
     fingerprint = (
         table_content_fingerprint(connection, table_name)
         if rewrite_required and safe else None
@@ -657,6 +949,12 @@ def _physical_dry_run(
         "rewrite_required": rewrite_required,
         "safe_automatic_rewrite": safe,
         "before_fingerprint": fingerprint,
+        "target_contract_sha256": _physical_target_contract_sha256(
+            table_name,
+            expected,
+        ),
+        "allowed_actions": allowed_actions,
+        **rewrite_safety,
     }
 
 
@@ -888,6 +1186,7 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
     deleted_duplicate_count = 0
     physical_evidence: dict[str, Any] = {}
     physical_contexts: dict[str, dict[str, Any]] = {}
+    physical_allowed_actions: dict[str, frozenset[str]] = {}
     resumed_physical_tables: set[str] = set()
     with engine.begin() as connection:
         ensure_evidence_table(connection)
@@ -911,6 +1210,18 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                 raise RuntimeError(
                     f"{table_name} pending physical PLAN differs"
                 )
+            contract_by_table = {
+                RECOMMENDATION_TABLE: RECOMMENDATION_COLUMN_CONTRACT,
+                ANALYSIS_TABLE: ANALYSIS_COLUMN_CONTRACT,
+                FAILURE_TABLE: FAILURE_SAMPLE_COLUMN_CONTRACT,
+            }
+            physical_allowed_actions[table_name] = (
+                _validate_pending_physical_plan_binding(
+                    table_name=table_name,
+                    expected=contract_by_table[table_name],
+                    pending=pending,
+                )
+            )
             verify_pending_plan_content(connection, pending)
             physical_contexts[table_name] = pending
             resumed_physical_tables.add(table_name)
@@ -950,6 +1261,7 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
             )
             if row_count and (drift or table_drift):
                 _assert_safe_nonempty_collation_rewrite(
+                    connection,
                     table_name=table_name,
                     columns=existing,
                     metadata=metadata,
@@ -981,6 +1293,7 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
             )
             if failure_rows and (failure_drift or failure_table_drift):
                 _assert_safe_nonempty_collation_rewrite(
+                    connection,
                     table_name=FAILURE_TABLE,
                     columns=failure_columns,
                     metadata=failure_metadata,
@@ -1068,13 +1381,24 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
             if (drift or table_drift) and row_count:
                 if metadata is None:
                     raise RuntimeError(f"required table is unavailable: {table_name}")
-                _assert_safe_nonempty_collation_rewrite(
+                rewrite_safety = _assert_safe_nonempty_collation_rewrite(
+                    connection,
                     table_name=table_name,
                     columns=columns,
                     metadata=metadata,
                     expected=expected,
                     drift=drift,
                 )
+                required_actions = _required_physical_rewrite_actions(
+                    metadata=metadata,
+                    expected=expected,
+                    drift=drift,
+                    legacy_columns=rewrite_safety["legacy_column_rewrites"],
+                )
+                if not required_actions:
+                    raise RuntimeError(
+                        f"{table_name} physical rewrite has no authorized action"
+                    )
                 before = table_content_fingerprint(connection, table_name)
                 manifest = {
                     "before_fingerprint": before,
@@ -1082,6 +1406,12 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                     "column_drift": sorted(drift),
                     "engine": metadata["engine"],
                     "table_collation": metadata["table_collation"],
+                    "target_contract_sha256": _physical_target_contract_sha256(
+                        table_name,
+                        expected,
+                    ),
+                    "allowed_actions": required_actions,
+                    **rewrite_safety,
                 }
                 physical_plan_payload = {"table": table_name, **manifest}
                 physical_plan_hash = plan_sha256(
@@ -1100,7 +1430,6 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                         plan_payload=physical_plan_payload,
                         plan_hash=physical_plan_hash,
                     )
-                    persist_and_verify_evidence(connection, [plan_record])
                     context = {
                         "record": plan_record,
                         "business_key": {"table": table_name},
@@ -1108,12 +1437,38 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                         "plan_payload": physical_plan_payload,
                         "plan_sha256": physical_plan_hash,
                     }
+                    physical_allowed_actions[table_name] = (
+                        _validate_pending_physical_plan_binding(
+                            table_name=table_name,
+                            expected=expected,
+                            pending=context,
+                        )
+                    )
+                    persist_and_verify_evidence(connection, [plan_record])
                     physical_contexts[table_name] = context
-                connection.execute(text(
-                    f"ALTER TABLE `{table_name}` ENGINE={EXPECTED_ENGINE}, "
-                    "CONVERT TO CHARACTER SET utf8mb4 "
-                    f"COLLATE {EXPECTED_COLLATION}"
-                ))
+                unauthorized = sorted(
+                    set(required_actions)
+                    - physical_allowed_actions[table_name]
+                )
+                if unauthorized:
+                    raise RuntimeError(
+                        f"{table_name} pending physical PLAN does not authorize "
+                        f"current actions: {unauthorized}"
+                    )
+                if _NORMALIZE_TABLE_ACTION in required_actions:
+                    connection.execute(text(
+                        f"ALTER TABLE `{table_name}` ENGINE={EXPECTED_ENGINE}, "
+                        "CONVERT TO CHARACTER SET utf8mb4 "
+                        f"COLLATE {EXPECTED_COLLATION}"
+                    ))
+                for action in required_actions:
+                    if not action.startswith(_MODIFY_COLUMN_ACTION_PREFIX):
+                        continue
+                    name = action.removeprefix(_MODIFY_COLUMN_ACTION_PREFIX)
+                    connection.execute(text(
+                        f"ALTER TABLE `{table_name}` MODIFY COLUMN `{name}` "
+                        f"{_ddl_for_spec(expected[name])}"
+                    ))
                 remaining = _column_drift(
                     _column_inventory(connection, table_name), expected
                 )

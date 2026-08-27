@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy.engine import Engine
 
 from integrations.qmt._control_schema import (
@@ -7,6 +9,7 @@ from integrations.qmt._control_schema import (
     FrozenIndex,
     FrozenTable,
     character_column,
+    plan_frozen_table_recovery,
     privileged_migrate_frozen_tables,
     validate_frozen_tables,
 )
@@ -258,6 +261,16 @@ def validate_audit_schema(engine: Engine, *, connection=None) -> dict[str, objec
         AUDIT_TABLE_CONTRACTS,
         context="QMT audit ledger",
         connection=connection,
+    )
+
+
+def plan_audit_schema_recovery(engine: Engine) -> dict[str, Any]:
+    """Build the read-only content-hashed audit-ledger recovery plan."""
+
+    return plan_frozen_table_recovery(
+        engine,
+        AUDIT_TABLE_CONTRACTS,
+        context="QMT audit ledger",
     )
 
 

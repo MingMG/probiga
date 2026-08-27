@@ -13,6 +13,7 @@ from integrations.qmt._control_schema import (
     FrozenIndex,
     FrozenTable,
     character_column,
+    plan_frozen_table_recovery,
     privileged_migrate_frozen_tables,
     validate_frozen_tables,
 )
@@ -221,6 +222,16 @@ def validate_catalog_schema(engine: Engine, *, connection=None) -> dict[str, Any
         CATALOG_TABLE_CONTRACTS,
         context="QMT API catalog",
         connection=connection,
+    )
+
+
+def plan_catalog_schema_recovery(engine: Engine) -> dict[str, Any]:
+    """Build the read-only content-hashed catalog recovery plan."""
+
+    return plan_frozen_table_recovery(
+        engine,
+        CATALOG_TABLE_CONTRACTS,
+        context="QMT API catalog",
     )
 
 

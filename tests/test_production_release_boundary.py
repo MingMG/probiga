@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -804,6 +805,9 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     prepare_closure = _normalized_shell(
         _shell_function_closure(function_bodies, "prepare_release")
     )
+    initial_preflight = _normalized_shell(
+        function_bodies["run_initial_database_schema_preflight"]
+    )
 
     required_prepare_commands = (
         'git --git-dir="$CODE_GIT_CACHE" worktree add',
@@ -835,15 +839,17 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     assert len(prepare_calls) == 1
     prepare_call = prepare_calls[0]
     schema_prepare = deploy_script.index(
-        "CUTOVER_STEP=preflight_strategy_governance_database_schema",
+        "CUTOVER_STEP=initial_database_schema_preflight",
         prepare_call,
     )
     schema_prepare_command = deploy_script.index(
-        '"$PREPARED_CODE_ROOT/tools/'
-        'prepare_strategy_governance_schema.py"',
+        "run_initial_database_schema_preflight",
         schema_prepare,
     )
-    schema_preflight = deploy_script.index("--phase preflight", schema_prepare_command)
+    deferred_dispatch = deploy_script.index(
+        'if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then',
+        schema_prepare_command,
+    )
     cutover_fence = deploy_script.index("CUTOVER_STARTED=1", prepare_call)
     first_cutover_stop = _required_shell_position(
         deploy_script[cutover_fence:], r"sudo systemctl stop\b"
@@ -852,10 +858,14 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         prepare_call
         < schema_prepare
         < schema_prepare_command
-        < schema_preflight
+        < deferred_dispatch
         < cutover_fence
         < first_cutover_stop
     )
+    assert "prepare_strategy_governance_schema.py" in initial_preflight
+    assert "--phase preflight" in initial_preflight
+    assert "validate_initial_database_schema_preflight_json" in initial_preflight
+    assert "prepare_strategy_governance_deferred_schema.py" not in initial_preflight
     pre_cutover = _normalized_shell(
         deploy_script[schema_prepare:cutover_fence]
     )
@@ -2627,6 +2637,9 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
+    initial_runner = _shell_function_bodies(deploy_script)[
+        "run_initial_database_schema_preflight"
+    ]
     history_tool = (
         ROOT / "tools/prepare_strategy_governance_qmt_history.py"
     ).read_text(encoding="utf-8")
@@ -2704,9 +2717,7 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         < guard_removal
         < api_start
     )
-    preflight_command = _normalized_shell(
-        deploy_script[preflight_call:restore_journal]
-    )
+    preflight_command = _normalized_shell(initial_runner)
     cutover_command = _normalized_shell(
         deploy_script[cutover_call:recover_call]
     )
@@ -3472,9 +3483,9 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'funding.get("manifest_max_bytes") == 1048576',
         'funding.get("audit_max_bytes") == 131072',
         'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
-        'runtime_bundle.get("recovery_planner_count") == 3',
+        'runtime_bundle.get("recovery_planner_count") == 6',
         'runtime_bundle.get("recovery_planner_names")',
-        'runtime_bundle.get("recovery_plan_count") == 3',
+        'runtime_bundle.get("recovery_plan_count") == 6',
         'set(runtime_bundle["recovery_plans"])',
         'get("status") == "PLANNED"',
         'get("read_only") is True',
@@ -3532,9 +3543,9 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'governance_source.get("core_metric_review_contract_hash")',
         'governance_names_hash == expected_trigger_names_hash',
         'runtime_bundle.get("contract_hash") == expected_runtime_bundle_hash',
-        'runtime_bundle.get("recovery_planner_count") == 3',
+        'runtime_bundle.get("recovery_planner_count") == 6',
         'runtime_bundle.get("recovery_planner_names")',
-        'runtime_bundle.get("recovery_plan_count") == 3',
+        'runtime_bundle.get("recovery_plan_count") == 6',
         'set(runtime_bundle["recovery_plans"])',
         'get("status") == "PLANNED"',
         'get("read_only") is True',
@@ -3566,7 +3577,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
-        "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c",
+        "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
@@ -4521,17 +4532,17 @@ def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
 
     prepare = normalized.index("CUTOVER_STEP=prepare_release")
     prepare_call = normalized.index("prepare_release", prepare)
-    same_sha_gate = normalized.index(
-        'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then', prepare_call
-    )
     database_preflight = normalized.index(
-        "# PREPARE DATABASE:", same_sha_gate
+        "CUTOVER_STEP=initial_database_schema_preflight", prepare_call
+    )
+    same_sha_gate = normalized.index(
+        'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then', database_preflight
     )
     cutover_journal = normalized.index(
         "CUTOVER_STEP=persist_database_writer_restore_journal",
-        database_preflight,
+        same_sha_gate,
     )
-    noop = normalized[same_sha_gate:database_preflight]
+    noop = normalized[same_sha_gate:cutover_journal]
     verifier = noop.index("if ! prepared_request_is_already_active; then")
     mismatch = noop.index("complete finalized request identity", verifier)
     fail_closed = noop.index("false", mismatch)
@@ -4543,8 +4554,8 @@ def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
     assert (
         prepare
         < prepare_call
-        < same_sha_gate
         < database_preflight
+        < same_sha_gate
         < cutover_journal
     )
     assert verifier < mismatch < fail_closed < ignore_transport
@@ -5221,17 +5232,352 @@ def test_database_boundary_bootstrap_precedes_database_preflight() -> None:
     deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    same_sha = deploy.index('if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then')
-    bootstrap = deploy.index("CUTOVER_STEP=prepare_production_database_boundary")
-    preflight = deploy.index("CUTOVER_STEP=preflight_strategy_governance_database_schema")
+    bodies = _shell_function_bodies(deploy)
+    initial = bodies["run_initial_database_schema_preflight"]
+    required = initial.split("    REQUIRED)", 1)[1].split("    *)", 1)[0]
+    bootstrap = initial.index("CUTOVER_STEP=prepare_production_database_boundary")
+    preflight = initial.index(
+        "CUTOVER_STEP=preflight_strategy_governance_database_schema"
+    )
     writer_journal = deploy.index("CUTOVER_STEP=persist_database_writer_restore_journal")
     commit = deploy.index("CUTOVER_STEP=commit_production_database_boundary")
     guard = deploy.index("CUTOVER_STEP=install_database_writer_guard_dropins")
-    assert same_sha < bootstrap
-    assert bootstrap < preflight
-    assert "run_database_boundary_bootstrap prepare" in deploy[bootstrap:preflight]
-    assert preflight < writer_journal < commit < guard
+    preflight_validator = initial.index(
+        "validate_initial_database_schema_preflight_json",
+        preflight,
+    )
+    required_start = initial.index("    REQUIRED)")
+    assert required_start < bootstrap < preflight
+    assert "run_database_boundary_bootstrap prepare" in required
+    assert initial.count("--phase preflight") == 1
+    assert preflight < preflight_validator
+
+    definition = deploy.index("run_initial_database_schema_preflight() {")
+    calls = [
+        match.start()
+        for match in re.finditer(
+            r"(?m)^run_initial_database_schema_preflight$",
+            deploy,
+        )
+        if match.start() > definition
+    ]
+    assert len(calls) == 1
+    initial_call = calls[0]
+    deferred_dispatch = deploy.index(
+        'if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then',
+        initial_call,
+    )
+    same_sha = deploy.index(
+        'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then',
+        deferred_dispatch,
+    )
+    stop_api = deploy.index("CUTOVER_STEP=stop_api", same_sha)
+    assert initial_call < deferred_dispatch < same_sha
+    assert same_sha < writer_journal < commit < guard < stop_api
     assert "run_database_boundary_bootstrap rollback" in deploy
+
+
+def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    validator_body = _shell_function_bodies(deploy)[
+        "validate_initial_database_schema_preflight_json"
+    ]
+    python_source = validator_body.split("    '\n", 1)[1].rsplit("\n'", 1)[0]
+    planner_names = [
+        "ai_bridge",
+        "analysis_output",
+        "recommended_run_history",
+        "sim_trade",
+        "qmt_catalog",
+        "qmt_audit",
+    ]
+    validator_names = [f"validator_{index}" for index in range(31)]
+    payload = {
+        "status": "ok",
+        "phase": "preflight",
+        "runtime_privilege_boundary_verified": True,
+        "runtime_least_privilege_verified": True,
+        "runtime_legacy_ddl_compatibility": False,
+        "runtime_self_definer_routine_count": 0,
+        "migrator_self_definer_routine_count": 0,
+        "runtime_definer_routine_count": 0,
+        "runtime_definer_routine_inventory_verified": True,
+        "runtime_definer_routine_inventory_complete": True,
+        "runtime_privileges_changed": False,
+        "global_trust_changed": False,
+        "trust_restoration_verified": True,
+        "automatic_real_order_submission": False,
+        "runtime_schema_bundle": {
+            "schema": "probiga.production-runtime-schema-bundle.v1",
+            "contract_hash": (
+                "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
+            ),
+            "migration_count": 28,
+            "seed_count": 3,
+            "trigger_installation_policy": "FROZEN_RELEASE_BROKER_ONLY",
+            "broker_owned_trigger_migration_names": [
+                "qmt_stock_catalog_truth",
+                "qmt_trade_calendar",
+                "market_field_capture",
+                "auxiliary_runtime",
+            ],
+            "validator_names": validator_names,
+            "validator_count": 31,
+            "contracts": {
+                name: {
+                    "status": (
+                        "MIGRATION_REQUIRED"
+                        if name == validator_names[-1] else "READY"
+                    ),
+                    "read_only": True,
+                }
+                for name in validator_names
+            },
+            "contract_count": 31,
+            "recovery_planner_names": planner_names,
+            "recovery_planner_count": 6,
+            "recovery_plans": {
+                name: {
+                    "status": "PLANNED",
+                    "read_only": True,
+                    "ready_for_privileged_apply": True,
+                    "plan_sha256": character * 64,
+                    **(
+                        {
+                            "recovery_bundle_sha256": character * 64,
+                            "atomic_plan_sha256": atomic * 64,
+                        }
+                        if atomic is not None else {}
+                    ),
+                }
+                for name, character, atomic in zip(
+                    planner_names,
+                    "abcdef",
+                    ("1", "2", None, None, None, None),
+                )
+            },
+            "recovery_plan_count": 6,
+            "recovery_ready_for_privileged_apply": True,
+            "migration_required": True,
+            "read_only": True,
+        },
+    }
+
+    accepted = subprocess.run(
+        [sys.executable, "-I", "-c", python_source],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+    blocked = deepcopy(payload)
+    blocked["runtime_schema_bundle"][
+        "recovery_ready_for_privileged_apply"
+    ] = False
+    rejected = subprocess.run(
+        [sys.executable, "-I", "-c", python_source],
+        input=json.dumps(blocked),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+
+    invalid_atomic = deepcopy(payload)
+    invalid_atomic["runtime_schema_bundle"]["recovery_plans"][
+        "analysis_output"
+    ]["atomic_plan_sha256"] = "not-a-sha256"
+    rejected_atomic = subprocess.run(
+        [sys.executable, "-I", "-c", python_source],
+        input=json.dumps(invalid_atomic),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected_atomic.returncode == 2, (
+        rejected_atomic.stdout + rejected_atomic.stderr
+    )
+
+    bodies = _shell_function_bodies(deploy)
+    initial = bodies["run_initial_database_schema_preflight"]
+    preflight = initial.index(
+        "CUTOVER_STEP=preflight_strategy_governance_database_schema"
+    )
+    validation = initial.index(
+        "| validate_initial_database_schema_preflight_json", preflight
+    )
+    assert preflight < validation
+
+    definition = deploy.index("run_initial_database_schema_preflight() {")
+    initial_call = next(
+        match.start()
+        for match in re.finditer(
+            r"(?m)^run_initial_database_schema_preflight$",
+            deploy,
+        )
+        if match.start() > definition
+    )
+    deferred_dispatch = deploy.index(
+        'if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then',
+        initial_call,
+    )
+    writer_journal = deploy.index(
+        "CUTOVER_STEP=persist_database_writer_restore_journal",
+        deferred_dispatch,
+    )
+    stop_api = deploy.index("CUTOVER_STEP=stop_api", writer_journal)
+    assert initial_call < deferred_dispatch < writer_journal < stop_api
+
+
+def test_deferred_dispatch_uses_the_same_strict_initial_schema_preflight():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    runner = bodies["run_initial_database_schema_preflight"]
+    assert "DEFERRED_DB) ;;" in runner
+    assert runner.count("prepare_strategy_governance_schema.py") == 1
+    assert runner.count("--phase preflight") == 1
+    assert runner.count("validate_initial_database_schema_preflight_json") == 1
+    assert "prepare_strategy_governance_deferred_schema.py" not in runner
+    assert "systemctl stop" not in runner
+
+    definition = deploy.index("run_initial_database_schema_preflight() {")
+    initial_call = next(
+        match.start()
+        for match in re.finditer(
+            r"(?m)^run_initial_database_schema_preflight$",
+            deploy,
+        )
+        if match.start() > definition
+    )
+    deferred_dispatch = deploy.index(
+        'if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then',
+        initial_call,
+    )
+    assert initial_call < deferred_dispatch
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_events"),
+    (
+        (
+            "DEFERRED_DB",
+            [
+                "required_tool",
+                "required_validator",
+                "deferred_dispatch",
+                "stop_api",
+            ],
+        ),
+        (
+            "REQUIRED",
+            ["boundary:prepare", "required_tool", "required_validator"],
+        ),
+    ),
+)
+def test_initial_schema_preflight_runtime_branch_order(mode, expected_events):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    runner = _shell_function_bodies(deploy)[
+        "run_initial_database_schema_preflight"
+    ]
+    script = f"""
+set -euo pipefail
+STRATEGY_GOVERNANCE_MODE={mode}
+PREPARED_CODE_ROOT=/prepared
+RELEASE_VENV_ROOT=/venv
+EXPECTED_SHA={'a' * 40}
+VALIDATOR_STATUS=0
+run_prepared_database_migration_tool() {{
+  printf '%s\n' required_tool >&2
+  printf '%s' '{{"status":"ok"}}'
+}}
+run_database_boundary_bootstrap() {{
+  printf 'boundary:%s\n' "$1" >&2
+}}
+validate_initial_database_schema_preflight_json() {{
+  cat >/dev/null
+  printf '%s\n' required_validator >&2
+  return "$VALIDATOR_STATUS"
+}}
+run_initial_database_schema_preflight() {{
+{runner}
+}}
+run_initial_database_schema_preflight
+if [ "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB ]; then
+  printf '%s\n' deferred_dispatch >&2
+  printf '%s\n' stop_api >&2
+fi
+"""
+
+    completed = subprocess.run(
+        [bash, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stderr.splitlines() == expected_events
+
+
+def test_rejected_deferred_initial_preflight_never_reaches_writer_stop():
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    runner = _shell_function_bodies(deploy)[
+        "run_initial_database_schema_preflight"
+    ]
+    script = f"""
+set -euo pipefail
+STRATEGY_GOVERNANCE_MODE=DEFERRED_DB
+PREPARED_CODE_ROOT=/prepared
+RELEASE_VENV_ROOT=/venv
+EXPECTED_SHA={'a' * 40}
+run_prepared_database_migration_tool() {{
+  printf '%s\n' required_tool >&2
+  printf '%s' '{{"status":"blocked"}}'
+}}
+validate_initial_database_schema_preflight_json() {{
+  cat >/dev/null
+  printf '%s\n' required_validator_rejected >&2
+  return 2
+}}
+run_database_boundary_bootstrap() {{ return 99; }}
+run_initial_database_schema_preflight() {{
+{runner}
+}}
+run_initial_database_schema_preflight
+printf '%s\n' deferred_dispatch >&2
+printf '%s\n' stop_api >&2
+"""
+
+    completed = subprocess.run(
+        [bash, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2, completed.stdout + completed.stderr
+    assert completed.stderr.splitlines() == [
+        "required_tool",
+        "required_validator_rejected",
+    ]
 
 
 def test_all_legacy_mutable_production_entrypoints_are_retired() -> None:

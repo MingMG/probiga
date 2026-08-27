@@ -2085,7 +2085,7 @@ def test_same_sha_request_identity_mismatch_fails_before_database_phase(
     gate_start = source.index(
         'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then', prepare
     )
-    database = source.index("# PREPARE DATABASE:", gate_start)
+    database = source.index("GOVERNANCE_TASK_OLD_SOURCE=", gate_start)
     gate = source[gate_start:database]
     marker = (tmp_path / "database-reached").as_posix()
     sha = "a" * 40

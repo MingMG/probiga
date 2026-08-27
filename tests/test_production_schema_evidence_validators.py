@@ -82,7 +82,7 @@ RUNTIME_BUNDLE_METADATA = _contract_metadata()
 
 def test_runtime_bundle_fixture_is_the_frozen_production_contract() -> None:
     assert RUNTIME_BUNDLE_METADATA["contract_hash"] == (
-        "57c2af03c5402ba5f550f57f0680ff3f02ab2e3d9bc9604cf5de48906dd3538c"
+        "aef5148b7b9dd41418ae24b34e730747f6f3307e03168fe12dec95a364e33081"
     )
     assert RUNTIME_BUNDLE_METADATA["migration_count"] == 28
     assert RUNTIME_BUNDLE_METADATA["validator_count"] == 31
@@ -695,6 +695,26 @@ COMMON_MUTATIONS: tuple[tuple[str, Mutator], ...] = (
     (
         "runtime_bundle_contract_hash",
         _set_path("runtime_schema_bundle", "contract_hash", "0" * 64),
+    ),
+    (
+        "runtime_bundle_invalid_atomic_plan_hash",
+        _set_path(
+            "runtime_schema_bundle",
+            "recovery_plans",
+            "ai_bridge",
+            "atomic_plan_sha256",
+            "not-a-sha256",
+        ),
+    ),
+    (
+        "runtime_bundle_mismatched_recovery_hash",
+        _set_path(
+            "runtime_schema_bundle",
+            "recovery_plans",
+            "ai_bridge",
+            "recovery_bundle_sha256",
+            "0" * 64,
+        ),
     ),
     (
         "supporting_owner_count",

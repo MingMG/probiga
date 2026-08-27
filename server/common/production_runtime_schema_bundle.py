@@ -39,8 +39,13 @@ from biz.stock_market.sync_stock_market import (
     privileged_migrate_sm_stock_kline_short_name,
     validate_stock_market_runtime_schema,
 )
-from integrations.qmt.audit import privileged_migrate_audit_schema, validate_audit_schema
+from integrations.qmt.audit import (
+    plan_audit_schema_recovery,
+    privileged_migrate_audit_schema,
+    validate_audit_schema,
+)
 from integrations.qmt.catalog import (
+    plan_catalog_schema_recovery,
     privileged_migrate_catalog_schema,
     privileged_seed_catalog_registry,
     validate_catalog_registry_seed,
@@ -51,6 +56,7 @@ from integrations.wecom.delivery import (
     validate_delivery_receipt_runtime,
 )
 from server.ai_bridge.schema import (
+    plan_ai_bridge_recovery,
     privileged_migrate_ai_bridge_schema,
     validate_ai_bridge_runtime_schema,
 )
@@ -236,9 +242,12 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
 )
 
 _RECOVERY_PLANNERS: tuple[tuple[str, SchemaCallable], ...] = (
+    ("ai_bridge", plan_ai_bridge_recovery),
     ("analysis_output", plan_analysis_output_recovery),
     ("recommended_run_history", plan_recommended_run_history_recovery),
     ("sim_trade", plan_sim_trade_legacy_recovery),
+    ("qmt_catalog", plan_catalog_schema_recovery),
+    ("qmt_audit", plan_audit_schema_recovery),
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -289,34 +298,44 @@ def _run(entries: tuple[tuple[str, SchemaCallable], ...], engine) -> dict[str, A
 
 def _normalize_recovery_plan(name: str, value: Any) -> dict[str, Any]:
     plan = _result(value)
+    atomic_hash = plan.get("plan_sha256")
+    bundle_hash = plan.get("recovery_bundle_sha256")
+    declared_atomic_hash = plan.get("atomic_plan_sha256")
     declared_hashes = [
         candidate
-        for candidate in (
-            plan.get("plan_sha256"),
-            plan.get("recovery_bundle_sha256"),
-        )
+        for candidate in (atomic_hash, bundle_hash, declared_atomic_hash)
         if candidate is not None
     ]
-    raw_hash = declared_hashes[0] if declared_hashes else None
+    canonical_hash = bundle_hash if bundle_hash is not None else atomic_hash
     ready = plan.get("ready_for_privileged_apply")
     if name == "sim_trade" and ready is None:
         ready = plan.get("safe_automatic_rewrite")
     declared_read_only = plan.get("read_only")
     if (
-        not isinstance(raw_hash, str)
-        or _SHA256.fullmatch(raw_hash) is None
-        or any(candidate != raw_hash for candidate in declared_hashes)
+        not declared_hashes
+        or any(
+            not isinstance(candidate, str)
+            or _SHA256.fullmatch(candidate) is None
+            for candidate in declared_hashes
+        )
+        or (
+            declared_atomic_hash is not None
+            and declared_atomic_hash != atomic_hash
+        )
         or type(ready) is not bool
         or (declared_read_only is not None and declared_read_only is not True)
     ):
         raise RuntimeError("production schema recovery plan contract differs")
-    return {
+    normalized = {
         **plan,
-        "plan_sha256": raw_hash,
+        "plan_sha256": canonical_hash,
         "ready_for_privileged_apply": ready,
         "read_only": True,
         "status": "PLANNED",
     }
+    if bundle_hash is not None and atomic_hash is not None:
+        normalized["atomic_plan_sha256"] = atomic_hash
+    return normalized
 
 
 def _collect_recovery_plans(engine) -> dict[str, Any]:

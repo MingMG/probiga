@@ -338,6 +338,337 @@ def _output_inventory(table_name: str):
     return _actual_columns(contracts[table_name])
 
 
+def _legacy_recommendation_inventory():
+    columns = _output_inventory(output_schema.RECOMMENDATION_TABLE)
+    columns["chase_risk_status"] = {
+        **columns["chase_risk_status"],
+        "column_type": "varchar(30)",
+        "is_nullable": "YES",
+        "column_default": "data_blocked",
+    }
+    columns["ordinary_buy_eligible"] = {
+        **columns["ordinary_buy_eligible"],
+        "is_nullable": "YES",
+        "column_default": "0",
+    }
+    return columns
+
+
+def _safe_legacy_recommendation_data(row_count: int = 12):
+    return {
+        "row_count": row_count,
+        "chase_null_count": 0,
+        "chase_overlength_count": 0,
+        "ordinary_null_count": 0,
+        "ordinary_invalid_count": 0,
+    }
+
+
+def test_analysis_output_planner_accepts_only_data_safe_exact_legacy_columns():
+    engine = MagicMock()
+    inventories = {
+        table: _output_inventory(table)
+        for table in (
+            output_schema.RECOMMENDATION_TABLE,
+            output_schema.ANALYSIS_TABLE,
+            output_schema.FAILURE_TABLE,
+        )
+    }
+    inventories[output_schema.RECOMMENDATION_TABLE] = (
+        _legacy_recommendation_inventory()
+    )
+    fingerprint = {"row_count": 12, "content_sha256": "d" * 64}
+    with patch.object(
+        output_schema,
+        "_column_inventory",
+        side_effect=lambda _connection, table: inventories[table],
+    ), patch.object(
+        output_schema, "_table_metadata", return_value=_metadata()
+    ), patch.object(
+        output_schema, "_row_count", return_value=12
+    ), patch.object(
+        output_schema, "_duplicate_key", return_value=False
+    ), patch.object(
+        output_schema, "_recommendation_inbound_foreign_keys", return_value=[]
+    ), patch.object(
+        output_schema,
+        "_recommendation_duplicate_plan",
+        return_value=output_schema._build_recommendation_duplicate_plan([]),
+    ), patch.object(
+        output_schema,
+        "_recommendation_legacy_data_contract",
+        return_value=_safe_legacy_recommendation_data(),
+    ), patch.object(
+        output_schema, "table_content_fingerprint", return_value=fingerprint
+    ):
+        plan = output_schema.plan_analysis_output_recovery(engine)
+
+    recommendation = plan["physical_tables"][output_schema.RECOMMENDATION_TABLE]
+    assert recommendation["safe_automatic_rewrite"] is True
+    assert recommendation["legacy_column_rewrites"] == [
+        "chase_risk_status",
+        "ordinary_buy_eligible",
+    ]
+    assert recommendation["legacy_data_contract"] == (
+        _safe_legacy_recommendation_data()
+    )
+    assert recommendation["before_fingerprint"] == fingerprint
+    assert plan["ready_for_privileged_apply"] is True
+
+
+@pytest.mark.parametrize(
+    "unsafe_counter",
+    (
+        "chase_null_count",
+        "chase_overlength_count",
+        "ordinary_null_count",
+        "ordinary_invalid_count",
+    ),
+)
+def test_analysis_output_planner_rejects_unsafe_legacy_column_data(
+    unsafe_counter,
+):
+    connection = MagicMock()
+    columns = _legacy_recommendation_inventory()
+    drift = output_schema._column_drift(
+        columns,
+        output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+    )
+    unsafe = _safe_legacy_recommendation_data()
+    unsafe[unsafe_counter] = 1
+    with patch.object(
+        output_schema,
+        "_recommendation_legacy_data_contract",
+        return_value=unsafe,
+    ), pytest.raises(RuntimeError, match="unsafe data"):
+        output_schema._assert_safe_nonempty_collation_rewrite(
+            connection,
+            table_name=output_schema.RECOMMENDATION_TABLE,
+            columns=columns,
+            metadata=_metadata(),
+            expected=output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+            drift=drift,
+        )
+
+
+@pytest.mark.parametrize(
+    ("column_name", "field", "value"),
+    (
+        ("chase_risk_status", "column_type", "varchar(29)"),
+        ("chase_risk_status", "is_nullable", "NO"),
+        ("chase_risk_status", "column_default", "watch"),
+        ("ordinary_buy_eligible", "column_type", "tinyint(2)"),
+        ("ordinary_buy_eligible", "is_nullable", "UNKNOWN"),
+        ("ordinary_buy_eligible", "column_default", "1"),
+    ),
+)
+def test_analysis_output_rejects_near_but_not_exact_legacy_column_shape(
+    column_name,
+    field,
+    value,
+):
+    connection = MagicMock()
+    columns = _legacy_recommendation_inventory()
+    columns[column_name][field] = value
+    drift = output_schema._column_drift(
+        columns,
+        output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+    )
+
+    with patch.object(
+        output_schema, "_recommendation_legacy_data_contract"
+    ) as legacy_data, pytest.raises(RuntimeError, match="cannot be modified"):
+        output_schema._assert_safe_nonempty_collation_rewrite(
+            connection,
+            table_name=output_schema.RECOMMENDATION_TABLE,
+            columns=columns,
+            metadata=_metadata(),
+            expected=output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+            drift=drift,
+        )
+
+    legacy_data.assert_not_called()
+
+
+def test_analysis_output_single_legacy_column_does_not_query_missing_additive():
+    connection = MagicMock()
+    result_row = MagicMock()
+    result_row.mappings.return_value.one.return_value = {
+        "row_count": 5,
+        "chase_null_count": 0,
+        "chase_overlength_count": 0,
+    }
+    connection.execute.return_value = result_row
+
+    result = output_schema._recommendation_legacy_data_contract(
+        connection,
+        ["chase_risk_status"],
+    )
+
+    sql = str(connection.execute.call_args.args[0]).lower()
+    assert "chase_risk_status" in sql
+    assert "ordinary_buy_eligible" not in sql
+    assert result == {
+        "row_count": 5,
+        "chase_null_count": 0,
+        "chase_overlength_count": 0,
+    }
+
+
+def test_analysis_output_planner_accepts_one_legacy_and_one_missing_additive():
+    connection = MagicMock()
+    columns = _legacy_recommendation_inventory()
+    columns.pop("ordinary_buy_eligible")
+    fingerprint = {"row_count": 5, "content_sha256": "f" * 64}
+    observed_probes = []
+
+    def legacy_data(_connection, legacy_columns):
+        observed_probes.append(list(legacy_columns))
+        return {
+            "row_count": 5,
+            "chase_null_count": 0,
+            "chase_overlength_count": 0,
+        }
+
+    with patch.object(
+        output_schema, "_column_inventory", return_value=columns
+    ), patch.object(
+        output_schema, "_table_metadata", return_value=_metadata()
+    ), patch.object(
+        output_schema, "_row_count", return_value=5
+    ), patch.object(
+        output_schema,
+        "_recommendation_legacy_data_contract",
+        side_effect=legacy_data,
+    ), patch.object(
+        output_schema, "table_content_fingerprint", return_value=fingerprint
+    ):
+        detail = output_schema._physical_dry_run(
+            connection,
+            output_schema.RECOMMENDATION_TABLE,
+            output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+            safe_additive_columns=frozenset(
+                output_schema.RECOMMENDATION_ADDITIVE_COLUMNS
+            ),
+        )
+
+    assert observed_probes == [["chase_risk_status"]]
+    assert detail["safe_automatic_rewrite"] is True
+    assert detail["legacy_column_rewrites"] == ["chase_risk_status"]
+    assert detail["before_fingerprint"] == fingerprint
+
+
+def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
+    engine = MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+    inventories = {
+        table: _output_inventory(table)
+        for table in (
+            output_schema.RECOMMENDATION_TABLE,
+            output_schema.ANALYSIS_TABLE,
+            output_schema.FAILURE_TABLE,
+        )
+    }
+    inventories[output_schema.RECOMMENDATION_TABLE] = (
+        _legacy_recommendation_inventory()
+    )
+    target_recommendation = _output_inventory(output_schema.RECOMMENDATION_TABLE)
+    fingerprint = {"row_count": 12, "content_sha256": "e" * 64}
+    events = []
+
+    def execute(statement, *_args, **_kwargs):
+        sql = str(statement).upper()
+        if "MODIFY COLUMN `CHASE_RISK_STATUS`" in sql:
+            inventories[output_schema.RECOMMENDATION_TABLE][
+                "chase_risk_status"
+            ] = target_recommendation["chase_risk_status"]
+            events.append("modify_chase")
+        elif "MODIFY COLUMN `ORDINARY_BUY_ELIGIBLE`" in sql:
+            inventories[output_schema.RECOMMENDATION_TABLE][
+                "ordinary_buy_eligible"
+            ] = target_recommendation["ordinary_buy_eligible"]
+            events.append("modify_ordinary")
+        elif "CONVERT TO CHARACTER SET" in sql:
+            events.append("convert")
+        result = MagicMock()
+        result.rowcount = 1
+        return result
+
+    connection.execute.side_effect = execute
+
+    def legacy_data(*_args, **_kwargs):
+        events.append("legacy_data_check")
+        return _safe_legacy_recommendation_data()
+
+    def apply_duplicates(*_args, **_kwargs):
+        events.append("delete_duplicates")
+        return 0
+
+    def persist(_connection, records):
+        events.append("evidence:" + records[0]["action"])
+        return {"evidence_verified": True, "evidence_row_count": len(records)}
+
+    with patch.object(
+        output_schema, "ensure_evidence_table"
+    ), patch.object(
+        output_schema, "load_pending_physical_rewrite_plan", return_value=None
+    ), patch.object(
+        output_schema,
+        "_column_inventory",
+        side_effect=lambda _connection, table: inventories[table],
+    ), patch.object(
+        output_schema, "_table_metadata", return_value=_metadata()
+    ), patch.object(
+        output_schema, "_row_count", return_value=12
+    ), patch.object(
+        output_schema, "_recommendation_inbound_foreign_keys", return_value=[]
+    ), patch.object(
+        output_schema, "_duplicate_key", return_value=False
+    ), patch.object(
+        output_schema,
+        "_recommendation_duplicate_plan",
+        return_value=output_schema._build_recommendation_duplicate_plan([]),
+    ), patch.object(
+        output_schema,
+        "_persist_duplicate_plan",
+        return_value={"evidence_verified": True, "evidence_row_count": 0},
+    ), patch.object(
+        output_schema, "_apply_duplicate_plan", side_effect=apply_duplicates
+    ), patch.object(
+        output_schema,
+        "_recommendation_legacy_data_contract",
+        side_effect=legacy_data,
+    ), patch.object(
+        output_schema,
+        "_index_inventory",
+        side_effect=lambda _connection, table: (
+            _output_indexes(table),
+            {"PRIMARY", "business", "lookup"},
+        ),
+    ), patch.object(
+        output_schema, "table_content_fingerprint", return_value=fingerprint
+    ), patch.object(
+        output_schema, "persist_and_verify_evidence", side_effect=persist
+    ), patch.object(
+        output_schema,
+        "validate_analysis_output_schema",
+        return_value={"physical_contract_verified": True},
+    ):
+        result = output_schema.migrate_analysis_output_schema(engine)
+
+    assert events.index("legacy_data_check") < events.index("delete_duplicates")
+    assert events.index("evidence:PHYSICAL_REWRITE_PLAN") < events.index(
+        "modify_chase"
+    )
+    assert events.index("modify_chase") < events.index("modify_ordinary")
+    evidence = result["physical_rewrite_evidence"][
+        output_schema.RECOMMENDATION_TABLE
+    ]
+    assert evidence["before_fingerprint"] == fingerprint
+    assert evidence["after_fingerprint"] == fingerprint
+    assert evidence["content_verified"] is True
+
+
 def test_analysis_output_validation_rejects_type_and_business_index_drift() -> None:
     engine = MagicMock()
     inventories = {
@@ -486,6 +817,128 @@ def test_analysis_output_migration_rejects_duplicate_business_key() -> None:
         output_schema.migrate_analysis_output_schema(engine)
 
 
+def test_analysis_output_pending_plan_cannot_authorize_new_legacy_modifies():
+    engine = MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+    inventories = {
+        table: _output_inventory(table)
+        for table in (
+            output_schema.RECOMMENDATION_TABLE,
+            output_schema.ANALYSIS_TABLE,
+            output_schema.FAILURE_TABLE,
+        )
+    }
+    table_name = output_schema.RECOMMENDATION_TABLE
+    inventories[table_name] = _legacy_recommendation_inventory()
+    fingerprint = {"row_count": 12, "content_sha256": "b" * 64}
+    manifest = {
+        "before_fingerprint": fingerprint,
+        "fingerprint_columns": list(inventories[table_name]),
+        "column_drift": [],
+        "engine": output_schema.EXPECTED_ENGINE,
+        "table_collation": "utf8mb4_general_ci",
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+        "target_contract_sha256": output_schema._physical_target_contract_sha256(
+            table_name,
+            output_schema.RECOMMENDATION_COLUMN_CONTRACT,
+        ),
+        "allowed_actions": [output_schema._NORMALIZE_TABLE_ACTION],
+    }
+    payload = {"table": table_name, **manifest}
+    record = output_schema.make_evidence_record(
+        recovery_version=output_schema.PHYSICAL_RECOVERY_VERSION,
+        source_table=table_name,
+        source_row_id=0,
+        action="PHYSICAL_REWRITE_PLAN",
+        business_key={"table": table_name},
+        source_row=manifest,
+        plan_payload=payload,
+    )
+    pending = {
+        "record": record,
+        "business_key": {"table": table_name},
+        "source_row": manifest,
+        "plan_payload": payload,
+        "plan_sha256": record["plan_sha256"],
+    }
+
+    def load_pending(_connection, *, source_table, **_kwargs):
+        return pending if source_table == table_name else None
+
+    with patch.object(
+        output_schema, "ensure_evidence_table"
+    ), patch.object(
+        output_schema,
+        "load_pending_physical_rewrite_plan",
+        side_effect=load_pending,
+    ), patch.object(
+        output_schema, "verify_pending_plan_content", return_value=fingerprint
+    ), patch.object(
+        output_schema,
+        "_column_inventory",
+        side_effect=lambda _connection, table: inventories[table],
+    ), patch.object(
+        output_schema, "_table_metadata", return_value=_metadata()
+    ), patch.object(
+        output_schema, "_row_count", return_value=12
+    ), patch.object(
+        output_schema, "_recommendation_inbound_foreign_keys", return_value=[]
+    ), patch.object(
+        output_schema, "_duplicate_key", return_value=False
+    ), patch.object(
+        output_schema,
+        "_recommendation_duplicate_plan",
+        return_value=output_schema._build_recommendation_duplicate_plan([]),
+    ), patch.object(
+        output_schema,
+        "_persist_duplicate_plan",
+        return_value={"evidence_verified": True, "evidence_row_count": 0},
+    ), patch.object(
+        output_schema, "_apply_duplicate_plan", return_value=0
+    ), patch.object(
+        output_schema,
+        "_recommendation_legacy_data_contract",
+        return_value=_safe_legacy_recommendation_data(),
+    ), patch.object(
+        output_schema, "table_content_fingerprint", return_value=fingerprint
+    ), pytest.raises(RuntimeError, match="does not authorize current actions"):
+        output_schema.migrate_analysis_output_schema(engine)
+
+    assert not any(
+        "ALTER TABLE" in str(call.args[0]).upper()
+        for call in connection.execute.call_args_list
+    )
+
+
+def test_analysis_output_rejects_pending_plan_for_stale_target_contract():
+    table_name = output_schema.ANALYSIS_TABLE
+    columns = _output_inventory(table_name)
+    fingerprint = {"row_count": 10, "content_sha256": "c" * 64}
+    manifest = {
+        "before_fingerprint": fingerprint,
+        "fingerprint_columns": list(columns),
+        "column_drift": ["stock_name"],
+        "engine": output_schema.EXPECTED_ENGINE,
+        "table_collation": "utf8mb4_general_ci",
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+        "target_contract_sha256": "0" * 64,
+        "allowed_actions": [output_schema._NORMALIZE_TABLE_ACTION],
+    }
+    pending = {
+        "source_row": manifest,
+        "plan_payload": {"table": table_name, **manifest},
+    }
+
+    with pytest.raises(RuntimeError, match="target differs"):
+        output_schema._validate_pending_physical_plan_binding(
+            table_name=table_name,
+            expected=output_schema.ANALYSIS_COLUMN_CONTRACT,
+            pending=pending,
+        )
+
+
 def test_analysis_output_resumes_crash_after_alter_and_only_verifies_plan():
     engine = MagicMock()
     inventories = {
@@ -504,6 +957,13 @@ def test_analysis_output_resumes_crash_after_alter_and_only_verifies_plan():
         "column_drift": ["stock_name"],
         "engine": output_schema.EXPECTED_ENGINE,
         "table_collation": "utf8mb4_general_ci",
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+        "target_contract_sha256": output_schema._physical_target_contract_sha256(
+            table_name,
+            output_schema.ANALYSIS_COLUMN_CONTRACT,
+        ),
+        "allowed_actions": [output_schema._NORMALIZE_TABLE_ACTION],
     }
     payload = {"table": table_name, **manifest}
     record = output_schema.make_evidence_record(
