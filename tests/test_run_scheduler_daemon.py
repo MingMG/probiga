@@ -163,6 +163,23 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert "git clean" not in installer.lower()
 
 
+def test_windows_powershell_git_wrappers_ignore_successful_fetch_stderr():
+    for name in (
+        "register_qmt_windows_edge_scheduler_task.ps1",
+        "run_local_scheduler_task.ps1",
+        "update_qmt_windows_edge.ps1",
+    ):
+        source = (
+            run_scheduler_daemon.ROOT / "tools" / name
+        ).read_text(encoding="utf-8")
+        assert "@Arguments 2>$null" in source
+        assert "@Arguments 2>&1" not in source
+        assert '$ErrorActionPreference = "Continue"' in source
+        assert "$ErrorActionPreference = $PreviousPreference" in source
+        assert "$ExitCode = $LASTEXITCODE" in source
+        assert "$ExitCode -ne 0" in source
+
+
 def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     wrapper = (
         run_scheduler_daemon.ROOT

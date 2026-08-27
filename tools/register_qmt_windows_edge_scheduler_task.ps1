@@ -54,8 +54,19 @@ foreach ($Path in @(
 }
 
 function Invoke-Git([string[]]$Arguments) {
-    $Output = & git -C $ExpectedRoot @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    # Windows PowerShell 5 surfaces a native program's stderr as a terminating
+    # NativeCommandError when ErrorActionPreference is Stop, even when git exits
+    # zero (notably fetch progress).  The exit code is the authority here; keep
+    # stderr out of the success output and fail closed on every non-zero code.
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $Output = & git -C $ExpectedRoot @Arguments 2>$null
+        $ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    if ($ExitCode -ne 0) {
         throw "git command failed: git $($Arguments -join ' ')"
     }
     return @($Output)

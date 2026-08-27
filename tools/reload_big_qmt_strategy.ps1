@@ -72,8 +72,15 @@ function Get-SafeErrorText($Failure) {
 }
 
 function Invoke-Git([string[]]$Arguments) {
-    $Output = & git -C $ExpectedRoot @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $Output = & git -C $ExpectedRoot @Arguments 2>$null
+        $ExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    if ($ExitCode -ne 0) {
         throw "git command failed: git $($Arguments -join ' ')"
     }
     return @($Output)

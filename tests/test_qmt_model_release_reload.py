@@ -174,3 +174,13 @@ def test_updater_reloads_before_restarting_the_writer_and_bootstrap() -> None:
     assert "failed closed" in updater
     assert '"ProBigA\\qmt-model-reload"' in register
     assert "$StrategyReloader" in register
+
+    reloader = (ROOT / "tools" / "reload_big_qmt_strategy.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "@Arguments 2>$null" in reloader
+    assert "@Arguments 2>&1" not in reloader
+    assert '$ErrorActionPreference = "Continue"' in reloader
+    assert "$ErrorActionPreference = $PreviousPreference" in reloader
+    assert "$ExitCode = $LASTEXITCODE" in reloader
+    assert "$ExitCode -ne 0" in reloader
