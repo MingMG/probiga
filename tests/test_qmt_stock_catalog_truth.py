@@ -329,7 +329,7 @@ def test_formal_calendar_without_build_identity_fails_before_database(
     monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
     monkeypatch.setattr(
         reference_sync,
-        "create_engine",
+        "create_batch_engine",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("database must follow build identity")
         ),
@@ -342,6 +342,57 @@ def test_formal_calendar_without_build_identity_fails_before_database(
             refresh_timeout=1,
             skip_calendar=False,
         )
+
+
+def test_reference_capture_uses_central_tls_factory(monkeypatch):
+    mysql_url = "mysql+pymysql://runtime:secret@127.0.0.1:3306/probiga"
+    captured = {}
+    sentinel = object()
+
+    monkeypatch.setattr(
+        reference_sync,
+        "get_mysql_url",
+        lambda required=True: mysql_url,
+    )
+
+    def create_tls_engine(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        reference_sync,
+        "create_batch_engine",
+        create_tls_engine,
+    )
+
+    class ValidationReached(RuntimeError):
+        pass
+
+    def stop_after_engine(engine):
+        assert engine is sentinel
+        raise ValidationReached
+
+    monkeypatch.setattr(
+        reference_sync,
+        "validate_reference_tables",
+        stop_after_engine,
+    )
+
+    with pytest.raises(ValidationReached):
+        reference_sync.sync_reference_data(
+            start_year=2026,
+            end_year=2027,
+            iscomplete=True,
+            refresh_timeout=1,
+            skip_refresh=True,
+            skip_calendar=True,
+        )
+
+    assert captured == {
+        "url": mysql_url,
+        "kwargs": {"pool_pre_ping": True, "future": True},
+    }
 
 
 def _calendar_trigger_rows():

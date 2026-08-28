@@ -554,6 +554,10 @@ def test_realtime_universe_uses_independent_qmt_catalog() -> None:
     normalized = " ".join(run_big_qmt_bridge.ACTIVE_UNIVERSE_SQL.split()).lower()
     assert "qmt_stock_catalog_member" in normalized
     assert "qmt_stock_catalog_batch" in normalized
+    assert (
+        "detail.qmt_code collate utf8mb4_unicode_ci=member.qmt_code"
+        in normalized
+    )
     assert "member.batch_id=:batch_id" in normalized
     assert "member.list_date <= :target_date" in normalized
     assert "member.expire_date >= :target_date" in normalized
