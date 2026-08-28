@@ -556,7 +556,7 @@ def test_realtime_universe_uses_independent_qmt_catalog() -> None:
     assert "qmt_stock_catalog_batch" in normalized
     assert "member.batch_id=:batch_id" in normalized
     assert "member.list_date <= :target_date" in normalized
-    assert "member.expire_date > :target_date" in normalized
+    assert "member.expire_date >= :target_date" in normalized
     assert "sm_stock_kline" not in normalized
 
 

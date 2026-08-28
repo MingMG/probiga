@@ -62,11 +62,17 @@ def test_persist_bigqmt_daily_capture_uses_local_evidence_table(monkeypatch):
         local_history,
         "_prepare_kline_rows",
         lambda *_args, **kwargs: [
-            {
-                "provider": kwargs["provider"],
-                "stock_code": "000001",
-            }
+                {
+                    "provider": kwargs["provider"],
+                    "stock_code": "000001",
+                    "trade_date": "2026-08-19",
+                }
         ],
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda *_args, **_kwargs: {("000001", "2026-08-19")},
     )
     monkeypatch.setattr(
         local_history,
@@ -137,7 +143,15 @@ def test_persist_capture_reuses_authenticated_cross_schema_connection(
     monkeypatch.setattr(
         local_history,
         "_prepare_kline_rows",
-        lambda *_args, **_kwargs: [{"stock_code": "000001"}],
+        lambda *_args, **_kwargs: [{
+            "stock_code": "000001",
+            "trade_date": "2026-08-19",
+        }],
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda *_args, **_kwargs: {("000001", "2026-08-19")},
     )
     monkeypatch.setattr(
         local_history,
@@ -213,3 +227,40 @@ def test_cross_schema_capture_validates_before_preparing_or_writing(
         )
 
     assert events == ["validate"]
+
+
+def test_direct_daily_capture_rejects_pre_listing_native_placeholder(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        local_history, "validate_local_history_tables", lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_prepare_kline_rows",
+        lambda *_a, **_k: [{
+            "stock_code": "920093",
+            "trade_date": "2026-08-12",
+            "volume": 0,
+            "amount": 0,
+        }],
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda *_a, **_k: set(),
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("pre-listing placeholder must not be persisted")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="lifecycle extras"):
+        local_history.persist_daily_kline_capture(
+            pd.DataFrame([{"stock_code": "920093"}]),
+            source_engine=object(),
+            local_engine=object(),
+        )

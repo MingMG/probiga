@@ -391,7 +391,7 @@ def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUn
         and str(member["list_date"]) <= target
         and (
             member.get("expire_date") in (None, "")
-            or target < str(member["expire_date"])
+            or target <= str(member["expire_date"])
         )
     }
     if set(qmt_by_stock) != traded or len(set(qmt_by_stock.values())) != len(traded):

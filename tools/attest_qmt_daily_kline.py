@@ -56,6 +56,11 @@ from server.common.qmt_attestation_contract import (
     expected_stock_set_contract,
     validated_universe_manifest,
 )
+from server.common.qmt_daily_no_row import (
+    build_no_row_exception_contract,
+    explicit_no_row_codes,
+    project_catalog_daily_codes,
+)
 from server.common.qmt_stock_catalog import (
     a_share_stock_code_sql,
     load_stock_catalog,
@@ -1762,9 +1767,15 @@ def attest_range(
     mismatch_sample_limit: int = 5000,
     schema_prepared: bool = False,
     local_history_engine: Engine | None = None,
+    exact_lifecycle_no_row_codes: tuple[str, ...] = (),
+    not_yet_listed_no_row_codes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     if type(schema_prepared) is not bool:
         raise TypeError("schema_prepared must be bool")
+    if type(exact_lifecycle_no_row_codes) is not tuple or type(
+        not_yet_listed_no_row_codes
+    ) is not tuple:
+        raise TypeError("QMT no-row exception codes must be canonical tuples")
     validate_attestation_schema(engine)
     target_table, source_table = _table_names(
         engine,
@@ -1834,13 +1845,15 @@ def attest_range(
             )
             if any(not day for day in catalog_sessions):
                 raise RuntimeError("QMT catalog target session is invalid")
-            catalog_daily_codes = {
+            raw_catalog_daily_codes = {
                 day: catalog.eligible_codes(day) for day in catalog_sessions
             }
-            if any(not codes for codes in catalog_daily_codes.values()):
+            if any(not codes for codes in raw_catalog_daily_codes.values()):
                 raise RuntimeError(
                     "independent QMT catalog has an empty target-date universe"
                 )
+            catalog_daily_codes = raw_catalog_daily_codes
+            no_row_exception_contract = None
             for temporary in (
                 compare_temp, source_temp, source_batch_temp, calendar_temp,
                 target_temp, expected_temp,
@@ -1971,6 +1984,60 @@ def attest_range(
                 ),
                 params,
             )
+            no_row_codes = sorted(
+                set(exact_lifecycle_no_row_codes)
+                | set(not_yet_listed_no_row_codes)
+            )
+            if no_row_codes:
+                target_rows_by_code: dict[str, int] = {}
+                history_rows_by_code: dict[str, int] = {}
+                for code in no_row_codes:
+                    row = connection.execute(text(f"""
+                        SELECT
+                          (
+                            SELECT COUNT(*) FROM {target_table}
+                            WHERE stock_code=:no_row_stock_code
+                              AND k_type=1 AND adjust_type=0
+                              AND trade_date BETWEEN :start_date AND :end_date
+                          ) AS target_rows,
+                          (
+                            SELECT COUNT(*) FROM {source_table}
+                            WHERE stock_code=:no_row_stock_code
+                              AND period='1d' AND k_type=1 AND adjust_type=0
+                              AND provider=:provider
+                              AND trade_date BETWEEN :start_date AND :end_date
+                          ) AS history_rows
+                    """), {
+                        **params,
+                        "no_row_stock_code": code,
+                    }).mappings().one()
+                    target_rows_by_code[code] = int(
+                        row.get("target_rows") or 0
+                    )
+                    history_rows_by_code[code] = int(
+                        row.get("history_rows") or 0
+                    )
+                no_row_exception_contract = build_no_row_exception_contract(
+                    catalog=catalog,
+                    calendar=calendar_receipt,
+                    start_date=start_date,
+                    end_date=end_date,
+                    exact_lifecycle_codes=list(
+                        exact_lifecycle_no_row_codes
+                    ),
+                    not_yet_listed_codes=list(
+                        not_yet_listed_no_row_codes
+                    ),
+                    target_rows_by_code=target_rows_by_code,
+                    history_rows_by_code=history_rows_by_code,
+                )
+                catalog_daily_codes = project_catalog_daily_codes(
+                    catalog=catalog,
+                    calendar=calendar_receipt,
+                    start_date=start_date,
+                    end_date=end_date,
+                    contract=no_row_exception_contract,
+                )
             connection.execute(text(f"""
                 CREATE TEMPORARY TABLE `{expected_temp}` (
                     trade_date DATE NOT NULL,
@@ -1985,13 +2052,25 @@ def attest_range(
                  AND member.list_date <= calendar.trade_date
                  AND (
                      member.expire_date IS NULL
-                     OR member.expire_date > calendar.trade_date
+                     OR member.expire_date >= calendar.trade_date
                  )
                 WHERE calendar.trade_date BETWEEN :start_date AND :end_date
             """), {
                 **params,
                 "catalog_batch_id": catalog.batch_id,
             })
+            if no_row_codes:
+                placeholders = ", ".join(
+                    f":no_row_code_{index}"
+                    for index in range(len(no_row_codes))
+                )
+                connection.execute(text(f"""
+                    DELETE FROM `{expected_temp}`
+                    WHERE stock_code IN ({placeholders})
+                """), {
+                    f"no_row_code_{index}": code
+                    for index, code in enumerate(no_row_codes)
+                })
             expected_rows = int(connection.execute(
                 text(f"SELECT COUNT(*) FROM `{expected_temp}`")
             ).scalar() or 0)
@@ -2317,7 +2396,10 @@ def attest_range(
                     day: expected_stock_set_contract(day, codes)
                     for day, codes in sorted(catalog_daily_codes.items())
                 }
-            run_tolerances = build_qmt_v2_manifest(daily_universe)
+            run_tolerances = build_qmt_v2_manifest(
+                daily_universe,
+                no_row_exception_contract=no_row_exception_contract,
+            )
             manifest_row_count = sum(
                 int(contract["stock_count"])
                 for contract in daily_universe.values()
@@ -2575,6 +2657,8 @@ def main() -> int:
     parser.add_argument("--mismatch-sample-limit", type=int, default=5000)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--exact-lifecycle-no-row-codes", default="")
+    parser.add_argument("--not-yet-listed-no-row-codes", default="")
     parser.add_argument(
         "--windows-local-option-file",
         action="store_true",
@@ -2584,6 +2668,28 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    try:
+        exact_lifecycle_no_row_codes = tuple(explicit_no_row_codes(
+            args.exact_lifecycle_no_row_codes,
+            category="EXACT_LIFECYCLE_NO_ROW",
+        ))
+        not_yet_listed_no_row_codes = tuple(explicit_no_row_codes(
+            args.not_yet_listed_no_row_codes,
+            category="NOT_YET_LISTED_NO_ROW",
+        ))
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (
+        exact_lifecycle_no_row_codes or not_yet_listed_no_row_codes
+    ) and (
+        not args.windows_local_option_file
+        or not args.apply
+        or args.provider != PROVIDER_ID
+    ):
+        parser.error(
+            "QMT no-row exception codes require protected Windows --apply "
+            f"with --provider {PROVIDER_ID}"
+        )
     load_project_env()
     local_history_engine = None
     if args.windows_local_option_file:
@@ -2603,6 +2709,8 @@ def main() -> int:
             provider=args.provider,
             mismatch_sample_limit=args.mismatch_sample_limit,
             local_history_engine=local_history_engine,
+            exact_lifecycle_no_row_codes=exact_lifecycle_no_row_codes,
+            not_yet_listed_no_row_codes=not_yet_listed_no_row_codes,
         )
     finally:
         if args.windows_local_option_file:

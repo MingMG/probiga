@@ -2699,7 +2699,7 @@ def _step_stock_kline_qmt(
         if str(member["list_date"]) <= normalized_end_text
         and (
             member.get("expire_date") in (None, "")
-            or normalized_start_text < str(member["expire_date"])
+            or normalized_start_text <= str(member["expire_date"])
         )
     )
     if not stock_codes:
@@ -2780,7 +2780,7 @@ def _step_stock_kline_qmt(
                     if str(member_by_code[code]["list_date"]) <= trade_date
                     and (
                         member_by_code[code].get("expire_date") in (None, "")
-                        or trade_date < str(member_by_code[code]["expire_date"])
+                        or trade_date <= str(member_by_code[code]["expire_date"])
                     )
                 }
                 observed = observed_by_date.get(trade_date, set())

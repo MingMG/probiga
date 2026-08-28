@@ -194,6 +194,10 @@ QMT_V2_MANIFEST_KEYS = frozenset({
     "universe_manifest_schema",
     "daily_universe",
 })
+QMT_V2_NO_ROW_MANIFEST_KEYS = frozenset({
+    *QMT_V2_MANIFEST_KEYS,
+    "no_row_exception_contract",
+})
 QMT_V2_DAILY_ENTRY_KEYS = frozenset({"stock_count", "stock_set_hash"})
 QMT_V2_BOUND_DAILY_ENTRY_KEYS = frozenset({
     *QMT_V2_DAILY_ENTRY_KEYS,
@@ -355,6 +359,8 @@ def bound_stock_set_contract(
 
 def build_qmt_v2_manifest(
     daily_universe: dict[str, dict[str, Any]],
+    *,
+    no_row_exception_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     entry_key_sets = {
         frozenset(entry) for entry in daily_universe.values()
@@ -368,12 +374,27 @@ def build_qmt_v2_manifest(
         manifest_schema = UNIVERSE_MANIFEST_SCHEMA
     else:
         raise ValueError("QMT daily universe entry fields differ")
-    return {
+    result = {
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
         **dict(QMT_V2_TOLERANCE_VALUES),
         "universe_manifest_schema": manifest_schema,
         "daily_universe": daily_universe,
     }
+    if no_row_exception_contract is not None:
+        from server.common.qmt_daily_no_row import (
+            validate_no_row_exception_contract_shape,
+        )
+
+        if type(no_row_exception_contract) is not dict:
+            raise ValueError("QMT no-row exception contract must be an object")
+        result["no_row_exception_contract"] = (
+            validate_no_row_exception_contract_shape(
+                no_row_exception_contract,
+                start_date=min(daily_universe),
+                end_date=max(daily_universe),
+            )
+        )
+    return result
 
 
 def validated_universe_manifest(
@@ -393,7 +414,10 @@ def validated_universe_manifest(
             raise ValueError("tolerance_json is not valid JSON") from exc
     if type(payload) is not dict:
         raise ValueError("tolerance_json must be an object")
-    if set(payload) != QMT_V2_MANIFEST_KEYS:
+    if set(payload) not in (
+        QMT_V2_MANIFEST_KEYS,
+        QMT_V2_NO_ROW_MANIFEST_KEYS,
+    ):
         raise ValueError("QMT V2 manifest top-level fields differ")
     if (
         type(payload["attestation_protocol"]) is not str
@@ -414,6 +438,16 @@ def validated_universe_manifest(
     daily = payload["daily_universe"]
     if type(daily) is not dict or not daily:
         raise ValueError("daily universe manifest must be non-empty")
+    if "no_row_exception_contract" in payload:
+        from server.common.qmt_daily_no_row import (
+            validate_no_row_exception_contract_shape,
+        )
+
+        validate_no_row_exception_contract_shape(
+            payload["no_row_exception_contract"],
+            start_date=start_date,
+            end_date=end_date,
+        )
     daily_entry_key_sets = {
         frozenset(entry) for entry in daily.values()
         if type(entry) is dict
@@ -547,3 +581,25 @@ def validated_universe_manifest(
             })
         normalized[raw_day] = normalized_entry
     return dict(sorted(normalized.items()))
+
+
+def validated_no_row_exception_contract(
+    tolerance_json: Any,
+    *,
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any] | None:
+    """Return the optional exact no-row proof after full manifest validation."""
+
+    validated_universe_manifest(
+        tolerance_json,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    payload = (
+        tolerance_json
+        if type(tolerance_json) is dict
+        else json.loads(str(tolerance_json or ""))
+    )
+    value = payload.get("no_row_exception_contract")
+    return dict(value) if type(value) is dict else None

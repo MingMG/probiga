@@ -196,7 +196,7 @@ def _load_history(
              AND member.stock_code=LEFT(k.stock_code, 6)
              AND member.instrument_type='STOCK'
              AND member.list_date<=k.trade_date
-             AND (member.expire_date IS NULL OR member.expire_date>k.trade_date)
+             AND (member.expire_date IS NULL OR member.expire_date>=k.trade_date)
             WHERE k.k_type = 1 AND k.adjust_type=0
               AND k.trade_date BETWEEN :start_date AND :end_date
               AND EXISTS (

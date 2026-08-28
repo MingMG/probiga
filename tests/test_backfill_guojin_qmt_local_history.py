@@ -100,7 +100,13 @@ class _DisposableEngine:
         self.disposed = True
 
 
-def _result(*, code_count=2, fetched_rows=2, written_rows=0):
+def _result(
+    *,
+    code_count=2,
+    fetched_rows=2,
+    written_rows=0,
+    allowed_missing_codes=(),
+):
     return LocalBackfillResult(
         run_id="run-1",
         dataset=LOCAL_KLINE_TABLE,
@@ -122,6 +128,7 @@ def _result(*, code_count=2, fetched_rows=2, written_rows=0):
                 fetched_rows=fetched_rows,
                 written_rows=written_rows,
                 skipped=written_rows == 0,
+                allowed_missing_codes=tuple(allowed_missing_codes),
             )
         ],
     )
@@ -222,6 +229,228 @@ def test_target_window_universe_rejects_empty_catalog_day(monkeypatch):
         )
 
 
+@pytest.mark.parametrize(
+    "raw_codes, expected",
+    [
+        ("002231", ["002231"]),
+        ("603056,002231", ["002231", "603056"]),
+        ("", []),
+    ],
+)
+def test_exact_lifecycle_no_row_codes_are_explicit_and_canonical(
+    raw_codes,
+    expected,
+):
+    assert backfill_tool._exact_lifecycle_no_row_codes(raw_codes) == expected
+
+
+@pytest.mark.parametrize(
+    "raw_codes",
+    [
+        "002231.SZ",
+        " 002231",
+        "002231 ",
+        "002231,002231",
+        "123",
+        "002231,,300344",
+        ",002231",
+        "002231,",
+        ",".join(f"{index:06d}" for index in range(33)),
+    ],
+)
+def test_exact_lifecycle_no_row_codes_reject_ambiguous_or_broad_input(
+    raw_codes,
+):
+    with pytest.raises(ValueError, match="unique exact six-digit"):
+        backfill_tool._exact_lifecycle_no_row_codes(raw_codes)
+
+
+def test_not_yet_listed_no_row_codes_are_exact_reviewed_subset_only():
+    assert backfill_tool._not_yet_listed_no_row_codes(
+        "301699,301688"
+    ) == ["301688", "301699"]
+    with pytest.raises(ValueError, match="allowed"):
+        backfill_tool._not_yet_listed_no_row_codes("688835")
+    with pytest.raises(ValueError, match="unique exact six-digit"):
+        backfill_tool._not_yet_listed_no_row_codes("301688.SZ")
+
+
+def _exact_no_row_catalog(*, list_date="2008-05-12", expire_date="2026-03-26"):
+    member = {
+        "stock_code": "002231",
+        "qmt_code": "002231.SZ",
+        "list_date": list_date,
+        "expire_date": expire_date,
+    }
+
+    def eligible_codes(trade_date):
+        if expire_date in (None, ""):
+            active = list_date <= trade_date
+        else:
+            active = list_date <= trade_date <= expire_date
+        return ["002231"] if active else []
+
+    return SimpleNamespace(
+        batch_id="catalog-batch",
+        member_set_hash="c" * 64,
+        manifest_hash="a" * 64,
+        members=(member,),
+        eligible_codes=eligible_codes,
+    )
+
+
+def _exact_no_row_calendar():
+    sessions = [
+        "2026-03-06",
+        "2026-03-09",
+        "2026-03-25",
+        "2026-03-26",
+        "2026-08-27",
+    ]
+    return SimpleNamespace(
+        batch_id="calendar-batch",
+        session_set_hash="d" * 64,
+        manifest_hash="b" * 64,
+        known_at="2026-08-27 18:00:00",
+        sessions_between=lambda _start, _end: list(sessions),
+    )
+
+
+def _exact_no_row_engine(*, target_rows=0, history_rows=0):
+    statements = []
+
+    class _Result:
+        def mappings(self):
+            return self
+
+        def one(self):
+            return {
+                "target_rows": target_rows,
+                "history_rows": history_rows,
+            }
+
+    class _Connection:
+        def execute(self, statement, params=None):
+            statements.append((str(statement), dict(params or {})))
+            return _Result()
+
+    class _Engine:
+        def begin(self):
+            return nullcontext(_Connection())
+
+    engine = _Engine()
+    engine.statements = statements
+    return engine
+
+
+def test_exact_lifecycle_no_row_proof_binds_catalog_calendar_and_zero_rows(
+    monkeypatch,
+):
+    engine = _exact_no_row_engine()
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_stock_catalog",
+        lambda _connection, **_kwargs: _exact_no_row_catalog(),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_trade_calendar_receipt",
+        lambda _connection, **_kwargs: _exact_no_row_calendar(),
+    )
+
+    first = backfill_tool._prove_exact_lifecycle_no_row_codes(
+        engine,
+        stock_codes=["002231"],
+        start_date="2026-03-06",
+        end_date="2026-08-27",
+    )
+    second = backfill_tool._prove_exact_lifecycle_no_row_codes(
+        engine,
+        stock_codes=["002231"],
+        start_date="2026-03-06",
+        end_date="2026-08-27",
+    )
+
+    assert first == second
+    assert first["schema"] == (
+        "probiga.qmt-daily-no-row-exceptions.v1"
+    )
+    assert first["exact_lifecycle_no_row_codes"] == ["002231"]
+    assert first["not_yet_listed_no_row_codes"] == []
+    assert first["entities"] == [
+        {
+            "category": "EXACT_LIFECYCLE_NO_ROW",
+            "stock_code": "002231",
+            "qmt_code": "002231.SZ",
+            "list_date": "2008-05-12",
+            "expire_date": "2026-03-26",
+            "affected_trade_dates": [
+                "2026-03-06", "2026-03-09", "2026-03-25",
+                "2026-03-26",
+            ],
+            "affected_trade_dates_sha256": first["entities"][0][
+                "affected_trade_dates_sha256"
+            ],
+            "target_rows": 0,
+            "history_rows": 0,
+        }
+    ]
+    assert len(first["proof_sha256"]) == 64
+    assert len(first["entities"][0]["affected_trade_dates_sha256"]) == 64
+    sql, params = engine.statements[0]
+    assert "`probiga`.`sm_stock_kline`" in sql
+    assert "`probiga_qmt_history`.`qmt_local_stock_kline`" in sql
+    assert params == {
+        "stock_code": "002231",
+        "start_date": "2026-03-06",
+        "end_date": "2026-08-27",
+    }
+
+
+@pytest.mark.parametrize(
+    "list_date, expire_date, target_rows, history_rows, error",
+    [
+        ("1970-01-01", "2026-03-26", 0, 0, "finite in-window"),
+        ("2008-05-12", None, 0, 0, "finite in-window"),
+        ("2008-05-12", "2026-09-01", 0, 0, "finite in-window"),
+        ("2008-05-12", "2026-03-26", 1, 0, "already has daily rows"),
+        ("2008-05-12", "2026-03-26", 0, 1, "already has daily rows"),
+    ],
+)
+def test_exact_lifecycle_no_row_proof_fails_closed(
+    monkeypatch,
+    list_date,
+    expire_date,
+    target_rows,
+    history_rows,
+    error,
+):
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_stock_catalog",
+        lambda _connection, **_kwargs: _exact_no_row_catalog(
+            list_date=list_date,
+            expire_date=expire_date,
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_trade_calendar_receipt",
+        lambda _connection, **_kwargs: _exact_no_row_calendar(),
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        backfill_tool._prove_exact_lifecycle_no_row_codes(
+            _exact_no_row_engine(
+                target_rows=target_rows,
+                history_rows=history_rows,
+            ),
+            stock_codes=["002231"],
+            start_date="2026-03-06",
+            end_date="2026-08-27",
+        )
+
+
 def test_target_window_unattestable_codes_requires_all_pre_close_invalid():
     engine = _SequenceEngine([[('688693',), ('000001',)]])
 
@@ -267,7 +496,27 @@ def test_universe_proof_is_sorted_deduplicated_and_stable():
     assert len(first["stock_codes_sha256"]) == 64
 
 
-def test_target_source_only_repair_inserts_missing_native_rows_only():
+def _patch_repair_market_roots(monkeypatch):
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_stock_catalog",
+        lambda *_a, **_k: SimpleNamespace(
+            batch_id="catalog-1", manifest_hash="a" * 64,
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "load_trade_calendar_receipt",
+        lambda *_a, **_k: SimpleNamespace(
+            batch_id="calendar-1", manifest_hash="b" * 64,
+        ),
+    )
+
+
+def test_target_source_only_repair_inserts_missing_native_rows_only(
+    monkeypatch,
+):
+    _patch_repair_market_roots(monkeypatch)
     class _Result:
         def __init__(self, *, scalar_value=None, rowcount=0):
             self.scalar_value = scalar_value
@@ -309,6 +558,10 @@ def test_target_source_only_repair_inserts_missing_native_rows_only():
         "provider": "gj_big_qmt_inner",
         "start_date": "2026-03-02",
         "end_date": "2026-03-13",
+        "catalog_batch_id": "catalog-1",
+        "catalog_manifest_hash": "a" * 64,
+        "calendar_batch_id": "calendar-1",
+        "calendar_manifest_hash": "b" * 64,
         "source_only_before": 556,
         "inserted_rows": 556,
         "source_only_after": 0,
@@ -322,6 +575,8 @@ def test_target_source_only_repair_inserts_missing_native_rows_only():
         in statements
     )
     assert "BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'" in statements
+    assert "member.expire_date>=s.trade_date" in statements
+    assert "qmt_trade_calendar_session" in statements
     assert "t.id IS NULL" in statements
     assert "UPDATE" not in statements.upper()
     assert all(
@@ -329,12 +584,15 @@ def test_target_source_only_repair_inserts_missing_native_rows_only():
             "start_date": "2026-03-02",
             "end_date": "2026-03-13",
             "provider": "gj_big_qmt_inner",
+            "catalog_batch_id": "catalog-1",
+            "calendar_batch_id": "calendar-1",
         }
         for _sql, params in engine.connection.statements
     )
 
 
-def test_target_source_only_repair_fails_closed_on_count_drift():
+def test_target_source_only_repair_fails_closed_on_count_drift(monkeypatch):
+    _patch_repair_market_roots(monkeypatch)
     class _Result:
         def __init__(self, *, scalar_value=None, rowcount=0):
             self.scalar_value = scalar_value
@@ -1629,6 +1887,148 @@ def test_plain_daily_apply_uses_separated_history_writer(monkeypatch, capsys):
     )
 
 
+def test_daily_exact_lifecycle_allowlist_is_proven_and_only_then_forwarded(
+    monkeypatch,
+    capsys,
+):
+    source_engine = object()
+    writer_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+    _patch_daily_lock_path(monkeypatch)
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda *, history_writer=False: (source_engine, writer_engine),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "validate_local_history_tables",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_codes",
+        lambda _engine, **_kwargs: (
+            ["002231", "600000"],
+            ["2026-03-06", "2026-08-27"],
+        ),
+    )
+    proof = {
+        "schema": backfill_tool.EXACT_LIFECYCLE_NO_ROW_PROOF_SCHEMA,
+        "policy": "OPERATOR_EXPLICIT_FINITE_EXPIRY_ZERO_DAILY_ROWS",
+        "stock_codes": ["002231"],
+        "proof_sha256": "c" * 64,
+    }
+    monkeypatch.setattr(
+        backfill_tool,
+        "_prove_reviewed_no_row_codes",
+        lambda engine, **kwargs: events.append(("proof", engine, kwargs))
+        or proof,
+    )
+    monkeypatch.setattr(backfill_tool, "_acquire_lock", lambda _path: (True, ""))
+    monkeypatch.setattr(backfill_tool, "_release_lock", lambda _path: None)
+
+    def fake_backfill(**kwargs):
+        events.append(("backfill", kwargs))
+        return _result(
+            code_count=2,
+            fetched_rows=1,
+            written_rows=1,
+            allowed_missing_codes=("002231",),
+        )
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "backfill_daily_kline_local",
+        fake_backfill,
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "daily",
+            "--windows-history-writer-option-file",
+            "--target-window-universe",
+            "--exact-lifecycle-no-row-codes",
+            "002231",
+            "--start-date",
+            "2026-03-06",
+            "--end-date",
+            "2026-08-27",
+            "--apply",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert events[0] == (
+        "proof",
+        source_engine,
+        {
+            "exact_lifecycle_codes": ["002231"],
+            "not_yet_listed_codes": [],
+            "start_date": "2026-03-06",
+            "end_date": "2026-08-27",
+        },
+    )
+    backfill_kwargs = next(
+        event[1] for event in events if event[0] == "backfill"
+    )
+    assert backfill_kwargs["allowed_missing_stock_codes"] == ["002231"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reviewed_no_row_allowlist"] == {
+        **proof,
+        "used_missing_codes": ["002231"],
+        "used_missing_code_count": 1,
+    }
+
+
+def test_daily_exact_lifecycle_allowlist_rejects_code_outside_target_union(
+    monkeypatch,
+):
+    _patch_daily_lock_path(monkeypatch)
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda *, history_writer=False: (
+            object(),
+            _DisposableEngine("probiga_qmt_history"),
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "validate_local_history_tables",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_codes",
+        lambda _engine, **_kwargs: (["600000"], ["2026-03-06"]),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_prove_exact_lifecycle_no_row_codes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("outside-universe code must fail before proof")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="outside the target universe"):
+        backfill_tool.main(
+            [
+                "daily",
+                "--windows-history-writer-option-file",
+                "--target-window-universe",
+                "--exact-lifecycle-no-row-codes",
+                "002231",
+                "--start-date",
+                "2026-03-06",
+                "--end-date",
+                "2026-08-27",
+                "--apply",
+            ]
+        )
+
+
 def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     monkeypatch,
     capsys,
@@ -1765,6 +2165,46 @@ def test_history_writer_option_file_is_only_valid_for_daily_apply(
 
     assert exc_info.value.code == 2
     assert "restricted to daily --apply" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [
+            "daily",
+            "--target-window-universe",
+            "--exact-lifecycle-no-row-codes",
+            "002231",
+            "--apply",
+        ],
+        [
+            "daily",
+            "--windows-history-writer-option-file",
+            "--exact-lifecycle-no-row-codes",
+            "002231",
+            "--apply",
+        ],
+        [
+            "daily",
+            "--windows-history-writer-option-file",
+            "--target-window-universe",
+            "--exact-lifecycle-no-row-codes",
+            "002231",
+            "--provider",
+            "gj_qmt",
+            "--apply",
+        ],
+    ],
+)
+def test_exact_lifecycle_no_row_cli_requires_strict_protected_route(
+    argv,
+    capsys,
+):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(argv)
+
+    assert exc_info.value.code == 2
+    assert "requires protected daily" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("mode", ["daily", "minute", "from-gaps"])
@@ -2033,6 +2473,15 @@ def _patch_daily_dependencies(monkeypatch, prepared_rows):
         "validate_local_history_tables",
         lambda _engine: None,
     )
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda _engine, *, stock_codes, start_date, end_date: {
+            (code, str(row.get("trade_date") or "")[:10])
+            for code in stock_codes
+            for row in (prepared_rows or [{"trade_date": ""}])
+        },
+    )
     run_events = []
     monkeypatch.setattr(
         local_history,
@@ -2147,6 +2596,92 @@ def test_daily_backfill_deduplicates_normalized_requested_codes(monkeypatch):
     assert result.batches[0].requested_codes == 2
     assert run_events[0][1]["requested_codes"] == 2
     assert run_events[-1][1]["status"] == "SUCCESS"
+
+
+def test_daily_backfill_discards_920093_pre_listing_placeholder_before_write(
+    monkeypatch,
+):
+    prepared_rows = [
+        {"stock_code": "920093", "trade_date": day}
+        for day in (
+            "2026-08-12", "2026-08-21", "2026-08-24",
+            "2026-08-25", "2026-08-26", "2026-08-27",
+        )
+    ]
+    _patch_daily_dependencies(monkeypatch, prepared_rows)
+    expected = {
+        ("920093", day)
+        for day in (
+            "2026-08-21", "2026-08-24", "2026-08-25",
+            "2026-08-26", "2026-08-27",
+        )
+    }
+    written = []
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda *_args, **_kwargs: expected,
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda _engine, **kwargs: written.extend(kwargs["rows"])
+        or len(kwargs["rows"]),
+    )
+
+    result = local_history.backfill_daily_kline_local(
+        source_engine=object(),
+        local_engine=_DisposableEngine("probiga_qmt_history"),
+        stock_codes=["920093"],
+        start_date="2026-08-06",
+        end_date="2026-08-27",
+        dry_run=False,
+    )
+
+    assert len(written) == 5
+    assert all(row["trade_date"] != "2026-08-12" for row in written)
+    assert result.discarded_outside_catalog_rows == 1
+    assert result.batches[0].discarded_outside_catalog_rows == 1
+
+
+def test_daily_backfill_keeps_all_four_real_expire_day_rows(monkeypatch):
+    expire_rows = [
+        {"stock_code": code, "trade_date": day, "volume": 1, "amount": 1}
+        for code, day in (
+            ("000004", "2026-07-13"),
+            ("002808", "2026-07-13"),
+            ("002898", "2026-07-16"),
+            ("300029", "2026-07-09"),
+        )
+    ]
+    _patch_daily_dependencies(monkeypatch, expire_rows)
+    expected = {
+        (row["stock_code"], row["trade_date"]) for row in expire_rows
+    }
+    written = []
+    monkeypatch.setattr(
+        local_history,
+        "_load_daily_expected_pairs",
+        lambda *_args, **_kwargs: expected,
+    )
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda _engine, **kwargs: written.extend(kwargs["rows"])
+        or len(kwargs["rows"]),
+    )
+
+    result = local_history.backfill_daily_kline_local(
+        source_engine=object(),
+        local_engine=_DisposableEngine("probiga_qmt_history"),
+        stock_codes=["000004", "002808", "002898", "300029"],
+        start_date="2026-07-09",
+        end_date="2026-07-16",
+        dry_run=False,
+    )
+
+    assert {(row["stock_code"], row["trade_date"]) for row in written} == expected
+    assert result.discarded_outside_catalog_rows == 0
 
 
 def test_daily_backfill_rejects_allowed_code_outside_requested_universe(

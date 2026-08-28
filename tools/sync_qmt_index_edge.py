@@ -72,7 +72,7 @@ class IndexCatalogMember:
 
     def eligible(self, trade_date: str) -> bool:
         return self.list_date <= trade_date and (
-            self.expire_date is None or self.expire_date > trade_date
+            self.expire_date is None or self.expire_date >= trade_date
         )
 
 
