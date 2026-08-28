@@ -67,12 +67,12 @@ class _Calendar:
         return [day for day in SESSIONS if start <= day <= end]
 
 
-def _contract(*, end_date="2026-08-27"):
+def _contract(*, start_date="2026-03-06", end_date="2026-08-27"):
     codes = ["002231", "301688", "301689", "301697", "301699"]
     return build_no_row_exception_contract(
         catalog=_Catalog(),
         calendar=_Calendar(),
-        start_date="2026-03-06",
+        start_date=start_date,
         end_date=end_date,
         exact_lifecycle_codes=["002231"],
         not_yet_listed_codes=["301688", "301689", "301697", "301699"],
@@ -108,7 +108,7 @@ def test_no_row_contract_rejects_unreviewed_code_future_window_and_rows():
         explicit_no_row_codes(
             "688835", category="NOT_YET_LISTED_NO_ROW",
         )
-    with pytest.raises(RuntimeError, match="reviewed cutoff"):
+    with pytest.raises(RuntimeError, match="exact reviewed window"):
         _contract(end_date="2026-08-28")
     codes = ["301688"]
     with pytest.raises(RuntimeError, match="already has daily rows"):
@@ -119,6 +119,23 @@ def test_no_row_contract_rejects_unreviewed_code_future_window_and_rows():
             target_rows_by_code={"301688": 1},
             history_rows_by_code={"301688": 0},
         )
+
+
+@pytest.mark.parametrize(
+    ("start_date", "end_date"),
+    (
+        ("2026-03-05", "2026-08-27"),
+        ("2026-03-06", "2026-08-26"),
+        ("2026-02-01", "2026-03-31"),
+        ("2026-08-21", "2026-08-24"),
+    ),
+)
+def test_no_row_contract_rejects_every_non_reviewed_window(
+    start_date,
+    end_date,
+):
+    with pytest.raises(RuntimeError, match="exact reviewed window"):
+        _contract(start_date=start_date, end_date=end_date)
 
 
 def test_manifest_binds_no_row_proof_and_rejects_hash_tamper():

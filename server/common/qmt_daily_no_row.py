@@ -20,7 +20,9 @@ EXACT_LIFECYCLE_NO_ROW_CANDIDATES = frozenset({"002231", "603056"})
 NOT_YET_LISTED_NO_ROW_CANDIDATES = frozenset({
     "301688", "301689", "301697", "301699",
 })
-NOT_YET_LISTED_PROOF_CUTOFF = "2026-08-27"
+NO_ROW_REVIEWED_START_DATE = "2026-03-06"
+NO_ROW_REVIEWED_END_DATE = "2026-08-27"
+NOT_YET_LISTED_PROOF_CUTOFF = NO_ROW_REVIEWED_END_DATE
 
 _A_SHARE_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
@@ -127,6 +129,14 @@ def build_no_row_exception_contract(
     all_codes = sorted(lifecycle + not_listed)
     if not all_codes or len(all_codes) != len(set(all_codes)):
         raise RuntimeError("QMT no-row proof requires distinct explicit codes")
+    if (
+        start != NO_ROW_REVIEWED_START_DATE
+        or end != NO_ROW_REVIEWED_END_DATE
+    ):
+        raise RuntimeError(
+            "QMT no-row proof must equal the exact reviewed window "
+            f"{NO_ROW_REVIEWED_START_DATE}..{NO_ROW_REVIEWED_END_DATE}"
+        )
     if not_listed and end > NOT_YET_LISTED_PROOF_CUTOFF:
         raise RuntimeError(
             "NOT_YET_LISTED proof cannot extend beyond its reviewed cutoff"
@@ -324,6 +334,8 @@ __all__ = [
     "EXACT_LIFECYCLE_NO_ROW_CANDIDATES",
     "NOT_YET_LISTED_NO_ROW_CANDIDATES",
     "NOT_YET_LISTED_PROOF_CUTOFF",
+    "NO_ROW_REVIEWED_END_DATE",
+    "NO_ROW_REVIEWED_START_DATE",
     "NO_ROW_EXCEPTION_CONTRACT_SCHEMA",
     "build_no_row_exception_contract",
     "explicit_no_row_codes",
