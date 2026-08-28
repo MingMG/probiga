@@ -304,7 +304,7 @@ class _NoRowCatalog:
     )
 
     def eligible_codes(self, day):
-        assert day in {"2026-08-21", "2026-08-24"}
+        assert day in {"2026-03-06", "2026-08-27"}
         return ["000001", "301688"]
 
 
@@ -312,6 +312,13 @@ class _NoRowCalendar(_Calendar):
     batch_id = "calendar-no-row"
     session_set_hash = "3" * 64
     manifest_hash = "4" * 64
+    known_at = "2026-08-27 18:00:00"
+
+    def sessions_between(self, start_date, end_date):
+        return [
+            day for day in ("2026-03-06", "2026-08-27")
+            if start_date <= day <= end_date
+        ]
 
 
 def _no_row_manifest():
@@ -320,8 +327,8 @@ def _no_row_manifest():
     proof = build_no_row_exception_contract(
         catalog=catalog,
         calendar=calendar,
-        start_date="2026-08-21",
-        end_date="2026-08-24",
+        start_date="2026-03-06",
+        end_date="2026-08-27",
         not_yet_listed_codes=["301688"],
         target_rows_by_code={"301688": 0},
         history_rows_by_code={"301688": 0},
@@ -329,8 +336,8 @@ def _no_row_manifest():
     projected = project_catalog_daily_codes(
         catalog=catalog,
         calendar=calendar,
-        start_date="2026-08-21",
-        end_date="2026-08-24",
+        start_date="2026-03-06",
+        end_date="2026-08-27",
         contract=proof,
     )
     source_id = daily_market_source_batch_id(
@@ -378,8 +385,8 @@ class _NoRowConnection:
             return _Result([{
                 "run_id": "attestation-no-row",
                 "provider": truth_module.QMT_DAILY_PROVIDER,
-                "start_date": "2026-08-21",
-                "end_date": "2026-08-24",
+                "start_date": "2026-03-06",
+                "end_date": "2026-08-27",
                 "status": "COMPLETED",
                 "target_rows": 2,
                 "qmt_rows": 2,
@@ -389,18 +396,18 @@ class _NoRowConnection:
                 "already_attested_rows": 0,
                 "updated_rows": 2,
                 "tolerance_json": _no_row_manifest(),
-                "finished_at": "2026-08-24 19:00:00",
+                "finished_at": "2026-08-27 19:00:00",
             }])
         if self.calls == 2:
             return _ScalarResult(self.excluded_target_rows)
         return _Result([
             {
-                "trade_date": "2026-08-21",
+                "trade_date": "2026-03-06",
                 "attested_row_count": 1,
                 "attested_stock_count": 1,
             },
             {
-                "trade_date": "2026-08-24",
+                "trade_date": "2026-08-27",
                 "attested_row_count": 1,
                 "attested_stock_count": 1,
             },
@@ -424,9 +431,9 @@ def test_consumer_truth_accepts_and_binds_reviewed_no_row_manifest(monkeypatch):
     _bind_no_row_roots(monkeypatch)
     truth = truth_module.load_qmt_daily_market_truth(
         _NoRowConnection(),
-        start_date="2026-08-21",
-        end_date="2026-08-24",
-        decision_known_at="2026-08-24 20:00:00",
+        start_date="2026-03-06",
+        end_date="2026-08-27",
+        decision_known_at="2026-08-27 20:00:00",
     )
 
     assert truth.attested_row_count == 2
@@ -443,7 +450,7 @@ def test_consumer_truth_rejects_row_appearing_under_no_row_exception(
     with pytest.raises(RuntimeError, match="target rows appeared"):
         truth_module.load_qmt_daily_market_truth(
             _NoRowConnection(excluded_target_rows=1),
-            start_date="2026-08-21",
-            end_date="2026-08-24",
-            decision_known_at="2026-08-24 20:00:00",
+            start_date="2026-03-06",
+            end_date="2026-08-27",
+            decision_known_at="2026-08-27 20:00:00",
         )
