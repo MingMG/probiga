@@ -2167,7 +2167,7 @@ def attest_range(
                     WHERE history.id IS NULL
                       AND target.id IS NULL
                     ORDER BY expected.stock_code, expected.trade_date
-                """)).mappings().all()
+                """), params).mappings().all()
                 unavailable_pairs = [
                     (
                         str(row.get("stock_code") or ""),

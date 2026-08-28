@@ -54,6 +54,17 @@ def test_attester_projects_reviewed_no_row_pairs_and_binds_manifest():
     assert "no_row_exception_contract=no_row_exception_contract" in source
 
 
+def test_historical_unavailable_lookup_binds_provider_params():
+    source = inspect.getsource(attester.attest_range)
+
+    assert re.search(
+        r"history\.provider=:provider.*?\"\"\"\), params\)"
+        r"\.mappings\(\)\.all\(\)",
+        source,
+        re.DOTALL,
+    )
+
+
 def test_attester_no_row_proof_rejects_history_row_from_other_provider():
     class _Result:
         def mappings(self):
