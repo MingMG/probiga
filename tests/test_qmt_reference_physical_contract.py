@@ -160,6 +160,55 @@ def test_exact_reference_physical_contract_accepts_only_expected_shape():
             reference_sync._validate_reference_table_snapshot(mutation)
 
 
+def test_reference_snapshot_normalizes_mysql_no_action_foreign_keys():
+    class _Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self._rows
+
+    class _Connection:
+        def execute(self, statement):
+            if "REFERENTIAL_CONSTRAINTS" not in str(statement):
+                return _Rows([])
+            return _Rows([
+                {
+                    "table_name": "qmt_stock_catalog_member",
+                    "constraint_name": "fk_qmt_stock_catalog_member_batch",
+                    "ordinal_position": 1,
+                    "column_name": "batch_id",
+                    "referenced_table_name": "qmt_stock_catalog_batch",
+                    "referenced_column_name": "batch_id",
+                    "update_rule": "NO ACTION",
+                    "delete_rule": "NO ACTION",
+                },
+                {
+                    "table_name": "qmt_trade_calendar_session",
+                    "constraint_name": "fk_qmt_calendar_session_batch",
+                    "ordinal_position": 1,
+                    "column_name": "batch_id",
+                    "referenced_table_name": "qmt_trade_calendar_batch",
+                    "referenced_column_name": "batch_id",
+                    "update_rule": "NO ACTION",
+                    "delete_rule": "NO ACTION",
+                },
+            ])
+
+    snapshot = reference_sync._reference_table_physical_snapshot(_Connection())
+
+    for table_name, expected in (
+        ("qmt_stock_catalog_member", "fk_qmt_stock_catalog_member_batch"),
+        ("qmt_trade_calendar_session", "fk_qmt_calendar_session_batch"),
+    ):
+        observed = snapshot["tables"][table_name]["foreign_keys"][expected]
+        assert observed["update_rule"] == "RESTRICT"
+        assert observed["delete_rule"] == "RESTRICT"
+
+
 def test_reference_trigger_body_or_table_tamper_is_rejected():
     snapshot = _trigger_snapshot()
     reference_sync._validate_reference_trigger_snapshot(snapshot)

@@ -32,6 +32,9 @@ from integrations.qmt.safe_upsert import safe_upsert_rows
 from integrations.qmt.sectors import fetch_sector_datasets
 from server.common.batch_db import write_frame
 from server.common.config import get_mysql_url
+from server.common.mysql_metadata_compat import (
+    normalize_mysql_referential_rule,
+)
 from server.common.qmt_stock_catalog import (
     NATIVE_A_SHARE_SECTORS,
     build_catalog_discovery,
@@ -599,8 +602,12 @@ def _reference_table_physical_snapshot(connection: Any) -> dict[str, Any]:
             "columns": [],
             "referenced_table": str(row.get("referenced_table_name") or ""),
             "referenced_columns": [],
-            "update_rule": str(row.get("update_rule") or "").upper(),
-            "delete_rule": str(row.get("delete_rule") or "").upper(),
+            "update_rule": normalize_mysql_referential_rule(
+                row.get("update_rule")
+            ),
+            "delete_rule": normalize_mysql_referential_rule(
+                row.get("delete_rule")
+            ),
         })
         part["columns"].append(str(row.get("column_name") or ""))
         part["referenced_columns"].append(
