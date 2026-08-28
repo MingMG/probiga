@@ -57,6 +57,21 @@ _REAL_LATEST_QMT_ANNOUNCEMENT_BATCH_CHECK = (
 
 @pytest.fixture(autouse=True)
 def _exact_funding_schema_contract(monkeypatch):
+    from server.db import migrations_v4
+
+    monkeypatch.setattr(
+        migrations_v4,
+        "run_v4_migrations",
+        lambda _engine, *, dry_run: [
+            SimpleNamespace(
+                version=str(migration["version"]),
+                status="would_apply",
+            )
+            for migration in migrations_v4.MIGRATIONS
+        ]
+        if dry_run
+        else pytest.fail("health fixture must not apply V4 migrations"),
+    )
     monkeypatch.setattr(
         health,
         "validate_strategy_funding_checkpoint_schema",
