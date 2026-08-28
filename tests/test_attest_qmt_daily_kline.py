@@ -43,11 +43,59 @@ def test_attestation_source_window_requires_daily_k_type():
 
 def test_attester_projects_reviewed_no_row_pairs_and_binds_manifest():
     source = inspect.getsource(attester.attest_range)
+    proof_source = inspect.getsource(
+        attester._build_attestation_no_row_contract
+    )
 
-    assert "build_no_row_exception_contract(" in source
+    assert "_build_attestation_no_row_contract(" in source
+    assert "build_no_row_exception_contract(" in proof_source
     assert "project_catalog_daily_codes(" in source
     assert "DELETE FROM `{expected_temp}`" in source
     assert "no_row_exception_contract=no_row_exception_contract" in source
+
+
+def test_attester_no_row_proof_rejects_history_row_from_other_provider():
+    class _Result:
+        def mappings(self):
+            return self
+
+        def one(self):
+            # This represents a row owned by any provider other than the
+            # selected attestation provider.  The aggregate must still see it.
+            return {"target_rows": 0, "history_rows": 1}
+
+    class _Connection:
+        def __init__(self):
+            self.sql = ""
+            self.params = None
+
+        def execute(self, statement, params):
+            self.sql = str(statement)
+            self.params = dict(params)
+            return _Result()
+
+    connection = _Connection()
+    with pytest.raises(RuntimeError, match="already has daily rows"):
+        attester._build_attestation_no_row_contract(
+            connection,
+            target_table="`probiga`.`sm_stock_kline`",
+            source_table=(
+                "`probiga_qmt_history`.`qmt_local_stock_kline`"
+            ),
+            catalog=object(),
+            calendar=object(),
+            start_date="2026-03-06",
+            end_date="2026-08-27",
+            exact_lifecycle_no_row_codes=("002231",),
+            not_yet_listed_no_row_codes=(),
+        )
+
+    assert "provider" not in connection.sql.lower()
+    assert connection.params == {
+        "no_row_stock_code": "002231",
+        "start_date": "2026-03-06",
+        "end_date": "2026-08-27",
+    }
 
 
 @pytest.mark.parametrize(
