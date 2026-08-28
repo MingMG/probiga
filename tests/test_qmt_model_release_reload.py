@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+import shutil
 import subprocess
 
 
@@ -31,9 +32,11 @@ def _powershell_function(source: str, name: str) -> str:
 
 def _run_powershell(program: str) -> dict[str, bool]:
     encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    assert executable is not None, "PowerShell is required for release tests"
     completed = subprocess.run(
         [
-            "powershell.exe",
+            executable,
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",
