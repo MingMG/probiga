@@ -362,6 +362,36 @@ def test_windows_mysql_boundary_requires_exact_local_84_identity_and_tls(
         )
 
 
+def test_windows_mysql_boundary_accepts_only_explicit_alternate_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        migration.socket,
+        "gethostname",
+        lambda: "WIN-20260322RGF",
+    )
+    writer_state = _valid_boundary_state()
+    writer_state["authenticated_user"] = (
+        "pb_qmt_hist_writer_0123abcdef89@127.0.0.1"
+    )
+
+    result = migration._validate_windows_local_mysql84_boundary(
+        _BoundaryEngine(writer_state),
+        expected_identity=(
+            "pb_qmt_hist_writer_0123abcdef89@127.0.0.1"
+        ),
+    )
+
+    assert result["ready"] is True
+    with pytest.raises(
+        migration.WindowsLocalHistoryBoundaryError,
+        match="identity or TLS",
+    ):
+        migration._validate_windows_local_mysql84_boundary(
+            _BoundaryEngine(writer_state)
+        )
+
+
 def test_windows_cli_route_skips_env_and_redacts_option_secret(
     monkeypatch,
     capsys,

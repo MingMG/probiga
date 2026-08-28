@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -41,7 +43,13 @@ from tools.migrate_qmt_local_history_provenance import (
     WINDOWS_LOCAL_OPTION_FILE,
     _connect_from_windows_option_file,
     _create_windows_local_history_engine,
+    _protected_windows_option_file,
+    _WINDOWS_ADMINISTRATORS_SID,
+    _WINDOWS_SYSTEM_SID,
     _validate_windows_local_mysql84_boundary,
+    _validate_windows_acl_snapshot,
+    _validate_windows_option_file_shape,
+    _windows_acl_snapshot,
 )
 from tools.qmt_operations_task_contract import (
     QMT_DAILY_BACKFILL_LOCK_PATH,
@@ -51,6 +59,32 @@ from tools.qmt_operations_task_contract import (
 
 
 WINDOWS_LOCAL_PRIMARY_DATABASE = "probiga"
+WINDOWS_LOCAL_HISTORY_WRITER_OPTION_FILE = Path(
+    r"C:\Users\Administrator\.probiga-secrets\mysql84-qmt-history-writer.ini"
+)
+WINDOWS_LOCAL_HISTORY_WRITER_PROFILE_ROOT = Path(r"C:\Users\Administrator")
+WINDOWS_LOCAL_HISTORY_WRITER_USER_RE = re.compile(
+    r"^pb_qmt_hist_writer_[0-9a-f]{12}$"
+)
+WINDOWS_LOCAL_HISTORY_WRITER_PRIVILEGES = frozenset(
+    {"SELECT", "INSERT", "UPDATE", "DELETE"}
+)
+_MYSQL_GRANT_RE = re.compile(
+    r"^GRANT\s+(?P<privileges>.+?)\s+ON\s+(?P<scope>.+?)\s+TO\s+",
+    re.IGNORECASE,
+)
+_WINDOWS_DIRECTORY_WRITE_RIGHTS = (
+    0x0002  # WriteData / CreateFiles
+    | 0x0004  # AppendData / CreateDirectories
+    | 0x0010  # WriteExtendedAttributes
+    | 0x0040  # DeleteSubdirectoriesAndFiles
+    | 0x0100  # WriteAttributes
+    | 0x00010000  # Delete
+    | 0x00040000  # ChangePermissions
+    | 0x00080000  # TakeOwnership
+    | 0x10000000  # GenericAll
+    | 0x40000000  # GenericWrite
+)
 TARGET_DAILY_TABLE = "sm_stock_kline"
 TARGET_DAILY_QUARANTINE_TABLE = "qmt_target_daily_quarantine"
 TARGET_WINDOW_UNIVERSE_SOURCE = "qmt_stock_catalog.target_window_exact_union"
@@ -92,14 +126,238 @@ def _source_engine():
     return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
 
 
-def _windows_local_engines():
-    """Open the fixed local primary/history schemas without copying a secret."""
-    history_engine = _create_windows_local_history_engine()
+def _normalized_mysql_grant_entries(
+    grants: list[str] | tuple[str, ...],
+) -> tuple[tuple[frozenset[str], str], ...]:
+    normalized = tuple(" ".join(str(item or "").upper().split()) for item in grants)
+    if (
+        not normalized
+        or any(not item.startswith("GRANT ") for item in normalized)
+        or any(" WITH GRANT OPTION" in item for item in normalized)
+        or any(item.startswith("GRANT PROXY ") for item in normalized)
+        or any(item.startswith("GRANT ") and " ON " not in item for item in normalized)
+        or not any(" REQUIRE SSL" in item for item in normalized)
+    ):
+        raise RuntimeError("Windows QMT history writer grants differ")
+    entries: list[tuple[frozenset[str], str]] = []
+    for grant in normalized:
+        match = _MYSQL_GRANT_RE.match(grant)
+        if match is None:
+            raise RuntimeError("Windows QMT history writer grants differ")
+        privileges = frozenset(
+            item.strip()
+            for item in match.group("privileges").split(",")
+            if item.strip()
+        )
+        scope = match.group("scope").replace("`", "").upper()
+        if not privileges or not scope:
+            raise RuntimeError("Windows QMT history writer grants differ")
+        entries.append((privileges, scope))
+    return tuple(entries)
+
+
+def _validate_windows_history_writer_grants(
+    grants: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    entries = _normalized_mysql_grant_entries(grants)
+    global_entries = tuple(
+        privileges for privileges, scope in entries if scope == "*.*"
+    )
+    history_entries = tuple(
+        privileges
+        for privileges, scope in entries
+        if scope == f"{WINDOWS_LOCAL_HISTORY_DATABASE.upper()}.*"
+    )
+    if (
+        any(
+            scope
+            not in {"*.*", f"{WINDOWS_LOCAL_HISTORY_DATABASE.upper()}.*"}
+            for _privileges, scope in entries
+        )
+        or len(global_entries) != 1
+        or global_entries[0] != frozenset({"USAGE"})
+        or len(history_entries) != 1
+        or history_entries[0] != WINDOWS_LOCAL_HISTORY_WRITER_PRIVILEGES
+    ):
+        raise RuntimeError("Windows QMT history writer grants differ")
+    return {
+        "ready": True,
+        "database": WINDOWS_LOCAL_HISTORY_DATABASE,
+        "schema_privileges": sorted(WINDOWS_LOCAL_HISTORY_WRITER_PRIVILEGES),
+        "global_privileges": ["USAGE"],
+        "grant_option": False,
+        "ddl_privileges": [],
+    }
+
+
+def _windows_history_writer_identity(option_file: Path) -> str:
+    _validate_windows_option_file_shape(option_file)
+    parser = configparser.RawConfigParser(interpolation=None, strict=True)
     try:
-        _validate_windows_local_mysql84_boundary(history_engine)
+        with option_file.open("r", encoding="utf-8-sig") as stream:
+            parser.read_file(stream)
+        user = parser.get("client", "user", raw=True).strip()
+        if WINDOWS_LOCAL_HISTORY_WRITER_USER_RE.fullmatch(user) is None:
+            raise ValueError("unexpected writer user")
+        return f"{user}@127.0.0.1"
+    except (OSError, UnicodeError, configparser.Error, ValueError):
+        raise RuntimeError(
+            "Windows QMT history writer option-file user differs"
+        ) from None
+    finally:
+        parser.clear()
+        if "user" in locals():
+            user = ""
+
+
+def _validate_windows_history_writer_boundary(
+    history_engine,
+    *,
+    expected_identity: str,
+) -> dict[str, Any]:
+    boundary = _validate_windows_local_mysql84_boundary(
+        history_engine,
+        expected_identity=expected_identity,
+    )
+    try:
+        with history_engine.connect() as connection:
+            grants = tuple(
+                str(value or "")
+                for value in connection.execute(
+                    text("SHOW GRANTS FOR CURRENT_USER()")
+                ).scalars()
+            )
     except Exception:
-        history_engine.dispose()
+        raise RuntimeError(
+            "fixed Windows QMT history writer grants cannot be verified"
+        ) from None
+    return {
+        **boundary,
+        "identity_verified": True,
+        "least_privilege": _validate_windows_history_writer_grants(grants),
+    }
+
+
+def _validate_windows_directory_has_no_untrusted_writer(
+    snapshot: dict[str, Any],
+) -> None:
+    current_sid = str(snapshot.get("current_user_sid") or "")
+    owner_sid = str(snapshot.get("owner_sid") or "")
+    allowed_sids = {
+        current_sid,
+        _WINDOWS_SYSTEM_SID,
+        _WINDOWS_ADMINISTRATORS_SID,
+    }
+    if not current_sid or owner_sid not in allowed_sids:
+        raise RuntimeError("Windows QMT history writer directory owner differs")
+    rules = snapshot.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise RuntimeError("Windows QMT history writer directory ACL differs")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise RuntimeError(
+                "Windows QMT history writer directory ACL differs"
+            )
+        try:
+            rights = int(rule.get("rights"))
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Windows QMT history writer directory ACL differs"
+            ) from None
+        if (
+            str(rule.get("access_type") or "") == "Allow"
+            and str(rule.get("sid") or "") not in allowed_sids
+            and rights & _WINDOWS_DIRECTORY_WRITE_RIGHTS
+        ):
+            raise RuntimeError(
+                "Windows QMT history writer parent is writable by another identity"
+            )
+
+
+def _validated_windows_history_writer_option_file() -> Path:
+    """Require a fixed private file under a non-replaceable profile path."""
+    configured = WINDOWS_LOCAL_HISTORY_WRITER_OPTION_FILE
+    profile = WINDOWS_LOCAL_HISTORY_WRITER_PROFILE_ROOT
+    try:
+        configured.relative_to(profile)
+    except ValueError:
+        raise RuntimeError(
+            "Windows QMT history writer private directory differs"
+        ) from None
+    resolved = _protected_windows_option_file(
+        configured
+    )
+    try:
+        resolved.relative_to(profile.resolve(strict=True))
+    except (OSError, ValueError):
+        raise RuntimeError(
+            "Windows QMT history writer private directory differs"
+        ) from None
+    current = configured.parent
+    while True:
+        try:
+            if not os.path.lexists(current) or current.is_symlink():
+                raise OSError("unsafe writer directory")
+            state = current.lstat()
+        except OSError:
+            raise RuntimeError(
+                "Windows QMT history writer directory is unavailable"
+            ) from None
+        if (
+            not stat.S_ISDIR(state.st_mode)
+            or int(getattr(state, "st_file_attributes", 0))
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        ):
+            raise RuntimeError(
+                "Windows QMT history writer directory is not private"
+            )
+        try:
+            snapshot = _windows_acl_snapshot(current)
+            if current == configured.parent:
+                _validate_windows_acl_snapshot(snapshot)
+            else:
+                _validate_windows_directory_has_no_untrusted_writer(snapshot)
+        except Exception:
+            raise RuntimeError(
+                "Windows QMT history writer directory is not private"
+            ) from None
+        if current == profile:
+            break
+        parent = current.parent
+        if parent == current or not _is_relative_to(parent, profile):
+            raise RuntimeError(
+                "Windows QMT history writer private directory differs"
+            )
+        current = parent
+    return resolved
+
+
+def _windows_local_engines(*, history_writer: bool = False):
+    """Open fixed, separated primary/history identities without copying secrets."""
+    runtime_boundary_engine = _create_windows_local_history_engine()
+    try:
+        _validate_windows_local_mysql84_boundary(runtime_boundary_engine)
+    except Exception:
+        runtime_boundary_engine.dispose()
         raise
+
+    if history_writer:
+        runtime_boundary_engine.dispose()
+        writer_option_file = _validated_windows_history_writer_option_file()
+        writer_identity = _windows_history_writer_identity(writer_option_file)
+        history_engine = _create_windows_local_history_engine(
+            writer_option_file
+        )
+        try:
+            _validate_windows_history_writer_boundary(
+                history_engine,
+                expected_identity=writer_identity,
+            )
+        except Exception:
+            history_engine.dispose()
+            raise
+    else:
+        history_engine = runtime_boundary_engine
 
     def connect_primary():
         connection = _connect_from_windows_option_file(WINDOWS_LOCAL_OPTION_FILE)
@@ -785,6 +1043,7 @@ def _validate_target_daily_quarantine_table(source_engine) -> dict[str, Any]:
 def _quarantine_invalid_target_rows_without_native(
     source_engine,
     *,
+    history_engine=None,
     start_date: str,
     end_date: str,
     provider: str,
@@ -862,6 +1121,7 @@ def _quarantine_invalid_target_rows_without_native(
         FOR UPDATE
         """
     )
+    native_lock_clause = "" if history_engine is not None else "FOR UPDATE"
     native_lookup_sql = text(
         f"""
         SELECT s.id
@@ -881,7 +1141,7 @@ def _quarantine_invalid_target_rows_without_native(
           AND s.volume IS NOT NULL AND s.volume >= 0
           AND s.amount IS NOT NULL AND s.amount >= 0
         LIMIT 1
-        FOR UPDATE
+        {native_lock_clause}
         """
     )
     conflict_sql = text(
@@ -1096,37 +1356,40 @@ def _quarantine_invalid_target_rows_without_native(
             "max_rows": int(max_rows),
             "existing_valid_target_rows_updated": 0,
         }
-        connection.execute(
-            text(
-                f"""
-                INSERT INTO {run_table} (
-                    run_id, provider, dataset, period,
-                    start_date, end_date, status, requested_codes,
-                    fetched_rows, written_rows, error_message,
-                    started_at, finished_at, extra_json
-                ) VALUES (
-                    :run_id, :provider, 'sm_stock_kline_target_quarantine',
-                    '1d', :start_date, :end_date, 'SUCCESS',
-                    :requested_codes, :row_count, :row_count, NULL,
-                    NOW(), NOW(), :extra_json
-                )
-                """
-            ),
-            {
-                **params,
-                "run_id": run_id,
-                "requested_codes": len(
-                    {str(row["stock_code"]) for row in rows}
-                ),
-                "row_count": len(rows),
-                "extra_json": json.dumps(
-                    extra,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
-            },
+        audit_statement = text(
+            f"""
+            INSERT INTO {run_table} (
+                run_id, provider, dataset, period,
+                start_date, end_date, status, requested_codes,
+                fetched_rows, written_rows, error_message,
+                started_at, finished_at, extra_json
+            ) VALUES (
+                :run_id, :provider, 'sm_stock_kline_target_quarantine',
+                '1d', :start_date, :end_date, 'SUCCESS',
+                :requested_codes, :row_count, :row_count, NULL,
+                NOW(), NOW(), :extra_json
+            )
+            """
         )
+        audit_params = {
+            **params,
+            "run_id": run_id,
+            "requested_codes": len(
+                {str(row["stock_code"]) for row in rows}
+            ),
+            "row_count": len(rows),
+            "extra_json": json.dumps(
+                {**extra, "separated_history_writer": history_engine is not None},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        if history_engine is None:
+            connection.execute(audit_statement, audit_params)
+    if history_engine is not None:
+        with history_engine.begin() as history_connection:
+            history_connection.execute(audit_statement, audit_params)
     return {
         "status": "APPLIED",
         "run_id": run_id,
@@ -1164,14 +1427,294 @@ def _quarantine_invalid_target_rows_without_native(
     }
 
 
+def _quarantine_source_only_legacy_rows_split_identity(
+    source_engine,
+    *,
+    history_engine,
+    start_date: str,
+    end_date: str,
+    provider: str,
+) -> dict[str, Any]:
+    """Quarantine history rows with a history-only DML identity.
+
+    The runtime identity proves absence from the primary target; the dedicated
+    history writer locks and mutates only the exact audited history row IDs.
+    """
+    normalized_start = _normalize_date(start_date)
+    normalized_end = _normalize_date(end_date)
+    history_table = (
+        f"`{WINDOWS_LOCAL_HISTORY_DATABASE}`.`qmt_local_stock_kline`"
+    )
+    run_table = (
+        f"`{WINDOWS_LOCAL_HISTORY_DATABASE}`.`qmt_local_backfill_run`"
+    )
+    target_table = f"`{WINDOWS_LOCAL_PRIMARY_DATABASE}`.`{TARGET_DAILY_TABLE}`"
+    params = {
+        "start_date": normalized_start,
+        "end_date": normalized_end,
+        "provider": provider,
+        "quarantine_provider": QUARANTINED_LEGACY_PROVIDER,
+        "quarantine_quality": QUARANTINED_LEGACY_QUALITY,
+    }
+    source_select = text(
+        f"""
+        SELECT s.id, s.stock_code, s.trade_date, s.adjust_type, s.data_version
+        FROM {history_table} s
+        LEFT JOIN {target_table} t
+          ON t.stock_code=s.stock_code COLLATE utf8mb4_unicode_ci
+         AND t.trade_date=s.trade_date
+         AND t.k_type=1
+         AND t.adjust_type=0
+        WHERE s.provider=:provider
+          AND s.period='1d'
+          AND s.k_type=1
+          AND s.adjust_type=0
+          AND s.trade_date BETWEEN :start_date AND :end_date
+          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
+          AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
+          AND t.id IS NULL
+        ORDER BY s.id
+        """
+    )
+    with source_engine.connect() as source_connection:
+        rows = list(
+            source_connection.execute(source_select, params).mappings().all()
+        )
+    identities = [
+        {
+            "id": int(row["id"]),
+            "stock_code": str(row["stock_code"]),
+            "trade_date": str(row["trade_date"])[:10],
+            "adjust_type": int(row["adjust_type"]),
+            "data_version": str(row.get("data_version") or ""),
+        }
+        for row in rows
+    ]
+    identity_hash = hashlib.sha256(
+        json.dumps(
+            identities,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    run_id = (
+        f"qmt_quarantine_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    quarantined_rows = 0
+    remaining_rows = 0
+    with history_engine.begin() as history_connection:
+        if identities:
+            identity_params = {
+                f"row_id_{index}": row["id"]
+                for index, row in enumerate(identities)
+            }
+            id_list = ", ".join(
+                f":row_id_{index}" for index in range(len(identities))
+            )
+            locked_rows = list(
+                history_connection.execute(
+                    text(
+                        f"""
+                        SELECT id, stock_code, trade_date, adjust_type,
+                               data_version
+                        FROM {history_table}
+                        WHERE id IN ({id_list})
+                          AND provider=:provider
+                          AND period='1d'
+                          AND k_type=1
+                          AND adjust_type=0
+                          AND trade_date BETWEEN :start_date AND :end_date
+                          AND BINARY pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
+                        ORDER BY id
+                        FOR UPDATE
+                        """
+                    ),
+                    {**params, **identity_params},
+                ).mappings().all()
+            )
+            locked_identities = [
+                {
+                    "id": int(row["id"]),
+                    "stock_code": str(row["stock_code"]),
+                    "trade_date": str(row["trade_date"])[:10],
+                    "adjust_type": int(row["adjust_type"]),
+                    "data_version": str(row.get("data_version") or ""),
+                }
+                for row in locked_rows
+            ]
+            if locked_identities != identities:
+                raise RuntimeError(
+                    "legacy quarantine history row identity changed"
+                )
+            conflict_rows = int(
+                history_connection.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {history_table} s
+                        JOIN {history_table} q
+                          ON q.provider=:quarantine_provider
+                         AND q.stock_code=s.stock_code
+                         AND q.period=s.period
+                         AND q.trade_date=s.trade_date
+                         AND q.adjust_type=s.adjust_type
+                        WHERE s.id IN ({id_list})
+                        """
+                    ),
+                    {**params, **identity_params},
+                ).scalar()
+                or 0
+            )
+            if conflict_rows:
+                raise RuntimeError(
+                    "legacy quarantine provider conflicts with existing rows: "
+                    f"conflict_rows={conflict_rows}"
+                )
+
+            target_params: dict[str, Any] = {}
+            target_pairs: list[str] = []
+            for index, row in enumerate(identities):
+                target_params[f"stock_code_{index}"] = row["stock_code"]
+                target_params[f"trade_date_{index}"] = row["trade_date"]
+                target_pairs.append(
+                    f"(:stock_code_{index}, :trade_date_{index})"
+                )
+            quarantined_rows = int(
+                history_connection.execute(
+                    text(
+                        f"""
+                        UPDATE {history_table}
+                        SET provider=:quarantine_provider,
+                            quality_status=:quarantine_quality,
+                            updated_at=NOW()
+                        WHERE id IN ({id_list})
+                          AND provider=:provider
+                          AND period='1d'
+                          AND k_type=1
+                          AND adjust_type=0
+                          AND BINARY pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
+                        """
+                    ),
+                    {**params, **identity_params},
+                ).rowcount
+                or 0
+            )
+            remaining_rows = int(
+                history_connection.execute(
+                    text(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {history_table}
+                        WHERE id IN ({id_list}) AND provider=:provider
+                        """
+                    ),
+                    {**params, **identity_params},
+                ).scalar()
+                or 0
+            )
+            with source_engine.connect() as source_connection:
+                target_rows = int(
+                    source_connection.execute(
+                        text(
+                            f"""
+                            SELECT COUNT(*)
+                            FROM {target_table}
+                            WHERE k_type=1 AND adjust_type=0
+                              AND (stock_code, trade_date) IN (
+                                  {', '.join(target_pairs)}
+                              )
+                            """
+                        ),
+                        target_params,
+                    ).scalar()
+                    or 0
+                )
+            if target_rows:
+                raise RuntimeError(
+                    "legacy quarantine target absence changed: "
+                    f"target_rows={target_rows}"
+                )
+        if quarantined_rows != len(identities) or remaining_rows != 0:
+            raise RuntimeError(
+                "legacy source-only quarantine is incomplete: "
+                f"selected_rows={len(identities)}, "
+                f"quarantined_rows={quarantined_rows}, "
+                f"remaining_rows={remaining_rows}"
+            )
+        extra = {
+            "reason": "SOURCE_ONLY_UNVERIFIED_LEGACY",
+            "source_provider": provider,
+            "quarantine_provider": QUARANTINED_LEGACY_PROVIDER,
+            "row_identity_sha256": identity_hash,
+            "existing_target_rows_updated": 0,
+            "separated_history_writer": True,
+        }
+        history_connection.execute(
+            text(
+                f"""
+                INSERT INTO {run_table} (
+                    run_id, provider, dataset, period,
+                    start_date, end_date, status, requested_codes,
+                    fetched_rows, written_rows, error_message,
+                    started_at, finished_at, extra_json
+                ) VALUES (
+                    :run_id, :provider, 'qmt_local_stock_kline_quarantine',
+                    '1d', :start_date, :end_date, 'SUCCESS',
+                    :requested_codes, :row_count, :row_count, NULL,
+                    NOW(), NOW(), :extra_json
+                )
+                """
+            ),
+            {
+                **params,
+                "run_id": run_id,
+                "requested_codes": len(
+                    {row["stock_code"] for row in identities}
+                ),
+                "row_count": len(identities),
+                "extra_json": json.dumps(
+                    extra,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        )
+    return {
+        "status": "APPLIED",
+        "run_id": run_id,
+        "provider": provider,
+        "quarantine_provider": QUARANTINED_LEGACY_PROVIDER,
+        "start_date": normalized_start,
+        "end_date": normalized_end,
+        "selected_rows": len(identities),
+        "quarantined_rows": quarantined_rows,
+        "remaining_rows": remaining_rows,
+        "row_identity_sha256": identity_hash,
+        "existing_target_rows_updated": 0,
+        "separated_history_writer": True,
+    }
+
+
 def _quarantine_source_only_legacy_rows(
     source_engine,
     *,
+    history_engine=None,
     start_date: str,
     end_date: str,
     provider: str,
 ) -> dict[str, Any]:
     """Move orphaned unverified legacy rows out of the native proof provider."""
+    if history_engine is not None and history_engine is not source_engine:
+        return _quarantine_source_only_legacy_rows_split_identity(
+            source_engine,
+            history_engine=history_engine,
+            start_date=start_date,
+            end_date=end_date,
+            provider=provider,
+        )
     normalized_start = _normalize_date(start_date)
     normalized_end = _normalize_date(end_date)
     history_table = (
@@ -1498,6 +2041,15 @@ def main(argv: list[str] | None = None) -> int:
             "for both the local primary and QMT history schemas."
         ),
     )
+    parser.add_argument(
+        "--windows-history-writer-option-file",
+        action="store_true",
+        help=(
+            "Use the fixed protected Windows QMT history writer option file "
+            "for history DML while retaining the fixed runtime identity for "
+            "primary reads and business DML. Valid only for daily --apply."
+        ),
+    )
     parser.add_argument("--codes", default="", help="Comma-separated stock codes. Empty means the current immutable QMT catalog universe.")
     parser.add_argument(
         "--target-window-universe",
@@ -1561,6 +2113,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.windows_history_writer_option_file and (
+        args.mode != "daily" or not args.apply
+    ):
+        parser.error(
+            "--windows-history-writer-option-file is restricted to daily --apply"
+        )
+    if args.windows_local_option_file and args.windows_history_writer_option_file:
+        parser.error(
+            "--windows-local-option-file and "
+            "--windows-history-writer-option-file are mutually exclusive"
+        )
+    if (
+        args.local_url
+        and (
+            args.windows_local_option_file
+            or args.windows_history_writer_option_file
+        )
+    ):
+        parser.error(
+            "protected Windows option-file routes and --local-url are "
+            "mutually exclusive"
+        )
+    if args.windows_local_option_file and args.apply:
+        parser.error(
+            "protected Windows apply requires "
+            "--windows-history-writer-option-file in daily mode; "
+            "--windows-local-option-file is the read-only runtime identity"
+        )
+
     gap_repair_lock_path: Path | None = None
     if args.mode == "from-gaps" and args.apply:
         _, gap_repair_lock_path = _validated_gap_repair_lock_path(
@@ -1572,10 +2153,6 @@ def main(argv: list[str] | None = None) -> int:
             "--state-root/--lock-path are only valid for from-gaps --apply"
         )
 
-    if args.windows_local_option_file and args.local_url:
-        parser.error(
-            "--windows-local-option-file and --local-url are mutually exclusive"
-        )
     if args.mode == "init" and args.windows_local_option_file:
         parser.error(
             "init requires a dedicated privileged database connection; "
@@ -1618,7 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.repair_target_source_only:
         if (
             args.mode != "daily"
-            or not args.windows_local_option_file
+            or not args.windows_history_writer_option_file
             or not args.target_window_universe
             or not args.apply
             or args.provider != "gj_big_qmt_inner"
@@ -1626,7 +2203,8 @@ def main(argv: list[str] | None = None) -> int:
         ):
             parser.error(
                 "--repair-target-source-only requires daily mode, "
-                "--windows-local-option-file, --target-window-universe, "
+                "--windows-history-writer-option-file, "
+                "--target-window-universe, "
                 "--provider gj_big_qmt_inner, --dividend-type none and --apply"
             )
     if args.quarantine_source_only_legacy:
@@ -1649,7 +2227,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "daily":
         _, daily_lock_path = _validated_daily_backfill_lock_path()
 
-    if args.windows_local_option_file:
+    if args.windows_history_writer_option_file:
+        source_engine, local_engine = _windows_local_engines(
+            history_writer=True
+        )
+        connection_mode = "fixed_protected_windows_history_writer_option_file"
+    elif args.windows_local_option_file:
         source_engine, local_engine = _windows_local_engines()
         connection_mode = "fixed_protected_windows_option_file"
     else:
@@ -1795,6 +2378,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_invalid_quarantine = (
                     _quarantine_invalid_target_rows_without_native(
                         source_engine,
+                        history_engine=local_engine,
                         start_date=args.start_date,
                         end_date=args.end_date,
                         provider=args.provider,
@@ -1813,6 +2397,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.quarantine_source_only_legacy:
                 legacy_quarantine = _quarantine_source_only_legacy_rows(
                     source_engine,
+                    history_engine=local_engine,
                     start_date=args.start_date,
                     end_date=args.end_date,
                     provider=args.provider,
