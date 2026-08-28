@@ -575,6 +575,10 @@ def test_target_source_only_repair_inserts_missing_native_rows_only(
         in statements
     )
     assert "BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'" in statements
+    assert (
+        "member.stock_code=s.stock_code COLLATE utf8mb4_unicode_ci"
+        in statements
+    )
     assert "member.expire_date>=s.trade_date" in statements
     assert "qmt_trade_calendar_session" in statements
     assert "t.id IS NULL" in statements

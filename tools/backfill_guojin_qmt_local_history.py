@@ -1039,7 +1039,7 @@ def _repair_target_source_only_rows(
             SELECT 1
             FROM `probiga`.`qmt_stock_catalog_member` member
             WHERE member.batch_id=:catalog_batch_id
-              AND member.stock_code=s.stock_code
+              AND member.stock_code=s.stock_code COLLATE utf8mb4_unicode_ci
               AND member.instrument_type='STOCK'
               AND member.list_date<=s.trade_date
               AND (
