@@ -1961,13 +1961,22 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         "validate_reference_tables",
         lambda *_args, **_kwargs: None,
     )
+    governance_schema_calls = []
+
+    def fake_governance_schema(**kwargs):
+        governance_schema_calls.append(dict(kwargs))
+        calls.append(
+            "governance-schema-base"
+            if kwargs.get("base_schema_only") is True
+            else "governance-schema-sealed"
+        )
+        assert kwargs.get("writers_fenced") is True
+        assert kwargs.get("trigger_ddl_executor") is None
+
     monkeypatch.setattr(
         strategy_governance,
         "ensure_strategy_governance_tables",
-        lambda **kwargs: (
-            calls.append("governance-schema-off"),
-            assert_callable(kwargs.get("trigger_ddl_executor")),
-        ),
+        fake_governance_schema,
     )
     monkeypatch.setattr(
         dynamic_shadow_ledger_schema,
@@ -2071,6 +2080,13 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert detail["funding_checkpoint_trigger_count"] == 4
     assert detail["trust_restoration_verified"] is True
     assert detail["runtime_least_privilege_verified"] is True
+    assert [
+        call.get("base_schema_only") for call in governance_schema_calls
+    ] == [True, None]
+    assert calls.index("governance-schema-base") < calls.index(
+        "governance-schema-sealed"
+    )
+    assert calls.index("governance-schema-sealed") < calls.index("seed")
     assert calls.count("scheduler-runtime-migration-off") == 1
     assert calls.count("scheduler-runtime-validate") == 1
     assert calls.count("triple-off") == 1

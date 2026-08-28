@@ -2770,6 +2770,7 @@ def ensure_strategy_governance_tables(
     trigger_ddl_executor: Callable[[str], None] | None = None,
     writers_fenced: bool = False,
     defer_triggers: bool = False,
+    base_schema_only: bool = False,
 ) -> None:
     """Create governance tables, columns, indexes and migration markers.
 
@@ -2777,18 +2778,30 @@ def ensure_strategy_governance_tables(
     broker supplies its separately authenticated, schema-scoped migration
     engine while all writers are fenced.  ``trigger_ddl_executor`` is retained
     for the full immutable-trigger phase.  ``defer_triggers`` is the explicit
-    base-schema-only phase and never invokes or accepts a trigger executor.
+    deferred deployment phase and never invokes or accepts a trigger executor.
+    ``base_schema_only`` is the release cutover preparation phase: it commits
+    table/data work without creating triggers or changing deferred/full
+    migration markers, so trigger DDL can run later on an independent
+    connection without waiting on this transaction's metadata locks.
     """
 
     if type(defer_triggers) is not bool:
         raise TypeError("defer_triggers must be bool")
+    if type(base_schema_only) is not bool:
+        raise TypeError("base_schema_only must be bool")
+    if defer_triggers and base_schema_only:
+        raise ValueError(
+            "deferred governance schema and cutover base schema are exclusive"
+        )
     if trigger_ddl_executor is not None and not callable(
         trigger_ddl_executor
     ):
         raise TypeError("trigger_ddl_executor must be callable")
-    if defer_triggers and trigger_ddl_executor is not None:
+    if (defer_triggers or base_schema_only) and (
+        trigger_ddl_executor is not None
+    ):
         raise ValueError(
-            "deferred governance schema cannot accept a trigger DDL executor"
+            "trigger-free governance schema cannot accept a trigger DDL executor"
         )
     statements = governance_table_ddl_statements()
     production_mode = (
@@ -2813,7 +2826,7 @@ def ensure_strategy_governance_tables(
         ensure_strategy_funding_checkpoint_schema(
             connection,
             trigger_ddl_executor=trigger_ddl_executor,
-            defer_triggers=defer_triggers,
+            defer_triggers=defer_triggers or base_schema_only,
         )
         metric_entity_type = connection.execute(
             text(
@@ -3138,12 +3151,12 @@ def ensure_strategy_governance_tables(
         _ensure_strategy_content_hash_schema(connection)
         checkpoint_migration_key = (
             FUNDING_CHECKPOINT_BASE_MIGRATION_KEY
-            if defer_triggers
+            if defer_triggers or base_schema_only
             else FUNDING_CHECKPOINT_MIGRATION_KEY
         )
         checkpoint_migration_hash = (
             FUNDING_CHECKPOINT_BASE_MIGRATION_HASH
-            if defer_triggers
+            if defer_triggers or base_schema_only
             else FUNDING_CHECKPOINT_MIGRATION_HASH
         )
         checkpoint_migration = connection.execute(text(
@@ -3166,6 +3179,11 @@ def ensure_strategy_governance_tables(
             checkpoint_migration_hash
         ):
             raise RuntimeError("资金检查点迁移标记哈希不一致")
+        if base_schema_only:
+            validate_governance_table_schema(connection)
+            validate_dynamic_shadow_ledger_schema(connection)
+            validate_strategy_funding_checkpoint_base_schema(connection)
+            return
         if defer_triggers:
             validate_governance_table_schema(connection)
             validate_dynamic_shadow_ledger_schema(connection)

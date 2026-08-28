@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import pytest
 
 from server.engine import strategy_funding_checkpoint as funding
@@ -126,6 +128,129 @@ def test_funding_deferred_phase_rejects_trigger_executor():
         funding.ensure_strategy_funding_checkpoint_schema(
             object(),
             defer_triggers=True,
+            trigger_ddl_executor=lambda _statement: None,
+        )
+
+
+def test_cutover_base_schema_commits_without_trigger_or_deferred_marker(
+    monkeypatch,
+):
+    statements: list[tuple[str, dict | None]] = []
+    calls: list[str] = []
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def first(self):
+            return None
+
+        def all(self):
+            return []
+
+        def scalar(self):
+            return 0
+
+        def __iter__(self):
+            return iter(())
+
+    class Connection:
+        def execute(self, statement, params=None):
+            statements.append((str(statement), dict(params) if params else None))
+            return Result()
+
+    class Engine:
+        def begin(self):
+            return nullcontext(Connection())
+
+    monkeypatch.setattr(governance, "governance_table_ddl_statements", tuple)
+    monkeypatch.setattr(
+        governance,
+        "ensure_dynamic_shadow_ledger_schema",
+        lambda *_args, **_kwargs: calls.append("dynamic-base"),
+    )
+
+    def funding_base(_connection, **kwargs):
+        assert kwargs == {
+            "trigger_ddl_executor": None,
+            "defer_triggers": True,
+        }
+        calls.append("funding-base")
+
+    monkeypatch.setattr(
+        governance,
+        "ensure_strategy_funding_checkpoint_schema",
+        funding_base,
+    )
+    monkeypatch.setattr(
+        governance,
+        "_ensure_strategy_content_hash_schema",
+        lambda _connection: calls.append("content-base"),
+    )
+    monkeypatch.setattr(
+        governance,
+        "validate_governance_table_schema",
+        lambda _connection: calls.append("governance-validated"),
+    )
+    monkeypatch.setattr(
+        governance,
+        "validate_dynamic_shadow_ledger_schema",
+        lambda _connection: calls.append("dynamic-validated"),
+    )
+    monkeypatch.setattr(
+        governance,
+        "validate_strategy_funding_checkpoint_base_schema",
+        lambda _connection: calls.append("funding-validated"),
+    )
+    monkeypatch.setattr(
+        governance,
+        "_ensure_governance_append_only_triggers",
+        lambda *_args, **_kwargs: pytest.fail("cutover base created triggers"),
+    )
+    monkeypatch.setattr(
+        governance,
+        "_ensure_metric_input_review_triggers",
+        lambda *_args, **_kwargs: pytest.fail("cutover base created triggers"),
+    )
+
+    governance.ensure_strategy_governance_tables(
+        engine=Engine(),
+        writers_fenced=True,
+        base_schema_only=True,
+    )
+
+    marker_params = [
+        params for _sql, params in statements
+        if params and "migration_key" in params
+    ]
+    assert any(
+        params["migration_key"] == funding.FUNDING_CHECKPOINT_BASE_MIGRATION_KEY
+        for params in marker_params
+    )
+    assert all(
+        params["migration_key"]
+        not in {
+            funding.FUNDING_CHECKPOINT_MIGRATION_KEY,
+            governance.DEFERRED_BASE_SCHEMA_MIGRATION_KEY,
+        }
+        for params in marker_params
+    )
+    assert calls[-3:] == [
+        "governance-validated",
+        "dynamic-validated",
+        "funding-validated",
+    ]
+
+
+def test_cutover_base_schema_rejects_deferred_or_trigger_executor():
+    with pytest.raises(ValueError, match="exclusive"):
+        governance.ensure_strategy_governance_tables(
+            defer_triggers=True,
+            base_schema_only=True,
+        )
+    with pytest.raises(ValueError, match="cannot accept"):
+        governance.ensure_strategy_governance_tables(
+            base_schema_only=True,
             trigger_ddl_executor=lambda _statement: None,
         )
 

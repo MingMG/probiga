@@ -3051,10 +3051,15 @@ def _cutover_schema(
         legacy_binding = apply_legacy_completed_run_binding(
             boundary.migrator_engine
         )
+        # Commit every governance table/data migration before opening any
+        # CREATE TRIGGER window.  The trigger executor uses a separate,
+        # narrowly authenticated connection; invoking it from inside the
+        # governance transaction would make that connection wait on our own
+        # metadata locks until MySQL's lock timeout expires.
         ensure_strategy_governance_tables(
             engine=boundary.migrator_engine,
-            trigger_ddl_executor=trigger_ddl_executor,
             writers_fenced=True,
+            base_schema_only=True,
         )
         supporting_trigger_source_detail = (
             _ensure_frozen_release_triggers(
@@ -3088,6 +3093,15 @@ def _cutover_schema(
                 ),
                 trigger_ddl_executor=trigger_ddl_executor,
             )
+        )
+        # The frozen release pass above has installed and validated every
+        # governance trigger outside the base-schema transaction.  Re-enter
+        # the idempotent full path only to seal the full migration markers and
+        # validate the already-present trigger contract; no trigger DDL is
+        # allowed or required in this transaction.
+        ensure_strategy_governance_tables(
+            engine=boundary.migrator_engine,
+            writers_fenced=True,
         )
         qmt_reference_seal = attest_prepared_reference_schema(
             boundary.migrator_engine
