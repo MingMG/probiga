@@ -212,6 +212,7 @@ def test_windows_option_engine_and_driver_arguments_never_contain_secret(
     assert "host" not in observed
     assert "port" not in observed
     assert observed["read_default_file"] == str(option_file.resolve())
+    assert observed["read_timeout"] == 300
     assert secret not in repr(observed)
 
 

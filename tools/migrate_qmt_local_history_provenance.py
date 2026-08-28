@@ -283,7 +283,7 @@ def _connect_from_windows_option_file(path: Path):
         charset="utf8mb4",
         autocommit=False,
         connect_timeout=10,
-        read_timeout=30,
+        read_timeout=300,
         write_timeout=30,
         ssl={"check_hostname": False},
     )
