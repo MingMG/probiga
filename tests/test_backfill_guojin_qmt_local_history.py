@@ -172,6 +172,7 @@ def test_target_window_universe_uses_exact_a_share_union_and_dates(
         backfill_tool,
         "load_stock_catalog",
         lambda _connection, **_kwargs: SimpleNamespace(
+            manifest_hash="a" * 64,
             eligible_codes=lambda day: (
                 ["000001", "600000"]
                 if day == "2026-08-18"
@@ -183,13 +184,14 @@ def test_target_window_universe_uses_exact_a_share_union_and_dates(
         backfill_tool,
         "load_trade_calendar_receipt",
         lambda _connection, **_kwargs: SimpleNamespace(
+            manifest_hash="b" * 64,
             sessions_between=lambda _start, _end: [
                 "2026-08-18", "2026-08-19"
             ]
         ),
     )
 
-    codes, trade_dates = backfill_tool._target_window_codes(
+    codes, trade_dates, source_batch_id = backfill_tool._target_window_codes(
         engine,
         start_date="20260818",
         end_date="2026-08-19",
@@ -197,6 +199,10 @@ def test_target_window_universe_uses_exact_a_share_union_and_dates(
 
     assert codes == ["000001", "300001", "600000"]
     assert trade_dates == ["2026-08-18", "2026-08-19"]
+    assert source_batch_id == backfill_tool.daily_market_source_batch_id(
+        catalog_manifest_hash="a" * 64,
+        calendar_manifest_hash="b" * 64,
+    )
     assert engine.connection.statements == []
 
 
@@ -2600,6 +2606,39 @@ def test_daily_backfill_deduplicates_normalized_requested_codes(monkeypatch):
     assert result.batches[0].requested_codes == 2
     assert run_events[0][1]["requested_codes"] == 2
     assert run_events[-1][1]["status"] == "SUCCESS"
+
+
+def test_daily_backfill_rebinds_transport_batches_to_formal_source_root(
+    monkeypatch,
+):
+    prepared_rows = [{
+        "stock_code": "000001",
+        "trade_date": "2026-08-19",
+        "batch_id": "transient-bridge-request",
+    }]
+    run_events = _patch_daily_dependencies(monkeypatch, prepared_rows)
+    persisted = []
+    monkeypatch.setattr(
+        local_history,
+        "_upsert_rows",
+        lambda _engine, *, rows, **_kwargs: persisted.extend(rows) or len(rows),
+    )
+    source_batch_id = "c" * 64
+
+    result = local_history.backfill_daily_kline_local(
+        source_engine=object(),
+        local_engine=_DisposableEngine("probiga_qmt_history"),
+        stock_codes=["000001"],
+        start_date="2026-08-19",
+        end_date="2026-08-19",
+        batch_size=10,
+        dry_run=False,
+        source_batch_id=source_batch_id,
+    )
+
+    assert result.status == "SUCCESS"
+    assert persisted[0]["batch_id"] == source_batch_id
+    assert run_events[0][1]["extra"]["source_batch_id"] == source_batch_id
 
 
 def test_daily_backfill_discards_920093_pre_listing_placeholder_before_write(

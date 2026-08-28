@@ -36,6 +36,9 @@ from integrations.qmt.local_history import (
     validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
+from server.common.qmt_attestation_contract import (
+    daily_market_source_batch_id,
+)
 from server.common.qmt_daily_no_row import (
     NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
     build_no_row_exception_contract,
@@ -890,7 +893,7 @@ def _target_window_codes(
     *,
     start_date: str,
     end_date: str,
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], str]:
     """Load the exact independent QMT catalog union for the target window."""
     normalized_start = _normalize_date(start_date)
     normalized_end = _normalize_date(end_date)
@@ -921,7 +924,11 @@ def _target_window_codes(
     codes = sorted(set().union(*expected_by_date.values()))
     if not codes:
         raise RuntimeError("QMT catalog target window stock-code union is empty")
-    return codes, target_dates
+    source_batch_id = daily_market_source_batch_id(
+        catalog_manifest_hash=catalog.manifest_hash,
+        calendar_manifest_hash=calendar_receipt.manifest_hash,
+    )
+    return codes, target_dates, source_batch_id
 
 
 def _target_window_unattestable_codes(
@@ -2545,12 +2552,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     target_trade_dates: list[str] | None = None
+    target_source_batch_id = ""
     if args.target_window_universe:
-        codes, target_trade_dates = _target_window_codes(
+        target_window = _target_window_codes(
             source_engine,
             start_date=args.start_date,
             end_date=args.end_date,
         )
+        codes, target_trade_dates = target_window[:2]
+        if len(target_window) >= 3:
+            target_source_batch_id = str(target_window[2] or "")
         universe_source = TARGET_WINDOW_UNIVERSE_SOURCE
     else:
         codes = _codes_from_arg(
@@ -2656,6 +2667,7 @@ def main(argv: list[str] | None = None) -> int:
                 provider=args.provider,
                 dry_run=dry_run,
                 allowed_missing_stock_codes=allowed_missing_codes,
+                source_batch_id=target_source_batch_id,
             )
             if result.fetched_rows <= 0 or result.code_count != len(codes):
                 raise RuntimeError(
@@ -2798,12 +2810,13 @@ def main(argv: list[str] | None = None) -> int:
                         }
                     )
                     continue
+                authoritative_window = _target_window_codes(
+                    source_engine,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
                 authoritative_codes, authoritative_trade_dates = (
-                    _target_window_codes(
-                        source_engine,
-                        start_date=start_date,
-                        end_date=end_date,
-                    )
+                    authoritative_window[:2]
                 )
                 if args.codes:
                     selected = set(codes)

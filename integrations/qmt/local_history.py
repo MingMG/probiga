@@ -1276,6 +1276,13 @@ def backfill_daily_kline_local(
                 batch_id=normalized_source_batch_id or run_id,
                 provider=provider,
             )
+            if normalized_source_batch_id:
+                # A formal full-window capture is one immutable dataset even
+                # when transport is chunked into several bridge requests.
+                # Never let transient bridge request ids fragment the source
+                # partition selected by the attester.
+                for row in rows:
+                    row["batch_id"] = normalized_source_batch_id
             raw_fetched_codes = {
                 str(row.get("stock_code") or "").strip().zfill(6)
                 for row in rows
