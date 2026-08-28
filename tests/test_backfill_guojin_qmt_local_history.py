@@ -899,6 +899,103 @@ def test_source_only_legacy_quarantine_cli_requires_native_repair(capsys):
     assert "requires --repair-target-source-only" in capsys.readouterr().err
 
 
+def test_source_only_legacy_quarantine_separates_runtime_and_history_dml():
+    rows = [
+        {
+            "id": 7,
+            "stock_code": "000001",
+            "trade_date": "2026-03-02",
+            "adjust_type": 0,
+            "data_version": "legacy-a",
+        },
+        {
+            "id": 9,
+            "stock_code": "600000",
+            "trade_date": "2026-03-03",
+            "adjust_type": 0,
+            "data_version": "legacy-b",
+        },
+    ]
+
+    class _Result:
+        def __init__(self, *, rows=None, scalar_value=None, rowcount=0):
+            self.rows = list(rows or [])
+            self.scalar_value = scalar_value
+            self.rowcount = rowcount
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return list(self.rows)
+
+        def scalar(self):
+            return self.scalar_value
+
+    class _Connection:
+        def __init__(self, results, statements):
+            self.results = results
+            self.statements = statements
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), dict(params or {})))
+            return self.results.pop(0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    class _Engine:
+        def __init__(self, results):
+            self.results = list(results)
+            self.statements = []
+
+        def connect(self):
+            return _Connection(self.results, self.statements)
+
+        def begin(self):
+            return nullcontext(_Connection(self.results, self.statements))
+
+    source_engine = _Engine(
+        [
+            _Result(rows=rows),
+            _Result(scalar_value=0),
+        ]
+    )
+    history_engine = _Engine(
+        [
+            _Result(rows=rows),
+            _Result(scalar_value=0),
+            _Result(rowcount=2),
+            _Result(scalar_value=0),
+            _Result(rowcount=1),
+        ]
+    )
+
+    result = backfill_tool._quarantine_source_only_legacy_rows(
+        source_engine,
+        history_engine=history_engine,
+        start_date="2026-03-02",
+        end_date="2026-03-13",
+        provider="gj_big_qmt_inner",
+    )
+
+    assert result["status"] == "APPLIED"
+    assert result["separated_history_writer"] is True
+    assert result["selected_rows"] == 2
+    assert result["quarantined_rows"] == 2
+    source_sql = "\n".join(sql for sql, _params in source_engine.statements)
+    history_sql = "\n".join(sql for sql, _params in history_engine.statements)
+    assert "UPDATE `probiga_qmt_history`" not in source_sql
+    assert "INSERT INTO `probiga_qmt_history`" not in source_sql
+    assert "DELETE" not in source_sql.upper()
+    assert "UPDATE `probiga_qmt_history`" in history_sql
+    assert "INSERT INTO `probiga_qmt_history`" in history_sql
+    assert "`probiga`.`sm_stock_kline`" not in history_sql
+
+
 def test_windows_option_file_route_uses_safe_urls_and_fixed_databases(
     monkeypatch,
 ):
@@ -963,6 +1060,320 @@ def test_windows_option_file_route_uses_safe_urls_and_fixed_databases(
     assert rendered_urls == ["mysql+pymysql:///probiga"]
     assert ("select_db", "probiga") in events
     assert ("boundary", history_engine) in events
+
+
+def test_windows_history_writer_grants_are_exact_and_tls_bound():
+    result = backfill_tool._validate_windows_history_writer_grants(
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON "
+            "`probiga_qmt_history`.* TO 'writer'@'127.0.0.1'",
+        )
+    )
+
+    assert result["ready"] is True
+    assert result["schema_privileges"] == [
+        "DELETE",
+        "INSERT",
+        "SELECT",
+        "UPDATE",
+    ]
+    assert result["ddl_privileges"] == []
+    assert result["grant_option"] is False
+
+
+@pytest.mark.parametrize(
+    "grants",
+    [
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE ON "
+            "probiga_qmt_history.* TO 'writer'@'127.0.0.1'",
+        ),
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT SELECT, INSERT, UPDATE ON probiga_qmt_history.* "
+            "TO 'writer'@'127.0.0.1'",
+        ),
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON probiga.* "
+            "TO 'writer'@'127.0.0.1'",
+        ),
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1'",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON "
+            "probiga_qmt_history.* TO 'writer'@'127.0.0.1'",
+        ),
+        (
+            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON "
+            "probiga_qmt_history.* TO 'writer'@'127.0.0.1' "
+            "WITH GRANT OPTION",
+        ),
+    ],
+)
+def test_windows_history_writer_grants_reject_excess_or_incomplete(grants):
+    with pytest.raises(RuntimeError, match="grants differ"):
+        backfill_tool._validate_windows_history_writer_grants(grants)
+
+
+@pytest.mark.parametrize(
+    "user, accepted",
+    [
+        ("pb_qmt_hist_writer_0123abcdef89", True),
+        ("pb_qmt_hist_writer_0123ABCDEf89", False),
+        ("probiga_qmt_history_writer", False),
+        ("pb_qmt_hist_writer_0123abcdef890", False),
+    ],
+)
+def test_windows_history_writer_identity_uses_random_controlled_name(
+    monkeypatch,
+    tmp_path,
+    user,
+    accepted,
+):
+    option_file = tmp_path / "writer.ini"
+    option_file.write_text(f"[client]\nuser={user}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_option_file_shape",
+        lambda _path: None,
+    )
+
+    if accepted:
+        assert backfill_tool._windows_history_writer_identity(option_file) == (
+            f"{user}@127.0.0.1"
+        )
+    else:
+        with pytest.raises(RuntimeError, match="user differs"):
+            backfill_tool._windows_history_writer_identity(option_file)
+
+
+def test_windows_history_writer_option_file_checks_secret_and_profile_acls(
+    monkeypatch,
+    tmp_path,
+):
+    profile = tmp_path / "Administrator"
+    secret = profile / ".probiga-secrets"
+    secret.mkdir(parents=True)
+    option_file = secret / "mysql84-qmt-history-writer.ini"
+    option_file.write_text("protected", encoding="utf-8")
+    snapshots = []
+    monkeypatch.setattr(
+        backfill_tool,
+        "WINDOWS_LOCAL_HISTORY_WRITER_OPTION_FILE",
+        option_file,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "WINDOWS_LOCAL_HISTORY_WRITER_PROFILE_ROOT",
+        profile,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_protected_windows_option_file",
+        lambda path: path.resolve(strict=True),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_acl_snapshot",
+        lambda snapshot: snapshots.append(("secret", snapshot)),
+    )
+
+    def acl_snapshot(path):
+        snapshots.append(("path", path))
+        return {
+            "owner_sid": "current",
+            "current_user_sid": "current",
+            "protected": True,
+            "rules": [
+                {
+                    "sid": "current",
+                    "access_type": "Allow",
+                    "inherited": False,
+                    "rights": 1,
+                },
+                {
+                    "sid": "read-only-group",
+                    "access_type": "Allow",
+                    "inherited": True,
+                    "rights": 1,
+                },
+            ],
+        }
+
+    monkeypatch.setattr(backfill_tool, "_windows_acl_snapshot", acl_snapshot)
+
+    assert backfill_tool._validated_windows_history_writer_option_file() == (
+        option_file.resolve()
+    )
+    checked_paths = [item[1] for item in snapshots if item[0] == "path"]
+    assert checked_paths == [secret.resolve(), profile.resolve()]
+
+
+def test_windows_history_writer_option_file_rejects_writable_profile_parent(
+    monkeypatch,
+    tmp_path,
+):
+    profile = tmp_path / "Administrator"
+    secret = profile / ".probiga-secrets"
+    secret.mkdir(parents=True)
+    option_file = secret / "mysql84-qmt-history-writer.ini"
+    option_file.write_text("protected", encoding="utf-8")
+    monkeypatch.setattr(
+        backfill_tool,
+        "WINDOWS_LOCAL_HISTORY_WRITER_OPTION_FILE",
+        option_file,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "WINDOWS_LOCAL_HISTORY_WRITER_PROFILE_ROOT",
+        profile,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_protected_windows_option_file",
+        lambda path: path.resolve(strict=True),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_acl_snapshot",
+        lambda _snapshot: None,
+    )
+
+    def acl_snapshot(path):
+        rules = [
+            {
+                "sid": "current",
+                "access_type": "Allow",
+                "inherited": False,
+                "rights": 1,
+            }
+        ]
+        if path == profile.resolve():
+            rules.append(
+                {
+                    "sid": "untrusted-group",
+                    "access_type": "Allow",
+                    "inherited": True,
+                    "rights": 0x0002,
+                }
+            )
+        return {
+            "owner_sid": "current",
+            "current_user_sid": "current",
+            "protected": True,
+            "rules": rules,
+        }
+
+    monkeypatch.setattr(backfill_tool, "_windows_acl_snapshot", acl_snapshot)
+
+    with pytest.raises(RuntimeError, match="directory is not private"):
+        backfill_tool._validated_windows_history_writer_option_file()
+
+
+def test_windows_history_writer_route_separates_primary_and_history(
+    monkeypatch,
+):
+    runtime_boundary_engine = _DisposableEngine("probiga_qmt_history")
+    writer_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+    writer_path = backfill_tool.Path(
+        r"C:\Users\Administrator\.probiga-secrets\mysql84-qmt-history-writer.ini"
+    )
+
+    class _DbapiConnection:
+        def select_db(self, database):
+            events.append(("primary_select_db", database))
+
+        def close(self):
+            events.append("primary_dbapi_close")
+
+    class _Scalar:
+        def scalar(self):
+            return "probiga"
+
+    class _PrimaryConnection:
+        def execute(self, _statement, _params=None):
+            return _Scalar()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    class _PrimaryEngine(_DisposableEngine):
+        def connect(self):
+            return _PrimaryConnection()
+
+    def create_history_engine(path=backfill_tool.WINDOWS_LOCAL_OPTION_FILE):
+        events.append(("history_option", path))
+        return (
+            runtime_boundary_engine
+            if path == backfill_tool.WINDOWS_LOCAL_OPTION_FILE
+            else writer_engine
+        )
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "_create_windows_local_history_engine",
+        create_history_engine,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_local_mysql84_boundary",
+        lambda engine, **kwargs: events.append(
+            ("runtime_boundary", engine, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validated_windows_history_writer_option_file",
+        lambda: writer_path,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_history_writer_identity",
+        lambda path: "pb_qmt_hist_writer_0123abcdef89@127.0.0.1",
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_history_writer_boundary",
+        lambda engine, **kwargs: events.append(
+            ("writer_boundary", engine, kwargs)
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_connect_from_windows_option_file",
+        lambda path: events.append(("primary_option", path))
+        or _DbapiConnection(),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "create_engine",
+        lambda _url, *, creator, **_kwargs: creator()
+        and _PrimaryEngine("probiga"),
+    )
+
+    primary_engine, history_engine = backfill_tool._windows_local_engines(
+        history_writer=True
+    )
+
+    assert isinstance(primary_engine, _PrimaryEngine)
+    assert history_engine is writer_engine
+    assert runtime_boundary_engine.disposed is True
+    assert ("history_option", writer_path) in events
+    assert (
+        "primary_option",
+        backfill_tool.WINDOWS_LOCAL_OPTION_FILE,
+    ) in events
+    writer_boundaries = [item for item in events if item[0] == "writer_boundary"]
+    assert writer_boundaries[0][2]["expected_identity"].startswith(
+        "pb_qmt_hist_writer_"
+    )
 
 
 def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
@@ -1030,6 +1441,72 @@ def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
     assert events[-1] == ("release", TEST_DAILY_LOCK)
 
 
+def test_plain_daily_apply_uses_separated_history_writer(monkeypatch, capsys):
+    source_engine = object()
+    writer_engine = _DisposableEngine("probiga_qmt_history")
+    events = []
+    _patch_daily_lock_path(monkeypatch)
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda *, history_writer=False: events.append(
+            ("engines", history_writer)
+        )
+        or (source_engine, writer_engine),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "validate_local_history_tables",
+        lambda engine: events.append(("schema", engine)),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_target_window_codes",
+        lambda _engine, **_kwargs: (["000001"], ["2026-08-19"]),
+    )
+    monkeypatch.setattr(backfill_tool, "_acquire_lock", lambda _path: (True, ""))
+    monkeypatch.setattr(
+        backfill_tool,
+        "_release_lock",
+        lambda _path: events.append("release"),
+    )
+
+    def fake_backfill(**kwargs):
+        events.append(("backfill", kwargs))
+        return _result(code_count=1, fetched_rows=1, written_rows=1)
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "backfill_daily_kline_local",
+        fake_backfill,
+    )
+
+    exit_code = backfill_tool.main(
+        [
+            "daily",
+            "--windows-history-writer-option-file",
+            "--target-window-universe",
+            "--start-date",
+            "2026-08-19",
+            "--end-date",
+            "2026-08-19",
+            "--apply",
+            "--json",
+        ]
+    )
+
+    assert exit_code == 0
+    assert events[0] == ("engines", True)
+    backfill_event = next(item for item in events if item[0] == "backfill")
+    assert backfill_event[1]["source_engine"] is source_engine
+    assert backfill_event[1]["local_engine"] is writer_engine
+    assert backfill_event[1]["dry_run"] is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["connection_mode"] == (
+        "fixed_protected_windows_history_writer_option_file"
+    )
+
+
 def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     monkeypatch,
     capsys,
@@ -1041,7 +1518,13 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     monkeypatch.setattr(
         backfill_tool,
         "_windows_local_engines",
-        lambda: (source_engine, local_engine),
+        lambda *, history_writer=False: (
+            (source_engine, local_engine)
+            if history_writer
+            else (_ for _ in ()).throw(
+                AssertionError("daily apply must use the history writer")
+            )
+        ),
     )
     monkeypatch.setattr(
         backfill_tool,
@@ -1104,7 +1587,7 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     exit_code = backfill_tool.main(
         [
             "daily",
-            "--windows-local-option-file",
+            "--windows-history-writer-option-file",
             "--target-window-universe",
             "--repair-target-source-only",
             "--quarantine-source-only-legacy",
@@ -1139,6 +1622,62 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
         "688693"
     ]
     assert payload["invalid_target_quarantine"]["deleted_rows"] == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["daily", "--windows-history-writer-option-file"],
+        ["minute", "--windows-history-writer-option-file", "--apply"],
+        ["from-gaps", "--windows-history-writer-option-file", "--apply"],
+        ["init", "--windows-history-writer-option-file", "--apply"],
+        ["validate-schema", "--windows-history-writer-option-file", "--apply"],
+    ],
+)
+def test_history_writer_option_file_is_only_valid_for_daily_apply(
+    argv,
+    capsys,
+):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(argv)
+
+    assert exc_info.value.code == 2
+    assert "restricted to daily --apply" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode", ["daily", "minute", "from-gaps"])
+def test_apply_rejects_read_only_windows_identity(mode, capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(
+            [mode, "--windows-local-option-file", "--apply"]
+        )
+
+    assert exc_info.value.code == 2
+    assert "requires --windows-history-writer-option-file" in (
+        capsys.readouterr().err
+    )
+
+
+def test_repair_rejects_the_read_only_windows_identity(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        backfill_tool.main(
+            [
+                "daily",
+                "--windows-local-option-file",
+                "--target-window-universe",
+                "--repair-target-source-only",
+                "--start-date",
+                "2026-03-01",
+                "--end-date",
+                "2026-03-31",
+                "--apply",
+            ]
+        )
+
+    assert exc_info.value.code == 2
+    assert "requires --windows-history-writer-option-file" in (
+        capsys.readouterr().err
+    )
 
 
 def test_daily_main_lock_contention_is_nonzero_and_does_not_fetch(

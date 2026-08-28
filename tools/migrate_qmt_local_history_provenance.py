@@ -306,7 +306,11 @@ def _create_windows_local_history_engine(
     )
 
 
-def _validate_windows_local_mysql84_boundary(engine: Engine) -> dict[str, Any]:
+def _validate_windows_local_mysql84_boundary(
+    engine: Engine,
+    *,
+    expected_identity: str = WINDOWS_LOCAL_MYSQL_RUNTIME_IDENTITY,
+) -> dict[str, Any]:
     try:
         with engine.connect() as connection:
             state = dict(connection.execute(text(
@@ -343,8 +347,7 @@ def _validate_windows_local_mysql84_boundary(engine: Engine) -> dict[str, Any]:
         != MYSQL_84_ISOLATED_ACCEPTANCE
         or not is_oracle_mysql_distribution(mysql_version, version_comment)
         or database_name != WINDOWS_LOCAL_HISTORY_DATABASE
-        or authenticated_user.casefold()
-        != WINDOWS_LOCAL_MYSQL_RUNTIME_IDENTITY.casefold()
+        or authenticated_user.casefold() != str(expected_identity).casefold()
         or server_uuid != WINDOWS_LOCAL_MYSQL_SERVER_UUID
         or server_hostname.casefold()
         != WINDOWS_LOCAL_MYSQL_HOSTNAME.casefold()
