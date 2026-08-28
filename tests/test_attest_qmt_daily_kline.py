@@ -57,6 +57,8 @@ def test_attester_projects_reviewed_no_row_pairs_and_binds_manifest():
 def test_historical_unavailable_lookup_binds_provider_params():
     source = inspect.getsource(attester.attest_range)
 
+    assert "LEFT JOIN `{source_temp}` AS history" in source
+    assert "LEFT JOIN `{target_temp}` AS target" in source
     assert re.search(
         r"history\.provider=:provider.*?\"\"\"\), params\)"
         r"\.mappings\(\)\.all\(\)",

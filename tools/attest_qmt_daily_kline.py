@@ -2135,13 +2135,10 @@ def attest_range(
                            DATE_FORMAT(expected.trade_date, '%Y-%m-%d')
                                AS trade_date
                     FROM `{expected_temp}` AS expected
-                    LEFT JOIN {source_table} AS history
+                    LEFT JOIN `{source_temp}` AS history
                       ON history.stock_code=expected.stock_code
                            COLLATE utf8mb4_unicode_ci
                      AND history.trade_date=expected.trade_date
-                     AND history.period='1d'
-                     AND history.k_type=1
-                     AND history.adjust_type=0
                      AND history.provider=:provider
                      AND BINARY history.pre_close_origin=BINARY 'NATIVE_QMT'
                      AND history.pre_close IS NOT NULL
@@ -2158,14 +2155,12 @@ def attest_range(
                      AND history.volume >= 0
                      AND history.amount IS NOT NULL
                      AND history.amount >= 0
-                    LEFT JOIN {target_table} AS target
+                    LEFT JOIN `{target_temp}` AS target
                       ON target.stock_code COLLATE utf8mb4_unicode_ci=
                          expected.stock_code
                      AND target.trade_date=expected.trade_date
-                     AND target.k_type=1
-                     AND target.adjust_type=0
-                    WHERE history.id IS NULL
-                      AND target.id IS NULL
+                    WHERE history.qmt_id IS NULL
+                      AND target.target_id IS NULL
                     ORDER BY expected.stock_code, expected.trade_date
                 """), params).mappings().all()
                 unavailable_pairs = [
