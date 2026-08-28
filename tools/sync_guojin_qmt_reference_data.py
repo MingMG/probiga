@@ -2152,7 +2152,7 @@ def sync_reference_data(
         if code not in set(native_stock_qmt_codes)
         and (
             member.get("expire_date") in (None, "")
-            or captured_day < str(member.get("expire_date"))[:10]
+            or captured_day <= str(member.get("expire_date"))[:10]
         )
     )
     if unresolved_removed:

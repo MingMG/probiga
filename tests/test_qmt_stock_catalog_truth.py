@@ -18,6 +18,7 @@ from server.common.qmt_attestation_contract import (
 from server.common.qmt_stock_catalog import (
     CATALOG_STATUS_COMPLETE,
     NATIVE_A_SHARE_SECTORS,
+    StockCatalogBatch,
     build_catalog_discovery,
     build_catalog_manifest,
     load_stock_catalog,
@@ -523,7 +524,7 @@ def test_governance_history_window_cannot_drift_with_mutable_calendar():
     assert "decision_known_at=" in close_source
 
 
-def test_target_date_catalog_adds_new_ipo_and_excludes_expired_member():
+def test_target_date_catalog_adds_new_ipo_and_includes_final_expiry_day():
     manifest, members = build_catalog_manifest(
         batch_id="catalog-batch-1",
         captured_at="2026-08-24 18:00:00",
@@ -536,9 +537,46 @@ def test_target_date_catalog_adds_new_ipo_and_excludes_expired_member():
     )
 
     assert catalog.eligible_codes("2026-08-23") == ["000001", "600001"]
-    assert catalog.eligible_codes("2026-08-24") == ["000001", "301999"]
+    assert catalog.eligible_codes("2026-08-24") == [
+        "000001", "301999", "600001",
+    ]
     with pytest.raises(RuntimeError, match="does not prove"):
         catalog.eligible_codes("1989-12-31")
+
+
+@pytest.mark.parametrize(
+    ("stock_code", "qmt_code", "expire_date"),
+    (
+        ("000004", "000004.SZ", "2026-07-13"),
+        ("002808", "002808.SZ", "2026-07-13"),
+        ("002898", "002898.SZ", "2026-07-16"),
+        ("300029", "300029.SZ", "2026-07-09"),
+    ),
+)
+def test_verified_native_expire_day_remains_catalog_eligible(
+    stock_code,
+    qmt_code,
+    expire_date,
+):
+    catalog = StockCatalogBatch(
+        batch_id="catalog-expire-inclusive",
+        captured_at="2026-08-27 18:00:00",
+        history_complete_from="2026-01-01",
+        member_count=1,
+        member_set_hash="a" * 64,
+        manifest_hash="b" * 64,
+        native_sectors=("深证A股",),
+        members=({
+            "stock_code": stock_code,
+            "qmt_code": qmt_code,
+            "list_date": "1990-01-01",
+            "expire_date": expire_date,
+            "instrument_batch_id": "instrument-1",
+            "instrument_type": "STOCK",
+        },),
+    )
+
+    assert catalog.eligible_codes(expire_date) == [stock_code]
 
 
 def test_expired_code_collision_rejects_index_as_equity():

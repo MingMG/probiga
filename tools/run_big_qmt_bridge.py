@@ -95,7 +95,7 @@ SELECT member.stock_code, COALESCE(detail.short_name, '') AS short_name
     ON detail.qmt_code=member.qmt_code
  WHERE member.batch_id=:batch_id
    AND member.list_date <= :target_date
-   AND (member.expire_date IS NULL OR member.expire_date > :target_date)
+   AND (member.expire_date IS NULL OR member.expire_date >= :target_date)
  ORDER BY member.stock_code
 """
 

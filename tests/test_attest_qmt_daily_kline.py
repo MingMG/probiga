@@ -41,6 +41,15 @@ def test_attestation_source_window_requires_daily_k_type():
     assert "AND period='1d' AND k_type=1 AND adjust_type=0" in source
 
 
+def test_attester_projects_reviewed_no_row_pairs_and_binds_manifest():
+    source = inspect.getsource(attester.attest_range)
+
+    assert "build_no_row_exception_contract(" in source
+    assert "project_catalog_daily_codes(" in source
+    assert "DELETE FROM `{expected_temp}`" in source
+    assert "no_row_exception_contract=no_row_exception_contract" in source
+
+
 @pytest.mark.parametrize(
     "statement",
     (
@@ -220,6 +229,49 @@ def test_main_windows_option_file_route_disposes_both_engines(
     assert calls[0][1]["apply"] is True
     assert primary.disposed is True
     assert history.disposed is True
+    assert json.loads(capsys.readouterr().out)["status"] == "COMPLETED"
+
+
+def test_main_forwards_exact_reviewed_no_row_code_categories(
+    monkeypatch,
+    capsys,
+):
+    from tools import backfill_guojin_qmt_local_history as backfill_tool
+
+    class FakeEngine:
+        def dispose(self):
+            pass
+
+    primary = FakeEngine()
+    history = FakeEngine()
+    monkeypatch.setattr(attester, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        backfill_tool, "_windows_local_engines", lambda: (primary, history),
+    )
+    calls = []
+    monkeypatch.setattr(
+        attester,
+        "attest_range",
+        lambda engine, **kwargs: calls.append((engine, kwargs))
+        or {"status": "COMPLETED"},
+    )
+    monkeypatch.setattr(attester.sys, "argv", [
+        "attest_qmt_daily_kline.py",
+        "--start-date", "2026-03-06",
+        "--end-date", "2026-08-27",
+        "--windows-local-option-file",
+        "--exact-lifecycle-no-row-codes", "002231,603056",
+        "--not-yet-listed-no-row-codes", "301688,301689,301697,301699",
+        "--apply", "--json",
+    ])
+
+    assert attester.main() == 0
+    assert calls[0][1]["exact_lifecycle_no_row_codes"] == (
+        "002231", "603056",
+    )
+    assert calls[0][1]["not_yet_listed_no_row_codes"] == (
+        "301688", "301689", "301697", "301699",
+    )
     assert json.loads(capsys.readouterr().out)["status"] == "COMPLETED"
 
 

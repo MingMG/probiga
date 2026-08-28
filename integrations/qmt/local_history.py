@@ -171,6 +171,7 @@ class LocalBackfillBatchResult:
     responded_code_set_hash: str = ""
     coverage_manifest_hash: str = ""
     coverage_manifest_json: str = ""
+    discarded_outside_catalog_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -191,6 +192,7 @@ class LocalBackfillResult:
     responded_code_set_hash: str = ""
     coverage_manifest_hash: str = ""
     coverage_manifest_json: str = ""
+    discarded_outside_catalog_rows: int = 0
 
 
 def now_china() -> datetime:
@@ -1007,6 +1009,40 @@ def persist_daily_kline_capture(
         ),
         provider=provider,
     )
+    if rows:
+        stock_codes = sorted({
+            str(row.get("stock_code") or "").strip().zfill(6)
+            for row in rows
+            if str(row.get("stock_code") or "").strip()
+        })
+        trade_dates = sorted({
+            str(row.get("trade_date") or "")[:10]
+            for row in rows
+            if str(row.get("trade_date") or "").strip()
+        })
+        if not stock_codes or not trade_dates:
+            raise RuntimeError(
+                "QMT daily capture lacks exact stock/date lifecycle keys"
+            )
+        expected_pairs = _load_daily_expected_pairs(
+            source_engine,
+            stock_codes=stock_codes,
+            start_date=trade_dates[0],
+            end_date=trade_dates[-1],
+        )
+        outside_pairs = sorted({
+            (
+                str(row.get("stock_code") or "").strip().zfill(6),
+                str(row.get("trade_date") or "")[:10],
+            )
+            for row in rows
+        } - expected_pairs)
+        if outside_pairs:
+            raise RuntimeError(
+                "QMT daily capture contains catalog/calendar lifecycle "
+                f"extras: count={len(outside_pairs)}, "
+                f"sample={outside_pairs[:10]}"
+            )
     return _upsert_rows(
         target_engine,
         table_name=table_name,
@@ -1094,6 +1130,39 @@ def _record_run_finish(
         )
 
 
+def _load_daily_expected_pairs(
+    source_engine: Engine,
+    *,
+    stock_codes: Sequence[str],
+    start_date: str,
+    end_date: str,
+) -> set[tuple[str, str]]:
+    """Freeze the only catalog/calendar pairs a native daily fetch may persist."""
+
+    decision_known_at = now_china()
+    with source_engine.begin() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=decision_known_at,
+        )
+        calendar = load_trade_calendar_receipt(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            decision_known_at=decision_known_at,
+        )
+    sessions = calendar.sessions_between(start_date, end_date)
+    if not sessions:
+        raise RuntimeError("QMT daily expected-pair calendar is empty")
+    requested = set(stock_codes)
+    return {
+        (code, day)
+        for day in sessions
+        for code in catalog.eligible_codes(day)
+        if code in requested
+    }
+
+
 def backfill_daily_kline_local(
     *,
     source_engine: Engine,
@@ -1131,6 +1200,12 @@ def backfill_daily_kline_local(
             f"count={len(unknown_allowed_codes)}, sample={unknown_allowed_codes[:10]}"
         )
     validate_local_history_tables(local_engine)
+    expected_pairs = _load_daily_expected_pairs(
+        source_engine,
+        stock_codes=requested_stock_codes,
+        start_date=_normalize_date(start_date),
+        end_date=_normalize_date(end_date),
+    )
     run_id = f"qmt_hist_kline_{now_china().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     normalized_source_batch_id = str(source_batch_id or "").strip()
     if normalized_source_batch_id and (
@@ -1141,6 +1216,7 @@ def backfill_daily_kline_local(
     batches: list[LocalBackfillBatchResult] = []
     fetched_total = 0
     written_total = 0
+    discarded_outside_catalog_total = 0
     _record_run_start(
         local_engine,
         run_id=run_id,
@@ -1200,6 +1276,37 @@ def backfill_daily_kline_local(
                 batch_id=normalized_source_batch_id or run_id,
                 provider=provider,
             )
+            raw_fetched_codes = {
+                str(row.get("stock_code") or "").strip().zfill(6)
+                for row in rows
+                if str(row.get("stock_code") or "").strip()
+            }
+            unexpected_codes = sorted(raw_fetched_codes - set(batch))
+            if unexpected_codes:
+                raise RuntimeError(
+                    "QMT daily batch returned unrequested stock codes: "
+                    f"count={len(unexpected_codes)}, "
+                    f"sample={unexpected_codes[:10]}"
+                )
+            accepted_rows: list[dict[str, Any]] = []
+            discarded_outside_catalog_rows = 0
+            accepted_pairs: set[tuple[str, str]] = set()
+            for row in rows:
+                code = str(row.get("stock_code") or "").strip().zfill(6)
+                trade_date = str(row.get("trade_date") or "")[:10]
+                pair = (code, trade_date)
+                if pair not in expected_pairs:
+                    discarded_outside_catalog_rows += 1
+                    continue
+                if pair in accepted_pairs:
+                    raise RuntimeError(
+                        "QMT daily batch returned duplicate catalog/date pair: "
+                        f"{code}/{trade_date}"
+                    )
+                accepted_pairs.add(pair)
+                accepted_rows.append(row)
+            rows = accepted_rows
+            discarded_outside_catalog_total += discarded_outside_catalog_rows
             fetched_codes = {
                 str(row.get("stock_code") or "").strip().zfill(6)
                 for row in rows
@@ -1213,8 +1320,7 @@ def backfill_daily_kline_local(
             fatal_missing_codes = sorted(
                 set(missing_codes) - allowed_missing_codes
             )
-            unexpected_codes = sorted(fetched_codes - expected_codes)
-            if fatal_missing_codes or unexpected_codes:
+            if fatal_missing_codes:
                 raise RuntimeError(
                     "QMT daily batch coverage is incomplete: "
                     f"requested_codes={len(expected_codes)}, "
@@ -1225,8 +1331,7 @@ def backfill_daily_kline_local(
                     f"allowed_missing_count={len(allowed_batch_missing_codes)}, "
                     f"fatal_missing_count={len(fatal_missing_codes)}, "
                     f"fatal_missing_sample={fatal_missing_codes[:10]}, "
-                    f"unexpected_count={len(unexpected_codes)}, "
-                    f"unexpected_sample={unexpected_codes[:10]}"
+                    "unexpected_count=0, unexpected_sample=[]"
                 )
             fetched_total += len(rows)
             written = 0 if dry_run or not rows else _upsert_rows(
@@ -1247,6 +1352,9 @@ def backfill_daily_kline_local(
                     written_rows=written,
                     skipped=dry_run,
                     allowed_missing_codes=tuple(allowed_batch_missing_codes),
+                    discarded_outside_catalog_rows=(
+                        discarded_outside_catalog_rows
+                    ),
                 )
             )
     except Exception as exc:
@@ -1274,6 +1382,7 @@ def backfill_daily_kline_local(
         fetched_rows=fetched_total,
         written_rows=written_total,
         batches=batches,
+        discarded_outside_catalog_rows=discarded_outside_catalog_total,
     )
 
 

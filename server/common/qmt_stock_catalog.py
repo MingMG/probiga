@@ -154,7 +154,7 @@ class StockCatalogBatch:
             if str(member["list_date"]) <= target_date
             and (
                 member.get("expire_date") in (None, "")
-                or target_date < str(member["expire_date"])
+                or target_date <= str(member["expire_date"])
             )
         })
 
@@ -209,8 +209,10 @@ def canonical_catalog_members(
         _require_iso_date(list_date)
         if expire_date is not None:
             _require_iso_date(expire_date)
-            if expire_date <= list_date:
-                raise ValueError("QMT instrument expire_date must follow list_date")
+            if expire_date < list_date:
+                raise ValueError(
+                    "QMT instrument expire_date cannot precede list_date"
+                )
         if not instrument_batch_id:
             raise ValueError("QMT instrument detail batch proof is missing")
         member = {

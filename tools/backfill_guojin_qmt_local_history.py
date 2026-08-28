@@ -36,6 +36,11 @@ from integrations.qmt.local_history import (
     validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
+from server.common.qmt_daily_no_row import (
+    NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
+    build_no_row_exception_contract,
+    explicit_no_row_codes,
+)
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.migrate_qmt_local_history_provenance import (
@@ -90,6 +95,7 @@ TARGET_DAILY_QUARANTINE_TABLE = "qmt_target_daily_quarantine"
 TARGET_WINDOW_UNIVERSE_SOURCE = "qmt_stock_catalog.target_window_exact_union"
 CURRENT_UNIVERSE_SOURCE = "qmt_stock_catalog.current_snapshot"
 EXPLICIT_UNIVERSE_SOURCE = "explicit_codes"
+EXACT_LIFECYCLE_NO_ROW_PROOF_SCHEMA = NO_ROW_EXCEPTION_CONTRACT_SCHEMA
 DAILY_LOCK_PATH = Path(QMT_DAILY_BACKFILL_LOCK_PATH)
 QUARANTINED_LEGACY_PROVIDER = "gj_big_qmt_legacy_unverified"
 QUARANTINED_LEGACY_QUALITY = "QUARANTINED_LEGACY"
@@ -645,6 +651,124 @@ def _codes_from_arg(source_engine, raw_codes: str, *, limit: int) -> list[str]:
     return load_stock_codes(source_engine, codes=codes or None, limit=max(0, int(limit or 0)))
 
 
+def _exact_lifecycle_no_row_codes(raw_codes: str) -> list[str]:
+    return explicit_no_row_codes(
+        raw_codes,
+        category="EXACT_LIFECYCLE_NO_ROW",
+    )
+
+
+def _not_yet_listed_no_row_codes(raw_codes: str) -> list[str]:
+    return explicit_no_row_codes(
+        raw_codes,
+        category="NOT_YET_LISTED_NO_ROW",
+    )
+
+
+def _prove_reviewed_no_row_codes(
+    source_engine,
+    *,
+    exact_lifecycle_codes: list[str],
+    not_yet_listed_codes: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    codes = sorted(exact_lifecycle_codes + not_yet_listed_codes)
+    if not codes:
+        raise RuntimeError("reviewed no-row proof requires explicit codes")
+    normalized_start = _normalize_date(start_date)
+    normalized_end = _normalize_date(end_date)
+    decision_known_at = datetime.now().replace(microsecond=0)
+    target_rows_by_code: dict[str, int] = {}
+    history_rows_by_code: dict[str, int] = {}
+    with source_engine.begin() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=decision_known_at,
+        )
+        calendar = load_trade_calendar_receipt(
+            connection,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            decision_known_at=decision_known_at,
+        )
+        for code in codes:
+            row = connection.execute(
+                text(
+                    f"""
+                    SELECT
+                      (
+                        SELECT COUNT(*)
+                        FROM `{WINDOWS_LOCAL_PRIMARY_DATABASE}`.`{TARGET_DAILY_TABLE}`
+                        WHERE stock_code=:stock_code
+                          AND k_type=1 AND adjust_type=0
+                          AND trade_date BETWEEN :start_date AND :end_date
+                      ) AS target_rows,
+                      (
+                        SELECT COUNT(*)
+                        FROM `{WINDOWS_LOCAL_HISTORY_DATABASE}`.`qmt_local_stock_kline`
+                        WHERE stock_code=:stock_code
+                          AND period='1d' AND k_type=1 AND adjust_type=0
+                          AND trade_date BETWEEN :start_date AND :end_date
+                      ) AS history_rows
+                    """
+                ),
+                {
+                    "stock_code": code,
+                    "start_date": normalized_start,
+                    "end_date": normalized_end,
+                },
+            ).mappings().one()
+            target_rows_by_code[code] = int(row.get("target_rows") or 0)
+            history_rows_by_code[code] = int(row.get("history_rows") or 0)
+    return build_no_row_exception_contract(
+        catalog=catalog,
+        calendar=calendar,
+        start_date=normalized_start,
+        end_date=normalized_end,
+        exact_lifecycle_codes=exact_lifecycle_codes,
+        not_yet_listed_codes=not_yet_listed_codes,
+        target_rows_by_code=target_rows_by_code,
+        history_rows_by_code=history_rows_by_code,
+    )
+
+
+def _prove_exact_lifecycle_no_row_codes(
+    source_engine,
+    *,
+    stock_codes: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Prove the exact reviewed finite-lifecycle exceptions."""
+
+    return _prove_reviewed_no_row_codes(
+        source_engine,
+        exact_lifecycle_codes=stock_codes,
+        not_yet_listed_codes=[],
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def _prove_not_yet_listed_no_row_codes(
+    source_engine,
+    *,
+    stock_codes: list[str],
+    start_date: str,
+    end_date: str,
+) -> dict[str, Any]:
+    """Prove reviewed 1970 sentinel members only through the frozen cutoff."""
+
+    return _prove_reviewed_no_row_codes(
+        source_engine,
+        exact_lifecycle_codes=[],
+        not_yet_listed_codes=stock_codes,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
 def _date_values(rows) -> list[str]:
     return sorted(
         {
@@ -857,6 +981,24 @@ def _repair_target_source_only_rows(
         AND s.`low` IS NOT NULL AND s.`low` > 0
         AND s.volume IS NOT NULL AND s.volume >= 0
         AND s.amount IS NOT NULL AND s.amount >= 0
+        AND EXISTS (
+            SELECT 1
+            FROM `probiga`.`qmt_stock_catalog_member` member
+            WHERE member.batch_id=:catalog_batch_id
+              AND member.stock_code=s.stock_code
+              AND member.instrument_type='STOCK'
+              AND member.list_date<=s.trade_date
+              AND (
+                  member.expire_date IS NULL
+                  OR member.expire_date>=s.trade_date
+              )
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM `probiga`.`qmt_trade_calendar_session` session
+            WHERE session.batch_id=:calendar_batch_id
+              AND session.trade_date=s.trade_date
+        )
         AND t.id IS NULL
     """
     count_sql = text(
@@ -901,6 +1043,21 @@ def _repair_target_source_only_rows(
         """
     )
     with source_engine.begin() as connection:
+        decision_known_at = datetime.now().replace(microsecond=0)
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=decision_known_at,
+        )
+        calendar = load_trade_calendar_receipt(
+            connection,
+            start_date=normalized_start,
+            end_date=normalized_end,
+            decision_known_at=decision_known_at,
+        )
+        params.update({
+            "catalog_batch_id": catalog.batch_id,
+            "calendar_batch_id": calendar.batch_id,
+        })
         source_only_before = int(
             connection.execute(count_sql, params).scalar() or 0
         )
@@ -927,6 +1084,10 @@ def _repair_target_source_only_rows(
         "provider": provider,
         "start_date": normalized_start,
         "end_date": normalized_end,
+        "catalog_batch_id": str(catalog.batch_id),
+        "catalog_manifest_hash": str(catalog.manifest_hash),
+        "calendar_batch_id": str(calendar.batch_id),
+        "calendar_manifest_hash": str(calendar.manifest_hash),
         "source_only_before": source_only_before,
         "inserted_rows": inserted_rows,
         "source_only_after": source_only_after,
@@ -2060,6 +2221,26 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--exact-lifecycle-no-row-codes",
+        default="",
+        help=(
+            "Comma-separated exact codes allowed to return no daily rows "
+            "only after immutable finite-expiry lifecycle and protected "
+            "target/history zero-row proof. Valid only for protected daily "
+            "target-window apply."
+        ),
+    )
+    parser.add_argument(
+        "--not-yet-listed-no-row-codes",
+        default="",
+        help=(
+            "Comma-separated reviewed 1970-sentinel codes allowed to return "
+            "no daily rows only through the frozen 2026-08-27 cutoff and "
+            "after protected target/history zero-row proof. Valid only for "
+            "protected daily target-window apply."
+        ),
+    )
+    parser.add_argument(
         "--repair-target-source-only",
         action="store_true",
         help=(
@@ -2112,6 +2293,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lock-path", default="")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    try:
+        exact_lifecycle_no_row_codes = _exact_lifecycle_no_row_codes(
+            args.exact_lifecycle_no_row_codes
+        )
+        not_yet_listed_no_row_codes = _not_yet_listed_no_row_codes(
+            args.not_yet_listed_no_row_codes
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.windows_history_writer_option_file and (
         args.mode != "daily" or not args.apply
@@ -2141,6 +2331,20 @@ def main(argv: list[str] | None = None) -> int:
             "--windows-history-writer-option-file in daily mode; "
             "--windows-local-option-file is the read-only runtime identity"
         )
+    if (exact_lifecycle_no_row_codes or not_yet_listed_no_row_codes) and (
+        args.mode != "daily"
+        or not args.windows_history_writer_option_file
+        or not args.target_window_universe
+        or not args.apply
+        or args.provider != "gj_big_qmt_inner"
+        or args.dividend_type != "none"
+    ):
+        parser.error(
+            "--exact-lifecycle-no-row-codes/"
+            "--not-yet-listed-no-row-codes requires protected daily "
+            "--windows-history-writer-option-file, --target-window-universe, "
+            "--provider gj_big_qmt_inner, --dividend-type none and --apply"
+        )
 
     gap_repair_lock_path: Path | None = None
     if args.mode == "from-gaps" and args.apply:
@@ -2167,6 +2371,8 @@ def main(argv: list[str] | None = None) -> int:
             args.apply
             or args.codes
             or args.target_window_universe
+            or args.exact_lifecycle_no_row_codes
+            or args.not_yet_listed_no_row_codes
             or args.repair_target_source_only
             or args.quarantine_source_only_legacy
             or args.quarantine_invalid_target_no_native
@@ -2303,6 +2509,18 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not codes:
         raise RuntimeError("No stock codes available for QMT local history backfill")
+    outside_exact_no_row_codes = sorted(
+        (
+            set(exact_lifecycle_no_row_codes)
+            | set(not_yet_listed_no_row_codes)
+        )
+        - set(codes)
+    )
+    if outside_exact_no_row_codes:
+        raise RuntimeError(
+            "exact lifecycle no-row codes fall outside the target universe: "
+            f"{outside_exact_no_row_codes}"
+        )
     universe = _universe_proof(
         codes,
         source=universe_source,
@@ -2338,12 +2556,31 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
         try:
-            allowed_missing_codes: list[str] = []
-            if args.quarantine_invalid_target_no_native:
-                allowed_missing_codes = _target_window_unattestable_codes(
+            no_row_exception_proof = None
+            allowed_missing_codes: list[str] = sorted(
+                set(exact_lifecycle_no_row_codes)
+                | set(not_yet_listed_no_row_codes)
+            )
+            if allowed_missing_codes:
+                no_row_exception_proof = _prove_reviewed_no_row_codes(
                     source_engine,
+                    exact_lifecycle_codes=exact_lifecycle_no_row_codes,
+                    not_yet_listed_codes=not_yet_listed_no_row_codes,
                     start_date=args.start_date,
                     end_date=args.end_date,
+                )
+            invalid_target_allowed_missing_codes: list[str] = []
+            if args.quarantine_invalid_target_no_native:
+                invalid_target_allowed_missing_codes = (
+                    _target_window_unattestable_codes(
+                        source_engine,
+                        start_date=args.start_date,
+                        end_date=args.end_date,
+                    )
+                )
+                allowed_missing_codes = sorted(
+                    set(allowed_missing_codes)
+                    | set(invalid_target_allowed_missing_codes)
                 )
                 unexpected_allowed_codes = sorted(
                     set(allowed_missing_codes) - set(codes)
@@ -2408,13 +2645,29 @@ def main(argv: list[str] | None = None) -> int:
         payload["dry_run"] = dry_run
         payload["universe"] = universe
         payload["connection_mode"] = connection_mode
+        if no_row_exception_proof is not None:
+            reviewed_no_row_set = (
+                set(exact_lifecycle_no_row_codes)
+                | set(not_yet_listed_no_row_codes)
+            )
+            used_reviewed_no_row_codes = sorted({
+                code
+                for batch in result.batches
+                for code in batch.allowed_missing_codes
+                if code in reviewed_no_row_set
+            })
+            payload["reviewed_no_row_allowlist"] = {
+                **no_row_exception_proof,
+                "used_missing_codes": used_reviewed_no_row_codes,
+                "used_missing_code_count": len(used_reviewed_no_row_codes),
+            }
         if args.quarantine_invalid_target_no_native:
             payload["allowed_missing_target_codes"] = {
                 "reason": TARGET_UNATTESTABLE_REASON,
-                "stock_count": len(allowed_missing_codes),
-                "stock_codes": allowed_missing_codes,
+                "stock_count": len(invalid_target_allowed_missing_codes),
+                "stock_codes": invalid_target_allowed_missing_codes,
                 "stock_codes_sha256": hashlib.sha256(
-                    "\n".join(allowed_missing_codes).encode("utf-8")
+                    "\n".join(invalid_target_allowed_missing_codes).encode("utf-8")
                 ).hexdigest(),
             }
         if target_invalid_quarantine is not None:

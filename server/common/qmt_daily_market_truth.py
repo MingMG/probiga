@@ -12,8 +12,10 @@ from server.common.qmt_attestation_contract import (
     QMT_V2_BOUND_DAILY_ENTRY_KEYS,
     canonical_digest,
     expected_stock_set_contract,
+    validated_no_row_exception_contract,
     validated_universe_manifest,
 )
+from server.common.qmt_daily_no_row import project_catalog_daily_codes
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
@@ -58,9 +60,10 @@ class QmtDailyMarketTruth:
     attested_row_count: int
     requested_sessions: tuple[str, ...]
     truth_hash: str
+    no_row_exception_proof_sha256: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema": "probiga.qmt-daily-market-consumer-truth.v1",
             "run_id": self.run_id,
             "run_start_date": self.run_start_date,
@@ -77,6 +80,11 @@ class QmtDailyMarketTruth:
             "requested_sessions": list(self.requested_sessions),
             "truth_hash": self.truth_hash,
         }
+        if self.no_row_exception_proof_sha256 is not None:
+            payload["no_row_exception_proof_sha256"] = (
+                self.no_row_exception_proof_sha256
+            )
+        return payload
 
 
 def _validate_bound_daily_entries(
@@ -86,16 +94,30 @@ def _validate_bound_daily_entries(
     calendar: Any,
     run_start_date: str,
     run_end_date: str,
+    no_row_exception_contract: Mapping[str, Any] | None = None,
 ) -> int:
     run_sessions = calendar.sessions_between(run_start_date, run_end_date)
     if set(daily) != set(run_sessions):
         raise RuntimeError("QMT attestation manifest/session inventory differs")
+    projected_codes = (
+        project_catalog_daily_codes(
+            catalog=catalog,
+            calendar=calendar,
+            start_date=run_start_date,
+            end_date=run_end_date,
+            contract=no_row_exception_contract,
+        )
+        if no_row_exception_contract is not None
+        else {
+            day: catalog.eligible_codes(day) for day in run_sessions
+        }
+    )
     expected_total = 0
     for day in run_sessions:
         entry = daily[day]
         if set(entry) != set(QMT_V2_BOUND_DAILY_ENTRY_KEYS):
             raise RuntimeError("QMT daily attestation is not catalog-bound")
-        expected_codes = catalog.eligible_codes(day)
+        expected_codes = projected_codes[day]
         expected_set = expected_stock_set_contract(day, expected_codes)
         if (
             entry["catalog_batch_id"] != catalog.batch_id
@@ -161,6 +183,11 @@ def load_qmt_daily_market_truth(
         start_date=run_start,
         end_date=run_end,
     )
+    no_row_exception_contract = validated_no_row_exception_contract(
+        run_row["tolerance_json"],
+        start_date=run_start,
+        end_date=run_end,
+    )
     if not all(set(entry) == set(QMT_V2_BOUND_DAILY_ENTRY_KEYS)
                for entry in daily.values()):
         raise RuntimeError("completed QMT attestation is not catalog-bound")
@@ -186,6 +213,7 @@ def load_qmt_daily_market_truth(
         calendar=calendar,
         run_start_date=run_start,
         run_end_date=run_end,
+        no_row_exception_contract=no_row_exception_contract,
     )
     if (
         int(run_row.get("target_rows") or 0) != expected_total
@@ -206,6 +234,35 @@ def load_qmt_daily_market_truth(
     requested_expected_count = sum(
         int(daily[day]["stock_count"]) for day in requested_sessions
     )
+    no_row_exception_proof_sha256 = None
+    if no_row_exception_contract is not None:
+        no_row_exception_proof_sha256 = str(
+            no_row_exception_contract["proof_sha256"]
+        )
+        excluded_codes = sorted({
+            str(entity["stock_code"])
+            for entity in no_row_exception_contract["entities"]
+        })
+        placeholders = ", ".join(
+            f":no_row_code_{index}"
+            for index in range(len(excluded_codes))
+        )
+        excluded_target_rows = int(connection.execute(text(f"""
+            SELECT COUNT(*)
+            FROM sm_stock_kline
+            WHERE k_type=1 AND adjust_type=0
+              AND trade_date BETWEEN :start_date AND :end_date
+              AND stock_code IN ({placeholders})
+        """), {
+            "start_date": run_start,
+            "end_date": run_end,
+            **{
+                f"no_row_code_{index}": code
+                for index, code in enumerate(excluded_codes)
+            },
+        }).scalar() or 0)
+        if excluded_target_rows != 0:
+            raise RuntimeError("QMT no-row exception target rows appeared")
     proof_rows = connection.execute(text("""
         SELECT k.trade_date,
                COUNT(*) AS attested_row_count,
@@ -216,7 +273,7 @@ def load_qmt_daily_market_truth(
          AND member.stock_code=LEFT(k.stock_code, 6)
          AND member.instrument_type='STOCK'
          AND member.list_date<=k.trade_date
-         AND (member.expire_date IS NULL OR member.expire_date>k.trade_date)
+         AND (member.expire_date IS NULL OR member.expire_date>=k.trade_date)
         WHERE k.k_type=1 AND k.adjust_type=0
           AND k.trade_date BETWEEN :start_date AND :end_date
           AND EXISTS (
@@ -282,6 +339,10 @@ def load_qmt_daily_market_truth(
         "attested_row_count": requested_expected_count,
         "requested_sessions": requested_sessions,
     }
+    if no_row_exception_proof_sha256 is not None:
+        payload["no_row_exception_proof_sha256"] = (
+            no_row_exception_proof_sha256
+        )
     return QmtDailyMarketTruth(
         run_id=payload["run_id"],
         run_start_date=run_start,
@@ -296,6 +357,9 @@ def load_qmt_daily_market_truth(
         calendar_session_set_hash=calendar.session_set_hash,
         attested_row_count=requested_expected_count,
         requested_sessions=tuple(requested_sessions),
+        no_row_exception_proof_sha256=(
+            no_row_exception_proof_sha256
+        ),
         truth_hash=canonical_digest(payload),
     )
 
