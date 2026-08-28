@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine, make_url
@@ -1768,6 +1768,9 @@ def _build_attestation_no_row_contract(
     end_date: str,
     exact_lifecycle_no_row_codes: tuple[str, ...],
     not_yet_listed_no_row_codes: tuple[str, ...],
+    historical_unavailable_dates_by_code: Mapping[
+        str, Sequence[str]
+    ] | None = None,
 ) -> dict[str, Any] | None:
     """Prove zero rows across the entire history table, not one provider."""
 
@@ -1775,7 +1778,18 @@ def _build_attestation_no_row_contract(
         set(exact_lifecycle_no_row_codes)
         | set(not_yet_listed_no_row_codes)
     )
-    if not no_row_codes:
+    historical_by_code = {
+        str(code): list(days)
+        for code, days in dict(
+            historical_unavailable_dates_by_code or {}
+        ).items()
+    }
+    historical_pairs = {
+        (code, day)
+        for code, days in historical_by_code.items()
+        for day in days
+    }
+    if not no_row_codes and not historical_pairs:
         return None
     target_rows_by_code: dict[str, int] = {}
     history_rows_by_code: dict[str, int] = {}
@@ -1810,6 +1824,9 @@ def _build_attestation_no_row_contract(
         not_yet_listed_codes=list(not_yet_listed_no_row_codes),
         target_rows_by_code=target_rows_by_code,
         history_rows_by_code=history_rows_by_code,
+        historical_unavailable_dates_by_code=historical_by_code,
+        target_rows_by_pair={pair: 0 for pair in historical_pairs},
+        history_rows_by_pair={pair: 0 for pair in historical_pairs},
     )
 
 
@@ -1825,6 +1842,7 @@ def attest_range(
     local_history_engine: Engine | None = None,
     exact_lifecycle_no_row_codes: tuple[str, ...] = (),
     not_yet_listed_no_row_codes: tuple[str, ...] = (),
+    historical_unavailable_pair_count: int = 0,
 ) -> dict[str, Any]:
     if type(schema_prepared) is not bool:
         raise TypeError("schema_prepared must be bool")
@@ -1832,6 +1850,13 @@ def attest_range(
         not_yet_listed_no_row_codes
     ) is not tuple:
         raise TypeError("QMT no-row exception codes must be canonical tuples")
+    if (
+        type(historical_unavailable_pair_count) is not int
+        or historical_unavailable_pair_count < 0
+    ):
+        raise TypeError(
+            "historical unavailable pair count must be a non-negative integer"
+        )
     validate_attestation_schema(engine)
     target_table, source_table = _table_names(
         engine,
@@ -1877,6 +1902,7 @@ def attest_range(
     source_batch_temp = "tmp_qmt_attest_source_batch"
     calendar_temp = "tmp_qmt_attest_calendar"
     expected_temp = "tmp_qmt_attest_expected"
+    unavailable_temp = "tmp_qmt_attest_historical_unavailable"
     compare_temp = "tmp_qmt_attest_compare"
     try:
         with _attestation_transaction(
@@ -1912,7 +1938,7 @@ def attest_range(
             no_row_exception_contract = None
             for temporary in (
                 compare_temp, source_temp, source_batch_temp, calendar_temp,
-                target_temp, expected_temp,
+                target_temp, expected_temp, unavailable_temp,
             ):
                 connection.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{temporary}`"))
             connection.execute(text(f"""
@@ -2103,6 +2129,116 @@ def attest_range(
                     f"no_row_code_{index}": code
                     for index, code in enumerate(no_row_codes)
                 })
+            if historical_unavailable_pair_count:
+                unavailable_rows = connection.execute(text(f"""
+                    SELECT expected.stock_code,
+                           DATE_FORMAT(expected.trade_date, '%Y-%m-%d')
+                               AS trade_date
+                    FROM `{expected_temp}` AS expected
+                    LEFT JOIN {source_table} AS history
+                      ON history.stock_code=expected.stock_code
+                           COLLATE utf8mb4_unicode_ci
+                     AND history.trade_date=expected.trade_date
+                     AND history.period='1d'
+                     AND history.k_type=1
+                     AND history.adjust_type=0
+                     AND history.provider=:provider
+                     AND BINARY history.pre_close_origin=BINARY 'NATIVE_QMT'
+                     AND history.pre_close IS NOT NULL
+                     AND history.pre_close > 0
+                     AND history.`open` IS NOT NULL
+                     AND history.`open` > 0
+                     AND history.`close` IS NOT NULL
+                     AND history.`close` > 0
+                     AND history.`high` IS NOT NULL
+                     AND history.`high` > 0
+                     AND history.`low` IS NOT NULL
+                     AND history.`low` > 0
+                     AND history.volume IS NOT NULL
+                     AND history.volume >= 0
+                     AND history.amount IS NOT NULL
+                     AND history.amount >= 0
+                    LEFT JOIN {target_table} AS target
+                      ON target.stock_code COLLATE utf8mb4_unicode_ci=
+                         expected.stock_code
+                     AND target.trade_date=expected.trade_date
+                     AND target.k_type=1
+                     AND target.adjust_type=0
+                    WHERE history.id IS NULL
+                      AND target.id IS NULL
+                    ORDER BY expected.stock_code, expected.trade_date
+                """)).mappings().all()
+                unavailable_pairs = [
+                    (
+                        str(row.get("stock_code") or ""),
+                        str(row.get("trade_date") or "")[:10],
+                    )
+                    for row in unavailable_rows
+                ]
+                if (
+                    len(unavailable_pairs)
+                    != historical_unavailable_pair_count
+                    or len(unavailable_pairs) != len(set(unavailable_pairs))
+                ):
+                    raise RuntimeError(
+                        "historical unavailable exact pair count differs: "
+                        f"expected={historical_unavailable_pair_count}, "
+                        f"observed={len(unavailable_pairs)}"
+                    )
+                historical_by_code: dict[str, list[str]] = {}
+                for code, day in unavailable_pairs:
+                    historical_by_code.setdefault(code, []).append(day)
+                no_row_exception_contract = (
+                    _build_attestation_no_row_contract(
+                        connection,
+                        target_table=target_table,
+                        source_table=source_table,
+                        catalog=catalog,
+                        calendar=calendar_receipt,
+                        start_date=start_date,
+                        end_date=end_date,
+                        exact_lifecycle_no_row_codes=(
+                            exact_lifecycle_no_row_codes
+                        ),
+                        not_yet_listed_no_row_codes=(
+                            not_yet_listed_no_row_codes
+                        ),
+                        historical_unavailable_dates_by_code=(
+                            historical_by_code
+                        ),
+                    )
+                )
+                assert no_row_exception_contract is not None
+                catalog_daily_codes = project_catalog_daily_codes(
+                    catalog=catalog,
+                    calendar=calendar_receipt,
+                    start_date=start_date,
+                    end_date=end_date,
+                    contract=no_row_exception_contract,
+                )
+                connection.execute(text(f"""
+                    CREATE TEMPORARY TABLE `{unavailable_temp}` (
+                        stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                            COLLATE utf8mb4_unicode_ci NOT NULL,
+                        trade_date DATE NOT NULL,
+                        PRIMARY KEY (stock_code, trade_date)
+                    ) ENGINE=InnoDB
+                """))
+                connection.execute(text(f"""
+                    INSERT INTO `{unavailable_temp}`
+                        (stock_code, trade_date)
+                    VALUES (:stock_code, :trade_date)
+                """), [
+                    {"stock_code": code, "trade_date": day}
+                    for code, day in unavailable_pairs
+                ])
+                connection.execute(text(f"""
+                    DELETE expected
+                    FROM `{expected_temp}` AS expected
+                    JOIN `{unavailable_temp}` AS unavailable
+                      ON unavailable.stock_code=expected.stock_code
+                     AND unavailable.trade_date=expected.trade_date
+                """))
             expected_rows = int(connection.execute(
                 text(f"SELECT COUNT(*) FROM `{expected_temp}`")
             ).scalar() or 0)
@@ -2625,7 +2761,7 @@ def attest_range(
             )
             for temporary in (
                 compare_temp, source_temp, source_batch_temp, calendar_temp,
-                target_temp, expected_temp,
+                target_temp, expected_temp, unavailable_temp,
             ):
                 connection.execute(text(f"DROP TEMPORARY TABLE IF EXISTS `{temporary}`"))
         return {
@@ -2692,6 +2828,15 @@ def main() -> int:
     parser.add_argument("--exact-lifecycle-no-row-codes", default="")
     parser.add_argument("--not-yet-listed-no-row-codes", default="")
     parser.add_argument(
+        "--historical-unavailable-pair-count",
+        type=int,
+        default=0,
+        help=(
+            "Accept exactly this many source-and-target-empty catalog/date "
+            "pairs in the fixed reviewed historical window."
+        ),
+    )
+    parser.add_argument(
         "--windows-local-option-file",
         action="store_true",
         help=(
@@ -2712,7 +2857,9 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
     if (
-        exact_lifecycle_no_row_codes or not_yet_listed_no_row_codes
+        exact_lifecycle_no_row_codes
+        or not_yet_listed_no_row_codes
+        or args.historical_unavailable_pair_count
     ) and (
         not args.windows_local_option_file
         or not args.apply
@@ -2743,6 +2890,9 @@ def main() -> int:
             local_history_engine=local_history_engine,
             exact_lifecycle_no_row_codes=exact_lifecycle_no_row_codes,
             not_yet_listed_no_row_codes=not_yet_listed_no_row_codes,
+            historical_unavailable_pair_count=(
+                args.historical_unavailable_pair_count
+            ),
         )
     finally:
         if args.windows_local_option_file:

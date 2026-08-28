@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import shutil
 import subprocess
 import sys
 from contextlib import AbstractContextManager
@@ -34,9 +35,11 @@ REFERENCE_BATCH_ID = f"qmt_rel_{BUILD_SHA}_20260825100500"
 
 def _run_powershell_json(program: str) -> dict[str, Any]:
     encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    assert executable is not None, "PowerShell is required for release tests"
     completed = subprocess.run(
         [
-            "powershell.exe",
+            executable,
             "-NoProfile",
             "-NonInteractive",
             "-EncodedCommand",

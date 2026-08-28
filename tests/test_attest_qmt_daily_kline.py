@@ -310,6 +310,7 @@ def test_main_forwards_exact_reviewed_no_row_code_categories(
         "--windows-local-option-file",
         "--exact-lifecycle-no-row-codes", "002231,603056",
         "--not-yet-listed-no-row-codes", "301688,301689,301697,301699",
+        "--historical-unavailable-pair-count", "1392",
         "--apply", "--json",
     ])
 
@@ -320,6 +321,7 @@ def test_main_forwards_exact_reviewed_no_row_code_categories(
     assert calls[0][1]["not_yet_listed_no_row_codes"] == (
         "301688", "301689", "301697", "301699",
     )
+    assert calls[0][1]["historical_unavailable_pair_count"] == 1392
     assert json.loads(capsys.readouterr().out)["status"] == "COMPLETED"
 
 

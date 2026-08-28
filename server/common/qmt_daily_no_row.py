@@ -1,8 +1,9 @@
-"""Frozen, fail-closed exceptions for catalog members with no daily bar.
+"""Frozen, fail-closed outcomes for catalog members with no daily bar.
 
 These are not general missing-data tolerances.  Every use is operator-explicit,
 limited to a reviewed stock-code set and an exact historical window, and bound
-to immutable catalog/calendar roots plus zero target/history row counts.
+to immutable catalog/calendar roots.  V2 additionally records exact historical
+catalog/date pairs for which no attestable native QMT bar remains available.
 """
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ from server.common.qmt_attestation_contract import canonical_digest
 
 NO_ROW_EXCEPTION_CONTRACT_SCHEMA = (
     "probiga.qmt-daily-no-row-exceptions.v1"
+)
+HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA = (
+    "probiga.qmt-daily-no-row-exceptions.v2"
 )
 EXACT_LIFECYCLE_NO_ROW_CANDIDATES = frozenset({"002231", "603056"})
 NOT_YET_LISTED_NO_ROW_CANDIDATES = frozenset({
@@ -111,8 +115,13 @@ def build_no_row_exception_contract(
     not_yet_listed_codes: Sequence[str] = (),
     target_rows_by_code: Mapping[str, int],
     history_rows_by_code: Mapping[str, int],
+    historical_unavailable_dates_by_code: Mapping[
+        str, Sequence[str]
+    ] | None = None,
+    target_rows_by_pair: Mapping[tuple[str, str], int] | None = None,
+    history_rows_by_pair: Mapping[tuple[str, str], int] | None = None,
 ) -> dict[str, Any]:
-    """Build one root- and window-bound proof for the two reviewed cases."""
+    """Build one root- and window-bound proof for reviewed no-row outcomes."""
 
     start = _date(start_date, label="QMT no-row start_date")
     end = _date(end_date, label="QMT no-row end_date")
@@ -127,7 +136,32 @@ def build_no_row_exception_contract(
         candidates=NOT_YET_LISTED_NO_ROW_CANDIDATES,
     )
     all_codes = sorted(lifecycle + not_listed)
-    if not all_codes or len(all_codes) != len(set(all_codes)):
+    historical_by_code: dict[str, list[str]] = {}
+    for raw_code, raw_dates in dict(
+        historical_unavailable_dates_by_code or {}
+    ).items():
+        code = str(raw_code)
+        dates = list(raw_dates)
+        if (
+            _A_SHARE_CODE_RE.fullmatch(code) is None
+            or dates != sorted(set(dates))
+            or any(_date(day, label="historical unavailable date") != day
+                   for day in dates)
+            or not dates
+        ):
+            raise RuntimeError(
+                "historical unavailable pairs must be canonical exact pairs"
+            )
+        historical_by_code[code] = dates
+    historical_pairs = sorted(
+        (code, day)
+        for code, dates in historical_by_code.items()
+        for day in dates
+    )
+    if (
+        (not all_codes and not historical_pairs)
+        or len(all_codes) != len(set(all_codes))
+    ):
         raise RuntimeError("QMT no-row proof requires distinct explicit codes")
     if (
         start != NO_ROW_REVIEWED_START_DATE
@@ -152,6 +186,20 @@ def build_no_row_exception_contract(
         + list(history_rows_by_code.values())
     ):
         raise RuntimeError("QMT no-row code already has daily rows")
+    target_pair_rows = dict(target_rows_by_pair or {})
+    history_pair_rows = dict(history_rows_by_pair or {})
+    if (
+        set(target_pair_rows) != set(historical_pairs)
+        or set(history_pair_rows) != set(historical_pairs)
+        or any(
+            type(rows) is not int or rows != 0
+            for rows in list(target_pair_rows.values())
+            + list(history_pair_rows.values())
+        )
+    ):
+        raise RuntimeError(
+            "historical unavailable pair inventory already has daily rows"
+        )
 
     sessions = list(calendar.sessions_between(start, end))
     if not sessions or sessions != sorted(set(sessions)):
@@ -232,9 +280,71 @@ def build_no_row_exception_contract(
                 "target_rows": 0,
                 "history_rows": 0,
             })
+    existing_pairs = {
+        (str(entity["stock_code"]), day)
+        for entity in entities
+        for day in entity["affected_trade_dates"]
+    }
+    for code, affected in sorted(historical_by_code.items()):
+        member = members.get(code)
+        if member is None:
+            raise RuntimeError(
+                f"historical unavailable code is absent from catalog: {code}"
+            )
+        qmt_code = str(member.get("qmt_code") or "").upper()
+        list_date = str(member.get("list_date") or "")[:10]
+        raw_expire = member.get("expire_date")
+        expire_date = (
+            str(raw_expire)[:10]
+            if raw_expire not in (None, "", "NaT")
+            else None
+        )
+        if (
+            _QMT_CODE_RE.fullmatch(qmt_code) is None
+            or qmt_code[:6] != code
+        ):
+            raise RuntimeError(
+                f"historical unavailable qmt_code differs: {code}"
+            )
+        _date(list_date, label="historical unavailable list_date")
+        if expire_date is not None:
+            _date(expire_date, label="historical unavailable expire_date")
+        if any(
+            day not in eligible_by_day
+            or code not in eligible_by_day[day]
+            or (code, day) in existing_pairs
+            for day in affected
+        ):
+            raise RuntimeError(
+                "historical unavailable pair is outside the exact eligible grid"
+            )
+        entities.append({
+            "category": "HISTORICAL_DATA_UNAVAILABLE",
+            "stock_code": code,
+            "qmt_code": qmt_code,
+            "list_date": list_date,
+            "expire_date": expire_date,
+            "affected_trade_dates": affected,
+            "affected_trade_dates_sha256": canonical_digest({
+                "schema": "probiga.qmt-daily-no-row-dates.v1",
+                "stock_code": code,
+                "trade_dates": affected,
+            }),
+            "target_rows": 0,
+            "history_rows": 0,
+        })
+    schema = (
+        HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
+        if historical_pairs
+        else NO_ROW_EXCEPTION_CONTRACT_SCHEMA
+    )
     core = {
-        "schema": NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
-        "policy": "OPERATOR_EXPLICIT_REVIEWED_WINDOW_ZERO_DAILY_ROWS",
+        "schema": schema,
+        "policy": (
+            "OPERATOR_ACCEPTED_FIXED_WINDOW_HISTORY_UNAVAILABLE_EXACT_PAIRS"
+            if historical_pairs
+            else "OPERATOR_EXPLICIT_REVIEWED_WINDOW_ZERO_DAILY_ROWS"
+        ),
         "start_date": start,
         "end_date": end,
         "catalog_batch_id": str(catalog.batch_id),
@@ -266,7 +376,11 @@ def validate_no_row_exception_contract_shape(
 ) -> dict[str, Any]:
     if type(value) is not dict or set(value) != _CONTRACT_KEYS:
         raise ValueError("QMT no-row exception contract fields differ")
-    if value.get("schema") != NO_ROW_EXCEPTION_CONTRACT_SCHEMA:
+    schema = value.get("schema")
+    if schema not in {
+        NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
+        HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
+    }:
         raise ValueError("QMT no-row exception schema differs")
     if (
         value.get("start_date") != start_date
@@ -281,6 +395,26 @@ def validate_no_row_exception_contract_shape(
         )
     ):
         raise ValueError("QMT no-row exception entity fields differ")
+    historical_entities = [
+        row for row in value["entities"]
+        if row.get("category") == "HISTORICAL_DATA_UNAVAILABLE"
+    ]
+    if (
+        (schema == NO_ROW_EXCEPTION_CONTRACT_SCHEMA and historical_entities)
+        or (
+            schema == HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
+            and not historical_entities
+        )
+        or any(
+            row.get("category") not in {
+                "EXACT_LIFECYCLE_NO_ROW",
+                "NOT_YET_LISTED_NO_ROW",
+                "HISTORICAL_DATA_UNAVAILABLE",
+            }
+            for row in value["entities"]
+        )
+    ):
+        raise ValueError("QMT no-row exception entity category differs")
     core = {key: value[key] for key in value if key != "proof_sha256"}
     if (
         type(value.get("proof_sha256")) is not str
@@ -306,6 +440,16 @@ def project_catalog_daily_codes(
     codes = list(shaped["exact_lifecycle_no_row_codes"])
     not_listed = list(shaped["not_yet_listed_no_row_codes"])
     all_codes = sorted(codes + not_listed)
+    historical_by_code = {
+        str(entity["stock_code"]): list(entity["affected_trade_dates"])
+        for entity in shaped["entities"]
+        if entity["category"] == "HISTORICAL_DATA_UNAVAILABLE"
+    }
+    historical_pairs = {
+        (code, day)
+        for code, days in historical_by_code.items()
+        for day in days
+    }
     rebuilt = build_no_row_exception_contract(
         catalog=catalog,
         calendar=calendar,
@@ -315,6 +459,9 @@ def project_catalog_daily_codes(
         not_yet_listed_codes=not_listed,
         target_rows_by_code={code: 0 for code in all_codes},
         history_rows_by_code={code: 0 for code in all_codes},
+        historical_unavailable_dates_by_code=historical_by_code,
+        target_rows_by_pair={pair: 0 for pair in historical_pairs},
+        history_rows_by_pair={pair: 0 for pair in historical_pairs},
     )
     if shaped != rebuilt:
         raise RuntimeError("QMT no-row exception immutable proof differs")
@@ -332,6 +479,7 @@ def project_catalog_daily_codes(
 
 __all__ = [
     "EXACT_LIFECYCLE_NO_ROW_CANDIDATES",
+    "HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA",
     "NOT_YET_LISTED_NO_ROW_CANDIDATES",
     "NOT_YET_LISTED_PROOF_CUTOFF",
     "NO_ROW_REVIEWED_END_DATE",

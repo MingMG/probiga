@@ -14,6 +14,7 @@ from server.common.qmt_attestation_contract import (
 )
 from server.common.qmt_daily_market_truth import _validate_bound_daily_entries
 from server.common.qmt_daily_no_row import (
+    HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
     build_no_row_exception_contract,
     explicit_no_row_codes,
     project_catalog_daily_codes,
@@ -97,6 +98,66 @@ def test_reviewed_no_row_contract_projects_only_exact_window_pairs():
     ]
     assert len(proof["proof_sha256"]) == 64
     assert projected == {day: ["000001"] for day in SESSIONS}
+
+
+def test_historical_unavailable_contract_excludes_only_exact_pairs():
+    pair = ("000001", "2026-03-25")
+    proof = build_no_row_exception_contract(
+        catalog=_Catalog(),
+        calendar=_Calendar(),
+        start_date="2026-03-06",
+        end_date="2026-08-27",
+        target_rows_by_code={},
+        history_rows_by_code={},
+        historical_unavailable_dates_by_code={
+            "000001": ["2026-03-25"],
+        },
+        target_rows_by_pair={pair: 0},
+        history_rows_by_pair={pair: 0},
+    )
+    projected = project_catalog_daily_codes(
+        catalog=_Catalog(),
+        calendar=_Calendar(),
+        start_date="2026-03-06",
+        end_date="2026-08-27",
+        contract=proof,
+    )
+
+    assert proof["schema"] == HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
+    assert proof["entities"] == [{
+        "category": "HISTORICAL_DATA_UNAVAILABLE",
+        "stock_code": "000001",
+        "qmt_code": "000001.SZ",
+        "list_date": "1991-04-03",
+        "expire_date": None,
+        "affected_trade_dates": ["2026-03-25"],
+        "affected_trade_dates_sha256": (
+            proof["entities"][0]["affected_trade_dates_sha256"]
+        ),
+        "target_rows": 0,
+        "history_rows": 0,
+    }]
+    assert "000001" in projected["2026-03-06"]
+    assert "000001" not in projected["2026-03-25"]
+    assert "000001" in projected["2026-03-26"]
+
+
+def test_historical_unavailable_contract_rejects_existing_pair_rows():
+    pair = ("000001", "2026-03-25")
+    with pytest.raises(RuntimeError, match="inventory already has daily rows"):
+        build_no_row_exception_contract(
+            catalog=_Catalog(),
+            calendar=_Calendar(),
+            start_date="2026-03-06",
+            end_date="2026-08-27",
+            target_rows_by_code={},
+            history_rows_by_code={},
+            historical_unavailable_dates_by_code={
+                "000001": ["2026-03-25"],
+            },
+            target_rows_by_pair={pair: 1},
+            history_rows_by_pair={pair: 0},
+        )
 
 
 def test_no_row_contract_rejects_unreviewed_code_future_window_and_rows():
