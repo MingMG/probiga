@@ -139,7 +139,7 @@ def test_missing_history_config_derives_exact_loopback_history_schema(
 
 
 def test_local_history_engine_uses_central_tls_factory(monkeypatch):
-    prod = "mysql+pymysql://runtime:secret@127.0.0.1:3306/probiga"
+    prod = "mysql+pymysql://runtime@127.0.0.1:3306/probiga"
     captured = {}
     sentinel = object()
     monkeypatch.setattr(
