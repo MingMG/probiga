@@ -3363,29 +3363,38 @@ def _cutover_schema(
     try:
         seed_governance_registry()
         api_engine = get_engine()
-        pit_runtime_schema = pit_fact_schema_health(api_engine)
+        metadata_engine = boundary.migrator_engine
+        pit_runtime_schema = pit_fact_schema_health(metadata_engine)
         if not bool(pit_runtime_schema.get("valid")):
             raise PrivilegedSchemaPreparationError(
                 "PIT fact schema runtime validation failed"
             )
-        validate_reference_tables(api_engine, verify_triggers=True)
+        validate_reference_tables(api_engine, verify_triggers=False)
+        validate_reference_tables(metadata_engine, verify_triggers=True)
         scheduler_task_history_runtime_schema = (
             validate_scheduler_task_history_schema(api_engine)
         )
         runtime_schema_bundle_validation = validate_runtime_schema_bundle(
-            api_engine
+            metadata_engine
         )
-        with api_engine.connect() as connection:
+        with api_engine.connect() as runtime_connection:
+            governance_schema = validate_governance_table_schema(
+                runtime_connection
+            )
+        with metadata_engine.connect() as metadata_connection:
             qmt_history_coverage_runtime_schema = validate_coverage_schema(
-                connection,
+                metadata_connection,
                 require_triggers=True,
             )
-            metric = validate_metric_input_review_triggers(connection)
-            governance_schema = validate_governance_table_schema(connection)
-            funding_schema = validate_strategy_funding_checkpoint_schema(
-                connection
+            metric = validate_metric_input_review_triggers(
+                metadata_connection
             )
-        append_only = validate_governance_append_only_triggers(api_engine)
+            funding_schema = validate_strategy_funding_checkpoint_schema(
+                metadata_connection
+            )
+        append_only = validate_governance_append_only_triggers(
+            metadata_engine
+        )
         seed_contract = validate_default_governance_seed_contract(
             api_engine,
             require_initial_shadow=True,

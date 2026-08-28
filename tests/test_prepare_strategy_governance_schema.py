@@ -1774,11 +1774,14 @@ def test_trigger_executor_restores_off_after_create_failure(monkeypatch):
 
 
 class _NoDeltaEngine:
+    def __init__(self, identity: str):
+        self.identity = identity
+
     def begin(self):
-        return nullcontext(SimpleNamespace())
+        return nullcontext(SimpleNamespace(engine=self))
 
     def connect(self):
-        return nullcontext(SimpleNamespace())
+        return nullcontext(SimpleNamespace(engine=self))
 
 
 def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
@@ -1799,9 +1802,26 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     from tools import sync_guojin_qmt_reference_data as qmt_reference
 
     boundary = _boundary(trust=0)
-    boundary.migrator_engine = _NoDeltaEngine()
+    migrator_engine = _NoDeltaEngine("migrator")
+    api_engine = _NoDeltaEngine("api")
+    boundary.migrator_engine = migrator_engine
     admin = _AdminConnection(trust=0)
     calls: list[str] = []
+    validator_engines: dict[str, list[_NoDeltaEngine]] = {
+        "pit": [],
+        "reference_triggers": [],
+        "runtime_bundle": [],
+        "qmt_coverage_triggers": [],
+        "metric_triggers": [],
+        "funding_triggers": [],
+        "append_only_triggers": [],
+        "governance_table": [],
+        "seed_contract": [],
+    }
+
+    def record_validator_engine(name, engine_or_connection):
+        observed = getattr(engine_or_connection, "engine", engine_or_connection)
+        validator_engines[name].append(observed)
     monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
     monkeypatch.setattr(
         schema,
@@ -1881,11 +1901,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         production_runtime_schema_bundle,
         "validate_runtime_schema_bundle",
-        lambda _engine: calls.append("runtime-schema-bundle-validate") or {
+        lambda engine: (
+            record_validator_engine("runtime_bundle", engine)
+            or calls.append("runtime-schema-bundle-validate")
+            or {
             "contracts": {},
             "runtime_ddl_required": False,
             "read_only": True,
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         schema,
@@ -1994,7 +2018,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         qmt_history_coverage,
         "validate_coverage_schema",
-        lambda *_args, **_kwargs: {
+        lambda connection, **kwargs: (
+            record_validator_engine(
+                "qmt_coverage_triggers",
+                connection,
+            )
+            if kwargs.get("require_triggers") is True
+            else None
+        )
+        or {
             "database": "probiga",
             "table_count": 2,
             "trigger_count": 4,
@@ -2036,7 +2068,7 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         pit_facts,
         "pit_fact_schema_health",
-        lambda _engine: {"valid": True},
+        lambda engine: record_validator_engine("pit", engine) or {"valid": True},
     )
     monkeypatch.setattr(
         qmt_reference,
@@ -2051,7 +2083,11 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         qmt_reference,
         "validate_reference_tables",
-        lambda *_args, **_kwargs: None,
+        lambda engine, **kwargs: (
+            record_validator_engine("reference_triggers", engine)
+            if kwargs.get("verify_triggers") is True
+            else None
+        ),
     )
     governance_schema_calls = []
 
@@ -2090,7 +2126,9 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch.setattr(
         strategy_governance,
         "validate_metric_input_review_triggers",
-        lambda _connection: {
+        lambda connection: (
+            record_validator_engine("metric_triggers", connection)
+            or {
             "trigger_count": 2,
             "trigger_names": sorted(
                 strategy_governance.EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES
@@ -2098,21 +2136,27 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             "contract_hash": (
                 strategy_governance.METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
             ),
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         strategy_governance,
         "validate_governance_table_schema",
-        lambda _connection: {
+        lambda connection: (
+            record_validator_engine("governance_table", connection)
+            or {
             "table_count": 15,
             "column_count": 1,
             "index_count": 1,
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         strategy_governance,
         "validate_governance_append_only_triggers",
-        lambda _engine: {
+        lambda engine: (
+            record_validator_engine("append_only_triggers", engine)
+            or {
             "trigger_count": 38,
             "trigger_names": sorted(
                 strategy_governance.EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES
@@ -2120,12 +2164,15 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             "contract_hash": (
                 strategy_governance.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
             ),
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         schema,
         "validate_strategy_funding_checkpoint_schema",
-        lambda _connection: {
+        lambda connection: (
+            record_validator_engine("funding_triggers", connection)
+            or {
             "table_count": 2,
             "tables": {
                 "st_strategy_funding_daily_fact": {
@@ -2143,21 +2190,25 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             },
             "trigger_count": 4,
                 "contract_hash": schema.EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH,
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         strategy_governance,
         "validate_default_governance_seed_contract",
-        lambda *_args, **_kwargs: {
+        lambda engine, **_kwargs: (
+            record_validator_engine("seed_contract", engine)
+            or {
             "seeded_strategy_count": 12,
             "seeded_combination_count": 6,
             "seed_contract_hash": "a" * 64,
-        },
+            }
+        ),
     )
     monkeypatch.setattr(
         api_engine_module,
         "get_engine",
-        lambda: _NoDeltaEngine(),
+        lambda: api_engine,
     )
     monkeypatch.setattr(api_engine_module, "dispose_engine", lambda: None)
 
@@ -2182,6 +2233,22 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert calls.count("scheduler-runtime-migration-off") == 1
     assert calls.count("scheduler-runtime-validate") == 1
     assert calls.count("triple-off") == 1
+    for validator in (
+        "pit",
+        "reference_triggers",
+        "runtime_bundle",
+        "qmt_coverage_triggers",
+        "metric_triggers",
+        "funding_triggers",
+        "append_only_triggers",
+    ):
+        assert validator_engines[validator]
+        assert all(
+            observed is migrator_engine
+            for observed in validator_engines[validator]
+        )
+    assert validator_engines["governance_table"] == [api_engine]
+    assert validator_engines["seed_contract"] == [api_engine]
 
 
 def assert_callable(value):
