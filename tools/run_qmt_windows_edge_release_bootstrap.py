@@ -299,8 +299,15 @@ def run_release_bootstrap(
         if owned_local_engine:
             target_local_engine.dispose()
     with primary_engine.connect() as connection:
+        # The Windows edge deliberately connects as the least-privilege
+        # runtime identity.  MySQL hides information_schema.TRIGGERS rows from
+        # an account without TRIGGER, so asking this connection to re-attest
+        # the privileged seal produces a false "inventory differs" failure.
+        # Linux installs and validates the four immutable triggers before it
+        # appends the build-bound request consumed above; here the edge proves
+        # the complete runtime-visible table/index/foreign-key contract.
         coverage_schema = validate_coverage_schema(
-            connection, require_triggers=True
+            connection, require_triggers=False
         )
 
     ping = ping_runner(timeout=60)
