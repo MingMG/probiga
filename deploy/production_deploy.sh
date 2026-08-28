@@ -5717,6 +5717,7 @@ controlled_guard_run_schema_tool() {
   local phase="$3"
   local release_venv="$2"
   local adata_sha
+  local adata_source
   local adata_tree_sha
   local release_tree_sha=""
   local adapter_registry_seal_sha=""
@@ -5731,6 +5732,16 @@ controlled_guard_run_schema_tool() {
   adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")" || return 1
   [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  test -d "$adata_source" || return 1
+  test ! -L "$adata_source" || return 1
+  test "$(readlink -f "$adata_source")" = "$adata_source" || return 1
+  test "$(stat -c '%U:%G' "$adata_source")" = root:root || return 1
+  test "$(<"$adata_source/.probiga-adata.gitsha")" = "$adata_sha" || return 1
+  test "$(<"$adata_source/.probiga-adata.tree.sha256")" = \
+    "$adata_tree_sha" || return 1
+  test -z "$(find -P "$adata_source" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   if [ -e "$release_venv/.release-tree.sha256" ] || \
     [ -e "$release_venv/.adapter-registry-seal.sha256" ]; then
     test -f "$release_venv/.release-tree.sha256" || return 1
@@ -5757,6 +5768,7 @@ controlled_guard_run_schema_tool() {
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+      PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
       "${attested_env[@]}" \
       "PYTHONPATH=$code_root" \
       "$release_venv/bin/python" -P \

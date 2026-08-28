@@ -3929,6 +3929,33 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'phase_args+=(--writers-fenced)' in guarded_runner
     assert 'preflight|recover)' in guarded_runner
     assert 'resume)' in guarded_runner
+    assert (
+        'adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"'
+        in guarded_runner
+    )
+    adata_marker = guarded_runner.index(
+        'adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")"'
+    )
+    adata_source = guarded_runner.index(
+        'adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"'
+    )
+    adata_source_seal = guarded_runner.index(
+        '"$adata_source/.probiga-adata.tree.sha256"', adata_source
+    )
+    adata_source_immutable = guarded_runner.index(
+        'find -P "$adata_source" -xdev', adata_source_seal
+    )
+    guarded_clean_env = guarded_runner.index("/usr/bin/env -i")
+    assert (
+        adata_marker
+        < adata_source
+        < adata_source_seal
+        < adata_source_immutable
+        < guarded_clean_env
+    )
+    assert 'PROBIGA_ADATA_SOURCE_DIR="$adata_source"' in guarded_runner
+    assert '"PYTHONPATH=$code_root"' in guarded_runner
+    assert '"PYTHONPATH=$adata_source:$code_root"' not in guarded_runner
     assert "--writer-fence" in guarded_writer_fence_runner
     assert "--require-no-live-scheduler-writers" in guarded_writer_fence_runner
     assert 'sudo -u "$service_user"' in guarded_writer_fence_runner
