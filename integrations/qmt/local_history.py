@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
@@ -18,6 +18,7 @@ from integrations.qmt import bridge
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.diagnostics import PROVIDER_ID as LEGACY_PROVIDER_ID
 from server.common.config import get_mysql_url, get_qmt_history_mysql_url
+from server.common.engine_factory import create_pooled_engine
 from server.common.qmt_history_coverage import (
     COVERAGE_EXACT,
     assess_minute_coverage,
@@ -336,7 +337,7 @@ def get_local_history_engine(local_url: str | None = None) -> Engine:
         resolved = resolved_history
     if prod and _same_database(resolved, prod):
         raise RuntimeError("QMT 历史本地库配置与生产 MYSQL_URL 相同，已拒绝执行")
-    return create_engine(resolved, pool_pre_ping=True, future=True)
+    return create_pooled_engine(resolved, pool_pre_ping=True, future=True)
 
 
 def _bind_database_name(bind: Any, database: str | None) -> str:

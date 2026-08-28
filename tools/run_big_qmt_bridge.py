@@ -92,7 +92,7 @@ SELECT member.stock_code, COALESCE(detail.short_name, '') AS short_name
     ON batch.batch_id=member.batch_id
    AND batch.status='COMPLETE'
   LEFT JOIN qmt_instrument_detail AS detail
-    ON detail.qmt_code=member.qmt_code
+    ON detail.qmt_code COLLATE utf8mb4_unicode_ci=member.qmt_code
  WHERE member.batch_id=:batch_id
    AND member.list_date <= :target_date
    AND (member.expire_date IS NULL OR member.expire_date >= :target_date)

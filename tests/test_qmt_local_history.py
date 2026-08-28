@@ -138,6 +138,39 @@ def test_missing_history_config_derives_exact_loopback_history_schema(
         engine.dispose()
 
 
+def test_local_history_engine_uses_central_tls_factory(monkeypatch):
+    prod = "mysql+pymysql://runtime:secret@127.0.0.1:3306/probiga"
+    captured = {}
+    sentinel = object()
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_mysql_url",
+        lambda required=False: prod,
+    )
+
+    def missing_history_url(required=True):
+        raise RuntimeError("missing")
+
+    monkeypatch.setattr(
+        "integrations.qmt.local_history.get_qmt_history_mysql_url",
+        missing_history_url,
+    )
+
+    def create_tls_engine(url, **kwargs):
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        local_history,
+        "create_pooled_engine",
+        create_tls_engine,
+    )
+
+    assert get_local_history_engine() is sentinel
+    assert make_url(captured["url"]).database == "probiga_qmt_history"
+    assert captured["kwargs"] == {"pool_pre_ping": True, "future": True}
+
+
 @pytest.mark.parametrize(
     "base_url",
     [

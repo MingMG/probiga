@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +30,7 @@ from integrations.qmt.info import (
 )
 from integrations.qmt.safe_upsert import safe_upsert_rows
 from integrations.qmt.sectors import fetch_sector_datasets
-from server.common.batch_db import write_frame
+from server.common.batch_db import create_batch_engine, write_frame
 from server.common.config import get_mysql_url
 from server.common.mysql_metadata_compat import (
     normalize_mysql_referential_rule,
@@ -1966,7 +1966,9 @@ def sync_reference_data(
         raise RuntimeError(
             "BigQMT formal calendar capture requires a release build SHA"
         )
-    engine = create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    engine = create_batch_engine(
+        get_mysql_url(required=True), pool_pre_ping=True, future=True
+    )
     # The scheduled runtime account is DML-only.  DDL/triggers are installed
     # once by the privileged schema migration path.
     validate_reference_tables(engine)
@@ -2415,7 +2417,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.prepare_schema_only:
-        engine = create_engine(
+        engine = create_batch_engine(
             get_mysql_url(required=True), pool_pre_ping=True, future=True
         )
         migration = privileged_migrate_reference_schema(engine)
