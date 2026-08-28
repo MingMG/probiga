@@ -3933,6 +3933,14 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert "--require-no-live-scheduler-writers" in guarded_writer_fence_runner
     assert 'sudo -u "$service_user"' in guarded_writer_fence_runner
     assert '"PYTHONPATH=$adata_source:$code_root"' in guarded_writer_fence_runner
+    clean_env = guarded_writer_fence_runner.index("/usr/bin/env -i")
+    unset_database_url = guarded_writer_fence_runner.index(
+        "-u MYSQL_URL -u DATABASE_URL -u MYSQL_PWD", clean_env
+    )
+    clean_path = guarded_writer_fence_runner.index(
+        "PATH=/usr/sbin:/usr/bin:/sbin:/bin", clean_env
+    )
+    assert clean_env < unset_database_url < clean_path
 
 
 def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:

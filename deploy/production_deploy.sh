@@ -5792,9 +5792,9 @@ controlled_guard_run_writer_fence() {
   (
     cd "$code_root"
     sudo -u "$service_user" /usr/bin/env -i \
-      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       -u MYSQL_URL -u DATABASE_URL -u MYSQL_PWD \
       -u MYSQL_UNIX_PORT -u MYSQL_TEST_LOGIN_FILE \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       API_EMBEDDED_SCHEDULER_ENABLED=false \
       GIT_OPTIONAL_LOCKS=0 \
       PYTHONDONTWRITEBYTECODE=1 \
