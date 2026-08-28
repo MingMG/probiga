@@ -39,6 +39,7 @@ from server.common.qmt_attestation_contract import (
     VOLUME_REL_TOLERANCE,
     validated_universe_manifest,
 )
+from server.common.qmt_stock_catalog import a_share_stock_code_sql
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.attest_qmt_daily_kline import (
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH,
@@ -352,6 +353,9 @@ def preflight_governance_qmt_history_readiness(
         "amount_rel_tolerance": AMOUNT_REL_TOLERANCE,
     }
     match_sql = _match_sql("t", "q")
+    unqualified_a_share = a_share_stock_code_sql("stock_code")
+    target_a_share = a_share_stock_code_sql("t.stock_code")
+    source_a_share = a_share_stock_code_sql("q.stock_code")
     with engine.connect() as connection:
         target_rows = connection.execute(
             text(
@@ -361,7 +365,7 @@ def preflight_governance_qmt_history_readiness(
                 FROM {target_table}
                 WHERE trade_date BETWEEN :start_date AND :end_date
                   AND k_type=1 AND adjust_type=0
-                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                  AND {unqualified_a_share}
                 GROUP BY trade_date
                 ORDER BY trade_date
                 """
@@ -382,7 +386,7 @@ def preflight_governance_qmt_history_readiness(
                 WHERE trade_date BETWEEN :start_date AND :end_date
                   AND period='1d' AND k_type=1 AND adjust_type=0
                   AND provider=:provider
-                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                  AND {unqualified_a_share}
                 GROUP BY trade_date
                 ORDER BY trade_date
                 """
@@ -415,8 +419,8 @@ def preflight_governance_qmt_history_readiness(
                      AND q.provider=:provider
                     WHERE t.trade_date BETWEEN :start_date AND :end_date
                       AND t.k_type=1 AND t.adjust_type=0
-                      AND t.stock_code REGEXP '^(0|3|4|6|8|9)'
-                      AND q.stock_code REGEXP '^(0|3|4|6|8|9)'
+                      AND {target_a_share}
+                      AND {source_a_share}
                 ) exact_match_rows
                 GROUP BY trade_date
                 ORDER BY trade_date

@@ -24,8 +24,21 @@ CATALOG_DISCOVERY_SCHEMA = "probiga.qmt-stock-catalog-discovery.v1"
 CATALOG_STATUS_COMPLETE = "COMPLETE"
 NATIVE_A_SHARE_SECTORS = ("上证A股", "深证A股", "京市A股", "沪深A股")
 
-_A_SHARE_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
-_QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
+# Exact exchange-listed A-share families.  In particular, ``900xxx`` is the
+# Shanghai B-share family and generic ``8xxxxx`` also contains non-A-share
+# instruments.  Beijing's historical A-share families are 43/83/87 and its
+# current unified family is 920.
+A_SHARE_STOCK_CODE_SQL_REGEXP = (
+    r"^((00|30|60|68|43|83|87)[0-9]{4}|920[0-9]{3})$"
+)
+_A_SHARE_CODE_RE = re.compile(A_SHARE_STOCK_CODE_SQL_REGEXP)
+_QMT_CODE_RE = re.compile(
+    r"^(?:(?:00|30|60|68|43|83|87)[0-9]{4}|920[0-9]{3})"
+    r"\.(?:SH|SZ|BJ)$"
+)
+_SQL_COLUMN_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*$"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STOCK_INSTRUMENT_TYPES = frozenset({"stock", "equity", "股票"})
 _IMMUTABILITY_TRIGGERS = {
@@ -75,6 +88,32 @@ STOCK_CATALOG_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
         "created_at",
     }),
 }
+
+
+def a_share_stock_code_sql(column: str = "stock_code") -> str:
+    """Return the canonical exact A-share SQL predicate for one column."""
+
+    normalized = str(column or "").strip()
+    if _SQL_COLUMN_RE.fullmatch(normalized) is None:
+        raise ValueError("A-share SQL stock-code column is invalid")
+    return f"{normalized} REGEXP '{A_SHARE_STOCK_CODE_SQL_REGEXP}'"
+
+
+def is_a_share_stock_code(value: Any) -> bool:
+    """Return whether a value belongs to an exact exchange A-share family."""
+
+    return _A_SHARE_CODE_RE.fullmatch(str(value or "").strip()) is not None
+
+
+def _qmt_exchange_matches_stock_code(stock_code: str, qmt_code: str) -> bool:
+    suffix = str(qmt_code or "").rsplit(".", 1)[-1]
+    if stock_code.startswith(("00", "30")):
+        return suffix == "SZ"
+    if stock_code.startswith(("60", "68")):
+        return suffix == "SH"
+    if stock_code.startswith(("43", "83", "87", "920")):
+        return suffix == "BJ"
+    return False
 
 
 def build_catalog_discovery(
@@ -202,9 +241,13 @@ def canonical_catalog_members(
         instrument_type_raw = str(raw.get("instrument_type") or "").strip()
         if instrument_type_raw.casefold() not in _STOCK_INSTRUMENT_TYPES:
             raise ValueError("QMT catalog member is not proven as equity")
-        if not _A_SHARE_CODE_RE.fullmatch(stock_code):
+        if not is_a_share_stock_code(stock_code):
             raise ValueError(f"invalid QMT A-share stock code: {stock_code!r}")
-        if not _QMT_CODE_RE.fullmatch(qmt_code) or qmt_code[:6] != stock_code:
+        if (
+            not _QMT_CODE_RE.fullmatch(qmt_code)
+            or qmt_code[:6] != stock_code
+            or not _qmt_exchange_matches_stock_code(stock_code, qmt_code)
+        ):
             raise ValueError(f"invalid QMT A-share instrument code: {qmt_code!r}")
         _require_iso_date(list_date)
         if expire_date is not None:
@@ -761,18 +804,21 @@ def load_target_stock_catalog(
 
 
 __all__ = [
+    "A_SHARE_STOCK_CODE_SQL_REGEXP",
     "CATALOG_MANIFEST_SCHEMA",
     "CATALOG_MEMBER_SET_SCHEMA",
     "CATALOG_DISCOVERY_SCHEMA",
     "CATALOG_STATUS_COMPLETE",
     "NATIVE_A_SHARE_SECTORS",
     "StockCatalogBatch",
+    "a_share_stock_code_sql",
     "build_catalog_manifest",
     "build_catalog_discovery",
     "canonical_catalog_members",
     "catalog_member_set_hash",
     "ensure_stock_catalog_tables",
     "insert_catalog_batch",
+    "is_a_share_stock_code",
     "load_stock_catalog",
     "load_target_stock_catalog",
     "privileged_migrate_stock_catalog_schema",

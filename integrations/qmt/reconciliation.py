@@ -12,7 +12,10 @@ from sqlalchemy.engine import Engine
 from integrations.qmt.audit import validate_audit_schema
 from integrations.qmt.diagnostics import PROVIDER_ID
 from integrations.qmt.pending_write import replay_pending_writes, result_dict as pending_result_dict
-from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_stock_catalog import (
+    a_share_stock_code_sql,
+    load_stock_catalog,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 
@@ -184,7 +187,7 @@ def _group_stock_sets_for_dates(
             SELECT DISTINCT trade_date, stock_code
             FROM `{table_name}`
             WHERE trade_date IN ({placeholders})
-              AND stock_code REGEXP '^(0|3|4|6|8|9)'
+              AND {a_share_stock_code_sql("stock_code")}
               {filters}
             ORDER BY trade_date, stock_code
         """), params).fetchall()

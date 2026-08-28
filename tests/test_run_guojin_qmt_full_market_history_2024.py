@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import inspect
 import json
 import os
 import stat
@@ -27,6 +28,13 @@ class _Engine:
 
     def __exit__(self, *_args):
         return False
+
+
+def test_daily_stock_set_uses_exact_a_share_predicate():
+    source = inspect.getsource(history_job._daily_stock_set)
+
+    assert "a_share_stock_code_sql" in source
+    assert "^(0|3|4|6|8|9)" not in source
 
 
 def _prepare_job(monkeypatch, *, expected: set[str], local_snapshots: list[set[str]]):

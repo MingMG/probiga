@@ -17,6 +17,8 @@ def test_qmt_symbol_mapping_roundtrip():
     assert to_qmt_symbol("600519") == "600519.SH"
     assert to_qmt_symbol("000001") == "000001.SZ"
     assert to_qmt_symbol("830799") == "830799.BJ"
+    assert to_qmt_symbol("920001") == "920001.BJ"
+    assert to_qmt_symbol("900901") == "900901.SH"
     assert from_qmt_symbol("600519.SH") == "600519"
 
 

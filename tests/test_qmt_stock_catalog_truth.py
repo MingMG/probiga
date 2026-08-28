@@ -16,13 +16,17 @@ from server.common.qmt_attestation_contract import (
     validated_universe_manifest,
 )
 from server.common.qmt_stock_catalog import (
+    A_SHARE_STOCK_CODE_SQL_REGEXP,
     CATALOG_STATUS_COMPLETE,
     NATIVE_A_SHARE_SECTORS,
+    a_share_stock_code_sql,
     build_catalog_discovery,
     build_catalog_manifest,
+    canonical_catalog_members,
     load_stock_catalog,
     privileged_migrate_stock_catalog_schema,
     ensure_stock_catalog_tables,
+    is_a_share_stock_code,
     validate_stock_catalog_immutability,
     validate_catalog_manifest,
 )
@@ -70,6 +74,34 @@ def _members():
             "instrument_type": "STOCK",
         },
     ]
+
+
+def test_exact_a_share_code_contract_includes_920_and_excludes_non_a_families():
+    for code in (
+        "000001", "301999", "600519", "688001", "430001", "830799",
+        "870001", "920001",
+    ):
+        assert is_a_share_stock_code(code)
+    for code in ("900901", "200001", "810001", "820001", "880001", "92001"):
+        assert not is_a_share_stock_code(code)
+
+    assert a_share_stock_code_sql("t.stock_code") == (
+        f"t.stock_code REGEXP '{A_SHARE_STOCK_CODE_SQL_REGEXP}'"
+    )
+    with pytest.raises(ValueError, match="column is invalid"):
+        a_share_stock_code_sql("stock_code OR 1=1")
+
+    member = {
+        "qmt_code": "920001.BJ",
+        "stock_code": "920001",
+        "list_date": "2022-12-27",
+        "expire_date": None,
+        "instrument_batch_id": "instrument-batch-920",
+        "instrument_type": "STOCK",
+    }
+    assert canonical_catalog_members([member])[0]["qmt_code"] == "920001.BJ"
+    with pytest.raises(ValueError, match="instrument code"):
+        canonical_catalog_members([{**member, "qmt_code": "920001.SH"}])
 
 
 def _discovery(members):

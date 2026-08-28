@@ -33,7 +33,10 @@ from server.common.qmt_history_coverage import (
     insert_coverage_bundle,
     require_exact_coverage,
 )
-from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_stock_catalog import (
+    a_share_stock_code_sql,
+    load_stock_catalog,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
 from tools.qmt_operations_task_contract import (
@@ -354,7 +357,7 @@ def _daily_stock_set(
             text(
                 f"SELECT DISTINCT stock_code FROM `{table}` "
                 "WHERE trade_date = :d AND k_type=1 "
-                "AND stock_code REGEXP '^(0|3|4|6|8|9)'"
+                f"AND {a_share_stock_code_sql('stock_code')}"
                 f"{native_raw_filter}{source_batch_filter}"
             ),
             {"d": trade_date, "source_batch_id": source_batch_id},

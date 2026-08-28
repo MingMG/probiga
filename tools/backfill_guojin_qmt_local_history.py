@@ -34,7 +34,10 @@ from integrations.qmt.local_history import (
     validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
-from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_stock_catalog import (
+    a_share_stock_code_sql,
+    load_stock_catalog,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.migrate_qmt_local_history_provenance import (
     WINDOWS_LOCAL_HISTORY_DATABASE,
@@ -506,7 +509,7 @@ def _target_window_unattestable_codes(
                 FROM `{WINDOWS_LOCAL_PRIMARY_DATABASE}`.`{TARGET_DAILY_TABLE}`
                 WHERE k_type=1
                   AND adjust_type=0
-                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                  AND {a_share_stock_code_sql("stock_code")}
                   AND trade_date BETWEEN :start_date AND :end_date
                 GROUP BY stock_code
                 HAVING SUM(
@@ -584,13 +587,13 @@ def _repair_target_source_only_rows(
         f"`{WINDOWS_LOCAL_HISTORY_DATABASE}`.`qmt_local_stock_kline`"
     )
     target_table = f"`{WINDOWS_LOCAL_PRIMARY_DATABASE}`.`{TARGET_DAILY_TABLE}`"
-    eligible = """
+    eligible = f"""
         s.provider=:provider
         AND s.period='1d'
         AND s.k_type=1
         AND s.adjust_type=0
         AND s.trade_date BETWEEN :start_date AND :end_date
-        AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
+        AND {a_share_stock_code_sql("s.stock_code")}
         AND BINARY s.pre_close_origin=BINARY 'NATIVE_QMT'
         AND s.pre_close IS NOT NULL AND s.pre_close > 0
         AND s.`open` IS NOT NULL AND s.`open` > 0
@@ -821,7 +824,7 @@ def _quarantine_invalid_target_rows_without_native(
         t.k_type=1
         AND t.adjust_type=0
         AND t.trade_date BETWEEN :start_date AND :end_date
-        AND t.stock_code REGEXP '^(0|3|4|6|8|9)'
+        AND {a_share_stock_code_sql("t.stock_code")}
         AND (
             t.pre_close IS NULL OR t.pre_close <= 0
             OR {_synthetic_target_sql('t')}
@@ -1200,7 +1203,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
+          AND {a_share_stock_code_sql("s.stock_code")}
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
     """
@@ -1229,7 +1232,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
+          AND {a_share_stock_code_sql("s.stock_code")}
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
         """
@@ -1250,7 +1253,7 @@ def _quarantine_source_only_legacy_rows(
           AND s.k_type=1
           AND s.adjust_type=0
           AND s.trade_date BETWEEN :start_date AND :end_date
-          AND s.stock_code REGEXP '^(0|3|4|6|8|9)'
+          AND {a_share_stock_code_sql("s.stock_code")}
           AND BINARY s.pre_close_origin=BINARY 'UNVERIFIED_LEGACY'
           AND t.id IS NULL
         """

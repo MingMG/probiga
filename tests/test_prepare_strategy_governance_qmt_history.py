@@ -3,6 +3,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from server.common.qmt_stock_catalog import a_share_stock_code_sql
 from tools import prepare_strategy_governance_qmt_history as preparation
 from tools import attest_qmt_daily_kline as attester
 
@@ -350,6 +351,14 @@ def test_readiness_preflight_is_select_only_and_requires_exact_native_matches(
     )
     assert "AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0" in (
         connection.statements[2][0]
+    )
+    assert a_share_stock_code_sql("stock_code") in connection.statements[0][0]
+    assert a_share_stock_code_sql("stock_code") in connection.statements[1][0]
+    assert a_share_stock_code_sql("t.stock_code") in connection.statements[2][0]
+    assert a_share_stock_code_sql("q.stock_code") in connection.statements[2][0]
+    assert all(
+        "^(0|3|4|6|8|9)" not in sql
+        for sql, _params in connection.statements
     )
     assert attester.QMT_ATTESTATION_COLLATION in connection.statements[2][0]
     assert all(
