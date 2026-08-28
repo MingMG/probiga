@@ -298,6 +298,27 @@ def _reference_task_id(connection: Any) -> int:
     return int(rows[0][0])
 
 
+def _validated_release_request_row(
+    row: Mapping[str, Any], *, expected_build_sha: str,
+) -> dict[str, Any]:
+    run_uid = qmt_edge_release_request_run_uid(expected_build_sha)
+    if (
+        str(row.get("run_uid") or "") != run_uid
+        or str(row.get("status") or "") != "pending"
+        or str(row.get("task_type") or "")
+        != QMT_EDGE_RELEASE_REQUEST_TASK_TYPE
+        or str(row.get("build_sha") or "").lower()
+        != _build_sha(expected_build_sha)
+        or str(row.get("trigger_source") or "")
+        != QMT_EDGE_RELEASE_REQUEST_TRIGGER_SOURCE
+    ):
+        raise QmtEdgeReleaseReceiptError("release request ledger row differs")
+    return validate_qmt_edge_release_request(
+        str(row.get("output") or ""),
+        expected_build_sha=expected_build_sha,
+    )
+
+
 def insert_qmt_edge_release_request(
     connection: Any, request: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -310,15 +331,20 @@ def insert_qmt_edge_release_request(
     )
     existing = connection.execute(
         text(
-            "SELECT output FROM st_scheduled_task_history "
+            "SELECT run_uid, status, task_type, build_sha, trigger_source, "
+            "output "
+            "FROM st_scheduled_task_history "
             "WHERE run_uid=:run_uid"
         ),
         {"run_uid": run_uid},
     ).mappings().all()
     if existing:
-        if len(existing) != 1 or str(existing[0].get("output") or "") != serialized:
+        if len(existing) != 1:
             raise QmtEdgeReleaseReceiptError("release request replay differs")
-        return {"status": "idempotent", **payload}
+        persisted = _validated_release_request_row(
+            existing[0], expected_build_sha=payload["build_sha"]
+        )
+        return {"status": "idempotent", **persisted}
     connection.execute(
         text(
             "INSERT INTO st_scheduled_task_history ("
@@ -348,24 +374,16 @@ def load_qmt_edge_release_request(
     run_uid = qmt_edge_release_request_run_uid(expected_build_sha)
     rows = connection.execute(
         text(
-            "SELECT run_uid, status, build_sha, trigger_source, output "
+            "SELECT run_uid, status, task_type, build_sha, trigger_source, "
+            "output "
             "FROM st_scheduled_task_history WHERE run_uid=:run_uid"
         ),
         {"run_uid": run_uid},
     ).mappings().all()
     if len(rows) != 1:
         raise QmtEdgeReleaseReceiptError("release request is unavailable")
-    row = rows[0]
-    if (
-        str(row.get("run_uid") or "") != run_uid
-        or str(row.get("status") or "") != "pending"
-        or str(row.get("build_sha") or "").lower() != _build_sha(expected_build_sha)
-        or str(row.get("trigger_source") or "")
-        != QMT_EDGE_RELEASE_REQUEST_TRIGGER_SOURCE
-    ):
-        raise QmtEdgeReleaseReceiptError("release request ledger row differs")
-    return validate_qmt_edge_release_request(
-        str(row.get("output") or ""), expected_build_sha=expected_build_sha
+    return _validated_release_request_row(
+        rows[0], expected_build_sha=expected_build_sha
     )
 
 

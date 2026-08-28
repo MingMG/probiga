@@ -64,6 +64,24 @@ def _release_request() -> dict[str, Any]:
     )
 
 
+def _release_request_row(request: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "run_uid": request["request_run_uid"],
+        "status": "pending",
+        "task_type": receipt_contract.QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+        "build_sha": request["build_sha"],
+        "trigger_source": (
+            receipt_contract.QMT_EDGE_RELEASE_REQUEST_TRIGGER_SOURCE
+        ),
+        "output": json.dumps(
+            request,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+
+
 def _release_receipt(
     *,
     requested_at: datetime = REQUESTED_AT,
@@ -127,14 +145,15 @@ class _MappedRows:
 
 
 class _RecordingConnection:
-    def __init__(self) -> None:
+    def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.statements: list[tuple[str, dict[str, Any]]] = []
+        self.rows = list(rows or [])
 
     def execute(
         self, statement: object, params: dict[str, Any] | None = None
     ) -> _MappedRows:
         self.statements.append((str(statement), dict(params or {})))
-        return _MappedRows([])
+        return _MappedRows(self.rows)
 
 
 def _forbidden(*_args: object, **_kwargs: object) -> Any:
@@ -177,6 +196,89 @@ def test_release_request_is_canonical_and_exactly_build_bound() -> None:
         receipt_contract.validate_qmt_edge_release_request(
             tampered,
             expected_build_sha=BUILD_SHA,
+        )
+
+
+def test_release_request_retry_returns_the_persisted_exact_request() -> None:
+    persisted = _release_request()
+    retry = receipt_contract.build_qmt_edge_release_request(
+        build_sha=BUILD_SHA,
+        requested_at=REQUESTED_AT + timedelta(minutes=5),
+    )
+    connection = _RecordingConnection([_release_request_row(persisted)])
+
+    result = receipt_contract.insert_qmt_edge_release_request(
+        connection,
+        retry,
+    )
+
+    assert result == {"status": "idempotent", **persisted}
+    assert result["requested_at"] == "2026-08-25T10:00:00"
+    assert result["request_hash"] == persisted["request_hash"]
+    assert len(connection.statements) == 1
+    assert "INSERT INTO st_scheduled_task_history" not in (
+        connection.statements[0][0]
+    )
+
+
+def test_append_release_request_retry_is_idempotent_at_tool_boundary() -> None:
+    persisted = _release_request()
+    connection = _RecordingConnection([_release_request_row(persisted)])
+    engine = _ReadOnlyEngine()
+    engine.connection = connection
+
+    result = bootstrap.append_release_request(
+        engine,
+        expected_build_sha=BUILD_SHA,
+        now=REQUESTED_AT + timedelta(minutes=5),
+    )
+
+    assert result == {
+        "mode": "request",
+        "status": "idempotent",
+        **persisted,
+        "database_writes": True,
+    }
+    assert engine.begin_calls == 1
+    assert engine.connect_calls == 0
+    assert len(connection.statements) == 1
+
+
+def test_release_request_retry_revalidates_the_persisted_ledger_row() -> None:
+    persisted = _release_request()
+    row = _release_request_row(persisted)
+    row["status"] = "success"
+    connection = _RecordingConnection([row])
+
+    with pytest.raises(
+        receipt_contract.QmtEdgeReleaseReceiptError,
+        match="ledger row differs",
+    ):
+        receipt_contract.insert_qmt_edge_release_request(
+            connection,
+            receipt_contract.build_qmt_edge_release_request(
+                build_sha=BUILD_SHA,
+                requested_at=REQUESTED_AT + timedelta(minutes=5),
+            ),
+        )
+
+
+def test_release_request_retry_rejects_a_different_ledger_task_type() -> None:
+    persisted = _release_request()
+    row = _release_request_row(persisted)
+    row["task_type"] = "another_task"
+    connection = _RecordingConnection([row])
+
+    with pytest.raises(
+        receipt_contract.QmtEdgeReleaseReceiptError,
+        match="ledger row differs",
+    ):
+        receipt_contract.insert_qmt_edge_release_request(
+            connection,
+            receipt_contract.build_qmt_edge_release_request(
+                build_sha=BUILD_SHA,
+                requested_at=REQUESTED_AT + timedelta(minutes=5),
+            ),
         )
 
 
