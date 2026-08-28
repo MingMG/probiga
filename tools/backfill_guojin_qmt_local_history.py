@@ -137,9 +137,9 @@ def _normalized_mysql_grant_entries(
         not normalized
         or any(not item.startswith("GRANT ") for item in normalized)
         or any(" WITH GRANT OPTION" in item for item in normalized)
+        or any(" WITH ADMIN OPTION" in item for item in normalized)
         or any(item.startswith("GRANT PROXY ") for item in normalized)
         or any(item.startswith("GRANT ") and " ON " not in item for item in normalized)
-        or not any(" REQUIRE SSL" in item for item in normalized)
     ):
         raise RuntimeError("Windows QMT history writer grants differ")
     entries: list[tuple[frozenset[str], str]] = []
@@ -193,6 +193,41 @@ def _validate_windows_history_writer_grants(
     }
 
 
+def _validate_windows_history_writer_account(
+    *,
+    create_user: str,
+    active_roles: str,
+    expected_identity: str,
+) -> dict[str, Any]:
+    try:
+        user, host = expected_identity.rsplit("@", 1)
+    except ValueError:
+        raise RuntimeError(
+            "Windows QMT history writer account metadata differs"
+        ) from None
+    normalized = " ".join(str(create_user or "").upper().split())
+    expected_account = f"`{user.upper()}`@`{host.upper()}`"
+    if (
+        WINDOWS_LOCAL_HISTORY_WRITER_USER_RE.fullmatch(user) is None
+        or host != "127.0.0.1"
+        or not normalized.startswith(f"CREATE USER {expected_account} ")
+        or " IDENTIFIED WITH 'CACHING_SHA2_PASSWORD' " not in normalized
+        or re.search(r"(?:^|\s)REQUIRE SSL(?:\s|$)", normalized) is None
+        or re.search(r"(?:^|\s)REQUIRE NONE(?:\s|$)", normalized) is not None
+        or re.search(r"(?:^|\s)ACCOUNT UNLOCK(?:\s|$)", normalized) is None
+        or re.search(r"(?:^|\s)ACCOUNT LOCK(?:\s|$)", normalized) is not None
+        or str(active_roles or "").strip().upper() != "NONE"
+    ):
+        raise RuntimeError("Windows QMT history writer account metadata differs")
+    return {
+        "ready": True,
+        "plugin": "caching_sha2_password",
+        "tls_required": True,
+        "account_unlocked": True,
+        "active_roles": "NONE",
+    }
+
+
 def _windows_history_writer_identity(option_file: Path) -> str:
     _validate_windows_option_file_shape(option_file)
     parser = configparser.RawConfigParser(interpolation=None, strict=True)
@@ -230,13 +265,29 @@ def _validate_windows_history_writer_boundary(
                     text("SHOW GRANTS FOR CURRENT_USER()")
                 ).scalars()
             )
+            create_user_row = connection.execute(
+                text("SHOW CREATE USER CURRENT_USER()")
+            ).one()
+            active_roles = str(
+                connection.execute(text("SELECT CURRENT_ROLE()"))
+                .scalar_one()
+                or ""
+            )
+            if len(create_user_row) < 1:
+                raise RuntimeError("writer account metadata was incomplete")
+            create_user = str(create_user_row[-1] or "")
     except Exception:
         raise RuntimeError(
-            "fixed Windows QMT history writer grants cannot be verified"
+            "fixed Windows QMT history writer account cannot be verified"
         ) from None
     return {
         **boundary,
         "identity_verified": True,
+        "account": _validate_windows_history_writer_account(
+            create_user=create_user,
+            active_roles=active_roles,
+            expected_identity=expected_identity,
+        ),
         "least_privilege": _validate_windows_history_writer_grants(grants),
     }
 

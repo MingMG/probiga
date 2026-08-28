@@ -1062,12 +1062,12 @@ def test_windows_option_file_route_uses_safe_urls_and_fixed_databases(
     assert ("boundary", history_engine) in events
 
 
-def test_windows_history_writer_grants_are_exact_and_tls_bound():
+def test_windows_history_writer_grants_accept_mysql84_account_level_tls_format():
     result = backfill_tool._validate_windows_history_writer_grants(
         (
-            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
+            "GRANT USAGE ON *.* TO `writer`@`127.0.0.1`",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON "
-            "`probiga_qmt_history`.* TO 'writer'@'127.0.0.1'",
+            "`probiga_qmt_history`.* TO `writer`@`127.0.0.1`",
         )
     )
 
@@ -1101,11 +1101,6 @@ def test_windows_history_writer_grants_are_exact_and_tls_bound():
             "TO 'writer'@'127.0.0.1'",
         ),
         (
-            "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1'",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON "
-            "probiga_qmt_history.* TO 'writer'@'127.0.0.1'",
-        ),
-        (
             "GRANT USAGE ON *.* TO 'writer'@'127.0.0.1' REQUIRE SSL",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON "
             "probiga_qmt_history.* TO 'writer'@'127.0.0.1' "
@@ -1116,6 +1111,133 @@ def test_windows_history_writer_grants_are_exact_and_tls_bound():
 def test_windows_history_writer_grants_reject_excess_or_incomplete(grants):
     with pytest.raises(RuntimeError, match="grants differ"):
         backfill_tool._validate_windows_history_writer_grants(grants)
+
+
+def test_windows_history_writer_account_accepts_mysql84_create_user_contract():
+    result = backfill_tool._validate_windows_history_writer_account(
+        create_user=(
+            "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+            "IDENTIFIED WITH 'caching_sha2_password' AS '<secret>' REQUIRE SSL "
+            "PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK"
+        ),
+        active_roles="NONE",
+        expected_identity="pb_qmt_hist_writer_0123abcdef89@127.0.0.1",
+    )
+
+    assert result == {
+        "ready": True,
+        "plugin": "caching_sha2_password",
+        "tls_required": True,
+        "account_unlocked": True,
+        "active_roles": "NONE",
+    }
+
+
+@pytest.mark.parametrize(
+    "create_user, active_roles",
+    [
+        (
+            "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+            "IDENTIFIED WITH 'caching_sha2_password' AS '<secret>' REQUIRE NONE "
+            "ACCOUNT UNLOCK",
+            "NONE",
+        ),
+        (
+            "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+            "IDENTIFIED WITH 'mysql_native_password' AS '<secret>' REQUIRE SSL "
+            "ACCOUNT UNLOCK",
+            "NONE",
+        ),
+        (
+            "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+            "IDENTIFIED WITH 'caching_sha2_password' AS '<secret>' REQUIRE SSL "
+            "ACCOUNT LOCK",
+            "NONE",
+        ),
+        (
+            "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+            "IDENTIFIED WITH 'caching_sha2_password' AS '<secret>' REQUIRE SSL "
+            "ACCOUNT UNLOCK",
+            "`unexpected_role`@`%`",
+        ),
+    ],
+)
+def test_windows_history_writer_account_rejects_unsafe_contract(
+    create_user,
+    active_roles,
+):
+    with pytest.raises(RuntimeError, match="account metadata differs"):
+        backfill_tool._validate_windows_history_writer_account(
+            create_user=create_user,
+            active_roles=active_roles,
+            expected_identity="pb_qmt_hist_writer_0123abcdef89@127.0.0.1",
+        )
+
+
+def test_windows_history_writer_boundary_splits_grants_from_account_tls(
+    monkeypatch,
+):
+    expected_identity = "pb_qmt_hist_writer_0123abcdef89@127.0.0.1"
+
+    class _Result:
+        def __init__(self, *, scalars=None, row=None, scalar=None):
+            self._scalars = scalars
+            self._row = row
+            self._scalar = scalar
+
+        def scalars(self):
+            return self._scalars
+
+        def one(self):
+            return self._row
+
+        def scalar_one(self):
+            return self._scalar
+
+    class _Connection:
+        def execute(self, statement):
+            sql = str(statement)
+            if sql == "SHOW GRANTS FOR CURRENT_USER()":
+                return _Result(scalars=(
+                    "GRANT USAGE ON *.* TO `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1`",
+                    "GRANT SELECT, INSERT, UPDATE, DELETE ON `probiga_qmt_history`.* "
+                    "TO `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1`",
+                ))
+            if sql == "SHOW CREATE USER CURRENT_USER()":
+                return _Result(row=(
+                    "CREATE USER `pb_qmt_hist_writer_0123abcdef89`@`127.0.0.1` "
+                    "IDENTIFIED WITH 'caching_sha2_password' AS '<secret>' "
+                    "REQUIRE SSL ACCOUNT UNLOCK",
+                ))
+            if sql == "SELECT CURRENT_ROLE()":
+                return _Result(scalar="NONE")
+            raise AssertionError(sql)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class _Engine:
+        def connect(self):
+            return _Connection()
+
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_windows_local_mysql84_boundary",
+        lambda _engine, **_kwargs: {"ready": True, "tls": True},
+    )
+
+    result = backfill_tool._validate_windows_history_writer_boundary(
+        _Engine(),
+        expected_identity=expected_identity,
+    )
+
+    assert result["ready"] is True
+    assert result["tls"] is True
+    assert result["account"]["tls_required"] is True
+    assert result["least_privilege"]["ddl_privileges"] == []
 
 
 @pytest.mark.parametrize(
