@@ -1,6 +1,7 @@
 """Privileged, fail-closed physical schema for AI analysis outputs."""
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from typing import Any, Mapping
 
@@ -28,6 +29,7 @@ PHYSICAL_RECOVERY_VERSION = "analysis-output-physical-normalization.v2"
 _TARGET_CONTRACT_HASH_VERSION = "analysis-output-target-contract.v1"
 _NORMALIZE_TABLE_ACTION = "NORMALIZE_TABLE_STORAGE"
 _MODIFY_COLUMN_ACTION_PREFIX = "MODIFY_COLUMN:"
+_PHYSICAL_COLUMN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LEGACY_UTF8MB4_COLLATIONS = frozenset(
     {"utf8mb4_general_ci", EXPECTED_COLLATION}
 )
@@ -766,6 +768,7 @@ def _validate_pending_physical_plan_binding(
     *,
     table_name: str,
     expected: Mapping[str, dict[str, Any]],
+    current_columns: Mapping[str, dict[str, Any]],
     pending: Mapping[str, Any],
 ) -> frozenset[str]:
     manifest = pending.get("source_row")
@@ -798,13 +801,23 @@ def _validate_pending_physical_plan_binding(
     column_drift = manifest.get("column_drift")
     source_engine = manifest.get("engine")
     source_collation = manifest.get("table_collation")
+    fingerprint_scope_valid = (
+        isinstance(current_columns, Mapping)
+        and isinstance(fingerprint_columns, list)
+        and all(
+            type(name) is str
+            and _PHYSICAL_COLUMN_IDENTIFIER.fullmatch(name) is not None
+            for name in fingerprint_columns
+        )
+        and len(fingerprint_columns) == len(set(fingerprint_columns))
+        and set(fingerprint_columns) == set(current_columns)
+        and set(expected).issubset(fingerprint_columns)
+    )
     if (
         not isinstance(fingerprint, dict)
         or type(fingerprint.get("row_count")) is not int
         or int(fingerprint["row_count"]) <= 0
-        or not isinstance(fingerprint_columns, list)
-        or set(fingerprint_columns) != set(expected)
-        or len(fingerprint_columns) != len(expected)
+        or not fingerprint_scope_valid
         or not isinstance(column_drift, list)
         or not all(type(name) is str for name in column_drift)
         or column_drift != sorted(set(column_drift))
@@ -1219,6 +1232,7 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                 _validate_pending_physical_plan_binding(
                     table_name=table_name,
                     expected=contract_by_table[table_name],
+                    current_columns=_column_inventory(connection, table_name),
                     pending=pending,
                 )
             )
@@ -1441,6 +1455,7 @@ def migrate_analysis_output_schema(engine) -> dict[str, Any]:
                         _validate_pending_physical_plan_binding(
                             table_name=table_name,
                             expected=expected,
+                            current_columns=columns,
                             pending=context,
                         )
                     )

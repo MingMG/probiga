@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from copy import deepcopy
 from datetime import datetime
 from unittest.mock import MagicMock, patch
@@ -364,6 +365,17 @@ def _safe_legacy_recommendation_data(row_count: int = 12):
     }
 
 
+def _historical_extra_column():
+    return {
+        "column_type": "varchar(255)",
+        "is_nullable": "YES",
+        "column_default": None,
+        "character_set_name": "utf8mb4",
+        "collation_name": "utf8mb4_general_ci",
+        "extra": "",
+    }
+
+
 def test_analysis_output_planner_accepts_only_data_safe_exact_legacy_columns():
     engine = MagicMock()
     inventories = {
@@ -558,7 +570,7 @@ def test_analysis_output_planner_accepts_one_legacy_and_one_missing_additive():
     assert detail["before_fingerprint"] == fingerprint
 
 
-def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
+def test_analysis_output_migrates_legacy_and_extra_columns_with_evidence_first():
     engine = MagicMock()
     connection = engine.begin.return_value.__enter__.return_value
     inventories = {
@@ -571,6 +583,9 @@ def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
     }
     inventories[output_schema.RECOMMENDATION_TABLE] = (
         _legacy_recommendation_inventory()
+    )
+    inventories[output_schema.RECOMMENDATION_TABLE]["legacy_note"] = (
+        _historical_extra_column()
     )
     target_recommendation = _output_inventory(output_schema.RECOMMENDATION_TABLE)
     fingerprint = {"row_count": 12, "content_sha256": "e" * 64}
@@ -604,7 +619,10 @@ def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
         events.append("delete_duplicates")
         return 0
 
+    persisted_records = []
+
     def persist(_connection, records):
+        persisted_records.extend(records)
         events.append("evidence:" + records[0]["action"])
         return {"evidence_verified": True, "evidence_row_count": len(records)}
 
@@ -647,7 +665,7 @@ def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
         ),
     ), patch.object(
         output_schema, "table_content_fingerprint", return_value=fingerprint
-    ), patch.object(
+    ) as content_fingerprint, patch.object(
         output_schema, "persist_and_verify_evidence", side_effect=persist
     ), patch.object(
         output_schema,
@@ -661,6 +679,18 @@ def test_analysis_output_migrates_exact_legacy_columns_with_evidence_first():
         "modify_chase"
     )
     assert events.index("modify_chase") < events.index("modify_ordinary")
+    plan_record = next(
+        record for record in persisted_records
+        if record["action"] == "PHYSICAL_REWRITE_PLAN"
+    )
+    assert "legacy_note" in json.loads(plan_record["source_row_json"])[
+        "fingerprint_columns"
+    ]
+    after_fingerprint_call = next(
+        call for call in content_fingerprint.call_args_list
+        if call.kwargs.get("columns") is not None
+    )
+    assert "legacy_note" in after_fingerprint_call.kwargs["columns"]
     evidence = result["physical_rewrite_evidence"][
         output_schema.RECOMMENDATION_TABLE
     ]
@@ -935,6 +965,90 @@ def test_analysis_output_rejects_pending_plan_for_stale_target_contract():
         output_schema._validate_pending_physical_plan_binding(
             table_name=table_name,
             expected=output_schema.ANALYSIS_COLUMN_CONTRACT,
+            current_columns=columns,
+            pending=pending,
+        )
+
+
+def test_analysis_output_pending_plan_covers_complete_physical_column_scope():
+    table_name = output_schema.ANALYSIS_TABLE
+    columns = _output_inventory(table_name)
+    columns["legacy_note"] = _historical_extra_column()
+    fingerprint = {"row_count": 10, "content_sha256": "c" * 64}
+    manifest = {
+        "before_fingerprint": fingerprint,
+        "fingerprint_columns": list(columns),
+        "column_drift": ["stock_name"],
+        "engine": output_schema.EXPECTED_ENGINE,
+        "table_collation": "utf8mb4_general_ci",
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+        "target_contract_sha256": output_schema._physical_target_contract_sha256(
+            table_name,
+            output_schema.ANALYSIS_COLUMN_CONTRACT,
+        ),
+        "allowed_actions": [output_schema._NORMALIZE_TABLE_ACTION],
+    }
+    pending = {
+        "source_row": manifest,
+        "plan_payload": {"table": table_name, **manifest},
+    }
+
+    allowed = output_schema._validate_pending_physical_plan_binding(
+        table_name=table_name,
+        expected=output_schema.ANALYSIS_COLUMN_CONTRACT,
+        current_columns=columns,
+        pending=pending,
+    )
+
+    assert allowed == frozenset({output_schema._NORMALIZE_TABLE_ACTION})
+
+
+@pytest.mark.parametrize(
+    "scope_case",
+    ("missing_expected", "untracked_current", "duplicate", "unsafe"),
+)
+def test_analysis_output_rejects_incomplete_or_unsafe_fingerprint_scope(
+    scope_case,
+):
+    table_name = output_schema.ANALYSIS_TABLE
+    columns = _output_inventory(table_name)
+    fingerprint_columns = list(columns)
+    if scope_case == "missing_expected":
+        columns.pop("stock_name")
+        fingerprint_columns.remove("stock_name")
+    elif scope_case == "untracked_current":
+        columns["legacy_note"] = _historical_extra_column()
+    elif scope_case == "duplicate":
+        fingerprint_columns.append(fingerprint_columns[-1])
+    else:
+        columns["unsafe-name"] = _historical_extra_column()
+        fingerprint_columns.append("unsafe-name")
+    fingerprint = {"row_count": 10, "content_sha256": "c" * 64}
+    manifest = {
+        "before_fingerprint": fingerprint,
+        "fingerprint_columns": fingerprint_columns,
+        "column_drift": ["stock_name"],
+        "engine": output_schema.EXPECTED_ENGINE,
+        "table_collation": "utf8mb4_general_ci",
+        "legacy_column_rewrites": [],
+        "legacy_data_contract": None,
+        "target_contract_sha256": output_schema._physical_target_contract_sha256(
+            table_name,
+            output_schema.ANALYSIS_COLUMN_CONTRACT,
+        ),
+        "allowed_actions": [output_schema._NORMALIZE_TABLE_ACTION],
+    }
+    pending = {
+        "source_row": manifest,
+        "plan_payload": {"table": table_name, **manifest},
+    }
+
+    with pytest.raises(RuntimeError, match="scope differs"):
+        output_schema._validate_pending_physical_plan_binding(
+            table_name=table_name,
+            expected=output_schema.ANALYSIS_COLUMN_CONTRACT,
+            current_columns=columns,
             pending=pending,
         )
 
