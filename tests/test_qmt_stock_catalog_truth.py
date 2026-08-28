@@ -345,7 +345,7 @@ def test_formal_calendar_without_build_identity_fails_before_database(
 
 
 def test_reference_capture_uses_central_tls_factory(monkeypatch):
-    mysql_url = "mysql+pymysql://runtime:secret@127.0.0.1:3306/probiga"
+    mysql_url = "mysql+pymysql://runtime@127.0.0.1:3306/probiga"
     captured = {}
     sentinel = object()
 
