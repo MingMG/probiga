@@ -124,6 +124,12 @@ _REFERENCE_SEAL_TRIGGER_DDL = (
         SET MESSAGE_TEXT='qmt_reference_schema_contract is append-only'
     """,
 )
+_CONDITIONAL_ADD_COLUMN_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s+"
+    r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+"
+    r"`?([A-Za-z_][A-Za-z0-9_]*)`?\b",
+    flags=re.IGNORECASE | re.DOTALL,
+)
 
 
 def release_bound_reference_batch_id(
@@ -163,6 +169,44 @@ def reference_trigger_ddl_contracts() -> tuple[str, ...]:
         *trade_calendar_trigger_ddl_statements(),
         *_REFERENCE_SEAL_TRIGGER_DDL,
     )
+
+
+def execute_reference_ddl_contracts(
+    connection: Any,
+    statements: Iterable[str],
+) -> None:
+    """Execute frozen reference DDL on MySQL with idempotent column adds."""
+
+    for statement in statements:
+        matched = _CONDITIONAL_ADD_COLUMN_RE.match(statement)
+        if matched is None:
+            if "ADD COLUMN IF NOT EXISTS" in statement.upper():
+                raise RuntimeError("QMT reference additive DDL contract differs")
+            connection.execute(text(statement))
+            continue
+        table_name, column_name = matched.groups()
+        rows = connection.execute(text("""
+            SELECT COLUMN_NAME
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME=:table_name
+              AND COLUMN_NAME=:column_name
+        """), {
+            "table_name": table_name,
+            "column_name": column_name,
+        }).mappings().all()
+        if rows:
+            continue
+        compatible, replacements = re.subn(
+            r"ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS",
+            "ADD COLUMN",
+            statement,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if replacements != 1:
+            raise RuntimeError("QMT reference additive DDL contract differs")
+        connection.execute(text(compatible))
 
 
 def _normalized_ddl(statement: str) -> str:
@@ -915,11 +959,10 @@ def privileged_migrate_reference_schema(
         install_triggers=False,
     )
     with engine.begin() as connection:
-        for statement in (
+        execute_reference_ddl_contracts(connection, (
             *_REFERENCE_SEAL_TABLE_DDL,
             *_REFERENCE_SEAL_MIGRATION_DDL,
-        ):
-            connection.execute(text(statement))
+        ))
     if install_triggers:
         if trigger_ddl_executor is None:
             with engine.begin() as connection:

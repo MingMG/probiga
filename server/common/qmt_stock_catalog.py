@@ -479,6 +479,32 @@ def _expected_trigger_contracts() -> dict[str, tuple[str, str, str]]:
     return contracts
 
 
+def _stock_catalog_column_names(connection: Any, table_name: str) -> set[str]:
+    rows = connection.execute(text("""
+        SELECT COLUMN_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name
+    """), {"table_name": table_name}).mappings().all()
+    return {
+        str(row.get("COLUMN_NAME") or row.get("column_name") or "").casefold()
+        for row in rows
+        if str(row.get("COLUMN_NAME") or row.get("column_name") or "")
+    }
+
+
+def _mysql_add_column_statement(statement: str) -> str:
+    marker = "ADD COLUMN IF NOT EXISTS"
+    if statement.upper().count(marker) != 1:
+        raise RuntimeError("QMT stock catalog additive DDL contract differs")
+    return re.sub(
+        marker,
+        "ADD COLUMN",
+        statement,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+
+
 def privileged_migrate_stock_catalog_schema(
     engine: Any,
     *,
@@ -510,10 +536,28 @@ def privileged_migrate_stock_catalog_schema(
             for statement in repair_statements:
                 trigger_ddl_executor(statement)
     with engine.begin() as connection:
-        for statement in (
-            *stock_catalog_table_ddl_statements(),
-            *stock_catalog_migration_statements(),
-        ):
+        for statement in stock_catalog_table_ddl_statements():
+            connection.execute(text(statement))
+        migration_statements = stock_catalog_migration_statements()
+        additive_migrations = (
+            (
+                "qmt_stock_catalog_batch",
+                "history_complete_from",
+                migration_statements[0],
+            ),
+            (
+                "qmt_stock_catalog_member",
+                "instrument_type",
+                migration_statements[1],
+            ),
+        )
+        for table_name, column_name, statement in additive_migrations:
+            if column_name.casefold() in _stock_catalog_column_names(
+                connection, table_name
+            ):
+                continue
+            connection.execute(text(_mysql_add_column_statement(statement)))
+        for statement in migration_statements[2:]:
             connection.execute(text(statement))
     if install_triggers:
         if trigger_ddl_executor is None:

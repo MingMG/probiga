@@ -605,30 +605,42 @@ def _catalog_trigger_rows():
 
 
 class _CatalogDdlConnection:
-    def __init__(self, *, trigger_rows=None):
+    def __init__(self, *, trigger_rows=None, columns_by_table=None):
         self.statements = []
         self.trigger_rows = (
             _catalog_trigger_rows() if trigger_rows is None else trigger_rows
         )
+        self.columns_by_table = columns_by_table or {}
 
-    def execute(self, statement, _params=None):
+    def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)
-        trigger_rows = self.trigger_rows
+        if "information_schema.COLUMNS" in sql:
+            rows = [
+                {"COLUMN_NAME": name}
+                for name in self.columns_by_table.get(
+                    str((params or {}).get("table_name") or ""),
+                    (),
+                )
+            ]
+        else:
+            rows = self.trigger_rows
 
         class _Result:
             def mappings(self):
                 return self
 
             def all(self):
-                return trigger_rows
+                return rows
 
         return _Result()
 
 
 class _CatalogDdlEngine:
-    def __init__(self):
-        self.connection = _CatalogDdlConnection()
+    def __init__(self, *, columns_by_table=None):
+        self.connection = _CatalogDdlConnection(
+            columns_by_table=columns_by_table
+        )
 
     def begin(self):
         connection = self.connection
@@ -664,6 +676,26 @@ def test_qmt_stock_catalog_schema_installs_database_append_only_guards():
     assert ddl.index(
         "DROP TRIGGER IF EXISTS `trg_qmt_stock_catalog_batch_no_update`"
     ) < ddl.index("UPDATE qmt_stock_catalog_batch")
+
+
+def test_qmt_stock_catalog_additive_migration_is_mysql_compatible_and_idempotent():
+    missing = _CatalogDdlEngine()
+    privileged_migrate_stock_catalog_schema(missing, install_triggers=False)
+    missing_sql = "\n".join(missing.connection.statements)
+
+    assert "ADD COLUMN IF NOT EXISTS" not in missing_sql
+    assert "ADD COLUMN history_complete_from" in missing_sql
+    assert "ADD COLUMN instrument_type" in missing_sql
+
+    existing = _CatalogDdlEngine(columns_by_table={
+        "qmt_stock_catalog_batch": {"history_complete_from"},
+        "qmt_stock_catalog_member": {"instrument_type"},
+    })
+    privileged_migrate_stock_catalog_schema(existing, install_triggers=False)
+    existing_sql = "\n".join(existing.connection.statements)
+
+    assert "ADD COLUMN history_complete_from" not in existing_sql
+    assert "ADD COLUMN instrument_type" not in existing_sql
 
 
 def test_qmt_stock_catalog_trigger_attestation_rejects_missing_or_noop():
@@ -819,6 +851,15 @@ def test_privileged_reference_migration_can_defer_triggers_to_release_broker(
 
         def execute(self, statement, _params=None):
             self.statements.append(str(statement))
+
+            class _Result:
+                def mappings(self):
+                    return self
+
+                def all(self):
+                    return []
+
+            return _Result()
 
     class _Engine:
         def __init__(self):

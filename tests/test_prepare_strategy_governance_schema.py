@@ -2350,6 +2350,9 @@ class _ReadOnlyResult:
     def mappings(self):
         return self
 
+    def all(self):
+        return []
+
     def __iter__(self):
         return iter(())
 
@@ -2535,11 +2538,18 @@ def test_qmt_reference_table_preparation_never_creates_triggers():
     assert detail["contract_hash"] == REFERENCE_SCHEMA_CONTRACT_HASH
     assert detail["table_names"] == list(REFERENCE_TABLE_NAMES)
     assert detail["trigger_names"] == list(REFERENCE_TRIGGER_NAMES)
-    assert len(statements) == (
+    mutations = [
+        statement for statement in statements
+        if not statement.upper().startswith("SELECT ")
+    ]
+    assert len(mutations) == (
         len(reference_table_ddl_contracts())
         + len(reference_migration_ddl_contracts())
     )
-    assert not any("CREATE TRIGGER" in statement.upper() for statement in statements)
+    assert not any("ADD COLUMN IF NOT EXISTS" in statement.upper()
+                   for statement in mutations)
+    assert not any("CREATE TRIGGER" in statement.upper()
+                   for statement in mutations)
     assert detail["runtime_ddl_required"] is False
 
 

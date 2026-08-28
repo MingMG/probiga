@@ -2234,6 +2234,7 @@ def _prepare_qmt_reference_schema_tables(engine: Engine) -> dict[str, Any]:
         REFERENCE_SCHEMA_CONTRACT_HASH,
         REFERENCE_TABLE_NAMES,
         REFERENCE_TRIGGER_NAMES,
+        execute_reference_ddl_contracts,
         reference_migration_ddl_contracts,
         reference_table_ddl_contracts,
     )
@@ -2241,8 +2242,10 @@ def _prepare_qmt_reference_schema_tables(engine: Engine) -> dict[str, Any]:
     table_statements = tuple(reference_table_ddl_contracts())
     migration_statements = tuple(reference_migration_ddl_contracts())
     with engine.begin() as connection:
-        for statement in (*table_statements, *migration_statements):
-            connection.execute(text(statement))
+        execute_reference_ddl_contracts(
+            connection,
+            (*table_statements, *migration_statements),
+        )
     return {
         "contract_hash": REFERENCE_SCHEMA_CONTRACT_HASH,
         "table_names": list(REFERENCE_TABLE_NAMES),

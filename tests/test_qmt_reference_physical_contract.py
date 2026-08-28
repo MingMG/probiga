@@ -209,6 +209,53 @@ def test_reference_schema_hash_binds_full_ddl_not_only_object_names():
     assert len(reference_sync.REFERENCE_SCHEMA_CONTRACT_HASH) == 64
 
 
+@pytest.mark.parametrize("columns_exist", (False, True))
+def test_reference_additive_ddl_is_mysql_compatible_and_idempotent(
+    columns_exist,
+):
+    class _Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class _Connection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            sql = str(statement).strip()
+            self.statements.append(sql)
+            if sql.upper().startswith("SELECT COLUMN_NAME"):
+                return _Result(
+                    [{"COLUMN_NAME": params["column_name"]}]
+                    if columns_exist else []
+                )
+            return _Result([])
+
+    connection = _Connection()
+    reference_sync.execute_reference_ddl_contracts(
+        connection,
+        reference_sync.reference_migration_ddl_contracts(),
+    )
+    mutations = [
+        statement for statement in connection.statements
+        if not statement.upper().startswith("SELECT ")
+    ]
+
+    assert not any("ADD COLUMN IF NOT EXISTS" in statement.upper()
+                   for statement in mutations)
+    plain_adds = [
+        statement for statement in mutations
+        if "ADD COLUMN" in statement.upper()
+    ]
+    assert len(plain_adds) == (0 if columns_exist else 6)
+
+
 def test_reference_preflight_is_read_only_for_empty_install(monkeypatch):
     class _Inspector:
         def has_table(self, _name):
