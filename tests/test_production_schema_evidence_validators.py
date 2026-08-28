@@ -10,6 +10,13 @@ from typing import Any
 
 import pytest
 
+from server.db.migrations_v4 import (
+    CLAIM_TOKEN_REGISTRY_TRIGGER_NAMES,
+    CONTROL_GUARD_TRIGGER_NAMES,
+    JOB_LEASE_TRIGGER_NAMES,
+    PIT_FACTOR_GUARD_TRIGGER_NAMES,
+    PIT_FACTOR_LINEAGE_TRIGGER_SPECS,
+)
 from server.common.production_runtime_schema_bundle import _contract_metadata
 from tools.prepare_strategy_governance_schema import (
     EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
@@ -75,6 +82,17 @@ FULL_TRIGGER_NAMES = sorted({
     *_final_v3_trigger_contracts(),
     *_non_v3_trigger_contracts(),
 })
+V4_TRIGGER_NAMES = sorted({
+    *JOB_LEASE_TRIGGER_NAMES,
+    *CLAIM_TOKEN_REGISTRY_TRIGGER_NAMES,
+    *CONTROL_GUARD_TRIGGER_NAMES,
+    *PIT_FACTOR_GUARD_TRIGGER_NAMES,
+    *(name for name, _event, _table, _statement in PIT_FACTOR_LINEAGE_TRIGGER_SPECS),
+})
+FULL_WITH_V4_TRIGGER_NAMES = sorted({*FULL_TRIGGER_NAMES, *V4_TRIGGER_NAMES})
+FULL_WITH_V4_TRIGGER_NAMESET_HASH = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+)
 QMT_TABLE_NAMES = list(REFERENCE_TABLE_NAMES)
 QMT_TRIGGER_NAMES = list(REFERENCE_TRIGGER_NAMES)
 RUNTIME_BUNDLE_METADATA = _contract_metadata()
@@ -365,8 +383,12 @@ def _resume_payload() -> dict[str, Any]:
                 "observed_count": 142,
                 "v2_count": 41,
                 "managed_count": 101,
+                "optional_v4_count": 0,
                 "expected_names": FULL_TRIGGER_NAMES,
                 "nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+                "base_nameset_sha256": (
+                    EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+                ),
                 "v2_source_contract_sha256": (
                     EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
                 ),
@@ -511,6 +533,19 @@ def _resume_payload() -> dict[str, Any]:
     return payload
 
 
+def _resume_payload_with_applied_v4() -> dict[str, Any]:
+    payload = _resume_payload()
+    inventory = payload["full_trigger_inventory"]
+    inventory.update({
+        "expected_count": 174,
+        "observed_count": 174,
+        "optional_v4_count": 32,
+        "expected_names": FULL_WITH_V4_TRIGGER_NAMES,
+        "nameset_sha256": FULL_WITH_V4_TRIGGER_NAMESET_HASH,
+    })
+    return payload
+
+
 def _preflight_payload() -> dict[str, Any]:
     payload = _common_payload("preflight")
     payload.update(
@@ -623,6 +658,40 @@ def test_schema_evidence_validator_accepts_complete_payload(
     result = _run_validator(validator_programs[phase], payload_factory())
 
     assert result.returncode == 0, result.stderr
+
+
+def test_resume_schema_evidence_validator_accepts_complete_applied_v4_group(
+    validator_programs: dict[str, str],
+) -> None:
+    assert len(V4_TRIGGER_NAMES) == 32
+    assert len(FULL_WITH_V4_TRIGGER_NAMES) == 174
+
+    result = _run_validator(
+        validator_programs["resume"],
+        _resume_payload_with_applied_v4(),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("optional_v4_count", 31),
+        ("nameset_sha256", EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH),
+    ),
+)
+def test_resume_schema_evidence_validator_rejects_applied_v4_tampering(
+    validator_programs: dict[str, str],
+    field: str,
+    value: Any,
+) -> None:
+    payload = _resume_payload_with_applied_v4()
+    payload["full_trigger_inventory"][field] = value
+
+    result = _run_validator(validator_programs["resume"], payload)
+
+    assert result.returncode == 2, (field, result.stdout, result.stderr)
 
 
 @pytest.mark.parametrize(("phase", "payload_factory"), VALIDATORS)

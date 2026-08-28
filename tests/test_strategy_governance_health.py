@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -8674,7 +8675,22 @@ def test_market_router_risk_cap_is_exact(monkeypatch):
     assert budget["passed"] is False
 
 
-def test_application_integrity_health_requires_exact_database_triggers():
+def test_application_integrity_health_requires_exact_database_triggers(
+    monkeypatch,
+):
+    from server.db import migrations_v4
+
+    monkeypatch.setattr(
+        migrations_v4,
+        "run_v4_migrations",
+        lambda _engine, *, dry_run=False: tuple(
+            SimpleNamespace(
+                version=str(migration["version"]),
+                status="would_apply",
+            )
+            for migration in migrations_v4.MIGRATIONS
+        ),
+    )
     connection = _GovernanceHealthEngine().connect()
     metric_passed, metric = health._metric_input_review_trigger_check(connection)
     ledger_passed, ledger = health._governance_append_only_trigger_check(
@@ -8892,7 +8908,21 @@ def test_supporting_release_inventory_rejects_missing_guard(
     assert detail["database_triggers_required"] is True
 
 
-def test_full_database_trigger_health_rejects_unrelated_trigger():
+def test_full_database_trigger_health_rejects_unrelated_trigger(monkeypatch):
+    from server.db import migrations_v4
+
+    monkeypatch.setattr(
+        migrations_v4,
+        "run_v4_migrations",
+        lambda _engine, *, dry_run=False: tuple(
+            SimpleNamespace(
+                version=str(migration["version"]),
+                status="would_apply",
+            )
+            for migration in migrations_v4.MIGRATIONS
+        ),
+    )
+
     class _UnexpectedGlobalTriggerEngine(_GovernanceHealthEngine):
         def _release_trigger_rows_fixture(self, rows, sql, _params):
             rows = deepcopy(rows)

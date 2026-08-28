@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from server.db import migrations_v4
 from tools import prepare_strategy_governance_schema as schema
 
 
@@ -145,6 +146,7 @@ class _FullInventoryConnection(_InventoryConnection):
     def __init__(self, rows, managed_names):
         super().__init__(rows)
         self.managed_names = set(managed_names)
+        self.engine = object()
 
     def execute(self, statement, _params=None):
         sql = str(statement)
@@ -1097,6 +1099,7 @@ def test_full_database_trigger_inventory_attests_exact_142_contracts():
     assert detail["observed_count"] == 142
     assert detail["v2_count"] == 41
     assert detail["managed_count"] == 101
+    assert detail["optional_v4_count"] == 0
     assert detail["nameset_sha256"] == (
         schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
     )
@@ -1108,6 +1111,95 @@ def test_full_database_trigger_inventory_attests_exact_142_contracts():
         statement.lstrip().startswith("SELECT ")
         for statement in connection.statements
     )
+
+
+def test_full_database_trigger_inventory_attests_complete_applied_v4_group(
+    monkeypatch,
+):
+    managed = {
+        **schema._final_v3_trigger_contracts(),
+        **schema._frozen_non_v3_release_trigger_contracts(
+            schema._non_v3_trigger_contracts()
+        ),
+    }
+    optional_v4_names = frozenset({
+        matched.group(1)
+        for migration in migrations_v4.MIGRATIONS
+        for statement in migration["statements"]
+        if (matched := schema._CREATE_TRIGGER_RE.match(str(statement).strip()))
+        is not None
+    })
+    rows = _full_trigger_rows(managed)
+    template = rows[0]
+    lineage_names = {
+        name for name, _event, _table, _statement
+        in migrations_v4.PIT_FACTOR_LINEAGE_TRIGGER_SPECS
+    }
+    rows.extend({
+        **template,
+        "trigger_name": name,
+        "action_order": 2 if name in lineage_names else 1,
+    } for name in optional_v4_names)
+    connection = _FullInventoryConnection(rows, managed)
+    monkeypatch.setattr(
+        schema,
+        "_validated_applied_v4_trigger_names",
+        lambda engine: optional_v4_names
+        if engine is connection.engine else pytest.fail("wrong engine"),
+    )
+
+    detail = schema.validate_full_database_trigger_inventory(
+        connection,
+        managed_contracts=managed,
+        include_applied_v4=True,
+    )
+
+    assert detail["expected_count"] == 174
+    assert detail["observed_count"] == 174
+    assert detail["optional_v4_count"] == 32
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected_count"),
+    (("exists", 32), ("would_apply", 0)),
+)
+def test_optional_v4_trigger_group_is_all_or_absent(
+    monkeypatch,
+    statuses,
+    expected_count,
+):
+    monkeypatch.setattr(
+        migrations_v4,
+        "run_v4_migrations",
+        lambda _engine, *, dry_run: [
+            SimpleNamespace(version=item["version"], status=statuses)
+            for item in migrations_v4.MIGRATIONS
+        ] if dry_run else pytest.fail("V4 attestation must be read-only"),
+    )
+
+    names = schema._validated_applied_v4_trigger_names(object())
+
+    assert len(names) == expected_count
+
+
+def test_optional_v4_trigger_group_rejects_partial_ledger(monkeypatch):
+    monkeypatch.setattr(
+        migrations_v4,
+        "run_v4_migrations",
+        lambda _engine, *, dry_run: [
+            SimpleNamespace(
+                version=item["version"],
+                status="exists" if index == 0 else "would_apply",
+            )
+            for index, item in enumerate(migrations_v4.MIGRATIONS)
+        ] if dry_run else pytest.fail("V4 attestation must be read-only"),
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="ledger is partial",
+    ):
+        schema._validated_applied_v4_trigger_names(object())
 
 
 @pytest.mark.parametrize("case", ("missing", "unexpected", "v2_body"))

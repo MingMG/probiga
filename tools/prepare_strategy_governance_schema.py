@@ -158,6 +158,14 @@ EXPECTED_FULL_RELEASE_TRIGGER_COUNT = 142
 EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH = (
     "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
 )
+EXPECTED_OPTIONAL_V4_TRIGGER_COUNT = 32
+EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH = (
+    "ca55fb3f2722ae7dfe05a8f12071b07929160ffba39dc42c9b19f29e2139b095"
+)
+EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT = 174
+EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+)
 EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
@@ -1535,6 +1543,55 @@ def _frozen_full_release_trigger_names(
     return expected
 
 
+def _validated_applied_v4_trigger_names(engine: Engine) -> frozenset[str]:
+    """Return the complete optional V4 trigger group after read-only attestation."""
+
+    from server.db.migrations_v4 import MIGRATIONS, run_v4_migrations
+
+    results = tuple(run_v4_migrations(engine, dry_run=True))
+    migrations = tuple(MIGRATIONS)
+    if len(results) != len(migrations):
+        raise PrivilegedSchemaPreparationError(
+            "optional V4 migration plan is incomplete"
+        )
+    statuses: list[str] = []
+    names: list[str] = []
+    for migration, result in zip(migrations, results):
+        version = str(migration["version"])
+        status = str(result.status)
+        if str(result.version) != version or status not in {
+            "exists", "would_apply",
+        }:
+            raise PrivilegedSchemaPreparationError(
+                "optional V4 migration plan differs"
+            )
+        statuses.append(status)
+        for raw in tuple(migration["statements"]):
+            matched = _CREATE_TRIGGER_RE.match(str(raw).strip())
+            if matched is not None:
+                names.append(matched.group(1))
+    if len(names) != len(set(names)):
+        raise PrivilegedSchemaPreparationError(
+            "optional V4 trigger source inventory is duplicated"
+        )
+    frozen_names = frozenset(names)
+    if (
+        len(frozen_names) != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+        or _full_release_trigger_nameset_hash(frozen_names)
+        != EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "optional V4 trigger source contract differs"
+        )
+    if all(status == "exists" for status in statuses):
+        return frozen_names
+    if all(status == "would_apply" for status in statuses):
+        return frozenset()
+    raise PrivilegedSchemaPreparationError(
+        "optional V4 migration ledger is partial"
+    )
+
+
 def _release_trigger_owner_counts(
     contracts: Mapping[str, TriggerContract],
 ) -> dict[str, int]:
@@ -1912,11 +1969,37 @@ def validate_full_database_trigger_inventory(
     connection: Connection,
     *,
     managed_contracts: Mapping[str, TriggerContract],
+    include_applied_v4: bool = False,
 ) -> dict[str, Any]:
     """Attest every production trigger, including the canonical V2 guards."""
 
     managed = dict(managed_contracts)
-    expected_names = _frozen_full_release_trigger_names(managed)
+    base_expected_names = _frozen_full_release_trigger_names(managed)
+    optional_v4_names = (
+        _validated_applied_v4_trigger_names(connection.engine)
+        if include_applied_v4 else frozenset()
+    )
+    if set(base_expected_names) & set(optional_v4_names):
+        raise PrivilegedSchemaPreparationError(
+            "optional V4 trigger inventory overlaps the release contract"
+        )
+    expected_names = frozenset({*base_expected_names, *optional_v4_names})
+    expected_nameset_hash = (
+        EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+        if optional_v4_names else EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+    )
+    expected_count = (
+        EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+        if optional_v4_names else EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+    )
+    if (
+        len(expected_names) != expected_count
+        or _full_release_trigger_nameset_hash(expected_names)
+        != expected_nameset_hash
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "full release trigger nameset differs"
+        )
     managed_detail = validate_release_trigger_contracts(
         connection,
         required=managed,
@@ -2006,7 +2089,7 @@ def validate_full_database_trigger_inventory(
                     "V2 release trigger physical contract differs"
                 )
             normalized_body = v2_bodies[name]
-        else:
+        elif name in managed:
             contract = managed[name]
             if action_order != 1:
                 raise PrivilegedSchemaPreparationError(
@@ -2017,6 +2100,18 @@ def validate_full_database_trigger_inventory(
                 row.get("action_statement")
                 or row.get("ACTION_STATEMENT")
                 or "",
+            )
+        else:
+            if name not in optional_v4_names:
+                raise PrivilegedSchemaPreparationError(
+                    "optional V4 trigger physical metadata differs"
+                )
+            from server.db.migrations_v4 import _normalize_trigger_body
+
+            normalized_body = _normalize_trigger_body(
+                row.get("action_statement")
+                or row.get("ACTION_STATEMENT")
+                or ""
             )
         canonical_rows.append({
             "name": name,
@@ -2057,8 +2152,10 @@ def validate_full_database_trigger_inventory(
         "observed_count": len(observed),
         "v2_count": len(v2_contracts),
         "managed_count": len(managed),
+        "optional_v4_count": len(optional_v4_names),
         "expected_names": sorted(expected_names),
-        "nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+        "nameset_sha256": expected_nameset_hash,
+        "base_nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
         "v2_source_contract_sha256": (
             EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
         ),
@@ -3147,6 +3244,7 @@ def _cutover_schema(
                 validate_full_database_trigger_inventory(
                     connection,
                     managed_contracts=final_contracts,
+                    include_applied_v4=True,
                 )
             )
         final_runtime_security = _runtime_least_privilege_evidence(boundary)

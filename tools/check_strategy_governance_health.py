@@ -1767,13 +1767,16 @@ def _supporting_release_trigger_inventory_check(
 def _full_database_trigger_inventory_check(
     connection,
 ) -> tuple[bool, dict[str, Any]]:
-    """Re-attest the exact source-bound 142-trigger database inventory."""
+    """Re-attest the base inventory plus the complete applied V4 group."""
 
     try:
         from tools.prepare_strategy_governance_schema import (
             EXPECTED_FULL_RELEASE_TRIGGER_COUNT,
             EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH,
             EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+            EXPECTED_OPTIONAL_V4_TRIGGER_COUNT,
             EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH,
             _final_v3_trigger_contracts,
             _frozen_non_v3_release_trigger_contracts,
@@ -1790,15 +1793,28 @@ def _full_database_trigger_inventory_check(
         detail = validate_full_database_trigger_inventory(
             connection,
             managed_contracts=managed,
+            include_applied_v4=True,
+        )
+        optional_v4_count = detail.get("optional_v4_count")
+        expected_count = (
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+            if optional_v4_count == EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+            else EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+        )
+        expected_nameset_hash = (
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+            if optional_v4_count == EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+            else EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
         )
         exact = (
-            detail.get("expected_count")
-            == EXPECTED_FULL_RELEASE_TRIGGER_COUNT
-            and detail.get("observed_count")
-            == EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+            type(optional_v4_count) is int
+            and optional_v4_count in {0, EXPECTED_OPTIONAL_V4_TRIGGER_COUNT}
+            and detail.get("expected_count") == expected_count
+            and detail.get("observed_count") == expected_count
             and detail.get("v2_count") == 41
             and detail.get("managed_count") == 101
-            and detail.get("nameset_sha256")
+            and detail.get("nameset_sha256") == expected_nameset_hash
+            and detail.get("base_nameset_sha256")
             == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
             and detail.get("v2_source_contract_sha256")
             == EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
@@ -1816,7 +1832,11 @@ def _full_database_trigger_inventory_check(
             "observed_count": 0,
             "v2_count": 41,
             "managed_count": 101,
+            "optional_v4_count": 0,
             "nameset_sha256": (
+                "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+            ),
+            "base_nameset_sha256": (
                 "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
             ),
             "v2_source_contract_sha256": (

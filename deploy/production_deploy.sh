@@ -2611,6 +2611,9 @@ expected_supporting_trigger_source_hash = (
 expected_full_trigger_nameset_hash = (
     "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
 )
+expected_full_with_v4_trigger_nameset_hash = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+)
 expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
@@ -2840,6 +2843,17 @@ full_managed_contract = (
     if isinstance(full_trigger_detail, dict)
     else None
 )
+full_optional_v4_count = (
+    full_trigger_detail.get("optional_v4_count")
+    if isinstance(full_trigger_detail, dict)
+    else None
+)
+expected_full_count = 174 if full_optional_v4_count == 32 else 142
+expected_full_nameset_hash = (
+    expected_full_with_v4_trigger_nameset_hash
+    if full_optional_v4_count == 32
+    else expected_full_trigger_nameset_hash
+)
 valid = valid and (
     isinstance(funding_schema_detail, dict)
     and funding_schema_detail.get("table_count") == 2
@@ -2944,18 +2958,23 @@ valid = valid and (
     and isinstance(full_trigger_detail, dict)
     and set(full_trigger_detail) == {
         "expected_count", "observed_count", "v2_count", "managed_count",
+        "optional_v4_count", "base_nameset_sha256",
         "expected_names", "nameset_sha256", "v2_source_contract_sha256",
         "managed_source_contract_sha256", "observed_metadata_sha256",
         "managed_contract", "metadata_frozen", "read_only",
     }  # expected_full_inventory_keys
-    and full_trigger_detail.get("expected_count") == 142
-    and full_trigger_detail.get("observed_count") == 142
+    and type(full_optional_v4_count) is int
+    and full_optional_v4_count in {0, 32}
+    and full_trigger_detail.get("expected_count") == expected_full_count
+    and full_trigger_detail.get("observed_count") == expected_full_count
     and full_trigger_detail.get("v2_count") == 41
     and full_trigger_detail.get("managed_count") == 101
     and full_trigger_names == sorted(set(full_trigger_names or []))
-    and len(full_trigger_names or []) == 142
-    and full_trigger_nameset_hash == expected_full_trigger_nameset_hash
+    and len(full_trigger_names or []) == expected_full_count
+    and full_trigger_nameset_hash == expected_full_nameset_hash
     and full_trigger_detail.get("nameset_sha256")
+    == expected_full_nameset_hash
+    and full_trigger_detail.get("base_nameset_sha256")
     == expected_full_trigger_nameset_hash
     and full_trigger_detail.get("v2_source_contract_sha256")
     == expected_v2_trigger_source_hash
@@ -5956,6 +5975,9 @@ expected_supporting_owner_counts = {
 expected_full_trigger_nameset_hash = (
     "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
 )
+expected_full_with_v4_trigger_nameset_hash = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+)
 expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
@@ -6237,22 +6259,38 @@ full_managed_contract = (
     if isinstance(full_trigger_inventory, dict)
     else None
 )
+full_optional_v4_count = (
+    full_trigger_inventory.get("optional_v4_count")
+    if isinstance(full_trigger_inventory, dict)
+    else None
+)
+expected_full_count = 174 if full_optional_v4_count == 32 else 142
+expected_full_nameset_hash = (
+    expected_full_with_v4_trigger_nameset_hash
+    if full_optional_v4_count == 32
+    else expected_full_trigger_nameset_hash
+)
 full_trigger_inventory_exact = (
     isinstance(full_trigger_inventory, dict)
     and set(full_trigger_inventory) == {
         "expected_count", "observed_count", "v2_count", "managed_count",
+        "optional_v4_count", "base_nameset_sha256",
         "expected_names", "nameset_sha256", "v2_source_contract_sha256",
         "managed_source_contract_sha256", "observed_metadata_sha256",
         "managed_contract", "metadata_frozen", "read_only",
     }  # expected_full_inventory_keys
-    and full_trigger_inventory.get("expected_count") == 142
-    and full_trigger_inventory.get("observed_count") == 142
+    and type(full_optional_v4_count) is int
+    and full_optional_v4_count in {0, 32}
+    and full_trigger_inventory.get("expected_count") == expected_full_count
+    and full_trigger_inventory.get("observed_count") == expected_full_count
     and full_trigger_inventory.get("v2_count") == 41
     and full_trigger_inventory.get("managed_count") == 101
     and full_trigger_names == sorted(set(full_trigger_names or []))
-    and len(full_trigger_names or []) == 142
-    and full_trigger_names_hash == expected_full_trigger_nameset_hash
+    and len(full_trigger_names or []) == expected_full_count
+    and full_trigger_names_hash == expected_full_nameset_hash
     and full_trigger_inventory.get("nameset_sha256")
+    == expected_full_nameset_hash
+    and full_trigger_inventory.get("base_nameset_sha256")
     == expected_full_trigger_nameset_hash
     and full_trigger_inventory.get("v2_source_contract_sha256")
     == expected_v2_trigger_source_hash

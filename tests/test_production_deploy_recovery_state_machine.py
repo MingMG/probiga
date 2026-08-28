@@ -2952,8 +2952,12 @@ shift
                 "observed_count": 142,
                 "v2_count": 41,
                 "managed_count": 101,
+                "optional_v4_count": 0,
                 "expected_names": full_trigger_names,
                 "nameset_sha256": (
+                    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                ),
+                "base_nameset_sha256": (
                     "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
                 ),
                 "v2_source_contract_sha256": (
