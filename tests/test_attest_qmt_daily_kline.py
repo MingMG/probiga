@@ -943,6 +943,16 @@ def test_full_window_attestation_bounds_database_statements_to_ten_sessions():
     assert "AND NOT COALESCE(q.provenance_already, 0)" in source
 
 
+def test_attestation_uses_exact_a_share_predicate_for_all_market_sets():
+    source = inspect.getsource(attester.attest_range)
+
+    assert 'a_share_stock_code_sql("stock_code")' in source
+    assert 'a_share_stock_code_sql("raw.stock_code")' in source
+    assert source.count("AND {unqualified_a_share}") == 2
+    assert "AND {raw_a_share}" in source
+    assert "^(0|3|4|6|8|9)" not in source
+
+
 def test_daily_universe_manifest_hash_and_parser_are_frozen():
     codes = ["600000", "000001", "600000"]
     contract = attester.expected_stock_set_contract("2026-08-21", codes)

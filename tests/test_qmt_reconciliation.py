@@ -76,6 +76,13 @@ def test_daily_reconciliation_is_exact_and_uses_independent_roots():
     assert "sm_stock_kline" not in previous_dates_source
 
 
+def test_reconciliation_actual_sets_use_exact_a_share_predicate():
+    source = inspect.getsource(reconciliation._group_stock_sets_for_dates)
+
+    assert "a_share_stock_code_sql" in source
+    assert "^(0|3|4|6|8|9)" not in source
+
+
 def test_nightly_reconciliation_fails_closed_before_business_dml_on_schema_drift(
     monkeypatch,
 ):

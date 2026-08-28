@@ -56,7 +56,10 @@ from server.common.qmt_attestation_contract import (
     expected_stock_set_contract,
     validated_universe_manifest,
 )
-from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_stock_catalog import (
+    a_share_stock_code_sql,
+    load_stock_catalog,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.env_config import load_project_env
 
@@ -1800,6 +1803,8 @@ def attest_range(
             {**params, "tolerance_json": json.dumps(tolerances, sort_keys=True)},
         )
     match_sql = _match_sql()
+    unqualified_a_share = a_share_stock_code_sql("stock_code")
+    raw_a_share = a_share_stock_code_sql("raw.stock_code")
     target_temp = "tmp_qmt_attest_target"
     source_temp = "tmp_qmt_attest_source"
     source_batch_temp = "tmp_qmt_attest_source_batch"
@@ -1880,7 +1885,7 @@ def attest_range(
                     FROM {target_table}
                     WHERE trade_date BETWEEN :start_date AND :end_date
                       AND k_type=1 AND adjust_type=0
-                      AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                      AND {unqualified_a_share}
                     """
                 ),
                 params,
@@ -1901,7 +1906,7 @@ def attest_range(
                 WHERE trade_date BETWEEN :start_date AND :end_date
                   AND period='1d' AND k_type=1 AND adjust_type=0
                   AND provider=:provider
-                  AND stock_code REGEXP '^(0|3|4|6|8|9)'
+                  AND {unqualified_a_share}
                 GROUP BY trade_date, batch_id
                 ORDER BY trade_date, latest_received_at DESC, BINARY batch_id DESC
             """), params).mappings().all()
@@ -1961,7 +1966,7 @@ def attest_range(
                       AND raw.period='1d' AND raw.k_type=1
                       AND raw.adjust_type=0
                       AND raw.provider=:provider
-                      AND raw.stock_code REGEXP '^(0|3|4|6|8|9)'
+                      AND {raw_a_share}
                     """
                 ),
                 params,

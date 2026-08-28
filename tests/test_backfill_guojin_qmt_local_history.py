@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -20,6 +21,20 @@ from tools import backfill_guojin_qmt_local_history as backfill_tool
 TEST_DAILY_LOCK = backfill_tool.Path(
     r"C:\ProgramData\ProBigA\qmt-local-gap-repair\qmt-local-daily-backfill.lock"
 )
+
+
+def test_governance_backfill_queries_share_the_exact_a_share_predicate():
+    functions = (
+        backfill_tool._target_window_unattestable_codes,
+        backfill_tool._repair_target_source_only_rows,
+        backfill_tool._quarantine_invalid_target_rows_without_native,
+        backfill_tool._quarantine_source_only_legacy_rows,
+    )
+
+    for function in functions:
+        source = inspect.getsource(function)
+        assert "a_share_stock_code_sql" in source
+        assert "^(0|3|4|6|8|9)" not in source
 
 
 @pytest.fixture(autouse=True)
