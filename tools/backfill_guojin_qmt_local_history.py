@@ -735,8 +735,8 @@ def _validate_target_daily_quarantine_table(source_engine) -> dict[str, Any]:
     if not inspector.has_table(table, schema=schema):
         raise RuntimeError(
             "QMT target quarantine table is missing; run explicit privileged "
-            "backfill_guojin_qmt_local_history.py init "
-            "--windows-local-option-file first"
+            "backfill_guojin_qmt_local_history.py init with dedicated "
+            "privileged MYSQL_URL/QMT_HISTORY_MYSQL_URL connections first"
         )
     columns = tuple(
         str(row.get("name") or "")

@@ -4,6 +4,8 @@ import inspect
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from integrations.qmt import local_history
 from tools import backfill_guojin_qmt_local_history as backfill_tool
 
@@ -240,3 +242,23 @@ def test_init_rejects_fixed_runtime_identity_before_database_access(
         raise AssertionError("runtime-backed privileged init must be rejected")
 
     assert "read-only runtime identity" in capsys.readouterr().err
+
+
+def test_missing_quarantine_schema_points_only_to_privileged_recovery(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        backfill_tool,
+        "inspect",
+        lambda _engine: SimpleNamespace(
+            has_table=lambda *_args, **_kwargs: False
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as failure:
+        backfill_tool._validate_target_daily_quarantine_table(object())
+
+    message = str(failure.value)
+    assert "dedicated privileged" in message
+    assert "MYSQL_URL/QMT_HISTORY_MYSQL_URL" in message
+    assert "--windows-local-option-file" not in message

@@ -395,13 +395,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "Use the fixed protected Windows client option file and verify "
-            "the exact local Oracle MySQL 8.4 identity before checking or "
-            "applying the history migration."
+            "the exact local Oracle MySQL 8.4 runtime identity before the "
+            "read-only history schema check."
         ),
     )
     args = parser.parse_args(argv)
     if args.apply and args.check_via_primary:
         parser.error("--apply and --check-via-primary are mutually exclusive")
+    if args.apply and args.windows_local_option_file:
+        parser.error(
+            "--apply requires a dedicated privileged database connection; "
+            "--windows-local-option-file is the read-only runtime identity"
+        )
     if args.windows_local_option_file and args.check_via_primary:
         parser.error(
             "--windows-local-option-file and --check-via-primary are "

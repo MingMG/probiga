@@ -407,6 +407,34 @@ def test_windows_cli_route_skips_env_and_redacts_option_secret(
     assert engine.disposed is True
 
 
+def test_windows_runtime_identity_rejects_apply_before_database_access(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        migration,
+        "_create_windows_local_history_engine",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("runtime database access must not start")
+        ),
+    )
+    monkeypatch.setattr(
+        migration,
+        "load_project_env",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("privileged environment must not load")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as failure:
+        migration.main(["--apply", "--windows-local-option-file"])
+
+    assert failure.value.code == 2
+    error = capsys.readouterr().err
+    assert "dedicated privileged database connection" in error
+    assert "read-only runtime identity" in error
+
+
 def test_windows_cli_boundary_failure_is_generic_and_disposes(
     monkeypatch,
     capsys,

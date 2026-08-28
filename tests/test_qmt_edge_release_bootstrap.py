@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
+import subprocess
+import sys
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -27,6 +30,31 @@ INSTANCE_ID = f"{HOST_NAME}-4321"
 REQUESTED_AT = datetime(2026, 8, 25, 10, 0, 0)
 CAPTURED_AT = REQUESTED_AT + timedelta(minutes=5)
 REFERENCE_BATCH_ID = f"qmt_rel_{BUILD_SHA}_20260825100500"
+
+
+def _run_powershell_json(program: str) -> dict[str, Any]:
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip())
+
+
+def _powershell_literal(value: object) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 def _release_request() -> dict[str, Any]:
@@ -258,6 +286,70 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "$StrategyReloadExit -eq 3" in updater
     assert "NEEDS_USER_ACTION" in updater
     assert updater.count("--check-request") == 1
+
+
+def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
+    tmp_path,
+) -> None:
+    updater = (
+        bootstrap.ROOT / "tools" / "update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    block_start = updater.index("Start-EdgeScheduler\n$BootstrapExit = -1")
+    block_end = updater.index(
+        'Write-UpdateLog "release bootstrap ready',
+        block_start,
+    )
+    bootstrap_block = updater[block_start:block_end]
+
+    failing_bootstrap = tmp_path / "failing_bootstrap.py"
+    failing_bootstrap.write_text(
+        "import sys\n"
+        "print('bootstrap native failure', file=sys.stderr)\n"
+        "raise SystemExit(9)\n",
+        encoding="utf-8",
+    )
+    migration_receipt = tmp_path / "local-history-schema.sha"
+    migration_receipt.write_text(BUILD_SHA + "\n", encoding="ascii")
+
+    program = f"""
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$Events = [System.Collections.Generic.List[string]]::new()
+function Start-EdgeScheduler {{ [void]$Events.Add("start") }}
+function Stop-EdgeScheduler {{ [void]$Events.Add("stop") }}
+function Write-UpdateLog([string]$Message) {{
+    [void]$Events.Add("log:" + $Message)
+}}
+$PythonExe = {_powershell_literal(sys.executable)}
+$BootstrapTool = {_powershell_literal(failing_bootstrap)}
+$LocalHistoryMigrationReceipt = {_powershell_literal(migration_receipt)}
+$CurrentSha = "{BUILD_SHA}"
+$Caught = $false
+$CaughtMessage = ""
+try {{
+{bootstrap_block}
+}} catch {{
+    $Caught = $true
+    $CaughtMessage = [string]$_.Exception.Message
+}}
+[ordered]@{{
+    caught = $Caught
+    caught_message = $CaughtMessage
+    bootstrap_exit = $BootstrapExit
+    receipt_exists = Test-Path -LiteralPath $LocalHistoryMigrationReceipt
+    events = @($Events)
+}} | ConvertTo-Json -Compress
+"""
+    result = _run_powershell_json(program)
+
+    assert result["caught"] is True
+    assert result["caught_message"] == (
+        "QMT Windows edge release bootstrap failed"
+    )
+    assert result["bootstrap_exit"] == 9
+    assert result["receipt_exists"] is False
+    assert result["events"][0:2] == ["start", "stop"]
+    assert result["events"][2].startswith("log:release bootstrap failed")
 
 
 def _bigqmt_strategy_release_payload(

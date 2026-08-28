@@ -307,18 +307,38 @@ if ($StrategyReloadExit -ne 0) {
 Write-UpdateLog "BigQMT exact strategy reloaded and identity-bound for $CurrentSha"
 
 Start-EdgeScheduler
-$BootstrapOutput = & $PythonExe -P $BootstrapTool `
-    --bootstrap --expected-build-sha $CurrentSha `
-    --expected-poll-seconds 60 --heartbeat-timeout-seconds 240 `
-    --compact 2>&1
-$BootstrapExit = $LASTEXITCODE
+$BootstrapExit = -1
+$BootstrapOutput = @()
+$PreviousPreference = $ErrorActionPreference
+try {
+    $ErrorActionPreference = "Continue"
+    # A native launch failure can otherwise leave the prior successful exit
+    # code in this automatic variable.  Reset it before invoking the child so
+    # every launch/traceback/non-zero path reaches the fail-closed branch.
+    $LASTEXITCODE = -1
+    try {
+        $BootstrapOutput = & $PythonExe -P $BootstrapTool `
+            --bootstrap --expected-build-sha $CurrentSha `
+            --expected-poll-seconds 60 --heartbeat-timeout-seconds 240 `
+            --compact 2>&1
+        $BootstrapExit = $LASTEXITCODE
+    } catch {
+        $BootstrapOutput = @($_)
+        $BootstrapExit = -1
+    }
+} finally {
+    $ErrorActionPreference = $PreviousPreference
+}
 if ($BootstrapExit -ne 0) {
-    Stop-EdgeScheduler
-    # A schema validation failure must make the next equal-SHA updater run the
-    # idempotent migration again.  The receipt is local/recoverable metadata;
-    # removing it never changes market history rows.
-    Remove-Item -LiteralPath $LocalHistoryMigrationReceipt `
-        -Force -ErrorAction SilentlyContinue
+    try {
+        Stop-EdgeScheduler
+    } finally {
+        # A bootstrap failure must make the next equal-SHA updater repeat the
+        # read-only schema validation.  The receipt is local/recoverable
+        # metadata; removing it never changes market history rows.
+        Remove-Item -LiteralPath $LocalHistoryMigrationReceipt `
+            -Force -ErrorAction SilentlyContinue
+    }
     Write-UpdateLog "release bootstrap failed for ${CurrentSha}: $($BootstrapOutput -join ' ')"
     throw "QMT Windows edge release bootstrap failed"
 }
