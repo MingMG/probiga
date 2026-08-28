@@ -1756,6 +1756,17 @@ def validate_coverage_schema(
     }
     expected_indexes = {
         (COVERAGE_TABLE, "PRIMARY"): (0, ("manifest_hash",)),
+        # MySQL creates these supporting indexes for the two manifest foreign
+        # keys.  Their names are bound to the explicit constraint names, so
+        # they are part of the physical table contract rather than drift.
+        (COVERAGE_TABLE, "fk_qmt_history_coverage_catalog"): (
+            1,
+            ("catalog_batch_id",),
+        ),
+        (COVERAGE_TABLE, "fk_qmt_history_coverage_calendar"): (
+            1,
+            ("calendar_batch_id",),
+        ),
         (COVERAGE_TABLE, "idx_qmt_history_coverage_lookup"): (
             1,
             ("dataset", "trade_date", "provider", "status", "captured_at"),

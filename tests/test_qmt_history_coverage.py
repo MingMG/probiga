@@ -665,6 +665,12 @@ def _coverage_schema_columns():
 def _coverage_index_rows():
     contracts = {
         (COVERAGE_TABLE, "PRIMARY", 0): ("manifest_hash",),
+        (COVERAGE_TABLE, "fk_qmt_history_coverage_catalog", 1): (
+            "catalog_batch_id",
+        ),
+        (COVERAGE_TABLE, "fk_qmt_history_coverage_calendar", 1): (
+            "calendar_batch_id",
+        ),
         (COVERAGE_TABLE, "idx_qmt_history_coverage_lookup", 1): (
             "dataset",
             "trade_date",
@@ -713,10 +719,11 @@ def _coverage_trigger_rows():
 
 
 class _CoverageSchemaConnection:
-    def __init__(self, *, triggers=None):
+    def __init__(self, *, triggers=None, indexes=None):
         self.triggers = (
             _coverage_trigger_rows() if triggers is None else triggers
         )
+        self.indexes = _coverage_index_rows() if indexes is None else indexes
 
     def execute(self, statement, params=None):
         sql = str(statement)
@@ -738,7 +745,7 @@ class _CoverageSchemaConnection:
         if "information_schema.COLUMNS" in sql:
             return _SchemaRows(_coverage_schema_columns())
         if "information_schema.STATISTICS" in sql:
-            return _SchemaRows(_coverage_index_rows())
+            return _SchemaRows(self.indexes)
         if "information_schema.KEY_COLUMN_USAGE" in sql:
             return _SchemaRows(
                 [
@@ -796,6 +803,19 @@ def test_coverage_schema_validator_rejects_missing_or_misbound_trigger():
     with pytest.raises(QmtHistoryCoverageError, match="trigger contract"):
         validate_coverage_schema(
             _CoverageSchemaConnection(triggers=triggers)
+        )
+
+
+def test_coverage_schema_validator_requires_mysql_foreign_key_indexes():
+    indexes = [
+        row for row in _coverage_index_rows()
+        if row["INDEX_NAME"] != "fk_qmt_history_coverage_catalog"
+    ]
+
+    with pytest.raises(QmtHistoryCoverageError, match="index contract"):
+        validate_coverage_schema(
+            _CoverageSchemaConnection(indexes=indexes),
+            require_triggers=False,
         )
 
 
