@@ -3497,6 +3497,17 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert '"$CODE_RELEASE_ROOT/$guarded_sha"' in recovery
     assert '"$RELEASE_VENV_ROOT/$guarded_sha"' in recovery
     assert 'git -C "$code_root" rev-parse HEAD' in recovery
+    venv_owner = recovery.index(
+        'test "$(stat -c \'%U\' "$release_venv_target")" = root'
+    )
+    venv_seal = recovery.index(
+        'controlled_guard_assert_immutable_venv_tree "$release_venv_target"'
+    )
+    venv_runtime_write_check = recovery.index(
+        'sudo -u "$service_user" test ! -w "$release_venv_target"'
+    )
+    assert venv_owner < venv_seal < venv_runtime_write_check
+    assert 'find -P "$release_venv_target"' not in recovery
     assert "--phase" not in recovery
     initial_recover_run = recovery.index(
         'controlled_guard_run_schema_tool "$code_root" '

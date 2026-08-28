@@ -6983,8 +6983,7 @@ controlled_database_guard_recovery() {
   test "$(cat "$release_venv/.probiga.gitsha")" = "$guarded_sha"
   test -x "$release_venv/bin/python"
   test "$(stat -c '%U' "$release_venv_target")" = root
-  test -z "$(find -P "$release_venv_target" -xdev \
-    \( ! -user root -o -perm /022 \) -print -quit)"
+  controlled_guard_assert_immutable_venv_tree "$release_venv_target" || return 1
   sudo -u "$service_user" test ! -w "$release_venv_target"
   adata_sha="$(cat "$release_venv/.adata.gitsha")"
   adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")"
