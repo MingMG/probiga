@@ -806,6 +806,77 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     assert engine.begin_calls == 0
 
 
+def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    engine = _ReadOnlyEngine()
+    identity = {
+        "current": {
+            "host_name": HOST_NAME,
+            "instance_id": INSTANCE_ID,
+            "build_sha": BUILD_SHA,
+        },
+        "errors": [],
+    }
+    coverage_calls: list[bool] = []
+
+    monkeypatch.setattr(
+        bootstrap,
+        "load_qmt_edge_release_request",
+        lambda *_args, **_kwargs: _release_request(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_wait_for_identity",
+        lambda *_args, **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "check_qmt_windows_edge_release_receipt",
+        lambda *_args, **_kwargs: (
+            False,
+            {"status": "NOT_READY", "errors": ["receipt_missing"]},
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "validate_local_history_tables",
+        lambda _engine: {"status": "ok"},
+    )
+
+    def _coverage(_connection: object, *, require_triggers: bool):
+        coverage_calls.append(require_triggers)
+        return {
+            "physical_schema_verified": True,
+            "physical_seal_verified": require_triggers,
+        }
+
+    monkeypatch.setattr(bootstrap, "validate_coverage_schema", _coverage)
+
+    def _stop_after_coverage(*, timeout: int) -> dict[str, Any]:
+        assert timeout == 60
+        raise AssertionError("stop after coverage validation")
+
+    with pytest.raises(AssertionError, match="stop after coverage validation"):
+        bootstrap.run_release_bootstrap(
+            engine,
+            expected_build_sha=BUILD_SHA,
+            local_engine=object(),
+            ping_runner=_stop_after_coverage,
+            capabilities_runner=_forbidden,
+            platform_name="nt",
+            host_name=HOST_NAME,
+            git_head=BUILD_SHA,
+        )
+
+    assert coverage_calls == [False]
+    assert engine.connect_calls == 3
+    assert engine.begin_calls == 0
+
+
 def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
