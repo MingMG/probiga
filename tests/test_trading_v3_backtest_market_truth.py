@@ -10,6 +10,10 @@ from server.common.qmt_attestation_contract import (
     build_qmt_v2_manifest,
     daily_market_source_batch_id,
 )
+from server.common.qmt_daily_no_row import (
+    build_no_row_exception_contract,
+    project_catalog_daily_codes,
+)
 from server.common import qmt_daily_market_truth as truth_module
 from server.trading_v3 import backtest
 
@@ -273,6 +277,172 @@ def test_consumer_truth_rejects_reused_row_proofs(monkeypatch):
     with pytest.raises(RuntimeError, match="counters differ"):
         truth_module.load_qmt_daily_market_truth(
             connection,
+            start_date="2026-08-21",
+            end_date="2026-08-24",
+            decision_known_at="2026-08-24 20:00:00",
+        )
+
+
+class _NoRowCatalog:
+    batch_id = "catalog-no-row"
+    member_count = 2
+    member_set_hash = "1" * 64
+    manifest_hash = "2" * 64
+    members = (
+        {
+            "stock_code": "000001",
+            "qmt_code": "000001.SZ",
+            "list_date": "1991-04-03",
+            "expire_date": None,
+        },
+        {
+            "stock_code": "301688",
+            "qmt_code": "301688.SZ",
+            "list_date": "1970-01-01",
+            "expire_date": None,
+        },
+    )
+
+    def eligible_codes(self, day):
+        assert day in {"2026-08-21", "2026-08-24"}
+        return ["000001", "301688"]
+
+
+class _NoRowCalendar(_Calendar):
+    batch_id = "calendar-no-row"
+    session_set_hash = "3" * 64
+    manifest_hash = "4" * 64
+
+
+def _no_row_manifest():
+    catalog = _NoRowCatalog()
+    calendar = _NoRowCalendar()
+    proof = build_no_row_exception_contract(
+        catalog=catalog,
+        calendar=calendar,
+        start_date="2026-08-21",
+        end_date="2026-08-24",
+        not_yet_listed_codes=["301688"],
+        target_rows_by_code={"301688": 0},
+        history_rows_by_code={"301688": 0},
+    )
+    projected = project_catalog_daily_codes(
+        catalog=catalog,
+        calendar=calendar,
+        start_date="2026-08-21",
+        end_date="2026-08-24",
+        contract=proof,
+    )
+    source_id = daily_market_source_batch_id(
+        catalog_manifest_hash=catalog.manifest_hash,
+        calendar_manifest_hash=calendar.manifest_hash,
+    )
+    daily = {
+        day: bound_stock_set_contract(
+            day,
+            codes,
+            catalog_batch_id=catalog.batch_id,
+            catalog_member_count=catalog.member_count,
+            catalog_member_set_hash=catalog.member_set_hash,
+            catalog_manifest_hash=catalog.manifest_hash,
+            source_batch_id=source_id,
+            calendar_batch_id=calendar.batch_id,
+            calendar_session_set_hash=calendar.session_set_hash,
+            calendar_manifest_hash=calendar.manifest_hash,
+            calendar_known_at=calendar.known_at,
+        )
+        for day, codes in projected.items()
+    }
+    return build_qmt_v2_manifest(
+        daily,
+        no_row_exception_contract=proof,
+    )
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar(self):
+        return self.value
+
+
+class _NoRowConnection:
+    def __init__(self, *, excluded_target_rows=0):
+        self.calls = 0
+        self.excluded_target_rows = excluded_target_rows
+
+    def execute(self, _statement, _params=None):
+        self.calls += 1
+        if self.calls == 1:
+            return _Result([{
+                "run_id": "attestation-no-row",
+                "provider": truth_module.QMT_DAILY_PROVIDER,
+                "start_date": "2026-08-21",
+                "end_date": "2026-08-24",
+                "status": "COMPLETED",
+                "target_rows": 2,
+                "qmt_rows": 2,
+                "matched_rows": 2,
+                "missing_qmt_rows": 0,
+                "mismatched_rows": 0,
+                "already_attested_rows": 0,
+                "updated_rows": 2,
+                "tolerance_json": _no_row_manifest(),
+                "finished_at": "2026-08-24 19:00:00",
+            }])
+        if self.calls == 2:
+            return _ScalarResult(self.excluded_target_rows)
+        return _Result([
+            {
+                "trade_date": "2026-08-21",
+                "attested_row_count": 1,
+                "attested_stock_count": 1,
+            },
+            {
+                "trade_date": "2026-08-24",
+                "attested_row_count": 1,
+                "attested_stock_count": 1,
+            },
+        ])
+
+
+def _bind_no_row_roots(monkeypatch):
+    monkeypatch.setattr(
+        truth_module,
+        "load_stock_catalog",
+        lambda *_a, **_k: _NoRowCatalog(),
+    )
+    monkeypatch.setattr(
+        truth_module,
+        "load_trade_calendar_receipt",
+        lambda *_a, **_k: _NoRowCalendar(),
+    )
+
+
+def test_consumer_truth_accepts_and_binds_reviewed_no_row_manifest(monkeypatch):
+    _bind_no_row_roots(monkeypatch)
+    truth = truth_module.load_qmt_daily_market_truth(
+        _NoRowConnection(),
+        start_date="2026-08-21",
+        end_date="2026-08-24",
+        decision_known_at="2026-08-24 20:00:00",
+    )
+
+    assert truth.attested_row_count == 2
+    assert len(truth.no_row_exception_proof_sha256 or "") == 64
+    assert truth.as_dict()["no_row_exception_proof_sha256"] == (
+        truth.no_row_exception_proof_sha256
+    )
+
+
+def test_consumer_truth_rejects_row_appearing_under_no_row_exception(
+    monkeypatch,
+):
+    _bind_no_row_roots(monkeypatch)
+    with pytest.raises(RuntimeError, match="target rows appeared"):
+        truth_module.load_qmt_daily_market_truth(
+            _NoRowConnection(excluded_target_rows=1),
             start_date="2026-08-21",
             end_date="2026-08-24",
             decision_known_at="2026-08-24 20:00:00",

@@ -1754,6 +1754,62 @@ def _match_sql(target_alias: str = "t", source_alias: str = "q") -> str:
     )
 
 
+def _build_attestation_no_row_contract(
+    connection: Connection,
+    *,
+    target_table: str,
+    source_table: str,
+    catalog: Any,
+    calendar: Any,
+    start_date: str,
+    end_date: str,
+    exact_lifecycle_no_row_codes: tuple[str, ...],
+    not_yet_listed_no_row_codes: tuple[str, ...],
+) -> dict[str, Any] | None:
+    """Prove zero rows across the entire history table, not one provider."""
+
+    no_row_codes = sorted(
+        set(exact_lifecycle_no_row_codes)
+        | set(not_yet_listed_no_row_codes)
+    )
+    if not no_row_codes:
+        return None
+    target_rows_by_code: dict[str, int] = {}
+    history_rows_by_code: dict[str, int] = {}
+    for code in no_row_codes:
+        row = connection.execute(text(f"""
+            SELECT
+              (
+                SELECT COUNT(*) FROM {target_table}
+                WHERE stock_code=:no_row_stock_code
+                  AND k_type=1 AND adjust_type=0
+                  AND trade_date BETWEEN :start_date AND :end_date
+              ) AS target_rows,
+              (
+                SELECT COUNT(*) FROM {source_table}
+                WHERE stock_code=:no_row_stock_code
+                  AND period='1d' AND k_type=1 AND adjust_type=0
+                  AND trade_date BETWEEN :start_date AND :end_date
+              ) AS history_rows
+        """), {
+            "no_row_stock_code": code,
+            "start_date": start_date,
+            "end_date": end_date,
+        }).mappings().one()
+        target_rows_by_code[code] = int(row.get("target_rows") or 0)
+        history_rows_by_code[code] = int(row.get("history_rows") or 0)
+    return build_no_row_exception_contract(
+        catalog=catalog,
+        calendar=calendar,
+        start_date=start_date,
+        end_date=end_date,
+        exact_lifecycle_codes=list(exact_lifecycle_no_row_codes),
+        not_yet_listed_codes=list(not_yet_listed_no_row_codes),
+        target_rows_by_code=target_rows_by_code,
+        history_rows_by_code=history_rows_by_code,
+    )
+
+
 def attest_range(
     engine: Engine,
     *,
@@ -1984,48 +2040,24 @@ def attest_range(
                 | set(not_yet_listed_no_row_codes)
             )
             if no_row_codes:
-                target_rows_by_code: dict[str, int] = {}
-                history_rows_by_code: dict[str, int] = {}
-                for code in no_row_codes:
-                    row = connection.execute(text(f"""
-                        SELECT
-                          (
-                            SELECT COUNT(*) FROM {target_table}
-                            WHERE stock_code=:no_row_stock_code
-                              AND k_type=1 AND adjust_type=0
-                              AND trade_date BETWEEN :start_date AND :end_date
-                          ) AS target_rows,
-                          (
-                            SELECT COUNT(*) FROM {source_table}
-                            WHERE stock_code=:no_row_stock_code
-                              AND period='1d' AND k_type=1 AND adjust_type=0
-                              AND provider=:provider
-                              AND trade_date BETWEEN :start_date AND :end_date
-                          ) AS history_rows
-                    """), {
-                        **params,
-                        "no_row_stock_code": code,
-                    }).mappings().one()
-                    target_rows_by_code[code] = int(
-                        row.get("target_rows") or 0
+                no_row_exception_contract = (
+                    _build_attestation_no_row_contract(
+                        connection,
+                        target_table=target_table,
+                        source_table=source_table,
+                        catalog=catalog,
+                        calendar=calendar_receipt,
+                        start_date=start_date,
+                        end_date=end_date,
+                        exact_lifecycle_no_row_codes=(
+                            exact_lifecycle_no_row_codes
+                        ),
+                        not_yet_listed_no_row_codes=(
+                            not_yet_listed_no_row_codes
+                        ),
                     )
-                    history_rows_by_code[code] = int(
-                        row.get("history_rows") or 0
-                    )
-                no_row_exception_contract = build_no_row_exception_contract(
-                    catalog=catalog,
-                    calendar=calendar_receipt,
-                    start_date=start_date,
-                    end_date=end_date,
-                    exact_lifecycle_codes=list(
-                        exact_lifecycle_no_row_codes
-                    ),
-                    not_yet_listed_codes=list(
-                        not_yet_listed_no_row_codes
-                    ),
-                    target_rows_by_code=target_rows_by_code,
-                    history_rows_by_code=history_rows_by_code,
                 )
+                assert no_row_exception_contract is not None
                 catalog_daily_codes = project_catalog_daily_codes(
                     catalog=catalog,
                     calendar=calendar_receipt,
