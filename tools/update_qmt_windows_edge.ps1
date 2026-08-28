@@ -227,11 +227,12 @@ if ($CurrentSha -cne $TargetSha) {
 $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 
-# The migration receipt is written only after the idempotent privileged init
-# succeeds for this exact release.  Keeping it outside the Git checkout makes
-# an interrupted post-fast-forward migration retryable even when HEAD already
-# equals origin/main, while avoiding a DDL window every five minutes during a
-# healthy steady state.
+# The local schema receipt is written only after the runtime identity proves
+# both frozen physical contracts read-only for this exact release.  Keeping it
+# outside the Git checkout makes an interrupted post-fast-forward validation
+# retryable even when HEAD already equals origin/main.  A real schema delta
+# remains fail-closed until a separately provisioned privileged migration is
+# completed; the updater never lends runtime credentials to persistent DDL.
 $PreparedSha = ""
 if (Test-Path -LiteralPath $LocalHistoryMigrationReceipt -PathType Leaf) {
     $ReceiptItem = Get-Item -LiteralPath $LocalHistoryMigrationReceipt -Force
@@ -247,11 +248,25 @@ if (Test-Path -LiteralPath $LocalHistoryMigrationReceipt -PathType Leaf) {
 }
 if ($PreparedSha -cne $CurrentSha) {
     Stop-EdgeScheduler
-    $MigrationOutput = & $PythonExe -P $LocalHistoryMigrationTool `
-        init --windows-local-option-file --json 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Write-UpdateLog "local history schema migration failed for ${CurrentSha}: $($MigrationOutput -join ' ')"
-        throw "QMT Windows local history schema migration failed"
+    # The fixed Windows option file is the least-privilege runtime identity.
+    # Prove the complete existing physical contract before writing the local
+    # release receipt; never hand that identity to a persistent-DDL path.
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $SchemaValidationOutput = & $PythonExe -P $LocalHistoryMigrationTool `
+            validate-schema --windows-local-option-file --json 2>&1
+        $SchemaValidationExit = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    if ($SchemaValidationExit -ne 0) {
+        Write-UpdateLog (
+            "read-only local history schema validation failed for " +
+            "${CurrentSha}; dedicated privileged migration or boundary " +
+            "repair is required"
+        )
+        throw "QMT Windows local history schema is not release-ready"
     }
     $MigrationReceiptTemp = "$LocalHistoryMigrationReceipt.$PID.tmp"
     [System.IO.File]::WriteAllText(
@@ -261,7 +276,10 @@ if ($PreparedSha -cne $CurrentSha) {
     )
     Move-Item -LiteralPath $MigrationReceiptTemp `
         -Destination $LocalHistoryMigrationReceipt -Force
-    Write-UpdateLog "local history schema prepared for $CurrentSha"
+    Write-UpdateLog (
+        "local history physical schema validated read-only and receipt " +
+        "prepared for $CurrentSha"
+    )
 }
 
 # Keep the database-writing edge stopped while the interactive QMT control

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,6 +13,41 @@ def _source() -> str:
     return (ROOT / "tools" / "reload_big_qmt_strategy.ps1").read_text(
         encoding="utf-8"
     )
+
+
+def _powershell_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}")
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"unterminated PowerShell function: {name}")
+
+
+def _run_powershell(program: str) -> dict[str, bool]:
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip())
 
 
 def test_release_reload_is_bound_to_clean_registered_exact_main() -> None:
@@ -107,21 +145,130 @@ def test_atomic_install_finishes_before_the_old_model_is_stopped() -> None:
 def test_loaded_identity_must_come_from_the_qmt_process_and_match_all_hashes() -> None:
     source = _source()
 
-    expected_checks = (
-        '[int]$Heartbeat.pid -eq [int]$QmtClient.Id',
-        '[string]$Heartbeat.strategy_build_sha -ceq $ExpectedBuild',
-        '[string]$Heartbeat.strategy_git_blob -ceq',
-        '[string]$Heartbeat.strategy_source_sha256 -ceq',
-        '[string]$Heartbeat.strategy_artifact_sha256 -ceq',
-        '[string]$Heartbeat.strategy_loaded_identity_sha256 -ceq',
-        '$Heartbeat.strategy_identity_frozen -eq $true',
-        '[string]$Heartbeat.strategy_identity_status -eq "BOUND"',
+    required_fields = (
+        "strategy_release_protocol",
+        "strategy_identity_protocol",
+        "strategy_identity_frozen",
+        "strategy_identity_status",
+        "strategy_build_sha",
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
     )
-    for expected in expected_checks:
-        assert expected in source
+    for field in required_fields:
+        assert f'"{field}"' in source
+    assert "Test-HeartbeatProperties $Heartbeat $Required" in source
+    assert '[int](Get-HeartbeatProperty $Heartbeat "pid") -eq [int]$QmtClient.Id' in source
+    assert '"strategy_build_sha") -ceq $ExpectedBuild' in source
+    assert '"strategy_identity_status") -eq "BOUND"' in source
     assert 'direct_python_strategy_execution = $false' in source
     assert 'automatic_order_submission = $false' in source
     assert "Test-ExpectedReleaseHeartbeat $Heartbeat $Release" in source
+
+
+def test_legacy_and_bound_heartbeat_predicates_are_strictmode_safe() -> None:
+    source = _source()
+    names = (
+        "Get-HeartbeatProperty",
+        "Test-HeartbeatProperty",
+        "Test-HeartbeatProperties",
+        "Get-StrategyIdentityHeartbeatPropertyNames",
+        "Test-SameHeartbeatPropertyShape",
+        "Test-RunningHeartbeat",
+        "Test-ExpectedReleaseHeartbeat",
+        "Test-OriginalReleaseHeartbeat",
+    )
+    functions = "\n\n".join(_powershell_function(source, name) for name in names)
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$ReleaseProtocol = "release-v2"
+$IdentityProtocol = "identity-v2"
+$ExpectedBuild = "build-123"
+$QmtClient = [pscustomobject]@{{ Id = 123 }}
+{functions}
+function New-LegacyHeartbeat([string]$Status, [string]$UpdatedAt) {{
+    return [pscustomobject][ordered]@{{
+        schema_version = 2
+        bridge_version = "bigqmt_inner_v2"
+        source = "gj_big_qmt_inner"
+        status = $Status
+        updated_at = $UpdatedAt
+        updated_ts = 1.0
+        pid = 123
+        last_error = ""
+    }}
+}}
+$Release = [pscustomobject]@{{
+    strategy_git_blob = "blob-123"
+    strategy_source_sha256 = "source-123"
+    strategy_artifact_sha256 = "artifact-123"
+    strategy_loaded_identity_sha256 = "loaded-123"
+}}
+$LegacyPrevious = New-LegacyHeartbeat "running" "before"
+$LegacyCurrent = New-LegacyHeartbeat "running" "after"
+$PreviousHeartbeat = $LegacyPrevious
+$PartialLegacy = New-LegacyHeartbeat "running" "partial"
+$PartialLegacy | Add-Member -NotePropertyName strategy_build_sha `
+    -NotePropertyValue "build-123"
+$Exact = [pscustomobject][ordered]@{{
+    schema_version = 2
+    bridge_version = "bigqmt_inner_v2"
+    strategy_release_protocol = "release-v2"
+    strategy_identity_protocol = "identity-v2"
+    strategy_identity_frozen = $true
+    strategy_identity_status = "BOUND"
+    strategy_build_sha = "build-123"
+    strategy_git_blob = "blob-123"
+    strategy_source_sha256 = "source-123"
+    strategy_artifact_sha256 = "artifact-123"
+    strategy_loaded_identity_sha256 = "loaded-123"
+    source = "gj_big_qmt_inner"
+    status = "running"
+    updated_at = "exact"
+    pid = 123
+}}
+$Tampered = $Exact | Select-Object *
+$Tampered.strategy_artifact_sha256 = "wrong"
+$MissingBoundField = $Exact | Select-Object *
+$MissingBoundField.PSObject.Properties.Remove("strategy_git_blob")
+$Results = [ordered]@{{
+    legacy_is_not_new_release = `
+        !(Test-ExpectedReleaseHeartbeat $LegacyCurrent $Release)
+    identical_legacy_is_valid_rollback = `
+        (Test-OriginalReleaseHeartbeat $LegacyCurrent)
+    partial_legacy_fails_closed = `
+        !(Test-OriginalReleaseHeartbeat $PartialLegacy)
+    empty_heartbeat_is_not_running = `
+        !(Test-RunningHeartbeat ([pscustomobject]@{{}}))
+    exact_bound_release_matches = `
+        (Test-ExpectedReleaseHeartbeat $Exact $Release)
+    tampered_bound_release_fails = `
+        !(Test-ExpectedReleaseHeartbeat $Tampered $Release)
+}}
+$PreviousHeartbeat = $Exact
+$Results["exact_bound_rollback_matches"] = `
+    (Test-OriginalReleaseHeartbeat ($Exact | Select-Object *))
+$Results["missing_bound_field_fails_closed"] = `
+    !(Test-OriginalReleaseHeartbeat $MissingBoundField)
+$Results | ConvertTo-Json -Compress
+"""
+    results = _run_powershell(program)
+
+    assert results
+    assert all(results.values()), results
+
+
+def test_legacy_heartbeat_compatibility_does_not_use_missing_properties() -> None:
+    source = _source()
+    expected = _powershell_function(source, "Test-ExpectedReleaseHeartbeat")
+    original = _powershell_function(source, "Test-OriginalReleaseHeartbeat")
+
+    assert "$Heartbeat.strategy_" not in expected
+    assert "$PreviousHeartbeat.strategy_identity_status" not in original
+    assert "Test-SameHeartbeatPropertyShape" in original
+    assert "$PreviousHasIdentityStatus" in original
 
 
 def test_failed_reload_restores_the_previous_artifact_and_model_or_fails_closed() -> None:

@@ -1485,14 +1485,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Backfill bulky Guojin QMT historical data into a local/off-production MySQL database."
     )
-    parser.add_argument("mode", choices=["init", "daily", "minute", "from-gaps"])
+    parser.add_argument(
+        "mode",
+        choices=["init", "validate-schema", "daily", "minute", "from-gaps"],
+    )
     parser.add_argument("--local-url", default="", help="Override QMT_HISTORY_MYSQL_URL/MINUTE_MYSQL_URL.")
     parser.add_argument(
         "--windows-local-option-file",
         action="store_true",
         help=(
-            "Use the fixed protected Windows MySQL 8.4 option file for both "
-            "the local primary and QMT history schemas."
+            "Use the fixed protected read-only Windows MySQL 8.4 option file "
+            "for both the local primary and QMT history schemas."
         ),
     )
     parser.add_argument("--codes", default="", help="Comma-separated stock codes. Empty means the current immutable QMT catalog universe.")
@@ -1573,6 +1576,34 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--windows-local-option-file and --local-url are mutually exclusive"
         )
+    if args.mode == "init" and args.windows_local_option_file:
+        parser.error(
+            "init requires a dedicated privileged database connection; "
+            "--windows-local-option-file is the read-only runtime identity"
+        )
+    if args.mode == "validate-schema":
+        if not args.windows_local_option_file:
+            parser.error(
+                "validate-schema requires --windows-local-option-file"
+            )
+        if (
+            args.apply
+            or args.codes
+            or args.target_window_universe
+            or args.repair_target_source_only
+            or args.quarantine_source_only_legacy
+            or args.quarantine_invalid_target_no_native
+            or args.start_date
+            or args.end_date
+            or args.trade_date
+            or int(args.limit or 0)
+            or int(args.stock_limit or 0)
+            or int(args.gap_limit or 0)
+        ):
+            parser.error(
+                "validate-schema is read-only and does not accept data-work "
+                "options"
+            )
     if args.target_window_universe:
         if args.mode != "daily":
             parser.error("--target-window-universe is only valid in daily mode")
@@ -1625,15 +1656,32 @@ def main(argv: list[str] | None = None) -> int:
         source_engine = _source_engine()
         local_engine = get_local_history_engine(args.local_url or None)
         connection_mode = "configured_mysql_urls"
+    if args.mode == "validate-schema":
+        try:
+            local_schema = validate_local_history_tables(local_engine)
+            quarantine_schema = _validate_target_daily_quarantine_table(
+                source_engine
+            )
+        finally:
+            source_engine.dispose()
+            local_engine.dispose()
+        _print(
+            {
+                "status": "ok",
+                "mode": "validate-schema",
+                "connection_mode": connection_mode,
+                "local_history_schema": local_schema,
+                "target_quarantine_schema": quarantine_schema,
+                "database_writes": False,
+            },
+            as_json=args.json,
+        )
+        return 0
     if args.mode == "init":
         local_schema = privileged_migrate_local_history_schema(local_engine)
-        quarantine_schema = None
-        if args.windows_local_option_file:
-            quarantine_schema = (
-                _privileged_migrate_target_daily_quarantine_schema(
-                    source_engine
-                )
-            )
+        quarantine_schema = _privileged_migrate_target_daily_quarantine_schema(
+            source_engine
+        )
     else:
         validate_local_history_tables(local_engine)
     limits = _resolve_limits(args.mode, limit=args.limit, stock_limit=args.stock_limit, gap_limit=args.gap_limit)

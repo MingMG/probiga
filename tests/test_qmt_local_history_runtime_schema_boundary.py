@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from types import SimpleNamespace
 
 from integrations.qmt import local_history
@@ -115,8 +116,13 @@ def test_init_is_the_only_cli_path_that_invokes_privileged_migrations(
     events: list[tuple[str, object]] = []
     monkeypatch.setattr(
         backfill_tool,
-        "_windows_local_engines",
-        lambda: (primary_engine, history_engine),
+        "_source_engine",
+        lambda: primary_engine,
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "get_local_history_engine",
+        lambda _url=None: history_engine,
     )
     monkeypatch.setattr(
         backfill_tool,
@@ -138,12 +144,99 @@ def test_init_is_the_only_cli_path_that_invokes_privileged_migrations(
         ),
     )
 
-    assert backfill_tool.main(
-        ["init", "--windows-local-option-file", "--json"]
-    ) == 0
+    assert backfill_tool.main(["init", "--json"]) == 0
 
     assert events == [
         ("local", history_engine),
         ("quarantine", primary_engine),
     ]
     assert '"ddl_executed": true' in capsys.readouterr().out
+
+
+def test_validate_schema_uses_only_runtime_readers_and_disposes(
+    monkeypatch,
+    capsys,
+):
+    events: list[tuple[str, object]] = []
+
+    class Engine:
+        def __init__(self, name: str):
+            self.name = name
+
+        def dispose(self):
+            events.append(("dispose", self.name))
+
+    primary_engine = Engine("primary")
+    history_engine = Engine("history")
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (primary_engine, history_engine),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "validate_local_history_tables",
+        lambda engine: events.append(("validate-history", engine.name))
+        or {"ready": True, "ddl_executed": False},
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_validate_target_daily_quarantine_table",
+        lambda engine: events.append(("validate-quarantine", engine.name))
+        or {"ready": True, "ddl_executed": False},
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "privileged_migrate_local_history_schema",
+        lambda _engine: (_ for _ in ()).throw(
+            AssertionError("runtime schema validation must not execute DDL")
+        ),
+    )
+    monkeypatch.setattr(
+        backfill_tool,
+        "_privileged_migrate_target_daily_quarantine_schema",
+        lambda _engine: (_ for _ in ()).throw(
+            AssertionError("runtime schema validation must not execute DDL")
+        ),
+    )
+
+    assert backfill_tool.main(
+        ["validate-schema", "--windows-local-option-file", "--json"]
+    ) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "validate-schema"
+    assert payload["database_writes"] is False
+    assert payload["local_history_schema"]["ready"] is True
+    assert payload["target_quarantine_schema"]["ready"] is True
+    assert events == [
+        ("validate-history", "history"),
+        ("validate-quarantine", "primary"),
+        ("dispose", "primary"),
+        ("dispose", "history"),
+    ]
+
+
+def test_init_rejects_fixed_runtime_identity_before_database_access(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("runtime engine must not open for privileged init")
+        ),
+    )
+
+    try:
+        backfill_tool.main(
+            ["init", "--windows-local-option-file", "--json"]
+        )
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("runtime-backed privileged init must be rejected")
+
+    assert "read-only runtime identity" in capsys.readouterr().err

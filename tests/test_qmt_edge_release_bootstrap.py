@@ -209,18 +209,18 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     migration_state = updater.index('$PreparedSha = ""')
     first_stop = updater.index("Stop-EdgeScheduler", updater.index("# Phase two"))
     fast_forward = updater.index('Invoke-Git @("merge", "--ff-only"')
-    migration_call = updater.index("$MigrationOutput = &")
+    schema_validation_call = updater.index("$SchemaValidationOutput = &")
     authorization_failure = updater[
         updater.index("$AuthorizationExit = $LASTEXITCODE"):
         updater.index("# Phase two")
     ]
     assert request_check < first_stop
     assert request_check < fast_forward
-    assert request_check < migration_call
+    assert request_check < schema_validation_call
     assert "$TargetSha" in updater[request_check - 100:request_check + 100]
     assert "Stop-EdgeScheduler" not in authorization_failure
     assert 'Invoke-Git @("merge"' not in authorization_failure
-    assert "$MigrationOutput" not in authorization_failure
+    assert "$SchemaValidationOutput" not in authorization_failure
     assert "exit 0" in authorization_failure
     assert "not authorized or unavailable" in authorization_failure
     assert request_check < ready_check < ready_exit < first_stop < migration_state
@@ -231,7 +231,10 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "$ReadyExit -ne 4" in equal_sha_probe
     assert "Stop-EdgeScheduler" not in equal_sha_probe
     assert migration < request_check
-    assert "init --windows-local-option-file --json" in updater
+    assert "validate-schema --windows-local-option-file --json" in updater
+    assert "init --windows-local-option-file --json" not in updater
+    assert "$SchemaValidationExit -ne 0" in updater
+    assert "dedicated privileged migration or boundary" in updater
     assert '"local-history-schema.sha"' in updater
     assert "$PreparedSha -cne $CurrentSha" in updater
     assert updater.index("$PreparedSha -cne $CurrentSha") > updater.index(
@@ -249,7 +252,7 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     bootstrap_call = updater.index(
         "--bootstrap --expected-build-sha", scheduler_start
     )
-    assert request_check < first_stop < fast_forward < migration_call
+    assert request_check < first_stop < fast_forward < schema_validation_call
     assert request_check < strategy_reload < reload_call < scheduler_start < bootstrap_call
     assert "BigQMT exact strategy reloaded and identity-bound" in updater
     assert "$StrategyReloadExit -eq 3" in updater

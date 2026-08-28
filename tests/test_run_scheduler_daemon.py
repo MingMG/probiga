@@ -221,7 +221,10 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert '"merge", "--ff-only", "origin/main"' in updater
     assert "Stop-ScheduledTask" in updater
     assert "backfill_guojin_qmt_local_history.py" in updater
-    assert "init --windows-local-option-file --json" in updater
+    assert "validate-schema --windows-local-option-file --json" in updater
+    assert "init --windows-local-option-file --json" not in updater
+    assert "$SchemaValidationExit -ne 0" in updater
+    assert "dedicated privileged migration or boundary" in updater
     assert "Start-ScheduledTask" in updater
     assert "git reset" not in updater.lower()
     assert "git clean" not in updater.lower()

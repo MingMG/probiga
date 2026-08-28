@@ -609,14 +609,79 @@ function Get-Heartbeat {
     }
 }
 
+function Get-HeartbeatProperty($Heartbeat, [string]$Name) {
+    if ($null -eq $Heartbeat -or [string]::IsNullOrWhiteSpace($Name)) {
+        return $null
+    }
+    $Property = $Heartbeat.PSObject.Properties[$Name]
+    if ($null -eq $Property) {
+        return $null
+    }
+    return $Property.Value
+}
+
+function Test-HeartbeatProperty($Heartbeat, [string]$Name) {
+    if ($null -eq $Heartbeat -or [string]::IsNullOrWhiteSpace($Name)) {
+        return $false
+    }
+    return $null -ne $Heartbeat.PSObject.Properties[$Name]
+}
+
+function Test-HeartbeatProperties($Heartbeat, [string[]]$Names) {
+    foreach ($Name in $Names) {
+        if (!(Test-HeartbeatProperty $Heartbeat $Name)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-StrategyIdentityHeartbeatPropertyNames {
+    return @(
+        "strategy_release_protocol",
+        "strategy_identity_protocol",
+        "strategy_identity_frozen",
+        "strategy_identity_status",
+        "strategy_build_sha",
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256"
+    )
+}
+
+function Test-SameHeartbeatPropertyShape($Left, $Right) {
+    if ($null -eq $Left -or $null -eq $Right) {
+        return $false
+    }
+    $LeftNames = @(
+        $Left.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object
+    )
+    $RightNames = @(
+        $Right.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object
+    )
+    if ($LeftNames.Count -ne $RightNames.Count) {
+        return $false
+    }
+    for ($Index = 0; $Index -lt $LeftNames.Count; $Index += 1) {
+        if ([string]$LeftNames[$Index] -cne [string]$RightNames[$Index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-RunningHeartbeat($Heartbeat) {
-    if (!$Heartbeat) {
+    if (!(Test-HeartbeatProperties $Heartbeat @("status", "source", "pid"))) {
         return $false
     }
     return (
-        [string]$Heartbeat.status -in @("running", "busy") -and
-        [string]$Heartbeat.source -eq "gj_big_qmt_inner" -and
-        [int]$Heartbeat.pid -eq [int]$QmtClient.Id
+        [string](Get-HeartbeatProperty $Heartbeat "status") -in @(
+            "running", "busy"
+        ) -and
+        [string](Get-HeartbeatProperty $Heartbeat "source") -eq `
+            "gj_big_qmt_inner" -and
+        [int](Get-HeartbeatProperty $Heartbeat "pid") -eq [int]$QmtClient.Id
     )
 }
 
@@ -624,20 +689,36 @@ function Test-ExpectedReleaseHeartbeat($Heartbeat, $Release) {
     if (!(Test-RunningHeartbeat $Heartbeat)) {
         return $false
     }
+    $Required = @("bridge_version") + @(
+        Get-StrategyIdentityHeartbeatPropertyNames
+    )
+    if (!(Test-HeartbeatProperties $Heartbeat $Required)) {
+        return $false
+    }
     return (
-        [string]$Heartbeat.bridge_version -eq "bigqmt_inner_v2" -and
-        [string]$Heartbeat.strategy_release_protocol -eq $ReleaseProtocol -and
-        [string]$Heartbeat.strategy_identity_protocol -eq $IdentityProtocol -and
-        $Heartbeat.strategy_identity_frozen -eq $true -and
-        [string]$Heartbeat.strategy_identity_status -eq "BOUND" -and
-        [string]$Heartbeat.strategy_build_sha -ceq $ExpectedBuild -and
-        [string]$Heartbeat.strategy_git_blob -ceq `
+        [string](Get-HeartbeatProperty $Heartbeat "bridge_version") -eq `
+            "bigqmt_inner_v2" -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_release_protocol") -eq $ReleaseProtocol -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_identity_protocol") -eq $IdentityProtocol -and
+        (Get-HeartbeatProperty $Heartbeat "strategy_identity_frozen") -eq `
+            $true -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_identity_status") -eq "BOUND" -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_build_sha") -ceq $ExpectedBuild -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_git_blob") -ceq `
             [string]$Release.strategy_git_blob -and
-        [string]$Heartbeat.strategy_source_sha256 -ceq `
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_source_sha256") -ceq `
             [string]$Release.strategy_source_sha256 -and
-        [string]$Heartbeat.strategy_artifact_sha256 -ceq `
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_artifact_sha256") -ceq `
             [string]$Release.strategy_artifact_sha256 -and
-        [string]$Heartbeat.strategy_loaded_identity_sha256 -ceq `
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "strategy_loaded_identity_sha256") -ceq `
             [string]$Release.strategy_loaded_identity_sha256
     )
 }
@@ -646,26 +727,66 @@ function Test-OriginalReleaseHeartbeat($Heartbeat) {
     if (!(Test-RunningHeartbeat $Heartbeat)) {
         return $false
     }
-    $PreviousStatus = [string]$PreviousHeartbeat.strategy_identity_status
-    if ($PreviousStatus -ne "BOUND") {
-        return [string]$Heartbeat.strategy_build_sha -ceq `
-            [string]$PreviousHeartbeat.strategy_build_sha
+    if (!(Test-RunningHeartbeat $PreviousHeartbeat)) {
+        return $false
     }
-    foreach ($Name in @(
-        "strategy_release_protocol",
-        "strategy_identity_protocol",
-        "strategy_identity_status",
-        "strategy_build_sha",
-        "strategy_git_blob",
-        "strategy_source_sha256",
-        "strategy_artifact_sha256",
-        "strategy_loaded_identity_sha256"
-    )) {
-        if ([string]$Heartbeat.$Name -cne [string]$PreviousHeartbeat.$Name) {
+    $IdentityNames = @(Get-StrategyIdentityHeartbeatPropertyNames)
+    $PreviousHasIdentityStatus = Test-HeartbeatProperty `
+        $PreviousHeartbeat "strategy_identity_status"
+    if (!$PreviousHasIdentityStatus) {
+        foreach ($Name in $IdentityNames) {
+            if (
+                (Test-HeartbeatProperty $PreviousHeartbeat $Name) -or
+                (Test-HeartbeatProperty $Heartbeat $Name)
+            ) {
+                return $false
+            }
+        }
+        $LegacyStable = @("schema_version", "bridge_version", "source", "pid")
+        if (
+            !(Test-HeartbeatProperties $PreviousHeartbeat $LegacyStable) -or
+            !(Test-HeartbeatProperties $Heartbeat $LegacyStable) -or
+            !(Test-SameHeartbeatPropertyShape $PreviousHeartbeat $Heartbeat)
+        ) {
+            return $false
+        }
+        return (
+            [int](Get-HeartbeatProperty $Heartbeat "schema_version") -eq 2 -and
+            [int](Get-HeartbeatProperty $PreviousHeartbeat "schema_version") `
+                -eq 2 -and
+            [string](Get-HeartbeatProperty $Heartbeat "bridge_version") `
+                -ceq "bigqmt_inner_v2" -and
+            [string](Get-HeartbeatProperty $Heartbeat "bridge_version") `
+                -ceq [string](Get-HeartbeatProperty `
+                    $PreviousHeartbeat "bridge_version") -and
+            [string](Get-HeartbeatProperty $Heartbeat "source") -ceq `
+                [string](Get-HeartbeatProperty $PreviousHeartbeat "source") -and
+            [int](Get-HeartbeatProperty $Heartbeat "pid") -eq `
+                [int](Get-HeartbeatProperty $PreviousHeartbeat "pid")
+        )
+    }
+    if (
+        [string](Get-HeartbeatProperty `
+            $PreviousHeartbeat "strategy_identity_status") -cne "BOUND" -or
+        !(Test-HeartbeatProperties $PreviousHeartbeat $IdentityNames) -or
+        !(Test-HeartbeatProperties $Heartbeat $IdentityNames)
+    ) {
+        return $false
+    }
+    foreach ($Name in $IdentityNames) {
+        if (
+            [string](Get-HeartbeatProperty $Heartbeat $Name) -cne `
+                [string](Get-HeartbeatProperty $PreviousHeartbeat $Name)
+        ) {
             return $false
         }
     }
-    return $Heartbeat.strategy_identity_frozen -eq $true
+    return (
+        (Get-HeartbeatProperty $Heartbeat "strategy_identity_frozen") -eq `
+            $true -and
+        (Get-HeartbeatProperty `
+            $PreviousHeartbeat "strategy_identity_frozen") -eq $true
+    )
 }
 
 function Wait-ForHeartbeat([scriptblock]$Predicate, [int]$TimeoutSeconds) {
@@ -922,7 +1043,7 @@ function Open-ExactStrategyEditor {
 
 function Stop-ExactStrategy([IntPtr]$Editor) {
     $Before = Get-Heartbeat
-    if ([string]$Before.status -eq "stopped") {
+    if ([string](Get-HeartbeatProperty $Before "status") -eq "stopped") {
         return $Before
     }
     if (!(Test-RunningHeartbeat $Before)) {
@@ -935,9 +1056,12 @@ function Stop-ExactStrategy([IntPtr]$Editor) {
             param($Heartbeat)
             return (
                 $Heartbeat -and
-                [string]$Heartbeat.status -eq "stopped" -and
-                [int]$Heartbeat.pid -eq [int]$QmtClient.Id -and
-                [string]$Heartbeat.updated_at -cne [string]$Before.updated_at
+                [string](Get-HeartbeatProperty $Heartbeat "status") -eq `
+                    "stopped" -and
+                [int](Get-HeartbeatProperty $Heartbeat "pid") -eq `
+                    [int]$QmtClient.Id -and
+                [string](Get-HeartbeatProperty $Heartbeat "updated_at") `
+                    -cne [string](Get-HeartbeatProperty $Before "updated_at")
             )
         } $StopTimeoutSeconds
         if ($Stopped) {
@@ -1230,7 +1354,10 @@ function Invoke-ModelRollback {
     }
     $Editors = @(Get-ExactEditorWindows)
     if ($Editors.Count -eq 1) {
-        if ([string]$CurrentHeartbeat.status -in @("running", "busy")) {
+        if (
+            [string](Get-HeartbeatProperty $CurrentHeartbeat "status") -in `
+                @("running", "busy")
+        ) {
             try {
                 Stop-ExactStrategy $Editors[0] | Out-Null
             }
@@ -1240,7 +1367,10 @@ function Invoke-ModelRollback {
             }
         }
         $StoppedHeartbeat = Get-Heartbeat
-        if ([string]$StoppedHeartbeat.status -eq "stopped") {
+        if (
+            [string](Get-HeartbeatProperty $StoppedHeartbeat "status") -eq `
+                "stopped"
+        ) {
             Close-ExactStrategyEditor $Editors[0]
         }
     }
