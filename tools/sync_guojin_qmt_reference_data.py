@@ -1402,12 +1402,27 @@ def _fetch_trading_calendar(
             if year == observed_as_of.year
             else f"{year:04d}-12-31"
         )
-        capture = bigqmt_bridge.trading_calendar_capture(
-            "SH",
-            start_date=requested_start,
-            end_date=requested_end,
-            timeout=120,
-        )
+        try:
+            capture = bigqmt_bridge.trading_calendar_capture(
+                "SH",
+                start_date=requested_start,
+                end_date=requested_end,
+                timeout=120,
+            )
+        except Exception as exc:
+            # 000001.SH has no authoritative ContextInfo sessions before its
+            # own available history. Empty leading years are outside the
+            # proven range, not missing partitions inside that range.
+            if not frames and "returned no sessions" in str(exc):
+                partitions.append({
+                    "calendar_year": year,
+                    "requested_start_date": requested_start,
+                    "requested_end_date": requested_end,
+                    "status": "UNPROVEN_BEFORE_SOURCE_HISTORY",
+                    "session_count": 0,
+                })
+                continue
+            raise
         for key in (
             "strategy_release_protocol",
             "strategy_identity_protocol",

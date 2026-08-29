@@ -323,6 +323,33 @@ def test_bigqmt_calendar_response_identity_drift_fails_closed(monkeypatch):
         )
 
 
+def test_bigqmt_calendar_allows_empty_leading_source_year(monkeypatch):
+    proof = _bigqmt_calendar_release_proof()
+    monkeypatch.setattr(reference_sync, "validate_strategy_release_payload", lambda *_a, **_k: proof)
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "capabilities", lambda **_k: {"status": "ok"})
+
+    def capture(_market, *, start_date, end_date, **_kwargs):
+        year = int(start_date[:4])
+        if year == 1990:
+            raise RuntimeError("Big QMT native trading calendar returned no sessions")
+        day = "1991-01-02"
+        return {
+            **proof, "status": "ok", "source": "gj_big_qmt_inner",
+            "action": "trading_calendar", "source_method": "ContextInfo.get_trading_dates",
+            "source_stock_code": "000001.SH", "requested_start_date": start_date,
+            "requested_end_date": end_date, "observed_start_date": day,
+            "observed_end_date": day, "rows": [{"market": "SH", "calendar_year": year,
+            "trade_date": day, "trade_status": 1, "day_week": 3}],
+        }
+
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "trading_calendar_capture", capture)
+    frame, evidence = reference_sync._fetch_trading_calendar(
+        1990, 1991, expected_build_sha="a" * 40, as_of_date=date(1991, 12, 31)
+    )
+    assert frame["trade_date"].tolist() == ["1991-01-02"]
+    assert evidence["partitions"][0]["status"] == "UNPROVEN_BEFORE_SOURCE_HISTORY"
+
+
 def test_formal_calendar_without_build_identity_fails_before_database(
     monkeypatch,
 ):
