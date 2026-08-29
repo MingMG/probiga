@@ -25,8 +25,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.authoritative_market_clock import (
-    DAILY_CLOSE_READY_HOUR,
     PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date as resolve_authoritative_closed_trade_date,
 )
 from server.common.batch_db import create_batch_engine
 from server.common.qmt_attestation_contract import (
@@ -234,35 +234,46 @@ def authoritative_closed_trade_date(
     engine,
     now: datetime | None = None,
 ) -> str:
-    """Resolve the closed market day only from a known immutable QMT root."""
+    """Resolve the shared closed day and bind it to an immutable QMT root."""
 
     decision_time = _calendar_decision_time(now)
-    today = decision_time.date()
-    start_date = (today - timedelta(days=550)).isoformat()
+    target_trade_date = resolve_authoritative_closed_trade_date(
+        engine,
+        now=decision_time,
+    )
+    if not target_trade_date:
+        raise GovernanceQmtHistoryNotReady(
+            "共享权威市场时钟未能解析已收盘交易日"
+        )
+    try:
+        target = date.fromisoformat(target_trade_date)
+    except (TypeError, ValueError) as exc:
+        raise GovernanceQmtHistoryNotReady(
+            "共享权威市场时钟返回了无效交易日"
+        ) from exc
+    if target > decision_time.date():
+        raise GovernanceQmtHistoryNotReady(
+            "共享权威市场时钟返回了未来交易日"
+        )
+    start_date = (target - timedelta(days=550)).isoformat()
     try:
         with engine.connect() as connection:
             receipt = load_trade_calendar_receipt(
                 connection,
                 start_date=start_date,
-                end_date=today.isoformat(),
+                end_date=target_trade_date,
                 decision_known_at=decision_time,
             )
     except Exception as exc:
         raise GovernanceQmtHistoryNotReady(
             "没有在决策时点已知且覆盖治理窗口的不可变QMT交易日历"
         ) from exc
-    inclusive = (
-        decision_time.hour,
-        decision_time.minute,
-        decision_time.second,
-    ) >= (DAILY_CLOSE_READY_HOUR, 0, 0)
-    candidates = [
-        session
-        for session in receipt.sessions_between(start_date, today.isoformat())
-        if session < today.isoformat()
-        or (inclusive and session == today.isoformat())
-    ]
-    return candidates[-1] if candidates else ""
+    candidates = receipt.sessions_between(start_date, target_trade_date)
+    if not candidates or candidates[-1] != target_trade_date:
+        raise GovernanceQmtHistoryNotReady(
+            "不可变QMT交易日历未包含共享时钟解析的目标交易日"
+        )
+    return target_trade_date
 
 
 def _latest_closed_sessions(

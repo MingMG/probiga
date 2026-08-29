@@ -1,5 +1,7 @@
 from copy import deepcopy
-from datetime import date, timedelta
+from contextlib import nullcontext
+from datetime import date, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +101,69 @@ def test_schema_preparation_creates_trigger_free_tables_then_validates(monkeypat
         "immutability_enforcement": "application_hashes",
         "automatic_real_order_submission": False,
     }
+
+
+def test_closed_trade_date_uses_shared_clock_before_loading_weekend_receipt(
+    monkeypatch,
+):
+    observed = {}
+
+    def resolve(_engine, now=None):
+        observed["clock_now"] = now
+        return "2026-08-28"
+
+    def load(_connection, **kwargs):
+        observed["receipt"] = kwargs
+        return SimpleNamespace(
+            sessions_between=lambda _start, _end: ["2026-08-28"]
+        )
+
+    monkeypatch.setattr(
+        preparation,
+        "resolve_authoritative_closed_trade_date",
+        resolve,
+    )
+    monkeypatch.setattr(preparation, "load_trade_calendar_receipt", load)
+    engine = SimpleNamespace(connect=lambda: nullcontext(object()))
+
+    result = preparation.authoritative_closed_trade_date(
+        engine,
+        now=datetime(2026, 8, 29, 9, 30),
+    )
+
+    assert result == "2026-08-28"
+    assert observed["clock_now"] == datetime(2026, 8, 29, 9, 30)
+    assert observed["receipt"]["end_date"] == "2026-08-28"
+    assert observed["receipt"]["decision_known_at"] == datetime(
+        2026, 8, 29, 9, 30
+    )
+
+
+def test_closed_trade_date_rejects_receipt_missing_shared_clock_target(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        preparation,
+        "resolve_authoritative_closed_trade_date",
+        lambda _engine, now=None: "2026-08-28",
+    )
+    monkeypatch.setattr(
+        preparation,
+        "load_trade_calendar_receipt",
+        lambda _connection, **_kwargs: SimpleNamespace(
+            sessions_between=lambda _start, _end: ["2026-08-27"]
+        ),
+    )
+    engine = SimpleNamespace(connect=lambda: nullcontext(object()))
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="未包含共享时钟解析的目标交易日",
+    ):
+        preparation.authoritative_closed_trade_date(
+            engine,
+            now=datetime(2026, 8, 29, 9, 30),
+        )
 
 
 def test_prepare_requires_and_attests_exact_120_closed_sessions(monkeypatch):
